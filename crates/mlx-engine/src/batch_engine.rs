@@ -155,7 +155,7 @@ impl BatchEngine {
     }
 
     /// Generate a complete (non-streaming) response.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     pub fn generate(
         &self,
         prompt_tokens: &[u32],
@@ -165,8 +165,13 @@ impl BatchEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        _pixel_values: Option<mlx_rs::Array>,
+        pixel_values: Option<mlx_rs::Array>,
     ) -> Result<GenerationOutput, EngineError> {
+        if pixel_values.is_some() {
+            return Err(EngineError::Generation(
+                "Batch engine does not support multimodal (image) inputs".to_owned(),
+            ));
+        }
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -231,7 +236,7 @@ impl BatchEngine {
     }
 
     /// Generate tokens one at a time via the provided channel.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     pub fn generate_streaming(
         &self,
         prompt_tokens: &[u32],
@@ -242,8 +247,13 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        _pixel_values: Option<mlx_rs::Array>,
+        pixel_values: Option<mlx_rs::Array>,
     ) -> Result<(), EngineError> {
+        if pixel_values.is_some() {
+            return Err(EngineError::Generation(
+                "Batch engine does not support multimodal (image) inputs".to_owned(),
+            ));
+        }
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }

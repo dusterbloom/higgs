@@ -9,7 +9,7 @@ OpenAI and Anthropic-compatible inference server for Apple Silicon, built in Rus
 
 Runs quantized LLMs locally using the Metal GPU with no Python runtime.
 
-### Features
+## Features
 
 - **OpenAI + Anthropic API** -- chat completions, text completions, embeddings, messages
 - **Advanced sampling** -- top-k, min-p, repetition/frequency/presence penalties, logprobs

@@ -394,7 +394,7 @@ fn sample_filtered(logits: &Array, params: &SamplingParams) -> Result<Array, Exc
     let top_p_mask = maximum(&cumsum_mask, &first_token_mask)?;
 
     // --- Min-p mask (GPU): prob >= min_p * max_prob ---
-    let combined = if let Some(min_p) = params.min_p {
+    let combined = if let Some(min_p) = params.min_p.map(|v| v.clamp(0.0, 1.0)) {
         let max_prob = sorted_probs.max_axes(&[-1], true)?;
         let threshold = max_prob.multiply(array!(min_p))?;
         let min_p_mask = sorted_probs.ge(threshold)?;
