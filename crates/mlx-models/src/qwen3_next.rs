@@ -839,12 +839,14 @@ impl SwitchMlpWeights {
     /// `indices`: `[..., top_k]` expert indices
     /// Returns: `[..., top_k, D]`
     pub(crate) fn forward_gather(&self, x: &Array, indices: &Array, sorted: bool) -> Result<Array, Exception> {
-        // Two expand_dims so x batch dims broadcast with the indices shape.
+        // Reshape so x batch dims broadcast with the indices shape.
         // x: [B, L, D] -> [B, L, 1, 1, D]
         //   batch = [B, L, 1], M=1, K=D
         // indices: [B, L, top_k]
         //   broadcast([B, L, 1], [B, L, top_k]) -> [B, L, top_k]
-        let x_exp = x.expand_dims(-2)?.expand_dims(-2)?;
+        let shape = x.shape();
+        let (b, l, d) = (shape[0], shape[1], shape[2]);
+        let x_exp = x.reshape(&[b, l, 1, 1, d])?;
 
         // Gate/up projections: [B, L, top_k, 1, intermediate]
         let gate_out = gather_qmm(

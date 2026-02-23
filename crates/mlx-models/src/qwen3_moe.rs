@@ -220,6 +220,7 @@ struct Qwen3MoeMlpBlock {
     #[param]
     up_proj: Option<QLinear>,
 
+    num_experts: i32,
     top_k: i32,
     norm_topk_prob: bool,
     is_moe: bool,
@@ -244,6 +245,7 @@ impl Qwen3MoeMlpBlock {
             gate_proj: None,
             down_proj: None,
             up_proj: None,
+            num_experts: args.num_experts,
             top_k: args.num_experts_per_tok,
             norm_topk_prob: args.norm_topk_prob,
             is_moe: true,
@@ -258,6 +260,7 @@ impl Qwen3MoeMlpBlock {
             gate_proj: Some(gate_proj),
             down_proj: Some(down_proj),
             up_proj: Some(up_proj),
+            num_experts: 0,
             top_k: 0,
             norm_topk_prob: false,
             is_moe: false,
@@ -286,12 +289,8 @@ impl Qwen3MoeMlpBlock {
 
         let neg_k = -self.top_k;
         let all_inds = ops::argpartition_axis(&gates, neg_k, -1)?;
-        let num_experts = *gates
-            .shape()
-            .last()
-            .ok_or_else(|| Exception::custom("gates must have last dim"))?;
-        let top_k_start = num_experts - self.top_k;
-        let top_inds = ops::sort_axis(all_inds.index((.., .., top_k_start..)), -1)?;
+        let top_k_start = self.num_experts - self.top_k;
+        let top_inds = all_inds.index((.., .., top_k_start..));
         let raw_scores = gates.take_along_axis(&top_inds, -1)?;
 
         let top_scores = if self.norm_topk_prob {
