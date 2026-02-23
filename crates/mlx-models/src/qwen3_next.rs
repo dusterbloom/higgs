@@ -845,6 +845,9 @@ impl SwitchMlpWeights {
         // indices: [B, L, top_k]
         //   broadcast([B, L, 1], [B, L, top_k]) -> [B, L, top_k]
         let shape = x.shape();
+        if shape.len() < 3 {
+            return Err(Exception::custom("forward_gather input must be [B, L, D]"));
+        }
         let (b, l, d) = (shape[0], shape[1], shape[2]);
         let x_exp = x.reshape(&[b, l, 1, 1, d])?;
 

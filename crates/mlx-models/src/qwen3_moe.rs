@@ -433,6 +433,14 @@ impl Qwen3MoeCausalLM {
         if !args.vocab_size.is_positive() {
             return Err(Exception::custom("vocab_size must be positive"));
         }
+        if !args.num_attention_heads.is_positive() {
+            return Err(Exception::custom("num_attention_heads must be positive"));
+        }
+        if args.head_dim.is_none() && args.hidden_size % args.num_attention_heads != 0 {
+            return Err(Exception::custom(
+                "hidden_size must be divisible by num_attention_heads",
+            ));
+        }
 
         let ql = args.quantization.as_ref().map_or(64, |q| q.group_size);
         let qb = args.quantization.as_ref().map_or(4, |q| q.bits);
