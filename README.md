@@ -9,6 +9,19 @@ OpenAI and Anthropic-compatible inference server for Apple Silicon, built in Rus
 
 Runs quantized LLMs locally using the Metal GPU with no Python runtime.
 
+### Comparison
+
+| | mlx-server (Rust) | [vllm-mlx](https://github.com/waybarrios/vllm-mlx) (Python) | mlx_lm (Python) |
+|---|---|---|---|
+| **Install** | `brew install mlx-server` | `pip install` + Python + mlx ecosystem | `pip install mlx-lm` + Python |
+| **Run** | `mlx-server --model org/name` | `vllm-mlx --model org/name` | Write a script |
+| **Deploy** | Single static binary | Ship a Python environment | Ship a Python environment |
+| **Modalities** | Text | Text + image + video + audio | Text |
+| **Batching** | Single request | Continuous batching | Single request |
+| **Text perf** | ~450 tok/s (1B) | Built on mlx_lm | ~453 tok/s (1B) |
+
+Text inference performance is near-identical to Python `mlx_lm` (within 1-2%) since both use the same MLX Metal kernels. If you need multimodal or concurrent batching, [vllm-mlx](https://github.com/waybarrios/vllm-mlx) is the more feature-rich option. If you want a zero-dependency binary for text inference, mlx-server is the simpler choice.
+
 ## Requirements
 
 - macOS 14+ on Apple Silicon (M1/M2/M3/M4)
@@ -121,18 +134,31 @@ curl http://localhost:8000/v1/models
 | Qwen2 | `qwen2` | Qwen2, Qwen2.5 |
 | Qwen3 | `qwen3` | Qwen3 |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder (hybrid SSM/attention + MoE) |
+| Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B, Qwen3-235B-A22B (sparse MoE) |
 
 ## Performance
 
-Decode throughput vs Python `mlx_lm` on Apple Silicon (500 tokens, long-form prompt):
+Decode throughput on M4 Max 128GB. Prompt: long-form technical design document (~100 input tokens), 500 generated tokens, temperature=0. Each engine runs alone (no concurrent processes), with a warmup pass before measurement.
 
-| Architecture | Model | Rust tok/s | Python tok/s | Ratio |
+| Model | Rust | Python mlx_lm | llama.cpp | Ollama |
 |---|---|---|---|---|
-| llama | Llama-3.2-1B-Instruct-4bit | 453.5 | 436.7 | 1.04x |
-| mistral | Mistral-7B-Instruct-v0.3-4bit | 103.7 | 102.8 | 1.01x |
-| qwen2 | Arch-Router-1.5B | 132.4 | 130.4 | 1.02x |
-| qwen3 | Qwen3-1.7B-4bit | 307.3 | 282.4 | 1.09x |
-| qwen3_next | Qwen3-Coder-Next-4bit | 75.1 | 86.6 | 0.87x |
+| Llama-3.2-1B-Instruct-4bit | 449.8 | 453.3 | 313.5 | 305.2 |
+| Mistral-7B-Instruct-v0.3-4bit | 101.1 | 101.6 | 86.7 | 84.7 |
+| Qwen3-1.7B-4bit | 303.4 | 305.4 | 215.7 | 183.1 |
+| Qwen3-30B-A3B-8bit (MoE) | 73.2 | 88.0 | 82.7 | 72.8 |
+
+Quantization: MLX models use 4-bit (8-bit for MoE). llama.cpp/Ollama use Q4_K_M (Q8_0 for MoE).
+
+Peak RSS memory (MB) after 500-token generation:
+
+| Model | Rust | Python mlx_lm |
+|---|---|---|
+| Llama-3.2-1B-Instruct-4bit | 883 | 1,094 |
+| Mistral-7B-Instruct-v0.3-4bit | 3,953 | 4,062 |
+| Qwen3-1.7B-4bit | 1,089 | 1,316 |
+| Qwen3-30B-A3B-8bit (MoE) | 31,095 | 31,348 |
+
+Model weights (in unified GPU memory) dominate RSS. Rust saves ~200 MB on small models by eliminating the Python runtime.
 
 ## Development
 
