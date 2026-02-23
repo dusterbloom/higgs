@@ -150,6 +150,17 @@ impl LlavaQwen2Model {
         pixel_values: &Array,
         cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
+        // Validate batch=1 assumption
+        let batch = input_ids
+            .shape()
+            .first()
+            .copied()
+            .ok_or_else(|| Exception::custom("input_ids must have >= 2 dims"))?;
+        if batch != 1 {
+            return Err(Exception::custom(format!(
+                "LLaVA-Qwen2 only supports batch_size=1, got {batch}"
+            )));
+        }
         let image_features = self.encode_image(pixel_values)?;
         // Replace IMAGE_TOKEN_INDEX sentinel with 0 before embedding lookup to
         // avoid out-of-bounds access. merge_embeddings overwrites these positions.
@@ -189,6 +200,15 @@ fn merge_embeddings(
 
     if image_positions.is_empty() {
         return Ok(text_embeddings.clone());
+    }
+
+    // Only single-image is supported; multiple IMAGE_TOKEN_INDEX positions
+    // would duplicate the same features, inflating the sequence length.
+    if image_positions.len() > 1 {
+        return Err(Exception::custom(format!(
+            "Expected 1 image token position, found {}",
+            image_positions.len()
+        )));
     }
 
     let image_feats = image_features.index(0); // [num_patches, hidden_size]

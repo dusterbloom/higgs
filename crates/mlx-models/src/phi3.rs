@@ -369,6 +369,12 @@ impl Phi3Model {
         if !args.num_hidden_layers.is_positive() {
             return Err(Exception::custom("num_hidden_layers must be positive"));
         }
+        if args.num_key_value_heads <= 0 || args.num_key_value_heads > args.num_attention_heads {
+            return Err(Exception::custom(format!(
+                "num_key_value_heads ({}) must be in [1, num_attention_heads ({})]",
+                args.num_key_value_heads, args.num_attention_heads
+            )));
+        }
 
         Ok(Self {
             embed_tokens: MaybeQuantized::Original(nn::Embedding::new(

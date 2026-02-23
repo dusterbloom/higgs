@@ -18,7 +18,7 @@ Runs quantized LLMs locally using the Metal GPU with no Python runtime.
 - **Continuous batching** -- concurrent request processing with shared decode loop
 - **Radix tree prefix cache** -- shared prefix reuse across requests
 - **Vision** -- multimodal image+text via LLaVA-Qwen2 (nanoLLaVA)
-- **10 architectures** -- LLaMA, Mistral, Qwen2/3, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, LLaVA-Qwen2
+- **11 architectures** -- LLaMA, Mistral, Qwen2/3, Qwen3-MoE, Qwen3-Next, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, LLaVA-Qwen2
 - **Zero dependencies** -- single static Rust binary, no Python runtime
 
 ### Comparison

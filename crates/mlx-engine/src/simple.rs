@@ -250,7 +250,7 @@ impl SimpleEngine {
         let current_token = sample(&last_logits, params).map_err(EngineError::Mlx)?;
 
         let logprob_data = if let Some(top_n) = logprob_top_n {
-            let scaled = if params.temperature == 0.0 {
+            let scaled = if params.temperature <= f32::EPSILON {
                 last_logits
             } else {
                 last_logits
@@ -318,7 +318,7 @@ impl SimpleEngine {
             // Compute logprobs from the same distribution we sampled from.
             // Temperature is already accounted for inside `sample`, so we
             // replicate the scaling here for the logprob computation.
-            let scaled = if params.temperature == 0.0 {
+            let scaled = if params.temperature <= f32::EPSILON {
                 constrained
             } else {
                 constrained

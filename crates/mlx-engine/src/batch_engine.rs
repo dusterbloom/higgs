@@ -383,6 +383,7 @@ fn worker_loop(
 /// Prefill a new request: run the full prompt through the model and sample
 /// the first token. Returns `None` if the request completed immediately
 /// (first token is EOS or hit a stop sequence).
+#[allow(clippy::too_many_lines)]
 fn prefill_request(
     model: &mut AnyModel,
     prefix_cache: &mut PrefixCache,
@@ -421,14 +422,41 @@ fn prefill_request(
         let logits = model
             .forward(&prompt_array, None, &mut cache)
             .map_err(EngineError::Mlx)?;
-        let current_token =
-            sample(&logits.index((.., -1, ..)), &req.params).map_err(EngineError::Mlx)?;
-        eval([&current_token]).map_err(EngineError::Mlx)?;
+        let last_logits = logits.index((.., -1, ..));
+        let current_token = sample(&last_logits, &req.params).map_err(EngineError::Mlx)?;
+
+        let logprob_top_n = req.logprobs.then(|| req.top_logprobs.unwrap_or(0));
+        let first_logprob_data = if let Some(top_n) = logprob_top_n {
+            let scaled = if req.params.temperature <= f32::EPSILON {
+                last_logits
+            } else {
+                last_logits
+                    .multiply(mlx_rs::array!(1.0 / req.params.temperature))
+                    .map_err(EngineError::Mlx)?
+            };
+            Some(
+                LogprobArrays::compute(&scaled, &current_token, Some(top_n))
+                    .map_err(EngineError::Mlx)?,
+            )
+        } else {
+            None
+        };
+
+        {
+            let mut eval_targets: Vec<&Array> = vec![&current_token];
+            if let Some(ref lp) = first_logprob_data {
+                eval_targets.extend(lp.eval_targets());
+            }
+            eval(eval_targets).map_err(EngineError::Mlx)?;
+        }
 
         // Cache the post-prefill state
         prefix_cache.store(&req.prompt_tokens, cache.clone());
 
         let first_token_id: u32 = current_token.item();
+        let first_token_logprob = first_logprob_data
+            .as_ref()
+            .map(|lp| lp.materialize(first_token_id));
 
         // Decode the first token for text diff tracking
         let first_text = tokenizer
@@ -448,7 +476,7 @@ fn prefill_request(
                 finish_reason: Some(finish_reason.to_owned()),
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
-                token_logprob: None,
+                token_logprob: first_token_logprob,
             });
             return Ok(None);
         }
@@ -463,14 +491,12 @@ fn prefill_request(
                 finish_reason: None,
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
-                token_logprob: None,
+                token_logprob: first_token_logprob,
             })
             .is_err()
         {
             return Ok(None); // Client disconnected
         }
-
-        let logprob_top_n = req.logprobs.then(|| req.top_logprobs.unwrap_or(0));
 
         Ok(Some(ActiveRequest {
             cache,
@@ -514,7 +540,7 @@ fn run_one_decode_step(
     let next_token = sample(&constrained, &ar.params).map_err(EngineError::Mlx)?;
 
     let logprob_data = if let Some(top_n) = ar.logprob_top_n {
-        let scaled = if ar.params.temperature == 0.0 {
+        let scaled = if ar.params.temperature <= f32::EPSILON {
             constrained
         } else {
             constrained

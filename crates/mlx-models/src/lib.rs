@@ -266,9 +266,9 @@ pub fn apply_penalties(
     let shape: Vec<i32> = logits.shape().to_vec();
     let mut result = logits.clone();
 
-    // Repetition penalty: for seen tokens, divide positive logits and multiply
-    // negative logits by the penalty factor. This pushes both toward zero,
-    // making seen tokens uniformly less likely regardless of logit sign.
+    // Repetition penalty: for seen tokens, divide positive logits by the penalty
+    // and multiply negative logits by the penalty. This moves positive logits
+    // down and negative logits further negative, making seen tokens less likely.
     if let Some(rep_penalty) = params.repetition_penalty {
         if rep_penalty != 1.0 {
             let inv = 1.0 / rep_penalty;
