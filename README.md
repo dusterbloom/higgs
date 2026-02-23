@@ -9,16 +9,18 @@ OpenAI and Anthropic-compatible inference server for Apple Silicon, built in Rus
 
 Runs quantized LLMs locally using the Metal GPU with no Python runtime.
 
-### Why not Python?
+### Comparison
 
-Performance is near-identical to Python `mlx_lm` (within 1-2%). The difference is operational:
+| | mlx-server (Rust) | [vllm-mlx](https://github.com/waybarrios/vllm-mlx) (Python) | mlx_lm (Python) |
+|---|---|---|---|
+| **Install** | `brew install mlx-server` | `pip install` + Python + mlx ecosystem | `pip install mlx-lm` + Python |
+| **Run** | `mlx-server --model org/name` | `vllm-mlx --model org/name` | Write a script |
+| **Deploy** | Single static binary | Ship a Python environment | Ship a Python environment |
+| **Modalities** | Text | Text + image + video + audio | Text |
+| **Batching** | Single request | Continuous batching | Single request |
+| **Text perf** | ~450 tok/s (1B) | Built on mlx_lm | ~453 tok/s (1B) |
 
-| | Rust (mlx-server) | Python (mlx_lm) |
-|---|---|---|
-| **Install** | `brew install mlx-server` | Python 3.x + pip + venv + `mlx` + `mlx-lm` + transformers + tokenizers + numpy + ... |
-| **Run** | `mlx-server --model org/name` | Write a script or install a wrapper server |
-| **Upgrade** | `brew upgrade mlx-server` | Resolve dependency conflicts between mlx, numpy, torch |
-| **Deploy** | Single static binary | Ship a Python environment |
+Text inference performance is near-identical to Python `mlx_lm` (within 1-2%) since both use the same MLX Metal kernels. If you need multimodal or concurrent batching, [vllm-mlx](https://github.com/waybarrios/vllm-mlx) is the more feature-rich option. If you want a zero-dependency binary for text inference, mlx-server is the simpler choice.
 
 ## Requirements
 
