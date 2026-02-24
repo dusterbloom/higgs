@@ -54,10 +54,10 @@ Single request, 500 generated tokens, median of 3 runs.
 | Mistral-7B-v0.3-4bit | 103 | 103 | -- | 87 | 85 |
 | Qwen3-1.7B-4bit | 305 | 293 | 300 | 216 | 183 |
 | Qwen3-30B-A3B-8bit | 75 | 86 | 87 | 83 | 73 |
-| Gemma-2-2B-4bit | 158 | 185 | 91 | -- | -- |
+| Gemma-2-2B-4bit | 163 | 185 | 91 | -- | -- |
 | Phi-3-mini-4bit | 171 | 170 | 95 | -- | -- |
 | Starcoder2-3B-4bit | 107 | 176 | 165 | -- | -- |
-| DeepSeek-V2-Lite-4bit | 137 | 174 | 99 | -- | -- |
+| DeepSeek-V2-Lite-4bit | 140 | 174 | 99 | -- | -- |
 
 MLX models use 4-bit (8-bit for MoE). llama.cpp/Ollama use Q4_K_M (Q8_0 for MoE).
 
@@ -78,7 +78,7 @@ MLX models use 4-bit (8-bit for MoE). llama.cpp/Ollama use Q4_K_M (Q8_0 for MoE)
 | Mistral-7B-v0.3-4bit | 3,965 | 4,384 | -- |
 | Qwen3-1.7B-4bit | 1,127 | 1,609 | 1,641 |
 | Qwen3-30B-A3B-8bit | 31,139 | 31,640 | 31,658 |
-| Gemma-2-2B-4bit | 1,639 | 2,307 | 2,350 |
+| Gemma-2-2B-4bit | 1,645 | 2,329 | 2,350 |
 | Phi-3-mini-4bit | 2,126 | 2,548 | 2,573 |
 | DeepSeek-V2-Lite-4bit | 8,528 | 8,972 | 8,998 |
 
