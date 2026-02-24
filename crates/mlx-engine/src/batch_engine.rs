@@ -369,7 +369,7 @@ fn worker_loop(
             && active.iter().all(|ar| ar.constraint.is_none());
 
         if use_batched {
-            let _: Result<(), EngineError> = with_new_default_stream(Stream::new(), || {
+            if let Err(e) = with_new_default_stream(Stream::new(), || {
                 run_batched_decode_round(
                     &mut model,
                     &mut active,
@@ -377,7 +377,20 @@ fn worker_loop(
                     eos_token_ids,
                     &mut finished_indices,
                 )
-            });
+            }) {
+                tracing::error!(error = %e, "Batched decode round failed");
+                for (i, ar) in active.iter().enumerate() {
+                    let _ = ar.response_tx.blocking_send(StreamingOutput {
+                        new_text: String::new(),
+                        finished: true,
+                        finish_reason: Some("error".to_owned()),
+                        prompt_tokens: ar.prompt_len,
+                        completion_tokens: 0,
+                        token_logprob: None,
+                    });
+                    finished_indices.push(i);
+                }
+            }
         } else {
             with_new_default_stream(Stream::new(), || {
                 run_pipelined_decode_round(
@@ -420,6 +433,14 @@ fn run_pipelined_decode_round(
                     Ok(()) => graphs.push(Some(result)),
                     Err(e) => {
                         tracing::error!(error = %e, "async_eval failed");
+                        let _ = ar.response_tx.blocking_send(StreamingOutput {
+                            new_text: String::new(),
+                            finished: true,
+                            finish_reason: Some("error".to_owned()),
+                            prompt_tokens: ar.prompt_len,
+                            completion_tokens: 0,
+                            token_logprob: None,
+                        });
                         finished_indices.push(i);
                         graphs.push(None);
                     }
@@ -427,6 +448,14 @@ fn run_pipelined_decode_round(
             }
             Err(e) => {
                 tracing::error!(error = %e, "Decode graph build failed");
+                let _ = ar.response_tx.blocking_send(StreamingOutput {
+                    new_text: String::new(),
+                    finished: true,
+                    finish_reason: Some("error".to_owned()),
+                    prompt_tokens: ar.prompt_len,
+                    completion_tokens: 0,
+                    token_logprob: None,
+                });
                 finished_indices.push(i);
                 graphs.push(None);
             }
@@ -908,8 +937,7 @@ mod tests {
     }
 
     fn make_tokenizer() -> Tokenizer {
-        // Minimal tokenizer that can decode token IDs
-        Tokenizer::from_pretrained("gpt2", None).unwrap()
+        Tokenizer::new(tokenizers::models::bpe::BPE::default())
     }
 
     #[test]

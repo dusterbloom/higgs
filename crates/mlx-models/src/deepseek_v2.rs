@@ -555,7 +555,11 @@ impl DeepSeekV2MlpBlock {
         };
 
         Ok(Self {
-            gate: Some(nn::LinearBuilder::new(args.hidden_size, n_routed).build()?),
+            gate: Some(
+                nn::LinearBuilder::new(args.hidden_size, n_routed)
+                    .bias(false)
+                    .build()?,
+            ),
             switch_mlp: Some(SwitchMlpWeights::new(ql, qb)?),
             shared_experts: shared,
             gate_proj: None,

@@ -162,7 +162,7 @@ pub fn build_vocabulary(
 
     let mut vocab = Vocabulary::new(eos_token_id);
 
-    // Added (special) tokens are inserted as-is since they represent literal strings.
+    // Added non-special tokens are inserted as-is since they represent literal strings.
     for (id, added) in tokenizer.get_added_tokens_decoder() {
         if !added.special && id != eos_token_id {
             if vocab
@@ -341,10 +341,7 @@ mod tests {
         // We test this by directly checking the code path:
         // If there are no allowed tokens the function returns early.
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        // The function returns Ok(logits.clone()) when allowed is None,
-        // so verify clone produces same values.
-        let cloned = logits.clone();
-        let vals: Vec<f32> = cloned.as_slice().to_vec();
+        let vals: Vec<f32> = logits.as_slice().to_vec();
         assert_eq!(vals, vec![1.0, 2.0, 3.0]);
     }
 
