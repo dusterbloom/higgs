@@ -672,11 +672,7 @@ impl Model {
         // Per-request offsets (from layer 0's cache, all layers have the same offset)
         let offsets: Vec<i32> = kv_caches
             .iter()
-            .map(|c| {
-                c.first()
-                    .and_then(|c| c.as_ref())
-                    .map_or(0, |c| c.offset())
-            })
+            .map(|c| c.first().and_then(|c| c.as_ref()).map_or(0, |c| c.offset()))
             .collect();
         let max_kv_len = offsets.iter().map(|&o| o + 1).max().unwrap_or(1);
         let kv_lengths: Vec<i32> = offsets.iter().map(|&o| o + 1).collect();
@@ -773,14 +769,10 @@ impl Model {
                 let seq_len = full_k.shape()[2];
                 if seq_len < max_kv_len {
                     let pad_len = max_kv_len - seq_len;
-                    let pad_k = ops::zeros_dtype(
-                        &[1, n_kv_heads, pad_len, head_dim],
-                        full_k.dtype(),
-                    )?;
-                    let pad_v = ops::zeros_dtype(
-                        &[1, n_kv_heads, pad_len, head_dim],
-                        full_v.dtype(),
-                    )?;
+                    let pad_k =
+                        ops::zeros_dtype(&[1, n_kv_heads, pad_len, head_dim], full_k.dtype())?;
+                    let pad_v =
+                        ops::zeros_dtype(&[1, n_kv_heads, pad_len, head_dim], full_v.dtype())?;
                     all_keys.push(ops::concatenate_axis(&[&full_k, &pad_k], 2)?);
                     all_values.push(ops::concatenate_axis(&[&full_v, &pad_v], 2)?);
                 } else {
@@ -791,22 +783,14 @@ impl Model {
             }
 
             // --- Batched: stack + SDPA + output proj + MLP ---
-            let stacked_q =
-                ops::concatenate_axis(&all_queries.iter().collect::<Vec<_>>(), 0)?;
-            let stacked_k =
-                ops::concatenate_axis(&all_keys.iter().collect::<Vec<_>>(), 0)?;
-            let stacked_v =
-                ops::concatenate_axis(&all_values.iter().collect::<Vec<_>>(), 0)?;
+            let stacked_q = ops::concatenate_axis(&all_queries.iter().collect::<Vec<_>>(), 0)?;
+            let stacked_k = ops::concatenate_axis(&all_keys.iter().collect::<Vec<_>>(), 0)?;
+            let stacked_v = ops::concatenate_axis(&all_values.iter().collect::<Vec<_>>(), 0)?;
 
             let mask = create_batched_decode_mask(&kv_lengths, max_kv_len)?;
 
-            let attn_out = scaled_dot_product_attention(
-                stacked_q,
-                stacked_k,
-                stacked_v,
-                scale,
-                Some(&mask),
-            )?;
+            let attn_out =
+                scaled_dot_product_attention(stacked_q, stacked_k, stacked_v, scale, Some(&mask))?;
 
             let attn_flat = attn_out
                 .transpose_axes(&[0, 2, 1, 3])?

@@ -629,11 +629,7 @@ impl DeepSeekV2MlpBlock {
 
         // Add shared experts
         if self.shared_experts.is_some() {
-            let shared_out = self
-                .shared_experts
-                .as_mut()
-                .unwrap()
-                .forward(x)?;
+            let shared_out = self.shared_experts.as_mut().unwrap().forward(x)?;
             result = result.add(shared_out)?;
         }
 

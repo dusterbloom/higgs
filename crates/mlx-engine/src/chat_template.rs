@@ -38,9 +38,7 @@ impl ChatTemplateRenderer {
 
     /// Like [`from_model_dir`] but returns `Ok(None)` when no template is present,
     /// rather than an error. Parse/IO failures still propagate as `Err`.
-    pub fn try_from_model_dir(
-        model_dir: &std::path::Path,
-    ) -> Result<Option<Self>, EngineError> {
+    pub fn try_from_model_dir(model_dir: &std::path::Path) -> Result<Option<Self>, EngineError> {
         // Prefer standalone chat_template.jinja
         let jinja_path = model_dir.join("chat_template.jinja");
         if jinja_path.exists() {

@@ -511,7 +511,9 @@ impl LogprobArrays {
             let neg = log_probs.negative()?;
             let sorted_idx = argsort_axis(&neg, -1)?;
             let top_idx = sorted_idx.index((.., ..clamped));
-            let top_vals = log_probs.take_along_axis(&top_idx, -1)?.as_dtype(mlx_rs::Dtype::Float32)?;
+            let top_vals = log_probs
+                .take_along_axis(&top_idx, -1)?
+                .as_dtype(mlx_rs::Dtype::Float32)?;
             (Some(top_idx), Some(top_vals))
         } else {
             (None, None)

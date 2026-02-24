@@ -182,7 +182,10 @@ pub fn build_vocabulary(
     // Added (special) tokens are inserted as-is since they represent literal strings.
     for (id, added) in tokenizer.get_added_tokens_decoder() {
         if !added.special && id != eos_token_id {
-            if vocab.try_insert(added.content.as_bytes().to_vec(), id).is_err() {
+            if vocab
+                .try_insert(added.content.as_bytes().to_vec(), id)
+                .is_err()
+            {
                 tracing::trace!(token = %added.content, id, "Skipping duplicate added token");
             }
         }

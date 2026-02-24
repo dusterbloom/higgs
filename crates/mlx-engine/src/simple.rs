@@ -483,8 +483,13 @@ impl SimpleEngine {
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
-        let (current_token, first_logprob_data) =
-            self.run_prefill(prompt_tokens, &mut prepared, params, logprob_top_n, constraint.as_ref())?;
+        let (current_token, first_logprob_data) = self.run_prefill(
+            prompt_tokens,
+            &mut prepared,
+            params,
+            logprob_top_n,
+            constraint.as_ref(),
+        )?;
 
         // Capture T1 (already eval'd inside run_prefill).
         let first_token_id: u32 = current_token.item();
@@ -802,8 +807,13 @@ impl SimpleEngine {
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
         let prompt_len = prepared.prompt_len;
-        let (current_token, first_logprob_data) =
-            self.run_prefill(prompt_tokens, &mut prepared, params, logprob_top_n, constraint.as_ref())?;
+        let (current_token, first_logprob_data) = self.run_prefill(
+            prompt_tokens,
+            &mut prepared,
+            params,
+            logprob_top_n,
+            constraint.as_ref(),
+        )?;
 
         let mut all_tokens: Vec<u32> = Vec::new();
         let first_token_id: u32 = current_token.item();

@@ -469,8 +469,7 @@ fn run_batched_decode_round(
         .map(|ar| ar.current_token.index((.., NewAxis)))
         .collect();
     let token_refs: Vec<&Array> = token_arrays.iter().collect();
-    let batched_input =
-        mlx_rs::ops::concatenate_axis(&token_refs, 0).map_err(EngineError::Mlx)?;
+    let batched_input = mlx_rs::ops::concatenate_axis(&token_refs, 0).map_err(EngineError::Mlx)?;
 
     // Collect mutable cache references
     let mut cache_refs: Vec<&mut mlx_models::AnyCache> =
@@ -739,7 +738,10 @@ fn materialize_decode_step(
         cg.advance(token_id);
     }
 
-    let token_logprob = result.logprob_data.as_ref().map(|lp| lp.materialize(token_id));
+    let token_logprob = result
+        .logprob_data
+        .as_ref()
+        .map(|lp| lp.materialize(token_id));
 
     ar.generated_tokens.push(token_id);
     ar.current_token = result.next_token;
