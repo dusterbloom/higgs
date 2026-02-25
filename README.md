@@ -7,7 +7,7 @@
 [![Crates.io](https://img.shields.io/crates/v/higgs)](https://crates.io/crates/higgs)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
 
-An inference server for Apple Silicon that optimizes model serving using unified memory. Serve local MLX models and proxy to remote providers (OpenAI, Anthropic, Ollama, etc.) through a single endpoint with automatic format translation. Single static Rust binary, no Python runtime. Built on [mlx-rs](https://github.com/oxideai/mlx-rs).
+A model router and inference server for Apple Silicon that optimizes model serving using unified memory. Serve local MLX models and proxy to remote providers (OpenAI, Anthropic, Ollama, etc.) through a single endpoint with automatic format translation. Single static Rust binary, no Python runtime. Built on [mlx-rs](https://github.com/oxideai/mlx-rs).
 
 ## Install
 
