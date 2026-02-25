@@ -17,6 +17,7 @@ fn main() {
         return;
     };
 
+    let mut copied = false;
     for entry in entries.flatten() {
         let entry_name = entry.file_name();
         let is_mlx_sys = entry_name
@@ -35,8 +36,8 @@ fn main() {
         if let Some(profile_dir) = out_dir.ancestors().nth(3) {
             let dst = profile_dir.join("mlx.metallib");
             if let Err(err) = fs::copy(&metallib, &dst) {
-                eprintln!(
-                    "failed to copy {} to {}: {}",
+                println!(
+                    "cargo:warning=failed to copy {} to {}: {}",
                     metallib.display(),
                     dst.display(),
                     err
@@ -44,8 +45,15 @@ fn main() {
                 process::exit(1);
             }
             println!("cargo:warning=Copied mlx.metallib to {}", dst.display());
+            copied = true;
         }
 
         break;
+    }
+
+    let is_macos = env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos");
+    if is_macos && !copied {
+        println!("cargo:warning=mlx.metallib not found in mlx-sys build output");
+        process::exit(1);
     }
 }
