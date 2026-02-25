@@ -272,3 +272,125 @@ async fn metrics_recorded_for_proxy() {
     assert_eq!(records[0].status, 200);
     assert_eq!(records[0].model, "gpt-4");
 }
+
+// ---------------------------------------------------------------------------
+// 5. Cross-format: OpenAI request -> Anthropic provider -> translated response
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn proxy_openai_to_anthropic_translation() {
+    let mock_server = MockServer::start().await;
+
+    // Upstream returns an Anthropic-format response
+    let anthropic_response = serde_json::json!({
+        "id": "msg_test123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-20250514",
+        "content": [{"type": "text", "text": "Hello from Anthropic!"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 12, "output_tokens": 8}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&anthropic_response))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Provider is Anthropic format -- the gateway must translate OpenAI -> Anthropic
+    let state = build_test_state(&mock_server.uri(), ApiFormat::Anthropic);
+    let app = build_app(state);
+
+    // Send an OpenAI-format request
+    let response = app
+        .oneshot(post_json(
+            "/v1/chat/completions",
+            &openai_chat_request_body(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    // Response should be translated back to OpenAI format
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "Hello from Anthropic!"
+    );
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert!(body["choices"][0]["finish_reason"].is_string());
+
+    // Verify the upstream received an Anthropic-format request
+    let received = mock_server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let upstream_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    // Anthropic requests have "messages" array and no "model" at top level is rewritten
+    assert!(
+        upstream_body.get("messages").is_some(),
+        "upstream should receive Anthropic-format request with messages"
+    );
+    assert!(
+        upstream_body.get("max_tokens").is_some(),
+        "Anthropic requests require max_tokens"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Cross-format: Anthropic request -> OpenAI provider -> translated response
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn proxy_anthropic_to_openai_translation() {
+    let mock_server = MockServer::start().await;
+
+    // Upstream returns an OpenAI-format response
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&openai_chat_response()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Provider is OpenAI format, request comes in as Anthropic
+    let state = build_test_state(&mock_server.uri(), ApiFormat::OpenAi);
+    let app = build_app(state);
+
+    // Send an Anthropic-format request to the Anthropic endpoint
+    let anthropic_request = serde_json::json!({
+        "model": "gpt-4",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+
+    let response = app
+        .oneshot(post_json("/v1/messages", &anthropic_request))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    // Response should be translated to Anthropic format
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["role"], "assistant");
+    assert!(body["content"].is_array());
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["content"][0]["text"], "Hello!");
+
+    // Verify the upstream received an OpenAI-format request
+    let received = mock_server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let upstream_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert!(
+        upstream_body.get("messages").is_some(),
+        "upstream should receive OpenAI-format request"
+    );
+}
