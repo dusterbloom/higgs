@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, process};
 
 fn main() {
     // Find mlx.metallib in the mlx-sys build output and copy it next to the binary.
@@ -18,11 +18,11 @@ fn main() {
     };
 
     for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            continue;
-        };
-        if !file_name.starts_with("mlx-sys-") {
+        let entry_name = entry.file_name();
+        let is_mlx_sys = entry_name
+            .to_str()
+            .is_some_and(|s| s.starts_with("mlx-sys-"));
+        if !is_mlx_sys {
             continue;
         }
 
@@ -35,12 +35,13 @@ fn main() {
         if let Some(profile_dir) = out_dir.ancestors().nth(3) {
             let dst = profile_dir.join("mlx.metallib");
             if let Err(err) = fs::copy(&metallib, &dst) {
-                panic!(
+                eprintln!(
                     "failed to copy {} to {}: {}",
                     metallib.display(),
                     dst.display(),
                     err
                 );
+                process::exit(1);
             }
             println!("cargo:warning=Copied mlx.metallib to {}", dst.display());
         }
