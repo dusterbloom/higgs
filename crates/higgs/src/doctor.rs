@@ -71,20 +71,26 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
 }
 
 fn check_duplicate_models(config: &HiggsConfig, result: &mut DoctorResult) {
-    let mut seen = HashSet::new();
+    let mut seen_paths = HashSet::new();
+    let mut seen_names = HashSet::new();
     let mut duplicates = Vec::new();
     for model in &config.models {
-        if !seen.insert(&model.path) {
-            duplicates.push(model.path.clone());
+        if !seen_paths.insert(&model.path) {
+            duplicates.push(format!("path: {}", model.path));
+        }
+        if let Some(ref name) = model.name {
+            if !seen_names.insert(name) {
+                duplicates.push(format!("name: {name}"));
+            }
         }
     }
     if duplicates.is_empty() {
         if config.models.len() > 1 {
-            pass("no duplicate model paths", result);
+            pass("no duplicate model paths or names", result);
         }
     } else {
         for dup in &duplicates {
-            warn(&format!("duplicate model path: {dup}"), result);
+            warn(&format!("duplicate model {dup}"), result);
         }
     }
 }
@@ -187,34 +193,40 @@ fn check_auto_router(config: &HiggsConfig, result: &mut DoctorResult) {
         return;
     }
 
-    let model_name = &config.auto_router.model;
-    if model_name.is_empty() {
+    let model_ref = &config.auto_router.model;
+    if model_ref.is_empty() {
         fail("auto_router enabled but no model specified", result);
         return;
     }
 
-    let model_known = config.models.iter().any(|m| m.path == *model_name);
-    if model_known {
+    // Match by name or path
+    let matched = config
+        .models
+        .iter()
+        .find(|m| m.path == *model_ref || m.name.as_deref() == Some(model_ref));
+
+    if let Some(matched_model) = matched {
         pass(
-            &format!("auto_router model \"{model_name}\" found in models"),
+            &format!("auto_router model \"{model_ref}\" found in models"),
             result,
         );
+        // Use the model's path for the download check
+        let resolve_path = &matched_model.path;
+        match model_resolver::resolve(resolve_path) {
+            Ok(_) => pass(
+                &format!("auto_router model \"{model_ref}\" downloaded"),
+                result,
+            ),
+            Err(err) => fail(
+                &format!("auto_router model \"{model_ref}\" not downloaded: {err}"),
+                result,
+            ),
+        }
     } else {
         fail(
-            &format!("auto_router model \"{model_name}\" not found in models"),
+            &format!("auto_router model \"{model_ref}\" not found in models"),
             result,
         );
-    }
-
-    match model_resolver::resolve(model_name) {
-        Ok(_) => pass(
-            &format!("auto_router model \"{model_name}\" downloaded"),
-            result,
-        ),
-        Err(err) => fail(
-            &format!("auto_router model \"{model_name}\" not downloaded: {err}"),
-            result,
-        ),
     }
 
     let routes_with_descriptions = config
@@ -319,10 +331,12 @@ mod tests {
             models: vec![
                 ModelConfig {
                     path: "org/model-a".to_owned(),
+                    name: None,
                     batch: false,
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
+                    name: None,
                     batch: false,
                 },
             ],
@@ -340,10 +354,12 @@ mod tests {
             models: vec![
                 ModelConfig {
                     path: "org/model-a".to_owned(),
+                    name: None,
                     batch: false,
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
+                    name: None,
                     batch: false,
                 },
             ],
@@ -591,14 +607,15 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/other-model".to_owned(),
+                name: None,
                 batch: false,
             }],
             ..HiggsConfig::default()
         };
         let mut result = empty_result();
         check_auto_router(&config, &mut result);
-        // Fails twice: not in [[models]] and not downloaded
-        assert_eq!(result.failures, 2);
+        // Fails once: not in [[models]] (download check skipped)
+        assert_eq!(result.failures, 1);
     }
 
     #[test]
@@ -612,6 +629,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/router-model".to_owned(),
+                name: None,
                 batch: false,
             }],
             ..HiggsConfig::default()
@@ -635,6 +653,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/router-model".to_owned(),
+                name: None,
                 batch: false,
             }],
             routes: vec![RouteConfig {

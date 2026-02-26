@@ -183,6 +183,8 @@ const fn default_max_body_size() -> usize {
 pub struct ModelConfig {
     pub path: String,
     #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub batch: bool,
 }
 
@@ -371,6 +373,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
         .iter()
         .map(|p| ModelConfig {
             path: p.clone(),
+            name: None,
             batch: args.batch,
         })
         .collect();
@@ -445,6 +448,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                 .iter()
                 .map(|p| ModelConfig {
                     path: p.clone(),
+                    name: None,
                     batch: serve_args.batch,
                 })
                 .collect();
@@ -474,12 +478,23 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
         if model.path.trim().is_empty() {
             return Err("model path must not be empty or whitespace-only".to_owned());
         }
+        if let Some(ref name) = model.name {
+            if name.trim().is_empty() {
+                return Err("model name must not be empty or whitespace-only".to_owned());
+            }
+        }
     }
 
-    let mut seen = std::collections::HashSet::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut seen_names = std::collections::HashSet::new();
     for model in &config.models {
-        if !seen.insert(&model.path) {
+        if !seen_paths.insert(&model.path) {
             return Err(format!("duplicate model path: {}", model.path));
+        }
+        if let Some(ref name) = model.name {
+            if !seen_names.insert(name) {
+                return Err(format!("duplicate model name: {name}"));
+            }
         }
     }
 
@@ -509,17 +524,21 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
 }
 
 /// If `auto_router` is enabled, ensure its model is present in `config.models`.
+///
+/// The `auto_router.model` field can reference a model by its `name` or `path`.
 fn ensure_auto_router_model(config: &mut HiggsConfig) {
     if !config.auto_router.enabled || config.auto_router.model.is_empty() {
         return;
     }
+    let auto_model = &config.auto_router.model;
     let already_listed = config
         .models
         .iter()
-        .any(|m| m.path == config.auto_router.model);
+        .any(|m| m.path == *auto_model || m.name.as_deref() == Some(auto_model));
     if !already_listed {
         config.models.push(ModelConfig {
             path: config.auto_router.model.clone(),
+            name: None,
             batch: false,
         });
     }
@@ -1003,5 +1022,102 @@ mod tests {
         let config = load_config_file(&path, Some(&args)).unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 9000);
+    }
+
+    #[test]
+    fn test_duplicate_model_names_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "org/model-a"
+            name = "coder"
+
+            [[models]]
+            path = "org/model-b"
+            name = "coder"
+            "#,
+        )
+        .unwrap();
+        assert!(load_config_file(&path, None).is_err());
+    }
+
+    #[test]
+    fn test_empty_model_name_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "org/model-a"
+            name = "  "
+            "#,
+        )
+        .unwrap();
+        assert!(load_config_file(&path, None).is_err());
+    }
+
+    #[test]
+    fn auto_router_matches_model_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "/some/long/path/Arch-Router-1.5B-4bit"
+            name = "router"
+
+            [auto_router]
+            enabled = true
+            model = "router"
+            "#,
+        )
+        .unwrap();
+        let config = load_config_file(&path, None).unwrap();
+        // The auto_router model should match by name, not inject a duplicate
+        let count = config
+            .models
+            .iter()
+            .filter(|m| m.name.as_deref() == Some("router"))
+            .count();
+        assert_eq!(count, 1);
+        assert_eq!(config.models.len(), 1);
+    }
+
+    #[test]
+    fn test_model_name_deserialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "org/model-a"
+            name = "coder"
+            "#,
+        )
+        .unwrap();
+        let config = load_config_file(&path, None).unwrap();
+        assert_eq!(config.models[0].name.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn test_model_name_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "org/model-a"
+            "#,
+        )
+        .unwrap();
+        let config = load_config_file(&path, None).unwrap();
+        assert!(config.models[0].name.is_none());
     }
 }
