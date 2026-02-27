@@ -18,6 +18,9 @@ use higgs::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    if let Some(ref name) = cli.profile {
+        config::validate_profile_name(name)?;
+    }
     let profile = cli.profile.as_deref();
 
     match cli.command {
@@ -53,8 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             init_tracing(cli.verbose);
             let config = if let Some(ref path) = cli.config {
                 config::load_config_file(path, Some(args))?
-            } else if let Some(ref name) = cli.profile {
-                let path = config::profile_config_path(name);
+            } else if cli.profile.is_some() {
+                let path = resolve_config_path(&cli)?;
                 config::load_config_file(&path, Some(args))?
             } else {
                 let default = config::default_config_path();

@@ -571,6 +571,25 @@ pub fn default_config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// Validates that a profile name is safe for use in file paths.
+pub fn validate_profile_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("profile name must not be empty".to_owned());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!("profile name '{name}' contains invalid characters"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "profile name '{name}' must contain only alphanumeric characters, hyphens, or underscores"
+        ));
+    }
+    Ok(())
+}
+
 /// Returns the config file path for a named profile (~/.config/higgs/config.<name>.toml).
 pub fn profile_config_path(name: &str) -> PathBuf {
     config_dir().join(format!("config.{name}.toml"))
@@ -1157,5 +1176,30 @@ mod tests {
         .unwrap();
         let config = load_config_file(&path, None).unwrap();
         assert!(config.models.first().unwrap().name.is_none());
+    }
+
+    #[test]
+    fn test_validate_profile_name_valid() {
+        assert!(validate_profile_name("dev").is_ok());
+        assert!(validate_profile_name("prod-us").is_ok());
+        assert!(validate_profile_name("test_1").is_ok());
+    }
+
+    #[test]
+    fn test_validate_profile_name_rejects_traversal() {
+        assert!(validate_profile_name("../etc").is_err());
+        assert!(validate_profile_name("foo/bar").is_err());
+        assert!(validate_profile_name("foo\\bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_profile_name_rejects_empty() {
+        assert!(validate_profile_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_profile_name_rejects_special_chars() {
+        assert!(validate_profile_name("dev.prod").is_err());
+        assert!(validate_profile_name("dev prod").is_err());
     }
 }

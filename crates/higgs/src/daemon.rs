@@ -275,7 +275,11 @@ pub fn detach(config_path: &Path, verbose: bool, profile: Option<&str>) {
     };
 
     // Probe the server address from config to check readiness
-    let Ok(probe_config) = crate::config::load_config_file(config_path, None) else {
+    let probe_path = profile.map_or_else(
+        || config_path.to_path_buf(),
+        crate::config::profile_config_path,
+    );
+    let Ok(probe_config) = crate::config::load_config_file(&probe_path, None) else {
         eprintln!(
             "{label} started (pid {child_pid}), log: {}",
             log_path(profile).display()
