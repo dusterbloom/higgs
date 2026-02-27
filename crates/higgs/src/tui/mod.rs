@@ -8,7 +8,85 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 
+use crate::config::HiggsConfig;
 use crate::metrics::MetricsStore;
+
+// ---------------------------------------------------------------------------
+// TuiConfig -- config data passed to the TUI for display
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct TuiConfig {
+    pub profile: Option<String>,
+    pub model_names: Vec<String>,
+    pub provider_names: Vec<String>,
+    pub routes: Vec<TuiRoute>,
+    pub default_provider: String,
+    pub auto_router: TuiAutoRouter,
+}
+
+#[derive(Debug, Clone)]
+pub struct TuiRoute {
+    pub pattern: Option<String>,
+    pub provider: String,
+    pub model_rewrite: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TuiAutoRouter {
+    pub enabled: bool,
+    pub force: bool,
+    pub model: String,
+    pub timeout_ms: u64,
+}
+
+impl TuiConfig {
+    pub fn from_higgs_config(config: &HiggsConfig, profile: Option<&str>) -> Self {
+        let model_names: Vec<String> = config
+            .models
+            .iter()
+            .map(|m| {
+                m.name
+                    .clone()
+                    .unwrap_or_else(|| m.path.rsplit('/').next().unwrap_or(&m.path).to_owned())
+            })
+            .collect();
+
+        let mut provider_names: Vec<String> = config.providers.keys().cloned().collect();
+        if !config.models.is_empty() && !provider_names.contains(&"higgs".to_owned()) {
+            provider_names.push("higgs".to_owned());
+        }
+        provider_names.sort();
+
+        let routes: Vec<TuiRoute> = config
+            .routes
+            .iter()
+            .map(|r| TuiRoute {
+                pattern: r.pattern.clone(),
+                provider: r.provider.clone(),
+                model_rewrite: r.model.clone(),
+                name: r.name.clone(),
+                description: r.description.clone(),
+            })
+            .collect();
+
+        Self {
+            profile: profile.map(String::from),
+            model_names,
+            provider_names,
+            routes,
+            default_provider: config.default.provider.clone(),
+            auto_router: TuiAutoRouter {
+                enabled: config.auto_router.enabled,
+                force: config.auto_router.force,
+                model: config.auto_router.model.clone(),
+                timeout_ms: config.auto_router.timeout_ms,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -16,11 +94,18 @@ pub enum Tab {
     Models,
     Providers,
     Errors,
+    Routing,
 }
 
 impl Tab {
     fn titles() -> Vec<&'static str> {
-        vec!["Overview [1]", "Models [2]", "Providers [3]", "Errors [4]"]
+        vec![
+            "Overview [1]",
+            "Models [2]",
+            "Providers [3]",
+            "Errors [4]",
+            "Routing [5]",
+        ]
     }
 
     const fn index(self) -> usize {
@@ -29,6 +114,7 @@ impl Tab {
             Self::Models => 1,
             Self::Providers => 2,
             Self::Errors => 3,
+            Self::Routing => 4,
         }
     }
 }
@@ -45,16 +131,22 @@ pub struct App {
     pub scroll_offset: usize,
     pub exit_mode: Option<ExitMode>,
     pub attached: bool,
+    pub config: Option<TuiConfig>,
 }
 
 impl App {
-    pub const fn new(metrics: Arc<MetricsStore>, attached: bool) -> Self {
+    pub const fn new(
+        metrics: Arc<MetricsStore>,
+        attached: bool,
+        config: Option<TuiConfig>,
+    ) -> Self {
         Self {
             metrics,
             active_tab: Tab::Overview,
             scroll_offset: 0,
             exit_mode: None,
             attached,
+            config,
         }
     }
 
@@ -84,21 +176,27 @@ impl App {
                 self.active_tab = Tab::Errors;
                 self.scroll_offset = 0;
             }
+            KeyCode::Char('5') => {
+                self.active_tab = Tab::Routing;
+                self.scroll_offset = 0;
+            }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 self.active_tab = match self.active_tab {
                     Tab::Overview => Tab::Models,
                     Tab::Models => Tab::Providers,
                     Tab::Providers => Tab::Errors,
-                    Tab::Errors => Tab::Overview,
+                    Tab::Errors => Tab::Routing,
+                    Tab::Routing => Tab::Overview,
                 };
                 self.scroll_offset = 0;
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.active_tab = match self.active_tab {
-                    Tab::Overview => Tab::Errors,
+                    Tab::Overview => Tab::Routing,
                     Tab::Models => Tab::Overview,
                     Tab::Providers => Tab::Models,
                     Tab::Errors => Tab::Providers,
+                    Tab::Routing => Tab::Errors,
                 };
                 self.scroll_offset = 0;
             }
@@ -135,10 +233,17 @@ impl App {
 
     #[allow(clippy::indexing_slicing)]
     pub fn draw(&self, frame: &mut Frame) {
+        let profile_tag = self
+            .config
+            .as_ref()
+            .and_then(|c| c.profile.as_ref())
+            .map(|p| format!(" [{p}]"))
+            .unwrap_or_default();
+
         let title = if self.attached {
-            " higgs (attached) "
+            format!(" higgs{profile_tag} (attached) ")
         } else {
-            " higgs "
+            format!(" higgs{profile_tag} ")
         };
 
         let hint = if self.attached {
@@ -173,13 +278,30 @@ impl App {
                 views::overview::draw(frame, content_area, &self.metrics, self.scroll_offset);
             }
             Tab::Models => {
-                views::models::draw(frame, content_area, &self.metrics, self.scroll_offset);
+                let names = self.config.as_ref().map(|c| c.model_names.as_slice());
+                views::models::draw(
+                    frame,
+                    content_area,
+                    &self.metrics,
+                    self.scroll_offset,
+                    names,
+                );
             }
             Tab::Providers => {
-                views::providers::draw(frame, content_area, &self.metrics, self.scroll_offset);
+                let names = self.config.as_ref().map(|c| c.provider_names.as_slice());
+                views::providers::draw(
+                    frame,
+                    content_area,
+                    &self.metrics,
+                    self.scroll_offset,
+                    names,
+                );
             }
             Tab::Errors => {
                 views::errors::draw(frame, content_area, &self.metrics, self.scroll_offset);
+            }
+            Tab::Routing => {
+                views::routing::draw(frame, content_area, self.config.as_ref());
             }
         }
 
@@ -191,7 +313,11 @@ impl App {
     }
 }
 
-pub fn run(metrics: Arc<MetricsStore>, attached: bool) -> io::Result<ExitMode> {
+pub fn run(
+    metrics: Arc<MetricsStore>,
+    attached: bool,
+    config: Option<TuiConfig>,
+) -> io::Result<ExitMode> {
     let mut terminal = ratatui::init();
 
     let default_hook = std::panic::take_hook();
@@ -200,7 +326,7 @@ pub fn run(metrics: Arc<MetricsStore>, attached: bool) -> io::Result<ExitMode> {
         default_hook(info);
     }));
 
-    let mut app = App::new(metrics, attached);
+    let mut app = App::new(metrics, attached, config);
 
     let result = (|| -> io::Result<ExitMode> {
         loop {
@@ -234,11 +360,19 @@ mod tests {
     use super::*;
 
     fn make_app() -> App {
-        App::new(Arc::new(MetricsStore::new(Duration::from_secs(60))), false)
+        App::new(
+            Arc::new(MetricsStore::new(Duration::from_secs(60))),
+            false,
+            None,
+        )
     }
 
     fn make_attached_app() -> App {
-        App::new(Arc::new(MetricsStore::new(Duration::from_secs(60))), true)
+        App::new(
+            Arc::new(MetricsStore::new(Duration::from_secs(60))),
+            true,
+            None,
+        )
     }
 
     fn key(code: KeyCode) -> event::KeyEvent {
@@ -294,6 +428,7 @@ mod tests {
             ('2', Tab::Models),
             ('3', Tab::Providers),
             ('4', Tab::Errors),
+            ('5', Tab::Routing),
             ('1', Tab::Overview),
         ] {
             app.handle_key(key(KeyCode::Char(ch)));
@@ -318,7 +453,13 @@ mod tests {
     fn tab_cycles_through_tabs() {
         assert_tab_cycle(
             KeyCode::Tab,
-            &[Tab::Models, Tab::Providers, Tab::Errors, Tab::Overview],
+            &[
+                Tab::Models,
+                Tab::Providers,
+                Tab::Errors,
+                Tab::Routing,
+                Tab::Overview,
+            ],
         );
     }
 
@@ -348,7 +489,13 @@ mod tests {
     fn right_arrow_cycles_forward() {
         assert_tab_cycle(
             KeyCode::Right,
-            &[Tab::Models, Tab::Providers, Tab::Errors, Tab::Overview],
+            &[
+                Tab::Models,
+                Tab::Providers,
+                Tab::Errors,
+                Tab::Routing,
+                Tab::Overview,
+            ],
         );
     }
 
@@ -356,7 +503,13 @@ mod tests {
     fn left_arrow_cycles_backward() {
         assert_tab_cycle(
             KeyCode::Left,
-            &[Tab::Errors, Tab::Providers, Tab::Models, Tab::Overview],
+            &[
+                Tab::Routing,
+                Tab::Errors,
+                Tab::Providers,
+                Tab::Models,
+                Tab::Overview,
+            ],
         );
     }
 

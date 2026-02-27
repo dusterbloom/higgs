@@ -21,8 +21,18 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct Cli {
     /// Path to config file (default: ~/.config/higgs/config.toml when auto-discovered).
-    #[arg(short, long, global = true, value_name = "FILE")]
+    #[arg(
+        short,
+        long,
+        global = true,
+        value_name = "FILE",
+        conflicts_with = "profile"
+    )]
     pub config: Option<PathBuf>,
+
+    /// Named config profile (resolves to ~/.config/higgs/config.<NAME>.toml).
+    #[arg(long, global = true, value_name = "NAME")]
+    pub profile: Option<String>,
 
     /// Enable debug logging.
     #[arg(short, long, global = true)]
@@ -363,7 +373,7 @@ const fn default_retention_minutes() -> u64 {
 
 /// Returns true if this is "simple mode" -- no config file, models come from CLI.
 pub const fn is_simple_mode(cli: &Cli, serve_args: &ServeArgs) -> bool {
-    cli.config.is_none() && !serve_args.models.is_empty()
+    cli.config.is_none() && cli.profile.is_none() && !serve_args.models.is_empty()
 }
 
 /// Build a `HiggsConfig` from CLI args only (simple mode, no config file).
@@ -561,14 +571,39 @@ pub fn default_config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-/// Returns the PID file path (~/.config/higgs/higgs.pid).
-pub fn pid_path() -> PathBuf {
-    config_dir().join("higgs.pid")
+/// Returns the config file path for a named profile (~/.config/higgs/config.<name>.toml).
+pub fn profile_config_path(name: &str) -> PathBuf {
+    config_dir().join(format!("config.{name}.toml"))
 }
 
-/// Returns the log file path (~/.config/higgs/higgs.log).
-pub fn log_path() -> PathBuf {
-    config_dir().join("higgs.log")
+/// Returns the PID file path, optionally scoped to a profile.
+pub fn pid_path(profile: Option<&str>) -> PathBuf {
+    profile.map_or_else(
+        || config_dir().join("higgs.pid"),
+        |name| config_dir().join(format!("higgs.{name}.pid")),
+    )
+}
+
+/// Returns the log file path, optionally scoped to a profile.
+pub fn log_path(profile: Option<&str>) -> PathBuf {
+    profile.map_or_else(
+        || config_dir().join("higgs.log"),
+        |name| config_dir().join(format!("higgs.{name}.log")),
+    )
+}
+
+/// Returns the default metrics log path, optionally scoped to a profile.
+pub fn default_metrics_log_path_for_profile(profile: &str) -> String {
+    directories::BaseDirs::new()
+        .map_or_else(
+            || PathBuf::from(format!("/tmp/higgs/logs/metrics.{profile}.jsonl")),
+            |d| {
+                d.home_dir()
+                    .join(format!(".config/higgs/logs/metrics.{profile}.jsonl"))
+            },
+        )
+        .to_string_lossy()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
