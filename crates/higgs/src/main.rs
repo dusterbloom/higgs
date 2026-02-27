@@ -124,8 +124,8 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         config::build_simple_config(args)?
     } else if let Some(ref path) = cli.config {
         config::load_config_file(path, Some(args))?
-    } else if let Some(ref name) = cli.profile {
-        let path = config::profile_config_path(name);
+    } else if cli.profile.is_some() {
+        let path = resolve_config_path(cli)?;
         config::load_config_file(&path, Some(args))?
     } else if args.models.is_empty() {
         let default_path = config::default_config_path();

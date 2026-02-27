@@ -56,7 +56,6 @@ pub fn cmd_stop(profile: Option<&str>) {
             while pid_is_alive(pid) {
                 if std::time::Instant::now() >= deadline {
                     eprintln!("sent SIGTERM to {pid} but process still running after 5s");
-                    remove_pid_file(profile);
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -93,7 +92,13 @@ pub fn cmd_init(profile: Option<&str>) {
         std::process::exit(1);
     }
 
-    let default_config = r#"[server]
+    let metrics_path_example = profile.map_or_else(
+        || "~/.config/higgs/logs/metrics.jsonl".to_owned(),
+        |name| format!("~/.config/higgs/logs/metrics.{name}.jsonl"),
+    );
+
+    let default_config = format!(
+        r#"[server]
 host = "0.0.0.0"
 port = 8000
 # max_tokens = 32768
@@ -164,10 +169,11 @@ provider = "higgs"
 
 # [logging.metrics]
 # enabled = true
-# path = "~/.config/higgs/logs/metrics.jsonl"
+# path = "{metrics_path_example}"
 # max_size_mb = 50
 # max_files = 5
-"#;
+"#
+    );
 
     if let Err(e) = fs::write(&path, default_config) {
         eprintln!("failed to write {}: {e}", path.display());

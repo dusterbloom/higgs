@@ -553,4 +553,181 @@ mod tests {
         let app = make_attached_app();
         assert!(app.attached);
     }
+
+    // -- TuiConfig::from_higgs_config tests -----------------------------------
+
+    use crate::config::{
+        AutoRouterConfig, DefaultRoute, HiggsConfig, ModelConfig, ProviderConfig, RouteConfig,
+    };
+    use std::collections::HashMap;
+
+    fn minimal_config() -> HiggsConfig {
+        HiggsConfig {
+            models: vec![ModelConfig {
+                path: "mlx-community/Llama-3.2-1B-Instruct-4bit".to_owned(),
+                name: None,
+                batch: false,
+            }],
+            ..HiggsConfig::default()
+        }
+    }
+
+    #[test]
+    fn from_config_extracts_model_name_from_path() {
+        let config = minimal_config();
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        assert_eq!(tui.model_names, vec!["Llama-3.2-1B-Instruct-4bit"]);
+    }
+
+    #[test]
+    fn from_config_uses_explicit_model_name() {
+        let mut config = minimal_config();
+        config.models[0].name = Some("llama".to_owned());
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        assert_eq!(tui.model_names, vec!["llama"]);
+    }
+
+    #[test]
+    fn from_config_injects_higgs_provider_when_models_exist() {
+        let config = minimal_config();
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        assert!(tui.provider_names.contains(&"higgs".to_owned()));
+    }
+
+    #[test]
+    fn from_config_no_higgs_provider_without_models() {
+        let config = HiggsConfig::default();
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        assert!(!tui.provider_names.contains(&"higgs".to_owned()));
+    }
+
+    #[test]
+    fn from_config_includes_remote_providers() {
+        let mut config = minimal_config();
+        config.providers.insert(
+            "anthropic".to_owned(),
+            ProviderConfig {
+                url: "https://api.anthropic.com".to_owned(),
+                format: crate::config::ApiFormat::Anthropic,
+                api_key: None,
+                strip_auth: false,
+                stub_count_tokens: false,
+            },
+        );
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        assert!(tui.provider_names.contains(&"anthropic".to_owned()));
+        assert!(tui.provider_names.contains(&"higgs".to_owned()));
+    }
+
+    #[test]
+    fn from_config_providers_are_sorted() {
+        let mut config = minimal_config();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_owned(),
+            ProviderConfig {
+                url: "https://api.openai.com".to_owned(),
+                format: crate::config::ApiFormat::OpenAi,
+                api_key: None,
+                strip_auth: false,
+                stub_count_tokens: false,
+            },
+        );
+        providers.insert(
+            "anthropic".to_owned(),
+            ProviderConfig {
+                url: "https://api.anthropic.com".to_owned(),
+                format: crate::config::ApiFormat::Anthropic,
+                api_key: None,
+                strip_auth: false,
+                stub_count_tokens: false,
+            },
+        );
+        config.providers = providers;
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        let expected = vec!["anthropic", "higgs", "openai"];
+        assert_eq!(tui.provider_names, expected);
+    }
+
+    #[test]
+    fn from_config_maps_routes() {
+        let mut config = minimal_config();
+        config.routes = vec![RouteConfig {
+            pattern: Some("claude-.*".to_owned()),
+            provider: "anthropic".to_owned(),
+            model: Some("claude-sonnet-4-6".to_owned()),
+            name: Some("Claude".to_owned()),
+            description: Some("Anthropic models".to_owned()),
+        }];
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        assert_eq!(tui.routes.len(), 1);
+        let r = &tui.routes[0];
+        assert_eq!(r.pattern.as_deref(), Some("claude-.*"));
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.model_rewrite.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(r.name.as_deref(), Some("Claude"));
+        assert_eq!(r.description.as_deref(), Some("Anthropic models"));
+    }
+
+    #[test]
+    fn from_config_copies_default_provider() {
+        let mut config = minimal_config();
+        config.default = DefaultRoute {
+            provider: "openai".to_owned(),
+        };
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        assert_eq!(tui.default_provider, "openai");
+    }
+
+    #[test]
+    fn from_config_copies_auto_router() {
+        let mut config = minimal_config();
+        config.auto_router = AutoRouterConfig {
+            enabled: true,
+            force: true,
+            model: "my-router".to_owned(),
+            timeout_ms: 5000,
+        };
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        assert!(tui.auto_router.enabled);
+        assert!(tui.auto_router.force);
+        assert_eq!(tui.auto_router.model, "my-router");
+        assert_eq!(tui.auto_router.timeout_ms, 5000);
+    }
+
+    #[test]
+    fn from_config_passes_profile() {
+        let config = minimal_config();
+        let tui = TuiConfig::from_higgs_config(&config, Some("dev"));
+        assert_eq!(tui.profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn from_config_none_profile() {
+        let config = minimal_config();
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        assert!(tui.profile.is_none());
+    }
+
+    #[test]
+    fn from_config_no_duplicate_higgs_when_already_a_provider() {
+        let mut config = minimal_config();
+        config.providers.insert(
+            "higgs".to_owned(),
+            ProviderConfig {
+                url: "http://localhost:8000".to_owned(),
+                format: crate::config::ApiFormat::OpenAi,
+                api_key: None,
+                strip_auth: false,
+                stub_count_tokens: false,
+            },
+        );
+        let tui = TuiConfig::from_higgs_config(&config, None);
+        let higgs_count = tui
+            .provider_names
+            .iter()
+            .filter(|n| n.as_str() == "higgs")
+            .count();
+        assert_eq!(higgs_count, 1);
+    }
 }

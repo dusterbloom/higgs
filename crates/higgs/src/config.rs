@@ -1202,4 +1202,82 @@ mod tests {
         assert!(validate_profile_name("dev.prod").is_err());
         assert!(validate_profile_name("dev prod").is_err());
     }
+
+    #[test]
+    fn test_validate_profile_name_rejects_unicode() {
+        assert!(validate_profile_name("caf\u{00e9}").is_err());
+        assert!(validate_profile_name("\u{1f600}").is_err());
+    }
+
+    #[test]
+    fn test_validate_profile_name_rejects_control_chars() {
+        assert!(validate_profile_name("dev\0prod").is_err());
+        assert!(validate_profile_name("dev\nprod").is_err());
+        assert!(validate_profile_name("dev\tprod").is_err());
+    }
+
+    #[test]
+    fn test_validate_profile_name_rejects_shell_metacharacters() {
+        assert!(validate_profile_name("dev;rm -rf").is_err());
+        assert!(validate_profile_name("$(whoami)").is_err());
+        assert!(validate_profile_name("dev|prod").is_err());
+        assert!(validate_profile_name("dev&prod").is_err());
+    }
+
+    #[test]
+    fn test_profile_config_path_format() {
+        let path = profile_config_path("dev");
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(file_name, "config.dev.toml");
+        assert!(path.parent().unwrap().ends_with(".config/higgs") || path.starts_with("/tmp"));
+    }
+
+    #[test]
+    fn test_profile_config_path_different_names() {
+        let dev = profile_config_path("dev");
+        let prod = profile_config_path("prod");
+        assert_ne!(dev, prod);
+        assert!(dev.to_str().unwrap().contains("config.dev.toml"));
+        assert!(prod.to_str().unwrap().contains("config.prod.toml"));
+    }
+
+    #[test]
+    fn test_profile_config_path_shares_parent_with_default() {
+        let profile_path = profile_config_path("test");
+        let default_path = default_config_path();
+        assert_eq!(profile_path.parent(), default_path.parent());
+    }
+
+    #[test]
+    fn test_default_metrics_log_path_for_profile_contains_profile_name() {
+        let path = default_metrics_log_path_for_profile("dev");
+        assert!(path.contains("metrics.dev.jsonl"), "path was: {path}");
+    }
+
+    #[test]
+    fn test_default_metrics_log_path_for_profile_different_names() {
+        let dev = default_metrics_log_path_for_profile("dev");
+        let prod = default_metrics_log_path_for_profile("prod");
+        assert_ne!(dev, prod);
+        assert!(dev.contains("metrics.dev.jsonl"));
+        assert!(prod.contains("metrics.prod.jsonl"));
+    }
+
+    #[test]
+    fn test_pid_path_default_vs_profile() {
+        let default = pid_path(None);
+        let profiled = pid_path(Some("dev"));
+        assert_ne!(default, profiled);
+        assert!(default.to_str().unwrap().contains("higgs.pid"));
+        assert!(profiled.to_str().unwrap().contains("higgs.dev.pid"));
+    }
+
+    #[test]
+    fn test_log_path_default_vs_profile() {
+        let default = log_path(None);
+        let profiled = log_path(Some("dev"));
+        assert_ne!(default, profiled);
+        assert!(default.to_str().unwrap().contains("higgs.log"));
+        assert!(profiled.to_str().unwrap().contains("higgs.dev.log"));
+    }
 }
