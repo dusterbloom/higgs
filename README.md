@@ -220,6 +220,15 @@ eval "$(higgs shellenv)"
 # Exports ANTHROPIC_BASE_URL and OPENAI_BASE_URL when the server is reachable
 ```
 
+Or run a single command with the env vars set:
+
+```bash
+higgs run -- claude
+higgs run -- aider --model openai/gpt-4o
+```
+
+`higgs run` verifies the server is reachable, sets `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`, then execs the command.
+
 ## CLI Commands
 
 | Command | Description |
@@ -230,6 +239,7 @@ eval "$(higgs shellenv)"
 | `higgs attach` | Attach TUI dashboard to a running daemon |
 | `higgs init` | Create default config at `~/.config/higgs/config.toml` |
 | `higgs shellenv` | Print `export` lines for `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` |
+| `higgs run -- <cmd>` | Set env vars and exec a command (replaces `eval "$(higgs shellenv)"`) |
 | `higgs config get <key>` | Read a config value (dot-separated key) |
 | `higgs config set <key> <value>` | Write a config value |
 | `higgs config path` | Print the resolved config file path |
