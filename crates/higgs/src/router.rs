@@ -153,21 +153,10 @@ impl Router {
             if auto_candidates.is_empty() {
                 warn!("auto_router is enabled but no routes have descriptions");
             }
-            // The engines map is keyed by resolved model name (directory basename),
-            // but the config may contain a full path or HF repo ID. Try both the
-            // raw config value and its basename.
             let auto_model = &config.auto_router.model;
-            let basename = std::path::Path::new(auto_model)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or(auto_model);
-            let engine = engines
-                .get(auto_model)
-                .or_else(|| engines.get(basename))
-                .cloned()
-                .ok_or_else(|| {
-                    format!("auto_router model '{auto_model}' not found among loaded models")
-                })?;
+            let engine = engines.get(auto_model).cloned().ok_or_else(|| {
+                format!("auto_router model '{auto_model}' not found among loaded models")
+            })?;
             Some(engine)
         } else {
             None
@@ -815,26 +804,24 @@ mod tests {
     }
 
     #[test]
-    fn auto_router_model_resolved_by_basename() {
+    fn auto_router_model_resolved_by_name() {
         let config = config_from_toml(
             r#"
             [[models]]
             path = "/Users/someone/models/Arch-Router-1.5B-4bit"
+            name = "router"
 
             [auto_router]
             enabled = true
-            model = "/Users/someone/models/Arch-Router-1.5B-4bit"
+            model = "router"
             "#,
         );
-        let engine = crate::state::Engine::test_stub("Arch-Router-1.5B-4bit");
+        let engine = crate::state::Engine::test_stub("router");
         let mut engines = HashMap::new();
-        engines.insert("Arch-Router-1.5B-4bit".to_owned(), Arc::new(engine));
+        engines.insert("router".to_owned(), Arc::new(engine));
 
         let router = Router::from_config(&config, engines);
-        assert!(
-            router.is_ok(),
-            "should resolve auto_router model by basename"
-        );
+        assert!(router.is_ok(), "should resolve auto_router model by name");
     }
 
     #[tokio::test]

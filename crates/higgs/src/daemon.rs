@@ -102,6 +102,7 @@ port = 8000
 
 # [[models]]
 # path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+# name = "llama"
 # batch = false
 
 # --- Remote providers ---

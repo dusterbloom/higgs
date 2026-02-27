@@ -217,7 +217,10 @@ fn load_engines(
         } else {
             Engine::load_simple(&resolved)?
         };
-        let name = engine.model_name().to_owned();
+        let name = model_cfg
+            .name
+            .clone()
+            .unwrap_or_else(|| engine.model_name().to_owned());
         tracing::info!(model_name = %name, "Model loaded");
 
         if engines.insert(name.clone(), Arc::new(engine)).is_some() {
