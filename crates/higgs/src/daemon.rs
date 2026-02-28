@@ -258,7 +258,7 @@ pub fn cmd_exec(config: &HiggsConfig, command: &[String]) -> ! {
     ctrlc::set_handler(move || {
         let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
     })
-    .ok();
+    .unwrap_or_else(|e| eprintln!("warning: failed to set signal handler: {e}"));
 
     let status = match child.wait() {
         Ok(s) => s.code().unwrap_or(1),
