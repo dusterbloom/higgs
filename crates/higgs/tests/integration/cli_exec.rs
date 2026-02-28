@@ -75,7 +75,7 @@ fn write_test_config(port: u16) -> tempfile::TempDir {
 }
 
 /// Bind a random port and write a config pointing at it.
-/// Returns (TcpListener, temp dir) -- keep the listener alive so `higgs exec`
+/// Returns (`TcpListener`, temp dir) -- keep the listener alive so `higgs exec`
 /// sees a "running" server.
 fn fake_server_env() -> (TcpListener, tempfile::TempDir) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
