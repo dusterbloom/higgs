@@ -209,12 +209,24 @@ pub fn anthropic_to_openai_request(body: &[u8]) -> Result<Bytes, ServerError> {
 
     let mut openai_messages = Vec::new();
 
-    // system field -> system message
-    if let Some(system) = anthropic.get("system").and_then(|s| s.as_str()) {
-        if !system.is_empty() {
+    // system field -> system message (string or array of text blocks)
+    if let Some(system_val) = anthropic.get("system") {
+        let system_text = match system_val {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Object(_) => String::new(),
+        };
+        if !system_text.is_empty() {
             openai_messages.push(serde_json::json!({
                 "role": "system",
-                "content": system,
+                "content": system_text,
             }));
         }
     }
@@ -979,11 +991,15 @@ fn extract_tool_results(blocks: &[serde_json::Value]) -> Vec<(String, String)> {
         .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
         .filter_map(|b| {
             let id = b.get("tool_use_id").and_then(|v| v.as_str())?.to_owned();
-            let content = b
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_owned();
+            let content = match b.get("content") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                _ => String::new(),
+            };
             Some((id, content))
         })
         .collect()

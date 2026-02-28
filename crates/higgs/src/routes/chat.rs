@@ -35,7 +35,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
-    let req: ChatCompletionRequest = serde_json::from_slice(&body)
+    let mut req: ChatCompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
 
     if req.messages.is_empty() {
@@ -57,14 +57,13 @@ pub async fn chat_completions(
         .await
         .map_err(ServerError::ModelNotFound)?;
 
-    let request_model = req.model.clone();
-
     match resolved {
         ResolvedRoute::Higgs {
             engine,
+            model_name,
             routing_method,
-            ..
         } => {
+            req.model = model_name;
             if req.stream == Some(true) {
                 let stream = chat_completions_stream(
                     Arc::clone(&state),
@@ -107,6 +106,7 @@ pub async fn chat_completions(
             routing_method,
             ..
         } => {
+            let metrics_model = model_rewrite.as_deref().unwrap_or(&req.model).to_owned();
             let is_streaming = req.stream == Some(true);
             match provider_format {
                 ApiFormat::OpenAi => {
@@ -131,7 +131,7 @@ pub async fn chat_completions(
                             id: 0,
                             timestamp: Instant::now(),
                             wallclock: chrono::Utc::now(),
-                            model: request_model,
+                            model: metrics_model.clone(),
                             provider: provider_name.clone(),
                             routing_method: routing_method.into(),
                             status: result.as_ref().map_or(502, |resp| resp.status().as_u16()),
@@ -173,7 +173,7 @@ pub async fn chat_completions(
                                 id: 0,
                                 timestamp: Instant::now(),
                                 wallclock: chrono::Utc::now(),
-                                model: request_model,
+                                model: metrics_model.clone(),
                                 provider: provider_name.clone(),
                                 routing_method: routing_method.into(),
                                 status: upstream_status,
@@ -209,7 +209,7 @@ pub async fn chat_completions(
                                 id: 0,
                                 timestamp: Instant::now(),
                                 wallclock: chrono::Utc::now(),
-                                model: request_model,
+                                model: metrics_model.clone(),
                                 provider: provider_name.clone(),
                                 routing_method: routing_method.into(),
                                 status: upstream_status,

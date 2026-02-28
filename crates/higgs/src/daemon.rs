@@ -1,6 +1,5 @@
 use std::fs;
 use std::net::TcpStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -155,7 +154,7 @@ provider = "higgs"
 
 # [auto_router]
 # enabled = true
-# model = "mlx-community/Arch-Router-1.5B-4bit"
+# model = "router"             # matches a [[models]] name
 # timeout_ms = 2000
 
 # --- Usage ---
@@ -235,14 +234,35 @@ pub fn cmd_exec(config: &HiggsConfig, command: &[String]) -> ! {
     }
 
     let base_url = format!("http://{addr}");
-    let err = std::process::Command::new(program)
+    let mut child = match std::process::Command::new(program)
         .args(args)
         .env("ANTHROPIC_BASE_URL", &base_url)
         .env("OPENAI_BASE_URL", &base_url)
-        .exec();
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to exec '{program}': {e}");
+            std::process::exit(1);
+        }
+    };
 
-    eprintln!("failed to exec '{program}': {err}");
-    std::process::exit(1);
+    let child_pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap_or(0));
+
+    // Forward SIGINT/SIGTERM to child, then wait for it to exit.
+    ctrlc::set_handler(move || {
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+    })
+    .ok();
+
+    let status = match child.wait() {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("failed to wait for '{program}': {e}");
+            1
+        }
+    };
+    std::process::exit(status);
 }
 
 #[allow(clippy::print_stderr, clippy::too_many_lines, unsafe_code)]

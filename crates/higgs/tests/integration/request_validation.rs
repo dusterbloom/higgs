@@ -247,7 +247,7 @@ fn anthropic_request_with_system_prompt() {
         "system": "You are a pirate."
     }"#;
     let req: CreateMessageRequest = serde_json::from_str(json).unwrap();
-    assert_eq!(req.system, Some("You are a pirate.".to_owned()));
+    assert_eq!(req.system.unwrap().to_text(), "You are a pirate.");
 }
 
 #[test]
@@ -282,7 +282,16 @@ fn anthropic_content_blocks() {
             assert_eq!(blocks.len(), 2);
             match &blocks[0] {
                 ContentBlock::Text { text } => assert_eq!(text, "first"),
-                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => {
+                ContentBlock::ToolUse { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::Document { .. }
+                | ContentBlock::ServerToolUse { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::Other => {
                     panic!("expected Text block")
                 }
             }
@@ -310,7 +319,16 @@ fn anthropic_tool_use_block() {
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
             }
-            ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => {
+            ContentBlock::Text { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Document { .. }
+            | ContentBlock::ServerToolUse { .. }
+            | ContentBlock::WebSearchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::Other => {
                 panic!("expected ToolUse block")
             }
         },
@@ -336,9 +354,18 @@ fn anthropic_tool_result_block() {
                 content,
             } => {
                 assert_eq!(tool_use_id, "toolu_123");
-                assert_eq!(content, "72 degrees");
+                assert_eq!(content.to_text(), "72 degrees");
             }
-            ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => {
+            ContentBlock::Text { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Document { .. }
+            | ContentBlock::ServerToolUse { .. }
+            | ContentBlock::WebSearchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::Other => {
                 panic!("expected ToolResult block")
             }
         },
@@ -354,7 +381,7 @@ fn anthropic_count_tokens_request() {
         "system": "be helpful"
     }"#;
     let req: CountTokensRequest = serde_json::from_str(json).unwrap();
-    assert_eq!(req.system, Some("be helpful".to_owned()));
+    assert_eq!(req.system.unwrap().to_text(), "be helpful");
     assert_eq!(req.messages.len(), 1);
 }
 
@@ -409,7 +436,8 @@ fn anthropic_messages_to_engine_with_system() {
     use higgs::anthropic_adapter::anthropic_messages_to_engine;
 
     let messages = make_single_user_message();
-    let result = anthropic_messages_to_engine(&messages, Some("be helpful"));
+    let system = higgs::types::anthropic::SystemPrompt::Text("be helpful".to_owned());
+    let result = anthropic_messages_to_engine(&messages, Some(&system));
     assert_eq!(result.len(), 2);
     assert_eq!(result[0].role, "system");
     assert_eq!(result[0].content, "be helpful");
