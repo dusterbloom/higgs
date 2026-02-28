@@ -1,6 +1,5 @@
 use std::fs;
 use std::net::TcpStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -155,7 +154,7 @@ provider = "higgs"
 
 # [auto_router]
 # enabled = true
-# model = "mlx-community/Arch-Router-1.5B-4bit"
+# model = "router"             # matches a [[models]] name
 # timeout_ms = 2000
 
 # --- Usage ---
@@ -212,9 +211,9 @@ pub fn cmd_shellenv(config: &HiggsConfig) {
     }
 }
 
-/// Execute a command with `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` pointing at the Higgs server.
+/// Spawn a command with `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` pointing at the Higgs server.
 ///
-/// Replaces the current process via `exec`. Never returns on success.
+/// Forwards signals to the child and exits with its status. Never returns.
 #[allow(clippy::print_stderr)]
 pub fn cmd_exec(config: &HiggsConfig, command: &[String]) -> ! {
     let Some((program, args)) = command.split_first() else {
@@ -235,14 +234,44 @@ pub fn cmd_exec(config: &HiggsConfig, command: &[String]) -> ! {
     }
 
     let base_url = format!("http://{addr}");
-    let err = std::process::Command::new(program)
+    let mut child = match std::process::Command::new(program)
         .args(args)
         .env("ANTHROPIC_BASE_URL", &base_url)
         .env("OPENAI_BASE_URL", &base_url)
-        .exec();
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to spawn '{program}': {e}");
+            std::process::exit(1);
+        }
+    };
 
-    eprintln!("failed to exec '{program}': {err}");
-    std::process::exit(1);
+    let Ok(child_pid_raw) = i32::try_from(child.id()) else {
+        eprintln!("child pid {} exceeds i32 range", child.id());
+        let _ = child.kill();
+        std::process::exit(1);
+    };
+    let child_pid = nix::unistd::Pid::from_raw(child_pid_raw);
+
+    // Forward Ctrl+C (SIGINT) to child as SIGTERM, then wait for it to exit.
+    ctrlc::set_handler(move || {
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+    })
+    .unwrap_or_else(|e| eprintln!("warning: failed to set signal handler: {e}"));
+
+    let status = match child.wait() {
+        Ok(s) => s.code().unwrap_or_else(|| {
+            // Child killed by signal -- use the Unix convention of 128 + signal.
+            use std::os::unix::process::ExitStatusExt;
+            s.signal().map_or(1, |sig| 128 + sig)
+        }),
+        Err(e) => {
+            eprintln!("failed to wait for '{program}': {e}");
+            1
+        }
+    };
+    std::process::exit(status);
 }
 
 #[allow(clippy::print_stderr, clippy::too_many_lines, unsafe_code)]

@@ -1,5 +1,32 @@
 use serde::{Deserialize, Serialize};
 
+/// The Anthropic API `system` field: either a plain string or an array of
+/// text blocks (with optional `cache_control` / `citations` we ignore).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SystemPrompt {
+    Text(String),
+    Blocks(Vec<SystemBlock>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SystemBlock {
+    pub text: String,
+}
+
+impl SystemPrompt {
+    pub fn to_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        }
+    }
+}
+
 /// POST /v1/messages request body (Anthropic Messages API).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateMessageRequest {
@@ -15,7 +42,7 @@ pub struct CreateMessageRequest {
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
-    pub system: Option<String>,
+    pub system: Option<SystemPrompt>,
     #[serde(default)]
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
@@ -38,6 +65,9 @@ pub enum AnthropicContent {
 }
 
 /// A content block in the Anthropic format.
+///
+/// Unknown future block types are captured as `Other`
+/// and silently skipped during text extraction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
@@ -52,8 +82,60 @@ pub enum ContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: AnthropicContent,
     },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
+    #[serde(rename = "image")]
+    Image { source: serde_json::Value },
+    #[serde(rename = "document")]
+    Document { source: serde_json::Value },
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "web_search_tool_result")]
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    #[serde(rename = "code_execution_tool_result")]
+    CodeExecutionToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    #[serde(other)]
+    Other,
+}
+
+impl AnthropicContent {
+    /// Flatten to a single string, joining text blocks with newlines.
+    pub fn to_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    ContentBlock::ToolUse { .. }
+                    | ContentBlock::ToolResult { .. }
+                    | ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::Image { .. }
+                    | ContentBlock::Document { .. }
+                    | ContentBlock::ServerToolUse { .. }
+                    | ContentBlock::WebSearchToolResult { .. }
+                    | ContentBlock::CodeExecutionToolResult { .. }
+                    | ContentBlock::Other => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        }
+    }
 }
 
 /// POST /v1/messages response (non-streaming).
@@ -91,7 +173,7 @@ pub struct CountTokensRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
     #[serde(default)]
-    pub system: Option<String>,
+    pub system: Option<SystemPrompt>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
 }
@@ -289,7 +371,7 @@ mod tests {
             "system": "You are helpful."
         }"#;
         let req: CountTokensRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.system, Some("You are helpful.".to_owned()));
+        assert_eq!(req.system.unwrap().to_text(), "You are helpful.");
     }
 
     #[test]
@@ -316,9 +398,16 @@ mod tests {
         );
         let blocks = expect_blocks(&msg);
         assert_eq!(blocks.len(), 1);
-        assert!(
-            matches!(&blocks[0], ContentBlock::ToolResult { tool_use_id, content } if tool_use_id == "tu_1" && content == "72 degrees")
-        );
+        if let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+        } = &blocks[0]
+        {
+            assert_eq!(tool_use_id, "tu_1");
+            assert_eq!(content.to_text(), "72 degrees");
+        } else {
+            panic!("expected ToolResult block");
+        }
     }
 
     #[test]
@@ -411,7 +500,7 @@ mod tests {
         let msg: AnthropicMessage = serde_json::from_str(&json).unwrap();
         let blocks = expect_blocks(&msg);
         if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
-            assert_eq!(content.len(), 10_000);
+            assert_eq!(content.to_text().len(), 10_000);
         } else {
             panic!("expected ToolResult block");
         }
@@ -436,7 +525,10 @@ mod tests {
             "system": "You are a helpful assistant."
         }"#;
         let req: CountTokensRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.system, Some("You are a helpful assistant.".to_owned()));
+        assert_eq!(
+            req.system.unwrap().to_text(),
+            "You are a helpful assistant."
+        );
     }
 
     #[test]
@@ -522,5 +614,149 @@ mod tests {
         assert!(req.tools.is_some());
         let tools = req.tools.unwrap();
         assert_eq!(tools.len(), 1);
+    }
+
+    #[test]
+    fn test_system_as_string() {
+        let req = anthropic_request_with(r#""system": "Be concise.""#);
+        assert_eq!(req.system.unwrap().to_text(), "Be concise.");
+    }
+
+    #[test]
+    fn test_system_as_array_of_blocks() {
+        let json = r#"{
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "system": [
+                {"type": "text", "text": "You are a helpful assistant."},
+                {"type": "text", "text": "Be concise.", "cache_control": {"type": "ephemeral"}}
+            ]
+        }"#;
+        let req: CreateMessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.system.unwrap().to_text(),
+            "You are a helpful assistant.\n\nBe concise."
+        );
+    }
+
+    #[test]
+    fn test_tool_result_content_as_array_of_blocks() {
+        let msg = parse_message(
+            r#"{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]}]}"#,
+        );
+        let blocks = expect_blocks(&msg);
+        if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
+            assert_eq!(content.to_text(), "first\n\nsecond");
+        } else {
+            panic!("expected ToolResult block");
+        }
+    }
+
+    #[test]
+    fn test_thinking_block() {
+        let msg = parse_message(
+            r#"{"role": "assistant", "content": [{"type": "thinking", "thinking": "Let me think...", "signature": "sig123"}]}"#,
+        );
+        let blocks = expect_blocks(&msg);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Thinking { thinking, signature }
+                if thinking == "Let me think..." && signature == "sig123"
+        ));
+    }
+
+    #[test]
+    fn test_redacted_thinking_block() {
+        let msg = parse_message(
+            r#"{"role": "assistant", "content": [{"type": "redacted_thinking", "data": "abc123"}]}"#,
+        );
+        let blocks = expect_blocks(&msg);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::RedactedThinking { data } if data == "abc123"
+        ));
+    }
+
+    #[test]
+    fn test_image_block() {
+        let msg = parse_message(
+            r#"{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR..."}}]}"#,
+        );
+        let blocks = expect_blocks(&msg);
+        assert!(matches!(&blocks[0], ContentBlock::Image { source } if source["type"] == "base64"));
+    }
+
+    #[test]
+    fn test_document_block() {
+        let msg = parse_message(
+            r#"{"role": "user", "content": [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBER..."}}]}"#,
+        );
+        let blocks = expect_blocks(&msg);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Document { source } if source["media_type"] == "application/pdf")
+        );
+    }
+
+    #[test]
+    fn test_server_tool_use_block() {
+        let msg = parse_message(
+            r#"{"role": "assistant", "content": [{"type": "server_tool_use", "id": "stu_1", "name": "web_search", "input": {"query": "rust lang"}}]}"#,
+        );
+        let blocks = expect_blocks(&msg);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::ServerToolUse { id, name, .. }
+                if id == "stu_1" && name == "web_search"
+        ));
+    }
+
+    #[test]
+    fn test_web_search_tool_result_block() {
+        let msg = parse_message(
+            r#"{"role": "user", "content": [{"type": "web_search_tool_result", "tool_use_id": "stu_1", "content": [{"type": "web_search_result", "url": "https://example.com", "title": "Example", "encrypted_content": "abc"}]}]}"#,
+        );
+        let blocks = expect_blocks(&msg);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::WebSearchToolResult { tool_use_id, .. }
+                if tool_use_id == "stu_1"
+        ));
+    }
+
+    #[test]
+    fn test_code_execution_tool_result_block() {
+        let msg = parse_message(
+            r#"{"role": "user", "content": [{"type": "code_execution_tool_result", "tool_use_id": "stu_2", "content": [{"type": "code_execution_output", "output": "hello world"}]}]}"#,
+        );
+        let blocks = expect_blocks(&msg);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::CodeExecutionToolResult { tool_use_id, .. }
+                if tool_use_id == "stu_2"
+        ));
+    }
+
+    #[test]
+    fn test_thinking_block_excluded_from_to_text() {
+        let content = AnthropicContent::Blocks(vec![
+            ContentBlock::Thinking {
+                thinking: "internal thought".to_owned(),
+                signature: "sig".to_owned(),
+            },
+            ContentBlock::Text {
+                text: "visible".to_owned(),
+            },
+        ]);
+        assert_eq!(content.to_text(), "visible");
+    }
+
+    #[test]
+    fn test_unknown_block_type_becomes_other() {
+        let msg = parse_message(
+            r#"{"role": "user", "content": [{"type": "some_future_type", "data": "whatever"}]}"#,
+        );
+        let blocks = expect_blocks(&msg);
+        assert!(matches!(&blocks[0], ContentBlock::Other));
     }
 }

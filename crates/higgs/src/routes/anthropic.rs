@@ -36,7 +36,7 @@ pub async fn create_message(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
-    let req: CreateMessageRequest = serde_json::from_slice(&body)
+    let mut req: CreateMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
 
     if req.messages.is_empty() {
@@ -61,9 +61,10 @@ pub async fn create_message(
     match resolved {
         ResolvedRoute::Higgs {
             engine,
+            model_name,
             routing_method,
-            ..
         } => {
+            req.model = model_name;
             let start = Instant::now();
             if req.stream == Some(true) {
                 let stream =
@@ -101,7 +102,7 @@ pub async fn create_message(
             ..
         } => {
             let start = Instant::now();
-            let model_name = req.model.clone();
+            let metrics_model = model_rewrite.as_deref().unwrap_or(&req.model).to_owned();
             let is_streaming = req.stream == Some(true);
             let result = match provider_format {
                 ApiFormat::Anthropic => {
@@ -180,7 +181,7 @@ pub async fn create_message(
                     id: 0,
                     timestamp: Instant::now(),
                     wallclock: chrono::Utc::now(),
-                    model: model_name,
+                    model: metrics_model,
                     provider: provider_name,
                     routing_method: routing_method.into(),
                     status,
@@ -208,7 +209,7 @@ async fn create_message_non_streaming(
     };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
 
-    let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_deref());
+    let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
     let tools = req.tools.as_deref();
 
     let prompt_tokens = engine
@@ -267,7 +268,7 @@ fn create_message_stream(
     };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
 
-    let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_deref());
+    let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
     let tools = req.tools.as_deref();
 
     let prompt_tokens = engine
@@ -445,8 +446,7 @@ pub async fn count_tokens(
 
     match resolved {
         ResolvedRoute::Higgs { engine, .. } => {
-            let engine_messages =
-                anthropic_messages_to_engine(&req.messages, req.system.as_deref());
+            let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
             let tools = req.tools.as_deref();
 
             let tokens = engine

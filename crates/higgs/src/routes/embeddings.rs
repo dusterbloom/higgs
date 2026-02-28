@@ -141,13 +141,14 @@ pub async fn embeddings(
                 api_key.as_deref(),
             )
             .await;
+            let metrics_model = model_rewrite.as_deref().unwrap_or(&req.model).to_owned();
             if let Some(ref metrics) = state.metrics {
                 let status = response.as_ref().map_or(502, |resp| resp.status().as_u16());
                 metrics.record(RequestRecord {
                     id: 0,
                     timestamp: Instant::now(),
                     wallclock: chrono::Utc::now(),
-                    model: req.model,
+                    model: metrics_model,
                     provider: provider_name,
                     routing_method: routing_method.into(),
                     status,

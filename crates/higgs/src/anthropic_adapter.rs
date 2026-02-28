@@ -1,4 +1,4 @@
-use crate::types::anthropic::{AnthropicContent, AnthropicMessage};
+use crate::types::anthropic::{AnthropicContent, AnthropicMessage, SystemPrompt};
 
 /// Map an `OpenAI` `finish_reason` to an Anthropic `stop_reason`.
 pub fn openai_finish_to_anthropic_stop(finish_reason: &str) -> String {
@@ -13,14 +13,14 @@ pub fn openai_finish_to_anthropic_stop(finish_reason: &str) -> String {
 /// Convert Anthropic messages to the engine's `ChatMessage` format.
 pub fn anthropic_messages_to_engine(
     messages: &[AnthropicMessage],
-    system: Option<&str>,
+    system: Option<&SystemPrompt>,
 ) -> Vec<higgs_engine::chat_template::ChatMessage> {
     let mut result = Vec::new();
 
     if let Some(sys) = system {
         result.push(higgs_engine::chat_template::ChatMessage {
             role: "system".to_owned(),
-            content: sys.to_owned(),
+            content: sys.to_text(),
             tool_calls: None,
         });
     }
@@ -33,7 +33,15 @@ pub fn anthropic_messages_to_engine(
                 .filter_map(|b| match b {
                     crate::types::anthropic::ContentBlock::Text { text } => Some(text.as_str()),
                     crate::types::anthropic::ContentBlock::ToolUse { .. }
-                    | crate::types::anthropic::ContentBlock::ToolResult { .. } => None,
+                    | crate::types::anthropic::ContentBlock::ToolResult { .. }
+                    | crate::types::anthropic::ContentBlock::Thinking { .. }
+                    | crate::types::anthropic::ContentBlock::RedactedThinking { .. }
+                    | crate::types::anthropic::ContentBlock::Image { .. }
+                    | crate::types::anthropic::ContentBlock::Document { .. }
+                    | crate::types::anthropic::ContentBlock::ServerToolUse { .. }
+                    | crate::types::anthropic::ContentBlock::WebSearchToolResult { .. }
+                    | crate::types::anthropic::ContentBlock::CodeExecutionToolResult { .. }
+                    | crate::types::anthropic::ContentBlock::Other => None,
                 })
                 .collect::<Vec<_>>()
                 .join(""),
@@ -88,8 +96,9 @@ mod tests {
     #[test]
     fn test_anthropic_messages_to_engine_with_system() {
         let messages = vec![text_message("user", "Hello")];
+        let system = SystemPrompt::Text("Be helpful".to_owned());
 
-        let result = anthropic_messages_to_engine(&messages, Some("Be helpful"));
+        let result = anthropic_messages_to_engine(&messages, Some(&system));
         assert_eq!(result.len(), 2);
         assert_eq!(result.first().map(|m| m.role.as_str()), Some("system"));
         assert_eq!(
@@ -142,7 +151,7 @@ mod tests {
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "tu_1".to_owned(),
-                    content: "72 degrees".to_owned(),
+                    content: AnthropicContent::Text("72 degrees".to_owned()),
                 },
             ],
         )];
@@ -174,8 +183,9 @@ mod tests {
     #[test]
     fn test_system_as_empty_string() {
         let messages = vec![text_message("user", "Hello")];
+        let system = SystemPrompt::Text(String::new());
 
-        let result = anthropic_messages_to_engine(&messages, Some(""));
+        let result = anthropic_messages_to_engine(&messages, Some(&system));
         assert_eq!(result.len(), 2);
         assert_eq!(result.first().map(|m| m.role.as_str()), Some("system"));
         assert_eq!(result.first().map(|m| m.content.as_str()), Some(""));
@@ -193,7 +203,7 @@ mod tests {
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "tu_1".to_owned(),
-                    content: "72 degrees".to_owned(),
+                    content: AnthropicContent::Text("72 degrees".to_owned()),
                 },
             ],
         )];

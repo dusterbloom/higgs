@@ -8,7 +8,8 @@ use crate::state::Engine;
 
 #[allow(clippy::expect_used)]
 static ROUTE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\{"route"\s*:\s*"([^"]+)"\}"#).expect("hardcoded regex is valid")
+    Regex::new(r#"\{["']\s*route["']\s*:\s*["']([^"']+)["']\s*\}"#)
+        .expect("hardcoded regex is valid")
 });
 
 const TASK_INSTRUCTION: &str = "\
@@ -67,8 +68,14 @@ fn build_prompt(routes: &[RouteCandidate], messages: &[serde_json::Value]) -> St
 }
 
 fn parse_route_name(text: &str, valid_names: &[&str]) -> Option<String> {
-    // Try full JSON parse first
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+    let trimmed = text.trim();
+
+    // Try strict JSON first, then lenient JSON5 (handles single quotes,
+    // trailing commas, unquoted keys, etc.)
+    let parsed = serde_json::from_str::<serde_json::Value>(trimmed)
+        .or_else(|_| json5::from_str::<serde_json::Value>(trimmed));
+
+    if let Ok(v) = parsed {
         if let Some(name) = v.get("route").and_then(|r| r.as_str()) {
             if name != "other" && valid_names.contains(&name) {
                 return Some(name.to_owned());
@@ -196,6 +203,15 @@ mod tests {
         let names = vec!["code_gen", "summarize"];
         let text = "Based on the analysis, the best route is:\n{\"route\": \"summarize\"}";
         assert_eq!(parse_route_name(text, &names), Some("summarize".to_owned()));
+    }
+
+    #[test]
+    fn parse_single_quoted_json() {
+        let names = vec!["small", "coder"];
+        assert_eq!(
+            parse_route_name("{'route': 'small'}", &names),
+            Some("small".to_owned())
+        );
     }
 
     #[test]
