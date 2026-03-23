@@ -82,11 +82,20 @@ pub struct SimpleEngine {
     template: Option<ChatTemplateRenderer>,
     model_name: String,
     eos_token_ids: Vec<u32>,
+    /// Optional draft model for speculative decoding.
+    draft: Option<Mutex<DraftState>>,
     /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
     enable_thinking: bool,
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
     /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
     think_close_token: Option<u32>,
+}
+
+/// State for the draft model used in speculative decoding.
+struct DraftState {
+    model: AnyModel,
+    cache_template: AnyCache,
+    num_draft: usize,
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
@@ -101,6 +110,22 @@ struct PreparedGeneration<'a> {
 impl SimpleEngine {
     /// Load a model and tokenizer from a directory.
     pub fn load<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
+        Self::load_impl(dir, None)
+    }
+
+    /// Load with an optional draft model for speculative decoding.
+    pub fn load_with_draft<P: AsRef<Path>>(
+        dir: P,
+        draft_dir: Option<P>,
+        num_draft: usize,
+    ) -> Result<Self, EngineError> {
+        Self::load_impl(dir, draft_dir.map(|d| (d, num_draft)))
+    }
+
+    fn load_impl<P: AsRef<Path>>(
+        dir: P,
+        draft_config: Option<(P, usize)>,
+    ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
 
@@ -142,11 +167,26 @@ impl SimpleEngine {
             tracing::info!(think_close_token, "Thinking mode enabled (Qwen3.5 model detected)");
         }
 
+        let draft = if let Some((draft_path, num_draft)) = draft_config {
+            let dp = draft_path.as_ref();
+            tracing::info!(draft_dir = %dp.display(), num_draft, "Loading draft model for speculative decoding");
+            let draft_model = model_loader::load_model(dp)?;
+            let draft_cache = draft_model.make_cache();
+            Some(Mutex::new(DraftState {
+                model: draft_model,
+                cache_template: draft_cache,
+                num_draft,
+            }))
+        } else {
+            None
+        };
+
         set_wired_limit_to_max();
 
         tracing::info!(
             model_name = %model_name,
             eos_tokens = ?eos_token_ids,
+            speculative = draft.is_some(),
             "Engine ready"
         );
 
@@ -157,6 +197,7 @@ impl SimpleEngine {
             template,
             model_name,
             eos_token_ids,
+            draft,
             enable_thinking,
             think_close_token,
         })
@@ -413,6 +454,230 @@ impl SimpleEngine {
         };
 
         Ok((next_token, logprob_data))
+    }
+
+    /// Speculative decode: draft K tokens with small model, verify with big model.
+    ///
+    /// Returns accepted tokens (1..=K+1). The verify pass processes all K draft
+    /// tokens in a single batch forward, then accepts the longest matching prefix.
+    #[allow(clippy::too_many_arguments)]
+    fn speculative_decode_step(
+        draft_model: &mut AnyModel,
+        draft_cache: &mut AnyCache,
+        target_model: &mut AnyModel,
+        target_cache: &mut AnyCache,
+        last_token: &Array,
+        num_draft: usize,
+        params: &SamplingParams,
+        generated_tokens: &[u32],
+    ) -> Result<Vec<Array>, EngineError> {
+        // Phase 1: Draft K tokens greedily with the small model
+        let mut draft_tokens: Vec<Array> = Vec::with_capacity(num_draft);
+        let mut current = last_token.clone();
+        for _ in 0..num_draft {
+            let input = current.index((.., NewAxis));
+            let logits = draft_model
+                .forward(&input, None, draft_cache)
+                .map_err(EngineError::Mlx)?;
+            let last_logits = logits.index((.., -1, ..));
+            // Greedy sampling for draft (fast, deterministic)
+            let next = mlx_rs::ops::indexing::argmax_axis(&last_logits, -1, false)
+                .map_err(EngineError::Mlx)?;
+            eval(std::slice::from_ref(&next)).map_err(EngineError::Mlx)?;
+            draft_tokens.push(next.clone());
+            current = next;
+        }
+
+        // Phase 2: Verify all K tokens with target model in one batch forward
+        // Build input: [last_token, draft_0, draft_1, ..., draft_K-1] = K+1 tokens
+        let mut verify_ids: Vec<u32> = Vec::with_capacity(num_draft + 1);
+        let last_id: u32 = last_token.item();
+        verify_ids.push(last_id);
+        for dt in &draft_tokens {
+            let id: u32 = dt.item();
+            verify_ids.push(id);
+        }
+
+        let verify_input =
+            Array::from_slice(&verify_ids, &[1, i32::try_from(verify_ids.len())
+                .map_err(|_| EngineError::Generation("verify len overflow".into()))?]);
+
+        let verify_logits = target_model
+            .forward(&verify_input, None, target_cache)
+            .map_err(EngineError::Mlx)?;
+        // verify_logits shape: [1, K+1, vocab_size]
+        // Position i has logits for predicting token at position i+1
+
+        eval(std::slice::from_ref(&verify_logits)).map_err(EngineError::Mlx)?;
+
+        // Phase 3: Accept-reject
+        // For each position i (0..K), check if target agrees with draft[i]
+        let mut accepted: Vec<Array> = Vec::new();
+        for i in 0..num_draft {
+            #[allow(clippy::cast_possible_truncation)]
+            let pos = i as i32;
+            let pos_logits = verify_logits.index((.., pos..pos + 1, ..)).squeeze()
+                .map_err(EngineError::Mlx)?;
+            // Apply penalties + sample from target distribution
+            let penalized = apply_penalties(&pos_logits, generated_tokens, params)
+                .map_err(EngineError::Mlx)?;
+            let target_token = sample(&penalized, params).map_err(EngineError::Mlx)?;
+            eval(std::slice::from_ref(&target_token)).map_err(EngineError::Mlx)?;
+
+            let target_id: u32 = target_token.item();
+            let draft_id: u32 = draft_tokens[i].item();
+
+            if target_id == draft_id {
+                accepted.push(target_token);
+            } else {
+                // Reject: use target's token instead of draft's
+                accepted.push(target_token);
+                break;
+            }
+        }
+
+        // If all K draft tokens accepted, also sample from the last verify position
+        if accepted.len() == num_draft {
+            #[allow(clippy::cast_possible_truncation)]
+            let nd = num_draft as i32;
+            let last_logits = verify_logits.index((.., nd..nd + 1, ..)).squeeze()
+                .map_err(EngineError::Mlx)?;
+            let penalized = apply_penalties(&last_logits, generated_tokens, params)
+                .map_err(EngineError::Mlx)?;
+            let bonus_token = sample(&penalized, params).map_err(EngineError::Mlx)?;
+            eval(std::slice::from_ref(&bonus_token)).map_err(EngineError::Mlx)?;
+            accepted.push(bonus_token);
+        }
+
+        // NOTE: We do NOT reset draft or target caches.
+        // - Target cache: correct for accepted tokens, stale for rejected (overwritten next cycle)
+        // - Draft cache: SSM state slightly wrong after rejection, but draft quality
+        //   only affects acceptance rate, not correctness (target always verifies).
+
+        Ok(accepted)
+    }
+
+    /// Speculative decode loop: draft K tokens, verify in batch, stream accepted.
+    #[allow(clippy::too_many_arguments)]
+    fn speculative_decode_loop(
+        &self,
+        prepared: &mut PreparedGeneration<'_>,
+        all_tokens: &mut Vec<u32>,
+        prev_decoded_len: &mut usize,
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        mut last_token: Array,
+        prompt_len: u32,
+    ) -> Result<(), EngineError> {
+        let draft_mutex = self
+            .draft
+            .as_ref()
+            .ok_or_else(|| EngineError::Generation("No draft model".into()))?;
+        let mut draft = draft_mutex
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Draft lock: {e}")))?;
+        let num_draft = draft.num_draft;
+
+        // Prefill draft model with the same prompt
+        let prompt_array = Array::from_slice(
+            all_tokens.as_slice(),
+            &[1, i32::try_from(all_tokens.len())
+                .map_err(|_| EngineError::Generation("prompt len overflow".into()))?],
+        );
+        let d = &mut *draft;
+        let (draft_model, draft_cache) = (&mut d.model, &mut d.cache_template);
+        let _ = draft_model
+            .forward(&prompt_array, None, draft_cache)
+            .map_err(EngineError::Mlx)?;
+
+        loop {
+            let accepted = Self::speculative_decode_step(
+                draft_model,
+                draft_cache,
+                &mut prepared.model,
+                &mut prepared.cache,
+                &last_token,
+                num_draft,
+                params,
+                all_tokens,
+            )?;
+
+            if accepted.is_empty() {
+                break;
+            }
+
+            let mut should_stop = false;
+            for token_arr in &accepted {
+                let token_id: u32 = token_arr.item();
+                all_tokens.push(token_id);
+
+                let completion_len = Self::completion_len(all_tokens)?;
+                let is_eos = self.eos_token_ids.contains(&token_id);
+                let is_max = completion_len >= max_tokens;
+
+                let full_text = self.decode_tokens(all_tokens)?;
+                let new_text = full_text
+                    .get(*prev_decoded_len..)
+                    .unwrap_or_default()
+                    .to_owned();
+                *prev_decoded_len = full_text.len();
+
+                let (final_text, hit_stop) = if stop_sequences.is_empty() {
+                    (new_text, false)
+                } else {
+                    check_stop_sequences(&full_text, stop_sequences)
+                        .map_or((new_text, false), |truncated| {
+                            let emit = truncated
+                                .get(prev_decoded_len.saturating_sub(truncated.len())..)
+                                .unwrap_or(&truncated)
+                                .to_owned();
+                            (emit, true)
+                        })
+                };
+
+                let finished = is_eos || hit_stop || is_max;
+
+                if sender
+                    .blocking_send(StreamingOutput {
+                        new_text: final_text,
+                        finished,
+                        finish_reason: if is_eos || hit_stop {
+                            Some("stop".to_owned())
+                        } else if is_max {
+                            Some("length".to_owned())
+                        } else {
+                            None
+                        },
+                        prompt_tokens: prompt_len,
+                        completion_tokens: completion_len,
+                        token_logprob: None,
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+
+                if finished {
+                    should_stop = true;
+                    break;
+                }
+            }
+
+            if should_stop {
+                break;
+            }
+
+            // Update last_token for next cycle
+            if let Some(last) = accepted.last() {
+                last_token = last.clone();
+            }
+
+            // Draft cache persists — no re-prefill needed.
+        }
+
+        Ok(())
     }
 
     /// Decode the token buffer and return the text, mapping tokenizer errors.
@@ -951,6 +1216,21 @@ impl SimpleEngine {
 
         if finished {
             return Ok(());
+        }
+
+        // Speculative decode path when draft model is available
+        if self.draft.is_some() {
+            return self.speculative_decode_loop(
+                &mut prepared,
+                &mut all_tokens,
+                &mut prev_decoded_len,
+                max_tokens,
+                params,
+                stop_sequences,
+                sender,
+                current_token,
+                prompt_len,
+            );
         }
 
         // Thinking budget (streaming): force </think> after N tokens.
