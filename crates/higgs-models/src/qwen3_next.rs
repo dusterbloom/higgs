@@ -1722,10 +1722,11 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     map.entry("intermediate_size")
         .or_insert(serde_json::Value::from(0));
 
-    // Use separate GDN projections (qwen3.5-style flat split)
+    // Weights are rearranged from flat (qkv,z,b,a) to per-head-grouped
+    // (qkvz,ba) at load time, so we use the combined forward path.
     map.insert(
         "use_separate_gdn_projections".to_owned(),
-        serde_json::Value::from(true),
+        serde_json::Value::from(false),
     );
 
     // Detect per-layer gate quantization override from top-level quantization config
@@ -1760,48 +1761,117 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
         "Loading qwen3_5_moe model (VLM text backbone via qwen3_next)"
     );
 
+    // Save GDN dimensions before args is moved
+    let gdn_dims = GdnDims {
+        num_k_heads: args.linear_num_key_heads,
+        num_v_heads: args.linear_num_value_heads,
+        head_k_dim: args.linear_key_head_dim,
+        head_v_dim: args.linear_value_head_dim,
+    };
     let mut model = Qwen3NextCausalLM::new(args)?;
 
-    // Separate GDN projections (in_proj_qkv, in_proj_z, in_proj_a, in_proj_b)
-    // load directly — no concat needed since forward branches on use_separate_projections.
-    // VLM weights have `language_model.` prefix.
-    crate::load_quantized_safetensors_weights_with_prefix(
-        &mut model,
-        model_path,
-        false,
-        "language_model.",
-    )?;
+    // Load weights with GDN projection rearrangement: flat (qkv,z,b,a)
+    // → per-head-grouped (qkvz,ba) for fused 2-dispatch forward path.
+    load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
 
     tracing::info!("Qwen3.5-MoE model loaded successfully");
     Ok(model)
 }
 
-/// GDN projection remapping pairs: (separate_a, separate_b) → combined target.
-const GDN_REMAP: &[(&str, &str, &str)] = &[
-    ("in_proj_qkv", "in_proj_z", "in_proj_qkvz"),
-    ("in_proj_b", "in_proj_a", "in_proj_ba"),
-];
+/// GDN dimension info extracted from model args before move.
+struct GdnDims {
+    num_k_heads: i32,
+    num_v_heads: i32,
+    head_k_dim: i32,
+    head_v_dim: i32,
+}
 
-/// Load weights for Qwen3.5-MoE, remapping separate GDN projections to combined.
+/// Build row permutation to convert flat [q_all|k_all|v_all|z_all] layout
+/// to per-head-grouped [q_h0|k_h0|v_h0|z_h0|q_h1|...] for in_proj_qkvz.
+fn build_qkvz_permutation(d: &GdnDims) -> Vec<i32> {
+    let nk = d.num_k_heads;
+    let dk = d.head_k_dim;
+    let v_per_k = d.num_v_heads / nk;
+    let dv = d.head_v_dim;
+    let key_dim = nk * dk;
+    let qkv_rows = key_dim * 2 + d.num_v_heads * dv; // offset for z
+
+    let mut perm = Vec::new();
+    for h in 0..nk {
+        // q: rows h*dk .. (h+1)*dk from qkv (offset 0)
+        for i in 0..dk {
+            perm.push(h * dk + i);
+        }
+        // k: rows key_dim + h*dk .. from qkv
+        for i in 0..dk {
+            perm.push(key_dim + h * dk + i);
+        }
+        // v: rows 2*key_dim + h*(v_per_k*dv) .. from qkv
+        for i in 0..(v_per_k * dv) {
+            perm.push(2 * key_dim + h * v_per_k * dv + i);
+        }
+        // z: rows h*(v_per_k*dv) .. from z (offset by qkv_rows)
+        for i in 0..(v_per_k * dv) {
+            perm.push(qkv_rows + h * v_per_k * dv + i);
+        }
+    }
+    perm
+}
+
+/// Build row permutation for flat [b_all|a_all] → per-head-grouped [b_h0|a_h0|b_h1|a_h1|...].
+fn build_ba_permutation(d: &GdnDims) -> Vec<i32> {
+    let nk = d.num_k_heads;
+    let v_per_k = d.num_v_heads / nk;
+    let nv = d.num_v_heads;
+
+    let mut perm = Vec::new();
+    for h in 0..nk {
+        // b: rows h*v_per_k .. (h+1)*v_per_k from b
+        for i in 0..v_per_k {
+            perm.push(h * v_per_k + i);
+        }
+        // a: rows h*v_per_k .. (h+1)*v_per_k from a (offset by nv)
+        for i in 0..v_per_k {
+            perm.push(nv + h * v_per_k + i);
+        }
+    }
+    perm
+}
+
+/// Concatenate two arrays along dim 0 and permute rows.
+fn concat_and_permute(a: &Array, b: &Array, perm: &[i32]) -> Result<Array, Exception> {
+    let cat = ops::concatenate_axis(&[a, b], 0)?;
+    let perm_arr = Array::from_slice(perm, &[i32::try_from(perm.len())
+        .map_err(|_| Exception::custom("perm len overflow"))?]);
+    cat.take_axis(&perm_arr, 0)
+}
+
+/// Load Qwen3.5-MoE weights with GDN projection fusion.
 ///
-/// Qwen3.5-MoE stores GDN projections as 4 separate matrices (in_proj_qkv,
-/// in_proj_z, in_proj_a, in_proj_b). Qwen3Next expects 2 combined matrices
-/// (in_proj_qkvz, in_proj_ba). This loader concatenates along dim 0 at load
-/// time so the forward pass works unchanged.
-fn load_qwen3_5_moe_weights<M: mlx_rs::module::ModuleParametersExt>(
+/// Rearranges flat (qkv,z,b,a) projections to per-head-grouped (qkvz,ba)
+/// so the model uses the fused 2-dispatch forward path instead of 4 separate.
+fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
+    gdn_dims: &GdnDims,
 ) -> Result<(), crate::error::ModelError> {
     use std::collections::HashMap;
 
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
     let mut params = model.parameters_mut().flatten();
 
-    // Collect GDN split tensors keyed by (layer, combined_name, suffix)
-    // e.g. ("model.layers.0.linear_attn", "in_proj_qkvz", "weight") → (part_a, part_b)
+    let qkvz_perm = build_qkvz_permutation(gdn_dims);
+    let ba_perm = build_ba_permutation(gdn_dims);
+
+    // GDN split keys: collect (part_a, part_b) for each combined target
+    // Key format: "model.layers.N.linear_attn.in_proj_qkvz.{weight|scales|biases}"
     let mut gdn_parts: HashMap<String, (Option<Array>, Option<Array>)> = HashMap::new();
 
     let prefix = "language_model.";
+    let gdn_remap: &[(&str, &str, &str)] = &[
+        ("in_proj_qkv", "in_proj_z", "in_proj_qkvz"),
+        ("in_proj_b", "in_proj_a", "in_proj_ba"),
+    ];
 
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
@@ -1812,16 +1882,14 @@ fn load_qwen3_5_moe_weights<M: mlx_rs::module::ModuleParametersExt>(
                 continue;
             };
 
-            // Check if this is a GDN split projection
             let mut handled = false;
-            for &(part_a_name, part_b_name, combined_name) in GDN_REMAP {
+            for &(part_a_name, part_b_name, combined_name) in gdn_remap {
                 for (is_b, split_name) in [(false, part_a_name), (true, part_b_name)] {
                     let needle = format!(".{split_name}.");
                     if let Some(pos) = stripped.find(&needle) {
-                        let prefix_part = &stripped[..pos];
-                        let suffix = &stripped[pos + needle.len()..];
-                        let map_key =
-                            format!("{prefix_part}.{combined_name}.{suffix}");
+                        let pfx = &stripped[..pos];
+                        let sfx = &stripped[pos + needle.len()..];
+                        let map_key = format!("{pfx}.{combined_name}.{sfx}");
                         let entry = gdn_parts.entry(map_key).or_insert((None, None));
                         if is_b {
                             entry.1 = Some(value.clone());
@@ -1838,7 +1906,6 @@ fn load_qwen3_5_moe_weights<M: mlx_rs::module::ModuleParametersExt>(
             }
 
             if !handled {
-                // Direct match for non-GDN weights
                 if let Some(param) = params.get_mut(stripped) {
                     **param = value;
                 }
@@ -1846,51 +1913,36 @@ fn load_qwen3_5_moe_weights<M: mlx_rs::module::ModuleParametersExt>(
         }
     }
 
-    // Concatenate GDN split pairs and assign to combined params
-    let mut concat_count = 0usize;
+    // Fuse GDN pairs: concat + row permutation
+    let mut fused_count = 0usize;
     for (combined_key, (part_a, part_b)) in &gdn_parts {
-        match (part_a, part_b) {
-            (Some(a), Some(b)) => {
-                if let Some(param) = params.get_mut(combined_key.as_str()) {
-                    if concat_count < 3 {
-                        tracing::info!(
-                            key = combined_key,
-                            a_shape = ?a.shape(),
-                            a_dtype = ?a.dtype(),
-                            b_shape = ?b.shape(),
-                            b_dtype = ?b.dtype(),
-                            "Concatenating GDN projections"
-                        );
-                    }
-                    match ops::concatenate_axis(&[a, b], 0) {
-                        Ok(combined) => {
-                            **param = combined;
-                            concat_count += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                key = combined_key,
-                                "Failed to concatenate GDN projections: {e}"
-                            );
-                        }
-                    }
-                }
+        let (Some(a), Some(b)) = (part_a, part_b) else {
+            tracing::warn!(key = combined_key, "Incomplete GDN projection pair");
+            continue;
+        };
+        let Some(param) = params.get_mut(combined_key.as_str()) else {
+            continue;
+        };
+        let perm = if combined_key.contains("in_proj_qkvz") {
+            &qkvz_perm
+        } else {
+            &ba_perm
+        };
+        match concat_and_permute(a, b, perm) {
+            Ok(fused) => {
+                **param = fused;
+                fused_count += 1;
             }
-            _ => {
-                tracing::warn!(
-                    key = combined_key,
-                    has_a = part_a.is_some(),
-                    has_b = part_b.is_some(),
-                    "Incomplete GDN projection pair"
-                );
+            Err(e) => {
+                tracing::warn!(key = combined_key, "GDN fusion failed: {e}");
             }
         }
     }
 
     tracing::info!(
-        concat_count,
-        total_gdn_pairs = gdn_parts.len(),
-        "Remapped GDN split projections to combined"
+        fused_count,
+        total_pairs = gdn_parts.len(),
+        "Fused GDN projections (4→2 dispatches per layer)"
     );
 
     model
