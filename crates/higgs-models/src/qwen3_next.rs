@@ -1339,6 +1339,114 @@ fn compute_g_compiled((a_log, a, dt_bias): (&Array, &Array, &Array)) -> Result<A
 // DecoderLayer
 // ---------------------------------------------------------------------------
 
+/// Wrapper for the FFN block: either sparse MoE or dense SwiGLU.
+/// Both share the `mlp` parameter namespace in safetensors — their sub-keys
+/// don't overlap (MoE: gate, switch_mlp, shared_expert; Dense: gate_proj, up_proj, down_proj).
+#[derive(Debug, Clone, ModuleParameters)]
+struct FfnBlock {
+    #[param]
+    gate: Option<QLinear>,
+    #[param]
+    switch_mlp: Option<SwitchMlpWeights>,
+    #[param]
+    shared_expert: Option<Qwen3NextMLP>,
+    #[param]
+    shared_expert_gate: Option<QLinear>,
+    #[param]
+    gate_proj: Option<QLinear>,
+    #[param]
+    up_proj: Option<QLinear>,
+    #[param]
+    down_proj: Option<QLinear>,
+    is_moe: bool,
+    top_k: i32,
+    norm_topk_prob: bool,
+}
+
+impl FfnBlock {
+    fn new_moe(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+        let moe = SparseMoeBlock::new(args, ql, qb)?;
+        Ok(Self {
+            gate: Some(moe.gate),
+            switch_mlp: Some(moe.switch_mlp),
+            shared_expert: Some(moe.shared_expert),
+            shared_expert_gate: Some(moe.shared_expert_gate),
+            gate_proj: None,
+            up_proj: None,
+            down_proj: None,
+            is_moe: true,
+            top_k: moe.top_k,
+            norm_topk_prob: moe.norm_topk_prob,
+        })
+    }
+
+    fn new_dense(ql: i32, qb: i32) -> Result<Self, Exception> {
+        Ok(Self {
+            gate: None,
+            switch_mlp: None,
+            shared_expert: None,
+            shared_expert_gate: None,
+            gate_proj: Some(QLinear::new(ql, qb)?),
+            up_proj: Some(QLinear::new(ql, qb)?),
+            down_proj: Some(QLinear::new(ql, qb)?),
+            is_moe: false,
+            top_k: 0,
+            norm_topk_prob: false,
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        if self.is_moe {
+            // Delegate to SparseMoeBlock logic
+            let gate_ref = self.gate.as_ref()
+                .ok_or_else(|| Exception::custom("MoE gate missing"))?;
+            let switch_ref = self.switch_mlp.as_ref()
+                .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
+            let se_ref = self.shared_expert.as_ref()
+                .ok_or_else(|| Exception::custom("MoE shared_expert missing"))?;
+            let seg_ref = self.shared_expert_gate.as_ref()
+                .ok_or_else(|| Exception::custom("MoE shared_expert_gate missing"))?;
+
+            let gates = ops::softmax_axis(&gate_ref.forward(x)?, -1, true)?;
+            let neg_k = -self.top_k;
+            let all_inds = ops::argpartition_axis(&gates, neg_k, -1)?;
+            let num_experts = *gates.shape().last()
+                .ok_or_else(|| Exception::custom("gates must have last dim"))?;
+            let top_k_start = num_experts - self.top_k;
+            let top_inds = all_inds.index((.., .., top_k_start..));
+            let top_scores = gates.take_along_axis(&top_inds, -1)?;
+            let top_scores = if self.norm_topk_prob {
+                let sum = top_scores.sum_axes(&[-1], true)?;
+                top_scores.divide(&sum)?
+            } else {
+                top_scores
+            };
+
+            let y = switch_ref.forward_gather(x, &top_inds, false)?;
+            let expert_sum = y
+                .multiply(&top_scores.expand_dims(-1)?)?
+                .sum_axes(&[-2], false)?;
+
+            let shared_y = se_ref.forward(x)?;
+            let shared_gate_val = nn::sigmoid(&seg_ref.forward(x)?)?;
+            let shared_out = shared_y.multiply(&shared_gate_val)?;
+
+            expert_sum.add(shared_out)
+        } else {
+            // Dense SwiGLU
+            let gp = self.gate_proj.as_ref()
+                .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
+            let up = self.up_proj.as_ref()
+                .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
+            let dp = self.down_proj.as_ref()
+                .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
+            let gate_out = gp.forward(x)?;
+            let up_out = up.forward(x)?;
+            dp.forward(&swiglu(&gate_out, &up_out)?)
+        }
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters)]
 struct DecoderLayer {
     #[param]
@@ -1350,7 +1458,7 @@ struct DecoderLayer {
     #[param]
     post_attention_layernorm: nn::RmsNorm,
     #[param]
-    mlp: SparseMoeBlock,
+    mlp: FfnBlock,
     is_linear: bool,
 }
 
@@ -1369,6 +1477,11 @@ impl DecoderLayer {
             Some(Qwen3NextAttention::new(args, ql, qb)?)
         };
 
+        let ffn = if args.num_experts > 0 {
+            FfnBlock::new_moe(args, ql, qb)?
+        } else {
+            FfnBlock::new_dense(ql, qb)?
+        };
         Ok(Self {
             linear_attn,
             self_attn,
@@ -1378,7 +1491,7 @@ impl DecoderLayer {
             post_attention_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
                 .eps(args.rms_norm_eps)
                 .build()?,
-            mlp: SparseMoeBlock::new(args, ql, qb)?,
+            mlp: ffn,
             is_linear,
         })
     }
