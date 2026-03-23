@@ -95,6 +95,7 @@ impl ChatTemplateRenderer {
                 minijinja::context! {
                     messages => messages,
                     add_generation_prompt => add_generation_prompt,
+                    enable_thinking => false,
                 }
             },
             |tool_list| {
@@ -102,6 +103,7 @@ impl ChatTemplateRenderer {
                     messages => messages,
                     tools => tool_list,
                     add_generation_prompt => add_generation_prompt,
+                    enable_thinking => false,
                 }
             },
         );
