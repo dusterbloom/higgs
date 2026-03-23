@@ -239,6 +239,7 @@ async fn create_message_non_streaming(
         .prepare_chat_prompt(&engine_messages, tools)
         .map_err(ServerError::Engine)?;
 
+    let thinking_enabled = engine.enable_thinking();
     let output = tokio::task::spawn_blocking(move || {
         engine.generate(
             &prompt_tokens,
@@ -258,11 +259,16 @@ async fn create_message_non_streaming(
     let stop_reason = openai_finish_to_anthropic_stop(&output.finish_reason);
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
-    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&output.text);
+    let parse_input = if thinking_enabled {
+        format!("<think>{}", output.text)
+    } else {
+        output.text
+    };
+    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
     let visible_text = if reasoning_result.reasoning.is_some() {
         reasoning_result.text
     } else {
-        output.text
+        parse_input
     };
 
     Ok(CreateMessageResponse {

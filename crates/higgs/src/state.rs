@@ -74,6 +74,15 @@ impl Engine {
         }
     }
 
+    pub fn enable_thinking(&self) -> bool {
+        match self {
+            Self::Simple(e) => e.enable_thinking(),
+            Self::Batch(_) => false,
+            #[cfg(test)]
+            Self::Stub(_) => false,
+        }
+    }
+
     pub fn is_vlm(&self) -> bool {
         match self {
             Self::Simple(e) => e.is_vlm(),

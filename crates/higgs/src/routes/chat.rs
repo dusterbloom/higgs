@@ -294,6 +294,7 @@ async fn chat_completions_non_streaming(
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
     let tokenizer = engine.tokenizer().clone();
+    let thinking_enabled = engine.enable_thinking();
     let output = tokio::task::spawn_blocking(move || {
         engine.generate(
             &prompt_tokens,
@@ -318,12 +319,20 @@ async fn chat_completions_non_streaming(
         .as_ref()
         .map(|lps| logprobs_to_response(lps, &tokenizer));
 
-    // Parse reasoning (think tags) from the output
-    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&output.text);
+    // Parse reasoning (think tags) from the output.
+    // When thinking mode is enabled, the template already opened `<think>` in the prompt,
+    // so the generated text starts inside the think block. Prepend `<think>` so the parser
+    // can find the matching `</think>` and split reasoning from visible content.
+    let parse_input = if thinking_enabled {
+        format!("<think>{}", output.text)
+    } else {
+        output.text
+    };
+    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
     let raw_text = if reasoning_result.reasoning.is_some() {
         reasoning_result.text
     } else {
-        output.text
+        parse_input
     };
     let reasoning_content = reasoning_result.reasoning;
 
@@ -397,11 +406,9 @@ fn chat_completions_stream(
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
-    if req.tools.is_some() {
-        return Err(ServerError::BadRequest(
-            "Streaming with tool_calls is not yet supported".to_owned(),
-        ));
-    }
+    // Silently ignore tools in streaming mode (nanobot always sends them).
+    // Tool-calling responses are not yet supported in streaming, but
+    // regular text generation works fine with tools present in the request.
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
@@ -466,6 +473,7 @@ fn chat_completions_stream(
     });
 
     let tokenizer = engine.tokenizer().clone();
+    let thinking_enabled_stream = engine.enable_thinking();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     tokio::task::spawn_blocking(move || {
@@ -509,7 +517,11 @@ fn chat_completions_stream(
             Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
         }
 
-        let mut reasoning_tracker = higgs_engine::reasoning_parser::StreamingReasoningTracker::new();
+        let mut reasoning_tracker = if thinking_enabled_stream {
+            higgs_engine::reasoning_parser::StreamingReasoningTracker::new_inside_think()
+        } else {
+            higgs_engine::reasoning_parser::StreamingReasoningTracker::new()
+        };
         let mut output_token_count: u32 = 0;
 
         while let Some(output) = rx.recv().await {
