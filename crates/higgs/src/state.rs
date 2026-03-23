@@ -28,6 +28,15 @@ impl Engine {
         SimpleEngine::load(dir).map(|e| Self::Simple(Box::new(e)))
     }
 
+    pub fn load_simple_with_draft<P: AsRef<Path>>(
+        dir: P,
+        draft_dir: P,
+        num_draft: usize,
+    ) -> Result<Self, EngineError> {
+        SimpleEngine::load_with_draft(dir, Some(draft_dir), num_draft)
+            .map(|e| Self::Simple(Box::new(e)))
+    }
+
     pub fn load_batch<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
         BatchEngine::load(dir).map(|e| Self::Batch(Box::new(e)))
     }

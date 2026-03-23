@@ -114,6 +114,14 @@ pub struct ServeArgs {
     /// Use batch engine for all models (simple mode only).
     #[arg(long)]
     pub batch: bool,
+
+    /// Path to a draft model for speculative decoding.
+    #[arg(long)]
+    pub draft_model: Option<String>,
+
+    /// Number of draft tokens per speculative cycle (default: 16).
+    #[arg(long, default_value = "16")]
+    pub num_draft: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +210,14 @@ pub struct ModelConfig {
     pub name: Option<String>,
     #[serde(default)]
     pub batch: bool,
+    #[serde(default)]
+    pub draft_model: Option<String>,
+    #[serde(default = "default_num_draft")]
+    pub num_draft: usize,
+}
+
+const fn default_num_draft() -> usize {
+    16
 }
 
 // -- Provider config --------------------------------------------------------
@@ -391,6 +407,8 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             path: p.clone(),
             name: None,
             batch: args.batch,
+            draft_model: args.draft_model.clone(),
+            num_draft: args.num_draft,
         })
         .collect();
 
@@ -466,6 +484,8 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     path: p.clone(),
                     name: None,
                     batch: serve_args.batch,
+                    draft_model: serve_args.draft_model.clone(),
+                    num_draft: serve_args.num_draft,
                 })
                 .collect();
             figment = figment.merge(Serialized::default("models", &extra));
@@ -573,6 +593,8 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         path,
         name: Some(name.clone()),
         batch: false,
+        draft_model: None,
+        num_draft: default_num_draft(),
     });
     config.auto_router.model = name;
 }
