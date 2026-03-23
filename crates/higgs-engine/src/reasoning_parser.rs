@@ -103,6 +103,16 @@ impl StreamingReasoningTracker {
         }
     }
 
+    /// Create a tracker that starts inside a `<think>` block.
+    /// Use when the chat template already opened `<think>` in the prompt.
+    pub const fn new_inside_think() -> Self {
+        Self {
+            buffer: String::new(),
+            inside_think: true,
+            started: true,
+        }
+    }
+
     /// Process a new text chunk from the model. Returns `(visible_text, reasoning_text)`.
     ///
     /// Either or both may be empty on a given call (e.g. when buffering a partial tag).

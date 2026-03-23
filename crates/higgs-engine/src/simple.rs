@@ -21,7 +21,12 @@ use crate::{
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 
-/// Pin model weights in GPU memory to prevent OS eviction.
+/// Cap MLX memory allocations to avoid Metal OOM on constrained GPUs.
+///
+/// Sets `mlx_set_memory_limit` to 75% of `max_recommended_working_set_size`
+/// and `mlx_set_cache_limit` to 50%. This lets MLX manage memory within
+/// bounds instead of the OS killing the process when Metal command buffers
+/// exceed GPU capacity (the root cause of 35B crashes on 32GB machines).
 #[allow(unsafe_code)]
 pub(crate) fn set_wired_limit_to_max() {
     unsafe {
@@ -34,11 +39,30 @@ pub(crate) fn set_wired_limit_to_max() {
             if mlx_sys::mlx_device_info_get_size(&raw mut max_rec, info, key.as_ptr()) == 0
                 && max_rec > 0
             {
-                let mut old_limit: usize = 0;
-                mlx_sys::mlx_set_wired_limit(&raw mut old_limit, max_rec);
+                let mem_limit = max_rec * 3 / 4; // 75% of GPU max
+                let cache_limit = max_rec / 2; // 50% of GPU max
+
+                let mut prev_mem: usize = 0;
+                let mut prev_cache: usize = 0;
+
+                // Check env var to optionally disable memory limits for testing
+                let limits_enabled =
+                    std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
+
+                if limits_enabled {
+                    mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
+                    mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
+                }
+
                 tracing::info!(
-                    wired_limit_mb = max_rec / (1024 * 1024),
-                    "Set wired memory limit"
+                    max_recommended_mb = max_rec / (1024 * 1024),
+                    memory_limit_mb = mem_limit / (1024 * 1024),
+                    cache_limit_mb = cache_limit / (1024 * 1024),
+                    limits_enabled,
+                    "MLX memory limits {} (prev mem={}MB, cache={}MB)",
+                    if limits_enabled { "set" } else { "skipped" },
+                    prev_mem / (1024 * 1024),
+                    prev_cache / (1024 * 1024),
                 );
             }
         }
@@ -60,6 +84,8 @@ pub struct SimpleEngine {
     eos_token_ids: Vec<u32>,
     /// Optional draft model for speculative decoding.
     draft: Option<Mutex<DraftState>>,
+    /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
+    enable_thinking: bool,
 }
 
 /// State for the draft model used in speculative decoding.
@@ -111,6 +137,17 @@ impl SimpleEngine {
 
         let eos_token_ids = extract_eos_tokens(model_dir);
 
+        // Auto-detect thinking mode: Qwen3.5 models support <think> tags.
+        // Override with HIGGS_ENABLE_THINKING=0 or HIGGS_ENABLE_THINKING=1.
+        let enable_thinking = match std::env::var("HIGGS_ENABLE_THINKING").ok().as_deref() {
+            Some("0" | "false") => false,
+            Some("1" | "true") => true,
+            _ => detect_thinking_support(model_dir),
+        };
+        if enable_thinking {
+            tracing::info!("Thinking mode enabled (Qwen3.5 model detected)");
+        }
+
         let draft = if let Some((draft_path, num_draft)) = draft_config {
             let dp = draft_path.as_ref();
             tracing::info!(draft_dir = %dp.display(), num_draft, "Loading draft model for speculative decoding");
@@ -142,6 +179,7 @@ impl SimpleEngine {
             model_name,
             eos_token_ids,
             draft,
+            enable_thinking,
         })
     }
 
@@ -160,6 +198,11 @@ impl SimpleEngine {
         &self.eos_token_ids
     }
 
+    /// Whether the engine has thinking mode enabled.
+    pub const fn enable_thinking(&self) -> bool {
+        self.enable_thinking
+    }
+
     /// Apply chat template and tokenize messages.
     pub fn prepare_chat_prompt(
         &self,
@@ -171,7 +214,7 @@ impl SimpleEngine {
                 "This model has no chat template; use /v1/completions instead".to_owned(),
             )
         })?;
-        let prompt = renderer.apply(messages, tools, true)?;
+        let prompt = renderer.apply_with_thinking(messages, tools, true, self.enable_thinking)?;
         let encoding = self
             .tokenizer
             .encode(prompt.as_str(), false)
@@ -758,6 +801,7 @@ impl SimpleEngine {
 
         // Capture T1 (already eval'd inside run_prefill).
         let first_token_id: u32 = current_token.item();
+        tracing::info!(token_id = first_token_id, "DEBUG_TOKEN prefill (T1)");
         // Advance the constraint past the first sampled token before decode.
         if let Some(ref mut cg) = constraint {
             cg.advance(first_token_id);
@@ -832,6 +876,13 @@ impl SimpleEngine {
         let mut total_other_ns: u128 = 0;
         let mut step_count: u32 = 0;
 
+        // Thinking budget: force </think> after N tokens if model hasn't closed it.
+        // Only active when enable_thinking is true.
+        const THINK_CLOSE_TOKEN: u32 = 248069;
+        const THINKING_BUDGET: u32 = 256;
+        let mut thinking_tokens: u32 = 0;
+        let mut seen_think_close = !self.enable_thinking; // skip tracking if thinking disabled
+
         loop {
             let t0 = std::time::Instant::now();
 
@@ -870,7 +921,21 @@ impl SimpleEngine {
             let t2 = std::time::Instant::now();
 
             // In the unconstrained pipeline, extract the token here (after building following).
-            let token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
+            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
+
+            // Thinking budget: force </think> after N tokens if model hasn't closed it.
+            if !seen_think_close {
+                if token_id == THINK_CLOSE_TOKEN {
+                    seen_think_close = true;
+                } else {
+                    thinking_tokens += 1;
+                    if thinking_tokens >= THINKING_BUDGET {
+                        token_id = THINK_CLOSE_TOKEN;
+                        seen_think_close = true;
+                        tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
+                    }
+                }
+            }
 
             // Materialize logprobs for the token we just extracted
             if let (Some(all_lp), Some(lp_data)) = (&mut all_logprobs, &next_logprob_data) {
@@ -964,7 +1029,14 @@ impl SimpleEngine {
                 });
             }
 
-            next_token = following;
+            // If thinking budget was just reached, override the pipelined token
+            // so the next decode step gets </think> as input.
+            if seen_think_close && thinking_tokens == THINKING_BUDGET {
+                next_token = Array::from_slice(&[THINK_CLOSE_TOKEN], &[1]);
+                thinking_tokens += 1; // prevent re-triggering
+            } else {
+                next_token = following;
+            }
             next_logprob_data = following_logprob_data;
         }
     }
@@ -1319,7 +1391,12 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
         }
     };
 
-    match config.get("eos_token_id") {
+    // Check top-level first, then text_config (VLM/Qwen3.5 nested config)
+    let eos_value = config
+        .get("eos_token_id")
+        .or_else(|| config.get("text_config").and_then(|tc| tc.get("eos_token_id")));
+
+    match eos_value {
         Some(serde_json::Value::Number(n)) => n
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
@@ -1339,6 +1416,24 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
             vec![]
         }
     }
+}
+
+/// Detect whether a model supports thinking mode based on model_type.
+fn detect_thinking_support(model_dir: &Path) -> bool {
+    let config_path = model_dir.join("config.json");
+    let config_str = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let config: serde_json::Value = match serde_json::from_str(&config_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // Qwen3.5 models (qwen3_5, qwen3_5_moe) support <think> tags
+    matches!(
+        config.get("model_type").and_then(|v| v.as_str()),
+        Some("qwen3_5" | "qwen3_5_moe")
+    )
 }
 
 #[cfg(test)]
