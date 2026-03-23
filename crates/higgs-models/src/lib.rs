@@ -655,20 +655,40 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
 
+        let mut matched = 0usize;
+        let mut unmatched = 0usize;
         for (key, value) in loaded {
             let Some(stripped) = key.strip_prefix(prefix) else {
                 continue;
             };
             if let Some(param) = params.get_mut(stripped) {
                 **param = value;
+                matched += 1;
             } else if quantized {
                 if let Some(remapped) = remap_quantized_key(stripped) {
                     if let Some(param) = params.get_mut(&*remapped) {
                         **param = value;
+                        matched += 1;
+                    } else {
+                        unmatched += 1;
+                        if unmatched <= 5 {
+                            tracing::warn!(stripped, remapped = &*remapped, "weight key unmatched after remap");
+                        }
                     }
+                } else {
+                    unmatched += 1;
+                    if unmatched <= 5 {
+                        tracing::warn!(stripped, "weight key unmatched (no remap)");
+                    }
+                }
+            } else {
+                unmatched += 1;
+                if unmatched <= 5 {
+                    tracing::warn!(stripped, "weight key unmatched");
                 }
             }
         }
+        tracing::info!(matched, unmatched, "Weight loading stats for shard");
     }
 
     model
