@@ -250,6 +250,9 @@ fn load_engines(
         tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
         let engine = if model_cfg.batch {
             Engine::load_batch(&resolved)?
+        } else if let Some(ref draft_path) = model_cfg.draft_model {
+            let draft_resolved = model_resolver::resolve(draft_path)?;
+            Engine::load_simple_with_draft(&resolved, &draft_resolved, model_cfg.num_draft)?
         } else {
             Engine::load_simple(&resolved)?
         };
