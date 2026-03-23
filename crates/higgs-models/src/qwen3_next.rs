@@ -155,6 +155,10 @@ pub struct Qwen3NextModelArgs {
 
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
+
+    /// Use separate GDN projections (qwen3.5-style) instead of combined (qwen3_next-style).
+    #[serde(default)]
+    pub use_separate_gdn_projections: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1023,15 @@ struct GatedDeltaNet {
     in_proj_qkvz: QLinear,
     #[param]
     in_proj_ba: QLinear,
+    // Separate projections for qwen3_5-style models (flat split, not per-head)
+    #[param]
+    in_proj_qkv: Option<QLinear>,
+    #[param]
+    in_proj_z: Option<QLinear>,
+    #[param]
+    in_proj_a: Option<QLinear>,
+    #[param]
+    in_proj_b: Option<QLinear>,
     #[param]
     conv1d: nn::Conv1d,
     #[param]
@@ -1036,6 +1049,7 @@ struct GatedDeltaNet {
     key_dim: i32,
     conv_dim: i32,
     conv_kernel_size: i32,
+    use_separate_projections: bool,
     qk_norm_weight_q: Array,
     qk_norm_weight_k: Array,
 }
@@ -1051,9 +1065,14 @@ impl GatedDeltaNet {
         let conv_dim = key_dim * 2 + value_dim;
         let conv_kernel_size = args.linear_conv_kernel_dim;
 
+        let use_sep = args.use_separate_gdn_projections;
         Ok(Self {
             in_proj_qkvz: QLinear::new(ql, qb)?,
             in_proj_ba: QLinear::new(ql, qb)?,
+            in_proj_qkv: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
+            in_proj_z: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
+            in_proj_a: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
+            in_proj_b: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
             conv1d: nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
                 .bias(false)
                 .groups(conv_dim)
@@ -1072,6 +1091,7 @@ impl GatedDeltaNet {
             key_dim,
             conv_dim,
             conv_kernel_size,
+            use_separate_projections: use_sep,
             qk_norm_weight_q: {
                 let dim_f32 = f32::from(
                     i16::try_from(head_k_dim)
@@ -1110,12 +1130,43 @@ impl GatedDeltaNet {
             .get(1)
             .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
 
-        // Project inputs
-        let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
-        let mixed_ba = self.in_proj_ba.forward(inputs)?;
+        // Project inputs and split into q, k, v, z, b, a
+        let (q, k, v, z, b, a) = if self.use_separate_projections {
+            // qwen3.5-style: 4 separate projections, flat split
+            let qkv_proj = self.in_proj_qkv.as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_qkv missing"))?;
+            let z_proj = self.in_proj_z.as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_z missing"))?;
+            let b_proj = self.in_proj_b.as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_b missing"))?;
+            let a_proj = self.in_proj_a.as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_a missing"))?;
 
-        // Split into q, k, v, z, b, a
-        let (q, k, v, z, b, a) = self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?;
+            let qkv = qkv_proj.forward(inputs)?;
+            let z = z_proj.forward(inputs)?
+                .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+            let b = b_proj.forward(inputs)?;
+            let a = a_proj.forward(inputs)?;
+
+            let split_indices = &[self.key_dim, self.key_dim * 2];
+            let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
+            let q = qkv_parts.first()
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+            let k = qkv_parts.get(1)
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+            let v = qkv_parts.get(2)
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+
+            (q, k, v, z, b, a)
+        } else {
+            // qwen3_next-style: combined projections, per-head reshape
+            let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
+            let mixed_ba = self.in_proj_ba.forward(inputs)?;
+            self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?
+        };
 
         // Conv1d with state management
         let conv_state = match cache.conv_state.take() {
@@ -1601,6 +1652,235 @@ pub fn load_qwen3_next_model<P: AsRef<Path>>(
 
     tracing::info!("Qwen3Next model loaded successfully");
     Ok(model)
+}
+
+// ---------------------------------------------------------------------------
+// Qwen3.5-MoE VLM support
+// ---------------------------------------------------------------------------
+
+/// Load model args from a Qwen3.5-MoE VLM config.json.
+///
+/// Qwen3.5-MoE uses the same architecture as `Qwen3Next` (hybrid
+/// GatedDeltaNet + full attention + sparse MoE with shared expert) but ships
+/// as a VLM with config nested under `text_config` and rope parameters nested
+/// under `rope_parameters`.
+fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
+    model_dir: P,
+) -> Result<Qwen3NextModelArgs, ModelError> {
+    let config_path = model_dir.as_ref().join("config.json");
+    let file = std::fs::File::open(config_path)?;
+    let config: serde_json::Value = serde_json::from_reader(file)?;
+
+    let text_config = config
+        .get("text_config")
+        .ok_or_else(|| {
+            ModelError::UnsupportedModel("missing text_config in config.json".into())
+        })?;
+
+    let mut obj = text_config.clone();
+    let map = obj
+        .as_object_mut()
+        .ok_or_else(|| ModelError::UnsupportedModel("text_config is not an object".into()))?;
+
+    // Flatten rope_parameters into top-level fields
+    if let Some(rope_params) = text_config.get("rope_parameters") {
+        if let Some(theta) = rope_params.get("rope_theta") {
+            map.entry("rope_theta").or_insert_with(|| theta.clone());
+        }
+        if let Some(prf) = rope_params.get("partial_rotary_factor") {
+            map.entry("partial_rotary_factor")
+                .or_insert_with(|| prf.clone());
+        }
+    }
+
+    // Merge top-level quantization config
+    if let Some(quant) = config.get("quantization") {
+        map.entry("quantization")
+            .or_insert_with(|| quant.clone());
+    }
+
+    // Merge top-level tie_word_embeddings
+    if let Some(tie) = config.get("tie_word_embeddings") {
+        map.entry("tie_word_embeddings")
+            .or_insert_with(|| tie.clone());
+    }
+
+    // All layers use MoE in qwen3.5-moe (no dense FFN)
+    map.entry("decoder_sparse_step")
+        .or_insert(serde_json::Value::from(1));
+
+    // intermediate_size is unused when all layers are MoE
+    map.entry("intermediate_size")
+        .or_insert(serde_json::Value::from(0));
+
+    // Use separate GDN projections (qwen3.5-style flat split)
+    map.insert(
+        "use_separate_gdn_projections".to_owned(),
+        serde_json::Value::from(true),
+    );
+
+    Ok(serde_json::from_value(obj)?)
+}
+
+/// Load a Qwen3.5-MoE model (VLM wrapper around Qwen3Next architecture).
+///
+/// Reads `text_config` for model args, strips `language_model.` prefix from
+/// safetensors weight keys.
+pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
+    model_dir: P,
+) -> Result<Qwen3NextCausalLM, ModelError> {
+    let model_path = model_dir.as_ref();
+    let args = load_qwen3_5_moe_text_config_args(model_path)?;
+
+    tracing::info!(
+        hidden_size = args.hidden_size,
+        num_layers = args.num_hidden_layers,
+        num_heads = args.num_attention_heads,
+        num_kv_heads = args.num_key_value_heads,
+        num_experts = args.num_experts,
+        vocab_size = args.vocab_size,
+        full_attention_interval = args.full_attention_interval,
+        "Loading qwen3_5_moe model (VLM text backbone via qwen3_next)"
+    );
+
+    let mut model = Qwen3NextCausalLM::new(args)?;
+
+    // Separate GDN projections (in_proj_qkv, in_proj_z, in_proj_a, in_proj_b)
+    // load directly — no concat needed since forward branches on use_separate_projections.
+    // VLM weights have `language_model.` prefix.
+    crate::load_quantized_safetensors_weights_with_prefix(
+        &mut model,
+        model_path,
+        false,
+        "language_model.",
+    )?;
+
+    tracing::info!("Qwen3.5-MoE model loaded successfully");
+    Ok(model)
+}
+
+/// GDN projection remapping pairs: (separate_a, separate_b) → combined target.
+const GDN_REMAP: &[(&str, &str, &str)] = &[
+    ("in_proj_qkv", "in_proj_z", "in_proj_qkvz"),
+    ("in_proj_b", "in_proj_a", "in_proj_ba"),
+];
+
+/// Load weights for Qwen3.5-MoE, remapping separate GDN projections to combined.
+///
+/// Qwen3.5-MoE stores GDN projections as 4 separate matrices (in_proj_qkv,
+/// in_proj_z, in_proj_a, in_proj_b). Qwen3Next expects 2 combined matrices
+/// (in_proj_qkvz, in_proj_ba). This loader concatenates along dim 0 at load
+/// time so the forward pass works unchanged.
+fn load_qwen3_5_moe_weights<M: mlx_rs::module::ModuleParametersExt>(
+    model: &mut M,
+    model_path: &Path,
+) -> Result<(), crate::error::ModelError> {
+    use std::collections::HashMap;
+
+    let safetensors_files = crate::collect_safetensors_files(model_path)?;
+    let mut params = model.parameters_mut().flatten();
+
+    // Collect GDN split tensors keyed by (layer, combined_name, suffix)
+    // e.g. ("model.layers.0.linear_attn", "in_proj_qkvz", "weight") → (part_a, part_b)
+    let mut gdn_parts: HashMap<String, (Option<Array>, Option<Array>)> = HashMap::new();
+
+    let prefix = "language_model.";
+
+    for file_path in &safetensors_files {
+        let loaded = Array::load_safetensors(file_path)
+            .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+
+        for (key, value) in loaded {
+            let Some(stripped) = key.strip_prefix(prefix) else {
+                continue;
+            };
+
+            // Check if this is a GDN split projection
+            let mut handled = false;
+            for &(part_a_name, part_b_name, combined_name) in GDN_REMAP {
+                for (is_b, split_name) in [(false, part_a_name), (true, part_b_name)] {
+                    let needle = format!(".{split_name}.");
+                    if let Some(pos) = stripped.find(&needle) {
+                        let prefix_part = &stripped[..pos];
+                        let suffix = &stripped[pos + needle.len()..];
+                        let map_key =
+                            format!("{prefix_part}.{combined_name}.{suffix}");
+                        let entry = gdn_parts.entry(map_key).or_insert((None, None));
+                        if is_b {
+                            entry.1 = Some(value.clone());
+                        } else {
+                            entry.0 = Some(value.clone());
+                        }
+                        handled = true;
+                        break;
+                    }
+                }
+                if handled {
+                    break;
+                }
+            }
+
+            if !handled {
+                // Direct match for non-GDN weights
+                if let Some(param) = params.get_mut(stripped) {
+                    **param = value;
+                }
+            }
+        }
+    }
+
+    // Concatenate GDN split pairs and assign to combined params
+    let mut concat_count = 0usize;
+    for (combined_key, (part_a, part_b)) in &gdn_parts {
+        match (part_a, part_b) {
+            (Some(a), Some(b)) => {
+                if let Some(param) = params.get_mut(combined_key.as_str()) {
+                    if concat_count < 3 {
+                        tracing::info!(
+                            key = combined_key,
+                            a_shape = ?a.shape(),
+                            a_dtype = ?a.dtype(),
+                            b_shape = ?b.shape(),
+                            b_dtype = ?b.dtype(),
+                            "Concatenating GDN projections"
+                        );
+                    }
+                    match ops::concatenate_axis(&[a, b], 0) {
+                        Ok(combined) => {
+                            **param = combined;
+                            concat_count += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                key = combined_key,
+                                "Failed to concatenate GDN projections: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    key = combined_key,
+                    has_a = part_a.is_some(),
+                    has_b = part_b.is_some(),
+                    "Incomplete GDN projection pair"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        concat_count,
+        total_gdn_pairs = gdn_parts.len(),
+        "Remapped GDN split projections to combined"
+    );
+
+    model
+        .eval()
+        .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
