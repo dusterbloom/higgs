@@ -156,6 +156,11 @@ pub struct Qwen3NextModelArgs {
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
 
+    /// Per-layer quantization override for router gate / shared_expert_gate.
+    /// When absent, uses the global quantization config.
+    #[serde(default)]
+    pub gate_quantization: Option<QuantizationConfig>,
+
     /// Use separate GDN projections (qwen3.5-style) instead of combined (qwen3_next-style).
     #[serde(default)]
     pub use_separate_gdn_projections: bool,
@@ -939,12 +944,16 @@ impl SparseMoeBlock {
                 "num_experts_per_tok must be <= num_experts",
             ));
         }
-        // Router gate and shared_expert_gate use 8-bit quantization
+        // Gate quantization: use per-layer override if present, else global
+        let (gate_ql, gate_qb) = args
+            .gate_quantization
+            .as_ref()
+            .map_or((ql, qb), |gq| (gq.group_size, gq.bits));
         Ok(Self {
-            gate: QLinear::new(64, 8)?,
+            gate: QLinear::new(gate_ql, gate_qb)?,
             switch_mlp: SwitchMlpWeights::new(ql, qb)?,
             shared_expert: Qwen3NextMLP::new(ql, qb)?,
-            shared_expert_gate: QLinear::new(64, 8)?,
+            shared_expert_gate: QLinear::new(gate_ql, gate_qb)?,
             top_k: args.num_experts_per_tok,
             norm_topk_prob: args.norm_topk_prob,
         })
@@ -1718,6 +1727,14 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
         "use_separate_gdn_projections".to_owned(),
         serde_json::Value::from(true),
     );
+
+    // Detect per-layer gate quantization override from top-level quantization config
+    if let Some(quant) = config.get("quantization") {
+        let gate_key = "language_model.model.layers.0.mlp.gate";
+        if let Some(gate_q) = quant.get(gate_key) {
+            map.insert("gate_quantization".to_owned(), gate_q.clone());
+        }
+    }
 
     Ok(serde_json::from_value(obj)?)
 }
