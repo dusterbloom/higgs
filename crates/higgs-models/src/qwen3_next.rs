@@ -93,6 +93,13 @@ const fn default_partial_rotary_factor() -> f32 {
     1.0
 }
 
+/// Match Python mlx-lm default: `norm_topk_prob: bool = True`.
+/// Without normalization, MoE expert scores sum to ~0.39 instead of 1.0,
+/// producing 0.39x output magnitude and degenerate generation.
+const fn default_norm_topk_prob() -> bool {
+    true
+}
+
 /// Quantization parameters from config.json (top-level defaults).
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuantizationConfig {
@@ -146,7 +153,7 @@ pub struct Qwen3NextModelArgs {
     pub shared_expert_intermediate_size: i32,
     #[serde(default)]
     pub moe_intermediate_size: i32,
-    #[serde(default)]
+    #[serde(default = "default_norm_topk_prob")]
     pub norm_topk_prob: bool,
     #[serde(default)]
     pub mlp_only_layers: Vec<i32>,
@@ -980,8 +987,8 @@ impl SparseMoeBlock {
             raw_scores
         };
 
-        // Expert computation via fused gather_qmm
-        let y = self.switch_mlp.forward_gather(x, &top_inds, false)?;
+        // Expert computation via fused gather_qmm (indices are pre-sorted)
+        let y = self.switch_mlp.forward_gather(x, &top_inds, true)?;
 
         // Weighted sum over experts: [B, L, top_k, D] * [B, L, top_k, 1] -> sum -> [B, L, D]
         let expert_sum = y
@@ -992,6 +999,23 @@ impl SparseMoeBlock {
         let shared_y = self.shared_expert.forward(x)?;
         let shared_gate_val = nn::sigmoid(&self.shared_expert_gate.forward(x)?)?;
         let shared_out = shared_y.multiply(&shared_gate_val)?;
+
+        // DEBUG MoE decomposition
+        {
+            expert_sum.eval()?;
+            shared_out.eval()?;
+            let es_f32 = expert_sum.as_dtype(mlx_rs::Dtype::Float32)?;
+            let so_f32 = shared_out.as_dtype(mlx_rs::Dtype::Float32)?;
+            es_f32.eval()?;
+            so_f32.eval()?;
+            let es_sq = es_f32.multiply(&es_f32)?.sum(None)?;
+            let so_sq = so_f32.multiply(&so_f32)?.sum(None)?;
+            es_sq.eval()?;
+            so_sq.eval()?;
+            let es_l2: f32 = es_sq.item();
+            let so_l2: f32 = so_sq.item();
+            eprintln!("DEBUG_MOE expert_sum_L2={:.4} shared_out_L2={:.4}", es_l2.sqrt(), so_l2.sqrt());
+        }
 
         expert_sum.add(shared_out)
     }
@@ -1408,23 +1432,48 @@ impl FfnBlock {
                 .ok_or_else(|| Exception::custom("MoE shared_expert_gate missing"))?;
 
             let gates = ops::softmax_axis(&gate_ref.forward(x)?, -1, true)?;
+
             let neg_k = -self.top_k;
             let all_inds = ops::argpartition_axis(&gates, neg_k, -1)?;
             let num_experts = *gates.shape().last()
                 .ok_or_else(|| Exception::custom("gates must have last dim"))?;
             let top_k_start = num_experts - self.top_k;
-            let top_inds = all_inds.index((.., .., top_k_start..));
-            let top_scores = gates.take_along_axis(&top_inds, -1)?;
-            let top_scores = if self.norm_topk_prob {
-                let sum = top_scores.sum_axes(&[-1], true)?;
-                top_scores.divide(&sum)?
+            let inds = all_inds.index((.., .., top_k_start..));
+            let scores = gates.take_along_axis(&inds, -1)?;
+            let scores = if self.norm_topk_prob {
+                let sum = scores.sum_axes(&[-1], true)?;
+                scores.divide(&sum)?
             } else {
-                top_scores
+                scores
             };
 
-            let y = switch_ref.forward_gather(x, &top_inds, false)?;
+            // Use Python-matching SwitchGLU: expand_dims + gather_qmm + swiglu + gather_qmm
+            let x_shape = x.shape();
+            let x_b = x_shape[0];
+            let x_l = x_shape[1];
+            let x_d = x_shape[2];
+            let x_exp = x.reshape(&[x_b, x_l, 1, 1, x_d])?;
+
+            let gate_out = gather_qmm(
+                &x_exp, &switch_ref.gate_proj.weight, &switch_ref.gate_proj.scales,
+                &switch_ref.gate_proj.biases, &inds, true,
+                switch_ref.gate_proj.group_size, switch_ref.gate_proj.bits, false,
+            )?;
+            let up_out = gather_qmm(
+                &x_exp, &switch_ref.up_proj.weight, &switch_ref.up_proj.scales,
+                &switch_ref.up_proj.biases, &inds, true,
+                switch_ref.up_proj.group_size, switch_ref.up_proj.bits, false,
+            )?;
+            let activated = swiglu(&gate_out, &up_out)?;
+            let down_out = gather_qmm(
+                &activated, &switch_ref.down_proj.weight, &switch_ref.down_proj.scales,
+                &switch_ref.down_proj.biases, &inds, true,
+                switch_ref.down_proj.group_size, switch_ref.down_proj.bits, false,
+            )?;
+            let y = down_out.squeeze_axes(&[-2])?;
+
             let expert_sum = y
-                .multiply(&top_scores.expand_dims(-1)?)?
+                .multiply(&scores.expand_dims(-1)?)?
                 .sum_axes(&[-2], false)?;
 
             let shared_y = se_ref.forward(x)?;
@@ -1642,6 +1691,7 @@ impl Qwen3NextCausalLM {
     ) -> Result<Array, Exception> {
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
+
         if kv_cache.is_empty() {
             *kv_cache = self.make_cache();
         }
@@ -1711,9 +1761,7 @@ impl Qwen3NextCausalLM {
 
             let h2 = h.add(r)?;
             let normed_post = layer.post_attention_layernorm.forward(&h2)?;
-
             let mlp_out = layer.mlp.forward(&normed_post)?;
-
             h = h2.add(mlp_out)?;
         }
 
@@ -1961,6 +2009,53 @@ fn concat_and_permute(a: &Array, b: &Array, perm: &[i32]) -> Result<Array, Excep
 
 /// Load Qwen3.5-MoE weights with GDN projection fusion.
 ///
+/// Direct weight loader: strip `language_model.` prefix, no rearrangement.
+/// Used when `use_separate_gdn_projections = true`.
+fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
+    model: &mut M,
+    model_path: &Path,
+) -> Result<(), crate::error::ModelError> {
+    let safetensors_files = crate::collect_safetensors_files(model_path)?;
+    let mut params = model.parameters_mut().flatten();
+    let prefix = "language_model.";
+    let mut matched = 0usize;
+    let mut unmatched = Vec::new();
+
+    for file_path in &safetensors_files {
+        let loaded = Array::load_safetensors(file_path)
+            .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+
+        for (key, value) in loaded {
+            let Some(stripped) = key.strip_prefix(prefix) else {
+                unmatched.push(key);
+                continue;
+            };
+            if let Some(param) = params.get_mut(stripped) {
+                **param = value;
+                matched += 1;
+            } else {
+                unmatched.push(key);
+            }
+        }
+    }
+
+    tracing::info!(matched, unmatched_count = unmatched.len(), "Direct weight loading stats");
+    if !unmatched.is_empty() {
+        for k in unmatched.iter().take(10) {
+            tracing::warn!(key = %k, "Unmatched weight key");
+        }
+    }
+    // Also log unset params (model params that weren't loaded)
+    let still_zero: Vec<_> = params.keys().take(5).collect();
+    tracing::info!(?still_zero, "First 5 param keys in model");
+
+    model
+        .eval()
+        .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+
+    Ok(())
+}
+
 /// Rearranges flat (qkv,z,b,a) projections to per-head-grouped (qkvz,ba)
 /// so the model uses the fused 2-dispatch forward path instead of 4 separate.
 fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(

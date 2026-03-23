@@ -85,6 +85,17 @@ impl ChatTemplateRenderer {
         tools: Option<&[serde_json::Value]>,
         add_generation_prompt: bool,
     ) -> Result<String, EngineError> {
+        self.apply_with_thinking(messages, tools, add_generation_prompt, false)
+    }
+
+    /// Apply the chat template with explicit `enable_thinking` control.
+    pub fn apply_with_thinking(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+    ) -> Result<String, EngineError> {
         let tmpl = self
             .env
             .get_template("chat")
@@ -95,7 +106,7 @@ impl ChatTemplateRenderer {
                 minijinja::context! {
                     messages => messages,
                     add_generation_prompt => add_generation_prompt,
-                    enable_thinking => false,
+                    enable_thinking => enable_thinking,
                 }
             },
             |tool_list| {
@@ -103,7 +114,7 @@ impl ChatTemplateRenderer {
                     messages => messages,
                     tools => tool_list,
                     add_generation_prompt => add_generation_prompt,
-                    enable_thinking => false,
+                    enable_thinking => enable_thinking,
                 }
             },
         );
