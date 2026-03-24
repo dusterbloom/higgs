@@ -262,14 +262,21 @@ impl QEmbedding {
     }
 
     pub(crate) fn forward(&self, indices: &Array) -> Result<Array, Exception> {
-        let full = ops::dequantize(
-            &*self.weight,
-            &*self.scales,
-            &*self.biases,
+        let shape = indices.shape().to_vec();
+        let flat = indices.flatten(None, None)?;
+        let weight = self.weight.index(&flat);
+        let scales = self.scales.index(&flat);
+        let biases = self.biases.index(&flat);
+        let out = ops::dequantize(
+            &weight,
+            &scales,
+            &biases,
             self.group_size,
             self.bits,
         )?;
-        full.take_axis(indices, 0)
+        let mut out_shape = shape;
+        out_shape.push(-1);
+        out.reshape(&out_shape)
     }
 
     pub(crate) fn as_linear(&self, x: &Array) -> Result<Array, Exception> {
