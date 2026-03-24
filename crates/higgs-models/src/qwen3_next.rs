@@ -153,6 +153,9 @@ pub struct Qwen3NextModelArgs {
     pub shared_expert_intermediate_size: i32,
     #[serde(default)]
     pub moe_intermediate_size: i32,
+    /// Normalize top-k expert scores to sum to 1.0 before weighting outputs.
+    /// Defaults to `true` to match Python mlx-lm. Setting to `false` scales
+    /// MoE output by the raw softmax scores (~0.39x), causing degenerate output.
     #[serde(default = "default_norm_topk_prob")]
     pub norm_topk_prob: bool,
     #[serde(default)]
@@ -999,23 +1002,6 @@ impl SparseMoeBlock {
         let shared_y = self.shared_expert.forward(x)?;
         let shared_gate_val = nn::sigmoid(&self.shared_expert_gate.forward(x)?)?;
         let shared_out = shared_y.multiply(&shared_gate_val)?;
-
-        // DEBUG MoE decomposition
-        {
-            expert_sum.eval()?;
-            shared_out.eval()?;
-            let es_f32 = expert_sum.as_dtype(mlx_rs::Dtype::Float32)?;
-            let so_f32 = shared_out.as_dtype(mlx_rs::Dtype::Float32)?;
-            es_f32.eval()?;
-            so_f32.eval()?;
-            let es_sq = es_f32.multiply(&es_f32)?.sum(None)?;
-            let so_sq = so_f32.multiply(&so_f32)?.sum(None)?;
-            es_sq.eval()?;
-            so_sq.eval()?;
-            let es_l2: f32 = es_sq.item();
-            let so_l2: f32 = so_sq.item();
-            eprintln!("DEBUG_MOE expert_sum_L2={:.4} shared_out_L2={:.4}", es_l2.sqrt(), so_l2.sqrt());
-        }
 
         expert_sum.add(shared_out)
     }
@@ -2045,9 +2031,8 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
             tracing::warn!(key = %k, "Unmatched weight key");
         }
     }
-    // Also log unset params (model params that weren't loaded)
-    let still_zero: Vec<_> = params.keys().take(5).collect();
-    tracing::info!(?still_zero, "First 5 param keys in model");
+    let param_count = params.keys().count();
+    tracing::info!(param_count, "Total model parameters loaded");
 
     model
         .eval()
@@ -2129,6 +2114,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             continue;
         };
         let Some(param) = params.get_mut(combined_key.as_str()) else {
+            tracing::warn!(key = %combined_key, "Fused target key not found in model params, skipping");
             continue;
         };
         let perm = if combined_key.contains("in_proj_qkvz") {
