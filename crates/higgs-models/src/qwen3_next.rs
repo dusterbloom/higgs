@@ -2117,27 +2117,27 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     let mut fused_count = 0usize;
     for (combined_key, (part_a, part_b)) in &gdn_parts {
         let (Some(a), Some(b)) = (part_a, part_b) else {
-            tracing::warn!(key = combined_key, "Incomplete GDN projection pair");
-            continue;
+            return Err(crate::error::ModelError::ShapeMismatch(format!(
+                "Incomplete GDN projection pair for {combined_key}"
+            )));
         };
         let Some(param) = params.get_mut(combined_key.as_str()) else {
-            tracing::warn!(key = %combined_key, "Fused target key not found in model params, skipping");
-            continue;
+            return Err(crate::error::ModelError::MissingWeight(format!(
+                "Fused GDN target key not found: {combined_key}"
+            )));
         };
         let perm = if combined_key.contains("in_proj_qkvz") {
             &qkvz_perm
         } else {
             &ba_perm
         };
-        match concat_and_permute(a, b, perm) {
-            Ok(fused) => {
-                **param = fused;
-                fused_count += 1;
-            }
-            Err(e) => {
-                tracing::warn!(key = combined_key, "GDN fusion failed: {e}");
-            }
-        }
+        let fused = concat_and_permute(a, b, perm).map_err(|e| {
+            crate::error::ModelError::ShapeMismatch(format!(
+                "GDN fusion failed for {combined_key}: {e}"
+            ))
+        })?;
+        **param = fused;
+        fused_count += 1;
     }
 
     tracing::info!(
@@ -2450,7 +2450,7 @@ mod tests {
         assert_eq!(args.num_experts, 0);
         assert_eq!(args.num_experts_per_tok, 0);
         assert_eq!(args.decoder_sparse_step, 0);
-        assert!(!args.norm_topk_prob);
+        assert!(args.norm_topk_prob);
         assert!(args.mlp_only_layers.is_empty());
     }
 

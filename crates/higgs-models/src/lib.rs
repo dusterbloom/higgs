@@ -649,6 +649,7 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
     let safetensors_files = collect_safetensors_files(model_path)?;
 
     let mut params = model.parameters_mut().flatten();
+    let mut warned_unmatched = 0usize;
 
     for file_path in &safetensors_files {
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
@@ -671,20 +672,23 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
                         matched += 1;
                     } else {
                         unmatched += 1;
-                        if unmatched <= 5 {
+                        if warned_unmatched < 5 {
                             tracing::warn!(stripped, remapped = &*remapped, "weight key unmatched after remap");
+                            warned_unmatched += 1;
                         }
                     }
                 } else {
                     unmatched += 1;
-                    if unmatched <= 5 {
+                    if warned_unmatched < 5 {
                         tracing::warn!(stripped, "weight key unmatched (no remap)");
+                        warned_unmatched += 1;
                     }
                 }
             } else {
                 unmatched += 1;
-                if unmatched <= 5 {
+                if warned_unmatched < 5 {
                     tracing::warn!(stripped, "weight key unmatched");
+                    warned_unmatched += 1;
                 }
             }
         }
