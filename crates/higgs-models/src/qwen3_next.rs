@@ -1088,10 +1088,26 @@ impl GatedDeltaNet {
         Ok(Self {
             in_proj_qkvz: QLinear::new(ql, qb)?,
             in_proj_ba: QLinear::new(ql, qb)?,
-            in_proj_qkv: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
-            in_proj_z: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
-            in_proj_a: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
-            in_proj_b: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
+            in_proj_qkv: if use_sep {
+                Some(QLinear::new(ql, qb)?)
+            } else {
+                None
+            },
+            in_proj_z: if use_sep {
+                Some(QLinear::new(ql, qb)?)
+            } else {
+                None
+            },
+            in_proj_a: if use_sep {
+                Some(QLinear::new(ql, qb)?)
+            } else {
+                None
+            },
+            in_proj_b: if use_sep {
+                Some(QLinear::new(ql, qb)?)
+            } else {
+                None
+            },
             conv1d: nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
                 .bias(false)
                 .groups(conv_dim)
@@ -1152,30 +1168,42 @@ impl GatedDeltaNet {
         // Project inputs and split into q, k, v, z, b, a
         let (q, k, v, z, b, a) = if self.use_separate_projections {
             // qwen3.5-style: 4 separate projections, flat split
-            let qkv_proj = self.in_proj_qkv.as_ref()
+            let qkv_proj = self
+                .in_proj_qkv
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_qkv missing"))?;
-            let z_proj = self.in_proj_z.as_ref()
+            let z_proj = self
+                .in_proj_z
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_z missing"))?;
-            let b_proj = self.in_proj_b.as_ref()
+            let b_proj = self
+                .in_proj_b
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_b missing"))?;
-            let a_proj = self.in_proj_a.as_ref()
+            let a_proj = self
+                .in_proj_a
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_a missing"))?;
 
             let qkv = qkv_proj.forward(inputs)?;
-            let z = z_proj.forward(inputs)?
+            let z = z_proj
+                .forward(inputs)?
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
             let b = b_proj.forward(inputs)?;
             let a = a_proj.forward(inputs)?;
 
             let split_indices = &[self.key_dim, self.key_dim * 2];
             let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
-            let q = qkv_parts.first()
+            let q = qkv_parts
+                .first()
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
                 .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
-            let k = qkv_parts.get(1)
+            let k = qkv_parts
+                .get(1)
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
                 .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
-            let v = qkv_parts.get(2)
+            let v = qkv_parts
+                .get(2)
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
 
@@ -1408,20 +1436,30 @@ impl FfnBlock {
     fn forward(&self, x: &Array) -> Result<Array, Exception> {
         if self.is_moe {
             // Delegate to SparseMoeBlock logic
-            let gate_ref = self.gate.as_ref()
+            let gate_ref = self
+                .gate
+                .as_ref()
                 .ok_or_else(|| Exception::custom("MoE gate missing"))?;
-            let switch_ref = self.switch_mlp.as_ref()
+            let switch_ref = self
+                .switch_mlp
+                .as_ref()
                 .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
-            let se_ref = self.shared_expert.as_ref()
+            let se_ref = self
+                .shared_expert
+                .as_ref()
                 .ok_or_else(|| Exception::custom("MoE shared_expert missing"))?;
-            let seg_ref = self.shared_expert_gate.as_ref()
+            let seg_ref = self
+                .shared_expert_gate
+                .as_ref()
                 .ok_or_else(|| Exception::custom("MoE shared_expert_gate missing"))?;
 
             let gates = ops::softmax_axis(&gate_ref.forward(x)?, -1, true)?;
 
             let neg_k = -self.top_k;
             let all_inds = ops::argpartition_axis(&gates, neg_k, -1)?;
-            let num_experts = *gates.shape().last()
+            let num_experts = *gates
+                .shape()
+                .last()
                 .ok_or_else(|| Exception::custom("gates must have last dim"))?;
             let top_k_start = num_experts - self.top_k;
             let inds = all_inds.index((.., .., top_k_start..));
@@ -1441,20 +1479,38 @@ impl FfnBlock {
             let x_exp = x.reshape(&[x_b, x_l, 1, 1, x_d])?;
 
             let gate_out = gather_qmm(
-                &x_exp, &switch_ref.gate_proj.weight, &switch_ref.gate_proj.scales,
-                &switch_ref.gate_proj.biases, &inds, true,
-                switch_ref.gate_proj.group_size, switch_ref.gate_proj.bits, false,
+                &x_exp,
+                &switch_ref.gate_proj.weight,
+                &switch_ref.gate_proj.scales,
+                &switch_ref.gate_proj.biases,
+                &inds,
+                true,
+                switch_ref.gate_proj.group_size,
+                switch_ref.gate_proj.bits,
+                false,
             )?;
             let up_out = gather_qmm(
-                &x_exp, &switch_ref.up_proj.weight, &switch_ref.up_proj.scales,
-                &switch_ref.up_proj.biases, &inds, true,
-                switch_ref.up_proj.group_size, switch_ref.up_proj.bits, false,
+                &x_exp,
+                &switch_ref.up_proj.weight,
+                &switch_ref.up_proj.scales,
+                &switch_ref.up_proj.biases,
+                &inds,
+                true,
+                switch_ref.up_proj.group_size,
+                switch_ref.up_proj.bits,
+                false,
             )?;
             let activated = swiglu(&gate_out, &up_out)?;
             let down_out = gather_qmm(
-                &activated, &switch_ref.down_proj.weight, &switch_ref.down_proj.scales,
-                &switch_ref.down_proj.biases, &inds, true,
-                switch_ref.down_proj.group_size, switch_ref.down_proj.bits, false,
+                &activated,
+                &switch_ref.down_proj.weight,
+                &switch_ref.down_proj.scales,
+                &switch_ref.down_proj.biases,
+                &inds,
+                true,
+                switch_ref.down_proj.group_size,
+                switch_ref.down_proj.bits,
+                false,
             )?;
             let y = down_out.squeeze_axes(&[-2])?;
 
@@ -1469,11 +1525,17 @@ impl FfnBlock {
             expert_sum.add(shared_out)
         } else {
             // Dense SwiGLU
-            let gp = self.gate_proj.as_ref()
+            let gp = self
+                .gate_proj
+                .as_ref()
                 .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
-            let up = self.up_proj.as_ref()
+            let up = self
+                .up_proj
+                .as_ref()
                 .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
-            let dp = self.down_proj.as_ref()
+            let dp = self
+                .down_proj
+                .as_ref()
                 .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
             let gate_out = gp.forward(x)?;
             let up_out = up.forward(x)?;
@@ -1677,7 +1739,6 @@ impl Qwen3NextCausalLM {
     ) -> Result<Array, Exception> {
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
-
         if kv_cache.is_empty() {
             *kv_cache = self.make_cache();
         }
@@ -1829,9 +1890,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
 
     let text_config = config
         .get("text_config")
-        .ok_or_else(|| {
-            ModelError::UnsupportedModel("missing text_config in config.json".into())
-        })?;
+        .ok_or_else(|| ModelError::UnsupportedModel("missing text_config in config.json".into()))?;
 
     let mut obj = text_config.clone();
     let map = obj
@@ -1851,8 +1910,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
 
     // Merge top-level quantization config
     if let Some(quant) = config.get("quantization") {
-        map.entry("quantization")
-            .or_insert_with(|| quant.clone());
+        map.entry("quantization").or_insert_with(|| quant.clone());
     }
 
     // Merge top-level tie_word_embeddings
@@ -1903,9 +1961,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
 /// Reads `text_config` for model args, strips `language_model.` prefix from
 /// safetensors weight keys. Unlike [`load_qwen3_5_moe_model`], does NOT force
 /// `decoder_sparse_step=1` or attempt MoE gate fusion.
-pub fn load_qwen3_5_model<P: AsRef<Path>>(
-    model_dir: P,
-) -> Result<Qwen3NextCausalLM, ModelError> {
+pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_qwen3_5_moe_text_config_args(model_path)?;
 
@@ -2040,8 +2096,10 @@ fn build_ba_permutation(d: &GdnDims) -> Vec<i32> {
 /// Concatenate two arrays along dim 0 and permute rows.
 fn concat_and_permute(a: &Array, b: &Array, perm: &[i32]) -> Result<Array, Exception> {
     let cat = ops::concatenate_axis(&[a, b], 0)?;
-    let perm_arr = Array::from_slice(perm, &[i32::try_from(perm.len())
-        .map_err(|_| Exception::custom("perm len overflow"))?]);
+    let perm_arr = Array::from_slice(
+        perm,
+        &[i32::try_from(perm.len()).map_err(|_| Exception::custom("perm len overflow"))?],
+    );
     cat.take_axis(&perm_arr, 0)
 }
 
@@ -2077,10 +2135,17 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
         }
     }
 
-    tracing::info!(matched, unmatched_count = unmatched.len(), "Direct weight loading stats");
+    tracing::info!(
+        matched,
+        unmatched_count = unmatched.len(),
+        "Direct weight loading stats"
+    );
     if !unmatched.is_empty() {
         for k in unmatched.iter().take(10) {
-            tracing::warn!(key = %k, "Unmatched weight key");
+            tracing::debug!(key = %k, "Unmatched weight key (no matching model param)");
+        }
+        if unmatched.len() > 10 {
+            tracing::debug!("... and {} more unmatched keys", unmatched.len() - 10);
         }
     }
     let param_count = params.keys().count();
@@ -2162,12 +2227,14 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     let mut fused_count = 0usize;
     for (combined_key, (part_a, part_b)) in &gdn_parts {
         let (Some(a), Some(b)) = (part_a, part_b) else {
-            tracing::warn!(key = combined_key, "Incomplete GDN projection pair");
-            continue;
+            return Err(crate::error::ModelError::Io(std::io::Error::other(
+                format!("Incomplete GDN projection pair for key: {combined_key}"),
+            )));
         };
         let Some(param) = params.get_mut(combined_key.as_str()) else {
-            tracing::warn!(key = %combined_key, "Fused target key not found in model params, skipping");
-            continue;
+            return Err(crate::error::ModelError::Io(std::io::Error::other(
+                format!("Fused target key not found in model params: {combined_key}"),
+            )));
         };
         let perm = if combined_key.contains("in_proj_qkvz") {
             &qkvz_perm
@@ -2180,7 +2247,9 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
                 fused_count += 1;
             }
             Err(e) => {
-                tracing::warn!(key = combined_key, "GDN fusion failed: {e}");
+                return Err(crate::error::ModelError::Io(std::io::Error::other(
+                    format!("GDN fusion failed for key {combined_key}: {e}"),
+                )));
             }
         }
     }
@@ -9848,8 +9917,8 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_async_pipeline() {
-        use mlx_rs::transforms::{eval, async_eval};
         use mlx_rs::random::normal;
+        use mlx_rs::transforms::{async_eval, eval};
 
         let d: &[i32] = &[2048, 2048];
         let w = normal::<f32>(d, None, None, None).unwrap();
@@ -9950,9 +10019,8 @@ mod tests {
 
     /// Write a qwen3.5-style VLM config.json (with text_config) and parse it.
     fn write_qwen35_config(dir: &std::path::Path, text_config_json: &str) {
-        let config = format!(
-            r#{{"text_config": {text_config_json}, "tie_word_embeddings": false}}"#
-        );
+        let config =
+            format!(r#"{{"text_config": {text_config_json}, "tie_word_embeddings": false}}"#);
         std::fs::write(dir.join("config.json"), config).unwrap();
     }
 
@@ -10031,5 +10099,61 @@ mod tests {
             "Dense model should NOT get decoder_sparse_step=1"
         );
         assert_eq!(args.num_experts, 0);
+    }
+
+    /// GQA ratio: `num_v_heads` must be divisible by `num_k_heads`.
+    /// This validates the assumption used in test/bench GDN recurrence loops.
+    #[test]
+    fn test_gqa_ratio_divisibility() {
+        let args = valid_causal_lm_args();
+        let hv = args.linear_num_value_heads;
+        let hk = args.linear_num_key_heads;
+        assert!(
+            hk > 0 && hv % hk == 0,
+            "linear_num_value_heads ({hv}) must be divisible by linear_num_key_heads ({hk})"
+        );
+    }
+
+    /// QEmbedding equivalence: dequantize-then-gather produces same result as
+    /// the full dequantize path (validates that gather on quantized storage
+    /// is safe for future optimisation).
+    #[test]
+    fn test_qembedding_gather_then_dequantize_equivalence() {
+        use mlx_rs::transforms::eval;
+
+        let group_size = 64i32;
+        let bits = 4i32;
+        let vocab = 256i32;
+        let hidden = 128i32;
+
+        // Create a random float matrix and quantize it
+        let float_weight =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[vocab, hidden], None).unwrap();
+        eval([&float_weight].into_iter()).unwrap();
+        let (qw, qs, qb) = ops::quantize(&float_weight, group_size, bits).unwrap();
+        eval([&qw, &qs, &qb].into_iter()).unwrap();
+
+        let indices = Array::from_slice(&[0i32, 5, 42, 255, 5], &[5]);
+        eval([&indices].into_iter()).unwrap();
+
+        // Path A: dequantize full vocab, then gather (current QEmbedding::forward)
+        let full_deq = ops::dequantize(&qw, &qs, &qb, group_size, bits).unwrap();
+        let path_a = full_deq.take_axis(&indices, 0).unwrap();
+        eval([&path_a].into_iter()).unwrap();
+
+        // Path B: gather quantized rows first, then dequantize only selected
+        let sel_w = qw.take_axis(&indices, 0).unwrap();
+        let sel_s = qs.take_axis(&indices, 0).unwrap();
+        let sel_b = qb.take_axis(&indices, 0).unwrap();
+        let path_b = ops::dequantize(&sel_w, &sel_s, &sel_b, group_size, bits).unwrap();
+        eval([&path_b].into_iter()).unwrap();
+
+        // They should be identical (both round-trip through the same quantized repr)
+        let diff = path_a.subtract(&path_b).unwrap().abs().unwrap();
+        let max_diff: f32 = diff.max(None, None).unwrap().item();
+        assert!(
+            max_diff < 1e-6,
+            "gather-then-dequantize should match dequantize-then-gather, max diff: {max_diff}"
+        );
     }
 }

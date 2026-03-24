@@ -406,9 +406,12 @@ fn chat_completions_stream(
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
-    // Silently ignore tools in streaming mode (nanobot always sends them).
-    // Tool-calling responses are not yet supported in streaming, but
-    // regular text generation works fine with tools present in the request.
+    // Tool-calling responses are not supported in streaming mode.
+    // Accept requests that include tools (nanobot always sends them) but
+    // exclude them from prompt rendering so the model generates plain text.
+    if req.tools.as_ref().is_some_and(|t| !t.is_empty()) {
+        tracing::debug!("Streaming request includes tools; ignoring for prompt rendering");
+    }
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
@@ -425,10 +428,10 @@ fn chat_completions_stream(
     };
 
     let messages = convert_messages(&effective_messages);
-    let tools = req.tools.as_deref();
 
+    // Exclude tools from streaming prompt — tool_calls deltas are unsupported.
     let mut prompt_tokens = engine
-        .prepare_chat_prompt(&messages, tools)
+        .prepare_chat_prompt(&messages, None)
         .map_err(ServerError::Engine)?;
 
     // Preprocess images for VLM

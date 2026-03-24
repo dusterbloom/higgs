@@ -480,6 +480,62 @@ TOOLS:{{ tools | length }}
         assert!(result.is_some());
     }
 
+    // -----------------------------------------------------------------------
+    // enable_thinking context passing
+    // -----------------------------------------------------------------------
+
+    /// Template that uses the `enable_thinking` variable.
+    const THINKING_TEMPLATE: &str = r"{%- for message in messages %}{{ message.content }}{%- endfor %}{%- if enable_thinking %}<think>{%- endif %}";
+
+    #[test]
+    fn apply_with_thinking_false_omits_think_tag() {
+        let renderer = ChatTemplateRenderer::new(THINKING_TEMPLATE).unwrap();
+        let result = renderer
+            .apply_with_thinking(&[msg("user", "hello")], None, false, false)
+            .unwrap();
+        assert!(
+            !result.contains("<think>"),
+            "should not contain <think> when disabled"
+        );
+    }
+
+    #[test]
+    fn apply_with_thinking_true_emits_think_tag() {
+        let renderer = ChatTemplateRenderer::new(THINKING_TEMPLATE).unwrap();
+        let result = renderer
+            .apply_with_thinking(&[msg("user", "hello")], None, false, true)
+            .unwrap();
+        assert!(
+            result.contains("<think>"),
+            "should contain <think> when enabled"
+        );
+    }
+
+    #[test]
+    fn apply_delegates_to_apply_with_thinking_false() {
+        let renderer = ChatTemplateRenderer::new(THINKING_TEMPLATE).unwrap();
+        let via_apply = renderer.apply(&[msg("user", "hi")], None, false).unwrap();
+        let via_explicit = renderer
+            .apply_with_thinking(&[msg("user", "hi")], None, false, false)
+            .unwrap();
+        assert_eq!(
+            via_apply, via_explicit,
+            "apply() should delegate with enable_thinking=false"
+        );
+    }
+
+    #[test]
+    fn apply_with_thinking_and_tools() {
+        let template = r"{%- for message in messages %}{{ message.content }}{%- endfor %}{%- if tools %}[TOOLS]{%- endif %}{%- if enable_thinking %}<think>{%- endif %}";
+        let renderer = ChatTemplateRenderer::new(template).unwrap();
+        let tools = vec![serde_json::json!({"type": "function"})];
+        let result = renderer
+            .apply_with_thinking(&[msg("user", "hi")], Some(&tools), false, true)
+            .unwrap();
+        assert!(result.contains("[TOOLS]"), "tools should be rendered");
+        assert!(result.contains("<think>"), "thinking tag should be present");
+    }
+
     #[test]
     fn try_from_model_dir_malformed_json_returns_err() {
         let dir = tempfile::tempdir().unwrap();

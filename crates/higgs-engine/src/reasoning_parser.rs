@@ -145,10 +145,9 @@ impl StreamingReasoningTracker {
                 } else {
                     break;
                 }
-            } else if let (Some(stray_pos), open_pos) = (
-                self.buffer.find(THINK_CLOSE),
-                self.buffer.find(THINK_OPEN),
-            ) {
+            } else if let (Some(stray_pos), open_pos) =
+                (self.buffer.find(THINK_CLOSE), self.buffer.find(THINK_OPEN))
+            {
                 // Strip stray </think> outside a thinking block, but only if
                 // it appears before any <think> (otherwise process <think> first).
                 if open_pos.is_none_or(|op| stray_pos < op) {
@@ -331,7 +330,10 @@ mod tests {
             total_visible.contains("The answer is 42."),
             "answer should be visible after </think>"
         );
-        assert!(!total_visible.contains("</think>"), "</think> tag should not leak into visible");
+        assert!(
+            !total_visible.contains("</think>"),
+            "</think> tag should not leak into visible"
+        );
         assert!(
             total_reasoning.contains("step 1"),
             "reasoning should be captured"
