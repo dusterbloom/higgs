@@ -145,6 +145,30 @@ impl StreamingReasoningTracker {
                 } else {
                     break;
                 }
+            } else if let (Some(stray_pos), open_pos) = (
+                self.buffer.find(THINK_CLOSE),
+                self.buffer.find(THINK_OPEN),
+            ) {
+                // Strip stray </think> outside a thinking block, but only if
+                // it appears before any <think> (otherwise process <think> first).
+                if open_pos.is_none_or(|op| stray_pos < op) {
+                    visible.push_str(self.buffer.get(..stray_pos).unwrap_or_default());
+                    self.buffer = self
+                        .buffer
+                        .get(stray_pos + THINK_CLOSE.len()..)
+                        .unwrap_or_default()
+                        .to_owned();
+                } else {
+                    let op = open_pos.unwrap_or(0);
+                    visible.push_str(self.buffer.get(..op).unwrap_or_default());
+                    self.buffer = self
+                        .buffer
+                        .get(op + THINK_OPEN.len()..)
+                        .unwrap_or_default()
+                        .to_owned();
+                    self.inside_think = true;
+                    self.started = true;
+                }
             } else if let Some(start_pos) = self.buffer.find(THINK_OPEN) {
                 visible.push_str(self.buffer.get(..start_pos).unwrap_or_default());
                 self.buffer = self
@@ -154,9 +178,9 @@ impl StreamingReasoningTracker {
                     .to_owned();
                 self.inside_think = true;
                 self.started = true;
-            } else if self.buffer.len() > THINK_OPEN.len() {
-                // Flush all but the last few chars (which could be a partial <think>)
-                let mut safe_len = self.buffer.len() - THINK_OPEN.len();
+            } else if self.buffer.len() > THINK_CLOSE.len() {
+                // Flush all but the last few chars (could be partial <think> or </think>)
+                let mut safe_len = self.buffer.len() - THINK_CLOSE.len();
                 while safe_len > 0 && !self.buffer.is_char_boundary(safe_len) {
                     safe_len -= 1;
                 }
@@ -284,5 +308,65 @@ mod tests {
         assert!(total_visible.contains("Hello world"));
         assert!(total_reasoning.is_empty());
         assert!(!tracker.has_reasoning());
+    }
+
+    /// Tracker created with `new_inside_think()` starts in thinking mode.
+    /// The first `</think>` transitions to visible output without needing `<think>`.
+    #[test]
+    fn streaming_tracker_new_inside_think() {
+        let mut tracker = StreamingReasoningTracker::new_inside_think();
+        assert!(tracker.has_reasoning());
+
+        // Feed reasoning content (no opening tag needed)
+        let (vis, reas) = tracker.process("step 1... step 2...");
+        assert!(vis.is_empty(), "reasoning should not be visible");
+        assert!(!reas.is_empty(), "should capture reasoning text");
+
+        // Close thinking and emit visible answer
+        let (vis, reas) = tracker.process("</think>The answer is 42.");
+        let (vis2, reas2) = tracker.flush();
+        let total_visible = format!("{vis}{vis2}");
+        let total_reasoning = format!("{reas}{reas2}");
+        assert!(
+            total_visible.contains("The answer is 42."),
+            "answer should be visible after </think>"
+        );
+        assert!(!total_visible.contains("</think>"), "</think> tag should not leak into visible");
+        assert!(
+            total_reasoning.contains("step 1"),
+            "reasoning should be captured"
+        );
+    }
+
+    /// When `</think>` is emitted twice (e.g. from a thinking budget bug),
+    /// the second `</think>` must NOT leak into visible output.
+    #[test]
+    fn streaming_tracker_double_close_does_not_leak() {
+        let mut tracker = StreamingReasoningTracker::new_inside_think();
+
+        // First close — legitimate end of thinking
+        let (vis1, _reas1) = tracker.process("reasoning</think>");
+        // Second close — erroneous duplicate (from budget enforcement bug)
+        let (vis2, _reas2) = tracker.process("</think>answer");
+        let (vis3, _reas3) = tracker.flush();
+        let total_visible = format!("{vis1}{vis2}{vis3}");
+
+        assert!(
+            !total_visible.contains("</think>"),
+            "double </think> should not leak into visible output, got: {total_visible}"
+        );
+    }
+
+    /// Flush when still inside thinking returns buffered content as reasoning.
+    #[test]
+    fn streaming_tracker_flush_while_thinking() {
+        let mut tracker = StreamingReasoningTracker::new_inside_think();
+        tracker.process("partial reasoning");
+        let (vis, reas) = tracker.flush();
+        assert!(vis.is_empty(), "nothing visible while still thinking");
+        assert!(
+            reas.contains("partial reasoning"),
+            "flush should return buffered reasoning"
+        );
     }
 }

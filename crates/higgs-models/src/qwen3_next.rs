@@ -1861,13 +1861,24 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
             .or_insert_with(|| tie.clone());
     }
 
-    // All layers use MoE in qwen3.5-moe (no dense FFN)
-    map.entry("decoder_sparse_step")
-        .or_insert(serde_json::Value::from(1));
+    // Set decoder_sparse_step=1 only for MoE models (num_experts > 0).
+    // Dense models (qwen3_5) use standard FFN and must keep decoder_sparse_step=0.
+    let has_experts = text_config
+        .get("num_experts")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        > 0;
+    if has_experts {
+        map.entry("decoder_sparse_step")
+            .or_insert(serde_json::Value::from(1));
+    }
 
-    // intermediate_size is unused when all layers are MoE
-    map.entry("intermediate_size")
-        .or_insert(serde_json::Value::from(0));
+    // intermediate_size is unused when all layers are MoE;
+    // for dense models, keep whatever value is in text_config.
+    if has_experts {
+        map.entry("intermediate_size")
+            .or_insert(serde_json::Value::from(0));
+    }
 
     // Weights are rearranged from flat (qkv,z,b,a) to per-head-grouped
     // (qkvz,ba) at load time, so we use the combined forward path.
@@ -1885,6 +1896,47 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     }
 
     Ok(serde_json::from_value(obj)?)
+}
+
+/// Load a Qwen3.5 dense model (VLM wrapper around Qwen3Next architecture).
+///
+/// Reads `text_config` for model args, strips `language_model.` prefix from
+/// safetensors weight keys. Unlike [`load_qwen3_5_moe_model`], does NOT force
+/// `decoder_sparse_step=1` or attempt MoE gate fusion.
+pub fn load_qwen3_5_model<P: AsRef<Path>>(
+    model_dir: P,
+) -> Result<Qwen3NextCausalLM, ModelError> {
+    let model_path = model_dir.as_ref();
+    let args = load_qwen3_5_moe_text_config_args(model_path)?;
+
+    tracing::info!(
+        hidden_size = args.hidden_size,
+        num_layers = args.num_hidden_layers,
+        num_heads = args.num_attention_heads,
+        num_kv_heads = args.num_key_value_heads,
+        vocab_size = args.vocab_size,
+        full_attention_interval = args.full_attention_interval,
+        "Loading qwen3_5 dense model (VLM text backbone via qwen3_next)"
+    );
+
+    let gdn_dims = GdnDims {
+        num_k_heads: args.linear_num_key_heads,
+        num_v_heads: args.linear_num_value_heads,
+        head_k_dim: args.linear_key_head_dim,
+        head_v_dim: args.linear_value_head_dim,
+    };
+    let use_separate_gdn = std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
+    let mut model = Qwen3NextCausalLM::new(args)?;
+
+    if use_separate_gdn {
+        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
+        tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
+    } else {
+        load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
+    }
+
+    tracing::info!("Qwen3.5 dense model loaded successfully");
+    Ok(model)
 }
 
 /// Load a Qwen3.5-MoE model (VLM wrapper around Qwen3Next architecture).
@@ -2443,7 +2495,7 @@ mod tests {
         assert_eq!(args.num_experts, 0);
         assert_eq!(args.num_experts_per_tok, 0);
         assert_eq!(args.decoder_sparse_step, 0);
-        assert!(!args.norm_topk_prob);
+        assert!(args.norm_topk_prob);
         assert!(args.mlp_only_layers.is_empty());
     }
 
@@ -9788,5 +9840,196 @@ mod tests {
                 "extras={n_extras:2} ops~={total_ops:4} eval={avg_ms:.2}ms ({us_per_op:.1}us/op)"
             );
         }
+    }
+
+    /// Measure async_eval pipelining: does GPU overlap with CPU graph building?
+    ///
+    /// cargo test -p higgs-models --release -- bench_async_pipeline --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn bench_async_pipeline() {
+        use mlx_rs::transforms::{eval, async_eval};
+        use mlx_rs::random::normal;
+
+        let d: &[i32] = &[2048, 2048];
+        let w = normal::<f32>(d, None, None, None).unwrap();
+        eval([&w].into_iter()).unwrap();
+
+        let build_graph = |x: &Array| -> Array {
+            let mut h = x.clone();
+            for _ in 0..40 {
+                let mm = h.matmul(&w).unwrap();
+                h = mm.add(&h).unwrap();
+            }
+            h
+        };
+
+        let x = normal::<f32>(&[1, 1, 2048], None, None, None).unwrap();
+        eval([&x].into_iter()).unwrap();
+
+        // Sequential
+        let n = 20usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let y = build_graph(&x);
+            eval([&y].into_iter()).unwrap();
+        }
+        let seq_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+        // Pipelined
+        let t0 = std::time::Instant::now();
+        let mut y = build_graph(&x);
+        async_eval([&y].into_iter()).unwrap();
+        for _ in 0..n {
+            let next_y = build_graph(&y);
+            async_eval([&next_y].into_iter()).unwrap();
+            eval([&y].into_iter()).unwrap();
+            y = next_y;
+        }
+        let pipe_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+        eprintln!("Rust mlx-rs sequential:  {seq_ms:.2}ms/step");
+        eprintln!("Rust mlx-rs pipelined:   {pipe_ms:.2}ms/step");
+        eprintln!("Speedup: {:.2}x", seq_ms / pipe_ms);
+    }
+
+    /// Measure pure FFI graph-building overhead: no eval, just op dispatch.
+    ///
+    /// cargo test -p higgs-models --release -- bench_ffi_overhead --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn bench_ffi_overhead() {
+        use mlx_rs::transforms::eval;
+
+        let a = Array::ones::<f32>(&[1, 1, 2048]).unwrap();
+        let b = Array::ones::<f32>(&[1, 1, 2048]).unwrap();
+        eval([&a, &b].into_iter()).unwrap();
+
+        let n = 2000usize;
+
+        // Graph build only (no eval)
+        let t0 = std::time::Instant::now();
+        let mut x = a.clone();
+        for _ in 0..n {
+            x = x.add(&b).unwrap();
+        }
+        let build_us = t0.elapsed().as_micros();
+        eprintln!(
+            "Rust mlx-rs: {n} adds graph-build = {build_us}us ({:.1}us/op)",
+            build_us as f64 / n as f64
+        );
+
+        // Graph build + eval
+        let t0 = std::time::Instant::now();
+        let mut x = a.clone();
+        for _ in 0..n {
+            x = x.add(&b).unwrap();
+        }
+        eval([&x].into_iter()).unwrap();
+        let total_us = t0.elapsed().as_micros();
+        eprintln!(
+            "Rust mlx-rs: {n} adds + eval = {total_us}us ({:.1}us/op)",
+            total_us as f64 / n as f64
+        );
+
+        // With task-local stream set
+        let stream = Stream::new();
+        mlx_rs::with_new_default_stream(stream, || {
+            let t0 = std::time::Instant::now();
+            let mut x = a.clone();
+            for _ in 0..n {
+                x = x.add(&b).unwrap();
+            }
+            let build_us = t0.elapsed().as_micros();
+            eprintln!(
+                "Rust mlx-rs (task-local stream): {n} adds graph-build = {build_us}us ({:.1}us/op)",
+                build_us as f64 / n as f64
+            );
+        });
+    }
+
+    /// Write a qwen3.5-style VLM config.json (with text_config) and parse it.
+    fn write_qwen35_config(dir: &std::path::Path, text_config_json: &str) {
+        let config = format!(
+            r#{{"text_config": {text_config_json}, "tie_word_embeddings": false}}"#
+        );
+        std::fs::write(dir.join("config.json"), config).unwrap();
+    }
+
+    /// Helper: minimal qwen3.5 text_config JSON for a dense (non-MoE) model.
+    fn qwen35_dense_text_config() -> &'static str {
+        r#"{
+            "model_type": "qwen3_5",
+            "hidden_size": 256,
+            "num_hidden_layers": 4,
+            "intermediate_size": 512,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "rms_norm_eps": 1e-06,
+            "vocab_size": 1024,
+            "max_position_embeddings": 512,
+            "full_attention_interval": 4,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 0,
+            "num_experts_per_tok": 0
+        }"#
+    }
+
+    /// Helper: minimal qwen3.5 text_config JSON for an MoE model.
+    fn qwen35_moe_text_config() -> &'static str {
+        r#"{
+            "model_type": "qwen3_5_moe",
+            "hidden_size": 256,
+            "num_hidden_layers": 4,
+            "intermediate_size": 0,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "rms_norm_eps": 1e-06,
+            "vocab_size": 1024,
+            "max_position_embeddings": 512,
+            "full_attention_interval": 4,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "shared_expert_intermediate_size": 256,
+            "moe_intermediate_size": 128,
+            "norm_topk_prob": true
+        }"#
+    }
+
+    #[test]
+    fn test_load_qwen35_moe_text_config_moe_sets_decoder_sparse_step() {
+        let dir = tempfile::tempdir().unwrap();
+        write_qwen35_config(dir.path(), qwen35_moe_text_config());
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+        assert_eq!(
+            args.decoder_sparse_step, 1,
+            "MoE model should get decoder_sparse_step=1"
+        );
+        assert!(args.num_experts > 0);
+    }
+
+    #[test]
+    fn test_load_qwen35_dense_text_config_no_forced_moe() {
+        let dir = tempfile::tempdir().unwrap();
+        write_qwen35_config(dir.path(), qwen35_dense_text_config());
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+        // Dense models (num_experts=0) must NOT get decoder_sparse_step=1,
+        // otherwise every layer tries to create SparseMoeBlock and fails.
+        assert_eq!(
+            args.decoder_sparse_step, 0,
+            "Dense model should NOT get decoder_sparse_step=1"
+        );
+        assert_eq!(args.num_experts, 0);
     }
 }
