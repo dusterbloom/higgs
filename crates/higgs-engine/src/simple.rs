@@ -46,8 +46,7 @@ pub(crate) fn set_wired_limit_to_max() {
                 let mut prev_cache: usize = 0;
 
                 // Check env var to optionally disable memory limits for testing
-                let limits_enabled =
-                    std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
+                let limits_enabled = std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
 
                 if limits_enabled {
                     mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
@@ -126,20 +125,20 @@ impl SimpleEngine {
         // Resolve </think> token ID from the tokenizer. If the tokenizer
         // doesn't know this token, disable thinking to avoid injecting
         // out-of-vocab IDs into the embedding lookup.
-        let think_close_token = tokenizer
-            .encode("</think>", false)
-            .ok()
-            .and_then(|enc| {
-                let ids = enc.get_ids();
-                // Must encode to exactly one token to be usable as a forced stop.
-                if ids.len() == 1 { Some(ids[0]) } else { None }
-            });
+        let think_close_token = tokenizer.encode("</think>", false).ok().and_then(|enc| {
+            let ids = enc.get_ids();
+            // Must encode to exactly one token to be usable as a forced stop.
+            if ids.len() == 1 { Some(ids[0]) } else { None }
+        });
         if enable_thinking && think_close_token.is_none() {
             tracing::warn!("Tokenizer has no single </think> token; disabling thinking mode");
             enable_thinking = false;
         }
         if enable_thinking {
-            tracing::info!(think_close_token, "Thinking mode enabled (Qwen3.5 model detected)");
+            tracing::info!(
+                think_close_token,
+                "Thinking mode enabled (Qwen3.5 model detected)"
+            );
         }
 
         set_wired_limit_to_max();
@@ -687,7 +686,10 @@ impl SimpleEngine {
                             token_id = close_id;
                         }
                         seen_think_close = true;
-                        tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
+                        tracing::info!(
+                            budget = THINKING_BUDGET,
+                            "Thinking budget reached, forcing </think>"
+                        );
                     }
                 }
             }
@@ -1004,7 +1006,10 @@ impl SimpleEngine {
                             token_id = close_id;
                         }
                         seen_think_close = true;
-                        tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
+                        tracing::info!(
+                            budget = THINKING_BUDGET,
+                            "Thinking budget reached, forcing </think>"
+                        );
                     }
                 }
             }
@@ -1157,9 +1162,11 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
     };
 
     // Check top-level first, then text_config (VLM/Qwen3.5 nested config)
-    let eos_value = config
-        .get("eos_token_id")
-        .or_else(|| config.get("text_config").and_then(|tc| tc.get("eos_token_id")));
+    let eos_value = config.get("eos_token_id").or_else(|| {
+        config
+            .get("text_config")
+            .and_then(|tc| tc.get("eos_token_id"))
+    });
 
     match eos_value {
         Some(serde_json::Value::Number(n)) => n

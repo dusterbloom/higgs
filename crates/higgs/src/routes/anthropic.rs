@@ -259,20 +259,24 @@ async fn create_message_non_streaming(
     let stop_reason = openai_finish_to_anthropic_stop(&output.finish_reason);
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
+    // When thinking is enabled, the template already opened `<think>` so
+    // the model output starts inside the thinking block. We wrap it in a
+    // properly closed `<think>...</think>` before parsing so the parser
+    // always sees balanced tags, even if the model was length-stopped.
     let parse_input = if thinking_enabled {
-        format!("<think>{}", output.text)
+        if output.text.contains("</think>") {
+            format!("<think>{}", output.text)
+        } else {
+            format!("<think>{}</think>", output.text)
+        }
     } else {
         output.text
     };
     let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
-    // If reasoning was detected, use the visible text. If the think block
-    // was never closed (e.g. length-stopped), fall back to the raw output
-    // to avoid returning an empty string.
-    let visible_text = if reasoning_result.reasoning.is_some() && !reasoning_result.text.is_empty() {
+    let visible_text = if reasoning_result.reasoning.is_some() {
         reasoning_result.text
     } else {
-        // Strip the <think> prefix we injected so the raw output is clean.
-        parse_input.strip_prefix("<think>").unwrap_or(&parse_input).to_owned()
+        parse_input
     };
 
     Ok(CreateMessageResponse {
