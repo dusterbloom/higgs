@@ -784,16 +784,12 @@ impl SimpleEngine {
                 });
             }
 
-            // If thinking budget was just reached, override the pipelined token
-            // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == THINKING_BUDGET {
-                if let Some(close_id) = think_close_token {
-                    next_token = Array::from_slice(&[close_id], &[1]);
-                }
-                thinking_tokens += 1; // prevent re-triggering
-            } else {
-                next_token = following;
-            }
+            // Advance the pipeline: use the model's output as the next input.
+            // When the thinking budget was just reached, we already emitted the
+            // close token via the `token_id` override above. Do NOT override
+            // `next_token` to `close_id` again — that would cause the close token
+            // to be extracted and emitted a second time on the next iteration.
+            next_token = following;
             next_logprob_data = following_logprob_data;
         }
     }
@@ -1082,6 +1078,11 @@ impl SimpleEngine {
                 break;
             }
 
+            // Advance the pipeline: use the model's output as the next input.
+            // When the thinking budget was just reached, we already emitted the
+            // close token via the `token_id` override above. Do NOT override
+            // `next_token` to `close_id` again — that would cause the close token
+            // to be extracted and emitted a second time on the next iteration.
             next_token = following;
             next_logprob_data = following_logprob_data;
         }
