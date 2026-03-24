@@ -68,7 +68,7 @@ Each profile gets isolated runtime files (`higgs.<profile>.pid`, `higgs.<profile
 - **Continuous batching** -- 755 tok/s aggregate at 8 concurrent requests
 - **Radix tree prefix cache** -- shared prefix reuse across requests
 - **Vision** -- multimodal image+text (LLaVA-Qwen2)
-- **11 architectures** -- LLaMA, Mistral, Qwen2/3, Qwen3-MoE, Qwen3-Next, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, LLaVA-Qwen2
+- **12 architectures** -- LLaMA, Mistral, Qwen2/3, Qwen3-MoE, Qwen3.5, Qwen3.5-MoE, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, LLaVA-Qwen2
 
 ### Gateway
 - **Remote providers** -- proxy requests to OpenAI, Anthropic, Ollama, or any OpenAI-compatible API
@@ -261,7 +261,8 @@ higgs exec -- aider --model openai/gpt-4o
 | Mistral | `mistral` | Mistral 7B |
 | Qwen2 | `qwen2` | Qwen2, Qwen2.5 |
 | Qwen3 | `qwen3` | Qwen3 |
-| Qwen3-Next | `qwen3_next` | Qwen3-Coder (SSM hybrid) |
+| Qwen3.5 | `qwen3_5` | Qwen3.5-0.8B/2B/4B/9B (dense SSM hybrid) |
+| Qwen3.5-MoE | `qwen3_5_moe` | Qwen3.5-35B-A3B (sparse MoE + SSM hybrid) |
 | Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B (sparse MoE) |
 | Gemma 2 | `gemma2` | Gemma 2 2B/9B/27B |
 | Phi-3 | `phi3` | Phi-3 Mini/Small/Medium |
@@ -310,6 +311,28 @@ MLX models use 4-bit (8-bit for MoE). llama.cpp/Ollama use Q4_K_M (Q8_0 for MoE)
 | Gemma-2-2B-4bit | 1,645 | 2,329 | 2,350 |
 | Phi-3-mini-4bit | 2,126 | 2,548 | 2,573 |
 | DeepSeek-V2-Lite-4bit | 8,528 | 8,972 | 8,998 |
+
+### Qwen3.5 (SSM hybrid, `qwen3_next`)
+
+Qwen3.5 models use a hybrid SSM+Attention architecture with GDN (Gated Delta Networks) recurrence — a fundamentally different compute pattern from pure transformer models. Higgs includes a dedicated `qwen3_next` engine with:
+
+- **Gather-then-dequantize embedding** -- indexes into raw quantized weights first, then dequantizes only the selected rows. Reduces embedding cost from O(vocab_size) to O(batch_size) — ~151,000x less dequantize work per decode step.
+- **Fused GDN projections** -- 4 separate projection matrices fused to 2 at load time with row permutation, halving the number of matmuls per recurrence step.
+- **Thinking mode** -- auto-detected `<think>` tag support with configurable budget (`HIGGS_ENABLE_THINKING=0/1`). Reasoning content extracted to `reasoning_content` in API responses.
+- **Speculative decoding** -- pair a small draft model (e.g. Qwen3.5-2B) with a large target (e.g. Qwen3.5-35B) via `--draft-model`. The draft generates candidate tokens greedily, then the target verifies in a single batch forward. At k=1, this pushes Qwen3.5-35B from 54 to **57.4 tok/s**.
+
+Benchmarks on M4 Max 128GB (temperature=0, warmup excluded, 200 generated tokens):
+
+| Model | Size | Quant | tok/s | Notes |
+|---|---|---|---|---|
+| Qwen3.5-0.8B | 0.8B | 8-bit | ~350 | Smallest, good for draft models |
+| Qwen3.5-2B | 2B | 8-bit | ~220 | |
+| Qwen3.5-4B | 4B | 4-bit | ~180 | |
+| Qwen3.5-9B | 9B | 4-bit | ~95 | |
+| Qwen3.5-35B-A3B | 35B (3B active) | 3-bit | ~54 | Sparse MoE, fits 32GB M4 |
+| Qwen3.5-35B-A3B + 2B draft | 35B (3B active) | 3-bit | **57.4** | Speculative decode, k=1 |
+
+The QEmbedding optimization alone is what put Higgs ahead of Python mlx-lm on the 35B MoE model. Speculative decoding with Qwen3.5-2B as draft pushes it further to **57.4 tok/s**.
 
 ### Feature comparison
 
