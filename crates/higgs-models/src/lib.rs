@@ -650,6 +650,10 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
 
     let mut params = model.parameters_mut().flatten();
 
+    // Loader-wide warning budget so throttling doesn't reset per shard.
+    let mut total_unmatched_warns = 0usize;
+    const MAX_UNMATCHED_WARNS: usize = 5;
+
     for file_path in &safetensors_files {
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
         let loaded = Array::load_safetensors(file_path)
@@ -671,7 +675,8 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
                         matched += 1;
                     } else {
                         unmatched += 1;
-                        if unmatched <= 5 {
+                        total_unmatched_warns += 1;
+                        if total_unmatched_warns <= MAX_UNMATCHED_WARNS {
                             tracing::debug!(
                                 stripped,
                                 remapped = &*remapped,
@@ -681,13 +686,15 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
                     }
                 } else {
                     unmatched += 1;
-                    if unmatched <= 5 {
+                    total_unmatched_warns += 1;
+                    if total_unmatched_warns <= MAX_UNMATCHED_WARNS {
                         tracing::debug!(stripped, "weight key unmatched (no remap)");
                     }
                 }
             } else {
                 unmatched += 1;
-                if unmatched <= 5 {
+                total_unmatched_warns += 1;
+                if total_unmatched_warns <= MAX_UNMATCHED_WARNS {
                     tracing::debug!(stripped, "weight key unmatched");
                 }
             }
