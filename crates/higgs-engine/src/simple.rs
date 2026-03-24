@@ -84,6 +84,9 @@ pub struct SimpleEngine {
     eos_token_ids: Vec<u32>,
     /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
     enable_thinking: bool,
+    /// Token ID for `</think>`, resolved from the tokenizer at load time.
+    /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
+    think_close_token: Option<u32>,
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
@@ -114,13 +117,29 @@ impl SimpleEngine {
 
         // Auto-detect thinking mode: Qwen3.5 models support <think> tags.
         // Override with HIGGS_ENABLE_THINKING=0 or HIGGS_ENABLE_THINKING=1.
-        let enable_thinking = match std::env::var("HIGGS_ENABLE_THINKING").ok().as_deref() {
+        let mut enable_thinking = match std::env::var("HIGGS_ENABLE_THINKING").ok().as_deref() {
             Some("0" | "false") => false,
             Some("1" | "true") => true,
             _ => detect_thinking_support(model_dir),
         };
+
+        // Resolve </think> token ID from the tokenizer. If the tokenizer
+        // doesn't know this token, disable thinking to avoid injecting
+        // out-of-vocab IDs into the embedding lookup.
+        let think_close_token = tokenizer
+            .encode("</think>", false)
+            .ok()
+            .and_then(|enc| {
+                let ids = enc.get_ids();
+                // Must encode to exactly one token to be usable as a forced stop.
+                if ids.len() == 1 { Some(ids[0]) } else { None }
+            });
+        if enable_thinking && think_close_token.is_none() {
+            tracing::warn!("Tokenizer has no single </think> token; disabling thinking mode");
+            enable_thinking = false;
+        }
         if enable_thinking {
-            tracing::info!("Thinking mode enabled (Qwen3.5 model detected)");
+            tracing::info!(think_close_token, "Thinking mode enabled (Qwen3.5 model detected)");
         }
 
         set_wired_limit_to_max();
@@ -139,6 +158,7 @@ impl SimpleEngine {
             model_name,
             eos_token_ids,
             enable_thinking,
+            think_close_token,
         })
     }
 
@@ -536,7 +556,6 @@ impl SimpleEngine {
 
         // Capture T1 (already eval'd inside run_prefill).
         let first_token_id: u32 = current_token.item();
-        tracing::info!(token_id = first_token_id, "DEBUG_TOKEN prefill (T1)");
         // Advance the constraint past the first sampled token before decode.
         if let Some(ref mut cg) = constraint {
             cg.advance(first_token_id);
@@ -612,11 +631,10 @@ impl SimpleEngine {
         let mut step_count: u32 = 0;
 
         // Thinking budget: force </think> after N tokens if model hasn't closed it.
-        // Only active when enable_thinking is true.
-        const THINK_CLOSE_TOKEN: u32 = 248069;
         const THINKING_BUDGET: u32 = 256;
+        let think_close_token = self.think_close_token;
         let mut thinking_tokens: u32 = 0;
-        let mut seen_think_close = !self.enable_thinking; // skip tracking if thinking disabled
+        let mut seen_think_close = think_close_token.is_none(); // skip tracking if no token
 
         loop {
             let t0 = std::time::Instant::now();
@@ -660,12 +678,14 @@ impl SimpleEngine {
 
             // Thinking budget: force </think> after N tokens if model hasn't closed it.
             if !seen_think_close {
-                if token_id == THINK_CLOSE_TOKEN {
+                if Some(token_id) == think_close_token {
                     seen_think_close = true;
                 } else {
                     thinking_tokens += 1;
                     if thinking_tokens >= THINKING_BUDGET {
-                        token_id = THINK_CLOSE_TOKEN;
+                        if let Some(close_id) = think_close_token {
+                            token_id = close_id;
+                        }
                         seen_think_close = true;
                         tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
                     }
@@ -767,7 +787,9 @@ impl SimpleEngine {
             // If thinking budget was just reached, override the pipelined token
             // so the next decode step gets </think> as input.
             if seen_think_close && thinking_tokens == THINKING_BUDGET {
-                next_token = Array::from_slice(&[THINK_CLOSE_TOKEN], &[1]);
+                if let Some(close_id) = think_close_token {
+                    next_token = Array::from_slice(&[close_id], &[1]);
+                }
                 thinking_tokens += 1; // prevent re-triggering
             } else {
                 next_token = following;
@@ -931,6 +953,12 @@ impl SimpleEngine {
             return Ok(());
         }
 
+        // Thinking budget (streaming): force </think> after N tokens.
+        const THINKING_BUDGET: u32 = 256;
+        let think_close_token = self.think_close_token;
+        let mut thinking_tokens: u32 = 0;
+        let mut seen_think_close = think_close_token.is_none();
+
         // Pipelined decode loop: build step N+2 while GPU computes step N+1
         let (mut next_token, mut next_logprob_data) = Self::decode_step(
             &current_token,
@@ -967,7 +995,23 @@ impl SimpleEngine {
                 async_eval(eval_targets).map_err(EngineError::Mlx)?;
             }
 
-            let token_id: u32 = next_token.item();
+            let mut token_id: u32 = next_token.item();
+
+            // Thinking budget: force </think> after N tokens if model hasn't closed it.
+            if !seen_think_close {
+                if Some(token_id) == think_close_token {
+                    seen_think_close = true;
+                } else {
+                    thinking_tokens += 1;
+                    if thinking_tokens >= THINKING_BUDGET {
+                        if let Some(close_id) = think_close_token {
+                            token_id = close_id;
+                        }
+                        seen_think_close = true;
+                        tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
+                    }
+                }
+            }
 
             // Advance constrained generator state
             if let Some(ref mut cg) = constraint {

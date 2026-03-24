@@ -265,10 +265,14 @@ async fn create_message_non_streaming(
         output.text
     };
     let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
-    let visible_text = if reasoning_result.reasoning.is_some() {
+    // If reasoning was detected, use the visible text. If the think block
+    // was never closed (e.g. length-stopped), fall back to the raw output
+    // to avoid returning an empty string.
+    let visible_text = if reasoning_result.reasoning.is_some() && !reasoning_result.text.is_empty() {
         reasoning_result.text
     } else {
-        parse_input
+        // Strip the <think> prefix we injected so the raw output is clean.
+        parse_input.strip_prefix("<think>").unwrap_or(&parse_input).to_owned()
     };
 
     Ok(CreateMessageResponse {
@@ -392,7 +396,12 @@ fn create_message_stream(
         // 3. content_block_delta events (one per token)
         let mut final_stop_reason = None;
         let mut total_output_tokens: u32 = 0;
-        let mut reasoning_tracker = higgs_engine::reasoning_parser::StreamingReasoningTracker::new();
+        let thinking_enabled = engine.enable_thinking();
+        let mut reasoning_tracker = if thinking_enabled {
+            higgs_engine::reasoning_parser::StreamingReasoningTracker::new_inside_think()
+        } else {
+            higgs_engine::reasoning_parser::StreamingReasoningTracker::new()
+        };
 
         while let Some(output) = rx.recv().await {
             let (visible, _reasoning) = reasoning_tracker.process(&output.new_text);
