@@ -320,6 +320,8 @@ fn create_message_stream(
     let prompt_token_count = u32::try_from(prompt_tokens.len())
         .map_err(|_| ServerError::BadRequest("Token count overflow".to_owned()))?;
 
+    let thinking_enabled = engine.enable_thinking();
+
     // Spawn generation before creating the stream so prefill starts immediately
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
@@ -396,7 +398,6 @@ fn create_message_stream(
         // 3. content_block_delta events (one per token)
         let mut final_stop_reason = None;
         let mut total_output_tokens: u32 = 0;
-        let thinking_enabled = engine.enable_thinking();
         let mut reasoning_tracker = if thinking_enabled {
             higgs_engine::reasoning_parser::StreamingReasoningTracker::new_inside_think()
         } else {
