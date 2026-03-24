@@ -1,5 +1,7 @@
 pub mod batch_engine;
 pub mod chat_template;
+#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
+pub mod compiled_decode;
 pub mod constrained;
 pub mod engine;
 pub mod error;

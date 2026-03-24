@@ -7,6 +7,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use mlx_rs::{
@@ -27,6 +28,9 @@ use serde::Deserialize;
 
 /// Captures the most recent MLX error message from our FFI calls.
 static FFI_LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+static GDN_TRACE_CALL_INDEX: AtomicUsize = AtomicUsize::new(0);
+static MHA_TRACE_CALL_INDEX: AtomicUsize = AtomicUsize::new(0);
+static FFN_TRACE_CALL_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 /// Error handler registered once with MLX to capture error messages.
 #[allow(unsafe_code)]
@@ -262,14 +266,21 @@ impl QEmbedding {
     }
 
     pub(crate) fn forward(&self, indices: &Array) -> Result<Array, Exception> {
-        let full = ops::dequantize(
-            &*self.weight,
-            &*self.scales,
-            &*self.biases,
+        let shape = indices.shape().to_vec();
+        let flat = indices.flatten(None, None)?;
+        let weight = self.weight.index(&flat);
+        let scales = self.scales.index(&flat);
+        let biases = self.biases.index(&flat);
+        let out = ops::dequantize(
+            &weight,
+            &scales,
+            &biases,
             self.group_size,
             self.bits,
         )?;
-        full.take_axis(indices, 0)
+        let mut out_shape = shape;
+        out_shape.push(-1);
+        out.reshape(&out_shape)
     }
 
     pub(crate) fn as_linear(&self, x: &Array) -> Result<Array, Exception> {
@@ -288,10 +299,12 @@ impl QEmbedding {
 // SwiGLU activation
 // ---------------------------------------------------------------------------
 
+/// SwiGLU activation: `silu(gate) * x`.
 pub(crate) fn swiglu(gate: &Array, x: &Array) -> Result<Array, Exception> {
     gate.multiply(nn::sigmoid(gate)?)?.multiply(x)
 }
 
+/// SiLU activation: `x * sigmoid(x)`.
 fn silu_direct(x: &Array) -> Result<Array, Exception> {
     x.multiply(nn::sigmoid(x)?)
 }
@@ -738,7 +751,113 @@ impl Qwen3NextAttention {
             .get(1)
             .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
 
+        let trace_stages = std::env::var("HIGGS_TRACE_MHA_STAGES").is_ok()
+            && mlx_rs::debug::graph_stats_enabled();
+        let trace_call_idx = if trace_stages {
+            Some(MHA_TRACE_CALL_INDEX.fetch_add(1, Ordering::Relaxed))
+        } else {
+            None
+        };
+        let mut last_stage_primitives = if trace_stages {
+            mlx_rs::debug::unique_primitive_count()
+        } else {
+            0
+        };
+        let mut last_stage_arrays = if trace_stages {
+            mlx_rs::debug::unique_array_count()
+        } else {
+            0
+        };
+        let mut trace_stage = |label: &str| {
+            if let Some(call_idx) = trace_call_idx {
+                let primitives = mlx_rs::debug::unique_primitive_count();
+                let arrays = mlx_rs::debug::unique_array_count();
+                eprintln!(
+                    "    MHA[{call_idx}] {label:<20} +{:>3} prim +{:>3} arr (total {} prim / {} arr)",
+                    primitives.saturating_sub(last_stage_primitives),
+                    arrays.saturating_sub(last_stage_arrays),
+                    primitives,
+                    arrays,
+                );
+                last_stage_primitives = primitives;
+                last_stage_arrays = arrays;
+            }
+        };
+
         // Q is projected to 2 * num_heads * head_dim (doubled for gating)
+        let q_proj_output = self.q_proj.forward(x)?;
+        let q_reshaped = q_proj_output.reshape(&[B, L, self.num_attention_heads, -1])?;
+        let q_halves = q_reshaped.split(2, Some(-1))?;
+        let queries_pre = q_halves
+            .first()
+            .ok_or_else(|| Exception::custom("split produced empty result"))?;
+        let gate = q_halves
+            .get(1)
+            .ok_or_else(|| Exception::custom("split produced empty result"))?
+            .reshape(&[B, L, -1])?;
+        trace_stage("q_proj_split");
+
+        let keys_raw = self.k_proj.forward(x)?;
+        let values_raw = self.v_proj.forward(x)?;
+        trace_stage("kv_proj");
+
+        // Per-head RmsNorm then transpose to [B, H, L, D]
+        let mut queries = self
+            .q_norm
+            .forward(queries_pre)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let mut keys = self
+            .k_norm
+            .forward(&keys_raw.reshape(&[B, L, self.num_key_value_heads, -1])?)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let mut values = values_raw
+            .reshape(&[B, L, self.num_key_value_heads, -1])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        trace_stage("qkv_norm_pack");
+
+        // RoPE with cache offset (Array-based for compiled trace)
+        let offset = cache.offset_array();
+        queries = apply_rope(&queries, &self.rope, &offset)?;
+        keys = apply_rope(&keys, &self.rope, &offset)?;
+        trace_stage("rope");
+
+        let (cached_keys, cached_values) = cache.update_and_fetch(keys, values)?;
+        keys = cached_keys;
+        values = cached_values;
+        trace_stage("cache_update");
+
+        let output = scaled_dot_product_attention(queries, keys, values, self.scale, mask)?;
+        trace_stage("sdpa");
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[B, L, -1])?;
+        trace_stage("output_pack");
+
+        let gated = output.multiply(nn::sigmoid(&gate)?)?;
+        trace_stage("gate");
+        let output = self.o_proj.forward(&gated)?;
+        trace_stage("out_proj");
+        Ok(output)
+    }
+}
+
+impl Qwen3NextAttention {
+    /// Compiled-mode forward: identical to `forward` but uses `update_and_fetch_compiled`
+    /// which avoids `.item()` on tracer arrays. Builds a padding mask from the offset.
+    #[allow(non_snake_case)]
+    fn forward_compiled(
+        &mut self,
+        x: &Array,
+        cache: &mut SteppingKeyValueCache,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let B = *shape
+            .first()
+            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
+        let L = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
+
         let q_proj_output = self.q_proj.forward(x)?;
         let q_reshaped = q_proj_output.reshape(&[B, L, self.num_attention_heads, -1])?;
         let q_halves = q_reshaped.split(2, Some(-1))?;
@@ -753,7 +872,6 @@ impl Qwen3NextAttention {
         let keys_raw = self.k_proj.forward(x)?;
         let values_raw = self.v_proj.forward(x)?;
 
-        // Per-head RmsNorm then transpose to [B, H, L, D]
         let mut queries = self
             .q_norm
             .forward(queries_pre)?
@@ -762,22 +880,28 @@ impl Qwen3NextAttention {
             .k_norm
             .forward(&keys_raw.reshape(&[B, L, self.num_key_value_heads, -1])?)?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let mut values = values_raw
+        let values = values_raw
             .reshape(&[B, L, self.num_key_value_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // RoPE with cache offset
-        let offset = cache.offset();
-        queries = apply_rope(&queries, &self.rope, offset)?;
-        keys = apply_rope(&keys, &self.rope, offset)?;
+        let offset = cache.offset_array();
+        queries = apply_rope(&queries, &self.rope, &offset)?;
+        keys = apply_rope(&keys, &self.rope, &offset)?;
 
-        let (cached_keys, cached_values) = cache.update_and_fetch(keys, values)?;
-        keys = cached_keys;
-        values = cached_values;
+        // Compiled cache update: concat-based, no .item(), no padding
+        let (cached_keys, cached_values) =
+            cache.update_and_fetch_compiled(keys, values)?;
 
-        let output = scaled_dot_product_attention(queries, keys, values, self.scale, mask)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?;
+        // No mask needed — concat only contains valid tokens (no padding)
+        let output = scaled_dot_product_attention(
+            queries,
+            cached_keys,
+            cached_values,
+            self.scale,
+            None,
+        )?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[B, L, -1])?;
 
         let gated = output.multiply(nn::sigmoid(&gate)?)?;
         self.o_proj.forward(&gated)
@@ -839,6 +963,22 @@ pub(crate) struct SwitchMlpWeights {
     up_proj: QLinear,
     #[param]
     down_proj: QLinear,
+    /// Fused gate+up weight: `[num_experts, 2*intermediate, packed_dim]`.
+    /// Lazily built on first forward to avoid blocking model load.
+    #[allow(dead_code)]
+    fused_gate_up: Option<FusedQLinearPair>,
+}
+
+/// Pre-concatenated gate+up weights for single-dispatch SwiGLU.
+#[derive(Debug, Clone)]
+pub(crate) struct FusedQLinearPair {
+    weight: Array,
+    scales: Array,
+    biases: Array,
+    group_size: i32,
+    bits: i32,
+    /// Output dim of each half (= intermediate_size), for splitting after matmul.
+    half_out: i32,
 }
 
 impl SwitchMlpWeights {
@@ -848,7 +988,26 @@ impl SwitchMlpWeights {
             gate_proj,
             up_proj,
             down_proj,
+            fused_gate_up: None,
         })
+    }
+
+    /// Fuse gate+up weights into a single array for 1-dispatch SwiGLU.
+    /// Call after model weights are loaded.
+    pub(crate) fn fuse_gate_up(&mut self) -> Result<(), Exception> {
+        let half_out = self.gate_proj.weight.shape()[1];
+        let weight = ops::concatenate_axis(&[&*self.gate_proj.weight, &*self.up_proj.weight], 1)?;
+        let scales = ops::concatenate_axis(&[&*self.gate_proj.scales, &*self.up_proj.scales], 1)?;
+        let biases = ops::concatenate_axis(&[&*self.gate_proj.biases, &*self.up_proj.biases], 1)?;
+        self.fused_gate_up = Some(FusedQLinearPair {
+            weight,
+            scales,
+            biases,
+            group_size: self.gate_proj.group_size,
+            bits: self.gate_proj.bits,
+            half_out,
+        });
+        Ok(())
     }
 
     /// Apply the full `SwiGLU` `MoE` block for all selected experts in one shot
@@ -863,11 +1022,6 @@ impl SwitchMlpWeights {
         indices: &Array,
         sorted: bool,
     ) -> Result<Array, Exception> {
-        // Reshape so x batch dims broadcast with the indices shape.
-        // x: [B, L, D] -> [B, L, 1, 1, D]
-        //   batch = [B, L, 1], M=1, K=D
-        // indices: [B, L, top_k]
-        //   broadcast([B, L, 1], [B, L, top_k]) -> [B, L, top_k]
         let shape = x.shape();
         let err = || Exception::custom("forward_gather input must be [B, L, D]");
         let b = *shape.first().ok_or_else(err)?;
@@ -875,34 +1029,51 @@ impl SwitchMlpWeights {
         let d = *shape.get(2).ok_or_else(err)?;
         let x_exp = x.reshape(&[b, l, 1, 1, d])?;
 
-        // Gate/up projections: [B, L, top_k, 1, intermediate]
-        let gate_out = gather_qmm(
-            &x_exp,
-            &self.gate_proj.weight,
-            &self.gate_proj.scales,
-            &self.gate_proj.biases,
-            indices,
-            true,
-            self.gate_proj.group_size,
-            self.gate_proj.bits,
-            sorted,
-        )?;
-        let up_out = gather_qmm(
-            &x_exp,
-            &self.up_proj.weight,
-            &self.up_proj.scales,
-            &self.up_proj.biases,
-            indices,
-            true,
-            self.up_proj.group_size,
-            self.up_proj.bits,
-            sorted,
-        )?;
-
-        let activated = swiglu(&gate_out, &up_out)?;
+        // Gate+up: fused (2 dispatches total) or separate (3 dispatches)
+        let activated = if let Some(ref fused) = self.fused_gate_up {
+            // Single dispatch: [B, L, top_k, 1, 2*intermediate]
+            let gate_up = gather_qmm(
+                &x_exp,
+                &fused.weight,
+                &fused.scales,
+                &fused.biases,
+                indices,
+                true,
+                fused.group_size,
+                fused.bits,
+                sorted,
+            )?;
+            // Split along last dim: gate=[..., intermediate], up=[..., intermediate]
+            let halves = gate_up.split_axis(&[fused.half_out], -1)?;
+            swiglu(&halves[0], &halves[1])?
+        } else {
+            // Fallback: 2 separate dispatches
+            let gate_out = gather_qmm(
+                &x_exp,
+                &self.gate_proj.weight,
+                &self.gate_proj.scales,
+                &self.gate_proj.biases,
+                indices,
+                true,
+                self.gate_proj.group_size,
+                self.gate_proj.bits,
+                sorted,
+            )?;
+            let up_out = gather_qmm(
+                &x_exp,
+                &self.up_proj.weight,
+                &self.up_proj.scales,
+                &self.up_proj.biases,
+                indices,
+                true,
+                self.up_proj.group_size,
+                self.up_proj.bits,
+                sorted,
+            )?;
+            swiglu(&gate_out, &up_out)?
+        };
 
         // Down projection: [B, L, top_k, 1, D]
-        // activated batch=[B,L,top_k] broadcasts with indices [B,L,top_k] exactly
         let down_out = gather_qmm(
             &activated,
             &self.down_proj.weight,
@@ -1000,23 +1171,6 @@ impl SparseMoeBlock {
         let shared_gate_val = nn::sigmoid(&self.shared_expert_gate.forward(x)?)?;
         let shared_out = shared_y.multiply(&shared_gate_val)?;
 
-        // DEBUG MoE decomposition
-        {
-            expert_sum.eval()?;
-            shared_out.eval()?;
-            let es_f32 = expert_sum.as_dtype(mlx_rs::Dtype::Float32)?;
-            let so_f32 = shared_out.as_dtype(mlx_rs::Dtype::Float32)?;
-            es_f32.eval()?;
-            so_f32.eval()?;
-            let es_sq = es_f32.multiply(&es_f32)?.sum(None)?;
-            let so_sq = so_f32.multiply(&so_f32)?.sum(None)?;
-            es_sq.eval()?;
-            so_sq.eval()?;
-            let es_l2: f32 = es_sq.item();
-            let so_l2: f32 = so_sq.item();
-            eprintln!("DEBUG_MOE expert_sum_L2={:.4} shared_out_L2={:.4}", es_l2.sqrt(), so_l2.sqrt());
-        }
-
         expert_sum.add(shared_out)
     }
 }
@@ -1030,16 +1184,25 @@ impl SparseMoeBlock {
 pub struct ArraysCache {
     pub conv_state: Option<Array>,
     pub ssm_state: Option<Array>,
-    pub offset: i32,
+    /// Sequence offset stored as a scalar `Array` so `FlatCache` can round-trip
+    /// it without calling `.item()` (which panics during `mx.compile` trace).
+    pub offset: Array,
 }
 
 impl ArraysCache {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             conv_state: None,
             ssm_state: None,
-            offset: 0,
+            offset: Array::from_int(0),
         }
+    }
+
+    /// Extract the offset as a concrete `i32`.
+    ///
+    /// Instant for evaluated arrays; panics on tracer arrays (compiled path).
+    pub fn offset_i32(&self) -> i32 {
+        self.offset.item::<i32>()
     }
 }
 
@@ -1085,6 +1248,8 @@ struct GatedDeltaNet {
     use_separate_projections: bool,
     qk_norm_weight_q: Array,
     qk_norm_weight_k: Array,
+    /// True after first forward converts norm weights to input dtype.
+    qk_norm_dtype_fixed: bool,
 }
 
 impl GatedDeltaNet {
@@ -1145,6 +1310,7 @@ impl GatedDeltaNet {
                 w.eval()?;
                 w
             },
+            qk_norm_dtype_fixed: false,
         })
     }
 
@@ -1163,6 +1329,39 @@ impl GatedDeltaNet {
             .get(1)
             .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
 
+        let trace_stages = std::env::var("HIGGS_TRACE_GDN_STAGES").is_ok()
+            && mlx_rs::debug::graph_stats_enabled();
+        let trace_call_idx = if trace_stages {
+            Some(GDN_TRACE_CALL_INDEX.fetch_add(1, Ordering::Relaxed))
+        } else {
+            None
+        };
+        let mut last_stage_primitives = if trace_stages {
+            mlx_rs::debug::unique_primitive_count()
+        } else {
+            0
+        };
+        let mut last_stage_arrays = if trace_stages {
+            mlx_rs::debug::unique_array_count()
+        } else {
+            0
+        };
+        let mut trace_stage = |label: &str| {
+            if let Some(call_idx) = trace_call_idx {
+                let primitives = mlx_rs::debug::unique_primitive_count();
+                let arrays = mlx_rs::debug::unique_array_count();
+                eprintln!(
+                    "    GDN[{call_idx}] {label:<20} +{:>3} prim +{:>3} arr (total {} prim / {} arr)",
+                    primitives.saturating_sub(last_stage_primitives),
+                    arrays.saturating_sub(last_stage_arrays),
+                    primitives,
+                    arrays,
+                );
+                last_stage_primitives = primitives;
+                last_stage_arrays = arrays;
+            }
+        };
+
         // Project inputs and split into q, k, v, z, b, a
         let (q, k, v, z, b, a) = if self.use_separate_projections {
             // qwen3.5-style: 4 separate projections, flat split
@@ -1180,6 +1379,7 @@ impl GatedDeltaNet {
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
             let b = b_proj.forward(inputs)?;
             let a = a_proj.forward(inputs)?;
+            trace_stage("proj_qkv_zba");
 
             let split_indices = &[self.key_dim, self.key_dim * 2];
             let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
@@ -1192,14 +1392,19 @@ impl GatedDeltaNet {
             let v = qkv_parts.get(2)
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+            trace_stage("split_repack");
 
             (q, k, v, z, b, a)
         } else {
             // qwen3_next-style: combined projections, per-head reshape
             let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
             let mixed_ba = self.in_proj_ba.forward(inputs)?;
-            self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?
+            trace_stage("proj_qkvz_ba");
+            let unpacked = self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?;
+            trace_stage("fix_qkv_order");
+            unpacked
         };
+        trace_stage("project_split_total");
 
         // Conv1d with state management
         let conv_state = match cache.conv_state.take() {
@@ -1227,8 +1432,10 @@ impl GatedDeltaNet {
             .ok_or_else(|| Exception::custom("conv_input missing seq dim"))?;
         let keep_start = conv_input_len - n_keep;
         cache.conv_state = Some(conv_input.index((.., keep_start.., ..)));
+        trace_stage("conv_prepare");
 
         let conv_out = silu_direct(&self.conv1d.forward(&conv_input)?)?;
+        trace_stage("conv_depthwise");
 
         // Split conv output back to q, k, v
         let split_indices = &[self.key_dim, self.key_dim * 2];
@@ -1245,16 +1452,23 @@ impl GatedDeltaNet {
             .get(2)
             .ok_or_else(|| Exception::custom("conv split failed"))?
             .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+        trace_stage("conv_split");
 
-        // On first call, convert weight vectors to match input dtype.
-        let in_dt = inputs.dtype();
-        if self.qk_norm_weight_q.dtype() != in_dt {
-            self.qk_norm_weight_q = self.qk_norm_weight_q.as_dtype(in_dt)?;
-            self.qk_norm_weight_k = self.qk_norm_weight_k.as_dtype(in_dt)?;
+        // QK norm: rms_norm with pre-computed scalar weights.
+        // Weights are converted to the correct dtype once (at first forward), not every call.
+        if !self.qk_norm_dtype_fixed {
+            let in_dt = inputs.dtype();
+            if self.qk_norm_weight_q.dtype() != in_dt {
+                self.qk_norm_weight_q = self.qk_norm_weight_q.as_dtype(in_dt)?;
+                self.qk_norm_weight_k = self.qk_norm_weight_k.as_dtype(in_dt)?;
+                self.qk_norm_weight_q.eval()?;
+                self.qk_norm_weight_k.eval()?;
+            }
+            self.qk_norm_dtype_fixed = true;
         }
-
         let norm_q = fast::rms_norm(&conv_q, &self.qk_norm_weight_q, 1e-6)?;
         let norm_k = fast::rms_norm(&conv_k, &self.qk_norm_weight_k, 1e-6)?;
+        trace_stage("qk_norm");
 
         // Get or initialize SSM state: [B, Hv, Dv, Dk]
         let state = match cache.ssm_state.take() {
@@ -1282,15 +1496,21 @@ impl GatedDeltaNet {
             self.num_v_heads,
             self.head_v_dim,
         )?;
+        trace_stage("gated_delta");
         cache.ssm_state = Some(new_state);
-        cache.offset += S;
+        cache.offset = cache.offset.add(Array::from_int(S))?;
+        trace_stage("state_update");
 
+        // Fused norm + gate: rms_norm(y) then swiglu(z, normed).
+        // Matches Python's Qwen3NextRMSNormGated.__call__(out, z).
         let normed = self.norm.forward(&y)?;
-        let gated_out = swiglu(&z, &normed)?;
+        let gated = swiglu(&z, &normed)?;
+        trace_stage("norm_gate");
 
         // Output projection
-        let out_flat = gated_out.reshape(&[B, S, -1])?;
-        self.out_proj.forward(&out_flat)
+        let out = self.out_proj.forward(&gated.reshape(&[B, S, -1])?)?;
+        trace_stage("out_proj");
+        Ok(out)
     }
 
     /// Reorder the projected qkvz and ba tensors into separate heads.
@@ -1420,6 +1640,39 @@ impl FfnBlock {
     }
 
     fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        let trace_stages = std::env::var("HIGGS_TRACE_FFN_STAGES").is_ok()
+            && mlx_rs::debug::graph_stats_enabled();
+        let trace_call_idx = if trace_stages {
+            Some(FFN_TRACE_CALL_INDEX.fetch_add(1, Ordering::Relaxed))
+        } else {
+            None
+        };
+        let mut last_stage_primitives = if trace_stages {
+            mlx_rs::debug::unique_primitive_count()
+        } else {
+            0
+        };
+        let mut last_stage_arrays = if trace_stages {
+            mlx_rs::debug::unique_array_count()
+        } else {
+            0
+        };
+        let mut trace_stage = |label: &str| {
+            if let Some(call_idx) = trace_call_idx {
+                let primitives = mlx_rs::debug::unique_primitive_count();
+                let arrays = mlx_rs::debug::unique_array_count();
+                eprintln!(
+                    "    FFN[{call_idx}] {label:<20} +{:>3} prim +{:>3} arr (total {} prim / {} arr)",
+                    primitives.saturating_sub(last_stage_primitives),
+                    arrays.saturating_sub(last_stage_arrays),
+                    primitives,
+                    arrays,
+                );
+                last_stage_primitives = primitives;
+                last_stage_arrays = arrays;
+            }
+        };
+
         if self.is_moe {
             // Delegate to SparseMoeBlock logic
             let gate_ref = self.gate.as_ref()
@@ -1432,6 +1685,7 @@ impl FfnBlock {
                 .ok_or_else(|| Exception::custom("MoE shared_expert_gate missing"))?;
 
             let gates = ops::softmax_axis(&gate_ref.forward(x)?, -1, true)?;
+            trace_stage("gate_softmax");
 
             let neg_k = -self.top_k;
             let all_inds = ops::argpartition_axis(&gates, neg_k, -1)?;
@@ -1446,6 +1700,7 @@ impl FfnBlock {
             } else {
                 scores
             };
+            trace_stage("topk_select");
 
             // Use Python-matching SwitchGLU: expand_dims + gather_qmm + swiglu + gather_qmm
             let x_shape = x.shape();
@@ -1453,6 +1708,7 @@ impl FfnBlock {
             let x_l = x_shape[1];
             let x_d = x_shape[2];
             let x_exp = x.reshape(&[x_b, x_l, 1, 1, x_d])?;
+            trace_stage("input_expand");
 
             let gate_out = gather_qmm(
                 &x_exp, &switch_ref.gate_proj.weight, &switch_ref.gate_proj.scales,
@@ -1464,6 +1720,7 @@ impl FfnBlock {
                 &switch_ref.up_proj.biases, &inds, true,
                 switch_ref.up_proj.group_size, switch_ref.up_proj.bits, false,
             )?;
+            trace_stage("gate_up_proj");
             let activated = swiglu(&gate_out, &up_out)?;
             let down_out = gather_qmm(
                 &activated, &switch_ref.down_proj.weight, &switch_ref.down_proj.scales,
@@ -1471,16 +1728,23 @@ impl FfnBlock {
                 switch_ref.down_proj.group_size, switch_ref.down_proj.bits, false,
             )?;
             let y = down_out.squeeze_axes(&[-2])?;
+            trace_stage("down_proj");
 
             let expert_sum = y
                 .multiply(&scores.expand_dims(-1)?)?
                 .sum_axes(&[-2], false)?;
+            trace_stage("expert_combine");
 
             let shared_y = se_ref.forward(x)?;
+            trace_stage("shared_expert");
             let shared_gate_val = nn::sigmoid(&seg_ref.forward(x)?)?;
+            trace_stage("shared_gate");
             let shared_out = shared_y.multiply(&shared_gate_val)?;
+            trace_stage("shared_mul");
 
-            expert_sum.add(shared_out)
+            let output = expert_sum.add(shared_out)?;
+            trace_stage("output_add");
+            Ok(output)
         } else {
             // Dense SwiGLU
             let gp = self.gate_proj.as_ref()
@@ -1491,7 +1755,12 @@ impl FfnBlock {
                 .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
             let gate_out = gp.forward(x)?;
             let up_out = up.forward(x)?;
-            dp.forward(&swiglu(&gate_out, &up_out)?)
+            trace_stage("dense_proj");
+            let activated = swiglu(&gate_out, &up_out)?;
+            trace_stage("dense_act");
+            let output = dp.forward(&activated)?;
+            trace_stage("dense_out");
+            Ok(output)
         }
     }
 }
@@ -1721,14 +1990,27 @@ impl Qwen3NextCausalLM {
                     .and_then(|c| c.as_ref())
                     .map_or(0, |c| match c {
                         LayerCache::KV(kv) => kv.offset(),
-                        LayerCache::Arrays(a) => a.offset,
+                        LayerCache::Arrays(a) => a.offset_i32(),
                     });
             Some(crate::utils::create_causal_mask(T, Some(offset))?)
         } else {
             None
         };
 
-        for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()) {
+        let profile_layers = std::env::var("HIGGS_PROFILE_LAYERS").is_ok();
+        let eval_every: usize = std::env::var("HIGGS_EVAL_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let max_layers: usize = std::env::var("HIGGS_MAX_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(self.model.layers.len());
+        let mut layer_attn_us: Vec<u64> = Vec::new();
+        let mut layer_ffn_us: Vec<u64> = Vec::new();
+
+        for (i, (layer, layer_cache)) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()).enumerate() {
+            if i >= max_layers { break; }
             let cache = layer_cache
                 .as_mut()
                 .ok_or_else(|| Exception::custom("Layer cache is None"))?;
@@ -1737,6 +2019,9 @@ impl Qwen3NextCausalLM {
             } else {
                 fa_mask.as_ref()
             };
+
+            if profile_layers { h.eval()?; }
+            let t0 = std::time::Instant::now();
 
             let normed = layer.input_layernorm.forward(&h)?;
             let r = if layer.is_linear {
@@ -1759,13 +2044,101 @@ impl Qwen3NextCausalLM {
                 attn.forward(&normed, mask, layer_kv)?
             };
 
+            if profile_layers {
+                r.eval()?;
+                layer_attn_us.push(t0.elapsed().as_micros() as u64);
+            }
+
+            let t1 = std::time::Instant::now();
+            let h2 = h.add(r)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            h = h2.add(mlp_out)?;
+
+            if profile_layers {
+                h.eval()?;
+                layer_ffn_us.push(t1.elapsed().as_micros() as u64);
+            }
+            if eval_every > 0 && (i + 1) % eval_every == 0 {
+                h.eval()?;
+            }
+        }
+
+        if profile_layers && !layer_attn_us.is_empty() {
+            let total_attn: u64 = layer_attn_us.iter().sum();
+            let total_ffn: u64 = layer_ffn_us.iter().sum();
+            let n = layer_attn_us.len();
+            eprintln!("  ── Per-layer profile ({n} layers, seq={T}) ──");
+            for i in 0..n {
+                let kind = if self.model.layers[i].is_linear { "GDN" } else { "MHA" };
+                eprintln!(
+                    "  L{i:02} {kind}: attn={:>6}us  ffn={:>6}us  total={:>6}us",
+                    layer_attn_us[i],
+                    layer_ffn_us[i],
+                    layer_attn_us[i] + layer_ffn_us[i],
+                );
+            }
+            eprintln!(
+                "  TOTAL: attn={:.2}ms  ffn={:.2}ms  all={:.2}ms",
+                total_attn as f64 / 1000.0,
+                total_ffn as f64 / 1000.0,
+                (total_attn + total_ffn) as f64 / 1000.0,
+            );
+        }
+
+        self.model.norm.forward(&h)
+    }
+
+    /// Compiled-mode forward: no `.item()` calls, fully traceable by mx.compile.
+    /// Only valid for seq=1 decode after prefill has initialized the cache.
+    /// Skips profiling, eval_every, and max_layers env vars.
+    #[allow(non_snake_case)]
+    pub fn forward_compiled(
+        &mut self,
+        inputs: &Array,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()) {
+            let cache = layer_cache
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Layer cache is None"))?;
+
+            let normed = layer.input_layernorm.forward(&h)?;
+            let r = if layer.is_linear {
+                let attn = layer
+                    .linear_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing"))?;
+                let LayerCache::Arrays(ssm_cache) = cache else {
+                    return Err(Exception::custom("Expected ArraysCache"));
+                };
+                // GDN layers: same as regular forward (no KV cache .item() issues)
+                attn.forward(&normed, None, ssm_cache)?
+            } else {
+                let attn = layer
+                    .self_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing"))?;
+                let LayerCache::KV(layer_kv) = cache else {
+                    return Err(Exception::custom("Expected KVCache"));
+                };
+                // MHA layers: use compiled path (put_along_axis + padding mask)
+                attn.forward_compiled(&normed, layer_kv)?
+            };
+
             let h2 = h.add(r)?;
             let normed_post = layer.post_attention_layernorm.forward(&h2)?;
             let mlp_out = layer.mlp.forward(&normed_post)?;
             h = h2.add(mlp_out)?;
         }
 
-        self.model.norm.forward(&h)
+        let h = self.model.norm.forward(&h)?;
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&h),
+            None => self.model.embed_tokens.as_linear(&h),
+        }
     }
 
     /// Forward pass producing logits.
@@ -1776,12 +2149,17 @@ impl Qwen3NextCausalLM {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<LayerCache>>,
     ) -> Result<Array, Exception> {
+        let t0 = std::time::Instant::now();
         let h = self.forward_hidden(inputs, mask, kv_cache)?;
 
-        match self.lm_head.as_ref() {
-            Some(head) => head.forward(&h),
-            None => self.model.embed_tokens.as_linear(&h),
+        let logits = match self.lm_head.as_ref() {
+            Some(head) => head.forward(&h)?,
+            None => self.model.embed_tokens.as_linear(&h)?,
+        };
+        if std::env::var("HIGGS_TRACE_CONSTRUCTION").is_ok() {
+            eprintln!("  graph_construction: {:.3}ms", t0.elapsed().as_secs_f64() * 1000.0);
         }
+        Ok(logits)
     }
 }
 
@@ -1883,11 +2261,13 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     map.entry("intermediate_size")
         .or_insert(serde_json::Value::from(0));
 
-    // Weights are rearranged from flat (qkv,z,b,a) to per-head-grouped
-    // (qkvz,ba) at load time, so we use the combined forward path.
+    // GDN projection mode: fused (2 dispatches) or separate (4 dispatches).
+    // Fused saves 2 quantized_matmul but adds ~8 reshape/split ops per layer.
+    // Env var HIGGS_SEPARATE_GDN_PROJ=1 forces separate for benchmarking.
+    let use_separate = std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
     map.insert(
         "use_separate_gdn_projections".to_owned(),
-        serde_json::Value::from(false),
+        serde_json::Value::from(use_separate),
     );
 
     // Detect per-layer gate quantization override from top-level quantization config
@@ -1929,11 +2309,31 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
         head_k_dim: args.linear_key_head_dim,
         head_v_dim: args.linear_value_head_dim,
     };
+    let use_separate_gdn = std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
     let mut model = Qwen3NextCausalLM::new(args)?;
 
-    // Load weights with GDN projection rearrangement: flat (qkv,z,b,a)
-    // → per-head-grouped (qkvz,ba) for fused 2-dispatch forward path.
-    load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
+    if use_separate_gdn {
+        // Direct weight loading: 4 separate GDN projections (no rearrangement)
+        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
+        tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
+    } else {
+        // Load weights with GDN projection rearrangement: flat (qkv,z,b,a)
+        // → per-head-grouped (qkvz,ba) for fused 2-dispatch forward path.
+        load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
+    }
+
+    // Fuse MoE gate+up projections: 3 gather_qmm → 2 per layer
+    let mut fused_moe_count = 0usize;
+    for layer in &mut model.model.layers {
+        if let Some(ref mut moe) = layer.mlp.switch_mlp {
+            if moe.fuse_gate_up().is_ok() {
+                fused_moe_count += 1;
+            }
+        }
+    }
+    if fused_moe_count > 0 {
+        tracing::info!(fused_moe_count, "Fused MoE gate+up projections (3→2 dispatches)");
+    }
 
     tracing::info!("Qwen3.5-MoE model loaded successfully");
     Ok(model)
@@ -2421,7 +2821,7 @@ mod tests {
             LayerCache::Arrays(_) => panic!("Expected KV variant"),
         }
         match &arrays {
-            LayerCache::Arrays(c) => assert_eq!(c.offset, 0),
+            LayerCache::Arrays(c) => assert_eq!(c.offset_i32(), 0),
             LayerCache::KV(_) => panic!("Expected Arrays variant"),
         }
     }
@@ -2636,7 +3036,7 @@ mod tests {
         let cache = ArraysCache::default();
         assert!(cache.conv_state.is_none());
         assert!(cache.ssm_state.is_none());
-        assert_eq!(cache.offset, 0);
+        assert_eq!(cache.offset_i32(), 0);
     }
 
     #[test]
@@ -4072,6 +4472,7 @@ mod tests {
                     gate_proj: make_switch_ql(d, d_inter),
                     up_proj: make_switch_ql(d, d_inter),
                     down_proj: make_switch_ql(d_inter, d),
+                    fused_gate_up: None,
                 },
                 shared_expert: Qwen3NextMLP {
                     gate_proj: make_ql(d, shared_inter * 2, gs, bits),
@@ -9501,6 +9902,163 @@ mod tests {
         }
     }
 
+    /// Pure forward+eval benchmark — no HTTP, no tokenizer, no penalties.
+    /// Isolates model forward from all other overhead.
+    ///
+    /// cargo test -p higgs-models --release -- bench_pure_forward_3bit --nocapture --ignored
+    #[test]
+    #[ignore = "requires 3-bit model on disk"]
+    fn bench_pure_forward_3bit() {
+        let model_path = std::env::var("HIGGS_MODEL_PATH").unwrap_or_else(|_| {
+            format!(
+                "{}/.cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit",
+                std::env::var("HOME").unwrap()
+            )
+        });
+        if !std::path::Path::new(&model_path).exists() {
+            eprintln!("Model not found at {model_path}, skipping");
+            return;
+        }
+
+        eprintln!("Loading model from {model_path}...");
+        let mut model = load_qwen3_5_moe_model(&model_path).unwrap();
+        let mut cache: Vec<Option<LayerCache>> = Vec::new();
+
+        // Prefill with a short prompt
+        let prompt = Array::from_slice(&[9707u32, 1879], &[1, 2]);
+        let prefill_out = model.forward(&prompt, None, &mut cache).unwrap();
+        let mut to_eval: Vec<&Array> = vec![&prefill_out];
+        for lc in &cache {
+            if let Some(lc) = lc {
+                match lc {
+                    LayerCache::Arrays(ac) => {
+                        if let Some(ref s) = ac.ssm_state { to_eval.push(s); }
+                        if let Some(ref c) = ac.conv_state { to_eval.push(c); }
+                    }
+                    LayerCache::KV(_) => {}
+                }
+            }
+        }
+        mlx_rs::transforms::eval(to_eval).unwrap();
+
+        let logits = prefill_out.index((.., -1, ..));
+        let token = ops::indexing::argmax_axis(&logits, -1, false).unwrap();
+        mlx_rs::transforms::eval([&token]).unwrap();
+
+        // Helper: eval all cache state
+        let eval_cache = |cache: &Vec<Option<LayerCache>>| {
+            let mut targets: Vec<&Array> = Vec::new();
+            for lc in cache.iter() {
+                if let Some(lc) = lc {
+                    match lc {
+                        LayerCache::Arrays(ac) => {
+                            if let Some(ref s) = ac.ssm_state { targets.push(s); }
+                            if let Some(ref c) = ac.conv_state { targets.push(c); }
+                        }
+                        LayerCache::KV(kv) => { kv.eval_state(); }
+                    }
+                }
+            }
+            if !targets.is_empty() {
+                mlx_rs::transforms::eval(targets).unwrap();
+            }
+        };
+
+        // Warmup 5 tokens (with cache eval to match Python behavior)
+        let mut current = token;
+        for _ in 0..5 {
+            let input = current.index((.., ops::indexing::NewAxis));
+            let out = model.forward(&input, None, &mut cache).unwrap();
+            let next = ops::indexing::argmax_axis(&out.index((.., -1, ..)), -1, false).unwrap();
+            mlx_rs::transforms::eval([&next]).unwrap();
+            eval_cache(&cache);
+            current = next;
+        }
+        eprintln!("Warmup done");
+
+        // Benchmark 50 tokens: measure forward + eval separately
+        let n: usize = std::env::var("HIGGS_BENCH_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let mut fwd_total_ns = 0u128;
+        let mut eval_total_ns = 0u128;
+        let trace_graph = std::env::var("HIGGS_TRACE_GRAPH").is_ok();
+        let mut total_graph_arrays = 0usize;
+        let mut first_graph_arrays = 0usize;
+        let mut total_graph_primitives = 0usize;
+        let mut first_graph_primitives = 0usize;
+        let mut first_op_callsites: Vec<(String, usize)> = Vec::new();
+
+        for i in 0..n {
+            let input = current.index((.., ops::indexing::NewAxis));
+
+            let t0 = std::time::Instant::now();
+            if trace_graph {
+                mlx_rs::debug::reset_graph_stats();
+                GDN_TRACE_CALL_INDEX.store(0, Ordering::Relaxed);
+                MHA_TRACE_CALL_INDEX.store(0, Ordering::Relaxed);
+                FFN_TRACE_CALL_INDEX.store(0, Ordering::Relaxed);
+                mlx_rs::debug::set_graph_stats_enabled(true);
+            }
+            let out = model.forward(&input, None, &mut cache).unwrap();
+            let next = ops::indexing::argmax_axis(&out.index((.., -1, ..)), -1, false).unwrap();
+            let t1 = std::time::Instant::now();
+            if trace_graph {
+                let graph_arrays = mlx_rs::debug::unique_array_count();
+                let graph_primitives = mlx_rs::debug::unique_primitive_count();
+                total_graph_arrays += graph_arrays;
+                total_graph_primitives += graph_primitives;
+                if i == 0 {
+                    first_graph_arrays = graph_arrays;
+                    first_graph_primitives = graph_primitives;
+                    first_op_callsites = mlx_rs::debug::primitive_callsite_counts();
+                }
+                mlx_rs::debug::set_graph_stats_enabled(false);
+            }
+
+            mlx_rs::transforms::eval([&next]).unwrap();
+            eval_cache(&cache);
+            let t2 = std::time::Instant::now();
+
+            fwd_total_ns += (t1 - t0).as_nanos();
+            eval_total_ns += (t2 - t1).as_nanos();
+
+            if i < 3 || i >= n - 3 {
+                eprintln!(
+                    "  Step {i}: fwd={:.2}ms eval={:.2}ms total={:.2}ms",
+                    (t1 - t0).as_secs_f64() * 1000.0,
+                    (t2 - t1).as_secs_f64() * 1000.0,
+                    (t2 - t0).as_secs_f64() * 1000.0,
+                );
+            }
+            current = next;
+        }
+
+        let avg_fwd = fwd_total_ns as f64 / n as f64 / 1e6;
+        let avg_eval = eval_total_ns as f64 / n as f64 / 1e6;
+        let avg_total = avg_fwd + avg_eval;
+        eprintln!("\n=== Pure forward benchmark ({n} tokens) ===");
+        eprintln!("  Forward: {avg_fwd:.2}ms");
+        eprintln!("  Eval:    {avg_eval:.2}ms");
+        eprintln!("  Total:   {avg_total:.2}ms = {:.1} tok/s", 1000.0 / avg_total);
+        if trace_graph {
+            eprintln!(
+                "  Graph:   avg_arrays={:.1} first_step_arrays={first_graph_arrays}",
+                total_graph_arrays as f64 / n as f64,
+            );
+            eprintln!(
+                "  Ops:     avg_primitives={:.1} first_step_primitives={first_graph_primitives}",
+                total_graph_primitives as f64 / n as f64,
+            );
+            eprintln!("  Top primitive callsites (step 0):");
+            for (callsite, count) in first_op_callsites.iter().take(25) {
+                eprintln!("    {count:>3} {callsite}");
+            }
+        }
+        eprintln!("\nCompare: Python sequential eval = 20.4ms = 49.1 tok/s");
+    }
+
     #[test]
     #[ignore = "benchmark, requires GPU"]
     fn bench_metal_kernel_gather_qmm_interleaving() {
@@ -9802,5 +10360,111 @@ mod tests {
                 "extras={n_extras:2} ops~={total_ops:4} eval={avg_ms:.2}ms ({us_per_op:.1}us/op)"
             );
         }
+    }
+
+    /// Measure async_eval pipelining: does GPU overlap with CPU graph building?
+    ///
+    /// cargo test -p higgs-models --release -- bench_async_pipeline --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn bench_async_pipeline() {
+        use mlx_rs::transforms::{eval, async_eval};
+        use mlx_rs::random::normal;
+
+        let d: &[i32] = &[2048, 2048];
+        let w = normal::<f32>(d, None, None, None).unwrap();
+        eval([&w].into_iter()).unwrap();
+
+        let build_graph = |x: &Array| -> Array {
+            let mut h = x.clone();
+            for _ in 0..40 {
+                let mm = h.matmul(&w).unwrap();
+                h = mm.add(&h).unwrap();
+            }
+            h
+        };
+
+        let x = normal::<f32>(&[1, 1, 2048], None, None, None).unwrap();
+        eval([&x].into_iter()).unwrap();
+
+        // Sequential
+        let n = 20usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let y = build_graph(&x);
+            eval([&y].into_iter()).unwrap();
+        }
+        let seq_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+        // Pipelined
+        let t0 = std::time::Instant::now();
+        let mut y = build_graph(&x);
+        async_eval([&y].into_iter()).unwrap();
+        for _ in 0..n {
+            let next_y = build_graph(&y);
+            async_eval([&next_y].into_iter()).unwrap();
+            eval([&y].into_iter()).unwrap();
+            y = next_y;
+        }
+        let pipe_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+        eprintln!("Rust mlx-rs sequential:  {seq_ms:.2}ms/step");
+        eprintln!("Rust mlx-rs pipelined:   {pipe_ms:.2}ms/step");
+        eprintln!("Speedup: {:.2}x", seq_ms / pipe_ms);
+    }
+
+    /// Measure pure FFI graph-building overhead: no eval, just op dispatch.
+    ///
+    /// cargo test -p higgs-models --release -- bench_ffi_overhead --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn bench_ffi_overhead() {
+        use mlx_rs::transforms::eval;
+
+        let a = Array::ones::<f32>(&[1, 1, 2048]).unwrap();
+        let b = Array::ones::<f32>(&[1, 1, 2048]).unwrap();
+        eval([&a, &b].into_iter()).unwrap();
+
+        let n = 2000usize;
+
+        // Graph build only (no eval)
+        let t0 = std::time::Instant::now();
+        let mut x = a.clone();
+        for _ in 0..n {
+            x = x.add(&b).unwrap();
+        }
+        let build_us = t0.elapsed().as_micros();
+        eprintln!(
+            "Rust mlx-rs: {n} adds graph-build = {build_us}us ({:.1}us/op)",
+            build_us as f64 / n as f64
+        );
+
+        // Graph build + eval
+        let t0 = std::time::Instant::now();
+        let mut x = a.clone();
+        for _ in 0..n {
+            x = x.add(&b).unwrap();
+        }
+        eval([&x].into_iter()).unwrap();
+        let total_us = t0.elapsed().as_micros();
+        eprintln!(
+            "Rust mlx-rs: {n} adds + eval = {total_us}us ({:.1}us/op)",
+            total_us as f64 / n as f64
+        );
+
+        // With task-local stream set
+        let stream = Stream::new();
+        mlx_rs::with_new_default_stream(stream, || {
+            let t0 = std::time::Instant::now();
+            let mut x = a.clone();
+            for _ in 0..n {
+                x = x.add(&b).unwrap();
+            }
+            let build_us = t0.elapsed().as_micros();
+            eprintln!(
+                "Rust mlx-rs (task-local stream): {n} adds graph-build = {build_us}us ({:.1}us/op)",
+                build_us as f64 / n as f64
+            );
+        });
     }
 }

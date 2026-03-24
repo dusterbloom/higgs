@@ -294,7 +294,13 @@ async fn chat_completions_non_streaming(
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
     let tokenizer = engine.tokenizer().clone();
-    let thinking_enabled = engine.enable_thinking();
+    // Per-request override: chat_template_kwargs.enable_thinking
+    let thinking_enabled = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|kw| kw.get("enable_thinking"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| engine.enable_thinking());
     let output = tokio::task::spawn_blocking(move || {
         engine.generate(
             &prompt_tokens,
@@ -473,7 +479,12 @@ fn chat_completions_stream(
     });
 
     let tokenizer = engine.tokenizer().clone();
-    let thinking_enabled_stream = engine.enable_thinking();
+    let thinking_enabled_stream = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|kw| kw.get("enable_thinking"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| engine.enable_thinking());
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     tokio::task::spawn_blocking(move || {

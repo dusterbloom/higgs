@@ -214,7 +214,22 @@ impl SimpleEngine {
                 "This model has no chat template; use /v1/completions instead".to_owned(),
             )
         })?;
-        let prompt = renderer.apply_with_thinking(messages, tools, true, self.enable_thinking)?;
+        self.prepare_chat_prompt_with_thinking(messages, tools, self.enable_thinking)
+    }
+
+    /// Prepare a chat prompt with an explicit thinking mode override.
+    pub fn prepare_chat_prompt_with_thinking(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+    ) -> Result<Vec<u32>, EngineError> {
+        let renderer = self.template.as_ref().ok_or_else(|| {
+            EngineError::Template(
+                "This model has no chat template; use /v1/completions instead".to_owned(),
+            )
+        })?;
+        let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
         let encoding = self
             .tokenizer
             .encode(prompt.as_str(), false)
@@ -876,6 +891,28 @@ impl SimpleEngine {
         let mut total_other_ns: u128 = 0;
         let mut step_count: u32 = 0;
 
+        // Compiled decode: trace the forward pass once, replay cached Metal
+        // commands on subsequent steps. Eliminates ~10ms/step of FFI overhead.
+        let use_compiled = crate::compiled_decode::compiled_decode_enabled()
+            && constraint.is_none(); // constrained decoding can't use compiled path
+        #[allow(unsafe_code)]
+        let mut compiled_step = if use_compiled {
+            match unsafe {
+                crate::compiled_decode::CompiledDecodeStep::new(
+                    &mut prepared.model,
+                    &mut prepared.cache,
+                )
+            } {
+                Ok(cs) => Some(cs),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to create compiled decode, falling back");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Thinking budget: force </think> after N tokens if model hasn't closed it.
         // Only active when enable_thinking is true.
         const THINK_CLOSE_TOKEN: u32 = 248069;
@@ -897,15 +934,40 @@ impl SimpleEngine {
                 id
             });
 
-            let (following, following_logprob_data) = Self::decode_step(
-                &next_token,
-                &mut prepared.model,
-                &mut prepared.cache,
-                params,
-                &tokens,
-                logprob_top_n,
-                constraint.as_ref(),
-            )?;
+            let (following, following_logprob_data) = if let Some(ref mut cs) = compiled_step {
+                // Compiled path: forward + slice are compiled, sampling is separate.
+                let logits = cs.step(&next_token)?;
+                let penalized = apply_penalties(&logits, &tokens, params)
+                    .map_err(EngineError::Mlx)?;
+                let next = sample(&penalized, params).map_err(EngineError::Mlx)?;
+                let lp = if let Some(top_n) = logprob_top_n {
+                    let scaled = if params.temperature <= f32::EPSILON {
+                        penalized
+                    } else {
+                        penalized
+                            .multiply(mlx_rs::array!(1.0 / params.temperature))
+                            .map_err(EngineError::Mlx)?
+                    };
+                    Some(
+                        LogprobArrays::compute(&scaled, &next, Some(top_n))
+                            .map_err(EngineError::Mlx)?,
+                    )
+                } else {
+                    None
+                };
+                (next, lp)
+            } else {
+                // Original uncompiled path.
+                Self::decode_step(
+                    &next_token,
+                    &mut prepared.model,
+                    &mut prepared.cache,
+                    params,
+                    &tokens,
+                    logprob_top_n,
+                    constraint.as_ref(),
+                )?
+            };
             let t1 = std::time::Instant::now();
             {
                 let mut eval_targets: Vec<&Array> = vec![&following];

@@ -18,7 +18,18 @@ pub trait KeyValueCache {
     }
 
     /// Current sequence offset (number of tokens already cached).
+    ///
+    /// Returns the offset as a concrete `i32`. During non-compiled execution
+    /// this extracts from the underlying Array instantly. Callers inside a
+    /// compiled trace should use `offset_array()` instead.
     fn offset(&self) -> i32;
+
+    /// Current sequence offset as an `Array` (for compiled trace paths).
+    ///
+    /// Default implementation wraps `offset()` in a scalar Array.
+    fn offset_array(&self) -> Array {
+        Array::from_int(self.offset())
+    }
 
     /// Maximum cache size, if bounded.
     fn max_size(&self) -> Option<i32>;
@@ -46,6 +57,10 @@ where
 
     fn offset(&self) -> i32 {
         T::offset(self)
+    }
+
+    fn offset_array(&self) -> Array {
+        T::offset_array(self)
     }
 
     fn max_size(&self) -> Option<i32> {
@@ -126,11 +141,14 @@ impl KeyValueCache for ConcatKeyValueCache {
 /// Matches Python `mlx_lm`'s `KVCache`: pre-allocates 256 slots at a time and
 /// uses `mlx_slice_update` for writes instead of concatenation every token.
 /// Keys/values have shape `[B, n_heads, seq_len, head_dim]` with sequence on axis 2.
+///
+/// `offset` is stored as an `Array` (scalar i32) so that `FlatCache` can
+/// round-trip it without calling `.item()`, which panics during `mx.compile` trace.
 #[derive(Debug, Clone)]
 pub struct SteppingKeyValueCache {
     keys: Option<Array>,
     values: Option<Array>,
-    offset: i32,
+    offset: Array,
     step: i32,
 }
 
@@ -139,7 +157,7 @@ impl Default for SteppingKeyValueCache {
         Self {
             keys: None,
             values: None,
-            offset: 0,
+            offset: Array::from_int(0),
             step: 256,
         }
     }
@@ -148,6 +166,41 @@ impl Default for SteppingKeyValueCache {
 impl SteppingKeyValueCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reference to cached keys (for FlatCache packing).
+    pub fn keys_ref(&self) -> Option<&Array> {
+        self.keys.as_ref()
+    }
+
+    /// Reference to cached values (for FlatCache packing).
+    pub fn values_ref(&self) -> Option<&Array> {
+        self.values.as_ref()
+    }
+
+    /// Set keys directly (for FlatCache unpacking).
+    pub fn set_keys(&mut self, keys: Array) {
+        self.keys = Some(keys);
+    }
+
+    /// Set values directly (for FlatCache unpacking).
+    pub fn set_values(&mut self, values: Array) {
+        self.values = Some(values);
+    }
+
+    /// Set offset directly from a concrete i32 (wraps in a scalar Array).
+    pub fn set_offset(&mut self, offset: i32) {
+        self.offset = Array::from_int(offset);
+    }
+
+    /// Set offset directly from an Array (for FlatCache unpacking in compiled path).
+    pub fn set_offset_array(&mut self, offset: Array) {
+        self.offset = offset;
+    }
+
+    /// Get the offset as an Array reference (for FlatCache packing).
+    pub fn offset_array_ref(&self) -> &Array {
+        &self.offset
     }
 }
 
@@ -224,9 +277,23 @@ fn slice_update_axis2(
     }
 }
 
+impl SteppingKeyValueCache {
+    /// Evaluate cached keys/values/offset to prevent graph accumulation.
+    pub fn eval_state(&self) {
+        let mut targets: Vec<&Array> = vec![&self.offset];
+        if let Some(ref k) = self.keys { targets.push(k); }
+        if let Some(ref v) = self.values { targets.push(v); }
+        let _ = mlx_rs::transforms::eval(targets);
+    }
+}
+
 impl KeyValueCache for SteppingKeyValueCache {
     fn offset(&self) -> i32 {
-        self.offset
+        self.offset.item::<i32>()
+    }
+
+    fn offset_array(&self) -> Array {
+        self.offset.clone()
     }
 
     fn max_size(&self) -> Option<i32> {
@@ -239,13 +306,17 @@ impl KeyValueCache for SteppingKeyValueCache {
         keys: Array,
         values: Array,
     ) -> Result<(Array, Array), Exception> {
-        let prev = self.offset;
         let new_tokens = keys.shape()[2];
+
+        // Growth check needs concrete offset. During compiled decode (seq=1),
+        // the buffer is pre-grown during prefill so this path isn't hit.
+        // For prefill (non-compiled), .item() is safe on a concrete array.
+        let prev_concrete = self.offset.item::<i32>();
 
         let need_grow = self
             .keys
             .as_ref()
-            .is_none_or(|k| (prev + new_tokens) > k.shape()[2]);
+            .is_none_or(|k| (prev_concrete + new_tokens) > k.shape()[2]);
 
         if need_grow {
             let b = keys.shape()[0];
@@ -261,8 +332,11 @@ impl KeyValueCache for SteppingKeyValueCache {
 
             let (grown_k, grown_v) = match (self.keys.as_ref(), self.values.as_ref()) {
                 (Some(old_k), Some(old_v)) => {
-                    let (trimmed_k, trimmed_v) = if prev % self.step != 0 {
-                        (slice_axis2(old_k, 0, prev)?, slice_axis2(old_v, 0, prev)?)
+                    let (trimmed_k, trimmed_v) = if prev_concrete % self.step != 0 {
+                        (
+                            slice_axis2(old_k, 0, prev_concrete)?,
+                            slice_axis2(old_v, 0, prev_concrete)?,
+                        )
                     } else {
                         (old_k.clone(), old_v.clone())
                     };
@@ -285,29 +359,221 @@ impl KeyValueCache for SteppingKeyValueCache {
             .as_ref()
             .ok_or_else(|| Exception::custom("Values cannot be None after grow"))?;
 
-        let updated_k = slice_update_axis2(k, &keys, prev, new_tokens)?;
-        let updated_v = slice_update_axis2(v, &values, prev, new_tokens)?;
+        // Write new K/V at the current offset position.
+        let updated_k = slice_update_axis2(k, &keys, prev_concrete, new_tokens)?;
+        let updated_v = slice_update_axis2(v, &values, prev_concrete, new_tokens)?;
         self.keys = Some(updated_k);
         self.values = Some(updated_v);
 
-        self.offset = prev + new_tokens;
+        let new_offset = prev_concrete + new_tokens;
+        self.offset = Array::from_int(new_offset);
 
+        // Read: slice up to the new offset.
         let result_k = slice_axis2(
             self.keys
                 .as_ref()
                 .ok_or_else(|| Exception::custom("Keys cannot be None after update"))?,
             0,
-            self.offset,
+            new_offset,
         )?;
         let result_v = slice_axis2(
             self.values
                 .as_ref()
                 .ok_or_else(|| Exception::custom("Values cannot be None after update"))?,
             0,
-            self.offset,
+            new_offset,
         )?;
 
         Ok((result_k, result_v))
+    }
+}
+
+impl SteppingKeyValueCache {
+    /// Compiled-mode update: concatenation-based (fully traceable by mx.compile).
+    ///
+    /// Instead of slice_update into a pre-allocated buffer (which needs `.item()`
+    /// for concrete indices), this simply concatenates the new KV onto the existing
+    /// cache. No padding, no masking. Shape grows by `new_tokens` each step —
+    /// `shapeless=true` in mx.compile handles this.
+    ///
+    /// Call only after prefill has populated `self.keys`/`self.values`.
+    pub fn update_and_fetch_compiled(
+        &mut self,
+        keys: Array,
+        values: Array,
+    ) -> Result<(Array, Array), Exception> {
+        // Number of new tokens from input shape (concrete during trace)
+        let new_tokens = keys.shape()[2];
+
+        let (result_k, result_v) = match (self.keys.take(), self.values.take()) {
+            (Some(old_k), Some(old_v)) => {
+                let new_k = concatenate_axis(&[old_k, keys], 2)?;
+                let new_v = concatenate_axis(&[old_v, values], 2)?;
+                (new_k, new_v)
+            }
+            _ => (keys, values),
+        };
+
+        self.keys = Some(result_k.clone());
+        self.values = Some(result_v.clone());
+        self.offset = self.offset.add(Array::from_int(new_tokens))?;
+
+        Ok((result_k, result_v))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FlatCache: flattened cache for compiled decode
+// ---------------------------------------------------------------------------
+
+/// Describes which flat-array indices belong to each layer's cache.
+#[derive(Debug, Clone)]
+pub enum FlatCacheSlot {
+    /// GDN layer: conv_state + ssm_state + offset_scalar
+    Gdn {
+        conv_idx: usize,
+        ssm_idx: usize,
+        offset_idx: usize,
+    },
+    /// MHA layer: keys + values + offset_scalar
+    Kv {
+        keys_idx: usize,
+        values_idx: usize,
+        offset_idx: usize,
+    },
+}
+
+/// All layer cache state flattened into a single `Vec<Array>`.
+///
+/// This enables `mlx_compile` by making cache state explicit inputs/outputs
+/// instead of mutable side effects. The compiled closure receives and returns
+/// these arrays, and the evaluator can trace through them.
+#[derive(Debug, Clone)]
+pub struct FlatCache {
+    /// Flat array of all cache state. Layout described by `slots`.
+    pub arrays: Vec<Array>,
+    /// Per-layer metadata: which indices in `arrays` belong to each layer.
+    pub slots: Vec<FlatCacheSlot>,
+}
+
+impl FlatCache {
+    /// Pack a hybrid cache (Vec<Option<LayerCache>>) into a flat array vec.
+    ///
+    /// Any `None` arrays (uninitialized cache) become zero-filled sentinels
+    /// with shapes that will be correct for the first decode step.
+    /// Offsets are stored as scalar i32 arrays so compile can trace them.
+    pub fn pack(
+        layers: &[Option<crate::qwen3_next::LayerCache>],
+    ) -> Result<Self, Exception> {
+        let mut arrays = Vec::new();
+        let mut slots = Vec::new();
+
+        for layer in layers {
+            let layer = layer
+                .as_ref()
+                .ok_or_else(|| Exception::custom("FlatCache::pack: layer cache is None"))?;
+            match layer {
+                crate::qwen3_next::LayerCache::Arrays(ac) => {
+                    let conv_idx = arrays.len();
+                    arrays.push(
+                        ac.conv_state
+                            .clone()
+                            .unwrap_or_else(|| Array::from_f32(0.0)),
+                    );
+                    let ssm_idx = arrays.len();
+                    arrays.push(
+                        ac.ssm_state
+                            .clone()
+                            .unwrap_or_else(|| Array::from_f32(0.0)),
+                    );
+                    let offset_idx = arrays.len();
+                    arrays.push(ac.offset.clone());
+                    slots.push(FlatCacheSlot::Gdn {
+                        conv_idx,
+                        ssm_idx,
+                        offset_idx,
+                    });
+                }
+                crate::qwen3_next::LayerCache::KV(kv) => {
+                    let keys_idx = arrays.len();
+                    arrays.push(
+                        kv.keys_ref()
+                            .cloned()
+                            .unwrap_or_else(|| Array::from_f32(0.0)),
+                    );
+                    let values_idx = arrays.len();
+                    arrays.push(
+                        kv.values_ref()
+                            .cloned()
+                            .unwrap_or_else(|| Array::from_f32(0.0)),
+                    );
+                    let offset_idx = arrays.len();
+                    arrays.push(kv.offset_array_ref().clone());
+                    slots.push(FlatCacheSlot::Kv {
+                        keys_idx,
+                        values_idx,
+                        offset_idx,
+                    });
+                }
+            }
+        }
+
+        Ok(Self { arrays, slots })
+    }
+
+    /// Unpack flat arrays back into the structured cache.
+    pub fn unpack(
+        &self,
+        layers: &mut [Option<crate::qwen3_next::LayerCache>],
+    ) -> Result<(), Exception> {
+        for (i, slot) in self.slots.iter().enumerate() {
+            let layer = layers
+                .get_mut(i)
+                .and_then(|l| l.as_mut())
+                .ok_or_else(|| Exception::custom("FlatCache::unpack: layer index out of bounds"))?;
+            match (slot, layer) {
+                (
+                    FlatCacheSlot::Gdn {
+                        conv_idx,
+                        ssm_idx,
+                        offset_idx,
+                    },
+                    crate::qwen3_next::LayerCache::Arrays(ac),
+                ) => {
+                    ac.conv_state = Some(self.arrays[*conv_idx].clone());
+                    ac.ssm_state = Some(self.arrays[*ssm_idx].clone());
+                    ac.offset = self.arrays[*offset_idx].clone();
+                }
+                (
+                    FlatCacheSlot::Kv {
+                        keys_idx,
+                        values_idx,
+                        offset_idx,
+                    },
+                    crate::qwen3_next::LayerCache::KV(kv),
+                ) => {
+                    kv.set_keys(self.arrays[*keys_idx].clone());
+                    kv.set_values(self.arrays[*values_idx].clone());
+                    kv.set_offset_array(self.arrays[*offset_idx].clone());
+                }
+                _ => {
+                    return Err(Exception::custom(
+                        "FlatCache::unpack: slot type mismatch",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Number of arrays in the flat cache.
+    pub fn len(&self) -> usize {
+        self.arrays.len()
+    }
+
+    /// Whether the flat cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.arrays.is_empty()
     }
 }
 

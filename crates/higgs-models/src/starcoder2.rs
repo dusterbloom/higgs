@@ -247,15 +247,17 @@ where
             .transpose_axes(&[0, 2, 1, 3])?;
 
         if let Some(ref mut kv_cache) = cache {
-            queries = apply_rope(&queries, &self.rope, kv_cache.offset())?;
-            keys = apply_rope(&keys, &self.rope, kv_cache.offset())?;
+            let off = kv_cache.offset_array();
+            queries = apply_rope(&queries, &self.rope, &off)?;
+            keys = apply_rope(&keys, &self.rope, &off)?;
 
             let (cached_keys, cached_values) = kv_cache.update_and_fetch(keys, values)?;
             keys = cached_keys;
             values = cached_values;
         } else {
-            queries = apply_rope(&queries, &self.rope, 0)?;
-            keys = apply_rope(&keys, &self.rope, 0)?;
+            let zero = Array::from_int(0);
+            queries = apply_rope(&queries, &self.rope, &zero)?;
+            keys = apply_rope(&keys, &self.rope, &zero)?;
         }
 
         let output = scaled_dot_product_attention(queries, keys, values, self.scale, mask)?

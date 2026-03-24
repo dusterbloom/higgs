@@ -33,6 +33,9 @@ pub struct ChatCompletionRequest {
     pub logprobs: Option<bool>,
     #[serde(default)]
     pub top_logprobs: Option<u32>,
+    /// Per-request chat template overrides (e.g. `{"enable_thinking": false}`).
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Response format specification.
