@@ -927,7 +927,7 @@ impl SimpleEngine {
         const THINKING_BUDGET: u32 = 256;
         let think_close_token = self.think_close_token;
         let mut thinking_tokens: u32 = 0;
-        let mut seen_think_close = think_close_token.is_none();
+        let mut seen_think_close = false;
 
         loop {
             let t0 = std::time::Instant::now();
@@ -995,17 +995,17 @@ impl SimpleEngine {
             let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
 
             // Thinking budget: force </think> after N tokens if model hasn't closed it.
-            if !seen_think_close {
-                if Some(token_id) == think_close_token {
-                    seen_think_close = true;
-                } else {
-                    thinking_tokens += 1;
-                    if thinking_tokens >= THINKING_BUDGET {
-                        if let Some(close_id) = think_close_token {
-                            token_id = close_id;
-                        }
+            if let Some(close_id) = think_close_token {
+                if !seen_think_close {
+                    if token_id == close_id {
                         seen_think_close = true;
-                        tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
+                    } else {
+                        thinking_tokens += 1;
+                        if thinking_tokens >= THINKING_BUDGET {
+                            token_id = close_id;
+                            seen_think_close = true;
+                            tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
+                        }
                     }
                 }
             }
@@ -1290,7 +1290,7 @@ impl SimpleEngine {
         const THINKING_BUDGET: u32 = 256;
         let think_close_token = self.think_close_token;
         let mut thinking_tokens: u32 = 0;
-        let mut seen_think_close = think_close_token.is_none();
+        let mut seen_think_close = false;
 
         // Pipelined decode loop: build step N+2 while GPU computes step N+1
         let (mut next_token, mut next_logprob_data) = Self::decode_step(
@@ -1331,17 +1331,17 @@ impl SimpleEngine {
             let mut token_id: u32 = next_token.item();
 
             // Thinking budget: force </think> after N tokens if model hasn't closed it.
-            if !seen_think_close {
-                if Some(token_id) == think_close_token {
-                    seen_think_close = true;
-                } else {
-                    thinking_tokens += 1;
-                    if thinking_tokens >= THINKING_BUDGET {
-                        if let Some(close_id) = think_close_token {
-                            token_id = close_id;
-                        }
+            if let Some(close_id) = think_close_token {
+                if !seen_think_close {
+                    if token_id == close_id {
                         seen_think_close = true;
-                        tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
+                    } else {
+                        thinking_tokens += 1;
+                        if thinking_tokens >= THINKING_BUDGET {
+                            token_id = close_id;
+                            seen_think_close = true;
+                            tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
+                        }
                     }
                 }
             }
@@ -1415,7 +1415,16 @@ impl SimpleEngine {
                 break;
             }
 
-            next_token = following;
+            // If thinking budget was just reached, override the pipelined token
+            // so the next decode step gets </think> as input.
+            if seen_think_close && thinking_tokens == THINKING_BUDGET {
+                if let Some(close_id) = think_close_token {
+                    next_token = Array::from_slice(&[close_id], &[1]);
+                }
+                thinking_tokens += 1; // prevent re-triggering
+            } else {
+                next_token = following;
+            }
             next_logprob_data = following_logprob_data;
         }
 
