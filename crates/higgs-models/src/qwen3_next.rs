@@ -107,6 +107,19 @@ pub struct QuantizationConfig {
     pub bits: i32,
 }
 
+/// Configuration for the Qwen3-Next / Qwen3.5 hybrid architecture.
+///
+/// Supports hybrid SSM/attention transformers with optional Sparse MoE.
+/// Every `full_attention_interval`-th layer uses full attention, all other
+/// layers use `GatedDeltaNet` (SSM-like linear attention). MoE layers are
+/// enabled when `decoder_sparse_step > 0` and `num_experts > 0`.
+///
+/// Key fields:
+/// - `norm_topk_prob` — normalize top-k expert scores (default `true`).
+/// - `gate_quantization` — optional quantization override for MoE gate weights.
+/// - `use_separate_gdn_projections` — when `true`, GDN layers use 4 separate
+///   projection matrices; when `false` (default), projections are fused to 2
+///   combined matrices for fewer GPU dispatches.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen3NextModelArgs {
     pub model_type: String,
@@ -1938,11 +1951,13 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
             .or_insert(serde_json::Value::from(0));
     }
 
-    // Weights are rearranged from flat (qkv,z,b,a) to per-head-grouped
-    // (qkvz,ba) at load time, so we use the combined forward path.
+    // When HIGGS_SEPARATE_GDN_PROJ is set, construct the model with separate
+    // GDN projection fields so the direct weight loader can match them.
+    // Otherwise, construct with fused fields (weights are rearranged at load time).
+    let use_separate = std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
     map.insert(
         "use_separate_gdn_projections".to_owned(),
-        serde_json::Value::from(false),
+        serde_json::Value::from(use_separate),
     );
 
     // Detect per-layer gate quantization override from top-level quantization config
