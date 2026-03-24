@@ -224,11 +224,6 @@ impl SimpleEngine {
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
     ) -> Result<Vec<u32>, EngineError> {
-        let renderer = self.template.as_ref().ok_or_else(|| {
-            EngineError::Template(
-                "This model has no chat template; use /v1/completions instead".to_owned(),
-            )
-        })?;
         self.prepare_chat_prompt_with_thinking(messages, tools, self.enable_thinking)
     }
 
