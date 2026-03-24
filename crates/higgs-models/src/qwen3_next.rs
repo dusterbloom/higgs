@@ -2445,9 +2445,8 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
             tracing::warn!(key = %k, "Unmatched weight key");
         }
     }
-    // Also log unset params (model params that weren't loaded)
-    let still_zero: Vec<_> = params.keys().take(5).collect();
-    tracing::info!(?still_zero, "First 5 param keys in model");
+    let param_count = params.keys().count();
+    tracing::info!(param_count, "Total model parameters loaded");
 
     model
         .eval()
