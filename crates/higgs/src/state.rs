@@ -32,16 +32,6 @@ impl Engine {
         SimpleEngine::load(dir, kv_cache_config).map(|e| Self::Simple(Box::new(e)))
     }
 
-    pub fn load_simple_with_draft<P: AsRef<Path>>(
-        dir: P,
-        draft_dir: P,
-        num_draft: usize,
-        kv_cache_config: KvCacheConfig,
-    ) -> Result<Self, EngineError> {
-        SimpleEngine::load_with_draft(dir, Some(draft_dir), num_draft, kv_cache_config)
-            .map(|e| Self::Simple(Box::new(e)))
-    }
-
     pub fn load_batch<P: AsRef<Path>>(
         dir: P,
         kv_cache_config: KvCacheConfig,

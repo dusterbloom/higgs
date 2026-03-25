@@ -116,14 +116,6 @@ pub struct ServeArgs {
     #[arg(long)]
     pub batch: bool,
 
-    /// Path to a draft model for speculative decoding.
-    #[arg(long)]
-    pub draft_model: Option<String>,
-
-    /// Number of draft tokens per speculative cycle (default: 16).
-    #[arg(long, default_value = "16")]
-    pub num_draft: usize,
-
     /// KV cache mode for simple mode models.
     #[arg(long, value_name = "MODE", value_parser = ["off", "turboquant"])]
     pub kv_cache: Option<String>,
@@ -224,19 +216,11 @@ pub struct ModelConfig {
     #[serde(default)]
     pub batch: bool,
     #[serde(default)]
-    pub draft_model: Option<String>,
-    #[serde(default = "default_num_draft")]
-    pub num_draft: usize,
-    #[serde(default)]
     pub kv_cache: KvCacheMode,
     #[serde(default = "default_kv_bits")]
     pub kv_bits: u8,
     #[serde(default)]
     pub kv_seed: u64,
-}
-
-const fn default_num_draft() -> usize {
-    16
 }
 
 const fn default_kv_bits() -> u8 {
@@ -441,8 +425,6 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             path: p.clone(),
             name: None,
             batch: args.batch,
-            draft_model: args.draft_model.clone(),
-            num_draft: args.num_draft,
             kv_cache,
             kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
             kv_seed: args.kv_seed.unwrap_or_default(),
@@ -522,8 +504,6 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     path: p.clone(),
                     name: None,
                     batch: serve_args.batch,
-                    draft_model: serve_args.draft_model.clone(),
-                    num_draft: serve_args.num_draft,
                     kv_cache,
                     kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
@@ -644,8 +624,6 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         path,
         name: Some(name.clone()),
         batch: false,
-        draft_model: None,
-        num_draft: default_num_draft(),
         kv_cache: KvCacheMode::Off,
         kv_bits: default_kv_bits(),
         kv_seed: 0,
@@ -783,9 +761,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: true,
-            draft_model: None,
-            num_draft: 16,
-            kv_cache: None,
+                    kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -809,9 +785,7 @@ mod tests {
             rate_limit: Some(60),
             timeout: Some(60.0),
             batch: false,
-            draft_model: None,
-            num_draft: 16,
-            kv_cache: None,
+                    kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -835,9 +809,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-            draft_model: None,
-            num_draft: 16,
-            kv_cache: Some("turboquant".to_owned()),
+                    kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(4),
             kv_seed: Some(99),
         };
@@ -859,9 +831,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-            draft_model: None,
-            num_draft: 16,
-            kv_cache: None,
+                    kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -879,9 +849,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-            draft_model: None,
-            num_draft: 16,
-            kv_cache: None,
+                    kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -899,9 +867,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-            draft_model: None,
-            num_draft: 16,
-            kv_cache: None,
+                    kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -919,9 +885,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: true,
-            draft_model: None,
-            num_draft: 16,
-            kv_cache: Some("turboquant".to_owned()),
+                    kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(3),
             kv_seed: Some(0),
         };
@@ -1227,9 +1191,7 @@ mod tests {
             rate_limit: None,
             timeout: Some(-1.0),
             batch: false,
-            draft_model: None,
-            num_draft: 16,
-            kv_cache: None,
+                    kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -1262,9 +1224,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-            draft_model: None,
-            num_draft: 16,
-            kv_cache: None,
+                    kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
