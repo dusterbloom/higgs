@@ -2058,8 +2058,14 @@ struct GdnDims {
 
 /// Build row permutation to convert flat [q_all|k_all|v_all|z_all] layout
 /// to per-head-grouped [q_h0|k_h0|v_h0|z_h0|q_h1|...] for in_proj_qkvz.
-fn build_qkvz_permutation(d: &GdnDims) -> Vec<i32> {
+fn build_qkvz_permutation(d: &GdnDims) -> Result<Vec<i32>, Exception> {
     let nk = d.num_k_heads;
+    if nk == 0 || d.num_v_heads % nk != 0 {
+        return Err(Exception::custom(format!(
+            "GQA ratio invalid: num_v_heads={} not divisible by num_k_heads={nk}",
+            d.num_v_heads
+        )));
+    }
     let dk = d.head_k_dim;
     let v_per_k = d.num_v_heads / nk;
     let dv = d.head_v_dim;
@@ -2085,7 +2091,7 @@ fn build_qkvz_permutation(d: &GdnDims) -> Vec<i32> {
             perm.push(qkv_rows + h * v_per_k * dv + i);
         }
     }
-    perm
+    Ok(perm)
 }
 
 /// Build row permutation for flat [b_all|a_all] → per-head-grouped [b_h0|a_h0|b_h1|a_h1|...].
@@ -2185,7 +2191,8 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
     let mut params = model.parameters_mut().flatten();
 
-    let qkvz_perm = build_qkvz_permutation(gdn_dims);
+    let qkvz_perm = build_qkvz_permutation(gdn_dims)
+        .map_err(|e| crate::error::ModelError::ShapeMismatch(e.to_string()))?;
     let ba_perm = build_ba_permutation(gdn_dims);
 
     // GDN split keys: collect (part_a, part_b) for each combined target

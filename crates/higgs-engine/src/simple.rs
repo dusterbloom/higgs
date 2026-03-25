@@ -631,7 +631,11 @@ impl SimpleEngine {
 
         // Thinking budget: force </think> after N tokens if model hasn't closed it.
         const THINKING_BUDGET: u32 = 256;
-        let think_close_token = self.think_close_token;
+        let think_close_token = if self.enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
         let mut thinking_tokens: u32 = 0;
         let mut seen_think_close = think_close_token.is_none(); // skip tracking if no token
 
@@ -953,7 +957,11 @@ impl SimpleEngine {
 
         // Thinking budget (streaming): force </think> after N tokens.
         const THINKING_BUDGET: u32 = 256;
-        let think_close_token = self.think_close_token;
+        let think_close_token = if self.enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
         let mut thinking_tokens: u32 = 0;
         let mut seen_think_close = think_close_token.is_none();
 
@@ -1201,11 +1209,18 @@ fn detect_thinking_support(model_dir: &Path) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    // Qwen3.5 models (qwen3_5, qwen3_5_moe) support <think> tags
-    matches!(
-        config.get("model_type").and_then(|v| v.as_str()),
-        Some("qwen3_5" | "qwen3_5_moe")
-    )
+    // Qwen3.5 models (qwen3_5, qwen3_5_moe) support <think> tags.
+    // Check both top-level and nested text_config for VLM wrappers.
+    let model_type = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("model_type"))
+                .and_then(|v| v.as_str())
+        });
+    matches!(model_type, Some("qwen3_5" | "qwen3_5_moe"))
 }
 
 #[cfg(test)]
