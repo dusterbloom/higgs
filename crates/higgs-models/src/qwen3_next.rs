@@ -94,7 +94,7 @@ const fn default_partial_rotary_factor() -> f32 {
 }
 
 /// Match Python mlx-lm default: `norm_topk_prob: bool = True`.
-/// Without normalization, MoE expert scores sum to ~0.39 instead of 1.0,
+/// Without normalization, `MoE` expert scores sum to ~0.39 instead of 1.0,
 /// producing 0.39x output magnitude and degenerate generation.
 const fn default_norm_topk_prob() -> bool {
     true
@@ -278,14 +278,15 @@ impl QEmbedding {
     }
 
     pub(crate) fn forward(&self, indices: &Array) -> Result<Array, Exception> {
-        let full = ops::dequantize(
-            &*self.weight,
-            &*self.scales,
-            &*self.biases,
-            self.group_size,
-            self.bits,
-        )?;
-        full.take_axis(indices, 0)
+        let shape = indices.shape().to_vec();
+        let flat = indices.flatten(None, None)?;
+        let w = (*self.weight).take_axis(&flat, 0)?;
+        let s = (*self.scales).take_axis(&flat, 0)?;
+        let b = (*self.biases).take_axis(&flat, 0)?;
+        let out = ops::dequantize(&w, &s, &b, self.group_size, self.bits)?;
+        let mut ret_shape: Vec<i32> = shape.to_vec();
+        ret_shape.push(-1);
+        out.reshape(&ret_shape)
     }
 
     pub(crate) fn as_linear(&self, x: &Array) -> Result<Array, Exception> {
@@ -982,6 +983,7 @@ impl SparseMoeBlock {
         })
     }
 
+    #[allow(dead_code)]
     fn forward(&self, x: &Array) -> Result<Array, Exception> {
         let gates = ops::softmax_axis(&self.gate.forward(x)?, -1, true)?;
 
