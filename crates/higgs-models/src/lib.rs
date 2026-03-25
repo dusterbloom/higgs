@@ -10,6 +10,7 @@ pub mod registry;
 pub mod siglip;
 pub mod starcoder2;
 pub mod transformer;
+pub mod turboquant;
 pub mod utils;
 
 use std::collections::{HashMap, HashSet};
@@ -22,6 +23,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::ModelError;
+use crate::turboquant::KvCacheConfig;
 
 // ---------------------------------------------------------------------------
 // SamplingParams -- configurable sampling parameters
@@ -104,6 +106,18 @@ pub enum AnyModel {
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
 }
 
+fn checked_head_dim(hidden_size: i32, num_attention_heads: i32) -> Result<i32, Exception> {
+    if num_attention_heads <= 0 {
+        return Err(Exception::custom("num_attention_heads must be positive"));
+    }
+    if hidden_size % num_attention_heads != 0 {
+        return Err(Exception::custom(format!(
+            "hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_attention_heads})",
+        )));
+    }
+    Ok(hidden_size / num_attention_heads)
+}
+
 fn make_kv_cache(num_hidden_layers: i32) -> AnyCache {
     let Ok(n_layers) = usize::try_from(num_hidden_layers) else {
         tracing::warn!(
@@ -117,6 +131,30 @@ fn make_kv_cache(num_hidden_layers: i32) -> AnyCache {
             .map(|_| Some(cache::SteppingKeyValueCache::new()))
             .collect(),
     )
+}
+
+fn make_turboquant_kv_cache(
+    num_hidden_layers: i32,
+    num_key_value_heads: i32,
+    head_dim: i32,
+    kv_cache_config: KvCacheConfig,
+) -> Result<AnyCache, Exception> {
+    let Ok(n_layers) = usize::try_from(num_hidden_layers) else {
+        tracing::warn!(
+            num_hidden_layers,
+            "negative num_hidden_layers; returning empty KV cache"
+        );
+        return Ok(AnyCache::KV(vec![]));
+    };
+    let mut caches = Vec::with_capacity(n_layers);
+    for _ in 0..n_layers {
+        caches.push(Some(cache::SteppingKeyValueCache::new_turbo(
+            kv_cache_config,
+            num_key_value_heads,
+            head_dim,
+        )?));
+    }
+    Ok(AnyCache::KV(caches))
 }
 
 impl AnyModel {
@@ -214,15 +252,106 @@ impl AnyModel {
     }
 
     pub fn make_cache(&self) -> AnyCache {
+        // Default to dense KV storage when no explicit config is provided.
+        match self.make_cache_with_config(KvCacheConfig::default()) {
+            Ok(cache) => cache,
+            Err(err) => {
+                tracing::error!(error = %err, "dense cache creation unexpectedly failed");
+                AnyCache::KV(vec![])
+            }
+        }
+    }
+
+    pub fn make_cache_with_config(
+        &self,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<AnyCache, Exception> {
         match self {
-            Self::Transformer(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::Qwen3Moe(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::Gemma2(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::Phi3(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::Starcoder2(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::LlavaQwen2(m) => make_kv_cache(m.num_hidden_layers()),
-            Self::DeepSeekV2(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::Qwen3Next(m) => AnyCache::Hybrid(m.make_cache()),
+            Self::Transformer(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        m.args.checked_head_dim()
+                            .map_err(|err| Exception::custom(err.to_string()))?,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
+            Self::Qwen3Moe(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
+            Self::Gemma2(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
+            Self::Phi3(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
+            Self::Starcoder2(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
+            Self::LlavaQwen2(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not yet supported for LlavaQwen2 models",
+                    ));
+                }
+                Ok(make_kv_cache(m.num_hidden_layers()))
+            }
+            Self::DeepSeekV2(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is only supported for standard KV transformer models",
+                    ));
+                }
+                Ok(make_kv_cache(m.args.num_hidden_layers))
+            }
+            Self::Qwen3Next(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not supported for qwen3_next hybrid caches",
+                    ));
+                }
+                Ok(AnyCache::Hybrid(m.make_cache()))
+            }
         }
     }
 
@@ -757,6 +886,7 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::cache::KeyValueCache;
 
     fn params(temp: f32, top_p: f32) -> SamplingParams {
         SamplingParams {
@@ -1040,6 +1170,26 @@ mod tests {
         let cache = any.make_cache();
         match &cache {
             AnyCache::KV(layers) => assert_eq!(layers.len(), 2),
+            AnyCache::Hybrid(_) => panic!("Expected KV cache for Qwen3Moe"),
+        }
+    }
+
+    #[test]
+    fn any_model_qwen3_moe_make_cache_with_turboquant_returns_quantized_kv() {
+        let model = qwen3_moe::Qwen3MoeCausalLM::new(small_qwen3_moe_args()).unwrap();
+        let any = AnyModel::Qwen3Moe(model);
+        let cache = any
+            .make_cache_with_config(turboquant::KvCacheConfig {
+                mode: turboquant::KvCacheMode::Turboquant,
+                bits: 3,
+                seed: 5,
+            })
+            .unwrap();
+        match &cache {
+            AnyCache::KV(layers) => {
+                assert_eq!(layers.len(), 2);
+                assert!(layers.iter().flatten().all(|cache| cache.is_quantized()));
+            }
             AnyCache::Hybrid(_) => panic!("Expected KV cache for Qwen3Moe"),
         }
     }

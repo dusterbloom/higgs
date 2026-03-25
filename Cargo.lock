@@ -253,9 +253,9 @@ dependencies = [
 
 [[package]]
 name = "bindgen"
-version = "0.72.1"
+version = "0.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
 dependencies = [
  "bitflags",
  "cexpr",
@@ -266,7 +266,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash",
+ "rustc-hash 1.1.0",
  "shlex",
  "syn",
 ]
@@ -1298,6 +1298,7 @@ dependencies = [
  "image",
  "mlx-rs",
  "mlx-sys",
+ "rand 0.9.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -1907,7 +1908,8 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a7c4444d624bf6b93db5cc22ebff4fdfa13593fd56154fe33b1f302a557c2c6"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -1919,7 +1921,8 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a819ee8b4434690572b6feb9c3ef0b6e90137e4190b340cf00150703b410aaf9"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -1930,7 +1933,8 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a0f592c5839b0237b3072530b1d3c503923579a2009ee0761df3edd1b1f27b"
 dependencies = [
  "dyn-clone",
  "half",
@@ -1953,7 +1957,8 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e3bc3880111918b2d5018f845d48fd995f9901f16efc81d1fcfd2f4210b8219"
 dependencies = [
  "bindgen",
  "cc",
@@ -2229,7 +2234,7 @@ dependencies = [
  "once_cell",
  "regex",
  "regex-automata",
- "rustc-hash",
+ "rustc-hash 2.1.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2708,6 +2713,12 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
