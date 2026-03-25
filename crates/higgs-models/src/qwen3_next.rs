@@ -350,15 +350,8 @@ pub(crate) fn gather_qmm(
             null_lhs,
             rhs_indices.as_ptr(),
             transpose,
-            mlx_sys::mlx_optional_int_ {
-                value: group_size,
-                has_value: true,
-            },
-            mlx_sys::mlx_optional_int_ {
-                value: bits,
-                has_value: true,
-            },
-            c"affine".as_ptr(),
+            group_size,
+            bits,
             sorted_indices,
             stream.as_ptr(),
         )
@@ -1047,6 +1040,19 @@ impl ArraysCache {
 impl Default for ArraysCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ArraysCache {
+    /// Evaluate lazy arrays so a subsequent `clone()` captures values.
+    pub fn eval_arrays(&self) -> Result<(), mlx_rs::error::Exception> {
+        if let Some(cs) = &self.conv_state {
+            cs.eval()?;
+        }
+        if let Some(ss) = &self.ssm_state {
+            ss.eval()?;
+        }
+        Ok(())
     }
 }
 
@@ -3437,7 +3443,7 @@ mod tests {
         let simple_ms = total_simple_ns as f64 / n3 as f64 / 1_000_000.0;
         eprintln!("240 chained adds (single eval): {simple_ms:.2}ms");
 
-        // Test with mlx-rs built-in ops::gather_qmm
+        // Test with the shared gather_qmm wrapper
         let n4 = 50;
         let mut total_builtin_build = 0u128;
         let mut total_builtin_eval = 0u128;
@@ -3445,26 +3451,24 @@ mod tests {
             let t0 = std::time::Instant::now();
             let mut y3 = x.clone();
             for _ in 0..48 {
-                let g = ops::gather_qmm(
+                let g = gather_qmm(
                     &y3,
                     &gate_w,
                     &gate_s,
-                    Some(&gate_b),
-                    None::<&Array>,
-                    Some(&indices),
+                    &gate_b,
+                    &indices,
                     true,
                     64,
                     4,
                     false,
                 )
                 .unwrap();
-                let u = ops::gather_qmm(
+                let u = gather_qmm(
                     &y3,
                     &up_w,
                     &up_s,
-                    Some(&up_b),
-                    None::<&Array>,
-                    Some(&indices),
+                    &up_b,
+                    &indices,
                     true,
                     64,
                     4,
@@ -3472,13 +3476,12 @@ mod tests {
                 )
                 .unwrap();
                 let activated = swiglu(&g, &u).unwrap();
-                y3 = ops::gather_qmm(
+                y3 = gather_qmm(
                     &activated,
                     &down_w,
                     &down_s,
-                    Some(&down_b),
-                    None::<&Array>,
-                    Some(&indices),
+                    &down_b,
+                    &indices,
                     true,
                     64,
                     4,
@@ -8857,7 +8860,7 @@ mod tests {
             total as f64 / n as f64 / 1e6
         );
 
-        // Test 5: interleaved state + MoE using ops::gather_qmm (library version)
+        // Test 5: interleaved state + MoE using gather_qmm
         let forward_interleaved_ops = |h_in: &Array, ss: &mut Vec<Array>| -> Array {
             let mut h = h_in.clone();
             let mut gdn_idx = 0usize;
@@ -8899,12 +8902,11 @@ mod tests {
                     .divide(raw_scores.sum_axes(&[-1], true).unwrap())
                     .unwrap();
                 let x_exp = h.expand_dims(-2).unwrap().expand_dims(-2).unwrap();
-                let g_out = ops::gather_qmm(
+                let g_out = gather_qmm(
                     &x_exp,
                     &sw_gate[i].0,
                     &sw_gate[i].1,
                     &sw_gate[i].2,
-                    None::<&Array>,
                     &top_inds,
                     true,
                     gs,
@@ -8912,12 +8914,11 @@ mod tests {
                     false,
                 )
                 .unwrap();
-                let u_out = ops::gather_qmm(
+                let u_out = gather_qmm(
                     &x_exp,
                     &sw_up[i].0,
                     &sw_up[i].1,
                     &sw_up[i].2,
-                    None::<&Array>,
                     &top_inds,
                     true,
                     gs,
@@ -8926,12 +8927,11 @@ mod tests {
                 )
                 .unwrap();
                 let activated = swiglu(&g_out, &u_out).unwrap();
-                let d_out = ops::gather_qmm(
+                let d_out = gather_qmm(
                     &activated,
                     &sw_down[i].0,
                     &sw_down[i].1,
                     &sw_down[i].2,
-                    None::<&Array>,
                     &top_inds,
                     true,
                     gs,
@@ -8969,7 +8969,7 @@ mod tests {
             total += t0.elapsed().as_nanos();
         }
         println!(
-            "Interleaved state + ops::gather_qmm (library version): {:.2}ms",
+            "Interleaved state + gather_qmm: {:.2}ms",
             total as f64 / n as f64 / 1e6
         );
     }
@@ -10174,7 +10174,7 @@ mod tests {
 
         // They should be identical (both round-trip through the same quantized repr)
         let diff = path_a.subtract(&path_b).unwrap().abs().unwrap();
-        let max_diff: f32 = diff.max(None, None).unwrap().item();
+        let max_diff: f32 = diff.max(None).unwrap().item();
         assert!(
             max_diff < 1e-6,
             "gather-then-dequantize should match dequantize-then-gather, max diff: {max_diff}"

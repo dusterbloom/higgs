@@ -3,10 +3,11 @@ use mlx_rs::{
     error::Exception,
     fast::ScaledDotProductAttentionMask,
     nn,
+    ops,
     ops::indexing::{IndexOp, NewAxis},
 };
 
-use crate::cache::KeyValueCache;
+use crate::cache::{KeyValueCache, KvCacheView};
 
 /// Apply `RoPE` directly without the 3D reshape in `nn::Rope::forward`.
 ///
@@ -55,8 +56,47 @@ pub(crate) fn scaled_dot_product_attention(
         values,
         scale,
         mask.map(ScaledDotProductAttentionMask::Array),
-        None::<&Array>,
     )
+}
+
+/// Append K/V to the cache and run attention, using the TurboQuant decode path
+/// for single-token decode when the cache view exposes quantized storage.
+pub(crate) fn cached_scaled_dot_product_attention<C>(
+    queries: Array,
+    kv_cache: &mut C,
+    keys: Array,
+    values: Array,
+    scale: f32,
+    mask: Option<&Array>,
+) -> Result<Array, Exception>
+where
+    C: KeyValueCache,
+{
+    match kv_cache.update_and_view(keys, values)? {
+        KvCacheView::TurboQuant(view)
+            if mask.is_none() && is_single_token_decode(&queries, view.context.head_dim) =>
+        {
+            let num_heads = queries
+                .shape()
+                .get(1)
+                .copied()
+                .ok_or_else(|| Exception::custom("queries must be 4D"))?;
+            let scores = view.decode_scores(&queries, num_heads)?;
+            let scale_arr = Array::from_f32(scale).as_dtype(scores.dtype())?;
+            let scaled_scores = scores.multiply(&scale_arr)?;
+            let weights = ops::softmax_axis(&scaled_scores, -1, true)?;
+            view.decode_values(&weights, num_heads)
+        }
+        view => {
+            let (keys, values) = view.into_dense()?;
+            scaled_dot_product_attention(queries, keys, values, scale, mask)
+        }
+    }
+}
+
+fn is_single_token_decode(queries: &Array, head_dim: i32) -> bool {
+    let shape = queries.shape();
+    shape.len() == 4 && shape[0] == 1 && shape[2] == 1 && shape[3] == head_dim
 }
 
 /// Create a causal attention mask.
@@ -128,7 +168,10 @@ pub(crate) fn create_batched_decode_mask(
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::cache::SteppingKeyValueCache;
+    use crate::{
+        cache::SteppingKeyValueCache,
+        turboquant::{KvCacheConfig, KvCacheMode},
+    };
 
     #[test]
     fn test_create_causal_mask_n4() {
@@ -270,6 +313,51 @@ mod tests {
         let v1: f32 = result.index((.., .., .., 1..2)).item();
         assert!((v0 - 3.0).abs() < 1e-4);
         assert!((v1 - 7.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_cached_scaled_dot_product_attention_matches_dense_turbo_adapter() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 13,
+        };
+        let queries = Array::from_slice(
+            &[0.1_f32, -0.3, 0.8, 0.2, -0.4, 0.6, 0.9, -0.1],
+            &[1, 1, 1, 8],
+        );
+        let keys = Array::from_slice(
+            &[0.3_f32, 0.7, -0.1, 0.4, -0.2, 0.5, 0.8, 0.6],
+            &[1, 1, 1, 8],
+        );
+        let values = Array::from_slice(
+            &[1.0_f32, 2.0, 3.5, 4.0, -1.0, -0.5, 0.25, 0.75],
+            &[1, 1, 1, 8],
+        );
+        let scale = (8.0_f32).sqrt().recip();
+
+        let mut fast_cache = SteppingKeyValueCache::new_turbo(config, 1, 8).unwrap();
+        let fast = cached_scaled_dot_product_attention(
+            queries.clone(),
+            &mut fast_cache,
+            keys.clone(),
+            values.clone(),
+            scale,
+            None,
+        )
+        .unwrap();
+
+        let mut dense_cache = SteppingKeyValueCache::new_turbo(config, 1, 8).unwrap();
+        let (dense_keys, dense_values) = dense_cache.update_and_fetch(keys, values).unwrap();
+        let dense =
+            scaled_dot_product_attention(queries, dense_keys, dense_values, scale, None).unwrap();
+
+        assert_eq!(fast.shape(), dense.shape());
+        let fast_vals = fast.as_slice::<f32>();
+        let dense_vals = dense.as_slice::<f32>();
+        for (lhs, rhs) in fast_vals.iter().zip(dense_vals.iter()) {
+            assert!((lhs - rhs).abs() < 1e-4, "lhs={lhs}, rhs={rhs}");
+        }
     }
 
     #[test]

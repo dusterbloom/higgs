@@ -8,6 +8,7 @@ use higgs_engine::error::EngineError;
 use higgs_engine::simple::SimpleEngine;
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
+use higgs_models::turboquant::KvCacheConfig;
 use mlx_rs::Array;
 
 use crate::config::HiggsConfig;
@@ -24,21 +25,28 @@ pub enum Engine {
 }
 
 impl Engine {
-    pub fn load_simple<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
-        SimpleEngine::load(dir).map(|e| Self::Simple(Box::new(e)))
+    pub fn load_simple<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        SimpleEngine::load(dir, kv_cache_config).map(|e| Self::Simple(Box::new(e)))
     }
 
     pub fn load_simple_with_draft<P: AsRef<Path>>(
         dir: P,
         draft_dir: P,
         num_draft: usize,
+        kv_cache_config: KvCacheConfig,
     ) -> Result<Self, EngineError> {
-        SimpleEngine::load_with_draft(dir, Some(draft_dir), num_draft)
+        SimpleEngine::load_with_draft(dir, Some(draft_dir), num_draft, kv_cache_config)
             .map(|e| Self::Simple(Box::new(e)))
     }
 
-    pub fn load_batch<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
-        BatchEngine::load(dir).map(|e| Self::Batch(Box::new(e)))
+    pub fn load_batch<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        BatchEngine::load(dir, kv_cache_config).map(|e| Self::Batch(Box::new(e)))
     }
 
     #[cfg(test)]

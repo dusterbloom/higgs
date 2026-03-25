@@ -514,6 +514,7 @@ fn chat_completions_stream(
                 finish_reason: None,
                 logprobs: None,
             }],
+            usage: None,
         };
         match serde_json::to_string(&role_chunk) {
             Ok(json) => yield Ok(Event::default().data(json)),
@@ -554,6 +555,7 @@ fn chat_completions_stream(
                         finish_reason: None,
                         logprobs: None,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&reas_chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
@@ -579,6 +581,7 @@ fn chat_completions_stream(
                         finish_reason: output.finish_reason.clone(),
                         logprobs: chunk_logprobs,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
@@ -602,6 +605,7 @@ fn chat_completions_stream(
                         finish_reason: output.finish_reason,
                         logprobs: chunk_logprobs,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
@@ -629,6 +633,7 @@ fn chat_completions_stream(
                     finish_reason: None,
                     logprobs: None,
                 }],
+                usage: None,
             };
             match serde_json::to_string(&reas_chunk) {
                 Ok(json) => yield Ok(Event::default().data(json)),
@@ -652,11 +657,30 @@ fn chat_completions_stream(
                     finish_reason: None,
                     logprobs: None,
                 }],
+                usage: None,
             };
             match serde_json::to_string(&vis_chunk) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
             }
+        }
+
+        // Emit final chunk with usage (OpenAI stream_options.include_usage)
+        let usage_chunk = ChatCompletionChunk {
+            id: request_id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.clone(),
+            choices: vec![],
+            usage: Some(CompletionUsage {
+                prompt_tokens: prompt_token_count,
+                completion_tokens: output_token_count,
+                total_tokens: prompt_token_count + output_token_count,
+            }),
+        };
+        match serde_json::to_string(&usage_chunk) {
+            Ok(json) => yield Ok(Event::default().data(json)),
+            Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
         }
 
         if let Some(ref m) = metrics {

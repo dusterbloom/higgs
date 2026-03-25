@@ -1,7 +1,10 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use higgs_models::{AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample};
+use higgs_models::{
+    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
+    turboquant::KvCacheConfig,
+};
 use mlx_rs::{
     Array, Dtype, Stream,
     ops::indexing::{IndexOp, NewAxis},
@@ -30,43 +33,34 @@ const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 #[allow(unsafe_code)]
 pub(crate) fn set_wired_limit_to_max() {
     unsafe {
-        let mut info = mlx_sys::mlx_device_info_new();
-        let mut dev = mlx_sys::mlx_device_new();
-        mlx_sys::mlx_get_default_device(&raw mut dev);
-        if mlx_sys::mlx_device_info_get(&raw mut (info), dev) == 0 {
-            let mut max_rec: usize = 0;
-            let key = c"max_recommended_working_set_size";
-            if mlx_sys::mlx_device_info_get_size(&raw mut max_rec, info, key.as_ptr()) == 0
-                && max_rec > 0
-            {
-                let mem_limit = max_rec * 3 / 4; // 75% of GPU max
-                let cache_limit = max_rec / 2; // 50% of GPU max
+        let info = mlx_sys::mlx_metal_device_info();
+        let max_rec = info.max_recommended_working_set_size;
+        if max_rec > 0 {
+            let mem_limit = max_rec * 3 / 4; // 75% of GPU max
+            let cache_limit = max_rec / 2; // 50% of GPU max
 
-                let mut prev_mem: usize = 0;
-                let mut prev_cache: usize = 0;
+            let mut prev_mem: usize = 0;
+            let mut prev_cache: usize = 0;
 
-                // Check env var to optionally disable memory limits for testing
-                let limits_enabled = std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
+            // Check env var to optionally disable memory limits for testing
+            let limits_enabled = std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
 
-                if limits_enabled {
-                    mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
-                    mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
-                }
-
-                tracing::info!(
-                    max_recommended_mb = max_rec / (1024 * 1024),
-                    memory_limit_mb = mem_limit / (1024 * 1024),
-                    cache_limit_mb = cache_limit / (1024 * 1024),
-                    limits_enabled,
-                    "MLX memory limits {} (prev mem={}MB, cache={}MB)",
-                    if limits_enabled { "set" } else { "skipped" },
-                    prev_mem / (1024 * 1024),
-                    prev_cache / (1024 * 1024),
-                );
+            if limits_enabled {
+                mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
+                mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
             }
+
+            tracing::info!(
+                max_recommended_mb = max_rec / (1024 * 1024),
+                memory_limit_mb = mem_limit / (1024 * 1024),
+                cache_limit_mb = cache_limit / (1024 * 1024),
+                limits_enabled,
+                "MLX memory limits {} (prev mem={}MB, cache={}MB)",
+                if limits_enabled { "set" } else { "skipped" },
+                prev_mem / (1024 * 1024),
+                prev_cache / (1024 * 1024),
+            );
         }
-        mlx_sys::mlx_device_info_free(info);
-        mlx_sys::mlx_device_free(dev);
     }
 }
 
@@ -88,6 +82,7 @@ pub struct SimpleEngine {
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
     /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
     think_close_token: Option<u32>,
+    kv_cache_config: KvCacheConfig,
 }
 
 /// State for the draft model used in speculative decoding.
@@ -108,8 +103,8 @@ struct PreparedGeneration<'a> {
 
 impl SimpleEngine {
     /// Load a model and tokenizer from a directory.
-    pub fn load<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
-        Self::load_impl(dir, None)
+    pub fn load<P: AsRef<Path>>(dir: P, kv_cache_config: KvCacheConfig) -> Result<Self, EngineError> {
+        Self::load_impl(dir, None, kv_cache_config)
     }
 
     /// Load with an optional draft model for speculative decoding.
@@ -117,13 +112,15 @@ impl SimpleEngine {
         dir: P,
         draft_dir: Option<P>,
         num_draft: usize,
+        kv_cache_config: KvCacheConfig,
     ) -> Result<Self, EngineError> {
-        Self::load_impl(dir, draft_dir.map(|d| (d, num_draft)))
+        Self::load_impl(dir, draft_dir.map(|d| (d, num_draft)), kv_cache_config)
     }
 
     fn load_impl<P: AsRef<Path>>(
         dir: P,
         draft_config: Option<(P, usize)>,
+        kv_cache_config: KvCacheConfig,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
@@ -131,6 +128,9 @@ impl SimpleEngine {
         tracing::info!(model_dir = %model_dir.display(), "Loading model");
 
         let model = model_loader::load_model(model_dir)?;
+        let _ = model
+            .make_cache_with_config(kv_cache_config)
+            .map_err(EngineError::Mlx)?;
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
         let template = ChatTemplateRenderer::try_from_model_dir(model_dir)?;
         if template.is_none() {
@@ -170,7 +170,9 @@ impl SimpleEngine {
             let dp = draft_path.as_ref();
             tracing::info!(draft_dir = %dp.display(), num_draft, "Loading draft model for speculative decoding");
             let draft_model = model_loader::load_model(dp)?;
-            let draft_cache = draft_model.make_cache();
+            let draft_cache = draft_model
+                .make_cache_with_config(kv_cache_config)
+                .map_err(EngineError::Mlx)?;
             Some(Mutex::new(DraftState {
                 model: draft_model,
                 cache_template: draft_cache,
@@ -199,6 +201,7 @@ impl SimpleEngine {
             draft,
             enable_thinking,
             think_close_token,
+            kv_cache_config,
         })
     }
 
@@ -317,12 +320,22 @@ impl SimpleEngine {
             );
             let suffix = prompt_tokens.get(matched.prefix_len..).unwrap_or_default();
             if suffix.is_empty() {
-                (prompt_tokens.to_vec(), model.make_cache())
+                (
+                    prompt_tokens.to_vec(),
+                    model
+                        .make_cache_with_config(self.kv_cache_config)
+                        .map_err(EngineError::Mlx)?,
+                )
             } else {
                 (suffix.to_vec(), matched.cache)
             }
         } else {
-            (prompt_tokens.to_vec(), model.make_cache())
+            (
+                prompt_tokens.to_vec(),
+                model
+                    .make_cache_with_config(self.kv_cache_config)
+                    .map_err(EngineError::Mlx)?,
+            )
         };
 
         let prompt_array = Array::from(actual_prompt_tokens.as_slice()).index(NewAxis);
@@ -711,7 +724,9 @@ impl SimpleEngine {
                 .model
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
-            let mut cache = model.make_cache();
+            let mut cache = model
+                .make_cache_with_config(self.kv_cache_config)
+                .map_err(EngineError::Mlx)?;
 
             // Forward pass to get hidden states [1, seq_len, hidden_size]
             let hidden = model
