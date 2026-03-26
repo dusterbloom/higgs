@@ -772,6 +772,7 @@ mod tests {
             &values,
             scale,
             Some(ScaledDotProductAttentionMask::Array(&mask_array)),
+            None::<&Array>,
         )
         .unwrap();
 
@@ -782,6 +783,7 @@ mod tests {
             &values,
             scale,
             Some(ScaledDotProductAttentionMask::Causal),
+            None::<&Array>,
         )
         .unwrap();
 
