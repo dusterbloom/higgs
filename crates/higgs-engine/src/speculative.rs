@@ -245,6 +245,76 @@ impl DraftModel for MlxDraftModel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ANE/CPU draft model (feature-gated)
+// ---------------------------------------------------------------------------
+
+/// CPU-accelerated draft model that loads weights from MLX safetensors.
+///
+/// Runs entirely on CPU (using Accelerate SGEMM), freeing the GPU for the
+/// target model. Uses its own KV cache with rollback support.
+///
+/// Architecture ready for ANE acceleration (BLOBFILE kernels) in a future pass.
+#[cfg(feature = "ane")]
+pub struct AneDraftModel {
+    model: higgs_ane::ModelWeights,
+    cache: higgs_ane::KvCache,
+    checkpoint_pos: Option<usize>,
+}
+
+#[cfg(feature = "ane")]
+impl AneDraftModel {
+    /// Load a draft model from an MLX safetensors directory.
+    pub fn load(dir: &std::path::Path, max_seq: usize) -> Result<Self, EngineError> {
+        let model = higgs_ane::load_draft_model(dir)
+            .map_err(|e| EngineError::Generation(format!("ANE draft load: {e}")))?;
+        let cache = higgs_ane::make_kv_cache(&model, max_seq);
+        Ok(Self {
+            model,
+            cache,
+            checkpoint_pos: None,
+        })
+    }
+}
+
+#[cfg(feature = "ane")]
+impl DraftModel for AneDraftModel {
+    fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<(), EngineError> {
+        self.cache.rollback_to(0);
+        self.checkpoint_pos = None;
+        for &token in prompt_tokens {
+            higgs_ane::decode_step(&self.model, token, &mut self.cache);
+        }
+        Ok(())
+    }
+
+    fn draft(&mut self, last_token_id: u32, num_draft: usize) -> Result<Vec<u32>, EngineError> {
+        self.checkpoint_pos = Some(self.cache.pos());
+        let mut drafts = Vec::with_capacity(num_draft);
+        let mut token = last_token_id;
+        for _ in 0..num_draft {
+            let result = higgs_ane::decode_step(&self.model, token, &mut self.cache);
+            token = higgs_ane::sample_argmax(&result.logits);
+            drafts.push(token);
+        }
+        Ok(drafts)
+    }
+
+    fn advance(&mut self, n: usize) -> Result<(), EngineError> {
+        if let Some(pre) = self.checkpoint_pos.take() {
+            self.cache.rollback_to(pre + n);
+        }
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<(), EngineError> {
+        if let Some(pre) = self.checkpoint_pos.take() {
+            self.cache.rollback_to(pre);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {

@@ -1,0 +1,45 @@
+[package]
+name = "higgs-ane"
+version = "0.1.0"
+description = "Apple Neural Engine draft model for speculative decoding"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# These are necessary for ported ANE decode code
+indexing_slicing = "allow"
+as_conversions = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+shadow_reuse = "allow"
+shadow_unrelated = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+struct_field_names = "allow"
+
+# Restriction lints we can follow
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+[dependencies]
+serde_json = "1"
+memmap2 = "0.9"
+tracing = "0.1"

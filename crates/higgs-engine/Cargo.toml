@@ -10,7 +10,11 @@ homepage.workspace = true
 [lints]
 workspace = true
 
+[features]
+ane = ["higgs-ane"]
+
 [dependencies]
+higgs-ane = { path = "../higgs-ane", optional = true }
 higgs-models.workspace = true
 mlx-rs.workspace = true
 mlx-sys.workspace = true
