@@ -19,8 +19,8 @@ const THREE_BIT_CENTROIDS: [f32; 8] = [
     -2.1520, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1520,
 ];
 const FOUR_BIT_CENTROIDS: [f32; 16] = [
-    -2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881,
-    0.6568, 0.9424, 1.2562, 1.6180, 2.0690, 2.7326,
+    -2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881, 0.6568,
+    0.9424, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
 const SQRT_PI_OVER_TWO: f32 = 1.253_314_1;
 
@@ -107,14 +107,12 @@ pub struct TurboQuantContext {
 }
 
 impl TurboQuantContext {
-    pub fn new(
-        config: KvCacheConfig,
-        head_dim: i32,
-        num_kv_heads: i32,
-    ) -> Result<Self, Exception> {
+    pub fn new(config: KvCacheConfig, head_dim: i32, num_kv_heads: i32) -> Result<Self, Exception> {
         config.validate()?;
         if head_dim <= 0 || num_kv_heads <= 0 {
-            return Err(Exception::custom("TurboQuant head_dim and num_kv_heads must be > 0"));
+            return Err(Exception::custom(
+                "TurboQuant head_dim and num_kv_heads must be > 0",
+            ));
         }
         let dim = usize::try_from(head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
         let scale = 1.0 / (head_dim as f32).sqrt();
@@ -147,7 +145,8 @@ impl TurboQuantContext {
     }
 
     pub fn quantize_value(&self, values: &[f32]) -> Result<QuantizedValue, Exception> {
-        let dim = usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
+        let dim =
+            usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
         if values.len() != dim {
             return Err(Exception::custom("TurboQuant value length mismatch"));
         }
@@ -171,7 +170,8 @@ impl TurboQuantContext {
     }
 
     pub fn quantize_key(&self, keys: &[f32]) -> Result<QuantizedKey, Exception> {
-        let dim = usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
+        let dim =
+            usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
         if keys.len() != dim {
             return Err(Exception::custom("TurboQuant key length mismatch"));
         }
@@ -218,7 +218,8 @@ impl TurboQuantContext {
     }
 
     pub fn dequantize_value(&self, value: &QuantizedValue) -> Result<Vec<f32>, Exception> {
-        let dim = usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
+        let dim =
+            usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
         let rotated = dequantize_rotated(
             &value.codes,
             self.config.bits,
@@ -230,7 +231,8 @@ impl TurboQuantContext {
     }
 
     pub fn dequantize_key(&self, key: &QuantizedKey) -> Result<Vec<f32>, Exception> {
-        let dim = usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
+        let dim =
+            usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
         let rotated = dequantize_rotated(
             &key.codes,
             self.config.key_bits(),
@@ -254,7 +256,9 @@ impl TurboQuantContext {
     }
 
     pub fn project_queries_qjl(&self, queries: &Array) -> Result<Array, Exception> {
-        queries.as_dtype(Dtype::Float32)?.matmul(&self.qjl_t_array()?)
+        queries
+            .as_dtype(Dtype::Float32)?
+            .matmul(&self.qjl_t_array()?)
     }
 
     pub fn rotation_array(&self) -> Result<Array, Exception> {
@@ -272,7 +276,10 @@ impl TurboQuantContext {
     }
 
     pub fn qjl_t_array(&self) -> Result<Array, Exception> {
-        Ok(Array::from_slice(&self.qjl_t, &[self.head_dim, self.head_dim]))
+        Ok(Array::from_slice(
+            &self.qjl_t,
+            &[self.head_dim, self.head_dim],
+        ))
     }
 
     pub fn key_centroids_array(&self) -> Result<Array, Exception> {
@@ -745,10 +752,8 @@ fn create_scores_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     unsafe {
         let in_vec =
             mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
-        let out_vec = mlx_sys::mlx_vector_string_new_data(
-            output_ptrs.as_ptr().cast_mut(),
-            output_ptrs.len(),
-        );
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
         let kernel = mlx_sys::mlx_fast_metal_kernel_new(
             c"turboquant_scores".as_ptr(),
             in_vec,
@@ -783,10 +788,8 @@ fn create_values_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     unsafe {
         let in_vec =
             mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
-        let out_vec = mlx_sys::mlx_vector_string_new_data(
-            output_ptrs.as_ptr().cast_mut(),
-            output_ptrs.len(),
-        );
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
         let kernel = mlx_sys::mlx_fast_metal_kernel_new(
             c"turboquant_values".as_ptr(),
             in_vec,
@@ -912,7 +915,9 @@ fn extract_single_output(
         if message.is_empty() {
             return Err(Exception::custom(format!("{label} kernel failed")));
         }
-        return Err(Exception::custom(format!("{label} kernel failed: {message}")));
+        return Err(Exception::custom(format!(
+            "{label} kernel failed: {message}"
+        )));
     }
 
     let mut out_ptr = unsafe { mlx_sys::mlx_array_new() };

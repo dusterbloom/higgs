@@ -365,6 +365,18 @@ impl SteppingKeyValueCache {
         self.config
     }
 
+    /// References to internal arrays that must be eval'd between chunked-prefill steps.
+    pub fn eval_targets(&self) -> Vec<&Array> {
+        let mut targets = Vec::with_capacity(2);
+        if let Some(ref k) = self.keys {
+            targets.push(k);
+        }
+        if let Some(ref v) = self.values {
+            targets.push(v);
+        }
+        targets
+    }
+
     fn update_dense(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
         let prev = self.offset;
         let new_tokens = keys.shape()[2];

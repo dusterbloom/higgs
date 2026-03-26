@@ -2,8 +2,7 @@ use mlx_rs::{
     Array, arange,
     error::Exception,
     fast::ScaledDotProductAttentionMask,
-    nn,
-    ops,
+    nn, ops,
     ops::indexing::{IndexOp, NewAxis},
 };
 
@@ -88,6 +87,9 @@ where
             let weights = ops::softmax_axis(&scaled_scores, -1, true)?;
             view.decode_values(&weights, num_heads)
         }
+        KvCacheView::TurboQuant(view) if supports_turboquant_attention(&queries, &view) => {
+            turboquant_attention_loop(queries, &view, scale, mask)
+        }
         view => {
             let (keys, values) = view.into_dense()?;
             scaled_dot_product_attention(queries, keys, values, scale, mask)
@@ -95,9 +97,124 @@ where
     }
 }
 
+fn supports_turboquant_attention(queries: &Array, view: &crate::cache::TurboQuantKvView) -> bool {
+    let shape = queries.shape();
+    shape.len() == 4 && shape[0] == 1 && shape[3] == view.context.head_dim
+}
+
 fn is_single_token_decode(queries: &Array, head_dim: i32) -> bool {
     let shape = queries.shape();
     shape.len() == 4 && shape[0] == 1 && shape[2] == 1 && shape[3] == head_dim
+}
+
+fn turboquant_attention_loop(
+    queries: Array,
+    view: &crate::cache::TurboQuantKvView,
+    scale: f32,
+    mask: Option<&Array>,
+) -> Result<Array, Exception> {
+    let shape = queries.shape();
+    let num_heads = *shape
+        .get(1)
+        .ok_or_else(|| Exception::custom("queries must be 4D"))?;
+    let query_len = *shape
+        .get(2)
+        .ok_or_else(|| Exception::custom("queries must be 4D"))?;
+
+    let mut outputs = Vec::with_capacity(usize::try_from(query_len).unwrap_or_default());
+    let mut cached_scale = None;
+    let mut cached_neg_inf = None;
+
+    for query_index in 0..query_len {
+        let query = queries.index((.., .., query_index..query_index + 1, ..));
+        let mut scores = view.decode_scores(&query, num_heads)?;
+
+        if cached_scale
+            .as_ref()
+            .is_none_or(|cached: &Array| cached.dtype() != scores.dtype())
+        {
+            cached_scale = Some(Array::from_f32(scale).as_dtype(scores.dtype())?);
+        }
+        let scale_arr = cached_scale
+            .as_ref()
+            .ok_or_else(|| Exception::custom("TurboQuant scale cache not initialized"))?;
+        scores = scores.multiply(scale_arr)?;
+
+        if let Some(mask_row) = mask_row_for_query(mask, query_index, view.seq_len)? {
+            if cached_neg_inf
+                .as_ref()
+                .is_none_or(|cached: &Array| cached.dtype() != scores.dtype())
+            {
+                cached_neg_inf = Some(Array::from_f32(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
+            }
+            let neg_inf = cached_neg_inf
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant neg-inf cache not initialized"))?;
+            scores = ops::r#where(&mask_row, &scores, neg_inf)?;
+        }
+
+        let weights = ops::softmax_axis(&scores, -1, true)?;
+        outputs.push(view.decode_values(&weights, num_heads)?);
+    }
+
+    match outputs.len() {
+        0 => Err(Exception::custom(
+            "TurboQuant attention received zero query tokens",
+        )),
+        1 => outputs
+            .pop()
+            .ok_or_else(|| Exception::custom("TurboQuant attention output missing")),
+        _ => ops::concatenate_axis(&outputs, 2),
+    }
+}
+
+fn mask_row_for_query(
+    mask: Option<&Array>,
+    query_index: i32,
+    seq_len: i32,
+) -> Result<Option<Array>, Exception> {
+    let Some(mask) = mask else {
+        return Ok(None);
+    };
+
+    let mask_shape = mask.shape();
+    let mask_row = match mask_shape.len() {
+        1 => {
+            if mask_shape[0] != seq_len {
+                return Err(Exception::custom(format!(
+                    "mask length ({}) does not match seq_len ({seq_len})",
+                    mask_shape[0]
+                )));
+            }
+            mask.reshape(&[1, seq_len])?
+        }
+        2 => {
+            if mask_shape[1] != seq_len {
+                return Err(Exception::custom(format!(
+                    "mask width ({}) does not match seq_len ({seq_len})",
+                    mask_shape[1]
+                )));
+            }
+            mask.index((query_index..query_index + 1, ..))
+        }
+        4 => {
+            if mask_shape[3] != seq_len {
+                return Err(Exception::custom(format!(
+                    "mask width ({}) does not match seq_len ({seq_len})",
+                    mask_shape[3]
+                )));
+            }
+            mask.index((0..1, 0..1, query_index..query_index + 1, ..))
+                .reshape(&[1, seq_len])?
+        }
+        dims => {
+            return Err(Exception::custom(format!(
+                "unsupported TurboQuant mask rank {dims}; expected 1D, 2D, or 4D"
+            )));
+        }
+    };
+
+    Ok(Some(mask_row))
 }
 
 /// Create a causal attention mask.
@@ -362,6 +479,138 @@ mod tests {
     }
 
     #[test]
+    fn test_cached_scaled_dot_product_attention_matches_dense_turbo_prefill_masked() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 17,
+        };
+        let queries = Array::from_slice(
+            &[
+                0.1_f32, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8, 0.8, -0.7, 0.6, -0.5, 0.4, -0.3,
+                0.2, -0.1,
+            ],
+            &[1, 1, 2, 8],
+        );
+        let keys = Array::from_slice(
+            &[
+                0.3_f32, 0.1, -0.2, 0.4, -0.5, 0.6, -0.7, 0.8, -0.8, 0.7, -0.6, 0.5, -0.4, 0.3,
+                -0.2, 0.1,
+            ],
+            &[1, 1, 2, 8],
+        );
+        let values = Array::from_slice(
+            &[
+                1.0_f32, 0.5, -0.25, 0.75, -1.0, 0.25, -0.5, 0.125, -0.75, 1.25, 0.5, -0.125,
+                0.375, -0.625, 0.875, -1.125,
+            ],
+            &[1, 1, 2, 8],
+        );
+        let mask = create_causal_mask(2, None).unwrap();
+        let scale = (8.0_f32).sqrt().recip();
+
+        let mut fast_cache = SteppingKeyValueCache::new_turbo(config, 1, 8).unwrap();
+        let fast = cached_scaled_dot_product_attention(
+            queries.clone(),
+            &mut fast_cache,
+            keys.clone(),
+            values.clone(),
+            scale,
+            Some(&mask),
+        )
+        .unwrap();
+
+        let mut dense_cache = SteppingKeyValueCache::new_turbo(config, 1, 8).unwrap();
+        let (dense_keys, dense_values) = dense_cache.update_and_fetch(keys, values).unwrap();
+        let dense =
+            scaled_dot_product_attention(queries, dense_keys, dense_values, scale, Some(&mask))
+                .unwrap();
+
+        assert_eq!(fast.shape(), dense.shape());
+        let fast_vals = fast.as_slice::<f32>();
+        let dense_vals = dense.as_slice::<f32>();
+        for (lhs, rhs) in fast_vals.iter().zip(dense_vals.iter()) {
+            assert!((lhs - rhs).abs() < 3e-2, "lhs={lhs}, rhs={rhs}");
+        }
+    }
+
+    #[test]
+    fn test_cached_scaled_dot_product_attention_matches_dense_turbo_mask_with_offset() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 19,
+        };
+        let prefix_keys = Array::from_slice(
+            &[
+                0.2_f32, 0.1, -0.1, 0.3, -0.3, 0.5, -0.5, 0.7, -0.2, 0.4, -0.4, 0.6, -0.6, 0.8,
+                -0.8, 1.0,
+            ],
+            &[1, 1, 2, 8],
+        );
+        let prefix_values = Array::from_slice(
+            &[
+                0.5_f32, -0.5, 0.75, -0.75, 1.0, -1.0, 1.25, -1.25, -0.25, 0.25, -0.375, 0.375,
+                -0.5, 0.5, -0.625, 0.625,
+            ],
+            &[1, 1, 2, 8],
+        );
+        let queries = Array::from_slice(
+            &[
+                0.15_f32, -0.25, 0.35, -0.45, 0.55, -0.65, 0.75, -0.85, -0.15, 0.25, -0.35, 0.45,
+                -0.55, 0.65, -0.75, 0.85,
+            ],
+            &[1, 1, 2, 8],
+        );
+        let keys = Array::from_slice(
+            &[
+                0.9_f32, -0.7, 0.5, -0.3, 0.1, 0.2, -0.4, 0.6, -0.9, 0.7, -0.5, 0.3, -0.1, -0.2,
+                0.4, -0.6,
+            ],
+            &[1, 1, 2, 8],
+        );
+        let values = Array::from_slice(
+            &[
+                1.5_f32, -1.25, 1.0, -0.75, 0.5, -0.25, 0.125, -0.0625, -1.5, 1.25, -1.0, 0.75,
+                -0.5, 0.25, -0.125, 0.0625,
+            ],
+            &[1, 1, 2, 8],
+        );
+        let mask = create_causal_mask(2, Some(2)).unwrap();
+        let scale = (8.0_f32).sqrt().recip();
+
+        let mut fast_cache = SteppingKeyValueCache::new_turbo(config, 1, 8).unwrap();
+        fast_cache
+            .update_and_fetch(prefix_keys.clone(), prefix_values.clone())
+            .unwrap();
+        let fast = cached_scaled_dot_product_attention(
+            queries.clone(),
+            &mut fast_cache,
+            keys.clone(),
+            values.clone(),
+            scale,
+            Some(&mask),
+        )
+        .unwrap();
+
+        let mut dense_cache = SteppingKeyValueCache::new_turbo(config, 1, 8).unwrap();
+        dense_cache
+            .update_and_fetch(prefix_keys, prefix_values)
+            .unwrap();
+        let (dense_keys, dense_values) = dense_cache.update_and_fetch(keys, values).unwrap();
+        let dense =
+            scaled_dot_product_attention(queries, dense_keys, dense_values, scale, Some(&mask))
+                .unwrap();
+
+        assert_eq!(fast.shape(), dense.shape());
+        let fast_vals = fast.as_slice::<f32>();
+        let dense_vals = dense.as_slice::<f32>();
+        for (lhs, rhs) in fast_vals.iter().zip(dense_vals.iter()) {
+            assert!((lhs - rhs).abs() < 4e-2, "lhs={lhs}, rhs={rhs}");
+        }
+    }
+
+    #[test]
     fn test_attention_mask_conversion_array() {
         let arr = Array::ones::<f32>(&[3, 3]).unwrap();
         let mask = AttentionMask::Array(arr);
@@ -374,6 +623,205 @@ mod tests {
         let mask = AttentionMask::Causal;
         let sdpa_mask: ScaledDotProductAttentionMask = (&mask).into();
         assert!(matches!(sdpa_mask, ScaledDotProductAttentionMask::Causal));
+    }
+
+    // -----------------------------------------------------------------------
+    // SDPA Causal enum vs materialized array
+    // -----------------------------------------------------------------------
+
+    /// Causal enum with GQA (more Q heads than KV heads) — reproduces
+    /// the real model shape (e.g. Qwen3.5-0.8B: 8 Q heads, 2 KV heads).
+    #[test]
+    fn test_sdpa_causal_enum_gqa() {
+        use mlx_rs::fast;
+
+        let t_q: i32 = 5;
+        let offset: i32 = 3;
+        let t_kv = offset + t_q; // 8
+        let n_q_heads: i32 = 8;
+        let n_kv_heads: i32 = 2;
+        let head_dim: i32 = 16;
+        let scale = (head_dim as f32).sqrt().recip();
+
+        let q_data: Vec<f32> = (0..n_q_heads * t_q * head_dim)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+        let k_data: Vec<f32> = (0..n_kv_heads * t_kv * head_dim)
+            .map(|i| (i as f32 * 0.07).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..n_kv_heads * t_kv * head_dim)
+            .map(|i| (i as f32 * 0.13 + 1.0).sin())
+            .collect();
+
+        let queries = Array::from_slice(&q_data, &[1, n_q_heads, t_q, head_dim]);
+        let keys = Array::from_slice(&k_data, &[1, n_kv_heads, t_kv, head_dim]);
+        let values = Array::from_slice(&v_data, &[1, n_kv_heads, t_kv, head_dim]);
+
+        // Path 1: Materialized causal mask array
+        let mask_array = create_causal_mask(t_q, Some(offset)).unwrap();
+        let result_array = fast::scaled_dot_product_attention(
+            &queries,
+            &keys,
+            &values,
+            scale,
+            Some(ScaledDotProductAttentionMask::Array(&mask_array)),
+            None::<&Array>,
+        )
+        .unwrap();
+
+        // Path 2: Causal enum
+        let result_causal = fast::scaled_dot_product_attention(
+            &queries,
+            &keys,
+            &values,
+            scale,
+            Some(ScaledDotProductAttentionMask::Causal),
+            None::<&Array>,
+        )
+        .unwrap();
+
+        assert_eq!(result_array.shape(), result_causal.shape());
+        let arr_vals = result_array.as_slice::<f32>();
+        let cau_vals = result_causal.as_slice::<f32>();
+        for (a, c) in arr_vals.iter().zip(cau_vals.iter()) {
+            assert!(
+                (a - c).abs() < 1e-4,
+                "GQA causal mismatch: array={a}, causal={c} (diff={})",
+                (a - c).abs()
+            );
+        }
+    }
+
+    /// Causal enum with GQA + float16 + head_dim=128 — matches real Qwen3.5 shapes.
+    #[test]
+    fn test_sdpa_causal_enum_gqa_f16_large() {
+        use mlx_rs::{Dtype, fast};
+
+        let t_q: i32 = 12; // typical chat prompt length
+        let n_q_heads: i32 = 8;
+        let n_kv_heads: i32 = 2;
+        let head_dim: i32 = 128;
+        let t_kv = t_q; // first prefill, no offset
+        let scale = (head_dim as f32).sqrt().recip();
+
+        let q_data: Vec<f32> = (0..n_q_heads * t_q * head_dim)
+            .map(|i| (i as f32 * 0.01).sin())
+            .collect();
+        let k_data: Vec<f32> = (0..n_kv_heads * t_kv * head_dim)
+            .map(|i| (i as f32 * 0.007).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..n_kv_heads * t_kv * head_dim)
+            .map(|i| (i as f32 * 0.013 + 1.0).sin())
+            .collect();
+
+        let queries = Array::from_slice(&q_data, &[1, n_q_heads, t_q, head_dim])
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        let keys = Array::from_slice(&k_data, &[1, n_kv_heads, t_kv, head_dim])
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        let values = Array::from_slice(&v_data, &[1, n_kv_heads, t_kv, head_dim])
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+
+        // This is the exact call path used in real inference
+        let result = fast::scaled_dot_product_attention(
+            &queries,
+            &keys,
+            &values,
+            scale,
+            Some(ScaledDotProductAttentionMask::Causal),
+            None::<&Array>,
+        )
+        .unwrap();
+
+        assert_eq!(result.shape(), &[1, n_q_heads, t_q, head_dim]);
+    }
+
+    #[test]
+    fn test_sdpa_causal_enum_matches_array_with_offset() {
+        use mlx_rs::fast;
+
+        let t_q: i32 = 3;
+        let offset: i32 = 5;
+        let t_kv = offset + t_q; // 8
+        let n_heads: i32 = 2;
+        let head_dim: i32 = 8;
+        let scale = (head_dim as f32).sqrt().recip();
+
+        // Varying values so attention isn't degenerate
+        let q_data: Vec<f32> = (0..n_heads * t_q * head_dim)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+        let kv_data: Vec<f32> = (0..n_heads * t_kv * head_dim)
+            .map(|i| (i as f32 * 0.07).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..n_heads * t_kv * head_dim)
+            .map(|i| (i as f32 * 0.13 + 1.0).sin())
+            .collect();
+
+        let queries = Array::from_slice(&q_data, &[1, n_heads, t_q, head_dim]);
+        let keys = Array::from_slice(&kv_data, &[1, n_heads, t_kv, head_dim]);
+        let values = Array::from_slice(&v_data, &[1, n_heads, t_kv, head_dim]);
+
+        // Path 1: Materialized causal mask array
+        let mask_array = create_causal_mask(t_q, Some(offset)).unwrap();
+        let result_array = fast::scaled_dot_product_attention(
+            &queries,
+            &keys,
+            &values,
+            scale,
+            Some(ScaledDotProductAttentionMask::Array(&mask_array)),
+        )
+        .unwrap();
+
+        // Path 2: Causal enum (MLX fast path)
+        let result_causal = fast::scaled_dot_product_attention(
+            &queries,
+            &keys,
+            &values,
+            scale,
+            Some(ScaledDotProductAttentionMask::Causal),
+        )
+        .unwrap();
+
+        assert_eq!(result_array.shape(), result_causal.shape());
+        let arr_vals = result_array.as_slice::<f32>();
+        let cau_vals = result_causal.as_slice::<f32>();
+        for (a, c) in arr_vals.iter().zip(cau_vals.iter()) {
+            assert!(
+                (a - c).abs() < 1e-4,
+                "array={a}, causal={c} (diff={})",
+                (a - c).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_intermediate_eval_preserves_output() {
+        // Verify that mid-graph eval() doesn't change the computed result.
+        let x = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let w = Array::from_slice(&[0.5_f32, -0.5, 1.0, -1.0, 0.25, -0.25], &[3, 2]);
+        let bias = Array::from_slice(&[0.1_f32, -0.2], &[1, 2]);
+
+        // Without intermediate eval
+        let y1 = ops::matmul(&x, &w).unwrap();
+        let z1 = y1.add(&bias).unwrap();
+        let r1 = z1.multiply(Array::from_f32(2.0)).unwrap();
+
+        // With intermediate eval after each step
+        let y2 = ops::matmul(&x, &w).unwrap();
+        mlx_rs::transforms::eval([&y2]).unwrap();
+        let z2 = y2.add(&bias).unwrap();
+        mlx_rs::transforms::eval([&z2]).unwrap();
+        let r2 = z2.multiply(Array::from_f32(2.0)).unwrap();
+
+        let v1 = r1.as_slice::<f32>();
+        let v2 = r2.as_slice::<f32>();
+        assert_eq!(v1.len(), v2.len());
+        for (a, b) in v1.iter().zip(v2.iter()) {
+            assert!((a - b).abs() < 1e-6, "no_eval={a}, with_eval={b}");
+        }
     }
 
     // -----------------------------------------------------------------------
