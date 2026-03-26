@@ -510,11 +510,13 @@ impl Phi3CausalLM {
     ) -> Result<Array, Exception> {
         let out = self.forward_hidden(inputs, mask, kv_cache)?;
 
+        let T = inputs.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if T > 1 { out.index((.., -1.., ..)) } else { out };
         match self.lm_head.as_mut() {
-            Some(head) => head.forward(&out),
+            Some(head) => head.forward(&lm_input),
             None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(embed) => embed.as_linear(&out),
-                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&out),
+                MaybeQuantized::Original(embed) => embed.as_linear(&lm_input),
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&lm_input),
             },
         }
     }

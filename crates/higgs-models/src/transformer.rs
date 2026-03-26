@@ -835,13 +835,15 @@ impl Model {
         self.apply_lm_head(&out)
     }
 
-    /// Apply the LM head to hidden states.
+    /// Apply the LM head to hidden states (last position only during prefill).
     fn apply_lm_head(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        let T = hidden.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if T > 1 { hidden.index((.., -1.., ..)) } else { hidden.clone() };
         match self.lm_head.as_mut() {
-            Some(head) => head.forward(hidden),
+            Some(head) => head.forward(&lm_input),
             None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(embed) => embed.as_linear(hidden),
-                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(hidden),
+                MaybeQuantized::Original(embed) => embed.as_linear(&lm_input),
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&lm_input),
             },
         }
     }

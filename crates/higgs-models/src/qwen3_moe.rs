@@ -531,9 +531,11 @@ impl Qwen3MoeCausalLM {
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, mask, kv_cache)?;
 
+        let T = inputs.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if T > 1 { h.index((.., -1.., ..)) } else { h };
         match self.lm_head.as_ref() {
-            Some(head) => head.forward(&h),
-            None => self.model.embed_tokens.as_linear(&h),
+            Some(head) => head.forward(&lm_input),
+            None => self.model.embed_tokens.as_linear(&lm_input),
         }
     }
 }
