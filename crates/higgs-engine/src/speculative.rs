@@ -1,3 +1,8 @@
+use higgs_models::{AnyCache, AnyModel};
+use mlx_rs::ops::indexing::{IndexOp, NewAxis};
+use mlx_rs::transforms::eval;
+use mlx_rs::Array;
+
 use crate::error::EngineError;
 
 /// Run one speculative decode cycle.
@@ -147,10 +152,83 @@ pub trait DraftModel: Send {
     fn rollback(&mut self) -> Result<(), EngineError>;
 }
 
+/// Draft model backed by an MLX `AnyModel` running on GPU.
+///
+/// This is the baseline implementation: both draft and target share the GPU.
+/// On Apple Silicon MoE models this doesn't speed up decode (see commit
+/// `1cea874`), but it validates the trait integration and serves as fallback
+/// when ANE is unavailable.
+pub struct MlxDraftModel {
+    model: AnyModel,
+    cache: AnyCache,
+    /// Snapshot of the cache before the last `draft()` call.
+    checkpoint: Option<AnyCache>,
+}
+
+impl MlxDraftModel {
+    pub fn new(model: AnyModel, cache: AnyCache) -> Self {
+        Self {
+            model,
+            cache,
+            checkpoint: None,
+        }
+    }
+}
+
+impl DraftModel for MlxDraftModel {
+    fn draft(&mut self, last_token_id: u32, num_draft: usize) -> Result<Vec<u32>, EngineError> {
+        // Save checkpoint for rollback
+        self.checkpoint = Some(self.cache.clone());
+
+        let mut tokens = Vec::with_capacity(num_draft);
+        let mut current = Array::from_slice(&[last_token_id], &[1]);
+
+        for _ in 0..num_draft {
+            let input = current.index((.., NewAxis));
+            let logits = self
+                .model
+                .forward(&input, None, &mut self.cache)
+                .map_err(EngineError::Mlx)?;
+            let last_logits = logits.index((.., -1, ..));
+            let next = mlx_rs::ops::indexing::argmax_axis(&last_logits, -1, false)
+                .map_err(EngineError::Mlx)?;
+            eval(std::slice::from_ref(&next)).map_err(EngineError::Mlx)?;
+
+            let token_id: u32 = next.item();
+            tokens.push(token_id);
+            current = Array::from_slice(&[token_id], &[1]);
+        }
+
+        Ok(tokens)
+    }
+
+    fn advance(&mut self, _n: usize) -> Result<(), EngineError> {
+        // Cache already has the right state for accepted tokens.
+        // Drop the checkpoint — no rollback needed.
+        self.checkpoint = None;
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<(), EngineError> {
+        if let Some(checkpoint) = self.checkpoint.take() {
+            self.cache = checkpoint;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // Compile-time check: MlxDraftModel satisfies DraftModel + Send
+    const _: () = {
+        fn _assert_send<T: DraftModel + Send>() {}
+        fn _check() {
+            _assert_send::<MlxDraftModel>();
+        }
+    };
 
     // ── accept_prefix ──────────────────────────────────────────────────
 

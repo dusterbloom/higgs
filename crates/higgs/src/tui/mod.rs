@@ -567,6 +567,8 @@ mod tests {
                 path: "mlx-community/Llama-3.2-1B-Instruct-4bit".to_owned(),
                 name: None,
                 batch: false,
+                draft_model: None,
+                num_draft: 8,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
