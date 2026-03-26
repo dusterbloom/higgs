@@ -251,6 +251,14 @@ fn load_engines(
         let kv_cache_config = model_cfg.kv_cache_config();
         let engine = if model_cfg.batch {
             Engine::load_batch(&resolved, kv_cache_config)?
+        } else if let Some(ref draft_path) = model_cfg.draft_model {
+            let draft_resolved = model_resolver::resolve(draft_path)?;
+            Engine::load_simple_with_draft(
+                &resolved,
+                &draft_resolved,
+                model_cfg.num_draft,
+                kv_cache_config,
+            )?
         } else {
             Engine::load_simple(&resolved, kv_cache_config)?
         };

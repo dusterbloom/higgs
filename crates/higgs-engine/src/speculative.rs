@@ -1,3 +1,4 @@
+use higgs_models::turboquant::KvCacheConfig;
 use higgs_models::{AnyCache, AnyModel};
 use mlx_rs::ops::indexing::{IndexOp, NewAxis};
 use mlx_rs::transforms::eval;
@@ -140,6 +141,11 @@ pub fn accept_prefix(draft_ids: &[u32], target_ids: &[u32]) -> Result<Vec<u32>, 
 /// Trait for a draft model that produces candidate tokens for speculative
 /// decoding. Implementations may run on any device (GPU, ANE, CPU).
 pub trait DraftModel: Send {
+    /// Prefill the draft model with the given prompt tokens, resetting any
+    /// prior cache state. Must be called once before the first `draft()` call
+    /// in a new generation request.
+    fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<(), EngineError>;
+
     /// Generate up to `num_draft` greedy tokens starting from `last_token_id`.
     fn draft(&mut self, last_token_id: u32, num_draft: usize) -> Result<Vec<u32>, EngineError>;
 
@@ -161,21 +167,41 @@ pub trait DraftModel: Send {
 pub struct MlxDraftModel {
     model: AnyModel,
     cache: AnyCache,
+    kv_cache_config: KvCacheConfig,
     /// Snapshot of the cache before the last `draft()` call.
     checkpoint: Option<AnyCache>,
 }
 
 impl MlxDraftModel {
-    pub fn new(model: AnyModel, cache: AnyCache) -> Self {
+    pub fn new(model: AnyModel, cache: AnyCache, kv_cache_config: KvCacheConfig) -> Self {
         Self {
             model,
             cache,
+            kv_cache_config,
             checkpoint: None,
         }
     }
 }
 
 impl DraftModel for MlxDraftModel {
+    fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<(), EngineError> {
+        self.cache = self
+            .model
+            .make_cache_with_config(self.kv_cache_config)
+            .map_err(EngineError::Mlx)?;
+        self.checkpoint = None;
+
+        let len =
+            i32::try_from(prompt_tokens.len()).map_err(|_| EngineError::Generation("prompt too long for draft prefill".into()))?;
+        let input = Array::from_slice(prompt_tokens, &[1, len]);
+        let logits = self
+            .model
+            .forward(&input, None, &mut self.cache)
+            .map_err(EngineError::Mlx)?;
+        eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
+        Ok(())
+    }
+
     fn draft(&mut self, last_token_id: u32, num_draft: usize) -> Result<Vec<u32>, EngineError> {
         // Save checkpoint for rollback
         self.checkpoint = Some(self.cache.clone());
@@ -204,7 +230,9 @@ impl DraftModel for MlxDraftModel {
 
     fn advance(&mut self, _n: usize) -> Result<(), EngineError> {
         // Cache already has the right state for accepted tokens.
-        // Drop the checkpoint — no rollback needed.
+        // Draft quality slightly degrades after partial acceptance (stale cache
+        // entries remain), but correctness is unaffected — the target always
+        // verifies. A future optimization can trim the draft cache too.
         self.checkpoint = None;
         Ok(())
     }
@@ -225,7 +253,7 @@ mod tests {
     // Compile-time check: MlxDraftModel satisfies DraftModel + Send
     const _: () = {
         fn _assert_send<T: DraftModel + Send>() {}
-        fn _check() {
+        fn _assert() {
             _assert_send::<MlxDraftModel>();
         }
     };
@@ -302,6 +330,10 @@ mod tests {
     }
 
     impl DraftModel for MockDraft {
+        fn prefill(&mut self, _prompt_tokens: &[u32]) -> Result<(), EngineError> {
+            Ok(())
+        }
+
         fn draft(&mut self, _last_token_id: u32, num_draft: usize) -> Result<Vec<u32>, EngineError> {
             let mut tokens = Vec::with_capacity(num_draft);
             for i in 0..num_draft {

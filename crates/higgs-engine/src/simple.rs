@@ -19,6 +19,7 @@ use crate::{
     error::EngineError,
     model_loader,
     paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
+    speculative::{self, DraftModel, MlxDraftModel},
 };
 
 /// Default maximum number of cached prefixes.
@@ -84,6 +85,10 @@ pub struct SimpleEngine {
     template: Option<ChatTemplateRenderer>,
     model_name: String,
     eos_token_ids: Vec<u32>,
+    /// Optional draft model for speculative decoding.
+    draft: Option<Mutex<Box<dyn DraftModel>>>,
+    /// Number of draft tokens per speculative cycle.
+    num_draft: usize,
     /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
     enable_thinking: bool,
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
@@ -169,10 +174,41 @@ impl SimpleEngine {
             template,
             model_name,
             eos_token_ids,
+            draft: None,
+            num_draft: 0,
             enable_thinking,
             think_close_token,
             kv_cache_config,
         })
+    }
+
+    /// Load with an optional draft model for speculative decoding.
+    pub fn load_with_draft<P: AsRef<Path>>(
+        dir: P,
+        draft_dir: P,
+        num_draft: usize,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        let mut engine = Self::load(&dir, kv_cache_config)?;
+
+        let dp = draft_dir.as_ref();
+        tracing::info!(draft_dir = %dp.display(), num_draft, "Loading draft model for speculative decoding");
+        let draft_model = model_loader::load_model(dp)?;
+        let draft_cache = draft_model
+            .make_cache_with_config(kv_cache_config)
+            .map_err(EngineError::Mlx)?;
+        let mlx_draft = MlxDraftModel::new(draft_model, draft_cache, kv_cache_config);
+        engine.draft = Some(Mutex::new(Box::new(mlx_draft)));
+        engine.num_draft = num_draft;
+
+        tracing::info!(
+            model_name = %engine.model_name,
+            speculative = true,
+            num_draft,
+            "Engine ready (speculative)"
+        );
+
+        Ok(engine)
     }
 
     /// Get the model name.
@@ -624,6 +660,20 @@ impl SimpleEngine {
             });
         }
 
+        // Speculative decode: if we have a draft model, no constraint, and no
+        // logprobs, use the fast speculative path instead of token-by-token decode.
+        if self.draft.is_some() && constraint.is_none() && !logprobs {
+            return self.speculative_generate(
+                prompt_tokens,
+                &mut prepared,
+                tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                prompt_len,
+            );
+        }
+
         // Pipelined decode: build step N+2's graph while GPU computes step N+1.
         // When constrained generation is active, pipelining would apply the FSM mask
         // one step behind (since we need the sampled token value to advance the FSM
@@ -855,6 +905,133 @@ impl SimpleEngine {
         }
     }
 
+    /// Non-streaming speculative decode: draft K tokens, verify in batch, repeat.
+    ///
+    /// The target model processes the verify batch in a single forward pass,
+    /// then we accept the longest matching prefix. This yields 1..=K+1 tokens
+    /// per cycle instead of 1 token per decode step.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        clippy::significant_drop_tightening,
+        clippy::cast_possible_truncation
+    )]
+    fn speculative_generate(
+        &self,
+        prompt_tokens: &[u32],
+        prepared: &mut PreparedGeneration<'_>,
+        mut tokens: Vec<u32>,
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        prompt_len: u32,
+    ) -> Result<GenerationOutput, EngineError> {
+        let draft_mutex = self
+            .draft
+            .as_ref()
+            .ok_or_else(|| EngineError::Generation("No draft model".into()))?;
+        let mut draft_guard = draft_mutex
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Draft lock: {e}")))?;
+        let draft = &mut **draft_guard;
+
+        // Prefill draft model with the same prompt
+        draft.prefill(prompt_tokens)?;
+
+        let model = &mut *prepared.model;
+        let cache = &mut prepared.cache;
+        let has_stop_sequences = !stop_sequences.is_empty();
+        let max = max_tokens as usize;
+
+        let mut current = *tokens
+            .last()
+            .ok_or_else(|| EngineError::Generation("No first token".into()))?;
+
+        while tokens.len() < max {
+            let remaining = max - tokens.len();
+            let k = self.num_draft.min(remaining);
+            if k == 0 {
+                break;
+            }
+
+            // 1. Draft K tokens, 2-3. verify, 4. accept — via speculative_step
+            let mut actual_k = 0usize;
+            let accepted =
+                speculative::speculative_step(draft, current, k, |batch: &[u32]| {
+                    actual_k = batch.len() - 1;
+                    let batch_len = i32::try_from(batch.len()).map_err(|_| {
+                        EngineError::Generation("verify batch overflow".into())
+                    })?;
+                    let input = Array::from_slice(batch, &[1, batch_len]);
+                    let logits =
+                        model.forward(&input, None, cache).map_err(EngineError::Mlx)?;
+                    eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
+
+                    let mut ids = Vec::with_capacity(batch.len());
+                    for i in 0..batch.len() {
+                        let pos_logits = logits.index((.., i as i32, ..));
+                        let penalized =
+                            higgs_models::apply_penalties(&pos_logits, &tokens, params)
+                                .map_err(EngineError::Mlx)?;
+                        let token =
+                            higgs_models::sample(&penalized, params).map_err(EngineError::Mlx)?;
+                        eval(std::slice::from_ref(&token)).map_err(EngineError::Mlx)?;
+                        ids.push(token.item());
+                    }
+                    Ok(ids)
+                })?;
+
+            // Trim target cache: remove entries for rejected draft tokens
+            let trim = (actual_k + 1) - accepted.len();
+            if trim > 0 {
+                cache.trim_by(trim as i32);
+            }
+
+            // Push accepted tokens, check termination
+            for &token_id in &accepted {
+                if tokens.len() >= max {
+                    break;
+                }
+                tokens.push(token_id);
+
+                if self.eos_token_ids.contains(&token_id) {
+                    return Ok(GenerationOutput {
+                        text: self.decode_tokens(&tokens)?,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: Self::completion_len(&tokens)?,
+                        token_logprobs: None,
+                    });
+                }
+
+                if has_stop_sequences {
+                    let text = self.decode_tokens(&tokens)?;
+                    if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
+                        return Ok(GenerationOutput {
+                            text: truncated,
+                            finish_reason: "stop".to_owned(),
+                            prompt_tokens: prompt_len,
+                            completion_tokens: Self::completion_len(&tokens)?,
+                            token_logprobs: None,
+                        });
+                    }
+                }
+            }
+
+            if let Some(&last) = tokens.last() {
+                current = last;
+            }
+        }
+
+        Ok(GenerationOutput {
+            text: self.decode_tokens(&tokens)?,
+            finish_reason: "length".to_owned(),
+            prompt_tokens: prompt_len,
+            completion_tokens: Self::completion_len(&tokens)?,
+            token_logprobs: None,
+        })
+    }
+
     /// Generate tokens one at a time, sending each via the provided channel.
     ///
     /// If the receiver is dropped (client disconnected), generation stops early.
@@ -983,6 +1160,22 @@ impl SimpleEngine {
 
         if finished {
             return Ok(());
+        }
+
+        // Speculative streaming: if draft model is available with no constraint
+        // and no logprobs, use speculative decode for higher throughput.
+        if self.draft.is_some() && constraint.is_none() && !logprobs {
+            return self.speculative_streaming(
+                prompt_tokens,
+                &mut prepared,
+                &mut all_tokens,
+                &mut prev_decoded_len,
+                max_tokens,
+                params,
+                stop_sequences,
+                sender,
+                prompt_len,
+            );
         }
 
         // Thinking budget (streaming): force </think> after N tokens.
@@ -1132,6 +1325,163 @@ impl SimpleEngine {
                 next_token = following;
             }
             next_logprob_data = following_logprob_data;
+        }
+
+        Ok(())
+    }
+
+    /// Streaming speculative decode: draft K tokens, verify in batch, stream
+    /// accepted tokens after each cycle.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        clippy::significant_drop_tightening,
+        clippy::cast_possible_truncation
+    )]
+    fn speculative_streaming(
+        &self,
+        prompt_tokens: &[u32],
+        prepared: &mut PreparedGeneration<'_>,
+        all_tokens: &mut Vec<u32>,
+        prev_decoded_len: &mut usize,
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        prompt_len: u32,
+    ) -> Result<(), EngineError> {
+        let draft_mutex = self
+            .draft
+            .as_ref()
+            .ok_or_else(|| EngineError::Generation("No draft model".into()))?;
+        let mut draft_guard = draft_mutex
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Draft lock: {e}")))?;
+        let draft = &mut **draft_guard;
+
+        // Prefill draft model with the same prompt
+        draft.prefill(prompt_tokens)?;
+
+        let model = &mut *prepared.model;
+        let cache = &mut prepared.cache;
+        let has_stop_sequences = !stop_sequences.is_empty();
+        let max = max_tokens as usize;
+
+        let mut current = *all_tokens
+            .last()
+            .ok_or_else(|| EngineError::Generation("No first token".into()))?;
+
+        loop {
+            let completion_so_far = all_tokens.len();
+            if completion_so_far >= max {
+                break;
+            }
+            let remaining = max - completion_so_far;
+            let k = self.num_draft.min(remaining);
+            if k == 0 {
+                break;
+            }
+
+            let mut actual_k = 0usize;
+            let accepted =
+                speculative::speculative_step(draft, current, k, |batch: &[u32]| {
+                    actual_k = batch.len() - 1;
+                    let batch_len = i32::try_from(batch.len()).map_err(|_| {
+                        EngineError::Generation("verify batch overflow".into())
+                    })?;
+                    let input = Array::from_slice(batch, &[1, batch_len]);
+                    let logits =
+                        model.forward(&input, None, cache).map_err(EngineError::Mlx)?;
+                    eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
+
+                    let mut ids = Vec::with_capacity(batch.len());
+                    for i in 0..batch.len() {
+                        let pos_logits = logits.index((.., i as i32, ..));
+                        let penalized =
+                            higgs_models::apply_penalties(&pos_logits, all_tokens, params)
+                                .map_err(EngineError::Mlx)?;
+                        let token = higgs_models::sample(&penalized, params)
+                            .map_err(EngineError::Mlx)?;
+                        eval(std::slice::from_ref(&token)).map_err(EngineError::Mlx)?;
+                        ids.push(token.item());
+                    }
+                    Ok(ids)
+                })?;
+
+            // Trim target cache for rejected draft tokens
+            let trim = (actual_k + 1) - accepted.len();
+            if trim > 0 {
+                cache.trim_by(trim as i32);
+            }
+
+            let mut should_stop = false;
+            for &token_id in &accepted {
+                if all_tokens.len() >= max {
+                    should_stop = true;
+                    break;
+                }
+                all_tokens.push(token_id);
+                let completion_len = Self::completion_len(all_tokens)?;
+                let is_eos = self.eos_token_ids.contains(&token_id);
+                let is_max = completion_len >= max_tokens;
+
+                let full_text = self.decode_tokens(all_tokens)?;
+                let new_text = full_text
+                    .get(*prev_decoded_len..)
+                    .unwrap_or_default()
+                    .to_owned();
+                *prev_decoded_len = full_text.len();
+
+                let (final_text, hit_stop) = if has_stop_sequences {
+                    check_stop_sequences(&full_text, stop_sequences).map_or_else(
+                        || (new_text, false),
+                        |truncated| {
+                            let emit = truncated
+                                .get(prev_decoded_len.saturating_sub(truncated.len())..)
+                                .unwrap_or(&truncated)
+                                .to_owned();
+                            (emit, true)
+                        },
+                    )
+                } else {
+                    (new_text, false)
+                };
+
+                let finished = is_eos || hit_stop || is_max;
+
+                if sender
+                    .blocking_send(StreamingOutput {
+                        new_text: final_text,
+                        finished,
+                        finish_reason: if is_eos || hit_stop {
+                            Some("stop".to_owned())
+                        } else if is_max {
+                            Some("length".to_owned())
+                        } else {
+                            None
+                        },
+                        prompt_tokens: prompt_len,
+                        completion_tokens: completion_len,
+                        token_logprob: None,
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+
+                if finished {
+                    should_stop = true;
+                    break;
+                }
+            }
+
+            if should_stop {
+                break;
+            }
+
+            if let Some(&last) = all_tokens.last() {
+                current = last;
+            }
         }
 
         Ok(())

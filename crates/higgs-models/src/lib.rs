@@ -86,6 +86,30 @@ pub enum AnyCache {
     Hybrid(Vec<Option<LayerCache>>),
 }
 
+impl AnyCache {
+    /// Trim all layer caches by `count` entries (reduce offset).
+    ///
+    /// Used after speculative decode verification to discard KV entries
+    /// for rejected draft tokens. Hybrid (SSM) layers are left unchanged
+    /// since their recurrent state cannot be trivially rolled back.
+    pub fn trim_by(&mut self, count: i32) {
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    layer.trim_by(count);
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        kv.trim_by(count);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Unified model wrapper dispatching to the correct architecture.
 pub enum AnyModel {
     /// Standard transformer architectures: Llama, Mistral, Qwen2/2.5, Qwen3.
