@@ -1,0 +1,22 @@
+================================================================================
+HEAD-TO-HEAD: Higgs vs oMLX — 2026-03-26 18:02:17
+Max tokens: 100  Turns: 5  Cooldown: 5s
+Models: DSV2
+oMLX: --no-cache (paged SSD cache disabled for fair comparison)
+================================================================================
+
+################################################################################
+# MODEL: DeepSeek-V2-Lite-4bit (MoE)
+# Path:  /Users/peppi/.cache/lm-studio/models/mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx
+################################################################################
+
+  --- higgs ---
+  Starting Higgs on :8899 ...
+  Server ready: model=DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx  RSS=8518MB
+  Warmup...
+  Warmup done. RSS=8528MB
+
+  [Single-turn]
+    short   : TTFT=    200ms  decode= 66.7tok/s  prompt=  19tok  gen= 17tok  total=  0.5s  RSS= 8528MB
+    medium  : TTFT=    496ms  decode= 59.1tok/s  prompt=  63tok  gen=100tok  total=  2.2s  RSS= 8529MB
+    long    : TTFT=   2510ms  decode= 57.9tok/s  prompt= 315tok  gen=100tok  total=  4.2s  RSS= 8529MB

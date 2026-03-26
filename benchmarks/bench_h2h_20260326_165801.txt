@@ -1,0 +1,75 @@
+================================================================================
+HEAD-TO-HEAD: Higgs vs oMLX — 2026-03-26 16:57:06
+Max tokens: 100  Turns: 5  Cooldown: 5s
+Models: DSV2
+oMLX: --no-cache (paged SSD cache disabled for fair comparison)
+================================================================================
+
+################################################################################
+# MODEL: DeepSeek-V2-Lite-4bit (MoE)
+# Path:  /Users/peppi/.cache/lm-studio/models/mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx
+################################################################################
+
+  --- higgs ---
+  Starting Higgs on :8899 ...
+  Server ready: model=DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx  RSS=8515MB
+  Warmup...
+  Warmup done. RSS=8527MB
+
+  [Single-turn]
+    short   : TTFT=    198ms  decode= 76.5tok/s  prompt=  19tok  gen= 12tok  total=  0.4s  RSS= 8528MB
+    medium  : TTFT=    496ms  decode= 63.3tok/s  prompt=  63tok  gen=100tok  total=  2.1s  RSS= 8528MB
+    long    : TTFT=   2510ms  decode= 61.5tok/s  prompt= 315tok  gen=100tok  total=  4.1s  RSS= 8529MB
+
+  [Multi-turn, 5 turns]
+    turn 1: TTFT=    568ms  decode= 65.5tok/s  prompt=  65tok  gen= 80tok  total=  1.8s  RSS= 8530MB  ctx~65
+    turn 2: TTFT=    808ms  decode= 62.0tok/s  prompt= 167tok  gen= 80tok  total=  2.1s  RSS= 8530MB  ctx~167
+    turn 3: TTFT=    889ms  decode= 62.4tok/s  prompt= 269tok  gen= 80tok  total=  2.2s  RSS= 8531MB  ctx~269
+    turn 4: TTFT=    952ms  decode= 61.9tok/s  prompt= 372tok  gen= 80tok  total=  2.2s  RSS= 8531MB  ctx~372
+    turn 5: TTFT=    998ms  decode= 60.5tok/s  prompt= 476tok  gen= 80tok  total=  2.3s  RSS= 8532MB  ctx~476
+
+  --- omlx ---
+  Starting oMLX on :8000 (--no-cache) ...
+  Server ready: model=DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx  RSS=123MB
+  Warmup...
+  Warmup done. RSS=8676MB
+
+  [Single-turn]
+    short   : TTFT=    194ms  decode= 55.6tok/s  prompt=   9tok  gen= 15tok  total=  0.5s  RSS= 8675MB
+    medium  : TTFT=    327ms  decode= 63.2tok/s  prompt= 100tok  gen= 99tok  total=  1.9s  RSS= 8677MB
+    long    : TTFT=    706ms  decode= 59.8tok/s  prompt= 379tok  gen= 98tok  total=  2.3s  RSS= 8678MB
+
+  [Multi-turn, 5 turns]
+    turn 1: TTFT=    337ms  decode= 64.1tok/s  prompt=  89tok  gen= 80tok  total=  1.6s  RSS= 8678MB  ctx~89
+    turn 2: TTFT=    499ms  decode= 61.3tok/s  prompt= 225tok  gen= 79tok  total=  1.8s  RSS= 8679MB  ctx~225
+    turn 3: TTFT=    650ms  decode= 61.6tok/s  prompt= 350tok  gen= 80tok  total=  1.9s  RSS= 8679MB  ctx~350
+    turn 4: TTFT=    808ms  decode= 58.9tok/s  prompt= 486tok  gen= 65tok  total=  1.9s  RSS= 8679MB  ctx~486
+    turn 5: TTFT=    935ms  decode= 58.1tok/s  prompt= 575tok  gen= 49tok  total=  1.8s  RSS= 8678MB  ctx~575
+
+================================================================================
+COMPARISON: DeepSeek-V2-Lite-4bit (MoE)
+================================================================================
+
+                          TTFT (ms)         Decode (tok/s)
+  Prompt           Higgs      oMLX       Higgs      oMLX     TTFT  Decode
+  --------------------------------------------------------------------------
+  short             198       194       76.5      55.6    0.98x   1.38x
+  medium            496       327       63.3      63.2    0.66x   1.00x
+  long             2510       706       61.5      59.8    0.28x   1.03x
+
+  Multi-turn TTFT progression:
+   Turn   Higgs TTFT    oMLX TTFT   Higgs dec    oMLX dec
+  -------------------------------------------------------
+      1        568ms        337ms      65.5/s      64.1/s
+      2        808ms        499ms      62.0/s      61.3/s
+      3        889ms        650ms      62.4/s      61.6/s
+      4        952ms        808ms      61.9/s      58.9/s
+      5        998ms        935ms      60.5/s      58.1/s
+
+================================================================================
+FINAL SUMMARY
+================================================================================
+
+  Model                                    TTFT Higgs  TTFT oMLX  Dec Higgs   Dec oMLX
+  ------------------------------------------------------------------------------------
+  DeepSeek-V2-Lite-4bit (MoE)                   496ms      327ms     63.3/s     63.2/s
