@@ -18,6 +18,7 @@ use mlx_rs::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParameters},
     nn, ops,
+    ops::indexing::IndexOp,
     quantization::MaybeQuantized,
     Array,
 };
@@ -806,11 +807,13 @@ impl Gemma2CausalLM {
     ) -> Result<Array, Exception> {
         let hidden = self.forward_hidden(inputs, mask, kv_cache)?;
 
+        let T = inputs.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if T > 1 { hidden.index((.., -1.., ..)) } else { hidden };
         let mut logits = match self.lm_head.as_mut() {
-            Some(head) => head.forward(&hidden)?,
+            Some(head) => head.forward(&lm_input)?,
             None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(embed) => embed.as_linear(&hidden)?,
-                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&hidden)?,
+                MaybeQuantized::Original(embed) => embed.as_linear(&lm_input)?,
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&lm_input)?,
             },
         };
 

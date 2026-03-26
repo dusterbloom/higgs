@@ -56,6 +56,7 @@ pub(crate) fn scaled_dot_product_attention(
         values,
         scale,
         mask.map(ScaledDotProductAttentionMask::Array),
+        None::<&Array>,
     )
 }
 

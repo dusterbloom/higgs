@@ -33,34 +33,43 @@ const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 #[allow(unsafe_code)]
 pub(crate) fn set_wired_limit_to_max() {
     unsafe {
-        let info = mlx_sys::mlx_metal_device_info();
-        let max_rec = info.max_recommended_working_set_size;
-        if max_rec > 0 {
-            let mem_limit = max_rec * 3 / 4; // 75% of GPU max
-            let cache_limit = max_rec / 2; // 50% of GPU max
+        let mut info = mlx_sys::mlx_device_info_new();
+        let mut dev = mlx_sys::mlx_device_new();
+        mlx_sys::mlx_get_default_device(&raw mut dev);
+        if mlx_sys::mlx_device_info_get(&raw mut info, dev) == 0 {
+            let mut max_rec: usize = 0;
+            let key = c"max_recommended_working_set_size";
+            if mlx_sys::mlx_device_info_get_size(&raw mut max_rec, info, key.as_ptr()) == 0
+                && max_rec > 0
+            {
+                let mem_limit = max_rec * 3 / 4; // 75% of GPU max
+                let cache_limit = max_rec / 2; // 50% of GPU max
 
-            let mut prev_mem: usize = 0;
-            let mut prev_cache: usize = 0;
+                let mut prev_mem: usize = 0;
+                let mut prev_cache: usize = 0;
 
-            // Check env var to optionally disable memory limits for testing
-            let limits_enabled = std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
+                // Check env var to optionally disable memory limits for testing
+                let limits_enabled = std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
 
-            if limits_enabled {
-                mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
-                mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
+                if limits_enabled {
+                    mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
+                    mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
+                }
+
+                tracing::info!(
+                    max_recommended_mb = max_rec / (1024 * 1024),
+                    memory_limit_mb = mem_limit / (1024 * 1024),
+                    cache_limit_mb = cache_limit / (1024 * 1024),
+                    limits_enabled,
+                    "MLX memory limits {} (prev mem={}MB, cache={}MB)",
+                    if limits_enabled { "set" } else { "skipped" },
+                    prev_mem / (1024 * 1024),
+                    prev_cache / (1024 * 1024),
+                );
             }
-
-            tracing::info!(
-                max_recommended_mb = max_rec / (1024 * 1024),
-                memory_limit_mb = mem_limit / (1024 * 1024),
-                cache_limit_mb = cache_limit / (1024 * 1024),
-                limits_enabled,
-                "MLX memory limits {} (prev mem={}MB, cache={}MB)",
-                if limits_enabled { "set" } else { "skipped" },
-                prev_mem / (1024 * 1024),
-                prev_cache / (1024 * 1024),
-            );
         }
+        mlx_sys::mlx_device_info_free(info);
+        mlx_sys::mlx_device_free(dev);
     }
 }
 

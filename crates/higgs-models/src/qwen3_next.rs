@@ -350,8 +350,9 @@ pub(crate) fn gather_qmm(
             null_lhs,
             rhs_indices.as_ptr(),
             transpose,
-            group_size,
-            bits,
+            mlx_sys::mlx_optional_int_ { value: group_size, has_value: true },
+            mlx_sys::mlx_optional_int_ { value: bits, has_value: true },
+            c"affine".as_ptr(),
             sorted_indices,
             stream.as_ptr(),
         )
