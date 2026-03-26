@@ -345,7 +345,7 @@ impl Qwen3MoeMlpBlock {
             raw_scores
         };
 
-        let y = experts.forward_gather(x, &top_inds, false)?;
+        let y = experts.forward_gather_global_sort(x, &top_inds)?;
 
         y.multiply(&top_scores.expand_dims(-1)?)?
             .sum_axes(&[-2], false)

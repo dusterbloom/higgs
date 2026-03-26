@@ -632,7 +632,7 @@ impl DeepSeekV2MlpBlock {
             .switch_mlp
             .as_ref()
             .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?
-            .forward_gather(x, &top_inds, false)?;
+            .forward_gather_global_sort(x, &top_inds)?;
         let mut result = y
             .multiply(&scaled_scores.expand_dims(-1)?)?
             .sum_axes(&[-2], false)?;
