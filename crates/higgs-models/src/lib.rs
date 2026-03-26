@@ -272,7 +272,8 @@ impl AnyModel {
                     make_turboquant_kv_cache(
                         m.args.num_hidden_layers,
                         m.args.num_key_value_heads,
-                        m.args.checked_head_dim()
+                        m.args
+                            .checked_head_dim()
                             .map_err(|err| Exception::custom(err.to_string()))?,
                         kv_cache_config,
                     )

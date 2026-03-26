@@ -86,7 +86,10 @@ pub struct BatchEngine {
 
 impl BatchEngine {
     /// Load a model and start the background processing loop.
-    pub fn load<P: AsRef<Path>>(dir: P, kv_cache_config: KvCacheConfig) -> Result<Self, EngineError> {
+    pub fn load<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
         if kv_cache_config.is_turboquant() {
             return Err(EngineError::Generation(
                 "TurboQuant is not supported with the batch engine".to_owned(),

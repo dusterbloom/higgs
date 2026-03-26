@@ -255,12 +255,7 @@ where
             keys = apply_rope(&keys, &self.rope, kv_cache.offset())?;
 
             let output = cached_scaled_dot_product_attention(
-                queries,
-                kv_cache,
-                keys,
-                values,
-                self.scale,
-                mask,
+                queries, kv_cache, keys, values, self.scale, mask,
             )?
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[B, L, -1])?;
@@ -575,6 +570,7 @@ impl Starcoder2CausalLM {
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
         let out = self.forward_hidden(inputs, mask, kv_cache)?;
+        let out = out.index((.., -1.., ..));
 
         let T = inputs.shape().get(1).copied().unwrap_or(1);
         let lm_input = if T > 1 { out.index((.., -1.., ..)) } else { out };

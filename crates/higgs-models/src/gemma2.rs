@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use mlx_rs::{
-    array,
+    Array, array,
     builder::Builder,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
@@ -20,14 +20,13 @@ use mlx_rs::{
     nn, ops,
     ops::indexing::IndexOp,
     quantization::MaybeQuantized,
-    Array,
 };
 use serde::Deserialize;
 
 use crate::{
     cache::{KeyValueCache, KvCacheView},
     error::ModelError,
-    utils::{apply_rope, create_attention_mask, AttentionMask},
+    utils::{AttentionMask, apply_rope, create_attention_mask},
 };
 
 // ---------------------------------------------------------------------------
@@ -806,6 +805,7 @@ impl Gemma2CausalLM {
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
         let hidden = self.forward_hidden(inputs, mask, kv_cache)?;
+        let hidden = hidden.index((.., -1.., ..));
 
         let T = inputs.shape().get(1).copied().unwrap_or(1);
         let lm_input = if T > 1 { hidden.index((.., -1.., ..)) } else { hidden };

@@ -832,10 +832,11 @@ impl DeepSeekV2CausalLM {
         kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, mask, kv_cache)?;
+        let h_last = h.index((.., -1.., ..));
 
         match self.lm_head.as_ref() {
-            Some(head) => head.forward(&h),
-            None => self.model.embed_tokens.as_linear(&h),
+            Some(head) => head.forward(&h_last),
+            None => self.model.embed_tokens.as_linear(&h_last),
         }
     }
 }
