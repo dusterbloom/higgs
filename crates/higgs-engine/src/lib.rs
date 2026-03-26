@@ -4,6 +4,7 @@ pub mod constrained;
 pub mod engine;
 pub mod error;
 pub mod model_loader;
+pub mod paged_prefix_cache;
 pub mod prompt_cache;
 pub mod reasoning_parser;
 pub mod simple;
