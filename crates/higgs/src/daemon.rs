@@ -114,6 +114,8 @@ port = 8000
 # path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # name = "llama"
 # batch = false
+# draft_model = "mlx-community/Llama-3.2-1B-Instruct-4bit"  # speculative decoding
+# num_draft = 8  # draft tokens per cycle (default: 8)
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.
