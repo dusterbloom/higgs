@@ -18,7 +18,7 @@ use crate::{
     engine::{GenerationOutput, StreamingOutput},
     error::EngineError,
     model_loader,
-    prompt_cache::PrefixCache,
+    paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
 };
 
 /// Default maximum number of cached prefixes.
@@ -79,7 +79,7 @@ pub(crate) fn set_wired_limit_to_max() {
 /// Reuses cached KV states for shared prompt prefixes (e.g., system prompts).
 pub struct SimpleEngine {
     model: Mutex<AnyModel>,
-    prefix_cache: Mutex<PrefixCache>,
+    prefix_cache: Mutex<PagedPrefixCache>,
     tokenizer: Tokenizer,
     template: Option<ChatTemplateRenderer>,
     model_name: String,
@@ -103,7 +103,10 @@ struct PreparedGeneration<'a> {
 
 impl SimpleEngine {
     /// Load a model and tokenizer from a directory.
-    pub fn load<P: AsRef<Path>>(dir: P, kv_cache_config: KvCacheConfig) -> Result<Self, EngineError> {
+    pub fn load<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
 
@@ -158,7 +161,10 @@ impl SimpleEngine {
 
         Ok(Self {
             model: Mutex::new(model),
-            prefix_cache: Mutex::new(PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE)),
+            prefix_cache: Mutex::new(PagedPrefixCache::new(
+                DEFAULT_PREFIX_CACHE_SIZE,
+                DEFAULT_BLOCK_SIZE,
+            )),
             tokenizer,
             template,
             model_name,
@@ -375,7 +381,7 @@ impl SimpleEngine {
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            pc.store(prompt_tokens, prepared.cache.clone());
+            pc.store(prompt_tokens, &prepared.cache);
         }
 
         Ok((current_token, logprob_data))

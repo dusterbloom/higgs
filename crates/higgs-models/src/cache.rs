@@ -76,11 +76,8 @@ impl TurboQuantKvView {
                 let sign_end = checked_add(sign_start, sign_bytes, "key sign range")?;
                 let value_code_start =
                     checked_mul(scalar_index, value_code_bytes, "value code index")?;
-                let value_code_end = checked_add(
-                    value_code_start,
-                    value_code_bytes,
-                    "value code range",
-                )?;
+                let value_code_end =
+                    checked_add(value_code_start, value_code_bytes, "value code range")?;
 
                 let key = QuantizedKey {
                     norm: key_norms[scalar_index],
@@ -112,7 +109,9 @@ impl TurboQuantKvView {
     pub fn decode_scores(&self, queries: &Array, num_heads: i32) -> Result<Array, Exception> {
         let query_shape = queries.shape();
         if query_shape != [1, num_heads, 1, self.context.head_dim] {
-            return Err(Exception::custom("TurboQuant decode expects [1, H, 1, D] queries"));
+            return Err(Exception::custom(
+                "TurboQuant decode expects [1, H, 1, D] queries",
+            ));
         }
 
         let queries = queries
@@ -158,9 +157,12 @@ impl TurboQuantKvView {
             self.context.value_code_bytes,
         )?;
 
-        out_rot
-            .matmul(&self.context.rotation_array()?)?
-            .reshape(&[1, num_heads, 1, self.context.head_dim])
+        out_rot.matmul(&self.context.rotation_array()?)?.reshape(&[
+            1,
+            num_heads,
+            1,
+            self.context.head_dim,
+        ])
     }
 }
 
@@ -377,6 +379,32 @@ impl SteppingKeyValueCache {
         targets
     }
 
+    /// Read-only access to internal key array (includes allocated-but-unused slots).
+    pub fn keys(&self) -> Option<&Array> {
+        self.keys.as_ref()
+    }
+
+    /// Read-only access to internal value array (includes allocated-but-unused slots).
+    pub fn values(&self) -> Option<&Array> {
+        self.values.as_ref()
+    }
+
+    /// Create a pre-filled cache from existing K/V arrays.
+    ///
+    /// Sets `offset = keys.shape()[2]` so the next `update_dense` triggers a
+    /// normal grow cycle. Dense mode only (no TurboQuant).
+    pub fn from_arrays(keys: Array, values: Array) -> Self {
+        let offset = keys.shape()[2];
+        Self {
+            keys: Some(keys),
+            values: Some(values),
+            turbo: None,
+            config: KvCacheConfig::default(),
+            offset,
+            step: 256,
+        }
+    }
+
     fn update_dense(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
         let prev = self.offset;
         let new_tokens = keys.shape()[2];
@@ -451,6 +479,7 @@ impl SteppingKeyValueCache {
             values: result_v,
         })
     }
+
 }
 
 impl TurboQuantStorage {
@@ -535,7 +564,9 @@ impl TurboQuantStorage {
                     "value start",
                 )?;
                 let value_end = checked_add(value_start, head_dim, "value end")?;
-                let quantized_value = self.context.quantize_value(&values_slice[value_start..value_end])?;
+                let quantized_value = self
+                    .context
+                    .quantize_value(&values_slice[value_start..value_end])?;
                 self.write_value(head, prev_usize + token, &quantized_value)?;
             }
         }
@@ -581,7 +612,11 @@ impl TurboQuantStorage {
             context: Arc::clone(&self.context),
             key_codes: Array::from_slice(
                 &key_codes,
-                &[self.context.num_kv_heads, seq_len, self.context.key_code_bytes],
+                &[
+                    self.context.num_kv_heads,
+                    seq_len,
+                    self.context.key_code_bytes,
+                ],
             ),
             key_norms: Array::from_slice(&key_norms, &[self.context.num_kv_heads, seq_len]),
             key_qjl_signs: Array::from_slice(
@@ -591,7 +626,11 @@ impl TurboQuantStorage {
             key_gammas: Array::from_slice(&key_gammas, &[self.context.num_kv_heads, seq_len]),
             value_codes: Array::from_slice(
                 &value_codes,
-                &[self.context.num_kv_heads, seq_len, self.context.value_code_bytes],
+                &[
+                    self.context.num_kv_heads,
+                    seq_len,
+                    self.context.value_code_bytes,
+                ],
             ),
             value_norms: Array::from_slice(&value_norms, &[self.context.num_kv_heads, seq_len]),
             seq_len,
@@ -606,9 +645,12 @@ impl TurboQuantStorage {
             return Err(Exception::custom("TurboQuant key payload length mismatch"));
         }
 
-        let scalar_index = checked_add(checked_mul(head, capacity, "scalar head stride")?, pos, "scalar index")?;
-        let key_code_start =
-            checked_mul(scalar_index, key_code_bytes, "key code start")?;
+        let scalar_index = checked_add(
+            checked_mul(head, capacity, "scalar head stride")?,
+            pos,
+            "scalar index",
+        )?;
+        let key_code_start = checked_mul(scalar_index, key_code_bytes, "key code start")?;
         let key_code_end = checked_add(key_code_start, key_code_bytes, "key code end")?;
         let sign_start = checked_mul(scalar_index, sign_bytes, "key sign start")?;
         let sign_end = checked_add(sign_start, sign_bytes, "key sign end")?;
@@ -629,12 +671,17 @@ impl TurboQuantStorage {
         let capacity = usize_from_i32(self.capacity, "capacity")?;
         let value_code_bytes = usize_from_i32(self.context.value_code_bytes, "value_code_bytes")?;
         if value.codes.len() != value_code_bytes {
-            return Err(Exception::custom("TurboQuant value payload length mismatch"));
+            return Err(Exception::custom(
+                "TurboQuant value payload length mismatch",
+            ));
         }
 
-        let scalar_index = checked_add(checked_mul(head, capacity, "scalar head stride")?, pos, "scalar index")?;
-        let value_code_start =
-            checked_mul(scalar_index, value_code_bytes, "value code start")?;
+        let scalar_index = checked_add(
+            checked_mul(head, capacity, "scalar head stride")?,
+            pos,
+            "scalar index",
+        )?;
+        let value_code_start = checked_mul(scalar_index, value_code_bytes, "value code start")?;
         let value_code_end = checked_add(value_code_start, value_code_bytes, "value code end")?;
 
         self.value_codes[value_code_start..value_code_end].copy_from_slice(&value.codes);
@@ -649,7 +696,9 @@ impl KeyValueCache for SteppingKeyValueCache {
     }
 
     fn bits(&self) -> Option<i32> {
-        self.config.is_turboquant().then_some(i32::from(self.config.bits))
+        self.config
+            .is_turboquant()
+            .then_some(i32::from(self.config.bits))
     }
 
     fn offset(&self) -> i32 {
@@ -682,16 +731,22 @@ fn validate_turboquant_shapes(
     let key_shape = keys.shape();
     let value_shape = values.shape();
     if key_shape.len() != 4 || value_shape.len() != 4 {
-        return Err(Exception::custom("TurboQuant cache expects 4D [B, H, T, D] tensors"));
+        return Err(Exception::custom(
+            "TurboQuant cache expects 4D [B, H, T, D] tensors",
+        ));
     }
     if key_shape[0] != 1 || value_shape[0] != 1 {
-        return Err(Exception::custom("TurboQuant cache currently only supports batch size 1"));
+        return Err(Exception::custom(
+            "TurboQuant cache currently only supports batch size 1",
+        ));
     }
     if key_shape[1] != context.num_kv_heads || value_shape[1] != context.num_kv_heads {
         return Err(Exception::custom("TurboQuant KV head count mismatch"));
     }
     if key_shape[2] != value_shape[2] {
-        return Err(Exception::custom("TurboQuant keys/values token count mismatch"));
+        return Err(Exception::custom(
+            "TurboQuant keys/values token count mismatch",
+        ));
     }
     if key_shape[3] != context.head_dim || value_shape[3] != context.head_dim {
         return Err(Exception::custom("TurboQuant head_dim mismatch"));
@@ -751,7 +806,7 @@ fn checked_add(lhs: usize, rhs: usize, label: &str) -> Result<usize, Exception> 
 
 /// Slice an array along axis 2: `arr[..., start:end, ...]`
 #[allow(unsafe_code, clippy::indexing_slicing)]
-fn slice_axis2(arr: &Array, start: i32, end: i32) -> Result<Array, Exception> {
+pub fn slice_axis2(arr: &Array, start: i32, end: i32) -> Result<Array, Exception> {
     let ndim = arr.ndim();
     debug_assert!(ndim >= 3, "slice_axis2 requires ndim >= 3, got {ndim}");
     let mut starts = vec![0i32; ndim];
