@@ -834,7 +834,11 @@ impl Model {
     /// Apply the LM head to hidden states (last position only during prefill).
     fn apply_lm_head(&mut self, hidden: &Array) -> Result<Array, Exception> {
         let T = hidden.shape().get(1).copied().unwrap_or(1);
-        let lm_input = if T > 1 { hidden.index((.., -1.., ..)) } else { hidden.clone() };
+        let lm_input = if T > 1 {
+            hidden.index((.., -1.., ..))
+        } else {
+            hidden.clone()
+        };
         match self.lm_head.as_mut() {
             Some(head) => head.forward(&lm_input),
             None => match &mut self.model.embed_tokens {
