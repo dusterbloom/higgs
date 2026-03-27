@@ -48,15 +48,32 @@ impl TurboQuantKvView {
         let head_dim = usize_from_i32(self.context.head_dim, "head_dim")?;
         let seq_len = usize_from_i32(self.seq_len, "seq_len")?;
         let key_code_bytes = usize_from_i32(self.context.key_code_bytes, "key_code_bytes")?;
+        let key_code_words = usize_from_i32(self.context.key_code_words, "key_code_words")?;
         let value_code_bytes = usize_from_i32(self.context.value_code_bytes, "value_code_bytes")?;
+        let value_code_words = usize_from_i32(self.context.value_code_words, "value_code_words")?;
         let sign_bytes = usize_from_i32(self.context.sign_bytes, "sign_bytes")?;
 
-        let key_codes = self.key_codes.as_slice::<u8>();
+        // Eval all view arrays — they may be lazy GPU results from the pack kernel.
+        self.key_codes.eval()?;
+        self.key_norms.eval()?;
+        self.key_qjl_signs.eval()?;
+        self.key_gammas.eval()?;
+        self.value_codes.eval()?;
+        self.value_norms.eval()?;
+
+        // Code arrays are u32 words — reinterpret as bytes for CPU dequant
+        let key_codes_u32 = self.key_codes.as_slice::<u32>();
+        let key_codes_u8: Vec<u8> = key_codes_u32.iter().flat_map(|w| w.to_le_bytes()).collect();
         let key_norms = self.key_norms.as_slice::<f32>();
         let key_qjl_signs = self.key_qjl_signs.as_slice::<u8>();
         let key_gammas = self.key_gammas.as_slice::<f32>();
-        let value_codes = self.value_codes.as_slice::<u8>();
+        let value_codes_u32 = self.value_codes.as_slice::<u32>();
+        let value_codes_u8: Vec<u8> = value_codes_u32.iter().flat_map(|w| w.to_le_bytes()).collect();
         let value_norms = self.value_norms.as_slice::<f32>();
+
+        // Each row occupies key_code_words * 4 bytes in the reinterpreted buffer
+        let key_row_bytes = checked_mul(key_code_words, 4, "key row bytes")?;
+        let value_row_bytes = checked_mul(value_code_words, 4, "value row bytes")?;
 
         let total_values = checked_mul(num_kv_heads, seq_len, "cache size")?;
         let total_dense = checked_mul(total_values, head_dim, "dense cache size")?;
@@ -70,24 +87,24 @@ impl TurboQuantKvView {
                     pos,
                     "scalar index",
                 )?;
-                let key_code_start = checked_mul(scalar_index, key_code_bytes, "key code index")?;
-                let key_code_end = checked_add(key_code_start, key_code_bytes, "key code range")?;
+                let key_byte_start = checked_mul(scalar_index, key_row_bytes, "key code index")?;
+                let key_byte_end = checked_add(key_byte_start, key_code_bytes, "key code range")?;
                 let sign_start = checked_mul(scalar_index, sign_bytes, "key sign index")?;
                 let sign_end = checked_add(sign_start, sign_bytes, "key sign range")?;
-                let value_code_start =
-                    checked_mul(scalar_index, value_code_bytes, "value code index")?;
-                let value_code_end =
-                    checked_add(value_code_start, value_code_bytes, "value code range")?;
+                let value_byte_start =
+                    checked_mul(scalar_index, value_row_bytes, "value code index")?;
+                let value_byte_end =
+                    checked_add(value_byte_start, value_code_bytes, "value code range")?;
 
                 let key = QuantizedKey {
                     norm: key_norms[scalar_index],
                     gamma: key_gammas[scalar_index],
-                    codes: key_codes[key_code_start..key_code_end].to_vec(),
+                    codes: key_codes_u8[key_byte_start..key_byte_end].to_vec(),
                     qjl_signs: key_qjl_signs[sign_start..sign_end].to_vec(),
                 };
                 let value = QuantizedValue {
                     norm: value_norms[scalar_index],
-                    codes: value_codes[value_code_start..value_code_end].to_vec(),
+                    codes: value_codes_u8[value_byte_start..value_byte_end].to_vec(),
                 };
 
                 dense_keys.extend(self.context.dequantize_key(&key)?);
@@ -134,7 +151,7 @@ impl TurboQuantKvView {
             self.seq_len,
             self.seq_len,
             self.context.config.key_bits(),
-            self.context.key_code_bytes,
+            self.context.key_code_words,
             self.context.sign_bytes,
         )
     }
@@ -154,7 +171,7 @@ impl TurboQuantKvView {
             self.seq_len,
             self.seq_len,
             self.context.config.bits,
-            self.context.value_code_bytes,
+            self.context.value_code_words,
         )?;
 
         out_rot.matmul(&self.context.rotation_array()?)?.reshape(&[
@@ -316,12 +333,12 @@ pub struct SteppingKeyValueCache {
 #[derive(Debug, Clone)]
 struct TurboQuantStorage {
     context: Arc<TurboQuantContext>,
-    key_codes: Vec<u8>,
-    key_norms: Vec<f32>,
-    key_qjl_signs: Vec<u8>,
-    key_gammas: Vec<f32>,
-    value_codes: Vec<u8>,
-    value_norms: Vec<f32>,
+    key_codes: Option<Array>,     // [H, capacity, key_code_words] u32
+    key_norms: Option<Array>,     // [H, capacity] f32
+    key_qjl_signs: Option<Array>, // [H, capacity, sign_bytes] u8
+    key_gammas: Option<Array>,    // [H, capacity] f32
+    value_codes: Option<Array>,   // [H, capacity, value_code_words] u32
+    value_norms: Option<Array>,   // [H, capacity] f32
     capacity: i32,
 }
 
@@ -369,12 +386,15 @@ impl SteppingKeyValueCache {
 
     /// References to internal arrays that must be eval'd between chunked-prefill steps.
     pub fn eval_targets(&self) -> Vec<&Array> {
-        let mut targets = Vec::with_capacity(2);
+        let mut targets = Vec::with_capacity(8);
         if let Some(ref k) = self.keys {
             targets.push(k);
         }
         if let Some(ref v) = self.values {
             targets.push(v);
+        }
+        if let Some(ref turbo) = self.turbo {
+            targets.extend(turbo.eval_targets());
         }
         targets
     }
@@ -479,19 +499,18 @@ impl SteppingKeyValueCache {
             values: result_v,
         })
     }
-
 }
 
 impl TurboQuantStorage {
     fn new(context: Arc<TurboQuantContext>) -> Self {
         Self {
             context,
-            key_codes: vec![],
-            key_norms: vec![],
-            key_qjl_signs: vec![],
-            key_gammas: vec![],
-            value_codes: vec![],
-            value_norms: vec![],
+            key_codes: None,
+            key_norms: None,
+            key_qjl_signs: None,
+            key_gammas: None,
+            value_codes: None,
+            value_norms: None,
             capacity: 0,
         }
     }
@@ -500,24 +519,48 @@ impl TurboQuantStorage {
         if required <= self.capacity {
             return Ok(());
         }
-        let new_capacity = ((required + step - 1) / step) * step;
-        let heads = usize_from_i32(self.context.num_kv_heads, "num_kv_heads")?;
-        let capacity = usize_from_i32(new_capacity, "new_capacity")?;
-        let key_code_bytes = usize_from_i32(self.context.key_code_bytes, "key_code_bytes")?;
-        let value_code_bytes = usize_from_i32(self.context.value_code_bytes, "value_code_bytes")?;
-        let sign_bytes = usize_from_i32(self.context.sign_bytes, "sign_bytes")?;
-        let scalar_len = checked_mul(heads, capacity, "TurboQuant scalar capacity")?;
-        let key_byte_len = checked_mul(scalar_len, key_code_bytes, "TurboQuant key bytes")?;
-        let value_byte_len = checked_mul(scalar_len, value_code_bytes, "TurboQuant value bytes")?;
-        let sign_len = checked_mul(scalar_len, sign_bytes, "TurboQuant sign bytes")?;
+        let new_cap = ((required + step - 1) / step) * step;
+        let h = self.context.num_kv_heads;
+        let old_cap = self.capacity;
 
-        self.key_codes.resize(key_byte_len, 0);
-        self.key_norms.resize(scalar_len, 0.0);
-        self.key_qjl_signs.resize(sign_len, 0);
-        self.key_gammas.resize(scalar_len, 0.0);
-        self.value_codes.resize(value_byte_len, 0);
-        self.value_norms.resize(scalar_len, 0.0);
-        self.capacity = new_capacity;
+        self.key_codes = Some(grow_array(
+            self.key_codes.take(),
+            old_cap,
+            &[h, new_cap, self.context.key_code_words],
+            Dtype::Uint32,
+        )?);
+        self.key_norms = Some(grow_array(
+            self.key_norms.take(),
+            old_cap,
+            &[h, new_cap],
+            Dtype::Float32,
+        )?);
+        self.key_qjl_signs = Some(grow_array(
+            self.key_qjl_signs.take(),
+            old_cap,
+            &[h, new_cap, self.context.sign_bytes],
+            Dtype::Uint8,
+        )?);
+        self.key_gammas = Some(grow_array(
+            self.key_gammas.take(),
+            old_cap,
+            &[h, new_cap],
+            Dtype::Float32,
+        )?);
+        self.value_codes = Some(grow_array(
+            self.value_codes.take(),
+            old_cap,
+            &[h, new_cap, self.context.value_code_words],
+            Dtype::Uint32,
+        )?);
+        self.value_norms = Some(grow_array(
+            self.value_norms.take(),
+            old_cap,
+            &[h, new_cap],
+            Dtype::Float32,
+        )?);
+
+        self.capacity = new_cap;
         Ok(())
     }
 
@@ -534,9 +577,6 @@ impl TurboQuantStorage {
         self.ensure_capacity(prev + new_tokens, step)?;
 
         // Force contiguous layout matching the logical [B, H, T, D] shape.
-        // Model layers transpose from [B, L, H, D] → [B, H, L, D] which changes
-        // strides but not storage order; as_slice returns raw storage, so we must
-        // flatten+reshape to materialise the logical layout before reading.
         let key_shape = keys.shape().to_vec();
         let value_shape = values.shape().to_vec();
         let keys = keys
@@ -547,158 +587,82 @@ impl TurboQuantStorage {
             .as_dtype(Dtype::Float32)?
             .flatten(None, None)?
             .reshape(&value_shape)?;
-        keys.eval()?;
-        values.eval()?;
 
-        let num_kv_heads = usize_from_i32(self.context.num_kv_heads, "num_kv_heads")?;
-        let head_dim = usize_from_i32(self.context.head_dim, "head_dim")?;
-        let new_tokens_usize = usize_from_i32(new_tokens, "new_tokens")?;
-        let prev_usize = usize_from_i32(prev, "prev offset")?;
-        let key_stride = checked_mul(new_tokens_usize, head_dim, "key stride")?;
-        let value_stride = checked_mul(new_tokens_usize, head_dim, "value stride")?;
-        let keys_slice = keys.as_slice::<f32>();
-        let values_slice = values.as_slice::<f32>();
+        // Squeeze batch dim: [1, H, T, D] → [H, T, D] for GPU quantization
+        let keys_3d =
+            keys.reshape(&[self.context.num_kv_heads, new_tokens, self.context.head_dim])?;
+        let values_3d =
+            values.reshape(&[self.context.num_kv_heads, new_tokens, self.context.head_dim])?;
 
-        for head in 0..num_kv_heads {
-            for token in 0..new_tokens_usize {
-                let start = checked_add(
-                    checked_mul(head, key_stride, "key offset")?,
-                    checked_mul(token, head_dim, "key token offset")?,
-                    "key start",
-                )?;
-                let end = checked_add(start, head_dim, "key end")?;
-                let quantized_key = self.context.quantize_key(&keys_slice[start..end])?;
-                self.write_key(head, prev_usize + token, &quantized_key)?;
+        // GPU quantize → lazy Arrays (no eval, no CPU readback)
+        let (v_norms, v_codes) = self.context.quantize_values_gpu(&values_3d)?;
+        let (k_norms, k_gammas, k_codes, k_signs) = self.context.quantize_keys_gpu(&keys_3d)?;
 
-                let value_start = checked_add(
-                    checked_mul(head, value_stride, "value offset")?,
-                    checked_mul(token, head_dim, "value token offset")?,
-                    "value start",
-                )?;
-                let value_end = checked_add(value_start, head_dim, "value end")?;
-                let quantized_value = self
-                    .context
-                    .quantize_value(&values_slice[value_start..value_end])?;
-                self.write_value(head, prev_usize + token, &quantized_value)?;
-            }
-        }
+        // slice_update into pre-allocated storage (all lazy GPU ops)
+        let err = || Exception::custom("TurboQuant storage not allocated");
+        self.value_norms = Some(slice_update_axis(
+            self.value_norms.as_ref().ok_or_else(err)?,
+            &v_norms, 1, prev, new_tokens,
+        )?);
+        self.value_codes = Some(slice_update_axis(
+            self.value_codes.as_ref().ok_or_else(err)?,
+            &v_codes, 1, prev, new_tokens,
+        )?);
+        self.key_norms = Some(slice_update_axis(
+            self.key_norms.as_ref().ok_or_else(err)?,
+            &k_norms, 1, prev, new_tokens,
+        )?);
+        self.key_gammas = Some(slice_update_axis(
+            self.key_gammas.as_ref().ok_or_else(err)?,
+            &k_gammas, 1, prev, new_tokens,
+        )?);
+        self.key_codes = Some(slice_update_axis(
+            self.key_codes.as_ref().ok_or_else(err)?,
+            &k_codes, 1, prev, new_tokens,
+        )?);
+        self.key_qjl_signs = Some(slice_update_axis(
+            self.key_qjl_signs.as_ref().ok_or_else(err)?,
+            &k_signs, 1, prev, new_tokens,
+        )?);
 
         self.view(prev + new_tokens)
     }
 
     fn view(&self, seq_len: i32) -> Result<TurboQuantKvView, Exception> {
-        let heads = usize_from_i32(self.context.num_kv_heads, "num_kv_heads")?;
-        let capacity = usize_from_i32(self.capacity, "capacity")?;
-        let seq_len_usize = usize_from_i32(seq_len, "seq_len")?;
-        let key_code_bytes = usize_from_i32(self.context.key_code_bytes, "key_code_bytes")?;
-        let value_code_bytes = usize_from_i32(self.context.value_code_bytes, "value_code_bytes")?;
-        let sign_bytes = usize_from_i32(self.context.sign_bytes, "sign_bytes")?;
-
-        let key_codes = collect_prefix_bytes(
-            &self.key_codes,
-            heads,
-            capacity,
-            seq_len_usize,
-            key_code_bytes,
-        )?;
-        let value_codes = collect_prefix_bytes(
-            &self.value_codes,
-            heads,
-            capacity,
-            seq_len_usize,
-            value_code_bytes,
-        )?;
-        let key_qjl_signs = collect_prefix_bytes(
-            &self.key_qjl_signs,
-            heads,
-            capacity,
-            seq_len_usize,
-            sign_bytes,
-        )?;
-        let key_norms = collect_prefix_scalars(&self.key_norms, heads, capacity, seq_len_usize)?;
-        let key_gammas = collect_prefix_scalars(&self.key_gammas, heads, capacity, seq_len_usize)?;
-        let value_norms =
-            collect_prefix_scalars(&self.value_norms, heads, capacity, seq_len_usize)?;
-
+        let err = || Exception::custom("TurboQuant storage not allocated");
         Ok(TurboQuantKvView {
             context: Arc::clone(&self.context),
-            key_codes: Array::from_slice(
-                &key_codes,
-                &[
-                    self.context.num_kv_heads,
-                    seq_len,
-                    self.context.key_code_bytes,
-                ],
-            ),
-            key_norms: Array::from_slice(&key_norms, &[self.context.num_kv_heads, seq_len]),
-            key_qjl_signs: Array::from_slice(
-                &key_qjl_signs,
-                &[self.context.num_kv_heads, seq_len, self.context.sign_bytes],
-            ),
-            key_gammas: Array::from_slice(&key_gammas, &[self.context.num_kv_heads, seq_len]),
-            value_codes: Array::from_slice(
-                &value_codes,
-                &[
-                    self.context.num_kv_heads,
-                    seq_len,
-                    self.context.value_code_bytes,
-                ],
-            ),
-            value_norms: Array::from_slice(&value_norms, &[self.context.num_kv_heads, seq_len]),
+            key_codes: slice_axis(self.key_codes.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
+            key_norms: slice_axis(self.key_norms.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
+            key_qjl_signs: slice_axis(self.key_qjl_signs.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
+            key_gammas: slice_axis(self.key_gammas.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
+            value_codes: slice_axis(self.value_codes.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
+            value_norms: slice_axis(self.value_norms.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
             seq_len,
         })
     }
 
-    fn write_key(&mut self, head: usize, pos: usize, key: &QuantizedKey) -> Result<(), Exception> {
-        let capacity = usize_from_i32(self.capacity, "capacity")?;
-        let key_code_bytes = usize_from_i32(self.context.key_code_bytes, "key_code_bytes")?;
-        let sign_bytes = usize_from_i32(self.context.sign_bytes, "sign_bytes")?;
-        if key.codes.len() != key_code_bytes || key.qjl_signs.len() != sign_bytes {
-            return Err(Exception::custom("TurboQuant key payload length mismatch"));
+    fn eval_targets(&self) -> Vec<&Array> {
+        let mut targets = Vec::with_capacity(6);
+        if let Some(ref a) = self.key_codes {
+            targets.push(a);
         }
-
-        let scalar_index = checked_add(
-            checked_mul(head, capacity, "scalar head stride")?,
-            pos,
-            "scalar index",
-        )?;
-        let key_code_start = checked_mul(scalar_index, key_code_bytes, "key code start")?;
-        let key_code_end = checked_add(key_code_start, key_code_bytes, "key code end")?;
-        let sign_start = checked_mul(scalar_index, sign_bytes, "key sign start")?;
-        let sign_end = checked_add(sign_start, sign_bytes, "key sign end")?;
-
-        self.key_codes[key_code_start..key_code_end].copy_from_slice(&key.codes);
-        self.key_qjl_signs[sign_start..sign_end].copy_from_slice(&key.qjl_signs);
-        self.key_norms[scalar_index] = key.norm;
-        self.key_gammas[scalar_index] = key.gamma;
-        Ok(())
-    }
-
-    fn write_value(
-        &mut self,
-        head: usize,
-        pos: usize,
-        value: &QuantizedValue,
-    ) -> Result<(), Exception> {
-        let capacity = usize_from_i32(self.capacity, "capacity")?;
-        let value_code_bytes = usize_from_i32(self.context.value_code_bytes, "value_code_bytes")?;
-        if value.codes.len() != value_code_bytes {
-            return Err(Exception::custom(
-                "TurboQuant value payload length mismatch",
-            ));
+        if let Some(ref a) = self.key_norms {
+            targets.push(a);
         }
-
-        let scalar_index = checked_add(
-            checked_mul(head, capacity, "scalar head stride")?,
-            pos,
-            "scalar index",
-        )?;
-        let value_code_start = checked_mul(scalar_index, value_code_bytes, "value code start")?;
-        let value_code_end = checked_add(value_code_start, value_code_bytes, "value code end")?;
-
-        self.value_codes[value_code_start..value_code_end].copy_from_slice(&value.codes);
-        self.value_norms[scalar_index] = value.norm;
-        Ok(())
+        if let Some(ref a) = self.key_qjl_signs {
+            targets.push(a);
+        }
+        if let Some(ref a) = self.key_gammas {
+            targets.push(a);
+        }
+        if let Some(ref a) = self.value_codes {
+            targets.push(a);
+        }
+        if let Some(ref a) = self.value_norms {
+            targets.push(a);
+        }
+        targets
     }
 }
 
@@ -764,42 +728,6 @@ fn validate_turboquant_shapes(
         return Err(Exception::custom("TurboQuant head_dim mismatch"));
     }
     Ok(())
-}
-
-fn collect_prefix_bytes(
-    data: &[u8],
-    heads: usize,
-    capacity: usize,
-    seq_len: usize,
-    bytes_per_slot: usize,
-) -> Result<Vec<u8>, Exception> {
-    let total_slots = checked_mul(heads, seq_len, "TurboQuant byte prefix slots")?;
-    let total_bytes = checked_mul(total_slots, bytes_per_slot, "TurboQuant byte prefix size")?;
-    let mut out = Vec::with_capacity(total_bytes);
-    let head_stride = checked_mul(capacity, bytes_per_slot, "TurboQuant head byte stride")?;
-    let prefix_len = checked_mul(seq_len, bytes_per_slot, "TurboQuant byte prefix len")?;
-    for head in 0..heads {
-        let head_start = checked_mul(head, head_stride, "TurboQuant byte head start")?;
-        let head_end = checked_add(head_start, prefix_len, "TurboQuant byte head end")?;
-        out.extend_from_slice(&data[head_start..head_end]);
-    }
-    Ok(out)
-}
-
-fn collect_prefix_scalars(
-    data: &[f32],
-    heads: usize,
-    capacity: usize,
-    seq_len: usize,
-) -> Result<Vec<f32>, Exception> {
-    let total_scalars = checked_mul(heads, seq_len, "TurboQuant scalar prefix size")?;
-    let mut out = Vec::with_capacity(total_scalars);
-    for head in 0..heads {
-        let head_start = checked_mul(head, capacity, "TurboQuant scalar head start")?;
-        let head_end = checked_add(head_start, seq_len, "TurboQuant scalar head end")?;
-        out.extend_from_slice(&data[head_start..head_end]);
-    }
-    Ok(out)
 }
 
 fn usize_from_i32(value: i32, label: &str) -> Result<usize, Exception> {
@@ -887,6 +815,91 @@ fn slice_update_axis2(
         }
         Ok(Array::from_ptr(result))
     }
+}
+
+/// Slice an array along an arbitrary axis: `arr[..., start:end, ...]`.
+#[allow(unsafe_code, clippy::indexing_slicing)]
+fn slice_axis(arr: &Array, axis: usize, start: i32, end: i32) -> Result<Array, Exception> {
+    let ndim = arr.ndim();
+    let mut starts = vec![0i32; ndim];
+    let mut ends: Vec<i32> = arr.shape().to_vec();
+    let strides = vec![1i32; ndim];
+    starts[axis] = start;
+    ends[axis] = end;
+
+    unsafe {
+        let mut result = mlx_sys::mlx_array_new();
+        let status = mlx_sys::mlx_slice(
+            &raw mut result,
+            arr.as_ptr(),
+            starts.as_ptr(),
+            starts.len(),
+            ends.as_ptr(),
+            ends.len(),
+            strides.as_ptr(),
+            strides.len(),
+            Stream::task_local_or_default().as_ptr(),
+        );
+        if status != 0 {
+            mlx_sys::mlx_array_free(result);
+            return Err(Exception::custom("mlx_slice failed"));
+        }
+        Ok(Array::from_ptr(result))
+    }
+}
+
+/// Write `update` into `target` at `[..., start:start+n, ...]` on an arbitrary axis.
+#[allow(unsafe_code, clippy::indexing_slicing)]
+fn slice_update_axis(
+    target: &Array,
+    update: &Array,
+    axis: usize,
+    start: i32,
+    n: i32,
+) -> Result<Array, Exception> {
+    let ndim = target.ndim();
+    let mut starts = vec![0i32; ndim];
+    let mut ends: Vec<i32> = target.shape().to_vec();
+    let strides = vec![1i32; ndim];
+    starts[axis] = start;
+    ends[axis] = start + n;
+
+    unsafe {
+        let mut result = mlx_sys::mlx_array_new();
+        let status = mlx_sys::mlx_slice_update(
+            &raw mut result,
+            target.as_ptr(),
+            update.as_ptr(),
+            starts.as_ptr(),
+            starts.len(),
+            ends.as_ptr(),
+            ends.len(),
+            strides.as_ptr(),
+            strides.len(),
+            Stream::task_local_or_default().as_ptr(),
+        );
+        if status != 0 {
+            mlx_sys::mlx_array_free(result);
+            return Err(Exception::custom("mlx_slice_update failed"));
+        }
+        Ok(Array::from_ptr(result))
+    }
+}
+
+/// Grow an Array buffer along axis 1 to a new capacity, preserving old data.
+fn grow_array(
+    old: Option<Array>,
+    old_cap: i32,
+    new_shape: &[i32],
+    dtype: Dtype,
+) -> Result<Array, Exception> {
+    let new_buf = ops::zeros_dtype(new_shape, dtype)?;
+    if old_cap > 0 {
+        if let Some(old_arr) = old {
+            return slice_update_axis(&new_buf, &old_arr, 1, 0, old_cap);
+        }
+    }
+    Ok(new_buf)
 }
 
 #[cfg(test)]
@@ -1103,7 +1116,8 @@ mod tests {
         let is_storage = slice[4] == 4.0;
         eprintln!(
             "as_slice order: logical={is_logical}, storage={is_storage}, slice[4]={}, slice={:?}",
-            slice[4], &slice[..24]
+            slice[4],
+            &slice[..24]
         );
         // This test documents the actual behavior — whichever assertion passes
         // tells us whether TurboQuantStorage::append is correct.
@@ -1117,12 +1131,17 @@ mod tests {
         assert!(is_storage, "expected storage order from as_slice");
 
         // Verify the fix: flatten+reshape forces contiguous layout
-        let fixed = transposed.flatten(None, None).unwrap().reshape(&[1, 2, 3, 4]).unwrap();
+        let fixed = transposed
+            .flatten(None, None)
+            .unwrap()
+            .reshape(&[1, 2, 3, 4])
+            .unwrap();
         fixed.eval().unwrap();
         let fixed_slice = fixed.as_slice::<f32>();
         // After flatten+reshape, slice[4..8] should be [8,9,10,11] (h=0, t=1 in logical order)
         assert_eq!(
-            fixed_slice[4], 8.0,
+            fixed_slice[4],
+            8.0,
             "flatten+reshape must produce contiguous logical order, got {:?}",
             &fixed_slice[..24]
         );
@@ -1141,7 +1160,9 @@ mod tests {
 
         let turbo = view.turboquant().unwrap();
         assert_eq!(turbo.seq_len, 2);
-        assert_eq!(turbo.key_codes.shape(), &[2, 2, 2]);
-        assert_eq!(turbo.value_codes.shape(), &[2, 2, 3]);
+        // head_dim=8, key_bits=2: ceil(8*2/32) = 1 u32 word
+        assert_eq!(turbo.key_codes.shape(), &[2, 2, 1]);
+        // head_dim=8, bits=3: ceil(8*3/32) = 1 u32 word
+        assert_eq!(turbo.value_codes.shape(), &[2, 2, 1]);
     }
 }
