@@ -1036,6 +1036,8 @@ auto kv_head = head / (H / HKV);
 
 float acc = 0.0f;
 for (int pos = 0; pos < T; ++pos) {
+  float w = float(weights[head * T + pos]);
+  if (w < 1e-6f) continue;
   auto packed_index = kv_head * Capacity + pos;
   auto bit_index = dim * VBits;
   auto word_index = bit_index / 32;
@@ -1046,7 +1048,7 @@ for (int pos = 0; pos < T; ++pos) {
     code |= code_ptr[word_index + 1] << (32 - shift);
   }
   code &= ((1u << VBits) - 1u);
-  acc += float(weights[head * T + pos]) * value_centroids[code] * float(v_norms[packed_index]);
+  acc += w * value_centroids[code] * float(v_norms[packed_index]);
 }
 out_rot[head * D + dim] = acc;
 ";

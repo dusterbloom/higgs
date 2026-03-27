@@ -87,134 +87,18 @@ where
             let weights = ops::softmax_axis(&scaled_scores, -1, true)?;
             view.decode_values(&weights, num_heads)
         }
-        KvCacheView::TurboQuant(view) if supports_turboquant_attention(&queries, &view) => {
-            turboquant_attention_loop(queries, &view, scale, mask)
-        }
         view => {
+            // Multi-token prefill (and any other non-decode path) materializes
+            // dense KV and uses native SDPA — single batched GPU op for all T.
             let (keys, values) = view.into_dense()?;
             scaled_dot_product_attention(queries, keys, values, scale, mask)
         }
     }
 }
 
-fn supports_turboquant_attention(queries: &Array, view: &crate::cache::TurboQuantKvView) -> bool {
-    let shape = queries.shape();
-    shape.len() == 4 && shape[0] == 1 && shape[3] == view.context.head_dim
-}
-
 fn is_single_token_decode(queries: &Array, head_dim: i32) -> bool {
     let shape = queries.shape();
     shape.len() == 4 && shape[0] == 1 && shape[2] == 1 && shape[3] == head_dim
-}
-
-fn turboquant_attention_loop(
-    queries: Array,
-    view: &crate::cache::TurboQuantKvView,
-    scale: f32,
-    mask: Option<&Array>,
-) -> Result<Array, Exception> {
-    let shape = queries.shape();
-    let num_heads = *shape
-        .get(1)
-        .ok_or_else(|| Exception::custom("queries must be 4D"))?;
-    let query_len = *shape
-        .get(2)
-        .ok_or_else(|| Exception::custom("queries must be 4D"))?;
-
-    let mut outputs = Vec::with_capacity(usize::try_from(query_len).unwrap_or_default());
-    let mut cached_scale = None;
-    let mut cached_neg_inf = None;
-
-    for query_index in 0..query_len {
-        let query = queries.index((.., .., query_index..query_index + 1, ..));
-        let mut scores = view.decode_scores(&query, num_heads)?;
-
-        if cached_scale
-            .as_ref()
-            .is_none_or(|cached: &Array| cached.dtype() != scores.dtype())
-        {
-            cached_scale = Some(Array::from_f32(scale).as_dtype(scores.dtype())?);
-        }
-        let scale_arr = cached_scale
-            .as_ref()
-            .ok_or_else(|| Exception::custom("TurboQuant scale cache not initialized"))?;
-        scores = scores.multiply(scale_arr)?;
-
-        if let Some(mask_row) = mask_row_for_query(mask, query_index, view.seq_len)? {
-            if cached_neg_inf
-                .as_ref()
-                .is_none_or(|cached: &Array| cached.dtype() != scores.dtype())
-            {
-                cached_neg_inf = Some(Array::from_f32(f32::NEG_INFINITY).as_dtype(scores.dtype())?);
-            }
-            let neg_inf = cached_neg_inf
-                .as_ref()
-                .ok_or_else(|| Exception::custom("TurboQuant neg-inf cache not initialized"))?;
-            scores = ops::r#where(&mask_row, &scores, neg_inf)?;
-        }
-
-        let weights = ops::softmax_axis(&scores, -1, true)?;
-        outputs.push(view.decode_values(&weights, num_heads)?);
-    }
-
-    match outputs.len() {
-        0 => Err(Exception::custom(
-            "TurboQuant attention received zero query tokens",
-        )),
-        1 => outputs
-            .pop()
-            .ok_or_else(|| Exception::custom("TurboQuant attention output missing")),
-        _ => ops::concatenate_axis(&outputs, 2),
-    }
-}
-
-fn mask_row_for_query(
-    mask: Option<&Array>,
-    query_index: i32,
-    seq_len: i32,
-) -> Result<Option<Array>, Exception> {
-    let Some(mask) = mask else {
-        return Ok(None);
-    };
-
-    let mask_shape = mask.shape();
-    let mask_row = match mask_shape.len() {
-        1 => {
-            if mask_shape[0] != seq_len {
-                return Err(Exception::custom(format!(
-                    "mask length ({}) does not match seq_len ({seq_len})",
-                    mask_shape[0]
-                )));
-            }
-            mask.reshape(&[1, seq_len])?
-        }
-        2 => {
-            if mask_shape[1] != seq_len {
-                return Err(Exception::custom(format!(
-                    "mask width ({}) does not match seq_len ({seq_len})",
-                    mask_shape[1]
-                )));
-            }
-            mask.index((query_index..query_index + 1, ..))
-        }
-        4 => {
-            if mask_shape[3] != seq_len {
-                return Err(Exception::custom(format!(
-                    "mask width ({}) does not match seq_len ({seq_len})",
-                    mask_shape[3]
-                )));
-            }
-            mask.index((0..1, 0..1, query_index..query_index + 1, ..))
-                .reshape(&[1, seq_len])?
-        }
-        dims => {
-            return Err(Exception::custom(format!(
-                "unsupported TurboQuant mask rank {dims}; expected 1D, 2D, or 4D"
-            )));
-        }
-    };
-
-    Ok(Some(mask_row))
 }
 
 /// Create a causal attention mask.
@@ -899,12 +783,15 @@ mod tests {
             .map(|i| (i as f32 * 0.071 + 0.5).sin() * 0.4)
             .collect();
 
-        let keys =
-            Array::from_slice(&k_data, &[1, num_kv_heads as i32, seq_len as i32, head_dim as i32]);
-        let values =
-            Array::from_slice(&v_data, &[1, num_kv_heads as i32, seq_len as i32, head_dim as i32]);
-        let queries =
-            Array::from_slice(&q_data, &[1, num_q_heads as i32, 1, head_dim as i32]);
+        let keys = Array::from_slice(
+            &k_data,
+            &[1, num_kv_heads as i32, seq_len as i32, head_dim as i32],
+        );
+        let values = Array::from_slice(
+            &v_data,
+            &[1, num_kv_heads as i32, seq_len as i32, head_dim as i32],
+        );
+        let queries = Array::from_slice(&q_data, &[1, num_q_heads as i32, 1, head_dim as i32]);
 
         // Path 1: Dense (unquantized) attention — ground truth
         let dense_out = scaled_dot_product_attention(
@@ -939,8 +826,16 @@ mod tests {
             .zip(turbo_vals)
             .map(|(a, b)| f64::from(*a) * f64::from(*b))
             .sum();
-        let norm_d: f64 = dense_vals.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
-        let norm_t: f64 = turbo_vals.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
+        let norm_d: f64 = dense_vals
+            .iter()
+            .map(|v| f64::from(*v).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let norm_t: f64 = turbo_vals
+            .iter()
+            .map(|v| f64::from(*v).powi(2))
+            .sum::<f64>()
+            .sqrt();
         let cos = dot / (norm_d * norm_t);
 
         // 3-bit values + 2-bit keys on head_dim=64 introduces meaningful quantization
@@ -1005,9 +900,21 @@ mod tests {
 
             let t_vals = turbo_out.as_slice::<f32>();
             let d_vals = dense_out.as_slice::<f32>();
-            let dot: f64 = t_vals.iter().zip(d_vals).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum();
-            let n_t: f64 = t_vals.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
-            let n_d: f64 = d_vals.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
+            let dot: f64 = t_vals
+                .iter()
+                .zip(d_vals)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum();
+            let n_t: f64 = t_vals
+                .iter()
+                .map(|v| f64::from(*v).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let n_d: f64 = d_vals
+                .iter()
+                .map(|v| f64::from(*v).powi(2))
+                .sum::<f64>()
+                .sqrt();
             if n_t > 1e-12 && n_d > 1e-12 {
                 total_cos += dot / (n_t * n_d);
             }

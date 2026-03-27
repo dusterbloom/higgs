@@ -350,8 +350,14 @@ pub(crate) fn gather_qmm(
             null_lhs,
             rhs_indices.as_ptr(),
             transpose,
-            mlx_sys::mlx_optional_int_ { value: group_size, has_value: true },
-            mlx_sys::mlx_optional_int_ { value: bits, has_value: true },
+            mlx_sys::mlx_optional_int_ {
+                value: group_size,
+                has_value: true,
+            },
+            mlx_sys::mlx_optional_int_ {
+                value: bits,
+                has_value: true,
+            },
             c"affine".as_ptr(),
             sorted_indices,
             stream.as_ptr(),
@@ -787,10 +793,16 @@ impl Qwen3NextAttention {
         values = cached_values;
 
         let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
-        let output =
-            fast::scaled_dot_product_attention(queries, keys, values, self.scale, sdpa_mask, None::<&Array>)?
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[B, L, -1])?;
+        let output = fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            self.scale,
+            sdpa_mask,
+            None::<&Array>,
+        )?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[B, L, -1])?;
 
         let gated = output.multiply(nn::sigmoid(&gate)?)?;
         self.o_proj.forward(&gated)
@@ -3059,10 +3071,7 @@ mod tests {
 
         // B=1, L=4, top_k=2 — enough tokens to exercise the sort path
         let x = Array::ones::<f32>(&[1, 4, 64]).unwrap();
-        let indices = Array::from_slice(
-            &[2u32, 0, 1, 3, 0, 2, 3, 1],
-            &[1, 4, 2],
-        );
+        let indices = Array::from_slice(&[2u32, 0, 1, 3, 0, 2, 3, 1], &[1, 4, 2]);
 
         let result = block.forward_gather_global_sort(&x, &indices).unwrap();
         assert_eq!(result.shape(), &[1, 4, 2, 64]);
@@ -3092,10 +3101,7 @@ mod tests {
         *block.down_proj.biases = db;
 
         let x = Array::ones::<f32>(&[1, 4, 64]).unwrap();
-        let indices = Array::from_slice(
-            &[2u32, 0, 1, 3, 0, 2, 3, 1],
-            &[1, 4, 2],
-        );
+        let indices = Array::from_slice(&[2u32, 0, 1, 3, 0, 2, 3, 1], &[1, 4, 2]);
 
         let baseline = block.forward_gather(&x, &indices, false).unwrap();
         let sorted = block.forward_gather_global_sort(&x, &indices).unwrap();
@@ -3122,34 +3128,32 @@ mod tests {
 
         let mut block = SwitchMlpWeights::new(64, 4).unwrap();
 
-        let gate_w = mlx_rs::random::uniform::<f32, f32>(
-            -1.0, 1.0, &[num_experts, hidden, hidden], None,
-        ).unwrap();
+        let gate_w =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
+                .unwrap();
         let (gw, gs, gb) = quantize_weights(&gate_w, 64, 4);
         *block.gate_proj.weight = gw;
         *block.gate_proj.scales = gs;
         *block.gate_proj.biases = gb;
 
-        let up_w = mlx_rs::random::uniform::<f32, f32>(
-            -1.0, 1.0, &[num_experts, hidden, hidden], None,
-        ).unwrap();
+        let up_w =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
+                .unwrap();
         let (uw, us, ub) = quantize_weights(&up_w, 64, 4);
         *block.up_proj.weight = uw;
         *block.up_proj.scales = us;
         *block.up_proj.biases = ub;
 
-        let down_w = mlx_rs::random::uniform::<f32, f32>(
-            -1.0, 1.0, &[num_experts, hidden, hidden], None,
-        ).unwrap();
+        let down_w =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
+                .unwrap();
         let (dw, ds, db) = quantize_weights(&down_w, 64, 4);
         *block.down_proj.weight = dw;
         *block.down_proj.scales = ds;
         *block.down_proj.biases = db;
 
         // Random input — each token is distinct
-        let x = mlx_rs::random::uniform::<f32, f32>(
-            -1.0, 1.0, &[b, l, hidden], None,
-        ).unwrap();
+        let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[b, l, hidden], None).unwrap();
         // Random expert indices in [0, num_experts)
         let idx_data: Vec<u32> = (0..(b * l * top_k) as u32)
             .map(|i| i % num_experts as u32)
