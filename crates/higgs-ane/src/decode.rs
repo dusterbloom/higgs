@@ -22,17 +22,47 @@ fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], dim: usize, eps: f32) {
     }
 }
 
-/// Matrix-vector multiply: out[m] = W[m,n] @ x[n]
-/// W is row-major [m, n], x is [n], returns [m].
-fn cpu_matvec(w: &[f32], x: &[f32], m: usize, n: usize) -> Vec<f32> {
+// ---------------------------------------------------------------------------
+// Accelerate SGEMM (Apple BLAS on AMX)
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: i32, transa: i32, transb: i32,
+        m: i32, n: i32, k: i32,
+        alpha: f32, a: *const f32, lda: i32,
+        b: *const f32, ldb: i32,
+        beta: f32, c: *mut f32, ldc: i32,
+    );
+}
+
+/// Matrix-vector multiply: out[m] = W[m,k] @ x[k]
+/// W is row-major [m, k], x is [k], returns [m].
+/// Uses Accelerate cblas_sgemm on macOS (GEMM with n=1).
+fn cpu_matvec(w: &[f32], x: &[f32], m: usize, k: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; m];
-    for i in 0..m {
-        let row = &w[i * n..(i + 1) * n];
-        let mut dot = 0.0f32;
-        for j in 0..n {
-            dot += row[j] * x[j];
+    #[cfg(target_os = "macos")]
+    unsafe {
+        cblas_sgemm(
+            101, // CblasRowMajor
+            111, // CblasNoTrans (A)
+            111, // CblasNoTrans (B)
+            m as i32, 1, k as i32,
+            1.0, w.as_ptr(), k as i32,
+            x.as_ptr(), 1,
+            0.0, out.as_mut_ptr(), 1,
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        for i in 0..m {
+            let row = &w[i * k..(i + 1) * k];
+            let mut dot = 0.0f32;
+            for j in 0..k {
+                dot += row[j] * x[j];
+            }
+            out[i] = dot;
         }
-        out[i] = dot;
     }
     out
 }
@@ -295,6 +325,24 @@ pub fn decode_step(model: &ModelWeights, token: u32, kv_cache: &mut KvCache) -> 
         } else {
             (q_raw, None)
         };
+
+        // QKNorm: per-head RMSNorm on Q and K before RoPE (Qwen3)
+        if let Some(ref qn) = lw.q_norm {
+            for h in 0..n_q_heads {
+                let off = h * head_dim;
+                let mut tmp = vec![0.0f32; head_dim];
+                rmsnorm(&mut tmp, &q[off..off + head_dim], qn, head_dim, cfg.rms_eps);
+                q[off..off + head_dim].copy_from_slice(&tmp);
+            }
+        }
+        if let Some(ref kn) = lw.k_norm {
+            for h in 0..n_kv_heads {
+                let off = h * head_dim;
+                let mut tmp = vec![0.0f32; head_dim];
+                rmsnorm(&mut tmp, &k[off..off + head_dim], kn, head_dim, cfg.rms_eps);
+                k[off..off + head_dim].copy_from_slice(&tmp);
+            }
+        }
 
         // RoPE
         rope_at_pos(&mut q, &mut k, n_q_heads, n_kv_heads, head_dim, pos, cfg.rope_theta);

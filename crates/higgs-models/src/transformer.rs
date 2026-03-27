@@ -602,6 +602,23 @@ impl Model {
         self.apply_lm_head(&out)
     }
 
+    /// Forward pass returning logits at ALL positions (for speculative verify).
+    pub fn forward_verify<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        let out = self.forward_hidden(inputs, mask, kv_cache)?;
+        match self.lm_head.as_mut() {
+            Some(head) => head.forward(&out),
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(embed) => embed.as_linear(&out),
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&out),
+            },
+        }
+    }
+
     /// Get the hidden size.
     pub const fn hidden_size(&self) -> i32 {
         self.args.hidden_size

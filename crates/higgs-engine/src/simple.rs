@@ -211,6 +211,36 @@ impl SimpleEngine {
         Ok(engine)
     }
 
+    /// Load with an ANE/CPU draft model for split-silicon speculative decoding.
+    ///
+    /// The draft model runs on CPU (freeing the GPU for the target model),
+    /// loading weights from MLX safetensors format.
+    #[cfg(feature = "ane")]
+    pub fn load_with_ane_draft<P: AsRef<Path>>(
+        dir: P,
+        draft_dir: P,
+        num_draft: usize,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        let mut engine = Self::load(&dir, kv_cache_config)?;
+
+        let dp = draft_dir.as_ref();
+        tracing::info!(draft_dir = %dp.display(), num_draft, "Loading ANE/CPU draft model");
+        let ane_draft = speculative::AneDraftModel::load(dp, 2048)?;
+        engine.draft = Some(Mutex::new(Box::new(ane_draft)));
+        engine.num_draft = num_draft;
+
+        tracing::info!(
+            model_name = %engine.model_name,
+            speculative = true,
+            num_draft,
+            backend = "ane",
+            "Engine ready (ANE speculative)"
+        );
+
+        Ok(engine)
+    }
+
     /// Get the model name.
     pub fn model_name(&self) -> &str {
         &self.model_name
@@ -964,7 +994,7 @@ impl SimpleEngine {
                     })?;
                     let input = Array::from_slice(batch, &[1, batch_len]);
                     let logits =
-                        model.forward(&input, None, cache).map_err(EngineError::Mlx)?;
+                        model.forward_verify(&input, None, cache).map_err(EngineError::Mlx)?;
                     eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
 
                     let mut ids = Vec::with_capacity(batch.len());
@@ -1391,7 +1421,7 @@ impl SimpleEngine {
                     })?;
                     let input = Array::from_slice(batch, &[1, batch_len]);
                     let logits =
-                        model.forward(&input, None, cache).map_err(EngineError::Mlx)?;
+                        model.forward_verify(&input, None, cache).map_err(EngineError::Mlx)?;
                     eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
 
                     let mut ids = Vec::with_capacity(batch.len());

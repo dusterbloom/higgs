@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+ane = ["higgs-engine/ane"]
+
 [lints]
 workspace = true
 

@@ -221,6 +221,25 @@ impl AnyModel {
         }
     }
 
+    /// Forward pass returning logits at ALL positions (for speculative verify).
+    ///
+    /// Unlike `forward` which returns only the last-position logits, this
+    /// returns `[batch, seq_len, vocab_size]` so the caller can compare
+    /// target samples at each draft position.
+    pub fn forward_verify(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Transformer(m), AnyCache::KV(c)) => m.forward_verify(inputs, mask, c),
+            _ => Err(Exception::custom(
+                "forward_verify only supported for Transformer models",
+            )),
+        }
+    }
+
     /// Batched decode forward pass for N requests each with 1 token.
     ///
     /// Only supported for the `Transformer` variant (Llama/Qwen/Mistral).

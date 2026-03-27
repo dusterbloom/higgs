@@ -16,6 +16,9 @@ pub struct LayerWeights {
     pub w3: Vec<f32>,
     pub rms_att: Vec<f32>,
     pub rms_ffn: Vec<f32>,
+    /// Per-head QKNorm weights (Qwen3). None for models without QKNorm.
+    pub q_norm: Option<Vec<f32>>,
+    pub k_norm: Option<Vec<f32>>,
 }
 
 /// Full model weights for CPU/ANE decode.
@@ -132,7 +135,10 @@ impl ModelWeights {
             let rms_att = get_bf16(&format!("{prefix}.input_layernorm.weight"))?;
             let rms_ffn = get_bf16(&format!("{prefix}.post_attention_layernorm.weight"))?;
 
-            layers.push(LayerWeights { wq, wk, wv, wo, w1, w2, w3, rms_att, rms_ffn });
+            let q_norm = get_bf16(&format!("{prefix}.self_attn.q_norm.weight")).ok();
+            let k_norm = get_bf16(&format!("{prefix}.self_attn.k_norm.weight")).ok();
+
+            layers.push(LayerWeights { wq, wk, wv, wo, w1, w2, w3, rms_att, rms_ffn, q_norm, k_norm });
 
             if l == 0 {
                 tracing::debug!(
