@@ -517,9 +517,9 @@ fn pack_indices(indices: &[u8], bits: u8) -> Vec<u8> {
         let byte_index = bit_index / 8;
         let shift = bit_index % 8;
         let value = u16::from(*code) & mask;
-        packed[byte_index] |= u8::try_from(value << shift).unwrap_or(0);
+        packed[byte_index] |= (value << shift) as u8;
         if shift + usize::from(bits) > 8 {
-            packed[byte_index + 1] |= u8::try_from(value >> (8 - shift)).unwrap_or(0);
+            packed[byte_index + 1] |= (value >> (8 - shift)) as u8;
         }
     }
     packed
@@ -621,6 +621,17 @@ fn random_normal<R: Rng>(rng: &mut R) -> f32 {
     let u1 = rng.random::<f32>().max(1.0e-7);
     let u2 = rng.random::<f32>();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+}
+
+#[cfg(test)]
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
 }
 
 // ---------------------------------------------------------------------------
@@ -924,5 +935,214 @@ fn extract_single_output(
     unsafe {
         mlx_sys::mlx_vector_array_get(&raw mut out_ptr, outputs_vec, 0);
         Ok(Array::from_ptr(out_ptr))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    fn make_context(bits: u8, head_dim: i32) -> TurboQuantContext {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits,
+            seed: 42,
+        };
+        TurboQuantContext::new(config, head_dim, 1).unwrap()
+    }
+
+    fn random_vector(dim: usize, seed: u64) -> Vec<f32> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        (0..dim).map(|_| random_normal(&mut rng)).collect()
+    }
+
+    // ── Bit-packing roundtrips ──────────────────────────────────────────
+
+    #[test]
+    fn test_pack_unpack_indices_roundtrip() {
+        for bits in [2_u8, 3, 4] {
+            let max_val = (1 << bits) - 1;
+            let indices: Vec<u8> = (0..128).map(|i| (i % (max_val + 1)) as u8).collect();
+            let packed = pack_indices(&indices, bits);
+            let unpacked: Vec<u8> = (0..128).map(|i| unpack_index(&packed, i, bits)).collect();
+            assert_eq!(indices, unpacked, "roundtrip failed for {bits}-bit");
+        }
+    }
+
+    #[test]
+    fn test_pack_unpack_signs_roundtrip() {
+        let signs: Vec<bool> = (0..128).map(|i| i % 3 != 0).collect();
+        let packed = pack_signs(signs.iter().copied());
+        let unpacked: Vec<bool> = (0..128).map(|i| unpack_sign(&packed, i)).collect();
+        assert_eq!(signs, unpacked);
+    }
+
+    // ── Orthogonal matrix properties ────────────────────────────────────
+
+    #[test]
+    fn test_orthogonal_matrix_is_orthogonal() {
+        let dim = 64;
+        let r = generate_orthogonal_matrix(dim, 42);
+        let rt = transpose(&r, dim);
+        // R * R^T should be identity
+        let product = mat_mat(&r, &rt, dim);
+        for i in 0..dim {
+            for j in 0..dim {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                let actual = product[i * dim + j];
+                assert!(
+                    (actual - expected).abs() < 1e-4,
+                    "R*R^T[{i},{j}] = {actual}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    fn mat_mat(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
+        let mut out = vec![0.0_f32; dim * dim];
+        for i in 0..dim {
+            for j in 0..dim {
+                let mut acc = 0.0;
+                for k in 0..dim {
+                    acc += a[i * dim + k] * b[k * dim + j];
+                }
+                out[i * dim + j] = acc;
+            }
+        }
+        out
+    }
+
+    // ── Value quantize/dequantize roundtrip ─────────────────────────────
+
+    #[test]
+    fn test_value_roundtrip_cosine_similarity() {
+        for bits in [2_u8, 3, 4] {
+            let ctx = make_context(bits, 128);
+            let mut total_cos = 0.0_f64;
+            let n = 100;
+            for seed in 0..n {
+                let original = random_vector(128, seed);
+                let quantized = ctx.quantize_value(&original).unwrap();
+                let recovered = ctx.dequantize_value(&quantized).unwrap();
+                let cos = cosine_similarity(&original, &recovered);
+                total_cos += f64::from(cos);
+            }
+            let avg_cos = total_cos / n as f64;
+            let min_cos = match bits {
+                2 => 0.80,
+                3 => 0.90,
+                4 => 0.95,
+                _ => unreachable!(),
+            };
+            assert!(
+                avg_cos > min_cos,
+                "value roundtrip {bits}-bit: avg cos {avg_cos:.4} < {min_cos}"
+            );
+        }
+    }
+
+    // ── Key quantize/dequantize roundtrip ───────────────────────────────
+
+    #[test]
+    fn test_key_roundtrip_cosine_similarity() {
+        for bits in [2_u8, 3, 4] {
+            let ctx = make_context(bits, 128);
+            let mut total_cos = 0.0_f64;
+            let n = 100;
+            for seed in 0..n {
+                let original = random_vector(128, seed);
+                let quantized = ctx.quantize_key(&original).unwrap();
+                let recovered = ctx.dequantize_key(&quantized).unwrap();
+                let cos = cosine_similarity(&original, &recovered);
+                total_cos += f64::from(cos);
+            }
+            let avg_cos = total_cos / n as f64;
+            // Key uses bits-1 for codes but QJL residual correction compensates
+            let min_cos = match bits {
+                2 => 0.60,
+                3 => 0.80,
+                4 => 0.90,
+                _ => unreachable!(),
+            };
+            assert!(
+                avg_cos > min_cos,
+                "key roundtrip {bits}-bit: avg cos {avg_cos:.4} < {min_cos}"
+            );
+        }
+    }
+
+    // ── Zero vector handling ────────────────────────────────────────────
+
+    #[test]
+    fn test_quantize_zero_vector() {
+        let ctx = make_context(3, 64);
+        let zeros = vec![0.0_f32; 64];
+
+        let qv = ctx.quantize_value(&zeros).unwrap();
+        assert_eq!(qv.norm, 0.0);
+        let dv = ctx.dequantize_value(&qv).unwrap();
+        assert!(dv.iter().all(|v| *v == 0.0));
+
+        let qk = ctx.quantize_key(&zeros).unwrap();
+        assert_eq!(qk.norm, 0.0);
+        assert_eq!(qk.gamma, 0.0);
+        let dk = ctx.dequantize_key(&qk).unwrap();
+        assert!(dk.iter().all(|v| *v == 0.0));
+    }
+
+    // ── Centroid scaling ────────────────────────────────────────────────
+
+    #[test]
+    fn test_scaled_centroids_preserve_relative_order() {
+        for bits in [1_u8, 2, 3, 4] {
+            let centroids = scaled_centroids(bits, 0.5).unwrap();
+            for pair in centroids.windows(2) {
+                assert!(pair[0] < pair[1], "{bits}-bit centroids not sorted");
+            }
+        }
+    }
+
+    // ── Config validation ───────────────────────────────────────────────
+
+    #[test]
+    fn test_config_validates_bit_range() {
+        let bad = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 5,
+            seed: 0,
+        };
+        assert!(bad.validate().is_err());
+
+        let good = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 0,
+        };
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn test_key_bits_is_bits_minus_one() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 0,
+        };
+        assert_eq!(config.key_bits(), 2);
+    }
+
+    // ── Deterministic with seed ─────────────────────────────────────────
+
+    #[test]
+    fn test_quantization_is_deterministic() {
+        let ctx1 = make_context(3, 64);
+        let ctx2 = make_context(3, 64);
+        let vec = random_vector(64, 99);
+
+        let q1 = ctx1.quantize_value(&vec).unwrap();
+        let q2 = ctx2.quantize_value(&vec).unwrap();
+        assert_eq!(q1.codes, q2.codes);
+        assert_eq!(q1.norm, q2.norm);
     }
 }

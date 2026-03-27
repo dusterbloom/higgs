@@ -871,4 +871,151 @@ mod tests {
         assert_eq!(mask.shape(), &[2, 1, 1, 5]);
         // This shape broadcasts correctly: the 1s expand to n_heads and seq_len
     }
+
+    /// Ground-truth test: TurboQuant attention vs unquantized dense attention.
+    /// Uses random KV vectors with realistic dimensions. Measures cosine similarity
+    /// between quantized and unquantized attention outputs.
+    #[test]
+    fn test_turboquant_attention_vs_unquantized_ground_truth() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 42,
+        };
+        let num_kv_heads = 2;
+        let num_q_heads = 8; // GQA: 4 Q heads per KV head
+        let head_dim = 64;
+        let seq_len = 16;
+        let scale = (head_dim as f32).sqrt().recip();
+
+        // Generate random KV with some structure (sin/cos patterns)
+        let k_data: Vec<f32> = (0..num_kv_heads * seq_len * head_dim)
+            .map(|i| (i as f32 * 0.037).sin() * 0.5)
+            .collect();
+        let v_data: Vec<f32> = (0..num_kv_heads * seq_len * head_dim)
+            .map(|i| (i as f32 * 0.053 + 1.0).cos() * 0.3)
+            .collect();
+        let q_data: Vec<f32> = (0..num_q_heads * head_dim)
+            .map(|i| (i as f32 * 0.071 + 0.5).sin() * 0.4)
+            .collect();
+
+        let keys =
+            Array::from_slice(&k_data, &[1, num_kv_heads as i32, seq_len as i32, head_dim as i32]);
+        let values =
+            Array::from_slice(&v_data, &[1, num_kv_heads as i32, seq_len as i32, head_dim as i32]);
+        let queries =
+            Array::from_slice(&q_data, &[1, num_q_heads as i32, 1, head_dim as i32]);
+
+        // Path 1: Dense (unquantized) attention — ground truth
+        let dense_out = scaled_dot_product_attention(
+            queries.clone(),
+            keys.clone(),
+            values.clone(),
+            scale,
+            None,
+        )
+        .unwrap();
+
+        // Path 2: TurboQuant attention via cache
+        let mut turbo_cache =
+            SteppingKeyValueCache::new_turbo(config, num_kv_heads as i32, head_dim as i32).unwrap();
+        let turbo_out = cached_scaled_dot_product_attention(
+            queries,
+            &mut turbo_cache,
+            keys,
+            values,
+            scale,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(dense_out.shape(), turbo_out.shape());
+        let dense_vals = dense_out.as_slice::<f32>();
+        let turbo_vals = turbo_out.as_slice::<f32>();
+
+        // Cosine similarity between full output vectors
+        let dot: f64 = dense_vals
+            .iter()
+            .zip(turbo_vals)
+            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+            .sum();
+        let norm_d: f64 = dense_vals.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
+        let norm_t: f64 = turbo_vals.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
+        let cos = dot / (norm_d * norm_t);
+
+        // 3-bit values + 2-bit keys on head_dim=64 introduces meaningful quantization
+        // noise. cos > 0.85 confirms the algorithm is working correctly — higher
+        // quality emerges at larger head_dim (128) and averages out across many heads/layers.
+        assert!(
+            cos > 0.85,
+            "TurboQuant 3-bit attention vs dense: cos={cos:.6} (need > 0.85)"
+        );
+    }
+
+    /// Verify TurboQuant sequential decode quality over 20 autoregressive steps.
+    /// Uses cosine similarity per step — more stable than argmax comparison.
+    #[test]
+    fn test_turboquant_sequential_decode_quality() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 77,
+        };
+        let head_dim = 64;
+        let scale = (head_dim as f32).sqrt().recip();
+
+        let mut turbo_cache = SteppingKeyValueCache::new_turbo(config, 1, head_dim).unwrap();
+        let mut dense_cache = SteppingKeyValueCache::new();
+
+        let mut total_cos = 0.0_f64;
+        let steps = 20;
+        for step in 0..steps {
+            let q_data: Vec<f32> = (0..head_dim)
+                .map(|i| ((step * head_dim + i) as f32 * 0.11).sin())
+                .collect();
+            let k_data: Vec<f32> = (0..head_dim)
+                .map(|i| ((step * head_dim + i) as f32 * 0.07).cos())
+                .collect();
+            let v_data: Vec<f32> = (0..head_dim)
+                .map(|i| ((step * head_dim + i) as f32 * 0.13 + 1.0).sin())
+                .collect();
+
+            let queries = Array::from_slice(&q_data, &[1, 1, 1, head_dim]);
+            let keys = Array::from_slice(&k_data, &[1, 1, 1, head_dim]);
+            let values = Array::from_slice(&v_data, &[1, 1, 1, head_dim]);
+
+            let turbo_out = cached_scaled_dot_product_attention(
+                queries.clone(),
+                &mut turbo_cache,
+                keys.clone(),
+                values.clone(),
+                scale,
+                None,
+            )
+            .unwrap();
+            let dense_out = cached_scaled_dot_product_attention(
+                queries,
+                &mut dense_cache,
+                keys,
+                values,
+                scale,
+                None,
+            )
+            .unwrap();
+
+            let t_vals = turbo_out.as_slice::<f32>();
+            let d_vals = dense_out.as_slice::<f32>();
+            let dot: f64 = t_vals.iter().zip(d_vals).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum();
+            let n_t: f64 = t_vals.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
+            let n_d: f64 = d_vals.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
+            if n_t > 1e-12 && n_d > 1e-12 {
+                total_cos += dot / (n_t * n_d);
+            }
+        }
+        let avg_cos = total_cos / steps as f64;
+        assert!(
+            avg_cos > 0.80,
+            "sequential 3-bit decode avg cos={avg_cos:.4} (need > 0.80)"
+        );
+    }
 }
