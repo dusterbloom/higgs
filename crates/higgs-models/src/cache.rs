@@ -533,8 +533,20 @@ impl TurboQuantStorage {
         let new_tokens = keys.shape()[2];
         self.ensure_capacity(prev + new_tokens, step)?;
 
-        let keys = keys.as_dtype(Dtype::Float32)?;
-        let values = values.as_dtype(Dtype::Float32)?;
+        // Force contiguous layout matching the logical [B, H, T, D] shape.
+        // Model layers transpose from [B, L, H, D] → [B, H, L, D] which changes
+        // strides but not storage order; as_slice returns raw storage, so we must
+        // flatten+reshape to materialise the logical layout before reading.
+        let key_shape = keys.shape().to_vec();
+        let value_shape = values.shape().to_vec();
+        let keys = keys
+            .as_dtype(Dtype::Float32)?
+            .flatten(None, None)?
+            .reshape(&key_shape)?;
+        let values = values
+            .as_dtype(Dtype::Float32)?
+            .flatten(None, None)?
+            .reshape(&value_shape)?;
         keys.eval()?;
         values.eval()?;
 
@@ -1073,6 +1085,47 @@ mod tests {
         assert_eq!(dense_values.shape(), &[1, 2, 3, 8]);
         assert!(cache.is_quantized());
         assert_eq!(cache.bits(), Some(3));
+    }
+
+    #[test]
+    fn test_as_slice_after_transpose_order() {
+        // Verify whether as_slice returns logical (transposed) or storage order
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let arr = Array::from_slice(&data, &[1, 3, 2, 4]); // [B=1, L=3, H=2, D=4]
+        let transposed = arr.transpose_axes(&[0, 2, 1, 3]).unwrap(); // [B=1, H=2, L=3, D=4]
+        assert_eq!(transposed.shape(), &[1, 2, 3, 4]);
+        transposed.eval().unwrap();
+        let slice = transposed.as_slice::<f32>();
+
+        // If LOGICAL order (transpose respected): slice[4..8] = [8,9,10,11] (h=0, t=1)
+        // If STORAGE order (transpose ignored): slice[4..8] = [4,5,6,7] (original layout)
+        let is_logical = slice[4] == 8.0;
+        let is_storage = slice[4] == 4.0;
+        eprintln!(
+            "as_slice order: logical={is_logical}, storage={is_storage}, slice[4]={}, slice={:?}",
+            slice[4], &slice[..24]
+        );
+        // This test documents the actual behavior — whichever assertion passes
+        // tells us whether TurboQuantStorage::append is correct.
+        assert!(
+            is_logical || is_storage,
+            "unexpected as_slice order: slice[4] = {}",
+            slice[4]
+        );
+        // as_slice returns storage order (confirmed), so we must flatten+reshape
+        // to make arrays contiguous before calling as_slice.
+        assert!(is_storage, "expected storage order from as_slice");
+
+        // Verify the fix: flatten+reshape forces contiguous layout
+        let fixed = transposed.flatten(None, None).unwrap().reshape(&[1, 2, 3, 4]).unwrap();
+        fixed.eval().unwrap();
+        let fixed_slice = fixed.as_slice::<f32>();
+        // After flatten+reshape, slice[4..8] should be [8,9,10,11] (h=0, t=1 in logical order)
+        assert_eq!(
+            fixed_slice[4], 8.0,
+            "flatten+reshape must produce contiguous logical order, got {:?}",
+            &fixed_slice[..24]
+        );
     }
 
     #[test]
