@@ -53,6 +53,17 @@ impl Engine {
             .map(|e| Self::Simple(Box::new(e)))
     }
 
+    #[cfg(feature = "ane")]
+    pub fn load_simple_with_coreml_draft<P: AsRef<Path>>(
+        dir: P,
+        draft_mlpackage: P,
+        num_draft: usize,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        SimpleEngine::load_with_coreml_draft(dir, draft_mlpackage, num_draft, kv_cache_config)
+            .map(|e| Self::Simple(Box::new(e)))
+    }
+
     pub fn load_batch<P: AsRef<Path>>(
         dir: P,
         kv_cache_config: KvCacheConfig,

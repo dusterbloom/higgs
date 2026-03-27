@@ -1,17 +1,20 @@
 //! Apple Neural Engine draft model for speculative decoding.
 //!
-//! Provides a CPU-accelerated (Accelerate SGEMM) draft model that loads weights
-//! from MLX safetensors format. Designed for split-silicon speculative decoding:
-//! ANE/CPU runs the draft model while GPU runs the target model.
+//! Provides two draft model backends:
+//! 1. **CPU (Accelerate SGEMM)** — loads weights from MLX safetensors, runs on CPU
+//! 2. **CoreML (ANE)** — loads a `.mlpackage`, dispatched to ANE by CoreML runtime
 //!
-//! Ported from nanobot-rs (private ANE infrastructure).
+//! Designed for split-silicon speculative decoding:
+//! ANE/CPU runs the draft model while GPU runs the target model.
 
 mod config;
+pub mod coreml;
 mod decode;
 mod safetensors;
 mod weights;
 
 pub use config::ModelConfig;
+pub use coreml::CoreMlDraftModel;
 pub use decode::{DecodeResult, KvCache};
 pub use weights::{LayerWeights, ModelWeights};
 

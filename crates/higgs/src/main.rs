@@ -255,12 +255,24 @@ fn load_engines(
             let draft_resolved = model_resolver::resolve(draft_path)?;
             #[cfg(feature = "ane")]
             {
-                Engine::load_simple_with_ane_draft(
-                    &resolved,
-                    &draft_resolved,
-                    model_cfg.num_draft,
-                    kv_cache_config,
-                )?
+                let is_mlpackage = draft_resolved
+                    .extension()
+                    .is_some_and(|ext| ext == "mlpackage");
+                if is_mlpackage {
+                    Engine::load_simple_with_coreml_draft(
+                        &resolved,
+                        &draft_resolved,
+                        model_cfg.num_draft,
+                        kv_cache_config,
+                    )?
+                } else {
+                    Engine::load_simple_with_ane_draft(
+                        &resolved,
+                        &draft_resolved,
+                        model_cfg.num_draft,
+                        kv_cache_config,
+                    )?
+                }
             }
             #[cfg(not(feature = "ane"))]
             {

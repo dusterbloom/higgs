@@ -1276,6 +1276,7 @@ dependencies = [
 name = "higgs-ane"
 version = "0.1.0"
 dependencies = [
+ "half",
  "memmap2",
  "serde_json",
  "tracing",

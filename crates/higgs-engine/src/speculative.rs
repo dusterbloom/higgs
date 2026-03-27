@@ -315,6 +315,57 @@ impl DraftModel for AneDraftModel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CoreML ANE draft model (feature-gated)
+// ---------------------------------------------------------------------------
+
+/// CoreML-backed draft model that runs on Apple Neural Engine.
+///
+/// Loads a `.mlpackage` compiled from the conversion script. CoreML routes
+/// inference to ANE/GPU/CPU as it sees fit. KV cache is managed as explicit
+/// fp16 buffers.
+#[cfg(feature = "ane")]
+pub struct CoreMlAneDraftModel {
+    inner: higgs_ane::CoreMlDraftModel,
+}
+
+#[cfg(feature = "ane")]
+impl CoreMlAneDraftModel {
+    /// Load a CoreML draft model from a `.mlpackage` directory.
+    pub fn load(path: &std::path::Path) -> Result<Self, EngineError> {
+        let inner = higgs_ane::CoreMlDraftModel::load(path)
+            .map_err(|e| EngineError::Generation(format!("CoreML draft load: {e}")))?;
+        Ok(Self { inner })
+    }
+}
+
+#[cfg(feature = "ane")]
+impl DraftModel for CoreMlAneDraftModel {
+    fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<(), EngineError> {
+        self.inner
+            .prefill(prompt_tokens)
+            .map_err(|e| EngineError::Generation(format!("CoreML prefill: {e}")))
+    }
+
+    fn draft(&mut self, last_token_id: u32, num_draft: usize) -> Result<Vec<u32>, EngineError> {
+        self.inner
+            .draft(last_token_id, num_draft)
+            .map_err(|e| EngineError::Generation(format!("CoreML draft: {e}")))
+    }
+
+    fn advance(&mut self, n: usize) -> Result<(), EngineError> {
+        self.inner
+            .advance(n)
+            .map_err(|e| EngineError::Generation(format!("CoreML advance: {e}")))
+    }
+
+    fn rollback(&mut self) -> Result<(), EngineError> {
+        self.inner
+            .rollback()
+            .map_err(|e| EngineError::Generation(format!("CoreML rollback: {e}")))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {

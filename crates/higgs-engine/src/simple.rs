@@ -241,6 +241,36 @@ impl SimpleEngine {
         Ok(engine)
     }
 
+    /// Load with a CoreML ANE draft model for split-silicon speculative decoding.
+    ///
+    /// The draft model runs on ANE via CoreML (freeing the GPU for the target model).
+    /// Requires a pre-converted `.mlpackage` from `scripts/convert_draft_coreml.py`.
+    #[cfg(feature = "ane")]
+    pub fn load_with_coreml_draft<P: AsRef<Path>>(
+        dir: P,
+        draft_mlpackage: P,
+        num_draft: usize,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        let mut engine = Self::load(&dir, kv_cache_config)?;
+
+        let dp = draft_mlpackage.as_ref();
+        tracing::info!(draft_model = %dp.display(), num_draft, "Loading CoreML ANE draft model");
+        let coreml_draft = speculative::CoreMlAneDraftModel::load(dp)?;
+        engine.draft = Some(Mutex::new(Box::new(coreml_draft)));
+        engine.num_draft = num_draft;
+
+        tracing::info!(
+            model_name = %engine.model_name,
+            speculative = true,
+            num_draft,
+            backend = "coreml_ane",
+            "Engine ready (CoreML ANE speculative)"
+        );
+
+        Ok(engine)
+    }
+
     /// Get the model name.
     pub fn model_name(&self) -> &str {
         &self.model_name
