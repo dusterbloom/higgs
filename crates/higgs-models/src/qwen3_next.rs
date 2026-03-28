@@ -72,7 +72,7 @@ impl Drop for CachedMetalKernel {
 static GATED_DELTA_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 use crate::{
-    cache::{KeyValueCache, SteppingKeyValueCache},
+    cache::{KeyValueCache, KvCacheView, SteppingKeyValueCache},
     error::ModelError,
     utils::{AttentionMask, apply_rope, create_causal_mask},
 };
@@ -788,25 +788,31 @@ impl Qwen3NextAttention {
         queries = apply_rope(&queries, &self.rope, offset)?;
         keys = apply_rope(&keys, &self.rope, offset)?;
 
-        // update_and_fetch dequantizes TurboQuant storage to dense KV then
-        // runs native SDPA — this gives memory savings from compressed storage
-        // without the per-dispatch overhead of custom TurboQuant decode kernels
-        // (which are too costly for 2 KV heads with GQA ratio 8).
-        let (cached_keys, cached_values) = cache.update_and_fetch(keys, values)?;
-        keys = cached_keys;
-        values = cached_values;
+        let view = cache.update_and_view(keys, values)?;
+        let is_tq_decode = mask.is_none() && L == 1 && view.turboquant().is_some();
 
-        let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
-        let output = fast::scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            self.scale,
-            sdpa_mask,
-            None::<&Array>,
-        )?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[B, L, -1])?;
+        let output = if is_tq_decode {
+            let tq_view = view.turboquant().unwrap();
+            let scores = tq_view.decode_scores(&queries, self.num_attention_heads)?;
+            let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
+            let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
+            tq_view.decode_values(&weights, self.num_attention_heads)?
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[B, L, -1])?
+        } else {
+            let (cached_keys, cached_values) = view.into_dense()?;
+            let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
+            fast::scaled_dot_product_attention(
+                queries,
+                cached_keys,
+                cached_values,
+                self.scale,
+                sdpa_mask,
+                None::<&Array>,
+            )?
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[B, L, -1])?
+        };
 
         let gated = output.multiply(nn::sigmoid(&gate)?)?;
         self.o_proj.forward(&gated)
