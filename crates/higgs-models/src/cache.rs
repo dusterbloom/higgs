@@ -686,8 +686,33 @@ impl KeyValueCache for SteppingKeyValueCache {
     }
 
     fn update_and_view(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
+        let new_tokens = keys.shape()[2];
+
         let view = if let Some(turbo) = self.turbo.as_mut() {
-            KvCacheView::TurboQuant(turbo.append(keys, values, self.offset, self.step)?)
+            if new_tokens > 1 && turbo.capacity == 0 {
+                // First prefill: accumulate in dense fp16 storage so attention
+                // uses native SDPA (single batched GPU op). Quantization is
+                // deferred until the first decode token.
+                self.update_dense(keys, values)?
+            } else {
+                // Decode (or subsequent multi-token after first decode).
+                // If dense KV was accumulated during prefill, bulk-quantize it
+                // into TurboQuant storage before appending the new token.
+                if turbo.capacity == 0 && self.offset > 0 {
+                    if let (Some(dense_k), Some(dense_v)) =
+                        (&self.keys, &self.values)
+                    {
+                        let k = slice_axis2(dense_k, 0, self.offset)?;
+                        let v = slice_axis2(dense_v, 0, self.offset)?;
+                        turbo.append(k, v, 0, self.step)?;
+                        self.keys = None;
+                        self.values = None;
+                    }
+                }
+                KvCacheView::TurboQuant(
+                    turbo.append(keys, values, self.offset, self.step)?,
+                )
+            }
         } else {
             self.update_dense(keys, values)?
         };
@@ -1148,21 +1173,30 @@ mod tests {
     }
 
     #[test]
-    fn test_turboquant_cache_returns_quantized_view() {
+    fn test_turboquant_cache_deferred_quantization() {
         let config = KvCacheConfig {
             mode: KvCacheMode::Turboquant,
             bits: 3,
             seed: 11,
         };
         let mut cache = SteppingKeyValueCache::new_turbo(config, 2, 8).unwrap();
+
+        // Multi-token prefill: returns Dense (quantization deferred)
         let (keys, values) = make_kv_pair(2, 8);
         let view = cache.update_and_view(keys, values).unwrap();
+        assert!(view.turboquant().is_none(), "prefill should return Dense view");
+        assert_eq!(cache.offset(), 2);
 
+        // First decode token: triggers bulk quantize, returns TurboQuant
+        let (k1, v1) = make_kv_pair(1, 8);
+        let view = cache.update_and_view(k1, v1).unwrap();
         let turbo = view.turboquant().unwrap();
-        assert_eq!(turbo.seq_len, 2);
+        assert_eq!(turbo.seq_len, 3); // 2 prefill + 1 decode
         // head_dim=8, key_bits=2: ceil(8*2/32) = 1 u32 word
-        assert_eq!(turbo.key_codes.shape(), &[2, 2, 1]);
+        assert_eq!(turbo.key_codes.shape(), &[2, 3, 1]);
         // head_dim=8, bits=3: ceil(8*3/32) = 1 u32 word
-        assert_eq!(turbo.value_codes.shape(), &[2, 2, 1]);
+        assert_eq!(turbo.value_codes.shape(), &[2, 3, 1]);
+        // Dense storage cleared after bulk quantize
+        assert!(cache.keys.is_none());
     }
 }
