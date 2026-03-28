@@ -71,8 +71,11 @@ impl SamplingParams {
     }
 }
 
-pub use qwen3_next::{LayerCache, Qwen3NextCausalLM};
+pub use qwen3_next::{LayerCache, MtpHead, Qwen3NextCausalLM};
 pub use transformer::{Model, ModelArgs};
+
+/// MTP (Multi-Token Prediction) KV cache — one `SteppingKeyValueCache` per MTP layer.
+pub type MtpCache = Vec<cache::SteppingKeyValueCache>;
 
 // ---------------------------------------------------------------------------
 // AnyModel / AnyCache -- unified dispatch across model architectures
@@ -285,6 +288,51 @@ impl AnyModel {
     /// Whether this model supports batched decode.
     pub const fn supports_batched_decode(&self) -> bool {
         matches!(self, Self::Transformer(_))
+    }
+
+    /// Whether this model has a loaded MTP head for speculative decode.
+    pub fn has_mtp(&self) -> bool {
+        matches!(self, Self::Qwen3Next(m) if m.has_mtp())
+    }
+
+    /// Create a fresh MTP KV cache, or `None` if no MTP head.
+    pub fn make_mtp_cache(&self) -> Option<MtpCache> {
+        match self {
+            Self::Qwen3Next(m) => m.make_mtp_cache(),
+            _ => None,
+        }
+    }
+
+    /// Run the MTP head to produce draft logits for position t+2.
+    ///
+    /// Returns draft logits `[B, 1, vocab]`, or an error if no MTP head.
+    pub fn mtp_draft(
+        &mut self,
+        hidden: &Array,
+        next_token_id: u32,
+        mtp_cache: &mut MtpCache,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.mtp_draft(hidden, next_token_id, mtp_cache),
+            _ => Err(Exception::custom("MTP not supported for this model")),
+        }
+    }
+
+    /// Forward pass returning both hidden states and logits for all positions.
+    ///
+    /// Used by MTP speculative decode for the verify pass.
+    pub fn forward_with_hidden(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<(Array, Array), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_with_hidden(inputs, mask, c),
+            _ => Err(Exception::custom(
+                "forward_with_hidden only supported for Qwen3Next",
+            )),
+        }
     }
 
     /// The model's hidden dimension.
@@ -895,10 +943,12 @@ fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf
         let json = std::fs::read_to_string(&index_path)?;
         let index: WeightMapIndex = serde_json::from_str(&json)?;
         let weight_files: HashSet<&String> = index.weight_map.values().collect();
-        Ok(weight_files
+        let mut files: Vec<_> = weight_files
             .into_iter()
             .map(|f| model_path.join(f))
-            .collect())
+            .collect();
+        files.sort();
+        Ok(files)
     } else {
         let single_path = model_path.join("model.safetensors");
         if single_path.exists() {
