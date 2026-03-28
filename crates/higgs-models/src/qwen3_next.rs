@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use mlx_rs::{
-    Array, Stream,
+    Array, Dtype, Stream,
     builder::Builder,
     error::Exception,
     fast,
@@ -187,6 +187,11 @@ pub struct Qwen3NextModelArgs {
     /// Use separate GDN projections (qwen3.5-style) instead of combined (qwen3_next-style).
     #[serde(default)]
     pub use_separate_gdn_projections: bool,
+
+    /// Number of MTP (Multi-Token Prediction) hidden layers.
+    /// 0 = no MTP head, 1 = one transformer layer for next-next-token prediction.
+    #[serde(default)]
+    pub mtp_num_hidden_layers: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -422,8 +427,10 @@ y += b_idx * T * Hv * Dv + hv_idx * Dv;
 auto dk_idx = thread_position_in_threadgroup.x;
 auto dv_idx = thread_position_in_grid.y;
 
-auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+// state_in/state_out are float32 buffers for numerical stability,
+// but the kernel signature types them as InT*. Reinterpret to float*.
+auto i_state = reinterpret_cast<const device float*>(state_in) + (n * Dv + dv_idx) * Dk;
+auto o_state = reinterpret_cast<device float*>(state_out) + (n * Dv + dv_idx) * Dk;
 
 float state[n_per_t];
 for (int i = 0; i < n_per_t; ++i) {
@@ -479,7 +486,7 @@ for (int t = 0; t < T; ++t) {
 }
 for (int i = 0; i < n_per_t; ++i) {
   auto s_idx = n_per_t * dk_idx + i;
-  o_state[s_idx] = static_cast<InT>(state[i]);
+  o_state[s_idx] = state[i];
 }
 ";
 
@@ -580,7 +587,7 @@ fn configure_gated_delta_kernel(
             config,
             state_shape.as_ptr(),
             state_shape.len(),
-            in_dtype,
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
         );
 
         config
@@ -860,6 +867,117 @@ impl Qwen3NextMLP {
         let activated = swiglu(&gate_out, &up_out)?;
         self.down_proj.forward(&activated)
     }
+}
+
+// ---------------------------------------------------------------------------
+// MTP (Multi-Token Prediction) head
+// ---------------------------------------------------------------------------
+
+/// Single MTP transformer layer (full attention + dense MLP).
+#[derive(Debug, Clone, ModuleParameters)]
+struct MtpTransformerLayer {
+    #[param]
+    self_attn: Qwen3NextAttention,
+    #[param]
+    input_layernorm: nn::RmsNorm,
+    #[param]
+    post_attention_layernorm: nn::RmsNorm,
+    #[param]
+    mlp: Qwen3NextMLP,
+}
+
+/// Multi-Token Prediction head.
+///
+/// Predicts the token at position t+2 given:
+/// - The backbone's hidden state at position t (`h_t`)
+/// - The embedding of the confirmed token at position t+1
+///
+/// Forward:
+///   `fc(concat(norm_h(h_t), norm_e(embed(tok_{t+1})))) → transformer layer → shared lm_head`
+#[derive(Debug, Clone, ModuleParameters)]
+pub struct MtpHead {
+    #[param]
+    pre_fc_norm_hidden: nn::RmsNorm,
+    #[param]
+    pre_fc_norm_embedding: nn::RmsNorm,
+    #[param]
+    fc: MtpFc,
+    #[param]
+    layers: Vec<MtpTransformerLayer>,
+    #[param]
+    norm: nn::RmsNorm,
+}
+
+/// MTP fusion projection — kept in full precision (fp16) for accuracy.
+///
+/// mlx-lm's `quant_predicate` excludes `mtp.fc` from quantization because
+/// quantizing the fusion layer destroys MTP prediction quality (0% acceptance).
+#[derive(Debug, Clone, ModuleParameters)]
+pub(crate) struct MtpFc {
+    #[param]
+    weight: Param<Array>,
+}
+
+impl MtpFc {
+    fn new() -> Result<Self, Exception> {
+        Ok(Self {
+            weight: Param::new(Array::zeros::<f32>(&[1, 1])?),
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        // Dense matmul: x @ W^T (weight shape [out_features, in_features])
+        // Reshape to 2D for matmul, then restore batch dims.
+        let shape = x.shape().to_vec();
+        let in_features = *shape.last().ok_or_else(|| Exception::custom("empty input"))?;
+        let batch: i32 = shape.iter().take(shape.len() - 1).product();
+        let x2d = x.reshape(&[batch, in_features])?;
+        let w = (*self.weight).as_dtype(x.dtype())?;
+        let out2d = x2d.matmul(&w.transpose()?)?;
+        let out_features = *out2d.shape().last().unwrap_or(&0);
+        let mut out_shape = shape;
+        if let Some(last) = out_shape.last_mut() {
+            *last = out_features;
+        }
+        out2d.reshape(&out_shape)
+    }
+}
+
+impl MtpHead {
+    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+        let n = usize::try_from(args.mtp_num_hidden_layers)
+            .map_err(|_| Exception::custom("mtp_num_hidden_layers must be non-negative"))?;
+
+        let layers = (0..n)
+            .map(|_| {
+                Ok(MtpTransformerLayer {
+                    self_attn: Qwen3NextAttention::new(args, ql, qb)?,
+                    input_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
+                        .eps(args.rms_norm_eps)
+                        .build()?,
+                    post_attention_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
+                        .eps(args.rms_norm_eps)
+                        .build()?,
+                    mlp: Qwen3NextMLP::new(ql, qb)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Exception>>()?;
+
+        Ok(Self {
+            pre_fc_norm_hidden: nn::RmsNormBuilder::new(args.hidden_size)
+                .eps(args.rms_norm_eps)
+                .build()?,
+            pre_fc_norm_embedding: nn::RmsNormBuilder::new(args.hidden_size)
+                .eps(args.rms_norm_eps)
+                .build()?,
+            fc: MtpFc::new()?,
+            layers,
+            norm: nn::RmsNormBuilder::new(args.hidden_size)
+                .eps(args.rms_norm_eps)
+                .build()?,
+        })
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,7 +1550,7 @@ impl GatedDeltaNet {
             Some(state) => state,
             None => ops::zeros_dtype(
                 &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
-                inputs.dtype(),
+                Dtype::Float32,
             )?,
         };
 
@@ -1456,8 +1574,10 @@ impl GatedDeltaNet {
         cache.ssm_state = Some(new_state);
         cache.offset += S;
 
+        // Fused RMSNorm + gated output: silu(z) * rms_norm(y)
+        // nn::silu is pre-compiled in MLX (1 fused dispatch vs 3 for manual swiglu)
         let normed = self.norm.forward(&y)?;
-        let gated_out = swiglu(&z, &normed)?;
+        let gated_out = nn::silu(&z)?.multiply(&normed)?;
 
         // Output projection
         let out_flat = gated_out.reshape(&[B, S, -1])?;
@@ -1833,6 +1953,8 @@ pub struct Qwen3NextCausalLM {
     model: Qwen3NextInner,
     #[param]
     lm_head: Option<QLinear>,
+    #[param]
+    mtp: Option<MtpHead>,
 }
 
 impl Qwen3NextCausalLM {
@@ -1856,11 +1978,17 @@ impl Qwen3NextCausalLM {
         } else {
             Some(QLinear::new(ql, qb)?)
         };
+        let mtp = if args.mtp_num_hidden_layers > 0 {
+            Some(MtpHead::new(&args, ql, qb)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             args,
             model,
             lm_head,
+            mtp,
         })
     }
 
@@ -1905,9 +2033,12 @@ impl Qwen3NextCausalLM {
             .collect()
     }
 
-    /// Forward pass returning hidden states before the LM head.
+    /// Forward pass returning raw hidden states (before final RMSNorm).
+    ///
+    /// Used internally by `forward_hidden` (which adds norm) and
+    /// `forward_with_hidden` (which needs raw states for MTP).
     #[allow(non_snake_case)]
-    pub fn forward_hidden(
+    fn forward_raw_hidden(
         &mut self,
         inputs: &Array,
         _mask: Option<&Array>,
@@ -1934,11 +2065,6 @@ impl Qwen3NextCausalLM {
             .ok_or_else(|| Exception::custom("Hidden state must have >= 2 dims"))?;
 
         let fa_mask: Option<AttentionMask> = if T > 1 {
-            // Read KV cache offset for chunked prefill: when offset > 0,
-            // we need an explicit array mask so queries at positions
-            // [offset, offset+T) attend correctly to KV at [0, offset+T).
-            // The `Causal` flag only creates a lower-triangular on array
-            // indices, which is wrong when Q_len < KV_len.
             let kv_offset = kv_cache
                 .iter()
                 .filter_map(|lc| match lc.as_ref()? {
@@ -1960,7 +2086,19 @@ impl Qwen3NextCausalLM {
             None
         };
 
-        for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()) {
+        // HIGGS_PROFILE=1: instrument per-layer timing with eval barriers.
+        // Samples layers 0-3 (3 GDN + 1 FA), extrapolates to all 64 layers.
+        let profiling = std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1") && T == 1;
+        let mut prof_gdn_attn_ns: u128 = 0;
+        let mut prof_gdn_mlp_ns: u128 = 0;
+        let mut prof_fa_attn_ns: u128 = 0;
+        let mut prof_fa_mlp_ns: u128 = 0;
+        let mut prof_gdn_samples: u32 = 0;
+        let mut prof_fa_samples: u32 = 0;
+
+        for (layer_idx, (layer, layer_cache)) in
+            self.model.layers.iter_mut().zip(kv_cache.iter_mut()).enumerate()
+        {
             let cache = layer_cache
                 .as_mut()
                 .ok_or_else(|| Exception::custom("Layer cache is None"))?;
@@ -1968,6 +2106,14 @@ impl Qwen3NextCausalLM {
                 None
             } else {
                 fa_mask.as_ref()
+            };
+
+            let sample_this = profiling && layer_idx < 4;
+            let t0 = if sample_this {
+                mlx_rs::transforms::eval([&h])?;
+                Some(std::time::Instant::now())
+            } else {
+                None
             };
 
             let normed = layer.input_layernorm.forward(&h)?;
@@ -1992,11 +2138,66 @@ impl Qwen3NextCausalLM {
             };
 
             let h2 = h.add(r)?;
-            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
-            let mlp_out = layer.mlp.forward(&normed_post)?;
-            h = h2.add(mlp_out)?;
+
+            if let Some(t0) = t0 {
+                mlx_rs::transforms::eval([&h2])?;
+                let attn_ns = t0.elapsed().as_nanos();
+                let t1 = std::time::Instant::now();
+
+                let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+                let mlp_out = layer.mlp.forward(&normed_post)?;
+                h = h2.add(mlp_out)?;
+                mlx_rs::transforms::eval([&h])?;
+                let mlp_ns = t1.elapsed().as_nanos();
+
+                if layer.is_linear {
+                    prof_gdn_attn_ns += attn_ns;
+                    prof_gdn_mlp_ns += mlp_ns;
+                    prof_gdn_samples += 1;
+                } else {
+                    prof_fa_attn_ns += attn_ns;
+                    prof_fa_mlp_ns += mlp_ns;
+                    prof_fa_samples += 1;
+                }
+            } else {
+                let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+                let mlp_out = layer.mlp.forward(&normed_post)?;
+                h = h2.add(mlp_out)?;
+            }
         }
 
+        if profiling && prof_gdn_samples > 0 && prof_fa_samples > 0 {
+            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            {
+                let gdn_attn_avg = prof_gdn_attn_ns as f64 / prof_gdn_samples as f64;
+                let gdn_mlp_avg = prof_gdn_mlp_ns as f64 / prof_gdn_samples as f64;
+                let fa_attn_avg = prof_fa_attn_ns as f64 / prof_fa_samples as f64;
+                let fa_mlp_avg = prof_fa_mlp_ns as f64 / prof_fa_samples as f64;
+                let est_total = (gdn_attn_avg + gdn_mlp_avg) * 48.0
+                    + (fa_attn_avg + fa_mlp_avg) * 16.0;
+                tracing::info!(
+                    gdn_attn_ms = format!("{:.2}", gdn_attn_avg / 1e6),
+                    gdn_mlp_ms = format!("{:.2}", gdn_mlp_avg / 1e6),
+                    fa_attn_ms = format!("{:.2}", fa_attn_avg / 1e6),
+                    fa_mlp_ms = format!("{:.2}", fa_mlp_avg / 1e6),
+                    est_total_ms = format!("{:.1}", est_total / 1e6),
+                    "PROFILE: per-layer avg (×48 GDN + ×16 FA)"
+                );
+            }
+        }
+
+        Ok(h)
+    }
+
+    /// Forward pass returning hidden states (after final RMSNorm, before LM head).
+    #[allow(non_snake_case)]
+    pub fn forward_hidden(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_raw_hidden(inputs, mask, kv_cache)?;
         self.model.norm.forward(&h)
     }
 
@@ -2089,6 +2290,103 @@ impl Qwen3NextCausalLM {
             Some(head) => head.forward(&h_last),
             None => self.model.embed_tokens.as_linear(&h_last),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // MTP (Multi-Token Prediction) speculative decode
+    // -----------------------------------------------------------------------
+
+    /// Whether this model has an MTP head loaded.
+    pub const fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// Create a fresh KV cache for the MTP head (one entry per MTP layer).
+    /// Returns `None` if the model has no MTP head.
+    pub fn make_mtp_cache(&self) -> Option<Vec<SteppingKeyValueCache>> {
+        self.mtp.as_ref().map(|mtp| {
+            mtp.layers
+                .iter()
+                .map(|_| SteppingKeyValueCache::new())
+                .collect()
+        })
+    }
+
+    /// Look up the embedding for a token id. Shape: `[1, 1, hidden_size]`.
+    pub fn embed_token(&self, token_id: u32) -> Result<Array, Exception> {
+        let ids = Array::from_slice(&[token_id as i32], &[1, 1]);
+        self.model.embed_tokens.forward(&ids)
+    }
+
+    /// Run the MTP head to produce draft logits for position t+2.
+    ///
+    /// - `hidden` — backbone hidden state at position t, shape `[B, 1, D]`.
+    /// - `next_token_id` — the confirmed next token (t+1).
+    /// - `mtp_cache` — per-layer KV cache for the MTP attention.
+    ///
+    /// Returns draft logits of shape `[B, 1, vocab]`.
+    pub fn mtp_draft(
+        &mut self,
+        hidden: &Array,
+        next_token_id: u32,
+        mtp_cache: &mut [SteppingKeyValueCache],
+    ) -> Result<Array, Exception> {
+        if self.mtp.is_none() {
+            return Err(Exception::custom("MTP head not loaded"));
+        }
+
+        // Compute embedding before mutable borrow of mtp.
+        let next_embed = self.embed_token(next_token_id)?;
+
+        // Scope the mutable borrow: run MTP forward, defer lm_head projection.
+        let normed = {
+            let mtp = self.mtp.as_mut().expect("checked above");
+
+            let h_norm = mtp.pre_fc_norm_hidden.forward(hidden)?;
+            let e_norm = mtp.pre_fc_norm_embedding.forward(&next_embed)?;
+            let concat = ops::concatenate_axis(&[&e_norm, &h_norm], -1)?;
+            let mut x = mtp.fc.forward(&concat)?;
+
+            for (layer, kv) in mtp.layers.iter_mut().zip(mtp_cache.iter_mut()) {
+                let normed = layer.input_layernorm.forward(&x)?;
+                let attn_out = layer.self_attn.forward(&normed, None, kv)?;
+                let h2 = x.add(attn_out)?;
+                let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+                let mlp_out = layer.mlp.forward(&normed_post)?;
+                x = h2.add(mlp_out)?;
+            }
+
+            mtp.norm.forward(&x)?
+        };
+
+        // Now lm_head/embed_tokens can be borrowed immutably.
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&normed),
+            None => self.model.embed_tokens.as_linear(&normed),
+        }
+    }
+
+    /// Forward pass returning BOTH raw hidden states and logits for all positions.
+    ///
+    /// Used by MTP speculative decode: the verify pass needs **raw** (pre-norm)
+    /// hidden states for the next MTP draft, and logits for acceptance check.
+    /// Returns `(raw_hidden, logits)` where both have shape `[B, T, ...]`.
+    /// The raw hidden states have NOT been through the final RMSNorm — the MTP
+    /// head applies its own `pre_fc_norm_hidden` instead.
+    #[allow(non_snake_case)]
+    pub fn forward_with_hidden(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<(Array, Array), Exception> {
+        let h_raw = self.forward_raw_hidden(inputs, mask, kv_cache)?;
+        let h_normed = self.model.norm.forward(&h_raw)?;
+        let logits = match self.lm_head.as_ref() {
+            Some(head) => head.forward(&h_normed)?,
+            None => self.model.embed_tokens.as_linear(&h_normed)?,
+        };
+        Ok((h_raw, logits))
     }
 }
 

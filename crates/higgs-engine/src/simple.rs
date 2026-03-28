@@ -642,6 +642,26 @@ impl SimpleEngine {
             });
         }
 
+        // MTP speculative decode: gated behind HIGGS_MTP=1 env var.
+        // Only for greedy (temperature == 0), no constraints, no logprobs.
+        #[allow(clippy::float_cmp)]
+        if std::env::var("HIGGS_MTP").is_ok_and(|v| v == "1")
+            && prepared.model.has_mtp()
+            && constraint.is_none()
+            && !logprobs
+            && params.temperature == 0.0
+        {
+            return self.mtp_generate(
+                &mut prepared.model,
+                &mut prepared.cache,
+                first_token_id,
+                max_tokens,
+                prompt_len,
+                &mut tokens,
+                stop_sequences,
+            );
+        }
+
         // Pipelined decode: build step N+2's graph while GPU computes step N+1.
         // When constrained generation is active, pipelining would apply the FSM mask
         // one step behind (since we need the sampled token value to advance the FSM
@@ -873,6 +893,317 @@ impl SimpleEngine {
         }
     }
 
+    /// MTP speculative decode loop.
+    ///
+    /// Runs the backbone to get the initial hidden state, then loops calling
+    /// `mtp_cycle()` which drafts one extra token per cycle for ~1.5x speedup.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::as_conversions,
+        clippy::cast_precision_loss
+    )]
+    fn mtp_generate(
+        &self,
+        model: &mut higgs_models::AnyModel,
+        cache: &mut higgs_models::AnyCache,
+        first_token_id: u32,
+        max_tokens: u32,
+        prompt_len: u32,
+        tokens: &mut Vec<u32>,
+        stop_sequences: &[String],
+    ) -> Result<GenerationOutput, EngineError> {
+        let has_stop_sequences = !stop_sequences.is_empty();
+
+        // Create MTP cache for the MTP head's attention layer(s).
+        let mut mtp_cache = model
+            .make_mtp_cache()
+            .ok_or_else(|| EngineError::Generation("MTP cache creation failed".into()))?;
+
+        // Get initial hidden state: re-run backbone on first token to obtain h_t.
+        // This single-token forward is cheap and gives us the hidden state needed
+        // for the first MTP draft.
+        let first_input = Array::from_slice(&[first_token_id as i32], &[1, 1]);
+        let (hidden, logits) = model
+            .forward_with_hidden(&first_input, None, cache)
+            .map_err(EngineError::Mlx)?;
+        let next_arr =
+            mlx_rs::argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
+        let h = hidden.index((.., -1.., ..));
+        eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
+
+        let mut current_hidden = h;
+        let mut confirmed_token_id: u32 = next_arr.item();
+        let mut accepted: u32 = 0;
+        let mut total_cycles: u32 = 0;
+        let t_start = std::time::Instant::now();
+
+        // Thinking budget: force </think> after N tokens if model hasn't closed it.
+        const THINKING_BUDGET: u32 = 256;
+        let think_close_token = if self.enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
+        let mut thinking_tokens: u32 = 0;
+        let mut seen_think_close = false;
+
+        loop {
+            let result = crate::mtp::mtp_cycle(
+                model,
+                cache,
+                &mut mtp_cache,
+                &current_hidden,
+                confirmed_token_id,
+            )?;
+
+            total_cycles += 1;
+
+            for &tok in &result.tokens {
+                // Thinking budget enforcement
+                if let Some(close_id) = think_close_token {
+                    if !seen_think_close {
+                        if tok == close_id {
+                            seen_think_close = true;
+                        } else {
+                            thinking_tokens += 1;
+                            if thinking_tokens >= THINKING_BUDGET {
+                                tokens.push(close_id);
+                                seen_think_close = true;
+                                tracing::info!(
+                                    budget = THINKING_BUDGET,
+                                    "MTP: thinking budget reached, forcing </think>"
+                                );
+                                // Skip remaining tokens from this cycle
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                tokens.push(tok);
+                accepted += 1;
+
+                if self.eos_token_ids.contains(&tok) {
+                    let elapsed = t_start.elapsed();
+                    tracing::info!(
+                        tokens = accepted,
+                        cycles = total_cycles,
+                        accept_rate =
+                            format!("{:.1}%", (accepted as f64 / total_cycles as f64 - 1.0) * 100.0),
+                        tok_per_s =
+                            format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                        "MTP decode complete"
+                    );
+                    return Ok(GenerationOutput {
+                        text: self.decode_tokens(tokens)?,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: Self::completion_len(tokens)?,
+                        token_logprobs: None,
+                    });
+                }
+            }
+
+            if has_stop_sequences {
+                let text = self.decode_tokens(tokens)?;
+                if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
+                    return Ok(GenerationOutput {
+                        text: truncated,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: Self::completion_len(tokens)?,
+                        token_logprobs: None,
+                    });
+                }
+            }
+
+            let completion_len = Self::completion_len(tokens)?;
+            if completion_len >= max_tokens {
+                let elapsed = t_start.elapsed();
+                tracing::info!(
+                    tokens = accepted,
+                    cycles = total_cycles,
+                    accept_rate =
+                        format!("{:.1}%", (accepted as f64 / total_cycles as f64 - 1.0) * 100.0),
+                    tok_per_s = format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                    "MTP decode complete (length limit)"
+                );
+                return Ok(GenerationOutput {
+                    text: self.decode_tokens(tokens)?,
+                    finish_reason: "length".to_owned(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: completion_len,
+                    token_logprobs: None,
+                });
+            }
+
+            current_hidden = result.hidden;
+            confirmed_token_id = result.next_token_id;
+        }
+    }
+
+    /// MTP speculative decode loop — streaming variant.
+    ///
+    /// Same logic as `mtp_generate`, but sends each accepted token (or pair)
+    /// via the streaming channel instead of accumulating into a buffer.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::as_conversions,
+        clippy::cast_precision_loss
+    )]
+    fn mtp_generate_streaming(
+        &self,
+        model: &mut higgs_models::AnyModel,
+        cache: &mut higgs_models::AnyCache,
+        first_token_id: u32,
+        max_tokens: u32,
+        prompt_len: u32,
+        tokens: &mut Vec<u32>,
+        stop_sequences: &[String],
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        mut prev_decoded_len: usize,
+    ) -> Result<(), EngineError> {
+        let has_stop_sequences = !stop_sequences.is_empty();
+
+        let mut mtp_cache = model
+            .make_mtp_cache()
+            .ok_or_else(|| EngineError::Generation("MTP cache creation failed".into()))?;
+
+        let first_input = Array::from_slice(&[first_token_id as i32], &[1, 1]);
+        let (hidden, logits) = model
+            .forward_with_hidden(&first_input, None, cache)
+            .map_err(EngineError::Mlx)?;
+        let next_arr =
+            mlx_rs::argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
+        let h = hidden.index((.., -1.., ..));
+        eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
+
+        let mut current_hidden = h;
+        let mut confirmed_token_id: u32 = next_arr.item();
+        let mut accepted: u32 = 0;
+        let mut total_cycles: u32 = 0;
+        let t_start = std::time::Instant::now();
+
+        const THINKING_BUDGET: u32 = 256;
+        let think_close_token = if self.enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
+        let mut thinking_tokens: u32 = 0;
+        let mut seen_think_close = false;
+
+        loop {
+            let result = crate::mtp::mtp_cycle(
+                model,
+                cache,
+                &mut mtp_cache,
+                &current_hidden,
+                confirmed_token_id,
+            )?;
+
+            total_cycles += 1;
+
+            for &tok in &result.tokens {
+                // Thinking budget enforcement
+                if let Some(close_id) = think_close_token {
+                    if !seen_think_close {
+                        if tok == close_id {
+                            seen_think_close = true;
+                        } else {
+                            thinking_tokens += 1;
+                            if thinking_tokens >= THINKING_BUDGET {
+                                tokens.push(close_id);
+                                seen_think_close = true;
+                                tracing::info!(
+                                    budget = THINKING_BUDGET,
+                                    "MTP streaming: thinking budget reached, forcing </think>"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                tokens.push(tok);
+                accepted += 1;
+
+                let is_eos = self.eos_token_ids.contains(&tok);
+                let completion_len = Self::completion_len(tokens)?;
+                let is_max = completion_len >= max_tokens;
+
+                let full_text = self.decode_tokens(tokens)?;
+                let new_text = full_text
+                    .get(prev_decoded_len..)
+                    .unwrap_or_default()
+                    .to_owned();
+                let old_decoded_len = prev_decoded_len;
+                prev_decoded_len = full_text.len();
+
+                let (final_new_text, hit_stop_seq) = if !has_stop_sequences {
+                    (new_text, false)
+                } else {
+                    check_stop_sequences(&full_text, stop_sequences).map_or(
+                        (new_text, false),
+                        |truncated| {
+                            let emit = truncated
+                                .get(old_decoded_len..)
+                                .unwrap_or_default()
+                                .to_owned();
+                            (emit, true)
+                        },
+                    )
+                };
+
+                let step_finished = is_eos || is_max || hit_stop_seq;
+                let finish_reason = if is_eos || hit_stop_seq {
+                    Some("stop".to_owned())
+                } else if is_max {
+                    Some("length".to_owned())
+                } else {
+                    None
+                };
+
+                if step_finished {
+                    let elapsed = t_start.elapsed();
+                    tracing::info!(
+                        tokens = accepted,
+                        cycles = total_cycles,
+                        accept_rate = format!(
+                            "{:.1}%",
+                            (accepted as f64 / total_cycles as f64 - 1.0) * 100.0
+                        ),
+                        tok_per_s =
+                            format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                        "MTP streaming decode complete"
+                    );
+                }
+
+                if sender
+                    .blocking_send(StreamingOutput {
+                        new_text: final_new_text,
+                        finished: step_finished,
+                        finish_reason,
+                        prompt_tokens: prompt_len,
+                        completion_tokens: completion_len,
+                        token_logprob: None,
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+
+                if step_finished {
+                    return Ok(());
+                }
+            }
+
+            current_hidden = result.hidden;
+            confirmed_token_id = result.next_token_id;
+        }
+    }
+
     /// Generate tokens one at a time, sending each via the provided channel.
     ///
     /// If the receiver is dropped (client disconnected), generation stops early.
@@ -1001,6 +1332,26 @@ impl SimpleEngine {
 
         if finished {
             return Ok(());
+        }
+
+        // MTP speculative decode (streaming): greedy, no constraints, no logprobs.
+        #[allow(clippy::float_cmp)]
+        if prepared.model.has_mtp()
+            && constraint.is_none()
+            && !logprobs
+            && params.temperature == 0.0
+        {
+            return self.mtp_generate_streaming(
+                &mut prepared.model,
+                &mut prepared.cache,
+                first_token_id,
+                max_tokens,
+                prompt_len,
+                &mut all_tokens,
+                stop_sequences,
+                sender,
+                prev_decoded_len,
+            );
         }
 
         // Thinking budget (streaming): force </think> after N tokens.
