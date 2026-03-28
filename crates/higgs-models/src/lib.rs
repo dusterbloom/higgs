@@ -397,12 +397,10 @@ impl AnyModel {
             }
             Self::Qwen3Next(m) => {
                 if kv_cache_config.is_turboquant() {
-                    return Err(Exception::custom(
-                        "TurboQuant is not yet supported for qwen3_next hybrid caches \
-                         (requires fused dequant-during-attention Metal kernels)",
-                    ));
+                    Ok(AnyCache::Hybrid(m.make_cache_turbo(kv_cache_config)?))
+                } else {
+                    Ok(AnyCache::Hybrid(m.make_cache()))
                 }
-                Ok(AnyCache::Hybrid(m.make_cache()))
             }
         }
     }

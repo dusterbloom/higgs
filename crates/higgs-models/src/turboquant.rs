@@ -991,19 +991,24 @@ static PACK_SIGNS_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 const TURBOQUANT_SCORES_KERNEL_SOURCE: &str = r"
 constexpr float kQjlScale = 1.2533141373155001f / float(D);
+constexpr int GQA = H / HKV;
 auto pos = thread_position_in_grid.x;
-auto head = thread_position_in_grid.y;
+auto kv_head = thread_position_in_grid.y;
 if (pos >= T) { return; }
-auto kv_head = head / (H / HKV);
-
-auto q_rot_ptr = q_rot + head * D;
-auto q_qjl_ptr = q_qjl + head * D;
 
 auto packed_index = kv_head * Capacity + pos;
 auto code_ptr = k_codes + packed_index * KWords;
 auto sign_ptr = k_qjl + packed_index * QBytes;
+float norm_val = float(k_norms[packed_index]);
+float gamma_val = float(k_gammas[packed_index]);
 
-float mse = 0.0f;
+float mse_acc[GQA];
+float res_acc[GQA];
+for (int g = 0; g < GQA; ++g) {
+  mse_acc[g] = 0.0f;
+  res_acc[g] = 0.0f;
+}
+
 for (int j = 0; j < D; ++j) {
   auto bit_index = j * KBits;
   auto word_index = bit_index / 32;
@@ -1013,19 +1018,23 @@ for (int j = 0; j < D; ++j) {
     code |= code_ptr[word_index + 1] << (32 - shift);
   }
   code &= ((1u << KBits) - 1u);
-  mse += float(q_rot_ptr[j]) * key_centroids[code];
-}
-float score = mse * float(k_norms[packed_index]);
+  float key_val = key_centroids[code];
 
-float residual = 0.0f;
-for (int j = 0; j < D; ++j) {
-  auto byte_index = j / 8;
-  auto shift = j % 8;
-  uint sign = (uint(sign_ptr[byte_index]) >> shift) & 1u;
-  residual += (sign == 1u ? 1.0f : -1.0f) * float(q_qjl_ptr[j]);
+  auto byte_idx = j / 8;
+  auto bit_shift = j % 8;
+  float sign_val = ((uint(sign_ptr[byte_idx]) >> bit_shift) & 1u) == 1u ? 1.0f : -1.0f;
+
+  for (int g = 0; g < GQA; ++g) {
+    int head = kv_head * GQA + g;
+    mse_acc[g] += float(q_rot[head * D + j]) * key_val;
+    res_acc[g] += sign_val * float(q_qjl[head * D + j]);
+  }
 }
 
-scores[head * T + pos] = score + float(k_gammas[packed_index]) * kQjlScale * residual;
+for (int g = 0; g < GQA; ++g) {
+  int head = kv_head * GQA + g;
+  scores[head * T + pos] = mse_acc[g] * norm_val + gamma_val * kQjlScale * res_acc[g];
+}
 ";
 
 const TURBOQUANT_VALUES_KERNEL_SOURCE: &str = r"
@@ -1196,7 +1205,7 @@ fn configure_scores_kernel(
             c"QBytes".as_ptr(),
             sign_bytes,
         );
-        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, seq_len, num_heads, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, seq_len, num_kv_heads, 1);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
         let shape = [num_heads, seq_len];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
