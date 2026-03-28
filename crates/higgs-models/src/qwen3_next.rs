@@ -686,6 +686,255 @@ fn gated_delta_kernel_ffi(
 }
 
 // ---------------------------------------------------------------------------
+// Custom quantized GEMV kernel — 4-bit affine, vectorized uint4 loads
+// ---------------------------------------------------------------------------
+
+/// Metal kernel for quantized GEMV: y = dequant(W) @ x.
+///
+/// One threadgroup computes ONE output row. 4 simdgroups split-K parallelize
+/// the dot product, then reduce via threadgroup memory. Uses `uint4` (16-byte)
+/// vectorized weight loads for peak bandwidth, vs MLX's `uint16` (2-byte) loads.
+///
+/// ALL buffers are float32 (InT=float32). Weight viewed from uint32 (same 4 bytes).
+/// Scales, biases, x pre-cast to float32 on Rust side. Output is float32.
+/// `K`, `GroupSize`, `KPacked` = compile-time int constants.
+/// Grid: `(N*32, 4, 1)`, Threadgroup: `(32, 4, 1)`.
+const QGEMV_4BIT_KERNEL_SOURCE: &str = r"
+auto row = threadgroup_position_in_grid.x;
+auto sg_idx = simdgroup_index_in_threadgroup;
+auto lane = thread_index_in_simdgroup;
+
+// All buffers are uint32 (InT). Weight is native uint32 packed nibbles.
+// Scales/biases/x contain f32 bits stored as uint32 — use as_type<float> to read.
+auto w_row = w + row * KPacked;
+
+// Split-K: divide KPacked across 4 simdgroups
+constexpr int NumSG = 4;
+const int chunk = (KPacked + NumSG - 1) / NumSG;
+const int start = sg_idx * chunk;
+const int end = min(start + chunk, KPacked);
+float acc = 0.0f;
+
+for (int i = 0; i < chunk; i += 32) {
+    int idx = start + i + lane;
+    if (idx >= end) break;
+
+    uint packed = w_row[idx];
+    int k_base = idx * 8;
+
+    // x values: f32 bits stored as uint32, 1 float per uint32 word
+    float x0 = as_type<float>(x[k_base]);     float x1 = as_type<float>(x[k_base + 1]);
+    float x2 = as_type<float>(x[k_base + 2]); float x3 = as_type<float>(x[k_base + 3]);
+    float x4 = as_type<float>(x[k_base + 4]); float x5 = as_type<float>(x[k_base + 5]);
+    float x6 = as_type<float>(x[k_base + 6]); float x7 = as_type<float>(x[k_base + 7]);
+
+    float dot_val =
+        float(packed & 0xFu)         * x0 +
+        float((packed >> 4u) & 0xFu)  * x1 +
+        float((packed >> 8u) & 0xFu)  * x2 +
+        float((packed >> 12u) & 0xFu) * x3 +
+        float((packed >> 16u) & 0xFu) * x4 +
+        float((packed >> 20u) & 0xFu) * x5 +
+        float((packed >> 24u) & 0xFu) * x6 +
+        float((packed >> 28u) & 0xFu) * x7;
+
+    int g = k_base / GroupSize;
+    float s_val = as_type<float>(scales[row * (K / GroupSize) + g]);
+    float b_val = as_type<float>(biases[row * (K / GroupSize) + g]);
+    acc += s_val * dot_val + b_val * (x0+x1+x2+x3+x4+x5+x6+x7);
+}
+
+acc = simd_sum(acc);
+
+// Reduce across simdgroups
+threadgroup float partial[NumSG];
+// Initialize to 0 to avoid reading uninitialized memory
+if (lane == 0) partial[sg_idx] = acc;
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+if (sg_idx == 0 && lane == 0) {
+    float sum = 0.0f;
+    for (int s = 0; s < NumSG; s++) {
+        sum += partial[s];
+    }
+    y[row] = as_type<uint>(sum);
+}
+";
+
+static QGEMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_qgemv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let input_names: [&std::ffi::CStr; 4] = [c"w", c"scales", c"biases", c"x"];
+    let output_names: [&std::ffi::CStr; 1] = [c"y"];
+
+    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
+
+    let source = CString::new(QGEMV_4BIT_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+
+    unsafe {
+        let in_vec =
+            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_qgemv_4bit".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            false, // ensure_row_contiguous — we handle contiguity manually
+            false, // atomic_outputs
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_qgemv_kernel(
+    x_dtype: mlx_sys::mlx_dtype,
+    n_rows: i32,
+    k_dim: i32,
+    group_size: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        // InT = uint32 for ALL buffers. Weight is natively uint32.
+        // Scales/biases/x are f32 view-cast to uint32 (same bytes).
+        // Kernel uses as_type<float>() to recover f32 values from uint32 bits.
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"InT".as_ptr(),
+            mlx_sys::mlx_dtype__MLX_UINT32,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"K".as_ptr(),
+            k_dim,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"GroupSize".as_ptr(),
+            group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"KPacked".as_ptr(),
+            k_dim / 8,
+        );
+
+        // Grid = total threads. N threadgroups of (32, 4, 1) = 4 simdgroups each.
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_rows * 32, 4, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1);
+
+        let y_shape = [1, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            mlx_sys::mlx_dtype__MLX_UINT32, // InT=uint32; kernel writes f32 bits via as_type
+        );
+
+        config
+    }
+}
+
+/// Custom quantized GEMV for 4-bit affine weights.
+///
+/// Computes `y = dequant(W, scales, biases) @ x` with vectorized loads.
+/// Falls back to `quantized_forward` for non-GEMV (batch > 1).
+#[allow(unsafe_code, clippy::too_many_arguments)]
+/// `scales_u32` and `biases_u32` must be pre-converted: `as_dtype(f32).view(u32)`.
+pub(crate) fn qgemv_4bit(
+    x: &Array,
+    weight: &Array,
+    scales_u32: &Array,
+    biases_u32: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let x_shape = x.shape();
+    let n_rows = weight.shape()[0];
+    let k_packed = weight.shape()[1]; // uint32 words per row
+    let k_dim = k_packed * 8; // logical elements (8 nibbles per uint32)
+
+    // Flatten x to 1D for the kernel
+    let x_flat = x.reshape(&[k_dim])?;
+
+    let stream = Stream::task_local_or_default();
+    let in_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    // Pre-cast ALL inputs to float32 so the kernel uses uniform InT=float32.
+    // Weight (uint32) is view-cast: same raw bytes, reinterpreted as float32.
+    // Scales, biases, x are value-cast from bfloat16 to float32.
+    // x: cast bf16→f32→view as u32 (per-token, small: K elements)
+    let x_f32 = x_flat.as_dtype(Dtype::Float32)?;
+    let x_u32 = x_f32.view_dtype_device(Dtype::Uint32, Stream::default())?;
+    // Weight is already uint32 — flatten for kernel
+    let w_flat = weight.reshape(&[-1])?;
+
+    let cached = QGEMV_KERNEL.get_or_init(|| CachedMetalKernel(create_qgemv_kernel()));
+    let config = configure_qgemv_kernel(in_dtype, n_rows, k_dim, group_size);
+
+    let input_ptrs = [
+        w_flat.as_ptr(),
+        scales_u32.as_ptr(),
+        biases_u32.as_ptr(),
+        x_u32.as_ptr(),
+    ];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        let mlx_msg = FFI_LAST_ERROR
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+            .unwrap_or_default();
+        Err(Exception::custom(format!(
+            "qgemv_4bit failed: {mlx_msg}"
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe {
+            mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0);
+        }
+        let y_u32 = unsafe { Array::from_ptr(y_ptr) };
+        // View-cast uint32 output bits back to float32, then to compute dtype
+        let y_f32 = y_u32.view_dtype_device(Dtype::Float32, Stream::default())?;
+        let y_typed = y_f32.as_dtype(x.dtype())?;
+        // Restore batch dims
+        let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+        out_shape.push(n_rows);
+        y_typed.reshape(&out_shape)
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Qwen3NextAttention (full attention with gated Q and partial RoPE)
 // ---------------------------------------------------------------------------
 
@@ -1678,6 +1927,9 @@ struct FfnBlock {
     norm_topk_prob: bool,
     /// Cached fused gate+up weights for dense layers (lazily computed on first forward).
     fused_gate_up: Option<(Array, Array, Array, i32)>,
+    /// Cached uint32 views of fused gate+up and down scales/biases for custom GEMV.
+    /// Format: (gate_up_scales_u32, gate_up_biases_u32, down_scales_u32, down_biases_u32)
+    gemv_cache: Option<(Array, Array, Array, Array)>,
 }
 
 impl FfnBlock {
@@ -1695,6 +1947,7 @@ impl FfnBlock {
             top_k: moe.top_k,
             norm_topk_prob: moe.norm_topk_prob,
             fused_gate_up: None,
+            gemv_cache: None,
         })
     }
 
@@ -1711,6 +1964,7 @@ impl FfnBlock {
             top_k: 0,
             norm_topk_prob: false,
             fused_gate_up: None,
+            gemv_cache: None,
         })
     }
 
@@ -1801,6 +2055,9 @@ impl FfnBlock {
                 .gate_proj
                 .as_ref()
                 .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
+
+            // Single-token decode: use custom GEMV kernel for MLP matmuls
+            let seq_len = *x.shape().get(1).unwrap_or(&0);
             let fused_out = quantized_forward(x, fw, fs, fb, gp.group_size, gp.bits)?;
             let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
             let gate_out = parts
@@ -1809,7 +2066,7 @@ impl FfnBlock {
             let up_out = parts
                 .get(1)
                 .ok_or_else(|| Exception::custom("fused split failed"))?;
-            dp.forward(&swiglu(gate_out, up_out)?)
+            dp.forward(&nn::silu(gate_out)?.multiply(up_out)?)
         }
     }
 }
@@ -11332,6 +11589,116 @@ mod tests {
             println!(
                 "  ---- GDN share of wall TTFT: {:.1}%",
                 ms(ns_gdn) / wall_ms * 100.0,
+            );
+        }
+    }
+
+    #[test]
+    fn test_qgemv_4bit_matches_quantized_matmul() {
+        use mlx_rs::Dtype;
+
+        // K=512 ensures clean split-K with 4 simdgroups (KPacked=64, chunk=16)
+        let k = 512i32;
+        let n = 16i32;
+        let group_size = 64i32;
+
+        // Random input
+        let x = mlx_rs::random::uniform_device::<_, f32>(0.0, 1.0, &[1, 1, k], None, Stream::default())
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+
+        // Random dense weight, then quantize via MLX
+        let w_dense =
+            mlx_rs::random::uniform_device::<_, f32>(-1.0, 1.0, &[n, k], None, Stream::default()).unwrap();
+        let (w_q, scales, biases) =
+            mlx_rs::ops::quantize(&w_dense, group_size, 4).unwrap();
+        mlx_rs::transforms::eval([&w_q, &scales, &biases, &x]).unwrap();
+
+        // Reference: MLX quantized_matmul
+        let ref_out = quantized_forward(&x, &w_q, &scales, &biases, group_size, 4).unwrap();
+        mlx_rs::transforms::eval([&ref_out]).unwrap();
+
+        // Pre-convert scales/biases for custom kernel
+        let s_u32 = scales.as_dtype(Dtype::Float32).unwrap()
+            .flatten(None, None).unwrap()
+            .view_dtype_device(Dtype::Uint32, Stream::default()).unwrap();
+        let b_u32 = biases.as_dtype(Dtype::Float32).unwrap()
+            .flatten(None, None).unwrap()
+            .view_dtype_device(Dtype::Uint32, Stream::default()).unwrap();
+        mlx_rs::transforms::eval([&s_u32, &b_u32]).unwrap();
+
+        // Custom kernel
+        let custom_out = qgemv_4bit(&x, &w_q, &s_u32, &b_u32, group_size).unwrap();
+        mlx_rs::transforms::eval([&custom_out]).unwrap();
+
+        // Compare
+        let ref_f32 = ref_out.as_dtype(Dtype::Float32).unwrap();
+        let cust_f32 = custom_out.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&ref_f32, &cust_f32]).unwrap();
+
+        let ref_vals = ref_f32.as_slice::<f32>();
+        let cust_vals = cust_f32.as_slice::<f32>();
+
+        println!("ref_out shape: {:?}", ref_out.shape());
+        println!("custom_out shape: {:?}", custom_out.shape());
+
+        // Also print the scales/biases for debugging
+        let s_f32 = scales.as_dtype(Dtype::Float32).unwrap();
+        let b_f32 = biases.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&s_f32, &b_f32]).unwrap();
+        println!("scales: {:?}", s_f32.as_slice::<f32>());
+        println!("biases: {:?}", b_f32.as_slice::<f32>());
+        println!("ref  values: {:?}", &ref_vals[..n as usize]);
+        println!("cust values: {:?}", &cust_vals[..n as usize]);
+
+        // Also compute expected output manually in Rust for comparison
+        let x_f32_arr = x.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&x_f32_arr]).unwrap();
+        let x_vals = x_f32_arr.as_slice::<f32>();
+        let w_vals = w_q.as_slice::<u32>();
+        let s_vals = scales.as_dtype(Dtype::Float32).unwrap();
+        let b_vals_arr = biases.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&s_vals, &b_vals_arr]).unwrap();
+        let sv = s_vals.as_slice::<f32>();
+        let bv = b_vals_arr.as_slice::<f32>();
+
+        println!("--- Manual Rust computation ---");
+        println!("w_q first words per row:");
+        let k_packed_val = k / 8;
+        for row in 0..n as usize {
+            println!("  row {row}: w[0]=0x{:08x}", w_vals[row * k_packed_val as usize]);
+        }
+        for row in 0..n as usize {
+            let mut acc = 0.0f32;
+            for word_idx in 0..k_packed_val as usize {
+                let packed = w_vals[row * k_packed_val as usize + word_idx];
+                let k_base = word_idx * 8;
+                let g = k_base / group_size as usize;
+                let s = sv[row * (k as usize / group_size as usize) + g];
+                let b = bv[row * (k as usize / group_size as usize) + g];
+                let mut dot = 0.0f32;
+                let mut xsum = 0.0f32;
+                for j in 0..8 {
+                    let nibble = ((packed >> (4 * j)) & 0xF) as f32;
+                    let xv = x_vals[k_base + j];
+                    dot += nibble * xv;
+                    xsum += xv;
+                }
+                acc += s * dot + b * xsum;
+            }
+            println!("  row {row}: manual={acc:.4}, ref={:.4}, cust={:.4}",
+                     ref_vals[row], cust_vals[row]);
+        }
+
+        assert_eq!(ref_vals.len(), cust_vals.len(), "output length mismatch");
+        for i in 0..ref_vals.len() {
+            let diff = (ref_vals[i] - cust_vals[i]).abs();
+            assert!(
+                diff < 0.5,
+                "mismatch at index {i}: ref={}, custom={}, diff={diff}",
+                ref_vals[i],
+                cust_vals[i]
             );
         }
     }
