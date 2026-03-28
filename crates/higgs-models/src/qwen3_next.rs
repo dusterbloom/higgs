@@ -1206,6 +1206,8 @@ struct GatedDeltaNet {
     use_separate_projections: bool,
     qk_norm_weight_q: Array,
     qk_norm_weight_k: Array,
+    /// Pre-transposed conv weight for fast T=1 decode: [kernel_size, conv_dim].
+    conv_weight_t: Option<Array>,
 }
 
 impl GatedDeltaNet {
@@ -1282,6 +1284,7 @@ impl GatedDeltaNet {
                 w.eval()?;
                 w
             },
+            conv_weight_t: None,
         })
     }
 
@@ -1377,7 +1380,26 @@ impl GatedDeltaNet {
         let keep_start = conv_input_len - n_keep;
         cache.conv_state = Some(conv_input.index((.., keep_start.., ..)));
 
-        let conv_out = silu_direct(&self.conv1d.forward(&conv_input)?)?;
+        // Fast path for single-token decode: depthwise conv1d with T=kernel_size
+        // is just element-wise multiply + sum, avoiding full Conv1d kernel dispatch.
+        let conv_out = if S == 1 {
+            let wt = match &self.conv_weight_t {
+                Some(w) => w.clone(),
+                None => {
+                    // Conv1d weight: [conv_dim, kernel_size, 1] → [kernel_size, conv_dim]
+                    let w = self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?;
+                    let w = w.as_dtype(inputs.dtype())?;
+                    w.eval()?;
+                    self.conv_weight_t = Some(w.clone());
+                    w
+                }
+            };
+            // conv_input: [B, kernel_size, conv_dim], wt: [kernel_size, conv_dim]
+            // → multiply + sum over time axis → [B, 1, conv_dim]
+            silu_direct(&conv_input.multiply(&wt)?.sum_axes(&[1], true)?)?
+        } else {
+            silu_direct(&self.conv1d.forward(&conv_input)?)?
+        };
 
         // Split conv output back to q, k, v
         let split_indices = &[self.key_dim, self.key_dim * 2];
@@ -1534,6 +1556,8 @@ struct FfnBlock {
     is_moe: bool,
     top_k: i32,
     norm_topk_prob: bool,
+    /// Cached fused gate+up weights for dense layers (lazily computed on first forward).
+    fused_gate_up: Option<(Array, Array, Array, i32)>,
 }
 
 impl FfnBlock {
@@ -1550,6 +1574,7 @@ impl FfnBlock {
             is_moe: true,
             top_k: moe.top_k,
             norm_topk_prob: moe.norm_topk_prob,
+            fused_gate_up: None,
         })
     }
 
@@ -1565,10 +1590,11 @@ impl FfnBlock {
             is_moe: false,
             top_k: 0,
             norm_topk_prob: false,
+            fused_gate_up: None,
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array, Exception> {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         if self.is_moe {
             // Delegate to SparseMoeBlock logic
             let gate_ref = self
@@ -1618,22 +1644,52 @@ impl FfnBlock {
 
             expert_sum.add(shared_out)
         } else {
-            // Dense SwiGLU
-            let gp = self
-                .gate_proj
-                .as_ref()
-                .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
-            let up = self
-                .up_proj
-                .as_ref()
-                .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
+            // Dense SwiGLU with fused gate+up (single quantized_matmul + split)
             let dp = self
                 .down_proj
                 .as_ref()
                 .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
-            let gate_out = gp.forward(x)?;
-            let up_out = up.forward(x)?;
-            dp.forward(&swiglu(&gate_out, &up_out)?)
+
+            if self.fused_gate_up.is_none() {
+                let gp = self
+                    .gate_proj
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
+                let up = self
+                    .up_proj
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
+                let intermediate = *gp
+                    .weight
+                    .shape()
+                    .first()
+                    .ok_or_else(|| Exception::custom("gate_proj weight has no dims"))?;
+                let fw = ops::concatenate_axis(&[&*gp.weight, &*up.weight], 0)?;
+                let fs = ops::concatenate_axis(&[&*gp.scales, &*up.scales], 0)?;
+                let fb = ops::concatenate_axis(&[&*gp.biases, &*up.biases], 0)?;
+                fw.eval()?;
+                fs.eval()?;
+                fb.eval()?;
+                self.fused_gate_up = Some((fw, fs, fb, intermediate));
+            }
+
+            let (fw, fs, fb, intermediate) = self
+                .fused_gate_up
+                .as_ref()
+                .ok_or_else(|| Exception::custom("fused_gate_up missing after init"))?;
+            let gp = self
+                .gate_proj
+                .as_ref()
+                .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
+            let fused_out = quantized_forward(x, fw, fs, fb, gp.group_size, gp.bits)?;
+            let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
+            let gate_out = parts
+                .first()
+                .ok_or_else(|| Exception::custom("fused split failed"))?;
+            let up_out = parts
+                .get(1)
+                .ok_or_else(|| Exception::custom("fused split failed"))?;
+            dp.forward(&swiglu(gate_out, up_out)?)
         }
     }
 }
