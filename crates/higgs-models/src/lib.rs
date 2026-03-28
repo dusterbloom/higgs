@@ -18,6 +18,7 @@ use std::path::Path;
 
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::transforms::eval;
 use mlx_rs::{Array, argmax_axis, array, categorical, error::Exception};
 use serde::Deserialize;
 use serde_json::Value;
@@ -197,6 +198,55 @@ impl AnyModel {
         }
     }
 
+    /// Chunked prefill: process the prompt in `chunk_size`-token segments.
+    ///
+    /// Produces identical logits to `forward()` but evaluates the compute graph
+    /// between chunks, bounding peak memory for long sequences. Only the last
+    /// position's logits are returned (same shape as `forward` during generation).
+    #[allow(non_snake_case)]
+    pub fn forward_chunked(
+        &mut self,
+        inputs: &Array,
+        cache: &mut AnyCache,
+        chunk_size: i32,
+    ) -> Result<Array, Exception> {
+        let T = *inputs
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
+
+        if chunk_size >= T {
+            return self.forward(inputs, None, cache);
+        }
+
+        // For Qwen3Next, delegate to the model's own chunked prefill which
+        // also handles SSM/conv state eval.
+        if let (Self::Qwen3Next(m), AnyCache::Hybrid(c)) = (&mut *self, &mut *cache) {
+            return m.forward_chunked(inputs, None, c, chunk_size);
+        }
+
+        // Generic path for all KV-only models.
+        let mut offset = 0i32;
+        while offset + chunk_size < T {
+            let chunk = inputs.index((.., offset..offset + chunk_size));
+            let h = self.forward_hidden(&chunk, None, cache)?;
+            // Eval hidden output + all cache states between chunks.
+            // Without eval, MLX's lazy graph accumulates and OOMs on long sequences.
+            let mut targets: Vec<&Array> = vec![&h];
+            if let AnyCache::KV(kv) = &*cache {
+                for kv_cache in kv.iter().flatten() {
+                    targets.extend(kv_cache.eval_targets());
+                }
+            }
+            eval(targets)?;
+            offset += chunk_size;
+        }
+
+        // Last chunk: forward + LM head projection on last position only.
+        let last_chunk = inputs.index((.., offset..));
+        self.forward(&last_chunk, None, cache)
+    }
+
     /// Batched decode forward pass for N requests each with 1 token.
     ///
     /// Only supported for the `Transformer` variant (Llama/Qwen/Mistral).
@@ -348,7 +398,8 @@ impl AnyModel {
             Self::Qwen3Next(m) => {
                 if kv_cache_config.is_turboquant() {
                     return Err(Exception::custom(
-                        "TurboQuant is not supported for qwen3_next hybrid caches",
+                        "TurboQuant is not yet supported for qwen3_next hybrid caches \
+                         (requires fused dequant-during-attention Metal kernels)",
                     ));
                 }
                 Ok(AnyCache::Hybrid(m.make_cache()))

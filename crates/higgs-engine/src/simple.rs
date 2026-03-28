@@ -24,6 +24,12 @@ use crate::{
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 
+/// Sequences longer than this trigger chunked prefill to bound peak memory.
+const CHUNKED_PREFILL_THRESHOLD: i32 = 512;
+
+/// Number of tokens per chunk during chunked prefill.
+const CHUNKED_PREFILL_CHUNK_SIZE: i32 = 512;
+
 /// Cap MLX memory allocations to avoid Metal OOM on constrained GPUs.
 ///
 /// Sets `mlx_set_memory_limit` to 75% of `max_recommended_working_set_size`
@@ -336,10 +342,22 @@ impl SimpleEngine {
                 .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
         } else {
-            prepared
-                .model
-                .forward(&prepared.prompt_array, None, &mut prepared.cache)
-                .map_err(EngineError::Mlx)?
+            let seq_len = prepared.prompt_array.shape().get(1).copied().unwrap_or(0);
+            if seq_len > CHUNKED_PREFILL_THRESHOLD {
+                prepared
+                    .model
+                    .forward_chunked(
+                        &prepared.prompt_array,
+                        &mut prepared.cache,
+                        CHUNKED_PREFILL_CHUNK_SIZE,
+                    )
+                    .map_err(EngineError::Mlx)?
+            } else {
+                prepared
+                    .model
+                    .forward(&prepared.prompt_array, None, &mut prepared.cache)
+                    .map_err(EngineError::Mlx)?
+            }
         };
         let last_logits = logits.index((.., -1, ..));
 

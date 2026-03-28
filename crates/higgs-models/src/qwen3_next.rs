@@ -788,6 +788,10 @@ impl Qwen3NextAttention {
         queries = apply_rope(&queries, &self.rope, offset)?;
         keys = apply_rope(&keys, &self.rope, offset)?;
 
+        // update_and_fetch dequantizes TurboQuant storage to dense KV then
+        // runs native SDPA — this gives memory savings from compressed storage
+        // without the per-dispatch overhead of custom TurboQuant decode kernels
+        // (which are too costly for 2 KV heads with GQA ratio 8).
         let (cached_keys, cached_values) = cache.update_and_fetch(keys, values)?;
         keys = cached_keys;
         values = cached_values;
@@ -1808,6 +1812,32 @@ impl Qwen3NextCausalLM {
                     Some(LayerCache::Arrays(ArraysCache::new()))
                 } else {
                     Some(LayerCache::KV(SteppingKeyValueCache::new()))
+                }
+            })
+            .collect()
+    }
+
+    /// Create a hybrid cache with TurboQuant on the full-attention KV layers.
+    ///
+    /// Linear-attention (SSM/GDN) layers get a plain `ArraysCache`; full-attention
+    /// layers get a `SteppingKeyValueCache` with TurboQuant storage. This matches
+    /// the selective compression strategy used by other TurboQuant implementations.
+    pub fn make_cache_turbo(
+        &self,
+        kv_cache_config: crate::turboquant::KvCacheConfig,
+    ) -> Result<Vec<Option<LayerCache>>, mlx_rs::error::Exception> {
+        self.model
+            .layers
+            .iter()
+            .map(|layer| {
+                if layer.is_linear {
+                    Ok(Some(LayerCache::Arrays(ArraysCache::new())))
+                } else {
+                    Ok(Some(LayerCache::KV(SteppingKeyValueCache::new_turbo(
+                        kv_cache_config,
+                        self.args.num_key_value_heads,
+                        self.args.head_dim,
+                    )?)))
                 }
             })
             .collect()
