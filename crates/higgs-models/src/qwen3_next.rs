@@ -695,38 +695,39 @@ fn gated_delta_kernel_ffi(
 /// the dot product, then reduce via threadgroup memory. Uses `uint4` (16-byte)
 /// vectorized weight loads for peak bandwidth, vs MLX's `uint16` (2-byte) loads.
 ///
-/// ALL buffers are float32 (InT=float32). Weight viewed from uint32 (same 4 bytes).
-/// Scales, biases, x pre-cast to float32 on Rust side. Output is float32.
-/// `K`, `GroupSize`, `KPacked` = compile-time int constants.
+/// Single packed buffer `wb` = [weight_u32 | scales_f32_as_u32 | biases_f32_as_u32].
+/// Eliminates per-token dtype conversions for scales/biases (packed once at load time).
+/// Only x needs per-token f32→u32 view-cast (tiny: K elements).
+///
+/// InT = uint32. Template: `K`, `GroupSize`, `KPacked`, `SOffset`, `BOffset`.
 /// Grid: `(N*32, 4, 1)`, Threadgroup: `(32, 4, 1)`.
 const QGEMV_4BIT_KERNEL_SOURCE: &str = r"
 auto row = threadgroup_position_in_grid.x;
 auto sg_idx = simdgroup_index_in_threadgroup;
 auto lane = thread_index_in_simdgroup;
 
-// All buffers are uint32 (InT). Weight is native uint32 packed nibbles.
-// Scales/biases/x contain f32 bits stored as uint32 — use as_type<float> to read.
-auto w_row = w + row * KPacked;
+// wb = [weight(N*KPacked u32) | scales(N*Groups f32-as-u32) | biases(N*Groups f32-as-u32)]
+auto w_row = wb + row * KPacked;
+auto s_ptr = wb + SOffset + row * (K / GroupSize);
+auto b_ptr = wb + BOffset + row * (K / GroupSize);
 
-// Split-K: divide KPacked across 4 simdgroups
 constexpr int NumSG = 4;
 const int chunk = (KPacked + NumSG - 1) / NumSG;
 const int start = sg_idx * chunk;
-const int end = min(start + chunk, KPacked);
+const int end_idx = min(start + chunk, KPacked);
 float acc = 0.0f;
 
 for (int i = 0; i < chunk; i += 32) {
     int idx = start + i + lane;
-    if (idx >= end) break;
+    if (idx >= end_idx) break;
 
     uint packed = w_row[idx];
     int k_base = idx * 8;
 
-    // x values: f32 bits stored as uint32, 1 float per uint32 word
-    float x0 = as_type<float>(x[k_base]);     float x1 = as_type<float>(x[k_base + 1]);
-    float x2 = as_type<float>(x[k_base + 2]); float x3 = as_type<float>(x[k_base + 3]);
-    float x4 = as_type<float>(x[k_base + 4]); float x5 = as_type<float>(x[k_base + 5]);
-    float x6 = as_type<float>(x[k_base + 6]); float x7 = as_type<float>(x[k_base + 7]);
+    float x0 = as_type<float>(x[k_base]);     float x1 = as_type<float>(x[k_base+1]);
+    float x2 = as_type<float>(x[k_base+2]);   float x3 = as_type<float>(x[k_base+3]);
+    float x4 = as_type<float>(x[k_base+4]);   float x5 = as_type<float>(x[k_base+5]);
+    float x6 = as_type<float>(x[k_base+6]);   float x7 = as_type<float>(x[k_base+7]);
 
     float dot_val =
         float(packed & 0xFu)         * x0 +
@@ -739,24 +740,19 @@ for (int i = 0; i < chunk; i += 32) {
         float((packed >> 28u) & 0xFu) * x7;
 
     int g = k_base / GroupSize;
-    float s_val = as_type<float>(scales[row * (K / GroupSize) + g]);
-    float b_val = as_type<float>(biases[row * (K / GroupSize) + g]);
+    float s_val = as_type<float>(s_ptr[g]);
+    float b_val = as_type<float>(b_ptr[g]);
     acc += s_val * dot_val + b_val * (x0+x1+x2+x3+x4+x5+x6+x7);
 }
 
 acc = simd_sum(acc);
-
-// Reduce across simdgroups
 threadgroup float partial[NumSG];
-// Initialize to 0 to avoid reading uninitialized memory
 if (lane == 0) partial[sg_idx] = acc;
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
 if (sg_idx == 0 && lane == 0) {
     float sum = 0.0f;
-    for (int s = 0; s < NumSG; s++) {
-        sum += partial[s];
-    }
+    for (int s = 0; s < NumSG; s++) sum += partial[s];
     y[row] = as_type<uint>(sum);
 }
 ";
@@ -765,7 +761,7 @@ static QGEMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 #[allow(unsafe_code)]
 fn create_qgemv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
-    let input_names: [&std::ffi::CStr; 4] = [c"w", c"scales", c"biases", c"x"];
+    let input_names: [&std::ffi::CStr; 2] = [c"wb", c"x"];
     let output_names: [&std::ffi::CStr; 1] = [c"y"];
 
     let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
@@ -795,37 +791,25 @@ fn create_qgemv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 
 #[allow(unsafe_code)]
 fn configure_qgemv_kernel(
-    x_dtype: mlx_sys::mlx_dtype,
     n_rows: i32,
     k_dim: i32,
     group_size: i32,
+    s_offset: i32,
+    b_offset: i32,
 ) -> mlx_sys::mlx_fast_metal_kernel_config {
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
 
-        // InT = uint32 for ALL buffers. Weight is natively uint32.
-        // Scales/biases/x are f32 view-cast to uint32 (same bytes).
-        // Kernel uses as_type<float>() to recover f32 values from uint32 bits.
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
             config,
             c"InT".as_ptr(),
             mlx_sys::mlx_dtype__MLX_UINT32,
         );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config,
-            c"K".as_ptr(),
-            k_dim,
-        );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config,
-            c"GroupSize".as_ptr(),
-            group_size,
-        );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config,
-            c"KPacked".as_ptr(),
-            k_dim / 8,
-        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"GroupSize".as_ptr(), group_size);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"KPacked".as_ptr(), k_dim / 8);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"SOffset".as_ptr(), s_offset);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"BOffset".as_ptr(), b_offset);
 
         // Grid = total threads. N threadgroups of (32, 4, 1) = 4 simdgroups each.
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_rows * 32, 4, 1);
@@ -833,10 +817,7 @@ fn configure_qgemv_kernel(
 
         let y_shape = [1, n_rows];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
-            config,
-            y_shape.as_ptr(),
-            y_shape.len(),
-            mlx_sys::mlx_dtype__MLX_UINT32, // InT=uint32; kernel writes f32 bits via as_type
+            config, y_shape.as_ptr(), y_shape.len(), mlx_sys::mlx_dtype__MLX_UINT32,
         );
 
         config
