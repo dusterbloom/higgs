@@ -14,6 +14,13 @@ pub mod transformer;
 pub mod turboquant;
 pub mod utils;
 
+#[cfg(feature = "ane")]
+pub mod ane_bridge;
+#[cfg(feature = "ane")]
+pub mod ane_forward;
+#[cfg(feature = "ane")]
+pub mod ane_mil;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
