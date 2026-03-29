@@ -221,6 +221,10 @@ pub struct ModelConfig {
     pub kv_bits: u8,
     #[serde(default)]
     pub kv_seed: u64,
+    /// Weight quantization to apply at load time (e.g., "int8").
+    /// Only applied to models that are not already pre-quantized.
+    #[serde(default)]
+    pub quantize: Option<String>,
 }
 
 const fn default_kv_bits() -> u8 {

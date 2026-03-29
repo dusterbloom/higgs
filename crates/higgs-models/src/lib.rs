@@ -948,7 +948,7 @@ pub(crate) fn collect_safetensors_files(
 /// MLX Python saves quantized weights as `layer.weight` but Rust mlx-rs
 /// QuantizedLinear/QuantizedEmbedding nest them as `layer.inner.weight`.
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
-fn remap_quantized_key(key: &str) -> Option<String> {
+pub(crate) fn remap_quantized_key(key: &str) -> Option<String> {
     // MaybeQuantized<nn::Linear> (used in gemma2, etc.) nests quantized params under `.inner.*`.
     if let Some(prefix) = key.strip_suffix(".weight") {
         Some(format!("{prefix}.inner.weight"))

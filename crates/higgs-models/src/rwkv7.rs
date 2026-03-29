@@ -827,7 +827,35 @@ fn remap_rwkv7_key(key: &str) -> String {
     k
 }
 
+/// Quantization mode for RWKV-7 weight loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantizeMode {
+    /// No quantization — load weights as-is (fp32/fp16).
+    None,
+    /// Quantize weights to int8 at load time (group_size=128).
+    Int8,
+}
+
+impl QuantizeMode {
+    /// Parse from a string (e.g., from config or env var).
+    pub fn from_str_opt(s: Option<&str>) -> Self {
+        match s {
+            Some("int8") => Self::Int8,
+            _ => Self::None,
+        }
+    }
+}
+
 pub fn load_rwkv7_model<P: AsRef<Path>>(model_dir: P) -> Result<Rwkv7CausalLM, ModelError> {
+    // Check for quantization via environment variable.
+    let quantize = QuantizeMode::from_str_opt(std::env::var("HIGGS_QUANTIZE").ok().as_deref());
+    load_rwkv7_model_with_quantize(model_dir, quantize)
+}
+
+pub fn load_rwkv7_model_with_quantize<P: AsRef<Path>>(
+    model_dir: P,
+    quantize: QuantizeMode,
+) -> Result<Rwkv7CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_model_args(model_path)?;
 
@@ -838,13 +866,25 @@ pub fn load_rwkv7_model<P: AsRef<Path>>(model_dir: P) -> Result<Rwkv7CausalLM, M
         head_dim = args.head_dim,
         vocab_size = args.vocab_size,
         intermediate_size = args.intermediate_size,
+        quantize = ?quantize,
         "Loading RWKV-7 model"
     );
 
-    let mut model = Rwkv7CausalLM::new(args)?;
+    let raw_model = Rwkv7CausalLM::new(args)?;
+
+    // Apply quantization structure if requested.
+    let mut model = if quantize == QuantizeMode::Int8 {
+        tracing::info!("Applying int8 quantization (group_size=128, bits=8)");
+        mlx_rs::nn::quantize(raw_model, 128, 8).map_err(|e| {
+            ModelError::ShapeMismatch(format!("Failed to quantize RWKV-7 model: {e}"))
+        })?
+    } else {
+        raw_model
+    };
 
     // Custom weight loading with key remapping for LoRA and GroupNorm names.
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
+    let is_quantized = quantize == QuantizeMode::Int8;
     let mut params = model.parameters_mut().flatten();
 
     for file_path in &safetensors_files {
@@ -854,10 +894,21 @@ pub fn load_rwkv7_model<P: AsRef<Path>>(model_dir: P) -> Result<Rwkv7CausalLM, M
 
         for (key, value) in loaded {
             let remapped = remap_rwkv7_key(&key);
-            if let Some(param) = params.get_mut(&*remapped) {
+
+            // Try remapped key first, then original.
+            let matched = params.get_mut(&*remapped).or_else(|| params.get_mut(&*key));
+
+            if let Some(param) = matched {
                 **param = value;
-            } else if let Some(param) = params.get_mut(&*key) {
-                **param = value;
+            } else if is_quantized {
+                // For quantized models, also try the `.inner.` remapping.
+                let inner_key = crate::remap_quantized_key(&remapped)
+                    .or_else(|| crate::remap_quantized_key(&key));
+                if let Some(inner) = inner_key {
+                    if let Some(param) = params.get_mut(&*inner) {
+                        **param = value;
+                    }
+                }
             }
         }
     }

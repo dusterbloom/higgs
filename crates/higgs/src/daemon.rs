@@ -118,6 +118,7 @@ port = 8000
 # [[models]]
 # path = "fla-hub/rwkv7-1.5B-world"
 # name = "rwkv7"
+# quantize = "int8"
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.
