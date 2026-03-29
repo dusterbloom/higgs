@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use higgs_models::{AnyModel, load_tokenizer as shared_load_tokenizer, registry, transformer};
+use higgs_models::{load_tokenizer as shared_load_tokenizer, registry, transformer, AnyModel};
 
 use crate::error::EngineError;
 
@@ -83,6 +83,11 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
             let model = higgs_models::deepseek_v2::load_deepseek_v2_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::DeepSeekV2(model))
+        }
+        "rwkv7" => {
+            let model = higgs_models::rwkv7::load_rwkv7_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Rwkv7(model))
         }
         other => Err(EngineError::Model(
             higgs_models::error::ModelError::UnsupportedModel(other.to_owned()),
@@ -195,6 +200,12 @@ mod tests {
     fn model_config_from_dir_qwen3_5_moe() {
         let (_dir, result) = config_for_model("qwen3_5_moe");
         assert_eq!(result.unwrap().model_type, "qwen3_5_moe");
+    }
+
+    #[test]
+    fn model_config_from_dir_rwkv7() {
+        let (_dir, result) = config_for_model("rwkv7");
+        assert_eq!(result.unwrap().model_type, "rwkv7");
     }
 
     #[test]

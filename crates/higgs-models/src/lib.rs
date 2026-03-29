@@ -7,6 +7,7 @@ pub mod phi3;
 pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod registry;
+pub mod rwkv7;
 pub mod siglip;
 pub mod starcoder2;
 pub mod transformer;
@@ -19,7 +20,7 @@ use std::path::Path;
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::eval;
-use mlx_rs::{Array, argmax_axis, array, categorical, error::Exception};
+use mlx_rs::{argmax_axis, array, categorical, error::Exception, Array};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -85,6 +86,8 @@ pub enum AnyCache {
     KV(Vec<Option<cache::SteppingKeyValueCache>>),
     /// Hybrid KV+SSM cache for `qwen3_next`.
     Hybrid(Vec<Option<LayerCache>>),
+    /// Fixed-size recurrent state for RWKV-7 (no KV cache).
+    Rwkv7(Vec<Option<rwkv7::Rwkv7LayerState>>),
 }
 
 /// Unified model wrapper dispatching to the correct architecture.
@@ -105,6 +108,8 @@ pub enum AnyModel {
     LlavaQwen2(llava_qwen2::LlavaQwen2Model),
     /// DeepSeek-V2 with Multi-head Latent Attention and sparse `MoE`.
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
+    /// RWKV-7 recurrent architecture with fixed-size state.
+    Rwkv7(rwkv7::Rwkv7CausalLM),
 }
 
 fn checked_head_dim(hidden_size: i32, num_attention_heads: i32) -> Result<i32, Exception> {
@@ -174,6 +179,7 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
+            (Self::Rwkv7(m), AnyCache::Rwkv7(c)) => m.forward(inputs, c),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -194,6 +200,7 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_hidden(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
+            (Self::Rwkv7(m), AnyCache::Rwkv7(c)) => m.forward_hidden(inputs, c),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -223,6 +230,11 @@ impl AnyModel {
         // also handles SSM/conv state eval.
         if let (Self::Qwen3Next(m), AnyCache::Hybrid(c)) = (&mut *self, &mut *cache) {
             return m.forward_chunked(inputs, None, c, chunk_size);
+        }
+
+        // RWKV-7: delegate to its own chunked prefill which evals recurrent state.
+        if let (Self::Rwkv7(m), AnyCache::Rwkv7(c)) = (&mut *self, &mut *cache) {
+            return m.forward_chunked(inputs, c, chunk_size);
         }
 
         // Generic path for all KV-only models.
@@ -260,9 +272,9 @@ impl AnyModel {
         for cache in caches.iter_mut() {
             match cache {
                 AnyCache::KV(kv) => kv_refs.push(kv),
-                AnyCache::Hybrid(_) => {
+                AnyCache::Hybrid(_) | AnyCache::Rwkv7(_) => {
                     return Err(Exception::custom(
-                        "Batched forward not supported for Hybrid cache",
+                        "Batched forward not supported for Hybrid/RWKV-7 cache",
                     ));
                 }
             }
@@ -276,7 +288,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom(
+            | Self::DeepSeekV2(_)
+            | Self::Rwkv7(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer models",
             )),
         }
@@ -298,6 +311,7 @@ impl AnyModel {
             Self::Starcoder2(m) => m.args.hidden_size,
             Self::LlavaQwen2(m) => m.hidden_size(),
             Self::DeepSeekV2(m) => m.args.hidden_size,
+            Self::Rwkv7(m) => m.args.hidden_size,
         }
     }
 
@@ -402,6 +416,14 @@ impl AnyModel {
                     Ok(AnyCache::Hybrid(m.make_cache()))
                 }
             }
+            Self::Rwkv7(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not applicable to RWKV-7 (no KV cache)",
+                    ));
+                }
+                Ok(AnyCache::Rwkv7(m.make_cache()))
+            }
         }
     }
 
@@ -420,7 +442,8 @@ impl AnyModel {
             | Self::Gemma2(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
-            | Self::DeepSeekV2(_) => None,
+            | Self::DeepSeekV2(_)
+            | Self::Rwkv7(_) => None,
         }
     }
 
@@ -889,7 +912,9 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
 }
 
 /// Collect safetensors file paths from a model directory.
-fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
+pub(crate) fn collect_safetensors_files(
+    model_path: &Path,
+) -> Result<Vec<std::path::PathBuf>, ModelError> {
     let index_path = model_path.join("model.safetensors.index.json");
     if index_path.exists() {
         let json = std::fs::read_to_string(&index_path)?;
@@ -1089,13 +1114,11 @@ mod tests {
         std::fs::write(dir.path().join("model.safetensors"), b"dummy").unwrap();
         let result = collect_safetensors_files(dir.path()).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(
-            result
-                .first()
-                .unwrap()
-                .to_string_lossy()
-                .contains("model.safetensors")
-        );
+        assert!(result
+            .first()
+            .unwrap()
+            .to_string_lossy()
+            .contains("model.safetensors"));
     }
 
     #[test]

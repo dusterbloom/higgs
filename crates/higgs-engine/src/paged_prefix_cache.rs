@@ -2,12 +2,12 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis2};
+use higgs_models::cache::{slice_axis2, KeyValueCache, SteppingKeyValueCache};
 use higgs_models::qwen3_next::ArraysCache;
 use higgs_models::{AnyCache, LayerCache};
-use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::concatenate_axis;
+use mlx_rs::Array;
 
 /// Default block size in tokens for paged caching.
 pub const DEFAULT_BLOCK_SIZE: usize = 32;
@@ -396,6 +396,7 @@ fn is_turboquant(cache: &AnyCache) -> bool {
         AnyCache::Hybrid(layers) => layers
             .iter()
             .any(|l| matches!(l, Some(LayerCache::KV(c)) if c.kv_cache_config().is_turboquant())),
+        AnyCache::Rwkv7(_) => false,
     }
 }
 
@@ -410,6 +411,7 @@ fn kv_offset(cache: &AnyCache) -> Option<i32> {
             Some(LayerCache::KV(c)) => Some(KeyValueCache::offset(c)),
             _ => None,
         }),
+        AnyCache::Rwkv7(layers) => layers.iter().find_map(|l| l.as_ref()).map(|s| s.offset),
     }
 }
 
@@ -425,6 +427,11 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
         i32::try_from(block_size).map_err(|_| Exception::custom("block_size overflow"))?;
 
     let (layers, is_hybrid) = match cache {
+        AnyCache::Rwkv7(_) => {
+            return Err(Exception::custom(
+                "RWKV-7 state is not block-pageable; use clone fallback",
+            ));
+        }
         AnyCache::KV(kv_layers) => {
             let layers: Result<Vec<_>, _> = kv_layers
                 .iter()
@@ -602,6 +609,7 @@ mod tests {
         match cache {
             AnyCache::KV(v) => v.len(),
             AnyCache::Hybrid(v) => v.len(),
+            AnyCache::Rwkv7(v) => v.len(),
         }
     }
 
@@ -618,6 +626,11 @@ mod tests {
                     Some(LayerCache::KV(c)) => Some(KeyValueCache::offset(c)),
                     _ => None,
                 })
+                .unwrap_or(0),
+            AnyCache::Rwkv7(layers) => layers
+                .iter()
+                .find_map(|l| l.as_ref())
+                .map(|s| s.offset)
                 .unwrap_or(0),
         }
     }

@@ -32,6 +32,7 @@ pub fn is_supported(model_type: &str) -> bool {
             | "starcoder2"
             | "llava-qwen2"
             | "deepseek_v2"
+            | "rwkv7"
     )
 }
 
@@ -226,6 +227,17 @@ mod tests {
     fn test_detect_model_type_empty_string_value() {
         let dir = write_model_type_config("");
         assert_eq!(detect_model_type(dir.path()).unwrap(), "");
+    }
+
+    #[test]
+    fn test_is_supported_rwkv7() {
+        assert!(is_supported("rwkv7"));
+    }
+
+    #[test]
+    fn test_detect_model_type_rwkv7() {
+        let dir = write_model_type_config("rwkv7");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "rwkv7");
     }
 
     #[test]

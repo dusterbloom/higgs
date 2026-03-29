@@ -314,8 +314,8 @@ impl PrefixCache {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use higgs_models::AnyCache;
     use higgs_models::cache::SteppingKeyValueCache;
+    use higgs_models::AnyCache;
 
     fn make_dummy_cache(num_layers: usize) -> AnyCache {
         let kv: Vec<Option<SteppingKeyValueCache>> = (0..num_layers)
@@ -328,6 +328,7 @@ mod tests {
         match cache {
             AnyCache::KV(v) => v.len(),
             AnyCache::Hybrid(v) => v.len(),
+            AnyCache::Rwkv7(v) => v.len(),
         }
     }
 

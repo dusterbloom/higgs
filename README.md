@@ -68,7 +68,7 @@ Each profile gets isolated runtime files (`higgs.<profile>.pid`, `higgs.<profile
 - **Continuous batching** -- 755 tok/s aggregate at 8 concurrent requests
 - **Radix tree prefix cache** -- shared prefix reuse across requests
 - **Vision** -- multimodal image+text (LLaVA-Qwen2)
-- **11 architectures** -- LLaMA, Mistral, Qwen2/3, Qwen3-MoE, Qwen3-Next, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, LLaVA-Qwen2
+- **12 architectures** -- LLaMA, Mistral, Qwen2/3, Qwen3-MoE, Qwen3-Next, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, LLaVA-Qwen2, RWKV-7
 
 ### Gateway
 - **Remote providers** -- proxy requests to OpenAI, Anthropic, Ollama, or any OpenAI-compatible API
@@ -268,6 +268,7 @@ higgs exec -- aider --model openai/gpt-4o
 | Starcoder2 | `starcoder2` | Starcoder2 3B/7B/15B |
 | DeepSeek-V2 | `deepseek_v2` | DeepSeek-V2-Lite (MLA + MoE) |
 | LLaVA-Qwen2 | `llava-qwen2` | nanoLLaVA-1.5 (vision) |
+| RWKV-7 | `rwkv7` | RWKV-7 1.5B (recurrent, fixed-size state) |
 
 ## Performance
 
