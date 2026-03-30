@@ -40,14 +40,13 @@ struct GdnSnapshot {
 
 /// Per-layer block for TurboQuant KV cache.
 ///
-/// Each block holds the 6 quantized arrays for `block_size` tokens:
-/// key/value codes (packed u32), norms, gammas, QJL signs.
+/// Each block holds the 5 quantized arrays for `block_size` tokens:
+/// key/value codes (packed u32), norms, gammas.
 #[derive(Debug, Clone)]
 struct TqBlock {
     key_codes: Array,
     key_norms: Array,
     key_gammas: Array,
-    key_qjl_signs: Array,
     value_codes: Array,
     value_norms: Array,
 }
@@ -522,7 +521,7 @@ fn slice_tq_layer(
     num_blocks: usize,
     block_size: i32,
 ) -> Result<CachedLayerData, Exception> {
-    let Some((_ctx, key_codes, key_norms, key_gammas, key_qjl_signs, value_codes, value_norms)) =
+    let Some((_ctx, key_codes, key_norms, key_gammas, value_codes, value_norms)) =
         kv.turbo_arrays()
     else {
         return Ok(CachedLayerData::Empty);
@@ -541,7 +540,6 @@ fn slice_tq_layer(
             key_codes: slice_axis1(key_codes, start, end)?,
             key_norms: slice_axis1(key_norms, start, end)?,
             key_gammas: slice_axis1(key_gammas, start, end)?,
-            key_qjl_signs: slice_axis1(key_qjl_signs, start, end)?,
             value_codes: slice_axis1(value_codes, start, end)?,
             value_norms: slice_axis1(value_norms, start, end)?,
         });
@@ -726,7 +724,6 @@ fn gather_tq_blocks(
     let key_codes = concat1(blocks.iter().map(|b| b.key_codes.clone()).collect())?;
     let key_norms = concat1(blocks.iter().map(|b| b.key_norms.clone()).collect())?;
     let key_gammas = concat1(blocks.iter().map(|b| b.key_gammas.clone()).collect())?;
-    let key_qjl_signs = concat1(blocks.iter().map(|b| b.key_qjl_signs.clone()).collect())?;
     let value_codes = concat1(blocks.iter().map(|b| b.value_codes.clone()).collect())?;
     let value_norms = concat1(blocks.iter().map(|b| b.value_norms.clone()).collect())?;
 
@@ -738,7 +735,6 @@ fn gather_tq_blocks(
         key_codes,
         key_norms,
         key_gammas,
-        key_qjl_signs,
         value_codes,
         value_norms,
         total,
