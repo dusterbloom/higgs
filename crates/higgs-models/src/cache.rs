@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use mlx_rs::{Array, Dtype, Stream, error::Exception, ops, ops::concatenate_axis};
 
@@ -11,6 +11,30 @@ use crate::turboquant::{
 pub enum KvCacheView {
     Dense { keys: Array, values: Array },
     TurboQuant(TurboQuantKvView),
+}
+
+static TURBOQUANT_ACTIVATE_AT: OnceLock<i32> = OnceLock::new();
+const DEFAULT_TURBOQUANT_ACTIVATE_AT: i32 = 5000;
+
+fn parse_turboquant_activate_at(raw: Option<&str>) -> i32 {
+    match raw.and_then(|s| s.parse::<i32>().ok()) {
+        Some(v) => v.max(0),
+        None => DEFAULT_TURBOQUANT_ACTIVATE_AT,
+    }
+}
+
+fn turboquant_activate_at() -> i32 {
+    *TURBOQUANT_ACTIVATE_AT.get_or_init(|| {
+        parse_turboquant_activate_at(
+            std::env::var("HIGGS_TURBOQUANT_ACTIVATE_AT")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+const fn should_activate_turboquant(offset: i32, new_tokens: i32, activate_at: i32) -> bool {
+    activate_at <= 0 || offset + new_tokens >= activate_at
 }
 
 impl KvCacheView {
@@ -68,7 +92,10 @@ impl TurboQuantKvView {
         let key_qjl_signs = self.key_qjl_signs.as_slice::<u8>();
         let key_gammas = self.key_gammas.as_slice::<f32>();
         let value_codes_u32 = self.value_codes.as_slice::<u32>();
-        let value_codes_u8: Vec<u8> = value_codes_u32.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let value_codes_u8: Vec<u8> = value_codes_u32
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         let value_norms = self.value_norms.as_slice::<f32>();
 
         // Each row occupies key_code_words * 4 bytes in the reinterpreted buffer
@@ -384,6 +411,14 @@ impl SteppingKeyValueCache {
         self.config
     }
 
+    /// Roll back the cache offset by `n` positions.
+    ///
+    /// Used by MTP speculative decode to undo a rejected draft token's KV entry.
+    /// The underlying storage is not deallocated — subsequent writes will overwrite.
+    pub fn trim_by(&mut self, n: i32) {
+        self.offset = (self.offset - n).max(0);
+    }
+
     /// References to internal arrays that must be eval'd between chunked-prefill steps.
     pub fn eval_targets(&self) -> Vec<&Array> {
         let mut targets = Vec::with_capacity(8);
@@ -499,6 +534,53 @@ impl SteppingKeyValueCache {
             values: result_v,
         })
     }
+
+    fn update_and_view_with_activation_threshold(
+        &mut self,
+        keys: Array,
+        values: Array,
+        activate_at: i32,
+    ) -> Result<KvCacheView, Exception> {
+        let new_tokens = keys.shape()[2];
+
+        let view = if let Some(turbo) = self.turbo.as_mut() {
+            if new_tokens > 1 && turbo.capacity == 0 {
+                // First prefill: accumulate in dense fp16 storage so attention
+                // uses native SDPA (single batched GPU op). Quantization is
+                // deferred until the first decode token.
+                self.update_dense(keys, values)?
+            } else {
+                let should_activate =
+                    should_activate_turboquant(self.offset, new_tokens, activate_at);
+
+                // Decode (or subsequent multi-token after first decode).
+                // If dense KV was accumulated during prefill, bulk-quantize it
+                // into TurboQuant storage before appending the new token.
+                if turbo.capacity == 0 && self.offset > 0 && should_activate {
+                    if let (Some(dense_k), Some(dense_v)) = (&self.keys, &self.values) {
+                        let k = slice_axis2(dense_k, 0, self.offset)?;
+                        let v = slice_axis2(dense_v, 0, self.offset)?;
+                        turbo.append(k, v, 0, self.step)?;
+                        self.keys = None;
+                        self.values = None;
+                    }
+                }
+
+                if turbo.capacity == 0 && !should_activate {
+                    self.update_dense(keys, values)?
+                } else {
+                    KvCacheView::TurboQuant(turbo.append(keys, values, self.offset, self.step)?)
+                }
+            }
+        } else {
+            self.update_dense(keys, values)?
+        };
+        self.offset = match &view {
+            KvCacheView::Dense { keys, .. } => keys.shape()[2],
+            KvCacheView::TurboQuant(view) => view.seq_len,
+        };
+        Ok(view)
+    }
 }
 
 impl TurboQuantStorage {
@@ -602,27 +684,45 @@ impl TurboQuantStorage {
         let err = || Exception::custom("TurboQuant storage not allocated");
         self.value_norms = Some(slice_update_axis(
             self.value_norms.as_ref().ok_or_else(err)?,
-            &v_norms, 1, prev, new_tokens,
+            &v_norms,
+            1,
+            prev,
+            new_tokens,
         )?);
         self.value_codes = Some(slice_update_axis(
             self.value_codes.as_ref().ok_or_else(err)?,
-            &v_codes, 1, prev, new_tokens,
+            &v_codes,
+            1,
+            prev,
+            new_tokens,
         )?);
         self.key_norms = Some(slice_update_axis(
             self.key_norms.as_ref().ok_or_else(err)?,
-            &k_norms, 1, prev, new_tokens,
+            &k_norms,
+            1,
+            prev,
+            new_tokens,
         )?);
         self.key_gammas = Some(slice_update_axis(
             self.key_gammas.as_ref().ok_or_else(err)?,
-            &k_gammas, 1, prev, new_tokens,
+            &k_gammas,
+            1,
+            prev,
+            new_tokens,
         )?);
         self.key_codes = Some(slice_update_axis(
             self.key_codes.as_ref().ok_or_else(err)?,
-            &k_codes, 1, prev, new_tokens,
+            &k_codes,
+            1,
+            prev,
+            new_tokens,
         )?);
         self.key_qjl_signs = Some(slice_update_axis(
             self.key_qjl_signs.as_ref().ok_or_else(err)?,
-            &k_signs, 1, prev, new_tokens,
+            &k_signs,
+            1,
+            prev,
+            new_tokens,
         )?);
 
         self.view(prev + new_tokens)
@@ -686,41 +786,7 @@ impl KeyValueCache for SteppingKeyValueCache {
     }
 
     fn update_and_view(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
-        let new_tokens = keys.shape()[2];
-
-        let view = if let Some(turbo) = self.turbo.as_mut() {
-            if new_tokens > 1 && turbo.capacity == 0 {
-                // First prefill: accumulate in dense fp16 storage so attention
-                // uses native SDPA (single batched GPU op). Quantization is
-                // deferred until the first decode token.
-                self.update_dense(keys, values)?
-            } else {
-                // Decode (or subsequent multi-token after first decode).
-                // If dense KV was accumulated during prefill, bulk-quantize it
-                // into TurboQuant storage before appending the new token.
-                if turbo.capacity == 0 && self.offset > 0 {
-                    if let (Some(dense_k), Some(dense_v)) =
-                        (&self.keys, &self.values)
-                    {
-                        let k = slice_axis2(dense_k, 0, self.offset)?;
-                        let v = slice_axis2(dense_v, 0, self.offset)?;
-                        turbo.append(k, v, 0, self.step)?;
-                        self.keys = None;
-                        self.values = None;
-                    }
-                }
-                KvCacheView::TurboQuant(
-                    turbo.append(keys, values, self.offset, self.step)?,
-                )
-            }
-        } else {
-            self.update_dense(keys, values)?
-        };
-        self.offset = match &view {
-            KvCacheView::Dense { keys, .. } => keys.shape()[2],
-            KvCacheView::TurboQuant(view) => view.seq_len,
-        };
-        Ok(view)
+        self.update_and_view_with_activation_threshold(keys, values, turboquant_activate_at())
     }
 }
 
@@ -1114,6 +1180,7 @@ mod tests {
             mode: KvCacheMode::Turboquant,
             bits: 3,
             seed: 7,
+            ..Default::default()
         };
         let mut cache = SteppingKeyValueCache::new_turbo(config, 2, 8).unwrap();
         let (keys, values) = make_kv_pair(3, 8);
@@ -1178,18 +1245,26 @@ mod tests {
             mode: KvCacheMode::Turboquant,
             bits: 3,
             seed: 11,
+            ..Default::default()
         };
         let mut cache = SteppingKeyValueCache::new_turbo(config, 2, 8).unwrap();
 
         // Multi-token prefill: returns Dense (quantization deferred)
         let (keys, values) = make_kv_pair(2, 8);
-        let view = cache.update_and_view(keys, values).unwrap();
-        assert!(view.turboquant().is_none(), "prefill should return Dense view");
+        let view = cache
+            .update_and_view_with_activation_threshold(keys, values, 0)
+            .unwrap();
+        assert!(
+            view.turboquant().is_none(),
+            "prefill should return Dense view"
+        );
         assert_eq!(cache.offset(), 2);
 
-        // First decode token: triggers bulk quantize, returns TurboQuant
+        // First decode token with an immediate threshold: triggers bulk quantize.
         let (k1, v1) = make_kv_pair(1, 8);
-        let view = cache.update_and_view(k1, v1).unwrap();
+        let view = cache
+            .update_and_view_with_activation_threshold(k1, v1, 0)
+            .unwrap();
         let turbo = view.turboquant().unwrap();
         assert_eq!(turbo.seq_len, 3); // 2 prefill + 1 decode
         // head_dim=8, key_bits=2: ceil(8*2/32) = 1 u32 word
@@ -1198,5 +1273,72 @@ mod tests {
         assert_eq!(turbo.value_codes.shape(), &[2, 3, 1]);
         // Dense storage cleared after bulk quantize
         assert!(cache.keys.is_none());
+    }
+
+    #[test]
+    fn test_turboquant_cache_threshold_keeps_dense_until_limit() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 11,
+            ..Default::default()
+        };
+        let mut cache = SteppingKeyValueCache::new_turbo(config, 2, 8).unwrap();
+
+        let (prefill_k, prefill_v) = make_kv_pair(2, 8);
+        let view = cache
+            .update_and_view_with_activation_threshold(prefill_k, prefill_v, 4)
+            .unwrap();
+        assert!(view.turboquant().is_none());
+        assert_eq!(cache.offset(), 2);
+
+        let (k1, v1) = make_kv_pair(1, 8);
+        let view = cache
+            .update_and_view_with_activation_threshold(k1, v1, 4)
+            .unwrap();
+        assert!(
+            view.turboquant().is_none(),
+            "decode below threshold should stay dense"
+        );
+        assert_eq!(cache.offset(), 3);
+        assert!(
+            cache.keys.is_some(),
+            "dense storage should be retained below threshold"
+        );
+
+        let (k2, v2) = make_kv_pair(1, 8);
+        let view = cache
+            .update_and_view_with_activation_threshold(k2, v2, 4)
+            .unwrap();
+        let turbo = view
+            .turboquant()
+            .expect("threshold-crossing decode should activate TurboQuant");
+        assert_eq!(turbo.seq_len, 4);
+        assert!(
+            cache.keys.is_none(),
+            "dense storage should clear after activation"
+        );
+    }
+
+    #[test]
+    fn parse_turboquant_activate_at_clamps_invalid_values() {
+        assert_eq!(
+            parse_turboquant_activate_at(None),
+            DEFAULT_TURBOQUANT_ACTIVATE_AT
+        );
+        assert_eq!(
+            parse_turboquant_activate_at(Some("bad")),
+            DEFAULT_TURBOQUANT_ACTIVATE_AT
+        );
+        assert_eq!(parse_turboquant_activate_at(Some("-5")), 0);
+        assert_eq!(parse_turboquant_activate_at(Some("8192")), 8192);
+    }
+
+    #[test]
+    fn should_activate_turboquant_respects_threshold() {
+        assert!(should_activate_turboquant(10, 1, 0));
+        assert!(!should_activate_turboquant(3, 1, 8));
+        assert!(should_activate_turboquant(7, 1, 8));
+        assert!(should_activate_turboquant(8, 1, 8));
     }
 }

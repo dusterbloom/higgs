@@ -1120,6 +1120,7 @@ mod tests {
                 mode: KvCacheMode::Turboquant,
                 bits: 3,
                 seed: 0,
+                ..Default::default()
             },
             args.num_key_value_heads,
             args.head_dim,

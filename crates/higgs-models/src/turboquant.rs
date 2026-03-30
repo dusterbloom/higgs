@@ -38,6 +38,18 @@ pub struct KvCacheConfig {
     pub mode: KvCacheMode,
     #[serde(default = "default_bits")]
     pub bits: u8,
+    /// Override key bit width (default: bits - 1).
+    #[serde(default)]
+    pub key_bits_override: Option<u8>,
+    /// Override value bit width (default: bits).
+    #[serde(default)]
+    pub value_bits_override: Option<u8>,
+    /// Enable post-quantization norm correction (default: true).
+    #[serde(default = "default_norm_correction")]
+    pub norm_correction: bool,
+    /// Number of final layers that stay dense (0 = all TQ).
+    #[serde(default)]
+    pub adaptive_dense_layers: u8,
     #[serde(default)]
     pub seed: u64,
 }
@@ -46,11 +58,19 @@ const fn default_bits() -> u8 {
     3
 }
 
+const fn default_norm_correction() -> bool {
+    true
+}
+
 impl Default for KvCacheConfig {
     fn default() -> Self {
         Self {
             mode: KvCacheMode::Off,
             bits: default_bits(),
+            key_bits_override: None,
+            value_bits_override: None,
+            norm_correction: true,
+            adaptive_dense_layers: 0,
             seed: 0,
         }
     }
@@ -62,17 +82,37 @@ impl KvCacheConfig {
     }
 
     pub fn validate(self) -> Result<(), Exception> {
-        if self.is_turboquant() && !(2..=4).contains(&self.bits) {
-            return Err(Exception::custom(format!(
-                "TurboQuant bits must be in [2, 4], got {}",
-                self.bits
-            )));
+        if self.is_turboquant() {
+            let kb = self.key_bits();
+            let vb = self.value_bits();
+            if !(1..=8).contains(&kb) {
+                return Err(Exception::custom(format!(
+                    "TurboQuant key bits must be in [1, 8], got {kb}"
+                )));
+            }
+            if !(2..=8).contains(&vb) {
+                return Err(Exception::custom(format!(
+                    "TurboQuant value bits must be in [2, 8], got {vb}"
+                )));
+            }
         }
         Ok(())
     }
 
+    /// Effective key bit width. Uses override if set, otherwise `bits - 1`.
     pub const fn key_bits(self) -> u8 {
-        self.bits - 1
+        match self.key_bits_override {
+            Some(kb) => kb,
+            None => self.bits - 1,
+        }
+    }
+
+    /// Effective value bit width. Uses override if set, otherwise `bits`.
+    pub const fn value_bits(self) -> u8 {
+        match self.value_bits_override {
+            Some(vb) => vb,
+            None => self.bits,
+        }
     }
 }
 
@@ -124,12 +164,12 @@ impl TurboQuantContext {
         let qjl = generate_gaussian_matrix(dim, config.seed.wrapping_add(1));
         let qjl_t = transpose(&qjl, dim);
         let key_centroids = scaled_centroids(config.key_bits(), scale)?;
-        let value_centroids = scaled_centroids(config.bits, scale)?;
+        let value_centroids = scaled_centroids(config.value_bits(), scale)?;
 
         let key_code_bytes = packed_bytes(dim, config.key_bits())?;
-        let value_code_bytes = packed_bytes(dim, config.bits)?;
+        let value_code_bytes = packed_bytes(dim, config.value_bits())?;
         let key_code_words = packed_words(dim, config.key_bits())?;
-        let value_code_words = packed_words(dim, config.bits)?;
+        let value_code_words = packed_words(dim, config.value_bits())?;
         let sign_bytes = packed_sign_bytes(dim)?;
 
         Ok(Self {
@@ -169,9 +209,22 @@ impl TurboQuantContext {
         let rotated = mat_vec(&self.rotation, dim, &normalized);
         let indices = quantize_rotated(&rotated, &self.value_centroids);
 
+        // Norm correction: corrected_norm = norm / ||reconstruction||
+        // Eliminates systematic norm shrinkage from discrete quantization.
+        let final_norm = if self.config.norm_correction {
+            let reconstruction_l2 = reconstruction_norm(&indices, &self.value_centroids);
+            if reconstruction_l2 > f32::EPSILON {
+                norm / reconstruction_l2
+            } else {
+                norm
+            }
+        } else {
+            norm
+        };
+
         Ok(QuantizedValue {
-            norm,
-            codes: pack_indices(&indices, self.config.bits),
+            norm: final_norm,
+            codes: pack_indices(&indices, self.config.value_bits()),
         })
     }
 
@@ -215,8 +268,20 @@ impl TurboQuantContext {
         let qjl_proj = mat_vec(&self.qjl, dim, &residual);
         let qjl_signs = pack_signs(qjl_proj.iter().map(|value| *value >= 0.0));
 
+        // Norm correction for keys
+        let final_norm = if self.config.norm_correction {
+            let reconstruction_l2 = reconstruction_norm(&mse_indices, &self.key_centroids);
+            if reconstruction_l2 > f32::EPSILON {
+                norm / reconstruction_l2
+            } else {
+                norm
+            }
+        } else {
+            norm
+        };
+
         Ok(QuantizedKey {
-            norm,
+            norm: final_norm,
             gamma,
             codes: pack_indices(&mse_indices, self.config.key_bits()),
             qjl_signs,
@@ -228,7 +293,7 @@ impl TurboQuantContext {
             usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
         let rotated = dequantize_rotated(
             &value.codes,
-            self.config.bits,
+            self.config.value_bits(),
             &self.value_centroids,
             dim,
             value.norm,
@@ -334,6 +399,17 @@ impl TurboQuantContext {
         // indices: [H, T, D] as u32
         let indices = argmin_axis!(&distances, -1)?;
 
+        // Norm correction on CPU batch path
+        let norms = if self.config.norm_correction {
+            let indices_i32 = indices.as_dtype(Dtype::Int32)?;
+            let gathered = centroids.take(&indices_i32)?;
+            let recon_l2 = ops::sqrt(&ops::sum_axis(&ops::square(&gathered)?, -1, None)?)?;
+            let safe_recon = ops::maximum(&recon_l2, &eps)?;
+            ops::divide(&norms, &safe_recon)?
+        } else {
+            norms
+        };
+
         // Pack on CPU: eval indices, read as flat u32, pack into bytes
         indices.eval()?;
         norms.eval()?;
@@ -343,7 +419,7 @@ impl TurboQuantContext {
         let ht = usize::try_from(h).unwrap() * usize::try_from(t).unwrap();
         let dim = usize::try_from(self.head_dim).unwrap();
         let code_bytes = usize::try_from(self.value_code_bytes).unwrap();
-        let bits = self.config.bits;
+        let bits = self.config.value_bits();
 
         let mut packed = vec![0_u8; ht * code_bytes];
         for row in 0..ht {
@@ -413,6 +489,16 @@ impl TurboQuantContext {
         // signs = (proj >= 0)
         let zero = Array::from_f32(0.0);
         let signs = qjl_proj.ge(&zero)?;
+
+        // Norm correction for keys
+        let norms = if self.config.norm_correction {
+            let recon_l2 =
+                ops::sqrt(&ops::sum_axis(&ops::square(&rotated_approx)?, -1, None)?)?;
+            let safe_recon = ops::maximum(&recon_l2, &eps)?;
+            ops::divide(&norms, &safe_recon)?
+        } else {
+            norms
+        };
 
         // Eval everything before CPU readout
         mse_indices.eval()?;
@@ -485,13 +571,31 @@ impl TurboQuantContext {
         // indices: [H, T, D] u32
         let indices = argmin_axis!(&distances, -1)?;
 
+        // Norm correction on GPU: gather centroids → L2 → divide norms
+        let corrected_norms = if self.config.norm_correction {
+            // reconstruction[h,t,d] = centroids[indices[h,t,d]]
+            let indices_i32 = indices.as_dtype(Dtype::Int32)?;
+            let gathered = centroids.take(&indices_i32)?;
+            // reconstruction_l2[h,t] = sqrt(sum(gathered^2, axis=-1))
+            let recon_l2 = ops::sqrt(&ops::sum_axis(&ops::square(&gathered)?, -1, None)?)?;
+            let safe_recon = ops::maximum(&recon_l2, &eps)?;
+            ops::divide(&norms, &safe_recon)?
+        } else {
+            norms
+        };
+
         // Pack on GPU: [H*T, D] u32 → [H*T, code_words] u32
         let indices_flat = indices.reshape(&[n, self.head_dim])?;
-        let packed_flat =
-            pack_indices_gpu(&indices_flat, n, self.head_dim, self.config.bits, self.value_code_words)?;
+        let packed_flat = pack_indices_gpu(
+            &indices_flat,
+            n,
+            self.head_dim,
+            self.config.value_bits(),
+            self.value_code_words,
+        )?;
         let packed = packed_flat.reshape(&[h, t, self.value_code_words])?;
 
-        Ok((norms, packed))
+        Ok((corrected_norms, packed))
     }
 
     /// Batch-quantize keys entirely on GPU, returning lazy Arrays.
@@ -534,6 +638,15 @@ impl TurboQuantContext {
             &norms,
         )?;
 
+        // Norm correction for keys: use rotated_approx L2
+        let corrected_norms = if self.config.norm_correction {
+            let recon_l2 = ops::sqrt(&ops::sum_axis(&ops::square(&rotated_approx)?, -1, None)?)?;
+            let safe_recon = ops::maximum(&recon_l2, &eps)?;
+            ops::divide(&norms, &safe_recon)?
+        } else {
+            norms
+        };
+
         // QJL: proj = residual @ qjl_t, signs = (proj >= 0)
         let qjl_t = self.qjl_t_array()?;
         let qjl_proj = residual.matmul(&qjl_t)?;
@@ -544,15 +657,19 @@ impl TurboQuantContext {
         let indices_flat = mse_indices.reshape(&[n, self.head_dim])?;
         let signs_flat = signs.reshape(&[n, self.head_dim])?;
 
-        let packed_codes_flat =
-            pack_indices_gpu(&indices_flat, n, self.head_dim, key_bits, self.key_code_words)?;
-        let packed_signs_flat =
-            pack_signs_gpu(&signs_flat, n, self.head_dim, self.sign_bytes)?;
+        let packed_codes_flat = pack_indices_gpu(
+            &indices_flat,
+            n,
+            self.head_dim,
+            key_bits,
+            self.key_code_words,
+        )?;
+        let packed_signs_flat = pack_signs_gpu(&signs_flat, n, self.head_dim, self.sign_bytes)?;
 
         let packed_codes = packed_codes_flat.reshape(&[h, t, self.key_code_words])?;
         let packed_signs = packed_signs_flat.reshape(&[h, t, self.sign_bytes])?;
 
-        Ok((norms, gammas, packed_codes, packed_signs))
+        Ok((corrected_norms, gammas, packed_codes, packed_signs))
     }
 }
 
@@ -772,6 +889,18 @@ fn packed_sign_bytes(dim: usize) -> Result<i32, Exception> {
 
 fn l2_norm(values: &[f32]) -> f32 {
     values.iter().map(|value| value * value).sum::<f32>().sqrt()
+}
+
+/// L2 norm of the quantized reconstruction: each index maps to a centroid value.
+fn reconstruction_norm(indices: &[u8], centroids: &[f32]) -> f32 {
+    indices
+        .iter()
+        .map(|&idx| {
+            let c = centroids.get(usize::from(idx)).copied().unwrap_or(0.0);
+            c * c
+        })
+        .sum::<f32>()
+        .sqrt()
 }
 
 fn dequantize_qjl(signs: &[u8], gamma: f32, qjl_t: &[f32], dim: usize) -> Vec<f32> {
@@ -1299,8 +1428,7 @@ fn create_pack_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let output_names: [&std::ffi::CStr; 1] = [c"packed"];
     let input_ptrs: Vec<*const c_char> = input_names.iter().map(|name| name.as_ptr()).collect();
     let output_ptrs: Vec<*const c_char> = output_names.iter().map(|name| name.as_ptr()).collect();
-    let source =
-        CString::new(TURBOQUANT_PACK_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+    let source = CString::new(TURBOQUANT_PACK_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
 
     unsafe {
         let in_vec =
@@ -1512,6 +1640,7 @@ mod tests {
             mode: KvCacheMode::Turboquant,
             bits,
             seed: 42,
+            ..Default::default()
         };
         TurboQuantContext::new(config, head_dim, 1).unwrap()
     }
@@ -1671,19 +1800,42 @@ mod tests {
 
     #[test]
     fn test_config_validates_bit_range() {
+        // value_bits = 10 (too high)
         let bad = KvCacheConfig {
             mode: KvCacheMode::Turboquant,
-            bits: 5,
-            seed: 0,
+            bits: 3,
+            value_bits_override: Some(10),
+            ..Default::default()
         };
         assert!(bad.validate().is_err());
 
+        // key_bits = 0 (too low)
+        let bad_key = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            key_bits_override: Some(0),
+            ..Default::default()
+        };
+        assert!(bad_key.validate().is_err());
+
+        // Default bits=3: key=2, value=3 — both valid
         let good = KvCacheConfig {
             mode: KvCacheMode::Turboquant,
             bits: 3,
             seed: 0,
+            ..Default::default()
         };
         assert!(good.validate().is_ok());
+
+        // Asymmetric: key=4, value=3 — both valid
+        let asym = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            key_bits_override: Some(4),
+            value_bits_override: Some(3),
+            ..Default::default()
+        };
+        assert!(asym.validate().is_ok());
     }
 
     #[test]
@@ -1691,9 +1843,21 @@ mod tests {
         let config = KvCacheConfig {
             mode: KvCacheMode::Turboquant,
             bits: 3,
-            seed: 0,
+            ..Default::default()
         };
         assert_eq!(config.key_bits(), 2);
+        assert_eq!(config.value_bits(), 3);
+
+        // With overrides
+        let config_asym = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            key_bits_override: Some(4),
+            value_bits_override: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(config_asym.key_bits(), 4);
+        assert_eq!(config_asym.value_bits(), 2);
     }
 
     // ── Deterministic with seed ─────────────────────────────────────────
@@ -1723,6 +1887,7 @@ mod tests {
                     mode: KvCacheMode::Turboquant,
                     bits,
                     seed: 42,
+                    ..Default::default()
                 },
                 dim,
                 heads,
@@ -1774,6 +1939,7 @@ mod tests {
                     mode: KvCacheMode::Turboquant,
                     bits,
                     seed: 42,
+                    ..Default::default()
                 },
                 dim,
                 heads,
@@ -1839,9 +2005,7 @@ mod tests {
             let code_words = packed_words(dim as usize, bits).unwrap();
 
             // Generate deterministic indices
-            let indices_vec: Vec<u32> = (0..(n * dim) as u32)
-                .map(|i| i % (max_val + 1))
-                .collect();
+            let indices_vec: Vec<u32> = (0..(n * dim) as u32).map(|i| i % (max_val + 1)).collect();
 
             // CPU pack (into bytes, then reinterpret as u32 words)
             let mut cpu_packed = vec![0_u8; (n as usize) * (code_bytes as usize)];
@@ -1866,10 +2030,7 @@ mod tests {
             gpu_packed.eval().unwrap();
             let gpu_data = gpu_packed.as_slice::<u32>();
 
-            assert_eq!(
-                gpu_data, &cpu_words[..],
-                "GPU pack mismatch for {bits}-bit",
-            );
+            assert_eq!(gpu_data, &cpu_words[..], "GPU pack mismatch for {bits}-bit",);
         }
     }
 
@@ -1895,7 +2056,9 @@ mod tests {
 
         // GPU pack: create bool array from u8 (MLX bool == uint8)
         let signs_u8: Vec<u8> = signs_bool.iter().map(|&b| b as u8).collect();
-        let signs_arr = Array::from_slice(&signs_u8, &[n, dim]).as_dtype(Dtype::Bool).unwrap();
+        let signs_arr = Array::from_slice(&signs_u8, &[n, dim])
+            .as_dtype(Dtype::Bool)
+            .unwrap();
         let gpu_packed = pack_signs_gpu(&signs_arr, n, dim, sign_bytes).unwrap();
         gpu_packed.eval().unwrap();
         let gpu_data = gpu_packed.as_slice::<u8>();
@@ -1927,7 +2090,11 @@ mod tests {
             let gpu_norms_data = gpu_norms.as_slice::<f32>();
 
             // Compare norms
-            for (i, (gpu, cpu)) in gpu_norms_data.iter().zip(cpu_result.norms.iter()).enumerate() {
+            for (i, (gpu, cpu)) in gpu_norms_data
+                .iter()
+                .zip(cpu_result.norms.iter())
+                .enumerate()
+            {
                 assert!(
                     (gpu - cpu).abs() < 1e-5,
                     "{bits}b norm[{i}]: gpu={gpu} vs cpu={cpu}",
@@ -1935,7 +2102,8 @@ mod tests {
             }
 
             // Reinterpret CPU bytes as u32 words for comparison
-            let cpu_words: Vec<u32> = cpu_result.packed_codes
+            let cpu_words: Vec<u32> = cpu_result
+                .packed_codes
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
@@ -1972,7 +2140,12 @@ mod tests {
             gpu_signs.eval().unwrap();
 
             // Compare norms
-            for (i, (gpu, cpu)) in gpu_norms.as_slice::<f32>().iter().zip(cpu_result.norms.iter()).enumerate() {
+            for (i, (gpu, cpu)) in gpu_norms
+                .as_slice::<f32>()
+                .iter()
+                .zip(cpu_result.norms.iter())
+                .enumerate()
+            {
                 assert!(
                     (gpu - cpu).abs() < 1e-5,
                     "{bits}b key norm[{i}]: gpu={gpu} vs cpu={cpu}",
@@ -1980,7 +2153,12 @@ mod tests {
             }
 
             // Compare gammas
-            for (i, (gpu, cpu)) in gpu_gammas.as_slice::<f32>().iter().zip(cpu_result.gammas.iter()).enumerate() {
+            for (i, (gpu, cpu)) in gpu_gammas
+                .as_slice::<f32>()
+                .iter()
+                .zip(cpu_result.gammas.iter())
+                .enumerate()
+            {
                 assert!(
                     (gpu - cpu).abs() < 1e-4,
                     "{bits}b gamma[{i}]: gpu={gpu} vs cpu={cpu}",
@@ -1988,7 +2166,8 @@ mod tests {
             }
 
             // Reinterpret CPU bytes as u32 words for comparison
-            let cpu_code_words: Vec<u32> = cpu_result.packed_codes
+            let cpu_code_words: Vec<u32> = cpu_result
+                .packed_codes
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();

@@ -150,13 +150,25 @@ fn make_turboquant_kv_cache(
         );
         return Ok(AnyCache::KV(vec![]));
     };
+    let dense_tail = usize::from(kv_cache_config.adaptive_dense_layers);
+    if dense_tail > 0 {
+        tracing::info!(
+            n_layers,
+            dense_tail,
+            "Layer-adaptive TQ: last {dense_tail} layers will use dense KV cache"
+        );
+    }
     let mut caches = Vec::with_capacity(n_layers);
-    for _ in 0..n_layers {
-        caches.push(Some(cache::SteppingKeyValueCache::new_turbo(
-            kv_cache_config,
-            num_key_value_heads,
-            head_dim,
-        )?));
+    for i in 0..n_layers {
+        if dense_tail > 0 && i >= n_layers.saturating_sub(dense_tail) {
+            caches.push(Some(cache::SteppingKeyValueCache::new()));
+        } else {
+            caches.push(Some(cache::SteppingKeyValueCache::new_turbo(
+                kv_cache_config,
+                num_key_value_heads,
+                head_dim,
+            )?));
+        }
     }
     Ok(AnyCache::KV(caches))
 }
@@ -314,6 +326,19 @@ impl AnyModel {
     ) -> Result<Array, Exception> {
         match self {
             Self::Qwen3Next(m) => m.mtp_draft(hidden, next_token_id, mtp_cache),
+            _ => Err(Exception::custom("MTP not supported for this model")),
+        }
+    }
+
+    /// Advance the MTP head/cache for an accepted token without projecting logits.
+    pub fn mtp_advance(
+        &mut self,
+        hidden: &Array,
+        next_token_id: u32,
+        mtp_cache: &mut MtpCache,
+    ) -> Result<(), Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.mtp_advance(hidden, next_token_id, mtp_cache),
             _ => Err(Exception::custom("MTP not supported for this model")),
         }
     }
@@ -1283,6 +1308,7 @@ mod tests {
                 mode: turboquant::KvCacheMode::Turboquant,
                 bits: 3,
                 seed: 5,
+                ..Default::default()
             })
             .unwrap();
         match &cache {

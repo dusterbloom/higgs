@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
@@ -24,18 +24,84 @@ use crate::{
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 
+/// Conservative default for chunked prefill on 27B-class models.
+const DEFAULT_CHUNKED_PREFILL_THRESHOLD: i32 = 512;
+
+/// Conservative default for chunked prefill on 27B-class models.
+const DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE: i32 = 512;
+
 /// Sequences longer than this trigger chunked prefill to bound peak memory.
-const CHUNKED_PREFILL_THRESHOLD: i32 = 512;
+static CHUNKED_PREFILL_THRESHOLD: OnceLock<i32> = OnceLock::new();
 
 /// Number of tokens per chunk during chunked prefill.
-const CHUNKED_PREFILL_CHUNK_SIZE: i32 = 512;
+static CHUNKED_PREFILL_CHUNK_SIZE: OnceLock<i32> = OnceLock::new();
+static CLEAR_CACHE_AFTER_PREFILL: OnceLock<bool> = OnceLock::new();
 
-/// Cap MLX memory allocations to avoid Metal OOM on constrained GPUs.
+fn parse_positive_chunked_prefill_value(raw: Option<&str>, default: i32) -> i32 {
+    raw.and_then(|s| s.parse::<i32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn parse_enabled_flag(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
+fn chunked_prefill_threshold() -> i32 {
+    *CHUNKED_PREFILL_THRESHOLD.get_or_init(|| {
+        parse_positive_chunked_prefill_value(
+            std::env::var("HIGGS_CHUNKED_PREFILL_THRESHOLD")
+                .ok()
+                .as_deref(),
+            DEFAULT_CHUNKED_PREFILL_THRESHOLD,
+        )
+    })
+}
+
+fn chunked_prefill_chunk_size() -> i32 {
+    *CHUNKED_PREFILL_CHUNK_SIZE.get_or_init(|| {
+        parse_positive_chunked_prefill_value(
+            std::env::var("HIGGS_CHUNKED_PREFILL_CHUNK_SIZE")
+                .ok()
+                .as_deref(),
+            DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE,
+        )
+    })
+}
+
+fn clear_cache_after_prefill_enabled() -> bool {
+    *CLEAR_CACHE_AFTER_PREFILL.get_or_init(|| {
+        parse_enabled_flag(
+            std::env::var("HIGGS_CLEAR_CACHE_AFTER_PREFILL")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn maybe_clear_mlx_cache(reason: &str) {
+    if !clear_cache_after_prefill_enabled() {
+        return;
+    }
+
+    let rc = unsafe { mlx_sys::mlx_clear_cache() };
+    if rc == 0 {
+        tracing::debug!(reason, "Cleared MLX allocator cache");
+    } else {
+        tracing::warn!(reason, rc, "Failed to clear MLX allocator cache");
+    }
+}
+
+/// Configure MLX's large-model working set on Apple Silicon.
 ///
-/// Sets `mlx_set_memory_limit` to 75% of `max_recommended_working_set_size`
-/// and `mlx_set_cache_limit` to 50%. This lets MLX manage memory within
-/// bounds instead of the OS killing the process when Metal command buffers
-/// exceed GPU capacity (the root cause of 35B crashes on 32GB machines).
+/// By default we mirror upstream `mlx-lm` and raise MLX's wired limit to the
+/// device's `max_recommended_working_set_size`. Set
+/// `HIGGS_WIRED_LIMIT_MODE=legacy` to restore the older conservative
+/// `memory_limit/cache_limit` behavior, or `HIGGS_NO_MEM_LIMIT=1` to skip both.
 #[allow(unsafe_code)]
 pub(crate) fn set_wired_limit_to_max() {
     unsafe {
@@ -48,30 +114,51 @@ pub(crate) fn set_wired_limit_to_max() {
             if mlx_sys::mlx_device_info_get_size(&raw mut max_rec, info, key.as_ptr()) == 0
                 && max_rec > 0
             {
-                let mem_limit = max_rec * 3 / 4; // 75% of GPU max
-                let cache_limit = max_rec / 2; // 50% of GPU max
-
+                let wired_mode = std::env::var("HIGGS_WIRED_LIMIT_MODE").ok();
+                let use_legacy_limits =
+                    matches!(wired_mode.as_deref(), Some("legacy" | "safe" | "caps"));
                 let mut prev_mem: usize = 0;
                 let mut prev_cache: usize = 0;
+                let mut prev_wired: usize = 0;
 
-                // Check env var to optionally disable memory limits for testing
                 let limits_enabled = std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
 
                 if limits_enabled {
-                    mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
-                    mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
+                    if use_legacy_limits {
+                        let mem_limit = max_rec * 3 / 4;
+                        let cache_limit = max_rec / 2;
+                        mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
+                        mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
+                        tracing::info!(
+                            mode = "legacy",
+                            max_recommended_mb = max_rec / (1024 * 1024),
+                            memory_limit_mb = mem_limit / (1024 * 1024),
+                            cache_limit_mb = cache_limit / (1024 * 1024),
+                            prev_mem_mb = prev_mem / (1024 * 1024),
+                            prev_cache_mb = prev_cache / (1024 * 1024),
+                            "Configured MLX legacy memory/cache caps",
+                        );
+                    } else {
+                        mlx_sys::mlx_set_wired_limit(&raw mut prev_wired, max_rec);
+                        tracing::info!(
+                            mode = "mlx_wired_limit",
+                            max_recommended_mb = max_rec / (1024 * 1024),
+                            wired_limit_mb = max_rec / (1024 * 1024),
+                            prev_wired_mb = prev_wired / (1024 * 1024),
+                            "Configured MLX wired limit",
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        mode = if use_legacy_limits {
+                            "legacy"
+                        } else {
+                            "mlx_wired_limit"
+                        },
+                        max_recommended_mb = max_rec / (1024 * 1024),
+                        "Skipped MLX memory-limit configuration",
+                    );
                 }
-
-                tracing::info!(
-                    max_recommended_mb = max_rec / (1024 * 1024),
-                    memory_limit_mb = mem_limit / (1024 * 1024),
-                    cache_limit_mb = cache_limit / (1024 * 1024),
-                    limits_enabled,
-                    "MLX memory limits {} (prev mem={}MB, cache={}MB)",
-                    if limits_enabled { "set" } else { "skipped" },
-                    prev_mem / (1024 * 1024),
-                    prev_cache / (1024 * 1024),
-                );
             }
         }
         mlx_sys::mlx_device_info_free(info);
@@ -343,14 +430,12 @@ impl SimpleEngine {
                 .map_err(EngineError::Mlx)?
         } else {
             let seq_len = prepared.prompt_array.shape().get(1).copied().unwrap_or(0);
-            if seq_len > CHUNKED_PREFILL_THRESHOLD {
+            let chunked_threshold = chunked_prefill_threshold();
+            let chunked_size = chunked_prefill_chunk_size();
+            if seq_len > chunked_threshold {
                 prepared
                     .model
-                    .forward_chunked(
-                        &prepared.prompt_array,
-                        &mut prepared.cache,
-                        CHUNKED_PREFILL_CHUNK_SIZE,
-                    )
+                    .forward_chunked(&prepared.prompt_array, &mut prepared.cache, chunked_size)
                     .map_err(EngineError::Mlx)?
             } else {
                 prepared
@@ -401,6 +486,7 @@ impl SimpleEngine {
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
             pc.store(prompt_tokens, &prepared.cache);
         }
+        maybe_clear_mlx_cache("simple_post_prefill");
 
         Ok((current_token, logprob_data))
     }
@@ -988,10 +1074,11 @@ impl SimpleEngine {
                     tracing::info!(
                         tokens = accepted,
                         cycles = total_cycles,
-                        accept_rate =
-                            format!("{:.1}%", (accepted as f64 / total_cycles as f64 - 1.0) * 100.0),
-                        tok_per_s =
-                            format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                        accept_rate = format!(
+                            "{:.1}%",
+                            (accepted as f64 / total_cycles as f64 - 1.0) * 100.0
+                        ),
+                        tok_per_s = format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
                         "MTP decode complete"
                     );
                     return Ok(GenerationOutput {
@@ -1023,8 +1110,10 @@ impl SimpleEngine {
                 tracing::info!(
                     tokens = accepted,
                     cycles = total_cycles,
-                    accept_rate =
-                        format!("{:.1}%", (accepted as f64 / total_cycles as f64 - 1.0) * 100.0),
+                    accept_rate = format!(
+                        "{:.1}%",
+                        (accepted as f64 / total_cycles as f64 - 1.0) * 100.0
+                    ),
                     tok_per_s = format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
                     "MTP decode complete (length limit)"
                 );
@@ -1174,8 +1263,7 @@ impl SimpleEngine {
                             "{:.1}%",
                             (accepted as f64 / total_cycles as f64 - 1.0) * 100.0
                         ),
-                        tok_per_s =
-                            format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                        tok_per_s = format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
                         "MTP streaming decode complete"
                     );
                 }
@@ -1336,7 +1424,8 @@ impl SimpleEngine {
 
         // MTP speculative decode (streaming): greedy, no constraints, no logprobs.
         #[allow(clippy::float_cmp)]
-        if prepared.model.has_mtp()
+        if std::env::var("HIGGS_MTP").is_ok_and(|v| v == "1")
+            && prepared.model.has_mtp()
             && constraint.is_none()
             && !logprobs
             && params.temperature == 0.0
@@ -1629,7 +1718,10 @@ fn detect_thinking_support(model_dir: &Path) -> bool {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
-    use super::{check_stop_sequences, derive_model_name};
+    use super::{
+        check_stop_sequences, derive_model_name, parse_enabled_flag,
+        parse_positive_chunked_prefill_value,
+    };
     use std::path::Path;
 
     /// Write a config.json file into the given directory with the provided JSON content.
@@ -1855,5 +1947,32 @@ mod tests {
             eos_from_config(r#"{"eos_token_id": [1, "two", 3]}"#),
             vec![1, 3]
         );
+    }
+
+    #[test]
+    fn test_parse_positive_chunked_prefill_value_uses_default_for_invalid_values() {
+        assert_eq!(parse_positive_chunked_prefill_value(None, 2048), 2048);
+        assert_eq!(
+            parse_positive_chunked_prefill_value(Some("bad"), 2048),
+            2048
+        );
+        assert_eq!(parse_positive_chunked_prefill_value(Some("0"), 2048), 2048);
+        assert_eq!(parse_positive_chunked_prefill_value(Some("-1"), 2048), 2048);
+        assert_eq!(
+            parse_positive_chunked_prefill_value(Some("1024"), 2048),
+            1024
+        );
+    }
+
+    #[test]
+    fn test_parse_enabled_flag_accepts_common_truthy_values() {
+        assert!(parse_enabled_flag(Some("1")));
+        assert!(parse_enabled_flag(Some("true")));
+        assert!(parse_enabled_flag(Some("On")));
+        assert!(parse_enabled_flag(Some("yes")));
+        assert!(!parse_enabled_flag(None));
+        assert!(!parse_enabled_flag(Some("0")));
+        assert!(!parse_enabled_flag(Some("false")));
+        assert!(!parse_enabled_flag(Some("unexpected")));
     }
 }

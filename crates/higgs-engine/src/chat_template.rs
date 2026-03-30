@@ -64,9 +64,11 @@ impl ChatTemplateRenderer {
                 .get(key)
                 .and_then(|v| {
                     // Token can be a string or {"content": "..."} object
-                    v.as_str()
-                        .map(ToOwned::to_owned)
-                        .or_else(|| v.get("content").and_then(|c| c.as_str()).map(ToOwned::to_owned))
+                    v.as_str().map(ToOwned::to_owned).or_else(|| {
+                        v.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(ToOwned::to_owned)
+                    })
                 })
                 .unwrap_or_default()
         };
