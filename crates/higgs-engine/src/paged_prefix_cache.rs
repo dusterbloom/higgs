@@ -158,7 +158,14 @@ impl RadixNode {
         let mut best = self
             .cached
             .as_ref()
-            .filter(|_| depth >= min_prefix)
+            .filter(|cs| {
+                // Cloned entries are valid at any depth > 0 (no block alignment needed).
+                // Paged entries require at least min_prefix tokens for block alignment.
+                match &cs.data {
+                    CachedData::Cloned(_) => depth > 0,
+                    _ => depth >= min_prefix,
+                }
+            })
             .map(|cs| (depth, cs));
 
         let Some(&next_token) = tokens.get(depth) else {
@@ -259,10 +266,16 @@ impl PagedPrefixCache {
     pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<PagedPrefixMatch> {
         self.root
             .find_deepest_match(tokens, 0, self.block_size)
-            .and_then(|(prefix_len, cs)| {
-                let cache = materialize(&cs.data).ok()?;
-                cs.last_accessed.set(Instant::now());
-                Some(PagedPrefixMatch { prefix_len, cache })
+            .and_then(|(prefix_len, cs)| match materialize(&cs.data) {
+                Ok(cache) => {
+                    tracing::debug!(prefix_len, "Prefix cache hit");
+                    cs.last_accessed.set(Instant::now());
+                    Some(PagedPrefixMatch { prefix_len, cache })
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Prefix cache materialize failed");
+                    None
+                }
             })
     }
 
@@ -444,6 +457,13 @@ fn kv_offset(cache: &AnyCache) -> Option<i32> {
 
 /// Slice a cache into block-aligned paged data.
 fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, Exception> {
+    // Hybrid caches (GDN+KV) can't be block-paged because GDN sequential state
+    // doesn't align to block boundaries. The KV offset would mismatch the GDN
+    // offset after materialization, producing corrupt attention. Use clone instead.
+    if matches!(cache, AnyCache::Hybrid(_)) {
+        return Ok(CachedData::Cloned(cache.clone()));
+    }
+
     let offset = kv_offset(cache).unwrap_or(0);
     let num_blocks = offset as usize / block_size;
     if num_blocks == 0 {
@@ -454,10 +474,8 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
         i32::try_from(block_size).map_err(|_| Exception::custom("block_size overflow"))?;
 
     // Slice KV layers as TQ blocks when actually quantized, dense otherwise.
-    // Note: with deferred quantization, `is_turboquant(cache)` may be true but
-    // the storage is still dense. We detect actual TQ by whether any layer
-    // yielded a TQ context during slicing.
-    let (layers, is_hybrid, tq_context) = match cache {
+    // Hybrid caches are handled by the early-return clone above.
+    let (layers, tq_context) = match cache {
         AnyCache::KV(kv_layers) => {
             let mut ctx: Option<Arc<TurboQuantContext>> = None;
             let layers: Result<Vec<_>, _> = kv_layers
@@ -476,34 +494,10 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
                     }
                 })
                 .collect();
-            (layers?, false, ctx)
+            (layers?, ctx)
         }
-        AnyCache::Hybrid(hybrid_layers) => {
-            let mut ctx: Option<Arc<TurboQuantContext>> = None;
-            let layers: Result<Vec<_>, _> = hybrid_layers
-                .iter()
-                .map(|layer_opt| match layer_opt {
-                    Some(LayerCache::KV(kv)) => {
-                        if kv.is_quantized() {
-                            if ctx.is_none() {
-                                ctx = kv.turbo_arrays().map(|(c, ..)| Arc::clone(c));
-                            }
-                            slice_tq_layer(kv, num_blocks, block_size_i32)
-                        } else {
-                            slice_kv_layer(Some(kv), num_blocks, block_size_i32)
-                        }
-                    }
-                    Some(LayerCache::Arrays(ac)) => Ok(CachedLayerData::Gdn(GdnSnapshot {
-                        conv_state: ac.conv_state.clone(),
-                        ssm_state: ac.ssm_state.clone(),
-                        conv_pos: ac.conv_pos,
-                        offset: ac.offset,
-                    })),
-                    None => Ok(CachedLayerData::Empty),
-                })
-                .collect();
-            (layers?, true, ctx)
-        }
+        // Hybrid caches returned Cloned above; this arm is unreachable.
+        AnyCache::Hybrid(_) => unreachable!("Hybrid caches use clone fallback"),
     };
 
     if let Some(context) = tq_context {
@@ -511,13 +505,13 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
             layers,
             context,
             total_tokens,
-            is_hybrid,
+            is_hybrid: false,
         })
     } else {
         Ok(CachedData::Paged {
             layers,
             total_tokens,
-            is_hybrid,
+            is_hybrid: false,
         })
     }
 }

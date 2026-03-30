@@ -522,6 +522,12 @@ impl SteppingKeyValueCache {
         }
     }
 
+    /// True when TQ storage has been populated (bulk quantization has happened).
+    /// Distinct from `is_quantized()` which checks config only.
+    pub fn is_turbo_active(&self) -> bool {
+        self.turbo.as_ref().is_some_and(|t| t.capacity > 0)
+    }
+
     fn update_dense(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
         let prev = self.offset;
         let new_tokens = keys.shape()[2];

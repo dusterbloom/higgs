@@ -379,7 +379,8 @@ impl SimpleEngine {
             tracing::debug!(
                 prefix_len = matched.prefix_len,
                 total_len = prompt_tokens.len(),
-                "Reusing cached prefix"
+                suffix_len = prompt_tokens.len() - matched.prefix_len,
+                "Prefix cache hit — reusing cached prefix"
             );
             let suffix = prompt_tokens.get(matched.prefix_len..).unwrap_or_default();
             if suffix.is_empty() {
@@ -770,6 +771,16 @@ impl SimpleEngine {
                 eval(eval_targets).map_err(EngineError::Mlx)?;
             } else {
                 async_eval(eval_targets).map_err(EngineError::Mlx)?;
+            }
+        }
+
+        // After the first decode step, TQ deferred quantization has activated:
+        // dense KV was bulk-quantized into TQ storage. Re-store the cache so the
+        // prefix cache gets the quantized blocks (the initial store after prefill
+        // only captured the dense pre-quantization state).
+        if self.kv_cache_config.is_turboquant() && prepared.pixel_values.is_none() {
+            if let Ok(mut pc) = self.prefix_cache.lock() {
+                pc.store(prompt_tokens, &prepared.cache);
             }
         }
 
@@ -1469,6 +1480,13 @@ impl SimpleEngine {
                 eval_targets.extend(lp.eval_targets());
             }
             async_eval(eval_targets).map_err(EngineError::Mlx)?;
+        }
+
+        // Re-store after TQ activation (see generate_inner for rationale).
+        if self.kv_cache_config.is_turboquant() && prepared.pixel_values.is_none() {
+            if let Ok(mut pc) = self.prefix_cache.lock() {
+                pc.store(prompt_tokens, &prepared.cache);
+            }
         }
 
         loop {
