@@ -59,6 +59,11 @@ pub fn mtp_cycle(
 
     if target_id == draft_token_id {
         // ACCEPT: draft matches backbone prediction.
+        // Keep the MTP cache aligned with the newly accepted draft token too.
+        model
+            .mtp_advance(&h_confirmed, draft_token_id, mtp_cache)
+            .map_err(EngineError::Mlx)?;
+
         // Process draft token to advance cache and get bonus prediction.
         let draft_input = Array::from_slice(&[draft_token_id as i32], &[1, 1]);
         let (draft_hidden, draft_logits) = model
@@ -77,13 +82,9 @@ pub fn mtp_cycle(
             next_token_id: bonus_id,
         })
     } else {
-        // REJECT: draft was never processed through backbone, no rollback needed.
-        // Confirmed token's KV entry stays in cache.
-
-        // Trim MTP cache by 1 (undo the draft position)
-        for kv in mtp_cache.iter_mut() {
-            kv.trim_by(1);
-        }
+        // REJECT: keep the MTP cache entry for the confirmed token.
+        // `mtp_draft()` advanced the speculative head using the confirmed token,
+        // not the rejected draft token, so rolling it back would drop real history.
 
         Ok(MtpCycleResult {
             tokens: vec![confirmed_token_id],

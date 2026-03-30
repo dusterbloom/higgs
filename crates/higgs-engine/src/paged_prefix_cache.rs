@@ -31,6 +31,7 @@ struct KvBlock {
 struct GdnSnapshot {
     conv_state: Option<Array>,
     ssm_state: Option<Array>,
+    conv_pos: i32,
     offset: i32,
 }
 
@@ -442,6 +443,7 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
                     Some(LayerCache::Arrays(ac)) => Ok(CachedLayerData::Gdn(GdnSnapshot {
                         conv_state: ac.conv_state.clone(),
                         ssm_state: ac.ssm_state.clone(),
+                        conv_pos: ac.conv_pos,
                         offset: ac.offset,
                     })),
                     None => Ok(CachedLayerData::Empty),
@@ -524,6 +526,7 @@ fn materialize_hybrid(layers: &[CachedLayerData]) -> Result<AnyCache, Exception>
             CachedLayerData::Gdn(snap) => Ok(Some(LayerCache::Arrays(ArraysCache {
                 conv_state: snap.conv_state.clone(),
                 ssm_state: snap.ssm_state.clone(),
+                conv_pos: snap.conv_pos,
                 offset: snap.offset,
             }))),
             CachedLayerData::Empty => Ok(None),
@@ -584,6 +587,7 @@ mod tests {
                     Some(LayerCache::Arrays(ArraysCache {
                         conv_state: Some(Array::zeros::<f32>(&[1, 4, 4]).unwrap()),
                         ssm_state: Some(Array::zeros::<f32>(&[1, 16]).unwrap()),
+                        conv_pos: 3,
                         offset: seq_len,
                     }))
                 } else {
@@ -723,6 +727,7 @@ mod tests {
                         LayerCache::Arrays(ac) => {
                             assert_eq!(i % 4, 0, "Layer {i} should be GDN");
                             assert_eq!(ac.offset, 64);
+                            assert_eq!(ac.conv_pos, 3);
                             assert!(ac.conv_state.is_some());
                             assert!(ac.ssm_state.is_some());
                         }

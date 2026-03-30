@@ -323,6 +323,7 @@ mod tests {
             mode: KvCacheMode::Turboquant,
             bits: 3,
             seed: 13,
+            ..Default::default()
         };
         let queries = Array::from_slice(
             &[0.1_f32, -0.3, 0.8, 0.2, -0.4, 0.6, 0.9, -0.1],
@@ -368,6 +369,7 @@ mod tests {
             mode: KvCacheMode::Turboquant,
             bits: 3,
             seed: 17,
+            ..Default::default()
         };
         let queries = Array::from_slice(
             &[
@@ -424,6 +426,7 @@ mod tests {
             mode: KvCacheMode::Turboquant,
             bits: 3,
             seed: 19,
+            ..Default::default()
         };
         let prefix_keys = Array::from_slice(
             &[
@@ -765,6 +768,7 @@ mod tests {
             mode: KvCacheMode::Turboquant,
             bits: 3,
             seed: 42,
+            ..Default::default()
         };
         let num_kv_heads = 2;
         let num_q_heads = 8; // GQA: 4 Q heads per KV head
@@ -855,6 +859,7 @@ mod tests {
             mode: KvCacheMode::Turboquant,
             bits: 3,
             seed: 77,
+            ..Default::default()
         };
         let head_dim = 64;
         let scale = (head_dim as f32).sqrt().recip();
