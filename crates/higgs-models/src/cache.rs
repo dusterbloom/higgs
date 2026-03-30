@@ -460,6 +460,68 @@ impl SteppingKeyValueCache {
         }
     }
 
+    // -- TurboQuant prefix-cache helpers ----------------------------------------
+
+    /// Read-only access to internal TQ arrays (for prefix cache block slicing).
+    /// Returns `(context, key_codes, key_norms, key_gammas, key_qjl_signs, value_codes, value_norms)`.
+    #[allow(clippy::type_complexity)]
+    pub fn turbo_arrays(
+        &self,
+    ) -> Option<(
+        &Arc<TurboQuantContext>,
+        &Array,
+        &Array,
+        &Array,
+        &Array,
+        &Array,
+        &Array,
+    )> {
+        let t = self.turbo.as_ref()?;
+        Some((
+            &t.context,
+            t.key_codes.as_ref()?,
+            t.key_norms.as_ref()?,
+            t.key_gammas.as_ref()?,
+            t.key_qjl_signs.as_ref()?,
+            t.value_codes.as_ref()?,
+            t.value_norms.as_ref()?,
+        ))
+    }
+
+    /// Reconstruct a TQ cache from pre-gathered arrays (prefix cache materialization).
+    pub fn from_turbo_arrays(
+        context: Arc<TurboQuantContext>,
+        key_codes: Array,
+        key_norms: Array,
+        key_gammas: Array,
+        key_qjl_signs: Array,
+        value_codes: Array,
+        value_norms: Array,
+        offset: i32,
+    ) -> Self {
+        let capacity = key_codes.shape().get(1).copied().unwrap_or(0);
+        Self {
+            keys: None,
+            values: None,
+            turbo: Some(TurboQuantStorage {
+                context,
+                key_codes: Some(key_codes),
+                key_norms: Some(key_norms),
+                key_qjl_signs: Some(key_qjl_signs),
+                key_gammas: Some(key_gammas),
+                value_codes: Some(value_codes),
+                value_norms: Some(value_norms),
+                capacity,
+            }),
+            config: KvCacheConfig {
+                mode: KvCacheMode::Turboquant,
+                ..KvCacheConfig::default()
+            },
+            offset,
+            step: 256,
+        }
+    }
+
     fn update_dense(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
         let prev = self.offset;
         let new_tokens = keys.shape()[2];
@@ -845,6 +907,40 @@ pub fn slice_axis2(arr: &Array, start: i32, end: i32) -> Result<Array, Exception
     let strides = vec![1i32; ndim];
     starts[2] = start;
     ends[2] = end;
+
+    unsafe {
+        let mut result = mlx_sys::mlx_array_new();
+        let status = mlx_sys::mlx_slice(
+            &raw mut result,
+            arr.as_ptr(),
+            starts.as_ptr(),
+            starts.len(),
+            ends.as_ptr(),
+            ends.len(),
+            strides.as_ptr(),
+            strides.len(),
+            Stream::task_local_or_default().as_ptr(),
+        );
+        if status != 0 {
+            mlx_sys::mlx_array_free(result);
+            return Err(Exception::custom("mlx_slice failed"));
+        }
+        Ok(Array::from_ptr(result))
+    }
+}
+
+/// Slice an array along axis 1: `arr[:, start:end, ...]`
+///
+/// Used for TQ arrays with shape `[H, capacity, ...]`.
+#[allow(unsafe_code, clippy::indexing_slicing)]
+pub fn slice_axis1(arr: &Array, start: i32, end: i32) -> Result<Array, Exception> {
+    let ndim = arr.ndim();
+    debug_assert!(ndim >= 2, "slice_axis1 requires ndim >= 2, got {ndim}");
+    let mut starts = vec![0i32; ndim];
+    let mut ends: Vec<i32> = arr.shape().to_vec();
+    let strides = vec![1i32; ndim];
+    starts[1] = start;
+    ends[1] = end;
 
     unsafe {
         let mut result = mlx_sys::mlx_array_new();
