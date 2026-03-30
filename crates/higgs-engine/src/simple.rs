@@ -182,6 +182,10 @@ pub struct SimpleEngine {
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
     /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
     think_close_token: Option<u32>,
+    /// Number of trailing tokens added by `add_generation_prompt=true`.
+    /// Stripped from the prefix cache key so that multi-turn conversations
+    /// share the same token prefix (the generation prompt changes between turns).
+    gen_prompt_suffix_len: usize,
     kv_cache_config: KvCacheConfig,
 }
 
@@ -246,6 +250,38 @@ impl SimpleEngine {
 
         set_wired_limit_to_max();
 
+        // Compute the generation prompt suffix length: tokens added by
+        // `add_generation_prompt=true` (e.g., `<|im_start|>assistant\n<think>\n`).
+        // We strip these from the prefix cache key so multi-turn conversations
+        // share their common history prefix.
+        let gen_prompt_suffix_len = template
+            .as_ref()
+            .and_then(|tmpl| {
+                let test_msg = vec![crate::chat_template::ChatMessage {
+                    role: "user".to_owned(),
+                    content: "x".to_owned(),
+                    tool_calls: None,
+                }];
+                let with_gen = tmpl
+                    .apply_with_thinking(&test_msg, None, true, enable_thinking)
+                    .ok()?;
+                let without_gen = tmpl
+                    .apply_with_thinking(&test_msg, None, false, enable_thinking)
+                    .ok()?;
+                let toks_with = tokenizer.encode(with_gen.as_str(), false).ok()?;
+                let toks_without = tokenizer.encode(without_gen.as_str(), false).ok()?;
+                let suffix = toks_with
+                    .get_ids()
+                    .len()
+                    .saturating_sub(toks_without.get_ids().len());
+                tracing::info!(
+                    gen_prompt_suffix_len = suffix,
+                    "Computed generation prompt suffix length for prefix cache"
+                );
+                Some(suffix)
+            })
+            .unwrap_or(0);
+
         tracing::info!(
             model_name = %model_name,
             eos_tokens = ?eos_token_ids,
@@ -264,6 +300,7 @@ impl SimpleEngine {
             eos_token_ids,
             enable_thinking,
             think_close_token,
+            gen_prompt_suffix_len,
             kv_cache_config,
         })
     }
@@ -485,7 +522,17 @@ impl SimpleEngine {
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            pc.store(prompt_tokens, &prepared.cache);
+            // Strip generation prompt suffix so multi-turn conversations
+            // share their common history prefix. The suffix tokens
+            // (`<|im_start|>assistant\n<think>\n`) change between turns.
+            let cache_key = prompt_tokens
+                .get(
+                    ..prompt_tokens
+                        .len()
+                        .saturating_sub(self.gen_prompt_suffix_len),
+                )
+                .unwrap_or(prompt_tokens);
+            pc.store(cache_key, &prepared.cache);
         }
         maybe_clear_mlx_cache("simple_post_prefill");
 
