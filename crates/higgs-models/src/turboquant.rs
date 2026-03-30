@@ -22,8 +22,6 @@ const FOUR_BIT_CENTROIDS: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881, 0.6568,
     0.9424, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
-const SQRT_PI_OVER_TWO: f32 = 1.253_314_1;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum KvCacheMode {
@@ -127,7 +125,6 @@ pub struct QuantizedKey {
     pub norm: f32,
     pub gamma: f32,
     pub codes: Vec<u8>,
-    pub qjl_signs: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,15 +134,12 @@ pub struct TurboQuantContext {
     pub num_kv_heads: i32,
     pub rotation: Vec<f32>,
     pub rotation_t: Vec<f32>,
-    pub qjl: Vec<f32>,
-    pub qjl_t: Vec<f32>,
     pub key_centroids: Vec<f32>,
     pub value_centroids: Vec<f32>,
     pub key_code_bytes: i32,
     pub value_code_bytes: i32,
     pub key_code_words: i32,
     pub value_code_words: i32,
-    pub sign_bytes: i32,
 }
 
 impl TurboQuantContext {
@@ -161,8 +155,6 @@ impl TurboQuantContext {
 
         let rotation = generate_orthogonal_matrix(dim, config.seed);
         let rotation_t = transpose(&rotation, dim);
-        let qjl = generate_gaussian_matrix(dim, config.seed.wrapping_add(1));
-        let qjl_t = transpose(&qjl, dim);
         let key_centroids = scaled_centroids(config.key_bits(), scale)?;
         let value_centroids = scaled_centroids(config.value_bits(), scale)?;
 
@@ -170,7 +162,6 @@ impl TurboQuantContext {
         let value_code_bytes = packed_bytes(dim, config.value_bits())?;
         let key_code_words = packed_words(dim, config.key_bits())?;
         let value_code_words = packed_words(dim, config.value_bits())?;
-        let sign_bytes = packed_sign_bytes(dim)?;
 
         Ok(Self {
             config,
@@ -178,15 +169,12 @@ impl TurboQuantContext {
             num_kv_heads,
             rotation,
             rotation_t,
-            qjl,
-            qjl_t,
             key_centroids,
             value_centroids,
             key_code_bytes,
             value_code_bytes,
             key_code_words,
             value_code_words,
-            sign_bytes,
         })
     }
 
@@ -237,36 +225,17 @@ impl TurboQuantContext {
 
         let norm = l2_norm(keys);
         let key_code_len = usize::try_from(self.key_code_bytes).unwrap_or(0);
-        let sign_len = usize::try_from(self.sign_bytes).unwrap_or(0);
         if norm <= f32::EPSILON {
             return Ok(QuantizedKey {
                 norm: 0.0,
                 gamma: 0.0,
                 codes: vec![0; key_code_len],
-                qjl_signs: vec![0; sign_len],
             });
         }
 
         let normalized: Vec<f32> = keys.iter().map(|value| *value / norm).collect();
         let rotated = mat_vec(&self.rotation, dim, &normalized);
         let mse_indices = quantize_rotated(&rotated, &self.key_centroids);
-        let rotated_approx = dequantize_rotated(
-            &pack_indices(&mse_indices, self.config.key_bits()),
-            self.config.key_bits(),
-            &self.key_centroids,
-            dim,
-            1.0,
-        );
-        let approx = mat_vec(&self.rotation_t, dim, &rotated_approx);
-
-        let residual: Vec<f32> = normalized
-            .iter()
-            .zip(approx.iter())
-            .map(|(lhs, rhs)| *lhs - *rhs)
-            .collect();
-        let gamma = l2_norm(&residual) * norm;
-        let qjl_proj = mat_vec(&self.qjl, dim, &residual);
-        let qjl_signs = pack_signs(qjl_proj.iter().map(|value| *value >= 0.0));
 
         // Norm correction for keys
         let final_norm = if self.config.norm_correction {
@@ -282,9 +251,8 @@ impl TurboQuantContext {
 
         Ok(QuantizedKey {
             norm: final_norm,
-            gamma,
+            gamma: 0.0,
             codes: pack_indices(&mse_indices, self.config.key_bits()),
-            qjl_signs,
         })
     }
 
@@ -311,25 +279,13 @@ impl TurboQuantContext {
             dim,
             key.norm,
         );
-        let approx = mat_vec(&self.rotation_t, dim, &rotated);
-        let residual = dequantize_qjl(&key.qjl_signs, key.gamma, &self.qjl_t, dim);
-        Ok(approx
-            .iter()
-            .zip(residual.iter())
-            .map(|(lhs, rhs)| *lhs + *rhs)
-            .collect())
+        Ok(mat_vec(&self.rotation_t, dim, &rotated))
     }
 
     pub fn rotate_queries(&self, queries: &Array) -> Result<Array, Exception> {
         queries
             .as_dtype(Dtype::Float32)?
             .matmul(&self.rotation_t_array()?)
-    }
-
-    pub fn project_queries_qjl(&self, queries: &Array) -> Result<Array, Exception> {
-        queries
-            .as_dtype(Dtype::Float32)?
-            .matmul(&self.qjl_t_array()?)
     }
 
     pub fn rotation_array(&self) -> Result<Array, Exception> {
@@ -342,13 +298,6 @@ impl TurboQuantContext {
     pub fn rotation_t_array(&self) -> Result<Array, Exception> {
         Ok(Array::from_slice(
             &self.rotation_t,
-            &[self.head_dim, self.head_dim],
-        ))
-    }
-
-    pub fn qjl_t_array(&self) -> Result<Array, Exception> {
-        Ok(Array::from_slice(
-            &self.qjl_t,
             &[self.head_dim, self.head_dim],
         ))
     }
@@ -442,7 +391,7 @@ impl TurboQuantContext {
     /// Batch-quantize keys using GPU ops.
     ///
     /// Input: `[H, T, D]` f32 tensor.
-    /// Returns `BatchQuantizedKeys` with norms, gammas, packed MSE codes, and QJL signs.
+    /// Returns `BatchQuantizedKeys` with norms, gammas, and packed MSE codes.
     pub fn quantize_keys_batch(&self, keys: &Array) -> Result<BatchQuantizedKeys, Exception> {
         let shape = keys.shape();
         let h = shape[0];
@@ -467,33 +416,11 @@ impl TurboQuantContext {
         let distances = ops::abs(&ops::subtract(&rotated_expanded, &key_centroids)?)?;
         let mse_indices = argmin_axis!(&distances, -1)?; // [H, T, D]
 
-        // Dequantize MSE: rotated_approx = take(centroids, indices) → [H, T, D]
-        let mse_indices_i32 = mse_indices.as_dtype(Dtype::Int32)?;
-        let rotated_approx = key_centroids.take(&mse_indices_i32)?;
-
-        // Back to original space: approx = rotated_approx @ rotation
-        let rotation = self.rotation_array()?;
-        let approx = rotated_approx.matmul(&rotation)?;
-
-        // Residual and gamma
-        let residual = ops::subtract(&normalized, &approx)?;
-        let gammas = ops::multiply(
-            &ops::sqrt(&ops::sum_axis(&ops::square(&residual)?, -1, None)?)?,
-            &norms,
-        )?;
-
-        // QJL projection: proj = residual @ qjl_t → [H, T, D], then pack signs
-        let qjl_t = self.qjl_t_array()?;
-        let qjl_proj = residual.matmul(&qjl_t)?;
-
-        // signs = (proj >= 0)
-        let zero = Array::from_f32(0.0);
-        let signs = qjl_proj.ge(&zero)?;
-
         // Norm correction for keys
         let norms = if self.config.norm_correction {
-            let recon_l2 =
-                ops::sqrt(&ops::sum_axis(&ops::square(&rotated_approx)?, -1, None)?)?;
+            let mse_indices_i32 = mse_indices.as_dtype(Dtype::Int32)?;
+            let rotated_approx = key_centroids.take(&mse_indices_i32)?;
+            let recon_l2 = ops::sqrt(&ops::sum_axis(&ops::square(&rotated_approx)?, -1, None)?)?;
             let safe_recon = ops::maximum(&recon_l2, &eps)?;
             ops::divide(&norms, &safe_recon)?
         } else {
@@ -503,21 +430,15 @@ impl TurboQuantContext {
         // Eval everything before CPU readout
         mse_indices.eval()?;
         norms.eval()?;
-        gammas.eval()?;
-        signs.eval()?;
 
         let indices_flat = mse_indices.as_slice::<u32>();
         let norms_flat = norms.as_slice::<f32>();
-        let gammas_flat = gammas.as_slice::<f32>();
-        let signs_flat = signs.as_slice::<bool>();
 
         let ht = usize::try_from(h).unwrap() * usize::try_from(t).unwrap();
         let dim = usize::try_from(self.head_dim).unwrap();
         let key_code_bytes = usize::try_from(self.key_code_bytes).unwrap();
-        let sign_bytes = usize::try_from(self.sign_bytes).unwrap();
 
         let mut packed_codes = vec![0_u8; ht * key_code_bytes];
-        let mut packed_signs = vec![0_u8; ht * sign_bytes];
         for row in 0..ht {
             let row_start = row * dim;
             let code_start = row * key_code_bytes;
@@ -526,20 +447,13 @@ impl TurboQuantContext {
                 key_bits,
                 &mut packed_codes[code_start..code_start + key_code_bytes],
             );
-            let sign_start = row * sign_bytes;
-            pack_bool_signs(
-                &signs_flat[row_start..row_start + dim],
-                &mut packed_signs[sign_start..sign_start + sign_bytes],
-            );
         }
 
         Ok(BatchQuantizedKeys {
             norms: norms_flat.to_vec(),
-            gammas: gammas_flat.to_vec(),
+            gammas: vec![0.0; ht],
             packed_codes,
-            packed_signs,
             key_code_bytes,
-            sign_bytes,
         })
     }
 
@@ -601,11 +515,8 @@ impl TurboQuantContext {
     /// Batch-quantize keys entirely on GPU, returning lazy Arrays.
     ///
     /// Input: `[H, T, D]` f32 tensor.
-    /// Returns `(norms [H,T], gammas [H,T], packed_codes [H,T,key_code_words] u32, packed_signs [H,T,sign_bytes] u8)`.
-    pub fn quantize_keys_gpu(
-        &self,
-        keys: &Array,
-    ) -> Result<(Array, Array, Array, Array), Exception> {
+    /// Returns `(norms [H,T], gammas [H,T], packed_codes [H,T,key_code_words] u32)`.
+    pub fn quantize_keys_gpu(&self, keys: &Array) -> Result<(Array, Array, Array), Exception> {
         let shape = keys.shape();
         let h = shape[0];
         let t = shape[1];
@@ -627,19 +538,10 @@ impl TurboQuantContext {
         let distances = ops::abs(&ops::subtract(&rotated.expand_dims(-1)?, &key_centroids)?)?;
         let mse_indices = argmin_axis!(&distances, -1)?;
 
-        // Dequantize to get residual: rotated_approx → approx → residual
-        let mse_i32 = mse_indices.as_dtype(Dtype::Int32)?;
-        let rotated_approx = key_centroids.take(&mse_i32)?;
-        let rotation = self.rotation_array()?;
-        let approx = rotated_approx.matmul(&rotation)?;
-        let residual = ops::subtract(&normalized, &approx)?;
-        let gammas = ops::multiply(
-            &ops::sqrt(&ops::sum_axis(&ops::square(&residual)?, -1, None)?)?,
-            &norms,
-        )?;
-
         // Norm correction for keys: use rotated_approx L2
         let corrected_norms = if self.config.norm_correction {
+            let mse_i32 = mse_indices.as_dtype(Dtype::Int32)?;
+            let rotated_approx = key_centroids.take(&mse_i32)?;
             let recon_l2 = ops::sqrt(&ops::sum_axis(&ops::square(&rotated_approx)?, -1, None)?)?;
             let safe_recon = ops::maximum(&recon_l2, &eps)?;
             ops::divide(&norms, &safe_recon)?
@@ -647,15 +549,11 @@ impl TurboQuantContext {
             norms
         };
 
-        // QJL: proj = residual @ qjl_t, signs = (proj >= 0)
-        let qjl_t = self.qjl_t_array()?;
-        let qjl_proj = residual.matmul(&qjl_t)?;
-        let zero = Array::from_f32(0.0);
-        let signs = qjl_proj.ge(&zero)?;
+        // Gammas are zeroed out (QJL removed)
+        let gammas = ops::zeros_dtype(&[h, t], Dtype::Float32)?;
 
         // Pack on GPU
         let indices_flat = mse_indices.reshape(&[n, self.head_dim])?;
-        let signs_flat = signs.reshape(&[n, self.head_dim])?;
 
         let packed_codes_flat = pack_indices_gpu(
             &indices_flat,
@@ -664,12 +562,10 @@ impl TurboQuantContext {
             key_bits,
             self.key_code_words,
         )?;
-        let packed_signs_flat = pack_signs_gpu(&signs_flat, n, self.head_dim, self.sign_bytes)?;
 
         let packed_codes = packed_codes_flat.reshape(&[h, t, self.key_code_words])?;
-        let packed_signs = packed_signs_flat.reshape(&[h, t, self.sign_bytes])?;
 
-        Ok((corrected_norms, gammas, packed_codes, packed_signs))
+        Ok((corrected_norms, gammas, packed_codes))
     }
 }
 
@@ -685,9 +581,7 @@ pub struct BatchQuantizedKeys {
     pub norms: Vec<f32>,
     pub gammas: Vec<f32>,
     pub packed_codes: Vec<u8>,
-    pub packed_signs: Vec<u8>,
     pub key_code_bytes: usize,
-    pub sign_bytes: usize,
 }
 
 /// Pack u32 index values into a byte buffer at the given bit width.
@@ -706,24 +600,11 @@ fn pack_u32_indices(indices: &[u32], bits: u8, out: &mut [u8]) {
     }
 }
 
-/// Pack bool signs into a byte buffer (true = 1 bit set).
-fn pack_bool_signs(signs: &[bool], out: &mut [u8]) {
-    out.fill(0);
-    for (index, &sign) in signs.iter().enumerate() {
-        if sign {
-            out[index / 8] |= 1_u8 << (index % 8);
-        }
-    }
-}
-
 #[allow(unsafe_code)]
 pub(crate) fn decode_scores(
     q_rot: &Array,
-    q_qjl: &Array,
     key_codes: &Array,
     key_norms: &Array,
-    key_qjl: &Array,
-    key_gammas: &Array,
     key_centroids: &Array,
     num_heads: i32,
     num_kv_heads: i32,
@@ -732,7 +613,6 @@ pub(crate) fn decode_scores(
     seq_len: i32,
     key_bits: u8,
     key_code_words: i32,
-    sign_bytes: i32,
 ) -> Result<Array, Exception> {
     ensure_ffi_error_handler();
 
@@ -745,18 +625,14 @@ pub(crate) fn decode_scores(
         seq_len,
         key_bits,
         key_code_words,
-        sign_bytes,
     );
 
     let capacity_scalar = unsafe { mlx_sys::mlx_array_new_int(capacity) };
     let seq_scalar = unsafe { mlx_sys::mlx_array_new_int(seq_len) };
     let input_ptrs = [
         q_rot.as_ptr(),
-        q_qjl.as_ptr(),
         key_codes.as_ptr(),
         key_norms.as_ptr(),
-        key_qjl.as_ptr(),
-        key_gammas.as_ptr(),
         key_centroids.as_ptr(),
         capacity_scalar,
         seq_scalar,
@@ -883,10 +759,6 @@ fn packed_words(dim: usize, bits: u8) -> Result<i32, Exception> {
         .map_err(|_| Exception::custom("TurboQuant packed word overflow"))
 }
 
-fn packed_sign_bytes(dim: usize) -> Result<i32, Exception> {
-    i32::try_from(dim.div_ceil(8)).map_err(|_| Exception::custom("TurboQuant sign byte overflow"))
-}
-
 fn l2_norm(values: &[f32]) -> f32 {
     values.iter().map(|value| value * value).sum::<f32>().sqrt()
 }
@@ -901,16 +773,6 @@ fn reconstruction_norm(indices: &[u8], centroids: &[f32]) -> f32 {
         })
         .sum::<f32>()
         .sqrt()
-}
-
-fn dequantize_qjl(signs: &[u8], gamma: f32, qjl_t: &[f32], dim: usize) -> Vec<f32> {
-    let mut z = vec![0.0_f32; dim];
-    for index in 0..dim {
-        z[index] = if unpack_sign(signs, index) { 1.0 } else { -1.0 };
-    }
-    let projection = mat_vec(qjl_t, dim, &z);
-    let scale = gamma * SQRT_PI_OVER_TWO / dim as f32;
-    projection.into_iter().map(|value| value * scale).collect()
 }
 
 fn quantize_rotated(values: &[f32], centroids: &[f32]) -> Vec<u8> {
@@ -974,21 +836,6 @@ fn unpack_index(data: &[u8], index: usize, bits: u8) -> u8 {
     u8::try_from(value & mask).unwrap_or(0)
 }
 
-fn pack_signs(signs: impl IntoIterator<Item = bool>) -> Vec<u8> {
-    let values: Vec<bool> = signs.into_iter().collect();
-    let mut packed = vec![0_u8; values.len().div_ceil(8)];
-    for (index, sign) in values.iter().enumerate() {
-        if *sign {
-            packed[index / 8] |= 1_u8 << (index % 8);
-        }
-    }
-    packed
-}
-
-fn unpack_sign(data: &[u8], index: usize) -> bool {
-    ((data[index / 8] >> (index % 8)) & 1_u8) == 1
-}
-
 fn mat_vec(matrix: &[f32], dim: usize, vector: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0_f32; dim];
     for row in 0..dim {
@@ -1009,15 +856,6 @@ fn transpose(matrix: &[f32], dim: usize) -> Vec<f32> {
         }
     }
     out
-}
-
-fn generate_gaussian_matrix(dim: usize, seed: u64) -> Vec<f32> {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let mut matrix = vec![0.0_f32; dim * dim];
-    for value in &mut matrix {
-        *value = random_normal(&mut rng);
-    }
-    matrix
 }
 
 fn generate_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
@@ -1116,10 +954,8 @@ impl Drop for CachedMetalKernel {
 static SCORE_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static VALUE_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static PACK_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
-static PACK_SIGNS_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 const TURBOQUANT_SCORES_KERNEL_SOURCE: &str = r"
-constexpr float kQjlScale = 1.2533141373155001f / float(D);
 constexpr int GQA = H / HKV;
 auto pos = thread_position_in_grid.x;
 auto kv_head = thread_position_in_grid.y;
@@ -1127,15 +963,11 @@ if (pos >= T) { return; }
 
 auto packed_index = kv_head * Capacity + pos;
 auto code_ptr = k_codes + packed_index * KWords;
-auto sign_ptr = k_qjl + packed_index * QBytes;
 float norm_val = float(k_norms[packed_index]);
-float gamma_val = float(k_gammas[packed_index]);
 
 float mse_acc[GQA];
-float res_acc[GQA];
 for (int g = 0; g < GQA; ++g) {
   mse_acc[g] = 0.0f;
-  res_acc[g] = 0.0f;
 }
 
 for (int j = 0; j < D; ++j) {
@@ -1149,20 +981,15 @@ for (int j = 0; j < D; ++j) {
   code &= ((1u << KBits) - 1u);
   float key_val = key_centroids[code];
 
-  auto byte_idx = j / 8;
-  auto bit_shift = j % 8;
-  float sign_val = ((uint(sign_ptr[byte_idx]) >> bit_shift) & 1u) == 1u ? 1.0f : -1.0f;
-
   for (int g = 0; g < GQA; ++g) {
     int head = kv_head * GQA + g;
     mse_acc[g] += float(q_rot[head * D + j]) * key_val;
-    res_acc[g] += sign_val * float(q_qjl[head * D + j]);
   }
 }
 
 for (int g = 0; g < GQA; ++g) {
   int head = kv_head * GQA + g;
-  scores[head * T + pos] = mse_acc[g] * norm_val + gamma_val * kQjlScale * res_acc[g];
+  scores[head * T + pos] = mse_acc[g] * norm_val;
 }
 ";
 
@@ -1207,29 +1034,12 @@ for (int b = 0; b < 32; ++b) {
 packed[ri * CodeWords + wi] = word;
 ";
 
-const TURBOQUANT_PACK_SIGNS_KERNEL_SOURCE: &str = r"
-int bi = int(thread_position_in_grid.x);
-int ri = int(thread_position_in_grid.y);
-if (bi >= SignBytes || ri >= N) return;
-
-uint8_t out = 0;
-for (int b = 0; b < 8; ++b) {
-    int dim = bi * 8 + b;
-    if (dim >= D) break;
-    if (uint(signs[ri * D + dim]) != 0u) out |= uint8_t(1u << b);
-}
-packed[ri * SignBytes + bi] = out;
-";
-
 #[allow(unsafe_code)]
 fn create_scores_kernel() -> mlx_sys::mlx_fast_metal_kernel {
-    let input_names: [&std::ffi::CStr; 9] = [
+    let input_names: [&std::ffi::CStr; 6] = [
         c"q_rot",
-        c"q_qjl",
         c"k_codes",
         c"k_norms",
-        c"k_qjl",
-        c"k_gammas",
         c"key_centroids",
         c"Capacity",
         c"T",
@@ -1304,7 +1114,6 @@ fn configure_scores_kernel(
     seq_len: i32,
     key_bits: u8,
     key_code_words: i32,
-    sign_bytes: i32,
 ) -> mlx_sys::mlx_fast_metal_kernel_config {
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
@@ -1328,11 +1137,6 @@ fn configure_scores_kernel(
             config,
             c"KWords".as_ptr(),
             key_code_words,
-        );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config,
-            c"QBytes".as_ptr(),
-            sign_bytes,
         );
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, seq_len, num_kv_heads, 1);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
@@ -1451,35 +1255,6 @@ fn create_pack_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 }
 
 #[allow(unsafe_code)]
-fn create_pack_signs_kernel() -> mlx_sys::mlx_fast_metal_kernel {
-    let input_names: [&std::ffi::CStr; 2] = [c"signs", c"N"];
-    let output_names: [&std::ffi::CStr; 1] = [c"packed"];
-    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|name| name.as_ptr()).collect();
-    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|name| name.as_ptr()).collect();
-    let source =
-        CString::new(TURBOQUANT_PACK_SIGNS_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
-
-    unsafe {
-        let in_vec =
-            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
-        let out_vec =
-            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
-        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
-            c"turboquant_pack_signs".as_ptr(),
-            in_vec,
-            out_vec,
-            source.as_ptr(),
-            c"".as_ptr(),
-            true,
-            false,
-        );
-        mlx_sys::mlx_vector_string_free(in_vec);
-        mlx_sys::mlx_vector_string_free(out_vec);
-        kernel
-    }
-}
-
-#[allow(unsafe_code)]
 fn configure_pack_kernel(
     n: i32,
     head_dim: i32,
@@ -1507,33 +1282,6 @@ fn configure_pack_kernel(
             shape.as_ptr(),
             shape.len(),
             mlx_sys::mlx_dtype__MLX_UINT32,
-        );
-        config
-    }
-}
-
-#[allow(unsafe_code)]
-fn configure_pack_signs_kernel(
-    n: i32,
-    head_dim: i32,
-    sign_bytes: i32,
-) -> mlx_sys::mlx_fast_metal_kernel_config {
-    unsafe {
-        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"D".as_ptr(), head_dim);
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config,
-            c"SignBytes".as_ptr(),
-            sign_bytes,
-        );
-        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, sign_bytes, n, 1);
-        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
-        let shape = [n, sign_bytes];
-        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
-            config,
-            shape.as_ptr(),
-            shape.len(),
-            mlx_sys::mlx_dtype__MLX_UINT8,
         );
         config
     }
@@ -1585,51 +1333,6 @@ pub(crate) fn pack_indices_gpu(
     result
 }
 
-/// Pack bool signs into bit-packed u8 bytes on GPU.
-///
-/// Input: `signs` `[N, D]` bool (stored as uint8 in MLX).
-/// Output: `[N, sign_bytes]` uint8.
-#[allow(unsafe_code)]
-pub(crate) fn pack_signs_gpu(
-    signs: &Array,
-    n: i32,
-    head_dim: i32,
-    sign_bytes: i32,
-) -> Result<Array, Exception> {
-    ensure_ffi_error_handler();
-
-    let stream = Stream::task_local_or_default();
-    let kernel = PACK_SIGNS_KERNEL.get_or_init(|| CachedMetalKernel(create_pack_signs_kernel()));
-    let config = configure_pack_signs_kernel(n, head_dim, sign_bytes);
-
-    let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n) };
-    let input_ptrs = [signs.as_ptr(), n_scalar];
-    let inputs_vec =
-        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
-
-    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
-    let status = unsafe {
-        mlx_sys::mlx_fast_metal_kernel_apply(
-            &raw mut outputs_vec,
-            kernel.0,
-            inputs_vec,
-            config,
-            stream.as_ptr(),
-        )
-    };
-
-    let result = extract_single_output(status, outputs_vec, "turboquant_pack_signs");
-
-    unsafe {
-        mlx_sys::mlx_fast_metal_kernel_config_free(config);
-        mlx_sys::mlx_vector_array_free(inputs_vec);
-        mlx_sys::mlx_vector_array_free(outputs_vec);
-        mlx_sys::mlx_array_free(n_scalar);
-    }
-
-    result
-}
-
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -1661,14 +1364,6 @@ mod tests {
             let unpacked: Vec<u8> = (0..128).map(|i| unpack_index(&packed, i, bits)).collect();
             assert_eq!(indices, unpacked, "roundtrip failed for {bits}-bit");
         }
-    }
-
-    #[test]
-    fn test_pack_unpack_signs_roundtrip() {
-        let signs: Vec<bool> = (0..128).map(|i| i % 3 != 0).collect();
-        let packed = pack_signs(signs.iter().copied());
-        let unpacked: Vec<bool> = (0..128).map(|i| unpack_sign(&packed, i)).collect();
-        assert_eq!(signs, unpacked);
     }
 
     // ── Orthogonal matrix properties ────────────────────────────────────
@@ -1751,11 +1446,11 @@ mod tests {
                 total_cos += f64::from(cos);
             }
             let avg_cos = total_cos / n as f64;
-            // Key uses bits-1 for codes but QJL residual correction compensates
+            // Key uses bits-1 for codes (MSE-only, no QJL correction)
             let min_cos = match bits {
-                2 => 0.60,
-                3 => 0.80,
-                4 => 0.90,
+                2 => 0.50,
+                3 => 0.75,
+                4 => 0.88,
                 _ => unreachable!(),
             };
             assert!(
@@ -1966,12 +1661,6 @@ mod tests {
                         batch.norms[idx],
                         scalar.norm,
                     );
-                    assert!(
-                        (batch.gammas[idx] - scalar.gamma).abs() < 1e-4,
-                        "{bits}b h={h} t={t}: gamma mismatch {} vs {}",
-                        batch.gammas[idx],
-                        scalar.gamma,
-                    );
 
                     let code_start = idx * batch.key_code_bytes;
                     let code_end = code_start + batch.key_code_bytes;
@@ -1979,14 +1668,6 @@ mod tests {
                         &batch.packed_codes[code_start..code_end],
                         &scalar.codes[..],
                         "{bits}b h={h} t={t}: key codes mismatch",
-                    );
-
-                    let sign_start = idx * batch.sign_bytes;
-                    let sign_end = sign_start + batch.sign_bytes;
-                    assert_eq!(
-                        &batch.packed_signs[sign_start..sign_end],
-                        &scalar.qjl_signs[..],
-                        "{bits}b h={h} t={t}: QJL signs mismatch",
                     );
                 }
             }
@@ -2032,38 +1713,6 @@ mod tests {
 
             assert_eq!(gpu_data, &cpu_words[..], "GPU pack mismatch for {bits}-bit",);
         }
-    }
-
-    #[test]
-    fn test_gpu_pack_signs_matches_cpu() {
-        let dim = 128_i32;
-        let n = 16_i32;
-        let sign_bytes = packed_sign_bytes(dim as usize).unwrap();
-
-        // Generate deterministic signs: alternating pattern
-        let signs_bool: Vec<bool> = (0..(n * dim) as u32).map(|i| i % 3 != 0).collect();
-
-        // CPU pack
-        let mut cpu_packed = vec![0_u8; (n as usize) * (sign_bytes as usize)];
-        for row in 0..n as usize {
-            let row_start = row * dim as usize;
-            let out_start = row * sign_bytes as usize;
-            pack_bool_signs(
-                &signs_bool[row_start..row_start + dim as usize],
-                &mut cpu_packed[out_start..out_start + sign_bytes as usize],
-            );
-        }
-
-        // GPU pack: create bool array from u8 (MLX bool == uint8)
-        let signs_u8: Vec<u8> = signs_bool.iter().map(|&b| b as u8).collect();
-        let signs_arr = Array::from_slice(&signs_u8, &[n, dim])
-            .as_dtype(Dtype::Bool)
-            .unwrap();
-        let gpu_packed = pack_signs_gpu(&signs_arr, n, dim, sign_bytes).unwrap();
-        gpu_packed.eval().unwrap();
-        let gpu_data = gpu_packed.as_slice::<u8>();
-
-        assert_eq!(gpu_data, &cpu_packed[..], "GPU sign pack mismatch");
     }
 
     #[test]
@@ -2132,12 +1781,9 @@ mod tests {
             let cpu_result = ctx.quantize_keys_batch(&keys).unwrap();
 
             // GPU path (codes are u32 words now)
-            let (gpu_norms, gpu_gammas, gpu_codes, gpu_signs) =
-                ctx.quantize_keys_gpu(&keys).unwrap();
+            let (gpu_norms, _gpu_gammas, gpu_codes) = ctx.quantize_keys_gpu(&keys).unwrap();
             gpu_norms.eval().unwrap();
-            gpu_gammas.eval().unwrap();
             gpu_codes.eval().unwrap();
-            gpu_signs.eval().unwrap();
 
             // Compare norms
             for (i, (gpu, cpu)) in gpu_norms
@@ -2152,19 +1798,6 @@ mod tests {
                 );
             }
 
-            // Compare gammas
-            for (i, (gpu, cpu)) in gpu_gammas
-                .as_slice::<f32>()
-                .iter()
-                .zip(cpu_result.gammas.iter())
-                .enumerate()
-            {
-                assert!(
-                    (gpu - cpu).abs() < 1e-4,
-                    "{bits}b gamma[{i}]: gpu={gpu} vs cpu={cpu}",
-                );
-            }
-
             // Reinterpret CPU bytes as u32 words for comparison
             let cpu_code_words: Vec<u32> = cpu_result
                 .packed_codes
@@ -2175,11 +1808,6 @@ mod tests {
                 gpu_codes.as_slice::<u32>(),
                 &cpu_code_words[..],
                 "{bits}b: GPU key codes mismatch",
-            );
-            assert_eq!(
-                gpu_signs.as_slice::<u8>(),
-                &cpu_result.packed_signs[..],
-                "{bits}b: GPU key signs mismatch",
             );
         }
     }

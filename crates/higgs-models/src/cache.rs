@@ -59,7 +59,6 @@ pub struct TurboQuantKvView {
     pub context: Arc<TurboQuantContext>,
     pub key_codes: Array,
     pub key_norms: Array,
-    pub key_qjl_signs: Array,
     pub key_gammas: Array,
     pub value_codes: Array,
     pub value_norms: Array,
@@ -75,12 +74,10 @@ impl TurboQuantKvView {
         let key_code_words = usize_from_i32(self.context.key_code_words, "key_code_words")?;
         let value_code_bytes = usize_from_i32(self.context.value_code_bytes, "value_code_bytes")?;
         let value_code_words = usize_from_i32(self.context.value_code_words, "value_code_words")?;
-        let sign_bytes = usize_from_i32(self.context.sign_bytes, "sign_bytes")?;
 
         // Eval all view arrays — they may be lazy GPU results from the pack kernel.
         self.key_codes.eval()?;
         self.key_norms.eval()?;
-        self.key_qjl_signs.eval()?;
         self.key_gammas.eval()?;
         self.value_codes.eval()?;
         self.value_norms.eval()?;
@@ -89,7 +86,6 @@ impl TurboQuantKvView {
         let key_codes_u32 = self.key_codes.as_slice::<u32>();
         let key_codes_u8: Vec<u8> = key_codes_u32.iter().flat_map(|w| w.to_le_bytes()).collect();
         let key_norms = self.key_norms.as_slice::<f32>();
-        let key_qjl_signs = self.key_qjl_signs.as_slice::<u8>();
         let key_gammas = self.key_gammas.as_slice::<f32>();
         let value_codes_u32 = self.value_codes.as_slice::<u32>();
         let value_codes_u8: Vec<u8> = value_codes_u32
@@ -116,8 +112,6 @@ impl TurboQuantKvView {
                 )?;
                 let key_byte_start = checked_mul(scalar_index, key_row_bytes, "key code index")?;
                 let key_byte_end = checked_add(key_byte_start, key_code_bytes, "key code range")?;
-                let sign_start = checked_mul(scalar_index, sign_bytes, "key sign index")?;
-                let sign_end = checked_add(sign_start, sign_bytes, "key sign range")?;
                 let value_byte_start =
                     checked_mul(scalar_index, value_row_bytes, "value code index")?;
                 let value_byte_end =
@@ -127,7 +121,6 @@ impl TurboQuantKvView {
                     norm: key_norms[scalar_index],
                     gamma: key_gammas[scalar_index],
                     codes: key_codes_u8[key_byte_start..key_byte_end].to_vec(),
-                    qjl_signs: key_qjl_signs[sign_start..sign_end].to_vec(),
                 };
                 let value = QuantizedValue {
                     norm: value_norms[scalar_index],
@@ -162,15 +155,11 @@ impl TurboQuantKvView {
             .as_dtype(Dtype::Float32)?
             .reshape(&[num_heads, self.context.head_dim])?;
         let q_rot = self.context.rotate_queries(&queries)?;
-        let q_qjl = self.context.project_queries_qjl(&queries)?;
 
         crate::turboquant::decode_scores(
             &q_rot,
-            &q_qjl,
             &self.key_codes,
             &self.key_norms,
-            &self.key_qjl_signs,
-            &self.key_gammas,
             &self.context.key_centroids_array()?,
             num_heads,
             self.context.num_kv_heads,
@@ -179,7 +168,6 @@ impl TurboQuantKvView {
             self.seq_len,
             self.context.config.key_bits(),
             self.context.key_code_words,
-            self.context.sign_bytes,
         )
     }
 
@@ -360,12 +348,11 @@ pub struct SteppingKeyValueCache {
 #[derive(Debug, Clone)]
 struct TurboQuantStorage {
     context: Arc<TurboQuantContext>,
-    key_codes: Option<Array>,     // [H, capacity, key_code_words] u32
-    key_norms: Option<Array>,     // [H, capacity] f32
-    key_qjl_signs: Option<Array>, // [H, capacity, sign_bytes] u8
-    key_gammas: Option<Array>,    // [H, capacity] f32
-    value_codes: Option<Array>,   // [H, capacity, value_code_words] u32
-    value_norms: Option<Array>,   // [H, capacity] f32
+    key_codes: Option<Array>,   // [H, capacity, key_code_words] u32
+    key_norms: Option<Array>,   // [H, capacity] f32
+    key_gammas: Option<Array>,  // [H, capacity] f32
+    value_codes: Option<Array>, // [H, capacity, value_code_words] u32
+    value_norms: Option<Array>, // [H, capacity] f32
     capacity: i32,
 }
 
@@ -463,13 +450,12 @@ impl SteppingKeyValueCache {
     // -- TurboQuant prefix-cache helpers ----------------------------------------
 
     /// Read-only access to internal TQ arrays (for prefix cache block slicing).
-    /// Returns `(context, key_codes, key_norms, key_gammas, key_qjl_signs, value_codes, value_norms)`.
+    /// Returns `(context, key_codes, key_norms, key_gammas, value_codes, value_norms)`.
     #[allow(clippy::type_complexity)]
     pub fn turbo_arrays(
         &self,
     ) -> Option<(
         &Arc<TurboQuantContext>,
-        &Array,
         &Array,
         &Array,
         &Array,
@@ -482,7 +468,6 @@ impl SteppingKeyValueCache {
             t.key_codes.as_ref()?,
             t.key_norms.as_ref()?,
             t.key_gammas.as_ref()?,
-            t.key_qjl_signs.as_ref()?,
             t.value_codes.as_ref()?,
             t.value_norms.as_ref()?,
         ))
@@ -494,7 +479,6 @@ impl SteppingKeyValueCache {
         key_codes: Array,
         key_norms: Array,
         key_gammas: Array,
-        key_qjl_signs: Array,
         value_codes: Array,
         value_norms: Array,
         offset: i32,
@@ -507,7 +491,6 @@ impl SteppingKeyValueCache {
                 context,
                 key_codes: Some(key_codes),
                 key_norms: Some(key_norms),
-                key_qjl_signs: Some(key_qjl_signs),
                 key_gammas: Some(key_gammas),
                 value_codes: Some(value_codes),
                 value_norms: Some(value_norms),
@@ -657,7 +640,6 @@ impl TurboQuantStorage {
             context,
             key_codes: None,
             key_norms: None,
-            key_qjl_signs: None,
             key_gammas: None,
             value_codes: None,
             value_norms: None,
@@ -684,12 +666,6 @@ impl TurboQuantStorage {
             old_cap,
             &[h, new_cap],
             Dtype::Float32,
-        )?);
-        self.key_qjl_signs = Some(grow_array(
-            self.key_qjl_signs.take(),
-            old_cap,
-            &[h, new_cap, self.context.sign_bytes],
-            Dtype::Uint8,
         )?);
         self.key_gammas = Some(grow_array(
             self.key_gammas.take(),
@@ -746,7 +722,7 @@ impl TurboQuantStorage {
 
         // GPU quantize → lazy Arrays (no eval, no CPU readback)
         let (v_norms, v_codes) = self.context.quantize_values_gpu(&values_3d)?;
-        let (k_norms, k_gammas, k_codes, k_signs) = self.context.quantize_keys_gpu(&keys_3d)?;
+        let (k_norms, k_gammas, k_codes) = self.context.quantize_keys_gpu(&keys_3d)?;
 
         // slice_update into pre-allocated storage (all lazy GPU ops)
         let err = || Exception::custom("TurboQuant storage not allocated");
@@ -785,13 +761,6 @@ impl TurboQuantStorage {
             prev,
             new_tokens,
         )?);
-        self.key_qjl_signs = Some(slice_update_axis(
-            self.key_qjl_signs.as_ref().ok_or_else(err)?,
-            &k_signs,
-            1,
-            prev,
-            new_tokens,
-        )?);
 
         self.view(prev + new_tokens)
     }
@@ -802,7 +771,6 @@ impl TurboQuantStorage {
             context: Arc::clone(&self.context),
             key_codes: slice_axis(self.key_codes.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
             key_norms: slice_axis(self.key_norms.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
-            key_qjl_signs: slice_axis(self.key_qjl_signs.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
             key_gammas: slice_axis(self.key_gammas.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
             value_codes: slice_axis(self.value_codes.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
             value_norms: slice_axis(self.value_norms.as_ref().ok_or_else(err)?, 1, 0, seq_len)?,
@@ -811,14 +779,11 @@ impl TurboQuantStorage {
     }
 
     fn eval_targets(&self) -> Vec<&Array> {
-        let mut targets = Vec::with_capacity(6);
+        let mut targets = Vec::with_capacity(5);
         if let Some(ref a) = self.key_codes {
             targets.push(a);
         }
         if let Some(ref a) = self.key_norms {
-            targets.push(a);
-        }
-        if let Some(ref a) = self.key_qjl_signs {
             targets.push(a);
         }
         if let Some(ref a) = self.key_gammas {
