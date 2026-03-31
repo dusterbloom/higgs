@@ -23,9 +23,16 @@
 ### 3. Diffusion LM ANE Engine (`diffusion.rs` + `diffusion_ane.rs`)
 - `AneDiffusionEngine::new(engine, seq_len)` compiles 28 fused BLOBFILE kernels
 - Each kernel = full transformer layer: RMSNorm→QKV→QKnorm→RoPE→SDPA→Wo→residual→RMSNorm→FFN→residual
-- 104 tok/s at seq=128, 3.6W system power, 35 mJ/token
+- 99-104 tok/s at seq=128, 3.6W system power, 35 mJ/token
 - Layer 0 does full compile, layers 1-27 use `patch_from_donor` (fast)
 - **First diffusion LM on ANE ever**
+
+### 4. Multi-dispatch generators (NEW — `diffusion_ane.rs`)
+- `gen_diffusion_attention()` — attention-only MIL (9 BLOBFILEs, ~12MB at dim=1024)
+- `gen_diffusion_ffn()` — FFN-only MIL (4 BLOBFILEs, ~18MB at dim=1024)
+- Chained output is **bit-identical** to fused (max_err = 0.000000)
+- 55 tok/s at seq=128 (1.81x overhead vs fused due to 56 vs 28 dispatches)
+- Each extra dispatch costs ~564µs (490µs hardware floor + I/O copy)
 
 ## Key Architecture Decisions
 
@@ -36,11 +43,18 @@
 - **concat op fails on `_ANEClient` path** — must use `_ANEInMemoryModel` (compile_multi_weights)
 - **~490µs dispatch floor** — hardware scheduling overhead per eval()
 - **Channel-first layout**: IOSurface is `[1, channels, 1, spatial]` fp32
+- **Int8 BLOBFILE: DEAD** — `tensor<int8>` rejected by `ANECCompile()`, `constexpr_affine_dequantize` also rejected. Tested 3 patterns (cast, dequant matmul, dequant conv1x1). nanobot-rs code is dead/untested. Not a viable path.
 
 ### BLAS vs ANE Crossover
 - **seq=1**: BLAS wins (130µs vs 224µs) — ANE dispatch overhead dominates
 - **seq≥16**: ANE wins (2.6x at seq=16, 4.4x at seq=128)
 - **Diffusion LMs operate at seq=64-128** → ANE sweet spot
+
+### Multi-dispatch vs Fused (benchmarked)
+- **Fused (1 dispatch/layer)**: 99 tok/s, 19.4ms/step — use when layer fits under 32MB
+- **Multi-dispatch (2 dispatches/layer)**: 55 tok/s, 35.2ms/step — use when layer > 32MB
+- Overhead: 1.81x (extra dispatch + IOSurface read/write between kernels)
+- Correctness: bit-identical (fp16→fp32→fp16 round-trip is lossless)
 
 ### Weight Blob Layout
 - PyTorch stores `[out_features, in_features]`
@@ -54,7 +68,7 @@
 | File | Purpose | Status |
 |------|---------|--------|
 | `crates/higgs-models/src/diffusion.rs` | BLAS engine + AneDiffusionEngine | ✅ Working |
-| `crates/higgs-models/src/diffusion_ane.rs` | `gen_fused_diffusion_layer()` MIL generator | ✅ Working |
+| `crates/higgs-models/src/diffusion_ane.rs` | `gen_fused_diffusion_layer()` + `gen_diffusion_attention()` + `gen_diffusion_ffn()` | ✅ Working |
 | `crates/higgs-models/src/rwkv7.rs` | RWKV-7 CPU model + AneContext | ✅ Working |
 | `crates/higgs-models/src/ane_bridge.rs` | ANE FFI bridge (compile, eval, IOSurface, blobs) | ✅ Working |
 | `crates/higgs-models/src/ane_mil.rs` | MIL codegen (blobfile_matmul, fused_qkv, etc.) | ✅ Working |
@@ -63,42 +77,38 @@
 
 ## What to Build Next (Priority Order)
 
-### 1. Int8 BLOBFILE Weights (1-2 days, Sonnet can do with clear spec)
+### ~~1. Int8 BLOBFILE Weights~~ — DEAD END
+**Confirmed dead**: ANE's raw MIL compiler (`_ANEDesc modelWithMILText:`) rejects `tensor<int8>` entirely. Three patterns tested:
+1. `tensor<int8>` + `cast(dtype="fp16")` → InvalidMILProgram
+2. `tensor<int8>` + `constexpr_affine_dequantize` (matmul) → InvalidMILProgram
+3. `tensor<int8>` + `constexpr_affine_dequantize` (conv1x1, nanobot-rs pattern) → InvalidMILProgram
 
-**Goal**: Halve BLOBFILE size → fit 1.2B models in 32MB limit.
+The nanobot-rs `gen_conv1x1_int8_blob()` at `ane_mil.rs:4318` was never called in production — dead code.
 
-**How**: In `diffusion_ane.rs`, change each BLOBFILE const from:
-```mil
-tensor<fp16, [1,1,{ic},{oc}]> W = const()[name=string("W"),
-  val=tensor<fp16, [1,1,{ic},{oc}]>(BLOBFILE(...))]
-```
-to:
-```mil
-tensor<int8, [1,1,{ic},{oc}]> W_int8 = const()[name=string("Wi"),
-  val=tensor<int8, [1,1,{ic},{oc}]>(BLOBFILE(...))]
-fp16 W_scale = const()[name=string("Ws"), val=fp16({scale})]
-fp16 W_zero = const()[name=string("Wz"), val=fp16(0)]
-tensor<fp16, [1,1,{ic},{oc}]> W = constexpr_affine_dequantize(
-  quantized_data=W_int8, scale=W_scale, zero_point=W_zero, axis=0)
-```
-
-Use `build_weight_blob_quantized(weights, rows, cols)` which returns `(blob, scale)`.
-
-**Test**: Compare int8 logits vs fp16 logits — max error should be < 1.0.
-
-### 2. LLaDA-MoE-7B-A1B on ANE (1 week, needs Opus for architecture)
+### 1. LLaDA-MoE-7B-A1B on ANE (needs Opus for architecture)
 
 **Model**: `inclusionAI/LLaDA-MoE-7B-A1B-Instruct` — config already downloaded.
 - hidden=2048, 16 layers, 16 heads (MHA), 64 experts, 8 active per token
 - expert_intermediate=1024 (tiny!), dense_intermediate=8192
 
-**Architecture**:
-- Attention kernel (int8): ~16MB → fits one kernel
-- MLP experts: 8 active × 3 × 2048 × 1024 = ~50MB fp16, ~25MB int8 → fits one kernel
-- 2 dispatches/layer × 16 layers = 32 dispatches
-- Estimated: ~100 tok/s at seq=128
+**Problem**: dim=2048 MHA doesn't fit in 2 dispatches:
+- Attention: 4 × 2048×2048 × fp16 = 32MB exactly + norms/RoPE → **33.6MB (over limit)**
+- FFN MoE: 8 active experts × 3 × 2048×1024 × fp16 = **100.7MB (way over)**
 
-**Needs**: Expert routing on CPU (top-8 selection), expert weight gathering, new MIL for MoE MLP.
+**Possible architectures** (needs investigation):
+- **3+ dispatches/layer**: Split attention into (QKV dispatch ~24MB) + (SDPA+Wo dispatch ~8MB). Split MoE into per-expert dispatches (~12.6MB each). Total: ~3 attn + 8 expert = 11 dispatches/layer × 16 layers = 176 dispatches. At 564µs/dispatch = ~99ms/step. At seq=128, 64 steps → ~1.6 tok/s. **Probably too slow.**
+- **Hybrid CPU+ANE**: Do expert routing + MoE on CPU (BLAS), attention on ANE. More practical.
+- **Wait for smaller diffusion MoE models**: dim=1024 MoE would fit fused.
+
+**Needs**: Weights downloaded, expert routing implementation, MoE MIL generator.
+
+### 2. Wire Multi-dispatch into AneDiffusionEngine (Sonnet can do)
+
+Currently `AneDiffusionEngine::new()` only uses `gen_fused_diffusion_layer()`. Add a fallback path:
+- If `gen_fused` BLOBFILE total > 32MB → use `gen_diffusion_attention` + `gen_diffusion_ffn`
+- Compile 2 kernels instead of 1
+- Forward loop: reload_weights for attn → eval → read → reload_weights for FFN → eval → read
+- This makes the engine work for any model dim without changing the public API
 
 ### 3. LoRA Training on ANE (2 weeks, needs Opus)
 
@@ -120,6 +130,9 @@ cargo test -p higgs-models --release -- diffusion::tests::test_generate --nocapt
 
 # ANE fused layer benchmark (needs --features ane)
 cargo test -p higgs-models --features ane --release -- diffusion_ane::tests::test_fused_layer --nocapture
+
+# ANE multi-dispatch correctness + benchmark
+cargo test -p higgs-models --features ane --release -- diffusion_ane::tests::test_multi_dispatch_vs_fused --nocapture
 
 # ANE E2E generate
 cargo test -p higgs-models --features ane --release -- diffusion::tests::test_ane_generate --nocapture
@@ -143,14 +156,22 @@ cargo test -p higgs-models --features ane --release -- ane_mil::tests::test_blas
 |--------|-------|-------|----------|----------|
 | BLAS sgemv | RWKV-7 1.5B (decode, seq=1) | 11.5 | 341 | 3.9 |
 | BLAS sgemm | Qwen3-0.6B diffusion (seq=128) | 10 | 354 | 3.5 |
-| **ANE fused** | **Qwen3-0.6B diffusion (seq=128)** | **104** | **35** | **3.6** |
+| **ANE fused** | **Qwen3-0.6B diffusion (seq=128)** | **99-104** | **35** | **3.6** |
+| ANE multi-dispatch | Qwen3-0.6B diffusion (seq=128) | 55 | ~65 | ~3.6 |
+
+### Multi-dispatch overhead breakdown
+| Dispatches | Time (28 layers) | tok/s (64-step) | Per-dispatch |
+|-----------|-----------------|-----------------|-------------|
+| 28 (fused) | 19.4ms | 99 | 693µs |
+| 56 (multi) | 35.2ms | 55 | 629µs |
+| Delta: +28 | +15.8ms | -44 | ~564µs/extra |
 
 ## Agent Delegation Guide
 
 **Opus**: Architecture decisions, debugging ANE compile failures, MoE expert routing design, MIL program generation for new architectures. Use sparingly.
 
 **Sonnet**: Well-specified coding tasks with clear input/output. Good for:
-- Int8 BLOBFILE swap (spec above is complete)
+- Wiring multi-dispatch into `AneDiffusionEngine` (fallback path)
 - Writing new tests
 - Wiring existing components together
 - Weight extraction for new models
