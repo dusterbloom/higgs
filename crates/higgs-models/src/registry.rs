@@ -32,6 +32,7 @@ pub fn is_supported(model_type: &str) -> bool {
             | "starcoder2"
             | "llava-qwen2"
             | "deepseek_v2"
+            | "rwkv7"
     )
 }
 

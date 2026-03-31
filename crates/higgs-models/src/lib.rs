@@ -10,6 +10,18 @@ pub mod registry;
 pub mod siglip;
 pub mod starcoder2;
 pub mod transformer;
+pub mod rwkv7;
+pub mod diffusion;
+#[cfg(feature = "ane")]
+pub mod diffusion_ane;
+#[cfg(feature = "ane")]
+pub mod ane_bridge;
+#[cfg(feature = "ane")]
+pub mod ane_extract;
+#[cfg(feature = "ane")]
+pub mod ane_forward;
+#[cfg(feature = "ane")]
+pub mod ane_mil;
 pub mod turboquant;
 pub mod utils;
 
@@ -88,6 +100,8 @@ pub enum AnyCache {
     KV(Vec<Option<cache::SteppingKeyValueCache>>),
     /// Hybrid KV+SSM cache for `qwen3_next`.
     Hybrid(Vec<Option<LayerCache>>),
+    /// Recurrent state for RWKV-7 (fixed size per layer, no KV).
+    Rwkv7(Vec<Option<rwkv7::Rwkv7LayerState>>),
 }
 
 /// Unified model wrapper dispatching to the correct architecture.
@@ -108,6 +122,8 @@ pub enum AnyModel {
     LlavaQwen2(llava_qwen2::LlavaQwen2Model),
     /// DeepSeek-V2 with Multi-head Latent Attention and sparse `MoE`.
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
+    /// RWKV-7 recurrent language model (no attention, fixed-size state).
+    Rwkv7(rwkv7::Rwkv7CausalLM),
 }
 
 fn checked_head_dim(hidden_size: i32, num_attention_heads: i32) -> Result<i32, Exception> {
@@ -189,6 +205,7 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
+            (Self::Rwkv7(m), AnyCache::Rwkv7(c)) => m.forward(inputs, c),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -209,6 +226,7 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_hidden(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
+            (Self::Rwkv7(m), AnyCache::Rwkv7(c)) => m.forward_hidden(inputs, c),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -238,6 +256,12 @@ impl AnyModel {
         // also handles SSM/conv state eval.
         if let (Self::Qwen3Next(m), AnyCache::Hybrid(c)) = (&mut *self, &mut *cache) {
             return m.forward_chunked(inputs, None, c, chunk_size);
+        }
+
+        // For RWKV-7, delegate to the model's own chunked prefill which
+        // evaluates recurrent state between chunks.
+        if let (Self::Rwkv7(m), AnyCache::Rwkv7(c)) = (&mut *self, &mut *cache) {
+            return m.forward_chunked(inputs, c, chunk_size);
         }
 
         // Generic path for all KV-only models.
@@ -275,9 +299,9 @@ impl AnyModel {
         for cache in caches.iter_mut() {
             match cache {
                 AnyCache::KV(kv) => kv_refs.push(kv),
-                AnyCache::Hybrid(_) => {
+                AnyCache::Hybrid(_) | AnyCache::Rwkv7(_) => {
                     return Err(Exception::custom(
-                        "Batched forward not supported for Hybrid cache",
+                        "Batched forward not supported for Hybrid/RWKV-7 cache",
                     ));
                 }
             }
@@ -291,7 +315,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom(
+            | Self::DeepSeekV2(_)
+            | Self::Rwkv7(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer models",
             )),
         }
@@ -371,6 +396,7 @@ impl AnyModel {
             Self::Starcoder2(m) => m.args.hidden_size,
             Self::LlavaQwen2(m) => m.hidden_size(),
             Self::DeepSeekV2(m) => m.args.hidden_size,
+            Self::Rwkv7(m) => m.args.hidden_size,
         }
     }
 
@@ -475,6 +501,14 @@ impl AnyModel {
                     Ok(AnyCache::Hybrid(m.make_cache()))
                 }
             }
+            Self::Rwkv7(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not supported for RWKV-7 models (no KV cache)",
+                    ));
+                }
+                Ok(AnyCache::Rwkv7(m.make_cache()))
+            }
         }
     }
 
@@ -493,7 +527,8 @@ impl AnyModel {
             | Self::Gemma2(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
-            | Self::DeepSeekV2(_) => None,
+            | Self::DeepSeekV2(_)
+            | Self::Rwkv7(_) => None,
         }
     }
 
@@ -1220,7 +1255,7 @@ mod tests {
         let cache = AnyCache::KV(vec![None, Some(cache::SteppingKeyValueCache::new())]);
         match &cache {
             AnyCache::KV(layers) => assert_eq!(layers.len(), 2),
-            AnyCache::Hybrid(_) => panic!("Expected KV variant"),
+            AnyCache::Hybrid(_) | AnyCache::Rwkv7(_) => panic!("Expected KV variant"),
         }
     }
 
@@ -1240,7 +1275,7 @@ mod tests {
                     assert!(c.is_some());
                 }
             }
-            AnyCache::Hybrid(_) => panic!("Expected KV variant"),
+            AnyCache::Hybrid(_) | AnyCache::Rwkv7(_) => panic!("Expected KV variant"),
         }
     }
 
@@ -1249,7 +1284,7 @@ mod tests {
         let cache = super::make_kv_cache(0);
         match &cache {
             AnyCache::KV(layers) => assert!(layers.is_empty()),
-            AnyCache::Hybrid(_) => panic!("Expected KV variant"),
+            AnyCache::Hybrid(_) | AnyCache::Rwkv7(_) => panic!("Expected KV variant"),
         }
     }
 
@@ -1258,7 +1293,7 @@ mod tests {
         let cache = super::make_kv_cache(-1);
         match &cache {
             AnyCache::KV(layers) => assert!(layers.is_empty()),
-            AnyCache::Hybrid(_) => panic!("Expected KV variant"),
+            AnyCache::Hybrid(_) | AnyCache::Rwkv7(_) => panic!("Expected KV variant"),
         }
     }
 
@@ -1295,7 +1330,7 @@ mod tests {
         let cache = any.make_cache();
         match &cache {
             AnyCache::KV(layers) => assert_eq!(layers.len(), 2),
-            AnyCache::Hybrid(_) => panic!("Expected KV cache for Qwen3Moe"),
+            AnyCache::Hybrid(_) | AnyCache::Rwkv7(_) => panic!("Expected KV cache for Qwen3Moe"),
         }
     }
 
@@ -1316,7 +1351,7 @@ mod tests {
                 assert_eq!(layers.len(), 2);
                 assert!(layers.iter().flatten().all(|cache| cache.is_quantized()));
             }
-            AnyCache::Hybrid(_) => panic!("Expected KV cache for Qwen3Moe"),
+            AnyCache::Hybrid(_) | AnyCache::Rwkv7(_) => panic!("Expected KV cache for Qwen3Moe"),
         }
     }
 

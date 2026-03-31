@@ -84,6 +84,11 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::DeepSeekV2(model))
         }
+        "rwkv7" => {
+            let model = higgs_models::rwkv7::load_rwkv7_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Rwkv7(model))
+        }
         other => Err(EngineError::Model(
             higgs_models::error::ModelError::UnsupportedModel(other.to_owned()),
         )),
