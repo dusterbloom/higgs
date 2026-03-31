@@ -394,268 +394,211 @@ impl DiffusionEngine {
 }
 
 // ---------------------------------------------------------------------------
-// ANE-accelerated engine
+// ANE-accelerated engine — fully-fused (1 dispatch per layer)
 // ---------------------------------------------------------------------------
 
-/// ANE kernels for one layer: 4 dispatches (QKV fused + O + GateUp fused + Down).
+/// ANE kernel for one transformer layer: a single fully-fused dispatch.
+///
+/// The compiled MIL program does everything: RMSNorm → QKV → QK-norm → RoPE →
+/// bidirectional SDPA → Wo → residual → RMSNorm → FFN → residual.
+/// Input and output are both `[1, dim, 1, seq]` fp32 channel-first.
 #[cfg(feature = "ane")]
 pub struct AneLayerKernels {
-    /// Fused QKV: hidden → Q|K|V (3 matmuls, 1 dispatch)
-    pub qkv: crate::ane_bridge::AneKernel,
-    /// O projection: q_dim → hidden
-    pub o_proj: crate::ane_bridge::AneKernel,
-    /// Fused gate+up: hidden → gate|up (2 matmuls, 1 dispatch)
-    pub gate_up: crate::ane_bridge::AneKernel,
-    /// Down projection: inter → hidden
-    pub down: crate::ane_bridge::AneKernel,
+    /// One fully-fused layer kernel: hidden_in → hidden_out.
+    pub fused: crate::ane_bridge::AneKernel,
 }
 
-/// ANE-accelerated diffusion engine. Compiles 3 BLOBFILE kernels per layer (84 total).
+/// ANE-accelerated diffusion engine. Compiles 28 fully-fused layer kernels (1 dispatch/layer).
+///
+/// Each kernel performs the complete transformer layer computation on ANE:
+/// embed → [fused_layer × 28] → final_norm → LM head (CPU).
 #[cfg(feature = "ane")]
 pub struct AneDiffusionEngine {
-    pub blas_engine: DiffusionEngine,  // CPU fallback for attention + norms
+    pub blas_engine: DiffusionEngine,
     pub ane_layers: Vec<AneLayerKernels>,
-    pub seq_len: usize,  // fixed seq for compiled kernels
+    pub seq_len: usize, // fixed seq for compiled kernels (padded to ANE_MIN_SPATIAL)
 }
 
 #[cfg(feature = "ane")]
 impl AneDiffusionEngine {
-    /// Compile ANE kernels for a fixed generation seq_len.
+    /// Compile fully-fused ANE kernels (1 per layer) for a fixed generation seq_len.
     pub fn new(engine: DiffusionEngine, seq_len: usize) -> Result<Self, String> {
         use crate::ane_bridge::{self, AneKernel, build_weight_blob, build_weight_blob_transposed};
-        use crate::ane_mil;
+        use crate::diffusion_ane;
+        use crate::ane_mil::ANE_MIN_SPATIAL;
 
         ane_bridge::ane_init()?;
 
         let cfg = &engine.config;
         let h = cfg.hidden;
-        let q_dim = cfg.heads * cfg.head_dim;
-        let kv_dim = cfg.kv_heads * cfg.head_dim;
+        let hd = cfg.head_dim;
+        let half_hd = hd / 2;
+        let q_dim = cfg.heads * hd;
+        let kv_dim = cfg.kv_heads * hd;
         let inter = cfg.inter;
+        let seq = seq_len.max(ANE_MIN_SPATIAL);
 
-        eprintln!("Compiling {} ANE kernels ({} layers × 4)...", cfg.layers * 4, cfg.layers);
+        eprintln!("Compiling {} fully-fused ANE layer kernels (seq={seq})...", cfg.layers);
         let t0 = std::time::Instant::now();
 
-        let mut ane_layers = Vec::with_capacity(cfg.layers);
-
-        for (i, lw) in engine.layers.iter().enumerate() {
-            // Fused QKV (3 matmuls, 1 dispatch)
-            // MIL weight shape is [1,1,ic,oc]. Weights are [oc,ic] (PyTorch). Use transposed blob.
-            let qkv_mil = ane_mil::gen_fused_qkv_proj(h, q_dim, kv_dim, seq_len);
-            let qkv_blobs = vec![
-                build_weight_blob_transposed(&lw.q_proj, q_dim, h),   // [q_dim,h] → blob as [h,q_dim]
-                build_weight_blob_transposed(&lw.k_proj, kv_dim, h),
-                build_weight_blob_transposed(&lw.v_proj, kv_dim, h),
-            ];
-            let qkv_refs: Vec<&[u8]> = qkv_blobs.iter().map(|b| b.as_slice()).collect();
-            let qkv_names: Vec<&str> = qkv_mil.weight_names.iter().map(|s| s.as_str()).collect();
-            let qkv_kern = AneKernel::compile_multi_weights(
-                &qkv_mil.mil_text, &qkv_names, &qkv_refs,
-                &[qkv_mil.input_bytes], &[qkv_mil.output_bytes],
-            ).map_err(|e| format!("L{i} qkv: {e}"))?;
-
-            // O projection — o_proj is [h, q_dim], MIL needs [q_dim, h] as ic=q_dim, oc=h
-            let o_mil = ane_mil::gen_blobfile_matmul(q_dim, h, seq_len, &format!("L{i}_o"));
-            let o_blob = build_weight_blob_transposed(&lw.o_proj, h, q_dim);
-            let o_names: Vec<&str> = o_mil.weight_names.iter().map(|s| s.as_str()).collect();
-            let o_kern = AneKernel::compile_multi_weights(
-                &o_mil.mil_text, &o_names, &[&o_blob],
-                &[o_mil.input_bytes], &[o_mil.output_bytes],
-            ).map_err(|e| format!("L{i} o: {e}"))?;
-
-            // Fused gate+up (2 matmuls, 1 dispatch)
-            let gu_mil = ane_mil::gen_fused_gate_up_proj(h, inter, seq_len);
-            let gu_blobs = vec![
-                build_weight_blob_transposed(&lw.gate_proj, inter, h),
-                build_weight_blob_transposed(&lw.up_proj, inter, h),
-            ];
-            let gu_refs: Vec<&[u8]> = gu_blobs.iter().map(|b| b.as_slice()).collect();
-            let gu_names: Vec<&str> = gu_mil.weight_names.iter().map(|s| s.as_str()).collect();
-            let gu_kern = AneKernel::compile_multi_weights(
-                &gu_mil.mil_text, &gu_names, &gu_refs,
-                &[gu_mil.input_bytes], &[gu_mil.output_bytes],
-            ).map_err(|e| format!("L{i} gu: {e}"))?;
-
-            // Down projection — down_proj is [h, inter], MIL needs [inter, h]
-            let d_mil = ane_mil::gen_blobfile_matmul(inter, h, seq_len, &format!("L{i}_d"));
-            let d_blob = build_weight_blob_transposed(&lw.down_proj, h, inter);
-            let d_names: Vec<&str> = d_mil.weight_names.iter().map(|s| s.as_str()).collect();
-            let d_kern = AneKernel::compile_multi_weights(
-                &d_mil.mil_text, &d_names, &[&d_blob],
-                &[d_mil.input_bytes], &[d_mil.output_bytes],
-            ).map_err(|e| format!("L{i} d: {e}"))?;
-
-            ane_layers.push(AneLayerKernels { qkv: qkv_kern, o_proj: o_kern, gate_up: gu_kern, down: d_kern });
+        // Precompute RoPE tables once — same for all layers (shared BLOBFILE data).
+        let mut rope_cos = vec![0.0f32; seq * half_hd];
+        let mut rope_sin = vec![0.0f32; seq * half_hd];
+        for pos in 0..seq {
+            for d in 0..half_hd {
+                let freq = 1.0 / (cfg.rope_theta as f32).powf(2.0 * d as f32 / hd as f32);
+                let angle = pos as f32 * freq;
+                rope_cos[pos * half_hd + d] = angle.cos();
+                rope_sin[pos * half_hd + d] = angle.sin();
+            }
         }
 
-        eprintln!("ANE compiled: {} kernels in {}ms", ane_layers.len() * 3, t0.elapsed().as_millis());
+        // Generate the MIL once — identical for all 28 layers (shape-only, no data).
+        let mil = diffusion_ane::gen_fused_diffusion_layer(
+            h, cfg.heads, cfg.kv_heads, hd, inter, seq, 1e-6,
+        );
+        let names: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
 
-        Ok(Self { blas_engine: engine, ane_layers, seq_len })
+        // Build the RoPE blobs once (layout: [seq, half_hd] row-major).
+        let rope_cos_blob = build_weight_blob(&rope_cos, seq, half_hd);
+        let rope_sin_blob = build_weight_blob(&rope_sin, seq, half_hd);
+
+        let mut ane_layers = Vec::with_capacity(cfg.layers);
+        let mut first_kernel: Option<AneKernel> = None;
+
+        for (i, lw) in engine.layers.iter().enumerate() {
+            // Build 13 weight blobs for this layer.
+            //
+            // Layout rules:
+            //   build_weight_blob(w, rows, cols)            → blob [rows, cols] row-major (as fp16)
+            //   build_weight_blob_transposed(w, rows, cols) → blob [cols, rows] transposed (as fp16)
+            //
+            // PyTorch projection weights are stored as [out, in]. The MIL matmul expects
+            // the weight tensor as [1, 1, in_ch, out_ch] (i.e. [ic, oc]).
+            // build_weight_blob_transposed(w, out, in) → transposes [out,in] to [in,out] = [ic,oc]. ✓
+            //
+            // Norm weights are 1-D [dim] vectors, stored as [1, dim, 1, 1] in MIL.
+            // build_weight_blob(w, 1, dim) packs them correctly.
+            let blobs: Vec<Vec<u8>> = vec![
+                build_weight_blob(&lw.input_norm, 1, h),                          // rms_att  [1,dim,1,1]
+                build_weight_blob(&lw.post_attn_norm, 1, h),                      // rms_ffn  [1,dim,1,1]
+                build_weight_blob_transposed(&lw.q_proj, q_dim, h),               // wq       [dim,q_dim]
+                build_weight_blob_transposed(&lw.k_proj, kv_dim, h),              // wk       [dim,kv_dim]
+                build_weight_blob_transposed(&lw.v_proj, kv_dim, h),              // wv       [dim,kv_dim]
+                build_weight_blob_transposed(&lw.o_proj, h, q_dim),               // wo       [q_dim,dim]
+                build_weight_blob_transposed(&lw.gate_proj, inter, h),            // gate     [dim,inter]
+                build_weight_blob_transposed(&lw.up_proj, inter, h),              // up       [dim,inter]
+                build_weight_blob_transposed(&lw.down_proj, h, inter),            // down     [inter,dim]
+                rope_cos_blob.clone(),                                              // rope_cos [seq,half_hd]
+                rope_sin_blob.clone(),                                              // rope_sin [seq,half_hd]
+                build_weight_blob(&lw.q_norm, 1, hd),                             // q_norm   [1,1,1,hd]
+                build_weight_blob(&lw.k_norm, 1, hd),                             // k_norm   [1,1,1,hd]
+            ];
+            let blob_refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+
+            // Layer 0: full compile.  Layers 1-27: patch from donor (no recompile).
+            let kernel = if let Some(ref donor) = first_kernel {
+                donor.patch_from_donor(
+                    &mil.mil_text, &names, &blob_refs,
+                    &[mil.input_bytes], &[mil.output_bytes],
+                ).map_err(|e| format!("L{i} patch: {e}"))?
+            } else {
+                let k = AneKernel::compile_multi_weights(
+                    &mil.mil_text, &names, &blob_refs,
+                    &[mil.input_bytes], &[mil.output_bytes],
+                ).map_err(|e| format!("L{i} compile: {e}"))?;
+                k
+            };
+
+            if i == 0 {
+                // Save a clone of the layer-0 kernel to use as donor for layers 1-27.
+                first_kernel = Some(kernel.clone_kernel().map_err(|e| format!("L0 clone: {e}"))?);
+            }
+
+            ane_layers.push(AneLayerKernels { fused: kernel });
+        }
+
+        let compile_ms = t0.elapsed().as_millis();
+        eprintln!(
+            "ANE compiled: {} fused layer kernels in {}ms ({} dispatch/layer)",
+            ane_layers.len(), compile_ms, 1,
+        );
+
+        Ok(Self { blas_engine: engine, ane_layers, seq_len: seq })
     }
 
-    /// ANE-accelerated forward pass.
+    /// Fully-fused ANE forward pass: embed → 28×fused_layer → final_norm → LM head.
     pub fn forward(&self, token_ids: &[u32]) -> Vec<f32> {
         let cfg = &self.blas_engine.config;
         let seq = token_ids.len();
         let h = cfg.hidden;
-        let hd = cfg.head_dim;
-        let half_hd = hd / 2;
-        let n_heads = cfg.heads;
-        let n_kv = cfg.kv_heads;
-        let gqa_ratio = n_heads / n_kv;
-        let q_dim = n_heads * hd;
-        let kv_dim = n_kv * hd;
-        let inter = cfg.inter;
-        let ps = self.seq_len; // padded seq for ANE IOSurface
+        let ps = self.seq_len; // padded spatial size for ANE IOSurface
 
-        // 1. Embedding
+        // 1. Embedding lookup — row-major [seq, h]
         let mut hidden = vec![0.0f32; seq * h];
         for (i, &tid) in token_ids.iter().enumerate() {
             let off = tid as usize * h;
             hidden[i * h..(i + 1) * h].copy_from_slice(&self.blas_engine.embed[off..off + h]);
         }
 
-        let mut normed = vec![0.0f32; seq * h];
-        let out_ch = q_dim + 2 * kv_dim + 2 * inter;
-
-        // Helper: pack row-major [seq, dim] → ANE channel-first [dim, ps] (padded)
+        // Pack row-major [seq, dim] → ANE channel-first fp32 [dim, ps] (zero-padded to ps).
+        // ANE layout: buf[channel * ps + spatial_pos] = value.
         let pack = |data: &[f32], dim: usize| -> Vec<u8> {
             let mut buf = vec![0.0f32; dim * ps];
-            for s in 0..seq { for c in 0..dim { buf[c * ps + s] = data[s * dim + c]; } }
+            for s in 0..seq {
+                for c in 0..dim {
+                    buf[c * ps + s] = data[s * dim + c];
+                }
+            }
             buf.iter().flat_map(|f| f.to_le_bytes()).collect()
         };
 
-        // Helper: unpack ANE channel-first [dim, ps] → row-major [seq, dim]
+        // Unpack ANE channel-first fp32 [dim, ps] → row-major [seq, dim].
         let unpack = |bytes: &[u8], dim: usize| -> Vec<f32> {
-            let all: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0],b[1],b[2],b[3]])).collect();
+            let all: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
             let mut out = vec![0.0f32; seq * dim];
-            for s in 0..seq { for c in 0..dim { out[s * dim + c] = all[c * ps + s]; } }
+            for s in 0..seq {
+                for c in 0..dim {
+                    out[s * dim + c] = all[c * ps + s];
+                }
+            }
             out
         };
 
-        let mut t_ane = 0u64;
-        let mut t_attn = 0u64;
-        let mut t_cpu = 0u64;
+        let t_fwd = std::time::Instant::now();
 
-        // 2. Layer loop (4 ANE dispatches + CPU attention/norms per layer)
-        for (_li, (lw, ak)) in self.blas_engine.layers.iter().zip(self.ane_layers.iter()).enumerate() {
-            // 1. RMSNorm (CPU)
-            rms_norm(&hidden, &lw.input_norm, &mut normed, seq, h);
+        // 2. Layer loop — 1 ANE dispatch per layer, no CPU work between layers.
+        //    The fused kernel handles: RMSNorm → QKV → QK-norm → RoPE → SDPA → Wo → residual
+        //                             → RMSNorm → FFN → residual.
+        //    Input/output: [1, dim, 1, seq] fp32 channel-first.
+        let mut layer_in_bytes = pack(&hidden, h);
+        let mut layer_out_bytes = vec![0u8; h * ps * 4];
 
-            // 2. ANE: fused QKV (1 dispatch)
-            let t0 = std::time::Instant::now();
-            let qkv_out_ch = q_dim + 2 * kv_dim;
-            ak.qkv.write_input(0, &pack(&normed, h));
-            ak.qkv.eval().unwrap();
-            let mut qkv_bytes = vec![0u8; qkv_out_ch * ps * 4];
-            ak.qkv.read_output(0, &mut qkv_bytes);
-            let qkv_all = unpack(&qkv_bytes, qkv_out_ch);
-
-            // Split Q, K, V from concatenated output
-            let mut q_buf = vec![0.0f32; seq * q_dim];
-            let mut k_buf = vec![0.0f32; seq * kv_dim];
-            let mut v_buf = vec![0.0f32; seq * kv_dim];
-            for s in 0..seq {
-                q_buf[s*q_dim..(s+1)*q_dim].copy_from_slice(&qkv_all[s*qkv_out_ch..s*qkv_out_ch+q_dim]);
-                k_buf[s*kv_dim..(s+1)*kv_dim].copy_from_slice(&qkv_all[s*qkv_out_ch+q_dim..s*qkv_out_ch+q_dim+kv_dim]);
-                v_buf[s*kv_dim..(s+1)*kv_dim].copy_from_slice(&qkv_all[s*qkv_out_ch+q_dim+kv_dim..s*qkv_out_ch+q_dim+2*kv_dim]);
-            }
-
-            t_ane += t0.elapsed().as_micros() as u64;
-
-            // 3. CPU: QK norm + RoPE
-            let t0 = std::time::Instant::now();
-            for s in 0..seq {
-                for head in 0..n_heads {
-                    let off = s * q_dim + head * hd;
-                    rms_norm_slice(&mut q_buf[off..off+hd], &lw.q_norm);
-                    apply_rope(&mut q_buf[off..off+hd], s, half_hd, &self.blas_engine.rope_cos, &self.blas_engine.rope_sin);
-                }
-                for head in 0..n_kv {
-                    let off = s * kv_dim + head * hd;
-                    rms_norm_slice(&mut k_buf[off..off+hd], &lw.k_norm);
-                    apply_rope(&mut k_buf[off..off+hd], s, half_hd, &self.blas_engine.rope_cos, &self.blas_engine.rope_sin);
-                }
-            }
-
-            // 4. CPU: Bidirectional SDPA
-            let scale = 1.0 / (hd as f32).sqrt();
-            let mut attn_out = vec![0.0f32; seq * q_dim];
-            for kv_h in 0..n_kv {
-                let mut k_head = vec![0.0f32; seq * hd];
-                let mut v_head = vec![0.0f32; seq * hd];
-                for s in 0..seq {
-                    k_head[s*hd..(s+1)*hd].copy_from_slice(&k_buf[s*kv_dim+kv_h*hd..s*kv_dim+kv_h*hd+hd]);
-                    v_head[s*hd..(s+1)*hd].copy_from_slice(&v_buf[s*kv_dim+kv_h*hd..s*kv_dim+kv_h*hd+hd]);
-                }
-                for g in 0..gqa_ratio {
-                    let q_h = kv_h * gqa_ratio + g;
-                    let mut q_head = vec![0.0f32; seq * hd];
-                    for s in 0..seq { q_head[s*hd..(s+1)*hd].copy_from_slice(&q_buf[s*q_dim+q_h*hd..s*q_dim+q_h*hd+hd]); }
-                    let mut scores = vec![0.0f32; seq * seq];
-                    sgemm_nt_scaled(seq, seq, hd, &q_head, &k_head, &mut scores, scale);
-                    for row in 0..seq { softmax_inplace(&mut scores[row*seq..(row+1)*seq]); }
-                    let mut ctx = vec![0.0f32; seq * hd];
-                    sgemm(seq, hd, seq, &scores, &v_head, &mut ctx);
-                    for s in 0..seq { attn_out[s*q_dim+q_h*hd..s*q_dim+q_h*hd+hd].copy_from_slice(&ctx[s*hd..(s+1)*hd]); }
-                }
-            }
-
-            t_attn += t0.elapsed().as_micros() as u64;
-
-            // 5. ANE: O projection (1 dispatch)
-            let t0 = std::time::Instant::now();
-            ak.o_proj.write_input(0, &pack(&attn_out, q_dim));
-            ak.o_proj.eval().unwrap();
-            let mut o_bytes = vec![0u8; h * ps * 4];
-            ak.o_proj.read_output(0, &mut o_bytes);
-            let o_vals = unpack(&o_bytes, h);
-            for i in 0..seq*h { hidden[i] += o_vals[i]; }
-
-            t_ane += t0.elapsed().as_micros() as u64;
-
-            // 6. CPU: post-attn norm
-            let t0 = std::time::Instant::now();
-            let mut normed2 = vec![0.0f32; seq * h];
-            rms_norm(&hidden, &lw.post_attn_norm, &mut normed2, seq, h);
-
-            t_cpu += t0.elapsed().as_micros() as u64;
-
-            // 7. ANE: fused gate+up (1 dispatch)
-            let t0 = std::time::Instant::now();
-            let gu_out_ch = 2 * inter;
-            ak.gate_up.write_input(0, &pack(&normed2, h));
-            ak.gate_up.eval().unwrap();
-            let mut gu_bytes = vec![0u8; gu_out_ch * ps * 4];
-            ak.gate_up.read_output(0, &mut gu_bytes);
-            let gu_all = unpack(&gu_bytes, gu_out_ch);
-
-            // Split gate, up and apply SiLU*up
-            let mut mlp_buf = vec![0.0f32; seq * inter];
-            for s in 0..seq {
-                for c in 0..inter {
-                    let gate = gu_all[s * gu_out_ch + c];
-                    let up = gu_all[s * gu_out_ch + inter + c];
-                    mlp_buf[s * inter + c] = gate * (1.0 / (1.0 + (-gate).exp())) * up; // SiLU(gate) * up
-                }
-            }
-
-            // 8. ANE: down projection (1 dispatch)
-            let t0b = std::time::Instant::now();
-            ak.down.write_input(0, &pack(&mlp_buf, inter));
-            ak.down.eval().unwrap();
-            let mut d_bytes = vec![0u8; h * ps * 4];
-            ak.down.read_output(0, &mut d_bytes);
-            let d_vals = unpack(&d_bytes, h);
-            for i in 0..seq*h { hidden[i] += d_vals[i]; }
-            t_ane += (t0.elapsed().as_micros() + t0b.elapsed().as_micros()) as u64;
+        for ak in &self.ane_layers {
+            ak.fused.write_input(0, &layer_in_bytes);
+            ak.fused.eval().unwrap();
+            ak.fused.read_output(0, &mut layer_out_bytes);
+            // Swap: output of this layer becomes input of next layer.
+            std::mem::swap(&mut layer_in_bytes, &mut layer_out_bytes);
         }
 
-        eprintln!("  fwd: ane={}ms attn={}ms cpu={}ms total={}ms",
-            t_ane/1000, t_attn/1000, t_cpu/1000, (t_ane+t_attn+t_cpu)/1000);
+        let fwd_ms = t_fwd.elapsed().as_millis();
+        eprintln!("  fwd: {} ANE dispatches in {}ms (seq={seq})", self.ane_layers.len(), fwd_ms);
 
-        // Final norm + LM head (CPU — vocab projection is huge)
-        rms_norm(&hidden, &self.blas_engine.final_norm, &mut normed, seq, h);
+        // Unpack final layer output back to row-major [seq, h].
+        // After the swap, layer_in_bytes holds the last layer's output.
+        let hidden_out = unpack(&layer_in_bytes, h);
+
+        // 3. Final RMSNorm (CPU)
+        let mut normed = vec![0.0f32; seq * h];
+        rms_norm(&hidden_out, &self.blas_engine.final_norm, &mut normed, seq, h);
+
+        // 4. LM head: normed[seq, h] @ embed^T[h, vocab] → logits[seq, vocab]
+        //    The embedding matrix doubles as the LM head weight (tied weights).
+        //    Too large for ANE (~600MB fp32), so we use BLAS on CPU.
         let mut logits = vec![0.0f32; seq * cfg.vocab];
         sgemm_nt(seq, cfg.vocab, h, &normed, &self.blas_engine.embed, &mut logits);
         logits
