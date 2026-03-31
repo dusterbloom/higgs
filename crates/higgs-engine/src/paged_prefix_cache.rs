@@ -437,6 +437,7 @@ fn is_turboquant(cache: &AnyCache) -> bool {
         AnyCache::Hybrid(layers) => layers
             .iter()
             .any(|l| matches!(l, Some(LayerCache::KV(c)) if c.kv_cache_config().is_turboquant())),
+        AnyCache::Rwkv7(_) => false,
     }
 }
 
@@ -451,6 +452,10 @@ fn kv_offset(cache: &AnyCache) -> Option<i32> {
             Some(LayerCache::KV(c)) => Some(KeyValueCache::offset(c)),
             _ => None,
         }),
+        AnyCache::Rwkv7(layers) => layers
+            .iter()
+            .find_map(|l| l.as_ref())
+            .map(|s| s.offset),
     }
 }
 
@@ -459,7 +464,7 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
     // Hybrid caches (GDN+KV) can't be block-paged because GDN sequential state
     // doesn't align to block boundaries. The KV offset would mismatch the GDN
     // offset after materialization, producing corrupt attention. Use clone instead.
-    if matches!(cache, AnyCache::Hybrid(_)) {
+    if matches!(cache, AnyCache::Hybrid(_) | AnyCache::Rwkv7(_)) {
         return Ok(CachedData::Cloned(cache.clone()));
     }
 
@@ -495,8 +500,10 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
                 .collect();
             (layers?, ctx)
         }
-        // Hybrid caches returned Cloned above; this arm is unreachable.
-        AnyCache::Hybrid(_) => unreachable!("Hybrid caches use clone fallback"),
+        // Hybrid/RWKV-7 caches returned Cloned above; this arm is unreachable.
+        AnyCache::Hybrid(_) | AnyCache::Rwkv7(_) => {
+            unreachable!("Hybrid/RWKV-7 caches use clone fallback")
+        }
     };
 
     if let Some(context) = tq_context {
