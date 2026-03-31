@@ -3119,6 +3119,25 @@ impl Qwen3NextCausalLM {
         }
     }
 
+    /// Forward pass returning logits at ALL positions (for speculative verify).
+    ///
+    /// Unlike `forward` which slices to the last position before the LM head,
+    /// this returns `[B, seq_len, vocab]` so the caller can verify each draft
+    /// position independently.
+    #[allow(non_snake_case)]
+    pub fn forward_verify(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_hidden(inputs, mask, kv_cache)?;
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&h),
+            None => self.model.embed_tokens.as_linear(&h),
+        }
+    }
+
     /// Chunked prefill: process the prompt in `chunk_size`-token segments
     /// through all layers. Produces identical logits to `forward()` but with
     /// smaller per-dispatch working sets and lower peak memory.
