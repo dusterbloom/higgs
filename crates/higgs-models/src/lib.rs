@@ -12,8 +12,13 @@ pub mod starcoder2;
 pub mod transformer;
 pub mod rwkv7;
 pub mod diffusion;
+pub mod diffusion_lora;
+pub mod diffusion_train;
+pub mod llada_moe;
 #[cfg(feature = "ane")]
 pub mod diffusion_ane;
+#[cfg(feature = "ane")]
+pub mod diffusion_ane_bwd;
 #[cfg(feature = "ane")]
 pub mod ane_bridge;
 #[cfg(feature = "ane")]
