@@ -22,7 +22,7 @@ unsafe extern "C" {
 }
 
 /// y[M,N] = alpha * A[M,K] @ B[K,N] + beta * y. Row-major.
-fn sgemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
+pub(crate) fn sgemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
     unsafe {
         cblas_sgemm(
             101, 111, 111, // RowMajor, NoTrans, NoTrans
@@ -35,7 +35,7 @@ fn sgemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
 }
 
 /// y[M,N] += alpha * A[M,K] @ B[K,N]. Accumulates into y.
-fn sgemm_acc(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
+pub(crate) fn sgemm_acc(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
     unsafe {
         cblas_sgemm(
             101, 111, 111,
@@ -48,7 +48,7 @@ fn sgemm_acc(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) 
 }
 
 /// y[M,N] = A^T[M,K] @ B[K,N] (A stored as [K,M], transposed)
-fn sgemm_at(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
+pub(crate) fn sgemm_at(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
     unsafe {
         cblas_sgemm(
             101, 112, 111, // RowMajor, Trans, NoTrans
@@ -109,8 +109,8 @@ pub struct DiffusionEngine {
     pub final_norm: Vec<f32>,   // [hidden]
     pub config: DiffusionConfig,
     // Precomputed RoPE tables
-    rope_cos: Vec<f32>,         // [max_seq, head_dim/2]
-    rope_sin: Vec<f32>,
+    pub(crate) rope_cos: Vec<f32>,         // [max_seq, head_dim/2]
+    pub(crate) rope_sin: Vec<f32>,
 }
 
 impl DiffusionEngine {
@@ -397,31 +397,35 @@ impl DiffusionEngine {
 // ANE-accelerated engine — fully-fused (1 dispatch per layer)
 // ---------------------------------------------------------------------------
 
-/// ANE kernel for one transformer layer: a single fully-fused dispatch.
-///
-/// The compiled MIL program does everything: RMSNorm → QKV → QK-norm → RoPE →
-/// bidirectional SDPA → Wo → residual → RMSNorm → FFN → residual.
-/// Input and output are both `[1, dim, 1, seq]` fp32 channel-first.
+/// Pre-built weight blobs for one transformer layer (ready for ANE reload).
 #[cfg(feature = "ane")]
-pub struct AneLayerKernels {
-    /// One fully-fused layer kernel: hidden_in → hidden_out.
-    pub fused: crate::ane_bridge::AneKernel,
+pub struct AneLayerWeightBlobs {
+    /// All 13 weight blobs in order expected by the fused MIL kernel.
+    pub blobs: Vec<Vec<u8>>,
 }
 
-/// ANE-accelerated diffusion engine. Compiles 28 fully-fused layer kernels (1 dispatch/layer).
+/// ANE-accelerated diffusion engine using a single fused kernel + per-layer weight reload.
 ///
-/// Each kernel performs the complete transformer layer computation on ANE:
-/// embed → [fused_layer × 28] → final_norm → LM head (CPU).
+/// Strategy to work around the ANE's ~12 concurrent kernel limit:
+/// - Compile ONE kernel (layer 0). The ANE caches the compiled microcode.
+/// - Pre-build weight blobs for all 28 layers.
+/// - At eval time: reload_weights(layer_blobs) → eval → next layer.
+///   `reload_weights` uses the delta cache (no recompile), just swaps weight BLOBFILEs.
+///
+/// This gives 1 ANE dispatch per layer with zero CPU computation in the inner loop.
 #[cfg(feature = "ane")]
 pub struct AneDiffusionEngine {
     pub blas_engine: DiffusionEngine,
-    pub ane_layers: Vec<AneLayerKernels>,
+    /// Single compiled kernel — weights are hot-swapped per layer via reload_weights.
+    pub kernel: crate::ane_bridge::AneKernel,
+    /// Pre-built weight blobs for each layer (13 blobs × 28 layers).
+    pub layer_blobs: Vec<AneLayerWeightBlobs>,
     pub seq_len: usize, // fixed seq for compiled kernels (padded to ANE_MIN_SPATIAL)
 }
 
 #[cfg(feature = "ane")]
 impl AneDiffusionEngine {
-    /// Compile fully-fused ANE kernels (1 per layer) for a fixed generation seq_len.
+    /// Compile one fully-fused ANE kernel and pre-build 28 sets of weight blobs.
     pub fn new(engine: DiffusionEngine, seq_len: usize) -> Result<Self, String> {
         use crate::ane_bridge::{self, AneKernel, build_weight_blob, build_weight_blob_transposed};
         use crate::diffusion_ane;
@@ -438,7 +442,7 @@ impl AneDiffusionEngine {
         let inter = cfg.inter;
         let seq = seq_len.max(ANE_MIN_SPATIAL);
 
-        eprintln!("Compiling {} fully-fused ANE layer kernels (seq={seq})...", cfg.layers);
+        eprintln!("Compiling 1 fully-fused ANE layer kernel (seq={seq}) + prebuilding {} weight sets...", cfg.layers);
         let t0 = std::time::Instant::now();
 
         // Precompute RoPE tables once — same for all layers (shared BLOBFILE data).
@@ -453,7 +457,7 @@ impl AneDiffusionEngine {
             }
         }
 
-        // Generate the MIL once — identical for all 28 layers (shape-only, no data).
+        // Generate the MIL once — identical for all 28 layers.
         let mil = diffusion_ane::gen_fused_diffusion_layer(
             h, cfg.heads, cfg.kv_heads, hd, inter, seq, 1e-6,
         );
@@ -463,71 +467,56 @@ impl AneDiffusionEngine {
         let rope_cos_blob = build_weight_blob(&rope_cos, seq, half_hd);
         let rope_sin_blob = build_weight_blob(&rope_sin, seq, half_hd);
 
-        let mut ane_layers = Vec::with_capacity(cfg.layers);
-        let mut first_kernel: Option<AneKernel> = None;
-
-        for (i, lw) in engine.layers.iter().enumerate() {
-            // Build 13 weight blobs for this layer.
-            //
-            // Layout rules:
-            //   build_weight_blob(w, rows, cols)            → blob [rows, cols] row-major (as fp16)
-            //   build_weight_blob_transposed(w, rows, cols) → blob [cols, rows] transposed (as fp16)
-            //
-            // PyTorch projection weights are stored as [out, in]. The MIL matmul expects
-            // the weight tensor as [1, 1, in_ch, out_ch] (i.e. [ic, oc]).
-            // build_weight_blob_transposed(w, out, in) → transposes [out,in] to [in,out] = [ic,oc]. ✓
-            //
-            // Norm weights are 1-D [dim] vectors, stored as [1, dim, 1, 1] in MIL.
-            // build_weight_blob(w, 1, dim) packs them correctly.
-            let blobs: Vec<Vec<u8>> = vec![
-                build_weight_blob(&lw.input_norm, 1, h),                          // rms_att  [1,dim,1,1]
-                build_weight_blob(&lw.post_attn_norm, 1, h),                      // rms_ffn  [1,dim,1,1]
-                build_weight_blob_transposed(&lw.q_proj, q_dim, h),               // wq       [dim,q_dim]
-                build_weight_blob_transposed(&lw.k_proj, kv_dim, h),              // wk       [dim,kv_dim]
-                build_weight_blob_transposed(&lw.v_proj, kv_dim, h),              // wv       [dim,kv_dim]
-                build_weight_blob_transposed(&lw.o_proj, h, q_dim),               // wo       [q_dim,dim]
-                build_weight_blob_transposed(&lw.gate_proj, inter, h),            // gate     [dim,inter]
-                build_weight_blob_transposed(&lw.up_proj, inter, h),              // up       [dim,inter]
-                build_weight_blob_transposed(&lw.down_proj, h, inter),            // down     [inter,dim]
-                rope_cos_blob.clone(),                                              // rope_cos [seq,half_hd]
-                rope_sin_blob.clone(),                                              // rope_sin [seq,half_hd]
-                build_weight_blob(&lw.q_norm, 1, hd),                             // q_norm   [1,1,1,hd]
-                build_weight_blob(&lw.k_norm, 1, hd),                             // k_norm   [1,1,1,hd]
+        // Pre-build weight blobs for all layers.
+        //
+        // Layout rules:
+        //   build_weight_blob(w, rows, cols)            → blob [rows, cols] row-major (as fp16)
+        //   build_weight_blob_transposed(w, rows, cols) → blob [cols, rows] transposed (as fp16)
+        //
+        // PyTorch projection weights are stored as [out, in]. The MIL matmul expects
+        // the weight tensor as [1, 1, in_ch, out_ch] (i.e. [ic, oc]).
+        // build_weight_blob_transposed(w, out, in) → transposes [out,in] to [in,out] = [ic,oc]. ✓
+        //
+        // Norm weights are 1-D [dim] vectors, stored as [1, dim, 1, 1] in MIL.
+        // build_weight_blob(w, 1, dim) packs them correctly.
+        let mut layer_blobs: Vec<AneLayerWeightBlobs> = Vec::with_capacity(cfg.layers);
+        for lw in &engine.layers {
+            let blobs = vec![
+                build_weight_blob(&lw.input_norm, 1, h),                          // rms_att
+                build_weight_blob(&lw.post_attn_norm, 1, h),                      // rms_ffn
+                build_weight_blob_transposed(&lw.q_proj, q_dim, h),               // wq
+                build_weight_blob_transposed(&lw.k_proj, kv_dim, h),              // wk
+                build_weight_blob_transposed(&lw.v_proj, kv_dim, h),              // wv
+                build_weight_blob_transposed(&lw.o_proj, h, q_dim),               // wo
+                build_weight_blob_transposed(&lw.gate_proj, inter, h),            // gate
+                build_weight_blob_transposed(&lw.up_proj, inter, h),              // up
+                build_weight_blob_transposed(&lw.down_proj, h, inter),            // down
+                rope_cos_blob.clone(),                                              // rope_cos
+                rope_sin_blob.clone(),                                              // rope_sin
+                build_weight_blob(&lw.q_norm, 1, hd),                             // q_norm
+                build_weight_blob(&lw.k_norm, 1, hd),                             // k_norm
             ];
-            let blob_refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
-
-            // Layer 0: full compile.  Layers 1-27: patch from donor (no recompile).
-            let kernel = if let Some(ref donor) = first_kernel {
-                donor.patch_from_donor(
-                    &mil.mil_text, &names, &blob_refs,
-                    &[mil.input_bytes], &[mil.output_bytes],
-                ).map_err(|e| format!("L{i} patch: {e}"))?
-            } else {
-                let k = AneKernel::compile_multi_weights(
-                    &mil.mil_text, &names, &blob_refs,
-                    &[mil.input_bytes], &[mil.output_bytes],
-                ).map_err(|e| format!("L{i} compile: {e}"))?;
-                k
-            };
-
-            if i == 0 {
-                // Save a clone of the layer-0 kernel to use as donor for layers 1-27.
-                first_kernel = Some(kernel.clone_kernel().map_err(|e| format!("L0 clone: {e}"))?);
-            }
-
-            ane_layers.push(AneLayerKernels { fused: kernel });
+            layer_blobs.push(AneLayerWeightBlobs { blobs });
         }
+
+        // Compile ONE kernel using layer-0 weights.
+        let l0 = &layer_blobs[0];
+        let l0_refs: Vec<&[u8]> = l0.blobs.iter().map(|b| b.as_slice()).collect();
+        let kernel = AneKernel::compile_multi_weights(
+            &mil.mil_text, &names, &l0_refs,
+            &[mil.input_bytes], &[mil.output_bytes],
+        ).map_err(|e| format!("L0 compile: {e}"))?;
 
         let compile_ms = t0.elapsed().as_millis();
         eprintln!(
-            "ANE compiled: {} fused layer kernels in {}ms ({} dispatch/layer)",
-            ane_layers.len(), compile_ms, 1,
+            "ANE compiled: 1 fused kernel in {}ms, {} weight blobs prebuilt",
+            compile_ms, cfg.layers,
         );
 
-        Ok(Self { blas_engine: engine, ane_layers, seq_len: seq })
+        Ok(Self { blas_engine: engine, kernel, layer_blobs, seq_len: seq })
     }
 
-    /// Fully-fused ANE forward pass: embed → 28×fused_layer → final_norm → LM head.
+    /// Fully-fused ANE forward pass: embed → 28×(reload+fused_dispatch) → final_norm → LM head.
     pub fn forward(&self, token_ids: &[u32]) -> Vec<f32> {
         let cfg = &self.blas_engine.config;
         let seq = token_ids.len();
@@ -542,7 +531,6 @@ impl AneDiffusionEngine {
         }
 
         // Pack row-major [seq, dim] → ANE channel-first fp32 [dim, ps] (zero-padded to ps).
-        // ANE layout: buf[channel * ps + spatial_pos] = value.
         let pack = |data: &[f32], dim: usize| -> Vec<u8> {
             let mut buf = vec![0.0f32; dim * ps];
             for s in 0..seq {
@@ -570,26 +558,31 @@ impl AneDiffusionEngine {
 
         let t_fwd = std::time::Instant::now();
 
-        // 2. Layer loop — 1 ANE dispatch per layer, no CPU work between layers.
+        // 2. Layer loop — 1 ANE dispatch per layer.
+        //    For each layer: reload weights (delta path, no recompile) → write input → eval → read output.
         //    The fused kernel handles: RMSNorm → QKV → QK-norm → RoPE → SDPA → Wo → residual
         //                             → RMSNorm → FFN → residual.
-        //    Input/output: [1, dim, 1, seq] fp32 channel-first.
         let mut layer_in_bytes = pack(&hidden, h);
         let mut layer_out_bytes = vec![0u8; h * ps * 4];
 
-        for ak in &self.ane_layers {
-            ak.fused.write_input(0, &layer_in_bytes);
-            ak.fused.eval().unwrap();
-            ak.fused.read_output(0, &mut layer_out_bytes);
+        for lb in &self.layer_blobs {
+            // Hot-swap weights for this layer.
+            // Uses delta cache: unloads model, writes new BLOBFILEs to disk, reloads.
+            // No recompile (compileWithQoS is skipped). Correct results verified empirically.
+            let blob_refs: Vec<&[u8]> = lb.blobs.iter().map(|b| b.as_slice()).collect();
+            self.kernel.reload_weights(&blob_refs).unwrap();
+
+            self.kernel.write_input(0, &layer_in_bytes);
+            self.kernel.eval().unwrap();
+            self.kernel.read_output(0, &mut layer_out_bytes);
             // Swap: output of this layer becomes input of next layer.
             std::mem::swap(&mut layer_in_bytes, &mut layer_out_bytes);
         }
 
         let fwd_ms = t_fwd.elapsed().as_millis();
-        eprintln!("  fwd: {} ANE dispatches in {}ms (seq={seq})", self.ane_layers.len(), fwd_ms);
+        eprintln!("  fwd: {} ANE dispatches in {}ms (seq={seq})", self.layer_blobs.len(), fwd_ms);
 
         // Unpack final layer output back to row-major [seq, h].
-        // After the swap, layer_in_bytes holds the last layer's output.
         let hidden_out = unpack(&layer_in_bytes, h);
 
         // 3. Final RMSNorm (CPU)
@@ -597,7 +590,7 @@ impl AneDiffusionEngine {
         rms_norm(&hidden_out, &self.blas_engine.final_norm, &mut normed, seq, h);
 
         // 4. LM head: normed[seq, h] @ embed^T[h, vocab] → logits[seq, vocab]
-        //    The embedding matrix doubles as the LM head weight (tied weights).
+        //    Embedding matrix doubles as LM head weight (tied weights).
         //    Too large for ANE (~600MB fp32), so we use BLAS on CPU.
         let mut logits = vec![0.0f32; seq * cfg.vocab];
         sgemm_nt(seq, cfg.vocab, h, &normed, &self.blas_engine.embed, &mut logits);
@@ -653,7 +646,7 @@ impl AneDiffusionEngine {
 // ---------------------------------------------------------------------------
 
 /// BF16 bytes → f32 vec.
-fn bf16_to_f32(data: &[u8]) -> Vec<f32> {
+pub(crate) fn bf16_to_f32(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(2)
         .map(|b| {
             let bits = u16::from_le_bytes([b[0], b[1]]);
@@ -663,7 +656,7 @@ fn bf16_to_f32(data: &[u8]) -> Vec<f32> {
 }
 
 /// RMSNorm: out[i] = x[i] * w[i] / sqrt(mean(x^2) + eps)
-fn rms_norm(x: &[f32], w: &[f32], out: &mut [f32], seq: usize, dim: usize) {
+pub(crate) fn rms_norm(x: &[f32], w: &[f32], out: &mut [f32], seq: usize, dim: usize) {
     let eps = 1e-6f32;
     for s in 0..seq {
         let row = &x[s * dim..(s + 1) * dim];
@@ -676,7 +669,7 @@ fn rms_norm(x: &[f32], w: &[f32], out: &mut [f32], seq: usize, dim: usize) {
 }
 
 /// In-place RMSNorm on a slice (for QK norm per head).
-fn rms_norm_slice(x: &mut [f32], w: &[f32]) {
+pub(crate) fn rms_norm_slice(x: &mut [f32], w: &[f32]) {
     let eps = 1e-6f32;
     let dim = x.len();
     let rms = (x.iter().map(|v| v * v).sum::<f32>() / dim as f32 + eps).sqrt();
@@ -687,7 +680,7 @@ fn rms_norm_slice(x: &mut [f32], w: &[f32]) {
 }
 
 /// Apply RoPE rotation in-place to a [head_dim] vector at position `pos`.
-fn apply_rope(x: &mut [f32], pos: usize, half_dim: usize, cos: &[f32], sin: &[f32]) {
+pub(crate) fn apply_rope(x: &mut [f32], pos: usize, half_dim: usize, cos: &[f32], sin: &[f32]) {
     let co = pos * half_dim;
     for d in 0..half_dim {
         let x0 = x[d];
@@ -700,7 +693,7 @@ fn apply_rope(x: &mut [f32], pos: usize, half_dim: usize, cos: &[f32], sin: &[f3
 }
 
 /// sgemm with B transposed: C[M,N] = A[M,K] @ B^T[K,N] where B stored as [N,K].
-fn sgemm_nt(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+pub(crate) fn sgemm_nt(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     unsafe {
         cblas_sgemm(
             101, 111, 112, // RowMajor, NoTrans, Trans
@@ -713,7 +706,7 @@ fn sgemm_nt(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
 }
 
 /// sgemm with B transposed and scaled: C = alpha * A @ B^T.
-fn sgemm_nt_scaled(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32], alpha: f32) {
+pub(crate) fn sgemm_nt_scaled(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32], alpha: f32) {
     unsafe {
         cblas_sgemm(
             101, 111, 112,
@@ -726,7 +719,7 @@ fn sgemm_nt_scaled(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [
 }
 
 /// In-place softmax over a row.
-fn softmax_inplace(row: &mut [f32]) {
+pub(crate) fn softmax_inplace(row: &mut [f32]) {
     let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for v in row.iter_mut() {
@@ -735,6 +728,86 @@ fn softmax_inplace(row: &mut [f32]) {
     }
     let inv = 1.0 / sum;
     for v in row.iter_mut() { *v *= inv; }
+}
+
+/// y[M,N] += A^T[M,K] @ B[K,N] (A stored as [K,M], transposed). Accumulates into y.
+pub(crate) fn sgemm_at_acc(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
+    unsafe {
+        cblas_sgemm(
+            101, 112, 111, // RowMajor, Trans, NoTrans
+            m as i32, n as i32, k as i32,
+            1.0, a.as_ptr(), m as i32,
+            b.as_ptr(), n as i32,
+            1.0, y.as_mut_ptr(), n as i32,
+        );
+    }
+}
+
+/// sgemm with B transposed, accumulating: C[M,N] += A[M,K] @ B^T[K,N].
+pub(crate) fn sgemm_nt_acc(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    unsafe {
+        cblas_sgemm(
+            101, 111, 112,
+            m as i32, n as i32, k as i32,
+            1.0, a.as_ptr(), k as i32,
+            b.as_ptr(), k as i32,
+            1.0, c.as_mut_ptr(), n as i32,
+        );
+    }
+}
+
+impl DiffusionEngine {
+    /// Create an engine with small random weights for gradient checking tests.
+    pub fn from_random(config: DiffusionConfig) -> Self {
+        let h = config.hidden;
+        let q_dim = config.heads * config.head_dim;
+        let kv_dim = config.kv_heads * config.head_dim;
+        let inter = config.inter;
+        let vocab = config.vocab;
+
+        let rand_vec = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|i| ((i as f32 * 0.618033988 + 0.31415926).fract() * 2.0 - 1.0) * scale).collect()
+        };
+
+        let embed = rand_vec(vocab * h, 0.02);
+        let final_norm = vec![1.0f32; h]; // init norm weights to 1
+
+        let mut layers = Vec::with_capacity(config.layers);
+        for l in 0..config.layers {
+            let seed = l * 1000;
+            let rv = |n: usize| -> Vec<f32> {
+                (0..n).map(|i| (((seed + i) as f32 * 0.618033988 + 0.31415926).fract() * 2.0 - 1.0) * 0.02).collect()
+            };
+            layers.push(DiffusionLayerWeights {
+                q_proj: rv(q_dim * h),
+                k_proj: rv(kv_dim * h),
+                v_proj: rv(kv_dim * h),
+                o_proj: rv(h * q_dim),
+                q_norm: vec![1.0; config.head_dim],
+                k_norm: vec![1.0; config.head_dim],
+                input_norm: vec![1.0; h],
+                post_attn_norm: vec![1.0; h],
+                gate_proj: rv(inter * h),
+                up_proj: rv(inter * h),
+                down_proj: rv(h * inter),
+            });
+        }
+
+        let max_seq = 4096;
+        let half_dim = config.head_dim / 2;
+        let mut rope_cos = vec![0.0f32; max_seq * half_dim];
+        let mut rope_sin = vec![0.0f32; max_seq * half_dim];
+        for pos in 0..max_seq {
+            for d in 0..half_dim {
+                let freq = 1.0 / (config.rope_theta as f32).powf(2.0 * d as f32 / config.head_dim as f32);
+                let angle = pos as f32 * freq;
+                rope_cos[pos * half_dim + d] = angle.cos();
+                rope_sin[pos * half_dim + d] = angle.sin();
+            }
+        }
+
+        Self { layers, embed, final_norm, config, rope_cos, rope_sin }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -826,7 +899,7 @@ mod tests {
     #[test]
     #[cfg(feature = "ane")]
     fn test_diffusion_blas_vs_ane() {
-        use crate::ane_bridge::{self, AneKernel, build_weight_blob, build_weight_blob_transposed};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob};
         use crate::ane_mil;
 
         ane_bridge::ane_init().expect("ANE init failed");
