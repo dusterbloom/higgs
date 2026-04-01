@@ -1959,6 +1959,7 @@ impl AneBonsaiEngine {
         let q_dim = cfg.heads * cfg.head_dim;
         let inter = cfg.inter;
         let ps = self.seq_len;
+        let verbose_trace = std::env::var_os("HIGGS_BONSAI_ANE_TRACE").is_some();
 
         let mut hidden = vec![0.0f32; seq * h];
         for (i, &tid) in token_ids.iter().enumerate() {
@@ -2022,7 +2023,9 @@ impl AneBonsaiEngine {
 
             {
                 let nan_count = hidden.iter().filter(|v| !v.is_finite()).count();
-                if nan_count > 0 || layer_idx < 3 || layer_idx == cfg.layers - 1 {
+                if nan_count > 0
+                    || (verbose_trace && (layer_idx < 3 || layer_idx == cfg.layers - 1))
+                {
                     let max_val = hidden
                         .iter()
                         .cloned()
@@ -2072,11 +2075,13 @@ impl AneBonsaiEngine {
         }
 
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "  hybrid fwd: {} ANE attn + {} BLAS FFN in {fwd_ms:.1}ms (seq={seq})",
-            self.attn_kernels.len(),
-            self.attn_kernels.len(),
-        );
+        if verbose_trace {
+            eprintln!(
+                "  hybrid fwd: {} ANE attn + {} BLAS FFN in {fwd_ms:.1}ms (seq={seq})",
+                self.attn_kernels.len(),
+                self.attn_kernels.len(),
+            );
+        }
 
         rms_norm_eps(
             &hidden,
@@ -2415,6 +2420,82 @@ mod tests {
         } else {
             None
         }
+    }
+
+    fn bonsai_bench_tokenizer() -> Option<tokenizers::Tokenizer> {
+        let dir = bonsai_1_7b_dir()?;
+        crate::load_tokenizer(dir).ok()
+    }
+
+    fn build_long_bonsai_prompt_ids(
+        tokenizer: &tokenizers::Tokenizer,
+        prompt_len: usize,
+    ) -> Vec<u32> {
+        let seed = concat!(
+            "Bonsai is a 1-bit Qwen3 model designed for efficient inference on Apple Silicon. ",
+            "We care about ANE throughput, GPU fallback, prompt fidelity, and generated quality. ",
+            "Summarize the tradeoffs of low-bit attention, residual error accumulation, and long-context performance. "
+        );
+        let seed_ids = tokenizer
+            .encode(seed, false)
+            .expect("seed prompt should tokenize")
+            .get_ids()
+            .to_vec();
+        assert!(!seed_ids.is_empty(), "seed prompt tokenized to zero length");
+
+        let mut ids = Vec::with_capacity(prompt_len);
+        while ids.len() < prompt_len {
+            ids.extend_from_slice(&seed_ids);
+        }
+        ids.truncate(prompt_len);
+        ids
+    }
+
+    fn bonsai_bench_mask_token_id(tokenizer: &tokenizers::Tokenizer) -> u32 {
+        tokenizer
+            .encode("<|endoftext|>", false)
+            .expect("pad token should tokenize")
+            .get_ids()
+            .first()
+            .copied()
+            .expect("pad token should yield one token")
+    }
+
+    fn sampled_masked_pseudo_ppl_runtime(
+        runtime: &DiffusionRuntime,
+        token_ids: &[u32],
+        mask_id: u32,
+        sample_count: usize,
+    ) -> f64 {
+        if token_ids.len() < 3 {
+            return f64::NAN;
+        }
+
+        let interior = token_ids.len() - 2;
+        let n = sample_count.min(interior).max(1);
+        let mut positions = Vec::with_capacity(n);
+        for i in 0..n {
+            let pos = 1 + i * interior / n;
+            if positions.last().copied() != Some(pos) {
+                positions.push(pos);
+            }
+        }
+
+        let mut nll_sum = 0.0f64;
+        for &pos in &positions {
+            let mut masked = token_ids.to_vec();
+            masked[pos] = mask_id;
+            let logits = runtime.forward(&masked);
+            let vocab = logits.len() / masked.len();
+            let row = &logits[pos * vocab..(pos + 1) * vocab];
+            let max_logit = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp = row.iter().map(|&v| (v - max_logit).exp()).sum::<f32>();
+            let target = token_ids[pos] as usize;
+            let logprob = row[target] - max_logit - sum_exp.ln();
+            nll_sum += -(logprob as f64);
+        }
+
+        (nll_sum / positions.len() as f64).exp()
     }
 
     #[test]
@@ -3068,6 +3149,129 @@ mod tests {
         );
 
         eprintln!("PASS: Bonsai-1.7B ANE hybrid engine matches BLAS reference");
+    }
+
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "Manual long-context Bonsai ANE benchmark"]
+    fn bench_bonsai_1_7b_ane_long_context() {
+        let Some(bonsai_dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+        let Some(tokenizer) = bonsai_bench_tokenizer() else {
+            eprintln!("Bonsai tokenizer not found, skipping");
+            return;
+        };
+
+        let base_engine = DiffusionEngine::load_q1(&bonsai_dir).unwrap();
+        let mask_id = bonsai_bench_mask_token_id(&tokenizer);
+        let gen_tokens = 16usize;
+        let steps = 16usize;
+        let ppl_samples = 8usize;
+
+        eprintln!(
+            "Bonsai long-context benchmark: gen_tokens={gen_tokens}, steps={steps}, sampled_pseudo_ppl={ppl_samples}"
+        );
+
+        for seq in [512usize, 1024, 2048] {
+            let prompt_len = seq - gen_tokens;
+            let prompt_ids = build_long_bonsai_prompt_ids(&tokenizer, prompt_len);
+            let masked_canvas: Vec<u32> = prompt_ids
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(mask_id).take(gen_tokens))
+                .collect();
+
+            eprintln!("\n=== Bonsai seq={seq} prompt={prompt_len} gen={gen_tokens} ===");
+
+            let mut cpu_engine = base_engine.clone();
+            cpu_engine.config.mask_token_id = mask_id;
+            let cpu = DiffusionRuntime::new_bonsai_q1(
+                cpu_engine,
+                seq,
+                1e-6,
+                DiffusionBackendPreference::CpuBlas,
+            )
+            .unwrap();
+
+            let mut ane_engine = base_engine.clone();
+            ane_engine.config.mask_token_id = mask_id;
+            let t0 = std::time::Instant::now();
+            let ane = match DiffusionRuntime::new_bonsai_q1(
+                ane_engine,
+                seq,
+                1e-6,
+                DiffusionBackendPreference::Ane,
+            ) {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    eprintln!("ANE compile failed at seq={seq}: {err}");
+                    continue;
+                }
+            };
+            let compile_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "backend={} compile_ms={compile_ms:.1}",
+                match ane.selected_backend() {
+                    DiffusionBackend::AneHybridBonsai => "AneHybridBonsai",
+                    DiffusionBackend::CpuBlas => "CpuBlas",
+                    DiffusionBackend::AneFused => "AneFused",
+                    DiffusionBackend::AneMultiDispatch => "AneMultiDispatch",
+                }
+            );
+
+            let _ = cpu.forward(&masked_canvas);
+            let t0 = std::time::Instant::now();
+            let _ = cpu.forward(&masked_canvas);
+            let cpu_prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let _ = ane.forward(&masked_canvas);
+            let t0 = std::time::Instant::now();
+            let _ = ane.forward(&masked_canvas);
+            let ane_prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let cpu_ppl =
+                sampled_masked_pseudo_ppl_runtime(&cpu, &prompt_ids, mask_id, ppl_samples);
+            let ane_ppl =
+                sampled_masked_pseudo_ppl_runtime(&ane, &prompt_ids, mask_id, ppl_samples);
+
+            let t0 = std::time::Instant::now();
+            let cpu_result = cpu.generate(&prompt_ids, gen_tokens, steps);
+            let cpu_decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let t0 = std::time::Instant::now();
+            let ane_result = ane.generate(&prompt_ids, gen_tokens, steps);
+            let ane_decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let cpu_gen_text = tokenizer
+                .decode(&cpu_result[prompt_len..], true)
+                .unwrap_or_else(|_| "<decode failed>".to_owned())
+                .replace('\n', "\\n");
+            let ane_gen_text = tokenizer
+                .decode(&ane_result[prompt_len..], true)
+                .unwrap_or_else(|_| "<decode failed>".to_owned())
+                .replace('\n', "\\n");
+
+            let prefill_speedup = cpu_prefill_ms / ane_prefill_ms;
+            let decode_speedup = cpu_decode_ms / ane_decode_ms;
+            let cpu_decode_tps = gen_tokens as f64 / (cpu_decode_ms / 1000.0);
+            let ane_decode_tps = gen_tokens as f64 / (ane_decode_ms / 1000.0);
+
+            eprintln!(
+                "prefill_ms: cpu={cpu_prefill_ms:.1} ane={ane_prefill_ms:.1} speedup={prefill_speedup:.2}x"
+            );
+            eprintln!(
+                "sampled_pseudo_ppl: cpu={cpu_ppl:.3} ane={ane_ppl:.3} delta={:.3}",
+                ane_ppl - cpu_ppl
+            );
+            eprintln!(
+                "decode_ms: cpu={cpu_decode_ms:.1} ane={ane_decode_ms:.1} speedup={decode_speedup:.2}x"
+            );
+            eprintln!("decode_tps: cpu={cpu_decode_tps:.2} ane={ane_decode_tps:.2}");
+            eprintln!("cpu_text: {cpu_gen_text}");
+            eprintln!("ane_text: {ane_gen_text}");
+        }
     }
 
     #[test]
