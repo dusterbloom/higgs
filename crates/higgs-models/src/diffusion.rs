@@ -3220,4 +3220,165 @@ mod tests {
             );
         }
     }
+
+    #[cfg(feature = "ane")]
+    fn bonsai_hybrid_forward_with_cpu_layers(
+        ane_engine: &super::AneBonsaiEngine,
+        token_ids: &[u32],
+        cpu_attention_layers: &[usize],
+    ) -> Vec<f32> {
+        let cfg = &ane_engine.blas_engine.config;
+        let seq = token_ids.len();
+        let h = cfg.hidden;
+        let q_dim = cfg.heads * cfg.head_dim;
+        let inter = cfg.inter;
+        let ps = ane_engine.seq_len;
+
+        let mut hidden = bonsai_embed_hidden(&ane_engine.blas_engine, token_ids);
+        let mut normed = vec![0.0f32; seq * h];
+        let mut attn_proj = vec![0.0f32; seq * h];
+        let mut gate_buf = vec![0.0f32; seq * inter];
+        let mut up_buf = vec![0.0f32; seq * inter];
+        let mut ffn_out = vec![0.0f32; seq * h];
+
+        for (layer_idx, kernel) in ane_engine.attn_kernels.iter().enumerate() {
+            let layer = &ane_engine.blas_engine.layers[layer_idx];
+            let residual = hidden.clone();
+            let attn_ctx = if cpu_attention_layers.contains(&layer_idx) {
+                diffusion_attention_context_cpu(&ane_engine.blas_engine, layer_idx, &hidden, ane_engine.eps)
+            } else {
+                bonsai_attention_context_ane_with_kernel(kernel, &hidden, seq, ps, h, q_dim)
+            };
+
+            sgemm_nt(seq, h, q_dim, &attn_ctx, &layer.o_proj, &mut attn_proj);
+            for i in 0..seq * h {
+                hidden[i] = residual[i] + attn_proj[i];
+            }
+
+            rms_norm_eps(
+                &hidden,
+                &layer.post_attn_norm,
+                &mut normed,
+                seq,
+                h,
+                ane_engine.eps,
+            );
+            sgemm_nt(seq, inter, h, &normed, &layer.gate_proj, &mut gate_buf);
+            sgemm_nt(seq, inter, h, &normed, &layer.up_proj, &mut up_buf);
+            for (g, u) in gate_buf.iter_mut().zip(up_buf.iter()) {
+                *g = *g * (1.0 / (1.0 + (-*g).exp())) * u;
+            }
+            sgemm_nt(seq, h, inter, &gate_buf, &layer.down_proj, &mut ffn_out);
+            for i in 0..seq * h {
+                hidden[i] += ffn_out[i];
+            }
+        }
+
+        rms_norm_eps(
+            &hidden,
+            &ane_engine.blas_engine.final_norm,
+            &mut normed,
+            seq,
+            h,
+            ane_engine.eps,
+        );
+
+        let mut logits = vec![0.0f32; seq * cfg.vocab];
+        sgemm_nt(
+            seq,
+            cfg.vocab,
+            h,
+            &normed,
+            &ane_engine.blas_engine.embed,
+            &mut logits,
+        );
+        logits
+    }
+
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "Exploratory search for Bonsai ANE/CPU split policy"]
+    fn test_bonsai_1_7b_hybrid_policy_search() {
+        let Some(bonsai_dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+
+        let short_input: Vec<u32> = vec![785, 6722, 315, 9625, 374];
+        let blas_engine = DiffusionEngine::load_q1(&bonsai_dir).unwrap();
+        let blas_logits = blas_engine.forward(&short_input);
+        let ane_engine = super::AneBonsaiEngine::new(
+            DiffusionEngine::load_q1(&bonsai_dir).unwrap(),
+            short_input.len(),
+            1e-6,
+        )
+        .unwrap();
+
+        let mk_range = |start: usize, end: usize| -> Vec<usize> { (start..end).collect() };
+        let policies: Vec<(&str, Vec<usize>)> = vec![
+            ("tail4", mk_range(24, 28)),
+            ("tail5", mk_range(23, 28)),
+            ("tail6", mk_range(22, 28)),
+            ("tail8", mk_range(20, 28)),
+            ("alt_even_from20", vec![20, 22, 24, 26]),
+            ("alt_odd_from20", vec![21, 23, 25, 27]),
+            ("every2_from18", vec![18, 20, 22, 24, 26]),
+            ("every3_from18", vec![18, 21, 24, 27]),
+        ];
+
+        let mut scored: Vec<(&str, Vec<usize>, f32, f32)> = Vec::new();
+        for (name, cpu_layers) in policies {
+            let logits = bonsai_hybrid_forward_with_cpu_layers(&ane_engine, &short_input, &cpu_layers);
+            let errs: Vec<f32> = blas_logits
+                .iter()
+                .zip(logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .filter(|e| e.is_finite())
+                .collect();
+            let max_err = errs.iter().cloned().fold(0.0f32, f32::max);
+            let mean_err = errs.iter().sum::<f32>() / errs.len() as f32;
+            eprintln!(
+                "policy={name:<16} cpu_layers={:?} max_err={max_err:.4} mean_err={mean_err:.6}",
+                cpu_layers
+            );
+            scored.push((name, cpu_layers, max_err, mean_err));
+        }
+
+        scored.sort_by(|a, b| {
+            a.2.partial_cmp(&b.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        eprintln!("Top policies by seq=5 max_err:");
+        for (rank, (name, cpu_layers, max_err, mean_err)) in scored.iter().take(3).enumerate() {
+            eprintln!(
+                "  {}. {} cpu_layers={:?} max_err={:.4} mean_err={:.6}",
+                rank + 1,
+                name,
+                cpu_layers,
+                max_err,
+                mean_err
+            );
+        }
+
+        let input_64: Vec<u32> = (0..64)
+            .map(|i| if i < 5 { 785 + i } else { 1000 + i })
+            .collect();
+        let ane_engine_64 = super::AneBonsaiEngine::new(
+            DiffusionEngine::load_q1(&bonsai_dir).unwrap(),
+            64,
+            1e-6,
+        )
+        .unwrap();
+        for (name, cpu_layers, _, _) in scored.iter().take(3) {
+            let _ = bonsai_hybrid_forward_with_cpu_layers(&ane_engine_64, &input_64, cpu_layers);
+            let t0 = std::time::Instant::now();
+            for _ in 0..2 {
+                let _ = bonsai_hybrid_forward_with_cpu_layers(&ane_engine_64, &input_64, cpu_layers);
+            }
+            let avg_ms = t0.elapsed().as_secs_f64() * 1000.0 / 2.0;
+            eprintln!("policy={name:<16} seq=64 avg_ms={avg_ms:.1}");
+        }
+    }
 }
