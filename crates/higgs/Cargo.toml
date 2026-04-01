@@ -50,3 +50,6 @@ tower = { version = "0.5", features = ["util"] }
 hyper = "1"
 tempfile = "3.25.0"
 wiremock = "0.6"
+
+[features]
+prism-1bit = ["higgs-engine/prism-1bit", "higgs-models/prism-1bit"]

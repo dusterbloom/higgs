@@ -1956,7 +1956,6 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
 dependencies = [
  "bindgen",
  "cc",

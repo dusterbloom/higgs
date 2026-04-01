@@ -182,8 +182,10 @@ pub fn gen_fused_diffusion_layer(
     let _ = writeln!(m, "        tensor<int32, [4]> os = const()[name=string(\"os\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> oo = reshape(shape=os,x=ot)[name=string(\"oo\")];");
 
-    // === Residual 1 ===
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> x2 = add(x=xh,y=oo)[name=string(\"x2\")];");
+    // === Residual 1 (fp32 to prevent overflow at dim>=2048) ===
+    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> oo32 = cast(dtype=to32,x=oo)[name=string(\"oo32\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> x2_32 = add(x=x,y=oo32)[name=string(\"x2_32\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> x2 = cast(dtype=to16,x=x2_32)[name=string(\"x2\")];");
 
     // === RMSNorm (FFN) ===
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> rn2_sq = mul(x=x2,y=x2)[name=string(\"rn2sq\")];");
@@ -224,11 +226,9 @@ pub fn gen_fused_diffusion_layer(
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> ft = transpose(perm=pm,x=fm)[name=string(\"ft\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> ffn_out = reshape(shape=os,x=ft)[name=string(\"ffn\")];");
 
-    // === Residual 2 ===
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xout = add(x=x2,y=ffn_out)[name=string(\"xout\")];");
-
-    // Output
-    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=xout)[name=string(\"cout\")];");
+    // === Residual 2 (fp32 to prevent overflow at dim>=2048) ===
+    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> ffn32 = cast(dtype=to32,x=ffn_out)[name=string(\"ffn32\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = add(x=x2_32,y=ffn32)[name=string(\"cout\")];");
     let _ = writeln!(m, "    }} -> (y);");
     m.push_str("}\n");
 
@@ -429,11 +429,9 @@ pub fn gen_diffusion_attention(
     let _ = writeln!(m, "        tensor<int32, [4]> os = const()[name=string(\"os\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> oo = reshape(shape=os,x=ot)[name=string(\"oo\")];");
 
-    // === Residual ===
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> x2 = add(x=xh,y=oo)[name=string(\"x2\")];");
-
-    // Output
-    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=x2)[name=string(\"cout\")];");
+    // === Residual (fp32 to prevent overflow at dim>=2048) ===
+    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> oo32 = cast(dtype=to32,x=oo)[name=string(\"oo32\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = add(x=x,y=oo32)[name=string(\"cout\")];");
     let _ = writeln!(m, "    }} -> (y);");
     m.push_str("}\n");
 
@@ -531,11 +529,9 @@ pub fn gen_diffusion_ffn(
     let _ = writeln!(m, "        tensor<int32, [4]> os = const()[name=string(\"os\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> ffn_out = reshape(shape=os,x=ft)[name=string(\"ffn\")];");
 
-    // === Residual ===
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xout = add(x=xh,y=ffn_out)[name=string(\"xout\")];");
-
-    // Output
-    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=xout)[name=string(\"cout\")];");
+    // === Residual (fp32 to prevent overflow at dim>=2048) ===
+    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> ffn32 = cast(dtype=to32,x=ffn_out)[name=string(\"ffn32\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = add(x=x,y=ffn32)[name=string(\"cout\")];");
     let _ = writeln!(m, "    }} -> (y);");
     m.push_str("}\n");
 

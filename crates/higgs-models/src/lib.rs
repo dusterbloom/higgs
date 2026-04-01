@@ -1553,4 +1553,37 @@ mod tests {
         assert!((vals[1] - 2.0).abs() < 1e-5);
         assert!((vals[2] - 4.5).abs() < 1e-5);
     }
+
+    #[cfg(feature = "prism-1bit")]
+    #[test]
+    fn prism_1bit_quantized_matmul_smoke() {
+        use mlx_rs::ops::{dequantize, quantize, quantized_matmul};
+
+        let x_data: Vec<f32> = (0..256)
+            .map(|i| ((i % 17) as f32 - 8.0) / 8.0)
+            .collect();
+        let w_data: Vec<f32> = (0..(128 * 128))
+            .map(|i| ((i % 23) as f32 - 11.0) / 11.0)
+            .collect();
+
+        let x = Array::from_slice(&x_data, &[2, 128]);
+        let w = Array::from_slice(&w_data, &[128, 128]);
+
+        let group_size = 128;
+        let bits = 1;
+        let (w_q, scales, biases) = quantize(&w, group_size, bits).unwrap();
+        let w_hat = dequantize(&w_q, &scales, &biases, group_size, bits).unwrap();
+
+        let y_q = quantized_matmul(&x, &w_q, &scales, &biases, false, group_size, bits).unwrap();
+        let y_hat = x.matmul(&w_hat).unwrap();
+
+        mlx_rs::transforms::eval([&y_q, &y_hat]).unwrap();
+        assert_eq!(w_q.shape(), [128, 4]);
+        assert_eq!(scales.shape(), [128, 1]);
+        assert_eq!(biases.shape(), [128, 1]);
+        assert_eq!(y_q.shape(), y_hat.shape());
+
+        let max_diff = ((&y_q - &y_hat).abs().unwrap().max(None).unwrap()).item::<f32>();
+        assert!(max_diff < 1e-2, "1-bit qmm drift too large: {max_diff}");
+    }
 }

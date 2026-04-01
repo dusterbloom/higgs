@@ -80,7 +80,7 @@ higgs-models = { path = "crates/higgs-models" }
 
 # MLX
 mlx-rs = { git = "https://github.com/oxideai/mlx-rs.git", rev = "af21d79" }
-mlx-sys = { git = "https://github.com/oxideai/mlx-rs.git", rev = "af21d79" }
+mlx-sys = { path = "vendor/mlx-sys" }
 
 # HTTP
 axum = { version = "0.8", features = ["macros"] }
@@ -143,3 +143,6 @@ rand = "0.9"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[patch."https://github.com/oxideai/mlx-rs.git"]
+mlx-sys = { path = "vendor/mlx-sys" }
