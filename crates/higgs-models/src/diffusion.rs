@@ -1995,11 +1995,11 @@ impl AneBonsaiEngine {
         let mut gate_buf = vec![0.0f32; seq * inter];
         let mut up_buf = vec![0.0f32; seq * inter];
         let mut ffn_out = vec![0.0f32; seq * h];
-        // Bonsai Q1 drift compounds in late layers on ANE attention, but the
-        // best measured hybrid split also benefits from rescuing a few earlier
-        // layers on CPU. Keep this small, explicit set until the ANE path is
-        // accurate enough to retire the workaround.
-        const BONSAI_CPU_ATTENTION_LAYERS: &[usize] = &[18, 19, 22, 24, 25, 26, 27];
+        // Bonsai Q1 drift compounds across depth on ANE attention. The best
+        // measured hybrid split keeps most layers on ANE but rescues a sparse
+        // set of earlier and late layers on CPU attention to stay within the
+        // current correctness gate.
+        const BONSAI_CPU_ATTENTION_LAYERS: &[usize] = &[12, 15, 16, 17, 18, 19, 22, 24, 25, 26, 27];
 
         let t_fwd = std::time::Instant::now();
         for (layer_idx, kernel) in self.attn_kernels.iter().enumerate() {
@@ -3526,6 +3526,184 @@ mod tests {
         });
 
         eprintln!("Top 10 tail4+rescue policies by seq=5 max_err:");
+        for (rank, (cpu_layers, max_err, mean_err)) in scored.iter().take(10).enumerate() {
+            eprintln!(
+                "  {}. cpu_layers={:?} max_err={:.4} mean_err={:.6}",
+                rank + 1,
+                cpu_layers,
+                max_err,
+                mean_err
+            );
+        }
+
+        let input_64: Vec<u32> = (0..64)
+            .map(|i| if i < 5 { 785 + i } else { 1000 + i })
+            .collect();
+        let ane_engine_64 =
+            super::AneBonsaiEngine::new(DiffusionEngine::load_q1(&bonsai_dir).unwrap(), 64, 1e-6)
+                .unwrap();
+
+        for (rank, (cpu_layers, max_err, mean_err)) in scored.iter().take(5).enumerate() {
+            let _ = bonsai_hybrid_forward_with_cpu_layers(&ane_engine_64, &input_64, cpu_layers);
+            let t0 = std::time::Instant::now();
+            for _ in 0..2 {
+                let _ =
+                    bonsai_hybrid_forward_with_cpu_layers(&ane_engine_64, &input_64, cpu_layers);
+            }
+            let avg_ms = t0.elapsed().as_secs_f64() * 1000.0 / 2.0;
+            eprintln!(
+                "  top{} seq=64 cpu_layers={:?} max_err={:.4} mean_err={:.6} avg_ms={:.1}",
+                rank + 1,
+                cpu_layers,
+                max_err,
+                mean_err,
+                avg_ms
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "Search wider rescue layers on top of the current Bonsai split"]
+    fn test_bonsai_1_7b_hybrid_tail4_wide_rescue_search() {
+        let Some(bonsai_dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+
+        let short_input: Vec<u32> = vec![785, 6722, 315, 9625, 374];
+        let blas_engine = DiffusionEngine::load_q1(&bonsai_dir).unwrap();
+        let blas_logits = blas_engine.forward(&short_input);
+        let ane_engine = super::AneBonsaiEngine::new(
+            DiffusionEngine::load_q1(&bonsai_dir).unwrap(),
+            short_input.len(),
+            1e-6,
+        )
+        .unwrap();
+
+        let base_tail = vec![24usize, 25, 26, 27];
+        let rescue_window = [16usize, 17, 18, 19, 20, 21, 22, 23];
+        let mut scored: Vec<(Vec<usize>, f32, f32)> = Vec::new();
+
+        for mask in 0usize..(1usize << rescue_window.len()) {
+            let mut cpu_layers = base_tail.clone();
+            for (bit, &layer) in rescue_window.iter().enumerate() {
+                if (mask & (1usize << bit)) != 0 {
+                    cpu_layers.push(layer);
+                }
+            }
+            cpu_layers.sort_unstable();
+
+            let logits =
+                bonsai_hybrid_forward_with_cpu_layers(&ane_engine, &short_input, &cpu_layers);
+            let errs: Vec<f32> = blas_logits
+                .iter()
+                .zip(logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .filter(|e| e.is_finite())
+                .collect();
+            let max_err = errs.iter().cloned().fold(0.0f32, f32::max);
+            let mean_err = errs.iter().sum::<f32>() / errs.len() as f32;
+            scored.push((cpu_layers, max_err, mean_err));
+        }
+
+        scored.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.0.len().cmp(&b.0.len()))
+        });
+
+        eprintln!("Top 10 wide-rescue policies by seq=5 max_err:");
+        for (rank, (cpu_layers, max_err, mean_err)) in scored.iter().take(10).enumerate() {
+            eprintln!(
+                "  {}. cpu_layers={:?} max_err={:.4} mean_err={:.6}",
+                rank + 1,
+                cpu_layers,
+                max_err,
+                mean_err
+            );
+        }
+
+        let input_64: Vec<u32> = (0..64)
+            .map(|i| if i < 5 { 785 + i } else { 1000 + i })
+            .collect();
+        let ane_engine_64 =
+            super::AneBonsaiEngine::new(DiffusionEngine::load_q1(&bonsai_dir).unwrap(), 64, 1e-6)
+                .unwrap();
+
+        for (rank, (cpu_layers, max_err, mean_err)) in scored.iter().take(5).enumerate() {
+            let _ = bonsai_hybrid_forward_with_cpu_layers(&ane_engine_64, &input_64, cpu_layers);
+            let t0 = std::time::Instant::now();
+            for _ in 0..2 {
+                let _ =
+                    bonsai_hybrid_forward_with_cpu_layers(&ane_engine_64, &input_64, cpu_layers);
+            }
+            let avg_ms = t0.elapsed().as_secs_f64() * 1000.0 / 2.0;
+            eprintln!(
+                "  top{} seq=64 cpu_layers={:?} max_err={:.4} mean_err={:.6} avg_ms={:.1}",
+                rank + 1,
+                cpu_layers,
+                max_err,
+                mean_err,
+                avg_ms
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "Search earlier rescue layers on top of the best known Bonsai split"]
+    fn test_bonsai_1_7b_hybrid_best_split_early_rescue_search() {
+        let Some(bonsai_dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+
+        let short_input: Vec<u32> = vec![785, 6722, 315, 9625, 374];
+        let blas_engine = DiffusionEngine::load_q1(&bonsai_dir).unwrap();
+        let blas_logits = blas_engine.forward(&short_input);
+        let ane_engine = super::AneBonsaiEngine::new(
+            DiffusionEngine::load_q1(&bonsai_dir).unwrap(),
+            short_input.len(),
+            1e-6,
+        )
+        .unwrap();
+
+        let base_split = vec![18usize, 19, 22, 24, 25, 26, 27];
+        let rescue_window = [12usize, 13, 14, 15, 16, 17];
+        let mut scored: Vec<(Vec<usize>, f32, f32)> = Vec::new();
+
+        for mask in 0usize..(1usize << rescue_window.len()) {
+            let mut cpu_layers = base_split.clone();
+            for (bit, &layer) in rescue_window.iter().enumerate() {
+                if (mask & (1usize << bit)) != 0 {
+                    cpu_layers.push(layer);
+                }
+            }
+            cpu_layers.sort_unstable();
+
+            let logits =
+                bonsai_hybrid_forward_with_cpu_layers(&ane_engine, &short_input, &cpu_layers);
+            let errs: Vec<f32> = blas_logits
+                .iter()
+                .zip(logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .filter(|e| e.is_finite())
+                .collect();
+            let max_err = errs.iter().cloned().fold(0.0f32, f32::max);
+            let mean_err = errs.iter().sum::<f32>() / errs.len() as f32;
+            scored.push((cpu_layers, max_err, mean_err));
+        }
+
+        scored.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.0.len().cmp(&b.0.len()))
+        });
+
+        eprintln!("Top 10 early-rescue policies by seq=5 max_err:");
         for (rank, (cpu_layers, max_err, mean_err)) in scored.iter().take(10).enumerate() {
             eprintln!(
                 "  {}. cpu_layers={:?} max_err={:.4} mean_err={:.6}",
