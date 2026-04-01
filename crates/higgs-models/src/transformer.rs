@@ -1415,4 +1415,156 @@ mod tests {
             .unwrap_or_else(|_| "<decode failed>".to_owned());
         eprintln!("next token argmax: id={best_idx} text={decoded:?} logit={best_val:.4}");
     }
+
+    #[test]
+    #[cfg(feature = "prism-1bit")]
+    #[ignore = "Manual local causal Bonsai generation smoke test"]
+    fn test_generate_bonsai_1_7b_causal_qwen3_smoke() {
+        let Some(model_dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+
+        let tokenizer = load_tokenizer(&model_dir).unwrap();
+        let prompt = "The capital of France is";
+        let encoding = tokenizer.encode(prompt, false).unwrap();
+        let mut generated = encoding.get_ids().to_vec();
+        assert!(!generated.is_empty(), "prompt should tokenize");
+
+        let mut any = AnyModel::Transformer(load_model(&model_dir).unwrap());
+        let mut cache = any.make_cache();
+        let eos_token = 151645u32;
+        let max_new_tokens = 16usize;
+
+        let prompt_i32: Vec<i32> = generated.iter().map(|&t| t as i32).collect();
+        let input = Array::from_slice(&prompt_i32, &[1, generated.len() as i32]);
+        let mut logits = any.forward(&input, None, &mut cache).unwrap();
+
+        for step in 0..max_new_tokens {
+            let logits_f32 = logits.as_dtype(Dtype::Float32).unwrap();
+            let flat = logits_f32.as_slice::<f32>();
+            let (best_idx, best_val) = flat
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap();
+            let next_token = best_idx as u32;
+            generated.push(next_token);
+            let decoded = tokenizer
+                .decode(&[next_token], true)
+                .unwrap_or_else(|_| "<decode failed>".to_owned());
+            eprintln!("step {step:02}: id={next_token} text={decoded:?} logit={best_val:.4}");
+            if next_token == eos_token {
+                break;
+            }
+
+            let next_input = Array::from_slice(&[next_token as i32], &[1, 1]);
+            logits = any.forward(&next_input, None, &mut cache).unwrap();
+        }
+
+        let completion = tokenizer
+            .decode(&generated[encoding.get_ids().len()..], true)
+            .unwrap_or_else(|_| "<decode failed>".to_owned());
+        eprintln!("completion: {:?}", completion);
+
+        let full = tokenizer
+            .decode(&generated, true)
+            .unwrap_or_else(|_| "<decode failed>".to_owned());
+        eprintln!("full text: {:?}", full);
+        assert!(
+            generated.len() > encoding.get_ids().len(),
+            "expected at least one generated token"
+        );
+    }
+
+    fn build_long_bonsai_prompt_ids(
+        tokenizer: &tokenizers::Tokenizer,
+        prompt_len: usize,
+    ) -> Vec<u32> {
+        let seed = concat!(
+            "Bonsai is a causal 1-bit Qwen3 model. ",
+            "We want stable long-context prefill, sane decode, and a clean GPU-to-ANE plan. ",
+            "Summarize long-context risks, retrieval needs, and KV-cache behavior. "
+        );
+        let seed_ids = tokenizer
+            .encode(seed, false)
+            .expect("seed prompt should tokenize")
+            .get_ids()
+            .to_vec();
+        assert!(!seed_ids.is_empty(), "seed prompt tokenized to zero length");
+
+        let mut ids = Vec::with_capacity(prompt_len);
+        while ids.len() < prompt_len {
+            ids.extend_from_slice(&seed_ids);
+        }
+        ids.truncate(prompt_len);
+        ids
+    }
+
+    #[test]
+    #[cfg(feature = "prism-1bit")]
+    #[ignore = "Manual local causal Bonsai context sweep"]
+    fn bench_bonsai_1_7b_causal_qwen3_context_sweep() {
+        let Some(model_dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+
+        let tokenizer = load_tokenizer(&model_dir).unwrap();
+        let eos_token = 151645u32;
+        let chunk_size = 512i32;
+        let decode_tokens = 8usize;
+
+        for seq in [1024usize, 4096usize] {
+            let prompt_ids = build_long_bonsai_prompt_ids(&tokenizer, seq);
+            eprintln!("\n=== causal Bonsai seq={seq} chunk_size={chunk_size} ===");
+
+            let mut any = AnyModel::Transformer(load_model(&model_dir).unwrap());
+            let mut cache = any.make_cache();
+            let input_ids: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+            let input = Array::from_slice(&input_ids, &[1, prompt_ids.len() as i32]);
+
+            let t0 = std::time::Instant::now();
+            let mut logits = any.forward_chunked(&input, &mut cache, chunk_size).unwrap();
+            let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let mut generated = prompt_ids.clone();
+            for step in 0..decode_tokens {
+                let logits_f32 = logits.as_dtype(Dtype::Float32).unwrap();
+                let flat = logits_f32.as_slice::<f32>();
+                let finite = flat.iter().filter(|v| v.is_finite()).count();
+                assert_eq!(
+                    finite,
+                    flat.len(),
+                    "non-finite logits at seq={seq} step={step}"
+                );
+
+                let (best_idx, best_val) = flat
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap();
+                let next_token = best_idx as u32;
+                generated.push(next_token);
+                let decoded = tokenizer
+                    .decode(&[next_token], true)
+                    .unwrap_or_else(|_| "<decode failed>".to_owned());
+                eprintln!("step {step:02}: id={next_token} text={decoded:?} logit={best_val:.4}");
+                if next_token == eos_token {
+                    break;
+                }
+
+                let next_input = Array::from_slice(&[next_token as i32], &[1, 1]);
+                logits = any.forward(&next_input, None, &mut cache).unwrap();
+            }
+
+            let completion = tokenizer
+                .decode(&generated[prompt_ids.len()..], true)
+                .unwrap_or_else(|_| "<decode failed>".to_owned());
+            eprintln!("prefill_ms={prefill_ms:.1}");
+            eprintln!("completion: {:?}", completion);
+        }
+    }
 }
