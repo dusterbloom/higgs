@@ -117,6 +117,7 @@ pub struct DiffusionConfig {
 // Per-layer weights
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct DiffusionLayerWeights {
     // Attention projections [out, in] row-major (PyTorch layout).
     pub q_proj: Vec<f32>, // [heads*head_dim, hidden] = [2048, 1024]
@@ -139,6 +140,7 @@ pub struct DiffusionLayerWeights {
 // Engine
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct DiffusionEngine {
     pub layers: Vec<DiffusionLayerWeights>,
     pub embed: Vec<f32>,      // [vocab, hidden]
@@ -149,16 +151,83 @@ pub struct DiffusionEngine {
     pub(crate) rope_sin: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffusionBackendPreference {
+    Auto,
+    CpuBlas,
+    #[cfg(feature = "ane")]
+    Ane,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffusionBackend {
+    CpuBlas,
+    #[cfg(feature = "ane")]
+    AneFused,
+    #[cfg(feature = "ane")]
+    AneMultiDispatch,
+    #[cfg(feature = "ane")]
+    AneHybridBonsai,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffusionBackendReport {
+    pub model_kind: DiffusionModelKind,
+    pub requested: DiffusionBackendPreference,
+    pub selected: DiffusionBackend,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffusionModelKind {
+    Standard,
+    BonsaiQ1,
+}
+
+pub enum DiffusionRuntime {
+    Cpu {
+        engine: DiffusionEngine,
+        report: DiffusionBackendReport,
+    },
+    #[cfg(feature = "ane")]
+    AneFused {
+        engine: AneDiffusionEngine,
+        report: DiffusionBackendReport,
+    },
+    #[cfg(feature = "ane")]
+    AneHybridBonsai {
+        engine: AneBonsaiEngine,
+        report: DiffusionBackendReport,
+    },
+}
+
 impl DiffusionEngine {
+    pub fn detect_model_kind<P: AsRef<Path>>(model_dir: P) -> Result<DiffusionModelKind, String> {
+        let cfg = load_diffusion_config_json(model_dir)?;
+        let bits = cfg
+            .get("quantization")
+            .and_then(|q| q.get("bits"))
+            .and_then(serde_json::Value::as_u64);
+        if bits == Some(1) {
+            Ok(DiffusionModelKind::BonsaiQ1)
+        } else {
+            Ok(DiffusionModelKind::Standard)
+        }
+    }
+
+    pub fn load_autodetect<P: AsRef<Path>>(model_dir: P) -> Result<Self, String> {
+        match Self::detect_model_kind(&model_dir)? {
+            DiffusionModelKind::Standard => Self::load(model_dir),
+            DiffusionModelKind::BonsaiQ1 => Self::load_q1(model_dir),
+        }
+    }
+
     /// Load model from a HuggingFace model directory containing config.json + model.safetensors.
     pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<Self, String> {
         let dir = model_dir.as_ref();
 
         // Load config
-        let config_str = std::fs::read_to_string(dir.join("config.json"))
-            .map_err(|e| format!("config.json: {e}"))?;
-        let cfg: serde_json::Value =
-            serde_json::from_str(&config_str).map_err(|e| format!("parse config: {e}"))?;
+        let cfg = load_diffusion_config_json(dir)?;
 
         let config = DiffusionConfig {
             hidden: cfg["hidden_size"].as_u64().unwrap() as usize,
@@ -245,10 +314,7 @@ impl DiffusionEngine {
     pub fn load_q1<P: AsRef<Path>>(model_dir: P) -> Result<Self, String> {
         let dir = model_dir.as_ref();
 
-        let config_str = std::fs::read_to_string(dir.join("config.json"))
-            .map_err(|e| format!("config.json: {e}"))?;
-        let cfg: serde_json::Value =
-            serde_json::from_str(&config_str).map_err(|e| format!("parse config: {e}"))?;
+        let cfg = load_diffusion_config_json(dir)?;
 
         let config = DiffusionConfig {
             hidden: cfg["hidden_size"].as_u64().unwrap() as usize,
@@ -600,6 +666,321 @@ impl DiffusionEngine {
     }
 }
 
+impl DiffusionRuntime {
+    pub fn load_autodetect_with_backend<P: AsRef<Path>>(
+        model_dir: P,
+        seq_len: usize,
+        backend: DiffusionBackendPreference,
+    ) -> Result<Self, String> {
+        match DiffusionEngine::detect_model_kind(&model_dir)? {
+            DiffusionModelKind::Standard => Self::load_with_backend(model_dir, seq_len, backend),
+            DiffusionModelKind::BonsaiQ1 => {
+                Self::load_q1_with_backend(model_dir, seq_len, 1e-6, backend)
+            }
+        }
+    }
+
+    pub fn load_with_backend<P: AsRef<Path>>(
+        model_dir: P,
+        seq_len: usize,
+        backend: DiffusionBackendPreference,
+    ) -> Result<Self, String> {
+        let engine = DiffusionEngine::load(model_dir)?;
+        Self::new(engine, seq_len, backend)
+    }
+
+    pub fn load_q1_with_backend<P: AsRef<Path>>(
+        model_dir: P,
+        seq_len: usize,
+        eps: f32,
+        backend: DiffusionBackendPreference,
+    ) -> Result<Self, String> {
+        let engine = DiffusionEngine::load_q1(model_dir)?;
+        Self::new_bonsai_q1(engine, seq_len, eps, backend)
+    }
+
+    pub fn new(
+        engine: DiffusionEngine,
+        seq_len: usize,
+        backend: DiffusionBackendPreference,
+    ) -> Result<Self, String> {
+        #[cfg(not(feature = "ane"))]
+        let _ = seq_len;
+
+        match backend {
+            DiffusionBackendPreference::Auto => {
+                #[cfg(feature = "ane")]
+                {
+                    match AneDiffusionEngine::new(engine.clone(), seq_len) {
+                        Ok(ane) => {
+                            let selected = ane.backend_kind();
+                            let detail = match selected {
+                                DiffusionBackend::AneFused => {
+                                    "Selected ANE fused diffusion backend automatically"
+                                        .to_owned()
+                                }
+                                DiffusionBackend::AneMultiDispatch => {
+                                    "Selected ANE multi-dispatch diffusion backend automatically after fused compile fallback"
+                                        .to_owned()
+                                }
+                                _ => unreachable!("unexpected diffusion backend for ANE engine"),
+                            };
+                            return Ok(Self::AneFused {
+                                engine: ane,
+                                report: DiffusionBackendReport {
+                                    model_kind: DiffusionModelKind::Standard,
+                                    requested: backend,
+                                    selected,
+                                    detail,
+                                },
+                            });
+                        }
+                        Err(err) => {
+                            return Ok(Self::Cpu {
+                                engine,
+                                report: DiffusionBackendReport {
+                                    model_kind: DiffusionModelKind::Standard,
+                                    requested: backend,
+                                    selected: DiffusionBackend::CpuBlas,
+                                    detail: format!(
+                                        "ANE fused diffusion backend unavailable, using CPU BLAS: {err}"
+                                    ),
+                                },
+                            });
+                        }
+                    }
+                }
+
+                #[cfg(not(feature = "ane"))]
+                {
+                    Ok(Self::Cpu {
+                        engine,
+                        report: DiffusionBackendReport {
+                            model_kind: DiffusionModelKind::Standard,
+                            requested: backend,
+                            selected: DiffusionBackend::CpuBlas,
+                            detail: "ANE feature not enabled, using CPU BLAS".to_owned(),
+                        },
+                    })
+                }
+            }
+            DiffusionBackendPreference::CpuBlas => Ok(Self::Cpu {
+                engine,
+                report: DiffusionBackendReport {
+                    model_kind: DiffusionModelKind::Standard,
+                    requested: backend,
+                    selected: DiffusionBackend::CpuBlas,
+                    detail: "CPU BLAS requested explicitly".to_owned(),
+                },
+            }),
+            #[cfg(feature = "ane")]
+            DiffusionBackendPreference::Ane => {
+                let ane = AneDiffusionEngine::new(engine, seq_len)?;
+                let selected = ane.backend_kind();
+                let detail = match selected {
+                    DiffusionBackend::AneFused => {
+                        "ANE fused diffusion backend requested explicitly".to_owned()
+                    }
+                    DiffusionBackend::AneMultiDispatch => {
+                        "ANE diffusion backend requested explicitly; using multi-dispatch fallback"
+                            .to_owned()
+                    }
+                    _ => unreachable!("unexpected diffusion backend for ANE engine"),
+                };
+                Ok(Self::AneFused {
+                    engine: ane,
+                    report: DiffusionBackendReport {
+                        model_kind: DiffusionModelKind::Standard,
+                        requested: backend,
+                        selected,
+                        detail,
+                    },
+                })
+            }
+        }
+    }
+
+    pub fn new_bonsai_q1(
+        engine: DiffusionEngine,
+        seq_len: usize,
+        eps: f32,
+        backend: DiffusionBackendPreference,
+    ) -> Result<Self, String> {
+        #[cfg(not(feature = "ane"))]
+        let _ = (seq_len, eps);
+
+        match backend {
+            DiffusionBackendPreference::Auto => {
+                #[cfg(feature = "ane")]
+                {
+                    match AneBonsaiEngine::new(engine.clone(), seq_len, eps) {
+                        Ok(ane) => {
+                            return Ok(Self::AneHybridBonsai {
+                                engine: ane,
+                                report: DiffusionBackendReport {
+                                    model_kind: DiffusionModelKind::BonsaiQ1,
+                                    requested: backend,
+                                    selected: DiffusionBackend::AneHybridBonsai,
+                                    detail: "Selected ANE Bonsai hybrid backend automatically"
+                                        .to_owned(),
+                                },
+                            });
+                        }
+                        Err(err) => {
+                            return Ok(Self::Cpu {
+                                engine,
+                                report: DiffusionBackendReport {
+                                    model_kind: DiffusionModelKind::BonsaiQ1,
+                                    requested: backend,
+                                    selected: DiffusionBackend::CpuBlas,
+                                    detail: format!(
+                                        "ANE Bonsai hybrid backend unavailable, using CPU BLAS: {err}"
+                                    ),
+                                },
+                            });
+                        }
+                    }
+                }
+
+                #[cfg(not(feature = "ane"))]
+                {
+                    Ok(Self::Cpu {
+                        engine,
+                        report: DiffusionBackendReport {
+                            model_kind: DiffusionModelKind::BonsaiQ1,
+                            requested: backend,
+                            selected: DiffusionBackend::CpuBlas,
+                            detail: "ANE feature not enabled, using CPU BLAS".to_owned(),
+                        },
+                    })
+                }
+            }
+            DiffusionBackendPreference::CpuBlas => Ok(Self::Cpu {
+                engine,
+                report: DiffusionBackendReport {
+                    model_kind: DiffusionModelKind::BonsaiQ1,
+                    requested: backend,
+                    selected: DiffusionBackend::CpuBlas,
+                    detail: "CPU BLAS requested explicitly".to_owned(),
+                },
+            }),
+            #[cfg(feature = "ane")]
+            DiffusionBackendPreference::Ane => {
+                let ane = AneBonsaiEngine::new(engine, seq_len, eps)?;
+                Ok(Self::AneHybridBonsai {
+                    engine: ane,
+                    report: DiffusionBackendReport {
+                        model_kind: DiffusionModelKind::BonsaiQ1,
+                        requested: backend,
+                        selected: DiffusionBackend::AneHybridBonsai,
+                        detail: "ANE Bonsai hybrid backend requested explicitly".to_owned(),
+                    },
+                })
+            }
+        }
+    }
+
+    pub fn backend_report(&self) -> &DiffusionBackendReport {
+        match self {
+            Self::Cpu { report, .. } => report,
+            #[cfg(feature = "ane")]
+            Self::AneFused { report, .. } => report,
+            #[cfg(feature = "ane")]
+            Self::AneHybridBonsai { report, .. } => report,
+        }
+    }
+
+    pub fn requested_backend(&self) -> DiffusionBackendPreference {
+        self.backend_report().requested
+    }
+
+    pub fn model_kind(&self) -> DiffusionModelKind {
+        self.backend_report().model_kind
+    }
+
+    pub fn selected_backend(&self) -> DiffusionBackend {
+        self.backend_report().selected
+    }
+
+    pub fn forward(&self, token_ids: &[u32]) -> Vec<f32> {
+        match self {
+            Self::Cpu { engine, .. } => engine.forward(token_ids),
+            #[cfg(feature = "ane")]
+            Self::AneFused { engine, .. } => engine.forward(token_ids),
+            #[cfg(feature = "ane")]
+            Self::AneHybridBonsai { engine, .. } => engine.forward(token_ids),
+        }
+    }
+
+    pub fn generate(&self, prompt_ids: &[u32], num_tokens: usize, steps: usize) -> Vec<u32> {
+        let mask_id = match self {
+            Self::Cpu { engine, .. } => engine.config.mask_token_id,
+            #[cfg(feature = "ane")]
+            Self::AneFused { engine, .. } => engine.blas_engine.config.mask_token_id,
+            #[cfg(feature = "ane")]
+            Self::AneHybridBonsai { engine, .. } => engine.blas_engine.config.mask_token_id,
+        };
+        let vocab = match self {
+            Self::Cpu { engine, .. } => engine.config.vocab,
+            #[cfg(feature = "ane")]
+            Self::AneFused { engine, .. } => engine.blas_engine.config.vocab,
+            #[cfg(feature = "ane")]
+            Self::AneHybridBonsai { engine, .. } => engine.blas_engine.config.vocab,
+        };
+
+        let mut canvas: Vec<u32> = Vec::with_capacity(prompt_ids.len() + num_tokens);
+        canvas.extend_from_slice(prompt_ids);
+        canvas.extend(std::iter::repeat(mask_id).take(num_tokens));
+
+        for step in 0..steps {
+            let logits = self.forward(&canvas);
+            let seq = canvas.len();
+
+            let mut mask_positions: Vec<(usize, f32, u32)> = Vec::new();
+            for pos in 0..seq {
+                if canvas[pos] != mask_id {
+                    continue;
+                }
+                let row = &logits[pos * vocab..(pos + 1) * vocab];
+                let max_logit = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f32;
+                let mut best_idx = 0u32;
+                let mut best_val = f32::NEG_INFINITY;
+                for (i, &v) in row.iter().enumerate() {
+                    sum_exp += (v - max_logit).exp();
+                    if v > best_val {
+                        best_val = v;
+                        best_idx = i as u32;
+                    }
+                }
+                let confidence = (best_val - max_logit).exp() / sum_exp;
+                mask_positions.push((pos, confidence, best_idx));
+            }
+
+            if mask_positions.is_empty() {
+                break;
+            }
+
+            let n_masks = mask_positions.len();
+            let n_keep = n_masks * (steps - step - 1) / steps;
+            let n_unmask = (n_masks - n_keep).max(1);
+            mask_positions
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for &(pos, _, pred) in mask_positions.iter().take(n_unmask) {
+                canvas[pos] = pred;
+            }
+        }
+
+        canvas
+    }
+}
+
+fn load_diffusion_config_json<P: AsRef<Path>>(model_dir: P) -> Result<serde_json::Value, String> {
+    let config_str = std::fs::read_to_string(model_dir.as_ref().join("config.json"))
+        .map_err(|e| format!("config.json: {e}"))?;
+    serde_json::from_str(&config_str).map_err(|e| format!("parse config: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // ANE-accelerated engine — fully-fused (1 dispatch per layer)
 // ---------------------------------------------------------------------------
@@ -607,8 +988,59 @@ impl DiffusionEngine {
 /// Pre-built weight blobs for one transformer layer (ready for ANE reload).
 #[cfg(feature = "ane")]
 pub struct AneLayerWeightBlobs {
-    /// All 13 weight blobs in order expected by the fused MIL kernel.
+    /// Weight blobs in the order expected by the compiled MIL kernel.
     pub blobs: Vec<Vec<u8>>,
+}
+
+#[cfg(feature = "ane")]
+enum AneDiffusionKernelSet {
+    Fused {
+        kernel: crate::ane_bridge::AneKernel,
+        layer_blobs: Vec<AneLayerWeightBlobs>,
+    },
+    MultiDispatch {
+        attn_kernel: crate::ane_bridge::AneKernel,
+        attn_layer_blobs: Vec<AneLayerWeightBlobs>,
+        ffn_kernel: crate::ane_bridge::AneKernel,
+        ffn_layer_blobs: Vec<AneLayerWeightBlobs>,
+    },
+}
+
+#[cfg(feature = "ane")]
+fn compile_ane_kernel(
+    label: &str,
+    mil_text: &str,
+    weight_names: &[&str],
+    weight_datas: &[&[u8]],
+    input_sizes: &[usize],
+    output_sizes: &[usize],
+) -> Result<crate::ane_bridge::AneKernel, String> {
+    use crate::ane_bridge::AneKernel;
+
+    match AneKernel::compile_multi_weights(
+        mil_text,
+        weight_names,
+        weight_datas,
+        input_sizes,
+        output_sizes,
+    ) {
+        Ok(kernel) => Ok(kernel),
+        Err(multi_err) => {
+            eprintln!(
+                "{label}: ANE multi-weight compile failed ({multi_err}), trying direct compile path..."
+            );
+            AneKernel::compile_direct(
+                mil_text,
+                weight_names,
+                weight_datas,
+                input_sizes,
+                output_sizes,
+            )
+            .map_err(|direct_err| {
+                format!("{label}: multi-weight compile failed ({multi_err}); direct compile failed ({direct_err})")
+            })
+        }
+    }
 }
 
 /// ANE-accelerated diffusion engine using a single fused kernel + per-layer weight reload.
@@ -623,18 +1055,22 @@ pub struct AneLayerWeightBlobs {
 #[cfg(feature = "ane")]
 pub struct AneDiffusionEngine {
     pub blas_engine: DiffusionEngine,
-    /// Single compiled kernel — weights are hot-swapped per layer via reload_weights.
-    pub kernel: crate::ane_bridge::AneKernel,
-    /// Pre-built weight blobs for each layer (13 blobs × 28 layers).
-    pub layer_blobs: Vec<AneLayerWeightBlobs>,
+    kernels: AneDiffusionKernelSet,
     pub seq_len: usize, // fixed seq for compiled kernels (padded to ANE_MIN_SPATIAL)
 }
 
 #[cfg(feature = "ane")]
 impl AneDiffusionEngine {
+    pub fn backend_kind(&self) -> DiffusionBackend {
+        match self.kernels {
+            AneDiffusionKernelSet::Fused { .. } => DiffusionBackend::AneFused,
+            AneDiffusionKernelSet::MultiDispatch { .. } => DiffusionBackend::AneMultiDispatch,
+        }
+    }
+
     /// Compile one fully-fused ANE kernel and pre-build 28 sets of weight blobs.
     pub fn new(engine: DiffusionEngine, seq_len: usize) -> Result<Self, String> {
-        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed, AneKernel};
+        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
         use crate::ane_mil::ANE_MIN_SPATIAL;
         use crate::diffusion_ane;
 
@@ -667,8 +1103,7 @@ impl AneDiffusionEngine {
             }
         }
 
-        // Generate the MIL once — identical for all 28 layers.
-        let mil = diffusion_ane::gen_fused_diffusion_layer(
+        let fused_mil = diffusion_ane::gen_fused_diffusion_layer(
             h,
             cfg.heads,
             cfg.kv_heads,
@@ -677,7 +1112,12 @@ impl AneDiffusionEngine {
             seq,
             1e-6,
         );
-        let names: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
+        let fused_names: Vec<&str> = fused_mil.weight_names.iter().map(|s| s.as_str()).collect();
+        let attn_mil =
+            diffusion_ane::gen_diffusion_attention(h, cfg.heads, cfg.kv_heads, hd, seq, 1e-6);
+        let attn_names: Vec<&str> = attn_mil.weight_names.iter().map(|s| s.as_str()).collect();
+        let ffn_mil = diffusion_ane::gen_diffusion_ffn(h, inter, seq, 1e-6);
+        let ffn_names: Vec<&str> = ffn_mil.weight_names.iter().map(|s| s.as_str()).collect();
 
         // Build the RoPE blobs once (layout: [seq, half_hd] row-major).
         let rope_cos_blob = build_weight_blob(&rope_cos, seq, half_hd);
@@ -695,9 +1135,11 @@ impl AneDiffusionEngine {
         //
         // Norm weights are 1-D [dim] vectors, stored as [1, dim, 1, 1] in MIL.
         // build_weight_blob(w, 1, dim) packs them correctly.
-        let mut layer_blobs: Vec<AneLayerWeightBlobs> = Vec::with_capacity(cfg.layers);
+        let mut fused_layer_blobs: Vec<AneLayerWeightBlobs> = Vec::with_capacity(cfg.layers);
+        let mut attn_layer_blobs: Vec<AneLayerWeightBlobs> = Vec::with_capacity(cfg.layers);
+        let mut ffn_layer_blobs: Vec<AneLayerWeightBlobs> = Vec::with_capacity(cfg.layers);
         for lw in &engine.layers {
-            let blobs = vec![
+            let fused_blobs = vec![
                 build_weight_blob(&lw.input_norm, 1, h),            // rms_att
                 build_weight_blob(&lw.post_attn_norm, 1, h),        // rms_ffn
                 build_weight_blob_transposed(&lw.q_proj, q_dim, h), // wq
@@ -712,31 +1154,94 @@ impl AneDiffusionEngine {
                 build_weight_blob(&lw.q_norm, 1, hd),               // q_norm
                 build_weight_blob(&lw.k_norm, 1, hd),               // k_norm
             ];
-            layer_blobs.push(AneLayerWeightBlobs { blobs });
+            let attn_blobs = vec![
+                build_weight_blob(&lw.input_norm, 1, h),
+                build_weight_blob_transposed(&lw.q_proj, q_dim, h),
+                build_weight_blob_transposed(&lw.k_proj, kv_dim, h),
+                build_weight_blob_transposed(&lw.v_proj, kv_dim, h),
+                build_weight_blob_transposed(&lw.o_proj, h, q_dim),
+                rope_cos_blob.clone(),
+                rope_sin_blob.clone(),
+                build_weight_blob(&lw.q_norm, 1, hd),
+                build_weight_blob(&lw.k_norm, 1, hd),
+            ];
+            let ffn_blobs = vec![
+                build_weight_blob(&lw.post_attn_norm, 1, h),
+                build_weight_blob_transposed(&lw.gate_proj, inter, h),
+                build_weight_blob_transposed(&lw.up_proj, inter, h),
+                build_weight_blob_transposed(&lw.down_proj, h, inter),
+            ];
+            fused_layer_blobs.push(AneLayerWeightBlobs { blobs: fused_blobs });
+            attn_layer_blobs.push(AneLayerWeightBlobs { blobs: attn_blobs });
+            ffn_layer_blobs.push(AneLayerWeightBlobs { blobs: ffn_blobs });
         }
 
-        // Compile ONE kernel using layer-0 weights.
-        let l0 = &layer_blobs[0];
-        let l0_refs: Vec<&[u8]> = l0.blobs.iter().map(|b| b.as_slice()).collect();
-        let kernel = AneKernel::compile_multi_weights(
-            &mil.mil_text,
-            &names,
-            &l0_refs,
-            &[mil.input_bytes],
-            &[mil.output_bytes],
-        )
-        .map_err(|e| format!("L0 compile: {e}"))?;
+        let fused_l0 = &fused_layer_blobs[0];
+        let fused_l0_refs: Vec<&[u8]> = fused_l0.blobs.iter().map(|b| b.as_slice()).collect();
 
-        let compile_ms = t0.elapsed().as_millis();
-        eprintln!(
-            "ANE compiled: 1 fused kernel in {}ms, {} weight blobs prebuilt",
-            compile_ms, cfg.layers,
-        );
+        let kernels = match compile_ane_kernel(
+            "L0 fused compile",
+            &fused_mil.mil_text,
+            &fused_names,
+            &fused_l0_refs,
+            &[fused_mil.input_bytes],
+            &[fused_mil.output_bytes],
+        ) {
+            Ok(kernel) => {
+                let compile_ms = t0.elapsed().as_millis();
+                eprintln!(
+                    "ANE compiled: 1 fused kernel in {}ms, {} weight blobs prebuilt",
+                    compile_ms, cfg.layers,
+                );
+                AneDiffusionKernelSet::Fused {
+                    kernel,
+                    layer_blobs: fused_layer_blobs,
+                }
+            }
+            Err(fused_err) => {
+                eprintln!(
+                    "Fused ANE layer compile failed ({fused_err}); falling back to multi-dispatch attention+FFN kernels..."
+                );
+
+                let attn_l0 = &attn_layer_blobs[0];
+                let attn_l0_refs: Vec<&[u8]> = attn_l0.blobs.iter().map(|b| b.as_slice()).collect();
+                let attn_kernel = compile_ane_kernel(
+                    "L0 attention compile after fused fallback",
+                    &attn_mil.mil_text,
+                    &attn_names,
+                    &attn_l0_refs,
+                    &[attn_mil.input_bytes],
+                    &[attn_mil.output_bytes],
+                )?;
+
+                let ffn_l0 = &ffn_layer_blobs[0];
+                let ffn_l0_refs: Vec<&[u8]> = ffn_l0.blobs.iter().map(|b| b.as_slice()).collect();
+                let ffn_kernel = compile_ane_kernel(
+                    "L0 FFN compile after fused fallback",
+                    &ffn_mil.mil_text,
+                    &ffn_names,
+                    &ffn_l0_refs,
+                    &[ffn_mil.input_bytes],
+                    &[ffn_mil.output_bytes],
+                )?;
+
+                let compile_ms = t0.elapsed().as_millis();
+                eprintln!(
+                    "ANE compiled: multi-dispatch fallback in {}ms (attention + FFN, {} layers prebuilt)",
+                    compile_ms, cfg.layers,
+                );
+                AneDiffusionKernelSet::MultiDispatch {
+                    attn_kernel,
+                    attn_layer_blobs,
+                    ffn_kernel,
+                    ffn_layer_blobs,
+                }
+            }
+        };
 
         Ok(Self {
             blas_engine: engine,
-            kernel,
-            layer_blobs,
+            kernels,
             seq_len: seq,
         })
     }
@@ -783,33 +1288,57 @@ impl AneDiffusionEngine {
 
         let t_fwd = std::time::Instant::now();
 
-        // 2. Layer loop — 1 ANE dispatch per layer.
-        //    For each layer: reload weights (delta path, no recompile) → write input → eval → read output.
-        //    The fused kernel handles: RMSNorm → QKV → QK-norm → RoPE → SDPA → Wo → residual
-        //                             → RMSNorm → FFN → residual.
         let mut layer_in_bytes = pack(&hidden, h);
         let mut layer_out_bytes = vec![0u8; h * ps * 4];
 
-        for lb in &self.layer_blobs {
-            // Hot-swap weights for this layer.
-            // Uses delta cache: unloads model, writes new BLOBFILEs to disk, reloads.
-            // No recompile (compileWithQoS is skipped). Correct results verified empirically.
-            let blob_refs: Vec<&[u8]> = lb.blobs.iter().map(|b| b.as_slice()).collect();
-            self.kernel.reload_weights(&blob_refs).unwrap();
+        match &self.kernels {
+            AneDiffusionKernelSet::Fused {
+                kernel,
+                layer_blobs,
+            } => {
+                for lb in layer_blobs {
+                    let blob_refs: Vec<&[u8]> = lb.blobs.iter().map(|b| b.as_slice()).collect();
+                    kernel.reload_weights(&blob_refs).unwrap();
 
-            self.kernel.write_input(0, &layer_in_bytes);
-            self.kernel.eval().unwrap();
-            self.kernel.read_output(0, &mut layer_out_bytes);
-            // Swap: output of this layer becomes input of next layer.
-            std::mem::swap(&mut layer_in_bytes, &mut layer_out_bytes);
+                    kernel.write_input(0, &layer_in_bytes);
+                    kernel.eval().unwrap();
+                    kernel.read_output(0, &mut layer_out_bytes);
+                    std::mem::swap(&mut layer_in_bytes, &mut layer_out_bytes);
+                }
+            }
+            AneDiffusionKernelSet::MultiDispatch {
+                attn_kernel,
+                attn_layer_blobs,
+                ffn_kernel,
+                ffn_layer_blobs,
+            } => {
+                let mut attn_out_bytes = vec![0u8; h * ps * 4];
+                for (attn_lb, ffn_lb) in attn_layer_blobs.iter().zip(ffn_layer_blobs.iter()) {
+                    let attn_refs: Vec<&[u8]> =
+                        attn_lb.blobs.iter().map(|b| b.as_slice()).collect();
+                    attn_kernel.reload_weights(&attn_refs).unwrap();
+                    attn_kernel.write_input(0, &layer_in_bytes);
+                    attn_kernel.eval().unwrap();
+                    attn_kernel.read_output(0, &mut attn_out_bytes);
+
+                    let ffn_refs: Vec<&[u8]> = ffn_lb.blobs.iter().map(|b| b.as_slice()).collect();
+                    ffn_kernel.reload_weights(&ffn_refs).unwrap();
+                    ffn_kernel.write_input(0, &attn_out_bytes);
+                    ffn_kernel.eval().unwrap();
+                    ffn_kernel.read_output(0, &mut layer_out_bytes);
+                    std::mem::swap(&mut layer_in_bytes, &mut layer_out_bytes);
+                }
+            }
         }
 
         let fwd_ms = t_fwd.elapsed().as_millis();
-        eprintln!(
-            "  fwd: {} ANE dispatches in {}ms (seq={seq})",
-            self.layer_blobs.len(),
-            fwd_ms
-        );
+        let dispatches = match &self.kernels {
+            AneDiffusionKernelSet::Fused { layer_blobs, .. } => layer_blobs.len(),
+            AneDiffusionKernelSet::MultiDispatch {
+                attn_layer_blobs, ..
+            } => attn_layer_blobs.len() * 2,
+        };
+        eprintln!("  fwd: {dispatches} ANE dispatches in {fwd_ms}ms (seq={seq})");
 
         // Unpack final layer output back to row-major [seq, h].
         let hidden_out = unpack(&layer_in_bytes, h);
@@ -1141,6 +1670,97 @@ pub(crate) fn sgemm_nt_acc(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c
     }
 }
 
+/// CPU attention context for one diffusion/Qwen-style layer, returned before Wo.
+pub(crate) fn diffusion_attention_context_cpu(
+    engine: &DiffusionEngine,
+    layer_idx: usize,
+    hidden: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    let cfg = &engine.config;
+    let seq = hidden.len() / cfg.hidden;
+    let h = cfg.hidden;
+    let hd = cfg.head_dim;
+    let half_hd = hd / 2;
+    let n_heads = cfg.heads;
+    let n_kv = cfg.kv_heads;
+    let gqa_ratio = n_heads / n_kv;
+    let q_dim = n_heads * hd;
+    let kv_dim = n_kv * hd;
+    let layer = &engine.layers[layer_idx];
+
+    let mut normed = vec![0.0f32; seq * h];
+    let mut q_buf = vec![0.0f32; seq * q_dim];
+    let mut k_buf = vec![0.0f32; seq * kv_dim];
+    let mut v_buf = vec![0.0f32; seq * kv_dim];
+    let mut attn_out = vec![0.0f32; seq * q_dim];
+
+    rms_norm_eps(hidden, &layer.input_norm, &mut normed, seq, h, eps);
+    sgemm_nt(seq, q_dim, h, &normed, &layer.q_proj, &mut q_buf);
+    sgemm_nt(seq, kv_dim, h, &normed, &layer.k_proj, &mut k_buf);
+    sgemm_nt(seq, kv_dim, h, &normed, &layer.v_proj, &mut v_buf);
+
+    for s in 0..seq {
+        for head in 0..n_heads {
+            let off = s * q_dim + head * hd;
+            rms_norm_slice(&mut q_buf[off..off + hd], &layer.q_norm);
+            apply_rope(
+                &mut q_buf[off..off + hd],
+                s,
+                half_hd,
+                &engine.rope_cos,
+                &engine.rope_sin,
+            );
+        }
+        for head in 0..n_kv {
+            let off = s * kv_dim + head * hd;
+            rms_norm_slice(&mut k_buf[off..off + hd], &layer.k_norm);
+            apply_rope(
+                &mut k_buf[off..off + hd],
+                s,
+                half_hd,
+                &engine.rope_cos,
+                &engine.rope_sin,
+            );
+        }
+    }
+
+    let scale = 1.0 / (hd as f32).sqrt();
+    for kv_h in 0..n_kv {
+        let mut k_head = vec![0.0f32; seq * hd];
+        let mut v_head = vec![0.0f32; seq * hd];
+        for s in 0..seq {
+            let ko = s * kv_dim + kv_h * hd;
+            k_head[s * hd..(s + 1) * hd].copy_from_slice(&k_buf[ko..ko + hd]);
+            v_head[s * hd..(s + 1) * hd].copy_from_slice(&v_buf[ko..ko + hd]);
+        }
+
+        for g in 0..gqa_ratio {
+            let q_h = kv_h * gqa_ratio + g;
+            let mut q_head = vec![0.0f32; seq * hd];
+            for s in 0..seq {
+                let qo = s * q_dim + q_h * hd;
+                q_head[s * hd..(s + 1) * hd].copy_from_slice(&q_buf[qo..qo + hd]);
+            }
+
+            let mut scores = vec![0.0f32; seq * seq];
+            sgemm_nt_scaled(seq, seq, hd, &q_head, &k_head, &mut scores, scale);
+            for row in 0..seq {
+                softmax_inplace(&mut scores[row * seq..(row + 1) * seq]);
+            }
+
+            let mut ctx = vec![0.0f32; seq * hd];
+            sgemm(seq, hd, seq, &scores, &v_head, &mut ctx);
+            for s in 0..seq {
+                let ao = s * q_dim + q_h * hd;
+                attn_out[ao..ao + hd].copy_from_slice(&ctx[s * hd..(s + 1) * hd]);
+            }
+        }
+    }
+
+    attn_out
+}
+
 impl DiffusionEngine {
     /// Create an engine with small random weights for gradient checking tests.
     pub fn from_random(config: DiffusionConfig) -> Self {
@@ -1227,7 +1847,7 @@ pub struct AneBonsaiEngine {
 impl AneBonsaiEngine {
     /// Build 28 attention-only ANE kernels + keep BLAS engine for FFN.
     pub fn new(engine: DiffusionEngine, seq_len: usize, eps: f32) -> Result<Self, String> {
-        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed, AneKernel};
+        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
         use crate::ane_mil::ANE_MIN_SPATIAL;
         use crate::diffusion_ane;
 
@@ -1258,8 +1878,14 @@ impl AneBonsaiEngine {
             }
         }
 
-        let mil =
-            diffusion_ane::gen_diffusion_attention(h, cfg.heads, cfg.kv_heads, hd, seq, eps as f64);
+        let mil = diffusion_ane::gen_bonsai_attention_projection(
+            h,
+            cfg.heads,
+            cfg.kv_heads,
+            hd,
+            seq,
+            eps as f64,
+        );
         let names: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
         let rope_cos_blob = build_weight_blob(&rope_cos, seq, half_hd);
         let rope_sin_blob = build_weight_blob(&rope_sin, seq, half_hd);
@@ -1270,7 +1896,6 @@ impl AneBonsaiEngine {
                 build_weight_blob_transposed(&lw.q_proj, q_dim, h),
                 build_weight_blob_transposed(&lw.k_proj, kv_dim, h),
                 build_weight_blob_transposed(&lw.v_proj, kv_dim, h),
-                build_weight_blob_transposed(&lw.o_proj, h, q_dim),
                 rope_cos_blob.clone(),
                 rope_sin_blob.clone(),
                 build_weight_blob(&lw.q_norm, 1, hd),
@@ -1280,14 +1905,14 @@ impl AneBonsaiEngine {
 
         let l0_blobs = build_attn_blobs(&engine.layers[0]);
         let l0_refs: Vec<&[u8]> = l0_blobs.iter().map(|b| b.as_slice()).collect();
-        let kernel0 = AneKernel::compile_multi_weights(
+        let kernel0 = compile_ane_kernel(
+            "L0 Bonsai attention compile",
             &mil.mil_text,
             &names,
             &l0_refs,
             &[mil.input_bytes],
             &[mil.output_bytes],
-        )
-        .map_err(|e| format!("L0 compile: {e}"))?;
+        )?;
 
         let l0_ms = t0.elapsed().as_millis();
         eprintln!("  L0 full compile: {l0_ms}ms");
@@ -1331,6 +1956,7 @@ impl AneBonsaiEngine {
         let cfg = &self.blas_engine.config;
         let seq = token_ids.len();
         let h = cfg.hidden;
+        let q_dim = cfg.heads * cfg.head_dim;
         let inter = cfg.inter;
         let ps = self.seq_len;
 
@@ -1365,20 +1991,33 @@ impl AneBonsaiEngine {
         };
 
         let mut normed = vec![0.0f32; seq * h];
+        let mut attn_proj = vec![0.0f32; seq * h];
         let mut gate_buf = vec![0.0f32; seq * inter];
         let mut up_buf = vec![0.0f32; seq * inter];
         let mut ffn_out = vec![0.0f32; seq * h];
+        // Bonsai Q1 remains accurate through roughly layer 23 on ANE attention, then drift compounds quickly.
+        // Use CPU attention for the tail to preserve correctness while still
+        // accelerating the bulk of the stack on ANE.
+        let ane_attention_layers = cfg.layers.saturating_sub(4);
 
         let t_fwd = std::time::Instant::now();
         for (layer_idx, kernel) in self.attn_kernels.iter().enumerate() {
             let layer = &self.blas_engine.layers[layer_idx];
-
-            let input_bytes = pack(&hidden, h);
-            kernel.write_input(0, &input_bytes);
-            kernel.eval().unwrap();
-            let mut output_bytes = vec![0u8; h * ps * 4];
-            kernel.read_output(0, &mut output_bytes);
-            hidden = unpack(&output_bytes, h);
+            let residual = hidden.clone();
+            let attn_ctx = if layer_idx < ane_attention_layers {
+                let input_bytes = pack(&hidden, h);
+                kernel.write_input(0, &input_bytes);
+                kernel.eval().unwrap();
+                let mut output_bytes = vec![0u8; q_dim * ps * 4];
+                kernel.read_output(0, &mut output_bytes);
+                unpack(&output_bytes, q_dim)
+            } else {
+                diffusion_attention_context_cpu(&self.blas_engine, layer_idx, &hidden, self.eps)
+            };
+            sgemm_nt(seq, h, q_dim, &attn_ctx, &layer.o_proj, &mut attn_proj);
+            for i in 0..seq * h {
+                hidden[i] = residual[i] + attn_proj[i];
+            }
 
             {
                 let nan_count = hidden.iter().filter(|v| !v.is_finite()).count();
@@ -1468,6 +2107,279 @@ impl AneBonsaiEngine {
 #[allow(clippy::panic, clippy::unwrap_used, unsafe_code)]
 mod tests {
     use super::*;
+
+    fn tiny_runtime_engine() -> DiffusionEngine {
+        let config = DiffusionConfig {
+            hidden: 2,
+            layers: 0,
+            heads: 1,
+            kv_heads: 1,
+            head_dim: 2,
+            inter: 2,
+            vocab: 4,
+            mask_token_id: 3,
+            rope_theta: 10_000.0,
+        };
+
+        DiffusionEngine {
+            layers: Vec::new(),
+            embed: vec![
+                1.0, 0.0, // token 0
+                0.0, 1.0, // token 1
+                1.0, 1.0, // token 2
+                0.5, -0.5, // mask token
+            ],
+            final_norm: vec![1.0, 1.0],
+            config,
+            rope_cos: vec![1.0; 8],
+            rope_sin: vec![0.0; 8],
+        }
+    }
+
+    #[cfg(feature = "ane")]
+    fn bonsai_embed_hidden(engine: &DiffusionEngine, token_ids: &[u32]) -> Vec<f32> {
+        let h = engine.config.hidden;
+        let mut hidden = vec![0.0f32; token_ids.len() * h];
+        for (i, &tid) in token_ids.iter().enumerate() {
+            let off = tid as usize * h;
+            hidden[i * h..(i + 1) * h].copy_from_slice(&engine.embed[off..off + h]);
+        }
+        hidden
+    }
+
+    #[cfg(feature = "ane")]
+    fn bonsai_l0_attention_context_cpu(engine: &DiffusionEngine, hidden: &[f32]) -> Vec<f32> {
+        bonsai_attention_context_cpu_for_layer(engine, 0, hidden)
+    }
+
+    #[cfg(feature = "ane")]
+    fn bonsai_attention_context_cpu_for_layer(
+        engine: &DiffusionEngine,
+        layer_idx: usize,
+        hidden: &[f32],
+    ) -> Vec<f32> {
+        let cfg = &engine.config;
+        let seq = hidden.len() / cfg.hidden;
+        let h = cfg.hidden;
+        let hd = cfg.head_dim;
+        let half_hd = hd / 2;
+        let n_heads = cfg.heads;
+        let n_kv = cfg.kv_heads;
+        let gqa_ratio = n_heads / n_kv;
+        let q_dim = n_heads * hd;
+        let kv_dim = n_kv * hd;
+        let layer = &engine.layers[layer_idx];
+
+        let mut normed = vec![0.0f32; seq * h];
+        let mut q_buf = vec![0.0f32; seq * q_dim];
+        let mut k_buf = vec![0.0f32; seq * kv_dim];
+        let mut v_buf = vec![0.0f32; seq * kv_dim];
+        let mut attn_out = vec![0.0f32; seq * q_dim];
+
+        rms_norm_eps(hidden, &layer.input_norm, &mut normed, seq, h, 1e-6);
+        sgemm_nt(seq, q_dim, h, &normed, &layer.q_proj, &mut q_buf);
+        sgemm_nt(seq, kv_dim, h, &normed, &layer.k_proj, &mut k_buf);
+        sgemm_nt(seq, kv_dim, h, &normed, &layer.v_proj, &mut v_buf);
+
+        for s in 0..seq {
+            for head in 0..n_heads {
+                let off = s * q_dim + head * hd;
+                rms_norm_slice(&mut q_buf[off..off + hd], &layer.q_norm);
+                apply_rope(
+                    &mut q_buf[off..off + hd],
+                    s,
+                    half_hd,
+                    &engine.rope_cos,
+                    &engine.rope_sin,
+                );
+            }
+            for head in 0..n_kv {
+                let off = s * kv_dim + head * hd;
+                rms_norm_slice(&mut k_buf[off..off + hd], &layer.k_norm);
+                apply_rope(
+                    &mut k_buf[off..off + hd],
+                    s,
+                    half_hd,
+                    &engine.rope_cos,
+                    &engine.rope_sin,
+                );
+            }
+        }
+
+        let scale = 1.0 / (hd as f32).sqrt();
+        for kv_h in 0..n_kv {
+            let mut k_head = vec![0.0f32; seq * hd];
+            let mut v_head = vec![0.0f32; seq * hd];
+            for s in 0..seq {
+                let ko = s * kv_dim + kv_h * hd;
+                k_head[s * hd..(s + 1) * hd].copy_from_slice(&k_buf[ko..ko + hd]);
+                v_head[s * hd..(s + 1) * hd].copy_from_slice(&v_buf[ko..ko + hd]);
+            }
+
+            for g in 0..gqa_ratio {
+                let q_h = kv_h * gqa_ratio + g;
+                let mut q_head = vec![0.0f32; seq * hd];
+                for s in 0..seq {
+                    let qo = s * q_dim + q_h * hd;
+                    q_head[s * hd..(s + 1) * hd].copy_from_slice(&q_buf[qo..qo + hd]);
+                }
+
+                let mut scores = vec![0.0f32; seq * seq];
+                sgemm_nt_scaled(seq, seq, hd, &q_head, &k_head, &mut scores, scale);
+                for row in 0..seq {
+                    softmax_inplace(&mut scores[row * seq..(row + 1) * seq]);
+                }
+
+                let mut ctx = vec![0.0f32; seq * hd];
+                sgemm(seq, hd, seq, &scores, &v_head, &mut ctx);
+                for s in 0..seq {
+                    let ao = s * q_dim + q_h * hd;
+                    attn_out[ao..ao + hd].copy_from_slice(&ctx[s * hd..(s + 1) * hd]);
+                }
+            }
+        }
+
+        attn_out
+    }
+
+    #[cfg(feature = "ane")]
+    fn bonsai_l0_attention_context_ane(engine: &DiffusionEngine, token_ids: &[u32]) -> Vec<f32> {
+        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
+        use crate::ane_mil::ANE_MIN_SPATIAL;
+
+        ane_bridge::ane_init().unwrap();
+
+        let cfg = &engine.config;
+        let h = cfg.hidden;
+        let hd = cfg.head_dim;
+        let q_dim = cfg.heads * hd;
+        let kv_dim = cfg.kv_heads * hd;
+        let seq = token_ids.len();
+        let ps = seq.max(ANE_MIN_SPATIAL);
+
+        let mil = crate::diffusion_ane::gen_bonsai_attention_projection(
+            h,
+            cfg.heads,
+            cfg.kv_heads,
+            hd,
+            seq,
+            1e-6,
+        );
+        let names: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
+        let layer = &engine.layers[0];
+        let half_hd = hd / 2;
+        let rope_cos = engine.rope_cos[..ps * half_hd].to_vec();
+        let rope_sin = engine.rope_sin[..ps * half_hd].to_vec();
+        let blobs = vec![
+            build_weight_blob(&layer.input_norm, 1, h),
+            build_weight_blob_transposed(&layer.q_proj, q_dim, h),
+            build_weight_blob_transposed(&layer.k_proj, kv_dim, h),
+            build_weight_blob_transposed(&layer.v_proj, kv_dim, h),
+            build_weight_blob(&rope_cos, ps, half_hd),
+            build_weight_blob(&rope_sin, ps, half_hd),
+            build_weight_blob(&layer.q_norm, 1, hd),
+            build_weight_blob(&layer.k_norm, 1, hd),
+        ];
+        let refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+        let kernel = super::compile_ane_kernel(
+            "L0 Bonsai attention-core compare compile",
+            &mil.mil_text,
+            &names,
+            &refs,
+            &[mil.input_bytes],
+            &[mil.output_bytes],
+        )
+        .unwrap();
+
+        let hidden = bonsai_embed_hidden(engine, token_ids);
+        let mut input = vec![0.0f32; h * ps];
+        for s in 0..seq {
+            for c in 0..h {
+                input[c * ps + s] = hidden[s * h + c];
+            }
+        }
+        let input_bytes: Vec<u8> = input.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let mut output_bytes = vec![0u8; q_dim * ps * 4];
+        kernel.write_input(0, &input_bytes);
+        kernel.eval().unwrap();
+        kernel.read_output(0, &mut output_bytes);
+
+        let all: Vec<f32> = output_bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let mut out = vec![0.0f32; seq * q_dim];
+        for s in 0..seq {
+            for c in 0..q_dim {
+                out[s * q_dim + c] = all[c * ps + s];
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "ane")]
+    fn permute_bonsai_gqa_head_layout(
+        data: &[f32],
+        seq: usize,
+        kv_heads: usize,
+        hd: usize,
+    ) -> Vec<f32> {
+        let heads = data.len() / (seq * hd);
+        let hpg = heads / kv_heads;
+        let mut out = vec![0.0f32; data.len()];
+        for s in 0..seq {
+            for kv_h in 0..kv_heads {
+                for g in 0..hpg {
+                    let src_head = kv_h * hpg + g;
+                    let dst_head = g * kv_heads + kv_h;
+                    let src = s * heads * hd + src_head * hd;
+                    let dst = s * heads * hd + dst_head * hd;
+                    out[dst..dst + hd].copy_from_slice(&data[src..src + hd]);
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "ane")]
+    fn bonsai_attention_context_ane_with_kernel(
+        kernel: &crate::ane_bridge::AneKernel,
+        hidden: &[f32],
+        seq: usize,
+        ps: usize,
+        h: usize,
+        q_dim: usize,
+    ) -> Vec<f32> {
+        let mut input = vec![0.0f32; h * ps];
+        for s in 0..seq {
+            for c in 0..h {
+                input[c * ps + s] = hidden[s * h + c];
+            }
+        }
+        let input_bytes: Vec<u8> = input.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let mut output_bytes = vec![0u8; q_dim * ps * 4];
+        kernel.write_input(0, &input_bytes);
+        kernel.eval().unwrap();
+        kernel.read_output(0, &mut output_bytes);
+
+        let all: Vec<f32> = output_bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let mut out = vec![0.0f32; seq * q_dim];
+        for s in 0..seq {
+            for c in 0..q_dim {
+                out[s * q_dim + c] = all[c * ps + s];
+            }
+        }
+        out
+    }
+
+    fn write_config_json(dir: &std::path::Path, body: &str) {
+        std::fs::write(dir.join("config.json"), body).unwrap();
+    }
 
     fn model_dir() -> Option<String> {
         let dir = format!(
@@ -1568,6 +2480,91 @@ mod tests {
         let masks = result.iter().filter(|&&t| t == 151669).count();
         eprintln!("Remaining masks: {masks}");
         assert!(masks < 5, "Too many masks remaining: {masks}");
+    }
+
+    #[test]
+    fn test_runtime_cpu_backend_report_and_forward() {
+        let engine = tiny_runtime_engine();
+        let input = vec![0, 3];
+        let expected = engine.forward(&input);
+
+        let runtime =
+            DiffusionRuntime::new(engine, input.len(), DiffusionBackendPreference::CpuBlas)
+                .unwrap();
+        let report = runtime.backend_report();
+
+        assert_eq!(report.model_kind, DiffusionModelKind::Standard);
+        assert_eq!(report.requested, DiffusionBackendPreference::CpuBlas);
+        assert_eq!(report.selected, DiffusionBackend::CpuBlas);
+        assert_eq!(report.detail, "CPU BLAS requested explicitly");
+        assert_eq!(runtime.model_kind(), DiffusionModelKind::Standard);
+        assert_eq!(
+            runtime.requested_backend(),
+            DiffusionBackendPreference::CpuBlas
+        );
+        assert_eq!(runtime.selected_backend(), DiffusionBackend::CpuBlas);
+        assert_eq!(runtime.forward(&input), expected);
+    }
+
+    #[test]
+    fn test_runtime_cpu_backend_generate_matches_engine() {
+        let engine = tiny_runtime_engine();
+        let prompt = vec![0];
+        let expected = engine.generate(&prompt, 1, 1);
+
+        let runtime = DiffusionRuntime::new(
+            engine,
+            prompt.len() + 1,
+            DiffusionBackendPreference::CpuBlas,
+        )
+        .unwrap();
+
+        assert_eq!(runtime.generate(&prompt, 1, 1), expected);
+    }
+
+    #[test]
+    fn test_detect_model_kind_standard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_json(
+            dir.path(),
+            r#"{
+                "hidden_size": 1024,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "intermediate_size": 3072,
+                "vocab_size": 151669
+            }"#,
+        );
+
+        assert_eq!(
+            DiffusionEngine::detect_model_kind(dir.path()).unwrap(),
+            DiffusionModelKind::Standard
+        );
+    }
+
+    #[test]
+    fn test_detect_model_kind_bonsai_q1() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_json(
+            dir.path(),
+            r#"{
+                "hidden_size": 2048,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "intermediate_size": 6144,
+                "vocab_size": 151669,
+                "quantization": {
+                    "bits": 1
+                }
+            }"#,
+        );
+
+        assert_eq!(
+            DiffusionEngine::detect_model_kind(dir.path()).unwrap(),
+            DiffusionModelKind::BonsaiQ1
+        );
     }
 
     /// Benchmark: BLAS vs ANE BLOBFILE for the diffusion projection matmuls.
@@ -1963,7 +2960,7 @@ mod tests {
         let ane_engine_short = super::AneBonsaiEngine::new(
             DiffusionEngine::load_q1(&bonsai_dir).unwrap(),
             short_seq,
-            1e-5,
+            1e-6,
         )
         .unwrap();
         let ane_logits_short = ane_engine_short.forward(&short_input);
@@ -2016,7 +3013,7 @@ mod tests {
             .collect();
         eprintln!("Compiling ANE hybrid engine (seq=64)...");
         let ane_engine_64 =
-            super::AneBonsaiEngine::new(DiffusionEngine::load_q1(&bonsai_dir).unwrap(), 64, 1e-5)
+            super::AneBonsaiEngine::new(DiffusionEngine::load_q1(&bonsai_dir).unwrap(), 64, 1e-6)
                 .unwrap();
 
         let n = 3;
@@ -2044,7 +3041,7 @@ mod tests {
             .collect();
         eprintln!("Compiling ANE hybrid engine (seq=128)...");
         let ane_engine_128 =
-            super::AneBonsaiEngine::new(DiffusionEngine::load_q1(&bonsai_dir).unwrap(), 128, 1e-5)
+            super::AneBonsaiEngine::new(DiffusionEngine::load_q1(&bonsai_dir).unwrap(), 128, 1e-6)
                 .unwrap();
 
         let _ = blas_engine.forward(&input_128);
@@ -2067,5 +3064,160 @@ mod tests {
         );
 
         eprintln!("PASS: Bonsai-1.7B ANE hybrid engine matches BLAS reference");
+    }
+
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "Exploratory compare for Bonsai ANE attention-core layout"]
+    fn test_bonsai_1_7b_l0_attention_context_compare() {
+        let Some(bonsai_dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+
+        let engine = DiffusionEngine::load_q1(&bonsai_dir).unwrap();
+        let token_ids: Vec<u32> = vec![785, 6722, 315, 9625, 374];
+        let seq = token_ids.len();
+        let hd = engine.config.head_dim;
+        let kv_heads = engine.config.kv_heads;
+
+        let hidden = bonsai_embed_hidden(&engine, &token_ids);
+        let cpu_ctx = bonsai_l0_attention_context_cpu(&engine, &hidden);
+        let ane_ctx = bonsai_l0_attention_context_ane(&engine, &token_ids);
+        let ane_ctx_gqa_t = permute_bonsai_gqa_head_layout(&ane_ctx, seq, kv_heads, hd);
+
+        let direct_errs: Vec<f32> = cpu_ctx
+            .iter()
+            .zip(ane_ctx.iter())
+            .map(|(a, b)| (a - b).abs())
+            .collect();
+        let transposed_errs: Vec<f32> = cpu_ctx
+            .iter()
+            .zip(ane_ctx_gqa_t.iter())
+            .map(|(a, b)| (a - b).abs())
+            .collect();
+
+        let direct_max = direct_errs.iter().cloned().fold(0.0f32, f32::max);
+        let direct_mean = direct_errs.iter().sum::<f32>() / direct_errs.len() as f32;
+        let transposed_max = transposed_errs.iter().cloned().fold(0.0f32, f32::max);
+        let transposed_mean = transposed_errs.iter().sum::<f32>() / transposed_errs.len() as f32;
+
+        eprintln!(
+            "L0 attention-context compare: direct max={direct_max:.6} mean={direct_mean:.6}"
+        );
+        eprintln!(
+            "L0 attention-context compare: gqa-transposed max={transposed_max:.6} mean={transposed_mean:.6}"
+        );
+        eprintln!("CPU ctx[0,:8] = {:?}", &cpu_ctx[..8]);
+        eprintln!("ANE ctx[0,:8] = {:?}", &ane_ctx[..8]);
+        eprintln!("ANE gqa-t[0,:8] = {:?}", &ane_ctx_gqa_t[..8]);
+
+        assert!(cpu_ctx.iter().all(|v| v.is_finite()));
+        assert!(ane_ctx.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "Exploratory layerwise drift trace for Bonsai ANE hybrid"]
+    fn test_bonsai_1_7b_hybrid_layerwise_drift() {
+        let Some(bonsai_dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+
+        let engine = DiffusionEngine::load_q1(&bonsai_dir).unwrap();
+        let seq = 5usize;
+        let eps = 1e-6f32;
+        let ane_engine = super::AneBonsaiEngine::new(
+            DiffusionEngine::load_q1(&bonsai_dir).unwrap(),
+            seq,
+            eps,
+        )
+        .unwrap();
+
+        let token_ids: Vec<u32> = vec![785, 6722, 315, 9625, 374];
+        let cfg = &engine.config;
+        let h = cfg.hidden;
+        let q_dim = cfg.heads * cfg.head_dim;
+        let inter = cfg.inter;
+        let ps = ane_engine.seq_len;
+
+        let mut hidden_cpu = bonsai_embed_hidden(&engine, &token_ids);
+        let mut hidden_ane = hidden_cpu.clone();
+        let mut normed = vec![0.0f32; seq * h];
+        let mut attn_proj = vec![0.0f32; seq * h];
+        let mut gate_buf = vec![0.0f32; seq * inter];
+        let mut up_buf = vec![0.0f32; seq * inter];
+        let mut ffn_out = vec![0.0f32; seq * h];
+
+        for (layer_idx, kernel) in ane_engine.attn_kernels.iter().enumerate() {
+            let layer = &engine.layers[layer_idx];
+
+            let cpu_ctx = bonsai_attention_context_cpu_for_layer(&engine, layer_idx, &hidden_cpu);
+            let ane_ctx =
+                bonsai_attention_context_ane_with_kernel(kernel, &hidden_ane, seq, ps, h, q_dim);
+
+            let ctx_errs: Vec<f32> = cpu_ctx
+                .iter()
+                .zip(ane_ctx.iter())
+                .map(|(a, b)| (a - b).abs())
+                .collect();
+            let ctx_max = ctx_errs.iter().cloned().fold(0.0f32, f32::max);
+            let ctx_mean = ctx_errs.iter().sum::<f32>() / ctx_errs.len() as f32;
+
+            let cpu_residual = hidden_cpu.clone();
+            let ane_residual = hidden_ane.clone();
+            sgemm_nt(seq, h, q_dim, &cpu_ctx, &layer.o_proj, &mut attn_proj);
+            for i in 0..seq * h {
+                hidden_cpu[i] = cpu_residual[i] + attn_proj[i];
+            }
+            sgemm_nt(seq, h, q_dim, &ane_ctx, &layer.o_proj, &mut attn_proj);
+            for i in 0..seq * h {
+                hidden_ane[i] = ane_residual[i] + attn_proj[i];
+            }
+
+            let post_attn_errs: Vec<f32> = hidden_cpu
+                .iter()
+                .zip(hidden_ane.iter())
+                .map(|(a, b)| (a - b).abs())
+                .collect();
+            let post_attn_max = post_attn_errs.iter().cloned().fold(0.0f32, f32::max);
+            let post_attn_mean =
+                post_attn_errs.iter().sum::<f32>() / post_attn_errs.len() as f32;
+
+            rms_norm_eps(&hidden_cpu, &layer.post_attn_norm, &mut normed, seq, h, eps);
+            sgemm_nt(seq, inter, h, &normed, &layer.gate_proj, &mut gate_buf);
+            sgemm_nt(seq, inter, h, &normed, &layer.up_proj, &mut up_buf);
+            for (g, u) in gate_buf.iter_mut().zip(up_buf.iter()) {
+                *g = *g * (1.0 / (1.0 + (-*g).exp())) * u;
+            }
+            sgemm_nt(seq, h, inter, &gate_buf, &layer.down_proj, &mut ffn_out);
+            for i in 0..seq * h {
+                hidden_cpu[i] += ffn_out[i];
+            }
+
+            rms_norm_eps(&hidden_ane, &layer.post_attn_norm, &mut normed, seq, h, eps);
+            sgemm_nt(seq, inter, h, &normed, &layer.gate_proj, &mut gate_buf);
+            sgemm_nt(seq, inter, h, &normed, &layer.up_proj, &mut up_buf);
+            for (g, u) in gate_buf.iter_mut().zip(up_buf.iter()) {
+                *g = *g * (1.0 / (1.0 + (-*g).exp())) * u;
+            }
+            sgemm_nt(seq, h, inter, &gate_buf, &layer.down_proj, &mut ffn_out);
+            for i in 0..seq * h {
+                hidden_ane[i] += ffn_out[i];
+            }
+
+            let post_ffn_errs: Vec<f32> = hidden_cpu
+                .iter()
+                .zip(hidden_ane.iter())
+                .map(|(a, b)| (a - b).abs())
+                .collect();
+            let post_ffn_max = post_ffn_errs.iter().cloned().fold(0.0f32, f32::max);
+            let post_ffn_mean = post_ffn_errs.iter().sum::<f32>() / post_ffn_errs.len() as f32;
+
+            eprintln!(
+                "L{layer_idx}: ctx max={ctx_max:.6} mean={ctx_mean:.6} | post-attn max={post_attn_max:.6} mean={post_attn_mean:.6} | post-ffn max={post_ffn_max:.6} mean={post_ffn_mean:.6}"
+            );
+        }
     }
 }
