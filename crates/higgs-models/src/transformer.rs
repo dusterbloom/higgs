@@ -974,6 +974,8 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::{AnyModel, load_tokenizer};
+    use mlx_rs::{Array, Dtype};
 
     /// Create a `ModelArgs` with sensible defaults. Only fields that vary
     /// between tests need to be overridden after construction.
@@ -1338,5 +1340,79 @@ mod tests {
         let args = make_model_args("llama", 256, 4, 2, 1000, -1);
         let result = Model::new(args);
         assert!(result.is_err(), "Should reject negative num_hidden_layers");
+    }
+
+    fn bonsai_1_7b_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".cache/lm-studio/models/prism-ml/Bonsai-1.7B-mlx-1bit");
+        if dir.join("model.safetensors").exists() {
+            Some(dir)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "prism-1bit")]
+    #[ignore = "Manual local causal Bonsai smoke test"]
+    fn test_load_bonsai_1_7b_causal_qwen3_smoke() {
+        let Some(model_dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+
+        let args = load_model_args(&model_dir).unwrap();
+        assert_eq!(args.model_type, "qwen3");
+        let qc = args
+            .quantization
+            .as_ref()
+            .expect("Bonsai should include quantization config");
+        assert_eq!(qc.bits, 1);
+        assert_eq!(qc.group_size, 128);
+
+        let tokenizer = load_tokenizer(&model_dir).unwrap();
+        let prompt = "The capital of France is";
+        let encoding = tokenizer.encode(prompt, false).unwrap();
+        let token_ids = encoding.get_ids().to_vec();
+        assert!(!token_ids.is_empty(), "prompt should tokenize");
+
+        let model = load_model(&model_dir).unwrap();
+        let mut any = AnyModel::Transformer(model);
+        let mut cache = any.make_cache();
+        let input_ids: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
+        let input = Array::from_slice(&input_ids, &[1, token_ids.len() as i32]);
+
+        let logits = any.forward(&input, None, &mut cache).unwrap();
+        let shape = logits.shape().to_vec();
+        eprintln!("causal Bonsai logits shape: {:?}", shape);
+        assert_eq!(shape, vec![1, 1, args.vocab_size]);
+
+        let logits = logits.as_dtype(Dtype::Float32).unwrap();
+        let flat = logits.as_slice::<f32>();
+        let finite = flat.iter().filter(|v| v.is_finite()).count();
+        let max_abs = flat
+            .iter()
+            .cloned()
+            .filter(|v| v.is_finite())
+            .fold(0.0f32, |a, b| a.max(b.abs()));
+        eprintln!(
+            "finite logits: {finite}/{} max_abs={max_abs:.4}",
+            flat.len()
+        );
+        assert_eq!(finite, flat.len(), "causal Bonsai logits must be finite");
+        assert!(max_abs > 0.0, "causal Bonsai logits should not be all zero");
+
+        let vocab = args.vocab_size as usize;
+        let last_row = &flat[..vocab];
+        let (best_idx, best_val) = last_row
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        let decoded = tokenizer
+            .decode(&[best_idx as u32], true)
+            .unwrap_or_else(|_| "<decode failed>".to_owned());
+        eprintln!("next token argmax: id={best_idx} text={decoded:?} logit={best_val:.4}");
     }
 }
