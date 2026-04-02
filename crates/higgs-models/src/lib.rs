@@ -8,6 +8,7 @@ pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod registry;
 pub mod siglip;
+pub mod spec_prefill;
 pub mod starcoder2;
 pub mod transformer;
 pub mod utils;
