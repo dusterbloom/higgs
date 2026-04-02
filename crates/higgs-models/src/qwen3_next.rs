@@ -2068,11 +2068,20 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
         head_k_dim: args.linear_key_head_dim,
         head_v_dim: args.linear_value_head_dim,
     };
-    let mut model = Qwen3NextCausalLM::new(args)?;
+    let mut model = Qwen3NextCausalLM::new(args.clone())?;
 
     // Load weights with GDN projection rearrangement: flat (qkv,z,b,a)
     // → per-head-grouped (qkvz,ba) for fused 2-dispatch forward path.
-    load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
+    // Respect use_separate_gdn_projections config flag or HIGGS_SEPARATE_GDN_PROJ env var.
+    let use_separate = args.use_separate_gdn_projections
+        || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
+    if use_separate {
+        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
+        tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
+    } else {
+        load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
+        tracing::info!("Using FUSED GDN projections (2 dispatches per layer)");
+    }
 
     tracing::info!("Qwen3.5-MoE model loaded successfully");
     Ok(model)

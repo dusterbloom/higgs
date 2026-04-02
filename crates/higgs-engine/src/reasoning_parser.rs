@@ -158,7 +158,8 @@ impl StreamingReasoningTracker {
                         .unwrap_or_default()
                         .to_owned();
                 } else {
-                    let op = open_pos.unwrap_or(0);
+                    // open_pos is guaranteed to be Some here (else branch of none_or)
+                    let op = open_pos.unwrap();
                     visible.push_str(self.buffer.get(..op).unwrap_or_default());
                     self.buffer = self
                         .buffer
@@ -358,6 +359,10 @@ mod tests {
         assert!(
             !total_visible.contains("</think>"),
             "double </think> should not leak into visible output, got: {total_visible}"
+        );
+        assert!(
+            total_visible.contains("answer"),
+            "content after duplicate close should remain visible, got: {total_visible}"
         );
     }
 
