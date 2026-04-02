@@ -132,7 +132,7 @@ impl SimpleEngine {
             .and_then(|enc| {
                 let ids = enc.get_ids();
                 // Must encode to exactly one token to be usable as a forced stop.
-                if ids.len() == 1 { Some(ids[0]) } else { None }
+                ids.first().copied().filter(|_| ids.len() == 1)
             });
         if enable_thinking && think_close_token.is_none() {
             tracing::warn!("Tokenizer has no single </think> token; disabling thinking mode");
@@ -677,6 +677,10 @@ impl SimpleEngine {
             let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
 
             // Thinking budget: force </think> after N tokens if model hasn't closed it.
+            // When forcing the close token, we must run a sequential decode step
+            // to update the KV cache with the close token (not the sampled token),
+            // otherwise the pipelined state becomes inconsistent.
+            let mut forced_close_array: Option<Array> = None;
             if let Some(close_id) = think_close_token {
                 if !seen_think_close {
                     if token_id == close_id {
@@ -684,9 +688,34 @@ impl SimpleEngine {
                     } else {
                         thinking_tokens += 1;
                         if thinking_tokens >= THINKING_BUDGET {
-                            token_id = close_id;
                             seen_think_close = true;
                             tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
+                            // Run sequential step with close token to update KV cache properly.
+                            let close_arr = Array::from_slice(&[close_id], &[1]);
+                            let (close_following, close_logprob_data) = Self::decode_step(
+                                &close_arr,
+                                &mut prepared.model,
+                                &mut prepared.cache,
+                                params,
+                                &tokens,
+                                logprob_top_n,
+                                constraint.as_ref(),
+                            )?;
+                            {
+                                let mut eval_targets: Vec<&Array> = vec![&close_following];
+                                if let Some(ref lp) = close_logprob_data {
+                                    eval_targets.extend(lp.eval_targets());
+                                }
+                                if constraint.is_some() {
+                                    eval(eval_targets).map_err(EngineError::Mlx)?;
+                                } else {
+                                    async_eval(eval_targets).map_err(EngineError::Mlx)?;
+                                }
+                            }
+                            token_id = close_id;
+                            next_token = close_following;
+                            next_logprob_data = close_logprob_data;
+                            forced_close_array = Some(close_arr);
                         }
                     }
                 }
@@ -786,15 +815,19 @@ impl SimpleEngine {
 
             // If thinking budget was just reached, override the pipelined token
             // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == THINKING_BUDGET {
-                if let Some(close_id) = think_close_token {
-                    next_token = Array::from_slice(&[close_id], &[1]);
+            // (Already handled in the forced-close branch above — only update
+            // next_token here when we didn't force-close this step.)
+            if forced_close_array.is_none() {
+                if seen_think_close && thinking_tokens == THINKING_BUDGET {
+                    if let Some(close_id) = think_close_token {
+                        next_token = Array::from_slice(&[close_id], &[1]);
+                    }
+                    thinking_tokens += 1; // prevent re-triggering
+                } else {
+                    next_token = following;
                 }
-                thinking_tokens += 1; // prevent re-triggering
-            } else {
-                next_token = following;
+                next_logprob_data = following_logprob_data;
             }
-            next_logprob_data = following_logprob_data;
         }
     }
 
@@ -998,6 +1031,9 @@ impl SimpleEngine {
             let mut token_id: u32 = next_token.item();
 
             // Thinking budget: force </think> after N tokens if model hasn't closed it.
+            // When forcing the close token, run a sequential decode step to update
+            // the KV cache properly (same fix as generate_inner).
+            let mut forced_close = false;
             if let Some(close_id) = think_close_token {
                 if !seen_think_close {
                     if token_id == close_id {
@@ -1005,9 +1041,29 @@ impl SimpleEngine {
                     } else {
                         thinking_tokens += 1;
                         if thinking_tokens >= THINKING_BUDGET {
-                            token_id = close_id;
                             seen_think_close = true;
                             tracing::info!(budget = THINKING_BUDGET, "Thinking budget reached, forcing </think>");
+                            let close_arr = Array::from_slice(&[close_id], &[1]);
+                            let (close_following, close_logprob_data) = Self::decode_step(
+                                &close_arr,
+                                &mut prepared.model,
+                                &mut prepared.cache,
+                                params,
+                                &all_tokens,
+                                logprob_top_n,
+                                constraint.as_ref(),
+                            )?;
+                            {
+                                let mut eval_targets: Vec<&Array> = vec![&close_following];
+                                if let Some(ref lp) = close_logprob_data {
+                                    eval_targets.extend(lp.eval_targets());
+                                }
+                                async_eval(eval_targets).map_err(EngineError::Mlx)?;
+                            }
+                            token_id = close_id;
+                            next_token = close_following;
+                            next_logprob_data = close_logprob_data;
+                            forced_close = true;
                         }
                     }
                 }
@@ -1084,15 +1140,19 @@ impl SimpleEngine {
 
             // If thinking budget was just reached, override the pipelined token
             // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == THINKING_BUDGET {
-                if let Some(close_id) = think_close_token {
-                    next_token = Array::from_slice(&[close_id], &[1]);
+            // (Already handled in the forced-close branch above — only update
+            // next_token here when we didn't force-close this step.)
+            if !forced_close {
+                if seen_think_close && thinking_tokens == THINKING_BUDGET {
+                    if let Some(close_id) = think_close_token {
+                        next_token = Array::from_slice(&[close_id], &[1]);
+                    }
+                    thinking_tokens += 1; // prevent re-triggering
+                } else {
+                    next_token = following;
                 }
-                thinking_tokens += 1; // prevent re-triggering
-            } else {
-                next_token = following;
+                next_logprob_data = following_logprob_data;
             }
-            next_logprob_data = following_logprob_data;
         }
 
         Ok(())

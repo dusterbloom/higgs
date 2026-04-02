@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use higgs_models::{AnyModel, load_tokenizer as shared_load_tokenizer, registry, transformer};
+use higgs_models::{load_tokenizer as shared_load_tokenizer, registry, transformer, AnyModel};
 
 use crate::error::EngineError;
 
@@ -45,9 +45,15 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
             Ok(AnyModel::Qwen3Next(model))
         }
         "qwen3_5" => {
-            let model = higgs_models::qwen3_next::load_qwen3_next_model(&config.model_dir)
-                .map_err(EngineError::Model)?;
-            Ok(AnyModel::Qwen3Next(model))
+            // Dense Qwen3.5 models (non-MoE) need a separate loader.
+            // The qwen3_5_moe loader always constructs MoE blocks and will
+            // panic when num_experts <= 0 for dense configs.
+            return Err(EngineError::Model(
+                higgs_models::error::ModelError::UnsupportedModel(
+                    "qwen3_5 (dense) loader not yet implemented; use qwen3_5_moe for MoE variants"
+                        .into(),
+                ),
+            ));
         }
         "qwen3_5_moe" => {
             let model = higgs_models::qwen3_next::load_qwen3_5_moe_model(&config.model_dir)
@@ -183,6 +189,12 @@ mod tests {
     fn model_config_from_dir_deepseek_v2() {
         let (_dir, result) = config_for_model("deepseek_v2");
         assert_eq!(result.unwrap().model_type, "deepseek_v2");
+    }
+
+    #[test]
+    fn model_config_from_dir_qwen3_5() {
+        let (_dir, result) = config_for_model("qwen3_5");
+        assert_eq!(result.unwrap().model_type, "qwen3_5");
     }
 
     #[test]

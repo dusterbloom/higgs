@@ -406,9 +406,13 @@ fn chat_completions_stream(
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
-    // Silently ignore tools in streaming mode (nanobot always sends them).
-    // Tool-calling responses are not yet supported in streaming, but
-    // regular text generation works fine with tools present in the request.
+    // Reject streaming requests with tools — tool-call deltas are not yet
+    // supported in streaming (every delta hardcodes tool_calls: None).
+    if req.tools.as_ref().is_some_and(|t| !t.is_empty()) {
+        return Err(ServerError::BadRequest(
+            "Tool calling is not supported in streaming mode".to_owned(),
+        ));
+    }
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);

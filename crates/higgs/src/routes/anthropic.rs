@@ -260,7 +260,7 @@ async fn create_message_non_streaming(
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
     let parse_input = if thinking_enabled {
-        format!("<think>{}", output.text)
+        format!("<think>{}</think>", output.text)
     } else {
         output.text
     };
@@ -268,11 +268,16 @@ async fn create_message_non_streaming(
     // If reasoning was detected, use the visible text. If the think block
     // was never closed (e.g. length-stopped), fall back to the raw output
     // to avoid returning an empty string.
-    let visible_text = if reasoning_result.reasoning.is_some() && !reasoning_result.text.is_empty() {
+    let visible_text = if reasoning_result.reasoning.is_some() && !reasoning_result.text.is_empty()
+    {
         reasoning_result.text
     } else {
-        // Strip the <think> prefix we injected so the raw output is clean.
-        parse_input.strip_prefix("<think>").unwrap_or(&parse_input).to_owned()
+        // Strip the <think>...</think> wrapper we injected so the raw output is clean.
+        parse_input
+            .strip_prefix("<think>")
+            .and_then(|s| s.strip_suffix("</think>"))
+            .unwrap_or(&parse_input)
+            .to_owned()
     };
 
     Ok(CreateMessageResponse {

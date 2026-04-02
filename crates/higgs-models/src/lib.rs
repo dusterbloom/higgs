@@ -673,7 +673,11 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
                     } else {
                         unmatched += 1;
                         if warned_unmatched < 5 {
-                            tracing::warn!(stripped, remapped = &*remapped, "weight key unmatched after remap");
+                            tracing::warn!(
+                                stripped,
+                                remapped = &*remapped,
+                                "weight key unmatched after remap"
+                            );
                             warned_unmatched += 1;
                         }
                     }

@@ -270,13 +270,7 @@ impl QEmbedding {
         let weight = self.weight.index(&flat);
         let scales = self.scales.index(&flat);
         let biases = self.biases.index(&flat);
-        let out = ops::dequantize(
-            &weight,
-            &scales,
-            &biases,
-            self.group_size,
-            self.bits,
-        )?;
+        let out = ops::dequantize(&weight, &scales, &biases, self.group_size, self.bits)?;
         let mut out_shape = shape;
         out_shape.push(-1);
         out.reshape(&out_shape)
@@ -1095,10 +1089,26 @@ impl GatedDeltaNet {
         Ok(Self {
             in_proj_qkvz: QLinear::new(ql, qb)?,
             in_proj_ba: QLinear::new(ql, qb)?,
-            in_proj_qkv: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
-            in_proj_z: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
-            in_proj_a: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
-            in_proj_b: if use_sep { Some(QLinear::new(ql, qb)?) } else { None },
+            in_proj_qkv: if use_sep {
+                Some(QLinear::new(ql, qb)?)
+            } else {
+                None
+            },
+            in_proj_z: if use_sep {
+                Some(QLinear::new(ql, qb)?)
+            } else {
+                None
+            },
+            in_proj_a: if use_sep {
+                Some(QLinear::new(ql, qb)?)
+            } else {
+                None
+            },
+            in_proj_b: if use_sep {
+                Some(QLinear::new(ql, qb)?)
+            } else {
+                None
+            },
             conv1d: nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
                 .bias(false)
                 .groups(conv_dim)
@@ -1159,30 +1169,42 @@ impl GatedDeltaNet {
         // Project inputs and split into q, k, v, z, b, a
         let (q, k, v, z, b, a) = if self.use_separate_projections {
             // qwen3.5-style: 4 separate projections, flat split
-            let qkv_proj = self.in_proj_qkv.as_ref()
+            let qkv_proj = self
+                .in_proj_qkv
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_qkv missing"))?;
-            let z_proj = self.in_proj_z.as_ref()
+            let z_proj = self
+                .in_proj_z
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_z missing"))?;
-            let b_proj = self.in_proj_b.as_ref()
+            let b_proj = self
+                .in_proj_b
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_b missing"))?;
-            let a_proj = self.in_proj_a.as_ref()
+            let a_proj = self
+                .in_proj_a
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_a missing"))?;
 
             let qkv = qkv_proj.forward(inputs)?;
-            let z = z_proj.forward(inputs)?
+            let z = z_proj
+                .forward(inputs)?
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
             let b = b_proj.forward(inputs)?;
             let a = a_proj.forward(inputs)?;
 
             let split_indices = &[self.key_dim, self.key_dim * 2];
             let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
-            let q = qkv_parts.first()
+            let q = qkv_parts
+                .first()
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
                 .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
-            let k = qkv_parts.get(1)
+            let k = qkv_parts
+                .get(1)
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
                 .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
-            let v = qkv_parts.get(2)
+            let v = qkv_parts
+                .get(2)
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
 
@@ -1414,59 +1436,44 @@ impl FfnBlock {
 
     fn forward(&self, x: &Array) -> Result<Array, Exception> {
         if self.is_moe {
-            // Delegate to SparseMoeBlock logic
-            let gate_ref = self.gate.as_ref()
+            let gate_ref = self
+                .gate
+                .as_ref()
                 .ok_or_else(|| Exception::custom("MoE gate missing"))?;
-            let switch_ref = self.switch_mlp.as_ref()
+            let switch_ref = self
+                .switch_mlp
+                .as_ref()
                 .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
-            let se_ref = self.shared_expert.as_ref()
+            let se_ref = self
+                .shared_expert
+                .as_ref()
                 .ok_or_else(|| Exception::custom("MoE shared_expert missing"))?;
-            let seg_ref = self.shared_expert_gate.as_ref()
+            let seg_ref = self
+                .shared_expert_gate
+                .as_ref()
                 .ok_or_else(|| Exception::custom("MoE shared_expert_gate missing"))?;
 
             let gates = ops::softmax_axis(&gate_ref.forward(x)?, -1, true)?;
 
             let neg_k = -self.top_k;
             let all_inds = ops::argpartition_axis(&gates, neg_k, -1)?;
-            let num_experts = *gates.shape().last()
+            let num_experts = *gates
+                .shape()
+                .last()
                 .ok_or_else(|| Exception::custom("gates must have last dim"))?;
             let top_k_start = num_experts - self.top_k;
-            let inds = all_inds.index((.., .., top_k_start..));
-            let scores = gates.take_along_axis(&inds, -1)?;
-            let scores = if self.norm_topk_prob {
-                let sum = scores.sum_axes(&[-1], true)?;
-                scores.divide(&sum)?
+            let top_inds = ops::sort_axis(all_inds.index((.., .., top_k_start..)), -1)?;
+            let raw_scores = gates.take_along_axis(&top_inds, -1)?;
+            let top_scores = if self.norm_topk_prob {
+                let sum = raw_scores.sum_axes(&[-1], true)?;
+                raw_scores.divide(&sum)?
             } else {
-                scores
+                raw_scores
             };
-
-            // Use Python-matching SwitchGLU: expand_dims + gather_qmm + swiglu + gather_qmm
-            let x_shape = x.shape();
-            let x_b = x_shape[0];
-            let x_l = x_shape[1];
-            let x_d = x_shape[2];
-            let x_exp = x.reshape(&[x_b, x_l, 1, 1, x_d])?;
-
-            let gate_out = gather_qmm(
-                &x_exp, &switch_ref.gate_proj.weight, &switch_ref.gate_proj.scales,
-                &switch_ref.gate_proj.biases, &inds, true,
-                switch_ref.gate_proj.group_size, switch_ref.gate_proj.bits, false,
-            )?;
-            let up_out = gather_qmm(
-                &x_exp, &switch_ref.up_proj.weight, &switch_ref.up_proj.scales,
-                &switch_ref.up_proj.biases, &inds, true,
-                switch_ref.up_proj.group_size, switch_ref.up_proj.bits, false,
-            )?;
-            let activated = swiglu(&gate_out, &up_out)?;
-            let down_out = gather_qmm(
-                &activated, &switch_ref.down_proj.weight, &switch_ref.down_proj.scales,
-                &switch_ref.down_proj.biases, &inds, true,
-                switch_ref.down_proj.group_size, switch_ref.down_proj.bits, false,
-            )?;
-            let y = down_out.squeeze_axes(&[-2])?;
+            let y = switch_ref.forward_gather(x, &top_inds, true)?;
 
             let expert_sum = y
-                .multiply(&scores.expand_dims(-1)?)?
+                .multiply(&top_scores.expand_dims(-1)?)?
                 .sum_axes(&[-2], false)?;
 
             let shared_y = se_ref.forward(x)?;
@@ -1476,11 +1483,17 @@ impl FfnBlock {
             expert_sum.add(shared_out)
         } else {
             // Dense SwiGLU
-            let gp = self.gate_proj.as_ref()
+            let gp = self
+                .gate_proj
+                .as_ref()
                 .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
-            let up = self.up_proj.as_ref()
+            let up = self
+                .up_proj
+                .as_ref()
                 .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
-            let dp = self.down_proj.as_ref()
+            let dp = self
+                .down_proj
+                .as_ref()
                 .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
             let gate_out = gp.forward(x)?;
             let up_out = up.forward(x)?;
@@ -1684,7 +1697,6 @@ impl Qwen3NextCausalLM {
     ) -> Result<Array, Exception> {
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
-
         if kv_cache.is_empty() {
             *kv_cache = self.make_cache();
         }
@@ -1836,9 +1848,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
 
     let text_config = config
         .get("text_config")
-        .ok_or_else(|| {
-            ModelError::UnsupportedModel("missing text_config in config.json".into())
-        })?;
+        .ok_or_else(|| ModelError::UnsupportedModel("missing text_config in config.json".into()))?;
 
     let mut obj = text_config.clone();
     let map = obj
@@ -1858,8 +1868,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
 
     // Merge top-level quantization config
     if let Some(quant) = config.get("quantization") {
-        map.entry("quantization")
-            .or_insert_with(|| quant.clone());
+        map.entry("quantization").or_insert_with(|| quant.clone());
     }
 
     // Merge top-level tie_word_embeddings
@@ -1878,10 +1887,8 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
 
     // Weights are rearranged from flat (qkv,z,b,a) to per-head-grouped
     // (qkvz,ba) at load time, so we use the combined forward path.
-    map.insert(
-        "use_separate_gdn_projections".to_owned(),
-        serde_json::Value::from(false),
-    );
+    map.entry("use_separate_gdn_projections".to_owned())
+        .or_insert(serde_json::Value::from(false));
 
     // Detect per-layer gate quantization override from top-level quantization config
     if let Some(quant) = config.get("quantization") {
@@ -1903,6 +1910,7 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
 ) -> Result<Qwen3NextCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_qwen3_5_moe_text_config_args(model_path)?;
+    let use_separate_gdn_projections = args.use_separate_gdn_projections;
 
     tracing::info!(
         hidden_size = args.hidden_size,
@@ -1924,9 +1932,13 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
     };
     let mut model = Qwen3NextCausalLM::new(args)?;
 
-    // Load weights with GDN projection rearrangement: flat (qkv,z,b,a)
-    // → per-head-grouped (qkvz,ba) for fused 2-dispatch forward path.
-    load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
+    if use_separate_gdn_projections {
+        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
+    } else {
+        // Load weights with GDN projection rearrangement: flat (qkv,z,b,a)
+        // → per-head-grouped (qkvz,ba) for fused 2-dispatch forward path.
+        load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
+    }
 
     tracing::info!("Qwen3.5-MoE model loaded successfully");
     Ok(model)
@@ -1940,12 +1952,28 @@ struct GdnDims {
     head_v_dim: i32,
 }
 
+fn validate_gqa_ratio(d: &GdnDims) -> Result<i32, crate::error::ModelError> {
+    if d.num_k_heads <= 0 {
+        return Err(crate::error::ModelError::ShapeMismatch(format!(
+            "Invalid GQA ratio: num_k_heads must be positive, got {}",
+            d.num_k_heads
+        )));
+    }
+    if d.num_v_heads % d.num_k_heads != 0 {
+        return Err(crate::error::ModelError::ShapeMismatch(format!(
+            "Invalid GQA ratio: num_v_heads={} is not a multiple of num_k_heads={}",
+            d.num_v_heads, d.num_k_heads
+        )));
+    }
+    Ok(d.num_v_heads / d.num_k_heads)
+}
+
 /// Build row permutation to convert flat [q_all|k_all|v_all|z_all] layout
 /// to per-head-grouped [q_h0|k_h0|v_h0|z_h0|q_h1|...] for in_proj_qkvz.
-fn build_qkvz_permutation(d: &GdnDims) -> Vec<i32> {
+fn build_qkvz_permutation(d: &GdnDims) -> Result<Vec<i32>, crate::error::ModelError> {
     let nk = d.num_k_heads;
     let dk = d.head_k_dim;
-    let v_per_k = d.num_v_heads / nk;
+    let v_per_k = validate_gqa_ratio(d)?;
     let dv = d.head_v_dim;
     let key_dim = nk * dk;
     let qkv_rows = key_dim * 2 + d.num_v_heads * dv; // offset for z
@@ -1969,13 +1997,13 @@ fn build_qkvz_permutation(d: &GdnDims) -> Vec<i32> {
             perm.push(qkv_rows + h * v_per_k * dv + i);
         }
     }
-    perm
+    Ok(perm)
 }
 
 /// Build row permutation for flat [b_all|a_all] → per-head-grouped [b_h0|a_h0|b_h1|a_h1|...].
-fn build_ba_permutation(d: &GdnDims) -> Vec<i32> {
+fn build_ba_permutation(d: &GdnDims) -> Result<Vec<i32>, crate::error::ModelError> {
     let nk = d.num_k_heads;
-    let v_per_k = d.num_v_heads / nk;
+    let v_per_k = validate_gqa_ratio(d)?;
     let nv = d.num_v_heads;
 
     let mut perm = Vec::new();
@@ -1989,14 +2017,16 @@ fn build_ba_permutation(d: &GdnDims) -> Vec<i32> {
             perm.push(nv + h * v_per_k + i);
         }
     }
-    perm
+    Ok(perm)
 }
 
 /// Concatenate two arrays along dim 0 and permute rows.
 fn concat_and_permute(a: &Array, b: &Array, perm: &[i32]) -> Result<Array, Exception> {
     let cat = ops::concatenate_axis(&[a, b], 0)?;
-    let perm_arr = Array::from_slice(perm, &[i32::try_from(perm.len())
-        .map_err(|_| Exception::custom("perm len overflow"))?]);
+    let perm_arr = Array::from_slice(
+        perm,
+        &[i32::try_from(perm.len()).map_err(|_| Exception::custom("perm len overflow"))?],
+    );
     cat.take_axis(&perm_arr, 0)
 }
 
@@ -2032,7 +2062,11 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
         }
     }
 
-    tracing::info!(matched, unmatched_count = unmatched.len(), "Direct weight loading stats");
+    tracing::info!(
+        matched,
+        unmatched_count = unmatched.len(),
+        "Direct weight loading stats"
+    );
     if !unmatched.is_empty() {
         for k in unmatched.iter().take(10) {
             tracing::warn!(key = %k, "Unmatched weight key");
@@ -2055,13 +2089,14 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     model_path: &Path,
     gdn_dims: &GdnDims,
 ) -> Result<(), crate::error::ModelError> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
     let mut params = model.parameters_mut().flatten();
 
-    let qkvz_perm = build_qkvz_permutation(gdn_dims);
-    let ba_perm = build_ba_permutation(gdn_dims);
+    let qkvz_perm = build_qkvz_permutation(gdn_dims)?;
+    let ba_perm = build_ba_permutation(gdn_dims)?;
+    let mut assigned_keys = HashSet::new();
 
     // GDN split keys: collect (part_a, part_b) for each combined target
     // Key format: "model.layers.N.linear_attn.in_proj_qkvz.{weight|scales|biases}"
@@ -2108,6 +2143,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             if !handled {
                 if let Some(param) = params.get_mut(stripped) {
                     **param = value;
+                    assigned_keys.insert(stripped.to_owned());
                 }
             }
         }
@@ -2137,7 +2173,24 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             ))
         })?;
         **param = fused;
+        assigned_keys.insert(combined_key.clone());
         fused_count += 1;
+    }
+
+    let missing_gdn_targets: Vec<String> = params
+        .keys()
+        .filter(|k| {
+            let kr = k.as_ref();
+            (kr.contains(".linear_attn.in_proj_qkvz.") || kr.contains(".linear_attn.in_proj_ba."))
+                && !assigned_keys.contains(kr)
+        })
+        .map(|key| key.as_ref().to_owned())
+        .collect();
+    if !missing_gdn_targets.is_empty() {
+        return Err(crate::error::ModelError::MissingWeight(format!(
+            "Missing fused GDN target weights: {}",
+            missing_gdn_targets.join(", ")
+        )));
     }
 
     tracing::info!(
@@ -2625,6 +2678,39 @@ mod tests {
     }
 
     #[test]
+    fn test_load_qwen3_5_moe_text_config_respects_projection_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = r#"{
+            "text_config": {
+                "model_type": "qwen3_next",
+                "hidden_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+                "rms_norm_eps": 1e-06,
+                "vocab_size": 1024,
+                "max_position_embeddings": 512,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 4,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "shared_expert_intermediate_size": 256,
+                "moe_intermediate_size": 128,
+                "use_separate_gdn_projections": true
+            }
+        }"#;
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(args.use_separate_gdn_projections);
+    }
+
+    #[test]
     fn test_arrays_cache_default() {
         let cache = ArraysCache::default();
         assert!(cache.conv_state.is_none());
@@ -2663,6 +2749,69 @@ mod tests {
     fn quantize_weights(w: &Array, group_size: i32, bits: i32) -> (Array, Array, Array) {
         let (qw, scales, biases) = ops::quantize(w, group_size, bits).unwrap();
         (qw, scales, biases)
+    }
+
+    #[test]
+    fn test_qembedding_forward_matches_dequantize_then_gather() {
+        let mut embedding = QEmbedding::new(64, 4).unwrap();
+        let weight_f = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[4, 64], None).unwrap();
+        let (weight, scales, biases) = quantize_weights(&weight_f, 64, 4);
+        *embedding.weight = weight;
+        *embedding.scales = scales;
+        *embedding.biases = biases;
+
+        let indices = Array::from_slice(&[2_u32, 1, 2, 3], &[2, 2]);
+        let new_result = embedding.forward(&indices).unwrap();
+
+        let full = ops::dequantize(
+            &embedding.weight,
+            &embedding.scales,
+            &*embedding.biases,
+            embedding.group_size,
+            embedding.bits,
+        )
+        .unwrap();
+        let flat = indices.flatten(None, None).unwrap();
+        let old_result = full
+            .take_axis(&flat, 0)
+            .unwrap()
+            .reshape(&[2, 2, 64])
+            .unwrap();
+
+        let diff = new_result.subtract(&old_result).unwrap().abs().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        assert!(
+            max_diff < 1e-5,
+            "QEmbedding forward deviates from dequantize-then-gather by {max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_build_qkvz_permutation_rejects_invalid_gqa_ratio() {
+        let dims = GdnDims {
+            num_k_heads: 2,
+            num_v_heads: 3,
+            head_k_dim: 32,
+            head_v_dim: 16,
+        };
+
+        let err = build_qkvz_permutation(&dims).unwrap_err();
+
+        assert!(err.to_string().contains("Invalid GQA ratio"));
+    }
+
+    #[test]
+    fn test_build_ba_permutation_rejects_invalid_gqa_ratio() {
+        let dims = GdnDims {
+            num_k_heads: 2,
+            num_v_heads: 3,
+            head_k_dim: 32,
+            head_v_dim: 16,
+        };
+
+        let err = build_ba_permutation(&dims).unwrap_err();
+
+        assert!(err.to_string().contains("Invalid GQA ratio"));
     }
 
     #[test]
@@ -2798,6 +2947,11 @@ mod tests {
         args.moe_intermediate_size = 64;
         args.shared_expert_intermediate_size = 64;
         args.hidden_size = 64;
+        // Use same quantization for gates as the test sets below
+        args.gate_quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 8,
+        });
 
         let mut block = SparseMoeBlock::new(&args, 64, 4).unwrap();
 
