@@ -159,6 +159,28 @@ impl AnyModel {
         }
     }
 
+    /// Forward pass producing logits for **only the last token**.
+    ///
+    /// During prefill we only need the last token's logits for sampling.
+    /// Computing the full `[B, L, vocab]` LM head is wasteful for large vocab.
+    /// This method computes hidden states for all tokens (needed for KV cache),
+    /// then applies the LM head only to the last token.
+    pub fn forward_last_token(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_last_token(inputs, mask, c),
+            // Fallback: compute full forward then slice for other architectures
+            (m, c) => {
+                let logits = m.forward(inputs, mask, c)?;
+                Ok(logits.index((.., -1, ..)))
+            }
+        }
+    }
+
     /// Batched decode forward pass for N requests each with 1 token.
     ///
     /// Only supported for the `Transformer` variant (Llama/Qwen/Mistral).

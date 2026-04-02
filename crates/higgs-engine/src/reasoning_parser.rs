@@ -318,14 +318,16 @@ mod tests {
 
         // Feed reasoning content (no opening tag needed)
         let (vis, reas) = tracker.process("step 1... step 2...");
+        let mut total_reasoning = reas.clone();
         assert!(vis.is_empty(), "reasoning should not be visible");
         assert!(!reas.is_empty(), "should capture reasoning text");
 
         // Close thinking and emit visible answer
         let (vis, reas) = tracker.process("</think>The answer is 42.");
+        total_reasoning.push_str(&reas);
         let (vis2, reas2) = tracker.flush();
+        total_reasoning.push_str(&reas2);
         let total_visible = format!("{vis}{vis2}");
-        let total_reasoning = format!("{reas}{reas2}");
         assert!(
             total_visible.contains("The answer is 42."),
             "answer should be visible after </think>"
@@ -363,11 +365,12 @@ mod tests {
     #[test]
     fn streaming_tracker_flush_while_thinking() {
         let mut tracker = StreamingReasoningTracker::new_inside_think();
-        tracker.process("partial reasoning");
-        let (vis, reas) = tracker.flush();
+        let (_, reas) = tracker.process("partial reasoning");
+        let (vis, reas2) = tracker.flush();
+        let total_reasoning = format!("{reas}{reas2}");
         assert!(vis.is_empty(), "nothing visible while still thinking");
         assert!(
-            reas.contains("partial reasoning"),
+            total_reasoning.contains("partial reasoning"),
             "flush should return buffered reasoning"
         );
     }

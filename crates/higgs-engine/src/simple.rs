@@ -307,14 +307,19 @@ impl SimpleEngine {
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
     ) -> Result<(Array, Option<LogprobArrays>), EngineError> {
         let logits = if let Some(ref pixel_values) = prepared.pixel_values {
+            // Multimodal path: full forward (VLMs need all tokens for vision)
             prepared
                 .model
                 .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
         } else {
+            // Text-only prefill: only need last token's logits for sampling.
+            // The LM head matmul on [B, L, vocab] is the bottleneck for large vocab,
+            // so we compute hidden states for all tokens (KV cache) then apply
+            // the LM head only to the last token.
             prepared
                 .model
-                .forward(&prepared.prompt_array, None, &mut prepared.cache)
+                .forward_last_token(&prepared.prompt_array, None, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
         };
         let last_logits = logits.index((.., -1, ..));

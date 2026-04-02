@@ -1845,6 +1845,34 @@ impl Qwen3NextCausalLM {
             None => self.model.embed_tokens.as_linear(&h),
         }
     }
+
+    /// Forward pass producing logits for **only the last token**.
+    ///
+    /// During prefill we only need the last token's logits for sampling.
+    /// Computing the full `[B, L, vocab]` LM head is wasteful for large vocab.
+    /// This method computes hidden states for all tokens (needed for KV cache),
+    /// then applies the LM head only to the last token.
+    #[allow(non_snake_case)]
+    pub fn forward_last_token(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_hidden(inputs, mask, kv_cache)?;
+        let last_h = h.index((.., -1, ..));
+        // Reshape to [B, 1, D] so the LM head produces [B, 1, vocab]
+        let shape = last_h.shape();
+        let last_h = if shape.len() == 2 {
+            last_h.reshape(&[1, 1, *shape.last().unwrap()])?
+        } else {
+            last_h.reshape(&[*shape.first().unwrap(), 1, *shape.last().unwrap()])?
+        };
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&last_h),
+            None => self.model.embed_tokens.as_linear(&last_h),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2936,6 +2964,10 @@ mod tests {
         args.moe_intermediate_size = 64;
         args.shared_expert_intermediate_size = 64;
         args.hidden_size = 64;
+        args.gate_quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 8,
+        });
 
         let mut block = SparseMoeBlock::new(&args, 64, 4).unwrap();
 
@@ -10174,7 +10206,7 @@ mod tests {
 
         // They should be identical (both round-trip through the same quantized repr)
         let diff = path_a.subtract(&path_b).unwrap().abs().unwrap();
-        let max_diff: f32 = diff.max(None, None).unwrap().item();
+        let max_diff: f32 = diff.max(None).unwrap().item();
         assert!(
             max_diff < 1e-6,
             "gather-then-dequantize should match dequantize-then-gather, max diff: {max_diff}"
