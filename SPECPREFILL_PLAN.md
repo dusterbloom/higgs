@@ -256,19 +256,92 @@ max_tokens = 65536
 
 **Phase 3 (Week 3) - Complete:**
 - ✅ Draft model loading and management (`draft.rs`)
+- ✅ Attention-based scoring implementation (`scoring_attention.rs`)
 - ✅ SpecPrefill engine integration (`spec_prefill.rs`)
 - ✅ Integration with `SimpleEngine::run_prefill()`
 - ✅ Feature flag `spec_prefill` for optional compilation
-- ⏳ End-to-end tests (TODO)
-- ⏳ Benchmarks vs baseline (TODO)
+- ⏳ End-to-end tests (TODO - need draft model)
+- ⏳ Benchmarks vs baseline (TODO - need draft model)
+
+## Implementation Summary
+
+### Files Created
+
+**`crates/higgs-models/src/spec_prefill/`:**
+- `mod.rs` - Module exports and constants
+- `scoring.rs` - Token importance data structures and selection
+- `scoring_attention.rs` - Attention-based scoring algorithm
+- `rope.rs` - Manual RoPE for arbitrary positions
+- `prefill.rs` - Sparse prefill integration
+- `draft.rs` - Draft model management
+
+**`crates/higgs-engine/src/spec_prefill.rs`:**
+- `SpecPrefillConfig` - Configuration
+- `SpecPrefillEngine` - Engine wrapper
+- `try_spec_prefill()` - Integration point
+
+### Current Status
+
+✅ **All core functionality implemented:**
+- Token scoring (uniform baseline + attention-based framework)
+- Chunk selection
+- Manual RoPE
+- Sparse prefill
+- Engine integration
+
+⏳ **Pending:**
+- Download draft model (Qwen3.5-0.6B-4bit)
+- Test attention-based scoring end-to-end
+- Run benchmarks to verify 3-5x speedup
+- Tune parameters (keep_rate, chunk_size, n_lookahead)
 
 ## Next Steps
 
-1. **Download draft model** - Qwen3.5-0.6B-4bit for testing
-2. **Implement attention-based scoring** - Replace uniform baseline with Q@K^T
-3. **Add end-to-end tests** - Verify correctness
-4. **Run benchmarks** - Measure actual speedup vs baseline
-5. **Tune parameters** - Optimize keep_rate, chunk_size, n_lookahead
+1. **Download draft model:**
+   ```bash
+   # Download Qwen3.5-0.6B-4bit for testing
+   ```
+
+2. **Test attention-based scoring:**
+   ```bash
+   cargo test -p higgs-models spec_prefill
+   ```
+
+3. **Run benchmarks:**
+   ```bash
+   # Benchmark with SpecPrefill enabled
+   ./bench_prefill.py --model Qwen3.5-35B-A3B-3bit --ctx 8192 --spec-prefill
+   # Expected: ~480 tok/s (vs ~160 tok/s baseline)
+   ```
+
+4. **Tune parameters:**
+   - Adjust `keep_rate` for quality/speed trade-off
+   - Tune `n_lookahead` for scoring quality
+   - Optimize `pool_kernel` for smoothing
+
+## Expected Performance
+
+| Context | Keep Rate | Tokens Processed | Expected Prefill | Speedup |
+|---------|-----------|------------------|------------------|---------|
+| 8k | 30% | 2,400 | ~480 tok/s | **3x** |
+| 16k | 25% | 4,000 | ~480 tok/s | **3x** |
+| 32k | 20% | 6,400 | ~480 tok/s | **3x** |
+| 64k | 20% | 12,800 | ~480 tok/s | **3x** |
+
+## Configuration
+
+```toml
+# higgs.toml
+[spec_prefill]
+enabled = true
+draft_model = "mlx-community/Qwen3.5-0.6B-4bit"
+threshold = 8192      # Enable for prompts >8k
+max_tokens = 65536    # Disable for prompts >64k
+keep_rate = 0.20      # Keep 20% (auto-computed if omitted)
+chunk_size = 32       # 32-token chunks
+n_lookahead = 8       # Lookahead decode steps
+pool_kernel = 13      # Smoothing kernel size
+```
 
 ## Open Questions
 

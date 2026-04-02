@@ -7,15 +7,19 @@
 //!
 //! Based on arxiv.org/abs/2502.02789 and oMLX implementation.
 
+pub mod draft;
 pub mod prefill;
 pub mod rope;
 pub mod scoring;
+pub mod scoring_attention;
 
-pub use scoring::{compute_keep_rate, score_tokens_uniform, ScoringConfig, TokenImportance};
+pub use scoring::{compute_keep_rate, score_tokens_uniform, TokenImportance};
 
 pub use rope::{manual_rope, manual_rope_with_freqs, OffsetAdjustedRoPE, PositionMappedRoPE};
 
 pub use prefill::{cleanup_sparse_prefill, sparse_prefill, SparsePrefillState};
+
+pub use draft::{auto_select_draft_model, score_with_draft, DraftModel, DraftModelConfig};
 
 /// Compute keep rate threshold for enabling SpecPrefill.
 pub const SPEC_PREFILL_THRESHOLD: usize = 8192;
