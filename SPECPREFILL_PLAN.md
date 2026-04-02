@@ -231,15 +231,35 @@ max_tokens = 65536
 - [ ] **<100ms overhead** for token scoring
 - [ ] **Works with all model types** (MoE, dense, VLM)
 
-## Timeline
+## Timeline & Progress
 
-| Week | Milestone |
-|------|-----------|
-| 1 | Token scoring + chunk selection |
-| 2 | Manual RoPE + sparse prefill |
-| 3 | Integration + testing + benchmarks |
+| Week | Milestone | Status |
+|------|-----------|--------|
+| 1 | Token scoring + chunk selection | ✅ **DONE** |
+| 2 | Manual RoPE + sparse prefill | ✅ **DONE** |
+| 3 | Integration + testing + benchmarks | 🔄 IN PROGRESS |
 
-**Total: 3 weeks for full implementation**
+**Phase 1 (Week 1) - Complete:**
+- ✅ `TokenImportance` struct
+- ✅ `select_chunks()` for top-K% selection
+- ✅ `select_topk()` for individual token selection
+- ✅ `score_tokens_uniform()` baseline
+- ✅ `compute_keep_rate()` presets
+
+**Phase 2 (Week 2) - Complete:**
+- ✅ `manual_rope()` - Apply RoPE at arbitrary positions
+- ✅ `manual_rope_with_freqs()` - Custom RoPE variants
+- ✅ `PositionMappedRoPE` - For sparse prefill phase
+- ✅ `OffsetAdjustedRoPE` - For decode phase
+- ✅ `sparse_prefill()` - Main integration function
+- ✅ `cleanup_sparse_prefill()` - Post-generation cleanup
+
+**Phase 3 (Week 3) - Remaining:**
+- [ ] Draft model loading and management
+- [ ] Attention-based token scoring (Q@K^T)
+- [ ] Integration with engine `run_prefill()`
+- [ ] End-to-end tests
+- [ ] Benchmarks vs baseline
 
 ## Open Questions
 

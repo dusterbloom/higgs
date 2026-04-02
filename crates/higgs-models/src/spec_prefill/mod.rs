@@ -7,12 +7,15 @@
 //!
 //! Based on arxiv.org/abs/2502.02789 and oMLX implementation.
 
+pub mod prefill;
+pub mod rope;
 pub mod scoring;
-// pub mod selection;  // TODO
-// pub mod rope;       // TODO
-// pub mod prefill;    // TODO
 
 pub use scoring::{compute_keep_rate, score_tokens_uniform, ScoringConfig, TokenImportance};
+
+pub use rope::{manual_rope, manual_rope_with_freqs, OffsetAdjustedRoPE, PositionMappedRoPE};
+
+pub use prefill::{cleanup_sparse_prefill, sparse_prefill, SparsePrefillState};
 
 /// Compute keep rate threshold for enabling SpecPrefill.
 pub const SPEC_PREFILL_THRESHOLD: usize = 8192;

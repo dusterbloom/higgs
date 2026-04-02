@@ -27,7 +27,11 @@ impl TokenImportance {
             chunk_scores.push((i, avg));
         }
         chunk_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut kept: Vec<usize> = chunk_scores.into_iter().take(keep_n).map(|(i, _)| i).collect();
+        let mut kept: Vec<usize> = chunk_scores
+            .into_iter()
+            .take(keep_n)
+            .map(|(i, _)| i)
+            .collect();
         kept.sort();
         let mut indices = Vec::new();
         for ci in kept {
@@ -55,8 +59,13 @@ pub fn score_tokens_uniform(n_tokens: usize) -> Result<TokenImportance, Exceptio
 }
 
 pub fn compute_keep_rate(prompt_len: usize) -> f32 {
-    if prompt_len < 8192 { 1.0 }
-    else if prompt_len < 16384 { 0.30 }
-    else if prompt_len < 32768 { 0.25 }
-    else { 0.20 }
+    if prompt_len < 8192 {
+        1.0
+    } else if prompt_len < 16384 {
+        0.30
+    } else if prompt_len < 32768 {
+        0.25
+    } else {
+        0.20
+    }
 }
