@@ -74,21 +74,21 @@ impl DraftModel {
     ///
     /// This implements the SpecPrefill scoring algorithm:
     /// 1. Prefill draft model with all prompt tokens
-    /// 2. Run N lookahead decode steps
-    /// 3. Capture query vectors during attention
-    /// 4. Compute importance = Q_lookahead @ K_prompt^T
-    /// 5. Aggregate across heads/layers, apply smoothing
+    /// 2. Run N lookahead decode steps, capturing query vectors
+    /// 3. Compute importance = Q_lookahead @ K_prompt^T (attention weights)
+    /// 4. Aggregate: max over heads/layers, mean over lookahead steps
+    /// 5. Apply avg_pool1d smoothing
     ///
     /// # Arguments
     /// * `tokens` - Prompt token IDs
     ///
     /// # Returns
-    /// Per-token importance scores (not normalized)
+    /// Per-token importance scores (not normalized, higher = more important)
     pub fn score_tokens(&self, tokens: &[u32]) -> Result<Array, ModelError> {
         match &self.model {
             AnyModel::Qwen3Next(model) => {
                 // Clone model for scoring (to avoid mutating the original)
-                // TODO: Implement proper model cloning or use Arc
+                // Note: This is inefficient - in production, use Arc<Mutex<>> or similar
                 let mut model_clone = model.clone();
 
                 // Use attention-based scoring

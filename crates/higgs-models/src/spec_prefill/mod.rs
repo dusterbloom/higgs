@@ -15,6 +15,8 @@ pub mod scoring_attention;
 
 pub use scoring::{compute_keep_rate, score_tokens_uniform, TokenImportance};
 
+pub use scoring_attention::score_tokens_with_attention;
+
 pub use rope::{manual_rope, manual_rope_with_freqs, OffsetAdjustedRoPE, PositionMappedRoPE};
 
 pub use prefill::{cleanup_sparse_prefill, sparse_prefill, SparsePrefillState};

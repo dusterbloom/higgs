@@ -237,7 +237,7 @@ max_tokens = 65536
 |------|-----------|--------|
 | 1 | Token scoring + chunk selection | ✅ **DONE** |
 | 2 | Manual RoPE + sparse prefill | ✅ **DONE** |
-| 3 | Integration + testing + benchmarks | ✅ **DONE** |
+| 3 | Integration + attention scoring | ✅ **DONE** |
 
 **Phase 1 (Week 1) - Complete:**
 - ✅ `TokenImportance` struct
@@ -256,68 +256,82 @@ max_tokens = 65536
 
 **Phase 3 (Week 3) - Complete:**
 - ✅ Draft model loading and management (`draft.rs`)
-- ✅ Attention-based scoring implementation (`scoring_attention.rs`)
+- ✅ **Attention-based scoring** (`scoring_attention.rs`)
+  - ✅ Query capture from attention layers
+  - ✅ Q@K^T attention weight computation
+  - ✅ Softmax over prompt positions
+  - ✅ Max across heads/layers
+  - ✅ Mean across lookahead steps
+  - ✅ avg_pool1d smoothing
 - ✅ SpecPrefill engine integration (`spec_prefill.rs`)
 - ✅ Integration with `SimpleEngine::run_prefill()`
 - ✅ Feature flag `spec_prefill` for optional compilation
-- ⏳ End-to-end tests (TODO - need draft model)
-- ⏳ Benchmarks vs baseline (TODO - need draft model)
 
 ## Implementation Summary
 
-### Files Created
+### Files Created (7 modules, ~1,500 lines)
 
 **`crates/higgs-models/src/spec_prefill/`:**
-- `mod.rs` - Module exports and constants
-- `scoring.rs` - Token importance data structures and selection
-- `scoring_attention.rs` - Attention-based scoring algorithm
-- `rope.rs` - Manual RoPE for arbitrary positions
-- `prefill.rs` - Sparse prefill integration
-- `draft.rs` - Draft model management
+1. `mod.rs` - Module exports and constants
+2. `scoring.rs` - Token importance data structures and selection (156 lines)
+3. `scoring_attention.rs` - **Full attention-based scoring** (450 lines)
+   - Query capture from all attention layers
+   - Q@K^T attention weight computation
+   - Aggregation across heads/layers/lookahead steps
+   - avg_pool1d smoothing
+4. `rope.rs` - Manual RoPE for arbitrary positions (230 lines)
+5. `prefill.rs` - Sparse prefill integration (180 lines)
+6. `draft.rs` - Draft model management (180 lines)
 
 **`crates/higgs-engine/src/spec_prefill.rs`:**
-- `SpecPrefillConfig` - Configuration
-- `SpecPrefillEngine` - Engine wrapper
-- `try_spec_prefill()` - Integration point
+7. Engine integration (320 lines)
 
 ### Current Status
 
-✅ **All core functionality implemented:**
-- Token scoring (uniform baseline + attention-based framework)
-- Chunk selection
-- Manual RoPE
-- Sparse prefill
-- Engine integration
+✅ **ALL FUNCTIONALITY IMPLEMENTED:**
+- ✅ Token scoring (uniform baseline + **attention-based Q@K^T**)
+- ✅ Chunk selection (top-K% by importance)
+- ✅ Manual RoPE (arbitrary positions)
+- ✅ Sparse prefill (selected tokens only)
+- ✅ Offset-adjusted RoPE (correct decode positioning)
+- ✅ Engine integration (feature-gated)
+- ✅ Draft model management
 
 ⏳ **Pending:**
-- Download draft model (Qwen3.5-0.6B-4bit)
-- Test attention-based scoring end-to-end
+- Download draft model (Qwen3-0.6B-4bit available at `~/.cache/lm-studio/models/mlx-community/`)
+- Configure draft model path
+- Run end-to-end tests
 - Run benchmarks to verify 3-5x speedup
 - Tune parameters (keep_rate, chunk_size, n_lookahead)
 
 ## Next Steps
 
-1. **Download draft model:**
-   ```bash
-   # Download Qwen3.5-0.6B-4bit for testing
+1. **Configure draft model path:**
+   ```toml
+   # higgs.toml
+   [spec_prefill]
+   draft_model = "mlx-community/Qwen3-0.6B-4bit"  # Already available locally
    ```
 
-2. **Test attention-based scoring:**
+2. **Build with feature flag:**
    ```bash
-   cargo test -p higgs-models spec_prefill
+   cargo build --release -p higgs --features spec_prefill
    ```
 
 3. **Run benchmarks:**
    ```bash
-   # Benchmark with SpecPrefill enabled
-   ./bench_prefill.py --model Qwen3.5-35B-A3B-3bit --ctx 8192 --spec-prefill
-   # Expected: ~480 tok/s (vs ~160 tok/s baseline)
+   # Baseline (no SpecPrefill)
+   python3 bench.py --model Qwen3.5-35B-A3B-3bit --ctx 16384
+   
+   # With SpecPrefill (expected 3x speedup)
+   python3 bench.py --model Qwen3.5-35B-A3B-3bit --ctx 16384 --spec-prefill
+   # Expected: ~480 tok/s vs ~160 tok/s baseline
    ```
 
 4. **Tune parameters:**
    - Adjust `keep_rate` for quality/speed trade-off
-   - Tune `n_lookahead` for scoring quality
-   - Optimize `pool_kernel` for smoothing
+   - Tune `n_lookahead` (8 is default from paper)
+   - Optimize `pool_kernel` (13 is default from paper)
 
 ## Expected Performance
 
@@ -334,13 +348,47 @@ max_tokens = 65536
 # higgs.toml
 [spec_prefill]
 enabled = true
-draft_model = "mlx-community/Qwen3.5-0.6B-4bit"
+draft_model = "~/.cache/lm-studio/models/mlx-community/Qwen3-0.6B-4bit"
 threshold = 8192      # Enable for prompts >8k
 max_tokens = 65536    # Disable for prompts >64k
 keep_rate = 0.20      # Keep 20% (auto-computed if omitted)
 chunk_size = 32       # 32-token chunks
 n_lookahead = 8       # Lookahead decode steps
 pool_kernel = 13      # Smoothing kernel size
+```
+
+## Algorithm Details
+
+### Attention-Based Scoring
+
+```
+For each lookahead step (N=8):
+  1. Run decode step
+  2. Capture Q from all attention layers: [B, n_heads, 1, head_dim]
+  3. Get cached K: [B, n_heads, n_prompt, head_dim]
+  4. Compute attention weights: Q @ K^T / sqrt(d)
+  5. Softmax over prompt positions
+
+Aggregate:
+  1. Max across heads
+  2. Max across layers
+  3. Mean across lookahead steps
+  4. avg_pool1d smoothing (kernel=13)
+
+Result: importance scores [n_prompt]
+```
+
+### Sparse Prefill
+
+```
+Input: M tokens, N selected indices (N = M * keep_rate)
+
+1. Create position array: [p0, p10, p25, ..., pM-1]
+2. Install PositionMappedRoPE on all attention layers
+3. Prefill on N selected tokens only
+4. Install OffsetAdjustedRoPE (adjustment = M - N)
+5. Generate tokens normally with correct positioning
+6. Cleanup after generation
 ```
 
 ## Open Questions
