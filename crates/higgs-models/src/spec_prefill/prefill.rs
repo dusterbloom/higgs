@@ -12,18 +12,49 @@ pub struct SparsePrefillState {
     pub adjustment: i32,
 }
 
+/// Select tokens at specified indices from input tensor.
+pub fn select_tokens(inputs: &Array, indices: &[usize]) -> Result<Array, mlx_rs::error::Exception> {
+    let shape = inputs.shape();
+    let B = shape[0];
+    let L = shape[1];
+    
+    let gather_indices: Vec<i32> = (0..B)
+        .flat_map(|b| indices.iter().map(move |&i| (b * L + i as i32)))
+        .collect();
+    
+    if shape.len() == 2 {
+        let inputs_2d = inputs.reshape(&[B * L, 1])?;
+        let n = indices.len() as i32;
+        let indices_array = Array::from_slice(&gather_indices, &[B * n, 1]);
+        let selected = inputs_2d.take_along_axis(&indices_array, 0)?;
+        selected.reshape(&[B, n])
+    } else {
+        let D = shape[2];
+        let inputs_2d = inputs.reshape(&[B * L, D])?;
+        let n = indices.len() as i32;
+        let indices_array = Array::from_slice(&gather_indices, &[B * n, 1]);
+        let selected = inputs_2d.take_along_axis(&indices_array, 0)?;
+        selected.reshape(&[B, n, D])
+    }
+}
+
+/// Create position array from token indices with offset.
+pub fn create_position_array(indices: &[usize], offset: i32) -> Array {
+    let positions: Vec<i32> = indices.iter().map(|&i| (i as i32) + offset).collect();
+    Array::from_slice(&positions, &[positions.len() as i32])
+}
+
 /// Prefill model with selected tokens at their original positions.
 pub fn sparse_prefill(
     model: &mut Qwen3NextCausalLM,
     inputs: &Array,
     selected_indices: &[usize],
     cache: &mut AnyCache,
-    position_offset: i32,
+    _position_offset: i32,
 ) -> Result<(Array, SparsePrefillState), mlx_rs::error::Exception> {
     let total_len = inputs.dim(1) as i32;
     let selected_len = selected_indices.len() as i32;
     
-    // Extract Vec<Option<LayerCache>> from AnyCache
     let layer_cache_vec = match cache {
         AnyCache::Hybrid(vec) => vec,
         AnyCache::KV(_) => {
@@ -33,28 +64,7 @@ pub fn sparse_prefill(
         }
     };
     
-    // Extract selected tokens using take_along_axis
-    let indices_array = Array::from_iter(
-        selected_indices.iter().map(|&i| i as i32),
-        &[1, selected_len]
-    );
-    
-    // Reshape inputs to [B*L, D] then gather
-    let shape = inputs.shape();
-    let B = shape[0];
-    let D = shape[shape.len() - 1];
-    let inputs_2d = inputs.reshape(&[B * total_len, D])?;
-    
-    // Create indices for gather
-    let gather_indices: Vec<i32> = (0..B)
-        .flat_map(|b| selected_indices.iter().map(move |&i| (b * total_len + i as i32)))
-        .collect();
-    
-    let indices_flat = Array::from_iter(gather_indices, &[B * selected_len, 1]);
-    let selected_tokens = inputs_2d.take_along_axis(&indices_flat, 0)?;
-    let selected_tokens = selected_tokens.reshape(&[B, selected_len, D])?;
-    
-    // Forward pass with selected tokens
+    let selected_tokens = select_tokens(inputs, selected_indices)?;
     let logits = model.forward(&selected_tokens, None, layer_cache_vec)?;
     
     let state = SparsePrefillState {
@@ -71,4 +81,28 @@ pub fn cleanup_sparse_prefill(
     _state: &SparsePrefillState,
 ) -> Result<(), mlx_rs::error::Exception> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_position_array() {
+        let indices = vec![0, 10, 25, 100];
+        let positions = create_position_array(&indices, 0);
+        
+        assert_eq!(positions.shape(), &[4]);
+        let pos_slice: &[i32] = positions.as_slice();
+        assert_eq!(pos_slice, &[0, 10, 25, 100]);
+    }
+
+    #[test]
+    fn test_create_position_array_with_offset() {
+        let indices = vec![0, 10, 25];
+        let positions = create_position_array(&indices, 50);
+        
+        let pos_slice: &[i32] = positions.as_slice();
+        assert_eq!(pos_slice, &[50, 60, 75]);
+    }
 }
