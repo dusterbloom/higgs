@@ -2678,6 +2678,70 @@ impl AneBonsaiEngine {
 }
 
 // ---------------------------------------------------------------------------
+// Adaptive K controller for AR speculative decode
+// ---------------------------------------------------------------------------
+
+/// Dynamic draft-length controller for AR speculative decode.
+///
+/// Tracks a rolling window of acceptance rates and switches between
+/// `k_high` (aggressive) and `k_low` (conservative) using hysteresis
+/// thresholds to prevent oscillation.
+pub struct AdaptiveKController {
+    k_high: usize,
+    k_low: usize,
+    current_k: usize,
+    window: std::collections::VecDeque<f64>,
+    window_size: usize,
+    drop_threshold: f64,
+    rise_threshold: f64,
+}
+
+impl AdaptiveKController {
+    /// Create a new controller. Starts at `k_high` (optimistic).
+    ///
+    /// - `drop_threshold`: rolling avg below this → switch to `k_low` (default 0.50)
+    /// - `rise_threshold`: rolling avg above this → switch to `k_high` (default 0.65)
+    pub fn new(k_low: usize, k_high: usize, window_size: usize) -> Self {
+        Self {
+            k_high,
+            k_low,
+            current_k: k_high,
+            window: std::collections::VecDeque::with_capacity(window_size + 1),
+            window_size,
+            drop_threshold: 0.50,
+            rise_threshold: 0.65,
+        }
+    }
+
+    pub const fn current_k(&self) -> usize {
+        self.current_k
+    }
+
+    /// Record a round's result and re-evaluate K.
+    #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+    pub fn record(&mut self, accepted: usize, drafted: usize) {
+        let rate = if drafted > 0 {
+            accepted as f64 / drafted as f64
+        } else {
+            0.0
+        };
+        self.window.push_back(rate);
+        if self.window.len() > self.window_size {
+            self.window.pop_front();
+        }
+        if self.window.len() >= self.window_size {
+            let avg = self.window.iter().sum::<f64>() / self.window.len() as f64;
+            if avg < self.drop_threshold {
+                self.current_k = self.k_low;
+            } else if avg > self.rise_threshold {
+                self.current_k = self.k_high;
+            }
+            // Between thresholds → keep current (hysteresis)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -5553,5 +5617,309 @@ mod tests {
                 eprintln!("  Generated text: {decoded:?}");
             }
         }
+    }
+
+    /// AR speculative decode with adaptive K controller.
+    ///
+    /// Same as `test_ar_spec_decode_acceptance` but uses `AdaptiveKController`
+    /// to dynamically switch between K=16 (high acceptance) and K=8 (low
+    /// acceptance).  Runs 15 rounds to give adaptation time.
+    #[test]
+    #[ignore] // Heavy — loads 0.8B draft + 27B verify model
+    fn test_ar_spec_decode_adaptive_k() {
+        const N_ROUNDS: usize = 15;
+
+        // --- Load draft model (0.8B) ---
+        let Some(draft_dir) = qwen3_5_0_8b_dir() else {
+            eprintln!("SKIP: Qwen3.5-0.8B-8bit not found");
+            return;
+        };
+        eprintln!("Loading draft model...");
+        let t_load = std::time::Instant::now();
+        let draft_model = crate::qwen3_next::load_qwen3_5_model(&draft_dir).unwrap();
+        let mut draft = crate::AnyModel::Qwen3Next(draft_model);
+        eprintln!("  Draft loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+
+        // --- Load verify model (27B) ---
+        let Some(verify_dir) = qwen3_5_27b_dir() else {
+            eprintln!("SKIP: Qwen3.5-27B-4bit not found");
+            return;
+        };
+        eprintln!("Loading verify model...");
+        let t_load = std::time::Instant::now();
+        let verify_model = crate::qwen3_next::load_qwen3_5_model(&verify_dir).unwrap();
+        let mut verify = crate::AnyModel::Qwen3Next(verify_model);
+        eprintln!(
+            "  Verify loaded in {:.1}s",
+            t_load.elapsed().as_secs_f64()
+        );
+
+        // Shared tokenizer (same vocab)
+        let tokenizer = crate::load_tokenizer(&draft_dir).unwrap();
+
+        let prompts = [
+            "The capital of France is",
+            "Explain quantum computing in simple terms:",
+            "fn fibonacci(n: u64) -> u64 {",
+        ];
+
+        for prompt in &prompts {
+            eprintln!("\n=== Adaptive K — Prompt: {prompt:?} ===");
+
+            let prompt_ids: Vec<u32> = tokenizer
+                .encode(*prompt, false)
+                .unwrap()
+                .get_ids()
+                .to_vec();
+            eprintln!("  Tokenized: {} tokens", prompt_ids.len());
+
+            let mut context = prompt_ids.clone();
+            let mut total_accepted: usize = 0;
+            let mut total_drafted: usize = 0;
+            let mut draft_time_ms: f64 = 0.0;
+            let mut verify_time_ms: f64 = 0.0;
+            let mut advance_time_ms: f64 = 0.0;
+
+            let mut controller = AdaptiveKController::new(8, 16, 3);
+
+            // Persistent caches
+            let mut draft_cache = draft.make_cache();
+            let mut verify_cache = verify.make_cache();
+
+            // Prefill both models
+            let ctx_input: Vec<i32> = prompt_ids.iter().map(|&id| id as i32).collect();
+            let ctx_len = ctx_input.len() as i32;
+            let ctx_arr = mlx_rs::Array::from_slice(&ctx_input, &[1, ctx_len]);
+
+            let t_prefill = std::time::Instant::now();
+            let mut saved_draft_logits = draft.forward(&ctx_arr, None, &mut draft_cache).unwrap();
+            mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+            let mut saved_verify_logits =
+                verify.forward(&ctx_arr, None, &mut verify_cache).unwrap();
+            mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+            draft_cache.eval_for_clone().unwrap();
+            verify_cache.eval_for_clone().unwrap();
+            let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("  Prefill: {prefill_ms:.0}ms (both models)");
+
+            for round in 0..N_ROUNDS {
+                let k = controller.current_k();
+
+                // --- Draft phase ---
+                let t_draft = std::time::Instant::now();
+                let draft_snapshot = draft_cache.clone();
+
+                let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
+                {
+                    use mlx_rs::ops::indexing as ix;
+                    let pred = ix::argmax_axis(&saved_draft_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&pred]).unwrap();
+                    draft_tokens.push(pred.item::<i32>() as u32);
+                }
+
+                for _ in 1..k {
+                    use mlx_rs::ops::indexing as ix;
+                    let tok = *draft_tokens.last().unwrap() as i32;
+                    let input = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+                    let logits = draft.forward(&input, None, &mut draft_cache).unwrap();
+                    mlx_rs::transforms::eval([&logits]).unwrap();
+                    let pred = ix::argmax_axis(&logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&pred]).unwrap();
+                    draft_tokens.push(pred.item::<i32>() as u32);
+                }
+
+                draft_time_ms += t_draft.elapsed().as_secs_f64() * 1000.0;
+
+                // --- Verify phase ---
+                let t_verify = std::time::Instant::now();
+                let verify_snapshot = verify_cache.clone();
+
+                let draft_input: Vec<i32> = draft_tokens.iter().map(|&d| d as i32).collect();
+                let draft_arr =
+                    mlx_rs::Array::from_slice(&draft_input, &[1, draft_input.len() as i32]);
+                let all_logits = verify
+                    .forward_all_logits(&draft_arr, None, &mut verify_cache)
+                    .unwrap();
+                mlx_rs::transforms::eval([&all_logits]).unwrap();
+
+                verify_time_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
+
+                use mlx_rs::ops::indexing::{self as ix, IndexOp};
+                let new_2d = all_logits.squeeze_axes(&[0]).unwrap();
+
+                let first_pred = {
+                    let p = ix::argmax_axis(&saved_verify_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&p]).unwrap();
+                    p.item::<i32>() as u32
+                };
+
+                let mut accepted = 0usize;
+                if first_pred == draft_tokens[0] {
+                    accepted = 1;
+                    let new_preds = ix::argmax_axis(&new_2d, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&new_preds]).unwrap();
+                    for i in 1..k {
+                        let pred_id = new_preds.index((i - 1) as i32).item::<i32>() as u32;
+                        if pred_id == draft_tokens[i] {
+                            accepted += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                let correction_or_bonus = if accepted == k {
+                    let bonus_logits = new_2d.index((k - 1) as i32);
+                    let p = ix::argmax_axis(&bonus_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&p]).unwrap();
+                    p.item::<i32>() as u32
+                } else if accepted == 0 {
+                    first_pred
+                } else {
+                    let corr_logits = new_2d.index((accepted - 1) as i32);
+                    let p = ix::argmax_axis(&corr_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&p]).unwrap();
+                    p.item::<i32>() as u32
+                };
+
+                let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
+                new_tokens.push(correction_or_bonus);
+                context.extend_from_slice(&new_tokens);
+
+                // --- Advance caches ---
+                let t_advance = std::time::Instant::now();
+
+                if accepted == k {
+                    let catchup: Vec<i32> =
+                        vec![draft_tokens[k - 1] as i32, correction_or_bonus as i32];
+                    let catchup_arr = mlx_rs::Array::from_slice(&catchup, &[1, 2]);
+                    saved_draft_logits =
+                        draft.forward(&catchup_arr, None, &mut draft_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                    draft_cache.eval_for_clone().unwrap();
+
+                    let bonus_arr =
+                        mlx_rs::Array::from_slice(&[correction_or_bonus as i32], &[1, 1]);
+                    saved_verify_logits =
+                        verify.forward(&bonus_arr, None, &mut verify_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                    verify_cache.eval_for_clone().unwrap();
+                } else {
+                    let advance_input: Vec<i32> =
+                        new_tokens.iter().map(|&t| t as i32).collect();
+                    let advance_arr = mlx_rs::Array::from_slice(
+                        &advance_input,
+                        &[1, advance_input.len() as i32],
+                    );
+
+                    draft_cache = draft_snapshot;
+                    saved_draft_logits =
+                        draft.forward(&advance_arr, None, &mut draft_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                    draft_cache.eval_for_clone().unwrap();
+
+                    verify_cache = verify_snapshot;
+                    saved_verify_logits =
+                        verify.forward(&advance_arr, None, &mut verify_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                    verify_cache.eval_for_clone().unwrap();
+                }
+
+                advance_time_ms += t_advance.elapsed().as_secs_f64() * 1000.0;
+
+                let prev_k = k;
+                controller.record(accepted, k);
+                let new_k = controller.current_k();
+
+                total_accepted += accepted;
+                total_drafted += k;
+
+                let draft_toks_str: Vec<String> =
+                    draft_tokens.iter().map(|t| t.to_string()).collect();
+                let k_change = if new_k != prev_k {
+                    format!(" → K={new_k}")
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "  Round {:2}: K={:2} accepted {}/{} (+{} new) | drafted [{}]{}",
+                    round + 1,
+                    k,
+                    accepted,
+                    k,
+                    new_tokens.len(),
+                    draft_toks_str.join(", "),
+                    k_change,
+                );
+            }
+
+            // --- Results ---
+            let acceptance_rate = total_accepted as f64 / total_drafted as f64 * 100.0;
+            let avg_per_round = total_accepted as f64 / N_ROUNDS as f64;
+            let total_new = context.len() - prompt_ids.len();
+            let total_ms = draft_time_ms + verify_time_ms + advance_time_ms;
+            let eff_tps = if total_ms > 0.0 {
+                total_new as f64 / total_ms * 1000.0
+            } else {
+                0.0
+            };
+
+            eprintln!("\n  --- Results for {prompt:?} ---");
+            eprintln!("  Acceptance rate:     {acceptance_rate:.1}%");
+            eprintln!("  Avg accepted/round:  {avg_per_round:.1}");
+            eprintln!("  Total new tokens:    {total_new}");
+            eprintln!(
+                "  Draft time:    {draft_time_ms:.0}ms ({:.1}ms/round)",
+                draft_time_ms / N_ROUNDS as f64
+            );
+            eprintln!(
+                "  Verify time:   {verify_time_ms:.0}ms ({:.1}ms/round)",
+                verify_time_ms / N_ROUNDS as f64
+            );
+            eprintln!(
+                "  Advance time:  {advance_time_ms:.0}ms ({:.1}ms/round)",
+                advance_time_ms / N_ROUNDS as f64
+            );
+            eprintln!("  Effective throughput: {eff_tps:.1} tok/s");
+
+            if let Ok(decoded) = tokenizer.decode(&context[prompt_ids.len()..], true) {
+                eprintln!("  Generated text: {decoded:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_adaptive_k_controller_thresholds() {
+        let mut c = AdaptiveKController::new(8, 16, 3);
+        assert_eq!(c.current_k(), 16, "starts at k_high");
+
+        // 3 rounds of low acceptance → should drop to k_low
+        c.record(3, 16); // 0.1875
+        c.record(4, 16); // 0.25
+        c.record(5, 16); // 0.3125 — avg 0.25 < 0.50
+        assert_eq!(c.current_k(), 8, "drops to k_low after low acceptance");
+
+        // 3 rounds of high acceptance → should rise to k_high
+        c.record(7, 8); // 0.875
+        c.record(6, 8); // 0.75
+        c.record(7, 8); // 0.875 — avg 0.833 > 0.65
+        assert_eq!(c.current_k(), 16, "rises to k_high after high acceptance");
+    }
+
+    #[test]
+    fn test_adaptive_k_controller_hysteresis() {
+        let mut c = AdaptiveKController::new(8, 16, 3);
+
+        // Drop to k_low
+        c.record(2, 16);
+        c.record(3, 16);
+        c.record(2, 16); // avg ~0.146
+        assert_eq!(c.current_k(), 8);
+
+        // Mid-range acceptance (between thresholds) → stays at k_low
+        c.record(5, 8); // 0.625
+        c.record(4, 8); // 0.50
+        c.record(5, 8); // 0.625 — avg 0.583, between 0.50 and 0.65
+        assert_eq!(c.current_k(), 8, "hysteresis: stays at k_low in dead zone");
     }
 }
