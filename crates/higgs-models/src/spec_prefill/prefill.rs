@@ -134,3 +134,50 @@ mod tests {
         assert_eq!(positions.shape(), &[2]);
     }
 }
+
+// ===========================================================================
+// Phase 3: Sparse Attention Forward (STUB - requires full layer iteration)
+// ===========================================================================
+
+/// Sparse model forward pass with custom RoPE positions.
+///
+/// This is a STUB - full implementation requires:
+/// 1. Iterate through all decoder layers
+/// 2. For each attention layer, apply RoPE at custom positions
+/// 3. Run attention with custom-positioned Q and K
+/// 4. Continue with MLP and residual connections
+///
+/// Currently falls back to standard forward pass.
+///
+/// # Arguments
+/// * `model` - Qwen3Next model
+/// * `inputs` - Input tokens [B, L]
+/// * `selected_indices` - Token indices to process
+/// * `cache` - KV cache
+/// * `position_offset` - Position offset (e.g., system prompt length)
+///
+/// # Returns
+/// (logits, state) - Logits from last selected token and state for cleanup
+pub fn sparse_model_forward(
+    model: &mut Qwen3NextCausalLM,
+    inputs: &Array,
+    selected_indices: &[usize],
+    cache: &mut AnyCache,
+    position_offset: i32,
+) -> Result<(Array, SparsePrefillState), mlx_rs::error::Exception> {
+    // STUB: For now, use the existing sparse_prefill which just selects tokens
+    // TODO: Implement full sparse forward with custom RoPE
+    sparse_prefill(model, inputs, selected_indices, cache, position_offset)
+}
+
+#[cfg(test)]
+mod phase3_tests {
+    use super::*;
+
+    #[test]
+    fn test_sparse_model_forward_exists() {
+        // Verify the function exists and has correct signature
+        // Full testing requires model loading
+        assert_eq!(sparse_model_forward as usize != 0, true);
+    }
+}
