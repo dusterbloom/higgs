@@ -231,7 +231,7 @@ impl AnyModel {
             // Fallback: compute full forward then slice for other architectures
             (m, c) => {
                 let logits = m.forward(inputs, mask, c)?;
-                Ok(logits.index((.., -1, ..)))
+                Ok(logits.index((.., -1.., ..)))
             }
         }
     }
