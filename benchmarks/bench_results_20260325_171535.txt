@@ -1,0 +1,65 @@
+================================================================================
+HIGGS BENCHMARK - 2026-03-25 17:15:35
+Binary: ./target/release/higgs   Max tokens: 200   Thinking: disabled
+================================================================================
+
+--- Qwen3-0.6B-4bit ---
+  Server ready (PID 79801)
+  short   : prompt=   23tok  TTFT=    119ms  prefill=   193.9tok/s  decode= 258.3tok/s  gen=200tok  total=  0.9s
+  medium  : prompt=  140tok  TTFT=    152ms  prefill=   922.5tok/s  decode= 247.8tok/s  gen=200tok  total=  1.0s
+  long    : prompt=  503tok  TTFT=    253ms  prefill=  1990.7tok/s  decode= 212.9tok/s  gen=200tok  total=  1.2s
+
+--- Qwen3-4B-4bit ---
+  Server ready (PID 80771)
+  short   : ERROR - HTTP Error 404: Not Found
+  medium  : ERROR - HTTP Error 404: Not Found
+  long    : ERROR - HTTP Error 404: Not Found
+
+--- Qwen3-8B-4bit ---
+  FAILED to start server
+
+--- Qwen3-14B-4bit ---
+  Server ready (PID 80779)
+  short   : prompt=   23tok  TTFT=    607ms  prefill=    37.9tok/s  decode=  11.8tok/s  gen=135tok  total= 12.1s
+  medium  : prompt=  140tok  TTFT=   1502ms  prefill=    93.2tok/s  decode=  11.5tok/s  gen=200tok  total= 18.8s
+  long    : prompt=  503tok  TTFT=   5199ms  prefill=    96.8tok/s  decode=  11.6tok/s  gen=200tok  total= 22.4s
+
+--- Qwen3.5-0.8B-8bit ---
+  Server ready (PID 80813)
+  short   : prompt=   23tok  TTFT=    110ms  prefill=   209.5tok/s  decode= 107.1tok/s  gen=108tok  total=  1.1s
+  medium  : prompt=  140tok  TTFT=    129ms  prefill=  1088.6tok/s  decode= 104.2tok/s  gen=200tok  total=  2.0s
+  long    : prompt=  511tok  TTFT=    361ms  prefill=  1415.0tok/s  decode= 103.1tok/s  gen=200tok  total=  2.3s
+
+--- Qwen3.5-2B-8bit ---
+  Server ready (PID 80814)
+  short   : ERROR - HTTP Error 404: Not Found
+  medium  : ERROR - HTTP Error 404: Not Found
+  long    : ERROR - HTTP Error 404: Not Found
+
+--- Qwen3.5-4B-4bit ---
+  Server ready (PID 80815)
+  short   : ERROR - HTTP Error 404: Not Found
+  medium  : ERROR - HTTP Error 404: Not Found
+  long    : ERROR - HTTP Error 404: Not Found
+
+--- Qwen3.5-9B-4bit ---
+  Server ready (PID 80819)
+  short   : ERROR - HTTP Error 404: Not Found
+  medium  : ERROR - HTTP Error 404: Not Found
+  long    : ERROR - HTTP Error 404: Not Found
+
+--- Qwen3.5-35B-A3B-3bit ---
+  Server ready (PID 80820)
+  short   : prompt=   23tok  TTFT=   1854ms  prefill=    12.4tok/s  decode=  56.5tok/s  gen= 93tok  total=  3.5s
+  medium  : prompt=  140tok  TTFT=    992ms  prefill=   141.1tok/s  decode=  55.2tok/s  gen=200tok  total=  4.6s
+  long    : prompt=  511tok  TTFT=   3515ms  prefill=   145.4tok/s  decode=  54.4tok/s  gen=200tok  total=  7.2s
+
+--- DeepSeek-V2-Lite-4bit ---
+  Server ready (PID 80828)
+  short   : ERROR - HTTP Error 404: Not Found
+  medium  : ERROR - HTTP Error 404: Not Found
+  long    : ERROR - HTTP Error 404: Not Found
+
+================================================================================
+DONE - results in bench_results_20260325_171535.txt
+================================================================================

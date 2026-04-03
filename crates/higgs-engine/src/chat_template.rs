@@ -15,6 +15,9 @@ pub struct ChatMessage {
 /// Renders chat messages using a Jinja2 template (`HuggingFace` format).
 pub struct ChatTemplateRenderer {
     env: Environment<'static>,
+    /// Special tokens loaded from tokenizer_config.json for template rendering.
+    bos_token: String,
+    eos_token: String,
 }
 
 impl ChatTemplateRenderer {
@@ -26,7 +29,11 @@ impl ChatTemplateRenderer {
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_template_owned("chat".to_owned(), template_source.into())
             .map_err(|e| EngineError::Template(e.to_string()))?;
-        Ok(Self { env })
+        Ok(Self {
+            env,
+            bos_token: String::new(),
+            eos_token: String::new(),
+        })
     }
 
     /// Load template from a model directory (`chat_template.jinja` or `tokenizer_config.json`).
@@ -39,25 +46,58 @@ impl ChatTemplateRenderer {
     /// Like [`Self::from_model_dir`] but returns `Ok(None)` when no template is present,
     /// rather than an error. Parse/IO failures still propagate as `Err`.
     pub fn try_from_model_dir(model_dir: &std::path::Path) -> Result<Option<Self>, EngineError> {
+        // Load tokenizer_config.json for special tokens (needed by both paths)
+        let config_path = model_dir.join("tokenizer_config.json");
+        let config: Option<serde_json::Value> = if config_path.exists() {
+            let config_str = std::fs::read_to_string(&config_path)
+                .map_err(|e| EngineError::Template(format!("Failed to read config: {e}")))?;
+            Some(
+                serde_json::from_str(&config_str)
+                    .map_err(|e| EngineError::Template(format!("Invalid JSON: {e}")))?,
+            )
+        } else {
+            None
+        };
+
+        let extract_token = |config: &serde_json::Value, key: &str| -> String {
+            config
+                .get(key)
+                .and_then(|v| {
+                    // Token can be a string or {"content": "..."} object
+                    v.as_str().map(ToOwned::to_owned).or_else(|| {
+                        v.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(ToOwned::to_owned)
+                    })
+                })
+                .unwrap_or_default()
+        };
+
+        let mut set_tokens = |renderer: &mut Self| {
+            if let Some(ref cfg) = config {
+                renderer.bos_token = extract_token(cfg, "bos_token");
+                renderer.eos_token = extract_token(cfg, "eos_token");
+            }
+        };
+
         // Prefer standalone chat_template.jinja
         let jinja_path = model_dir.join("chat_template.jinja");
         if jinja_path.exists() {
             let template = std::fs::read_to_string(&jinja_path)
                 .map_err(|e| EngineError::Template(format!("Failed to read template: {e}")))?;
-            return Self::new(&template).map(Some);
+            let mut renderer = Self::new(&template)?;
+            set_tokens(&mut renderer);
+            return Ok(Some(renderer));
         }
 
         // Fall back to tokenizer_config.json
-        let config_path = model_dir.join("tokenizer_config.json");
-        if config_path.exists() {
-            let config_str = std::fs::read_to_string(&config_path)
-                .map_err(|e| EngineError::Template(format!("Failed to read config: {e}")))?;
-            let config: serde_json::Value = serde_json::from_str(&config_str)
-                .map_err(|e| EngineError::Template(format!("Invalid JSON: {e}")))?;
-            if let Some(ct) = config.get("chat_template") {
+        if let Some(ref cfg) = config {
+            if let Some(ct) = cfg.get("chat_template") {
                 // String template
                 if let Some(template) = ct.as_str() {
-                    return Self::new(template).map(Some);
+                    let mut renderer = Self::new(template)?;
+                    set_tokens(&mut renderer);
+                    return Ok(Some(renderer));
                 }
                 // Array of {name, template} objects -- use "default" or first entry
                 if let Some(arr) = ct.as_array() {
@@ -68,7 +108,9 @@ impl ChatTemplateRenderer {
                         .and_then(|v| v.get("template"))
                         .and_then(|v| v.as_str());
                     if let Some(template) = found {
-                        return Self::new(template).map(Some);
+                        let mut renderer = Self::new(template)?;
+                        set_tokens(&mut renderer);
+                        return Ok(Some(renderer));
                     }
                 }
                 tracing::warn!("chat_template field present but not a string or valid array");
@@ -101,12 +143,16 @@ impl ChatTemplateRenderer {
             .get_template("chat")
             .map_err(|e| EngineError::Template(e.to_string()))?;
 
+        let bos = &self.bos_token;
+        let eos = &self.eos_token;
         let context = tools.map_or_else(
             || {
                 minijinja::context! {
                     messages => messages,
                     add_generation_prompt => add_generation_prompt,
                     enable_thinking => enable_thinking,
+                    bos_token => bos,
+                    eos_token => eos,
                 }
             },
             |tool_list| {
@@ -115,6 +161,8 @@ impl ChatTemplateRenderer {
                     tools => tool_list,
                     add_generation_prompt => add_generation_prompt,
                     enable_thinking => enable_thinking,
+                    bos_token => bos,
+                    eos_token => eos,
                 }
             },
         );

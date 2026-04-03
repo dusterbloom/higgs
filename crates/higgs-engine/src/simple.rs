@@ -1,7 +1,10 @@
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use higgs_models::{AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample};
+use higgs_models::{
+    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
+    turboquant::KvCacheConfig,
+};
 use mlx_rs::{
     Array, Dtype, Stream,
     ops::indexing::{IndexOp, NewAxis},
@@ -18,54 +21,147 @@ use crate::{
     spec_prefill::{SpecPrefillConfig, SpecPrefillEngine},
     error::EngineError,
     model_loader,
-    prompt_cache::PrefixCache,
+    paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
 };
 
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 
-/// Cap MLX memory allocations to avoid Metal OOM on constrained GPUs.
+/// Conservative default for chunked prefill on 27B-class models.
+const DEFAULT_CHUNKED_PREFILL_THRESHOLD: i32 = 512;
+
+/// Conservative default for chunked prefill on 27B-class models.
+const DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE: i32 = 512;
+
+/// Sequences longer than this trigger chunked prefill to bound peak memory.
+static CHUNKED_PREFILL_THRESHOLD: OnceLock<i32> = OnceLock::new();
+
+/// Number of tokens per chunk during chunked prefill.
+static CHUNKED_PREFILL_CHUNK_SIZE: OnceLock<i32> = OnceLock::new();
+static CLEAR_CACHE_AFTER_PREFILL: OnceLock<bool> = OnceLock::new();
+
+fn parse_positive_chunked_prefill_value(raw: Option<&str>, default: i32) -> i32 {
+    raw.and_then(|s| s.parse::<i32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn parse_enabled_flag(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
+fn chunked_prefill_threshold() -> i32 {
+    *CHUNKED_PREFILL_THRESHOLD.get_or_init(|| {
+        parse_positive_chunked_prefill_value(
+            std::env::var("HIGGS_CHUNKED_PREFILL_THRESHOLD")
+                .ok()
+                .as_deref(),
+            DEFAULT_CHUNKED_PREFILL_THRESHOLD,
+        )
+    })
+}
+
+fn chunked_prefill_chunk_size() -> i32 {
+    *CHUNKED_PREFILL_CHUNK_SIZE.get_or_init(|| {
+        parse_positive_chunked_prefill_value(
+            std::env::var("HIGGS_CHUNKED_PREFILL_CHUNK_SIZE")
+                .ok()
+                .as_deref(),
+            DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE,
+        )
+    })
+}
+
+fn clear_cache_after_prefill_enabled() -> bool {
+    *CLEAR_CACHE_AFTER_PREFILL.get_or_init(|| {
+        parse_enabled_flag(
+            std::env::var("HIGGS_CLEAR_CACHE_AFTER_PREFILL")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn maybe_clear_mlx_cache(reason: &str) {
+    if !clear_cache_after_prefill_enabled() {
+        return;
+    }
+
+    let rc = unsafe { mlx_sys::mlx_clear_cache() };
+    if rc == 0 {
+        tracing::debug!(reason, "Cleared MLX allocator cache");
+    } else {
+        tracing::warn!(reason, rc, "Failed to clear MLX allocator cache");
+    }
+}
+
+/// Configure MLX's large-model working set on Apple Silicon.
 ///
-/// Sets `mlx_set_memory_limit` to 75% of `max_recommended_working_set_size`
-/// and `mlx_set_cache_limit` to 50%. This lets MLX manage memory within
-/// bounds instead of the OS killing the process when Metal command buffers
-/// exceed GPU capacity (the root cause of 35B crashes on 32GB machines).
+/// By default we mirror upstream `mlx-lm` and raise MLX's wired limit to the
+/// device's `max_recommended_working_set_size`. Set
+/// `HIGGS_WIRED_LIMIT_MODE=legacy` to restore the older conservative
+/// `memory_limit/cache_limit` behavior, or `HIGGS_NO_MEM_LIMIT=1` to skip both.
 #[allow(unsafe_code)]
 pub(crate) fn set_wired_limit_to_max() {
     unsafe {
         let mut info = mlx_sys::mlx_device_info_new();
         let mut dev = mlx_sys::mlx_device_new();
         mlx_sys::mlx_get_default_device(&raw mut dev);
-        if mlx_sys::mlx_device_info_get(&raw mut (info), dev) == 0 {
+        if mlx_sys::mlx_device_info_get(&raw mut info, dev) == 0 {
             let mut max_rec: usize = 0;
             let key = c"max_recommended_working_set_size";
             if mlx_sys::mlx_device_info_get_size(&raw mut max_rec, info, key.as_ptr()) == 0
                 && max_rec > 0
             {
-                let mem_limit = max_rec * 3 / 4; // 75% of GPU max
-                let cache_limit = max_rec / 2; // 50% of GPU max
-
+                let wired_mode = std::env::var("HIGGS_WIRED_LIMIT_MODE").ok();
+                let use_legacy_limits =
+                    matches!(wired_mode.as_deref(), Some("legacy" | "safe" | "caps"));
                 let mut prev_mem: usize = 0;
                 let mut prev_cache: usize = 0;
+                let mut prev_wired: usize = 0;
 
-                // Check env var to optionally disable memory limits for testing
                 let limits_enabled = std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
 
                 if limits_enabled {
-                    mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
-                    mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
+                    if use_legacy_limits {
+                        let mem_limit = max_rec * 3 / 4;
+                        let cache_limit = max_rec / 2;
+                        mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
+                        mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
+                        tracing::info!(
+                            mode = "legacy",
+                            max_recommended_mb = max_rec / (1024 * 1024),
+                            memory_limit_mb = mem_limit / (1024 * 1024),
+                            cache_limit_mb = cache_limit / (1024 * 1024),
+                            prev_mem_mb = prev_mem / (1024 * 1024),
+                            prev_cache_mb = prev_cache / (1024 * 1024),
+                            "Configured MLX legacy memory/cache caps",
+                        );
+                    } else {
+                        mlx_sys::mlx_set_wired_limit(&raw mut prev_wired, max_rec);
+                        tracing::info!(
+                            mode = "mlx_wired_limit",
+                            max_recommended_mb = max_rec / (1024 * 1024),
+                            wired_limit_mb = max_rec / (1024 * 1024),
+                            prev_wired_mb = prev_wired / (1024 * 1024),
+                            "Configured MLX wired limit",
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        mode = if use_legacy_limits {
+                            "legacy"
+                        } else {
+                            "mlx_wired_limit"
+                        },
+                        max_recommended_mb = max_rec / (1024 * 1024),
+                        "Skipped MLX memory-limit configuration",
+                    );
                 }
-
-                tracing::info!(
-                    max_recommended_mb = max_rec / (1024 * 1024),
-                    memory_limit_mb = mem_limit / (1024 * 1024),
-                    cache_limit_mb = cache_limit / (1024 * 1024),
-                    limits_enabled,
-                    "MLX memory limits {} (prev mem={}MB, cache={}MB)",
-                    if limits_enabled { "set" } else { "skipped" },
-                    prev_mem / (1024 * 1024),
-                    prev_cache / (1024 * 1024),
-                );
             }
         }
         mlx_sys::mlx_device_info_free(info);
@@ -89,8 +185,7 @@ pub struct Session {
 /// for continuous batching across multiple sessions.
 pub struct SimpleEngine {
     model: Mutex<AnyModel>,
-    /// Legacy prefix cache for backward compatibility (single-request mode)
-    prefix_cache: Mutex<PrefixCache>,
+    prefix_cache: Mutex<PagedPrefixCache>,
     /// Paged KV cache for session-based generation
     paged_cache: Mutex<PagedKvCache>,
     /// Session scheduler for continuous batching
@@ -112,6 +207,11 @@ pub struct SimpleEngine {
     spec_prefill: SpecPrefillEngine,
     /// Maximum batch size for continuous batching
     max_batch_size: usize,
+    /// Number of trailing tokens added by `add_generation_prompt=true`.
+    /// Stripped from the prefix cache key so that multi-turn conversations
+    /// share the same token prefix (the generation prompt changes between turns).
+    gen_prompt_suffix_len: usize,
+    kv_cache_config: KvCacheConfig,
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
@@ -125,13 +225,19 @@ struct PreparedGeneration<'a> {
 
 impl SimpleEngine {
     /// Load a model and tokenizer from a directory.
-    pub fn load<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
+    pub fn load<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model");
 
         let model = model_loader::load_model(model_dir)?;
+        let _ = model
+            .make_cache_with_config(kv_cache_config)
+            .map_err(EngineError::Mlx)?;
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
         let template = ChatTemplateRenderer::try_from_model_dir(model_dir)?;
         if template.is_none() {
@@ -169,6 +275,38 @@ impl SimpleEngine {
 
         set_wired_limit_to_max();
 
+        // Compute the generation prompt suffix length: tokens added by
+        // `add_generation_prompt=true` (e.g., `<|im_start|>assistant\n<think>\n`).
+        // We strip these from the prefix cache key so multi-turn conversations
+        // share their common history prefix.
+        let gen_prompt_suffix_len = template
+            .as_ref()
+            .and_then(|tmpl| {
+                let test_msg = vec![crate::chat_template::ChatMessage {
+                    role: "user".to_owned(),
+                    content: "x".to_owned(),
+                    tool_calls: None,
+                }];
+                let with_gen = tmpl
+                    .apply_with_thinking(&test_msg, None, true, enable_thinking)
+                    .ok()?;
+                let without_gen = tmpl
+                    .apply_with_thinking(&test_msg, None, false, enable_thinking)
+                    .ok()?;
+                let toks_with = tokenizer.encode(with_gen.as_str(), false).ok()?;
+                let toks_without = tokenizer.encode(without_gen.as_str(), false).ok()?;
+                let suffix = toks_with
+                    .get_ids()
+                    .len()
+                    .saturating_sub(toks_without.get_ids().len());
+                tracing::info!(
+                    gen_prompt_suffix_len = suffix,
+                    "Computed generation prompt suffix length for prefix cache"
+                );
+                Some(suffix)
+            })
+            .unwrap_or(0);
+
         tracing::info!(
             model_name = %model_name,
             eos_tokens = ?eos_token_ids,
@@ -191,7 +329,10 @@ impl SimpleEngine {
 
         Ok(Self {
             model: Mutex::new(model),
-            prefix_cache: Mutex::new(PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE)),
+            prefix_cache: Mutex::new(PagedPrefixCache::new(
+                DEFAULT_PREFIX_CACHE_SIZE,
+                DEFAULT_BLOCK_SIZE,
+            )),
             paged_cache: Mutex::new(paged_cache),
             scheduler: Mutex::new(RoundRobinScheduler::new()),
             sessions: Mutex::new(std::collections::HashMap::new()),
@@ -204,6 +345,8 @@ impl SimpleEngine {
             think_close_token,
             spec_prefill,
             max_batch_size: 4,
+            gen_prompt_suffix_len,
+            kv_cache_config,
         })
     }
 
@@ -318,16 +461,27 @@ impl SimpleEngine {
             tracing::debug!(
                 prefix_len = matched.prefix_len,
                 total_len = prompt_tokens.len(),
-                "Reusing cached prefix"
+                suffix_len = prompt_tokens.len() - matched.prefix_len,
+                "Prefix cache hit — reusing cached prefix"
             );
             let suffix = prompt_tokens.get(matched.prefix_len..).unwrap_or_default();
             if suffix.is_empty() {
-                (prompt_tokens.to_vec(), model.make_cache())
+                (
+                    prompt_tokens.to_vec(),
+                    model
+                        .make_cache_with_config(self.kv_cache_config)
+                        .map_err(EngineError::Mlx)?,
+                )
             } else {
                 (suffix.to_vec(), matched.cache)
             }
         } else {
-            (prompt_tokens.to_vec(), model.make_cache())
+            (
+                prompt_tokens.to_vec(),
+                model
+                    .make_cache_with_config(self.kv_cache_config)
+                    .map_err(EngineError::Mlx)?,
+            )
         };
 
         let prompt_array = Array::from(actual_prompt_tokens.as_slice()).index(NewAxis);
@@ -415,14 +569,22 @@ impl SimpleEngine {
                 return Err(EngineError::Generation("Expected Qwen3Next model".to_string()));
             }
         } else {
-            // Text-only prefill: only need last token's logits for sampling.
-            // The LM head matmul on [B, L, vocab] is the bottleneck for large vocab,
-            // so we compute hidden states for all tokens (KV cache) then apply
-            // the LM head only to the last token.
-            prepared
-                .model
-                .forward_last_token(&prepared.prompt_array, None, &mut prepared.cache)
-                .map_err(EngineError::Mlx)?
+            // Text-only prefill: use chunked prefill for long sequences to bound
+            // peak memory, otherwise single-pass with last-token-only LM head.
+            let seq_len = prepared.prompt_array.shape().get(1).copied().unwrap_or(0);
+            let chunked_threshold = chunked_prefill_threshold();
+            let chunked_size = chunked_prefill_chunk_size();
+            if seq_len > chunked_threshold {
+                prepared
+                    .model
+                    .forward_chunked(&prepared.prompt_array, &mut prepared.cache, chunked_size)
+                    .map_err(EngineError::Mlx)?
+            } else {
+                prepared
+                    .model
+                    .forward_last_token(&prepared.prompt_array, None, &mut prepared.cache)
+                    .map_err(EngineError::Mlx)?
+            }
         };
         let last_logits = logits.index((.., -1, ..));
 
@@ -464,8 +626,19 @@ impl SimpleEngine {
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            pc.store(prompt_tokens, prepared.cache.clone());
+            // Strip generation prompt suffix so multi-turn conversations
+            // share their common history prefix. The suffix tokens
+            // (`<|im_start|>assistant\n<think>\n`) change between turns.
+            let cache_key = prompt_tokens
+                .get(
+                    ..prompt_tokens
+                        .len()
+                        .saturating_sub(self.gen_prompt_suffix_len),
+                )
+                .unwrap_or(prompt_tokens);
+            pc.store(cache_key, &prepared.cache);
         }
+        maybe_clear_mlx_cache("simple_post_prefill");
 
         Ok((current_token, logprob_data))
     }
@@ -553,7 +726,9 @@ impl SimpleEngine {
                 .model
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
-            let mut cache = model.make_cache();
+            let mut cache = model
+                .make_cache_with_config(self.kv_cache_config)
+                .map_err(EngineError::Mlx)?;
 
             // Forward pass to get hidden states [1, seq_len, hidden_size]
             let hidden = model
@@ -871,6 +1046,26 @@ impl SimpleEngine {
             });
         }
 
+        // MTP speculative decode: gated behind HIGGS_MTP=1 env var.
+        // Only for greedy (temperature == 0), no constraints, no logprobs.
+        #[allow(clippy::float_cmp)]
+        if std::env::var("HIGGS_MTP").is_ok_and(|v| v == "1")
+            && prepared.model.has_mtp()
+            && constraint.is_none()
+            && !logprobs
+            && params.temperature == 0.0
+        {
+            return self.mtp_generate(
+                &mut prepared.model,
+                &mut prepared.cache,
+                first_token_id,
+                max_tokens,
+                prompt_len,
+                &mut tokens,
+                stop_sequences,
+            );
+        }
+
         // Pipelined decode: build step N+2's graph while GPU computes step N+1.
         // When constrained generation is active, pipelining would apply the FSM mask
         // one step behind (since we need the sampled token value to advance the FSM
@@ -893,6 +1088,16 @@ impl SimpleEngine {
                 eval(eval_targets).map_err(EngineError::Mlx)?;
             } else {
                 async_eval(eval_targets).map_err(EngineError::Mlx)?;
+            }
+        }
+
+        // After the first decode step, TQ deferred quantization has activated:
+        // dense KV was bulk-quantized into TQ storage. Re-store the cache so the
+        // prefix cache gets the quantized blocks (the initial store after prefill
+        // only captured the dense pre-quantization state).
+        if self.kv_cache_config.is_turboquant() && prepared.pixel_values.is_none() {
+            if let Ok(mut pc) = self.prefix_cache.lock() {
+                pc.store(prompt_tokens, &prepared.cache);
             }
         }
 
@@ -1102,6 +1307,319 @@ impl SimpleEngine {
         }
     }
 
+    /// MTP speculative decode loop.
+    ///
+    /// Runs the backbone to get the initial hidden state, then loops calling
+    /// `mtp_cycle()` which drafts one extra token per cycle for ~1.5x speedup.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::as_conversions,
+        clippy::cast_precision_loss
+    )]
+    fn mtp_generate(
+        &self,
+        model: &mut higgs_models::AnyModel,
+        cache: &mut higgs_models::AnyCache,
+        first_token_id: u32,
+        max_tokens: u32,
+        prompt_len: u32,
+        tokens: &mut Vec<u32>,
+        stop_sequences: &[String],
+    ) -> Result<GenerationOutput, EngineError> {
+        let has_stop_sequences = !stop_sequences.is_empty();
+
+        // Create MTP cache for the MTP head's attention layer(s).
+        let mut mtp_cache = model
+            .make_mtp_cache()
+            .ok_or_else(|| EngineError::Generation("MTP cache creation failed".into()))?;
+
+        // Get initial hidden state: re-run backbone on first token to obtain h_t.
+        // This single-token forward is cheap and gives us the hidden state needed
+        // for the first MTP draft.
+        let first_input = Array::from_slice(&[first_token_id as i32], &[1, 1]);
+        let (hidden, logits) = model
+            .forward_with_hidden(&first_input, None, cache)
+            .map_err(EngineError::Mlx)?;
+        let next_arr =
+            mlx_rs::argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
+        let h = hidden.index((.., -1.., ..));
+        eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
+
+        let mut current_hidden = h;
+        let mut confirmed_token_id: u32 = next_arr.item();
+        let mut accepted: u32 = 0;
+        let mut total_cycles: u32 = 0;
+        let t_start = std::time::Instant::now();
+
+        // Thinking budget: force </think> after N tokens if model hasn't closed it.
+        const THINKING_BUDGET: u32 = 256;
+        let think_close_token = if self.enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
+        let mut thinking_tokens: u32 = 0;
+        let mut seen_think_close = false;
+
+        loop {
+            let result = crate::mtp::mtp_cycle(
+                model,
+                cache,
+                &mut mtp_cache,
+                &current_hidden,
+                confirmed_token_id,
+            )?;
+
+            total_cycles += 1;
+
+            for &tok in &result.tokens {
+                // Thinking budget enforcement
+                if let Some(close_id) = think_close_token {
+                    if !seen_think_close {
+                        if tok == close_id {
+                            seen_think_close = true;
+                        } else {
+                            thinking_tokens += 1;
+                            if thinking_tokens >= THINKING_BUDGET {
+                                tokens.push(close_id);
+                                seen_think_close = true;
+                                tracing::info!(
+                                    budget = THINKING_BUDGET,
+                                    "MTP: thinking budget reached, forcing </think>"
+                                );
+                                // Skip remaining tokens from this cycle
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                tokens.push(tok);
+                accepted += 1;
+
+                if self.eos_token_ids.contains(&tok) {
+                    let elapsed = t_start.elapsed();
+                    tracing::info!(
+                        tokens = accepted,
+                        cycles = total_cycles,
+                        accept_rate = format!(
+                            "{:.1}%",
+                            (accepted as f64 / total_cycles as f64 - 1.0) * 100.0
+                        ),
+                        tok_per_s = format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                        "MTP decode complete"
+                    );
+                    return Ok(GenerationOutput {
+                        text: self.decode_tokens(tokens)?,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: Self::completion_len(tokens)?,
+                        token_logprobs: None,
+                    });
+                }
+            }
+
+            if has_stop_sequences {
+                let text = self.decode_tokens(tokens)?;
+                if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
+                    return Ok(GenerationOutput {
+                        text: truncated,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: Self::completion_len(tokens)?,
+                        token_logprobs: None,
+                    });
+                }
+            }
+
+            let completion_len = Self::completion_len(tokens)?;
+            if completion_len >= max_tokens {
+                let elapsed = t_start.elapsed();
+                tracing::info!(
+                    tokens = accepted,
+                    cycles = total_cycles,
+                    accept_rate = format!(
+                        "{:.1}%",
+                        (accepted as f64 / total_cycles as f64 - 1.0) * 100.0
+                    ),
+                    tok_per_s = format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                    "MTP decode complete (length limit)"
+                );
+                return Ok(GenerationOutput {
+                    text: self.decode_tokens(tokens)?,
+                    finish_reason: "length".to_owned(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: completion_len,
+                    token_logprobs: None,
+                });
+            }
+
+            current_hidden = result.hidden;
+            confirmed_token_id = result.next_token_id;
+        }
+    }
+
+    /// MTP speculative decode loop — streaming variant.
+    ///
+    /// Same logic as `mtp_generate`, but sends each accepted token (or pair)
+    /// via the streaming channel instead of accumulating into a buffer.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::as_conversions,
+        clippy::cast_precision_loss
+    )]
+    fn mtp_generate_streaming(
+        &self,
+        model: &mut higgs_models::AnyModel,
+        cache: &mut higgs_models::AnyCache,
+        first_token_id: u32,
+        max_tokens: u32,
+        prompt_len: u32,
+        tokens: &mut Vec<u32>,
+        stop_sequences: &[String],
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        mut prev_decoded_len: usize,
+    ) -> Result<(), EngineError> {
+        let has_stop_sequences = !stop_sequences.is_empty();
+
+        let mut mtp_cache = model
+            .make_mtp_cache()
+            .ok_or_else(|| EngineError::Generation("MTP cache creation failed".into()))?;
+
+        let first_input = Array::from_slice(&[first_token_id as i32], &[1, 1]);
+        let (hidden, logits) = model
+            .forward_with_hidden(&first_input, None, cache)
+            .map_err(EngineError::Mlx)?;
+        let next_arr =
+            mlx_rs::argmax_axis!(&logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
+        let h = hidden.index((.., -1.., ..));
+        eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
+
+        let mut current_hidden = h;
+        let mut confirmed_token_id: u32 = next_arr.item();
+        let mut accepted: u32 = 0;
+        let mut total_cycles: u32 = 0;
+        let t_start = std::time::Instant::now();
+
+        const THINKING_BUDGET: u32 = 256;
+        let think_close_token = if self.enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
+        let mut thinking_tokens: u32 = 0;
+        let mut seen_think_close = false;
+
+        loop {
+            let result = crate::mtp::mtp_cycle(
+                model,
+                cache,
+                &mut mtp_cache,
+                &current_hidden,
+                confirmed_token_id,
+            )?;
+
+            total_cycles += 1;
+
+            for &tok in &result.tokens {
+                // Thinking budget enforcement
+                if let Some(close_id) = think_close_token {
+                    if !seen_think_close {
+                        if tok == close_id {
+                            seen_think_close = true;
+                        } else {
+                            thinking_tokens += 1;
+                            if thinking_tokens >= THINKING_BUDGET {
+                                tokens.push(close_id);
+                                seen_think_close = true;
+                                tracing::info!(
+                                    budget = THINKING_BUDGET,
+                                    "MTP streaming: thinking budget reached, forcing </think>"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                tokens.push(tok);
+                accepted += 1;
+
+                let is_eos = self.eos_token_ids.contains(&tok);
+                let completion_len = Self::completion_len(tokens)?;
+                let is_max = completion_len >= max_tokens;
+
+                let full_text = self.decode_tokens(tokens)?;
+                let new_text = full_text
+                    .get(prev_decoded_len..)
+                    .unwrap_or_default()
+                    .to_owned();
+                let old_decoded_len = prev_decoded_len;
+                prev_decoded_len = full_text.len();
+
+                let (final_new_text, hit_stop_seq) = if !has_stop_sequences {
+                    (new_text, false)
+                } else {
+                    check_stop_sequences(&full_text, stop_sequences).map_or(
+                        (new_text, false),
+                        |truncated| {
+                            let emit = truncated
+                                .get(old_decoded_len..)
+                                .unwrap_or_default()
+                                .to_owned();
+                            (emit, true)
+                        },
+                    )
+                };
+
+                let step_finished = is_eos || is_max || hit_stop_seq;
+                let finish_reason = if is_eos || hit_stop_seq {
+                    Some("stop".to_owned())
+                } else if is_max {
+                    Some("length".to_owned())
+                } else {
+                    None
+                };
+
+                if step_finished {
+                    let elapsed = t_start.elapsed();
+                    tracing::info!(
+                        tokens = accepted,
+                        cycles = total_cycles,
+                        accept_rate = format!(
+                            "{:.1}%",
+                            (accepted as f64 / total_cycles as f64 - 1.0) * 100.0
+                        ),
+                        tok_per_s = format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                        "MTP streaming decode complete"
+                    );
+                }
+
+                if sender
+                    .blocking_send(StreamingOutput {
+                        new_text: final_new_text,
+                        finished: step_finished,
+                        finish_reason,
+                        prompt_tokens: prompt_len,
+                        completion_tokens: completion_len,
+                        token_logprob: None,
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+
+                if step_finished {
+                    return Ok(());
+                }
+            }
+
+            current_hidden = result.hidden;
+            confirmed_token_id = result.next_token_id;
+        }
+    }
+
     /// Generate tokens one at a time, sending each via the provided channel.
     ///
     /// If the receiver is dropped (client disconnected), generation stops early.
@@ -1232,6 +1750,27 @@ impl SimpleEngine {
             return Ok(());
         }
 
+        // MTP speculative decode (streaming): greedy, no constraints, no logprobs.
+        #[allow(clippy::float_cmp)]
+        if std::env::var("HIGGS_MTP").is_ok_and(|v| v == "1")
+            && prepared.model.has_mtp()
+            && constraint.is_none()
+            && !logprobs
+            && params.temperature == 0.0
+        {
+            return self.mtp_generate_streaming(
+                &mut prepared.model,
+                &mut prepared.cache,
+                first_token_id,
+                max_tokens,
+                prompt_len,
+                &mut all_tokens,
+                stop_sequences,
+                sender,
+                prev_decoded_len,
+            );
+        }
+
         // Thinking budget (streaming): force </think> after N tokens.
         const THINKING_BUDGET: u32 = 256;
         let think_close_token = if self.enable_thinking {
@@ -1258,6 +1797,13 @@ impl SimpleEngine {
                 eval_targets.extend(lp.eval_targets());
             }
             async_eval(eval_targets).map_err(EngineError::Mlx)?;
+        }
+
+        // Re-store after TQ activation (see generate_inner for rationale).
+        if self.kv_cache_config.is_turboquant() && prepared.pixel_values.is_none() {
+            if let Ok(mut pc) = self.prefix_cache.lock() {
+                pc.store(prompt_tokens, &prepared.cache);
+            }
         }
 
         loop {
@@ -1507,7 +2053,10 @@ fn detect_thinking_support(model_dir: &Path) -> bool {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
-    use super::{check_stop_sequences, derive_model_name};
+    use super::{
+        check_stop_sequences, derive_model_name, parse_enabled_flag,
+        parse_positive_chunked_prefill_value,
+    };
     use std::path::Path;
 
     /// Write a config.json file into the given directory with the provided JSON content.
@@ -1769,5 +2318,32 @@ mod tests {
         // Note: We can't actually load the model without weights, so we test
         // session management methods directly on the engine structure
         // This is a placeholder test - full integration testing requires model weights
+    }
+
+    #[test]
+    fn test_parse_positive_chunked_prefill_value_uses_default_for_invalid_values() {
+        assert_eq!(parse_positive_chunked_prefill_value(None, 2048), 2048);
+        assert_eq!(
+            parse_positive_chunked_prefill_value(Some("bad"), 2048),
+            2048
+        );
+        assert_eq!(parse_positive_chunked_prefill_value(Some("0"), 2048), 2048);
+        assert_eq!(parse_positive_chunked_prefill_value(Some("-1"), 2048), 2048);
+        assert_eq!(
+            parse_positive_chunked_prefill_value(Some("1024"), 2048),
+            1024
+        );
+    }
+
+    #[test]
+    fn test_parse_enabled_flag_accepts_common_truthy_values() {
+        assert!(parse_enabled_flag(Some("1")));
+        assert!(parse_enabled_flag(Some("true")));
+        assert!(parse_enabled_flag(Some("On")));
+        assert!(parse_enabled_flag(Some("yes")));
+        assert!(!parse_enabled_flag(None));
+        assert!(!parse_enabled_flag(Some("0")));
+        assert!(!parse_enabled_flag(Some("false")));
+        assert!(!parse_enabled_flag(Some("unexpected")));
     }
 }

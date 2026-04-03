@@ -1,0 +1,75 @@
+================================================================================
+HEAD-TO-HEAD: Higgs vs oMLX — 2026-03-26 14:23:31
+Max tokens: 100  Turns: 5  Cooldown: 5s
+Models: 35B
+oMLX: --no-cache (paged SSD cache disabled for fair comparison)
+================================================================================
+
+################################################################################
+# MODEL: Qwen3.5-35B-A3B-3bit (MoE)
+# Path:  /Users/peppi/.cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit
+################################################################################
+
+  --- higgs ---
+  Starting Higgs on :8899 ...
+  Server ready: model=Qwen3.5-35B-A3B-3bit  RSS=9522MB
+  Warmup...
+  Warmup done. RSS=9359MB
+
+  [Single-turn]
+    short   : TTFT=    248ms  decode=  0.0tok/s  prompt=  24tok  gen=  2tok  total=  0.2s  RSS= 9342MB
+    medium  : TTFT=    515ms  decode= 37.9tok/s  prompt=  65tok  gen=100tok  total=  3.2s  RSS= 9343MB
+    long    : TTFT=   1940ms  decode= 37.7tok/s  prompt= 299tok  gen=100tok  total=  4.6s  RSS= 9343MB
+
+  [Multi-turn, 5 turns]
+    turn 1: TTFT=    560ms  decode= 38.5tok/s  prompt=  71tok  gen= 80tok  total=  2.6s  RSS= 9343MB  ctx~71
+    turn 2: TTFT=   1149ms  decode= 37.9tok/s  prompt= 174tok  gen= 80tok  total=  3.3s  RSS= 9344MB  ctx~174
+    turn 3: TTFT=   1835ms  decode= 38.3tok/s  prompt= 277tok  gen= 80tok  total=  3.9s  RSS= 9344MB  ctx~277
+    turn 4: TTFT=   2448ms  decode= 37.7tok/s  prompt= 381tok  gen= 80tok  total=  4.6s  RSS= 9344MB  ctx~381
+    turn 5: TTFT=   3115ms  decode= 37.8tok/s  prompt= 486tok  gen= 80tok  total=  5.2s  RSS= 9344MB  ctx~486
+
+  --- omlx ---
+  Starting oMLX on :8000 (--no-cache) ...
+  Server ready: model=Qwen3.5-35B-A3B-3bit  RSS=122MB
+  Warmup...
+  Warmup done. RSS=7707MB
+
+  [Single-turn]
+    short   : TTFT=   2152ms  decode=  0.0tok/s  prompt=   9tok  gen=  0tok  total=  2.2s  RSS= 7707MB
+    medium  : TTFT=   2344ms  decode=  0.0tok/s  prompt= 100tok  gen=  0tok  total=  2.3s  RSS= 7709MB
+    long    : TTFT=   2820ms  decode=  0.0tok/s  prompt= 379tok  gen=  0tok  total=  2.8s  RSS= 7709MB
+
+  [Multi-turn, 5 turns]
+    turn 1: TTFT=   2042ms  decode=  0.0tok/s  prompt=  89tok  gen=  0tok  total=  2.0s  RSS= 7712MB  ctx~89
+    turn 2: TTFT=   2131ms  decode=  0.0tok/s  prompt= 108tok  gen=  0tok  total=  2.1s  RSS= 7712MB  ctx~108
+    turn 3: TTFT=   2230ms  decode=  0.0tok/s  prompt= 128tok  gen=  0tok  total=  2.2s  RSS= 7710MB  ctx~128
+    turn 4: TTFT=   2147ms  decode=  0.0tok/s  prompt= 148tok  gen=  0tok  total=  2.1s  RSS= 7712MB  ctx~148
+    turn 5: TTFT=   2217ms  decode=  0.0tok/s  prompt= 170tok  gen=  0tok  total=  2.2s  RSS= 7713MB  ctx~170
+
+================================================================================
+COMPARISON: Qwen3.5-35B-A3B-3bit (MoE)
+================================================================================
+
+                          TTFT (ms)         Decode (tok/s)
+  Prompt           Higgs      oMLX       Higgs      oMLX     TTFT  Decode
+  --------------------------------------------------------------------------
+  short             248      2152        0.0       0.0    8.69x       —
+  medium            515      2344       37.9       0.0    4.55x       —
+  long             1940      2820       37.7       0.0    1.45x       —
+
+  Multi-turn TTFT progression:
+   Turn   Higgs TTFT    oMLX TTFT   Higgs dec    oMLX dec
+  -------------------------------------------------------
+      1        560ms       2042ms      38.5/s       0.0/s
+      2       1149ms       2131ms      37.9/s       0.0/s
+      3       1835ms       2230ms      38.3/s       0.0/s
+      4       2448ms       2147ms      37.7/s       0.0/s
+      5       3115ms       2217ms      37.8/s       0.0/s
+
+================================================================================
+FINAL SUMMARY
+================================================================================
+
+  Model                                    TTFT Higgs  TTFT oMLX  Dec Higgs   Dec oMLX
+  ------------------------------------------------------------------------------------
+  Qwen3.5-35B-A3B-3bit (MoE)                    515ms     2344ms     37.9/s      0.0/s

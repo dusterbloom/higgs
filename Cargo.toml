@@ -138,10 +138,7 @@ base64 = "0.22"
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-
-[patch.crates-io]
-mlx-rs = { git = "https://github.com/oxideai/mlx-rs.git", rev = "af21d79" }
-mlx-sys = { git = "https://github.com/oxideai/mlx-rs.git", rev = "af21d79" }
+rand = "0.9"
 
 [profile.release]
 lto = "thin"
