@@ -13,6 +13,25 @@ pub mod transformer;
 pub mod turboquant;
 pub mod utils;
 
+pub mod diffusion;
+pub mod diffusion_lora;
+pub mod diffusion_train;
+pub mod llada_moe;
+pub mod rwkv7;
+
+#[cfg(feature = "ane")]
+pub mod ane_bridge;
+#[cfg(feature = "ane")]
+pub mod ane_extract;
+#[cfg(feature = "ane")]
+pub mod ane_forward;
+#[cfg(feature = "ane")]
+pub mod ane_mil;
+#[cfg(feature = "ane")]
+pub mod diffusion_ane;
+#[cfg(feature = "ane")]
+pub mod diffusion_ane_bwd;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
