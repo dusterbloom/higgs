@@ -10315,7 +10315,20 @@ fn forward_attention_sparse(
         .transpose_axes(&[0, 2, 1, 3])?;
 
     // Apply RoPE at CUSTOM positions using rope_dynamic
-    let (queries_with_rope, keys_with_rope) = attn.apply_rope_at_positions(&queries, &keys, positions)?;
+    tracing::debug!(
+        "forward_attention_sparse: queries.shape={:?}, keys.shape={:?}, positions.shape={:?}",
+        queries.shape(), keys.shape(), positions.shape()
+    );
+    let (queries_with_rope, keys_with_rope) = match attn.apply_rope_at_positions(&queries, &keys, positions) {
+        Ok(result) => {
+            tracing::debug!("rope_dynamic succeeded");
+            result
+        }
+        Err(e) => {
+            tracing::error!("rope_dynamic failed: {:?}", e);
+            return Err(e);
+        }
+    };
     queries = queries_with_rope;
     keys = keys_with_rope;
 

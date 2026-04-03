@@ -321,7 +321,7 @@ impl SimpleEngine {
                 .model
                 .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
-        } else if false && self.spec_prefill.should_use_spec_prefill(prompt_tokens.len()) {
+        } else if false && self.spec_prefill.should_use_spec_prefill(prompt_tokens.len()) { // SPARSE_PREFILL_DISABLED
             // Sparse prefill with custom RoPE positions
             use higgs_models::AnyCache;
             
@@ -347,9 +347,15 @@ impl SimpleEngine {
             let selected_tokens_vec: Vec<u32> = selected_indices.iter().map(|&i| prompt_tokens[i]).collect();
             let selected_tokens = Array::from_slice(&selected_tokens_vec, &[1, selected_indices.len() as i32]);
             
-            // Create position array
+            // Create position array with batch dimension [B, L]
             let positions: Vec<i32> = selected_indices.iter().map(|&i| i as i32).collect();
-            let positions_array = Array::from_slice(&positions, &[selected_indices.len() as i32]);
+            let positions_array = Array::from_slice(&positions, &[1, selected_indices.len() as i32]);
+            
+            tracing::info!(
+                "Sparse prefill: positions_array.shape={:?}, positions={:?}",
+                positions_array.shape(),
+                &positions[..std::cmp::min(10, positions.len())]
+            );
             
             // Get cache
             let cache = match &mut prepared.cache {
