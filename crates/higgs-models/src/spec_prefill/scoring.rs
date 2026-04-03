@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Token importance scoring for SpecPrefill.
 
-use mlx_rs::{Array, Exception};
+use mlx_rs::Array;
+use crate::error::ModelError;
 
-/// Token importance scoring result.
 #[derive(Debug, Clone)]
 pub struct TokenImportance {
     pub scores: Array,
@@ -11,12 +11,12 @@ pub struct TokenImportance {
 }
 
 impl TokenImportance {
-    pub fn select_chunks(&self, keep_pct: f32, chunk_size: usize) -> Result<Vec<usize>, Exception> {
+    pub fn select_chunks(&self, keep_pct: f32, chunk_size: usize) -> Result<Vec<usize>, mlx_rs::error::Exception> {
         let n = self.n_tokens;
         if keep_pct >= 1.0 {
             return Ok((0..n).collect());
         }
-        let scores: Vec<f32> = self.scores.try_into()?;
+        let scores: &[f32] = self.scores.as_slice();
         let n_chunks = (n + chunk_size - 1) / chunk_size;
         let keep_n = std::cmp::max(1, (n_chunks as f32 * keep_pct).ceil() as usize);
         let mut chunk_scores: Vec<(usize, f32)> = Vec::with_capacity(n_chunks);
@@ -27,11 +27,7 @@ impl TokenImportance {
             chunk_scores.push((i, avg));
         }
         chunk_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut kept: Vec<usize> = chunk_scores
-            .into_iter()
-            .take(keep_n)
-            .map(|(i, _)| i)
-            .collect();
+        let mut kept: Vec<usize> = chunk_scores.into_iter().take(keep_n).map(|(i, _)| i).collect();
         kept.sort();
         let mut indices = Vec::new();
         for ci in kept {
@@ -42,9 +38,9 @@ impl TokenImportance {
         Ok(indices)
     }
 
-    pub fn select_topk(&self, k: usize) -> Result<Vec<usize>, Exception> {
-        let scores: Vec<f32> = self.scores.try_into()?;
-        let mut indexed: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+    pub fn select_topk(&self, k: usize) -> Result<Vec<usize>, mlx_rs::error::Exception> {
+        let scores: &[f32] = self.scores.as_slice();
+        let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut indices: Vec<usize> = indexed.into_iter().take(k).map(|(i, _)| i).collect();
         indices.sort();
@@ -52,20 +48,15 @@ impl TokenImportance {
     }
 }
 
-pub fn score_tokens_uniform(n_tokens: usize) -> Result<TokenImportance, Exception> {
+pub fn score_tokens_uniform(n_tokens: usize) -> Result<TokenImportance, ModelError> {
     let uniform = 1.0 / n_tokens as f32;
-    let scores = Array::from_full(&[n_tokens as i32], uniform)?;
+    let scores = Array::from_iter(vec![uniform; n_tokens], &[n_tokens as i32]);
     Ok(TokenImportance { scores, n_tokens })
 }
 
 pub fn compute_keep_rate(prompt_len: usize) -> f32 {
-    if prompt_len < 8192 {
-        1.0
-    } else if prompt_len < 16384 {
-        0.30
-    } else if prompt_len < 32768 {
-        0.25
-    } else {
-        0.20
-    }
+    if prompt_len < 8192 { 1.0 }
+    else if prompt_len < 16384 { 0.30 }
+    else if prompt_len < 32768 { 0.25 }
+    else { 0.20 }
 }

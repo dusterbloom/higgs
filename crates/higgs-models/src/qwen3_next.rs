@@ -683,7 +683,7 @@ fn gated_delta_kernel_ffi(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct Qwen3NextAttention {
+pub struct Qwen3NextAttention {
     #[param]
     q_proj: QLinear,
     #[param]
@@ -799,6 +799,47 @@ impl Qwen3NextAttention {
         let gated = output.multiply(nn::sigmoid(&gate)?)?;
         self.o_proj.forward(&gated)
     }
+
+    /// Apply RoPE at custom positions using rope_dynamic.
+    ///
+    /// # Arguments
+    /// * `queries` - Query tensor [B, n_heads, L, head_dim]
+    /// * `keys` - Key tensor [B, n_kv_heads, L, head_dim]
+    /// * `positions` - Position indices [L] (can be non-contiguous)
+    ///
+    /// # Returns
+    /// (queries, keys) with RoPE applied at specified positions
+    pub fn apply_rope_at_positions(
+        &self,
+        queries: &Array,
+        keys: &Array,
+        positions: &Array,
+    ) -> Result<(Array, Array), Exception> {
+        use mlx_rs::fast;
+        
+        // Use rope_dynamic with custom positions
+        let queries_with_rope = fast::rope_dynamic(
+            queries,
+            self.rope.dimensions,
+            self.rope.traditional,
+            Some(self.rope.base),
+            self.rope.scale,
+            positions,
+            None,
+        )?;
+        
+        let keys_with_rope = fast::rope_dynamic(
+            keys,
+            self.rope.dimensions,
+            self.rope.traditional,
+            Some(self.rope.base),
+            self.rope.scale,
+            positions,
+            None,
+        )?;
+        
+        Ok((queries_with_rope, keys_with_rope))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +847,7 @@ impl Qwen3NextAttention {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct Qwen3NextMLP {
+pub struct Qwen3NextMLP {
     #[param]
     gate_proj: QLinear,
     #[param]

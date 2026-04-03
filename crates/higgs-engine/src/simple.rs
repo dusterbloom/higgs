@@ -86,9 +86,6 @@ pub struct SimpleEngine {
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
     /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
     think_close_token: Option<u32>,
-    /// Whether to enable SpecPrefill for long prompts (>8k tokens).
-    #[cfg(feature = "spec_prefill")]
-    spec_prefill_enabled: bool,
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
@@ -161,8 +158,6 @@ impl SimpleEngine {
             eos_token_ids,
             enable_thinking,
             think_close_token,
-            #[cfg(feature = "spec_prefill")]
-            spec_prefill_enabled: true,
         })
     }
 
@@ -311,19 +306,6 @@ impl SimpleEngine {
         logprob_top_n: Option<u32>,
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
     ) -> Result<(Array, Option<LogprobArrays>), EngineError> {
-        // Check if SpecPrefill should be used
-        #[cfg(feature = "spec_prefill")]
-        {
-            use crate::spec_prefill::{SpecPrefillEngine, SpecPrefillConfig};
-            
-            let prompt_len = prompt_tokens.len();
-            if prompt_len >= 8192 && prompt_len <= 65536 && self.spec_prefill_enabled {
-                tracing::info!("Using SpecPrefill for {} token prompt", prompt_len);
-                // TODO: Integrate full SpecPrefill engine
-                // For now, fall through to standard prefill
-            }
-        }
-        
         let logits = if let Some(ref pixel_values) = prepared.pixel_values {
             // Multimodal path: full forward (VLMs need all tokens for vision)
             prepared
