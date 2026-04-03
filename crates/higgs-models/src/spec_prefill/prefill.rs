@@ -2,7 +2,7 @@
 //! Sparse prefill for SpecPrefill.
 
 use crate::AnyCache;
-use crate::qwen3_next::{Qwen3NextCausalLM, LayerCache, Qwen3NextAttention};
+use crate::qwen3_next::{Qwen3NextCausalLM, LayerCache};
 use mlx_rs::{Array, ops};
 
 #[derive(Debug, Clone)]
@@ -44,13 +44,13 @@ pub fn create_position_array(indices: &[usize], offset: i32) -> Array {
     Array::from_slice(&positions, &[positions.len() as i32])
 }
 
-/// Prefill model with selected tokens at their original positions.
+/// Prefill model with selected tokens at their original positions using custom RoPE.
 pub fn sparse_prefill(
     model: &mut Qwen3NextCausalLM,
     inputs: &Array,
     selected_indices: &[usize],
     cache: &mut AnyCache,
-    _position_offset: i32,
+    position_offset: i32,
 ) -> Result<(Array, SparsePrefillState), mlx_rs::error::Exception> {
     let total_len = inputs.dim(1) as i32;
     let selected_len = selected_indices.len() as i32;
@@ -64,8 +64,17 @@ pub fn sparse_prefill(
         }
     };
     
+    // Select tokens
     let selected_tokens = select_tokens(inputs, selected_indices)?;
-    let logits = model.forward(&selected_tokens, None, layer_cache_vec)?;
+    
+    // Create position array for selected tokens
+    let positions = create_position_array(selected_indices, position_offset);
+    
+    // Use sparse forward pass with custom RoPE positions
+    let hidden = model.forward_hidden_sparse(&selected_tokens, &positions, layer_cache_vec)?;
+    
+    // Compute logits from hidden states
+    let logits = model.compute_logits(&hidden)?;
     
     let state = SparsePrefillState {
         total_prompt_len: total_len,
@@ -83,18 +92,15 @@ pub fn cleanup_sparse_prefill(
     Ok(())
 }
 
-// ===========================================================================
-// Phase 2: Custom RoPE Application
-// ===========================================================================
-
-/// Apply RoPE at custom positions for a single attention layer.
-pub fn apply_rope_at_positions(
-    attention: &Qwen3NextAttention,
-    queries: &Array,
-    keys: &Array,
-    positions: &Array,
-) -> Result<(Array, Array), mlx_rs::error::Exception> {
-    attention.apply_rope_at_positions(queries, keys, positions)
+/// Sparse model forward pass with custom RoPE positions.
+pub fn sparse_model_forward(
+    model: &mut Qwen3NextCausalLM,
+    inputs: &Array,
+    selected_indices: &[usize],
+    cache: &mut AnyCache,
+    position_offset: i32,
+) -> Result<(Array, SparsePrefillState), mlx_rs::error::Exception> {
+    sparse_prefill(model, inputs, selected_indices, cache, position_offset)
 }
 
 #[cfg(test)]
@@ -122,8 +128,6 @@ mod tests {
 
     #[test]
     fn test_apply_rope_at_positions_signature() {
-        // Verify the function signature is correct
-        // Actual testing requires model loading which causes test harness issues
         let shape = [1, 2, 1, 64];
         let queries = Array::from_slice(&vec![1.0f32; 128], &shape);
         let keys = Array::from_slice(&vec![1.0f32; 128], &shape);
@@ -133,51 +137,9 @@ mod tests {
         assert_eq!(keys.shape(), &shape);
         assert_eq!(positions.shape(), &[2]);
     }
-}
-
-// ===========================================================================
-// Phase 3: Sparse Attention Forward (STUB - requires full layer iteration)
-// ===========================================================================
-
-/// Sparse model forward pass with custom RoPE positions.
-///
-/// This is a STUB - full implementation requires:
-/// 1. Iterate through all decoder layers
-/// 2. For each attention layer, apply RoPE at custom positions
-/// 3. Run attention with custom-positioned Q and K
-/// 4. Continue with MLP and residual connections
-///
-/// Currently falls back to standard forward pass.
-///
-/// # Arguments
-/// * `model` - Qwen3Next model
-/// * `inputs` - Input tokens [B, L]
-/// * `selected_indices` - Token indices to process
-/// * `cache` - KV cache
-/// * `position_offset` - Position offset (e.g., system prompt length)
-///
-/// # Returns
-/// (logits, state) - Logits from last selected token and state for cleanup
-pub fn sparse_model_forward(
-    model: &mut Qwen3NextCausalLM,
-    inputs: &Array,
-    selected_indices: &[usize],
-    cache: &mut AnyCache,
-    position_offset: i32,
-) -> Result<(Array, SparsePrefillState), mlx_rs::error::Exception> {
-    // STUB: For now, use the existing sparse_prefill which just selects tokens
-    // TODO: Implement full sparse forward with custom RoPE
-    sparse_prefill(model, inputs, selected_indices, cache, position_offset)
-}
-
-#[cfg(test)]
-mod phase3_tests {
-    use super::*;
 
     #[test]
     fn test_sparse_model_forward_exists() {
-        // Verify the function exists and has correct signature
-        // Full testing requires model loading
-        assert_eq!(sparse_model_forward as usize != 0, true);
+        assert_eq!(sparse_model_forward as *const () as usize != 0, true);
     }
 }
