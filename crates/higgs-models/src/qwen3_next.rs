@@ -815,27 +815,21 @@ impl Qwen3NextAttention {
         keys: &Array,
         positions: &Array,
     ) -> Result<(Array, Array), Exception> {
-        use mlx_rs::fast;
-        
-        // Use rope_dynamic with custom positions
-        let queries_with_rope = fast::rope_dynamic(
+        // Use manual RoPE implementation for per-token positions
+        let queries_with_rope = apply_rope_manual(
             queries,
-            self.rope.dimensions,
-            self.rope.traditional,
-            Some(self.rope.base),
-            self.rope.scale,
             positions,
-            None,
+            self.rope.dimensions,
+            self.rope.base,
+            self.rope.scale,
         )?;
         
-        let keys_with_rope = fast::rope_dynamic(
+        let keys_with_rope = apply_rope_manual(
             keys,
-            self.rope.dimensions,
-            self.rope.traditional,
-            Some(self.rope.base),
-            self.rope.scale,
             positions,
-            None,
+            self.rope.dimensions,
+            self.rope.base,
+            self.rope.scale,
         )?;
         
         Ok((queries_with_rope, keys_with_rope))
@@ -1740,6 +1734,87 @@ pub struct Qwen3NextCausalLM {
     #[param]
     lm_head: Option<QLinear>,
 }
+
+// Manual RoPE implementation for arbitrary positions
+/// Manual RoPE implementation for arbitrary positions
+#[allow(dead_code)]
+fn apply_rope_manual(
+    x: &Array,
+    positions: &Array,
+    dimensions: i32,
+    base: f32,
+    scale: f32,
+) -> Result<Array, Exception> {
+    use mlx_rs::{Dtype, ops};
+    
+    // x shape: [B, H, L, D] or [B, L, D]
+    let shape = x.shape();
+    let ndim = shape.len();
+    
+    if ndim < 2 {
+        return Err(Exception::custom("Input must have at least 2 dimensions"));
+    }
+    
+    let D = shape[ndim - 1] as i32;
+    let half_dim = dimensions / 2;
+    
+    // Compute frequencies: base^(-2i/dimensions) for i in [0, half_dim)
+    let inv_freq: Vec<f32> = (0..half_dim)
+        .map(|i| {
+            let power = -2.0 * (i as f32) / (dimensions as f32);
+            base.powf(power)
+        })
+        .collect();
+    let inv_freq_arr = Array::from_slice(&inv_freq, &[half_dim as i32]);
+    
+    // Get positions as [L] or [B, L]
+    let pos_shape = positions.shape();
+    let L = if pos_shape.len() == 1 {
+        pos_shape[0]
+    } else {
+        pos_shape[pos_shape.len() - 1]
+    };
+    
+    tracing::debug!("apply_rope_manual: x.shape={:?}, positions.shape={:?}, dimensions={}, base={}", x.shape(), positions.shape(), dimensions, base);
+    // Compute angles: positions * inv_freq
+    // positions: [L], inv_freq: [half_dim] -> angles: [L, half_dim]
+    let positions_expanded = positions.reshape(&[L, 1])?;
+    let inv_freq_expanded = inv_freq_arr.reshape(&[1, half_dim as i32])?;
+    let angles = ops::multiply(&positions_expanded, &inv_freq_expanded)?;
+    
+    // Compute cos and sin
+    let cos = ops::cos(&angles)?;
+    let sin = ops::sin(&angles)?;
+    
+    // Reshape for broadcasting: [1, 1, L, half_dim] or [1, L, half_dim]
+    let cos_shape: Vec<i32> = if ndim == 4 {
+        vec![1, 1, L, half_dim as i32]
+    } else {
+        vec![1, L, half_dim as i32]
+    };
+    let cos = cos.reshape(&cos_shape)?;
+    let sin = sin.reshape(&cos_shape)?;
+    
+    // Split x into two halves along last dimension
+    let x_first = x.index((.., .., .., ..half_dim));
+    let x_second = x.index((.., .., .., half_dim..));
+    
+    // Apply RoPE rotation
+    // output_first = x_first * cos - x_second * sin
+    // output_second = x_first * sin + x_second * cos
+    let output_first = ops::subtract(
+        &ops::multiply(&x_first, &cos)?,
+        &ops::multiply(&x_second, &sin)?,
+    )?;
+    let output_second = ops::add(
+        &ops::multiply(&x_first, &sin)?,
+        &ops::multiply(&x_second, &cos)?,
+    )?;
+    
+    // Concatenate back
+    ops::concatenate_axis(&[&output_first, &output_second], (ndim - 1) as i32)
+}
+
 
 impl Qwen3NextCausalLM {
     pub fn new(args: Qwen3NextModelArgs) -> Result<Self, Exception> {
