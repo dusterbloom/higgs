@@ -10,7 +10,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 
 use mlx_rs::{Array, Dtype, Stream, argmin_axis, error::Exception, ops};
-use rand::{Rng, SeedableRng};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 const ONE_BIT_CENTROIDS: [f32; 2] = [-0.797_884_6, 0.797_884_6];
@@ -132,8 +132,6 @@ pub struct TurboQuantContext {
     pub config: KvCacheConfig,
     pub head_dim: i32,
     pub num_kv_heads: i32,
-    pub rotation: Vec<f32>,
-    pub rotation_t: Vec<f32>,
     pub key_centroids: Vec<f32>,
     pub value_centroids: Vec<f32>,
     pub key_code_bytes: i32,
@@ -150,11 +148,14 @@ impl TurboQuantContext {
                 "TurboQuant head_dim and num_kv_heads must be > 0",
             ));
         }
+        if head_dim < 2 || (head_dim & (head_dim - 1)) != 0 {
+            return Err(Exception::custom(format!(
+                "TurboQuant FWHT requires power-of-2 head_dim, got {head_dim}"
+            )));
+        }
         let dim = usize::try_from(head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let rotation = generate_orthogonal_matrix(dim, config.seed);
-        let rotation_t = transpose(&rotation, dim);
         let key_centroids = scaled_centroids(config.key_bits(), scale)?;
         let value_centroids = scaled_centroids(config.value_bits(), scale)?;
 
@@ -167,8 +168,6 @@ impl TurboQuantContext {
             config,
             head_dim,
             num_kv_heads,
-            rotation,
-            rotation_t,
             key_centroids,
             value_centroids,
             key_code_bytes,
@@ -193,9 +192,9 @@ impl TurboQuantContext {
             });
         }
 
-        let normalized: Vec<f32> = values.iter().map(|value| *value / norm).collect();
-        let rotated = mat_vec(&self.rotation, dim, &normalized);
-        let indices = quantize_rotated(&rotated, &self.value_centroids);
+        let mut normalized: Vec<f32> = values.iter().map(|value| *value / norm).collect();
+        fwht_normalized(&mut normalized);
+        let indices = quantize_rotated(&normalized, &self.value_centroids);
 
         // Norm correction: corrected_norm = norm / ||reconstruction||
         // Eliminates systematic norm shrinkage from discrete quantization.
@@ -233,9 +232,9 @@ impl TurboQuantContext {
             });
         }
 
-        let normalized: Vec<f32> = keys.iter().map(|value| *value / norm).collect();
-        let rotated = mat_vec(&self.rotation, dim, &normalized);
-        let mse_indices = quantize_rotated(&rotated, &self.key_centroids);
+        let mut normalized: Vec<f32> = keys.iter().map(|value| *value / norm).collect();
+        fwht_normalized(&mut normalized);
+        let mse_indices = quantize_rotated(&normalized, &self.key_centroids);
 
         // Norm correction for keys
         let final_norm = if self.config.norm_correction {
@@ -259,47 +258,35 @@ impl TurboQuantContext {
     pub fn dequantize_value(&self, value: &QuantizedValue) -> Result<Vec<f32>, Exception> {
         let dim =
             usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
-        let rotated = dequantize_rotated(
+        let mut rotated = dequantize_rotated(
             &value.codes,
             self.config.value_bits(),
             &self.value_centroids,
             dim,
             value.norm,
         );
-        Ok(mat_vec(&self.rotation_t, dim, &rotated))
+        fwht_normalized(&mut rotated);
+        Ok(rotated)
     }
 
     pub fn dequantize_key(&self, key: &QuantizedKey) -> Result<Vec<f32>, Exception> {
         let dim =
             usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
-        let rotated = dequantize_rotated(
+        let mut rotated = dequantize_rotated(
             &key.codes,
             self.config.key_bits(),
             &self.key_centroids,
             dim,
             key.norm,
         );
-        Ok(mat_vec(&self.rotation_t, dim, &rotated))
+        fwht_normalized(&mut rotated);
+        Ok(rotated)
     }
 
     pub fn rotate_queries(&self, queries: &Array) -> Result<Array, Exception> {
         queries
             .as_dtype(Dtype::Float32)?
-            .matmul(&self.rotation_t_array()?)
-    }
-
-    pub fn rotation_array(&self) -> Result<Array, Exception> {
-        Ok(Array::from_slice(
-            &self.rotation,
-            &[self.head_dim, self.head_dim],
-        ))
-    }
-
-    pub fn rotation_t_array(&self) -> Result<Array, Exception> {
-        Ok(Array::from_slice(
-            &self.rotation_t,
-            &[self.head_dim, self.head_dim],
-        ))
+            .hadamard_transform(None)
     }
 
     pub fn key_centroids_array(&self) -> Result<Array, Exception> {
@@ -336,9 +323,8 @@ impl TurboQuantContext {
         let safe_norms = ops::maximum(&norms, &eps)?;
         let normalized = ops::divide(values, &safe_norms.expand_dims(-1)?)?;
 
-        // rotated: [H, T, D] = normalized @ rotation_t
-        let rotation_t = self.rotation_t_array()?;
-        let rotated = normalized.matmul(&rotation_t)?;
+        // rotated: [H, T, D] = hadamard(normalized) — orthonormal FWHT replaces D×D matmul
+        let rotated = normalized.hadamard_transform(None)?;
 
         // distances: [H, T, D, C] = |rotated[..., None] - centroids|
         let centroids = self.value_centroids_array()?;
@@ -406,9 +392,8 @@ impl TurboQuantContext {
         let safe_norms = ops::maximum(&norms, &eps)?;
         let normalized = ops::divide(keys, &safe_norms.expand_dims(-1)?)?;
 
-        // rotated: [H, T, D] = normalized @ rotation_t
-        let rotation_t = self.rotation_t_array()?;
-        let rotated = normalized.matmul(&rotation_t)?;
+        // rotated: [H, T, D] = hadamard(normalized)
+        let rotated = normalized.hadamard_transform(None)?;
 
         // MSE quantize: find nearest centroid in rotated space
         let key_centroids = self.key_centroids_array()?;
@@ -474,9 +459,8 @@ impl TurboQuantContext {
         let safe_norms = ops::maximum(&norms, &eps)?;
         let normalized = ops::divide(values, &safe_norms.expand_dims(-1)?)?;
 
-        // rotated: [H, T, D] = normalized @ rotation_t
-        let rotation_t = self.rotation_t_array()?;
-        let rotated = normalized.matmul(&rotation_t)?;
+        // rotated: [H, T, D] = hadamard(normalized)
+        let rotated = normalized.hadamard_transform(None)?;
 
         // distances: [H, T, D, C] = |rotated[..., None] - centroids|
         let centroids = self.value_centroids_array()?;
@@ -529,9 +513,8 @@ impl TurboQuantContext {
         let safe_norms = ops::maximum(&norms, &eps)?;
         let normalized = ops::divide(keys, &safe_norms.expand_dims(-1)?)?;
 
-        // rotated: [H, T, D] = normalized @ rotation_t
-        let rotation_t = self.rotation_t_array()?;
-        let rotated = normalized.matmul(&rotation_t)?;
+        // rotated: [H, T, D] = hadamard(normalized)
+        let rotated = normalized.hadamard_transform(None)?;
 
         // MSE quantize: find nearest centroid in rotated space
         let key_centroids = self.key_centroids_array()?;
@@ -836,60 +819,46 @@ fn unpack_index(data: &[u8], index: usize, bits: u8) -> u8 {
     u8::try_from(value & mask).unwrap_or(0)
 }
 
-fn mat_vec(matrix: &[f32], dim: usize, vector: &[f32]) -> Vec<f32> {
-    let mut out = vec![0.0_f32; dim];
-    for row in 0..dim {
-        let mut acc = 0.0_f32;
-        for col in 0..dim {
-            acc += matrix[row * dim + col] * vector[col];
-        }
-        out[row] = acc;
-    }
-    out
-}
+// ---------------------------------------------------------------------------
+// Fast Walsh-Hadamard Transform (FWHT) — replaces dense orthogonal rotation.
+// ---------------------------------------------------------------------------
 
-fn transpose(matrix: &[f32], dim: usize) -> Vec<f32> {
-    let mut out = vec![0.0_f32; dim * dim];
-    for row in 0..dim {
-        for col in 0..dim {
-            out[col * dim + row] = matrix[row * dim + col];
-        }
-    }
-    out
-}
-
-fn generate_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let mut cols: Vec<Vec<f32>> = (0..dim)
-        .map(|_| (0..dim).map(|_| random_normal(&mut rng)).collect())
-        .collect();
-
-    for index in 0..dim {
-        for prev in 0..index {
-            let dot = dot(&cols[index], &cols[prev]);
-            for dim_index in 0..dim {
-                cols[index][dim_index] -= dot * cols[prev][dim_index];
+/// In-place iterative FWHT on a `&mut [f32]` slice. Length must be a power of 2.
+///
+/// Computes `H @ x` (unnormalized Hadamard). The caller is responsible for
+/// scaling by `1/sqrt(D)` to make the transform orthonormal.
+///
+/// `H` is the Sylvester-constructed Hadamard matrix of order `D`. Since
+/// `H² = D·I`, the orthonormal version `H/√D` is self-inverse, meaning
+/// `fwht(fwht(x)) / D = x`.
+pub fn fwht(x: &mut [f32]) {
+    let n = x.len();
+    debug_assert!(n.is_power_of_two(), "FWHT requires power-of-2 length, got {n}");
+    let mut stride = n >> 1;
+    while stride > 0 {
+        for i in 0..n {
+            if (i / stride) % 2 == 0 {
+                let j = i + stride;
+                let a = x[i];
+                let b = x[j];
+                x[i] = a + b;
+                x[j] = a - b;
             }
         }
-        let norm = l2_norm(&cols[index]);
-        if norm > f32::EPSILON {
-            for value in &mut cols[index] {
-                *value /= norm;
-            }
-        }
+        stride >>= 1;
     }
-
-    let mut matrix = vec![0.0_f32; dim * dim];
-    for col in 0..dim {
-        for row in 0..dim {
-            matrix[row * dim + col] = cols[col][row];
-        }
-    }
-    matrix
 }
 
-fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
-    lhs.iter().zip(rhs.iter()).map(|(l, r)| l * r).sum()
+/// Apply orthonormal FWHT: `H/√D @ x`, which is self-inverse.
+///
+/// For a vector of length D, this computes `fwht(x) / √D`.
+/// Applying twice recovers the original: `fwht_normalized(fwht_normalized(x)) = x`.
+pub fn fwht_normalized(x: &mut [f32]) {
+    fwht(x);
+    let scale = 1.0 / (x.len() as f32).sqrt();
+    for val in x.iter_mut() {
+        *val *= scale;
+    }
 }
 
 fn random_normal<R: Rng>(rng: &mut R) -> f32 {
@@ -1337,6 +1306,7 @@ pub(crate) fn pack_indices_gpu(
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
 
     fn make_context(bits: u8, head_dim: i32) -> TurboQuantContext {
         let config = KvCacheConfig {
@@ -1364,41 +1334,6 @@ mod tests {
             let unpacked: Vec<u8> = (0..128).map(|i| unpack_index(&packed, i, bits)).collect();
             assert_eq!(indices, unpacked, "roundtrip failed for {bits}-bit");
         }
-    }
-
-    // ── Orthogonal matrix properties ────────────────────────────────────
-
-    #[test]
-    fn test_orthogonal_matrix_is_orthogonal() {
-        let dim = 64;
-        let r = generate_orthogonal_matrix(dim, 42);
-        let rt = transpose(&r, dim);
-        // R * R^T should be identity
-        let product = mat_mat(&r, &rt, dim);
-        for i in 0..dim {
-            for j in 0..dim {
-                let expected = if i == j { 1.0 } else { 0.0 };
-                let actual = product[i * dim + j];
-                assert!(
-                    (actual - expected).abs() < 1e-4,
-                    "R*R^T[{i},{j}] = {actual}, expected {expected}"
-                );
-            }
-        }
-    }
-
-    fn mat_mat(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
-        let mut out = vec![0.0_f32; dim * dim];
-        for i in 0..dim {
-            for j in 0..dim {
-                let mut acc = 0.0;
-                for k in 0..dim {
-                    acc += a[i * dim + k] * b[k * dim + j];
-                }
-                out[i * dim + j] = acc;
-            }
-        }
-        out
     }
 
     // ── Value quantize/dequantize roundtrip ─────────────────────────────
@@ -1808,6 +1743,138 @@ mod tests {
                 gpu_codes.as_slice::<u32>(),
                 &cpu_code_words[..],
                 "{bits}b: GPU key codes mismatch",
+            );
+        }
+    }
+
+    // ── FWHT (Fast Walsh-Hadamard Transform) ──────────────────────────────
+
+    #[test]
+    fn test_fwht_known_vector() {
+        // H2 @ [a, b] = [a+b, a-b]
+        let mut x = vec![3.0_f32, 1.0];
+        fwht(&mut x);
+        assert_eq!(x[0], 4.0);
+        assert_eq!(x[1], 2.0);
+
+        // H4 @ [1,2,3,4]: apply H2 pairwise, then stride-2 butterfly
+        let mut v = vec![1.0_f32, 2.0, 3.0, 4.0];
+        fwht(&mut v);
+        // H4 = [[1,1,1,1],[1,-1,1,-1],[1,1,-1,-1],[1,-1,-1,1]]
+        // [1+2+3+4, 1-2+3-4, 1+2-3-4, 1-2-3+4] = [10, -2, -4, 0]
+        assert_eq!(v, vec![10.0, -2.0, -4.0, 0.0]);
+    }
+
+    #[test]
+    fn test_fwht_self_inverse_normalized() {
+        // fwht_normalized(fwht_normalized(x)) == x for any x
+        for dim in [4, 8, 16, 32, 64, 128] {
+            let original = random_vector(dim, 42);
+            let mut x = original.clone();
+            fwht_normalized(&mut x);
+            fwht_normalized(&mut x);
+            for (i, (got, expected)) in x.iter().zip(original.iter()).enumerate() {
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "FWHT roundtrip failed at dim={dim} idx={i}: got {got}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fwht_norm_preservation_normalized() {
+        // Orthonormal FWHT preserves L2 norm
+        for dim in [4, 8, 32, 64, 128] {
+            let original = random_vector(dim, 99);
+            let norm_before = l2_norm(&original);
+            let mut x = original.clone();
+            fwht_normalized(&mut x);
+            let norm_after = l2_norm(&x);
+            assert!(
+                (norm_before - norm_after).abs() < 1e-4 * norm_before,
+                "Norm not preserved at dim={dim}: {norm_before} vs {norm_after}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fwht_involution_property() {
+        // fwht(fwht(x)) = D * x (unnormalized)
+        for dim in [4, 8, 16, 64, 128] {
+            let original = random_vector(dim, 7);
+            let mut x = original.clone();
+            fwht(&mut x);
+            fwht(&mut x);
+            let d = dim as f32;
+            for (i, (got, expected)) in x.iter().zip(original.iter()).enumerate() {
+                assert!(
+                    (got - d * expected).abs() < 1e-3 * d,
+                    "FWHT² != D*I at dim={dim} idx={i}: got {got}, expected {}",
+                    d * expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fwht_gpu_matches_cpu() {
+        // MLX hadamard_transform with default scale = 1/sqrt(D) should match
+        // our CPU fwht_normalized
+        for dim in [4_i32, 8, 16, 32, 64, 128] {
+            let original = random_vector(dim as usize, 42);
+
+            // CPU path
+            let mut cpu = original.clone();
+            fwht_normalized(&mut cpu);
+
+            // GPU path via MLX hadamard_transform
+            let arr = Array::from_slice(&original, &[dim]);
+            let gpu = arr.hadamard_transform(None).unwrap();
+            gpu.eval().unwrap();
+            let gpu_data = gpu.as_slice::<f32>();
+
+            for (i, (c, g)) in cpu.iter().zip(gpu_data.iter()).enumerate() {
+                assert!(
+                    (c - g).abs() < 1e-3,
+                    "CPU/GPU mismatch at dim={dim} idx={i}: cpu={c}, gpu={g}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fwht_gpu_batch_matches_cpu() {
+        // Test [H, T, D] batch — matches the shape used in quantize_keys/values_gpu
+        let h = 2_i32;
+        let t = 4_i32;
+        let dim = 128_i32;
+        let total = (h * t * dim) as usize;
+        let original: Vec<f32> = (0..total)
+            .map(|i| random_normal(&mut rand::rngs::StdRng::seed_from_u64(i as u64 + 500)))
+            .collect();
+
+        // CPU: fwht_normalized per row
+        let mut cpu = original.clone();
+        for row in 0..(h * t) as usize {
+            let start = row * dim as usize;
+            let end = start + dim as usize;
+            fwht_normalized(&mut cpu[start..end]);
+        }
+
+        // GPU: MLX hadamard_transform on [H, T, D]
+        let arr = Array::from_slice(&original, &[h, t, dim]);
+        let gpu = arr.hadamard_transform(None).unwrap();
+        gpu.eval().unwrap();
+        let gpu_data = gpu.as_slice::<f32>();
+
+        let mut max_err = 0.0_f32;
+        for (i, (c, g)) in cpu.iter().zip(gpu_data.iter()).enumerate() {
+            let err = (c - g).abs();
+            max_err = max_err.max(err);
+            assert!(
+                err < 1e-3,
+                "Batch CPU/GPU mismatch at idx={i}: cpu={c}, gpu={g}"
             );
         }
     }
