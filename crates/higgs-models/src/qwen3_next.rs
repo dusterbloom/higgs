@@ -2662,7 +2662,7 @@ impl FfnBlock {
                 .last()
                 .ok_or_else(|| Exception::custom("gates must have last dim"))?;
             let top_k_start = num_experts - self.top_k;
-            let inds = all_inds.index((.., .., top_k_start..));
+            let inds = ops::sort_axis(all_inds.index((.., .., top_k_start..)), -1)?;
             let scores = gates.take_along_axis(&inds, -1)?;
             let scores = if self.norm_topk_prob {
                 let sum = scores.sum_axes(&[-1], true)?;
@@ -3176,6 +3176,14 @@ impl Qwen3NextCausalLM {
                 let mlp_out = layer.mlp.forward(&normed_post)?;
                 h = h2.add(mlp_out)?;
             }
+
+            // Eval every 8 layers during prefill to bound lazy graph size.
+            // Without this, 40 layers × ~15 ops × T tokens accumulates a huge
+            // graph that MLX must analyze at once, increasing scheduler overhead
+            // and peak memory. Decode (T=1) is unaffected.
+            if T > 1 && (layer_idx + 1) % 8 == 0 {
+                mlx_rs::transforms::eval([&h])?;
+            }
         }
 
         if profiling && prof_gdn_samples > 0 && prof_fa_samples > 0 {
@@ -3253,9 +3261,10 @@ impl Qwen3NextCausalLM {
         // Reshape to [B, 1, D] so the LM head produces [B, 1, vocab]
         let shape = last_h.shape();
         let last_h = if shape.len() == 2 {
-            last_h.reshape(&[1, 1, *shape.last().unwrap()])?
+            // [B, D] → [B, 1, D]
+            last_h.reshape(&[shape[0], 1, shape[1]])?
         } else {
-            last_h.reshape(&[*shape.first().unwrap(), 1, *shape.last().unwrap()])?
+            last_h.reshape(&[shape[0], 1, *shape.last().unwrap()])?
         };
         match self.lm_head.as_ref() {
             Some(head) => head.forward(&last_h),
@@ -3321,15 +3330,10 @@ impl Qwen3NextCausalLM {
             offset += chunk_size;
         }
 
-        // Last chunk: run through forward_hidden, project only last position.
+        // Last chunk: use forward_last_token which efficiently projects only
+        // the last position through the LM head.
         let last_chunk = inputs.index((.., offset..));
-        let h = self.forward_hidden(&last_chunk, None, kv_cache)?;
-        let h_last = h.index((.., -1.., ..)); // [B, 1, hidden]
-
-        match self.lm_head.as_ref() {
-            Some(head) => head.forward(&h_last),
-            None => self.model.embed_tokens.as_linear(&h_last),
-        }
+        self.forward_last_token(&last_chunk, None, kv_cache)
     }
 
     // -----------------------------------------------------------------------
@@ -3608,6 +3612,7 @@ pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausa
         head_k_dim: args.linear_key_head_dim,
         head_v_dim: args.linear_value_head_dim,
     };
+    gdn_dims.validate()?;
     let use_separate_gdn = std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
     let mut model = Qwen3NextCausalLM::new(args)?;
 
@@ -3650,6 +3655,7 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
         head_k_dim: args.linear_key_head_dim,
         head_v_dim: args.linear_value_head_dim,
     };
+    gdn_dims.validate()?;
     let mut model = Qwen3NextCausalLM::new(args.clone())?;
 
     // Load weights with GDN projection rearrangement: flat (qkv,z,b,a)
@@ -3675,6 +3681,19 @@ struct GdnDims {
     num_v_heads: i32,
     head_k_dim: i32,
     head_v_dim: i32,
+}
+
+impl GdnDims {
+    /// Validate GQA ratio: num_v_heads must be divisible by num_k_heads.
+    fn validate(&self) -> Result<(), Exception> {
+        if self.num_k_heads == 0 || self.num_v_heads % self.num_k_heads != 0 {
+            return Err(Exception::custom(format!(
+                "GQA ratio invalid: num_v_heads={} not divisible by num_k_heads={}",
+                self.num_v_heads, self.num_k_heads
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Build row permutation to convert flat [q_all|k_all|v_all|z_all] layout
@@ -3790,8 +3809,23 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
             tracing::debug!("... and {} more unmatched keys", unmatched.len() - 10);
         }
     }
-    let param_count = params.keys().count();
-    tracing::info!(param_count, "Total model parameters loaded");
+    let param_count = params.len();
+    // Detect params still at their [1] placeholder (never loaded from checkpoint).
+    let placeholders: Vec<_> = params
+        .iter()
+        .filter(|(_, v)| v.shape() == &[1])
+        .map(|(k, _)| k.to_string())
+        .collect();
+    if !placeholders.is_empty() {
+        tracing::warn!(
+            count = placeholders.len(),
+            "Model params still at [1] placeholder (no matching weight loaded)"
+        );
+        for k in placeholders.iter().take(10) {
+            tracing::warn!(key = %k, "Placeholder param");
+        }
+    }
+    tracing::info!(param_count, matched, "Total model parameters loaded");
 
     model
         .eval()

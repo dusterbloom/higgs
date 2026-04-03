@@ -1114,8 +1114,10 @@ impl SimpleEngine {
         } else {
             None
         };
-        let mut thinking_tokens: u32 = 0;
-        let mut seen_think_close = false;
+        // Seed thinking state from the first token (already emitted above).
+        let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
+        let mut seen_think_close = think_close_token
+            .is_some_and(|close_id| first_token_id == close_id);
 
         loop {
             let t0 = std::time::Instant::now();
@@ -1158,6 +1160,11 @@ impl SimpleEngine {
             let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
 
             // Thinking budget: force </think> after N tokens if model hasn't closed it.
+            // NOTE: when the budget fires, token_id is overwritten but the KV cache
+            // already reflects the originally-sampled token.  The next forward pass
+            // feeds close_id as input while the cache holds a different token at this
+            // position — a one-entry discontinuity.  Re-running forward to fix the
+            // cache is expensive for negligible quality impact after 256+ tokens.
             if let Some(close_id) = think_close_token {
                 if !seen_think_close {
                     if token_id == close_id {
@@ -1358,8 +1365,10 @@ impl SimpleEngine {
         } else {
             None
         };
-        let mut thinking_tokens: u32 = 0;
-        let mut seen_think_close = false;
+        // Seed thinking state from the first token (already emitted by caller).
+        let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
+        let mut seen_think_close = think_close_token
+            .is_some_and(|close_id| first_token_id == close_id);
 
         loop {
             let result = crate::mtp::mtp_cycle(
@@ -1508,8 +1517,9 @@ impl SimpleEngine {
         } else {
             None
         };
-        let mut thinking_tokens: u32 = 0;
-        let mut seen_think_close = false;
+        let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
+        let mut seen_think_close = think_close_token
+            .is_some_and(|close_id| first_token_id == close_id);
 
         loop {
             let result = crate::mtp::mtp_cycle(
@@ -1778,8 +1788,10 @@ impl SimpleEngine {
         } else {
             None
         };
-        let mut thinking_tokens: u32 = 0;
-        let mut seen_think_close = false;
+        // Seed thinking state from the first token (already emitted above).
+        let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
+        let mut seen_think_close = think_close_token
+            .is_some_and(|close_id| first_token_id == close_id);
 
         // Pipelined decode loop: build step N+2 while GPU computes step N+1
         let (mut next_token, mut next_logprob_data) = Self::decode_step(
@@ -1827,6 +1839,7 @@ impl SimpleEngine {
             let mut token_id: u32 = next_token.item();
 
             // Thinking budget: force </think> after N tokens if model hasn't closed it.
+            // NOTE: same KV-cache discontinuity caveat as the non-streaming path.
             if let Some(close_id) = think_close_token {
                 if !seen_think_close {
                     if token_id == close_id {
@@ -1996,12 +2009,16 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
         }
     };
 
-    // Check top-level first, then text_config (VLM/Qwen3.5 nested config)
-    let eos_value = config.get("eos_token_id").or_else(|| {
-        config
-            .get("text_config")
-            .and_then(|tc| tc.get("eos_token_id"))
-    });
+    // Check top-level first, then text_config (VLM/Qwen3.5 nested config).
+    // Filter null so explicit `"eos_token_id": null` falls through to text_config.
+    let eos_value = config
+        .get("eos_token_id")
+        .filter(|v| !v.is_null())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("eos_token_id"))
+        });
 
     match eos_value {
         Some(serde_json::Value::Number(n)) => n
