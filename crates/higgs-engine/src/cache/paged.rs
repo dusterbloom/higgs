@@ -159,7 +159,7 @@ impl PagedKvCache {
     }
 
     /// Get view of a session's KV cache.
-    pub fn get_session_view(&self, session_id: u64) -> Option<KvCacheView> {
+    pub fn get_session_view(&self, session_id: u64) -> Option<KvCacheView<'_>> {
         let blocks = self.page_table.get_blocks(session_id)?;
         let num_tokens = self.session_tokens.get(&session_id).copied()?;
 
