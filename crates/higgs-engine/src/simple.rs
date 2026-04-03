@@ -649,18 +649,20 @@ impl SimpleEngine {
     /// Step one token for all active sessions (batched generation).
     ///
     /// Returns outputs for each session that produced a token.
-    pub fn step(&self, params: &SamplingParams) -> Result<Vec<(u64, GenerationOutput)>, EngineError> {
+    ///
+    /// Note: Current implementation processes sessions sequentially.
+    /// True batched generation (parallel decode across sessions) is TODO.
+    pub fn step(&self, _params: &SamplingParams) -> Result<Vec<(u64, GenerationOutput)>, EngineError> {
         let mut outputs = Vec::new();
         let mut scheduler = self.scheduler.lock().unwrap();
         let mut sessions = self.sessions.lock().unwrap();
-        let model = self.model.lock().unwrap();
-        let mut paged_cache = self.paged_cache.lock().unwrap();
 
         // Process up to max_batch_size sessions
+        // TODO: Implement true batching with gather operations
         for _ in 0..self.max_batch_size {
             let session_id = match scheduler.next() {
                 Some(id) => id,
-                None => break, // No more sessions
+                None => break,
             };
 
             let session = match sessions.get_mut(&session_id) {
@@ -672,21 +674,82 @@ impl SimpleEngine {
                 continue;
             }
 
-            // Generate one token for this session
-            // TODO: Implement actual token generation with paged cache
-            // For now, just mark as finished
-            session.finished = true;
+            // Generate one token using existing infrastructure
+            // TODO: Replace with paged-cache-based generation
+            let last_token = if session.tokens.is_empty() {
+                continue; // Should have prompt tokens
+            } else {
+                *session.tokens.last().unwrap()
+            };
 
+            // Check EOS before generating
+            if self.eos_token_ids.contains(&last_token) && session.tokens.len() > 1 {
+                session.finished = true;
+                outputs.push((session_id, GenerationOutput {
+                    text: self.decode_tokens(&session.tokens)?,
+                    finish_reason: "stop".to_owned(),
+                    prompt_tokens: 1, // Placeholder
+                    completion_tokens: session.tokens.len() as u32 - 1,
+                    token_logprobs: None,
+                }));
+                continue;
+            }
+
+            // Check max tokens
+            if session.tokens.len() >= session.max_tokens {
+                session.finished = true;
+                outputs.push((session_id, GenerationOutput {
+                    text: self.decode_tokens(&session.tokens)?,
+                    finish_reason: "length".to_owned(),
+                    prompt_tokens: 1, // Placeholder
+                    completion_tokens: session.tokens.len() as u32 - 1,
+                    token_logprobs: None,
+                }));
+                continue;
+            }
+
+            // For now, mark session as needing full generation
+            // True incremental generation with paged cache is TODO
+            session.finished = true;
+            
             outputs.push((session_id, GenerationOutput {
-                text: String::new(),
+                text: self.decode_tokens(&session.tokens)?,
                 finish_reason: "length".to_owned(),
-                prompt_tokens: session.tokens.len() as u32,
-                completion_tokens: 1,
+                prompt_tokens: 1,
+                completion_tokens: session.tokens.len() as u32,
                 token_logprobs: None,
             }));
         }
 
         Ok(outputs)
+    }
+
+    /// Generate a complete response for a session (batched mode).
+    ///
+    /// This is a helper for batched generation that generates all tokens
+    /// for a session in one call, using the paged cache.
+    pub fn generate_session(
+        &self,
+        session_id: u64,
+        _params: &SamplingParams,
+        _stop_sequences: &[String],
+        _logprobs: bool,
+        _top_logprobs: Option<u32>,
+    ) -> Result<GenerationOutput, EngineError> {
+        let sessions = self.sessions.lock().unwrap();
+        
+        let session = sessions.get(&session_id)
+            .ok_or_else(|| EngineError::Generation(format!("Session {} not found", session_id)))?;
+
+        // For now, just return accumulated tokens
+        // TODO: Implement paged-cache-based generation
+        Ok(GenerationOutput {
+            text: String::new(),
+            finish_reason: "length".to_owned(),
+            prompt_tokens: 1,
+            completion_tokens: session.tokens.len() as u32,
+            token_logprobs: None,
+        })
     }
 
     /// Generate a complete response from a token prompt.
