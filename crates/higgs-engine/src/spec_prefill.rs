@@ -17,7 +17,7 @@ impl Default for SpecPrefillConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            threshold: 8192,
+            threshold: 1000,
             max_tokens: 65536,
             keep_rate: None,
             chunk_size: 32,

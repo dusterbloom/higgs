@@ -13,6 +13,7 @@ use tokenizers::Tokenizer;
 use crate::{
     chat_template::{ChatMessage, ChatTemplateRenderer},
     engine::{GenerationOutput, StreamingOutput},
+    spec_prefill::{SpecPrefillConfig, SpecPrefillEngine},
     error::EngineError,
     model_loader,
     prompt_cache::PrefixCache,
@@ -86,6 +87,8 @@ pub struct SimpleEngine {
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
     /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
     think_close_token: Option<u32>,
+    /// SpecPrefill configuration for sparse prefill optimization.
+    spec_prefill: SpecPrefillEngine,
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
@@ -149,6 +152,11 @@ impl SimpleEngine {
             "Engine ready"
         );
 
+        // SpecPrefill configuration
+        let spec_prefill_config = SpecPrefillConfig::default();
+        let spec_prefill = SpecPrefillEngine::new(spec_prefill_config)
+            .map_err(|e: higgs_models::error::ModelError| EngineError::Generation(e.to_string()))?;
+
         Ok(Self {
             model: Mutex::new(model),
             prefix_cache: Mutex::new(PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE)),
@@ -158,6 +166,7 @@ impl SimpleEngine {
             eos_token_ids,
             enable_thinking,
             think_close_token,
+            spec_prefill,
         })
     }
 
@@ -312,6 +321,56 @@ impl SimpleEngine {
                 .model
                 .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
+        } else if false && self.spec_prefill.should_use_spec_prefill(prompt_tokens.len()) {
+            // Sparse prefill with custom RoPE positions
+            use higgs_models::AnyCache;
+            
+            let prompt_len = prompt_tokens.len();
+            let keep_rate = self.spec_prefill.get_keep_rate(prompt_len);
+            let n_selected = (prompt_len as f32 * keep_rate) as usize;
+            
+            // Select evenly spaced tokens
+            let step = if n_selected > 0 { prompt_len / n_selected } else { 1 };
+            let selected_indices: Vec<usize> = (0..n_selected).map(|i| i * step).collect();
+            
+            tracing::info!(
+                prompt_len,
+                selected_len = selected_indices.len(),
+                keep_rate,
+                "SpecPrefill: selected {}/{} tokens ({:.1}%)",
+                selected_indices.len(),
+                prompt_len,
+                (selected_indices.len() as f32 / prompt_len as f32) * 100.0
+            );
+            
+            // Create input array for selected tokens
+            let selected_tokens_vec: Vec<u32> = selected_indices.iter().map(|&i| prompt_tokens[i]).collect();
+            let selected_tokens = Array::from_slice(&selected_tokens_vec, &[1, selected_indices.len() as i32]);
+            
+            // Create position array
+            let positions: Vec<i32> = selected_indices.iter().map(|&i| i as i32).collect();
+            let positions_array = Array::from_slice(&positions, &[selected_indices.len() as i32]);
+            
+            // Get cache
+            let cache = match &mut prepared.cache {
+                AnyCache::Hybrid(vec) => vec,
+                AnyCache::KV(_) => {
+                    return Err(EngineError::Generation("Expected Hybrid cache for Qwen3Next".to_string()));
+                }
+            };
+            
+            // Run sparse forward pass
+            if let higgs_models::AnyModel::Qwen3Next(qwen_model) = &mut *prepared.model {
+                let hidden = qwen_model.forward_hidden_sparse(&selected_tokens, &positions_array, cache)
+                    .map_err(EngineError::Mlx)?;
+                
+                // Compute logits from last selected token
+                let logits = qwen_model.compute_logits(&hidden)
+                    .map_err(EngineError::Mlx)?;
+                logits
+            } else {
+                return Err(EngineError::Generation("Expected Qwen3Next model".to_string()));
+            }
         } else {
             // Text-only prefill: only need last token's logits for sampling.
             // The LM head matmul on [B, L, vocab] is the bottleneck for large vocab,
