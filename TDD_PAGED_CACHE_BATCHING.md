@@ -485,43 +485,110 @@ fn test_batched_generate() {
 
 ---
 
-## Phase 3: Integration & Benchmarking (Week 4)
+## Phase 3: Integration & Benchmarking (Week 4) - IN PROGRESS
 
-### 3.1 SimpleEngine Integration
+### 3.1 SimpleEngine Integration - ✅ COMPLETE
 
 **Changes to `higgs-engine/src/simple.rs`:**
 
-1. Add `PagedKvCache` field
-2. Replace `PrefixCache` with session-based caching
-3. Add `BatchScheduler` field
-4. Modify `generate()` to support batching
+1. Added `PagedKvCache` field
+2. Added `RoundRobinScheduler` field
+3. Added session management:
+   - `Session` struct
+   - `create_session()` - Create new session
+   - `remove_session()` - Free session resources
+   - `get_session()` - Query session state
+   - `is_session_finished()` - Check completion
+4. Added `step()` method for batched generation
+5. Added `generate_session()` helper
 
-### 3.2 Benchmarking
+**Current Status:**
+- ✅ Session management API complete
+- ✅ Scheduler integration complete
+- ⏳ True batched generation (parallel decode) - TODO
+
+### 3.2 Batched Generation Implementation - TODO
+
+**What's Missing:**
+
+The current `step()` implementation processes sessions sequentially. To achieve true batching:
+
+1. **Gather tokens from multiple sessions**
+   ```rust
+   // Collect last tokens from N sessions
+   let session_tokens: Vec<u32> = sessions.iter()
+       .map(|s| s.tokens.last().copied().unwrap())
+       .collect();
+   ```
+
+2. **Batched forward pass**
+   ```rust
+   // Single forward pass for all sessions
+   let batched_hidden = model.forward_hidden(&session_tokens, ..., &mut paged_cache)?;
+   ```
+
+3. **Scatter results back to sessions**
+   ```rust
+   // Distribute generated tokens back to sessions
+   for (session, token) in sessions.iter_mut().zip(generated_tokens) {
+       session.tokens.push(token);
+   }
+   ```
+
+**Challenges:**
+- Sessions have different sequence lengths
+- Need to handle variable-length sequences in batch
+- Paged cache needs scatter/gather operations
+- SpecPrefill integration for long prompts
+
+### 3.3 Benchmarking
 
 **Benchmarks to run:**
 
 ```bash
-# Baseline (current)
+# Baseline (current single-request)
 ./bench_prefill.py --model Qwen3.5-35B-A3B-3bit --ctx 2000
 # Expected: ~150 tok/s
 
-# With paged cache
-./bench_prefill.py --model Qwen3.5-35B-A3B-3bit --ctx 2000 --paged-cache
-# Expected: ~250-300 tok/s (reduced memory pressure)
+# With paged cache (single session)
+# TODO: Add benchmark
 
-# With batching (4 concurrent)
-./bench_prefill.py --model Qwen3.5-35B-A3B-3bit --ctx 2000 --batch-size 4
+# With batching (4 concurrent sessions)
+# TODO: Add benchmark
 # Expected: ~400+ tok/s (amortized overhead)
 ```
 
-### 3.3 Success Criteria
+### 3.4 Success Criteria
 
 | Metric | Current | Target | Status |
 |--------|---------|--------|--------|
 | Prefill 2k | 153 tok/s | 400+ tok/s | ⏳ Pending |
 | Decode | 55 tok/s | 50+ tok/s | ✅ Met |
-| Memory usage | High | Reduced (paged) | ⏳ Pending |
-| Concurrent sessions | 1 | 4+ | ⏳ Pending |
+| Memory usage | High | Reduced (paged) | ✅ Ready |
+| Concurrent sessions | 1 | 4+ | ✅ Infrastructure ready |
+| True batching | ❌ No | ✅ Yes | ⏳ TODO |
+
+---
+
+## Current Status Summary
+
+**Completed (Week 1-3):**
+- ✅ BlockAllocator (6 tests)
+- ✅ PageTable (4 tests)
+- ✅ CpuKvStorage (5 tests)
+- ✅ PagedKvCache (4 tests)
+- ✅ RoundRobinScheduler (6 tests)
+- ✅ SimpleEngine integration
+- ✅ Session management API
+
+**Remaining (Week 4+):**
+- ⏳ True batched token generation (gather/forward/scatter)
+- ⏳ SpecPrefill integration with paged cache
+- ⏳ Benchmarks to verify 400+ tok/s
+
+**Total Tests:** 25 unit tests passing
+
+---
 
 ---
 
@@ -608,3 +675,77 @@ cellm = "https://github.com/jeffasante/cellm"
 4. **Weekly check-ins** on progress
 
 **Ready to begin?**
+
+---
+
+## Implementation Summary
+
+### What We Built
+
+**1. Paged KV Cache (400+ lines, 19 tests)**
+- BlockAllocator: Fixed-size block management with O(1) alloc/free
+- PageTable: Session → blocks mapping with HashMap
+- CpuKvStorage: f16 KV buffers with gather support for sparse attention
+- PagedKvCache: Full integration with automatic block allocation
+
+**2. Continuous Batching (150 lines, 6 tests)**
+- RoundRobinScheduler: Session queue with rotation
+- Session struct: Per-session state tracking
+- SimpleEngine integration: create_session(), step(), etc.
+
+**3. Infrastructure Ready**
+- 4096 blocks × 64 tokens = 262k token capacity
+- Configurable batch size (default: 4)
+- Session lifecycle management
+
+### What's Missing
+
+**True Batched Generation:**
+The current `step()` processes sessions sequentially. To achieve 400+ tok/s:
+
+1. **Gather**: Collect tokens from N sessions into batch
+2. **Batched Forward**: Single model forward pass for all sessions
+3. **Scatter**: Distribute results back to sessions
+
+This requires:
+- Modifying decode_step() to handle batched input
+- Paged cache scatter/gather operations
+- Handling variable-length sequences in batch
+
+**Estimated Effort:** 2-3 weeks for full implementation
+
+### Path to 400+ tok/s
+
+**Option A: Complete Batched Generation** (Recommended)
+- Implement gather/forward/scatter
+- Add SpecPrefill integration
+- Benchmark and optimize
+- Timeline: 2-3 weeks
+
+**Option B: Use Existing Infrastructure As-Is**
+- Session management works
+- Paged cache reduces memory pressure
+- Sequential generation still provides value
+- Add batching as future optimization
+
+**Option C: Hybrid Approach**
+- Use existing generate() for single sessions
+- Add batching only for high-throughput scenarios
+- Gradual rollout based on usage patterns
+
+---
+
+## Next Actions
+
+1. **Decide on batching strategy** (Option A/B/C)
+2. **If Option A**: Implement gather/forward/scatter
+3. **If Option B**: Document current capabilities, plan batching for future
+4. **Benchmark**: Measure current performance with paged cache
+5. **Documentation**: Add API docs for session management
+
+---
+
+**Status:** Phase 1-2 complete, Phase 3 in progress
+**Tests:** 25 passing
+**Lines of Code:** ~1200 new (cache + scheduler + integration)
+**Next:** Decide on batching implementation strategy
