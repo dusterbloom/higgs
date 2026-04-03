@@ -106,6 +106,45 @@ pub enum AnyCache {
     Hybrid(Vec<Option<LayerCache>>),
 }
 
+impl AnyCache {
+    /// Force-evaluate all lazy arrays so a subsequent `clone()` captures
+    /// materialized values rather than the compute graph.  Required before
+    /// snapshotting for speculative-decode rollback.
+    pub fn eval_for_clone(&self) -> Result<(), mlx_rs::error::Exception> {
+        match self {
+            Self::KV(layers) => {
+                let mut targets: Vec<&mlx_rs::Array> = Vec::new();
+                for layer in layers.iter().flatten() {
+                    targets.extend(layer.eval_targets());
+                }
+                if !targets.is_empty() {
+                    mlx_rs::transforms::eval(targets)?;
+                }
+            }
+            Self::Hybrid(layers) => {
+                let mut targets: Vec<&mlx_rs::Array> = Vec::new();
+                for layer in layers.iter().flatten() {
+                    match layer {
+                        LayerCache::KV(kv) => targets.extend(kv.eval_targets()),
+                        LayerCache::Arrays(arr) => {
+                            if let Some(ref cs) = arr.conv_state {
+                                targets.push(cs);
+                            }
+                            if let Some(ref ss) = arr.ssm_state {
+                                targets.push(ss);
+                            }
+                        }
+                    }
+                }
+                if !targets.is_empty() {
+                    mlx_rs::transforms::eval(targets)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Unified model wrapper dispatching to the correct architecture.
 pub enum AnyModel {
     /// Standard transformer architectures: Llama, Mistral, Qwen2/2.5, Qwen3.
@@ -459,6 +498,27 @@ impl AnyModel {
             }
             _ => Err(Exception::custom(
                 "Model does not support multimodal forward",
+            )),
+        }
+    }
+
+    /// Forward pass returning logits for ALL positions, not just the last.
+    ///
+    /// Calls `forward_hidden` then applies the LM head to every position,
+    /// returning shape `[B, T, vocab]`. Used by speculative decoding to
+    /// verify a draft sequence in a single forward pass.
+    pub fn forward_all_logits(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<Array, Exception> {
+        let hidden = self.forward_hidden(inputs, mask, cache)?;
+        match self {
+            Self::Transformer(m) => m.apply_lm_head_all(&hidden),
+            Self::Qwen3Next(m) => m.apply_lm_head_all(&hidden),
+            _ => Err(Exception::custom(
+                "forward_all_logits not yet supported for this model type",
             )),
         }
     }

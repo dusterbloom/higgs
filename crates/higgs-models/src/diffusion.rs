@@ -2544,6 +2544,27 @@ impl AneBonsaiEngine {
             BONSAI_CPU_ATTENTION_LAYERS
         };
 
+        let rt_enabled = crate::ane_bridge::AneKernel::begin_realtime();
+
+        let ane_eval = |kernel: &crate::ane_bridge::AneKernel| {
+            if rt_enabled {
+                kernel
+                    .eval_realtime()
+                    .unwrap_or_else(|_| kernel.eval().unwrap());
+            } else {
+                kernel.eval().unwrap();
+            }
+        };
+        let ane_eval_chain = |kernels: &[&crate::ane_bridge::AneKernel]| {
+            if rt_enabled {
+                crate::ane_bridge::AneKernel::eval_chain_realtime(kernels).unwrap_or_else(|_| {
+                    crate::ane_bridge::AneKernel::eval_chain(kernels).unwrap();
+                });
+            } else {
+                crate::ane_bridge::AneKernel::eval_chain(kernels).unwrap();
+            }
+        };
+
         let t_fwd = std::time::Instant::now();
         for (layer_idx, kernel) in self.attn_kernels.iter().enumerate() {
             let layer = &self.blas_engine.layers[layer_idx];
@@ -2554,7 +2575,7 @@ impl AneBonsaiEngine {
                 attn_ctx_buf.copy_from_slice(&cpu_ctx);
             } else {
                 write_input_cf32(kernel, &hidden, h);
-                kernel.eval().unwrap();
+                ane_eval(kernel);
                 scatter_output_cf32(kernel, q_dim, 0, &mut attn_ctx_buf, q_dim);
             }
             sgemm_nt(seq, h, q_dim, &attn_ctx_buf, &layer.o_proj, &mut attn_proj);
@@ -2596,7 +2617,7 @@ impl AneBonsaiEngine {
                 let gated_kernel = &self.ffn_gated_kernels[kernel_idx];
                 let down_kernel = &self.ffn_down_kernels[kernel_idx];
                 write_input_cf32(gated_kernel, &normed, h);
-                crate::ane_bridge::AneKernel::eval_chain(&[gated_kernel, down_kernel]).unwrap();
+                ane_eval_chain(&[gated_kernel, down_kernel]);
                 accumulate_output_cf32(down_kernel, h, &mut ffn_out, h);
             }
 
@@ -2620,12 +2641,17 @@ impl AneBonsaiEngine {
             }
         }
 
+        if rt_enabled {
+            crate::ane_bridge::AneKernel::end_realtime();
+        }
+
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
         if verbose_trace {
             eprintln!(
-                "  hybrid fwd: {} ANE attn + {} ANE FFN chains in {fwd_ms:.1}ms (seq={seq})",
+                "  hybrid fwd: {} ANE attn + {} ANE FFN chains in {fwd_ms:.1}ms (seq={seq}, rt={})",
                 self.attn_kernels.len(),
                 self.ffn_gated_kernels.len(),
+                rt_enabled,
             );
         }
 
@@ -3568,7 +3594,6 @@ mod tests {
     /// and compares logits against pure-BLAS reference.
     #[test]
     #[cfg(feature = "ane")]
-    #[ignore = "Recovered exploratory test; archived run produced non-finite ANE logits"]
     fn test_bonsai_1_7b_ane_hybrid() {
         let Some(bonsai_dir) = bonsai_1_7b_dir() else {
             eprintln!("Bonsai-1.7B not found, skipping");
@@ -3717,6 +3742,85 @@ mod tests {
         );
 
         eprintln!("PASS: Bonsai-1.7B ANE hybrid engine matches BLAS reference");
+    }
+
+    /// Sweep seq lengths to find ANE sweet spot for Bonsai 1.7B.
+    /// Measures forward latency at seq=1..128 (padded to ANE min 16) and
+    /// computes effective tok/s for both autoregressive and diffusion-style.
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "Manual benchmark — sweep ANE seq lengths for Bonsai 1.7B"]
+    fn bench_bonsai_ane_seq_sweep() {
+        let Some(bonsai_dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+
+        eprintln!("=== Bonsai-1.7B ANE seq length sweep ===\n");
+        eprintln!(
+            "{:>6} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "seq", "padded", "compile_s", "blas_ms", "ane_ms", "speedup", "ane_fwd/s"
+        );
+        eprintln!("{}", "-".repeat(72));
+
+        for seq in [1, 4, 8, 16, 32, 64, 128] {
+            let padded = seq.max(16); // ANE_MIN_SPATIAL
+
+            // Build input
+            let input: Vec<u32> = (0..seq)
+                .map(|i| if i < 5 { 785u32 + i as u32 } else { 1000u32 + i as u32 })
+                .collect();
+
+            // Compile ANE engine
+            let compile_t0 = std::time::Instant::now();
+            let ane_engine = super::AneBonsaiEngine::new(
+                DiffusionEngine::load_q1(&bonsai_dir).unwrap(),
+                seq,
+                1e-6,
+            )
+            .unwrap();
+            let compile_s = compile_t0.elapsed().as_secs_f64();
+
+            // BLAS engine
+            let blas_engine = DiffusionEngine::load_q1(&bonsai_dir).unwrap();
+
+            // Warmup
+            let _ = blas_engine.forward(&input);
+            let _ = ane_engine.forward(&input);
+
+            // Benchmark (more iters for small seq)
+            let n = if seq <= 16 { 10 } else { 5 };
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = blas_engine.forward(&input);
+            }
+            let blas_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = ane_engine.forward(&input);
+            }
+            let ane_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+            let speedup = blas_ms / ane_ms;
+            let ane_fwd_per_s = 1000.0 / ane_ms;
+
+            eprintln!(
+                "{seq:>6} {padded:>6} {compile_s:>10.1} {blas_ms:>10.1} {ane_ms:>10.1} {speedup:>10.2}x {ane_fwd_per_s:>10.1}"
+            );
+
+            // Drop before next iteration to free ANE resources
+            drop(ane_engine);
+            drop(blas_engine);
+        }
+
+        eprintln!("\n=== Effective generation speed ===\n");
+        eprintln!("Autoregressive (1 token per forward):");
+        eprintln!("  tok/s = ane_fwd/s (from seq=1 or seq=16 row above)");
+        eprintln!("\nDiffusion (all tokens in parallel, K denoising steps):");
+        eprintln!("  tok/s = (seq - prompt_len) / (K × ane_fwd_ms / 1000)");
+        eprintln!("  e.g. seq=128, prompt=5, K=64 → 123 / (64 × ane_ms/1000)");
     }
 
     #[test]
@@ -4904,6 +5008,550 @@ mod tests {
             eprintln!("  CPU BLAS FFN stack: {blas_ms:.0}ms");
             eprintln!("  ANE tiled FFN stack: {ane_ms:.0}ms");
             eprintln!("  speedup: {speedup:.2}x");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // dLLM draft → AR verify acceptance rate test
+    // -----------------------------------------------------------------------
+
+    fn qwen3_5_27b_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-27B-4bit");
+        dir.join("config.json").exists().then_some(dir)
+    }
+
+    fn qwen3_8b_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".cache/lm-studio/models/mlx-community/Qwen3-8B-4bit");
+        dir.join("config.json").exists().then_some(dir)
+    }
+
+    fn qwen3_14b_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".cache/lm-studio/models/mlx-community/Qwen3-14B-4bit");
+        dir.join("config.json").exists().then_some(dir)
+    }
+
+    fn bonsai_8b_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".cache/lm-studio/models/prism-ml/Bonsai-8B-mlx-1bit");
+        dir.join("config.json").exists().then_some(dir)
+    }
+
+    fn qwen3_5_0_8b_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit");
+        dir.join("config.json").exists().then_some(dir)
+    }
+
+    /// Measure what fraction of diffusion-drafted tokens a target AR model accepts.
+    ///
+    /// Uses fresh KV cache per round (single forward pass over context+drafts) to
+    /// avoid cache rollback complexity. Each round:
+    ///   1. Draft: MDLM diffusion on context[-120..] + K masks, 8 denoising steps
+    ///   2. Verify: target model forward_all_logits on full_seq = context + drafts
+    ///   3. Compare argmax(logits[P-1+i]) with draft[i] for longest accepted prefix
+    #[test]
+    #[ignore] // Heavy — loads 27B AR model + diffusion model
+    fn test_diffusion_draft_acceptance_rate() {
+        const K: usize = 8; // draft tokens per round
+        const STEPS: usize = 1; // DEER/DFlash consensus: 1 step optimal
+        const CONTEXT_WINDOW: usize = 120; // sliding window for diffusion input
+        const N_ROUNDS: usize = 10;
+
+        // --- Load diffusion draft model ---
+        let Some(diff_dir) = model_dir() else {
+            eprintln!("SKIP: Diffusion model not found");
+            return;
+        };
+        let diff_engine = DiffusionEngine::load_autodetect(&diff_dir).unwrap();
+        let diff_runtime = DiffusionRuntime::new(
+            diff_engine,
+            CONTEXT_WINDOW + K, // canvas size
+            DiffusionBackendPreference::Auto,
+        )
+        .unwrap();
+        eprintln!(
+            "Draft model loaded: {:?} ({})",
+            diff_runtime.selected_backend(),
+            diff_runtime.backend_report().detail
+        );
+
+        // Tokenize prompt using the diffusion model's tokenizer (shared Qwen3 vocab)
+        let tokenizer = crate::load_tokenizer(&diff_dir).unwrap();
+        let prompt = "Explain quantum computing in simple terms";
+        let prompt_ids: Vec<u32> = tokenizer
+            .encode(prompt, false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        eprintln!("Prompt: {prompt:?} ({} tokens)", prompt_ids.len());
+
+        // --- Target model specs ---
+        struct Target {
+            name: &'static str,
+            dir: Option<std::path::PathBuf>,
+        }
+        let targets = [
+            Target {
+                name: "Qwen3-8B-4bit",
+                dir: qwen3_8b_dir(),
+            },
+            Target {
+                name: "Qwen3-14B-4bit",
+                dir: qwen3_14b_dir(),
+            },
+            Target {
+                name: "Qwen3.5-27B-4bit",
+                dir: qwen3_5_27b_dir(),
+            },
+            Target {
+                name: "Bonsai-8B-mlx-1bit",
+                dir: bonsai_8b_dir(),
+            },
+        ];
+
+        for target in &targets {
+            let Some(ref dir) = target.dir else {
+                eprintln!("\n--- SKIP: {} (not found) ---", target.name);
+                continue;
+            };
+
+            eprintln!("\n=== {} ===", target.name);
+            let t_load = std::time::Instant::now();
+
+            // Detect model type and load
+            let model_type = crate::registry::detect_model_type(dir).unwrap();
+            let load_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match model_type.as_str() {
+                    "qwen3_5" => crate::qwen3_next::load_qwen3_5_model(dir)
+                        .map(crate::AnyModel::Qwen3Next)
+                        .map_err(|e| e.to_string()),
+                    "qwen2" | "qwen3" | "llama" | "mistral" => {
+                        crate::transformer::load_model(dir)
+                            .map(crate::AnyModel::Transformer)
+                            .map_err(|e| e.to_string())
+                    }
+                    other => Err(format!("Unsupported model_type={other}")),
+                }
+            }));
+            let mut model = match load_result {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) => {
+                    eprintln!("  Failed to load: {e}");
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("  Load panicked (likely unsupported quantization), skipping");
+                    continue;
+                }
+            };
+            eprintln!(
+                "  Loaded in {:.1}s (type={model_type})",
+                t_load.elapsed().as_secs_f64()
+            );
+
+            let mut context = prompt_ids.clone();
+            let mut total_accepted: usize = 0;
+            let mut total_drafted: usize = 0;
+            let mut draft_time_ms: u128 = 0;
+            let mut verify_time_ms: u128 = 0;
+
+            for round in 0..N_ROUNDS {
+                // --- Draft phase ---
+                let ctx_start = context.len().saturating_sub(CONTEXT_WINDOW);
+                let ctx_slice = &context[ctx_start..];
+
+                let t_draft = std::time::Instant::now();
+                let canvas = diff_runtime.generate(ctx_slice, K, STEPS);
+                draft_time_ms += t_draft.elapsed().as_millis();
+
+                // Extract draft tokens (last K of canvas)
+                let draft: Vec<u32> = canvas[canvas.len() - K..].to_vec();
+
+                // --- Verify phase (fresh cache, single forward pass) ---
+                // Build full_input = context + draft_tokens
+                let mut full_seq: Vec<i32> = context.iter().map(|&id| id as i32).collect();
+                for &d in &draft {
+                    full_seq.push(d as i32);
+                }
+                let t_total = full_seq.len() as i32;
+                let input_arr = mlx_rs::Array::from_slice(&full_seq, &[1, t_total]);
+
+                let mut cache = model.make_cache();
+
+                let t_verify = std::time::Instant::now();
+                let fwd = model.forward_all_logits(&input_arr, None, &mut cache);
+                let all_logits = match fwd.and_then(|l| {
+                    mlx_rs::transforms::eval([&l])?;
+                    Ok(l)
+                }) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("  forward_all_logits failed at round {}: {e}", round + 1);
+                        eprintln!("  (model may not support full-sequence logits)");
+                        break;
+                    }
+                };
+                verify_time_ms += t_verify.elapsed().as_millis();
+
+                // all_logits shape: [1, T, vocab]
+                // logits at position P-1+i predicts what should be at position P+i
+                // → compare argmax(logits[P-1+i]) with draft[i]
+                //
+                // Batch argmax over the K+1 positions we care about to minimize
+                // round-trips to the GPU.
+                use mlx_rs::ops::indexing::{self as ix, IndexOp};
+
+                let p = context.len(); // prompt+accepted token count
+                let start = (p - 1) as i32;
+                let end = start + K as i32 + 1; // +1 for bonus token
+                let verify_logits = all_logits.index((.., start..end, ..)); // [1, K+1, vocab]
+                let verify_2d = verify_logits.squeeze_axes(&[0]).unwrap(); // [K+1, vocab]
+                let preds = ix::argmax_axis(&verify_2d, -1, false).unwrap(); // [K+1]
+                mlx_rs::transforms::eval([&preds]).unwrap();
+
+                let mut accepted_this_round = 0usize;
+                for i in 0..K {
+                    let pred_id = preds.index(i as i32).item::<i32>() as u32;
+                    if pred_id == draft[i] {
+                        accepted_this_round += 1;
+                        context.push(draft[i]);
+                    } else {
+                        context.push(pred_id);
+                        break;
+                    }
+                }
+
+                // If all K accepted, grab the bonus token
+                if accepted_this_round == K {
+                    let bonus_id = preds.index(K as i32).item::<i32>() as u32;
+                    context.push(bonus_id);
+                }
+
+                total_accepted += accepted_this_round;
+                total_drafted += K;
+
+                eprintln!(
+                    "  Round {:2}: accepted {}/{K} (ctx={})",
+                    round + 1,
+                    accepted_this_round,
+                    context.len()
+                );
+            }
+
+            // --- Results ---
+            let acceptance_rate = total_accepted as f64 / total_drafted as f64 * 100.0;
+            let avg_per_round = total_accepted as f64 / N_ROUNDS as f64;
+            let total_new = context.len() - prompt_ids.len();
+            let total_ms = draft_time_ms + verify_time_ms;
+            let eff_tps = if total_ms > 0 {
+                total_new as f64 / total_ms as f64 * 1000.0
+            } else {
+                0.0
+            };
+
+            eprintln!("\n  --- {} Results ---", target.name);
+            eprintln!("  Acceptance rate:     {acceptance_rate:.1}%");
+            eprintln!("  Avg accepted/round:  {avg_per_round:.1}/{K}");
+            eprintln!("  Total new tokens:    {total_new}");
+            eprintln!(
+                "  Draft time:  {draft_time_ms}ms ({:.1}ms/round)",
+                draft_time_ms as f64 / N_ROUNDS as f64
+            );
+            eprintln!(
+                "  Verify time: {verify_time_ms}ms ({:.1}ms/round)",
+                verify_time_ms as f64 / N_ROUNDS as f64
+            );
+            eprintln!("  Effective throughput: {eff_tps:.1} tok/s");
+
+            if let Ok(decoded) = tokenizer.decode(&context[prompt_ids.len()..], true) {
+                eprintln!("  Generated text: {decoded:?}");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // AR spec decode: small Qwen3.5 draft → large Qwen3.5 verify
+    // -----------------------------------------------------------------------
+
+    /// Autoregressive speculative decoding with **cache reuse**.
+    ///
+    /// Drafts K tokens with Qwen3.5-0.8B, verifies with Qwen3.5-27B.
+    /// Both draft and verify caches persist across rounds — only new tokens
+    /// are processed each round.  Uses snapshot-restore to roll back rejected
+    /// draft tokens from both KV and SSM/conv state.
+    #[test]
+    #[ignore] // Heavy — loads 0.8B draft + 27B verify model
+    fn test_ar_spec_decode_acceptance() {
+        const K: usize = 8; // draft tokens per round
+        const N_ROUNDS: usize = 10;
+
+        // --- Load draft model (0.8B) ---
+        let Some(draft_dir) = qwen3_5_0_8b_dir() else {
+            eprintln!("SKIP: Qwen3.5-0.8B-8bit not found");
+            return;
+        };
+        eprintln!("Loading draft model...");
+        let t_load = std::time::Instant::now();
+        let draft_model = crate::qwen3_next::load_qwen3_5_model(&draft_dir).unwrap();
+        let mut draft = crate::AnyModel::Qwen3Next(draft_model);
+        eprintln!("  Draft loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+
+        // --- Load verify model (27B) ---
+        let Some(verify_dir) = qwen3_5_27b_dir() else {
+            eprintln!("SKIP: Qwen3.5-27B-4bit not found");
+            return;
+        };
+        eprintln!("Loading verify model...");
+        let t_load = std::time::Instant::now();
+        let verify_model = crate::qwen3_next::load_qwen3_5_model(&verify_dir).unwrap();
+        let mut verify = crate::AnyModel::Qwen3Next(verify_model);
+        eprintln!(
+            "  Verify loaded in {:.1}s",
+            t_load.elapsed().as_secs_f64()
+        );
+
+        // Shared tokenizer (same vocab)
+        let tokenizer = crate::load_tokenizer(&draft_dir).unwrap();
+
+        let prompts = [
+            "The capital of France is",
+            "Explain quantum computing in simple terms:",
+            "fn fibonacci(n: u64) -> u64 {",
+        ];
+
+        for prompt in &prompts {
+            eprintln!("\n=== Prompt: {prompt:?} ===");
+
+            let prompt_ids: Vec<u32> = tokenizer
+                .encode(*prompt, false)
+                .unwrap()
+                .get_ids()
+                .to_vec();
+            eprintln!("  Tokenized: {} tokens", prompt_ids.len());
+
+            let mut context = prompt_ids.clone();
+            let mut total_accepted: usize = 0;
+            let mut total_drafted: usize = 0;
+            let mut draft_time_ms: f64 = 0.0;
+            let mut verify_time_ms: f64 = 0.0;
+            let mut advance_time_ms: f64 = 0.0;
+
+            // Persistent caches — survive across rounds
+            let mut draft_cache = draft.make_cache();
+            let mut verify_cache = verify.make_cache();
+
+            // Prefill both models with prompt (once per prompt).
+            // SAVE the returned logits — they predict the first generated token
+            // and are needed for round 0 verification + drafting.
+            let ctx_input: Vec<i32> = prompt_ids.iter().map(|&id| id as i32).collect();
+            let ctx_len = ctx_input.len() as i32;
+            let ctx_arr = mlx_rs::Array::from_slice(&ctx_input, &[1, ctx_len]);
+
+            let t_prefill = std::time::Instant::now();
+            let mut saved_draft_logits = draft.forward(&ctx_arr, None, &mut draft_cache).unwrap();
+            mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+            let mut saved_verify_logits =
+                verify.forward(&ctx_arr, None, &mut verify_cache).unwrap();
+            mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+            draft_cache.eval_for_clone().unwrap();
+            verify_cache.eval_for_clone().unwrap();
+            let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("  Prefill: {prefill_ms:.0}ms (both models)");
+
+            for round in 0..N_ROUNDS {
+                // --- Draft phase: decode K tokens from persistent draft cache ---
+                let t_draft = std::time::Instant::now();
+
+                // Snapshot draft cache before drafting
+                let draft_snapshot = draft_cache.clone();
+
+                // Greedy decode K tokens using saved_draft_logits for the first
+                let mut draft_tokens: Vec<u32> = Vec::with_capacity(K);
+                {
+                    use mlx_rs::ops::indexing as ix;
+                    let pred = ix::argmax_axis(&saved_draft_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&pred]).unwrap();
+                    draft_tokens.push(pred.item::<i32>() as u32);
+                }
+
+                for _ in 1..K {
+                    use mlx_rs::ops::indexing as ix;
+                    let tok = *draft_tokens.last().unwrap() as i32;
+                    let input = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+                    let logits = draft.forward(&input, None, &mut draft_cache).unwrap();
+                    mlx_rs::transforms::eval([&logits]).unwrap();
+                    let pred = ix::argmax_axis(&logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&pred]).unwrap();
+                    draft_tokens.push(pred.item::<i32>() as u32);
+                }
+
+                draft_time_ms += t_draft.elapsed().as_secs_f64() * 1000.0;
+
+                // --- Verify phase: forward K draft tokens through verify model ---
+                // The verify cache already has context from prefill + previous rounds.
+                // saved_verify_logits predicts draft[0].
+                // forward_all_logits(draft_tokens) gives logits for draft[1..K-1] + bonus.
+                let t_verify = std::time::Instant::now();
+
+                let verify_snapshot = verify_cache.clone();
+
+                let draft_input: Vec<i32> = draft_tokens.iter().map(|&d| d as i32).collect();
+                let draft_arr =
+                    mlx_rs::Array::from_slice(&draft_input, &[1, draft_input.len() as i32]);
+                let all_logits = verify
+                    .forward_all_logits(&draft_arr, None, &mut verify_cache)
+                    .unwrap();
+                mlx_rs::transforms::eval([&all_logits]).unwrap();
+
+                verify_time_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
+
+                // all_logits: [1, K, vocab]
+                //   all_logits[0]   at pos P   → predicts pos P+1 → verifies draft[1]
+                //   all_logits[i-1] at pos P+i-1 → predicts pos P+i → verifies draft[i]
+                //   all_logits[K-1] at pos P+K-1 → predicts pos P+K → bonus token
+                // saved_verify_logits at pos P-1 → predicts pos P → verifies draft[0]
+                use mlx_rs::ops::indexing::{self as ix, IndexOp};
+                let new_2d = all_logits.squeeze_axes(&[0]).unwrap(); // [K, vocab]
+
+                // Verify draft[0] from saved logits
+                let first_pred = {
+                    let p = ix::argmax_axis(&saved_verify_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&p]).unwrap();
+                    p.item::<i32>() as u32
+                };
+
+                let mut accepted = 0usize;
+                if first_pred == draft_tokens[0] {
+                    accepted = 1;
+                    // Verify draft[1..K-1] from new logits
+                    let new_preds = ix::argmax_axis(&new_2d, -1, false).unwrap(); // [K]
+                    mlx_rs::transforms::eval([&new_preds]).unwrap();
+                    for i in 1..K {
+                        let pred_id = new_preds.index((i - 1) as i32).item::<i32>() as u32;
+                        if pred_id == draft_tokens[i] {
+                            accepted += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                // Build accepted sequence + bonus/correction
+                let correction_or_bonus = if accepted == K {
+                    // All accepted — bonus from all_logits[K-1]
+                    let bonus_logits = new_2d.index((K - 1) as i32); // [vocab]
+                    let p = ix::argmax_axis(&bonus_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&p]).unwrap();
+                    p.item::<i32>() as u32
+                } else if accepted == 0 {
+                    // None accepted — correction from saved_verify_logits
+                    first_pred
+                } else {
+                    // Partial — correction from all_logits[accepted-1]
+                    let corr_logits = new_2d.index((accepted - 1) as i32); // [vocab]
+                    let p = ix::argmax_axis(&corr_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&p]).unwrap();
+                    p.item::<i32>() as u32
+                };
+
+                let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
+                new_tokens.push(correction_or_bonus);
+                context.extend_from_slice(&new_tokens);
+
+                // --- Advance caches with accepted tokens ---
+                let t_advance = std::time::Instant::now();
+
+                if accepted == K {
+                    // FAST PATH: all K accepted — caches already have the right state.
+                    // Draft cache is at P+K-1 (draft[K-1] not yet fed). Feed it + bonus.
+                    let catchup: Vec<i32> =
+                        vec![draft_tokens[K - 1] as i32, correction_or_bonus as i32];
+                    let catchup_arr = mlx_rs::Array::from_slice(&catchup, &[1, 2]);
+                    saved_draft_logits =
+                        draft.forward(&catchup_arr, None, &mut draft_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                    draft_cache.eval_for_clone().unwrap();
+
+                    // Verify cache is at P+K (all draft tokens processed). Feed bonus only.
+                    let bonus_arr =
+                        mlx_rs::Array::from_slice(&[correction_or_bonus as i32], &[1, 1]);
+                    saved_verify_logits =
+                        verify.forward(&bonus_arr, None, &mut verify_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                    verify_cache.eval_for_clone().unwrap();
+                } else {
+                    // SLOW PATH: partial accept — restore snapshots and re-feed.
+                    let advance_input: Vec<i32> =
+                        new_tokens.iter().map(|&t| t as i32).collect();
+                    let advance_arr = mlx_rs::Array::from_slice(
+                        &advance_input,
+                        &[1, advance_input.len() as i32],
+                    );
+
+                    draft_cache = draft_snapshot;
+                    saved_draft_logits =
+                        draft.forward(&advance_arr, None, &mut draft_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                    draft_cache.eval_for_clone().unwrap();
+
+                    verify_cache = verify_snapshot;
+                    saved_verify_logits =
+                        verify.forward(&advance_arr, None, &mut verify_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                    verify_cache.eval_for_clone().unwrap();
+                }
+
+                advance_time_ms += t_advance.elapsed().as_secs_f64() * 1000.0;
+
+                total_accepted += accepted;
+                total_drafted += K;
+
+                let draft_toks_str: Vec<String> =
+                    draft_tokens.iter().map(|t| t.to_string()).collect();
+                eprintln!(
+                    "  Round {:2}: accepted {}/{K} (+{} new) | drafted [{}]",
+                    round + 1,
+                    accepted,
+                    new_tokens.len(),
+                    draft_toks_str.join(", ")
+                );
+            }
+
+            // --- Results ---
+            let acceptance_rate = total_accepted as f64 / total_drafted as f64 * 100.0;
+            let avg_per_round = total_accepted as f64 / N_ROUNDS as f64;
+            let total_new = context.len() - prompt_ids.len();
+            let total_ms = draft_time_ms + verify_time_ms + advance_time_ms;
+            let eff_tps = if total_ms > 0.0 {
+                total_new as f64 / total_ms * 1000.0
+            } else {
+                0.0
+            };
+
+            eprintln!("\n  --- Results for {prompt:?} ---");
+            eprintln!("  Acceptance rate:     {acceptance_rate:.1}%");
+            eprintln!("  Avg accepted/round:  {avg_per_round:.1}/{K}");
+            eprintln!("  Total new tokens:    {total_new}");
+            eprintln!(
+                "  Draft time:    {draft_time_ms:.0}ms ({:.1}ms/round)",
+                draft_time_ms / N_ROUNDS as f64
+            );
+            eprintln!(
+                "  Verify time:   {verify_time_ms:.0}ms ({:.1}ms/round)",
+                verify_time_ms / N_ROUNDS as f64
+            );
+            eprintln!(
+                "  Advance time:  {advance_time_ms:.0}ms ({:.1}ms/round)",
+                advance_time_ms / N_ROUNDS as f64
+            );
+            eprintln!("  Effective throughput: {eff_tps:.1} tok/s");
+
+            if let Ok(decoded) = tokenizer.decode(&context[prompt_ids.len()..], true) {
+                eprintln!("  Generated text: {decoded:?}");
+            }
         }
     }
 }
