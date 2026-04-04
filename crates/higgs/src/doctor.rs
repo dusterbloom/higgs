@@ -340,6 +340,10 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    kv_key_bits: None,
+                    kv_value_bits: None,
+                    kv_norm_correction: true,
+                    kv_adaptive_dense_layers: 0,
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
@@ -348,6 +352,10 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    kv_key_bits: None,
+                    kv_value_bits: None,
+                    kv_norm_correction: true,
+                    kv_adaptive_dense_layers: 0,
                 },
             ],
             ..HiggsConfig::default()
@@ -369,6 +377,10 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    kv_key_bits: None,
+                    kv_value_bits: None,
+                    kv_norm_correction: true,
+                    kv_adaptive_dense_layers: 0,
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
@@ -377,6 +389,10 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    kv_key_bits: None,
+                    kv_value_bits: None,
+                    kv_norm_correction: true,
+                    kv_adaptive_dense_layers: 0,
                 },
             ],
             ..HiggsConfig::default()
@@ -628,6 +644,10 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                kv_key_bits: None,
+                kv_value_bits: None,
+                kv_norm_correction: true,
+                kv_adaptive_dense_layers: 0,
             }],
             ..HiggsConfig::default()
         };
@@ -653,6 +673,10 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                kv_key_bits: None,
+                kv_value_bits: None,
+                kv_norm_correction: true,
+                kv_adaptive_dense_layers: 0,
             }],
             ..HiggsConfig::default()
         };
@@ -680,6 +704,10 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                kv_key_bits: None,
+                kv_value_bits: None,
+                kv_norm_correction: true,
+                kv_adaptive_dense_layers: 0,
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),

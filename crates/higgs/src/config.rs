@@ -124,6 +124,22 @@ pub struct ServeArgs {
     #[arg(long)]
     pub kv_bits: Option<u8>,
 
+    /// Override key bit width (default: kv-bits - 1).
+    #[arg(long)]
+    pub kv_key_bits: Option<u8>,
+
+    /// Override value bit width (default: kv-bits).
+    #[arg(long)]
+    pub kv_value_bits: Option<u8>,
+
+    /// Disable post-quantization norm correction.
+    #[arg(long)]
+    pub kv_no_norm_correction: bool,
+
+    /// Number of final layers that stay dense (0 = all TQ).
+    #[arg(long, default_value = "0")]
+    pub kv_adaptive_dense_layers: Option<u8>,
+
     /// Seed used to generate TurboQuant rotation/QJL matrices.
     #[arg(long)]
     pub kv_seed: Option<u64>,
@@ -220,7 +236,19 @@ pub struct ModelConfig {
     #[serde(default = "default_kv_bits")]
     pub kv_bits: u8,
     #[serde(default)]
+    pub kv_key_bits: Option<u8>,
+    #[serde(default)]
+    pub kv_value_bits: Option<u8>,
+    #[serde(default = "default_norm_correction")]
+    pub kv_norm_correction: bool,
+    #[serde(default)]
+    pub kv_adaptive_dense_layers: u8,
+    #[serde(default)]
     pub kv_seed: u64,
+}
+
+const fn default_norm_correction() -> bool {
+    true
 }
 
 const fn default_kv_bits() -> u8 {
@@ -232,6 +260,10 @@ impl ModelConfig {
         KvCacheConfig {
             mode: self.kv_cache,
             bits: self.kv_bits,
+            key_bits_override: self.kv_key_bits,
+            value_bits_override: self.kv_value_bits,
+            norm_correction: self.kv_norm_correction,
+            adaptive_dense_layers: self.kv_adaptive_dense_layers,
             seed: self.kv_seed,
         }
     }
@@ -427,6 +459,10 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             batch: args.batch,
             kv_cache,
             kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
+            kv_key_bits: args.kv_key_bits,
+            kv_value_bits: args.kv_value_bits,
+            kv_norm_correction: !args.kv_no_norm_correction,
+            kv_adaptive_dense_layers: args.kv_adaptive_dense_layers.unwrap_or(0),
             kv_seed: args.kv_seed.unwrap_or_default(),
         })
         .collect();
@@ -506,6 +542,10 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     batch: serve_args.batch,
                     kv_cache,
                     kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
+                    kv_key_bits: serve_args.kv_key_bits,
+                    kv_value_bits: serve_args.kv_value_bits,
+                    kv_norm_correction: !serve_args.kv_no_norm_correction,
+                    kv_adaptive_dense_layers: serve_args.kv_adaptive_dense_layers.unwrap_or(0),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
                 })
                 .collect();
@@ -626,6 +666,10 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         batch: false,
         kv_cache: KvCacheMode::Off,
         kv_bits: default_kv_bits(),
+        kv_key_bits: None,
+        kv_value_bits: None,
+        kv_norm_correction: true,
+        kv_adaptive_dense_layers: 0,
         kv_seed: 0,
     });
     config.auto_router.model = name;
@@ -761,9 +805,13 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: true,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         let config = build_simple_config(&args).unwrap();
         assert_eq!(config.models.len(), 2);
@@ -785,9 +833,13 @@ mod tests {
             rate_limit: Some(60),
             timeout: Some(60.0),
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         let config = build_simple_config(&args).unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
@@ -809,9 +861,13 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-                    kv_cache: Some("turboquant".to_owned()),
+            kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(4),
             kv_seed: Some(99),
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         let config = build_simple_config(&args).unwrap();
         let model = config.models.first().unwrap();
@@ -831,9 +887,13 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -849,9 +909,13 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -867,9 +931,13 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -885,9 +953,13 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: true,
-                    kv_cache: Some("turboquant".to_owned()),
+            kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(3),
             kv_seed: Some(0),
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         let error = build_simple_config(&args).unwrap_err();
         assert!(error.contains("TurboQuant"));
@@ -1191,9 +1263,13 @@ mod tests {
             rate_limit: None,
             timeout: Some(-1.0),
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
         assert!(build_simple_config(&args).is_err());
     }
@@ -1224,9 +1300,13 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_no_norm_correction: false,
+            kv_adaptive_dense_layers: None,
         };
 
         let config = load_config_file(&path, Some(&args)).unwrap();
