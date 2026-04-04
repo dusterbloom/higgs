@@ -897,8 +897,14 @@ pub fn load_quantized_safetensors_weights<M: ModuleParametersExt>(
                 if let Some(remapped) = remap_quantized_key(&key) {
                     if let Some(param) = params.get_mut(&*remapped) {
                         **param = value;
+                    } else {
+                        tracing::warn!(key = %key, remapped = %remapped, "Weight key remapped but target parameter not found");
                     }
+                } else {
+                    tracing::warn!(key = %key, "Weight key not found in model parameters (quantized remap failed)");
                 }
+            } else {
+                tracing::warn!(key = %key, "Weight key not found in model parameters");
             }
         }
     }

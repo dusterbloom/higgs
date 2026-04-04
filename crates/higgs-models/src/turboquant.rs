@@ -6,8 +6,9 @@
     clippy::too_many_lines
 )]
 
+use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use mlx_rs::{Array, Dtype, Stream, argmin_axis, error::Exception, ops};
 use rand::Rng;
@@ -569,6 +570,12 @@ pub struct BatchQuantizedKeys {
 
 /// Pack u32 index values into a byte buffer at the given bit width.
 fn pack_u32_indices(indices: &[u32], bits: u8, out: &mut [u8]) {
+    let required_bytes = (indices.len() * usize::from(bits) + 7) / 8;
+    assert!(
+        out.len() >= required_bytes,
+        "pack_u32_indices: output buffer too small ({} < {required_bytes})",
+        out.len()
+    );
     out.fill(0);
     let mask = (1_u16 << bits) - 1;
     for (index, &code) in indices.iter().enumerate() {
@@ -814,6 +821,10 @@ fn unpack_index(data: &[u8], index: usize, bits: u8) -> u8 {
     let mask = (1_u16 << bits) - 1;
     let mut value = u16::from(data[byte_index] >> shift);
     if shift + usize::from(bits) > 8 {
+        assert!(
+            byte_index + 1 < data.len(),
+            "unpack_index: read past end of buffer"
+        );
         value |= u16::from(data[byte_index + 1]) << (8 - shift);
     }
     u8::try_from(value & mask).unwrap_or(0)
@@ -882,16 +893,19 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // Metal kernel plumbing.
 // ---------------------------------------------------------------------------
 
-static FFI_LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+/// Per-thread FFI error capture — avoids cross-contamination between threads.
+thread_local! {
+    static FFI_LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 #[allow(unsafe_code)]
 unsafe extern "C" fn ffi_error_handler(msg: *const c_char, _data: *mut c_void) {
     let message = unsafe { CStr::from_ptr(msg) }
         .to_string_lossy()
         .into_owned();
-    if let Ok(mut guard) = FFI_LAST_ERROR.lock() {
-        *guard = Some(message);
-    }
+    FFI_LAST_ERROR.with(|cell| {
+        *cell.borrow_mut() = Some(message);
+    });
 }
 
 fn ensure_ffi_error_handler() {
@@ -906,6 +920,9 @@ fn ensure_ffi_error_handler() {
 
 struct CachedMetalKernel(mlx_sys::mlx_fast_metal_kernel);
 
+// SAFETY: The kernel handle is created once during initialization and used
+// read-only thereafter (only passed as an argument to `mlx_fast_metal_kernel_apply`).
+// No mutable state is shared across threads.
 #[allow(unsafe_code)]
 unsafe impl Send for CachedMetalKernel {}
 #[allow(unsafe_code)]
@@ -1084,6 +1101,11 @@ fn configure_scores_kernel(
     key_bits: u8,
     key_code_words: i32,
 ) -> mlx_sys::mlx_fast_metal_kernel_config {
+    assert!(num_heads > 0, "num_heads must be positive");
+    assert!(num_kv_heads > 0, "num_kv_heads must be positive");
+    assert!(head_dim > 0, "head_dim must be positive");
+    assert!(seq_len > 0, "seq_len must be positive");
+    assert!(key_bits > 0, "key_bits must be positive");
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"D".as_ptr(), head_dim);
@@ -1128,6 +1150,10 @@ fn configure_values_kernel(
     value_bits: u8,
     value_code_words: i32,
 ) -> mlx_sys::mlx_fast_metal_kernel_config {
+    assert!(num_heads > 0, "num_heads must be positive");
+    assert!(num_kv_heads > 0, "num_kv_heads must be positive");
+    assert!(head_dim > 0, "head_dim must be positive");
+    assert!(value_bits > 0, "value_bits must be positive");
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"D".as_ptr(), head_dim);
@@ -1172,9 +1198,7 @@ fn extract_single_output(
 ) -> Result<Array, Exception> {
     if status != 0 {
         let message = FFI_LAST_ERROR
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
+            .with(|cell| cell.borrow_mut().take())
             .unwrap_or_default();
         if message.is_empty() {
             return Err(Exception::custom(format!("{label} kernel failed")));
