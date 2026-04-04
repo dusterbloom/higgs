@@ -285,4 +285,42 @@ mod tests {
         assert!(total_reasoning.is_empty());
         assert!(!tracker.has_reasoning());
     }
+
+    #[test]
+    fn streaming_tracker_new_inside_think_starts_in_thinking_mode() {
+        let mut tracker = StreamingReasoningTracker::new_inside_think();
+        assert!(tracker.has_reasoning());
+
+        // Tokens before </think> should be reasoning, not visible
+        let (vis, reas) = tracker.process("step 1...");
+        assert!(vis.is_empty());
+        assert!(!reas.is_empty() || tracker.has_reasoning());
+
+        // After </think>, tokens become visible
+        let (vis, _reas) = tracker.process("</think>The answer is 42.");
+        let (vis2, _) = tracker.flush();
+        let total_visible = format!("{vis}{vis2}");
+        assert!(total_visible.contains("The answer is 42."));
+    }
+
+    #[test]
+    fn streaming_tracker_new_inside_think_flush_without_close() {
+        let mut tracker = StreamingReasoningTracker::new_inside_think();
+        let (_vis, _reas) = tracker.process("still thinking");
+        let (vis_flush, reas_flush) = tracker.flush();
+        // Everything should be reasoning, nothing visible
+        assert!(vis_flush.is_empty());
+        assert!(reas_flush.contains("thinking"));
+    }
+
+    #[test]
+    fn streaming_tracker_new_inside_think_immediate_close() {
+        let mut tracker = StreamingReasoningTracker::new_inside_think();
+        let (vis, reas) = tracker.process("</think>Direct answer.");
+        let (vis2, reas2) = tracker.flush();
+        let total_visible = format!("{vis}{vis2}");
+        let total_reasoning = format!("{reas}{reas2}");
+        assert!(total_visible.contains("Direct answer."));
+        assert!(total_reasoning.is_empty() || total_reasoning.trim().is_empty());
+    }
 }

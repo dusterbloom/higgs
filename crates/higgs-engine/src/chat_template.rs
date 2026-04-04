@@ -490,4 +490,66 @@ TOOLS:{{ tools | length }}
         .unwrap();
         assert!(ChatTemplateRenderer::try_from_model_dir(dir.path()).is_err());
     }
+
+    #[test]
+    fn test_apply_with_thinking_enabled() {
+        // Template that conditionally emits <think> when enable_thinking is set
+        let template = r#"{%- for message in messages %}
+{{ message.content }}
+{%- endfor %}
+{%- if enable_thinking %}
+<think>
+{%- endif %}"#;
+
+        let renderer = ChatTemplateRenderer::new(template).unwrap();
+        let messages = vec![msg("user", "Hello")];
+
+        // With thinking enabled, should include <think>
+        let result = renderer
+            .apply_with_thinking(&messages, None, false, true)
+            .unwrap();
+        assert!(result.contains("<think>"));
+
+        // With thinking disabled, should not include <think>
+        let result = renderer
+            .apply_with_thinking(&messages, None, false, false)
+            .unwrap();
+        assert!(!result.contains("<think>"));
+    }
+
+    #[test]
+    fn test_apply_with_thinking_and_tools() {
+        let template = r#"{%- for message in messages %}
+{{ message.content }}
+{%- endfor %}
+{%- if tools %}TOOLS:{{ tools | length }}{%- endif %}
+{%- if enable_thinking %}THINKING{%- endif %}"#;
+
+        let renderer = ChatTemplateRenderer::new(template).unwrap();
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "test"}})];
+        let messages = vec![msg("user", "Hi")];
+
+        let result = renderer
+            .apply_with_thinking(&messages, Some(&tools), false, true)
+            .unwrap();
+        assert!(result.contains("TOOLS:1"));
+        assert!(result.contains("THINKING"));
+    }
+
+    #[test]
+    fn test_apply_delegates_to_apply_with_thinking_disabled() {
+        // Verify that `apply` is equivalent to `apply_with_thinking(false)`
+        let template = r#"{%- for message in messages %}{{ message.content }}{%- endfor %}
+{%- if enable_thinking %}THINKING{%- endif %}"#;
+
+        let renderer = ChatTemplateRenderer::new(template).unwrap();
+        let messages = vec![msg("user", "Hi")];
+
+        let via_apply = renderer.apply(&messages, None, true).unwrap();
+        let via_explicit = renderer
+            .apply_with_thinking(&messages, None, true, false)
+            .unwrap();
+        assert_eq!(via_apply, via_explicit);
+        assert!(!via_apply.contains("THINKING"));
+    }
 }

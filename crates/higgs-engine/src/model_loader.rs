@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use higgs_models::{load_tokenizer as shared_load_tokenizer, registry, transformer, AnyModel};
+use higgs_models::{AnyModel, load_tokenizer as shared_load_tokenizer, registry, transformer};
 
 use crate::error::EngineError;
 
