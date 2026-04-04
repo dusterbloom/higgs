@@ -14,8 +14,10 @@ pub mod turboquant;
 pub mod utils;
 
 pub mod diffusion;
+pub mod diffusion_eggroll;
 pub mod diffusion_lora;
 pub mod diffusion_train;
+pub mod eggroll_quantized;
 pub mod llada_moe;
 pub mod rwkv7;
 
