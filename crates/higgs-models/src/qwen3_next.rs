@@ -250,6 +250,56 @@ impl QLinear {
             self.bits,
         )
     }
+
+    /// Perturbed forward: y = qmm(W, x) + x @ delta^T + scale * (x @ B) @ A^T
+    pub(crate) fn forward_perturbed(
+        &self,
+        x: &Array,
+        delta: Option<&Array>,
+        perturbation: Option<(&Array, &Array, f32)>,
+    ) -> Result<Array, Exception> {
+        let mut y = self.forward(x)?;
+
+        if let Some(d) = delta {
+            y = y.add(&x.matmul(&d.transpose()?)?)?;
+        }
+
+        if let Some((a, b, scale)) = perturbation {
+            let xb = x.matmul(b)?;
+            let pert = xb.matmul(&a.transpose()?)?;
+            y = y.add(&pert.multiply(&Array::from_f32(scale))?)?;
+        }
+
+        Ok(y)
+    }
+}
+
+/// Perturbation map: target key → (A, B, scale) low-rank factors.
+pub(crate) type PerturbMap = std::collections::HashMap<String, (Array, Array, f32)>;
+/// Delta map: target key → accumulated fp32 delta [out_dim, in_dim].
+pub(crate) type DeltaMap = std::collections::HashMap<String, Array>;
+
+/// Dispatch helper: routes through `forward_perturbed` only when perturbations are active.
+/// When both maps are None, calls `ql.forward(x)` directly (zero overhead).
+fn qlinear_fwd(
+    x: &Array,
+    ql: &QLinear,
+    prefix: &str,
+    proj_name: &str,
+    perts: Option<&PerturbMap>,
+    delts: Option<&DeltaMap>,
+) -> Result<Array, Exception> {
+    if perts.is_none() && delts.is_none() {
+        return ql.forward(x);
+    }
+    let key = if prefix.is_empty() {
+        proj_name.to_string()
+    } else {
+        format!("{prefix}.{proj_name}")
+    };
+    let delta = delts.and_then(|d| d.get(&key));
+    let pert = perts.and_then(|p| p.get(&key)).map(|(a, b, s)| (a, b, *s));
+    ql.forward_perturbed(x, delta, pert)
 }
 
 /// Quantized embedding stored as raw weight/scales/biases arrays.
@@ -746,6 +796,9 @@ impl Qwen3NextAttention {
         x: &Array,
         mask: Option<&AttentionMask>,
         cache: &mut SteppingKeyValueCache,
+        prefix: &str,
+        perts: Option<&PerturbMap>,
+        delts: Option<&DeltaMap>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let B = *shape
@@ -756,7 +809,7 @@ impl Qwen3NextAttention {
             .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
 
         // Q is projected to 2 * num_heads * head_dim (doubled for gating)
-        let q_proj_output = self.q_proj.forward(x)?;
+        let q_proj_output = qlinear_fwd(x, &self.q_proj, prefix, "q_proj", perts, delts)?;
         let q_reshaped = q_proj_output.reshape(&[B, L, self.num_attention_heads, -1])?;
         let q_halves = q_reshaped.split(2, Some(-1))?;
         let queries_pre = q_halves
@@ -767,8 +820,8 @@ impl Qwen3NextAttention {
             .ok_or_else(|| Exception::custom("split produced empty result"))?
             .reshape(&[B, L, -1])?;
 
-        let keys_raw = self.k_proj.forward(x)?;
-        let values_raw = self.v_proj.forward(x)?;
+        let keys_raw = qlinear_fwd(x, &self.k_proj, prefix, "k_proj", perts, delts)?;
+        let values_raw = qlinear_fwd(x, &self.v_proj, prefix, "v_proj", perts, delts)?;
 
         // Per-head RmsNorm then transpose to [B, H, L, D]
         let mut queries = self
@@ -815,7 +868,7 @@ impl Qwen3NextAttention {
         };
 
         let gated = output.multiply(nn::sigmoid(&gate)?)?;
-        self.o_proj.forward(&gated)
+        qlinear_fwd(&gated, &self.o_proj, prefix, "o_proj", perts, delts)
     }
 }
 
@@ -854,11 +907,17 @@ impl Qwen3NextMLP {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        let gate_out = self.gate_proj.forward(x)?;
-        let up_out = self.up_proj.forward(x)?;
+    fn forward(
+        &self,
+        x: &Array,
+        prefix: &str,
+        perts: Option<&PerturbMap>,
+        delts: Option<&DeltaMap>,
+    ) -> Result<Array, Exception> {
+        let gate_out = qlinear_fwd(x, &self.gate_proj, prefix, "gate_proj", perts, delts)?;
+        let up_out = qlinear_fwd(x, &self.up_proj, prefix, "up_proj", perts, delts)?;
         let activated = swiglu(&gate_out, &up_out)?;
-        self.down_proj.forward(&activated)
+        qlinear_fwd(&activated, &self.down_proj, prefix, "down_proj", perts, delts)
     }
 }
 
@@ -1121,7 +1180,7 @@ impl SparseMoeBlock {
             .sum_axes(&[-2], false)?;
 
         // Shared expert
-        let shared_y = self.shared_expert.forward(x)?;
+        let shared_y = self.shared_expert.forward(x, "", None, None)?;
         let shared_gate_val = nn::sigmoid(&self.shared_expert_gate.forward(x)?)?;
         let shared_out = shared_y.multiply(&shared_gate_val)?;
 
@@ -1294,6 +1353,9 @@ impl GatedDeltaNet {
         inputs: &Array,
         _mask: Option<&AttentionMask>,
         cache: &mut ArraysCache,
+        prefix: &str,
+        perts: Option<&PerturbMap>,
+        delts: Option<&DeltaMap>,
     ) -> Result<Array, Exception> {
         let shape = inputs.shape();
         let B = *shape
@@ -1323,12 +1385,11 @@ impl GatedDeltaNet {
                 .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_a missing"))?;
 
-            let qkv = qkv_proj.forward(inputs)?;
-            let z = z_proj
-                .forward(inputs)?
+            let qkv = qlinear_fwd(inputs, qkv_proj, prefix, "in_proj_qkv", perts, delts)?;
+            let z = qlinear_fwd(inputs, z_proj, prefix, "in_proj_z", perts, delts)?
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
-            let b = b_proj.forward(inputs)?;
-            let a = a_proj.forward(inputs)?;
+            let b = qlinear_fwd(inputs, b_proj, prefix, "in_proj_b", perts, delts)?;
+            let a = qlinear_fwd(inputs, a_proj, prefix, "in_proj_a", perts, delts)?;
 
             let split_indices = &[self.key_dim, self.key_dim * 2];
             let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
@@ -1348,8 +1409,8 @@ impl GatedDeltaNet {
             (q, k, v, z, b, a)
         } else {
             // qwen3_next-style: combined projections, per-head reshape
-            let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
-            let mixed_ba = self.in_proj_ba.forward(inputs)?;
+            let mixed_qkvz = qlinear_fwd(inputs, &self.in_proj_qkvz, prefix, "in_proj_qkvz", perts, delts)?;
+            let mixed_ba = qlinear_fwd(inputs, &self.in_proj_ba, prefix, "in_proj_ba", perts, delts)?;
             self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?
         };
 
@@ -1461,7 +1522,7 @@ impl GatedDeltaNet {
 
         // Output projection
         let out_flat = gated_out.reshape(&[B, S, -1])?;
-        self.out_proj.forward(&out_flat)
+        qlinear_fwd(&out_flat, &self.out_proj, prefix, "out_proj", perts, delts)
     }
 
     /// Reorder the projected qkvz and ba tensors into separate heads.
@@ -1594,7 +1655,13 @@ impl FfnBlock {
         })
     }
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+    fn forward(
+        &mut self,
+        x: &Array,
+        prefix: &str,
+        perts: Option<&PerturbMap>,
+        delts: Option<&DeltaMap>,
+    ) -> Result<Array, Exception> {
         if self.is_moe {
             // Delegate to SparseMoeBlock logic
             let gate_ref = self
@@ -1614,7 +1681,7 @@ impl FfnBlock {
                 .as_ref()
                 .ok_or_else(|| Exception::custom("MoE shared_expert_gate missing"))?;
 
-            let gates = ops::softmax_axis(&gate_ref.forward(x)?, -1, true)?;
+            let gates = ops::softmax_axis(&qlinear_fwd(x, gate_ref, prefix, "gate", perts, delts)?, -1, true)?;
 
             let neg_k = -self.top_k;
             let all_inds = ops::argpartition_axis(&gates, neg_k, -1)?;
@@ -1632,25 +1699,29 @@ impl FfnBlock {
                 scores
             };
 
+            // switch_mlp stays untouched (excluded from training)
             let y = switch_ref.forward_gather_global_sort(x, &inds)?;
 
             let expert_sum = y
                 .multiply(&scores.expand_dims(-1)?)?
                 .sum_axes(&[-2], false)?;
 
-            let shared_y = se_ref.forward(x)?;
-            let shared_gate_val = nn::sigmoid(&seg_ref.forward(x)?)?;
+            let se_prefix = if prefix.is_empty() {
+                "shared_expert".to_string()
+            } else {
+                format!("{prefix}.shared_expert")
+            };
+            let shared_y = se_ref.forward(x, &se_prefix, perts, delts)?;
+            let shared_gate_val = nn::sigmoid(&qlinear_fwd(x, seg_ref, prefix, "shared_expert_gate", perts, delts)?)?;
             let shared_out = shared_y.multiply(&shared_gate_val)?;
 
             expert_sum.add(shared_out)
         } else {
-            // Dense SwiGLU with fused gate+up (single quantized_matmul + split)
-            let dp = self
-                .down_proj
-                .as_ref()
-                .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
+            // Dense SwiGLU: bypass fused optimization when perturbations are active
+            let has_perts = perts.is_some() || delts.is_some();
 
-            if self.fused_gate_up.is_none() {
+            if has_perts {
+                // Separate path: individual projections through qlinear_fwd
                 let gp = self
                     .gate_proj
                     .as_ref()
@@ -1659,37 +1730,62 @@ impl FfnBlock {
                     .up_proj
                     .as_ref()
                     .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
-                let intermediate = *gp
-                    .weight
-                    .shape()
-                    .first()
-                    .ok_or_else(|| Exception::custom("gate_proj weight has no dims"))?;
-                let fw = ops::concatenate_axis(&[&*gp.weight, &*up.weight], 0)?;
-                let fs = ops::concatenate_axis(&[&*gp.scales, &*up.scales], 0)?;
-                let fb = ops::concatenate_axis(&[&*gp.biases, &*up.biases], 0)?;
-                fw.eval()?;
-                fs.eval()?;
-                fb.eval()?;
-                self.fused_gate_up = Some((fw, fs, fb, intermediate));
-            }
+                let dp = self
+                    .down_proj
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
+                let gate_out = qlinear_fwd(x, gp, prefix, "gate_proj", perts, delts)?;
+                let up_out = qlinear_fwd(x, up, prefix, "up_proj", perts, delts)?;
+                let activated = swiglu(&gate_out, &up_out)?;
+                qlinear_fwd(&activated, dp, prefix, "down_proj", perts, delts)
+            } else {
+                // Fused gate+up (single quantized_matmul + split)
+                let dp = self
+                    .down_proj
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
 
-            let (fw, fs, fb, intermediate) = self
-                .fused_gate_up
-                .as_ref()
-                .ok_or_else(|| Exception::custom("fused_gate_up missing after init"))?;
-            let gp = self
-                .gate_proj
-                .as_ref()
-                .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
-            let fused_out = quantized_forward(x, fw, fs, fb, gp.group_size, gp.bits)?;
-            let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
-            let gate_out = parts
-                .first()
-                .ok_or_else(|| Exception::custom("fused split failed"))?;
-            let up_out = parts
-                .get(1)
-                .ok_or_else(|| Exception::custom("fused split failed"))?;
-            dp.forward(&swiglu(gate_out, up_out)?)
+                if self.fused_gate_up.is_none() {
+                    let gp = self
+                        .gate_proj
+                        .as_ref()
+                        .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
+                    let up = self
+                        .up_proj
+                        .as_ref()
+                        .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
+                    let intermediate = *gp
+                        .weight
+                        .shape()
+                        .first()
+                        .ok_or_else(|| Exception::custom("gate_proj weight has no dims"))?;
+                    let fw = ops::concatenate_axis(&[&*gp.weight, &*up.weight], 0)?;
+                    let fs = ops::concatenate_axis(&[&*gp.scales, &*up.scales], 0)?;
+                    let fb = ops::concatenate_axis(&[&*gp.biases, &*up.biases], 0)?;
+                    fw.eval()?;
+                    fs.eval()?;
+                    fb.eval()?;
+                    self.fused_gate_up = Some((fw, fs, fb, intermediate));
+                }
+
+                let (fw, fs, fb, intermediate) = self
+                    .fused_gate_up
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("fused_gate_up missing after init"))?;
+                let gp = self
+                    .gate_proj
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
+                let fused_out = quantized_forward(x, fw, fs, fb, gp.group_size, gp.bits)?;
+                let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
+                let gate_out = parts
+                    .first()
+                    .ok_or_else(|| Exception::custom("fused split failed"))?;
+                let up_out = parts
+                    .get(1)
+                    .ok_or_else(|| Exception::custom("fused split failed"))?;
+                dp.forward(&swiglu(gate_out, up_out)?)
+            }
         }
     }
 }
@@ -1760,7 +1856,7 @@ impl DecoderLayer {
             let LayerCache::Arrays(ssm_cache) = cache else {
                 return Err(Exception::custom("Expected ArraysCache for linear layer"));
             };
-            attn.forward(&normed, mask, ssm_cache)?
+            attn.forward(&normed, mask, ssm_cache, "", None, None)?
         } else {
             let attn = self
                 .self_attn
@@ -1769,12 +1865,12 @@ impl DecoderLayer {
             let LayerCache::KV(kv_cache) = cache else {
                 return Err(Exception::custom("Expected KVCache for attention layer"));
             };
-            attn.forward(&normed, mask, kv_cache)?
+            attn.forward(&normed, mask, kv_cache, "", None, None)?
         };
 
         let h = x.add(r)?;
         let normed_post = self.post_attention_layernorm.forward(&h)?;
-        let mlp_out = self.mlp.forward(&normed_post)?;
+        let mlp_out = self.mlp.forward(&normed_post, "", None, None)?;
         h.add(mlp_out)
     }
 }
@@ -1833,6 +1929,10 @@ pub struct Qwen3NextCausalLM {
     model: Qwen3NextInner,
     #[param]
     lm_head: Option<QLinear>,
+    /// Active perturbations for EGGROLL training (set before forward, cleared after).
+    pub(crate) perturbations: Option<PerturbMap>,
+    /// Accumulated fp32 deltas for EGGROLL training (set before forward, cleared after).
+    pub(crate) train_deltas: Option<DeltaMap>,
 }
 
 impl Qwen3NextCausalLM {
@@ -1861,6 +1961,8 @@ impl Qwen3NextCausalLM {
             args,
             model,
             lm_head,
+            perturbations: None,
+            train_deltas: None,
         })
     }
 
@@ -1960,7 +2062,12 @@ impl Qwen3NextCausalLM {
             None
         };
 
-        for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()) {
+        // Extract perturbation context before entering the layer loop to avoid
+        // borrowing self while iterating over self.model.layers.
+        let perts = self.perturbations.as_ref();
+        let delts = self.train_deltas.as_ref();
+
+        for (i, (layer, layer_cache)) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()).enumerate() {
             let cache = layer_cache
                 .as_mut()
                 .ok_or_else(|| Exception::custom("Layer cache is None"))?;
@@ -1971,6 +2078,23 @@ impl Qwen3NextCausalLM {
             };
 
             let normed = layer.input_layernorm.forward(&h)?;
+
+            // Build layer-specific prefixes for perturbation lookup
+            let attn_prefix = if perts.is_some() || delts.is_some() {
+                if layer.is_linear {
+                    format!("model.layers.{i}.linear_attn")
+                } else {
+                    format!("model.layers.{i}.self_attn")
+                }
+            } else {
+                String::new()
+            };
+            let mlp_prefix = if perts.is_some() || delts.is_some() {
+                format!("model.layers.{i}.mlp")
+            } else {
+                String::new()
+            };
+
             let r = if layer.is_linear {
                 let attn = layer
                     .linear_attn
@@ -1979,7 +2103,7 @@ impl Qwen3NextCausalLM {
                 let LayerCache::Arrays(ssm_cache) = cache else {
                     return Err(Exception::custom("Expected ArraysCache"));
                 };
-                attn.forward(&normed, mask, ssm_cache)?
+                attn.forward(&normed, mask, ssm_cache, &attn_prefix, perts, delts)?
             } else {
                 let attn = layer
                     .self_attn
@@ -1988,12 +2112,12 @@ impl Qwen3NextCausalLM {
                 let LayerCache::KV(layer_kv) = cache else {
                     return Err(Exception::custom("Expected KVCache"));
                 };
-                attn.forward(&normed, mask, layer_kv)?
+                attn.forward(&normed, mask, layer_kv, &attn_prefix, perts, delts)?
             };
 
             let h2 = h.add(r)?;
             let normed_post = layer.post_attention_layernorm.forward(&h2)?;
-            let mlp_out = layer.mlp.forward(&normed_post)?;
+            let mlp_out = layer.mlp.forward(&normed_post, &mlp_prefix, perts, delts)?;
             h = h2.add(mlp_out)?;
         }
 
@@ -2020,6 +2144,27 @@ impl Qwen3NextCausalLM {
             Some(head) => head.forward(&h_last),
             None => self.model.embed_tokens.as_linear(&h_last),
         }
+    }
+
+    /// Apply the LM head to hidden states at ALL positions. Returns `[B, T, vocab]`.
+    pub fn apply_lm_head_all(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(hidden),
+            None => self.model.embed_tokens.as_linear(hidden),
+        }
+    }
+
+    /// Forward returning logits for ALL positions: `[B, T, vocab]`.
+    ///
+    /// Used by EGGROLL training where loss is computed across multiple positions.
+    /// Creates a fresh empty cache each call (no KV state carried across steps).
+    pub(crate) fn forward_all_logits(
+        &mut self,
+        inputs: &Array,
+    ) -> Result<Array, Exception> {
+        let mut cache = self.make_cache();
+        let h = self.forward_hidden(inputs, None, &mut cache)?;
+        self.apply_lm_head_all(&h)
     }
 
     /// Chunked prefill: process the prompt in `chunk_size`-token segments
@@ -10924,7 +11069,7 @@ mod tests {
                     let LayerCache::Arrays(sc) = lc else {
                         panic!("Expected ArraysCache");
                     };
-                    let out = gdn.forward(&normed, mask_ref, sc).unwrap();
+                    let out = gdn.forward(&normed, mask_ref, sc, "", None, None).unwrap();
                     let mut tgts: Vec<&Array> = vec![&out];
                     if let Some(ref s) = sc.ssm_state {
                         tgts.push(s);
@@ -10941,7 +11086,7 @@ mod tests {
                     let LayerCache::KV(kvc) = lc else {
                         panic!("Expected KVCache");
                     };
-                    let out = attn.forward(&normed, mask_ref, kvc).unwrap();
+                    let out = attn.forward(&normed, mask_ref, kvc, "", None, None).unwrap();
                     eval([&out].into_iter()).unwrap();
                     n_attn += 1;
                     ns_attn += t0.elapsed().as_nanos();
@@ -10957,7 +11102,7 @@ mod tests {
 
                 // MLP / MoE
                 let t0 = Instant::now();
-                let mlp_out = layer.mlp.forward(&normed_post).unwrap();
+                let mlp_out = layer.mlp.forward(&normed_post, "", None, None).unwrap();
                 eval([&mlp_out].into_iter()).unwrap();
                 ns_mlp += t0.elapsed().as_nanos();
 
