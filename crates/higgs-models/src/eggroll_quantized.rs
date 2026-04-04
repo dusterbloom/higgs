@@ -211,8 +211,11 @@ impl EggrollQuantizedTrainer {
             qlinear.bits,
         )?;
 
-        // Add delta and requantize
+        // Add delta and requantize.
+        // Eval merged to materialize the lazy graph before quantize — without
+        // this, the accumulated dequant+add graph can be too large for Metal.
         let merged = deq.add(&delta)?;
+        merged.eval()?;
         let (new_w, new_s, new_b) =
             ops::quantize(&merged, qlinear.group_size, qlinear.bits)?;
 
@@ -323,7 +326,19 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
             }
 
             let out_dim = shape[0] as usize;
-            let in_dim = (shape[1] as usize) * 32 / (bits as usize);
+
+            // Derive in_dim from the scales array, which has shape
+            // [out_dim, n_groups] where n_groups = in_dim / group_size.
+            // This is correct for ALL bit widths (3, 4, 8, etc.) unlike the
+            // packed-weight formula `shape[1] * 32 / bits` which truncates
+            // for non-power-of-2 bit widths.
+            let s = params.get(scales_key.as_str()).unwrap();
+            let s_shape = s.shape();
+            if s_shape.len() < 2 {
+                continue; // malformed scales — skip
+            }
+            let n_groups = s_shape[1] as usize;
+            let in_dim = n_groups * (group_size as usize);
 
             // Parse layer index from key: "model.layers.N...."
             let layer_idx = parse_layer_idx(base).unwrap_or(0);
@@ -343,6 +358,20 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
                 layer_idx,
                 weight_idx,
             });
+        }
+
+        // Log discovered targets (first 5 + summary)
+        if !targets.is_empty() {
+            let sample = targets.len().min(5);
+            for t in &targets[..sample] {
+                eprintln!(
+                    "[EGGROLL-Q] target: {} [{} x {}] layer={} wi={}",
+                    t.name, t.out_dim, t.in_dim, t.layer_idx, t.weight_idx,
+                );
+            }
+            if targets.len() > sample {
+                eprintln!("[EGGROLL-Q] ... and {} more targets", targets.len() - sample);
+            }
         }
 
         let deltas = HashMap::new();
@@ -464,7 +493,11 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
                 let s = *params.get(t.scales_key.as_str()).unwrap();
                 let b = *params.get(t.biases_key.as_str()).unwrap();
                 let deq = ops::dequantize(w, s, b, t.group_size, t.bits)?;
+                // Eval merged to materialize the lazy graph before quantize —
+                // without this, the accumulated dequant+add graph across all
+                // targets can be too large for Metal to evaluate at once.
                 let merged = deq.add(&delta)?;
+                merged.eval()?;
                 let (new_w, new_s, new_b) =
                     ops::quantize(&merged, t.group_size, t.bits)?;
                 updates.push((
@@ -510,6 +543,21 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
         let input =
             Array::from_slice(&input_ids, &[1, seq_len as i32]).as_type::<u32>()?;
 
+        eprintln!(
+            "[EGGROLL-Q] targets={} layers={} seq_len={seq_len} prompt_len={prompt_len} pop={n} steps={total_steps}",
+            self.targets.len(),
+            self.model.args.num_hidden_layers,
+        );
+
+        // Sanity check: run a plain forward (no perturbations) to verify the model works.
+        {
+            eprintln!("[EGGROLL-Q] sanity: forward_all_logits (no perturbations)...");
+            let sanity_logits = self.model.forward_all_logits(&input)?;
+            mlx_rs::transforms::eval(std::slice::from_ref(&sanity_logits))?;
+            let sanity_loss = causal_lm_loss(&sanity_logits, tokens, prompt_len, vocab)?;
+            eprintln!("[EGGROLL-Q] sanity: OK  baseline_loss={sanity_loss:.4}");
+        }
+
         for step in 0..total_steps {
             let lr = cosine_lr(
                 step,
@@ -533,11 +581,21 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
             for member in 0..n {
                 // +perturbation: set fields on model, forward, clear
                 let perts_plus = self.build_perturbation_map(step, member, 1.0);
+                let n_perts = perts_plus.len();
                 self.model.perturbations = Some(perts_plus);
                 self.model.train_deltas = delta_map.clone();
+                if step == 0 && member == 0 {
+                    eprintln!("[EGGROLL-Q] step=0 member=0 sign=+1 n_perts={n_perts} starting forward...");
+                }
                 let logits_plus = self.model.forward_all_logits(&input)?;
+                if step == 0 && member == 0 {
+                    eprintln!("[EGGROLL-Q] step=0 member=0 sign=+1 forward done, evaluating...");
+                }
                 mlx_rs::transforms::eval(std::slice::from_ref(&logits_plus))?;
                 let loss_plus = causal_lm_loss(&logits_plus, tokens, prompt_len, vocab)?;
+                if step == 0 && member == 0 {
+                    eprintln!("[EGGROLL-Q] step=0 member=0 sign=+1 loss={loss_plus:.4}");
+                }
                 self.model.perturbations = None;
                 self.model.train_deltas = None;
 
@@ -545,10 +603,19 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
                 let perts_minus = self.build_perturbation_map(step, member, -1.0);
                 self.model.perturbations = Some(perts_minus);
                 self.model.train_deltas = delta_map.clone();
+                if step == 0 && member == 0 {
+                    eprintln!("[EGGROLL-Q] step=0 member=0 sign=-1 starting forward...");
+                }
                 let logits_minus = self.model.forward_all_logits(&input)?;
+                if step == 0 && member == 0 {
+                    eprintln!("[EGGROLL-Q] step=0 member=0 sign=-1 forward done, evaluating...");
+                }
                 mlx_rs::transforms::eval(std::slice::from_ref(&logits_minus))?;
                 let loss_minus =
                     causal_lm_loss(&logits_minus, tokens, prompt_len, vocab)?;
+                if step == 0 && member == 0 {
+                    eprintln!("[EGGROLL-Q] step=0 member=0 sign=-1 loss={loss_minus:.4}");
+                }
                 self.model.perturbations = None;
                 self.model.train_deltas = None;
 
@@ -576,9 +643,11 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
             }
         }
 
-        // Final merge of any remaining deltas
-        if !self.deltas.is_empty() {
+        // Final merge of any remaining deltas (skip if merge_interval=0 → user wants no merge)
+        if self.merge_interval > 0 && !self.deltas.is_empty() {
+            eprintln!("[EGGROLL-Q] final merge of {} delta buffers...", self.deltas.len());
             self.merge_deltas()?;
+            eprintln!("[EGGROLL-Q] merge complete");
         }
 
         Ok(losses)
@@ -1315,7 +1384,7 @@ mod tests {
         let mut trainer = Qwen3NextEggrollTrainer::new_for_model(
             &mut model,
             config,
-            0, // no merge — just accumulate
+            1, // merge every step — exercises the full dequant→add→requant cycle
         )
         .unwrap();
 
