@@ -261,13 +261,16 @@ struct QWeightMeta {
 
 /// Full EGGROLL training loop for quantized Qwen3Next models.
 ///
-/// Uses snapshot-inject-restore: mutate all QLinear weights in-place before
-/// the normal forward pass, then restore originals. Avoids modifying the
-/// model's forward path — works on any Qwen3Next configuration (dense/MoE,
-/// GDN/full attention).
+/// Applies low-rank perturbations additively during forward passes:
+///   y = quantized_matmul(W, x) + sigma * A @ (B^T @ x)
+///
+/// After training, accumulated fp32 deltas are persisted on the model
+/// for inference-time additive application (no lossy requantization).
+/// Works on any Qwen3Next configuration (dense/MoE, GDN/full attention).
 pub struct Qwen3NextEggrollTrainer<'m> {
     model: &'m mut Qwen3NextCausalLM,
     pub config: EggrollConfig,
+    /// Deprecated: merge is disabled (corrupts 3-bit weights). Kept for API compat.
     pub merge_interval: usize,
     targets: Vec<QWeightMeta>,
     deltas: HashMap<String, Array>,
@@ -483,6 +486,11 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
     }
 
     /// Merge accumulated deltas into quantized base weights and clear buffers.
+    ///
+    /// **WARNING**: This corrupts 3-bit models. The dequant→requant cycle
+    /// recomputes scales/biases, shifting the quantization grid for all elements
+    /// in each group. Use `persist deltas` (the default `train()` behavior) instead.
+    #[allow(dead_code)]
     fn merge_deltas(&mut self) -> Result<(), Exception> {
         eprintln!(
             "[EGGROLL-Q] merge_deltas: {} targets, {} deltas",
@@ -647,10 +655,11 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
             // Accumulate ES gradient
             self.accumulate_gradient(&fitnesses, step, lr)?;
 
-            // Periodic merge
-            if self.merge_interval > 0 && (step + 1) % self.merge_interval == 0 {
-                self.merge_deltas()?;
-            }
+            // NOTE: periodic merge_deltas is intentionally disabled.
+            // The dequant→add→requant cycle corrupts weights on 3-bit models
+            // because ops::quantize recomputes scales/biases, shifting the
+            // entire quantization grid. Deltas stay in fp32 and are applied
+            // additively during inference via forward_perturbed.
 
             if self.config.log_interval > 0 && (step + 1) % self.config.log_interval == 0 {
                 eprintln!(
@@ -661,11 +670,25 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
             }
         }
 
-        // Final merge of any remaining deltas (skip if merge_interval=0 → user wants no merge)
-        if self.merge_interval > 0 && !self.deltas.is_empty() {
-            eprintln!("[EGGROLL-Q] final merge of {} delta buffers...", self.deltas.len());
-            self.merge_deltas()?;
-            eprintln!("[EGGROLL-Q] merge complete");
+        // Persist deltas on the model for inference-time additive application.
+        // This avoids the lossy dequant→requant cycle that corrupts 3-bit weights.
+        if !self.deltas.is_empty() {
+            let n_deltas = self.deltas.len();
+            let total_bytes: usize = self
+                .deltas
+                .values()
+                .map(|d| d.shape().iter().map(|&s| s as usize).product::<usize>() * 4)
+                .sum();
+            eprintln!(
+                "[EGGROLL-Q] persisting {} delta buffers ({:.1} MB) for inference",
+                n_deltas,
+                total_bytes as f64 / (1024.0 * 1024.0),
+            );
+            // Eval all deltas so they're materialized before we hand them to inference
+            for d in self.deltas.values() {
+                d.eval()?;
+            }
+            self.model.train_deltas = Some(std::mem::take(&mut self.deltas));
         }
 
         Ok(losses)
@@ -1371,7 +1394,8 @@ mod tests {
             !trainer.target_names().iter().any(|n| n.contains("switch_mlp")),
             "new_for_model should auto-exclude switch_mlp for MoE models",
         );
-        assert_eq!(trainer.num_targets(), 16);
+        // 7 per layer (4 attn + 3 shared expert; router gate + switch_mlp excluded) × 2 layers = 14
+        assert_eq!(trainer.num_targets(), 14);
 
         // new_for_model on dense model should NOT exclude mlp projections
         drop(trainer);
@@ -1393,6 +1417,7 @@ mod tests {
         // Full E2E: run train() on tiny MoE model with switch_mlp excluded.
         // This proves the perturbed forward pass through MoE layers produces
         // finite, positive loss and doesn't panic on excluded targets.
+        // After training, deltas are persisted (not merged into quantized weights).
         let mut model = tiny_qwen3next_moe_model();
         let mut config = small_config();
         config.total_steps = 2;
@@ -1402,7 +1427,7 @@ mod tests {
         let mut trainer = Qwen3NextEggrollTrainer::new_for_model(
             &mut model,
             config,
-            1, // merge every step — exercises the full dequant→add→requant cycle
+            0,
         )
         .unwrap();
 
@@ -1412,14 +1437,7 @@ mod tests {
             "switch_mlp should be auto-excluded",
         );
 
-        // Snapshot a scale tensor before training to verify weights change
-        let snap_key = trainer.targets[0].scales_key.clone();
-        let pre_scales = {
-            let p = trainer.model.parameters().flatten();
-            let s = *p.get(snap_key.as_str()).unwrap();
-            mlx_rs::transforms::eval(std::slice::from_ref(s)).unwrap();
-            s.as_slice::<f32>().to_vec()
-        };
+        let n_targets = trainer.num_targets();
 
         // Tiny token sequence: 2 prompt + 4 completion
         let tokens: Vec<u32> = vec![1, 5, 10, 20, 30, 40];
@@ -1438,21 +1456,18 @@ mod tests {
             );
         }
 
-        // Verify weights actually changed (deltas merged into base weights)
-        let post_scales = {
-            let p = trainer.model.parameters().flatten();
-            let s = *p.get(snap_key.as_str()).unwrap();
-            mlx_rs::transforms::eval(std::slice::from_ref(s)).unwrap();
-            s.as_slice::<f32>().to_vec()
-        };
-        let max_diff = pre_scales
-            .iter()
-            .zip(post_scales.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        // Verify deltas are persisted on model (not merged into quantized weights)
         assert!(
-            max_diff > 0.0,
-            "Weights should change after training (deltas merged into base)",
+            trainer.model.train_deltas.is_some(),
+            "train_deltas should be persisted on model after training",
+        );
+        let deltas = trainer.model.train_deltas.as_ref().unwrap();
+        assert_eq!(
+            deltas.len(),
+            n_targets,
+            "Should have one delta per target, got {} (expected {})",
+            deltas.len(),
+            n_targets,
         );
     }
 
@@ -1546,7 +1561,8 @@ mod tests {
 
         // Pre-training eval
         let input = Array::from_slice(&tokens, &[1, tokens.len() as i32])
-            .as_type::<u32>().unwrap();
+            .as_type::<u32>()
+            .unwrap();
         let pre_logits = model.forward_all_logits(&input).unwrap();
         mlx_rs::transforms::eval(std::slice::from_ref(&pre_logits)).unwrap();
         let pre_loss = causal_lm_loss(&pre_logits, &tokens, prompt_len, 4096).unwrap();
@@ -1554,7 +1570,7 @@ mod tests {
 
         // Train
         let config = EggrollConfig {
-            sigma: 0.15,      // larger sigma: additive gradient must survive merge→requant
+            sigma: 0.15,
             lr: 0.015,
             rank: 4,
             population: 16,
@@ -1566,7 +1582,7 @@ mod tests {
         };
 
         let mut trainer =
-            Qwen3NextEggrollTrainer::new(&mut model, config, 10, &["embed_tokens"]).unwrap();
+            Qwen3NextEggrollTrainer::new(&mut model, config, 0, &["embed_tokens"]).unwrap();
         let losses = trainer.train(&tokens, prompt_len).unwrap();
         assert_eq!(losses.len(), 120);
         assert!(losses.iter().all(|l| l.is_finite()), "all losses must be finite");
@@ -1590,70 +1606,94 @@ mod tests {
         assert!(
             post_loss < pre_loss,
             "QUANTIZED CONVERGENCE FAILED: post_loss={post_loss:.4} >= pre_loss={pre_loss:.4} \
-             — ES signal does NOT survive dequant→perturb→requant"
+             — ES signal does not improve model with persisted deltas"
         );
     }
 
-    /// Prove: periodic merge doesn't regress convergence.
+    /// Prove: persisted deltas produce correct inference results.
     ///
-    /// Run same sequence with merge_interval=5 vs merge_interval=0 (merge at end).
-    /// Both should converge; the merged path should not have higher final loss.
+    /// After training, deltas are persisted on the model. A fresh forward
+    /// pass (simulating inference) should apply them additively and produce
+    /// different logits than clean (no-delta) inference.
     #[test]
-    fn test_periodic_merge_doesnt_regress() {
+    fn test_persisted_deltas_applied_at_inference() {
         let tokens: Vec<u32> = (0..24).map(|i| ((i * 11 + 5) % 256) as u32).collect();
         let prompt_len = 4;
-        let steps = 30;
 
-        // Path A: merge every 5 steps
-        let mut model_a = tiny_qwen3next_model();
-        let config_a = EggrollConfig {
+        let mut model = tiny_qwen3next_model();
+        let config = EggrollConfig {
             sigma: 0.05,
             lr: 0.005,
             rank: 4,
             population: 8,
-            total_steps: steps,
-            warmup_steps: 3,
+            total_steps: 10,
+            warmup_steps: 2,
             min_lr_frac: 0.1,
             log_interval: 0,
             base_seed: 42,
         };
-        let mut trainer_a =
-            Qwen3NextEggrollTrainer::new(&mut model_a, config_a, 5, &["embed_tokens"]).unwrap();
-        let losses_a = trainer_a.train(&tokens, prompt_len).unwrap();
 
-        // Path B: merge only at end
-        let mut model_b = tiny_qwen3next_model();
-        let config_b = EggrollConfig {
-            sigma: 0.05,
-            lr: 0.005,
-            rank: 4,
-            population: 8,
-            total_steps: steps,
-            warmup_steps: 3,
-            min_lr_frac: 0.1,
-            log_interval: 0,
-            base_seed: 42,
-        };
-        let mut trainer_b =
-            Qwen3NextEggrollTrainer::new(&mut model_b, config_b, 0, &["embed_tokens"]).unwrap();
-        let losses_b = trainer_b.train(&tokens, prompt_len).unwrap();
+        // Pre-training forward (clean)
+        let input = Array::from_slice(&tokens, &[1, tokens.len() as i32])
+            .as_type::<u32>()
+            .unwrap();
+        let pre_logits = model.forward_all_logits(&input).unwrap();
+        mlx_rs::transforms::eval(std::slice::from_ref(&pre_logits)).unwrap();
+        let pre_loss = causal_lm_loss(&pre_logits, &tokens, prompt_len, 256).unwrap();
+        eprintln!("[persist test] pre-training loss = {pre_loss:.4}");
 
-        let window = steps / 4;
-        let last_a: f32 = losses_a[losses_a.len() - window..].iter().sum::<f32>() / window as f32;
-        let last_b: f32 = losses_b[losses_b.len() - window..].iter().sum::<f32>() / window as f32;
+        // Train — deltas will be persisted on model
+        let mut trainer =
+            Qwen3NextEggrollTrainer::new(&mut model, config, 0, &["embed_tokens"]).unwrap();
+        let losses = trainer.train(&tokens, prompt_len).unwrap();
+        assert!(losses.iter().all(|l| l.is_finite()));
 
+        // Verify deltas are persisted
+        assert!(
+            trainer.model.train_deltas.is_some(),
+            "train_deltas should be set after training",
+        );
+        let n_deltas = trainer.model.train_deltas.as_ref().unwrap().len();
+        assert!(n_deltas > 0, "should have non-zero delta count");
+
+        // Post-training forward (with persisted deltas — inference path)
+        let post_logits = trainer.model.forward_all_logits(&input).unwrap();
+        mlx_rs::transforms::eval(std::slice::from_ref(&post_logits)).unwrap();
+        let post_loss = causal_lm_loss(&post_logits, &tokens, prompt_len, 256).unwrap();
+
+        let improvement = (pre_loss - post_loss) / pre_loss * 100.0;
         eprintln!(
-            "[merge test] periodic(5)={last_a:.4}  end_only={last_b:.4}  \
-             diff={:.4}",
-            last_a - last_b,
+            "[persist test] post-training loss = {post_loss:.4}  \
+             improvement = {improvement:.1}%  ({pre_loss:.4} → {post_loss:.4})  \
+             deltas={n_deltas}",
         );
 
-        // Both should be finite
-        assert!(last_a.is_finite() && last_b.is_finite());
-        // Periodic merge should not be catastrophically worse (allow 20% margin for noise)
+        // Deltas should change the logits
+        let pre_vals: Vec<f32> = pre_logits.as_slice().to_vec();
+        let post_vals: Vec<f32> = post_logits.as_slice().to_vec();
+        let max_diff = pre_vals
+            .iter()
+            .zip(post_vals.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(
-            last_a < last_b * 1.2,
-            "Periodic merge regressed: {last_a:.4} vs end-only {last_b:.4}"
+            max_diff > 1e-6,
+            "Inference with persisted deltas should produce different logits, max_diff={max_diff}",
+        );
+
+        // Clearing deltas should restore original behavior
+        trainer.model.train_deltas = None;
+        let clean_logits = trainer.model.forward_all_logits(&input).unwrap();
+        mlx_rs::transforms::eval(std::slice::from_ref(&clean_logits)).unwrap();
+        let clean_vals: Vec<f32> = clean_logits.as_slice().to_vec();
+        let restore_diff = pre_vals
+            .iter()
+            .zip(clean_vals.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            restore_diff == 0.0,
+            "After clearing deltas, should match pre-training logits, diff={restore_diff}",
         );
     }
 
