@@ -2,8 +2,11 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis2};
+use std::sync::Arc;
+
+use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis1, slice_axis2};
 use higgs_models::qwen3_next::ArraysCache;
+use higgs_models::turboquant::TurboQuantContext;
 use higgs_models::{AnyCache, LayerCache};
 use mlx_rs::Array;
 use mlx_rs::error::Exception;
@@ -31,14 +34,30 @@ struct KvBlock {
 struct GdnSnapshot {
     conv_state: Option<Array>,
     ssm_state: Option<Array>,
+    conv_pos: i32,
     offset: i32,
+}
+
+/// Per-layer block for TurboQuant KV cache.
+///
+/// Each block holds the 5 quantized arrays for `block_size` tokens:
+/// key/value codes (packed u32), norms, gammas.
+#[derive(Debug, Clone)]
+struct TqBlock {
+    key_codes: Array,
+    key_norms: Array,
+    key_gammas: Array,
+    value_codes: Array,
+    value_norms: Array,
 }
 
 /// Per-layer cached data.
 #[derive(Debug, Clone)]
 enum CachedLayerData {
-    /// Attention layer: sequence of K/V blocks.
+    /// Attention layer: sequence of dense K/V blocks.
     Kv(Vec<KvBlock>),
+    /// Attention layer: sequence of TurboQuant blocks.
+    TurboQuantKv(Vec<TqBlock>),
     /// GDN/SSM layer: state snapshot at block boundary.
     Gdn(GdnSnapshot),
     /// Layer had no cache data.
@@ -57,7 +76,14 @@ enum CachedData {
         total_tokens: usize,
         is_hybrid: bool,
     },
-    /// Full clone fallback (TurboQuant caches).
+    /// Block-paged TurboQuant cache with shared quantization context.
+    TurboQuantPaged {
+        layers: Vec<CachedLayerData>,
+        context: Arc<TurboQuantContext>,
+        total_tokens: usize,
+        is_hybrid: bool,
+    },
+    /// Full clone fallback (cache too short for paging).
     Cloned(AnyCache),
 }
 
@@ -131,7 +157,14 @@ impl RadixNode {
         let mut best = self
             .cached
             .as_ref()
-            .filter(|_| depth >= min_prefix)
+            .filter(|cs| {
+                // Cloned entries are valid at any depth > 0 (no block alignment needed).
+                // Paged entries require at least min_prefix tokens for block alignment.
+                match &cs.data {
+                    CachedData::Cloned(_) => depth > 0,
+                    _ => depth >= min_prefix,
+                }
+            })
             .map(|cs| (depth, cs));
 
         let Some(&next_token) = tokens.get(depth) else {
@@ -232,10 +265,16 @@ impl PagedPrefixCache {
     pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<PagedPrefixMatch> {
         self.root
             .find_deepest_match(tokens, 0, self.block_size)
-            .and_then(|(prefix_len, cs)| {
-                let cache = materialize(&cs.data).ok()?;
-                cs.last_accessed.set(Instant::now());
-                Some(PagedPrefixMatch { prefix_len, cache })
+            .and_then(|(prefix_len, cs)| match materialize(&cs.data) {
+                Ok(cache) => {
+                    tracing::debug!(prefix_len, "Prefix cache hit");
+                    cs.last_accessed.set(Instant::now());
+                    Some(PagedPrefixMatch { prefix_len, cache })
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Prefix cache materialize failed");
+                    None
+                }
             })
     }
 
@@ -249,20 +288,22 @@ impl PagedPrefixCache {
             return;
         }
 
-        let data = if is_turboquant(cache) {
-            CachedData::Cloned(cache.clone())
-        } else {
-            match slice_into_blocks(cache, self.block_size) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to page cache, using clone fallback");
-                    CachedData::Cloned(cache.clone())
-                }
+        // TurboQuant caches with deferred quantization are stored as dense
+        // blocks until TQ activates. Full TQ block paging is implemented in the
+        // CachedData::TurboQuantPaged variant but requires the TQ arrays to be
+        // populated (post-activation). For now, use clone fallback when TQ config
+        // is set but arrays aren't yet quantized to avoid cache corruption.
+        let data = match slice_into_blocks(cache, self.block_size) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to page cache, using clone fallback");
+                CachedData::Cloned(cache.clone())
             }
         };
 
         let aligned_len = match &data {
-            CachedData::Paged { total_tokens, .. } => *total_tokens,
+            CachedData::Paged { total_tokens, .. }
+            | CachedData::TurboQuantPaged { total_tokens, .. } => *total_tokens,
             CachedData::Cloned(_) => prefix_tokens.len(),
         };
         let tokens_to_store = prefix_tokens.get(..aligned_len).unwrap_or(prefix_tokens);
@@ -415,6 +456,13 @@ fn kv_offset(cache: &AnyCache) -> Option<i32> {
 
 /// Slice a cache into block-aligned paged data.
 fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, Exception> {
+    // Hybrid caches (GDN+KV) can't be block-paged because GDN sequential state
+    // doesn't align to block boundaries. The KV offset would mismatch the GDN
+    // offset after materialization, producing corrupt attention. Use clone instead.
+    if matches!(cache, AnyCache::Hybrid(_)) {
+        return Ok(CachedData::Cloned(cache.clone()));
+    }
+
     let offset = kv_offset(cache).unwrap_or(0);
     let num_blocks = offset as usize / block_size;
     if num_blocks == 0 {
@@ -424,38 +472,80 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
     let block_size_i32 =
         i32::try_from(block_size).map_err(|_| Exception::custom("block_size overflow"))?;
 
-    let (layers, is_hybrid) = match cache {
+    // Slice KV layers as TQ blocks when actually quantized, dense otherwise.
+    // Hybrid caches are handled by the early-return clone above.
+    let (layers, tq_context) = match cache {
         AnyCache::KV(kv_layers) => {
+            let mut ctx: Option<Arc<TurboQuantContext>> = None;
             let layers: Result<Vec<_>, _> = kv_layers
                 .iter()
-                .map(|layer_opt| slice_kv_layer(layer_opt.as_ref(), num_blocks, block_size_i32))
-                .collect();
-            (layers?, false)
-        }
-        AnyCache::Hybrid(hybrid_layers) => {
-            let layers: Result<Vec<_>, _> = hybrid_layers
-                .iter()
-                .map(|layer_opt| match layer_opt {
-                    Some(LayerCache::KV(kv)) => {
+                .map(|layer_opt| {
+                    let Some(kv) = layer_opt.as_ref() else {
+                        return Ok(CachedLayerData::Empty);
+                    };
+                    if kv.is_quantized() {
+                        if ctx.is_none() {
+                            ctx = kv.turbo_arrays().map(|(c, ..)| Arc::clone(c));
+                        }
+                        slice_tq_layer(kv, num_blocks, block_size_i32)
+                    } else {
                         slice_kv_layer(Some(kv), num_blocks, block_size_i32)
                     }
-                    Some(LayerCache::Arrays(ac)) => Ok(CachedLayerData::Gdn(GdnSnapshot {
-                        conv_state: ac.conv_state.clone(),
-                        ssm_state: ac.ssm_state.clone(),
-                        offset: ac.offset,
-                    })),
-                    None => Ok(CachedLayerData::Empty),
                 })
                 .collect();
-            (layers?, true)
+            (layers?, ctx)
         }
+        // Hybrid caches returned Cloned above; this arm is unreachable.
+        AnyCache::Hybrid(_) => unreachable!("Hybrid caches use clone fallback"),
     };
 
-    Ok(CachedData::Paged {
-        layers,
-        total_tokens,
-        is_hybrid,
-    })
+    if let Some(context) = tq_context {
+        Ok(CachedData::TurboQuantPaged {
+            layers,
+            context,
+            total_tokens,
+            is_hybrid: false,
+        })
+    } else {
+        Ok(CachedData::Paged {
+            layers,
+            total_tokens,
+            is_hybrid: false,
+        })
+    }
+}
+
+/// Slice a single TurboQuant KV layer into blocks along axis 1.
+fn slice_tq_layer(
+    kv: &SteppingKeyValueCache,
+    num_blocks: usize,
+    block_size: i32,
+) -> Result<CachedLayerData, Exception> {
+    let Some((_ctx, key_codes, key_norms, key_gammas, value_codes, value_norms)) =
+        kv.turbo_arrays()
+    else {
+        return Ok(CachedLayerData::Empty);
+    };
+
+    let mut blocks = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
+        let start = i32::try_from(i)
+            .map_err(|_| Exception::custom("block index overflow"))?
+            .checked_mul(block_size)
+            .ok_or_else(|| Exception::custom("block start overflow"))?;
+        let end = start
+            .checked_add(block_size)
+            .ok_or_else(|| Exception::custom("block end overflow"))?;
+        blocks.push(TqBlock {
+            key_codes: slice_axis1(key_codes, start, end)?,
+            key_norms: slice_axis1(key_norms, start, end)?,
+            key_gammas: slice_axis1(key_gammas, start, end)?,
+            value_codes: slice_axis1(value_codes, start, end)?,
+            value_norms: slice_axis1(value_norms, start, end)?,
+        });
+    }
+
+    Ok(CachedLayerData::TurboQuantKv(blocks))
 }
 
 /// Slice a single KV layer into blocks.
@@ -501,6 +591,18 @@ fn materialize(data: &CachedData) -> Result<AnyCache, Exception> {
                 materialize_kv(layers)
             }
         }
+        CachedData::TurboQuantPaged {
+            layers,
+            context,
+            is_hybrid,
+            ..
+        } => {
+            if *is_hybrid {
+                materialize_tq_hybrid(layers, context)
+            } else {
+                materialize_tq_kv(layers, context)
+            }
+        }
     }
 }
 
@@ -509,8 +611,29 @@ fn materialize_kv(layers: &[CachedLayerData]) -> Result<AnyCache, Exception> {
         .iter()
         .map(|layer| match layer {
             CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(Some),
+            CachedLayerData::TurboQuantKv(_) => {
+                Err(Exception::custom("TQ layer in non-TQ materialize"))
+            }
             CachedLayerData::Empty => Ok(Some(SteppingKeyValueCache::new())),
             CachedLayerData::Gdn(_) => Err(Exception::custom("Unexpected GDN layer in KV cache")),
+        })
+        .collect();
+    Ok(AnyCache::KV(kv_layers?))
+}
+
+fn materialize_tq_kv(
+    layers: &[CachedLayerData],
+    context: &Arc<TurboQuantContext>,
+) -> Result<AnyCache, Exception> {
+    let kv_layers: Result<Vec<_>, _> = layers
+        .iter()
+        .map(|layer| match layer {
+            CachedLayerData::TurboQuantKv(blocks) => gather_tq_blocks(blocks, context).map(Some),
+            CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(Some),
+            CachedLayerData::Empty => Ok(Some(SteppingKeyValueCache::new())),
+            CachedLayerData::Gdn(_) => {
+                Err(Exception::custom("Unexpected GDN layer in TQ KV cache"))
+            }
         })
         .collect();
     Ok(AnyCache::KV(kv_layers?))
@@ -521,9 +644,36 @@ fn materialize_hybrid(layers: &[CachedLayerData]) -> Result<AnyCache, Exception>
         .iter()
         .map(|layer| match layer {
             CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(|kv| Some(LayerCache::KV(kv))),
+            CachedLayerData::TurboQuantKv(_) => {
+                Err(Exception::custom("TQ layer in non-TQ hybrid materialize"))
+            }
             CachedLayerData::Gdn(snap) => Ok(Some(LayerCache::Arrays(ArraysCache {
                 conv_state: snap.conv_state.clone(),
                 ssm_state: snap.ssm_state.clone(),
+                conv_pos: snap.conv_pos,
+                offset: snap.offset,
+            }))),
+            CachedLayerData::Empty => Ok(None),
+        })
+        .collect();
+    Ok(AnyCache::Hybrid(hybrid_layers?))
+}
+
+fn materialize_tq_hybrid(
+    layers: &[CachedLayerData],
+    context: &Arc<TurboQuantContext>,
+) -> Result<AnyCache, Exception> {
+    let hybrid_layers: Result<Vec<_>, _> = layers
+        .iter()
+        .map(|layer| match layer {
+            CachedLayerData::TurboQuantKv(blocks) => {
+                gather_tq_blocks(blocks, context).map(|kv| Some(LayerCache::KV(kv)))
+            }
+            CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(|kv| Some(LayerCache::KV(kv))),
+            CachedLayerData::Gdn(snap) => Ok(Some(LayerCache::Arrays(ArraysCache {
+                conv_state: snap.conv_state.clone(),
+                ssm_state: snap.ssm_state.clone(),
+                conv_pos: snap.conv_pos,
                 offset: snap.offset,
             }))),
             CachedLayerData::Empty => Ok(None),
@@ -551,6 +701,44 @@ fn gather_blocks(blocks: &[KvBlock]) -> Result<SteppingKeyValueCache, Exception>
     let values = concatenate_axis(&value_arrays, 2)?;
 
     Ok(SteppingKeyValueCache::from_arrays(keys, values))
+}
+
+/// Gather TQ blocks into a single `SteppingKeyValueCache` with TQ storage.
+fn gather_tq_blocks(
+    blocks: &[TqBlock],
+    context: &Arc<TurboQuantContext>,
+) -> Result<SteppingKeyValueCache, Exception> {
+    if blocks.is_empty() {
+        return Ok(SteppingKeyValueCache::new());
+    }
+
+    // Concatenate all block arrays along axis 1 (the sequence dimension).
+    let concat1 = |arrays: Vec<Array>| -> Result<Array, Exception> {
+        if arrays.len() == 1 {
+            Ok(arrays.into_iter().next().unwrap())
+        } else {
+            concatenate_axis(&arrays, 1)
+        }
+    };
+
+    let key_codes = concat1(blocks.iter().map(|b| b.key_codes.clone()).collect())?;
+    let key_norms = concat1(blocks.iter().map(|b| b.key_norms.clone()).collect())?;
+    let key_gammas = concat1(blocks.iter().map(|b| b.key_gammas.clone()).collect())?;
+    let value_codes = concat1(blocks.iter().map(|b| b.value_codes.clone()).collect())?;
+    let value_norms = concat1(blocks.iter().map(|b| b.value_norms.clone()).collect())?;
+
+    // Total tokens = sum of block sizes along axis 1.
+    let total = key_norms.shape().get(1).copied().unwrap_or(0);
+
+    Ok(SteppingKeyValueCache::from_turbo_arrays(
+        Arc::clone(context),
+        key_codes,
+        key_norms,
+        key_gammas,
+        value_codes,
+        value_norms,
+        total,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +772,7 @@ mod tests {
                     Some(LayerCache::Arrays(ArraysCache {
                         conv_state: Some(Array::zeros::<f32>(&[1, 4, 4]).unwrap()),
                         ssm_state: Some(Array::zeros::<f32>(&[1, 16]).unwrap()),
+                        conv_pos: 3,
                         offset: seq_len,
                     }))
                 } else {
@@ -723,6 +912,7 @@ mod tests {
                         LayerCache::Arrays(ac) => {
                             assert_eq!(i % 4, 0, "Layer {i} should be GDN");
                             assert_eq!(ac.offset, 64);
+                            assert_eq!(ac.conv_pos, 3);
                             assert!(ac.conv_state.is_some());
                             assert!(ac.ssm_state.is_some());
                         }
