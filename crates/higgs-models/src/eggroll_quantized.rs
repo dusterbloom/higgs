@@ -211,13 +211,12 @@ impl EggrollQuantizedTrainer {
             qlinear.bits,
         )?;
 
-        // Add delta and requantize.
-        // Eval merged to materialize the lazy graph before quantize — without
-        // this, the accumulated dequant+add graph can be too large for Metal.
+        // Fully materialize the round-trip so no lazy graph leaks.
         let merged = deq.add(&delta)?;
         merged.eval()?;
         let (new_w, new_s, new_b) =
             ops::quantize(&merged, qlinear.group_size, qlinear.bits)?;
+        mlx_rs::transforms::eval([&new_w, &new_s, &new_b])?;
 
         // Replace weights
         *qlinear.weight = new_w;
@@ -326,19 +325,24 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
             }
 
             let out_dim = shape[0] as usize;
+            let packed_cols = shape[1] as usize;
 
-            // Derive in_dim from the scales array, which has shape
-            // [out_dim, n_groups] where n_groups = in_dim / group_size.
-            // This is correct for ALL bit widths (3, 4, 8, etc.) unlike the
-            // packed-weight formula `shape[1] * 32 / bits` which truncates
-            // for non-power-of-2 bit widths.
+            // Derive in_dim from scales [out_dim, n_groups] where n_groups = in_dim / group_size.
             let s = params.get(scales_key.as_str()).unwrap();
             let s_shape = s.shape();
             if s_shape.len() < 2 {
-                continue; // malformed scales — skip
+                continue;
             }
             let n_groups = s_shape[1] as usize;
             let in_dim = n_groups * (group_size as usize);
+
+            // Derive actual bits from the packing ratio — models can have mixed
+            // quantization (e.g. 3-bit projections + 8-bit router/gate).
+            let actual_bits = if in_dim > 0 {
+                ((packed_cols * 32) / in_dim) as i32
+            } else {
+                bits
+            };
 
             // Parse layer index from key: "model.layers.N...."
             let layer_idx = parse_layer_idx(base).unwrap_or(0);
@@ -354,7 +358,7 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
                 out_dim,
                 in_dim,
                 group_size,
-                bits,
+                bits: actual_bits,
                 layer_idx,
                 weight_idx,
             });
@@ -396,9 +400,9 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
         merge_interval: usize,
     ) -> Result<Self, Exception> {
         let exclude: &[&str] = if model.args.num_experts > 0 {
-            &["switch_mlp", "embed_tokens"]
+            &["switch_mlp", "embed_tokens", "lm_head", "mlp.gate"]
         } else {
-            &["embed_tokens"]
+            &["embed_tokens", "lm_head"]
         };
         Self::new(model, config, merge_interval, exclude)
     }
@@ -480,11 +484,16 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
 
     /// Merge accumulated deltas into quantized base weights and clear buffers.
     fn merge_deltas(&mut self) -> Result<(), Exception> {
+        eprintln!(
+            "[EGGROLL-Q] merge_deltas: {} targets, {} deltas",
+            self.targets.len(),
+            self.deltas.len(),
+        );
         // Phase 1: read current weights + deltas, compute merged+requantized values
         let mut updates: Vec<(String, String, String, Array, Array, Array)> = Vec::new();
         {
             let params = self.model.parameters().flatten();
-            for t in &self.targets {
+            for (idx, t) in self.targets.iter().enumerate() {
                 let delta = match self.deltas.get(&t.name) {
                     Some(d) => d.clone(),
                     None => continue,
@@ -492,14 +501,23 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
                 let w = *params.get(t.weight_key.as_str()).unwrap();
                 let s = *params.get(t.scales_key.as_str()).unwrap();
                 let b = *params.get(t.biases_key.as_str()).unwrap();
+                eprintln!(
+                    "[EGGROLL-Q] merge {idx}/{}: {} bits={} gs={} w={:?} s={:?}",
+                    self.targets.len(), t.name, t.bits, t.group_size,
+                    w.shape(), s.shape(),
+                );
                 let deq = ops::dequantize(w, s, b, t.group_size, t.bits)?;
-                // Eval merged to materialize the lazy graph before quantize —
-                // without this, the accumulated dequant+add graph across all
-                // targets can be too large for Metal to evaluate at once.
                 let merged = deq.add(&delta)?;
+                // Fully materialize each target's round-trip (dequant→add→requant)
+                // before moving to the next. Without this, ~291 lazy graphs
+                // accumulate and exhaust Metal memory on the real 35B model.
                 merged.eval()?;
                 let (new_w, new_s, new_b) =
                     ops::quantize(&merged, t.group_size, t.bits)?;
+                mlx_rs::transforms::eval([&new_w, &new_s, &new_b])?;
+                if idx % 50 == 0 || idx == self.targets.len() - 1 {
+                    eprintln!("[EGGROLL-Q] merge {idx}: dequant+requant OK");
+                }
                 updates.push((
                     t.weight_key.clone(),
                     t.scales_key.clone(),
