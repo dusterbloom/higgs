@@ -8,6 +8,7 @@ pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod registry;
 pub mod siglip;
+pub mod spec_prefill;
 pub mod starcoder2;
 pub mod transformer;
 pub mod turboquant;
@@ -71,8 +72,11 @@ impl SamplingParams {
     }
 }
 
-pub use qwen3_next::{LayerCache, Qwen3NextCausalLM};
+pub use qwen3_next::{LayerCache, MtpHead, Qwen3NextCausalLM};
 pub use transformer::{Model, ModelArgs};
+
+/// MTP (Multi-Token Prediction) KV cache — one `SteppingKeyValueCache` per MTP layer.
+pub type MtpCache = Vec<cache::SteppingKeyValueCache>;
 
 // ---------------------------------------------------------------------------
 // AnyModel / AnyCache -- unified dispatch across model architectures
@@ -147,13 +151,25 @@ fn make_turboquant_kv_cache(
         );
         return Ok(AnyCache::KV(vec![]));
     };
+    let dense_tail = usize::from(kv_cache_config.adaptive_dense_layers);
+    if dense_tail > 0 {
+        tracing::info!(
+            n_layers,
+            dense_tail,
+            "Layer-adaptive TQ: last {dense_tail} layers will use dense KV cache"
+        );
+    }
     let mut caches = Vec::with_capacity(n_layers);
-    for _ in 0..n_layers {
-        caches.push(Some(cache::SteppingKeyValueCache::new_turbo(
-            kv_cache_config,
-            num_key_value_heads,
-            head_dim,
-        )?));
+    for i in 0..n_layers {
+        if dense_tail > 0 && i >= n_layers.saturating_sub(dense_tail) {
+            caches.push(Some(cache::SteppingKeyValueCache::new()));
+        } else {
+            caches.push(Some(cache::SteppingKeyValueCache::new_turbo(
+                kv_cache_config,
+                num_key_value_heads,
+                head_dim,
+            )?));
+        }
     }
     Ok(AnyCache::KV(caches))
 }
@@ -195,6 +211,28 @@ impl AnyModel {
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
             _ => Err(Exception::custom("Model/cache type mismatch")),
+        }
+    }
+
+    /// Forward pass producing logits for **only the last token**.
+    ///
+    /// During prefill we only need the last token's logits for sampling.
+    /// Computing the full `[B, L, vocab]` LM head is wasteful for large vocab.
+    /// This method computes hidden states for all tokens (needed for KV cache),
+    /// then applies the LM head only to the last token.
+    pub fn forward_last_token(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_last_token(inputs, mask, c),
+            // Fallback: compute full forward then slice for other architectures
+            (m, c) => {
+                let logits = m.forward(inputs, mask, c)?;
+                Ok(logits.index((.., -1.., ..)))
+            }
         }
     }
 
@@ -285,6 +323,64 @@ impl AnyModel {
     /// Whether this model supports batched decode.
     pub const fn supports_batched_decode(&self) -> bool {
         matches!(self, Self::Transformer(_))
+    }
+
+    /// Whether this model has a loaded MTP head for speculative decode.
+    pub fn has_mtp(&self) -> bool {
+        matches!(self, Self::Qwen3Next(m) if m.has_mtp())
+    }
+
+    /// Create a fresh MTP KV cache, or `None` if no MTP head.
+    pub fn make_mtp_cache(&self) -> Option<MtpCache> {
+        match self {
+            Self::Qwen3Next(m) => m.make_mtp_cache(),
+            _ => None,
+        }
+    }
+
+    /// Run the MTP head to produce draft logits for position t+2.
+    ///
+    /// Returns draft logits `[B, 1, vocab]`, or an error if no MTP head.
+    pub fn mtp_draft(
+        &mut self,
+        hidden: &Array,
+        next_token_id: u32,
+        mtp_cache: &mut MtpCache,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.mtp_draft(hidden, next_token_id, mtp_cache),
+            _ => Err(Exception::custom("MTP not supported for this model")),
+        }
+    }
+
+    /// Advance the MTP head/cache for an accepted token without projecting logits.
+    pub fn mtp_advance(
+        &mut self,
+        hidden: &Array,
+        next_token_id: u32,
+        mtp_cache: &mut MtpCache,
+    ) -> Result<(), Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.mtp_advance(hidden, next_token_id, mtp_cache),
+            _ => Err(Exception::custom("MTP not supported for this model")),
+        }
+    }
+
+    /// Forward pass returning both hidden states and logits for all positions.
+    ///
+    /// Used by MTP speculative decode for the verify pass.
+    pub fn forward_with_hidden(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<(Array, Array), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_with_hidden(inputs, mask, c),
+            _ => Err(Exception::custom(
+                "forward_with_hidden only supported for Qwen3Next",
+            )),
+        }
     }
 
     /// The model's hidden dimension.
@@ -895,10 +991,12 @@ fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf
         let json = std::fs::read_to_string(&index_path)?;
         let index: WeightMapIndex = serde_json::from_str(&json)?;
         let weight_files: HashSet<&String> = index.weight_map.values().collect();
-        Ok(weight_files
+        let mut files: Vec<_> = weight_files
             .into_iter()
             .map(|f| model_path.join(f))
-            .collect())
+            .collect();
+        files.sort();
+        Ok(files)
     } else {
         let single_path = model_path.join("model.safetensors");
         if single_path.exists() {
@@ -1233,6 +1331,7 @@ mod tests {
                 mode: turboquant::KvCacheMode::Turboquant,
                 bits: 3,
                 seed: 5,
+                ..Default::default()
             })
             .unwrap();
         match &cache {
