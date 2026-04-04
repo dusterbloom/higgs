@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use mlx_rs::{
     Array, Dtype, Stream,
@@ -32,18 +32,21 @@ use serde::Deserialize;
 // FFI error capture for gather_qmm
 // ---------------------------------------------------------------------------
 
-/// Captures the most recent MLX error message from our FFI calls.
-static FFI_LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+/// Per-thread FFI error capture — avoids cross-contamination between threads.
+thread_local! {
+    static FFI_LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 /// Error handler registered once with MLX to capture error messages.
+/// Runs on the calling thread, so thread-local storage is safe here.
 #[allow(unsafe_code)]
 unsafe extern "C" fn ffi_error_handler(msg: *const c_char, _data: *mut c_void) {
     let s = unsafe { CStr::from_ptr(msg) }
         .to_string_lossy()
         .into_owned();
-    if let Ok(mut guard) = FFI_LAST_ERROR.lock() {
-        *guard = Some(s);
-    }
+    FFI_LAST_ERROR.with(|cell| {
+        *cell.borrow_mut() = Some(s);
+    });
 }
 
 /// Register our FFI error handler exactly once.
@@ -60,7 +63,9 @@ fn ensure_ffi_error_handler() {
 /// Wrapper for the cached `GatedDeltaNet` Metal kernel object.
 struct CachedMetalKernel(mlx_sys::mlx_fast_metal_kernel);
 
-// The kernel object is immutable after creation and used read-only in apply.
+// SAFETY: The kernel handle is created once during initialization and used
+// read-only thereafter (only passed as an argument to `mlx_fast_metal_kernel_apply`).
+// No mutable state is shared across threads.
 #[allow(unsafe_code)]
 unsafe impl Send for CachedMetalKernel {}
 #[allow(unsafe_code)]
@@ -553,9 +558,7 @@ pub(crate) fn gather_qmm(
         // Free the uninitialized result array
         unsafe { mlx_sys::mlx_array_free(result) };
         let mlx_msg = FFI_LAST_ERROR
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+            .with(|cell| cell.borrow_mut().take())
             .unwrap_or_default();
         let msg = format!(
             "gather_qmm failed: {mlx_msg} \

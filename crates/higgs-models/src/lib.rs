@@ -8,7 +8,6 @@ pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod registry;
 pub mod siglip;
-pub mod spec_prefill;
 pub mod starcoder2;
 pub mod transformer;
 pub mod turboquant;
@@ -897,8 +896,14 @@ pub fn load_quantized_safetensors_weights<M: ModuleParametersExt>(
                 if let Some(remapped) = remap_quantized_key(&key) {
                     if let Some(param) = params.get_mut(&*remapped) {
                         **param = value;
+                    } else {
+                        tracing::warn!(key = %key, remapped = %remapped, "Weight key remapped but target parameter not found");
                     }
+                } else {
+                    tracing::warn!(key = %key, "Weight key not found in model parameters (quantized remap failed)");
                 }
+            } else {
+                tracing::warn!(key = %key, "Weight key not found in model parameters");
             }
         }
     }
