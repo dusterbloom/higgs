@@ -2069,7 +2069,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     );
     if !unmatched.is_empty() {
         for k in unmatched.iter().take(10) {
-            tracing::warn!(key = %k, "Unmatched weight key");
+            tracing::debug!(key = %k, "Unmatched weight key (expected for VLM vision weights)");
         }
     }
     let param_count = params.keys().count();

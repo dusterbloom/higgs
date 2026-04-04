@@ -673,7 +673,7 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
                     } else {
                         unmatched += 1;
                         if warned_unmatched < 5 {
-                            tracing::warn!(
+                            tracing::debug!(
                                 stripped,
                                 remapped = &*remapped,
                                 "weight key unmatched after remap"
@@ -684,14 +684,14 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
                 } else {
                     unmatched += 1;
                     if warned_unmatched < 5 {
-                        tracing::warn!(stripped, "weight key unmatched (no remap)");
+                        tracing::debug!(stripped, "weight key unmatched (no remap)");
                         warned_unmatched += 1;
                     }
                 }
             } else {
                 unmatched += 1;
                 if warned_unmatched < 5 {
-                    tracing::warn!(stripped, "weight key unmatched");
+                    tracing::debug!(stripped, "weight key unmatched");
                     warned_unmatched += 1;
                 }
             }
