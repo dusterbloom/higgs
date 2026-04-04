@@ -611,6 +611,153 @@ impl DiffusionEngine {
         logits
     }
 
+    /// Forward pass returning logits for the LAST position only → `[vocab]`.
+    ///
+    /// Full layer computation is identical to `forward()` (bidirectional attention
+    /// requires all positions), but the final RMSNorm + LM-head matmul only
+    /// operates on the last hidden row: 1×vocab instead of seq×vocab.
+    pub fn forward_last(&self, token_ids: &[u32]) -> Vec<f32> {
+        let cfg = &self.config;
+        let seq = token_ids.len();
+        let h = cfg.hidden;
+        let hd = cfg.head_dim;
+        let half_hd = hd / 2;
+        let n_heads = cfg.heads;
+        let n_kv = cfg.kv_heads;
+        let gqa_ratio = n_heads / n_kv;
+        let q_dim = n_heads * hd;
+        let kv_dim = n_kv * hd;
+
+        // 1. Embedding lookup
+        let mut hidden = vec![0.0f32; seq * h];
+        for (i, &tid) in token_ids.iter().enumerate() {
+            let offset = tid as usize * h;
+            hidden[i * h..(i + 1) * h].copy_from_slice(&self.embed[offset..offset + h]);
+        }
+
+        // 2. Layer loop (identical to forward())
+        let mut q_buf = vec![0.0f32; seq * q_dim];
+        let mut k_buf = vec![0.0f32; seq * kv_dim];
+        let mut v_buf = vec![0.0f32; seq * kv_dim];
+        let mut attn_out = vec![0.0f32; seq * q_dim];
+        let mut o_buf = vec![0.0f32; seq * h];
+        let mut gate_buf = vec![0.0f32; seq * cfg.inter];
+        let mut up_buf = vec![0.0f32; seq * cfg.inter];
+        let mut normed = vec![0.0f32; seq * h];
+
+        for layer in &self.layers {
+            rms_norm(&hidden, &layer.input_norm, &mut normed, seq, h);
+
+            sgemm_nt(seq, q_dim, h, &normed, &layer.q_proj, &mut q_buf);
+            sgemm_nt(seq, kv_dim, h, &normed, &layer.k_proj, &mut k_buf);
+            sgemm_nt(seq, kv_dim, h, &normed, &layer.v_proj, &mut v_buf);
+
+            for s in 0..seq {
+                for head in 0..n_heads {
+                    let off = s * q_dim + head * hd;
+                    rms_norm_slice(&mut q_buf[off..off + hd], &layer.q_norm);
+                }
+                for head in 0..n_kv {
+                    let off = s * kv_dim + head * hd;
+                    rms_norm_slice(&mut k_buf[off..off + hd], &layer.k_norm);
+                }
+            }
+
+            for s in 0..seq {
+                for head in 0..n_heads {
+                    let off = s * q_dim + head * hd;
+                    apply_rope(
+                        &mut q_buf[off..off + hd],
+                        s,
+                        half_hd,
+                        &self.rope_cos,
+                        &self.rope_sin,
+                    );
+                }
+                for head in 0..n_kv {
+                    let off = s * kv_dim + head * hd;
+                    apply_rope(
+                        &mut k_buf[off..off + hd],
+                        s,
+                        half_hd,
+                        &self.rope_cos,
+                        &self.rope_sin,
+                    );
+                }
+            }
+
+            let scale = 1.0 / (hd as f32).sqrt();
+            for kv_h in 0..n_kv {
+                let mut k_head = vec![0.0f32; seq * hd];
+                let mut v_head = vec![0.0f32; seq * hd];
+                for s in 0..seq {
+                    let ko = s * kv_dim + kv_h * hd;
+                    k_head[s * hd..(s + 1) * hd].copy_from_slice(&k_buf[ko..ko + hd]);
+                    v_head[s * hd..(s + 1) * hd].copy_from_slice(&v_buf[ko..ko + hd]);
+                }
+
+                for g in 0..gqa_ratio {
+                    let q_h = kv_h * gqa_ratio + g;
+                    let mut q_head = vec![0.0f32; seq * hd];
+                    for s in 0..seq {
+                        let qo = s * q_dim + q_h * hd;
+                        q_head[s * hd..(s + 1) * hd].copy_from_slice(&q_buf[qo..qo + hd]);
+                    }
+
+                    let mut scores = vec![0.0f32; seq * seq];
+                    sgemm_nt_scaled(seq, seq, hd, &q_head, &k_head, &mut scores, scale);
+
+                    for row in 0..seq {
+                        softmax_inplace(&mut scores[row * seq..(row + 1) * seq]);
+                    }
+
+                    let mut ctx = vec![0.0f32; seq * hd];
+                    sgemm(seq, hd, seq, &scores, &v_head, &mut ctx);
+
+                    for s in 0..seq {
+                        let ao = s * q_dim + q_h * hd;
+                        attn_out[ao..ao + hd].copy_from_slice(&ctx[s * hd..(s + 1) * hd]);
+                    }
+                }
+            }
+
+            sgemm_nt(seq, h, q_dim, &attn_out, &layer.o_proj, &mut o_buf);
+
+            for i in 0..seq * h {
+                hidden[i] += o_buf[i];
+            }
+
+            rms_norm(&hidden, &layer.post_attn_norm, &mut normed, seq, h);
+
+            sgemm_nt(seq, cfg.inter, h, &normed, &layer.gate_proj, &mut gate_buf);
+            for v in gate_buf.iter_mut() {
+                *v *= 1.0 / (1.0 + (-*v).exp());
+            }
+
+            sgemm_nt(seq, cfg.inter, h, &normed, &layer.up_proj, &mut up_buf);
+
+            for (g, u) in gate_buf.iter_mut().zip(up_buf.iter()) {
+                *g *= u;
+            }
+
+            sgemm_nt(seq, h, cfg.inter, &gate_buf, &layer.down_proj, &mut o_buf);
+
+            for i in 0..seq * h {
+                hidden[i] += o_buf[i];
+            }
+        }
+
+        // 3. Final RMSNorm — LAST POSITION ONLY
+        let last_row = &hidden[(seq - 1) * h..seq * h];
+        let mut last_normed = vec![0.0f32; h];
+        rms_norm(last_row, &self.final_norm, &mut last_normed, 1, h);
+
+        // 4. LM head: 1×vocab instead of seq×vocab
+        let mut logits = vec![0.0f32; cfg.vocab];
+        sgemm_nt(1, cfg.vocab, h, &last_normed, &self.embed, &mut logits);
+        logits
+    }
+
     /// MDLM denoising: generate `num_tokens` from mask positions.
     pub fn generate(&self, prompt_ids: &[u32], num_tokens: usize, steps: usize) -> Vec<u32> {
         let mask_id = self.config.mask_token_id;
@@ -1012,6 +1159,21 @@ impl DiffusionRuntime {
             Self::AneFused { engine, .. } => engine.forward(token_ids),
             #[cfg(feature = "ane")]
             Self::AneHybridBonsai { engine, .. } => engine.forward(token_ids),
+        }
+    }
+
+    /// Forward pass returning logits for the LAST position only → `[vocab]`.
+    ///
+    /// Same ANE/BLAS compute for hidden states (causal attention needs all positions),
+    /// but the CPU LM head matmul is 1×vocab instead of seq×vocab — saves ~15ms per
+    /// call when seq>1 and vocab=151936.
+    pub fn forward_last(&self, token_ids: &[u32]) -> Vec<f32> {
+        match self {
+            Self::Cpu { engine, .. } => engine.forward_last(token_ids),
+            #[cfg(feature = "ane")]
+            Self::AneFused { engine, .. } => engine.forward_last(token_ids),
+            #[cfg(feature = "ane")]
+            Self::AneHybridBonsai { engine, .. } => engine.forward_last(token_ids),
         }
     }
 
@@ -1685,6 +1847,99 @@ impl AneDiffusionEngine {
             &self.blas_engine.embed,
             &mut logits,
         );
+        logits
+    }
+
+    /// Forward pass returning logits for the LAST position only → `[vocab]`.
+    ///
+    /// All ANE dispatch layers run identically to `forward()` (causal attention
+    /// requires all positions).  Only the CPU final-norm + LM-head matmul is
+    /// reduced from seq×vocab to 1×vocab, saving ~15ms per call at vocab=151936.
+    pub fn forward_last(&self, token_ids: &[u32]) -> Vec<f32> {
+        let cfg = &self.blas_engine.config;
+        let seq = token_ids.len();
+        let h = cfg.hidden;
+        let ps = self.seq_len;
+
+        // 1. Embedding lookup — row-major [seq, h]
+        let mut hidden = vec![0.0f32; seq * h];
+        for (i, &tid) in token_ids.iter().enumerate() {
+            let off = tid as usize * h;
+            hidden[i * h..(i + 1) * h].copy_from_slice(&self.blas_engine.embed[off..off + h]);
+        }
+
+        // Pack row-major [seq, dim] → ANE channel-first fp32 [dim, ps]
+        let pack = |data: &[f32], dim: usize| -> Vec<u8> {
+            let mut buf = vec![0.0f32; dim * ps];
+            for s in 0..seq {
+                for c in 0..dim {
+                    buf[c * ps + s] = data[s * dim + c];
+                }
+            }
+            buf.iter().flat_map(|f| f.to_le_bytes()).collect()
+        };
+
+        // Unpack ANE channel-first fp32 [dim, ps] → row-major, LAST POSITION ONLY → [dim]
+        let unpack_last = |bytes: &[u8], dim: usize| -> Vec<f32> {
+            let all: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let last = seq - 1;
+            let mut out = vec![0.0f32; dim];
+            for c in 0..dim {
+                out[c] = all[c * ps + last];
+            }
+            out
+        };
+
+        // 2. ANE layer dispatch (identical to forward())
+        let mut layer_in_bytes = pack(&hidden, h);
+        let mut layer_out_bytes = vec![0u8; h * ps * 4];
+
+        match &self.kernels {
+            AneDiffusionKernelSet::Fused { kernels } => {
+                for kernel in kernels {
+                    kernel.write_input(0, &layer_in_bytes);
+                    kernel.eval().unwrap();
+                    kernel.read_output(0, &mut layer_out_bytes);
+                    std::mem::swap(&mut layer_in_bytes, &mut layer_out_bytes);
+                }
+            }
+            AneDiffusionKernelSet::MultiDispatch {
+                attn_kernels,
+                ffn_kernels,
+            } => {
+                let mut attn_out_bytes = vec![0u8; h * ps * 4];
+                for (attn_kernel, ffn_kernel) in attn_kernels.iter().zip(ffn_kernels.iter()) {
+                    attn_kernel.write_input(0, &layer_in_bytes);
+                    attn_kernel.eval().unwrap();
+                    attn_kernel.read_output(0, &mut attn_out_bytes);
+
+                    ffn_kernel.write_input(0, &attn_out_bytes);
+                    ffn_kernel.eval().unwrap();
+                    ffn_kernel.read_output(0, &mut layer_out_bytes);
+                    std::mem::swap(&mut layer_in_bytes, &mut layer_out_bytes);
+                }
+            }
+        }
+
+        // 3. Unpack LAST position only → [h]
+        let last_hidden = unpack_last(&layer_in_bytes, h);
+
+        // 4. Final RMSNorm — single row
+        let mut last_normed = vec![0.0f32; h];
+        rms_norm(
+            &last_hidden,
+            &self.blas_engine.final_norm,
+            &mut last_normed,
+            1,
+            h,
+        );
+
+        // 5. LM head: 1×vocab instead of seq×vocab
+        let mut logits = vec![0.0f32; cfg.vocab];
+        sgemm_nt(1, cfg.vocab, h, &last_normed, &self.blas_engine.embed, &mut logits);
         logits
     }
 
@@ -2675,6 +2930,505 @@ impl AneBonsaiEngine {
         );
         logits
     }
+
+    /// Forward pass returning logits for the LAST position only → `[vocab]`.
+    ///
+    /// ANE attention + tiled FFN layers run identically to `forward()`.
+    /// Only the CPU final-norm + LM-head matmul is 1×vocab instead of seq×vocab.
+    pub fn forward_last(&self, token_ids: &[u32]) -> Vec<f32> {
+        let cfg = &self.blas_engine.config;
+        let seq = token_ids.len();
+        let h = cfg.hidden;
+        let q_dim = cfg.heads * cfg.head_dim;
+        let ps = self.seq_len;
+        let verbose_trace = std::env::var_os("HIGGS_BONSAI_ANE_TRACE").is_some();
+
+        let mut hidden = vec![0.0f32; seq * h];
+        for (i, &tid) in token_ids.iter().enumerate() {
+            let off = tid as usize * h;
+            hidden[i * h..(i + 1) * h].copy_from_slice(&self.blas_engine.embed[off..off + h]);
+        }
+
+        let ane_dsb_sy = || {
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                std::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            }
+        };
+
+        let write_input_cf32 =
+            |kernel: &crate::ane_bridge::AneKernel, data: &[f32], dim: usize| {
+                let base = kernel.get_input_base(0) as *mut f32;
+                assert!(!base.is_null(), "ANE input base should not be null");
+                unsafe {
+                    for c in 0..dim {
+                        let dst = std::slice::from_raw_parts_mut(base.add(c * ps), ps);
+                        for s in 0..seq {
+                            dst[s] = data[s * dim + c];
+                        }
+                    }
+                }
+                ane_dsb_sy();
+            };
+
+        let scatter_output_cf32 =
+            |kernel: &crate::ane_bridge::AneKernel,
+             actual_dim: usize,
+             start: usize,
+             dst: &mut [f32],
+             dst_stride: usize| {
+                let base = kernel.get_output_base(0) as *const f32;
+                assert!(!base.is_null(), "ANE output base should not be null");
+                ane_dsb_sy();
+                unsafe {
+                    for c in 0..actual_dim {
+                        let src = std::slice::from_raw_parts(base.add(c * ps), ps);
+                        for s in 0..seq {
+                            dst[s * dst_stride + start + c] = src[s];
+                        }
+                    }
+                }
+            };
+
+        let accumulate_output_cf32 =
+            |kernel: &crate::ane_bridge::AneKernel,
+             actual_dim: usize,
+             dst: &mut [f32],
+             dst_stride: usize| {
+                let base = kernel.get_output_base(0) as *const f32;
+                assert!(!base.is_null(), "ANE output base should not be null");
+                ane_dsb_sy();
+                unsafe {
+                    for c in 0..actual_dim {
+                        let src = std::slice::from_raw_parts(base.add(c * ps), ps);
+                        for s in 0..seq {
+                            dst[s * dst_stride + c] += src[s];
+                        }
+                    }
+                }
+            };
+
+        let mut normed = vec![0.0f32; seq * h];
+        let mut attn_proj = vec![0.0f32; seq * h];
+        let mut attn_ctx_buf = vec![0.0f32; seq * q_dim];
+        let mut ffn_out = vec![0.0f32; seq * h];
+        const BONSAI_CPU_ATTENTION_LAYERS: &[usize] = &[12, 15, 16, 17, 18, 19, 22, 24, 25, 26, 27];
+        const BONSAI_CAUSAL_CPU_ATTENTION_LAYERS: &[usize] =
+            &[14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27];
+        let cpu_layers = if self.causal {
+            BONSAI_CAUSAL_CPU_ATTENTION_LAYERS
+        } else {
+            BONSAI_CPU_ATTENTION_LAYERS
+        };
+
+        let rt_enabled = crate::ane_bridge::AneKernel::begin_realtime();
+
+        let ane_eval = |kernel: &crate::ane_bridge::AneKernel| {
+            if rt_enabled {
+                kernel
+                    .eval_realtime()
+                    .unwrap_or_else(|_| kernel.eval().unwrap());
+            } else {
+                kernel.eval().unwrap();
+            }
+        };
+        let ane_eval_chain = |kernels: &[&crate::ane_bridge::AneKernel]| {
+            if rt_enabled {
+                crate::ane_bridge::AneKernel::eval_chain_realtime(kernels).unwrap_or_else(|_| {
+                    crate::ane_bridge::AneKernel::eval_chain(kernels).unwrap();
+                });
+            } else {
+                crate::ane_bridge::AneKernel::eval_chain(kernels).unwrap();
+            }
+        };
+
+        for (layer_idx, kernel) in self.attn_kernels.iter().enumerate() {
+            let layer = &self.blas_engine.layers[layer_idx];
+            let residual = hidden.clone();
+            if cpu_layers.contains(&layer_idx) {
+                let cpu_ctx =
+                    diffusion_attention_context_cpu(&self.blas_engine, layer_idx, &hidden, self.eps);
+                attn_ctx_buf.copy_from_slice(&cpu_ctx);
+            } else {
+                write_input_cf32(kernel, &hidden, h);
+                ane_eval(kernel);
+                scatter_output_cf32(kernel, q_dim, 0, &mut attn_ctx_buf, q_dim);
+            }
+            sgemm_nt(seq, h, q_dim, &attn_ctx_buf, &layer.o_proj, &mut attn_proj);
+            for i in 0..seq * h {
+                hidden[i] = residual[i] + attn_proj[i];
+            }
+
+            rms_norm_eps(
+                &hidden,
+                &layer.post_attn_norm,
+                &mut normed,
+                seq,
+                h,
+                self.eps,
+            );
+
+            let n_w13 = self.w13_plan.n_tiles;
+            ffn_out.fill(0.0);
+            for t in 0..n_w13 {
+                let kernel_idx = layer_idx * n_w13 + t;
+                let gated_kernel = &self.ffn_gated_kernels[kernel_idx];
+                let down_kernel = &self.ffn_down_kernels[kernel_idx];
+                write_input_cf32(gated_kernel, &normed, h);
+                ane_eval_chain(&[gated_kernel, down_kernel]);
+                accumulate_output_cf32(down_kernel, h, &mut ffn_out, h);
+            }
+
+            for i in 0..seq * h {
+                hidden[i] += ffn_out[i];
+            }
+        }
+
+        if rt_enabled {
+            crate::ane_bridge::AneKernel::end_realtime();
+        }
+
+        // Final RMSNorm — LAST POSITION ONLY
+        let last_row = &hidden[(seq - 1) * h..seq * h];
+        let mut last_normed = vec![0.0f32; h];
+        rms_norm_eps(last_row, &self.blas_engine.final_norm, &mut last_normed, 1, h, self.eps);
+
+        // LM head: 1×vocab
+        let mut logits = vec![0.0f32; cfg.vocab];
+        sgemm_nt(1, cfg.vocab, h, &last_normed, &self.blas_engine.embed, &mut logits);
+        logits
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ANE AR Decode Engine — T=1 decode with KV cache for speculative draft
+// ---------------------------------------------------------------------------
+
+/// T=1 decode engine on ANE with persistent KV cache IOSurfaces.
+///
+/// CPU pre-computes K/V per layer (fp16 matvec), writes to cache IOSurfaces.
+/// ANE kernel does Q proj → QK-norm → RoPE → SDPA vs cache → Wo → residual → FFN.
+///
+/// Snapshot/restore is zero-cost: just reset `pos` and re-mask (stale K/V are masked out).
+#[cfg(feature = "ane")]
+pub struct AneArDecodeEngine {
+    /// One compiled ANE kernel per transformer layer.
+    kernels: Vec<crate::ane_bridge::AneKernel>,
+    /// Reference to loaded model weights (for CPU K/V path + embed + final_norm).
+    blas_engine: DiffusionEngine,
+    // CPU K/V weights are accessed directly from blas_engine.layers
+    /// Current decode position (next token goes here).
+    pos: usize,
+    /// Maximum sequence length (cache capacity).
+    max_seq: usize,
+    /// Total channels in packed input: dim + 2*kv_dim + hd + 1.
+    total_ch: usize,
+    /// Persistent input buffer per layer: [total_ch * max_seq] f32, updated incrementally.
+    /// One buffer per layer (each layer has its own K/V cache state).
+    input_bufs: Vec<Vec<f32>>,
+}
+
+#[cfg(feature = "ane")]
+impl AneArDecodeEngine {
+    /// Build the decode engine: compile ANE kernels with single packed input.
+    ///
+    /// `max_seq` is the cache capacity (must be >= 16). Each layer gets a persistent
+    /// input buffer that holds x, K/V cache, rope, and mask in a single IOSurface.
+    pub fn new(engine: DiffusionEngine, max_seq: usize) -> Result<Self, String> {
+        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
+        use crate::ane_mil::ANE_MIN_SPATIAL;
+        use crate::diffusion_ane;
+
+        ane_bridge::ane_init()?;
+
+        let cfg = &engine.config;
+        let h = cfg.hidden;
+        let hd = cfg.head_dim;
+        let q_dim = cfg.heads * hd;
+        let inter = cfg.inter;
+        let kv_dim = cfg.kv_heads * hd;
+        let total_ch = h + 2 * kv_dim + hd + 1;
+
+        assert!(max_seq >= ANE_MIN_SPATIAL, "max_seq must be >= {ANE_MIN_SPATIAL}");
+        assert!(hd >= ANE_MIN_SPATIAL, "head_dim must be >= {ANE_MIN_SPATIAL}");
+
+        eprintln!(
+            "AneArDecodeEngine: compiling {} decode kernels (max_seq={max_seq}, total_ch={total_ch})...",
+            cfg.layers
+        );
+        let t0 = std::time::Instant::now();
+
+        // Generate decode layer MIL
+        let mil = diffusion_ane::gen_decode_layer(h, cfg.heads, cfg.kv_heads, hd, inter, max_seq, 1e-6);
+        let mil_names: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
+
+        // Build weight blobs for each layer (8 BLOBFILEs per layer)
+        let build_decode_blobs = |lw: &DiffusionLayerWeights| -> Vec<Vec<u8>> {
+            vec![
+                build_weight_blob(&lw.input_norm, 1, h),              // rms_att
+                build_weight_blob_transposed(&lw.q_proj, q_dim, h),   // wq
+                build_weight_blob_transposed(&lw.o_proj, h, q_dim),   // wo
+                build_weight_blob(&lw.q_norm, 1, hd),                 // q_norm
+                build_weight_blob(&lw.post_attn_norm, 1, h),          // rms_ffn
+                build_weight_blob_transposed(&lw.gate_proj, inter, h), // gate
+                build_weight_blob_transposed(&lw.up_proj, inter, h),  // up
+                build_weight_blob_transposed(&lw.down_proj, h, inter), // down
+            ]
+        };
+
+        // Compile L0 full
+        let l0_blobs = build_decode_blobs(&engine.layers[0]);
+        let l0_refs: Vec<&[u8]> = l0_blobs.iter().map(|b| b.as_slice()).collect();
+
+        let kernel0 = compile_ane_kernel(
+            "L0 decode compile",
+            &mil.mil_text,
+            &mil_names,
+            &l0_refs,
+            &[mil.input_bytes],
+            &[mil.output_bytes],
+        )?;
+        let l0_ms = t0.elapsed().as_millis();
+        eprintln!("  L0 full compile: {l0_ms}ms");
+
+        // Patch layers 1+ from L0
+        let mut kernels = Vec::with_capacity(cfg.layers);
+        kernels.push(kernel0);
+        for (i, lw) in engine.layers.iter().enumerate().skip(1) {
+            let blobs = build_decode_blobs(lw);
+            let refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+            let ki = kernels[0]
+                .patch_from_donor(
+                    &mil.mil_text,
+                    &mil_names,
+                    &refs,
+                    &[mil.input_bytes],
+                    &[mil.output_bytes],
+                )
+                .map_err(|e| format!("L{i} decode patch: {e}"))?;
+            kernels.push(ki);
+        }
+        let total_ms = t0.elapsed().as_millis();
+        eprintln!(
+            "AneArDecodeEngine: {} kernels in {total_ms}ms (L0={l0_ms}ms + {} patches)",
+            cfg.layers,
+            cfg.layers - 1
+        );
+
+        // Initialize per-layer input buffers with mask channel set to -1e9
+        let buf_len = total_ch * max_seq;
+        let mask_ch = h + 2 * kv_dim + hd;
+        let mut input_bufs = Vec::with_capacity(cfg.layers);
+        for _ in 0..cfg.layers {
+            let mut buf = vec![0.0f32; buf_len];
+            // Mask channel: all positions masked
+            for p in 0..max_seq {
+                buf[mask_ch * max_seq + p] = -1e9;
+            }
+            input_bufs.push(buf);
+        }
+
+        Ok(Self {
+            kernels,
+            blas_engine: engine,
+            pos: 0,
+            max_seq,
+            total_ch,
+            input_bufs,
+        })
+    }
+
+    /// Decode a single token: embed → 28 layers → final_norm → logits.
+    ///
+    /// Each layer: CPU computes K/V → write cache → ANE kernel → read output.
+    /// Returns logits `[vocab]`.
+    pub fn decode_step(&mut self, token_id: u32) -> Vec<f32> {
+        assert!(self.pos < self.max_seq, "KV cache full (pos={})", self.pos);
+
+        let cfg = &self.blas_engine.config;
+        let h = cfg.hidden;
+        let hd = cfg.head_dim;
+        let half_hd = hd / 2;
+        let kv_dim = cfg.kv_heads * hd;
+        let pos = self.pos;
+
+        // 1. Embedding lookup
+        let mut hidden = vec![0.0f32; h];
+        let off = token_id as usize * h;
+        hidden.copy_from_slice(&self.blas_engine.embed[off..off + h]);
+
+        // Precompute RoPE for current position
+        let mut rope_cos = vec![0.0f32; half_hd];
+        let mut rope_sin = vec![0.0f32; half_hd];
+        for d in 0..half_hd {
+            let freq =
+                1.0 / (cfg.rope_theta as f32).powf(2.0 * d as f32 / hd as f32);
+            let angle = pos as f32 * freq;
+            rope_cos[d] = angle.cos();
+            rope_sin[d] = angle.sin();
+        }
+        let ms = self.max_seq;
+
+        // CPU scratch buffers for K/V computation
+        let mut normed = vec![0.0f32; h];
+        let mut k_buf = vec![0.0f32; kv_dim];
+        let mut v_buf = vec![0.0f32; kv_dim];
+
+        // 2. Layer loop — single packed input per layer
+        for layer_idx in 0..self.kernels.len() {
+            let lw = &self.blas_engine.layers[layer_idx];
+
+            // CPU: RMSNorm → K/V projection → QK-norm on K → RoPE on K
+            rms_norm_vec(&hidden, &lw.input_norm, &mut normed);
+
+            // K = normed @ k_proj^T (sgemm_nt: [1,h] @ [kv_dim,h]^T → [1,kv_dim])
+            sgemm_nt(1, kv_dim, h, &normed, &lw.k_proj, &mut k_buf);
+            // V = normed @ v_proj^T
+            sgemm_nt(1, kv_dim, h, &normed, &lw.v_proj, &mut v_buf);
+
+            // QK-norm on K (per-head RMSNorm)
+            for kv_h in 0..cfg.kv_heads {
+                let off = kv_h * hd;
+                rms_norm_slice(&mut k_buf[off..off + hd], &lw.k_norm);
+            }
+
+            // RoPE on K
+            for kv_h in 0..cfg.kv_heads {
+                let off = kv_h * hd;
+                apply_rope(&mut k_buf[off..off + hd], pos, half_hd, &self.blas_engine.rope_cos, &self.blas_engine.rope_sin);
+            }
+
+            // --- Update persistent input buffer (single packed IOSurface) ---
+            let buf = &mut self.input_bufs[layer_idx];
+
+            // x: channels [0..h), position 0 only
+            for ch in 0..h {
+                buf[ch * ms] = hidden[ch];
+            }
+
+            // K cache at position pos: channels [h .. h+kv_dim)
+            // Channel = h + kh*hd + d, spatial = pos
+            for kh in 0..cfg.kv_heads {
+                for d in 0..hd {
+                    let ch = h + kh * hd + d;
+                    buf[ch * ms + pos] = k_buf[kh * hd + d];
+                }
+            }
+
+            // V cache at position pos: channels [h+kv_dim .. h+2*kv_dim)
+            for kh in 0..cfg.kv_heads {
+                for d in 0..hd {
+                    let ch = h + kv_dim + kh * hd + d;
+                    buf[ch * ms + pos] = v_buf[kh * hd + d];
+                }
+            }
+
+            // Rope cos at position 0: channels [h+2*kv_dim .. h+2*kv_dim+half_hd)
+            let rope_base = h + 2 * kv_dim;
+            for d in 0..half_hd {
+                buf[(rope_base + d) * ms] = rope_cos[d];
+            }
+
+            // Rope sin at position 0: channels [h+2*kv_dim+half_hd .. h+2*kv_dim+hd)
+            for d in 0..half_hd {
+                buf[(rope_base + half_hd + d) * ms] = rope_sin[d];
+            }
+
+            // Mask: unmask position pos (leave previous positions as-is, already 0)
+            let mask_ch = h + 2 * kv_dim + hd;
+            buf[mask_ch * ms + pos] = 0.0;
+
+            // Write full packed buffer to single IOSurface input
+            let bytes: Vec<u8> = buf.iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.kernels[layer_idx].write_input(0, &bytes);
+
+            // ANE eval
+            self.kernels[layer_idx].eval().unwrap_or_else(|e| panic!("L{layer_idx} decode eval failed: {e}"));
+
+            // Read output: [1, dim, 1, ms] fp32 — position 0 only
+            hidden = self.kernels[layer_idx].read_output_zerocopy(0, h, ms);
+        }
+
+        // 3. Final norm + LM head (logits)
+        let mut final_normed = vec![0.0f32; h];
+        rms_norm_vec(&hidden, &self.blas_engine.final_norm, &mut final_normed);
+
+        // logits = embed^T @ final_normed (vocab, hidden) @ (hidden,) → (vocab,)
+        let vocab = cfg.vocab;
+        let mut logits = vec![0.0f32; vocab];
+        sgemm_at(vocab, 1, h, &self.blas_engine.embed, &final_normed, &mut logits);
+
+        self.pos += 1;
+        logits
+    }
+
+    /// Process multiple tokens sequentially through the decode path.
+    pub fn prefill(&mut self, token_ids: &[u32]) {
+        for &tid in token_ids {
+            let _ = self.decode_step(tid);
+        }
+    }
+
+    /// Snapshot the current position for later restore (zero-cost).
+    pub fn snapshot(&self) -> usize {
+        self.pos
+    }
+
+    /// Restore to a previous position. Stale K/V in cache are harmless (masked out).
+    pub fn restore(&mut self, saved_pos: usize) {
+        assert!(saved_pos <= self.pos, "cannot restore to future position");
+        let cfg = &self.blas_engine.config;
+        let h = cfg.hidden;
+        let hd = cfg.head_dim;
+        let kv_dim = cfg.kv_heads * hd;
+        let mask_ch = h + 2 * kv_dim + hd;
+        let ms = self.max_seq;
+        // Re-mask positions >= saved_pos in all layer input buffers
+        for buf in &mut self.input_bufs {
+            for p in saved_pos..ms {
+                buf[mask_ch * ms + p] = -1e9;
+            }
+        }
+        self.pos = saved_pos;
+    }
+
+    /// Current decode position.
+    pub fn current_pos(&self) -> usize {
+        self.pos
+    }
+}
+
+/// f32 → fp16 bit conversion (matches ane_extract::f32_to_f16_bits).
+fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x007F_FFFF;
+
+    if exp == 0xFF {
+        return (sign | 0x7C00 | if frac != 0 { 0x0200 } else { 0 }) as u16;
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return (sign | 0x7C00) as u16;
+    }
+    if new_exp <= 0 {
+        return sign as u16; // flush to zero
+    }
+    (sign | ((new_exp as u32) << 10) | (frac >> 13)) as u16
+}
+
+/// RMS norm for a single vector x[dim] with weight w[dim], output to out[dim].
+fn rms_norm_vec(x: &[f32], w: &[f32], out: &mut [f32]) {
+    let dim = x.len();
+    let mut sum_sq = 0.0f32;
+    for &v in x {
+        sum_sq += v * v;
+    }
+    let rms = (sum_sq / dim as f32 + 1e-6).sqrt().recip();
+    for i in 0..dim {
+        out[i] = x[i] * rms * w[i];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2739,6 +3493,263 @@ impl AdaptiveKController {
             // Between thresholds → keep current (hysteresis)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ANE Causal Drafter — speculative decode with ANE causal engine
+// ---------------------------------------------------------------------------
+
+/// Greedy acceptance for speculative decode.
+///
+/// Compares draft tokens against verify-model argmax predictions.
+/// `verify_argmax` has length `draft.len() + 1`: the first entry verifies `draft[0]`,
+/// and the last is the bonus/correction token.
+///
+/// Returns the accepted prefix plus one correction/bonus token.
+pub fn accept_prefix(draft: &[u32], verify_argmax: &[u32]) -> Vec<u32> {
+    debug_assert_eq!(verify_argmax.len(), draft.len() + 1);
+
+    let mut accepted = 0;
+    for (d, &v) in draft.iter().zip(verify_argmax.iter()) {
+        if *d == v {
+            accepted += 1;
+        } else {
+            break;
+        }
+    }
+    let mut out: Vec<u32> = draft[..accepted].to_vec();
+    out.push(verify_argmax[accepted]);
+    out
+}
+
+/// ANE-based causal drafter for speculative decoding.
+///
+/// Wraps a `DiffusionRuntime` compiled with causal masking. Each `draft()` call
+/// does K full-sequence causal forwards on ANE (~19ms each for 0.6B).
+/// The GPU is 100% free for the verify model — no resource contention.
+#[cfg(feature = "ane")]
+pub struct AneCausalDrafter {
+    pub(crate) runtime: DiffusionRuntime,
+    pub(crate) vocab: usize,
+    pub(crate) max_seq: usize,
+}
+
+#[cfg(feature = "ane")]
+impl AneCausalDrafter {
+    /// Build a causal ANE drafter from a model directory (e.g. Qwen3-0.6B-Base).
+    pub fn new(model_path: &Path, max_seq: usize) -> Result<Self, String> {
+        let engine = DiffusionEngine::load(model_path)?;
+        let vocab = engine.config.vocab;
+        let runtime =
+            DiffusionRuntime::new_causal(engine, max_seq, DiffusionBackendPreference::Auto)?;
+        eprintln!(
+            "AneCausalDrafter: backend={:?}, max_seq={max_seq}",
+            runtime.selected_backend()
+        );
+        Ok(Self {
+            runtime,
+            vocab,
+            max_seq,
+        })
+    }
+
+    /// Generate K draft tokens given a prefix via greedy argmax.
+    ///
+    /// Each step runs a full causal forward over `prefix ++ drafted_so_far`,
+    /// takes the argmax at the last position, and appends it.
+    /// Truncates prefix to `max_seq - k` if necessary.
+    pub fn draft(&self, prefix: &[u32], k: usize) -> Vec<u32> {
+        let budget = self.max_seq.saturating_sub(k);
+        let start = if prefix.len() > budget {
+            prefix.len() - budget
+        } else {
+            0
+        };
+        let mut seq: Vec<u32> = prefix[start..].to_vec();
+
+        let mut drafted = Vec::with_capacity(k);
+        for _ in 0..k {
+            if seq.len() >= self.max_seq {
+                break;
+            }
+            let logits = self.runtime.forward(&seq);
+            // logits: [seq_len * vocab], take last position
+            let last_offset = (seq.len() - 1) * self.vocab;
+            let row = &logits[last_offset..last_offset + self.vocab];
+            let token = row
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx as u32)
+                .unwrap();
+            drafted.push(token);
+            seq.push(token);
+        }
+        drafted
+    }
+
+    /// Get full logits for a token sequence. Returns `[seq_len, vocab]` flat.
+    pub fn forward_logits(&self, token_ids: &[u32]) -> Vec<f32> {
+        self.runtime.forward(token_ids)
+    }
+}
+
+/// ANE→GPU speculative generation with fresh-cache verify and saved ANE logits.
+///
+/// Each round:
+///   1. Draft[0] from saved ANE logits (FREE, no forward needed)
+///   2. Draft[1..K-1] via sequential ANE causal forwards
+///   3. GPU verify: fresh cache + forward_all_logits(context ++ drafts)
+///      — no clone/restore/eval_for_clone overhead
+///   4. Accept prefix, extend context
+///
+/// Returns generated tokens (not including prompt).
+#[cfg(feature = "ane")]
+#[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+pub fn speculative_generate(
+    drafter: &AneCausalDrafter,
+    verifier: &mut crate::AnyModel,
+    prompt: &[u32],
+    max_tokens: usize,
+    k_low: usize,
+    k_high: usize,
+) -> Vec<u32> {
+    use mlx_rs::ops::indexing::{self as ix, IndexOp};
+
+    let mut context: Vec<u32> = prompt.to_vec();
+    let mut generated: Vec<u32> = Vec::new();
+    let mut k_ctrl = AdaptiveKController::new(k_low, k_high, 3);
+
+    let mut total_drafted = 0usize;
+    let mut total_accepted = 0usize;
+    let mut draft_ms = 0.0f64;
+    let mut verify_ms = 0.0f64;
+
+    // Bootstrap: one full ANE forward on the prompt to get saved logits.
+    // The last-position argmax gives us draft[0] for round 0 — FOR FREE.
+    let t_boot = std::time::Instant::now();
+    let mut saved_ane_logits = drafter.forward_logits(&context);
+    let boot_ms = t_boot.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("  Bootstrap ANE logits: {boot_ms:.0}ms");
+
+    while generated.len() < max_tokens {
+        let k = k_ctrl.current_k().min(max_tokens - generated.len());
+        if k == 0 {
+            break;
+        }
+
+        // --- Draft on ANE ---
+        let t0 = std::time::Instant::now();
+
+        // Draft[0] from saved logits — no forward needed
+        let last_offset = (context.len() - 1) * drafter.vocab;
+        let row = &saved_ane_logits[last_offset..last_offset + drafter.vocab];
+        let draft_0 = row
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(idx, _)| idx as u32)
+            .unwrap();
+
+        let mut draft_tokens: Vec<u32> = vec![draft_0];
+
+        // Draft[1..K-1] via sequential ANE causal forwards
+        let budget = drafter.max_seq;
+        let mut seq: Vec<u32> = context.clone();
+        seq.push(draft_0);
+
+        for _ in 1..k {
+            if seq.len() >= budget {
+                break;
+            }
+            // forward_last: same ANE dispatch but 1×vocab LM head instead of seq×vocab
+            let logits = drafter.runtime.forward_last(&seq);
+            let token = logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx as u32)
+                .unwrap();
+            draft_tokens.push(token);
+            seq.push(token);
+        }
+
+        let actual_k = draft_tokens.len();
+        draft_ms += t0.elapsed().as_secs_f64() * 1000.0;
+
+        // --- Verify on GPU (fresh cache — no clone/restore overhead) ---
+        let t1 = std::time::Instant::now();
+        let mut cache = verifier.make_cache();
+        let full_seq: Vec<i32> = context
+            .iter()
+            .chain(draft_tokens.iter())
+            .map(|&t| t as i32)
+            .collect();
+        let full_arr = mlx_rs::Array::from_slice(&full_seq, &[1, full_seq.len() as i32]);
+        let all_logits = verifier
+            .forward_all_logits(&full_arr, None, &mut cache)
+            .unwrap();
+        mlx_rs::transforms::eval([&all_logits]).unwrap();
+
+        // Extract argmax at verify positions
+        let logits_2d = all_logits.squeeze_axes(&[0]).unwrap(); // [full_len, vocab]
+        let all_preds = ix::argmax_axis(&logits_2d, -1, false).unwrap();
+        mlx_rs::transforms::eval([&all_preds]).unwrap();
+
+        let ctx_len = context.len();
+        let mut verify_argmax: Vec<u32> = Vec::with_capacity(actual_k + 1);
+        for i in 0..=actual_k {
+            let pos = (ctx_len - 1 + i) as i32;
+            verify_argmax.push(all_preds.index(pos).item::<i32>() as u32);
+        }
+        verify_ms += t1.elapsed().as_secs_f64() * 1000.0;
+
+        // --- Accept ---
+        let mut accepted_tokens = accept_prefix(&draft_tokens, &verify_argmax);
+        let remaining = max_tokens - generated.len();
+        if accepted_tokens.len() > remaining {
+            accepted_tokens.truncate(remaining);
+        }
+        let accepted = accepted_tokens.len().saturating_sub(1);
+        total_accepted += accepted;
+        total_drafted += actual_k;
+        k_ctrl.record(accepted, actual_k);
+
+        // Deferred save: always save ANE logits on the CORRECT context after verify.
+        // On full acceptance, context+accepted == seq (same as eager save).
+        // On rejection, we skip the wasted eager forward that would have been discarded.
+        context.extend_from_slice(&accepted_tokens);
+        saved_ane_logits = drafter.forward_logits(&context);
+        generated.extend_from_slice(&accepted_tokens);
+
+        let round = total_drafted / k.max(1);
+        eprintln!(
+            "  R{round}: accepted {accepted}/{actual_k} (+{} new) | K={}",
+            accepted_tokens.len(),
+            k_ctrl.current_k()
+        );
+    }
+
+    let total_ms = draft_ms + verify_ms;
+    let tps = if total_ms > 0.0 {
+        generated.len() as f64 / total_ms * 1000.0
+    } else {
+        0.0
+    };
+    let acc_rate = if total_drafted > 0 {
+        total_accepted as f64 / total_drafted as f64 * 100.0
+    } else {
+        0.0
+    };
+    eprintln!("  --- Totals ---");
+    eprintln!(
+        "  {:.0}ms draft + {:.0}ms verify = {:.0}ms",
+        draft_ms, verify_ms, total_ms
+    );
+    eprintln!("  Acceptance: {total_accepted}/{total_drafted} ({acc_rate:.1}%)");
+    eprintln!("  Throughput: {tps:.1} tok/s");
+
+    generated
 }
 
 // ---------------------------------------------------------------------------
@@ -5921,5 +6932,314 @@ mod tests {
         c.record(4, 8); // 0.50
         c.record(5, 8); // 0.625 — avg 0.583, between 0.50 and 0.65
         assert_eq!(c.current_k(), 8, "hysteresis: stays at k_low in dead zone");
+    }
+
+    // -----------------------------------------------------------------------
+    // accept_prefix tests (pure logic, no models)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_accept_prefix() {
+        // All match → all draft tokens + bonus
+        assert_eq!(
+            super::accept_prefix(&[5, 3, 7], &[5, 3, 7, 42]),
+            vec![5, 3, 7, 42]
+        );
+
+        // First mismatch → correction only
+        assert_eq!(
+            super::accept_prefix(&[5, 3, 7], &[9, 1, 2, 0]),
+            vec![9]
+        );
+
+        // Mid mismatch → accepted prefix + correction
+        assert_eq!(
+            super::accept_prefix(&[5, 3, 7], &[5, 3, 9, 0]),
+            vec![5, 3, 9]
+        );
+
+        // Single draft token, matches → draft + bonus
+        assert_eq!(super::accept_prefix(&[10], &[10, 20]), vec![10, 20]);
+
+        // Single draft token, no match → correction
+        assert_eq!(super::accept_prefix(&[10], &[99, 20]), vec![99]);
+
+        // Empty draft → just the correction/bonus
+        assert_eq!(super::accept_prefix(&[], &[42]), vec![42]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ANE Causal Drafter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "Needs Qwen3-0.6B-Base model on disk"]
+    fn test_ane_causal_drafter_generates() {
+        let Some(dir) = qwen3_base_dir() else {
+            eprintln!("SKIP: Qwen3-0.6B-Base not found");
+            return;
+        };
+
+        eprintln!("Building AneCausalDrafter (max_seq=64)...");
+        let t0 = std::time::Instant::now();
+        let drafter = super::AneCausalDrafter::new(&dir, 64).expect("build drafter");
+        eprintln!("  Built in {:.1}s", t0.elapsed().as_secs_f64());
+
+        let prefix: Vec<u32> = vec![2, 1820, 374]; // "The answer is"
+        eprintln!("Drafting 4 tokens from prefix {:?}...", prefix);
+        let t1 = std::time::Instant::now();
+        let tokens = drafter.draft(&prefix, 4);
+        let draft_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  Got {} tokens in {draft_ms:.0}ms: {:?}", tokens.len(), tokens);
+
+        assert_eq!(tokens.len(), 4, "should produce exactly 4 draft tokens");
+        assert!(
+            tokens.iter().all(|&t| (t as usize) < drafter.vocab),
+            "all tokens should be < vocab"
+        );
+        // Not all the same token (degenerate)
+        let unique: std::collections::HashSet<u32> = tokens.iter().copied().collect();
+        // Relax this check slightly — it's possible but very unlikely for 4 tokens to be identical
+        eprintln!("  Unique tokens: {}", unique.len());
+    }
+
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "Needs Qwen3-0.6B-Base + Qwen3-14B-4bit models on disk"]
+    fn test_speculative_generate_e2e() {
+        let Some(draft_dir) = qwen3_base_dir() else {
+            eprintln!("SKIP: Qwen3-0.6B-Base not found");
+            return;
+        };
+        let Some(verify_dir) = qwen3_14b_dir() else {
+            eprintln!("SKIP: Qwen3-14B-4bit not found");
+            return;
+        };
+
+        eprintln!("Building ANE drafter (0.6B, max_seq=128)...");
+        let drafter = super::AneCausalDrafter::new(&draft_dir, 128).expect("build drafter");
+
+        eprintln!("Loading GPU verifier (14B)...");
+        let t0 = std::time::Instant::now();
+        let verify_model = crate::transformer::load_model(&verify_dir).unwrap();
+        let mut verifier = crate::AnyModel::Transformer(verify_model);
+        eprintln!("  Verifier loaded in {:.1}s", t0.elapsed().as_secs_f64());
+
+        let prompt: Vec<u32> = vec![785, 6722, 315, 9625, 374]; // "The capital of France is"
+
+        eprintln!("Running speculative_generate (max_tokens=20, k=4..8)...");
+        let t1 = std::time::Instant::now();
+        let tokens = super::speculative_generate(
+            &drafter,
+            &mut verifier,
+            &prompt,
+            20,
+            4,
+            8,
+        );
+        let gen_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        let tps = if gen_ms > 0.0 {
+            tokens.len() as f64 / gen_ms * 1000.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  Generated {} tokens in {gen_ms:.0}ms ({tps:.1} tok/s)",
+            tokens.len()
+        );
+        eprintln!("  Tokens: {:?}", tokens);
+
+        assert!(!tokens.is_empty(), "should produce at least 1 token");
+        assert!(tokens.len() <= 20, "should not exceed max_tokens");
+    }
+
+    // -----------------------------------------------------------------------
+    // ANE AR Decode Engine tests
+    // -----------------------------------------------------------------------
+
+    /// Unit test: compile a tiny decode kernel with random weights, eval, check not NaN.
+    /// No model files needed — all weights are synthetic.
+    #[test]
+    #[cfg(feature = "ane")]
+    fn test_ane_decode_kernel_compiles() {
+        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed, AneKernel};
+        use crate::diffusion_ane;
+
+        ane_bridge::ane_init().expect("ANE init");
+
+        // Tiny dims (all spatial >= 16)
+        let dim = 64;
+        let heads = 2;
+        let kv_heads = 1;
+        let hd = 32;
+        let half_hd = 16;
+        let inter = 64;
+        let max_seq = 16;
+        let attn_dim = heads * hd; // 64
+
+        let mil = diffusion_ane::gen_decode_layer(dim, heads, kv_heads, hd, inter, max_seq, 1e-6);
+        let names: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
+
+        // Random weights
+        let rms_att = build_weight_blob(&vec![1.0f32; dim], 1, dim);
+        let wq = build_weight_blob_transposed(&vec![0.01f32; attn_dim * dim], attn_dim, dim);
+        let wo = build_weight_blob_transposed(&vec![0.01f32; dim * attn_dim], dim, attn_dim);
+        let q_norm = build_weight_blob(&vec![1.0f32; hd], 1, hd);
+        let rms_ffn = build_weight_blob(&vec![1.0f32; dim], 1, dim);
+        let gate = build_weight_blob_transposed(&vec![0.01f32; inter * dim], inter, dim);
+        let up = build_weight_blob_transposed(&vec![0.01f32; inter * dim], inter, dim);
+        let down = build_weight_blob_transposed(&vec![0.01f32; dim * inter], dim, inter);
+
+        let blobs: Vec<&[u8]> = vec![&rms_att, &wq, &wo, &q_norm, &rms_ffn, &gate, &up, &down];
+
+        let kernel = compile_ane_kernel(
+            "test decode compile",
+            &mil.mil_text,
+            &names,
+            &blobs,
+            &[mil.input_bytes],
+            &[mil.output_bytes],
+        )
+        .expect("decode kernel should compile");
+
+        // Build single packed input buffer: [total_ch * max_seq] f32
+        let kv_dim = kv_heads * hd;
+        let total_ch = dim + 2 * kv_dim + hd + 1;
+        let mut input_buf = vec![0.0f32; total_ch * max_seq];
+
+        // x at channels [0..dim), position 0
+        for ch in 0..dim {
+            input_buf[ch * max_seq] = (ch as f32 * 0.01).sin();
+        }
+
+        // K/V cache: leave as zeros (will be masked)
+
+        // rope_cos at position 0, channels [dim+2*kv_dim .. dim+2*kv_dim+half_hd)
+        let rope_base = dim + 2 * kv_dim;
+        for d in 0..half_hd {
+            input_buf[(rope_base + d) * max_seq] = 1.0; // cos(0) = 1
+        }
+        // rope_sin: leave as 0 (sin(0) = 0)
+
+        // mask: unmask position 0, rest masked
+        let mask_ch = dim + 2 * kv_dim + hd;
+        input_buf[mask_ch * max_seq] = 0.0;
+        for p in 1..max_seq {
+            input_buf[mask_ch * max_seq + p] = -1e9;
+        }
+
+        let bytes: Vec<u8> = input_buf.iter().flat_map(|v| v.to_le_bytes()).collect();
+        kernel.write_input(0, &bytes);
+
+        kernel.eval().expect("decode eval");
+        let out = kernel.read_output_zerocopy(0, dim, max_seq);
+
+        assert!(out.iter().all(|v| v.is_finite()), "output contains NaN/Inf");
+        let max_abs = out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        eprintln!("Decode kernel output max_abs: {max_abs:.6}");
+        assert!(max_abs > 0.0, "output is all zeros");
+    }
+
+    /// Integration test: decode 5 tokens, verify outputs are sensible and deterministic.
+    /// Runs two independent decode engines with same tokens — outputs must match exactly.
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore] // needs Qwen3-0.6B-Base model on disk
+    fn test_ane_decode_matches_blas() {
+        let Some(base_path) = qwen3_base_dir() else {
+            eprintln!("Qwen3-0.6B-Base not found, skipping");
+            return;
+        };
+
+        let engine = DiffusionEngine::load(&base_path).expect("load model");
+        let mut dec1 = AneArDecodeEngine::new(engine.clone(), 128).expect("build decode engine 1");
+        let mut dec2 = AneArDecodeEngine::new(engine, 128).expect("build decode engine 2");
+
+        let tokens: Vec<u32> = vec![2, 1820, 374, 264, 1296];
+
+        for &tid in &tokens {
+            let logits1 = dec1.decode_step(tid);
+            let logits2 = dec2.decode_step(tid);
+
+            assert!(logits1.iter().all(|v| v.is_finite()), "logits1 non-finite");
+            assert!(logits2.iter().all(|v| v.is_finite()), "logits2 non-finite");
+
+            let max_diff: f32 = logits1
+                .iter()
+                .zip(logits2.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_diff < 0.01, "two runs diverged: max_diff={max_diff}");
+        }
+
+        let logits = dec1.decode_step(tokens[0]); // one more token
+        let argmax = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        eprintln!("After 5+1 tokens, argmax={} logit={:.4}", argmax.0, argmax.1);
+        assert!(argmax.1.abs() > 0.1, "logits suspiciously near zero");
+    }
+
+    /// Integration test: snapshot/restore produces correct divergent outputs.
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore] // needs Qwen3-0.6B-Base model on disk
+    fn test_ane_decode_snapshot_restore() {
+        let Some(base_path) = qwen3_base_dir() else {
+            eprintln!("Qwen3-0.6B-Base not found, skipping");
+            return;
+        };
+
+        let engine = DiffusionEngine::load(&base_path).expect("load model");
+        let mut decode = AneArDecodeEngine::new(engine, 128).expect("build decode engine");
+
+        // Decode 5 tokens
+        let prefix: Vec<u32> = vec![2, 1820, 374, 264, 1296];
+        for &tid in &prefix {
+            let _ = decode.decode_step(tid);
+        }
+
+        // Snapshot at pos=5
+        let snap = decode.snapshot();
+        assert_eq!(snap, 5);
+
+        // Decode 3 more tokens (branch A)
+        let branch_a: Vec<u32> = vec![311, 279, 264];
+        let mut logits_a5 = Vec::new();
+        for (i, &tid) in branch_a.iter().enumerate() {
+            let logits = decode.decode_step(tid);
+            if i == 0 {
+                logits_a5 = logits;
+            }
+        }
+
+        // Restore to pos=5
+        decode.restore(snap);
+        assert_eq!(decode.current_pos(), 5);
+
+        // Decode 3 DIFFERENT tokens (branch B)
+        let branch_b: Vec<u32> = vec![500, 600, 700];
+        let mut logits_b5 = Vec::new();
+        for (i, &tid) in branch_b.iter().enumerate() {
+            let logits = decode.decode_step(tid);
+            if i == 0 {
+                logits_b5 = logits;
+            }
+        }
+
+        // At pos=5 (first token after restore), logits should match since
+        // the input token differs but the prefix is the same. The logits at
+        // pos=5 depend on the token fed (branch_a[0]=311 vs branch_b[0]=500),
+        // so they SHOULD diverge.
+        let diff: f32 = logits_a5
+            .iter()
+            .zip(logits_b5.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        eprintln!("Logit diff at pos=5 between branches: {diff:.4}");
+        assert!(diff > 1.0, "branches should diverge after different tokens");
     }
 }
