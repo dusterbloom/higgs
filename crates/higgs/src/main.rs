@@ -176,6 +176,21 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         Some(m)
     };
 
+    // Create adaptive memory manager if enabled
+    let memory = if higgs_config.memory.enabled {
+        tracing::info!(
+            buffer_size = higgs_config.memory.replay_buffer_size,
+            idle_timeout = higgs_config.memory.idle_timeout_secs,
+            rank = higgs_config.memory.rank,
+            "[MEMORY] Adaptive memory enabled"
+        );
+        Some(Arc::new(higgs::memory::AdaptiveMemoryManager::new(
+            higgs_config.memory.clone(),
+        )))
+    } else {
+        None
+    };
+
     // Create shared state
     let http_client = reqwest::Client::new();
     let shared_state = Arc::new(AppState {
@@ -183,7 +198,15 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         config: higgs_config,
         http_client,
         metrics,
+        memory: memory.clone(),
     });
+
+    // Spawn idle trainer if memory is enabled
+    if let Some(ref mem) = memory {
+        if let Some(engine) = shared_state.router.resolve_first_local().await {
+            higgs::memory::spawn_idle_trainer(Arc::clone(mem), engine);
+        }
+    }
 
     // Build router with middleware
     let app = build_router(shared_state, timeout_secs, api_key, rate_limit);

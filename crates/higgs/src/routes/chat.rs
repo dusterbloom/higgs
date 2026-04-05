@@ -295,6 +295,11 @@ async fn chat_completions_non_streaming(
 
     let tokenizer = engine.tokenizer().clone();
     let thinking_enabled = engine.enable_thinking();
+    let prompt_tokens_for_memory = if state.memory.is_some() {
+        Some(prompt_tokens.clone())
+    } else {
+        None
+    };
     let output = tokio::task::spawn_blocking(move || {
         engine.generate(
             &prompt_tokens,
@@ -312,6 +317,53 @@ async fn chat_completions_non_streaming(
     .map_err(ServerError::Engine)?;
 
     let request_id = generate_request_id();
+
+    // Adaptive memory: detect implicit feedback + push to replay buffer
+    if let Some(ref memory) = state.memory {
+        memory.touch();
+
+        // Detect implicit feedback from incoming messages
+        let has_tool_result = req.messages.iter().any(|m| m.role == "tool");
+        let user_text = req.messages.iter().rev().find(|m| m.role == "user")
+            .and_then(|m| m.content.as_ref())
+            .map(|c| c.text());
+        let pt = prompt_tokens_for_memory.as_deref().unwrap_or(&[]);
+        let feedback = memory.detect_implicit_feedback(
+            pt,
+            has_tool_result,
+            user_text.as_deref(),
+        );
+        if !feedback.is_empty() {
+            memory.apply_feedback(&feedback);
+        }
+
+        // Push to replay buffer if surprise exceeds threshold
+        if let Some(surprise) = output.surprise {
+            let mut full_tokens = pt.to_vec();
+            // Tokenize the completion to get completion tokens
+            if let Ok(encoding) = tokenizer.encode(output.text.as_str(), false) {
+                full_tokens.extend_from_slice(encoding.get_ids());
+                let prompt_len = pt.len();
+                let entry = higgs_engine::replay_buffer::ReplayEntry {
+                    request_id: request_id.clone(),
+                    tokens: full_tokens,
+                    prompt_len,
+                    surprise,
+                    reward: 0.0,
+                    created: std::time::Instant::now(),
+                    pinned: false,
+                    train_count: 0,
+                };
+                memory.replay_buffer.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+            }
+        }
+
+        // Record hash for re-prompt detection
+        if let Some(ref text) = user_text {
+            memory.record_request_hash(text, &request_id);
+        }
+    }
+
     let has_tools = req.tools.is_some();
 
     let logprobs_response = output

@@ -8,6 +8,9 @@ pub struct GenerationOutput {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub token_logprobs: Option<Vec<TokenLogprobInfo>>,
+    /// Mean negative log-probability (surprise) of completion tokens.
+    /// Always computed; used by the adaptive memory system to gate replay.
+    pub surprise: Option<f32>,
 }
 
 /// Output from a streaming generation step.
@@ -34,11 +37,13 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             token_logprobs: None,
+            surprise: Some(2.5),
         };
         assert_eq!(output.text, "Hello world");
         assert_eq!(output.finish_reason, "stop");
         assert_eq!(output.prompt_tokens, 10);
         assert_eq!(output.completion_tokens, 5);
+        assert!((output.surprise.unwrap() - 2.5).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -49,10 +54,12 @@ mod tests {
             prompt_tokens: 0,
             completion_tokens: 0,
             token_logprobs: None,
+            surprise: None,
         };
         assert!(output.text.is_empty());
         assert_eq!(output.prompt_tokens, 0);
         assert_eq!(output.completion_tokens, 0);
+        assert!(output.surprise.is_none());
     }
 
     #[test]
@@ -107,10 +114,12 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 3,
             token_logprobs: None,
+            surprise: Some(1.0),
         };
         let cloned = output.clone();
         assert_eq!(cloned.text, output.text);
         assert_eq!(cloned.finish_reason, output.finish_reason);
+        assert_eq!(cloned.surprise, output.surprise);
     }
 
     #[test]
@@ -137,6 +146,7 @@ mod tests {
             prompt_tokens: 1,
             completion_tokens: 1,
             token_logprobs: None,
+            surprise: None,
         };
         let debug_str = format!("{output:?}");
         assert!(debug_str.contains("GenerationOutput"));
@@ -179,6 +189,7 @@ mod tests {
                     },
                 ],
             }]),
+            surprise: Some(0.5),
         };
         let lps = output.token_logprobs.unwrap();
         assert_eq!(lps.len(), 1);

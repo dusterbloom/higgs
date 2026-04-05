@@ -7,6 +7,7 @@ pub mod model_loader;
 pub mod paged_prefix_cache;
 pub mod prompt_cache;
 pub mod reasoning_parser;
+pub mod replay_buffer;
 pub mod simple;
 pub mod tool_parser;
 

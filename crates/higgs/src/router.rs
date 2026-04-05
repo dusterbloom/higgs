@@ -220,6 +220,11 @@ impl Router {
         &self.local_engines
     }
 
+    /// Get the first available local engine (for tokenization, feedback, etc.)
+    pub async fn resolve_first_local(&self) -> Option<Arc<Engine>> {
+        self.local_engines.values().next().map(Arc::clone)
+    }
+
     // -- Private helpers ---------------------------------------------------
 
     async fn try_auto_route(

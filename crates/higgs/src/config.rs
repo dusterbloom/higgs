@@ -151,7 +151,68 @@ pub struct HiggsConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
+
+// -- Adaptive memory section ------------------------------------------------
+
+/// Configuration for the adaptive memory / self-training system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// Enable the adaptive memory system.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of entries in the replay buffer.
+    #[serde(default = "default_replay_buffer_size")]
+    pub replay_buffer_size: usize,
+    /// Seconds of idle time before training a step.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// Low-rank dimension for PCAST deltas.
+    #[serde(default = "default_memory_rank")]
+    pub rank: usize,
+    /// Learning rate for idle training.
+    #[serde(default = "default_memory_lr")]
+    pub lr: f32,
+    /// Minimum mean NLL to admit an entry into the replay buffer.
+    #[serde(default = "default_surprise_threshold")]
+    pub surprise_threshold: f32,
+    /// Maximum delta size in MB before SVD compression fires.
+    #[serde(default = "default_delta_budget_mb")]
+    pub delta_budget_mb: u32,
+    /// Maximum times a single entry can be trained on.
+    #[serde(default = "default_max_trains_per_entry")]
+    pub max_trains_per_entry: u32,
+    /// KL divergence threshold for system prompt anchoring.
+    #[serde(default = "default_anchor_kl_threshold")]
+    pub anchor_kl_threshold: f32,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            replay_buffer_size: default_replay_buffer_size(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+            rank: default_memory_rank(),
+            lr: default_memory_lr(),
+            surprise_threshold: default_surprise_threshold(),
+            delta_budget_mb: default_delta_budget_mb(),
+            max_trains_per_entry: default_max_trains_per_entry(),
+            anchor_kl_threshold: default_anchor_kl_threshold(),
+        }
+    }
+}
+
+const fn default_replay_buffer_size() -> usize { 256 }
+const fn default_idle_timeout_secs() -> u64 { 30 }
+const fn default_memory_rank() -> usize { 4 }
+fn default_memory_lr() -> f32 { 0.0005 }
+fn default_surprise_threshold() -> f32 { 1.0 }
+const fn default_delta_budget_mb() -> u32 { 32 }
+const fn default_max_trains_per_entry() -> u32 { 10 }
+fn default_anchor_kl_threshold() -> f32 { 0.1 }
 
 // -- Server section ---------------------------------------------------------
 

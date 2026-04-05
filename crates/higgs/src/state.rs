@@ -264,6 +264,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Request metrics (present in config mode, absent in simple mode).
     pub metrics: Option<Arc<MetricsStore>>,
+    /// Adaptive memory manager (present when [memory] enabled = true).
+    pub memory: Option<Arc<crate::memory::AdaptiveMemoryManager>>,
 }
 
 /// Type alias for the shared state used by Axum handlers.

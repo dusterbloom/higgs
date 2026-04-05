@@ -287,7 +287,7 @@ impl QLinear {
 /// Perturbation map: target key → (A, B, scale) low-rank factors.
 pub(crate) type PerturbMap = std::collections::HashMap<String, (Array, Array, f32)>;
 /// Delta map: target key → accumulated fp32 delta [out_dim, in_dim].
-pub(crate) type DeltaMap = std::collections::HashMap<String, Array>;
+pub type DeltaMap = std::collections::HashMap<String, Array>;
 
 /// Dispatch helper: routes through `forward_perturbed` only when perturbations are active.
 /// When both maps are None, calls `ql.forward(x)` directly (zero overhead).

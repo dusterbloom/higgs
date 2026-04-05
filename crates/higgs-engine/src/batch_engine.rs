@@ -199,6 +199,7 @@ impl BatchEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
                 token_logprobs: None,
+                surprise: None,
             });
         }
 
@@ -243,6 +244,7 @@ impl BatchEngine {
             prompt_tokens: prompt_len,
             completion_tokens,
             token_logprobs: all_logprobs,
+            surprise: None, // batch engine doesn't compute surprise yet
         })
     }
 

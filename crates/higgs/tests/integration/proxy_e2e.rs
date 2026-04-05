@@ -62,6 +62,7 @@ fn build_test_state(mock_url: &str, format: ApiFormat) -> Arc<AppState> {
         config,
         http_client: reqwest::Client::new(),
         metrics: Some(metrics),
+        memory: None,
     })
 }
 
@@ -212,6 +213,7 @@ async fn proxy_model_rewrite() {
         config,
         http_client: reqwest::Client::new(),
         metrics: Some(metrics),
+        memory: None,
     });
     let app = build_app(state);
 

@@ -13,6 +13,7 @@ pub mod transformer;
 pub mod turboquant;
 pub mod utils;
 
+pub mod delta_persistence;
 pub mod diffusion;
 pub mod diffusion_eggroll;
 pub mod diffusion_lora;

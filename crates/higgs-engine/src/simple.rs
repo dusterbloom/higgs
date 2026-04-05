@@ -327,7 +327,8 @@ impl SimpleEngine {
 
     /// Run the prefill forward pass and sample the first token. Stores the
     /// post-prefill KV state back into the prefix cache (skipped for multimodal).
-    /// Optionally computes logprobs for the first token.
+    /// Run prefill forward pass and sample the first token.
+    /// Always computes chosen-token logprob for surprise scoring.
     fn run_prefill(
         &self,
         prompt_tokens: &[u32],
@@ -335,7 +336,7 @@ impl SimpleEngine {
         params: &SamplingParams,
         logprob_top_n: Option<u32>,
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
-    ) -> Result<(Array, Option<LogprobArrays>), EngineError> {
+    ) -> Result<(Array, LogprobArrays), EngineError> {
         let logits = if let Some(ref pixel_values) = prepared.pixel_values {
             prepared
                 .model
@@ -369,27 +370,22 @@ impl SimpleEngine {
 
         let current_token = sample(&constrained_logits, params).map_err(EngineError::Mlx)?;
 
-        let logprob_data = if let Some(top_n) = logprob_top_n {
-            let scaled = if params.temperature <= f32::EPSILON {
-                constrained_logits
-            } else {
-                constrained_logits
-                    .multiply(Array::from_f32(1.0 / params.temperature))
-                    .map_err(EngineError::Mlx)?
-            };
-            Some(
-                LogprobArrays::compute(&scaled, &current_token, Some(top_n))
-                    .map_err(EngineError::Mlx)?,
-            )
+        // Always compute chosen-token logprob (for surprise scoring).
+        // top-N argsort only runs when the user requests logprobs.
+        let scaled = if params.temperature <= f32::EPSILON {
+            constrained_logits
         } else {
-            None
+            constrained_logits
+                .multiply(Array::from_f32(1.0 / params.temperature))
+                .map_err(EngineError::Mlx)?
         };
+        let logprob_data =
+            LogprobArrays::compute(&scaled, &current_token, logprob_top_n)
+                .map_err(EngineError::Mlx)?;
 
         {
             let mut eval_targets: Vec<&Array> = vec![&current_token];
-            if let Some(ref lp) = logprob_data {
-                eval_targets.extend(lp.eval_targets());
-            }
+            eval_targets.extend(logprob_data.eval_targets());
             eval(eval_targets).map_err(EngineError::Mlx)?;
         }
 
@@ -406,7 +402,8 @@ impl SimpleEngine {
     }
 
     /// Decode a single step: forward pass on the current token, apply penalties
-    /// and optional constraint mask, then sample. Returns `(next_token, Option<LogprobArrays>)`.
+    /// and optional constraint mask, then sample. Always computes chosen-token
+    /// logprob for surprise scoring; top-N argsort only when `logprob_top_n` is `Some`.
     fn decode_step(
         current_token: &Array,
         model: &mut AnyModel,
@@ -415,7 +412,7 @@ impl SimpleEngine {
         generated_tokens: &[u32],
         logprob_top_n: Option<u32>,
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
-    ) -> Result<(Array, Option<LogprobArrays>), EngineError> {
+    ) -> Result<(Array, LogprobArrays), EngineError> {
         let decode_input = current_token.index((.., NewAxis));
         let logits = model
             .forward(&decode_input, None, cache)
@@ -434,24 +431,18 @@ impl SimpleEngine {
 
         let next_token = sample(&constrained, params).map_err(EngineError::Mlx)?;
 
-        let logprob_data = if let Some(top_n) = logprob_top_n {
-            // Compute logprobs from the same distribution we sampled from.
-            // Temperature is already accounted for inside `sample`, so we
-            // replicate the scaling here for the logprob computation.
-            let scaled = if params.temperature <= f32::EPSILON {
-                constrained
-            } else {
-                constrained
-                    .multiply(mlx_rs::array!(1.0 / params.temperature))
-                    .map_err(EngineError::Mlx)?
-            };
-            Some(
-                LogprobArrays::compute(&scaled, &next_token, Some(top_n))
-                    .map_err(EngineError::Mlx)?,
-            )
+        // Always compute chosen-token logprob (for surprise scoring).
+        // Temperature scaling replicates what `sample` sees internally.
+        let scaled = if params.temperature <= f32::EPSILON {
+            constrained
         } else {
-            None
+            constrained
+                .multiply(mlx_rs::array!(1.0 / params.temperature))
+                .map_err(EngineError::Mlx)?
         };
+        let logprob_data =
+            LogprobArrays::compute(&scaled, &next_token, logprob_top_n)
+                .map_err(EngineError::Mlx)?;
 
         Ok((next_token, logprob_data))
     }
@@ -589,6 +580,7 @@ impl SimpleEngine {
                 prompt_tokens: Self::prompt_len(prompt_tokens)?,
                 completion_tokens: 0,
                 token_logprobs: None,
+                surprise: None,
             });
         }
 
@@ -644,8 +636,13 @@ impl SimpleEngine {
         }
         let mut tokens: Vec<u32> = vec![first_token_id];
         let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
-        if let (Some(all_lp), Some(lp_data)) = (&mut all_logprobs, &first_logprob_data) {
-            all_lp.push(lp_data.materialize(first_token_id));
+
+        // Surprise accumulator: sum of -logprob for each completion token.
+        let first_surprise: f32 = -first_logprob_data.token_logprob.item::<f32>();
+        let mut surprise_sum: f32 = first_surprise;
+
+        if let Some(all_lp) = &mut all_logprobs {
+            all_lp.push(first_logprob_data.materialize(first_token_id));
         }
         let has_stop_sequences = !stop_sequences.is_empty();
 
@@ -657,6 +654,7 @@ impl SimpleEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
+                surprise: Some(surprise_sum),
             });
         }
         if has_stop_sequences {
@@ -668,6 +666,7 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: 1,
                     token_logprobs: all_logprobs,
+                    surprise: Some(surprise_sum),
                 });
             }
         }
@@ -678,6 +677,7 @@ impl SimpleEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
+                surprise: Some(surprise_sum),
             });
         }
 
@@ -696,9 +696,7 @@ impl SimpleEngine {
         )?;
         {
             let mut eval_targets: Vec<&Array> = vec![&next_token];
-            if let Some(ref lp) = next_logprob_data {
-                eval_targets.extend(lp.eval_targets());
-            }
+            eval_targets.extend(next_logprob_data.eval_targets());
             if constraint.is_some() {
                 eval(eval_targets).map_err(EngineError::Mlx)?;
             } else {
@@ -748,9 +746,7 @@ impl SimpleEngine {
             let t1 = std::time::Instant::now();
             {
                 let mut eval_targets: Vec<&Array> = vec![&following];
-                if let Some(ref lp) = following_logprob_data {
-                    eval_targets.extend(lp.eval_targets());
-                }
+                eval_targets.extend(following_logprob_data.eval_targets());
                 if constraint.is_some() {
                     eval(eval_targets).map_err(EngineError::Mlx)?;
                 } else {
@@ -781,9 +777,12 @@ impl SimpleEngine {
                 }
             }
 
-            // Materialize logprobs for the token we just extracted
-            if let (Some(all_lp), Some(lp_data)) = (&mut all_logprobs, &next_logprob_data) {
-                all_lp.push(lp_data.materialize(token_id));
+            // Accumulate surprise from the chosen-token logprob.
+            surprise_sum += -next_logprob_data.token_logprob.item::<f32>();
+
+            // Materialize full logprobs for response only if user requested them.
+            if let Some(all_lp) = &mut all_logprobs {
+                all_lp.push(next_logprob_data.materialize(token_id));
             }
 
             let t3 = std::time::Instant::now();
@@ -810,12 +809,14 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
+                let mean_surprise = surprise_sum / completion_len as f32;
                 return Ok(GenerationOutput {
                     text: self.decode_tokens(&tokens)?,
                     finish_reason: "stop".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    surprise: Some(mean_surprise),
                 });
             }
 
@@ -827,12 +828,14 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
+                let mean_surprise = surprise_sum / completion_len as f32;
                 return Ok(GenerationOutput {
                     text: self.decode_tokens(&tokens)?,
                     finish_reason: "stop".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    surprise: Some(mean_surprise),
                 });
             }
 
@@ -846,12 +849,14 @@ impl SimpleEngine {
                         total_item_ns,
                         total_other_ns,
                     );
+                    let mean_surprise = surprise_sum / completion_len as f32;
                     return Ok(GenerationOutput {
                         text: truncated,
                         finish_reason: "stop".to_owned(),
                         prompt_tokens: prompt_len,
                         completion_tokens: completion_len,
                         token_logprobs: all_logprobs,
+                        surprise: Some(mean_surprise),
                     });
                 }
             }
@@ -864,12 +869,14 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
+                let mean_surprise = surprise_sum / completion_len as f32;
                 return Ok(GenerationOutput {
                     text: self.decode_tokens(&tokens)?,
                     finish_reason: "length".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    surprise: Some(mean_surprise),
                 });
             }
 
@@ -1014,9 +1021,11 @@ impl SimpleEngine {
         let first_is_eos = self.eos_token_ids.contains(&first_token_id);
         let finished = first_is_eos || first_hit_stop || 1 >= max_tokens;
 
-        let first_logprob = first_logprob_data
-            .as_ref()
-            .map(|lp| lp.materialize(first_token_id));
+        let first_logprob = if logprobs {
+            Some(first_logprob_data.materialize(first_token_id))
+        } else {
+            None
+        };
 
         if sender
             .blocking_send(StreamingOutput {
@@ -1064,9 +1073,7 @@ impl SimpleEngine {
         )?;
         {
             let mut eval_targets: Vec<&Array> = vec![&next_token];
-            if let Some(ref lp) = next_logprob_data {
-                eval_targets.extend(lp.eval_targets());
-            }
+            eval_targets.extend(next_logprob_data.eval_targets());
             async_eval(eval_targets).map_err(EngineError::Mlx)?;
         }
 
@@ -1082,9 +1089,7 @@ impl SimpleEngine {
             )?;
             {
                 let mut eval_targets: Vec<&Array> = vec![&following];
-                if let Some(ref lp) = following_logprob_data {
-                    eval_targets.extend(lp.eval_targets());
-                }
+                eval_targets.extend(following_logprob_data.eval_targets());
                 async_eval(eval_targets).map_err(EngineError::Mlx)?;
             }
 
@@ -1114,9 +1119,11 @@ impl SimpleEngine {
                 cg.advance(token_id);
             }
 
-            let token_logprob = next_logprob_data
-                .as_ref()
-                .map(|lp_data| lp_data.materialize(token_id));
+            let token_logprob = if logprobs {
+                Some(next_logprob_data.materialize(token_id))
+            } else {
+                None
+            };
 
             all_tokens.push(token_id);
 
