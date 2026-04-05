@@ -260,13 +260,23 @@ impl QLinear {
     ) -> Result<Array, Exception> {
         let mut y = self.forward(x)?;
 
+        // Cast perturbation/delta factors to match activation dtype (model runs in f16/bf16,
+        // but perturbation factors are generated as f32).
+        let dt = x.dtype();
+
         if let Some(d) = delta {
-            y = y.add(&x.matmul(&d.transpose()?)?)?;
+            // Freeze base output for gradient path: gradients only flow through the
+            // delta term. This is a no-op for ES (no autograd), backwards-compatible.
+            y = mlx_rs::stop_gradient(&y)?;
+            let d_cast = d.as_dtype(dt)?;
+            y = y.add(&x.matmul(&d_cast.transpose()?)?)?;
         }
 
         if let Some((a, b, scale)) = perturbation {
-            let xb = x.matmul(b)?;
-            let pert = xb.matmul(&a.transpose()?)?;
+            let b_cast = b.as_dtype(dt)?;
+            let a_cast = a.as_dtype(dt)?;
+            let xb = x.matmul(&b_cast)?;
+            let pert = xb.matmul(&a_cast.transpose()?)?;
             y = y.add(&pert.multiply(&Array::from_f32(scale))?)?;
         }
 
@@ -299,7 +309,13 @@ fn qlinear_fwd(
     };
     let delta = delts.and_then(|d| d.get(&key));
     let pert = perts.and_then(|p| p.get(&key)).map(|(a, b, s)| (a, b, *s));
-    ql.forward_perturbed(x, delta, pert)
+    let y = ql.forward_perturbed(x, delta, pert)?;
+    // In gradient mode, stop_gradient on targets that have no delta so their
+    // quantized_matmul doesn't appear in the backward graph (MLX can't VJP it).
+    if delts.is_some() && delta.is_none() && pert.is_none() {
+        return mlx_rs::stop_gradient(&y);
+    }
+    Ok(y)
 }
 
 /// Quantized embedding stored as raw weight/scales/biases arrays.
@@ -1101,6 +1117,85 @@ impl SwitchMlpWeights {
         // Reshape back to [B, L, top_k, D]
         out_unsorted.reshape(&[b, l, top_k, d])
     }
+
+    /// Like `forward_gather_global_sort` but injects shared deltas from a `DeltaMap`.
+    ///
+    /// Each projection (gate/up/down) gets a shared delta `[out, in]` that broadcasts
+    /// across all experts. The base `gather_qmm` output is `stop_gradient`'d so gradients
+    /// only flow through the delta path.
+    pub(crate) fn forward_gather_global_sort_perturbed(
+        &self,
+        x: &Array,
+        indices: &Array,
+        delts: &DeltaMap,
+        prefix: &str,
+    ) -> Result<Array, Exception> {
+        let x_shape = x.shape();
+        let err = || Exception::custom("forward_gather_global_sort_perturbed input must be [B, L, D]");
+        let b = *x_shape.first().ok_or_else(err)?;
+        let l = *x_shape.get(1).ok_or_else(err)?;
+        let d = *x_shape.get(2).ok_or_else(err)?;
+        let top_k = *indices
+            .shape()
+            .last()
+            .ok_or_else(|| Exception::custom("indices must have last dim"))?;
+
+        let dt = x.dtype();
+
+        // --- Global sort ---
+        let idx_flat = indices.flatten(None, None)?;
+        let order = ops::argsort_axis(&idx_flat, 0)?;
+        let inv_order = ops::argsort_axis(&order, 0)?;
+        let top_k_arr = Array::from_slice(&[top_k as u32], &[1]);
+        let token_idx = order.floor_divide(&top_k_arr)?;
+        let x_flat = x.reshape(&[b * l, 1, d])?;
+        let x_sorted = x_flat.take_axis(&token_idx, 0)?;
+        let idx_sorted = idx_flat.take_axis(&order, 0)?;
+
+        // --- gate_proj ---
+        // Always stop_gradient gather_qmm outputs so they don't appear in backward graph.
+        let mut gate_out = mlx_rs::stop_gradient(&gather_qmm(
+            &x_sorted, &self.gate_proj.weight, &self.gate_proj.scales,
+            &self.gate_proj.biases, &idx_sorted, true,
+            self.gate_proj.group_size, self.gate_proj.bits, true,
+        )?)?;
+        let gate_key = format!("{prefix}.gate_proj");
+        if let Some(delta) = delts.get(&gate_key) {
+            let d_cast = delta.as_dtype(dt)?;
+            // x_sorted: [N, 1, D], delta: [out, in] -> x @ delta.T: [N, 1, out]
+            gate_out = gate_out.add(&x_sorted.matmul(&d_cast.transpose()?)?)?;
+        }
+
+        // --- up_proj ---
+        let mut up_out = mlx_rs::stop_gradient(&gather_qmm(
+            &x_sorted, &self.up_proj.weight, &self.up_proj.scales,
+            &self.up_proj.biases, &idx_sorted, true,
+            self.up_proj.group_size, self.up_proj.bits, true,
+        )?)?;
+        let up_key = format!("{prefix}.up_proj");
+        if let Some(delta) = delts.get(&up_key) {
+            let d_cast = delta.as_dtype(dt)?;
+            up_out = up_out.add(&x_sorted.matmul(&d_cast.transpose()?)?)?;
+        }
+
+        let activated = swiglu(&gate_out, &up_out)?;
+
+        // --- down_proj ---
+        let mut down_out = mlx_rs::stop_gradient(&gather_qmm(
+            &activated, &self.down_proj.weight, &self.down_proj.scales,
+            &self.down_proj.biases, &idx_sorted, true,
+            self.down_proj.group_size, self.down_proj.bits, true,
+        )?)?;
+        let down_key = format!("{prefix}.down_proj");
+        if let Some(delta) = delts.get(&down_key) {
+            let d_cast = delta.as_dtype(dt)?;
+            down_out = down_out.add(&activated.matmul(&d_cast.transpose()?)?)?;
+        }
+
+        let out_flat = down_out.squeeze_axes(&[-2])?;
+        let out_unsorted = out_flat.take_axis(&inv_order, 0)?;
+        out_unsorted.reshape(&[b, l, top_k, d])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,8 +1794,17 @@ impl FfnBlock {
                 scores
             };
 
-            // switch_mlp stays untouched (excluded from training)
-            let y = switch_ref.forward_gather_global_sort(x, &inds)?;
+            // Use perturbed path when deltas are present (gradient training includes experts)
+            let y = if let Some(d) = delts {
+                let switch_prefix = if prefix.is_empty() {
+                    "switch_mlp".to_string()
+                } else {
+                    format!("{prefix}.switch_mlp")
+                };
+                switch_ref.forward_gather_global_sort_perturbed(x, &inds, d, &switch_prefix)?
+            } else {
+                switch_ref.forward_gather_global_sort(x, &inds)?
+            };
 
             let expert_sum = y
                 .multiply(&scores.expand_dims(-1)?)?
@@ -2017,6 +2121,12 @@ impl Qwen3NextCausalLM {
     ) -> Result<Array, Exception> {
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
+        // In gradient mode, freeze embedding so quantized embedding lookup
+        // doesn't appear in the backward graph.
+        if self.train_deltas.is_some() {
+            h = mlx_rs::stop_gradient(&h)?;
+        }
+
         if kv_cache.is_empty() {
             *kv_cache = self.make_cache();
         }
@@ -2066,6 +2176,8 @@ impl Qwen3NextCausalLM {
         // borrowing self while iterating over self.model.layers.
         let perts = self.perturbations.as_ref();
         let delts = self.train_deltas.as_ref();
+        let training_mode = perts.is_some() || delts.is_some();
+        let n_layers = self.model.layers.len();
 
         for (i, (layer, layer_cache)) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()).enumerate() {
             let cache = layer_cache
@@ -2078,6 +2190,13 @@ impl Qwen3NextCausalLM {
             };
 
             let normed = layer.input_layernorm.forward(&h)?;
+
+            if training_mode && i % 10 == 0 {
+                eprintln!(
+                    "[fwd-train] layer {i}/{n_layers} type={}",
+                    if layer.is_linear { "GDN" } else { "attn" },
+                );
+            }
 
             // Build layer-specific prefixes for perturbation lookup
             let attn_prefix = if perts.is_some() || delts.is_some() {
@@ -2103,7 +2222,14 @@ impl Qwen3NextCausalLM {
                 let LayerCache::Arrays(ssm_cache) = cache else {
                     return Err(Exception::custom("Expected ArraysCache"));
                 };
-                attn.forward(&normed, mask, ssm_cache, &attn_prefix, perts, delts)?
+                let gdn_out = attn.forward(&normed, mask, ssm_cache, &attn_prefix, perts, delts)?;
+                // GDN sequential scan has O(T) unrolled backward graph — impractical for
+                // backprop. stop_gradient so gradients reach earlier layers via residual only.
+                if delts.is_some() {
+                    mlx_rs::stop_gradient(&gdn_out)?
+                } else {
+                    gdn_out
+                }
             } else {
                 let attn = layer
                     .self_attn
@@ -2119,6 +2245,14 @@ impl Qwen3NextCausalLM {
             let normed_post = layer.post_attention_layernorm.forward(&h2)?;
             let mlp_out = layer.mlp.forward(&normed_post, &mlp_prefix, perts, delts)?;
             h = h2.add(mlp_out)?;
+
+            // During training (perturbations active), eval hidden state every 4
+            // layers to bound the MLX lazy graph.  Without this, 40+ layers of
+            // quantized_matmul + perturbation matmuls creates a graph too large
+            // for Metal to compile/execute in one shot.
+            if (perts.is_some() || delts.is_some()) && (i + 1) % 4 == 0 {
+                mlx_rs::transforms::eval(std::slice::from_ref(&h))?;
+            }
         }
 
         self.model.norm.forward(&h)

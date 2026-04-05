@@ -515,6 +515,45 @@ impl SimpleEngine {
         })
     }
 
+    /// Run EGGROLL self-training on the loaded model.
+    ///
+    /// Locks the model mutex (blocking inference) for the duration of training.
+    /// Only supported for Qwen3Next models.
+    pub fn train_eggroll(
+        &self,
+        config: higgs_models::diffusion_eggroll::EggrollConfig,
+        tokens: &[u32],
+        prompt_len: usize,
+        merge_interval: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+        model
+            .train_eggroll(config, tokens, prompt_len, merge_interval)
+            .map_err(EngineError::Mlx)
+    }
+
+    /// Run PCAST gradient-based self-training on the loaded model.
+    ///
+    /// Locks the model mutex (blocking inference) for the duration of training.
+    /// Only supported for Qwen3Next models.
+    pub fn train_gradient(
+        &self,
+        config: higgs_models::diffusion_eggroll::EggrollConfig,
+        tokens: &[u32],
+        prompt_len: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+        model
+            .train_gradient(config, tokens, prompt_len)
+            .map_err(EngineError::Mlx)
+    }
+
     /// Convert a token count to u32, with an overflow error.
     fn completion_len(tokens: &[u32]) -> Result<u32, EngineError> {
         tokens

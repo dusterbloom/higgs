@@ -17,6 +17,7 @@ pub mod diffusion;
 pub mod diffusion_eggroll;
 pub mod diffusion_lora;
 pub mod diffusion_train;
+pub mod eggroll_gradient;
 pub mod eggroll_quantized;
 pub mod llada_moe;
 pub mod rwkv7;
@@ -521,6 +522,55 @@ impl AnyModel {
             Self::Qwen3Next(m) => m.apply_lm_head_all(&hidden),
             _ => Err(Exception::custom(
                 "forward_all_logits not yet supported for this model type",
+            )),
+        }
+    }
+
+    /// Run EGGROLL self-training on this model.
+    ///
+    /// Only supported for `Qwen3Next` models (dense and MoE). Auto-detects MoE
+    /// and excludes expert stack weights. Returns per-step loss values.
+    pub fn train_eggroll(
+        &mut self,
+        config: diffusion_eggroll::EggrollConfig,
+        tokens: &[u32],
+        prompt_len: usize,
+        merge_interval: usize,
+    ) -> Result<Vec<f32>, Exception> {
+        match self {
+            Self::Qwen3Next(model) => {
+                let mut trainer =
+                    eggroll_quantized::Qwen3NextEggrollTrainer::new_for_model(
+                        model,
+                        config,
+                        merge_interval,
+                    )?;
+                trainer.train(tokens, prompt_len)
+            }
+            _ => Err(Exception::custom(
+                "EGGROLL training only supports Qwen3Next models",
+            )),
+        }
+    }
+
+    /// Run PCAST gradient-based self-training on this model.
+    ///
+    /// Uses exact backprop through low-rank delta paths instead of ES.
+    /// Covers all targets including MoE experts. Returns per-step loss values.
+    pub fn train_gradient(
+        &mut self,
+        config: diffusion_eggroll::EggrollConfig,
+        tokens: &[u32],
+        prompt_len: usize,
+    ) -> Result<Vec<f32>, Exception> {
+        match self {
+            Self::Qwen3Next(model) => {
+                let grad_config = eggroll_gradient::GradientTrainerConfig::from(&config);
+                let mut trainer = eggroll_gradient::GradientTrainer::new(model, grad_config)?;
+                trainer.train(model, tokens, prompt_len)
+            }
+            _ => Err(Exception::custom(
+                "PCAST gradient training only supports Qwen3Next models",
             )),
         }
     }

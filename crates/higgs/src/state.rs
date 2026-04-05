@@ -217,6 +217,41 @@ impl Engine {
             Self::Stub(_) => Ok(Vec::new()),
         }
     }
+
+    /// Run EGGROLL self-training. Only supported on Simple engine with Qwen3Next models.
+    pub fn train_eggroll(
+        &self,
+        config: higgs_models::diffusion_eggroll::EggrollConfig,
+        tokens: &[u32],
+        prompt_len: usize,
+        merge_interval: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        match self {
+            Self::Simple(e) => e.train_eggroll(config, tokens, prompt_len, merge_interval),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "EGGROLL training not supported on batch engine".to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    /// Run PCAST gradient-based self-training. Only supported on Simple engine with Qwen3Next.
+    pub fn train_gradient(
+        &self,
+        config: higgs_models::diffusion_eggroll::EggrollConfig,
+        tokens: &[u32],
+        prompt_len: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        match self {
+            Self::Simple(e) => e.train_gradient(config, tokens, prompt_len),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "Gradient training not supported on batch engine".to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
 }
 
 /// Shared application state available to all route handlers.

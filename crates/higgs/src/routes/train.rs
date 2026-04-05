@@ -11,6 +11,9 @@ pub struct TrainRequest {
     pub tokens: Vec<u32>,
     /// Number of prompt tokens (loss computed only on completion).
     pub prompt_len: usize,
+    /// Training method: "gradient" (PCAST, default) or "es" (EGGROLL ES).
+    #[serde(default = "default_method")]
+    pub method: String,
     /// EGGROLL hyperparameters.
     #[serde(default = "default_sigma")]
     pub sigma: f32,
@@ -32,6 +35,7 @@ pub struct TrainRequest {
     pub delta_decay: f32,
 }
 
+fn default_method() -> String { "gradient".to_owned() }
 fn default_sigma() -> f32 { 0.001 }
 fn default_lr() -> f32 { 0.0005 }
 fn default_rank() -> usize { 4 }
@@ -67,17 +71,22 @@ pub async fn train(
             req.tokens.len()
         )));
     }
-    if req.sigma <= 0.0 {
-        return Err(ServerError::BadRequest("sigma must be > 0".into()));
+    let use_gradient = req.method == "gradient";
+
+    if !use_gradient {
+        // ES-specific validation
+        if req.sigma <= 0.0 {
+            return Err(ServerError::BadRequest("sigma must be > 0".into()));
+        }
+        if req.population == 0 {
+            return Err(ServerError::BadRequest("population must be >= 1".into()));
+        }
     }
     if req.lr <= 0.0 {
         return Err(ServerError::BadRequest("lr must be > 0".into()));
     }
     if req.rank == 0 {
         return Err(ServerError::BadRequest("rank must be >= 1".into()));
-    }
-    if req.population == 0 {
-        return Err(ServerError::BadRequest("population must be >= 1".into()));
     }
     if req.total_steps == 0 {
         return Err(ServerError::BadRequest("total_steps must be >= 1".into()));
@@ -111,11 +120,15 @@ pub async fn train(
 
             // Run training synchronously (blocks the model mutex).
             let losses = tokio::task::spawn_blocking(move || {
-                engine.train_eggroll(config, &req.tokens, req.prompt_len, req.merge_interval)
+                if use_gradient {
+                    engine.train_gradient(config, &req.tokens, req.prompt_len)
+                } else {
+                    engine.train_eggroll(config, &req.tokens, req.prompt_len, req.merge_interval)
+                }
             })
             .await
             .map_err(|e| ServerError::InternalError(format!("Training task panicked: {e}")))?
-            .map_err(|e| ServerError::InternalError(format!("EGGROLL training failed: {e}")))?;
+            .map_err(|e| ServerError::InternalError(format!("Training failed: {e}")))?;
 
             let final_loss = losses.last().copied().unwrap_or(0.0);
             Ok(Json(TrainResponse {
@@ -126,7 +139,7 @@ pub async fn train(
             }))
         }
         crate::router::ResolvedRoute::Remote { .. } => Err(ServerError::BadRequest(
-            "EGGROLL training only supported on local models".to_owned(),
+            "Training only supported on local models".to_owned(),
         )),
     }
 }
