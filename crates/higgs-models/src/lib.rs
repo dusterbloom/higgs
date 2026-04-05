@@ -10,6 +10,7 @@ pub mod registry;
 pub mod siglip;
 pub mod starcoder2;
 pub mod transformer;
+pub mod turboquant;
 pub mod utils;
 
 use std::collections::{HashMap, HashSet};
@@ -17,11 +18,13 @@ use std::path::Path;
 
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::transforms::eval;
 use mlx_rs::{Array, argmax_axis, array, categorical, error::Exception};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::ModelError;
+use crate::turboquant::KvCacheConfig;
 
 // ---------------------------------------------------------------------------
 // SamplingParams -- configurable sampling parameters
@@ -104,6 +107,18 @@ pub enum AnyModel {
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
 }
 
+fn checked_head_dim(hidden_size: i32, num_attention_heads: i32) -> Result<i32, Exception> {
+    if num_attention_heads <= 0 {
+        return Err(Exception::custom("num_attention_heads must be positive"));
+    }
+    if hidden_size % num_attention_heads != 0 {
+        return Err(Exception::custom(format!(
+            "hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_attention_heads})",
+        )));
+    }
+    Ok(hidden_size / num_attention_heads)
+}
+
 fn make_kv_cache(num_hidden_layers: i32) -> AnyCache {
     let Ok(n_layers) = usize::try_from(num_hidden_layers) else {
         tracing::warn!(
@@ -117,6 +132,30 @@ fn make_kv_cache(num_hidden_layers: i32) -> AnyCache {
             .map(|_| Some(cache::SteppingKeyValueCache::new()))
             .collect(),
     )
+}
+
+fn make_turboquant_kv_cache(
+    num_hidden_layers: i32,
+    num_key_value_heads: i32,
+    head_dim: i32,
+    kv_cache_config: KvCacheConfig,
+) -> Result<AnyCache, Exception> {
+    let Ok(n_layers) = usize::try_from(num_hidden_layers) else {
+        tracing::warn!(
+            num_hidden_layers,
+            "negative num_hidden_layers; returning empty KV cache"
+        );
+        return Ok(AnyCache::KV(vec![]));
+    };
+    let mut caches = Vec::with_capacity(n_layers);
+    for _ in 0..n_layers {
+        caches.push(Some(cache::SteppingKeyValueCache::new_turbo(
+            kv_cache_config,
+            num_key_value_heads,
+            head_dim,
+        )?));
+    }
+    Ok(AnyCache::KV(caches))
 }
 
 impl AnyModel {
@@ -157,6 +196,55 @@ impl AnyModel {
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
+    }
+
+    /// Chunked prefill: process the prompt in `chunk_size`-token segments.
+    ///
+    /// Produces identical logits to `forward()` but evaluates the compute graph
+    /// between chunks, bounding peak memory for long sequences. Only the last
+    /// position's logits are returned (same shape as `forward` during generation).
+    #[allow(non_snake_case)]
+    pub fn forward_chunked(
+        &mut self,
+        inputs: &Array,
+        cache: &mut AnyCache,
+        chunk_size: i32,
+    ) -> Result<Array, Exception> {
+        let T = *inputs
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
+
+        if chunk_size >= T {
+            return self.forward(inputs, None, cache);
+        }
+
+        // For Qwen3Next, delegate to the model's own chunked prefill which
+        // also handles SSM/conv state eval.
+        if let (Self::Qwen3Next(m), AnyCache::Hybrid(c)) = (&mut *self, &mut *cache) {
+            return m.forward_chunked(inputs, None, c, chunk_size);
+        }
+
+        // Generic path for all KV-only models.
+        let mut offset = 0i32;
+        while offset + chunk_size < T {
+            let chunk = inputs.index((.., offset..offset + chunk_size));
+            let h = self.forward_hidden(&chunk, None, cache)?;
+            // Eval hidden output + all cache states between chunks.
+            // Without eval, MLX's lazy graph accumulates and OOMs on long sequences.
+            let mut targets: Vec<&Array> = vec![&h];
+            if let AnyCache::KV(kv) = &*cache {
+                for kv_cache in kv.iter().flatten() {
+                    targets.extend(kv_cache.eval_targets());
+                }
+            }
+            eval(targets)?;
+            offset += chunk_size;
+        }
+
+        // Last chunk: forward + LM head projection on last position only.
+        let last_chunk = inputs.index((.., offset..));
+        self.forward(&last_chunk, None, cache)
     }
 
     /// Batched decode forward pass for N requests each with 1 token.
@@ -214,15 +302,106 @@ impl AnyModel {
     }
 
     pub fn make_cache(&self) -> AnyCache {
+        // Default to dense KV storage when no explicit config is provided.
+        match self.make_cache_with_config(KvCacheConfig::default()) {
+            Ok(cache) => cache,
+            Err(err) => {
+                tracing::error!(error = %err, "dense cache creation unexpectedly failed");
+                AnyCache::KV(vec![])
+            }
+        }
+    }
+
+    pub fn make_cache_with_config(
+        &self,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<AnyCache, Exception> {
         match self {
-            Self::Transformer(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::Qwen3Moe(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::Gemma2(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::Phi3(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::Starcoder2(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::LlavaQwen2(m) => make_kv_cache(m.num_hidden_layers()),
-            Self::DeepSeekV2(m) => make_kv_cache(m.args.num_hidden_layers),
-            Self::Qwen3Next(m) => AnyCache::Hybrid(m.make_cache()),
+            Self::Transformer(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        m.args
+                            .checked_head_dim()
+                            .map_err(|err| Exception::custom(err.to_string()))?,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
+            Self::Qwen3Moe(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
+            Self::Gemma2(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
+            Self::Phi3(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
+            Self::Starcoder2(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
+            Self::LlavaQwen2(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not yet supported for LlavaQwen2 models",
+                    ));
+                }
+                Ok(make_kv_cache(m.num_hidden_layers()))
+            }
+            Self::DeepSeekV2(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is only supported for standard KV transformer models",
+                    ));
+                }
+                Ok(make_kv_cache(m.args.num_hidden_layers))
+            }
+            Self::Qwen3Next(m) => {
+                if kv_cache_config.is_turboquant() {
+                    Ok(AnyCache::Hybrid(m.make_cache_turbo(kv_cache_config)?))
+                } else {
+                    Ok(AnyCache::Hybrid(m.make_cache()))
+                }
+            }
         }
     }
 
@@ -650,25 +829,56 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
 
     let mut params = model.parameters_mut().flatten();
 
+    // Loader-wide warning budget so throttling doesn't reset per shard.
+    let mut total_unmatched_warns = 0usize;
+    const MAX_UNMATCHED_WARNS: usize = 5;
+
     for file_path in &safetensors_files {
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
 
+        let mut matched = 0usize;
+        let mut unmatched = 0usize;
         for (key, value) in loaded {
             let Some(stripped) = key.strip_prefix(prefix) else {
                 continue;
             };
             if let Some(param) = params.get_mut(stripped) {
                 **param = value;
+                matched += 1;
             } else if quantized {
                 if let Some(remapped) = remap_quantized_key(stripped) {
                     if let Some(param) = params.get_mut(&*remapped) {
                         **param = value;
+                        matched += 1;
+                    } else {
+                        unmatched += 1;
+                        total_unmatched_warns += 1;
+                        if total_unmatched_warns <= MAX_UNMATCHED_WARNS {
+                            tracing::debug!(
+                                stripped,
+                                remapped = &*remapped,
+                                "weight key unmatched after remap"
+                            );
+                        }
                     }
+                } else {
+                    unmatched += 1;
+                    total_unmatched_warns += 1;
+                    if total_unmatched_warns <= MAX_UNMATCHED_WARNS {
+                        tracing::debug!(stripped, "weight key unmatched (no remap)");
+                    }
+                }
+            } else {
+                unmatched += 1;
+                total_unmatched_warns += 1;
+                if total_unmatched_warns <= MAX_UNMATCHED_WARNS {
+                    tracing::debug!(stripped, "weight key unmatched");
                 }
             }
         }
+        tracing::info!(matched, unmatched, "Weight loading stats for shard");
     }
 
     model
@@ -726,6 +936,7 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::cache::KeyValueCache;
 
     fn params(temp: f32, top_p: f32) -> SamplingParams {
         SamplingParams {
@@ -1009,6 +1220,26 @@ mod tests {
         let cache = any.make_cache();
         match &cache {
             AnyCache::KV(layers) => assert_eq!(layers.len(), 2),
+            AnyCache::Hybrid(_) => panic!("Expected KV cache for Qwen3Moe"),
+        }
+    }
+
+    #[test]
+    fn any_model_qwen3_moe_make_cache_with_turboquant_returns_quantized_kv() {
+        let model = qwen3_moe::Qwen3MoeCausalLM::new(small_qwen3_moe_args()).unwrap();
+        let any = AnyModel::Qwen3Moe(model);
+        let cache = any
+            .make_cache_with_config(turboquant::KvCacheConfig {
+                mode: turboquant::KvCacheMode::Turboquant,
+                bits: 3,
+                seed: 5,
+            })
+            .unwrap();
+        match &cache {
+            AnyCache::KV(layers) => {
+                assert_eq!(layers.len(), 2);
+                assert!(layers.iter().flatten().all(|cache| cache.is_quantized()));
+            }
             AnyCache::Hybrid(_) => panic!("Expected KV cache for Qwen3Moe"),
         }
     }

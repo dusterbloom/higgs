@@ -337,11 +337,17 @@ mod tests {
                     path: "org/model-a".to_owned(),
                     name: None,
                     batch: false,
+                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                    kv_bits: 3,
+                    kv_seed: 0,
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
                     name: None,
                     batch: false,
+                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                    kv_bits: 3,
+                    kv_seed: 0,
                 },
             ],
             ..HiggsConfig::default()
@@ -360,11 +366,17 @@ mod tests {
                     path: "org/model-a".to_owned(),
                     name: None,
                     batch: false,
+                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                    kv_bits: 3,
+                    kv_seed: 0,
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
                     name: None,
                     batch: false,
+                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                    kv_bits: 3,
+                    kv_seed: 0,
                 },
             ],
             ..HiggsConfig::default()
@@ -613,6 +625,9 @@ mod tests {
                 path: "org/other-model".to_owned(),
                 name: None,
                 batch: false,
+                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                kv_bits: 3,
+                kv_seed: 0,
             }],
             ..HiggsConfig::default()
         };
@@ -635,6 +650,9 @@ mod tests {
                 path: "org/router-model".to_owned(),
                 name: None,
                 batch: false,
+                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                kv_bits: 3,
+                kv_seed: 0,
             }],
             ..HiggsConfig::default()
         };
@@ -659,6 +677,9 @@ mod tests {
                 path: "org/router-model".to_owned(),
                 name: None,
                 batch: false,
+                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                kv_bits: 3,
+                kv_seed: 0,
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),

@@ -1298,6 +1298,7 @@ dependencies = [
  "image",
  "mlx-rs",
  "mlx-sys",
+ "rand 0.9.2",
  "serde",
  "serde_json",
  "tempfile",

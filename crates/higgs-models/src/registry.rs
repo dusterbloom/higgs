@@ -25,6 +25,8 @@ pub fn is_supported(model_type: &str) -> bool {
             | "mistral"
             | "qwen3_next"
             | "qwen3_moe"
+            | "qwen3_5"
+            | "qwen3_5_moe"
             | "gemma2"
             | "phi3"
             | "starcoder2"
@@ -149,6 +151,17 @@ mod tests {
     fn test_detect_model_type_qwen3_moe() {
         let dir = write_model_type_config("qwen3_moe");
         assert_eq!(detect_model_type(dir.path()).unwrap(), "qwen3_moe");
+    }
+
+    #[test]
+    fn test_is_supported_qwen3_5_moe() {
+        assert!(is_supported("qwen3_5_moe"));
+    }
+
+    #[test]
+    fn test_detect_model_type_qwen3_5_moe() {
+        let dir = write_model_type_config("qwen3_5_moe");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "qwen3_5_moe");
     }
 
     #[test]

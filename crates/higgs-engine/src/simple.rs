@@ -1,7 +1,10 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use higgs_models::{AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample};
+use higgs_models::{
+    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
+    turboquant::KvCacheConfig,
+};
 use mlx_rs::{
     Array, Dtype, Stream,
     ops::indexing::{IndexOp, NewAxis},
@@ -15,30 +18,59 @@ use crate::{
     engine::{GenerationOutput, StreamingOutput},
     error::EngineError,
     model_loader,
-    prompt_cache::PrefixCache,
+    paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
 };
 
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 
-/// Pin model weights in GPU memory to prevent OS eviction.
+/// Sequences longer than this trigger chunked prefill to bound peak memory.
+const CHUNKED_PREFILL_THRESHOLD: i32 = 512;
+
+/// Number of tokens per chunk during chunked prefill.
+const CHUNKED_PREFILL_CHUNK_SIZE: i32 = 512;
+
+/// Cap MLX memory allocations to avoid Metal OOM on constrained GPUs.
+///
+/// Sets `mlx_set_memory_limit` to 75% of `max_recommended_working_set_size`
+/// and `mlx_set_cache_limit` to 50%. This lets MLX manage memory within
+/// bounds instead of the OS killing the process when Metal command buffers
+/// exceed GPU capacity (the root cause of 35B crashes on 32GB machines).
 #[allow(unsafe_code)]
 pub(crate) fn set_wired_limit_to_max() {
     unsafe {
         let mut info = mlx_sys::mlx_device_info_new();
         let mut dev = mlx_sys::mlx_device_new();
         mlx_sys::mlx_get_default_device(&raw mut dev);
-        if mlx_sys::mlx_device_info_get(&raw mut (info), dev) == 0 {
+        if mlx_sys::mlx_device_info_get(&raw mut info, dev) == 0 {
             let mut max_rec: usize = 0;
             let key = c"max_recommended_working_set_size";
             if mlx_sys::mlx_device_info_get_size(&raw mut max_rec, info, key.as_ptr()) == 0
                 && max_rec > 0
             {
-                let mut old_limit: usize = 0;
-                mlx_sys::mlx_set_wired_limit(&raw mut old_limit, max_rec);
+                let mem_limit = max_rec * 3 / 4; // 75% of GPU max
+                let cache_limit = max_rec / 2; // 50% of GPU max
+
+                let mut prev_mem: usize = 0;
+                let mut prev_cache: usize = 0;
+
+                // Check env var to optionally disable memory limits for testing
+                let limits_enabled = std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
+
+                if limits_enabled {
+                    mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
+                    mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
+                }
+
                 tracing::info!(
-                    wired_limit_mb = max_rec / (1024 * 1024),
-                    "Set wired memory limit"
+                    max_recommended_mb = max_rec / (1024 * 1024),
+                    memory_limit_mb = mem_limit / (1024 * 1024),
+                    cache_limit_mb = cache_limit / (1024 * 1024),
+                    limits_enabled,
+                    "MLX memory limits {} (prev mem={}MB, cache={}MB)",
+                    if limits_enabled { "set" } else { "skipped" },
+                    prev_mem / (1024 * 1024),
+                    prev_cache / (1024 * 1024),
                 );
             }
         }
@@ -53,11 +85,17 @@ pub(crate) fn set_wired_limit_to_max() {
 /// Reuses cached KV states for shared prompt prefixes (e.g., system prompts).
 pub struct SimpleEngine {
     model: Mutex<AnyModel>,
-    prefix_cache: Mutex<PrefixCache>,
+    prefix_cache: Mutex<PagedPrefixCache>,
     tokenizer: Tokenizer,
     template: Option<ChatTemplateRenderer>,
     model_name: String,
     eos_token_ids: Vec<u32>,
+    /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
+    enable_thinking: bool,
+    /// Token ID for `</think>`, resolved from the tokenizer at load time.
+    /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
+    think_close_token: Option<u32>,
+    kv_cache_config: KvCacheConfig,
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
@@ -71,13 +109,19 @@ struct PreparedGeneration<'a> {
 
 impl SimpleEngine {
     /// Load a model and tokenizer from a directory.
-    pub fn load<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
+    pub fn load<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model");
 
         let model = model_loader::load_model(model_dir)?;
+        let _ = model
+            .make_cache_with_config(kv_cache_config)
+            .map_err(EngineError::Mlx)?;
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
         let template = ChatTemplateRenderer::try_from_model_dir(model_dir)?;
         if template.is_none() {
@@ -85,6 +129,33 @@ impl SimpleEngine {
         }
 
         let eos_token_ids = extract_eos_tokens(model_dir);
+
+        // Auto-detect thinking mode: Qwen3.5 models support <think> tags.
+        // Override with HIGGS_ENABLE_THINKING=0 or HIGGS_ENABLE_THINKING=1.
+        let mut enable_thinking = match std::env::var("HIGGS_ENABLE_THINKING").ok().as_deref() {
+            Some("0" | "false") => false,
+            Some("1" | "true") => true,
+            _ => detect_thinking_support(model_dir),
+        };
+
+        // Resolve </think> token ID from the tokenizer. If the tokenizer
+        // doesn't know this token, disable thinking to avoid injecting
+        // out-of-vocab IDs into the embedding lookup.
+        let think_close_token = tokenizer.encode("</think>", false).ok().and_then(|enc| {
+            let ids = enc.get_ids();
+            // Must encode to exactly one token to be usable as a forced stop.
+            if ids.len() == 1 { Some(ids[0]) } else { None }
+        });
+        if enable_thinking && think_close_token.is_none() {
+            tracing::warn!("Tokenizer has no single </think> token; disabling thinking mode");
+            enable_thinking = false;
+        }
+        if enable_thinking {
+            tracing::info!(
+                think_close_token,
+                "Thinking mode enabled (Qwen3.5 model detected)"
+            );
+        }
 
         set_wired_limit_to_max();
 
@@ -96,11 +167,17 @@ impl SimpleEngine {
 
         Ok(Self {
             model: Mutex::new(model),
-            prefix_cache: Mutex::new(PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE)),
+            prefix_cache: Mutex::new(PagedPrefixCache::new(
+                DEFAULT_PREFIX_CACHE_SIZE,
+                DEFAULT_BLOCK_SIZE,
+            )),
             tokenizer,
             template,
             model_name,
             eos_token_ids,
+            enable_thinking,
+            think_close_token,
+            kv_cache_config,
         })
     }
 
@@ -119,6 +196,11 @@ impl SimpleEngine {
         &self.eos_token_ids
     }
 
+    /// Whether the engine has thinking mode enabled.
+    pub const fn enable_thinking(&self) -> bool {
+        self.enable_thinking
+    }
+
     /// Apply chat template and tokenize messages.
     pub fn prepare_chat_prompt(
         &self,
@@ -130,7 +212,7 @@ impl SimpleEngine {
                 "This model has no chat template; use /v1/completions instead".to_owned(),
             )
         })?;
-        let prompt = renderer.apply(messages, tools, true)?;
+        let prompt = renderer.apply_with_thinking(messages, tools, true, self.enable_thinking)?;
         let encoding = self
             .tokenizer
             .encode(prompt.as_str(), false)
@@ -214,12 +296,22 @@ impl SimpleEngine {
             );
             let suffix = prompt_tokens.get(matched.prefix_len..).unwrap_or_default();
             if suffix.is_empty() {
-                (prompt_tokens.to_vec(), model.make_cache())
+                (
+                    prompt_tokens.to_vec(),
+                    model
+                        .make_cache_with_config(self.kv_cache_config)
+                        .map_err(EngineError::Mlx)?,
+                )
             } else {
                 (suffix.to_vec(), matched.cache)
             }
         } else {
-            (prompt_tokens.to_vec(), model.make_cache())
+            (
+                prompt_tokens.to_vec(),
+                model
+                    .make_cache_with_config(self.kv_cache_config)
+                    .map_err(EngineError::Mlx)?,
+            )
         };
 
         let prompt_array = Array::from(actual_prompt_tokens.as_slice()).index(NewAxis);
@@ -250,10 +342,22 @@ impl SimpleEngine {
                 .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
         } else {
-            prepared
-                .model
-                .forward(&prepared.prompt_array, None, &mut prepared.cache)
-                .map_err(EngineError::Mlx)?
+            let seq_len = prepared.prompt_array.shape().get(1).copied().unwrap_or(0);
+            if seq_len > CHUNKED_PREFILL_THRESHOLD {
+                prepared
+                    .model
+                    .forward_chunked(
+                        &prepared.prompt_array,
+                        &mut prepared.cache,
+                        CHUNKED_PREFILL_CHUNK_SIZE,
+                    )
+                    .map_err(EngineError::Mlx)?
+            } else {
+                prepared
+                    .model
+                    .forward(&prepared.prompt_array, None, &mut prepared.cache)
+                    .map_err(EngineError::Mlx)?
+            }
         };
         let last_logits = logits.index((.., -1, ..));
 
@@ -295,7 +399,7 @@ impl SimpleEngine {
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            pc.store(prompt_tokens, prepared.cache.clone());
+            pc.store(prompt_tokens, &prepared.cache);
         }
 
         Ok((current_token, logprob_data))
@@ -384,7 +488,9 @@ impl SimpleEngine {
                 .model
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
-            let mut cache = model.make_cache();
+            let mut cache = model
+                .make_cache_with_config(self.kv_cache_config)
+                .map_err(EngineError::Mlx)?;
 
             // Forward pass to get hidden states [1, seq_len, hidden_size]
             let hidden = model
@@ -567,6 +673,16 @@ impl SimpleEngine {
         let mut total_other_ns: u128 = 0;
         let mut step_count: u32 = 0;
 
+        // Thinking budget: force </think> after N tokens if model hasn't closed it.
+        const THINKING_BUDGET: u32 = 256;
+        let think_close_token = if self.enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
+        let mut thinking_tokens: u32 = 0;
+        let mut seen_think_close = false;
+
         loop {
             let t0 = std::time::Instant::now();
 
@@ -605,7 +721,26 @@ impl SimpleEngine {
             let t2 = std::time::Instant::now();
 
             // In the unconstrained pipeline, extract the token here (after building following).
-            let token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
+            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
+
+            // Thinking budget: force </think> after N tokens if model hasn't closed it.
+            if let Some(close_id) = think_close_token {
+                if !seen_think_close {
+                    if token_id == close_id {
+                        seen_think_close = true;
+                    } else {
+                        thinking_tokens += 1;
+                        if thinking_tokens >= THINKING_BUDGET {
+                            token_id = close_id;
+                            seen_think_close = true;
+                            tracing::info!(
+                                budget = THINKING_BUDGET,
+                                "Thinking budget reached, forcing </think>"
+                            );
+                        }
+                    }
+                }
+            }
 
             // Materialize logprobs for the token we just extracted
             if let (Some(all_lp), Some(lp_data)) = (&mut all_logprobs, &next_logprob_data) {
@@ -699,7 +834,16 @@ impl SimpleEngine {
                 });
             }
 
-            next_token = following;
+            // If thinking budget was just reached, override the pipelined token
+            // so the next decode step gets </think> as input.
+            if seen_think_close && thinking_tokens == THINKING_BUDGET {
+                if let Some(close_id) = think_close_token {
+                    next_token = Array::from_slice(&[close_id], &[1]);
+                }
+                thinking_tokens += 1; // prevent re-triggering
+            } else {
+                next_token = following;
+            }
             next_logprob_data = following_logprob_data;
         }
     }
@@ -859,6 +1003,16 @@ impl SimpleEngine {
             return Ok(());
         }
 
+        // Thinking budget (streaming): force </think> after N tokens.
+        const THINKING_BUDGET: u32 = 256;
+        let think_close_token = if self.enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
+        let mut thinking_tokens: u32 = 0;
+        let mut seen_think_close = false;
+
         // Pipelined decode loop: build step N+2 while GPU computes step N+1
         let (mut next_token, mut next_logprob_data) = Self::decode_step(
             &current_token,
@@ -895,7 +1049,26 @@ impl SimpleEngine {
                 async_eval(eval_targets).map_err(EngineError::Mlx)?;
             }
 
-            let token_id: u32 = next_token.item();
+            let mut token_id: u32 = next_token.item();
+
+            // Thinking budget: force </think> after N tokens if model hasn't closed it.
+            if let Some(close_id) = think_close_token {
+                if !seen_think_close {
+                    if token_id == close_id {
+                        seen_think_close = true;
+                    } else {
+                        thinking_tokens += 1;
+                        if thinking_tokens >= THINKING_BUDGET {
+                            token_id = close_id;
+                            seen_think_close = true;
+                            tracing::info!(
+                                budget = THINKING_BUDGET,
+                                "Thinking budget reached, forcing </think>"
+                            );
+                        }
+                    }
+                }
+            }
 
             // Advance constrained generator state
             if let Some(ref mut cg) = constraint {
@@ -966,7 +1139,16 @@ impl SimpleEngine {
                 break;
             }
 
-            next_token = following;
+            // If thinking budget was just reached, override the pipelined token
+            // so the next decode step gets </think> as input.
+            if seen_think_close && thinking_tokens == THINKING_BUDGET {
+                if let Some(close_id) = think_close_token {
+                    next_token = Array::from_slice(&[close_id], &[1]);
+                }
+                thinking_tokens += 1; // prevent re-triggering
+            } else {
+                next_token = following;
+            }
             next_logprob_data = following_logprob_data;
         }
 
@@ -1039,7 +1221,14 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
         }
     };
 
-    match config.get("eos_token_id") {
+    // Check top-level first, then text_config (VLM/Qwen3.5 nested config)
+    let eos_value = config.get("eos_token_id").or_else(|| {
+        config
+            .get("text_config")
+            .and_then(|tc| tc.get("eos_token_id"))
+    });
+
+    match eos_value {
         Some(serde_json::Value::Number(n)) => n
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
@@ -1059,6 +1248,31 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
             vec![]
         }
     }
+}
+
+/// Detect whether a model supports thinking mode based on model_type.
+fn detect_thinking_support(model_dir: &Path) -> bool {
+    let config_path = model_dir.join("config.json");
+    let config_str = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let config: serde_json::Value = match serde_json::from_str(&config_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // Qwen3.5 models (qwen3_5, qwen3_5_moe) support <think> tags.
+    // Check both top-level and nested text_config for VLM wrappers.
+    let model_type = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("model_type"))
+                .and_then(|v| v.as_str())
+        });
+    matches!(model_type, Some("qwen3_5" | "qwen3_5_moe"))
 }
 
 #[cfg(test)]

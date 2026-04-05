@@ -23,8 +23,8 @@ use crate::{
     types::openai::{
         ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionDelta,
         ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ChoiceLogprobs,
-        CompletionUsage, MessageContent, StopSequence, TokenLogprob, ToolCall, ToolCallFunction,
-        TopLogprob,
+        CompletionUsage, MessageContent, StopSequence, TokenLogprob, ToolCall, ToolCallDelta,
+        ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
     },
 };
 use higgs_models::SamplingParams;
@@ -294,6 +294,7 @@ async fn chat_completions_non_streaming(
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
     let tokenizer = engine.tokenizer().clone();
+    let thinking_enabled = engine.enable_thinking();
     let output = tokio::task::spawn_blocking(move || {
         engine.generate(
             &prompt_tokens,
@@ -318,12 +319,20 @@ async fn chat_completions_non_streaming(
         .as_ref()
         .map(|lps| logprobs_to_response(lps, &tokenizer));
 
-    // Parse reasoning (think tags) from the output
-    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&output.text);
+    // Parse reasoning (think tags) from the output.
+    // When thinking mode is enabled, the template already opened `<think>` in the prompt,
+    // so the generated text starts inside the think block. Prepend `<think>` so the parser
+    // can find the matching `</think>` and split reasoning from visible content.
+    let parse_input = if thinking_enabled {
+        format!("<think>{}", output.text)
+    } else {
+        output.text
+    };
+    let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
     let raw_text = if reasoning_result.reasoning.is_some() {
         reasoning_result.text
     } else {
-        output.text
+        parse_input
     };
     let reasoning_content = reasoning_result.reasoning;
 
@@ -397,11 +406,7 @@ fn chat_completions_stream(
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
-    if req.tools.is_some() {
-        return Err(ServerError::BadRequest(
-            "Streaming with tool_calls is not yet supported".to_owned(),
-        ));
-    }
+    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
@@ -418,10 +423,9 @@ fn chat_completions_stream(
     };
 
     let messages = convert_messages(&effective_messages);
-    let tools = req.tools.as_deref();
-
+    let tools_ref = if has_tools { req.tools.as_deref() } else { None };
     let mut prompt_tokens = engine
-        .prepare_chat_prompt(&messages, tools)
+        .prepare_chat_prompt(&messages, tools_ref)
         .map_err(ServerError::Engine)?;
 
     // Preprocess images for VLM
@@ -466,6 +470,7 @@ fn chat_completions_stream(
     });
 
     let tokenizer = engine.tokenizer().clone();
+    let thinking_enabled_stream = engine.enable_thinking();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     tokio::task::spawn_blocking(move || {
@@ -503,13 +508,20 @@ fn chat_completions_stream(
                 finish_reason: None,
                 logprobs: None,
             }],
+            usage: None,
         };
         match serde_json::to_string(&role_chunk) {
             Ok(json) => yield Ok(Event::default().data(json)),
             Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
         }
 
-        let mut reasoning_tracker = higgs_engine::reasoning_parser::StreamingReasoningTracker::new();
+        let mut reasoning_tracker = if thinking_enabled_stream {
+            higgs_engine::reasoning_parser::StreamingReasoningTracker::new_inside_think()
+        } else {
+            higgs_engine::reasoning_parser::StreamingReasoningTracker::new()
+        };
+        let mut tool_tracker = higgs_engine::tool_parser::StreamingToolCallTracker::new(has_tools);
+        let mut deferred_finish_reason: Option<String> = None;
         let mut output_token_count: u32 = 0;
 
         while let Some(output) = rx.recv().await {
@@ -539,6 +551,7 @@ fn chat_completions_stream(
                         finish_reason: None,
                         logprobs: None,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&reas_chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
@@ -546,32 +559,13 @@ fn chat_completions_stream(
                 }
             }
 
-            // Emit visible content chunk
-            if !visible.is_empty() {
-                let chunk = ChatCompletionChunk {
-                    id: request_id.clone(),
-                    object: "chat.completion.chunk",
-                    created,
-                    model: model.clone(),
-                    choices: vec![ChatCompletionChunkChoice {
-                        index: 0,
-                        delta: ChatCompletionDelta {
-                            role: None,
-                            content: Some(visible),
-                            reasoning_content: None,
-                            tool_calls: None,
-                        },
-                        finish_reason: output.finish_reason.clone(),
-                        logprobs: chunk_logprobs,
-                    }],
-                };
-                match serde_json::to_string(&chunk) {
-                    Ok(json) => yield Ok(Event::default().data(json)),
-                    Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
-                }
-            } else if output.finish_reason.is_some() {
-                // Even if no visible text, still emit the finish_reason
-                let chunk = ChatCompletionChunk {
+            // Process visible text through tool call tracker
+            let tool_output = tool_tracker.process(&visible);
+
+            // Emit tool call deltas for completed tool calls
+            for (i, tc) in tool_output.new_tool_calls.iter().enumerate() {
+                let idx = tool_tracker.completed_count() - tool_output.new_tool_calls.len() + i;
+                let tc_chunk = ChatCompletionChunk {
                     id: request_id.clone(),
                     object: "chat.completion.chunk",
                     created,
@@ -582,16 +576,56 @@ fn chat_completions_stream(
                             role: None,
                             content: None,
                             reasoning_content: None,
+                            tool_calls: Some(vec![ToolCallDelta {
+                                index: u32::try_from(idx).unwrap_or(0),
+                                id: Some(format!("call_{idx}_{}", uuid::Uuid::new_v4())),
+                                r#type: Some("function".to_owned()),
+                                function: Some(ToolCallFunctionDelta {
+                                    name: Some(tc.name.clone()),
+                                    arguments: Some(tc.arguments.to_string()),
+                                }),
+                            }]),
+                        },
+                        finish_reason: None,
+                        logprobs: None,
+                    }],
+                    usage: None,
+                };
+                match serde_json::to_string(&tc_chunk) {
+                    Ok(json) => yield Ok(Event::default().data(json)),
+                    Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+                }
+            }
+
+            // Emit visible content chunk (after tool call extraction)
+            if !tool_output.visible.is_empty() {
+                let chunk = ChatCompletionChunk {
+                    id: request_id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model.clone(),
+                    choices: vec![ChatCompletionChunkChoice {
+                        index: 0,
+                        delta: ChatCompletionDelta {
+                            role: None,
+                            content: Some(tool_output.visible),
+                            reasoning_content: None,
                             tool_calls: None,
                         },
-                        finish_reason: output.finish_reason,
+                        finish_reason: None,
                         logprobs: chunk_logprobs,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
                     Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
                 }
+            }
+
+            // Capture finish_reason for deferred emission
+            if output.finish_reason.is_some() {
+                deferred_finish_reason = output.finish_reason;
             }
         }
 
@@ -614,13 +648,50 @@ fn chat_completions_stream(
                     finish_reason: None,
                     logprobs: None,
                 }],
+                usage: None,
             };
             match serde_json::to_string(&reas_chunk) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
             }
         }
-        if !flush_vis.is_empty() {
+
+        // Process flushed visible text through tool tracker
+        let flush_tool_output = tool_tracker.process(&flush_vis);
+        for (i, tc) in flush_tool_output.new_tool_calls.iter().enumerate() {
+            let idx = tool_tracker.completed_count() - flush_tool_output.new_tool_calls.len() + i;
+            let tc_chunk = ChatCompletionChunk {
+                id: request_id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model.clone(),
+                choices: vec![ChatCompletionChunkChoice {
+                    index: 0,
+                    delta: ChatCompletionDelta {
+                        role: None,
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: Some(vec![ToolCallDelta {
+                            index: u32::try_from(idx).unwrap_or(0),
+                            id: Some(format!("call_{idx}_{}", uuid::Uuid::new_v4())),
+                            r#type: Some("function".to_owned()),
+                            function: Some(ToolCallFunctionDelta {
+                                name: Some(tc.name.clone()),
+                                arguments: Some(tc.arguments.to_string()),
+                            }),
+                        }]),
+                    },
+                    finish_reason: None,
+                    logprobs: None,
+                }],
+                usage: None,
+            };
+            match serde_json::to_string(&tc_chunk) {
+                Ok(json) => yield Ok(Event::default().data(json)),
+                Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+            }
+        }
+        if !flush_tool_output.visible.is_empty() {
             let vis_chunk = ChatCompletionChunk {
                 id: request_id.clone(),
                 object: "chat.completion.chunk",
@@ -630,18 +701,95 @@ fn chat_completions_stream(
                     index: 0,
                     delta: ChatCompletionDelta {
                         role: None,
-                        content: Some(flush_vis),
+                        content: Some(flush_tool_output.visible),
                         reasoning_content: None,
                         tool_calls: None,
                     },
                     finish_reason: None,
                     logprobs: None,
                 }],
+                usage: None,
             };
             match serde_json::to_string(&vis_chunk) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
             }
+        }
+
+        // Final flush of tool tracker
+        let final_tool_output = tool_tracker.flush();
+        if !final_tool_output.visible.is_empty() {
+            let vis_chunk = ChatCompletionChunk {
+                id: request_id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model.clone(),
+                choices: vec![ChatCompletionChunkChoice {
+                    index: 0,
+                    delta: ChatCompletionDelta {
+                        role: None,
+                        content: Some(final_tool_output.visible),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                    logprobs: None,
+                }],
+                usage: None,
+            };
+            match serde_json::to_string(&vis_chunk) {
+                Ok(json) => yield Ok(Event::default().data(json)),
+                Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+            }
+        }
+
+        // Emit finish_reason (deferred to determine tool_calls vs stop)
+        let effective_finish = if tool_tracker.has_tool_calls() {
+            Some("tool_calls".to_owned())
+        } else {
+            deferred_finish_reason
+        };
+        if effective_finish.is_some() {
+            let finish_chunk = ChatCompletionChunk {
+                id: request_id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model.clone(),
+                choices: vec![ChatCompletionChunkChoice {
+                    index: 0,
+                    delta: ChatCompletionDelta {
+                        role: None,
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: effective_finish,
+                    logprobs: None,
+                }],
+                usage: None,
+            };
+            match serde_json::to_string(&finish_chunk) {
+                Ok(json) => yield Ok(Event::default().data(json)),
+                Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+            }
+        }
+
+        // Emit final chunk with usage (OpenAI stream_options.include_usage)
+        let usage_chunk = ChatCompletionChunk {
+            id: request_id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.clone(),
+            choices: vec![],
+            usage: Some(CompletionUsage {
+                prompt_tokens: prompt_token_count,
+                completion_tokens: output_token_count,
+                total_tokens: prompt_token_count + output_token_count,
+            }),
+        };
+        match serde_json::to_string(&usage_chunk) {
+            Ok(json) => yield Ok(Event::default().data(json)),
+            Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
         }
 
         if let Some(ref m) = metrics {
