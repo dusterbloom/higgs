@@ -1,0 +1,11 @@
+model	task	sigma	lr	rank	pop	steps	status	first_loss	last_loss	best_loss	tail_avg	delta_pct	elapsed_s	ms_per_step	gen_kw_score	gen_overlap	gen_len_ratio	base_kw_score	base_overlap	kw_delta	overlap_delta
+qwen35	fibonacci	0.01	0.002	4	4	50	ok	16.0976	13.8712	13.8126	13.9859	13.12	782.1	15642	0.00	0.00	0.00	0.25	0.28	-0.25	-0.28
+qwen35	fibonacci	0.01	0.003	4	4	50	ok	15.1613	14.4064	14.1879	14.4155	4.92	782.5	15651	0.00	0.00	0.00	0.25	0.28	-0.25	-0.28
+qwen35	fibonacci	0.01	0.005	4	4	50	ok	15.3887	13.9286	13.8691	14.1341	8.15	761.3	15225	0.00	0.03	0.05	0.25	0.28	-0.25	-0.25
+qwen35	fibonacci	0.01	0.007	4	4	50	ok	16.3914	13.9510	13.8357	14.1040	13.95	807.2	16144	0.00	0.00	0.00	0.25	0.28	-0.25	-0.28
+qwen35	fibonacci	0.01	0.01	4	4	50	ok	15.9367	14.2127	14.1240	14.2266	10.73	767.4	15348	0.00	0.00	0.00	0.25	0.28	-0.25	-0.28
+qwen35	fizzbuzz	0.01	0.002	4	4	50	ok	15.6620	14.0996	14.0479	14.1519	9.64	753.7	15075	0.00	0.00	0.00	0.20	0.57	-0.20	-0.57
+qwen35	fizzbuzz	0.01	0.003	4	4	50	ok	15.7292	14.0478	13.9912	14.1679	9.93	803.9	16077	0.00	0.05	0.05	0.20	0.57	-0.20	-0.52
+qwen35	fizzbuzz	0.01	0.005	4	4	0	error						0.0								
+qwen35	fizzbuzz	0.01	0.007	4	4	0	error						0.0								
+qwen35	fizzbuzz	0.01	0.01	4	4	0	error						0.0								

@@ -1,0 +1,3 @@
+model	task	sigma	lr	rank	pop	steps	status	first_loss	last_loss	best_loss	tail_avg	delta_pct	elapsed_s	ms_per_step
+qwen35	fibonacci	0.01	0.001	4	4	0	error						300.0	
+qwen35	fibonacci	0.01	0.005	4	4	0	error						300.0	

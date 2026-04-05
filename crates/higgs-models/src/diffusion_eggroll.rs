@@ -62,13 +62,17 @@ pub struct EggrollConfig {
     pub min_lr_frac: f32,
     pub log_interval: usize,
     pub base_seed: u64,
+    /// Max delta Frobenius norm as fraction of base weight norm. 0 = disabled.
+    pub clip_ratio: f32,
+    /// Per-step weight decay applied to accumulated deltas. 0 = disabled.
+    pub delta_decay: f32,
 }
 
 impl Default for EggrollConfig {
     fn default() -> Self {
         Self {
-            sigma: 0.01,
-            lr: 0.001,
+            sigma: 0.001,
+            lr: 0.0005,
             rank: 4,
             population: 32,
             total_steps: 100,
@@ -76,6 +80,8 @@ impl Default for EggrollConfig {
             min_lr_frac: 0.1,
             log_interval: 10,
             base_seed: 42,
+            clip_ratio: 0.05,
+            delta_decay: 0.001,
         }
     }
 }
@@ -482,6 +488,8 @@ mod tests {
             min_lr_frac: 0.1,
             log_interval: 5,
             base_seed: 42,
+            clip_ratio: 0.0,
+            delta_decay: 0.0,
         }
     }
 
@@ -606,6 +614,8 @@ mod tests {
             min_lr_frac: 0.1,
             log_interval: 10,
             base_seed: 42,
+            clip_ratio: 0.0,
+            delta_decay: 0.0,
         };
 
         let mut trainer = EggrollTrainer::new(engine, eggroll_cfg);
@@ -625,6 +635,83 @@ mod tests {
         assert!(
             last_5 < first_5 * 2.0,
             "loss should not explode: first_5={first_5:.4} last_5={last_5:.4}"
+        );
+    }
+
+    /// Prove: EGGROLL converges on a memorizable sequence.
+    ///
+    /// Uses vocab=4096 so initial loss ≈ ln(4096) ≈ 8.3 — plenty of room to learn.
+    /// After 200 steps, evaluates on a FIXED mask to eliminate masking variance.
+    /// Success: post-training eval loss < pre-training eval loss.
+    #[test]
+    fn test_eggroll_convergence_proof() {
+        let cfg = DiffusionConfig {
+            hidden: 64,
+            layers: 2,
+            heads: 4,
+            kv_heads: 2,
+            head_dim: 16,
+            inter: 128,
+            vocab: 4096,       // large vocab → high initial loss → clear gradient
+            mask_token_id: 0,
+            rope_theta: 10000.0,
+        };
+        let vocab = 4096;
+        let engine = DiffusionEngine::from_random(cfg);
+
+        // Evaluate loss on a FIXED mask before training
+        let tokens: Vec<u32> = (0..24).map(|i| ((i * 7 + 3) % 4096) as u32).collect();
+        let prompt_len = 4;
+        let mask_id = 0u32;
+        let fixed_mask_positions: Vec<usize> = (prompt_len..tokens.len()).collect();
+        // Create masked input (mask all completion positions)
+        let masked: Vec<u32> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| if i >= prompt_len { mask_id } else { t })
+            .collect();
+
+        let pre_logits = engine.forward(&masked);
+        let (pre_loss, _) =
+            mdlm_loss(&pre_logits, &tokens, &fixed_mask_positions, vocab);
+        eprintln!("[convergence] pre-training eval loss = {pre_loss:.4}");
+
+        // Train
+        let eggroll_cfg = EggrollConfig {
+            sigma: 0.01,
+            lr: 0.01,
+            rank: 4,
+            population: 32,
+            total_steps: 200,
+            warmup_steps: 20,
+            min_lr_frac: 0.1,
+            log_interval: 50,
+            base_seed: 42,
+            clip_ratio: 0.0,
+            delta_decay: 0.0,
+        };
+
+        let mut trainer = EggrollTrainer::new(engine, eggroll_cfg);
+        let losses = trainer.train(&tokens, prompt_len);
+        assert_eq!(losses.len(), 200);
+        assert!(losses.iter().all(|l| l.is_finite()), "all losses must be finite");
+
+        // Evaluate loss on the SAME fixed mask after training
+        let post_logits = trainer.engine.forward(&masked);
+        let (post_loss, _) =
+            mdlm_loss(&post_logits, &tokens, &fixed_mask_positions, vocab);
+
+        let improvement = (pre_loss - post_loss) / pre_loss * 100.0;
+        eprintln!(
+            "[convergence] post-training eval loss = {post_loss:.4}  \
+             improvement = {improvement:.1}%  \
+             ({pre_loss:.4} → {post_loss:.4})"
+        );
+
+        assert!(
+            post_loss < pre_loss,
+            "CONVERGENCE FAILED: post_loss={post_loss:.4} >= pre_loss={pre_loss:.4} \
+             — EGGROLL cannot learn on this architecture"
         );
     }
 

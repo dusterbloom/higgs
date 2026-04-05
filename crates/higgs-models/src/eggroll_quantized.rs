@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 
 use mlx_rs::{
-    Array,
+    Array, Dtype,
     error::Exception,
     module::ModuleParameters as _,
     ops,
@@ -438,9 +438,13 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
         map
     }
 
-    /// Accumulate ES gradient into delta buffers.
+    /// Accumulate ES gradient into delta buffers with optional norm clipping.
     ///
     /// For each population member: delta += (fitness * lr / (2*N*sigma)) * A @ B^T
+    ///
+    /// If `config.clip_ratio > 0`, each target's accumulated delta is clipped so that
+    /// `||delta||_F <= clip_ratio * ||dequant(W)||_F`, preventing catastrophic forgetting
+    /// from over-aggressive updates.
     fn accumulate_gradient(
         &mut self,
         fitnesses: &[f32],
@@ -480,6 +484,41 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
                     zeros.add(&update)?
                 };
                 self.deltas.insert(t.name.clone(), current);
+            }
+
+            // Delta norm clipping: ||delta||_F <= clip_ratio * ||dequant(W)||_F
+            if self.config.clip_ratio > 0.0 {
+                if let Some(delta) = self.deltas.get(&t.name) {
+                    let delta_norm_sq = delta.multiply(delta)?.sum(None)?;
+                    delta_norm_sq.eval()?;
+                    let delta_norm = delta_norm_sq.item::<f32>().sqrt();
+
+                    if delta_norm > 1e-12 {
+                        // Dequantize base weight to compute reference norm
+                        let params = self.model.parameters().flatten();
+                        let w = *params.get(t.weight_key.as_str()).unwrap();
+                        let s = *params.get(t.scales_key.as_str()).unwrap();
+                        let b = *params.get(t.biases_key.as_str()).unwrap();
+                        let deq = ops::dequantize(w, s, b, t.group_size, t.bits)?;
+                        let w_norm_sq = deq.multiply(&deq)?.sum(None)?;
+                        w_norm_sq.eval()?;
+                        let w_norm = w_norm_sq.item::<f32>().sqrt();
+
+                        let max_norm = self.config.clip_ratio * w_norm;
+                        if delta_norm > max_norm {
+                            let scale = max_norm / delta_norm;
+                            let clipped = delta.multiply(&Array::from_f32(scale))?;
+                            if step % self.config.log_interval.max(1) == 0 {
+                                eprintln!(
+                                    "[EGGROLL-Q] clip {}: ||delta||={:.4} > {:.4} ({}% of ||W||={:.4}), scaled by {:.4}",
+                                    t.name, delta_norm, max_norm,
+                                    (self.config.clip_ratio * 100.0) as i32, w_norm, scale,
+                                );
+                            }
+                            self.deltas.insert(t.name.clone(), clipped);
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -652,8 +691,17 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
             let avg_loss = step_loss / n as f32;
             losses.push(avg_loss);
 
-            // Accumulate ES gradient
+            // Accumulate ES gradient (includes norm clipping if clip_ratio > 0)
             self.accumulate_gradient(&fitnesses, step, lr)?;
+
+            // Delta weight decay: shrink accumulated deltas toward zero each step.
+            // Prevents unbounded drift from base weights over long training runs.
+            if self.config.delta_decay > 0.0 {
+                let retain = Array::from_f32(1.0 - self.config.delta_decay);
+                for d in self.deltas.values_mut() {
+                    *d = d.multiply(&retain)?;
+                }
+            }
 
             // NOTE: periodic merge_deltas is intentionally disabled.
             // The dequant→add→requant cycle corrupts weights on 3-bit models
@@ -672,22 +720,28 @@ impl<'m> Qwen3NextEggrollTrainer<'m> {
 
         // Persist deltas on the model for inference-time additive application.
         // This avoids the lossy dequant→requant cycle that corrupts 3-bit weights.
+        // Deltas are converted from fp32 → fp16 to halve memory (3.3 GB → 1.6 GB
+        // for 280 targets on Qwen3.5-35B-A3B). forward_perturbed casts to activation
+        // dtype anyway, so no precision lost at inference.
         if !self.deltas.is_empty() {
             let n_deltas = self.deltas.len();
-            let total_bytes: usize = self
+            let fp32_bytes: usize = self
                 .deltas
                 .values()
                 .map(|d| d.shape().iter().map(|&s| s as usize).product::<usize>() * 4)
                 .sum();
-            eprintln!(
-                "[EGGROLL-Q] persisting {} delta buffers ({:.1} MB) for inference",
-                n_deltas,
-                total_bytes as f64 / (1024.0 * 1024.0),
-            );
-            // Eval all deltas so they're materialized before we hand them to inference
-            for d in self.deltas.values() {
+            // Convert fp32 → fp16 and materialize
+            for d in self.deltas.values_mut() {
+                *d = d.as_dtype(Dtype::Float16)?;
                 d.eval()?;
             }
+            let fp16_bytes = fp32_bytes / 2;
+            eprintln!(
+                "[EGGROLL-Q] persisting {} delta buffers as fp16 ({:.1} MB, saved {:.1} MB)",
+                n_deltas,
+                fp16_bytes as f64 / (1024.0 * 1024.0),
+                (fp32_bytes - fp16_bytes) as f64 / (1024.0 * 1024.0),
+            );
             self.model.train_deltas = Some(std::mem::take(&mut self.deltas));
         }
 
@@ -772,6 +826,8 @@ mod tests {
             min_lr_frac: 0.1,
             log_interval: 5,
             base_seed: 42,
+            clip_ratio: 0.0,
+            delta_decay: 0.0,
         }
     }
 
@@ -1579,6 +1635,8 @@ mod tests {
             min_lr_frac: 0.1,
             log_interval: 30,
             base_seed: 42,
+            clip_ratio: 0.0,
+            delta_decay: 0.0,
         };
 
         let mut trainer =
@@ -1631,6 +1689,8 @@ mod tests {
             min_lr_frac: 0.1,
             log_interval: 0,
             base_seed: 42,
+            clip_ratio: 0.0,
+            delta_decay: 0.0,
         };
 
         // Pre-training forward (clean)
@@ -1793,6 +1853,8 @@ mod tests {
             min_lr_frac: 0.1,
             log_interval: 0,
             base_seed: 42,
+            clip_ratio: 0.0,
+            delta_decay: 0.0,
         };
 
         let trainer = Qwen3NextEggrollTrainer::new(
@@ -1889,6 +1951,8 @@ mod tests {
                 min_lr_frac: 0.1,
                 log_interval: 0,
                 base_seed: 42,
+                clip_ratio: 0.0,
+                delta_decay: 0.0,
             };
             let mut tr = Qwen3NextEggrollTrainer::new(
                 &mut model2, cfg, 0, &["embed_tokens"],
