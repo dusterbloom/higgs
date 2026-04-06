@@ -342,25 +342,36 @@ async fn chat_completions_non_streaming(
             let mut full_tokens = pt.to_vec();
             // Tokenize the completion to get completion tokens
             if let Ok(encoding) = tokenizer.encode(output.text.as_str(), false) {
-                full_tokens.extend_from_slice(encoding.get_ids());
-                let prompt_len = pt.len();
-                let entry = higgs_engine::replay_buffer::ReplayEntry {
-                    request_id: request_id.clone(),
-                    tokens: full_tokens,
-                    prompt_len,
-                    surprise,
-                    reward: 0.0,
-                    created: std::time::Instant::now(),
-                    pinned: false,
-                    train_count: 0,
-                };
-                let accepted = memory.replay_buffer.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
-                tracing::debug!(
-                    surprise = %format!("{surprise:.4}"),
-                    accepted,
-                    threshold = %format!("{:.2}", memory.config.surprise_threshold),
-                    "[MEMORY] replay push"
-                );
+                let completion_ids = encoding.get_ids();
+                if completion_ids.is_empty() {
+                    // Empty completion (immediate EOS) → entry can never produce
+                    // a gradient in PCAST (prompt_len == tokens.len() → loss=0.0).
+                    // Don't waste a replay buffer slot.
+                    tracing::debug!(
+                        surprise = %format!("{surprise:.4}"),
+                        "[MEMORY] skip replay push: empty completion"
+                    );
+                } else {
+                    full_tokens.extend_from_slice(completion_ids);
+                    let prompt_len = pt.len();
+                    let entry = higgs_engine::replay_buffer::ReplayEntry {
+                        request_id: request_id.clone(),
+                        tokens: full_tokens,
+                        prompt_len,
+                        surprise,
+                        reward: 0.0,
+                        created: std::time::Instant::now(),
+                        pinned: false,
+                        train_count: 0,
+                    };
+                    let accepted = memory.replay_buffer.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+                    tracing::debug!(
+                        surprise = %format!("{surprise:.4}"),
+                        accepted,
+                        threshold = %format!("{:.2}", memory.config.surprise_threshold),
+                        "[MEMORY] replay push"
+                    );
+                }
             }
         }
 

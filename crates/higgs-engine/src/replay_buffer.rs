@@ -134,7 +134,7 @@ impl ReplayBuffer {
     pub fn pick_for_training(&self, max_trains: u32) -> Option<&ReplayEntry> {
         self.entries
             .iter()
-            .filter(|e| e.train_count < max_trains && !e.tokens.is_empty())
+            .filter(|e| e.train_count < max_trains && !e.tokens.is_empty() && e.tokens.len() > e.prompt_len)
             .max_by(|a, b| {
                 let score_a = a.reward * a.surprise + a.surprise * 0.5;
                 let score_b = b.reward * b.surprise + b.surprise * 0.5;
@@ -343,6 +343,37 @@ mod tests {
         assert!(buf.get("zombie").is_none(), "zombie must be evicted first");
         assert!(buf.get("live").is_some());
         assert!(buf.get("new").is_some());
+    }
+
+    #[test]
+    fn pick_skips_zero_completion_entries() {
+        let mut buf = ReplayBuffer::new(10, 0.0);
+        // Entry where prompt_len == tokens.len() (empty completion, e.g. immediate EOS)
+        buf.push_unchecked(ReplayEntry {
+            request_id: "empty-completion".to_owned(),
+            tokens: vec![1, 2, 3],  // 3 prompt tokens, 0 completion tokens
+            prompt_len: 3,
+            surprise: 10.0,
+            reward: 5.0,
+            created: Instant::now(),
+            pinned: false,
+            train_count: 0,
+        });
+        // Entry with actual completion tokens
+        buf.push(make_entry("has-completion", 1.0, 0.0));  // tokens=[1,2,3,4,5], prompt_len=2
+
+        let picked = buf.pick_for_training(10).unwrap();
+        assert_eq!(
+            picked.request_id, "has-completion",
+            "must skip entry where prompt_len == tokens.len()"
+        );
+
+        // If the only entries have no completion, pick returns None
+        buf.remove("has-completion");
+        assert!(
+            buf.pick_for_training(10).is_none(),
+            "no trainable entries when all have empty completions"
+        );
     }
 
     #[test]
