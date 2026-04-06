@@ -82,6 +82,11 @@ impl KvCacheConfig {
 
     pub fn validate(self) -> Result<(), Exception> {
         if self.is_turboquant() {
+            if self.bits == 0 {
+                return Err(Exception::custom(
+                    "TurboQuant bits must be >= 1, got 0",
+                ));
+            }
             let kb = self.key_bits();
             let vb = self.value_bits();
             if !(1..=4).contains(&kb) {
@@ -128,16 +133,29 @@ pub struct QuantizedKey {
     pub codes: Vec<u8>,
 }
 
+/// Precomputed quantization context shared across all KV cache layers.
+///
+/// Created once at model load time; holds centroid tables, packing
+/// geometry, and the originating [`KvCacheConfig`].
 #[derive(Debug, Clone)]
 pub struct TurboQuantContext {
+    /// The KV cache quantization config that produced this context.
     pub config: KvCacheConfig,
+    /// Dimensionality of each attention head (e.g. 128).
     pub head_dim: i32,
+    /// Number of key/value heads (GQA group count).
     pub num_kv_heads: i32,
+    /// Centroid values for key quantization, length = 2^key_bits.
     pub key_centroids: Vec<f32>,
+    /// Centroid values for value quantization, length = 2^value_bits.
     pub value_centroids: Vec<f32>,
+    /// Packed byte count per key vector: ceil(head_dim * key_bits / 8).
     pub key_code_bytes: i32,
+    /// Packed byte count per value vector: ceil(head_dim * value_bits / 8).
     pub value_code_bytes: i32,
+    /// Packed u32 word count per key vector: ceil(head_dim * key_bits / 32).
     pub key_code_words: i32,
+    /// Packed u32 word count per value vector: ceil(head_dim * value_bits / 32).
     pub value_code_words: i32,
 }
 
@@ -259,9 +277,17 @@ impl TurboQuantContext {
     pub fn dequantize_value(&self, value: &QuantizedValue) -> Result<Vec<f32>, Exception> {
         let dim =
             usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
+        let bits = self.config.value_bits();
+        let expected_bytes = (dim * usize::from(bits) + 7) / 8;
+        if value.codes.len() < expected_bytes {
+            return Err(Exception::custom(format!(
+                "dequantize_value: packed buffer too short ({} < {expected_bytes})",
+                value.codes.len()
+            )));
+        }
         let mut rotated = dequantize_rotated(
             &value.codes,
-            self.config.value_bits(),
+            bits,
             &self.value_centroids,
             dim,
             value.norm,
@@ -273,9 +299,17 @@ impl TurboQuantContext {
     pub fn dequantize_key(&self, key: &QuantizedKey) -> Result<Vec<f32>, Exception> {
         let dim =
             usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
+        let bits = self.config.key_bits();
+        let expected_bytes = (dim * usize::from(bits) + 7) / 8;
+        if key.codes.len() < expected_bytes {
+            return Err(Exception::custom(format!(
+                "dequantize_key: packed buffer too short ({} < {expected_bytes})",
+                key.codes.len()
+            )));
+        }
         let mut rotated = dequantize_rotated(
             &key.codes,
-            self.config.key_bits(),
+            bits,
             &self.key_centroids,
             dim,
             key.norm,
@@ -449,6 +483,12 @@ impl TurboQuantContext {
     /// Returns `(norms: [H, T] f32, packed_codes: [H, T, value_code_words] u32)`.
     /// No `eval()` or CPU readback — the entire graph stays lazy.
     pub fn quantize_values_gpu(&self, values: &Array) -> Result<(Array, Array), Exception> {
+        if values.ndim() < 3 {
+            return Err(Exception::custom(format!(
+                "quantize_values_gpu: expected ndim >= 3, got {}",
+                values.ndim()
+            )));
+        }
         let shape = values.shape();
         let h = shape[0];
         let t = shape[1];
@@ -502,6 +542,12 @@ impl TurboQuantContext {
     /// Input: `[H, T, D]` f32 tensor.
     /// Returns `(norms [H,T], gammas [H,T], packed_codes [H,T,key_code_words] u32)`.
     pub fn quantize_keys_gpu(&self, keys: &Array) -> Result<(Array, Array, Array), Exception> {
+        if keys.ndim() < 3 {
+            return Err(Exception::custom(format!(
+                "quantize_keys_gpu: expected ndim >= 3, got {}",
+                keys.ndim()
+            )));
+        }
         let shape = keys.shape();
         let h = shape[0];
         let t = shape[1];

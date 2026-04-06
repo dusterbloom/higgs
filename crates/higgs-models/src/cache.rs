@@ -589,6 +589,18 @@ impl SteppingKeyValueCache {
         values: Array,
         activate_at: i32,
     ) -> Result<KvCacheView, Exception> {
+        if keys.ndim() < 3 {
+            return Err(Exception::custom(format!(
+                "update_and_view: keys must have ndim >= 3, got {}",
+                keys.ndim()
+            )));
+        }
+        if values.ndim() < 3 {
+            return Err(Exception::custom(format!(
+                "update_and_view: values must have ndim >= 3, got {}",
+                values.ndim()
+            )));
+        }
         let new_tokens = keys.shape()[2];
 
         let view = if let Some(turbo) = self.turbo.as_mut() {
