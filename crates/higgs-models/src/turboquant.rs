@@ -84,14 +84,14 @@ impl KvCacheConfig {
         if self.is_turboquant() {
             let kb = self.key_bits();
             let vb = self.value_bits();
-            if !(1..=8).contains(&kb) {
+            if !(1..=4).contains(&kb) {
                 return Err(Exception::custom(format!(
-                    "TurboQuant key bits must be in [1, 8], got {kb}"
+                    "TurboQuant key bits must be in [1, 4], got {kb}"
                 )));
             }
-            if !(2..=8).contains(&vb) {
+            if !(2..=4).contains(&vb) {
                 return Err(Exception::custom(format!(
-                    "TurboQuant value bits must be in [2, 8], got {vb}"
+                    "TurboQuant value bits must be in [2, 4], got {vb}"
                 )));
             }
         }

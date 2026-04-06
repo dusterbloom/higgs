@@ -429,10 +429,13 @@ impl AnyModel {
             }
             Self::Qwen3Moe(m) => {
                 if kv_cache_config.is_turboquant() {
+                    let head_dim = m.args.head_dim.unwrap_or_else(||
+                        m.args.hidden_size / m.args.num_attention_heads
+                    );
                     make_turboquant_kv_cache(
                         m.args.num_hidden_layers,
                         m.args.num_key_value_heads,
-                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        head_dim,
                         kv_cache_config,
                     )
                 } else {
@@ -444,7 +447,7 @@ impl AnyModel {
                     make_turboquant_kv_cache(
                         m.args.num_hidden_layers,
                         m.args.num_key_value_heads,
-                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        m.args.head_dim,
                         kv_cache_config,
                     )
                 } else {

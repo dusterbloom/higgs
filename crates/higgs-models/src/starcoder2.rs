@@ -570,7 +570,6 @@ impl Starcoder2CausalLM {
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
         let out = self.forward_hidden(inputs, mask, kv_cache)?;
-        let out = out.index((.., -1.., ..));
 
         let T = inputs.shape().get(1).copied().unwrap_or(1);
         let lm_input = if T > 1 {
