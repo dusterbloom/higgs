@@ -930,4 +930,68 @@ mod tests {
             "sequential 3-bit decode avg cos={avg_cos:.4} (need > 0.80)"
         );
     }
+
+    /// Verify the TurboQuant decode path is actually exercised by pre-filling
+    /// past the activation threshold and running a decode step.
+    #[test]
+    fn test_turboquant_decode_path_activated() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 42,
+            ..Default::default()
+        };
+        let head_dim: i32 = 8;
+        let num_kv_heads: i32 = 1;
+        let mut cache = SteppingKeyValueCache::new_turbo(config, num_kv_heads, head_dim).unwrap();
+
+        // Prefill 4 tokens to accumulate dense KV
+        let prefill_k = Array::from_slice(
+            &[
+                0.3_f32, 0.7, -0.1, 0.4, -0.2, 0.5, 0.8, 0.6, -0.5, 0.3, 0.1, -0.6, 0.7, -0.4, 0.2,
+                0.9, 0.1, -0.8, 0.4, 0.3, -0.7, 0.6, -0.3, 0.5, 0.8, -0.2, -0.5, 0.7, 0.1, 0.4,
+                -0.6, 0.3,
+            ],
+            &[1, 1, 4, 8],
+        );
+        let prefill_v = Array::from_slice(
+            &[
+                1.0_f32, 2.0, 3.5, 4.0, -1.0, -0.5, 0.25, 0.75, -0.5, 1.5, -2.0, 0.3, 0.8, -0.7,
+                1.2, -0.4, 0.6, -1.1, 0.9, -0.2, 1.4, -0.8, 0.3, 0.7, -1.3, 0.4, 0.6, -0.9, 0.2,
+                1.1, -0.5, 0.8,
+            ],
+            &[1, 1, 4, 8],
+        );
+        // Use activate_at=0 to force TQ activation on next decode
+        cache
+            .update_and_view_with_activation_threshold(prefill_k, prefill_v, 0)
+            .unwrap();
+
+        // Decode token: should trigger bulk quantize + TQ decode
+        let decode_k = Array::from_slice(
+            &[0.9_f32, -0.7, 0.5, -0.3, 0.1, 0.2, -0.4, 0.6],
+            &[1, 1, 1, 8],
+        );
+        let decode_v = Array::from_slice(
+            &[1.5_f32, -1.25, 1.0, -0.75, 0.5, -0.25, 0.125, -0.0625],
+            &[1, 1, 1, 8],
+        );
+        let view = cache
+            .update_and_view_with_activation_threshold(decode_k, decode_v, 0)
+            .unwrap();
+
+        // Verify TQ path is active
+        let turbo_view = view
+            .turboquant()
+            .expect("should have activated TurboQuant path");
+        assert_eq!(turbo_view.seq_len, 5); // 4 prefill + 1 decode
+
+        // Decode a query through the TQ path
+        let queries = Array::from_slice(
+            &[0.15_f32, -0.25, 0.35, -0.45, 0.55, -0.65, 0.75, -0.85],
+            &[1, 1, 1, 8],
+        );
+        let scores = turbo_view.decode_scores(&queries, 1).unwrap();
+        assert_eq!(scores.shape(), &[1, 1, 1, 5]);
+    }
 }

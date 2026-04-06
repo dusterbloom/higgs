@@ -6,4 +6,5 @@ target/
 .vscode/
 mlx-rs/
 bench/
+# Nexus CI local cache directory
 .gitnexus
