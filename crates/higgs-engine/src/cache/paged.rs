@@ -205,12 +205,19 @@ impl PagedKvCache {
         let bases: Vec<usize> = token_indices
             .iter()
             .map(|&token_idx| {
+                if token_idx >= view.num_tokens {
+                    return Err(CacheError::ReadOutOfBounds {
+                        base: token_idx,
+                        len: 1,
+                        cap: view.num_tokens,
+                    });
+                }
                 let block_idx = token_idx / self.block_size;
                 let offset = token_idx % self.block_size;
                 let block_id = view.blocks[block_idx] as usize;
-                (block_id * self.block_size + offset) * kv_dim
+                Ok((block_id * self.block_size + offset) * kv_dim)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         self.storage.gather_tokens_f16(&bases, k_out, v_out)
     }

@@ -466,8 +466,10 @@ impl SimpleEngine {
             );
             let suffix = prompt_tokens.get(matched.prefix_len..).unwrap_or_default();
             if suffix.is_empty() {
-                // Full cache hit — reuse the matched cache as-is
-                (prompt_tokens.to_vec(), matched.cache)
+                // Full cache hit — feed only the last token to get logits
+                // (cache already contains all KV state from the prefix)
+                let last = prompt_tokens.last().copied().unwrap_or(0);
+                (vec![last], matched.cache)
             } else {
                 (suffix.to_vec(), matched.cache)
             }
@@ -842,6 +844,7 @@ impl SimpleEngine {
             };
 
             if session.finished {
+                scheduler.remove(session_id);
                 continue;
             }
 
@@ -856,6 +859,7 @@ impl SimpleEngine {
             // Check EOS before generating
             if self.eos_token_ids.contains(&last_token) && session.tokens.len() > 1 {
                 session.finished = true;
+                scheduler.remove(session_id);
                 outputs.push((session_id, GenerationOutput {
                     text: self.decode_tokens(&session.tokens)?,
                     finish_reason: "stop".to_owned(),
@@ -869,6 +873,7 @@ impl SimpleEngine {
             // Check max tokens
             if session.tokens.len() >= session.max_tokens {
                 session.finished = true;
+                scheduler.remove(session_id);
                 outputs.push((session_id, GenerationOutput {
                     text: self.decode_tokens(&session.tokens)?,
                     finish_reason: "length".to_owned(),
@@ -882,7 +887,8 @@ impl SimpleEngine {
             // For now, mark session as needing full generation
             // True incremental generation with paged cache is TODO
             session.finished = true;
-            
+            scheduler.remove(session_id);
+
             outputs.push((session_id, GenerationOutput {
                 text: self.decode_tokens(&session.tokens)?,
                 finish_reason: "length".to_owned(),
