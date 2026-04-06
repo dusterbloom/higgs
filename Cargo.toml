@@ -78,7 +78,8 @@ wildcard_enum_match_arm = "deny"
 higgs-engine = { path = "crates/higgs-engine" }
 higgs-models = { path = "crates/higgs-models" }
 
-# MLX
+# MLX — pinned to a specific commit for hadamard_transform + custom metal
+# kernel support not yet available on crates.io (oxideai/mlx-rs#287).
 mlx-rs = { git = "https://github.com/oxideai/mlx-rs.git", rev = "f4aa309c79b6be35255ca7d34157dfc10d9ed4c9" }
 mlx-sys = { git = "https://github.com/oxideai/mlx-rs.git", rev = "f4aa309c79b6be35255ca7d34157dfc10d9ed4c9" }
 

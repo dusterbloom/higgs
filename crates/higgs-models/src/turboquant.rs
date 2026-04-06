@@ -23,24 +23,38 @@ const FOUR_BIT_CENTROIDS: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881, 0.6568,
     0.9424, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
+/// KV cache quantization mode.
+///
+/// - `Off`: standard dense FP16 cache (no quantization).
+/// - `Turboquant`: TurboQuant compressed cache using FWHT + scalar quantization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum KvCacheMode {
+    /// Dense (unquantized) KV cache — the default.
     #[default]
     Off,
+    /// TurboQuant compressed KV cache with configurable bit widths.
     Turboquant,
 }
 
+/// Configuration for the KV cache quantization strategy.
+///
+/// When `mode` is `Turboquant`, keys and values are compressed using FWHT-based
+/// scalar quantization. Bit widths default to `bits - 1` for keys and `bits` for
+/// values, but can be overridden individually.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvCacheConfig {
+    /// Quantization mode — `Off` (dense) or `Turboquant`.
     #[serde(default)]
     pub mode: KvCacheMode,
+    /// Base bit width for quantization (default: 3). Key bits default to
+    /// `bits - 1`, value bits default to `bits`.
     #[serde(default = "default_bits")]
     pub bits: u8,
-    /// Override key bit width (default: bits - 1).
+    /// Override key bit width (default: bits - 1). Must be in `[1, 4]`.
     #[serde(default)]
     pub key_bits_override: Option<u8>,
-    /// Override value bit width (default: bits).
+    /// Override value bit width (default: bits). Must be in `[2, 4]`.
     #[serde(default)]
     pub value_bits_override: Option<u8>,
     /// Enable post-quantization norm correction (default: true).
@@ -49,6 +63,7 @@ pub struct KvCacheConfig {
     /// Number of final layers that stay dense (0 = all TQ).
     #[serde(default)]
     pub adaptive_dense_layers: u8,
+    /// RNG seed for stochastic quantization operations.
     #[serde(default)]
     pub seed: u64,
 }
@@ -84,14 +99,14 @@ impl KvCacheConfig {
         if self.is_turboquant() {
             let kb = self.key_bits();
             let vb = self.value_bits();
-            if !(1..=8).contains(&kb) {
+            if !(1..=4).contains(&kb) {
                 return Err(Exception::custom(format!(
-                    "TurboQuant key bits must be in [1, 8], got {kb}"
+                    "TurboQuant key bits must be in [1, 4], got {kb}"
                 )));
             }
-            if !(2..=8).contains(&vb) {
+            if !(2..=4).contains(&vb) {
                 return Err(Exception::custom(format!(
-                    "TurboQuant value bits must be in [2, 8], got {vb}"
+                    "TurboQuant value bits must be in [2, 4], got {vb}"
                 )));
             }
         }
@@ -285,9 +300,7 @@ impl TurboQuantContext {
     }
 
     pub fn rotate_queries(&self, queries: &Array) -> Result<Array, Exception> {
-        queries
-            .as_dtype(Dtype::Float32)?
-            .hadamard_transform(None)
+        queries.as_dtype(Dtype::Float32)?.hadamard_transform(None)
     }
 
     pub fn key_centroids_array(&self) -> Result<Array, Exception> {
@@ -313,8 +326,20 @@ impl TurboQuantContext {
     /// laid out as `[H * T * value_code_bytes]` in row-major order.
     pub fn quantize_values_batch(&self, values: &Array) -> Result<BatchQuantizedValues, Exception> {
         let shape = values.shape();
+        if shape.len() != 3 {
+            return Err(Exception::custom(format!(
+                "quantize_values_batch expects [H, T, D] (ndim=3), got ndim={}",
+                shape.len()
+            )));
+        }
         let h = shape[0];
         let t = shape[1];
+        if shape[2] != self.head_dim {
+            return Err(Exception::custom(format!(
+                "quantize_values_batch: D ({}) != head_dim ({})",
+                shape[2], self.head_dim
+            )));
+        }
 
         // norms: [H, T]
         let norms = ops::sqrt(&ops::sum_axis(&ops::square(values)?, -1, None)?)?;
@@ -381,6 +406,18 @@ impl TurboQuantContext {
     /// Returns `BatchQuantizedKeys` with norms, gammas, and packed MSE codes.
     pub fn quantize_keys_batch(&self, keys: &Array) -> Result<BatchQuantizedKeys, Exception> {
         let shape = keys.shape();
+        if shape.len() != 3 {
+            return Err(Exception::custom(format!(
+                "quantize_keys_batch expects [H, T, D] (ndim=3), got ndim={}",
+                shape.len()
+            )));
+        }
+        if shape[2] != self.head_dim {
+            return Err(Exception::custom(format!(
+                "quantize_keys_batch: D ({}) != head_dim ({})",
+                shape[2], self.head_dim
+            )));
+        }
         let h = shape[0];
         let t = shape[1];
         let key_bits = self.config.key_bits();
@@ -844,7 +881,10 @@ fn unpack_index(data: &[u8], index: usize, bits: u8) -> u8 {
 /// `fwht(fwht(x)) / D = x`.
 pub fn fwht(x: &mut [f32]) {
     let n = x.len();
-    debug_assert!(n.is_power_of_two(), "FWHT requires power-of-2 length, got {n}");
+    debug_assert!(
+        n.is_power_of_two(),
+        "FWHT requires power-of-2 length, got {n}"
+    );
     let mut stride = n >> 1;
     while stride > 0 {
         for i in 0..n {

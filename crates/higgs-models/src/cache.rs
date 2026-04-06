@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
-use mlx_rs::{error::Exception, ops, ops::concatenate_axis, Array, Dtype, Stream};
+use mlx_rs::{Array, Dtype, Stream, error::Exception, ops, ops::concatenate_axis};
 
 use crate::turboquant::{
     KvCacheConfig, KvCacheMode, QuantizedKey, QuantizedValue, TurboQuantContext,
@@ -54,14 +54,24 @@ impl KvCacheView {
 }
 
 /// Quantized cache view used by the TurboQuant decode path.
+///
+/// All code arrays are packed u32 words laid out as `[H, seq_len, code_words]`.
+/// Norm/gamma arrays are f32 with shape `[H, seq_len]`.
 #[derive(Debug, Clone)]
 pub struct TurboQuantKvView {
+    /// Shared quantization context (centroids, config, dimensions).
     pub context: Arc<TurboQuantContext>,
+    /// Packed key quantization codes — `[H, seq_len, key_code_words]`, dtype u32.
     pub key_codes: Array,
+    /// Per-token key L2 norms — `[H, seq_len]`, dtype f32.
     pub key_norms: Array,
+    /// Per-token key gamma corrections — `[H, seq_len]`, dtype f32.
     pub key_gammas: Array,
+    /// Packed value quantization codes — `[H, seq_len, value_code_words]`, dtype u32.
     pub value_codes: Array,
+    /// Per-token value L2 norms — `[H, seq_len]`, dtype f32.
     pub value_norms: Array,
+    /// Number of cached tokens.
     pub seq_len: i32,
 }
 
@@ -399,8 +409,9 @@ impl SteppingKeyValueCache {
     ///
     /// Used by MTP speculative decode to undo a rejected draft token's KV entry.
     /// The underlying storage is not deallocated — subsequent writes will overwrite.
-    pub fn trim_by(&mut self, n: i32) {
-        self.offset = (self.offset - n).max(0);
+    pub fn trim_by(&mut self, n: u32) {
+        let n_i32 = i32::try_from(n).unwrap_or(i32::MAX);
+        self.offset = (self.offset - n_i32).max(0);
     }
 
     /// References to internal arrays that must be eval'd between chunked-prefill steps.
@@ -432,16 +443,32 @@ impl SteppingKeyValueCache {
     ///
     /// Sets `offset = keys.shape()[2]` so the next `update_dense` triggers a
     /// normal grow cycle. Dense mode only (no TurboQuant).
-    pub fn from_arrays(keys: Array, values: Array) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `keys` or `values` have fewer than 3 dimensions.
+    pub fn from_arrays(keys: Array, values: Array) -> Result<Self, Exception> {
+        if keys.ndim() < 3 {
+            return Err(Exception::custom(format!(
+                "from_arrays: keys must have ndim >= 3, got {}",
+                keys.ndim()
+            )));
+        }
+        if values.ndim() < 3 {
+            return Err(Exception::custom(format!(
+                "from_arrays: values must have ndim >= 3, got {}",
+                values.ndim()
+            )));
+        }
         let offset = keys.shape()[2];
-        Self {
+        Ok(Self {
             keys: Some(keys),
             values: Some(values),
             turbo: None,
             config: KvCacheConfig::default(),
             offset,
             step: 256,
-        }
+        })
     }
 
     // -- TurboQuant prefix-cache helpers ----------------------------------------
@@ -471,6 +498,10 @@ impl SteppingKeyValueCache {
     }
 
     /// Reconstruct a TQ cache from pre-gathered arrays (prefix cache materialization).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `offset` exceeds the array capacity.
     pub fn from_turbo_arrays(
         context: Arc<TurboQuantContext>,
         key_codes: Array,
@@ -479,9 +510,15 @@ impl SteppingKeyValueCache {
         value_codes: Array,
         value_norms: Array,
         offset: i32,
-    ) -> Self {
+    ) -> Result<Self, Exception> {
         let capacity = key_codes.shape().get(1).copied().unwrap_or(0);
-        Self {
+        if offset > capacity {
+            return Err(Exception::custom(format!(
+                "from_turbo_arrays: offset ({offset}) exceeds capacity ({capacity})"
+            )));
+        }
+        let config = context.config;
+        Ok(Self {
             keys: None,
             values: None,
             turbo: Some(TurboQuantStorage {
@@ -493,13 +530,10 @@ impl SteppingKeyValueCache {
                 value_norms: Some(value_norms),
                 capacity,
             }),
-            config: KvCacheConfig {
-                mode: KvCacheMode::Turboquant,
-                ..KvCacheConfig::default()
-            },
+            config,
             offset,
             step: 256,
-        }
+        })
     }
 
     /// True when TQ storage has been populated (bulk quantization has happened).
@@ -509,6 +543,18 @@ impl SteppingKeyValueCache {
     }
 
     fn update_dense(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
+        if keys.ndim() < 4 {
+            return Err(Exception::custom(format!(
+                "update_dense: keys must have ndim >= 4, got {}",
+                keys.ndim()
+            )));
+        }
+        if values.ndim() < 4 {
+            return Err(Exception::custom(format!(
+                "update_dense: values must have ndim >= 4, got {}",
+                values.ndim()
+            )));
+        }
         let prev = self.offset;
         let new_tokens = keys.shape()[2];
 
@@ -583,7 +629,7 @@ impl SteppingKeyValueCache {
         })
     }
 
-    fn update_and_view_with_activation_threshold(
+    pub(crate) fn update_and_view_with_activation_threshold(
         &mut self,
         keys: Array,
         values: Array,
@@ -869,7 +915,11 @@ fn checked_add(lhs: usize, rhs: usize, label: &str) -> Result<usize, Exception> 
 #[allow(unsafe_code, clippy::indexing_slicing)]
 pub fn slice_axis2(arr: &Array, start: i32, end: i32) -> Result<Array, Exception> {
     let ndim = arr.ndim();
-    debug_assert!(ndim >= 3, "slice_axis2 requires ndim >= 3, got {ndim}");
+    if ndim < 3 {
+        return Err(Exception::custom(format!(
+            "slice_axis2 requires ndim >= 3, got {ndim}"
+        )));
+    }
     let mut starts = vec![0i32; ndim];
     let mut ends: Vec<i32> = arr.shape().to_vec();
     let strides = vec![1i32; ndim];
@@ -903,7 +953,11 @@ pub fn slice_axis2(arr: &Array, start: i32, end: i32) -> Result<Array, Exception
 #[allow(unsafe_code, clippy::indexing_slicing)]
 pub fn slice_axis1(arr: &Array, start: i32, end: i32) -> Result<Array, Exception> {
     let ndim = arr.ndim();
-    debug_assert!(ndim >= 2, "slice_axis1 requires ndim >= 2, got {ndim}");
+    if ndim < 2 {
+        return Err(Exception::custom(format!(
+            "slice_axis1 requires ndim >= 2, got {ndim}"
+        )));
+    }
     let mut starts = vec![0i32; ndim];
     let mut ends: Vec<i32> = arr.shape().to_vec();
     let strides = vec![1i32; ndim];
@@ -1331,7 +1385,7 @@ mod tests {
             .unwrap();
         let turbo = view.turboquant().unwrap();
         assert_eq!(turbo.seq_len, 3); // 2 prefill + 1 decode
-                                      // head_dim=8, key_bits=2: ceil(8*2/32) = 1 u32 word
+        // head_dim=8, key_bits=2: ceil(8*2/32) = 1 u32 word
         assert_eq!(turbo.key_codes.shape(), &[2, 3, 1]);
         // head_dim=8, bits=3: ceil(8*3/32) = 1 u32 word
         assert_eq!(turbo.value_codes.shape(), &[2, 3, 1]);
