@@ -82,16 +82,21 @@ impl KvCacheConfig {
 
     pub fn validate(self) -> Result<(), Exception> {
         if self.is_turboquant() {
+            if self.bits == 0 {
+                return Err(Exception::custom(
+                    "TurboQuant bits must be >= 1, got 0",
+                ));
+            }
             let kb = self.key_bits();
             let vb = self.value_bits();
-            if !(1..=8).contains(&kb) {
+            if !(1..=4).contains(&kb) {
                 return Err(Exception::custom(format!(
-                    "TurboQuant key bits must be in [1, 8], got {kb}"
+                    "TurboQuant key bits must be in [1, 4], got {kb}"
                 )));
             }
-            if !(2..=8).contains(&vb) {
+            if !(2..=4).contains(&vb) {
                 return Err(Exception::custom(format!(
-                    "TurboQuant value bits must be in [2, 8], got {vb}"
+                    "TurboQuant value bits must be in [2, 4], got {vb}"
                 )));
             }
         }
@@ -115,29 +120,51 @@ impl KvCacheConfig {
     }
 }
 
+/// A single quantized value head: packed codes and the L2 norm used to rescale
+/// the dequantized vector back to its original magnitude.
 #[derive(Debug, Clone)]
 pub struct QuantizedValue {
+    /// L2 norm of the original (pre-rotation) value vector.
     pub norm: f32,
+    /// Packed centroid indices (bit-packed according to `value_bits`).
     pub codes: Vec<u8>,
 }
 
+/// A single quantized key head: packed codes, L2 norm, and gamma correction
+/// factor from the QJL projection (currently zeroed).
 #[derive(Debug, Clone)]
 pub struct QuantizedKey {
+    /// L2 norm of the original (pre-rotation) key vector.
     pub norm: f32,
+    /// QJL gamma correction factor (currently unused / zeroed).
     pub gamma: f32,
+    /// Packed centroid indices (bit-packed according to `key_bits`).
     pub codes: Vec<u8>,
 }
 
+/// Precomputed quantization context shared across all KV cache layers.
+///
+/// Created once at model load time; holds centroid tables, packing
+/// geometry, and the originating [`KvCacheConfig`].
 #[derive(Debug, Clone)]
 pub struct TurboQuantContext {
+    /// The originating cache configuration (bit widths, mode, flags).
     pub config: KvCacheConfig,
+    /// Per-head embedding dimension (must be a power of two for FWHT).
     pub head_dim: i32,
+    /// Number of key-value heads in the model.
     pub num_kv_heads: i32,
+    /// Precomputed centroid values for key quantization.
     pub key_centroids: Vec<f32>,
+    /// Precomputed centroid values for value quantization.
     pub value_centroids: Vec<f32>,
+    /// Number of packed bytes per key head.
     pub key_code_bytes: i32,
+    /// Number of packed bytes per value head.
     pub value_code_bytes: i32,
+    /// Number of packed u32 words per key head.
     pub key_code_words: i32,
+    /// Number of packed u32 words per value head.
     pub value_code_words: i32,
 }
 
@@ -259,9 +286,17 @@ impl TurboQuantContext {
     pub fn dequantize_value(&self, value: &QuantizedValue) -> Result<Vec<f32>, Exception> {
         let dim =
             usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
+        let bits = self.config.value_bits();
+        let expected_bytes = (dim * usize::from(bits) + 7) / 8;
+        if value.codes.len() < expected_bytes {
+            return Err(Exception::custom(format!(
+                "dequantize_value: packed buffer too short ({} < {expected_bytes})",
+                value.codes.len()
+            )));
+        }
         let mut rotated = dequantize_rotated(
             &value.codes,
-            self.config.value_bits(),
+            bits,
             &self.value_centroids,
             dim,
             value.norm,
@@ -273,9 +308,17 @@ impl TurboQuantContext {
     pub fn dequantize_key(&self, key: &QuantizedKey) -> Result<Vec<f32>, Exception> {
         let dim =
             usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
+        let bits = self.config.key_bits();
+        let expected_bytes = (dim * usize::from(bits) + 7) / 8;
+        if key.codes.len() < expected_bytes {
+            return Err(Exception::custom(format!(
+                "dequantize_key: packed buffer too short ({} < {expected_bytes})",
+                key.codes.len()
+            )));
+        }
         let mut rotated = dequantize_rotated(
             &key.codes,
-            self.config.key_bits(),
+            bits,
             &self.key_centroids,
             dim,
             key.norm,
@@ -449,6 +492,12 @@ impl TurboQuantContext {
     /// Returns `(norms: [H, T] f32, packed_codes: [H, T, value_code_words] u32)`.
     /// No `eval()` or CPU readback — the entire graph stays lazy.
     pub fn quantize_values_gpu(&self, values: &Array) -> Result<(Array, Array), Exception> {
+        if values.ndim() < 3 {
+            return Err(Exception::custom(format!(
+                "quantize_values_gpu: expected ndim >= 3, got {}",
+                values.ndim()
+            )));
+        }
         let shape = values.shape();
         let h = shape[0];
         let t = shape[1];
@@ -502,6 +551,12 @@ impl TurboQuantContext {
     /// Input: `[H, T, D]` f32 tensor.
     /// Returns `(norms [H,T], gammas [H,T], packed_codes [H,T,key_code_words] u32)`.
     pub fn quantize_keys_gpu(&self, keys: &Array) -> Result<(Array, Array, Array), Exception> {
+        if keys.ndim() < 3 {
+            return Err(Exception::custom(format!(
+                "quantize_keys_gpu: expected ndim >= 3, got {}",
+                keys.ndim()
+            )));
+        }
         let shape = keys.shape();
         let h = shape[0];
         let t = shape[1];

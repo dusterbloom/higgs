@@ -432,7 +432,7 @@ impl AnyModel {
                     make_turboquant_kv_cache(
                         m.args.num_hidden_layers,
                         m.args.num_key_value_heads,
-                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        m.args.head_dim.unwrap_or_else(|| m.args.hidden_size / m.args.num_attention_heads),
                         kv_cache_config,
                     )
                 } else {
@@ -444,7 +444,7 @@ impl AnyModel {
                     make_turboquant_kv_cache(
                         m.args.num_hidden_layers,
                         m.args.num_key_value_heads,
-                        checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
+                        m.args.head_dim,
                         kv_cache_config,
                     )
                 } else {

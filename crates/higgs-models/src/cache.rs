@@ -433,7 +433,7 @@ impl SteppingKeyValueCache {
     /// Sets `offset = keys.shape()[2]` so the next `update_dense` triggers a
     /// normal grow cycle. Dense mode only (no TurboQuant).
     pub fn from_arrays(keys: Array, values: Array) -> Self {
-        let offset = keys.shape()[2];
+        let offset = keys.shape().get(2).copied().unwrap_or(0);
         Self {
             keys: Some(keys),
             values: Some(values),
@@ -589,6 +589,18 @@ impl SteppingKeyValueCache {
         values: Array,
         activate_at: i32,
     ) -> Result<KvCacheView, Exception> {
+        if keys.ndim() < 3 {
+            return Err(Exception::custom(format!(
+                "update_and_view: keys must have ndim >= 3, got {}",
+                keys.ndim()
+            )));
+        }
+        if values.ndim() < 3 {
+            return Err(Exception::custom(format!(
+                "update_and_view: values must have ndim >= 3, got {}",
+                values.ndim()
+            )));
+        }
         let new_tokens = keys.shape()[2];
 
         let view = if let Some(turbo) = self.turbo.as_mut() {
@@ -976,6 +988,11 @@ fn slice_update_axis2(
 #[allow(unsafe_code, clippy::indexing_slicing)]
 fn slice_axis(arr: &Array, axis: usize, start: i32, end: i32) -> Result<Array, Exception> {
     let ndim = arr.ndim();
+    if axis >= ndim {
+        return Err(Exception::custom(format!(
+            "slice_axis: axis {axis} out of bounds for ndim {ndim}"
+        )));
+    }
     let mut starts = vec![0i32; ndim];
     let mut ends: Vec<i32> = arr.shape().to_vec();
     let strides = vec![1i32; ndim];
@@ -1013,6 +1030,11 @@ fn slice_update_axis(
     n: i32,
 ) -> Result<Array, Exception> {
     let ndim = target.ndim();
+    if axis >= ndim {
+        return Err(Exception::custom(format!(
+            "slice_update_axis: axis {axis} out of bounds for ndim {ndim}"
+        )));
+    }
     let mut starts = vec![0i32; ndim];
     let mut ends: Vec<i32> = target.shape().to_vec();
     let strides = vec![1i32; ndim];

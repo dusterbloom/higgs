@@ -972,11 +972,12 @@ mod tests {
         let prefix: Vec<u32> = (0..16).collect();
         let kv = make_kv_cache(4, 16);
         cache.store(&prefix, &kv);
-        // Stored (via clone fallback since too short for paging),
-        // but find won't match because prefix_len < block_size
+        // Stored via clone fallback since too short for block paging.
+        // Clone fallback still makes the prefix findable.
         let mut query: Vec<u32> = prefix;
         query.push(999);
-        assert!(cache.find_longest_prefix(&query).is_none());
+        let matched = cache.find_longest_prefix(&query).expect("clone fallback should be findable");
+        assert_eq!(matched.prefix_len, 16);
     }
 
     #[test]

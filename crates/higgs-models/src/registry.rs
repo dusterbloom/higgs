@@ -163,6 +163,11 @@ mod tests {
     }
 
     #[test]
+    fn test_is_supported_qwen3_5() {
+        assert!(is_supported("qwen3_5"));
+    }
+
+    #[test]
     fn test_is_supported_qwen3_5_moe() {
         assert!(is_supported("qwen3_5_moe"));
     }

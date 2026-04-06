@@ -466,12 +466,8 @@ impl SimpleEngine {
             );
             let suffix = prompt_tokens.get(matched.prefix_len..).unwrap_or_default();
             if suffix.is_empty() {
-                (
-                    prompt_tokens.to_vec(),
-                    model
-                        .make_cache_with_config(self.kv_cache_config)
-                        .map_err(EngineError::Mlx)?,
-                )
+                // Full cache hit — reuse the matched cache as-is
+                (prompt_tokens.to_vec(), matched.cache)
             } else {
                 (suffix.to_vec(), matched.cache)
             }

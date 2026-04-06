@@ -29,6 +29,9 @@ pub enum CacheError {
     #[error("Session not found: {0}")]
     SessionNotFound(u64),
 
+    #[error("Session already exists: {0}")]
+    SessionAlreadyExists(u64),
+
     #[error("Cache write out of bounds: base={base}, len={len}, cap={cap}")]
     WriteOutOfBounds { base: usize, len: usize, cap: usize },
 
