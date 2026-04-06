@@ -994,10 +994,11 @@ fn slice_update_axis2(
     n: i32,
 ) -> Result<Array, Exception> {
     let ndim = target.ndim();
-    debug_assert!(
-        ndim >= 3,
-        "slice_update_axis2 requires ndim >= 3, got {ndim}"
-    );
+    if ndim < 3 {
+        return Err(Exception::custom(format!(
+            "slice_update_axis2 requires ndim >= 3, got {ndim}"
+        )));
+    }
     let mut starts = vec![0i32; ndim];
     let mut ends: Vec<i32> = target.shape().to_vec();
     let strides = vec![1i32; ndim];

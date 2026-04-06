@@ -130,16 +130,23 @@ impl KvCacheConfig {
     }
 }
 
+/// Single quantized value vector: unit-norm codes scaled by `norm`.
 #[derive(Debug, Clone)]
 pub struct QuantizedValue {
+    /// L2 norm of the original value vector (reconstruction scale factor).
     pub norm: f32,
+    /// Quantized code indices into the value centroid table.
     pub codes: Vec<u8>,
 }
 
+/// Single quantized key vector: affine codes scaled by `norm` and shifted by `gamma`.
 #[derive(Debug, Clone)]
 pub struct QuantizedKey {
+    /// L2 norm of the original key vector (reconstruction scale factor).
     pub norm: f32,
+    /// Affine shift applied after centroid lookup (key-specific bias).
     pub gamma: f32,
+    /// Quantized code indices into the key centroid table.
     pub codes: Vec<u8>,
 }
 

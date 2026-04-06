@@ -886,9 +886,7 @@ fn gated_delta_kernel_ffi(
 
     let result = if status != 0 {
         let mlx_msg = FFI_LAST_ERROR
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
+            .with(|cell| cell.borrow_mut().take())
             .unwrap_or_default();
         Err(Exception::custom(format!(
             "gated_delta_kernel failed: {mlx_msg}"
@@ -1295,9 +1293,7 @@ pub(crate) fn qgemv_4bit(
 
     let result = if status != 0 {
         let mlx_msg = FFI_LAST_ERROR
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
+            .with(|cell| cell.borrow_mut().take())
             .unwrap_or_default();
         Err(Exception::custom(format!("qgemv_4bit failed: {mlx_msg}")))
     } else {
