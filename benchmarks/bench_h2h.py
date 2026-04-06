@@ -307,7 +307,7 @@ def stream_chat(port, messages, max_tokens=MAX_TOKENS, model_name="test",
     ttft_s = first_token_time - t0
     decode_s = end - first_token_time
     n_completion = completion_tokens or len(tokens)
-    decode_tps = n_completion / decode_s if decode_s > 0.001 else 0
+    decode_tps = max(n_completion - 1, 0) / decode_s if decode_s > 0.001 else 0
 
     # Estimate prompt tokens if server didn't report (oMLX SSE doesn't)
     if not prompt_tokens:

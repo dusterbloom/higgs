@@ -5,6 +5,7 @@ Tests gather_qmm at DeepSeek-V2-Lite scale:
   hidden=2048, intermediate=1408, 64 experts, top_k=6, 4-bit quantized
 """
 
+import statistics
 import time
 import mlx.core as mx
 import mlx.nn
@@ -142,7 +143,7 @@ def bench(fn, label, *args, **kwargs):
         mx.eval(r)
         times.append(time.perf_counter() - t0)
 
-    med = sorted(times)[ITERS // 2]
+    med = statistics.median(times)
     return med
 
 
@@ -196,7 +197,7 @@ def main():
             r = _gather_sort(x_exp, indices)
             mx.eval(*r)
             times.append(time.perf_counter() - t0)
-        med = sorted(times)[ITERS // 2]
+        med = statistics.median(times)
         print(f"  L={L:>5}: global sort = {med*1000:.2f} ms")
 
 

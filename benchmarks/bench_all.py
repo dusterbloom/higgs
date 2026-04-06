@@ -170,7 +170,7 @@ def bench(model_name, prompt, label):
     end = time.perf_counter()
     ttft_ms = (first_token_time - start) * 1000 if first_token_time else -1
     decode_s = end - first_token_time if first_token_time else 0.001
-    decode_tps = completion_tokens / decode_s if decode_s > 0 else 0
+    decode_tps = max(completion_tokens - 1, 0) / decode_s if decode_s > 0 else 0
     prefill_tps = prompt_tokens / (ttft_ms / 1000) if ttft_ms > 0 and prompt_tokens > 0 else 0
 
     log(

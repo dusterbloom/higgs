@@ -3,6 +3,7 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -149,13 +150,11 @@ def bench_model(model_dir, label):
     print(f"Model: {label}")
     print(f"{'='*70}")
 
-    subprocess.run(["pkill", "-f", "higgs serve"], capture_output=True)
-    time.sleep(2)
-
     env = {**os.environ, "HIGGS_ENABLE_THINKING": "0"}
     proc = subprocess.Popen(
         [HIGGS, "serve", "--model", model_dir, "--port", "8080"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        preexec_fn=os.setsid,
     )
 
     try:
@@ -211,11 +210,14 @@ def bench_model(model_dir, label):
             print(f"  {'new':<6} {est_tokens:>10} {ttft:>10.0f} {ratio:>8}  {q[:50]}...")
 
     finally:
-        proc.terminate()
         try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         time.sleep(2)
 
 

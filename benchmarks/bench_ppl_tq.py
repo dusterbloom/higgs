@@ -83,9 +83,8 @@ def compute_ppl_mlx(model_path, ctx_len=2048, stride=512, max_chunks=50):
         score_logits = logits[score_start:]
         score_targets = targets[score_start:]
 
-        # Log softmax → gather target logprobs
-        log_probs = mx.softmax(score_logits, axis=-1)
-        log_probs = mx.log(log_probs + 1e-10)
+        # Log-softmax (numerically stable) → gather target logprobs
+        log_probs = score_logits - mx.logsumexp(score_logits, axis=-1, keepdims=True)
 
         target_logprobs = mx.take_along_axis(
             log_probs, score_targets[:, None], axis=1

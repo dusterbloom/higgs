@@ -1,4 +1,5 @@
 """Quick TTFT benchmark at different prompt lengths."""
+import statistics
 import time, json, urllib.request
 
 BASE = "http://localhost:9999/v1"
@@ -42,7 +43,7 @@ def bench_ttft(label, prompt):
         times.append(t)
         ptoks = pt
 
-    med = sorted(times)[len(times) // 2]
+    med = statistics.median(times)
     return med, ptoks
 
 print(f"TTFT benchmark — {MODEL}")

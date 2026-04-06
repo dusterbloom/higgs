@@ -177,10 +177,6 @@ def bench_model(model_dir, label):
     print(f"Path:  {model_dir}")
     print(f"{'='*70}")
 
-    # Kill any existing server
-    subprocess.run(["pkill", "-f", "higgs serve"], capture_output=True)
-    time.sleep(1)
-
     # Start server
     env = {**os.environ, "HIGGS_ENABLE_THINKING": "0"}
     proc = subprocess.Popen(
@@ -188,6 +184,7 @@ def bench_model(model_dir, label):
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        preexec_fn=os.setsid,
     )
 
     try:
@@ -244,11 +241,14 @@ def bench_model(model_dir, label):
         }
 
     finally:
-        proc.terminate()
         try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         time.sleep(2)
 
 
