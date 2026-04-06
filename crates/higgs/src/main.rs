@@ -201,15 +201,16 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         memory: memory.clone(),
     });
 
-    // Spawn idle trainer if memory is enabled
+    // Spawn idle trainer if memory is enabled, and load persisted state
     if let Some(ref mem) = memory {
         if let Some(engine) = shared_state.router.resolve_first_local().await {
+            mem.load_state(&engine);
             higgs::memory::spawn_idle_trainer(Arc::clone(mem), engine);
         }
     }
 
     // Build router with middleware
-    let app = build_router(shared_state, timeout_secs, api_key, rate_limit);
+    let app = build_router(Arc::clone(&shared_state), timeout_secs, api_key, rate_limit);
 
     // Start server
     tracing::info!(addr = %bind_addr, "Starting server");
@@ -224,6 +225,16 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     )
     .with_graceful_shutdown(higgs::daemon::await_shutdown_signal())
     .await?;
+
+    // Save adaptive memory state on shutdown (blocking I/O off the async runtime)
+    if let Some(ref mem) = memory {
+        if let Some(engine) = shared_state.router.resolve_first_local().await {
+            let mem = Arc::clone(mem);
+            tokio::task::spawn_blocking(move || mem.save_state(&engine))
+                .await
+                .ok();
+        }
+    }
 
     higgs::daemon::remove_pid_file(profile);
     Ok(())

@@ -15,7 +15,7 @@ pub struct ReplayEntry {
     pub tokens: Vec<u32>,
     /// Number of prompt tokens (loss computed only on completion portion).
     pub prompt_len: usize,
-    /// Mean negative log-probability of the completion tokens.
+    /// Total negative log-probability (sum) of the completion tokens.
     pub surprise: f32,
     /// Accumulated reward from implicit/explicit feedback.
     pub reward: f32,
@@ -76,6 +76,20 @@ impl ReplayBuffer {
         true
     }
 
+    /// Insert an entry without surprise threshold check.
+    ///
+    /// Used when restoring persisted metadata where the original surprise
+    /// already passed the threshold at recording time.
+    pub fn push_unchecked(&mut self, entry: ReplayEntry) -> bool {
+        if self.entries.len() >= self.capacity && !self.evict_one() {
+            return false; // all pinned, full
+        }
+        let idx = self.entries.len();
+        self.id_index.insert(entry.request_id.clone(), idx);
+        self.entries.push(entry);
+        true
+    }
+
     /// Look up an entry by request_id.
     pub fn get(&self, request_id: &str) -> Option<&ReplayEntry> {
         self.id_index.get(request_id).map(|&i| &self.entries[i])
@@ -116,10 +130,11 @@ impl ReplayBuffer {
     /// Pick the highest-priority entry for training.
     ///
     /// Priority = `reward * surprise` where `train_count < max_trains`.
+    /// Entries with empty tokens (restored metadata without token data) are skipped.
     pub fn pick_for_training(&self, max_trains: u32) -> Option<&ReplayEntry> {
         self.entries
             .iter()
-            .filter(|e| e.train_count < max_trains)
+            .filter(|e| e.train_count < max_trains && !e.tokens.is_empty())
             .max_by(|a, b| {
                 let score_a = a.reward * a.surprise + a.surprise * 0.5;
                 let score_b = b.reward * b.surprise + b.surprise * 0.5;

@@ -21,7 +21,15 @@ pub enum Engine {
     Simple(Box<SimpleEngine>),
     Batch(Box<BatchEngine>),
     #[cfg(test)]
-    Stub(String),
+    Stub(StubEngine),
+}
+
+/// Test-only engine that stores deltas in memory so persistence tests
+/// exercise the real save → disk → load → engine data flow.
+#[cfg(test)]
+pub struct StubEngine {
+    name: String,
+    deltas: std::sync::Mutex<Option<higgs_models::qwen3_next::DeltaMap>>,
 }
 
 impl Engine {
@@ -41,7 +49,10 @@ impl Engine {
 
     #[cfg(test)]
     pub fn test_stub(name: &str) -> Self {
-        Self::Stub(name.to_owned())
+        Self::Stub(StubEngine {
+            name: name.to_owned(),
+            deltas: std::sync::Mutex::new(None),
+        })
     }
 
     pub fn model_name(&self) -> &str {
@@ -49,7 +60,7 @@ impl Engine {
             Self::Simple(e) => e.model_name(),
             Self::Batch(e) => e.model_name(),
             #[cfg(test)]
-            Self::Stub(name) => name,
+            Self::Stub(s) => &s.name,
         }
     }
 
@@ -250,6 +261,36 @@ impl Engine {
             )),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    /// Get a clone of the current training deltas, if any.
+    pub fn get_deltas(&self) -> Result<Option<higgs_models::qwen3_next::DeltaMap>, EngineError> {
+        match self {
+            Self::Simple(e) => e.get_deltas(),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "get_deltas not supported on batch engine".to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(s) => Ok(s.deltas.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+        }
+    }
+
+    /// Set training deltas on the model.
+    pub fn set_deltas(
+        &self,
+        deltas: higgs_models::qwen3_next::DeltaMap,
+    ) -> Result<(), EngineError> {
+        match self {
+            Self::Simple(e) => e.set_deltas(deltas),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "set_deltas not supported on batch engine".to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(s) => {
+                *s.deltas.lock().unwrap_or_else(|e| e.into_inner()) = Some(deltas);
+                Ok(())
+            }
         }
     }
 }

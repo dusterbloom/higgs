@@ -45,8 +45,12 @@ pub fn save_deltas(deltas: &DeltaMap, path: &Path) -> Result<(), String> {
 
     let serialized = safetensors::serialize(tensors, &None)
         .map_err(|e| format!("Failed to serialize deltas: {e}"))?;
-    std::fs::write(path, serialized)
-        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    // Atomic write: write to .tmp then rename to avoid corruption on crash.
+    let tmp_path = path.with_extension("safetensors.tmp");
+    std::fs::write(&tmp_path, serialized)
+        .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| format!("Failed to rename {} → {}: {e}", tmp_path.display(), path.display()))?;
 
     Ok(())
 }
@@ -84,8 +88,12 @@ pub fn save_replay_metadata(
     }
     let json = serde_json::to_string_pretty(entries)
         .map_err(|e| format!("Failed to serialize replay metadata: {e}"))?;
-    std::fs::write(path, json)
-        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    // Atomic write: write to .tmp then rename to avoid corruption on crash.
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json)
+        .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| format!("Failed to rename {} → {}: {e}", tmp_path.display(), path.display()))?;
     Ok(())
 }
 
@@ -107,10 +115,11 @@ pub struct ReplayMeta {
     pub train_count: u32,
 }
 
-/// Compress deltas when they exceed the budget by scaling them down.
+/// Scale deltas down when they exceed the byte budget.
 ///
-/// Scales all deltas uniformly so total size fits within budget.
-/// Acts as a regularizer — kills noise while preserving dominant patterns.
+/// Applies uniform scaling (multiply by `sqrt(budget/current)`) to all tensors.
+/// This is lossy — it shrinks all delta magnitudes, not just noise.
+/// Use a generous budget to avoid destroying learned information.
 pub fn compress_deltas(deltas: &mut DeltaMap, budget_bytes: usize) -> Result<(), String> {
     let current_bytes: usize = deltas
         .values()

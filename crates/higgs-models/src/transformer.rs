@@ -831,6 +831,17 @@ impl Model {
         self.apply_lm_head(&out)
     }
 
+    /// Apply the LM head to hidden states at ALL positions. Returns `[B, T, vocab]`.
+    pub fn apply_lm_head_all(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        match self.lm_head.as_mut() {
+            Some(head) => head.forward(hidden),
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(embed) => embed.as_linear(hidden),
+                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(hidden),
+            },
+        }
+    }
+
     /// Apply the LM head to hidden states (last position only during prefill).
     fn apply_lm_head(&mut self, hidden: &Array) -> Result<Array, Exception> {
         let T = hidden.shape().get(1).copied().unwrap_or(1);

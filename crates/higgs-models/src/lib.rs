@@ -575,6 +575,26 @@ impl AnyModel {
             )),
         }
     }
+
+    /// Get a clone of the current training deltas, if any.
+    pub fn get_deltas(&self) -> Option<qwen3_next::DeltaMap> {
+        match self {
+            Self::Qwen3Next(m) => m.train_deltas.clone(),
+            _ => None,
+        }
+    }
+
+    /// Set training deltas on the model.
+    pub fn set_deltas(&mut self, deltas: qwen3_next::DeltaMap) {
+        match self {
+            Self::Qwen3Next(m) => {
+                m.train_deltas = Some(deltas);
+            }
+            _ => {
+                tracing::warn!("set_deltas called on non-Qwen3Next model; ignoring");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -545,6 +545,28 @@ impl SimpleEngine {
             .map_err(EngineError::Mlx)
     }
 
+    /// Get a clone of the current training deltas, if any.
+    pub fn get_deltas(&self) -> Result<Option<higgs_models::qwen3_next::DeltaMap>, EngineError> {
+        let model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+        Ok(model.get_deltas())
+    }
+
+    /// Set training deltas on the model.
+    pub fn set_deltas(
+        &self,
+        deltas: higgs_models::qwen3_next::DeltaMap,
+    ) -> Result<(), EngineError> {
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+        model.set_deltas(deltas);
+        Ok(())
+    }
+
     /// Convert a token count to u32, with an overflow error.
     fn completion_len(tokens: &[u32]) -> Result<u32, EngineError> {
         tokens
@@ -809,14 +831,13 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
-                let mean_surprise = surprise_sum / completion_len as f32;
                 return Ok(GenerationOutput {
                     text: self.decode_tokens(&tokens)?,
                     finish_reason: "stop".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
-                    surprise: Some(mean_surprise),
+                    surprise: Some(surprise_sum),
                 });
             }
 
@@ -828,14 +849,13 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
-                let mean_surprise = surprise_sum / completion_len as f32;
                 return Ok(GenerationOutput {
                     text: self.decode_tokens(&tokens)?,
                     finish_reason: "stop".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
-                    surprise: Some(mean_surprise),
+                    surprise: Some(surprise_sum),
                 });
             }
 
@@ -849,14 +869,13 @@ impl SimpleEngine {
                         total_item_ns,
                         total_other_ns,
                     );
-                    let mean_surprise = surprise_sum / completion_len as f32;
                     return Ok(GenerationOutput {
                         text: truncated,
                         finish_reason: "stop".to_owned(),
                         prompt_tokens: prompt_len,
                         completion_tokens: completion_len,
                         token_logprobs: all_logprobs,
-                        surprise: Some(mean_surprise),
+                        surprise: Some(surprise_sum),
                     });
                 }
             }
@@ -869,14 +888,13 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
-                let mean_surprise = surprise_sum / completion_len as f32;
                 return Ok(GenerationOutput {
                     text: self.decode_tokens(&tokens)?,
                     finish_reason: "length".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
-                    surprise: Some(mean_surprise),
+                    surprise: Some(surprise_sum),
                 });
             }
 

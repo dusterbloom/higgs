@@ -8,7 +8,7 @@ pub struct GenerationOutput {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub token_logprobs: Option<Vec<TokenLogprobInfo>>,
-    /// Mean negative log-probability (surprise) of completion tokens.
+    /// Total negative log-probability (surprise) summed over all completion tokens.
     /// Always computed; used by the adaptive memory system to gate replay.
     pub surprise: Option<f32>,
 }

@@ -354,7 +354,13 @@ async fn chat_completions_non_streaming(
                     pinned: false,
                     train_count: 0,
                 };
-                memory.replay_buffer.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+                let accepted = memory.replay_buffer.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+                tracing::debug!(
+                    surprise = %format!("{surprise:.4}"),
+                    accepted,
+                    threshold = %format!("{:.2}", memory.config.surprise_threshold),
+                    "[MEMORY] replay push"
+                );
             }
         }
 
