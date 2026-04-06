@@ -530,7 +530,9 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
         if let Some(timeout) = serve_args.timeout {
             figment = figment.merge(Serialized::default("server.timeout", timeout));
         }
-        // Additional models from CLI in config mode
+        // Additional models from CLI in config mode — append to TOML models
+        // (figment.merge would replace the entire array, so we extract first,
+        // concatenate, then re-merge the combined list)
         if !serve_args.models.is_empty() {
             let kv_cache = cli_kv_cache_mode(serve_args.kv_cache.as_deref())?;
             let extra: Vec<ModelConfig> = serve_args
@@ -549,7 +551,11 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
                 })
                 .collect();
-            figment = figment.merge(Serialized::default("models", &extra));
+            let mut existing: Vec<ModelConfig> = figment
+                .extract_inner("models")
+                .unwrap_or_default();
+            existing.extend(extra);
+            figment = figment.merge(Serialized::default("models", &existing));
         }
     }
 
@@ -623,8 +629,8 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
         ));
     }
 
-    if !config.server.timeout.is_finite() || config.server.timeout < 0.0 {
-        return Err("timeout must be a finite, non-negative number".to_owned());
+    if !config.server.timeout.is_finite() || config.server.timeout <= 0.0 {
+        return Err("timeout must be a finite, positive number".to_owned());
     }
 
     Ok(())
