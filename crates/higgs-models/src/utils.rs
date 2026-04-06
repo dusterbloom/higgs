@@ -992,6 +992,6 @@ mod tests {
             &[1, 1, 1, 8],
         );
         let scores = turbo_view.decode_scores(&queries, 1).unwrap();
-        assert_eq!(scores.shape(), &[1, 1, 1, 5]);
+        assert_eq!(scores.shape(), &[1, 5]);
     }
 }
