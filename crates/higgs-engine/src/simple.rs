@@ -554,6 +554,19 @@ impl SimpleEngine {
         Ok(model.get_deltas())
     }
 
+    /// Access training deltas by reference without cloning.
+    /// Holds the model lock for the duration of the closure.
+    pub fn with_deltas<F, R>(&self, f: F) -> Result<R, EngineError>
+    where
+        F: FnOnce(Option<&higgs_models::qwen3_next::DeltaMap>) -> R,
+    {
+        let model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+        Ok(model.with_deltas(f))
+    }
+
     /// Set training deltas on the model.
     pub fn set_deltas(
         &self,

@@ -115,6 +115,45 @@ pub struct ReplayMeta {
     pub train_count: u32,
 }
 
+/// Serializable hash entry for re-prompt detection across restarts.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HashEntry {
+    pub hash: u64,
+    pub request_id: String,
+}
+
+/// Save recent request hashes to JSON.
+pub fn save_hashes(entries: &[(u64, String)], path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory: {e}"))?;
+    }
+    let data: Vec<HashEntry> = entries
+        .iter()
+        .map(|(hash, id)| HashEntry {
+            hash: *hash,
+            request_id: id.clone(),
+        })
+        .collect();
+    let json = serde_json::to_string(&data)
+        .map_err(|e| format!("Failed to serialize hashes: {e}"))?;
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json)
+        .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| format!("Failed to rename {} → {}: {e}", tmp_path.display(), path.display()))?;
+    Ok(())
+}
+
+/// Load recent request hashes from JSON.
+pub fn load_hashes(path: &Path) -> Result<Vec<(u64, String)>, String> {
+    let json = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let entries: Vec<HashEntry> = serde_json::from_str(&json)
+        .map_err(|e| format!("Failed to deserialize hashes: {e}"))?;
+    Ok(entries.into_iter().map(|e| (e.hash, e.request_id)).collect())
+}
+
 /// Scale deltas down when they exceed the byte budget.
 ///
 /// Applies uniform scaling (multiply by `sqrt(budget/current)`) to all tensors.

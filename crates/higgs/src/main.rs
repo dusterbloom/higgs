@@ -186,6 +186,7 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         );
         Some(Arc::new(higgs::memory::AdaptiveMemoryManager::new(
             higgs_config.memory.clone(),
+            higgs::config::config_dir(),
         )))
     } else {
         None

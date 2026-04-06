@@ -12,8 +12,8 @@ use crate::config::MemoryConfig;
 use crate::state::Engine;
 use higgs_engine::replay_buffer::{ReplayBuffer, ReplayEntry};
 use higgs_models::delta_persistence::{
-    compress_deltas, load_deltas, load_replay_metadata, save_deltas, save_replay_metadata,
-    ReplayMeta,
+    compress_deltas, load_deltas, load_hashes, load_replay_metadata, save_deltas, save_hashes,
+    save_replay_metadata, ReplayMeta,
 };
 
 /// Central orchestrator for the adaptive memory system.
@@ -22,6 +22,9 @@ pub struct AdaptiveMemoryManager {
     /// Unix millis of the last inference request.
     pub last_request_time: AtomicU64,
     pub config: MemoryConfig,
+    /// Base configuration directory (e.g. ~/.config/higgs).
+    /// Persistence writes to `{config_dir}/memory/{model_name}/`.
+    config_dir: PathBuf,
     /// Cached system prompt tokens (captured from first request).
     system_prompt_tokens: Mutex<Option<Vec<u32>>>,
     /// Total idle training steps performed.
@@ -31,7 +34,7 @@ pub struct AdaptiveMemoryManager {
 }
 
 impl AdaptiveMemoryManager {
-    pub fn new(config: MemoryConfig) -> Self {
+    pub fn new(config: MemoryConfig, config_dir: PathBuf) -> Self {
         Self {
             replay_buffer: Mutex::new(ReplayBuffer::new(
                 config.replay_buffer_size,
@@ -39,6 +42,7 @@ impl AdaptiveMemoryManager {
             )),
             last_request_time: AtomicU64::new(now_millis()),
             config,
+            config_dir,
             system_prompt_tokens: Mutex::new(None),
             idle_train_steps: AtomicU64::new(0),
             recent_hashes: Mutex::new(Vec::new()),
@@ -156,33 +160,51 @@ impl AdaptiveMemoryManager {
     // Persistence
     // -----------------------------------------------------------------------
 
+    /// Build the persistence directory for a given model name.
+    fn data_dir(&self, model_name: &str) -> PathBuf {
+        let sanitized = model_name.replace('/', "--");
+        self.config_dir.join("memory").join(sanitized)
+    }
+
     /// Save deltas and replay metadata to disk. Never panics.
     pub fn save_state(&self, engine: &Engine) {
         let model_name = engine.model_name();
-        let dir = memory_data_dir(model_name);
+        let dir = self.data_dir(model_name);
 
-        // Save deltas
-        match engine.get_deltas() {
-            Ok(Some(mut deltas)) => {
-                let budget = self.config.delta_budget_mb as usize * 1024 * 1024;
-                if let Err(e) = compress_deltas(&mut deltas, budget) {
-                    tracing::warn!(error = %e, "[MEMORY] delta compression failed");
-                }
-                let path = dir.join("deltas.safetensors");
-                match save_deltas(&deltas, &path) {
-                    Ok(()) => {
-                        tracing::info!(
-                            path = %path.display(),
-                            n_tensors = deltas.len(),
-                            "[MEMORY] deltas saved"
-                        );
-                    }
-                    Err(e) => tracing::warn!(error = %e, "[MEMORY] failed to save deltas"),
-                }
+        // Save deltas (holds model lock only for the save, avoids cloning the DeltaMap)
+        let budget = self.config.delta_budget_mb as usize * 1024 * 1024;
+        let path = dir.join("deltas.safetensors");
+        match engine.with_deltas(|deltas_opt| -> Result<bool, String> {
+            let Some(deltas) = deltas_opt else { return Ok(false) };
+            // Check if compression is needed (rare — only when deltas exceed budget)
+            let current_bytes: usize = deltas
+                .values()
+                .map(|a| a.shape().iter().map(|&d| d as usize).product::<usize>() * 4)
+                .sum();
+            if current_bytes > budget {
+                let mut compressed = deltas.clone();
+                compress_deltas(&mut compressed, budget)?;
+                save_deltas(&compressed, &path)?;
+                tracing::info!(
+                    path = %path.display(),
+                    n_tensors = compressed.len(),
+                    "[MEMORY] deltas saved (compressed)"
+                );
+            } else {
+                save_deltas(deltas, &path)?;
+                tracing::info!(
+                    path = %path.display(),
+                    n_tensors = deltas.len(),
+                    "[MEMORY] deltas saved"
+                );
             }
-            Ok(None) => {
+            Ok(true)
+        }) {
+            Ok(Ok(false)) => {
                 tracing::debug!("[MEMORY] no deltas to save");
             }
+            Ok(Ok(true)) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "[MEMORY] failed to save deltas"),
             Err(e) => {
                 tracing::warn!(error = %e, "[MEMORY] failed to get deltas from engine");
             }
@@ -215,12 +237,28 @@ impl AdaptiveMemoryManager {
                 Err(e) => tracing::warn!(error = %e, "[MEMORY] failed to save replay metadata"),
             }
         }
+
+        // Save recent hashes for cross-session re-prompt detection
+        let hashes = self.recent_hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if !hashes.is_empty() {
+            let path = dir.join("hashes.json");
+            match save_hashes(&hashes, &path) {
+                Ok(()) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        n_entries = hashes.len(),
+                        "[MEMORY] request hashes saved"
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "[MEMORY] failed to save hashes"),
+            }
+        }
     }
 
     /// Load deltas and replay metadata from disk. Missing files = cold start.
     pub fn load_state(&self, engine: &Engine) {
         let model_name = engine.model_name();
-        let dir = memory_data_dir(model_name);
+        let dir = self.data_dir(model_name);
 
         // Load deltas (missing file = cold start, not an error)
         let deltas_path = dir.join("deltas.safetensors");
@@ -282,6 +320,31 @@ impl AdaptiveMemoryManager {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "[MEMORY] failed to load replay metadata");
+            }
+        }
+
+        // Load recent hashes (missing file = cold start)
+        let hashes_path = dir.join("hashes.json");
+        match load_hashes(&hashes_path) {
+            Ok(entries) => {
+                let n = entries.len();
+                let mut recent = self.recent_hashes.lock().unwrap_or_else(|e| e.into_inner());
+                recent.extend(entries);
+                // Keep bounded
+                while recent.len() > 32 {
+                    recent.remove(0);
+                }
+                tracing::info!(
+                    path = %hashes_path.display(),
+                    n_entries = n,
+                    "[MEMORY] request hashes loaded"
+                );
+            }
+            Err(e) if e.contains("Failed to read") => {
+                tracing::debug!("[MEMORY] no persisted hashes found (cold start)");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "[MEMORY] failed to load hashes");
             }
         }
     }
@@ -382,12 +445,6 @@ pub fn spawn_idle_trainer(memory: Arc<AdaptiveMemoryManager>, engine: Arc<Engine
     });
 }
 
-/// Build the persistence directory for a given model name.
-fn memory_data_dir(model_name: &str) -> PathBuf {
-    let sanitized = model_name.replace('/', "--");
-    crate::config::config_dir().join("memory").join(sanitized)
-}
-
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -402,7 +459,7 @@ fn hash_str(s: &str) -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, unsafe_code)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -420,16 +477,24 @@ mod tests {
         }
     }
 
+    fn test_manager() -> AdaptiveMemoryManager {
+        AdaptiveMemoryManager::new(test_config(), PathBuf::from("/tmp/higgs-test-unused"))
+    }
+
+    fn test_manager_with_dir(dir: PathBuf) -> AdaptiveMemoryManager {
+        AdaptiveMemoryManager::new(test_config(), dir)
+    }
+
     #[test]
     fn manager_touch_updates_idle() {
-        let mgr = AdaptiveMemoryManager::new(test_config());
+        let mgr = test_manager();
         mgr.touch();
         assert!(mgr.idle_ms() < 100); // should be nearly zero
     }
 
     #[test]
     fn reprompt_detection() {
-        let mgr = AdaptiveMemoryManager::new(test_config());
+        let mgr = test_manager();
 
         // First request — no re-prompt
         mgr.record_request_hash("hello world", "req-1");
@@ -440,7 +505,7 @@ mod tests {
 
     #[test]
     fn tool_result_positive_feedback() {
-        let mgr = AdaptiveMemoryManager::new(test_config());
+        let mgr = test_manager();
         {
             let mut buf = mgr.replay_buffer.lock().unwrap_or_else(|e| e.into_inner());
             buf.push(ReplayEntry {
@@ -460,7 +525,7 @@ mod tests {
 
     #[test]
     fn system_prompt_cached_once() {
-        let mgr = AdaptiveMemoryManager::new(test_config());
+        let mgr = test_manager();
         mgr.set_system_prompt(vec![10, 20, 30]);
         mgr.set_system_prompt(vec![99, 99]); // should not overwrite
         assert_eq!(mgr.system_prompt_tokens(), Some(vec![10, 20, 30]));
@@ -477,8 +542,6 @@ mod tests {
         use mlx_rs::Array;
 
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: test runs with --test-threads=1, no concurrent env mutation.
-        unsafe { std::env::set_var("HIGGS_CONFIG_DIR", tmp.path()) };
 
         // === Session 1: train + accumulate + shutdown ===
         let engine1 = Engine::test_stub("test-org/my-model");
@@ -498,7 +561,7 @@ mod tests {
         // Verify engine actually holds them
         assert!(engine1.get_deltas().unwrap().is_some(), "engine must hold deltas after set");
 
-        let mgr1 = AdaptiveMemoryManager::new(test_config());
+        let mgr1 = test_manager_with_dir(tmp.path().to_owned());
         {
             let mut buf = mgr1.replay_buffer.lock().unwrap();
             buf.push(ReplayEntry {
@@ -523,6 +586,10 @@ mod tests {
             });
         }
 
+        // Record request hashes for re-prompt detection
+        mgr1.record_request_hash("hello world", "high-surprise");
+        mgr1.record_request_hash("another prompt", "normal");
+
         // Shutdown: save everything
         mgr1.save_state(&engine1);
 
@@ -530,12 +597,13 @@ mod tests {
         let data_dir = tmp.path().join("memory").join("test-org--my-model");
         assert!(data_dir.join("deltas.safetensors").exists());
         assert!(data_dir.join("replay.json").exists());
+        assert!(data_dir.join("hashes.json").exists());
 
         // === Session 2: fresh boot ===
         let engine2 = Engine::test_stub("test-org/my-model");
         assert!(engine2.get_deltas().unwrap().is_none(), "fresh engine has no deltas");
 
-        let mgr2 = AdaptiveMemoryManager::new(test_config());
+        let mgr2 = test_manager_with_dir(tmp.path().to_owned());
         assert!(mgr2.replay_buffer.lock().unwrap().is_empty());
 
         // Startup: load persisted state
@@ -573,9 +641,15 @@ mod tests {
         assert!((normal.reward - (-0.2)).abs() < f32::EPSILON);
         assert!(!normal.pinned);
         assert_eq!(normal.train_count, 0);
+        drop(buf);
 
-        // SAFETY: test runs with --test-threads=1, no concurrent env mutation.
-        unsafe { std::env::remove_var("HIGGS_CONFIG_DIR") };
+        // --- Verify hashes survived ---
+        // Session 2 should detect re-prompt from session 1
+        let feedback = mgr2.detect_implicit_feedback(&[], false, Some("hello world"));
+        assert!(
+            feedback.iter().any(|(id, r)| id == "high-surprise" && *r < 0.0),
+            "cross-session re-prompt must be detected"
+        );
     }
 
     /// Restored entries (empty tokens) must be skipped by pick_for_training.
@@ -652,19 +726,13 @@ mod tests {
     #[test]
     fn cold_start_no_persisted_state() {
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: test runs with --test-threads=1, no concurrent env mutation.
-        unsafe { std::env::set_var("HIGGS_CONFIG_DIR", &tmp.path().join("nope")) };
-
-        let mgr = AdaptiveMemoryManager::new(test_config());
+        let mgr = test_manager_with_dir(tmp.path().join("nope"));
         let engine = Engine::test_stub("ghost-model");
         mgr.load_state(&engine);
 
         assert!(mgr.replay_buffer.lock().unwrap().is_empty());
         assert!(engine.get_deltas().unwrap().is_none());
         assert_eq!(mgr.total_train_steps(), 0);
-
-        // SAFETY: test runs with --test-threads=1, no concurrent env mutation.
-        unsafe { std::env::remove_var("HIGGS_CONFIG_DIR") };
     }
 
     /// Regression: restored entries (empty tokens) must NOT trigger false
@@ -672,7 +740,7 @@ mod tests {
     /// every request → spurious +0.5 reward on all restored entries.
     #[test]
     fn restored_entries_no_false_continuation_signal() {
-        let mgr = AdaptiveMemoryManager::new(test_config());
+        let mgr = test_manager();
         {
             let mut buf = mgr.replay_buffer.lock().unwrap();
             buf.push_unchecked(ReplayEntry {
@@ -721,9 +789,6 @@ mod tests {
         use mlx_rs::Array;
 
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: test runs with --test-threads=1, no concurrent env mutation.
-        unsafe { std::env::set_var("HIGGS_CONFIG_DIR", tmp.path()) };
-
         let engine = Engine::test_stub("bench-model");
 
         // Build production-sized deltas: ~200 targets matching 35B-A3B dimensions.
@@ -758,7 +823,7 @@ mod tests {
         let mut cfg = test_config();
         cfg.replay_buffer_size = 256;
         cfg.surprise_threshold = 0.0;
-        let mgr = AdaptiveMemoryManager::new(cfg);
+        let mgr = AdaptiveMemoryManager::new(cfg, tmp.path().to_owned());
         {
             let mut buf = mgr.replay_buffer.lock().unwrap();
             for i in 0..256 {
@@ -793,7 +858,7 @@ mod tests {
         let mut cfg2 = test_config();
         cfg2.replay_buffer_size = 256;
         cfg2.surprise_threshold = 0.0;
-        let mgr2 = AdaptiveMemoryManager::new(cfg2);
+        let mgr2 = AdaptiveMemoryManager::new(cfg2, tmp.path().to_owned());
 
         let t1 = std::time::Instant::now();
         mgr2.load_state(&engine2);
@@ -812,8 +877,5 @@ mod tests {
         eprintln!("[BENCH] overhead: save adds {save_ms:.1}ms to shutdown, load adds {load_ms:.1}ms to startup");
         eprintln!("[BENCH] for context: model load is ~2000-5000ms, so this is {:.1}% of startup",
             load_ms / 3000.0 * 100.0);
-
-        // SAFETY: test runs with --test-threads=1, no concurrent env mutation.
-        unsafe { std::env::remove_var("HIGGS_CONFIG_DIR") };
     }
 }

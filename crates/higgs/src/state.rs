@@ -276,6 +276,25 @@ impl Engine {
         }
     }
 
+    /// Access training deltas by reference without cloning.
+    /// Holds the model lock for the duration of the closure.
+    pub fn with_deltas<F, R>(&self, f: F) -> Result<R, EngineError>
+    where
+        F: FnOnce(Option<&higgs_models::qwen3_next::DeltaMap>) -> R,
+    {
+        match self {
+            Self::Simple(e) => e.with_deltas(f),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "with_deltas not supported on batch engine".to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(s) => {
+                let guard = s.deltas.lock().unwrap_or_else(|e| e.into_inner());
+                Ok(f(guard.as_ref()))
+            }
+        }
+    }
+
     /// Set training deltas on the model.
     pub fn set_deltas(
         &self,

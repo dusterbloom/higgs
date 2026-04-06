@@ -206,7 +206,13 @@ impl ReplayBuffer {
     /// Score for eviction: lower = more likely to be evicted.
     fn eviction_score(entry: &ReplayEntry, now: Instant) -> f32 {
         let age_hours = now.duration_since(entry.created).as_secs_f32() / 3600.0;
-        entry.reward + entry.surprise * 0.5 - age_hours * 0.1
+        let base = entry.reward + entry.surprise * 0.5 - age_hours * 0.1;
+        // Zombie entries (restored without tokens) can never be trained — prefer to evict
+        if entry.tokens.is_empty() {
+            base - 100.0
+        } else {
+            base
+        }
     }
 }
 
@@ -313,6 +319,30 @@ mod tests {
         assert_eq!(e.tokens, vec![10, 20, 30, 40]);
         assert_eq!(e.prompt_len, 1);
         assert_eq!(e.train_count, 0);
+    }
+
+    #[test]
+    fn zombie_entries_evicted_first() {
+        let mut buf = ReplayBuffer::new(2, 0.0);
+        // Zombie entry: high surprise/reward but empty tokens (restored from disk)
+        buf.push_unchecked(ReplayEntry {
+            request_id: "zombie".to_owned(),
+            tokens: Vec::new(),
+            prompt_len: 0,
+            surprise: 10.0,
+            reward: 5.0,
+            created: Instant::now(),
+            pinned: false,
+            train_count: 0,
+        });
+        buf.push(make_entry("live", 1.0, 0.0));
+        assert_eq!(buf.len(), 2);
+        // Push a third entry — zombie should be evicted despite higher score
+        buf.push(make_entry("new", 0.5, 0.0));
+        assert_eq!(buf.len(), 2);
+        assert!(buf.get("zombie").is_none(), "zombie must be evicted first");
+        assert!(buf.get("live").is_some());
+        assert!(buf.get("new").is_some());
     }
 
     #[test]

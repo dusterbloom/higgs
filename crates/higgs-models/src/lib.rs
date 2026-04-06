@@ -584,6 +584,17 @@ impl AnyModel {
         }
     }
 
+    /// Access training deltas by reference without cloning.
+    pub fn with_deltas<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(Option<&qwen3_next::DeltaMap>) -> R,
+    {
+        match self {
+            Self::Qwen3Next(m) => f(m.train_deltas.as_ref()),
+            _ => f(None),
+        }
+    }
+
     /// Set training deltas on the model.
     pub fn set_deltas(&mut self, deltas: qwen3_next::DeltaMap) {
         match self {
