@@ -324,7 +324,13 @@ async fn chat_completions_non_streaming(
     // so the generated text starts inside the think block. Prepend `<think>` so the parser
     // can find the matching `</think>` and split reasoning from visible content.
     let parse_input = if thinking_enabled {
-        format!("<think>{}", output.text)
+        if output.text.contains("</think>") {
+            format!("<think>{}", output.text)
+        } else {
+            // Model was length-stopped mid-thinking — close the tag so the
+            // parser can extract reasoning instead of leaking raw `<think>`.
+            format!("<think>{}</think>", output.text)
+        }
     } else {
         output.text
     };
