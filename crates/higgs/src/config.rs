@@ -137,7 +137,7 @@ pub struct ServeArgs {
     pub kv_no_norm_correction: bool,
 
     /// Number of final layers that stay dense (0 = all TQ).
-    #[arg(long, default_value = "0")]
+    #[arg(long)]
     pub kv_adaptive_dense_layers: Option<u8>,
 
     /// Seed used to generate TurboQuant rotation/QJL matrices.
