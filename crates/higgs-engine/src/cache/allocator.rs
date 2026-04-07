@@ -4,8 +4,8 @@
 //! The allocator manages block IDs (u32). The actual KV bytes live in a
 //! separate storage owned by the cache implementation.
 //!
-//! Implementation inspired by cellm's BlockAllocator:
-//! https://github.com/jeffasante/cellm/blob/main/crates/cellm-cache/src/allocator.rs
+//! Implementation inspired by cellm's `BlockAllocator`:
+//! <https://github.com/jeffasante/cellm/blob/main/crates/cellm-cache/src/allocator.rs>
 
 use crate::cache::CacheError;
 use std::collections::VecDeque;

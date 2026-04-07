@@ -29,7 +29,7 @@ impl PageTable {
 
     /// Get blocks assigned to a session.
     pub fn get_blocks(&self, session_id: u64) -> Option<&[u32]> {
-        self.sessions.get(&session_id).map(|v| v.as_slice())
+        self.sessions.get(&session_id).map(std::vec::Vec::as_slice)
     }
 
     /// Get mutable reference to blocks for a session.
@@ -56,6 +56,41 @@ impl PageTable {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::shadow_reuse,
+    clippy::shadow_same,
+    clippy::shadow_unrelated,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::doc_markdown,
+    clippy::needless_for_each,
+    clippy::needless_collect,
+    clippy::redundant_closure_for_method_calls,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_range_loop,
+    clippy::manual_flatten,
+    clippy::unnecessary_map_or,
+    clippy::uninlined_format_args,
+    clippy::manual_range_contains,
+    clippy::explicit_iter_loop,
+    clippy::borrow_as_ptr,
+    clippy::ref_as_ptr,
+    clippy::str_to_string,
+    clippy::if_then_some_else_none,
+    clippy::redundant_type_annotations
+)]
 mod tests {
     use super::*;
 

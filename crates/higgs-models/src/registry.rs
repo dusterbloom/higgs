@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::error::ModelError;
 
-/// Maximum config.json size (10 MiB) — prevents DoS from symlinked large files.
+/// Maximum config.json size (10 MiB) — prevents `DoS` from symlinked large files.
 const MAX_CONFIG_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Detect the model architecture from config.json's `model_type` field.

@@ -548,7 +548,7 @@ impl Qwen3MoeCausalLM {
         kv_cache: &mut Vec<Option<SteppingKeyValueCache>>,
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, mask, kv_cache)?;
-        let h_last = h.index((.., -1.., ..)); // [B, 1, hidden]
+        let _h_last = h.index((.., -1.., ..)); // [B, 1, hidden]
 
         let T = inputs.shape().get(1).copied().unwrap_or(1);
         let lm_input = if T > 1 { h.index((.., -1.., ..)) } else { h };

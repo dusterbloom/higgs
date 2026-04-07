@@ -59,7 +59,7 @@ pub(crate) fn scaled_dot_product_attention(
     )
 }
 
-/// Append K/V to the cache and run attention, using the TurboQuant decode path
+/// Append K/V to the cache and run attention, using the `TurboQuant` decode path
 /// for single-token decode when the cache view exposes quantized storage.
 pub(crate) fn cached_scaled_dot_product_attention<C>(
     queries: Array,

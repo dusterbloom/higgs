@@ -121,14 +121,14 @@ pub struct QuantizationConfig {
 
 /// Configuration for the Qwen3-Next / Qwen3.5 hybrid architecture.
 ///
-/// Supports hybrid SSM/attention transformers with optional Sparse MoE.
+/// Supports hybrid SSM/attention transformers with optional Sparse `MoE`.
 /// Every `full_attention_interval`-th layer uses full attention, all other
-/// layers use `GatedDeltaNet` (SSM-like linear attention). MoE layers are
+/// layers use `GatedDeltaNet` (SSM-like linear attention). `MoE` layers are
 /// enabled when `decoder_sparse_step > 0` and `num_experts > 0`.
 ///
 /// Key fields:
 /// - `norm_topk_prob` — normalize top-k expert scores (default `true`).
-/// - `gate_quantization` — optional quantization override for MoE gate weights.
+/// - `gate_quantization` — optional quantization override for `MoE` gate weights.
 /// - `use_separate_gdn_projections` — when `true`, GDN layers use 4 separate
 ///   projection matrices; when `false` (default), projections are fused to 2
 ///   combined matrices for fewer GPU dispatches.
@@ -180,7 +180,7 @@ pub struct Qwen3NextModelArgs {
     pub moe_intermediate_size: i32,
     /// Normalize top-k expert scores to sum to 1.0 before weighting outputs.
     /// Defaults to `true` to match Python mlx-lm. Setting to `false` scales
-    /// MoE output by the raw softmax scores (~0.39x), causing degenerate output.
+    /// `MoE` output by the raw softmax scores (~0.39x), causing degenerate output.
     #[serde(default = "default_norm_topk_prob")]
     pub norm_topk_prob: bool,
     #[serde(default)]
@@ -191,7 +191,7 @@ pub struct Qwen3NextModelArgs {
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
 
-    /// Per-layer quantization override for router gate / shared_expert_gate.
+    /// Per-layer quantization override for router gate / `shared_expert_gate`.
     /// When absent, uses the global quantization config.
     #[serde(default)]
     pub gate_quantization: Option<QuantizationConfig>,
@@ -317,7 +317,7 @@ impl QEmbedding {
         let s = (*self.scales).take_axis(&flat, 0)?;
         let b = (*self.biases).take_axis(&flat, 0)?;
         let out = ops::dequantize(&w, &s, &b, self.group_size, self.bits)?;
-        let mut ret_shape: Vec<i32> = shape.to_vec();
+        let mut ret_shape: Vec<i32> = shape.clone();
         ret_shape.push(-1);
         out.reshape(&ret_shape)
     }
@@ -358,7 +358,7 @@ static ASYNC_LAYER_STATE_EVAL_ENABLED: OnceLock<bool> = OnceLock::new();
 fn parse_compiled_gating_enabled(raw: Option<&str>) -> bool {
     !matches!(
         raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("0") | Some("false") | Some("off") | Some("no")
+        Some("0" | "false" | "off" | "no")
     )
 }
 
@@ -402,7 +402,7 @@ fn compiled_gdn_decode_enabled() -> bool {
                 .ok()
                 .map(|s| s.trim().to_ascii_lowercase())
                 .as_deref(),
-            Some("1") | Some("true") | Some("on") | Some("yes")
+            Some("1" | "true" | "on" | "yes")
         )
     })
 }
@@ -414,7 +414,7 @@ fn async_layer_state_eval_enabled() -> bool {
                 .ok()
                 .map(|s| s.trim().to_ascii_lowercase())
                 .as_deref(),
-            Some("1") | Some("true") | Some("on") | Some("yes")
+            Some("1" | "true" | "on" | "yes")
         )
     })
 }
@@ -925,7 +925,7 @@ fn gated_delta_kernel_ffi(
 /// the dot product, then reduce via threadgroup memory. Uses `uint4` (16-byte)
 /// vectorized weight loads for peak bandwidth, vs MLX's `uint16` (2-byte) loads.
 ///
-/// Single packed buffer `wb` = [weight_u32 | scales_f32_as_u32 | biases_f32_as_u32].
+/// Single packed buffer `wb` = [`weight_u32` | `scales_f32_as_u32` | `biases_f32_as_u32`].
 /// Eliminates per-token dtype conversions for scales/biases (packed once at load time).
 /// Tiled GEMV with shared memory for x and K-chunking.
 ///
@@ -1050,15 +1050,15 @@ fn truthy_env_var(name: &str) -> bool {
             .ok()
             .map(|s| s.trim().to_ascii_lowercase())
             .as_deref(),
-        Some("1") | Some("true") | Some("on") | Some("yes")
+        Some("1" | "true" | "on" | "yes")
     )
 }
 
 fn parse_dense_ffn_gemv_mode(raw: Option<&str>) -> DenseFfnGemvMode {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("fused") | Some("fused_only") => DenseFfnGemvMode::FusedOnly,
-        Some("down") | Some("down_only") => DenseFfnGemvMode::DownOnly,
-        Some("off") | Some("none") => DenseFfnGemvMode::Off,
+        Some("fused" | "fused_only") => DenseFfnGemvMode::FusedOnly,
+        Some("down" | "down_only") => DenseFfnGemvMode::DownOnly,
+        Some("off" | "none") => DenseFfnGemvMode::Off,
         _ => DenseFfnGemvMode::Both,
     }
 }
@@ -1073,7 +1073,7 @@ fn dense_ffn_fuse_gate_up() -> bool {
     *DENSE_FFN_FUSE_GATE_UP.get_or_init(|| match std::env::var("HIGGS_DENSE_FFN_GATE_UP") {
         Ok(raw) => !matches!(
             Some(raw.trim().to_ascii_lowercase()).as_deref(),
-            Some("separate") | Some("split") | Some("0") | Some("false") | Some("off")
+            Some("separate" | "split" | "0" | "false" | "off")
         ),
         Err(_) => !should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand()),
     })
@@ -1088,7 +1088,7 @@ fn gated_delta_config_cache_enabled() -> bool {
         match std::env::var("HIGGS_CACHE_GATED_DELTA_CONFIGS") {
             Ok(raw) => matches!(
                 Some(raw.trim().to_ascii_lowercase()).as_deref(),
-                Some("1") | Some("true") | Some("on") | Some("yes")
+                Some("1" | "true" | "on" | "yes")
             ),
             Err(_) => true,
         }
@@ -1484,15 +1484,15 @@ impl Qwen3NextAttention {
         }
     }
 
-    /// Apply RoPE at custom positions using rope_dynamic.
+    /// Apply `RoPE` at custom positions using `rope_dynamic`.
     ///
     /// # Arguments
-    /// * `queries` - Query tensor [B, n_heads, L, head_dim]
-    /// * `keys` - Key tensor [B, n_kv_heads, L, head_dim]
+    /// * `queries` - Query tensor [B, `n_heads`, L, `head_dim`]
+    /// * `keys` - Key tensor [B, `n_kv_heads`, L, `head_dim`]
     /// * `positions` - Position indices [L] (can be non-contiguous)
     ///
     /// # Returns
-    /// (queries, keys) with RoPE applied at specified positions
+    /// (queries, keys) with `RoPE` applied at specified positions
     pub fn apply_rope_at_positions(
         &self,
         queries: &Array,
@@ -1798,8 +1798,8 @@ impl SwitchMlpWeights {
         let inv_order = ops::argsort_axis(&order, 0)?;
 
         // Map each sorted position back to its source token: order / top_k
-        let top_k_u32 = u32::try_from(top_k)
-            .map_err(|_| Exception::custom("top_k must fit in u32"))?;
+        let top_k_u32 =
+            u32::try_from(top_k).map_err(|_| Exception::custom("top_k must fit in u32"))?;
         let top_k_arr = Array::from_slice(&[top_k_u32], &[1]);
         let token_idx = order.floor_divide(&top_k_arr)?;
 
@@ -2021,9 +2021,7 @@ fn compiled_gdn_decode_step(
     inputs: &[Array],
 ) -> Result<Vec<Array>, Exception> {
     let [q, k, v, g, beta, z, norm_weight] = inputs else {
-        return Err(Exception::custom(
-            "compiled GDN decode expects 7 inputs",
-        ));
+        return Err(Exception::custom("compiled GDN decode expects 7 inputs"));
     };
     // q: [B, 1, Hv, Dk]
     // k: [B, 1, Hv, Dk]
@@ -2105,7 +2103,7 @@ struct GatedDeltaNet {
     use_separate_projections: bool,
     qk_norm_weight_q: Array,
     qk_norm_weight_k: Array,
-    /// Pre-transposed conv weight for fast T=1 decode: [kernel_size, conv_dim].
+    /// Pre-transposed conv weight for fast T=1 decode: [`kernel_size`, `conv_dim`].
     conv_weight_t: Option<Array>,
 }
 
@@ -2194,16 +2192,15 @@ impl GatedDeltaNet {
         batch: i32,
     ) -> Result<Array, Exception> {
         let history_len = self.conv_kernel_size.saturating_sub(1);
-        let wt = match &self.conv_weight_t {
-            Some(w) => w.clone(),
-            None => {
-                // Conv1d weight: [conv_dim, kernel_size, 1] -> [kernel_size, conv_dim]
-                let raw_w = self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?;
-                let typed_w = raw_w.as_dtype(mixed_qkv.dtype())?;
-                typed_w.eval()?;
-                self.conv_weight_t = Some(typed_w.clone());
-                typed_w
-            }
+        let wt = if let Some(w) = &self.conv_weight_t {
+            w.clone()
+        } else {
+            // Conv1d weight: [conv_dim, kernel_size, 1] -> [kernel_size, conv_dim]
+            let raw_w = self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?;
+            let typed_w = raw_w.as_dtype(mixed_qkv.dtype())?;
+            typed_w.eval()?;
+            self.conv_weight_t = Some(typed_w.clone());
+            typed_w
         };
 
         let current_flat = mixed_qkv.reshape(&[batch, self.conv_dim])?;
@@ -2384,24 +2381,24 @@ impl GatedDeltaNet {
 
             let repeat_factor = self.num_v_heads / self.num_k_heads;
             let q_decode = if repeat_factor > 1 {
-                ops::repeat_axis::<f32>(norm_q.clone(), repeat_factor, -2)?
+                ops::repeat_axis::<f32>(norm_q, repeat_factor, -2)?
             } else {
-                norm_q.clone()
+                norm_q
             };
             let k_decode = if repeat_factor > 1 {
-                ops::repeat_axis::<f32>(norm_k.clone(), repeat_factor, -2)?
+                ops::repeat_axis::<f32>(norm_k, repeat_factor, -2)?
             } else {
-                norm_k.clone()
+                norm_k
             };
             let g = compute_g_direct(self.A_log.as_ref(), &a, self.dt_bias.as_ref())?;
             let beta = nn::sigmoid(&b)?;
             let kernel_inputs = [
                 q_decode,
                 k_decode,
-                conv_v.clone(),
+                conv_v,
                 g,
                 beta,
-                z.clone(),
+                z,
                 self.norm.weight.as_ref().clone(),
             ];
             let gated_out = run_compiled_gdn_decode(cache, &kernel_inputs)?;
@@ -2531,9 +2528,9 @@ fn compute_g_compiled((a_log, a, dt_bias): (&Array, &Array, &Array)) -> Result<A
 // DecoderLayer
 // ---------------------------------------------------------------------------
 
-/// Wrapper for the FFN block: either sparse MoE or dense SwiGLU.
+/// Wrapper for the FFN block: either sparse `MoE` or dense `SwiGLU`.
 /// Both share the `mlp` parameter namespace in safetensors — their sub-keys
-/// don't overlap (MoE: gate, switch_mlp, shared_expert; Dense: gate_proj, up_proj, down_proj).
+/// don't overlap (`MoE`: gate, `switch_mlp`, `shared_expert`; Dense: `gate_proj`, `up_proj`, `down_proj`).
 #[derive(Debug, Clone, ModuleParameters)]
 struct FfnBlock {
     #[param]
@@ -2900,7 +2897,7 @@ pub struct Qwen3NextCausalLM {
 }
 
 // Manual RoPE implementation for arbitrary positions
-/// Manual RoPE implementation for arbitrary positions
+/// Manual `RoPE` implementation for arbitrary positions
 #[allow(dead_code)]
 fn apply_rope_manual(
     x: &Array,
@@ -3039,11 +3036,11 @@ impl Qwen3NextCausalLM {
             .collect()
     }
 
-    /// Create a hybrid cache with TurboQuant on the full-attention KV layers.
+    /// Create a hybrid cache with `TurboQuant` on the full-attention KV layers.
     ///
     /// Linear-attention (SSM/GDN) layers get a plain `ArraysCache`; full-attention
-    /// layers get a `SteppingKeyValueCache` with TurboQuant storage. This matches
-    /// the selective compression strategy used by other TurboQuant implementations.
+    /// layers get a `SteppingKeyValueCache` with `TurboQuant` storage. This matches
+    /// the selective compression strategy used by other `TurboQuant` implementations.
     pub fn make_cache_turbo(
         &self,
         kv_cache_config: crate::turboquant::KvCacheConfig,
@@ -3071,7 +3068,7 @@ impl Qwen3NextCausalLM {
             .collect()
     }
 
-    /// Forward pass returning raw hidden states (before final RMSNorm).
+    /// Forward pass returning raw hidden states (before final `RMSNorm`).
     ///
     /// Used internally by `forward_hidden` (which adds norm) and
     /// `forward_with_hidden` (which needs raw states for MTP).
@@ -3218,12 +3215,12 @@ impl Qwen3NextCausalLM {
         if profiling && prof_gdn_samples > 0 && prof_fa_samples > 0 {
             #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
             {
-                let gdn_attn_avg = prof_gdn_attn_ns as f64 / prof_gdn_samples as f64;
-                let gdn_mlp_avg = prof_gdn_mlp_ns as f64 / prof_gdn_samples as f64;
-                let fa_attn_avg = prof_fa_attn_ns as f64 / prof_fa_samples as f64;
-                let fa_mlp_avg = prof_fa_mlp_ns as f64 / prof_fa_samples as f64;
+                let gdn_attn_avg = prof_gdn_attn_ns as f64 / f64::from(prof_gdn_samples);
+                let gdn_mlp_avg = prof_gdn_mlp_ns as f64 / f64::from(prof_gdn_samples);
+                let fa_attn_avg = prof_fa_attn_ns as f64 / f64::from(prof_fa_samples);
+                let fa_mlp_avg = prof_fa_mlp_ns as f64 / f64::from(prof_fa_samples);
                 let est_total =
-                    (gdn_attn_avg + gdn_mlp_avg) * 48.0 + (fa_attn_avg + fa_mlp_avg) * 16.0;
+                    (gdn_attn_avg + gdn_mlp_avg).mul_add(48.0, (fa_attn_avg + fa_mlp_avg) * 16.0);
                 tracing::info!(
                     gdn_attn_ms = format!("{:.2}", gdn_attn_avg / 1e6),
                     gdn_mlp_ms = format!("{:.2}", gdn_mlp_avg / 1e6),
@@ -3238,7 +3235,7 @@ impl Qwen3NextCausalLM {
         Ok(h)
     }
 
-    /// Forward pass returning hidden states (after final RMSNorm, before LM head).
+    /// Forward pass returning hidden states (after final `RMSNorm`, before LM head).
     #[allow(non_snake_case)]
     pub fn forward_hidden(
         &mut self,
@@ -3253,7 +3250,7 @@ impl Qwen3NextCausalLM {
     /// Forward pass producing logits for the **last position only**.
     ///
     /// During inference only the last token's logits are sampled, so we
-    /// slice hidden states before the lm_head projection. This avoids a
+    /// slice hidden states before the `lm_head` projection. This avoids a
     /// full `quantized_matmul(vocab, hidden)` on T-1 discarded positions.
     /// Returns shape `[B, 1, vocab]`.
     #[allow(non_snake_case)]
@@ -3388,8 +3385,8 @@ impl Qwen3NextCausalLM {
 
     /// Look up the embedding for a token id. Shape: `[1, 1, hidden_size]`.
     pub fn embed_token(&self, token_id: u32) -> Result<Array, Exception> {
-        let token_id_i32 = i32::try_from(token_id)
-            .map_err(|_| Exception::custom("token_id exceeds i32 range"))?;
+        let token_id_i32 =
+            i32::try_from(token_id).map_err(|_| Exception::custom("token_id exceeds i32 range"))?;
         let ids = Array::from_slice(&[token_id_i32], &[1, 1]);
         self.model.embed_tokens.forward(&ids)
     }
@@ -3477,7 +3474,7 @@ impl Qwen3NextCausalLM {
     /// Used by MTP speculative decode: the verify pass needs **raw** (pre-norm)
     /// hidden states for the next MTP draft, and logits for acceptance check.
     /// Returns `(raw_hidden, logits)` where both have shape `[B, T, ...]`.
-    /// The raw hidden states have NOT been through the final RMSNorm — the MTP
+    /// The raw hidden states have NOT been through the final `RMSNorm` — the MTP
     /// head applies its own `pre_fc_norm_hidden` instead.
     #[allow(non_snake_case)]
     pub fn forward_with_hidden(
@@ -3542,7 +3539,7 @@ pub fn load_qwen3_next_model<P: AsRef<Path>>(
 /// Load model args from a Qwen3.5-MoE VLM config.json.
 ///
 /// Qwen3.5-MoE uses the same architecture as `Qwen3Next` (hybrid
-/// GatedDeltaNet + full attention + sparse MoE with shared expert) but ships
+/// `GatedDeltaNet` + full attention + sparse `MoE` with shared expert) but ships
 /// as a VLM with config nested under `text_config` and rope parameters nested
 /// under `rope_parameters`.
 fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
@@ -3622,11 +3619,11 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     Ok(serde_json::from_value(obj)?)
 }
 
-/// Load a Qwen3.5 dense model (VLM wrapper around Qwen3Next architecture).
+/// Load a Qwen3.5 dense model (VLM wrapper around `Qwen3Next` architecture).
 ///
 /// Reads `text_config` for model args, strips `language_model.` prefix from
 /// safetensors weight keys. Unlike [`load_qwen3_5_moe_model`], does NOT force
-/// `decoder_sparse_step=1` or attempt MoE gate fusion.
+/// `decoder_sparse_step=1` or attempt `MoE` gate fusion.
 pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_qwen3_5_moe_text_config_args(model_path)?;
@@ -3662,7 +3659,7 @@ pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausa
     Ok(model)
 }
 
-/// Load a Qwen3.5-MoE model (VLM wrapper around Qwen3Next architecture).
+/// Load a Qwen3.5-MoE model (VLM wrapper around `Qwen3Next` architecture).
 ///
 /// Reads `text_config` for model args, strips `language_model.` prefix from
 /// safetensors weight keys.
@@ -3719,7 +3716,7 @@ struct GdnDims {
 }
 
 impl GdnDims {
-    /// Validate GQA ratio: num_v_heads must be divisible by num_k_heads.
+    /// Validate GQA ratio: `num_v_heads` must be divisible by `num_k_heads`.
     fn validate(&self) -> Result<(), Exception> {
         if self.num_k_heads == 0 || self.num_v_heads % self.num_k_heads != 0 {
             return Err(Exception::custom(format!(
@@ -3731,8 +3728,8 @@ impl GdnDims {
     }
 }
 
-/// Build row permutation to convert flat [q_all|k_all|v_all|z_all] layout
-/// to per-head-grouped [q_h0|k_h0|v_h0|z_h0|q_h1|...] for in_proj_qkvz.
+/// Build row permutation to convert flat [`q_all|k_all|v_all|z_all`] layout
+/// to per-head-grouped [`q_h0|k_h0|v_h0|z_h0|q_h1`|...] for `in_proj_qkvz`.
 fn build_qkvz_permutation(d: &GdnDims) -> Result<Vec<i32>, Exception> {
     let nk = d.num_k_heads;
     if nk == 0 || d.num_v_heads % nk != 0 {
@@ -3769,7 +3766,7 @@ fn build_qkvz_permutation(d: &GdnDims) -> Result<Vec<i32>, Exception> {
     Ok(perm)
 }
 
-/// Build row permutation for flat [b_all|a_all] → per-head-grouped [b_h0|a_h0|b_h1|a_h1|...].
+/// Build row permutation for flat [`b_all|a_all`] → per-head-grouped [`b_h0|a_h0|b_h1|a_h1`|...].
 fn build_ba_permutation(d: &GdnDims) -> Vec<i32> {
     let nk = d.num_k_heads;
     let v_per_k = d.num_v_heads / nk;
@@ -3848,7 +3845,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     // Detect params still at their [1] placeholder (never loaded from checkpoint).
     let placeholders: Vec<_> = params
         .iter()
-        .filter(|(_, v)| v.shape() == &[1])
+        .filter(|(_, v)| v.shape() == [1])
         .map(|(k, _)| k.to_string())
         .collect();
     if !placeholders.is_empty() {
@@ -13468,7 +13465,7 @@ mod tests {
 // Sparse Forward Pass with Custom RoPE Positions
 // ===========================================================================
 
-/// Forward pass for a single attention layer with custom RoPE positions.
+/// Forward pass for a single attention layer with custom `RoPE` positions.
 ///
 /// This is a standalone function to avoid borrow checker issues.
 fn forward_attention_sparse(
@@ -13478,16 +13475,16 @@ fn forward_attention_sparse(
     cache: &mut crate::cache::SteppingKeyValueCache,
 ) -> Result<Array, Exception> {
     let shape = x.shape();
-    let B = *shape
+    let b = *shape
         .first()
         .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-    let L = *shape
+    let l = *shape
         .get(1)
         .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
 
     // Q is projected to 2 * num_heads * head_dim (doubled for gating)
     let q_proj_output = attn.q_proj.forward(x)?;
-    let q_reshaped = q_proj_output.reshape(&[B, L, attn.num_attention_heads, -1])?;
+    let q_reshaped = q_proj_output.reshape(&[b, l, attn.num_attention_heads, -1])?;
     let q_halves = q_reshaped.split(2, Some(-1))?;
     let queries_pre = q_halves
         .first()
@@ -13495,7 +13492,7 @@ fn forward_attention_sparse(
     let gate = q_halves
         .get(1)
         .ok_or_else(|| Exception::custom("split produced empty result"))?
-        .reshape(&[B, L, -1])?;
+        .reshape(&[b, l, -1])?;
 
     let keys_raw = attn.k_proj.forward(x)?;
     let values_raw = attn.v_proj.forward(x)?;
@@ -13507,10 +13504,10 @@ fn forward_attention_sparse(
         .transpose_axes(&[0, 2, 1, 3])?;
     let mut keys = attn
         .k_norm
-        .forward(&keys_raw.reshape(&[B, L, attn.num_key_value_heads, -1])?)?
+        .forward(&keys_raw.reshape(&[b, l, attn.num_key_value_heads, -1])?)?
         .transpose_axes(&[0, 2, 1, 3])?;
     let values = values_raw
-        .reshape(&[B, L, attn.num_key_value_heads, -1])?
+        .reshape(&[b, l, attn.num_key_value_heads, -1])?
         .transpose_axes(&[0, 2, 1, 3])?;
 
     // Apply RoPE at CUSTOM positions using rope_dynamic
@@ -13548,17 +13545,17 @@ fn forward_attention_sparse(
         None, // No mask needed for sparse prefill
     )?
     .transpose_axes(&[0, 2, 1, 3])?
-    .reshape(&[B, L, -1])?;
+    .reshape(&[b, l, -1])?;
 
     let gated = output.multiply(nn::sigmoid(&gate)?)?;
     attn.o_proj.forward(&gated)
 }
 
 impl Qwen3NextCausalLM {
-    /// Forward pass with custom RoPE positions for sparse prefill.
+    /// Forward pass with custom `RoPE` positions for sparse prefill.
     ///
-    /// This method applies RoPE at arbitrary (non-contiguous) positions using
-    /// rope_dynamic, enabling sparse prefill where only selected tokens are processed.
+    /// This method applies `RoPE` at arbitrary (non-contiguous) positions using
+    /// `rope_dynamic`, enabling sparse prefill where only selected tokens are processed.
     ///
     /// # Arguments
     /// * `inputs` - Selected tokens [B, N] where N = number of selected tokens
@@ -13566,7 +13563,7 @@ impl Qwen3NextCausalLM {
     /// * `kv_cache` - KV cache to update
     ///
     /// # Returns
-    /// Hidden states [B, N, D] with RoPE applied at custom positions
+    /// Hidden states [B, N, D] with `RoPE` applied at custom positions
     pub fn forward_hidden_sparse(
         &mut self,
         inputs: &Array,

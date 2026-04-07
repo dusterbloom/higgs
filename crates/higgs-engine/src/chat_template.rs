@@ -15,7 +15,7 @@ pub struct ChatMessage {
 /// Renders chat messages using a Jinja2 template (`HuggingFace` format).
 pub struct ChatTemplateRenderer {
     env: Environment<'static>,
-    /// Special tokens loaded from tokenizer_config.json for template rendering.
+    /// Special tokens loaded from `tokenizer_config.json` for template rendering.
     bos_token: String,
     eos_token: String,
 }

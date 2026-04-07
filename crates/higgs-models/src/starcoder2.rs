@@ -261,10 +261,9 @@ where
             .reshape(&[B, L, -1])?;
 
             return self.o_proj.forward(&output);
-        } else {
-            queries = apply_rope(&queries, &self.rope, 0)?;
-            keys = apply_rope(&keys, &self.rope, 0)?;
         }
+        queries = apply_rope(&queries, &self.rope, 0)?;
+        keys = apply_rope(&keys, &self.rope, 0)?;
 
         let output = scaled_dot_product_attention(queries, keys, values, self.scale, mask)?
             .transpose_axes(&[0, 2, 1, 3])?
@@ -563,6 +562,7 @@ impl Starcoder2CausalLM {
         })
     }
 
+    #[allow(non_snake_case)]
     pub fn forward<C: KeyValueCache>(
         &mut self,
         inputs: &Array,
@@ -571,8 +571,8 @@ impl Starcoder2CausalLM {
     ) -> Result<Array, Exception> {
         let out = self.forward_hidden(inputs, mask, kv_cache)?;
 
-        let T = inputs.shape().get(1).copied().unwrap_or(1);
-        let lm_input = if T > 1 {
+        let t = inputs.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if t > 1 {
             out.index((.., -1.., ..))
         } else {
             out

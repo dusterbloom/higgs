@@ -38,7 +38,7 @@ struct GdnSnapshot {
     offset: i32,
 }
 
-/// Per-layer block for TurboQuant KV cache.
+/// Per-layer block for `TurboQuant` KV cache.
 ///
 /// Each block holds the 5 quantized arrays for `block_size` tokens:
 /// key/value codes (packed u32), norms, gammas.
@@ -56,7 +56,7 @@ struct TqBlock {
 enum CachedLayerData {
     /// Attention layer: sequence of dense K/V blocks.
     Kv(Vec<KvBlock>),
-    /// Attention layer: sequence of TurboQuant blocks.
+    /// Attention layer: sequence of `TurboQuant` blocks.
     TurboQuantKv(Vec<TqBlock>),
     /// GDN/SSM layer: state snapshot at block boundary.
     Gdn(GdnSnapshot),
@@ -76,7 +76,7 @@ enum CachedData {
         total_tokens: usize,
         is_hybrid: bool,
     },
-    /// Block-paged TurboQuant cache with shared quantization context.
+    /// Block-paged `TurboQuant` cache with shared quantization context.
     TurboQuantPaged {
         layers: Vec<CachedLayerData>,
         context: Arc<TurboQuantContext>,
@@ -283,7 +283,7 @@ impl PagedPrefixCache {
     /// Store a prefix and its cache state as paged blocks.
     ///
     /// For dense KV caches, the K/V arrays are sliced into block-sized views
-    /// (lazy, nearly free). For TurboQuant caches, a full clone fallback is
+    /// (lazy, nearly free). For `TurboQuant` caches, a full clone fallback is
     /// used. Only block-aligned tokens are stored in the trie.
     pub fn store(&mut self, prefix_tokens: &[u32], cache: &AnyCache) {
         if self.max_cached == 0 {
@@ -429,7 +429,7 @@ impl PagedPrefixCache {
 // Slice & materialize helpers
 // ---------------------------------------------------------------------------
 
-/// Check if any layer in the cache uses TurboQuant.
+/// Check if any layer in the cache uses `TurboQuant`.
 fn is_turboquant(cache: &AnyCache) -> bool {
     match cache {
         AnyCache::KV(layers) => layers.iter().any(|l| {
@@ -510,7 +510,7 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
     }
 }
 
-/// Slice a single TurboQuant KV layer into blocks along axis 1.
+/// Slice a single `TurboQuant` KV layer into blocks along axis 1.
 fn slice_tq_layer(
     kv: &SteppingKeyValueCache,
     num_blocks: usize,
@@ -744,7 +744,13 @@ fn gather_tq_blocks(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::shadow_unrelated
+)]
 mod tests {
     use super::*;
     use higgs_models::cache::KeyValueCache;

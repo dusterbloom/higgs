@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Paged KV cache for Higgs.
 //!
-//! Inspired by cellm's BlockAllocator:
-//! https://github.com/jeffasante/cellm/blob/main/crates/cellm-cache/src/allocator.rs
+//! Inspired by cellm's `BlockAllocator`:
+//! <https://github.com/jeffasante/cellm/blob/main/crates/cellm-cache/src/allocator.rs>
 
 pub mod allocator;
 pub mod paged;

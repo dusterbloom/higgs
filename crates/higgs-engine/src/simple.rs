@@ -21,11 +21,17 @@ use crate::{
     model_loader,
     paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
     scheduler::RoundRobinScheduler,
-    spec_prefill::{SpecPrefillConfig, SpecPrefillEngine},
 };
 
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
+
+/// Acquire a `Mutex` lock, recovering from poison by reusing the inner data.
+/// Used in this crate to keep session-management methods infallible while
+/// still satisfying `clippy::unwrap_used`.
+fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Conservative default for chunked prefill on 27B-class models.
 const DEFAULT_CHUNKED_PREFILL_THRESHOLD: i32 = 512;
@@ -49,7 +55,7 @@ fn parse_positive_chunked_prefill_value(raw: Option<&str>, default: i32) -> i32 
 fn parse_enabled_flag(raw: Option<&str>) -> bool {
     matches!(
         raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1") | Some("true") | Some("on") | Some("yes")
+        Some("1" | "true" | "on" | "yes")
     )
 }
 
@@ -180,7 +186,7 @@ pub struct Session {
 
 /// Simple single-request inference engine with paged KV caching and continuous batching.
 ///
-/// Supports both single-request mode (via generate()) and batched mode (via step()).
+/// Supports both single-request mode (via `generate()`) and batched mode (via `step()`).
 /// Uses paged KV cache for efficient memory management and round-robin scheduling
 /// for continuous batching across multiple sessions.
 pub struct SimpleEngine {
@@ -203,8 +209,6 @@ pub struct SimpleEngine {
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
     /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
     think_close_token: Option<u32>,
-    /// SpecPrefill configuration for sparse prefill optimization.
-    spec_prefill: SpecPrefillEngine,
     /// Maximum batch size for continuous batching
     max_batch_size: usize,
     /// Number of trailing tokens added by `add_generation_prompt=true`.
@@ -260,7 +264,11 @@ impl SimpleEngine {
         let think_close_token = tokenizer.encode("</think>", false).ok().and_then(|enc| {
             let ids = enc.get_ids();
             // Must encode to exactly one token to be usable as a forced stop.
-            if ids.len() == 1 { Some(ids[0]) } else { None }
+            if let [single] = ids {
+                Some(*single)
+            } else {
+                None
+            }
         });
         if enable_thinking && think_close_token.is_none() {
             tracing::warn!("Tokenizer has no single </think> token; disabling thinking mode");
@@ -313,11 +321,6 @@ impl SimpleEngine {
             "Engine ready"
         );
 
-        // SpecPrefill configuration
-        let spec_prefill_config = SpecPrefillConfig::default();
-        let spec_prefill = SpecPrefillEngine::new(spec_prefill_config)
-            .map_err(|e: higgs_models::error::ModelError| EngineError::Generation(e.to_string()))?;
-
         // Paged KV cache: 4096 blocks × 64 tokens/block = 262k tokens capacity
         // Adjust based on model size and expected context lengths
         let paged_cache = PagedKvCache::new(
@@ -344,7 +347,6 @@ impl SimpleEngine {
             eos_token_ids,
             enable_thinking,
             think_close_token,
-            spec_prefill,
             max_batch_size: 4,
             gen_prompt_suffix_len,
             kv_cache_config,
@@ -511,79 +513,6 @@ impl SimpleEngine {
                 .model
                 .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
-        } else if false
-            && self
-                .spec_prefill
-                .should_use_spec_prefill(prompt_tokens.len())
-        {
-            // DISABLED: manual RoPE too slow
-            // Sparse prefill with custom RoPE positions
-            use higgs_models::AnyCache;
-
-            let prompt_len = prompt_tokens.len();
-            let keep_rate = self.spec_prefill.get_keep_rate(prompt_len);
-            let n_selected = (prompt_len as f32 * keep_rate) as usize;
-
-            // Select evenly spaced tokens
-            let step = if n_selected > 0 {
-                prompt_len / n_selected
-            } else {
-                1
-            };
-            let selected_indices: Vec<usize> = (0..n_selected).map(|i| i * step).collect();
-
-            tracing::info!(
-                prompt_len,
-                selected_len = selected_indices.len(),
-                keep_rate,
-                "SpecPrefill: selected {}/{} tokens ({:.1}%)",
-                selected_indices.len(),
-                prompt_len,
-                (selected_indices.len() as f32 / prompt_len as f32) * 100.0
-            );
-
-            // Create input array for selected tokens
-            let selected_tokens_vec: Vec<u32> =
-                selected_indices.iter().map(|&i| prompt_tokens[i]).collect();
-            let selected_tokens =
-                Array::from_slice(&selected_tokens_vec, &[1, selected_indices.len() as i32]);
-
-            // Create position array [L]
-            let positions: Vec<i32> = selected_indices.iter().map(|&i| i as i32).collect();
-            let positions_array = Array::from_slice(&positions, &[selected_indices.len() as i32]);
-
-            tracing::info!(
-                "Sparse prefill: positions_array.shape={:?}, positions={:?}",
-                positions_array.shape(),
-                &positions[..std::cmp::min(10, positions.len())]
-            );
-
-            // Get cache
-            let cache = match &mut prepared.cache {
-                AnyCache::Hybrid(vec) => vec,
-                AnyCache::KV(_) => {
-                    return Err(EngineError::Generation(
-                        "Expected Hybrid cache for Qwen3Next".to_string(),
-                    ));
-                }
-            };
-
-            // Run sparse forward pass
-            if let higgs_models::AnyModel::Qwen3Next(qwen_model) = &mut *prepared.model {
-                let hidden = qwen_model
-                    .forward_hidden_sparse(&selected_tokens, &positions_array, cache)
-                    .map_err(EngineError::Mlx)?;
-
-                // Compute logits from last selected token
-                let logits = qwen_model
-                    .compute_logits(&hidden)
-                    .map_err(EngineError::Mlx)?;
-                logits
-            } else {
-                return Err(EngineError::Generation(
-                    "Expected Qwen3Next model".to_string(),
-                ));
-            }
         } else {
             // Text-only prefill: use chunked prefill for long sequences to bound
             // peak memory, otherwise single-pass with last-token-only LM head.
@@ -789,10 +718,10 @@ impl SimpleEngine {
         prompt_tokens: &[u32],
         max_tokens: usize,
     ) -> Result<u64, EngineError> {
-        let mut sessions = self.sessions.lock().unwrap();
-        let mut next_id = self.next_session_id.lock().unwrap();
-        let mut scheduler = self.scheduler.lock().unwrap();
-        let mut paged_cache = self.paged_cache.lock().unwrap();
+        let mut sessions = lock_or_recover(&self.sessions);
+        let mut next_id = lock_or_recover(&self.next_session_id);
+        let mut scheduler = lock_or_recover(&self.scheduler);
+        let mut paged_cache = lock_or_recover(&self.paged_cache);
 
         let session_id = *next_id;
         *next_id += 1;
@@ -800,7 +729,7 @@ impl SimpleEngine {
         // Create session in paged cache
         paged_cache
             .create_session(session_id)
-            .map_err(|e| EngineError::Generation(format!("Failed to create session: {}", e)))?;
+            .map_err(|e| EngineError::Generation(format!("Failed to create session: {e}")))?;
 
         // Create session state
         let session = Session {
@@ -818,32 +747,29 @@ impl SimpleEngine {
 
     /// Get session state.
     pub fn get_session(&self, session_id: u64) -> Option<Session> {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = lock_or_recover(&self.sessions);
         sessions.get(&session_id).cloned()
     }
 
     /// Remove a session and free its resources.
     pub fn remove_session(&self, session_id: u64) -> Result<(), EngineError> {
-        let mut sessions = self.sessions.lock().unwrap();
-        let mut scheduler = self.scheduler.lock().unwrap();
-        let mut paged_cache = self.paged_cache.lock().unwrap();
+        let mut sessions = lock_or_recover(&self.sessions);
+        let mut scheduler = lock_or_recover(&self.scheduler);
+        let mut paged_cache = lock_or_recover(&self.paged_cache);
 
         sessions.remove(&session_id);
         scheduler.remove(session_id);
         paged_cache
             .remove_session(session_id)
-            .map_err(|e| EngineError::Generation(format!("Failed to remove session: {}", e)))?;
+            .map_err(|e| EngineError::Generation(format!("Failed to remove session: {e}")))?;
 
         Ok(())
     }
 
     /// Check if session is finished.
     pub fn is_session_finished(&self, session_id: u64) -> bool {
-        let sessions = self.sessions.lock().unwrap();
-        sessions
-            .get(&session_id)
-            .map(|s| s.finished)
-            .unwrap_or(true)
+        let sessions = lock_or_recover(&self.sessions);
+        sessions.get(&session_id).map_or(true, |s| s.finished)
     }
 
     /// Step one token for all active sessions (batched generation).
@@ -857,8 +783,8 @@ impl SimpleEngine {
         _params: &SamplingParams,
     ) -> Result<Vec<(u64, GenerationOutput)>, EngineError> {
         let mut outputs = Vec::new();
-        let mut scheduler = self.scheduler.lock().unwrap();
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut scheduler = lock_or_recover(&self.scheduler);
+        let mut sessions = lock_or_recover(&self.sessions);
 
         // Process up to max_batch_size sessions
         // TODO: Implement true batching with gather operations
@@ -880,10 +806,8 @@ impl SimpleEngine {
 
             // Generate one token using existing infrastructure
             // TODO: Replace with paged-cache-based generation
-            let last_token = if session.tokens.is_empty() {
+            let Some(&last_token) = session.tokens.last() else {
                 continue; // Should have prompt tokens
-            } else {
-                *session.tokens.last().unwrap()
             };
 
             // Check EOS before generating
@@ -896,7 +820,8 @@ impl SimpleEngine {
                         text: self.decode_tokens(&session.tokens)?,
                         finish_reason: "stop".to_owned(),
                         prompt_tokens: 1, // Placeholder
-                        completion_tokens: session.tokens.len() as u32 - 1,
+                        completion_tokens: u32::try_from(session.tokens.len().saturating_sub(1))
+                            .unwrap_or(u32::MAX),
                         token_logprobs: None,
                     },
                 ));
@@ -913,7 +838,8 @@ impl SimpleEngine {
                         text: self.decode_tokens(&session.tokens)?,
                         finish_reason: "length".to_owned(),
                         prompt_tokens: 1, // Placeholder
-                        completion_tokens: session.tokens.len() as u32 - 1,
+                        completion_tokens: u32::try_from(session.tokens.len().saturating_sub(1))
+                            .unwrap_or(u32::MAX),
                         token_logprobs: None,
                     },
                 ));
@@ -931,7 +857,7 @@ impl SimpleEngine {
                     text: self.decode_tokens(&session.tokens)?,
                     finish_reason: "length".to_owned(),
                     prompt_tokens: 1,
-                    completion_tokens: session.tokens.len() as u32,
+                    completion_tokens: u32::try_from(session.tokens.len()).unwrap_or(u32::MAX),
                     token_logprobs: None,
                 },
             ));
@@ -952,11 +878,11 @@ impl SimpleEngine {
         _logprobs: bool,
         _top_logprobs: Option<u32>,
     ) -> Result<GenerationOutput, EngineError> {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = lock_or_recover(&self.sessions);
 
         let session = sessions
             .get(&session_id)
-            .ok_or_else(|| EngineError::Generation(format!("Session {} not found", session_id)))?;
+            .ok_or_else(|| EngineError::Generation(format!("Session {session_id} not found")))?;
 
         // For now, just return accumulated tokens
         // TODO: Implement paged-cache-based generation
@@ -964,7 +890,7 @@ impl SimpleEngine {
             text: String::new(),
             finish_reason: "length".to_owned(),
             prompt_tokens: 1,
-            completion_tokens: session.tokens.len() as u32,
+            completion_tokens: u32::try_from(session.tokens.len()).unwrap_or(u32::MAX),
             token_logprobs: None,
         })
     }
@@ -1147,7 +1073,7 @@ impl SimpleEngine {
             None
         };
         // Seed thinking state from the first token (already emitted above).
-        let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
+        let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
         let mut seen_think_close =
             think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
@@ -1398,7 +1324,7 @@ impl SimpleEngine {
             None
         };
         // Seed thinking state from the first token (already emitted by caller).
-        let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
+        let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
         let mut seen_think_close =
             think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
@@ -1445,9 +1371,9 @@ impl SimpleEngine {
                         cycles = total_cycles,
                         accept_rate = format!(
                             "{:.1}%",
-                            (accepted as f64 / total_cycles as f64 - 1.0) * 100.0
+                            (f64::from(accepted) / f64::from(total_cycles) - 1.0) * 100.0
                         ),
-                        tok_per_s = format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                        tok_per_s = format!("{:.1}", f64::from(accepted) / elapsed.as_secs_f64()),
                         "MTP decode complete"
                     );
                     return Ok(GenerationOutput {
@@ -1481,9 +1407,9 @@ impl SimpleEngine {
                     cycles = total_cycles,
                     accept_rate = format!(
                         "{:.1}%",
-                        (accepted as f64 / total_cycles as f64 - 1.0) * 100.0
+                        (f64::from(accepted) / f64::from(total_cycles) - 1.0) * 100.0
                     ),
-                    tok_per_s = format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                    tok_per_s = format!("{:.1}", f64::from(accepted) / elapsed.as_secs_f64()),
                     "MTP decode complete (length limit)"
                 );
                 return Ok(GenerationOutput {
@@ -1549,7 +1475,7 @@ impl SimpleEngine {
         } else {
             None
         };
-        let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
+        let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
         let mut seen_think_close =
             think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
@@ -1600,9 +1526,7 @@ impl SimpleEngine {
                 let old_decoded_len = prev_decoded_len;
                 prev_decoded_len = full_text.len();
 
-                let (final_new_text, hit_stop_seq) = if !has_stop_sequences {
-                    (new_text, false)
-                } else {
+                let (final_new_text, hit_stop_seq) = if has_stop_sequences {
                     check_stop_sequences(&full_text, stop_sequences).map_or(
                         (new_text, false),
                         |truncated| {
@@ -1613,6 +1537,8 @@ impl SimpleEngine {
                             (emit, true)
                         },
                     )
+                } else {
+                    (new_text, false)
                 };
 
                 let step_finished = is_eos || is_max || hit_stop_seq;
@@ -1631,9 +1557,9 @@ impl SimpleEngine {
                         cycles = total_cycles,
                         accept_rate = format!(
                             "{:.1}%",
-                            (accepted as f64 / total_cycles as f64 - 1.0) * 100.0
+                            (f64::from(accepted) / f64::from(total_cycles) - 1.0) * 100.0
                         ),
-                        tok_per_s = format!("{:.1}", accepted as f64 / elapsed.as_secs_f64()),
+                        tok_per_s = format!("{:.1}", f64::from(accepted) / elapsed.as_secs_f64()),
                         "MTP streaming decode complete"
                     );
                 }
@@ -1821,7 +1747,7 @@ impl SimpleEngine {
             None
         };
         // Seed thinking state from the first token (already emitted above).
-        let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
+        let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
         let mut seen_think_close =
             think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
@@ -2077,7 +2003,7 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
     }
 }
 
-/// Detect whether a model supports thinking mode based on model_type.
+/// Detect whether a model supports thinking mode based on `model_type`.
 fn detect_thinking_support(model_dir: &Path) -> bool {
     let config_path = model_dir.join("config.json");
     let config_str = match std::fs::read_to_string(&config_path) {
@@ -2338,8 +2264,6 @@ mod tests {
 
     #[test]
     fn test_session_management() {
-        use crate::simple::SimpleEngine;
-        use higgs_models::SamplingParams;
         use tempfile::TempDir;
 
         // Create a minimal test model directory

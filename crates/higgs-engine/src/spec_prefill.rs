@@ -3,7 +3,7 @@
 //! Selects a subset of prompt tokens for initial prefill, trading off
 //! accuracy for reduced TTFT on long sequences.
 //!
-//! Currently disabled pending optimized RoPE implementation.
+//! Currently disabled pending optimized `RoPE` implementation.
 
 use higgs_models::error::ModelError;
 
@@ -32,17 +32,17 @@ pub struct SpecPrefillEngine {
 
 impl SpecPrefillEngine {
     /// Create a new speculative prefill engine.
-    pub fn new(config: SpecPrefillConfig) -> Result<Self, ModelError> {
+    pub const fn new(config: SpecPrefillConfig) -> Result<Self, ModelError> {
         Ok(Self { config })
     }
 
     /// Whether speculative prefill should be used for a given prompt length.
-    pub fn should_use_spec_prefill(&self, prompt_len: usize) -> bool {
+    pub const fn should_use_spec_prefill(&self, prompt_len: usize) -> bool {
         prompt_len >= self.config.min_prompt_len
     }
 
     /// Get the keep rate for token selection.
-    pub fn get_keep_rate(&self, _prompt_len: usize) -> f32 {
+    pub const fn get_keep_rate(&self, _prompt_len: usize) -> f32 {
         self.config.keep_rate
     }
 }

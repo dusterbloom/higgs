@@ -285,7 +285,7 @@ impl TurboQuantContext {
         let dim =
             usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
         let bits = self.config.value_bits();
-        let expected_bytes = (dim * usize::from(bits) + 7) / 8;
+        let expected_bytes = (dim * usize::from(bits)).div_ceil(8);
         if value.codes.len() < expected_bytes {
             return Err(Exception::custom(format!(
                 "dequantize_value: packed buffer too short ({} < {expected_bytes})",
@@ -302,7 +302,7 @@ impl TurboQuantContext {
         let dim =
             usize::try_from(self.head_dim).map_err(|_| Exception::custom("head_dim overflow"))?;
         let bits = self.config.key_bits();
-        let expected_bytes = (dim * usize::from(bits) + 7) / 8;
+        let expected_bytes = (dim * usize::from(bits)).div_ceil(8);
         if key.codes.len() < expected_bytes {
             return Err(Exception::custom(format!(
                 "dequantize_key: packed buffer too short ({} < {expected_bytes})",
@@ -337,7 +337,7 @@ impl TurboQuantContext {
     /// Batch-quantize values using GPU ops.
     ///
     /// Input: `[H, T, D]` f32 tensor.
-    /// Returns `(norms: [H, T], packed_codes: Vec<u8>)` where packed_codes is
+    /// Returns `(norms: [H, T], packed_codes: Vec<u8>)` where `packed_codes` is
     /// laid out as `[H * T * value_code_bytes]` in row-major order.
     pub fn quantize_values_batch(&self, values: &Array) -> Result<BatchQuantizedValues, Exception> {
         let shape = values.shape();
@@ -629,7 +629,7 @@ pub struct BatchQuantizedKeys {
 
 /// Pack u32 index values into a byte buffer at the given bit width.
 fn pack_u32_indices(indices: &[u32], bits: u8, out: &mut [u8]) {
-    let required_bytes = (indices.len() * usize::from(bits) + 7) / 8;
+    let required_bytes = (indices.len() * usize::from(bits)).div_ceil(8);
     assert!(
         out.len() >= required_bytes,
         "pack_u32_indices: output buffer too small ({} < {required_bytes})",
@@ -784,8 +784,7 @@ fn scaled_centroids(bits: u8, scale: f32) -> Result<Vec<f32>, Exception> {
         4 => &FOUR_BIT_CENTROIDS,
         _ => {
             return Err(Exception::custom(format!(
-                "TurboQuant centroids only implemented for 1-4 bits, got {}",
-                bits
+                "TurboQuant centroids only implemented for 1-4 bits, got {bits}"
             )));
         }
     };

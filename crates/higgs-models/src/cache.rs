@@ -17,10 +17,8 @@ static TURBOQUANT_ACTIVATE_AT: OnceLock<i32> = OnceLock::new();
 const DEFAULT_TURBOQUANT_ACTIVATE_AT: i32 = 5000;
 
 fn parse_turboquant_activate_at(raw: Option<&str>) -> i32 {
-    match raw.and_then(|s| s.parse::<i32>().ok()) {
-        Some(v) => v.max(0),
-        None => DEFAULT_TURBOQUANT_ACTIVATE_AT,
-    }
+    raw.and_then(|s| s.parse::<i32>().ok())
+        .map_or(DEFAULT_TURBOQUANT_ACTIVATE_AT, |v| v.max(0))
 }
 
 fn turboquant_activate_at() -> i32 {
@@ -45,7 +43,7 @@ impl KvCacheView {
         }
     }
 
-    pub fn turboquant(&self) -> Option<&TurboQuantKvView> {
+    pub const fn turboquant(&self) -> Option<&TurboQuantKvView> {
         match self {
             Self::Dense { .. } => None,
             Self::TurboQuant(view) => Some(view),
@@ -53,7 +51,7 @@ impl KvCacheView {
     }
 }
 
-/// Quantized cache view used by the TurboQuant decode path.
+/// Quantized cache view used by the `TurboQuant` decode path.
 #[derive(Debug, Clone)]
 pub struct TurboQuantKvView {
     pub context: Arc<TurboQuantContext>,
@@ -392,7 +390,11 @@ impl SteppingKeyValueCache {
             mode: KvCacheMode::Turboquant,
             ..config
         };
-        let context = Arc::new(TurboQuantContext::new(turbo_config, head_dim, num_kv_heads)?);
+        let context = Arc::new(TurboQuantContext::new(
+            turbo_config,
+            head_dim,
+            num_kv_heads,
+        )?);
         Ok(Self {
             keys: None,
             values: None,
@@ -431,19 +433,19 @@ impl SteppingKeyValueCache {
     }
 
     /// Read-only access to internal key array (includes allocated-but-unused slots).
-    pub fn keys(&self) -> Option<&Array> {
+    pub const fn keys(&self) -> Option<&Array> {
         self.keys.as_ref()
     }
 
     /// Read-only access to internal value array (includes allocated-but-unused slots).
-    pub fn values(&self) -> Option<&Array> {
+    pub const fn values(&self) -> Option<&Array> {
         self.values.as_ref()
     }
 
     /// Create a pre-filled cache from existing K/V arrays.
     ///
     /// Sets `offset = keys.shape()[2]` so the next `update_dense` triggers a
-    /// normal grow cycle. Dense mode only (no TurboQuant).
+    /// normal grow cycle. Dense mode only (no `TurboQuant`).
     pub fn from_arrays(keys: Array, values: Array) -> Self {
         let offset = keys.shape().get(2).copied().unwrap_or(0);
         Self {
@@ -493,7 +495,7 @@ impl SteppingKeyValueCache {
         offset: i32,
     ) -> Self {
         let capacity = key_codes.shape().get(1).copied().unwrap_or(0);
-        let config = context.config.clone();
+        let config = context.config;
         Self {
             keys: None,
             values: None,
@@ -518,14 +520,14 @@ impl SteppingKeyValueCache {
         self.turbo.as_ref().is_some_and(|t| t.capacity > 0)
     }
 
-    fn update_dense(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
+    fn update_dense(&mut self, keys: &Array, values: &Array) -> Result<KvCacheView, Exception> {
         let prev = self.offset;
         let k_shape = keys.shape();
         let v_shape = values.shape();
         let dim = |s: &[i32], i: usize, label: &'static str| -> Result<i32, Exception> {
-            s.get(i)
-                .copied()
-                .ok_or_else(|| Exception::custom(format!("update_dense: missing dim {i} ({label})")))
+            s.get(i).copied().ok_or_else(|| {
+                Exception::custom(format!("update_dense: missing dim {i} ({label})"))
+            })
         };
         let new_tokens = dim(k_shape, 2, "keys T")?;
 
@@ -574,8 +576,8 @@ impl SteppingKeyValueCache {
             .as_ref()
             .ok_or_else(|| Exception::custom("Values cannot be None after grow"))?;
 
-        let updated_k = slice_update_axis2(k, &keys, prev, new_tokens)?;
-        let updated_v = slice_update_axis2(v, &values, prev, new_tokens)?;
+        let updated_k = slice_update_axis2(k, keys, prev, new_tokens)?;
+        let updated_v = slice_update_axis2(v, values, prev, new_tokens)?;
         self.keys = Some(updated_k);
         self.values = Some(updated_v);
 
@@ -604,8 +606,8 @@ impl SteppingKeyValueCache {
 
     fn update_and_view_with_activation_threshold(
         &mut self,
-        keys: Array,
-        values: Array,
+        keys: &Array,
+        values: &Array,
         activate_at: i32,
     ) -> Result<KvCacheView, Exception> {
         if keys.ndim() < 4 {
@@ -641,7 +643,7 @@ impl SteppingKeyValueCache {
                     if let (Some(dense_k), Some(dense_v)) = (&self.keys, &self.values) {
                         let k = slice_axis2(dense_k, 0, self.offset)?;
                         let v = slice_axis2(dense_v, 0, self.offset)?;
-                        turbo.append(k, v, 0, self.step)?;
+                        turbo.append(&k, &v, 0, self.step)?;
                         self.keys = None;
                         self.values = None;
                     }
@@ -657,9 +659,11 @@ impl SteppingKeyValueCache {
             self.update_dense(keys, values)?
         };
         self.offset = match &new_view {
-            KvCacheView::Dense { keys: dense_keys, .. } => *dense_keys.shape().get(2).ok_or_else(
-                || Exception::custom("update_and_view: dense result missing token dim"),
-            )?,
+            KvCacheView::Dense {
+                keys: dense_keys, ..
+            } => *dense_keys.shape().get(2).ok_or_else(|| {
+                Exception::custom("update_and_view: dense result missing token dim")
+            })?,
             KvCacheView::TurboQuant(turbo_view) => turbo_view.seq_len,
         };
         Ok(new_view)
@@ -667,7 +671,7 @@ impl SteppingKeyValueCache {
 }
 
 impl TurboQuantStorage {
-    fn new(context: Arc<TurboQuantContext>) -> Self {
+    const fn new(context: Arc<TurboQuantContext>) -> Self {
         Self {
             context,
             key_codes: None,
@@ -724,12 +728,12 @@ impl TurboQuantStorage {
 
     fn append(
         &mut self,
-        keys: Array,
-        values: Array,
+        keys: &Array,
+        values: &Array,
         prev: i32,
         step: i32,
     ) -> Result<TurboQuantKvView, Exception> {
-        validate_turboquant_shapes(&keys, &values, &self.context)?;
+        validate_turboquant_shapes(keys, values, &self.context)?;
 
         let new_tokens = *keys
             .shape()
@@ -750,16 +754,10 @@ impl TurboQuantStorage {
             .reshape(&value_shape)?;
 
         // Squeeze batch dim: [1, H, T, D] → [H, T, D] for GPU quantization
-        let keys_3d = keys_cont.reshape(&[
-            self.context.num_kv_heads,
-            new_tokens,
-            self.context.head_dim,
-        ])?;
-        let values_3d = values_cont.reshape(&[
-            self.context.num_kv_heads,
-            new_tokens,
-            self.context.head_dim,
-        ])?;
+        let keys_3d =
+            keys_cont.reshape(&[self.context.num_kv_heads, new_tokens, self.context.head_dim])?;
+        let values_3d =
+            values_cont.reshape(&[self.context.num_kv_heads, new_tokens, self.context.head_dim])?;
 
         // GPU quantize → lazy Arrays (no eval, no CPU readback)
         let (v_norms, v_codes) = self.context.quantize_values_gpu(&values_3d)?;
@@ -860,7 +858,7 @@ impl KeyValueCache for SteppingKeyValueCache {
     }
 
     fn update_and_view(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
-        self.update_and_view_with_activation_threshold(keys, values, turboquant_activate_at())
+        self.update_and_view_with_activation_threshold(&keys, &values, turboquant_activate_at())
     }
 }
 
@@ -1367,7 +1365,7 @@ mod tests {
         // Multi-token prefill: returns Dense (quantization deferred)
         let (keys, values) = make_kv_pair(2, 8);
         let prefill_view = cache
-            .update_and_view_with_activation_threshold(keys, values, 0)
+            .update_and_view_with_activation_threshold(&keys, &values, 0)
             .unwrap();
         assert!(
             prefill_view.turboquant().is_none(),
@@ -1378,7 +1376,7 @@ mod tests {
         // First decode token with an immediate threshold: triggers bulk quantize.
         let (k1, v1) = make_kv_pair(1, 8);
         let decode_view = cache
-            .update_and_view_with_activation_threshold(k1, v1, 0)
+            .update_and_view_with_activation_threshold(&k1, &v1, 0)
             .unwrap();
         let turbo = decode_view.turboquant().unwrap();
         assert_eq!(turbo.seq_len, 3); // 2 prefill + 1 decode
@@ -1402,14 +1400,14 @@ mod tests {
 
         let (prefill_k, prefill_v) = make_kv_pair(2, 8);
         let prefill_view = cache
-            .update_and_view_with_activation_threshold(prefill_k, prefill_v, 4)
+            .update_and_view_with_activation_threshold(&prefill_k, &prefill_v, 4)
             .unwrap();
         assert!(prefill_view.turboquant().is_none());
         assert_eq!(cache.offset(), 2);
 
         let (k1, v1) = make_kv_pair(1, 8);
         let below_view = cache
-            .update_and_view_with_activation_threshold(k1, v1, 4)
+            .update_and_view_with_activation_threshold(&k1, &v1, 4)
             .unwrap();
         assert!(
             below_view.turboquant().is_none(),
@@ -1423,11 +1421,11 @@ mod tests {
 
         let (k2, v2) = make_kv_pair(1, 8);
         let cross_view = cache
-            .update_and_view_with_activation_threshold(k2, v2, 4)
+            .update_and_view_with_activation_threshold(&k2, &v2, 4)
             .unwrap();
-        let turbo = cross_view.turboquant().unwrap_or_else(|| {
-            panic!("threshold-crossing decode should activate TurboQuant")
-        });
+        let turbo = cross_view
+            .turboquant()
+            .unwrap_or_else(|| panic!("threshold-crossing decode should activate TurboQuant"));
         assert_eq!(turbo.seq_len, 4);
         assert!(
             cache.keys.is_none(),
@@ -1471,7 +1469,7 @@ mod tests {
         // 3D shape [B, T, D] — missing the head axis.
         let bad_keys = Array::zeros::<f32>(&[1, 4, 8]).unwrap();
         let bad_values = Array::zeros::<f32>(&[1, 4, 8]).unwrap();
-        let result = cache.update_and_view_with_activation_threshold(bad_keys, bad_values, 0);
+        let result = cache.update_and_view_with_activation_threshold(&bad_keys, &bad_values, 0);
         assert!(result.is_err(), "3D input should be rejected, not panic");
     }
 

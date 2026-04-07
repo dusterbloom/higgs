@@ -81,7 +81,7 @@ impl PagedKvCache {
     }
 
     /// Get number of blocks in use.
-    pub fn in_use_blocks(&self) -> usize {
+    pub const fn in_use_blocks(&self) -> usize {
         self.allocator.in_use_count()
     }
 

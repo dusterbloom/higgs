@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Round-robin scheduler for continuous batching.
 //!
-//! Implementation inspired by cellm's RoundRobinScheduler:
-//! https://github.com/jeffasante/cellm/blob/main/crates/cellm-scheduler/src/rr.rs
+//! Implementation inspired by cellm's `RoundRobinScheduler`:
+//! <https://github.com/jeffasante/cellm/blob/main/crates/cellm-scheduler/src/rr.rs>
 
 use std::collections::VecDeque;
 
@@ -17,7 +17,7 @@ pub struct RoundRobinScheduler {
 
 impl RoundRobinScheduler {
     /// Create a new empty scheduler.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { q: VecDeque::new() }
     }
 

@@ -14,8 +14,8 @@ pub struct KvCacheLayout {
 }
 
 impl KvCacheLayout {
-    /// Calculate elements per token (num_kv_heads * head_dim).
-    pub fn elems_per_token(&self) -> usize {
+    /// Calculate elements per token (`num_kv_heads` * `head_dim`).
+    pub const fn elems_per_token(&self) -> usize {
         self.num_kv_heads * self.head_dim
     }
 
@@ -51,21 +51,21 @@ impl CpuKvStorage {
     }
 
     /// Get the cache layout.
-    pub fn layout(&self) -> &KvCacheLayout {
+    pub const fn layout(&self) -> &KvCacheLayout {
         &self.layout
     }
 
     /// Get capacity in tokens.
-    pub fn capacity_tokens(&self) -> usize {
+    pub const fn capacity_tokens(&self) -> usize {
         self.layout.num_blocks * self.layout.block_size
     }
 
     /// Write a single token's KV data in f16 format.
     ///
     /// # Arguments
-    /// * `base` - Base index in the cache (token position * elems_per_token)
-    /// * `k_src` - Key data [num_kv_heads * head_dim]
-    /// * `v_src` - Value data [num_kv_heads * head_dim]
+    /// * `base` - Base index in the cache (token position * `elems_per_token`)
+    /// * `k_src` - Key data [`num_kv_heads` * `head_dim`]
+    /// * `v_src` - Value data [`num_kv_heads` * `head_dim`]
     pub fn write_token_f16(
         &mut self,
         base: usize,
@@ -80,15 +80,25 @@ impl CpuKvStorage {
             });
         }
         let end = base.saturating_add(kv_dim);
-        if end > self.k.len() || end > self.v.len() {
-            return Err(CacheError::WriteOutOfBounds {
+        let cap = self.k.len();
+        let k_dst = self
+            .k
+            .get_mut(base..end)
+            .ok_or(CacheError::WriteOutOfBounds {
                 base,
                 len: kv_dim,
-                cap: self.k.len(),
-            });
-        }
-        self.k[base..end].copy_from_slice(k_src);
-        self.v[base..end].copy_from_slice(v_src);
+                cap,
+            })?;
+        let v_dst = self
+            .v
+            .get_mut(base..end)
+            .ok_or(CacheError::WriteOutOfBounds {
+                base,
+                len: kv_dim,
+                cap,
+            })?;
+        k_dst.copy_from_slice(k_src);
+        v_dst.copy_from_slice(v_src);
         Ok(())
     }
 
@@ -107,16 +117,28 @@ impl CpuKvStorage {
             });
         }
         let end = base.saturating_add(kv_dim);
-        if end > self.k.len() || end > self.v.len() {
-            return Err(CacheError::WriteOutOfBounds {
+        let cap = self.k.len();
+        let k_dst = self
+            .k
+            .get_mut(base..end)
+            .ok_or(CacheError::WriteOutOfBounds {
                 base,
                 len: kv_dim,
-                cap: self.k.len(),
-            });
+                cap,
+            })?;
+        let v_dst = self
+            .v
+            .get_mut(base..end)
+            .ok_or(CacheError::WriteOutOfBounds {
+                base,
+                len: kv_dim,
+                cap,
+            })?;
+        for (dst, src) in k_dst.iter_mut().zip(k_src.iter()) {
+            *dst = f16::from_f32(*src);
         }
-        for i in 0..kv_dim {
-            self.k[base + i] = f16::from_f32(k_src[i]);
-            self.v[base + i] = f16::from_f32(v_src[i]);
+        for (dst, src) in v_dst.iter_mut().zip(v_src.iter()) {
+            *dst = f16::from_f32(*src);
         }
         Ok(())
     }
@@ -136,15 +158,19 @@ impl CpuKvStorage {
             });
         }
         let end = base.saturating_add(kv_dim);
-        if end > self.k.len() || end > self.v.len() {
-            return Err(CacheError::ReadOutOfBounds {
-                base,
-                len: kv_dim,
-                cap: self.k.len(),
-            });
-        }
-        k_out.copy_from_slice(&self.k[base..end]);
-        v_out.copy_from_slice(&self.v[base..end]);
+        let cap = self.k.len();
+        let k_src = self.k.get(base..end).ok_or(CacheError::ReadOutOfBounds {
+            base,
+            len: kv_dim,
+            cap,
+        })?;
+        let v_src = self.v.get(base..end).ok_or(CacheError::ReadOutOfBounds {
+            base,
+            len: kv_dim,
+            cap,
+        })?;
+        k_out.copy_from_slice(k_src);
+        v_out.copy_from_slice(v_src);
         Ok(())
     }
 
@@ -163,16 +189,22 @@ impl CpuKvStorage {
             });
         }
         let end = base.saturating_add(kv_dim);
-        if end > self.k.len() || end > self.v.len() {
-            return Err(CacheError::ReadOutOfBounds {
-                base,
-                len: kv_dim,
-                cap: self.k.len(),
-            });
+        let cap = self.k.len();
+        let k_src = self.k.get(base..end).ok_or(CacheError::ReadOutOfBounds {
+            base,
+            len: kv_dim,
+            cap,
+        })?;
+        let v_src = self.v.get(base..end).ok_or(CacheError::ReadOutOfBounds {
+            base,
+            len: kv_dim,
+            cap,
+        })?;
+        for (dst, src) in k_out.iter_mut().zip(k_src.iter()) {
+            *dst = src.to_f32();
         }
-        for i in 0..kv_dim {
-            k_out[i] = self.k[base + i].to_f32();
-            v_out[i] = self.v[base + i].to_f32();
+        for (dst, src) in v_out.iter_mut().zip(v_src.iter()) {
+            *dst = src.to_f32();
         }
         Ok(())
     }
@@ -181,8 +213,8 @@ impl CpuKvStorage {
     ///
     /// # Arguments
     /// * `bases` - Base indices for each token to gather
-    /// * `k_out` - Output buffer [bases.len() * kv_dim]
-    /// * `v_out` - Output buffer [bases.len() * kv_dim]
+    /// * `k_out` - Output buffer [`bases.len()` * `kv_dim`]
+    /// * `v_out` - Output buffer [`bases.len()` * `kv_dim`]
     pub fn gather_tokens_f16(
         &self,
         bases: &[usize],
@@ -203,18 +235,24 @@ impl CpuKvStorage {
                 v_len: need,
             });
         }
-        for (t, &base) in bases.iter().enumerate() {
+        let cap = self.k.len();
+        for (k_chunk, (v_chunk, &base)) in k_out
+            .chunks_exact_mut(kv_dim)
+            .zip(v_out.chunks_exact_mut(kv_dim).zip(bases.iter()))
+        {
             let end = base.saturating_add(kv_dim);
-            if end > self.k.len() || end > self.v.len() {
-                return Err(CacheError::ReadOutOfBounds {
-                    base,
-                    len: kv_dim,
-                    cap: self.k.len(),
-                });
-            }
-            let dst = t * kv_dim;
-            k_out[dst..dst + kv_dim].copy_from_slice(&self.k[base..end]);
-            v_out[dst..dst + kv_dim].copy_from_slice(&self.v[base..end]);
+            let k_src = self.k.get(base..end).ok_or(CacheError::ReadOutOfBounds {
+                base,
+                len: kv_dim,
+                cap,
+            })?;
+            let v_src = self.v.get(base..end).ok_or(CacheError::ReadOutOfBounds {
+                base,
+                len: kv_dim,
+                cap,
+            })?;
+            k_chunk.copy_from_slice(k_src);
+            v_chunk.copy_from_slice(v_src);
         }
         Ok(())
     }
@@ -240,19 +278,27 @@ impl CpuKvStorage {
                 v_len: need,
             });
         }
-        for (t, &base) in bases.iter().enumerate() {
+        let cap = self.k.len();
+        for (k_chunk, (v_chunk, &base)) in k_out
+            .chunks_exact_mut(kv_dim)
+            .zip(v_out.chunks_exact_mut(kv_dim).zip(bases.iter()))
+        {
             let end = base.saturating_add(kv_dim);
-            if end > self.k.len() || end > self.v.len() {
-                return Err(CacheError::ReadOutOfBounds {
-                    base,
-                    len: kv_dim,
-                    cap: self.k.len(),
-                });
+            let k_src = self.k.get(base..end).ok_or(CacheError::ReadOutOfBounds {
+                base,
+                len: kv_dim,
+                cap,
+            })?;
+            let v_src = self.v.get(base..end).ok_or(CacheError::ReadOutOfBounds {
+                base,
+                len: kv_dim,
+                cap,
+            })?;
+            for (dst, src) in k_chunk.iter_mut().zip(k_src.iter()) {
+                *dst = src.to_f32();
             }
-            let dst = t * kv_dim;
-            for i in 0..kv_dim {
-                k_out[dst + i] = self.k[base + i].to_f32();
-                v_out[dst + i] = self.v[base + i].to_f32();
+            for (dst, src) in v_chunk.iter_mut().zip(v_src.iter()) {
+                *dst = src.to_f32();
             }
         }
         Ok(())
@@ -260,6 +306,41 @@ impl CpuKvStorage {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::shadow_reuse,
+    clippy::shadow_same,
+    clippy::shadow_unrelated,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::doc_markdown,
+    clippy::needless_for_each,
+    clippy::needless_collect,
+    clippy::redundant_closure_for_method_calls,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_range_loop,
+    clippy::manual_flatten,
+    clippy::unnecessary_map_or,
+    clippy::uninlined_format_args,
+    clippy::manual_range_contains,
+    clippy::explicit_iter_loop,
+    clippy::borrow_as_ptr,
+    clippy::ref_as_ptr,
+    clippy::str_to_string,
+    clippy::if_then_some_else_none,
+    clippy::redundant_type_annotations
+)]
 mod tests {
     use super::*;
 

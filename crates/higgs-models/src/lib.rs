@@ -332,7 +332,7 @@ impl AnyModel {
     }
 
     /// Whether this model has a loaded MTP head for speculative decode.
-    pub fn has_mtp(&self) -> bool {
+    pub const fn has_mtp(&self) -> bool {
         matches!(self, Self::Qwen3Next(m) if m.has_mtp())
     }
 
@@ -1066,7 +1066,6 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::cache::KeyValueCache;
 
     fn params(temp: f32, top_p: f32) -> SamplingParams {
         SamplingParams {
