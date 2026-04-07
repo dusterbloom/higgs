@@ -1425,4 +1425,60 @@ mod tests {
         assert!(should_activate_turboquant(7, 1, 8));
         assert!(should_activate_turboquant(8, 1, 8));
     }
+
+    /// Regression: `update_and_view_with_activation_threshold` must reject
+    /// 3D inputs because `update_dense` indexes `shape()[3]`. Previously the
+    /// guard was `ndim() < 3`, which let 3D arrays through and panicked.
+    #[test]
+    fn test_update_and_view_rejects_3d_input() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            ..Default::default()
+        };
+        let mut cache = SteppingKeyValueCache::new_turbo(config, 2, 8).unwrap();
+        // 3D shape [B, T, D] — missing the head axis.
+        let bad_keys = Array::zeros::<f32>(&[1, 4, 8]).unwrap();
+        let bad_values = Array::zeros::<f32>(&[1, 4, 8]).unwrap();
+        let result = cache.update_and_view_with_activation_threshold(bad_keys, bad_values, 0);
+        assert!(result.is_err(), "3D input should be rejected, not panic");
+    }
+
+    /// Regression: `from_turbo_arrays` must propagate the parent context's
+    /// `KvCacheConfig` (key_bits, seed, etc.) instead of hard-coding defaults.
+    /// Previously the constructor wrote `KvCacheConfig { mode: Turboquant,
+    /// ..default() }`, silently dropping all user-configured fields.
+    #[test]
+    fn test_from_turbo_arrays_propagates_config() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 4,
+            seed: 99,
+            ..Default::default()
+        };
+        let context = Arc::new(TurboQuantContext::new(config, 8, 2).unwrap());
+
+        // Build minimal placeholder arrays — shapes don't matter for this test;
+        // we only verify the config was carried through.
+        let key_codes = Array::zeros::<u32>(&[2, 0, 1]).unwrap();
+        let key_norms = Array::zeros::<f32>(&[2, 0]).unwrap();
+        let key_gammas = Array::zeros::<f32>(&[2, 0]).unwrap();
+        let value_codes = Array::zeros::<u32>(&[2, 0, 1]).unwrap();
+        let value_norms = Array::zeros::<f32>(&[2, 0]).unwrap();
+
+        let cache = SteppingKeyValueCache::from_turbo_arrays(
+            context,
+            key_codes,
+            key_norms,
+            key_gammas,
+            value_codes,
+            value_norms,
+            0,
+        );
+
+        let propagated = cache.kv_cache_config();
+        assert_eq!(propagated.bits, 4, "bits must be carried from context");
+        assert_eq!(propagated.seed, 99, "seed must be carried from context");
+        assert!(matches!(propagated.mode, KvCacheMode::Turboquant));
+    }
 }
