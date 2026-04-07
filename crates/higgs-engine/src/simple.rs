@@ -325,7 +325,8 @@ impl SimpleEngine {
             64,   // block_size (tokens per block)
             2,    // num_kv_heads (Qwen3.5-35B-A3B uses GQA with 2 KV heads)
             256,  // head_dim (Qwen3.5-35B-A3B)
-        );
+        )
+        .map_err(|e| EngineError::Generation(format!("paged cache init: {e}")))?;
 
         Ok(Self {
             model: Mutex::new(model),

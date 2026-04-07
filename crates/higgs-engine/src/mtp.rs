@@ -66,12 +66,12 @@ pub fn mtp_cycle(
 
         // Process draft token to advance cache and get bonus prediction.
         let draft_input = Array::from_slice(&[draft_token_id as i32], &[1, 1]);
-        let (draft_hidden, draft_logits) = model
+        let (draft_hidden, bonus_logits) = model
             .forward_with_hidden(&draft_input, None, cache)
             .map_err(EngineError::Mlx)?;
 
         let bonus_token =
-            argmax_axis!(&draft_logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
+            argmax_axis!(&bonus_logits.index((.., -1, ..)), -1).map_err(EngineError::Mlx)?;
         let h_last = draft_hidden.index((.., -1.., ..));
         eval([&bonus_token, &h_last]).map_err(EngineError::Mlx)?;
         let bonus_id: u32 = bonus_token.item();

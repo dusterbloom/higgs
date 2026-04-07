@@ -162,7 +162,9 @@ impl RadixNode {
                 // Paged entries require at least min_prefix tokens for block alignment.
                 match &cs.data {
                     CachedData::Cloned(_) => depth > 0,
-                    _ => depth >= min_prefix,
+                    CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => {
+                        depth >= min_prefix
+                    }
                 }
             })
             .map(|cs| (depth, cs));
@@ -459,12 +461,13 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
     // Hybrid caches (GDN+KV) can't be block-paged because GDN sequential state
     // doesn't align to block boundaries. The KV offset would mismatch the GDN
     // offset after materialization, producing corrupt attention. Use clone instead.
-    if matches!(cache, AnyCache::Hybrid(_)) {
+    let AnyCache::KV(kv_layers) = cache else {
         return Ok(CachedData::Cloned(cache.clone()));
-    }
+    };
 
     let offset = kv_offset(cache).unwrap_or(0);
-    let num_blocks = offset as usize / block_size;
+    let offset_usize = usize::try_from(offset).unwrap_or(0);
+    let num_blocks = offset_usize / block_size;
     if num_blocks == 0 {
         return Err(Exception::custom("Cache too short for paging"));
     }
@@ -473,31 +476,23 @@ fn slice_into_blocks(cache: &AnyCache, block_size: usize) -> Result<CachedData, 
         i32::try_from(block_size).map_err(|_| Exception::custom("block_size overflow"))?;
 
     // Slice KV layers as TQ blocks when actually quantized, dense otherwise.
-    // Hybrid caches are handled by the early-return clone above.
-    let (layers, tq_context) = match cache {
-        AnyCache::KV(kv_layers) => {
-            let mut ctx: Option<Arc<TurboQuantContext>> = None;
-            let layers: Result<Vec<_>, _> = kv_layers
-                .iter()
-                .map(|layer_opt| {
-                    let Some(kv) = layer_opt.as_ref() else {
-                        return Ok(CachedLayerData::Empty);
-                    };
-                    if kv.is_quantized() {
-                        if ctx.is_none() {
-                            ctx = kv.turbo_arrays().map(|(c, ..)| Arc::clone(c));
-                        }
-                        slice_tq_layer(kv, num_blocks, block_size_i32)
-                    } else {
-                        slice_kv_layer(Some(kv), num_blocks, block_size_i32)
-                    }
-                })
-                .collect();
-            (layers?, ctx)
-        }
-        // Hybrid caches returned Cloned above; this arm is unreachable.
-        AnyCache::Hybrid(_) => unreachable!("Hybrid caches use clone fallback"),
-    };
+    let mut tq_context: Option<Arc<TurboQuantContext>> = None;
+    let layers: Vec<CachedLayerData> = kv_layers
+        .iter()
+        .map(|layer_opt| {
+            let Some(kv) = layer_opt.as_ref() else {
+                return Ok(CachedLayerData::Empty);
+            };
+            if kv.is_quantized() {
+                if tq_context.is_none() {
+                    tq_context = kv.turbo_arrays().map(|(c, ..)| Arc::clone(c));
+                }
+                slice_tq_layer(kv, num_blocks, block_size_i32)
+            } else {
+                slice_kv_layer(Some(kv), num_blocks, block_size_i32)
+            }
+        })
+        .collect::<Result<_, _>>()?;
 
     if let Some(context) = tq_context {
         Ok(CachedData::TurboQuantPaged {
@@ -550,11 +545,11 @@ fn slice_tq_layer(
 
 /// Slice a single KV layer into blocks.
 fn slice_kv_layer(
-    kv: Option<&SteppingKeyValueCache>,
+    kv_opt: Option<&SteppingKeyValueCache>,
     num_blocks: usize,
     block_size: i32,
 ) -> Result<CachedLayerData, Exception> {
-    let Some(kv) = kv else {
+    let Some(kv) = kv_opt else {
         return Ok(CachedLayerData::Empty);
     };
     let (Some(keys), Some(values)) = (kv.keys(), kv.values()) else {
@@ -684,14 +679,14 @@ fn materialize_tq_hybrid(
 
 /// Gather KV blocks into a single contiguous `SteppingKeyValueCache`.
 fn gather_blocks(blocks: &[KvBlock]) -> Result<SteppingKeyValueCache, Exception> {
-    if blocks.is_empty() {
+    let Some(first) = blocks.first() else {
         return Ok(SteppingKeyValueCache::new());
-    }
+    };
 
     if blocks.len() == 1 {
         return Ok(SteppingKeyValueCache::from_arrays(
-            blocks[0].keys.clone(),
-            blocks[0].values.clone(),
+            first.keys.clone(),
+            first.values.clone(),
         ));
     }
 
@@ -714,10 +709,13 @@ fn gather_tq_blocks(
 
     // Concatenate all block arrays along axis 1 (the sequence dimension).
     let concat1 = |arrays: Vec<Array>| -> Result<Array, Exception> {
-        if arrays.len() == 1 {
-            Ok(arrays.into_iter().next().unwrap())
-        } else {
-            concatenate_axis(&arrays, 1)
+        match arrays.len() {
+            0 => Err(Exception::custom("empty TQ block array")),
+            1 => arrays
+                .into_iter()
+                .next()
+                .ok_or_else(|| Exception::custom("empty TQ block array")),
+            _ => concatenate_axis(&arrays, 1),
         }
     };
 

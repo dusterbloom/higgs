@@ -59,9 +59,8 @@ impl ChatTemplateRenderer {
             None
         };
 
-        let extract_token = |config: &serde_json::Value, key: &str| -> String {
-            config
-                .get(key)
+        let extract_token = |cfg: &serde_json::Value, key: &str| -> String {
+            cfg.get(key)
                 .and_then(|v| {
                     // Token can be a string or {"content": "..."} object
                     v.as_str().map(ToOwned::to_owned).or_else(|| {
@@ -73,7 +72,7 @@ impl ChatTemplateRenderer {
                 .unwrap_or_default()
         };
 
-        let mut set_tokens = |renderer: &mut Self| {
+        let set_tokens = |renderer: &mut Self| {
             if let Some(ref cfg) = config {
                 renderer.bos_token = extract_token(cfg, "bos_token");
                 renderer.eos_token = extract_token(cfg, "eos_token");

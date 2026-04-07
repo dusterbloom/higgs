@@ -7,3 +7,6 @@ target/
 mlx-rs/
 bench/
 .gitnexus
+.venv/
+.pytest_cache/
+*   /__pycache__/

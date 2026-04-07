@@ -13,21 +13,21 @@ pub struct KvCacheView<'a> {
     pub layout: &'a KvCacheLayout,
 }
 
-impl<'a> KvCacheView<'a> {
+impl KvCacheView<'_> {
     /// Get number of tokens in this session.
-    pub fn num_tokens(&self) -> usize {
+    pub const fn num_tokens(&self) -> usize {
         self.num_tokens
     }
 
-    /// Get block ID for a token position.
-    pub fn block_for_token(&self, token_idx: usize) -> u32 {
+    /// Get block ID for a token position, or `None` if out of range.
+    pub fn block_for_token(&self, token_idx: usize) -> Option<u32> {
         let block_size = self.layout.block_size;
         let block_idx = token_idx / block_size;
-        self.blocks[block_idx]
+        self.blocks.get(block_idx).copied()
     }
 
     /// Get offset within block for a token position.
-    pub fn offset_in_block(&self, token_idx: usize) -> usize {
+    pub const fn offset_in_block(&self, token_idx: usize) -> usize {
         token_idx % self.layout.block_size
     }
 }
@@ -50,14 +50,19 @@ impl PagedKvCache {
     /// * `block_size` - Tokens per block
     /// * `num_kv_heads` - Number of KV heads
     /// * `head_dim` - Dimension per head
-    pub fn new(num_blocks: usize, block_size: usize, num_kv_heads: usize, head_dim: usize) -> Self {
-        Self {
-            allocator: BlockAllocator::new(num_blocks),
+    pub fn new(
+        num_blocks: usize,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, CacheError> {
+        Ok(Self {
+            allocator: BlockAllocator::new(num_blocks)?,
             page_table: PageTable::new(),
             storage: CpuKvStorage::new(num_blocks, block_size, num_kv_heads, head_dim),
             session_tokens: std::collections::HashMap::new(),
             block_size,
-        }
+        })
     }
 
     /// Get cache layout.
@@ -117,8 +122,12 @@ impl PagedKvCache {
         let blocks = self.ensure_blocks_for_session(session_id, current_block_idx + 1)?;
 
         // Calculate write position
-        let block_id = blocks[current_block_idx];
-        let base = (block_id as usize * self.block_size + offset_in_block) * kv_dim;
+        let block_id = *blocks
+            .get(current_block_idx)
+            .ok_or(CacheError::SessionNotFound(session_id))?;
+        let block_id_usize =
+            usize::try_from(block_id).map_err(|_| CacheError::InvalidBlockId(block_id))?;
+        let base = (block_id_usize * self.block_size + offset_in_block) * kv_dim;
 
         // Write token
         self.storage.write_token_f16(base, k, v)?;
@@ -148,8 +157,12 @@ impl PagedKvCache {
 
         let blocks = self.ensure_blocks_for_session(session_id, current_block_idx + 1)?;
 
-        let block_id = blocks[current_block_idx];
-        let base = (block_id as usize * self.block_size + offset_in_block) * kv_dim;
+        let block_id = *blocks
+            .get(current_block_idx)
+            .ok_or(CacheError::SessionNotFound(session_id))?;
+        let block_id_usize =
+            usize::try_from(block_id).map_err(|_| CacheError::InvalidBlockId(block_id))?;
+        let base = (block_id_usize * self.block_size + offset_in_block) * kv_dim;
 
         self.storage.write_token_f32(base, k, v)?;
 
@@ -214,7 +227,17 @@ impl PagedKvCache {
                 }
                 let block_idx = token_idx / self.block_size;
                 let offset = token_idx % self.block_size;
-                let block_id = view.blocks[block_idx] as usize;
+                let block_id_u32 =
+                    *view
+                        .blocks
+                        .get(block_idx)
+                        .ok_or(CacheError::ReadOutOfBounds {
+                            base: token_idx,
+                            len: 1,
+                            cap: view.num_tokens,
+                        })?;
+                let block_id = usize::try_from(block_id_u32)
+                    .map_err(|_| CacheError::InvalidBlockId(block_id_u32))?;
                 Ok((block_id * self.block_size + offset) * kv_dim)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -231,21 +254,32 @@ impl PagedKvCache {
         // Check if session exists
         if !self.page_table.has_session(session_id) {
             // Allocate initial block
-            let block_id = self.allocator.alloc().ok_or(CacheError::OutOfBlocks {
-                requested: 1,
-                free: self.allocator.free_count(),
-            })?;
+            let free = self.allocator.free_count();
+            let block_id = self
+                .allocator
+                .alloc()
+                .ok_or(CacheError::OutOfBlocks { requested: 1, free })?;
             self.page_table.assign_blocks(session_id, &[block_id])?;
             if needed_blocks == 1 {
-                return Ok(self.page_table.get_blocks(session_id).unwrap());
+                return self
+                    .page_table
+                    .get_blocks(session_id)
+                    .ok_or(CacheError::SessionNotFound(session_id));
             }
         }
 
         // Get current blocks
-        let current_blocks = self.page_table.get_blocks(session_id).unwrap().to_vec();
+        let current_blocks = self
+            .page_table
+            .get_blocks(session_id)
+            .ok_or(CacheError::SessionNotFound(session_id))?
+            .to_vec();
 
         if current_blocks.len() >= needed_blocks {
-            return Ok(self.page_table.get_blocks(session_id).unwrap());
+            return self
+                .page_table
+                .get_blocks(session_id)
+                .ok_or(CacheError::SessionNotFound(session_id));
         }
 
         // Allocate additional blocks
@@ -257,17 +291,28 @@ impl PagedKvCache {
         all_blocks.extend(new_blocks);
         self.page_table.assign_blocks(session_id, &all_blocks)?;
 
-        Ok(self.page_table.get_blocks(session_id).unwrap())
+        self.page_table
+            .get_blocks(session_id)
+            .ok_or(CacheError::SessionNotFound(session_id))
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_paged_cache_session_lifecycle() {
-        let mut cache = PagedKvCache::new(1024, 64, 2, 128);
+        let mut cache = PagedKvCache::new(1024, 64, 2, 128).unwrap();
         let kv_dim = 256;
 
         // Create session
@@ -294,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_paged_cache_block_allocation() {
-        let mut cache = PagedKvCache::new(10, 4, 2, 128);
+        let mut cache = PagedKvCache::new(10, 4, 2, 128).unwrap();
 
         // Create session and append 10 tokens (needs 3 blocks with block_size=4)
         let session_id = 1u64;
@@ -316,7 +361,7 @@ mod tests {
 
     #[test]
     fn test_paged_cache_gather() {
-        let mut cache = PagedKvCache::new(1024, 64, 2, 128);
+        let mut cache = PagedKvCache::new(1024, 64, 2, 128).unwrap();
         let kv_dim = 256;
 
         // Create session
@@ -345,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_paged_cache_out_of_blocks() {
-        let mut cache = PagedKvCache::new(2, 4, 2, 128);
+        let mut cache = PagedKvCache::new(2, 4, 2, 128).unwrap();
         let kv_dim = 256;
 
         // Create session

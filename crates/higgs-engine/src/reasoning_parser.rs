@@ -145,29 +145,30 @@ impl StreamingReasoningTracker {
                 } else {
                     break;
                 }
-            } else if let (Some(stray_pos), open_pos) =
-                (self.buffer.find(THINK_CLOSE), self.buffer.find(THINK_OPEN))
-            {
+            } else if let Some(stray_pos) = self.buffer.find(THINK_CLOSE) {
                 // Strip stray </think> outside a thinking block, but only if
                 // it appears before any <think> (otherwise process <think> first).
-                if open_pos.is_none_or(|op| stray_pos < op) {
-                    visible.push_str(self.buffer.get(..stray_pos).unwrap_or_default());
-                    self.buffer = self
-                        .buffer
-                        .get(stray_pos + THINK_CLOSE.len()..)
-                        .unwrap_or_default()
-                        .to_owned();
-                } else {
-                    // open_pos is guaranteed to be Some here (else branch of none_or)
-                    let op = open_pos.unwrap();
-                    visible.push_str(self.buffer.get(..op).unwrap_or_default());
-                    self.buffer = self
-                        .buffer
-                        .get(op + THINK_OPEN.len()..)
-                        .unwrap_or_default()
-                        .to_owned();
-                    self.inside_think = true;
-                    self.started = true;
+                match self.buffer.find(THINK_OPEN) {
+                    Some(op) if op <= stray_pos => {
+                        // <think> open is at or before stray </think>; process it.
+                        visible.push_str(self.buffer.get(..op).unwrap_or_default());
+                        self.buffer = self
+                            .buffer
+                            .get(op + THINK_OPEN.len()..)
+                            .unwrap_or_default()
+                            .to_owned();
+                        self.inside_think = true;
+                        self.started = true;
+                    }
+                    _ => {
+                        // No <think> ahead, or stray </think> comes first -- strip it.
+                        visible.push_str(self.buffer.get(..stray_pos).unwrap_or_default());
+                        self.buffer = self
+                            .buffer
+                            .get(stray_pos + THINK_CLOSE.len()..)
+                            .unwrap_or_default()
+                            .to_owned();
+                    }
                 }
             } else if let Some(start_pos) = self.buffer.find(THINK_OPEN) {
                 visible.push_str(self.buffer.get(..start_pos).unwrap_or_default());
