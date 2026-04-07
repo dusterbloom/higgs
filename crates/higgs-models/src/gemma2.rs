@@ -335,8 +335,8 @@ where
 
                     return self.o_proj.forward(&output);
                 }
-                view => {
-                    let (cached_keys, cached_values) = view.into_dense()?;
+                other @ (KvCacheView::Dense { .. } | KvCacheView::TurboQuant(_)) => {
+                    let (cached_keys, cached_values) = other.into_dense()?;
                     keys = cached_keys;
                     values = cached_values;
                 }
@@ -464,7 +464,7 @@ where
 
 fn is_single_token_decode(queries: &Array) -> bool {
     let shape = queries.shape();
-    shape.len() == 4 && shape[0] == 1 && shape[2] == 1
+    matches!(shape, [1, _, 1, _])
 }
 
 /// Create a boolean mask for sliding window attention.
@@ -804,14 +804,14 @@ impl Gemma2CausalLM {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let hidden = self.forward_hidden(inputs, mask, kv_cache)?;
-        let hidden = hidden.index((.., -1.., ..));
+        let hidden_all = self.forward_hidden(inputs, mask, kv_cache)?;
+        let hidden_last = hidden_all.index((.., -1.., ..));
 
-        let T = inputs.shape().get(1).copied().unwrap_or(1);
-        let lm_input = if T > 1 {
-            hidden.index((.., -1.., ..))
+        let seq_len = inputs.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if seq_len > 1 {
+            hidden_last.index((.., -1.., ..))
         } else {
-            hidden
+            hidden_last
         };
         let mut logits = match self.lm_head.as_mut() {
             Some(head) => head.forward(&lm_input)?,
@@ -1107,12 +1107,14 @@ mod tests {
         let mut dense_attn = Gemma2Attention::new(&args, false).unwrap();
         let mut turbo_attn = dense_attn.clone();
 
-        let prefill: Vec<f32> = (0..args.hidden_size).map(|i| i as f32 / 100.0).collect();
-        let decode: Vec<f32> = (0..args.hidden_size)
-            .map(|i| (args.hidden_size - i) as f32 / 100.0)
+        let prefill_vals: Vec<f32> = (0..args.hidden_size)
+            .map(|i| f32::from(i16::try_from(i).unwrap()) / 100.0)
             .collect();
-        let prefill = Array::from_slice(&prefill, &[1, 1, args.hidden_size]);
-        let decode = Array::from_slice(&decode, &[1, 1, args.hidden_size]);
+        let decode_vals: Vec<f32> = (0..args.hidden_size)
+            .map(|i| f32::from(i16::try_from(args.hidden_size - i).unwrap()) / 100.0)
+            .collect();
+        let prefill = Array::from_slice(&prefill_vals, &[1, 1, args.hidden_size]);
+        let decode = Array::from_slice(&decode_vals, &[1, 1, args.hidden_size]);
 
         let mut dense_cache = SteppingKeyValueCache::new();
         let mut turbo_cache = SteppingKeyValueCache::new_turbo(

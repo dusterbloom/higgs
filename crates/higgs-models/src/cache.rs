@@ -118,13 +118,25 @@ impl TurboQuantKvView {
                     checked_add(value_byte_start, value_code_bytes, "value code range")?;
 
                 let key = QuantizedKey {
-                    norm: key_norms[scalar_index],
-                    gamma: key_gammas[scalar_index],
-                    codes: key_codes_u8[key_byte_start..key_byte_end].to_vec(),
+                    norm: *key_norms
+                        .get(scalar_index)
+                        .ok_or_else(|| Exception::custom("key_norms index out of bounds"))?,
+                    gamma: *key_gammas
+                        .get(scalar_index)
+                        .ok_or_else(|| Exception::custom("key_gammas index out of bounds"))?,
+                    codes: key_codes_u8
+                        .get(key_byte_start..key_byte_end)
+                        .ok_or_else(|| Exception::custom("key_codes range out of bounds"))?
+                        .to_vec(),
                 };
                 let value = QuantizedValue {
-                    norm: value_norms[scalar_index],
-                    codes: value_codes_u8[value_byte_start..value_byte_end].to_vec(),
+                    norm: *value_norms
+                        .get(scalar_index)
+                        .ok_or_else(|| Exception::custom("value_norms index out of bounds"))?,
+                    codes: value_codes_u8
+                        .get(value_byte_start..value_byte_end)
+                        .ok_or_else(|| Exception::custom("value_codes range out of bounds"))?
+                        .to_vec(),
                 };
 
                 dense_keys.extend(self.context.dequantize_key(&key)?);
@@ -151,10 +163,10 @@ impl TurboQuantKvView {
             ));
         }
 
-        let queries = queries
+        let queries_flat = queries
             .as_dtype(Dtype::Float32)?
             .reshape(&[num_heads, self.context.head_dim])?;
-        let q_rot = self.context.rotate_queries(&queries)?;
+        let q_rot = self.context.rotate_queries(&queries_flat)?;
 
         crate::turboquant::decode_scores(
             &q_rot,
@@ -172,11 +184,11 @@ impl TurboQuantKvView {
     }
 
     pub fn decode_values(&self, weights: &Array, num_heads: i32) -> Result<Array, Exception> {
-        let weights = weights
+        let weights_flat = weights
             .as_dtype(Dtype::Float32)?
             .reshape(&[num_heads, self.seq_len])?;
         let out_rot = crate::turboquant::decode_weighted_values(
-            &weights,
+            &weights_flat,
             &self.value_codes,
             &self.value_norms,
             &self.context.value_centroids_array()?,
@@ -376,16 +388,16 @@ impl SteppingKeyValueCache {
         num_kv_heads: i32,
         head_dim: i32,
     ) -> Result<Self, Exception> {
-        let config = KvCacheConfig {
+        let turbo_config = KvCacheConfig {
             mode: KvCacheMode::Turboquant,
             ..config
         };
-        let context = Arc::new(TurboQuantContext::new(config, head_dim, num_kv_heads)?);
+        let context = Arc::new(TurboQuantContext::new(turbo_config, head_dim, num_kv_heads)?);
         Ok(Self {
             keys: None,
             values: None,
             turbo: Some(TurboQuantStorage::new(context)),
-            config,
+            config: turbo_config,
             offset: 0,
             step: 256,
         })
@@ -508,18 +520,27 @@ impl SteppingKeyValueCache {
 
     fn update_dense(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
         let prev = self.offset;
-        let new_tokens = keys.shape()[2];
+        let k_shape = keys.shape();
+        let v_shape = values.shape();
+        let dim = |s: &[i32], i: usize, label: &'static str| -> Result<i32, Exception> {
+            s.get(i)
+                .copied()
+                .ok_or_else(|| Exception::custom(format!("update_dense: missing dim {i} ({label})")))
+        };
+        let new_tokens = dim(k_shape, 2, "keys T")?;
 
-        let need_grow = self
+        let key_cap = self
             .keys
             .as_ref()
-            .is_none_or(|k| (prev + new_tokens) > k.shape()[2]);
+            .map(|k| dim(k.shape(), 2, "cached keys T"))
+            .transpose()?;
+        let need_grow = key_cap.is_none_or(|cap| (prev + new_tokens) > cap);
 
         if need_grow {
-            let b = keys.shape()[0];
-            let n_kv_heads = keys.shape()[1];
-            let k_head_dim = keys.shape()[3];
-            let v_head_dim = values.shape()[3];
+            let b = dim(k_shape, 0, "keys B")?;
+            let n_kv_heads = dim(k_shape, 1, "keys H")?;
+            let k_head_dim = dim(k_shape, 3, "keys D")?;
+            let v_head_dim = dim(v_shape, 3, "values D")?;
 
             let n_steps = (self.step + new_tokens - 1) / self.step;
             let new_slots = n_steps * self.step;
@@ -599,9 +620,11 @@ impl SteppingKeyValueCache {
                 values.ndim()
             )));
         }
-        let new_tokens = keys.shape()[2];
+        let new_tokens = *keys.shape().get(2).ok_or_else(|| {
+            Exception::custom("update_and_view: keys must have a token dim at axis 2")
+        })?;
 
-        let view = if let Some(turbo) = self.turbo.as_mut() {
+        let new_view = if let Some(turbo) = self.turbo.as_mut() {
             if new_tokens > 1 && turbo.capacity == 0 {
                 // First prefill: accumulate in dense fp16 storage so attention
                 // uses native SDPA (single batched GPU op). Quantization is
@@ -633,11 +656,13 @@ impl SteppingKeyValueCache {
         } else {
             self.update_dense(keys, values)?
         };
-        self.offset = match &view {
-            KvCacheView::Dense { keys, .. } => keys.shape()[2],
-            KvCacheView::TurboQuant(view) => view.seq_len,
+        self.offset = match &new_view {
+            KvCacheView::Dense { keys: dense_keys, .. } => *dense_keys.shape().get(2).ok_or_else(
+                || Exception::custom("update_and_view: dense result missing token dim"),
+            )?,
+            KvCacheView::TurboQuant(turbo_view) => turbo_view.seq_len,
         };
-        Ok(view)
+        Ok(new_view)
     }
 }
 
@@ -706,26 +731,35 @@ impl TurboQuantStorage {
     ) -> Result<TurboQuantKvView, Exception> {
         validate_turboquant_shapes(&keys, &values, &self.context)?;
 
-        let new_tokens = keys.shape()[2];
+        let new_tokens = *keys
+            .shape()
+            .get(2)
+            .ok_or_else(|| Exception::custom("TurboQuantStorage::append: keys missing dim 2"))?;
         self.ensure_capacity(prev + new_tokens, step)?;
 
         // Force contiguous layout matching the logical [B, H, T, D] shape.
         let key_shape = keys.shape().to_vec();
         let value_shape = values.shape().to_vec();
-        let keys = keys
+        let keys_cont = keys
             .as_dtype(Dtype::Float32)?
             .flatten(None, None)?
             .reshape(&key_shape)?;
-        let values = values
+        let values_cont = values
             .as_dtype(Dtype::Float32)?
             .flatten(None, None)?
             .reshape(&value_shape)?;
 
         // Squeeze batch dim: [1, H, T, D] → [H, T, D] for GPU quantization
-        let keys_3d =
-            keys.reshape(&[self.context.num_kv_heads, new_tokens, self.context.head_dim])?;
-        let values_3d =
-            values.reshape(&[self.context.num_kv_heads, new_tokens, self.context.head_dim])?;
+        let keys_3d = keys_cont.reshape(&[
+            self.context.num_kv_heads,
+            new_tokens,
+            self.context.head_dim,
+        ])?;
+        let values_3d = values_cont.reshape(&[
+            self.context.num_kv_heads,
+            new_tokens,
+            self.context.head_dim,
+        ])?;
 
         // GPU quantize → lazy Arrays (no eval, no CPU readback)
         let (v_norms, v_codes) = self.context.quantize_values_gpu(&values_3d)?;
@@ -837,25 +871,26 @@ fn validate_turboquant_shapes(
 ) -> Result<(), Exception> {
     let key_shape = keys.shape();
     let value_shape = values.shape();
-    if key_shape.len() != 4 || value_shape.len() != 4 {
-        return Err(Exception::custom(
-            "TurboQuant cache expects 4D [B, H, T, D] tensors",
-        ));
-    }
-    if key_shape[0] != 1 || value_shape[0] != 1 {
+    let [k_b, k_h, k_t, k_d] = <[i32; 4]>::try_from(key_shape).map_err(|_| {
+        Exception::custom("TurboQuant cache expects 4D [B, H, T, D] tensors (keys)")
+    })?;
+    let [v_b, v_h, v_t, v_d] = <[i32; 4]>::try_from(value_shape).map_err(|_| {
+        Exception::custom("TurboQuant cache expects 4D [B, H, T, D] tensors (values)")
+    })?;
+    if k_b != 1 || v_b != 1 {
         return Err(Exception::custom(
             "TurboQuant cache currently only supports batch size 1",
         ));
     }
-    if key_shape[1] != context.num_kv_heads || value_shape[1] != context.num_kv_heads {
+    if k_h != context.num_kv_heads || v_h != context.num_kv_heads {
         return Err(Exception::custom("TurboQuant KV head count mismatch"));
     }
-    if key_shape[2] != value_shape[2] {
+    if k_t != v_t {
         return Err(Exception::custom(
             "TurboQuant keys/values token count mismatch",
         ));
     }
-    if key_shape[3] != context.head_dim || value_shape[3] != context.head_dim {
+    if k_d != context.head_dim || v_d != context.head_dim {
         return Err(Exception::custom("TurboQuant head_dim mismatch"));
     }
     Ok(())
@@ -1279,7 +1314,9 @@ mod tests {
     #[test]
     fn test_as_slice_after_transpose_order() {
         // Verify whether as_slice returns logical (transposed) or storage order
-        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i8::try_from(i).unwrap()))
+            .collect();
         let arr = Array::from_slice(&data, &[1, 3, 2, 4]); // [B=1, L=3, H=2, D=4]
         let transposed = arr.transpose_axes(&[0, 2, 1, 3]).unwrap(); // [B=1, H=2, L=3, D=4]
         assert_eq!(transposed.shape(), &[1, 2, 3, 4]);
@@ -1288,19 +1325,14 @@ mod tests {
 
         // If LOGICAL order (transpose respected): slice[4..8] = [8,9,10,11] (h=0, t=1)
         // If STORAGE order (transpose ignored): slice[4..8] = [4,5,6,7] (original layout)
-        let is_logical = slice[4] == 8.0;
-        let is_storage = slice[4] == 4.0;
-        eprintln!(
-            "as_slice order: logical={is_logical}, storage={is_storage}, slice[4]={}, slice={:?}",
-            slice[4],
-            &slice[..24]
-        );
+        let slice_4 = *slice.get(4).unwrap();
+        let is_logical = (slice_4 - 8.0).abs() < f32::EPSILON;
+        let is_storage = (slice_4 - 4.0).abs() < f32::EPSILON;
         // This test documents the actual behavior — whichever assertion passes
         // tells us whether TurboQuantStorage::append is correct.
         assert!(
             is_logical || is_storage,
-            "unexpected as_slice order: slice[4] = {}",
-            slice[4]
+            "unexpected as_slice order: slice[4] = {slice_4}"
         );
         // as_slice returns storage order (confirmed), so we must flatten+reshape
         // to make arrays contiguous before calling as_slice.
@@ -1314,12 +1346,11 @@ mod tests {
             .unwrap();
         fixed.eval().unwrap();
         let fixed_slice = fixed.as_slice::<f32>();
+        let fixed_4 = *fixed_slice.get(4).unwrap();
         // After flatten+reshape, slice[4..8] should be [8,9,10,11] (h=0, t=1 in logical order)
-        assert_eq!(
-            fixed_slice[4],
-            8.0,
-            "flatten+reshape must produce contiguous logical order, got {:?}",
-            &fixed_slice[..24]
+        assert!(
+            (fixed_4 - 8.0).abs() < f32::EPSILON,
+            "flatten+reshape must produce contiguous logical order, got {fixed_4}"
         );
     }
 
@@ -1335,21 +1366,21 @@ mod tests {
 
         // Multi-token prefill: returns Dense (quantization deferred)
         let (keys, values) = make_kv_pair(2, 8);
-        let view = cache
+        let prefill_view = cache
             .update_and_view_with_activation_threshold(keys, values, 0)
             .unwrap();
         assert!(
-            view.turboquant().is_none(),
+            prefill_view.turboquant().is_none(),
             "prefill should return Dense view"
         );
         assert_eq!(cache.offset(), 2);
 
         // First decode token with an immediate threshold: triggers bulk quantize.
         let (k1, v1) = make_kv_pair(1, 8);
-        let view = cache
+        let decode_view = cache
             .update_and_view_with_activation_threshold(k1, v1, 0)
             .unwrap();
-        let turbo = view.turboquant().unwrap();
+        let turbo = decode_view.turboquant().unwrap();
         assert_eq!(turbo.seq_len, 3); // 2 prefill + 1 decode
         // head_dim=8, key_bits=2: ceil(8*2/32) = 1 u32 word
         assert_eq!(turbo.key_codes.shape(), &[2, 3, 1]);
@@ -1370,18 +1401,18 @@ mod tests {
         let mut cache = SteppingKeyValueCache::new_turbo(config, 2, 8).unwrap();
 
         let (prefill_k, prefill_v) = make_kv_pair(2, 8);
-        let view = cache
+        let prefill_view = cache
             .update_and_view_with_activation_threshold(prefill_k, prefill_v, 4)
             .unwrap();
-        assert!(view.turboquant().is_none());
+        assert!(prefill_view.turboquant().is_none());
         assert_eq!(cache.offset(), 2);
 
         let (k1, v1) = make_kv_pair(1, 8);
-        let view = cache
+        let below_view = cache
             .update_and_view_with_activation_threshold(k1, v1, 4)
             .unwrap();
         assert!(
-            view.turboquant().is_none(),
+            below_view.turboquant().is_none(),
             "decode below threshold should stay dense"
         );
         assert_eq!(cache.offset(), 3);
@@ -1391,12 +1422,12 @@ mod tests {
         );
 
         let (k2, v2) = make_kv_pair(1, 8);
-        let view = cache
+        let cross_view = cache
             .update_and_view_with_activation_threshold(k2, v2, 4)
             .unwrap();
-        let turbo = view
-            .turboquant()
-            .expect("threshold-crossing decode should activate TurboQuant");
+        let turbo = cross_view.turboquant().unwrap_or_else(|| {
+            panic!("threshold-crossing decode should activate TurboQuant")
+        });
         assert_eq!(turbo.seq_len, 4);
         assert!(
             cache.keys.is_none(),

@@ -597,9 +597,9 @@ impl Model {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let out = self.forward_hidden(inputs, mask, kv_cache)?;
-        let out = out.index((.., -1.., ..));
-        self.apply_lm_head(&out)
+        let hidden = self.forward_hidden(inputs, mask, kv_cache)?;
+        let last = hidden.index((.., -1.., ..));
+        self.apply_lm_head(&last)
     }
 
     /// Get the hidden size.

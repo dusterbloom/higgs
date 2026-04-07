@@ -341,15 +341,19 @@ impl TurboQuantContext {
     /// laid out as `[H * T * value_code_bytes]` in row-major order.
     pub fn quantize_values_batch(&self, values: &Array) -> Result<BatchQuantizedValues, Exception> {
         let shape = values.shape();
-        let h = shape[0];
-        let t = shape[1];
+        let h = *shape
+            .first()
+            .ok_or_else(|| Exception::custom("quantize_values_batch: values has no dim 0"))?;
+        let t = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("quantize_values_batch: values has no dim 1"))?;
 
         // norms: [H, T]
-        let norms = ops::sqrt(&ops::sum_axis(&ops::square(values)?, -1, None)?)?;
+        let raw_norms = ops::sqrt(&ops::sum_axis(&ops::square(values)?, -1, None)?)?;
 
         // normalized: [H, T, D] — safe div with epsilon
         let eps = Array::from_f32(f32::EPSILON);
-        let safe_norms = ops::maximum(&norms, &eps)?;
+        let safe_norms = ops::maximum(&raw_norms, &eps)?;
         let normalized = ops::divide(values, &safe_norms.expand_dims(-1)?)?;
 
         // rotated: [H, T, D] = hadamard(normalized) — orthonormal FWHT replaces D×D matmul
@@ -369,9 +373,9 @@ impl TurboQuantContext {
             let gathered = centroids.take(&indices_i32)?;
             let recon_l2 = ops::sqrt(&ops::sum_axis(&ops::square(&gathered)?, -1, None)?)?;
             let safe_recon = ops::maximum(&recon_l2, &eps)?;
-            ops::divide(&norms, &safe_recon)?
+            ops::divide(&raw_norms, &safe_recon)?
         } else {
-            norms
+            raw_norms
         };
 
         // Pack on CPU: eval indices, read as flat u32, pack into bytes
@@ -380,20 +384,26 @@ impl TurboQuantContext {
 
         let indices_flat = indices.as_slice::<u32>();
         let norms_flat = norms.as_slice::<f32>();
-        let ht = usize::try_from(h).unwrap() * usize::try_from(t).unwrap();
-        let dim = usize::try_from(self.head_dim).unwrap();
-        let code_bytes = usize::try_from(self.value_code_bytes).unwrap();
+        let h_usize = usize::try_from(h)
+            .map_err(|_| Exception::custom("quantize_values_batch: h is negative"))?;
+        let t_usize = usize::try_from(t)
+            .map_err(|_| Exception::custom("quantize_values_batch: t is negative"))?;
+        let ht = h_usize * t_usize;
+        let dim = usize::try_from(self.head_dim)
+            .map_err(|_| Exception::custom("quantize_values_batch: head_dim is negative"))?;
+        let code_bytes = usize::try_from(self.value_code_bytes).map_err(|_| {
+            Exception::custom("quantize_values_batch: value_code_bytes is negative")
+        })?;
         let bits = self.config.value_bits();
 
         let mut packed = vec![0_u8; ht * code_bytes];
-        for row in 0..ht {
+        for (row, packed_row) in packed.chunks_exact_mut(code_bytes).enumerate() {
             let row_start = row * dim;
-            let out_start = row * code_bytes;
-            pack_u32_indices(
-                &indices_flat[row_start..row_start + dim],
-                bits,
-                &mut packed[out_start..out_start + code_bytes],
-            );
+            let row_end = row_start + dim;
+            let row_indices = indices_flat.get(row_start..row_end).ok_or_else(|| {
+                Exception::custom("quantize_values_batch: indices row out of bounds")
+            })?;
+            pack_u32_indices(row_indices, bits, packed_row);
         }
 
         Ok(BatchQuantizedValues {
@@ -409,16 +419,20 @@ impl TurboQuantContext {
     /// Returns `BatchQuantizedKeys` with norms, gammas, and packed MSE codes.
     pub fn quantize_keys_batch(&self, keys: &Array) -> Result<BatchQuantizedKeys, Exception> {
         let shape = keys.shape();
-        let h = shape[0];
-        let t = shape[1];
+        let h = *shape
+            .first()
+            .ok_or_else(|| Exception::custom("quantize_keys_batch: keys has no dim 0"))?;
+        let t = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("quantize_keys_batch: keys has no dim 1"))?;
         let key_bits = self.config.key_bits();
 
         // norms: [H, T]
-        let norms = ops::sqrt(&ops::sum_axis(&ops::square(keys)?, -1, None)?)?;
+        let raw_norms = ops::sqrt(&ops::sum_axis(&ops::square(keys)?, -1, None)?)?;
 
         // normalized: [H, T, D]
         let eps = Array::from_f32(f32::EPSILON);
-        let safe_norms = ops::maximum(&norms, &eps)?;
+        let safe_norms = ops::maximum(&raw_norms, &eps)?;
         let normalized = ops::divide(keys, &safe_norms.expand_dims(-1)?)?;
 
         // rotated: [H, T, D] = hadamard(normalized)
@@ -436,9 +450,9 @@ impl TurboQuantContext {
             let rotated_approx = key_centroids.take(&mse_indices_i32)?;
             let recon_l2 = ops::sqrt(&ops::sum_axis(&ops::square(&rotated_approx)?, -1, None)?)?;
             let safe_recon = ops::maximum(&recon_l2, &eps)?;
-            ops::divide(&norms, &safe_recon)?
+            ops::divide(&raw_norms, &safe_recon)?
         } else {
-            norms
+            raw_norms
         };
 
         // Eval everything before CPU readout
@@ -448,19 +462,24 @@ impl TurboQuantContext {
         let indices_flat = mse_indices.as_slice::<u32>();
         let norms_flat = norms.as_slice::<f32>();
 
-        let ht = usize::try_from(h).unwrap() * usize::try_from(t).unwrap();
-        let dim = usize::try_from(self.head_dim).unwrap();
-        let key_code_bytes = usize::try_from(self.key_code_bytes).unwrap();
+        let h_usize = usize::try_from(h)
+            .map_err(|_| Exception::custom("quantize_keys_batch: h is negative"))?;
+        let t_usize = usize::try_from(t)
+            .map_err(|_| Exception::custom("quantize_keys_batch: t is negative"))?;
+        let ht = h_usize * t_usize;
+        let dim = usize::try_from(self.head_dim)
+            .map_err(|_| Exception::custom("quantize_keys_batch: head_dim is negative"))?;
+        let key_code_bytes = usize::try_from(self.key_code_bytes)
+            .map_err(|_| Exception::custom("quantize_keys_batch: key_code_bytes is negative"))?;
 
         let mut packed_codes = vec![0_u8; ht * key_code_bytes];
-        for row in 0..ht {
+        for (row, packed_row) in packed_codes.chunks_exact_mut(key_code_bytes).enumerate() {
             let row_start = row * dim;
-            let code_start = row * key_code_bytes;
-            pack_u32_indices(
-                &indices_flat[row_start..row_start + dim],
-                key_bits,
-                &mut packed_codes[code_start..code_start + key_code_bytes],
-            );
+            let row_end = row_start + dim;
+            let row_indices = indices_flat.get(row_start..row_end).ok_or_else(|| {
+                Exception::custom("quantize_keys_batch: indices row out of bounds")
+            })?;
+            pack_u32_indices(row_indices, key_bits, packed_row);
         }
 
         Ok(BatchQuantizedKeys {
@@ -1418,12 +1437,12 @@ mod tests {
                 let cos = cosine_similarity(&original, &recovered);
                 total_cos += f64::from(cos);
             }
-            let avg_cos = total_cos / n as f64;
+            let avg_cos = total_cos / f64::from(u32::try_from(n).unwrap());
             let min_cos = match bits {
                 2 => 0.80,
                 3 => 0.90,
                 4 => 0.95,
-                _ => unreachable!(),
+                other => panic!("unexpected bit width in test: {other}"),
             };
             assert!(
                 avg_cos > min_cos,
@@ -1447,13 +1466,13 @@ mod tests {
                 let cos = cosine_similarity(&original, &recovered);
                 total_cos += f64::from(cos);
             }
-            let avg_cos = total_cos / n as f64;
+            let avg_cos = total_cos / f64::from(u32::try_from(n).unwrap());
             // Key uses bits-1 for codes (MSE-only, no QJL correction)
             let min_cos = match bits {
                 2 => 0.50,
                 3 => 0.75,
                 4 => 0.88,
-                _ => unreachable!(),
+                other => panic!("unexpected bit width in test: {other}"),
             };
             assert!(
                 avg_cos > min_cos,

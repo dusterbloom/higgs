@@ -340,7 +340,13 @@ impl AnyModel {
     pub fn make_mtp_cache(&self) -> Option<MtpCache> {
         match self {
             Self::Qwen3Next(m) => m.make_mtp_cache(),
-            _ => None,
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_) => None,
         }
     }
 
@@ -355,7 +361,13 @@ impl AnyModel {
     ) -> Result<Array, Exception> {
         match self {
             Self::Qwen3Next(m) => m.mtp_draft(hidden, next_token_id, mtp_cache),
-            _ => Err(Exception::custom("MTP not supported for this model")),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 
@@ -368,7 +380,13 @@ impl AnyModel {
     ) -> Result<(), Exception> {
         match self {
             Self::Qwen3Next(m) => m.mtp_advance(hidden, next_token_id, mtp_cache),
-            _ => Err(Exception::custom("MTP not supported for this model")),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 
@@ -1340,7 +1358,7 @@ mod tests {
     fn any_model_qwen3_moe_make_cache_with_turboquant_returns_quantized_kv() {
         let model = qwen3_moe::Qwen3MoeCausalLM::new(small_qwen3_moe_args()).unwrap();
         let any = AnyModel::Qwen3Moe(model);
-        let cache = any
+        let any_cache = any
             .make_cache_with_config(turboquant::KvCacheConfig {
                 mode: turboquant::KvCacheMode::Turboquant,
                 bits: 3,
@@ -1348,10 +1366,15 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        match &cache {
+        match &any_cache {
             AnyCache::KV(layers) => {
                 assert_eq!(layers.len(), 2);
-                assert!(layers.iter().flatten().all(|cache| cache.is_quantized()));
+                assert!(
+                    layers
+                        .iter()
+                        .flatten()
+                        .all(super::cache::KeyValueCache::is_quantized)
+                );
             }
             AnyCache::Hybrid(_) => panic!("Expected KV cache for Qwen3Moe"),
         }
