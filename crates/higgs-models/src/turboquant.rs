@@ -599,18 +599,25 @@ impl TurboQuantContext {
     }
 }
 
-/// Result of batch value quantization.
+/// Result of batch value quantization for a contiguous span of vectors.
 pub struct BatchQuantizedValues {
+    /// L2 norm (post-correction) of each input vector. Length = number of vectors.
     pub norms: Vec<f32>,
+    /// Concatenated packed centroid indices, `code_bytes` per vector.
     pub packed_codes: Vec<u8>,
+    /// Packed code length in bytes per single vector: `ceil(head_dim * value_bits / 8)`.
     pub code_bytes: usize,
 }
 
-/// Result of batch key quantization.
+/// Result of batch key quantization for a contiguous span of vectors.
 pub struct BatchQuantizedKeys {
+    /// L2 norm (post-correction) of each input vector. Length = number of vectors.
     pub norms: Vec<f32>,
+    /// Hadamard-rotated norm correction factor per vector.
     pub gammas: Vec<f32>,
+    /// Concatenated packed centroid indices, `key_code_bytes` per vector.
     pub packed_codes: Vec<u8>,
+    /// Packed code length in bytes per single vector: `ceil(head_dim * key_bits / 8)`.
     pub key_code_bytes: usize,
 }
 

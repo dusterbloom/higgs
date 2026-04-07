@@ -8,7 +8,7 @@ pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod registry;
 pub mod siglip;
-pub mod spec_prefill;
+mod spec_prefill;
 pub mod starcoder2;
 pub mod transformer;
 pub mod turboquant;
@@ -248,6 +248,11 @@ impl AnyModel {
         cache: &mut AnyCache,
         chunk_size: i32,
     ) -> Result<Array, Exception> {
+        if chunk_size <= 0 {
+            return Err(Exception::custom(format!(
+                "chunk_size must be > 0, got {chunk_size}"
+            )));
+        }
         let T = *inputs
             .shape()
             .get(1)

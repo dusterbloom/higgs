@@ -145,27 +145,20 @@ impl ChatTemplateRenderer {
 
         let bos = &self.bos_token;
         let eos = &self.eos_token;
-        let context = tools.map_or_else(
-            || {
-                minijinja::context! {
-                    messages => messages,
-                    add_generation_prompt => add_generation_prompt,
-                    enable_thinking => enable_thinking,
-                    bos_token => bos,
-                    eos_token => eos,
-                }
+        let base_context = minijinja::context! {
+            messages => messages,
+            add_generation_prompt => add_generation_prompt,
+            enable_thinking => enable_thinking,
+            bos_token => bos,
+            eos_token => eos,
+        };
+        let context = match tools {
+            Some(tool_list) => minijinja::context! {
+                tools => tool_list,
+                ..base_context
             },
-            |tool_list| {
-                minijinja::context! {
-                    messages => messages,
-                    tools => tool_list,
-                    add_generation_prompt => add_generation_prompt,
-                    enable_thinking => enable_thinking,
-                    bos_token => bos,
-                    eos_token => eos,
-                }
-            },
-        );
+            None => base_context,
+        };
 
         tmpl.render(context)
             .map_err(|e| EngineError::Template(e.to_string()))

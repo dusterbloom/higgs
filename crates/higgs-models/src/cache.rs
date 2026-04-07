@@ -9,7 +9,20 @@ use crate::turboquant::{
 /// View over a KV cache after appending new tokens.
 #[derive(Debug, Clone)]
 pub enum KvCacheView {
-    Dense { keys: Array, values: Array },
+    /// Dense (unquantized) KV view used by standard transformer attention.
+    Dense {
+        /// Stored key tensor for the layer's KV cache.
+        ///
+        /// Shape: `[B, num_kv_heads, T, head_dim]`. Dtype matches the model's
+        /// compute dtype (typically `fp16` or `bf16`).
+        keys: Array,
+        /// Stored value tensor for the layer's KV cache.
+        ///
+        /// Shape: `[B, num_kv_heads, T, head_dim]`. Dtype matches the model's
+        /// compute dtype (typically `fp16` or `bf16`).
+        values: Array,
+    },
+    /// TurboQuant-compressed KV view used by quantized attention kernels.
     TurboQuant(TurboQuantKvView),
 }
 
