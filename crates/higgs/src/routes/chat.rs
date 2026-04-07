@@ -503,6 +503,7 @@ fn chat_completions_stream(
                 finish_reason: None,
                 logprobs: None,
             }],
+            usage: None,
         };
         match serde_json::to_string(&role_chunk) {
             Ok(json) => yield Ok(Event::default().data(json)),
@@ -539,6 +540,7 @@ fn chat_completions_stream(
                         finish_reason: None,
                         logprobs: None,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&reas_chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
@@ -564,6 +566,7 @@ fn chat_completions_stream(
                         finish_reason: output.finish_reason.clone(),
                         logprobs: chunk_logprobs,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
@@ -587,6 +590,7 @@ fn chat_completions_stream(
                         finish_reason: output.finish_reason,
                         logprobs: chunk_logprobs,
                     }],
+                    usage: None,
                 };
                 match serde_json::to_string(&chunk) {
                     Ok(json) => yield Ok(Event::default().data(json)),
@@ -614,6 +618,7 @@ fn chat_completions_stream(
                     finish_reason: None,
                     logprobs: None,
                 }],
+                usage: None,
             };
             match serde_json::to_string(&reas_chunk) {
                 Ok(json) => yield Ok(Event::default().data(json)),
@@ -637,6 +642,7 @@ fn chat_completions_stream(
                     finish_reason: None,
                     logprobs: None,
                 }],
+                usage: None,
             };
             match serde_json::to_string(&vis_chunk) {
                 Ok(json) => yield Ok(Event::default().data(json)),
