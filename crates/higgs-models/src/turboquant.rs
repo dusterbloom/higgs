@@ -492,9 +492,14 @@ impl TurboQuantContext {
 
     /// Batch-quantize values entirely on GPU, returning lazy Arrays.
     ///
-    /// Input: `[H, T, D]` f32 tensor.
+    /// Input: `[H, T, D]` float tensor (fp16, bf16, or fp32).
     /// Returns `(norms: [H, T] f32, packed_codes: [H, T, value_code_words] u32)`.
     /// No `eval()` or CPU readback — the entire graph stays lazy.
+    ///
+    /// The function is dtype-agnostic: it computes in the input dtype and
+    /// only casts `norms` to f32 at the very end (for cache storage). This
+    /// avoids per-decode-token fp16→fp32 copies of the full `[H, T, D]`
+    /// tensor once TurboQuant activates.
     pub fn quantize_values_gpu(&self, values: &Array) -> Result<(Array, Array), Exception> {
         if values.ndim() < 3 {
             return Err(Exception::custom(format!(
@@ -506,18 +511,21 @@ impl TurboQuantContext {
         let h = shape[0];
         let t = shape[1];
         let n = h * t;
+        let input_dtype = values.dtype();
 
-        // norms: [H, T]
+        // norms: [H, T] — stay in input dtype (no upcast copy)
         let norms = ops::sqrt(&ops::sum_axis(&ops::square(values)?, -1, None)?)?;
-        let eps = Array::from_f32(f32::EPSILON);
+        let eps = Array::from_f32(eps_for_dtype(input_dtype)).as_dtype(input_dtype)?;
         let safe_norms = ops::maximum(&norms, &eps)?;
         let normalized = ops::divide(values, &safe_norms.expand_dims(-1)?)?;
 
-        // rotated: [H, T, D] = hadamard(normalized)
+        // rotated: [H, T, D] = hadamard(normalized) — MLX supports fp16/bf16/fp32
         let rotated = normalized.hadamard_transform(None)?;
 
+        // centroids cast to input dtype (tiny 2..16 element array) — prevents
+        // fp16→fp32 promotion inside ops::subtract below.
+        let centroids = self.value_centroids_array()?.as_dtype(input_dtype)?;
         // distances: [H, T, D, C] = |rotated[..., None] - centroids|
-        let centroids = self.value_centroids_array()?;
         let distances = ops::abs(&ops::subtract(&rotated.expand_dims(-1)?, &centroids)?)?;
 
         // indices: [H, T, D] u32
@@ -536,6 +544,10 @@ impl TurboQuantContext {
             norms
         };
 
+        // Cast corrected norms to f32 for cache storage ([H, T] — tiny cast).
+        // No-op for already-f32 inputs.
+        let corrected_norms_f32 = corrected_norms.as_dtype(Dtype::Float32)?;
+
         // Pack on GPU: [H*T, D] u32 → [H*T, code_words] u32
         let indices_flat = indices.reshape(&[n, self.head_dim])?;
         let packed_flat = pack_indices_gpu(
@@ -547,13 +559,18 @@ impl TurboQuantContext {
         )?;
         let packed = packed_flat.reshape(&[h, t, self.value_code_words])?;
 
-        Ok((corrected_norms, packed))
+        Ok((corrected_norms_f32, packed))
     }
 
     /// Batch-quantize keys entirely on GPU, returning lazy Arrays.
     ///
-    /// Input: `[H, T, D]` f32 tensor.
-    /// Returns `(norms [H,T], gammas [H,T], packed_codes [H,T,key_code_words] u32)`.
+    /// Input: `[H, T, D]` float tensor (fp16, bf16, or fp32).
+    /// Returns `(norms [H,T] f32, gammas [H,T] f32, packed_codes [H,T,key_code_words] u32)`.
+    ///
+    /// The function is dtype-agnostic: it computes in the input dtype and
+    /// only casts `norms` to f32 at the very end (for cache storage). This
+    /// avoids per-decode-token fp16→fp32 copies of the full `[H, T, D]`
+    /// tensor once TurboQuant activates.
     pub fn quantize_keys_gpu(&self, keys: &Array) -> Result<(Array, Array, Array), Exception> {
         if keys.ndim() < 3 {
             return Err(Exception::custom(format!(
@@ -566,18 +583,21 @@ impl TurboQuantContext {
         let t = shape[1];
         let n = h * t;
         let key_bits = self.config.key_bits();
+        let input_dtype = keys.dtype();
 
-        // norms: [H, T]
+        // norms: [H, T] — stay in input dtype (no upcast copy)
         let norms = ops::sqrt(&ops::sum_axis(&ops::square(keys)?, -1, None)?)?;
-        let eps = Array::from_f32(f32::EPSILON);
+        let eps = Array::from_f32(eps_for_dtype(input_dtype)).as_dtype(input_dtype)?;
         let safe_norms = ops::maximum(&norms, &eps)?;
         let normalized = ops::divide(keys, &safe_norms.expand_dims(-1)?)?;
 
-        // rotated: [H, T, D] = hadamard(normalized)
+        // rotated: [H, T, D] = hadamard(normalized) — MLX supports fp16/bf16/fp32
         let rotated = normalized.hadamard_transform(None)?;
 
+        // centroids cast to input dtype (tiny 2..16 element array) — prevents
+        // fp16→fp32 promotion inside ops::subtract below.
+        let key_centroids = self.key_centroids_array()?.as_dtype(input_dtype)?;
         // MSE quantize: find nearest centroid in rotated space
-        let key_centroids = self.key_centroids_array()?;
         let distances = ops::abs(&ops::subtract(&rotated.expand_dims(-1)?, &key_centroids)?)?;
         let mse_indices = argmin_axis!(&distances, -1)?;
 
@@ -591,6 +611,10 @@ impl TurboQuantContext {
         } else {
             norms
         };
+
+        // Cast corrected norms to f32 for cache storage ([H, T] — tiny cast).
+        // No-op for already-f32 inputs.
+        let corrected_norms_f32 = corrected_norms.as_dtype(Dtype::Float32)?;
 
         // Gammas are zeroed out (QJL removed)
         let gammas = ops::zeros_dtype(&[h, t], Dtype::Float32)?;
@@ -608,7 +632,22 @@ impl TurboQuantContext {
 
         let packed_codes = packed_codes_flat.reshape(&[h, t, self.key_code_words])?;
 
-        Ok((corrected_norms, gammas, packed_codes))
+        Ok((corrected_norms_f32, gammas, packed_codes))
+    }
+}
+
+/// Return a safe epsilon value for the given float dtype.
+///
+/// `f32::EPSILON` (~1.19e-7) rounds to 0 or a slow denormal in fp16, which
+/// defeats the purpose of the epsilon (preventing divide-by-zero). For
+/// half-precision dtypes we use `1e-4` which is a well-represented normal
+/// number in fp16/bf16 and still negligible relative to typical key/value
+/// norms (≈ √D, tens to hundreds).
+const fn eps_for_dtype(dtype: Dtype) -> f32 {
+    if matches!(dtype, Dtype::Float16 | Dtype::Bfloat16) {
+        1e-4_f32
+    } else {
+        f32::EPSILON
     }
 }
 

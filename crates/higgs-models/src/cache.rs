@@ -741,23 +741,16 @@ impl TurboQuantStorage {
             .ok_or_else(|| Exception::custom("TurboQuantStorage::append: keys missing dim 2"))?;
         self.ensure_capacity(prev + new_tokens, step)?;
 
-        // Force contiguous layout matching the logical [B, H, T, D] shape.
-        let key_shape = keys.shape().to_vec();
-        let value_shape = values.shape().to_vec();
-        let keys_cont = keys
-            .as_dtype(Dtype::Float32)?
-            .flatten(None, None)?
-            .reshape(&key_shape)?;
-        let values_cont = values
-            .as_dtype(Dtype::Float32)?
-            .flatten(None, None)?
-            .reshape(&value_shape)?;
-
-        // Squeeze batch dim: [1, H, T, D] → [H, T, D] for GPU quantization
-        let keys_3d =
-            keys_cont.reshape(&[self.context.num_kv_heads, new_tokens, self.context.head_dim])?;
-        let values_3d =
-            values_cont.reshape(&[self.context.num_kv_heads, new_tokens, self.context.head_dim])?;
+        // Squeeze batch dim: [1, H, T, D] → [H, T, D] via pure-view squeeze.
+        // No copy, no dtype cast. `quantize_*_gpu` are dtype-agnostic and
+        // handle fp16/bf16/fp32 inputs natively (see turboquant.rs).
+        //
+        // Previously this path did `.as_dtype(Float32).flatten().reshape()`
+        // which materialized two [1, H, T, D] fp32 copies per decode token
+        // once TurboQuant activated, showing up as 2 Copy primitives per token
+        // in GPU profiles and capping decode throughput at long contexts.
+        let keys_3d = keys.squeeze_axes(&[0])?;
+        let values_3d = values.squeeze_axes(&[0])?;
 
         // GPU quantize → lazy Arrays (no eval, no CPU readback)
         let (v_norms, v_codes) = self.context.quantize_values_gpu(&values_3d)?;
