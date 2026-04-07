@@ -32,7 +32,15 @@ pub struct SpecPrefillEngine {
 
 impl SpecPrefillEngine {
     /// Create a new speculative prefill engine.
+    ///
+    /// Returns an error if `config.keep_rate` is outside `(0.0, 1.0]`.
     pub fn new(config: SpecPrefillConfig) -> Result<Self, ModelError> {
+        if !(config.keep_rate > 0.0 && config.keep_rate <= 1.0) {
+            return Err(ModelError::Mlx(mlx_rs::error::Exception::custom(format!(
+                "SpecPrefill keep_rate must be in (0.0, 1.0], got {}",
+                config.keep_rate
+            ))));
+        }
         Ok(Self { config })
     }
 

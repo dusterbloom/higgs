@@ -1093,15 +1093,12 @@ impl SimpleEngine {
             }
         }
 
-        // After the first decode step, TQ deferred quantization has activated:
-        // dense KV was bulk-quantized into TQ storage. Re-store the cache so the
-        // prefix cache gets the quantized blocks (the initial store after prefill
-        // only captured the dense pre-quantization state).
-        if self.kv_cache_config.is_turboquant() && prepared.pixel_values.is_none() {
-            if let Ok(mut pc) = self.prefix_cache.lock() {
-                pc.store(prompt_tokens, &prepared.cache);
-            }
-        }
+        // NOTE: A TQ re-store used to live here to upgrade the prefix cache
+        // entry from dense to quantized blocks once TQ activated on the first
+        // decode step. It was removed because at this point `prepared.cache`
+        // contains one extra (generated) token beyond `prompt_tokens`, so the
+        // re-store would have written a cache state that did not match its
+        // key. The prefix cache keeps the dense entry stored after prefill.
 
         let mut total_forward_ns: u128 = 0;
         let mut total_eval_ns: u128 = 0;
@@ -1813,35 +1810,22 @@ impl SimpleEngine {
             async_eval(eval_targets).map_err(EngineError::Mlx)?;
         }
 
-        // Re-store after TQ activation (see generate_inner for rationale).
-        if self.kv_cache_config.is_turboquant() && prepared.pixel_values.is_none() {
-            if let Ok(mut pc) = self.prefix_cache.lock() {
-                pc.store(prompt_tokens, &prepared.cache);
-            }
-        }
+        // NOTE: TQ re-store removed for the same reason as the non-streaming
+        // path — at this point `prepared.cache` already contains one generated
+        // token beyond `prompt_tokens`, so storing under the prompt key would
+        // misreport the cache length on future hits.
 
         loop {
-            let (following, following_logprob_data) = Self::decode_step(
-                &next_token,
-                &mut prepared.model,
-                &mut prepared.cache,
-                params,
-                &all_tokens,
-                logprob_top_n,
-                constraint.as_ref(),
-            )?;
-            {
-                let mut eval_targets: Vec<&Array> = vec![&following];
-                if let Some(ref lp) = following_logprob_data {
-                    eval_targets.extend(lp.eval_targets());
-                }
-                async_eval(eval_targets).map_err(EngineError::Mlx)?;
-            }
-
+            // When constrained, extract the sampled token and advance the FSM
+            // *before* building the next decode step, so the constraint mask is
+            // applied at the correct FSM state. (Mirrors the non-streaming
+            // path; without this, the FSM lags one token behind.)
+            //
+            // Thinking-budget overrides are also evaluated up-front so the FSM
+            // sees the same token_id that we will emit. The overridden token
+            // produces the same KV-cache discontinuity as in the non-streaming
+            // path, which is acceptable for the budget feature.
             let mut token_id: u32 = next_token.item();
-
-            // Thinking budget: force </think> after N tokens if model hasn't closed it.
-            // NOTE: same KV-cache discontinuity caveat as the non-streaming path.
             if let Some(close_id) = think_close_token {
                 if !seen_think_close {
                     if token_id == close_id {
@@ -1859,10 +1843,29 @@ impl SimpleEngine {
                     }
                 }
             }
-
-            // Advance constrained generator state
             if let Some(ref mut cg) = constraint {
                 cg.advance(token_id);
+            }
+
+            let (following, following_logprob_data) = Self::decode_step(
+                &next_token,
+                &mut prepared.model,
+                &mut prepared.cache,
+                params,
+                &all_tokens,
+                logprob_top_n,
+                constraint.as_ref(),
+            )?;
+            {
+                let mut eval_targets: Vec<&Array> = vec![&following];
+                if let Some(ref lp) = following_logprob_data {
+                    eval_targets.extend(lp.eval_targets());
+                }
+                if constraint.is_some() {
+                    eval(eval_targets).map_err(EngineError::Mlx)?;
+                } else {
+                    async_eval(eval_targets).map_err(EngineError::Mlx)?;
+                }
             }
 
             let token_logprob = next_logprob_data

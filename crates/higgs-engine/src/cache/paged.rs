@@ -82,9 +82,9 @@ impl PagedKvCache {
 
     /// Create a new session.
     pub fn create_session(&mut self, session_id: u64) -> Result<(), CacheError> {
-        if self.page_table.has_session(session_id) {
-            return Err(CacheError::SessionAlreadyExists(session_id));
-        }
+        // Register an empty session in the page table so `get_session_view` and
+        // `remove_session` see the session even before any tokens are appended.
+        self.page_table.create_session(session_id)?;
         self.session_tokens.insert(session_id, 0);
         Ok(())
     }

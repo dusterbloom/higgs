@@ -27,6 +27,17 @@ impl PageTable {
         Ok(())
     }
 
+    /// Register an empty session (no blocks yet).
+    ///
+    /// Returns `Err(SessionAlreadyExists)` if the session is already registered.
+    pub fn create_session(&mut self, session_id: u64) -> Result<(), CacheError> {
+        if self.sessions.contains_key(&session_id) {
+            return Err(CacheError::SessionAlreadyExists(session_id));
+        }
+        self.sessions.insert(session_id, Vec::new());
+        Ok(())
+    }
+
     /// Get blocks assigned to a session.
     pub fn get_blocks(&self, session_id: u64) -> Option<&[u32]> {
         self.sessions.get(&session_id).map(|v| v.as_slice())

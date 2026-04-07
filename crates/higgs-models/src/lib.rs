@@ -248,6 +248,12 @@ impl AnyModel {
         cache: &mut AnyCache,
         chunk_size: i32,
     ) -> Result<Array, Exception> {
+        if chunk_size <= 0 {
+            return Err(Exception::custom(format!(
+                "forward_chunked: chunk_size must be > 0, got {chunk_size}"
+            )));
+        }
+
         let T = *inputs
             .shape()
             .get(1)

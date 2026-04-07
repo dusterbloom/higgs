@@ -481,6 +481,10 @@ impl SteppingKeyValueCache {
         offset: i32,
     ) -> Self {
         let capacity = key_codes.shape().get(1).copied().unwrap_or(0);
+        // Preserve the original TurboQuant config (bit widths, norm correction,
+        // adaptive dense layers, seed) so the materialized cache reports the
+        // correct settings instead of advertising defaults.
+        let config = context.config;
         Self {
             keys: None,
             values: None,
@@ -493,10 +497,7 @@ impl SteppingKeyValueCache {
                 value_norms: Some(value_norms),
                 capacity,
             }),
-            config: KvCacheConfig {
-                mode: KvCacheMode::Turboquant,
-                ..KvCacheConfig::default()
-            },
+            config,
             offset,
             step: 256,
         }
