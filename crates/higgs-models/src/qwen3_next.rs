@@ -441,9 +441,9 @@ thread_local! {
 
 fn silu_mul(gate: &Array, x: &Array) -> Result<Array, Exception> {
     if compiled_gating_enabled() {
-        COMPILED_SILU_MUL_FN.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let compiled = slot.get_or_insert_with(|| {
+        COMPILED_SILU_MUL_FN.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let compiled = guard.get_or_insert_with(|| {
                 Box::new(mlx_rs::transforms::compile::compile(
                     compiled_silu_mul,
                     None,
@@ -462,9 +462,9 @@ fn compiled_sigmoid_mul((gate, x): (&Array, &Array)) -> Result<Array, Exception>
 
 fn sigmoid_mul(gate: &Array, x: &Array) -> Result<Array, Exception> {
     if compiled_gating_enabled() {
-        COMPILED_SIGMOID_MUL_FN.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let compiled = slot.get_or_insert_with(|| {
+        COMPILED_SIGMOID_MUL_FN.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let compiled = guard.get_or_insert_with(|| {
                 Box::new(mlx_rs::transforms::compile::compile(
                     compiled_sigmoid_mul,
                     None,
@@ -484,9 +484,9 @@ fn compiled_gdn_output_gate((y, weight, z): (&Array, &Array, &Array)) -> Result<
 
 fn gdn_output_gate(y: &Array, weight: &Array, eps: f32, z: &Array) -> Result<Array, Exception> {
     if compiled_gating_enabled() && (eps - 1e-6).abs() <= f32::EPSILON {
-        COMPILED_GDN_OUTPUT_GATE_FN.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let compiled = slot.get_or_insert_with(|| {
+        COMPILED_GDN_OUTPUT_GATE_FN.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let compiled = guard.get_or_insert_with(|| {
                 Box::new(mlx_rs::transforms::compile::compile(
                     compiled_gdn_output_gate,
                     None,
@@ -799,7 +799,7 @@ fn gated_delta_kernel_config(
     }
 
     let key = GatedDeltaKernelConfigKey {
-        in_dtype: in_dtype as u32,
+        in_dtype,
         batch,
         seq_len,
         num_k_heads,
@@ -807,9 +807,9 @@ fn gated_delta_kernel_config(
         num_v_heads,
         head_v_dim,
     };
-    let config = GATED_DELTA_CONFIG_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        *cache.entry(key).or_insert_with(|| {
+    let config = GATED_DELTA_CONFIG_CACHE.with(|cache_cell| {
+        let mut cache_map = cache_cell.borrow_mut();
+        *cache_map.entry(key).or_insert_with(|| {
             configure_gated_delta_kernel(
                 in_dtype,
                 batch,
@@ -1022,7 +1022,7 @@ enum DenseFfnGemvMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct QgemvKernelConfigKey {
-    out_dtype: u32,
+    out_dtype: mlx_sys::mlx_dtype,
     n_rows: i32,
     k_dim: i32,
     group_size: i32,
@@ -1031,7 +1031,7 @@ struct QgemvKernelConfigKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GatedDeltaKernelConfigKey {
-    in_dtype: u32,
+    in_dtype: mlx_sys::mlx_dtype,
     batch: i32,
     seq_len: i32,
     num_k_heads: i32,
@@ -1116,9 +1116,9 @@ fn make_compiled_gdn_decode() -> Box<CompiledGdnDecodeFn> {
 }
 
 fn run_compiled_gdn_decode(cache: &mut ArraysCache, inputs: &[Array]) -> Result<Array, Exception> {
-    COMPILED_GDN_DECODE_FN.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let compiled = slot.get_or_insert_with(make_compiled_gdn_decode);
+    COMPILED_GDN_DECODE_FN.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let compiled = guard.get_or_insert_with(make_compiled_gdn_decode);
         let mut out = compiled(cache, inputs)?;
         out.pop()
             .ok_or_else(|| Exception::custom("compiled GDN decode returned no outputs"))
@@ -1221,15 +1221,15 @@ fn qgemv_kernel_config(
     }
 
     let key = QgemvKernelConfigKey {
-        out_dtype: out_dtype as u32,
+        out_dtype,
         n_rows,
         k_dim,
         group_size,
         nsg,
     };
-    let config = QGEMV_CONFIG_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        *cache
+    let config = QGEMV_CONFIG_CACHE.with(|cache_cell| {
+        let mut cache_map = cache_cell.borrow_mut();
+        *cache_map
             .entry(key)
             .or_insert_with(|| configure_qgemv_kernel(out_dtype, n_rows, k_dim, group_size))
     });
@@ -1252,8 +1252,15 @@ pub(crate) fn qgemv_4bit(
     ensure_ffi_error_handler();
 
     let x_shape = x.shape();
-    let n_rows = weight.shape()[0];
-    let k_packed = weight.shape()[1]; // uint32 words per row
+    let weight_shape = weight.shape();
+    let n_rows = weight_shape
+        .first()
+        .copied()
+        .ok_or_else(|| Exception::custom("qgemv_4bit: weight has no rows"))?;
+    let k_packed = weight_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| Exception::custom("qgemv_4bit: weight has no columns"))?; // uint32 words per row
     let k_dim = k_packed * 8; // logical elements (8 nibbles per uint32)
 
     // Flatten all inputs to 1D for the kernel
@@ -1303,7 +1310,11 @@ pub(crate) fn qgemv_4bit(
         }
         // Output is already in the correct dtype (OutT = x.dtype()) — no conversion
         let y = unsafe { Array::from_ptr(y_ptr) };
-        let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+        let trim_to = x_shape.len().saturating_sub(1);
+        let mut out_shape = x_shape
+            .get(..trim_to)
+            .ok_or_else(|| Exception::custom("qgemv_4bit: x_shape too small"))?
+            .to_vec();
         out_shape.push(n_rows);
         y.reshape(&out_shape)
     };
@@ -1431,30 +1442,33 @@ impl Qwen3NextAttention {
         keys = apply_rope(&keys, &self.rope, offset)?;
 
         let view = cache.update_and_view(keys, values)?;
-        let is_tq_decode = mask.is_none() && L == 1 && view.turboquant().is_some();
+        let try_tq_decode = mask.is_none() && L == 1;
 
-        let output = if is_tq_decode {
-            let tq_view = view.turboquant().unwrap();
-            let scores = tq_view.decode_scores(&queries, self.num_attention_heads)?;
-            let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
-            let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
-            tq_view
-                .decode_values(&weights, self.num_attention_heads)?
+        let output = match view {
+            crate::cache::KvCacheView::TurboQuant(tq_view) if try_tq_decode => {
+                let scores = tq_view.decode_scores(&queries, self.num_attention_heads)?;
+                let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
+                let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
+                tq_view
+                    .decode_values(&weights, self.num_attention_heads)?
+                    .transpose_axes(&[0, 2, 1, 3])?
+                    .reshape(&[B, L, -1])?
+            }
+            other @ (crate::cache::KvCacheView::Dense { .. }
+            | crate::cache::KvCacheView::TurboQuant(_)) => {
+                let (cached_keys, cached_values) = other.into_dense()?;
+                let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
+                fast::scaled_dot_product_attention(
+                    queries,
+                    cached_keys,
+                    cached_values,
+                    self.scale,
+                    sdpa_mask,
+                    None::<&Array>,
+                )?
                 .transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[B, L, -1])?
-        } else {
-            let (cached_keys, cached_values) = view.into_dense()?;
-            let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
-            fast::scaled_dot_product_attention(
-                queries,
-                cached_keys,
-                cached_values,
-                self.scale,
-                sdpa_mask,
-                None::<&Array>,
-            )?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[B, L, -1])?
+            }
         };
 
         if L == 1 && async_layer_state_eval_enabled() {
@@ -1784,7 +1798,9 @@ impl SwitchMlpWeights {
         let inv_order = ops::argsort_axis(&order, 0)?;
 
         // Map each sorted position back to its source token: order / top_k
-        let top_k_arr = Array::from_slice(&[top_k as u32], &[1]);
+        let top_k_u32 = u32::try_from(top_k)
+            .map_err(|_| Exception::custom("top_k must fit in u32"))?;
+        let top_k_arr = Array::from_slice(&[top_k_u32], &[1]);
         let token_idx = order.floor_divide(&top_k_arr)?;
 
         // x_flat: [B*L, 1, D] -> x_sorted: [N, 1, D]
@@ -2004,13 +2020,18 @@ fn compiled_gdn_decode_step(
     cache: &mut ArraysCache,
     inputs: &[Array],
 ) -> Result<Vec<Array>, Exception> {
-    let q = &inputs[0]; // [B, 1, Hv, Dk]
-    let k = &inputs[1]; // [B, 1, Hv, Dk]
-    let v = &inputs[2]; // [B, 1, Hv, Dv]
-    let g = &inputs[3]; // [B, 1, Hv]
-    let beta = &inputs[4]; // [B, 1, Hv]
-    let z = &inputs[5]; // [B, 1, Hv, Dv]
-    let norm_weight = &inputs[6]; // [Dv]
+    let [q, k, v, g, beta, z, norm_weight] = inputs else {
+        return Err(Exception::custom(
+            "compiled GDN decode expects 7 inputs",
+        ));
+    };
+    // q: [B, 1, Hv, Dk]
+    // k: [B, 1, Hv, Dk]
+    // v: [B, 1, Hv, Dv]
+    // g: [B, 1, Hv]
+    // beta: [B, 1, Hv]
+    // z: [B, 1, Hv, Dv]
+    // norm_weight: [Dv]
 
     let state = cache
         .ssm_state
@@ -2177,11 +2198,11 @@ impl GatedDeltaNet {
             Some(w) => w.clone(),
             None => {
                 // Conv1d weight: [conv_dim, kernel_size, 1] -> [kernel_size, conv_dim]
-                let w = self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?;
-                let w = w.as_dtype(mixed_qkv.dtype())?;
-                w.eval()?;
-                self.conv_weight_t = Some(w.clone());
-                w
+                let raw_w = self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?;
+                let typed_w = raw_w.as_dtype(mixed_qkv.dtype())?;
+                typed_w.eval()?;
+                self.conv_weight_t = Some(typed_w.clone());
+                typed_w
             }
         };
 
@@ -2374,7 +2395,7 @@ impl GatedDeltaNet {
             };
             let g = compute_g_direct(self.A_log.as_ref(), &a, self.dt_bias.as_ref())?;
             let beta = nn::sigmoid(&b)?;
-            let inputs = [
+            let kernel_inputs = [
                 q_decode,
                 k_decode,
                 conv_v.clone(),
@@ -2383,7 +2404,7 @@ impl GatedDeltaNet {
                 z.clone(),
                 self.norm.weight.as_ref().clone(),
             ];
-            let gated_out = run_compiled_gdn_decode(cache, &inputs)?;
+            let gated_out = run_compiled_gdn_decode(cache, &kernel_inputs)?;
             cache.offset += S;
 
             let out_flat = gated_out.reshape(&[B, S, -1])?;
@@ -2662,12 +2683,12 @@ impl FfnBlock {
                 .ok_or_else(|| Exception::custom("gates must have last dim"))?;
             let top_k_start = num_experts - self.top_k;
             let inds = ops::sort_axis(all_inds.index((.., .., top_k_start..)), -1)?;
-            let scores = gates.take_along_axis(&inds, -1)?;
+            let raw_scores = gates.take_along_axis(&inds, -1)?;
             let scores = if self.norm_topk_prob {
-                let sum = scores.sum_axes(&[-1], true)?;
-                scores.divide(&sum)?
+                let sum = raw_scores.sum_axes(&[-1], true)?;
+                raw_scores.divide(&sum)?
             } else {
-                scores
+                raw_scores
             };
 
             let y = switch_ref.forward_gather_global_sort(x, &inds)?;
@@ -2886,9 +2907,9 @@ fn apply_rope_manual(
     positions: &Array,
     dimensions: i32,
     base: f32,
-    scale: f32,
+    _scale: f32,
 ) -> Result<Array, Exception> {
-    use mlx_rs::{Dtype, ops};
+    use mlx_rs::ops;
 
     // x shape: [B, H, L, D] or [B, L, D]
     let shape = x.shape();
@@ -2898,25 +2919,27 @@ fn apply_rope_manual(
         return Err(Exception::custom("Input must have at least 2 dimensions"));
     }
 
-    let D = shape[ndim - 1] as i32;
     let half_dim = dimensions / 2;
+    let half_dim_i32 = half_dim;
+    #[allow(clippy::cast_precision_loss)]
+    let dimensions_f32 = f32::from(i16::try_from(dimensions).unwrap_or(i16::MAX));
 
     // Compute frequencies: base^(-2i/dimensions) for i in [0, half_dim)
     let inv_freq: Vec<f32> = (0..half_dim)
         .map(|i| {
-            let power = -2.0 * (i as f32) / (dimensions as f32);
+            #[allow(clippy::cast_precision_loss)]
+            let i_f32 = f32::from(i16::try_from(i).unwrap_or(i16::MAX));
+            let power = -2.0 * i_f32 / dimensions_f32;
             base.powf(power)
         })
         .collect();
-    let inv_freq_arr = Array::from_slice(&inv_freq, &[half_dim as i32]);
+    let inv_freq_arr = Array::from_slice(&inv_freq, &[half_dim_i32]);
 
     // Get positions as [L] or [B, L]
     let pos_shape = positions.shape();
-    let L = if pos_shape.len() == 1 {
-        pos_shape[0]
-    } else {
-        pos_shape[pos_shape.len() - 1]
-    };
+    let l_dim = *pos_shape
+        .last()
+        .ok_or_else(|| Exception::custom("positions must have at least 1 dim"))?;
 
     tracing::debug!(
         "apply_rope_manual: x.shape={:?}, positions.shape={:?}, dimensions={}, base={}",
@@ -2927,22 +2950,22 @@ fn apply_rope_manual(
     );
     // Compute angles: positions * inv_freq
     // positions: [L], inv_freq: [half_dim] -> angles: [L, half_dim]
-    let positions_expanded = positions.reshape(&[L, 1])?;
-    let inv_freq_expanded = inv_freq_arr.reshape(&[1, half_dim as i32])?;
+    let positions_expanded = positions.reshape(&[l_dim, 1])?;
+    let inv_freq_expanded = inv_freq_arr.reshape(&[1, half_dim_i32])?;
     let angles = ops::multiply(&positions_expanded, &inv_freq_expanded)?;
 
     // Compute cos and sin
-    let cos = ops::cos(&angles)?;
-    let sin = ops::sin(&angles)?;
+    let cos_raw = ops::cos(&angles)?;
+    let sin_raw = ops::sin(&angles)?;
 
     // Reshape for broadcasting: [1, 1, L, half_dim] or [1, L, half_dim]
     let cos_shape: Vec<i32> = if ndim == 4 {
-        vec![1, 1, L, half_dim as i32]
+        vec![1, 1, l_dim, half_dim_i32]
     } else {
-        vec![1, L, half_dim as i32]
+        vec![1, l_dim, half_dim_i32]
     };
-    let cos = cos.reshape(&cos_shape)?;
-    let sin = sin.reshape(&cos_shape)?;
+    let cos = cos_raw.reshape(&cos_shape)?;
+    let sin = sin_raw.reshape(&cos_shape)?;
 
     // Split x into two halves along last dimension
     let x_first = x.index((.., .., .., ..half_dim));
@@ -2961,7 +2984,9 @@ fn apply_rope_manual(
     )?;
 
     // Concatenate back
-    ops::concatenate_axis(&[&output_first, &output_second], (ndim - 1) as i32)
+    let last_axis = i32::try_from(ndim.saturating_sub(1))
+        .map_err(|_| Exception::custom("ndim too large for i32"))?;
+    ops::concatenate_axis(&[&output_first, &output_second], last_axis)
 }
 
 impl Qwen3NextCausalLM {
@@ -3154,11 +3179,11 @@ impl Qwen3NextCausalLM {
                 attn.forward(&normed, mask, layer_kv)?
             };
 
-            if let Some(t0) = t0 {
+            if let Some(start) = t0 {
                 let h2 = h.add(r)?;
                 let normed_post = layer.post_attention_layernorm.forward(&h2)?;
                 mlx_rs::transforms::eval([&h2])?;
-                let attn_ns = t0.elapsed().as_nanos();
+                let attn_ns = start.elapsed().as_nanos();
                 let t1 = std::time::Instant::now();
                 let mlp_out = layer.mlp.forward(&normed_post)?;
                 h = h2.add(mlp_out)?;
@@ -3261,15 +3286,16 @@ impl Qwen3NextCausalLM {
         kv_cache: &mut Vec<Option<LayerCache>>,
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, mask, kv_cache)?;
-        let last_h = h.index((.., -1, ..));
+        let last_slice = h.index((.., -1, ..));
         // Reshape to [B, 1, D] so the LM head produces [B, 1, vocab]
-        let shape = last_h.shape();
-        let last_h = if shape.len() == 2 {
-            // [B, D] → [B, 1, D]
-            last_h.reshape(&[shape[0], 1, shape[1]])?
-        } else {
-            last_h.reshape(&[shape[0], 1, *shape.last().unwrap()])?
-        };
+        let shape = last_slice.shape();
+        let batch = *shape
+            .first()
+            .ok_or_else(|| Exception::custom("forward_last_token: empty shape"))?;
+        let last_dim = *shape
+            .last()
+            .ok_or_else(|| Exception::custom("forward_last_token: empty shape"))?;
+        let last_h = last_slice.reshape(&[batch, 1, last_dim])?;
         match self.lm_head.as_ref() {
             Some(head) => head.forward(&last_h),
             None => self.model.embed_tokens.as_linear(&last_h),
@@ -3362,7 +3388,9 @@ impl Qwen3NextCausalLM {
 
     /// Look up the embedding for a token id. Shape: `[1, 1, hidden_size]`.
     pub fn embed_token(&self, token_id: u32) -> Result<Array, Exception> {
-        let ids = Array::from_slice(&[token_id as i32], &[1, 1]);
+        let token_id_i32 = i32::try_from(token_id)
+            .map_err(|_| Exception::custom("token_id exceeds i32 range"))?;
+        let ids = Array::from_slice(&[token_id_i32], &[1, 1]);
         self.model.embed_tokens.forward(&ids)
     }
 
@@ -3388,7 +3416,10 @@ impl Qwen3NextCausalLM {
 
         // Scope the mutable borrow: run MTP forward, defer lm_head projection.
         Ok({
-            let mtp = self.mtp.as_mut().expect("checked above");
+            let mtp = self
+                .mtp
+                .as_mut()
+                .ok_or_else(|| Exception::custom("MTP head not loaded"))?;
 
             let h_norm = mtp.pre_fc_norm_hidden.forward(hidden)?;
             let e_norm = mtp.pre_fc_norm_embedding.forward(&next_embed)?;
@@ -3978,7 +4009,9 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     clippy::manual_range_contains,
     clippy::explicit_iter_loop,
     clippy::borrow_as_ptr,
-    clippy::ref_as_ptr
+    clippy::ref_as_ptr,
+    clippy::str_to_string,
+    clippy::if_then_some_else_none
 )]
 mod tests {
     use super::*;

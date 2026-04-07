@@ -87,18 +87,18 @@ where
             let weights = ops::softmax_axis(&scaled_scores, -1, true)?;
             view.decode_values(&weights, num_heads)
         }
-        view => {
+        other @ (KvCacheView::Dense { .. } | KvCacheView::TurboQuant(_)) => {
             // Multi-token prefill (and any other non-decode path) materializes
             // dense KV and uses native SDPA — single batched GPU op for all T.
-            let (keys, values) = view.into_dense()?;
-            scaled_dot_product_attention(queries, keys, values, scale, mask)
+            let (dense_keys, dense_values) = other.into_dense()?;
+            scaled_dot_product_attention(queries, dense_keys, dense_values, scale, mask)
         }
     }
 }
 
 fn is_single_token_decode(queries: &Array, head_dim: i32) -> bool {
     let shape = queries.shape();
-    shape.len() == 4 && shape[0] == 1 && shape[2] == 1 && shape[3] == head_dim
+    matches!(shape, &[1, _, 1, h] if h == head_dim)
 }
 
 /// Create a causal attention mask.
@@ -167,7 +167,20 @@ pub(crate) fn create_batched_decode_mask(
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::redundant_type_annotations,
+    clippy::shadow_unrelated,
+    clippy::shadow_reuse,
+    clippy::shadow_same
+)]
 mod tests {
     use super::*;
     use crate::{
