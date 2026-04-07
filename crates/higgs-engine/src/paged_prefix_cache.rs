@@ -976,7 +976,9 @@ mod tests {
         // Clone fallback still makes the prefix findable.
         let mut query: Vec<u32> = prefix;
         query.push(999);
-        let matched = cache.find_longest_prefix(&query).expect("clone fallback should be findable");
+        let matched = cache
+            .find_longest_prefix(&query)
+            .expect("clone fallback should be findable");
         assert_eq!(matched.prefix_len, 16);
     }
 

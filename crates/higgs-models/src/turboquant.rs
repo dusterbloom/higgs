@@ -83,9 +83,7 @@ impl KvCacheConfig {
     pub fn validate(self) -> Result<(), Exception> {
         if self.is_turboquant() {
             if self.bits == 0 {
-                return Err(Exception::custom(
-                    "TurboQuant bits must be >= 1, got 0",
-                ));
+                return Err(Exception::custom("TurboQuant bits must be >= 1, got 0"));
             }
             let kb = self.key_bits();
             let vb = self.value_bits();
@@ -294,13 +292,8 @@ impl TurboQuantContext {
                 value.codes.len()
             )));
         }
-        let mut rotated = dequantize_rotated(
-            &value.codes,
-            bits,
-            &self.value_centroids,
-            dim,
-            value.norm,
-        );
+        let mut rotated =
+            dequantize_rotated(&value.codes, bits, &self.value_centroids, dim, value.norm);
         fwht_normalized(&mut rotated);
         Ok(rotated)
     }
@@ -316,21 +309,13 @@ impl TurboQuantContext {
                 key.codes.len()
             )));
         }
-        let mut rotated = dequantize_rotated(
-            &key.codes,
-            bits,
-            &self.key_centroids,
-            dim,
-            key.norm,
-        );
+        let mut rotated = dequantize_rotated(&key.codes, bits, &self.key_centroids, dim, key.norm);
         fwht_normalized(&mut rotated);
         Ok(rotated)
     }
 
     pub fn rotate_queries(&self, queries: &Array) -> Result<Array, Exception> {
-        queries
-            .as_dtype(Dtype::Float32)?
-            .hadamard_transform(None)
+        queries.as_dtype(Dtype::Float32)?.hadamard_transform(None)
     }
 
     pub fn key_centroids_array(&self) -> Result<Array, Exception> {
@@ -899,7 +884,10 @@ fn unpack_index(data: &[u8], index: usize, bits: u8) -> u8 {
 /// `fwht(fwht(x)) / D = x`.
 pub fn fwht(x: &mut [f32]) {
     let n = x.len();
-    debug_assert!(n.is_power_of_two(), "FWHT requires power-of-2 length, got {n}");
+    debug_assert!(
+        n.is_power_of_two(),
+        "FWHT requires power-of-2 length, got {n}"
+    );
     let mut stride = n >> 1;
     while stride > 0 {
         for i in 0..n {

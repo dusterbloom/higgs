@@ -17,11 +17,11 @@ use crate::{
     cache::PagedKvCache,
     chat_template::{ChatMessage, ChatTemplateRenderer},
     engine::{GenerationOutput, StreamingOutput},
-    scheduler::RoundRobinScheduler,
-    spec_prefill::{SpecPrefillConfig, SpecPrefillEngine},
     error::EngineError,
     model_loader,
     paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
+    scheduler::RoundRobinScheduler,
+    spec_prefill::{SpecPrefillConfig, SpecPrefillEngine},
 };
 
 /// Default maximum number of cached prefixes.
@@ -321,10 +321,10 @@ impl SimpleEngine {
         // Paged KV cache: 4096 blocks × 64 tokens/block = 262k tokens capacity
         // Adjust based on model size and expected context lengths
         let paged_cache = PagedKvCache::new(
-            4096,  // num_blocks
-            64,    // block_size (tokens per block)
-            2,     // num_kv_heads (Qwen3.5-35B-A3B uses GQA with 2 KV heads)
-            256,   // head_dim (Qwen3.5-35B-A3B)
+            4096, // num_blocks
+            64,   // block_size (tokens per block)
+            2,    // num_kv_heads (Qwen3.5-35B-A3B uses GQA with 2 KV heads)
+            256,  // head_dim (Qwen3.5-35B-A3B)
         );
 
         Ok(Self {
@@ -510,18 +510,27 @@ impl SimpleEngine {
                 .model
                 .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
-        } else if false && self.spec_prefill.should_use_spec_prefill(prompt_tokens.len()) { // DISABLED: manual RoPE too slow
+        } else if false
+            && self
+                .spec_prefill
+                .should_use_spec_prefill(prompt_tokens.len())
+        {
+            // DISABLED: manual RoPE too slow
             // Sparse prefill with custom RoPE positions
             use higgs_models::AnyCache;
-            
+
             let prompt_len = prompt_tokens.len();
             let keep_rate = self.spec_prefill.get_keep_rate(prompt_len);
             let n_selected = (prompt_len as f32 * keep_rate) as usize;
-            
+
             // Select evenly spaced tokens
-            let step = if n_selected > 0 { prompt_len / n_selected } else { 1 };
+            let step = if n_selected > 0 {
+                prompt_len / n_selected
+            } else {
+                1
+            };
             let selected_indices: Vec<usize> = (0..n_selected).map(|i| i * step).collect();
-            
+
             tracing::info!(
                 prompt_len,
                 selected_len = selected_indices.len(),
@@ -531,40 +540,48 @@ impl SimpleEngine {
                 prompt_len,
                 (selected_indices.len() as f32 / prompt_len as f32) * 100.0
             );
-            
+
             // Create input array for selected tokens
-            let selected_tokens_vec: Vec<u32> = selected_indices.iter().map(|&i| prompt_tokens[i]).collect();
-            let selected_tokens = Array::from_slice(&selected_tokens_vec, &[1, selected_indices.len() as i32]);
-            
+            let selected_tokens_vec: Vec<u32> =
+                selected_indices.iter().map(|&i| prompt_tokens[i]).collect();
+            let selected_tokens =
+                Array::from_slice(&selected_tokens_vec, &[1, selected_indices.len() as i32]);
+
             // Create position array [L]
             let positions: Vec<i32> = selected_indices.iter().map(|&i| i as i32).collect();
             let positions_array = Array::from_slice(&positions, &[selected_indices.len() as i32]);
-            
+
             tracing::info!(
                 "Sparse prefill: positions_array.shape={:?}, positions={:?}",
                 positions_array.shape(),
                 &positions[..std::cmp::min(10, positions.len())]
             );
-            
+
             // Get cache
             let cache = match &mut prepared.cache {
                 AnyCache::Hybrid(vec) => vec,
                 AnyCache::KV(_) => {
-                    return Err(EngineError::Generation("Expected Hybrid cache for Qwen3Next".to_string()));
+                    return Err(EngineError::Generation(
+                        "Expected Hybrid cache for Qwen3Next".to_string(),
+                    ));
                 }
             };
-            
+
             // Run sparse forward pass
             if let higgs_models::AnyModel::Qwen3Next(qwen_model) = &mut *prepared.model {
-                let hidden = qwen_model.forward_hidden_sparse(&selected_tokens, &positions_array, cache)
+                let hidden = qwen_model
+                    .forward_hidden_sparse(&selected_tokens, &positions_array, cache)
                     .map_err(EngineError::Mlx)?;
-                
+
                 // Compute logits from last selected token
-                let logits = qwen_model.compute_logits(&hidden)
+                let logits = qwen_model
+                    .compute_logits(&hidden)
                     .map_err(EngineError::Mlx)?;
                 logits
             } else {
-                return Err(EngineError::Generation("Expected Qwen3Next model".to_string()));
+                return Err(EngineError::Generation(
+                    "Expected Qwen3Next model".to_string(),
+                ));
             }
         } else {
             // Text-only prefill: use chunked prefill for long sequences to bound
@@ -766,7 +783,11 @@ impl SimpleEngine {
     /// Create a new session for batched generation.
     ///
     /// Returns the session ID.
-    pub fn create_session(&self, prompt_tokens: &[u32], max_tokens: usize) -> Result<u64, EngineError> {
+    pub fn create_session(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+    ) -> Result<u64, EngineError> {
         let mut sessions = self.sessions.lock().unwrap();
         let mut next_id = self.next_session_id.lock().unwrap();
         let mut scheduler = self.scheduler.lock().unwrap();
@@ -776,7 +797,8 @@ impl SimpleEngine {
         *next_id += 1;
 
         // Create session in paged cache
-        paged_cache.create_session(session_id)
+        paged_cache
+            .create_session(session_id)
             .map_err(|e| EngineError::Generation(format!("Failed to create session: {}", e)))?;
 
         // Create session state
@@ -807,7 +829,8 @@ impl SimpleEngine {
 
         sessions.remove(&session_id);
         scheduler.remove(session_id);
-        paged_cache.remove_session(session_id)
+        paged_cache
+            .remove_session(session_id)
             .map_err(|e| EngineError::Generation(format!("Failed to remove session: {}", e)))?;
 
         Ok(())
@@ -816,7 +839,10 @@ impl SimpleEngine {
     /// Check if session is finished.
     pub fn is_session_finished(&self, session_id: u64) -> bool {
         let sessions = self.sessions.lock().unwrap();
-        sessions.get(&session_id).map(|s| s.finished).unwrap_or(true)
+        sessions
+            .get(&session_id)
+            .map(|s| s.finished)
+            .unwrap_or(true)
     }
 
     /// Step one token for all active sessions (batched generation).
@@ -825,7 +851,10 @@ impl SimpleEngine {
     ///
     /// Note: Current implementation processes sessions sequentially.
     /// True batched generation (parallel decode across sessions) is TODO.
-    pub fn step(&self, _params: &SamplingParams) -> Result<Vec<(u64, GenerationOutput)>, EngineError> {
+    pub fn step(
+        &self,
+        _params: &SamplingParams,
+    ) -> Result<Vec<(u64, GenerationOutput)>, EngineError> {
         let mut outputs = Vec::new();
         let mut scheduler = self.scheduler.lock().unwrap();
         let mut sessions = self.sessions.lock().unwrap();
@@ -860,13 +889,16 @@ impl SimpleEngine {
             if self.eos_token_ids.contains(&last_token) && session.tokens.len() > 1 {
                 session.finished = true;
                 scheduler.remove(session_id);
-                outputs.push((session_id, GenerationOutput {
-                    text: self.decode_tokens(&session.tokens)?,
-                    finish_reason: "stop".to_owned(),
-                    prompt_tokens: 1, // Placeholder
-                    completion_tokens: session.tokens.len() as u32 - 1,
-                    token_logprobs: None,
-                }));
+                outputs.push((
+                    session_id,
+                    GenerationOutput {
+                        text: self.decode_tokens(&session.tokens)?,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: 1, // Placeholder
+                        completion_tokens: session.tokens.len() as u32 - 1,
+                        token_logprobs: None,
+                    },
+                ));
                 continue;
             }
 
@@ -874,13 +906,16 @@ impl SimpleEngine {
             if session.tokens.len() >= session.max_tokens {
                 session.finished = true;
                 scheduler.remove(session_id);
-                outputs.push((session_id, GenerationOutput {
-                    text: self.decode_tokens(&session.tokens)?,
-                    finish_reason: "length".to_owned(),
-                    prompt_tokens: 1, // Placeholder
-                    completion_tokens: session.tokens.len() as u32 - 1,
-                    token_logprobs: None,
-                }));
+                outputs.push((
+                    session_id,
+                    GenerationOutput {
+                        text: self.decode_tokens(&session.tokens)?,
+                        finish_reason: "length".to_owned(),
+                        prompt_tokens: 1, // Placeholder
+                        completion_tokens: session.tokens.len() as u32 - 1,
+                        token_logprobs: None,
+                    },
+                ));
                 continue;
             }
 
@@ -889,13 +924,16 @@ impl SimpleEngine {
             session.finished = true;
             scheduler.remove(session_id);
 
-            outputs.push((session_id, GenerationOutput {
-                text: self.decode_tokens(&session.tokens)?,
-                finish_reason: "length".to_owned(),
-                prompt_tokens: 1,
-                completion_tokens: session.tokens.len() as u32,
-                token_logprobs: None,
-            }));
+            outputs.push((
+                session_id,
+                GenerationOutput {
+                    text: self.decode_tokens(&session.tokens)?,
+                    finish_reason: "length".to_owned(),
+                    prompt_tokens: 1,
+                    completion_tokens: session.tokens.len() as u32,
+                    token_logprobs: None,
+                },
+            ));
         }
 
         Ok(outputs)
@@ -914,8 +952,9 @@ impl SimpleEngine {
         _top_logprobs: Option<u32>,
     ) -> Result<GenerationOutput, EngineError> {
         let sessions = self.sessions.lock().unwrap();
-        
-        let session = sessions.get(&session_id)
+
+        let session = sessions
+            .get(&session_id)
             .ok_or_else(|| EngineError::Generation(format!("Session {} not found", session_id)))?;
 
         // For now, just return accumulated tokens
@@ -1108,8 +1147,8 @@ impl SimpleEngine {
         };
         // Seed thinking state from the first token (already emitted above).
         let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
-        let mut seen_think_close = think_close_token
-            .is_some_and(|close_id| first_token_id == close_id);
+        let mut seen_think_close =
+            think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
         loop {
             let t0 = std::time::Instant::now();
@@ -1359,8 +1398,8 @@ impl SimpleEngine {
         };
         // Seed thinking state from the first token (already emitted by caller).
         let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
-        let mut seen_think_close = think_close_token
-            .is_some_and(|close_id| first_token_id == close_id);
+        let mut seen_think_close =
+            think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
         loop {
             let result = crate::mtp::mtp_cycle(
@@ -1510,8 +1549,8 @@ impl SimpleEngine {
             None
         };
         let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
-        let mut seen_think_close = think_close_token
-            .is_some_and(|close_id| first_token_id == close_id);
+        let mut seen_think_close =
+            think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
         loop {
             let result = crate::mtp::mtp_cycle(
@@ -1782,8 +1821,8 @@ impl SimpleEngine {
         };
         // Seed thinking state from the first token (already emitted above).
         let mut thinking_tokens: u32 = if think_close_token.is_some() { 1 } else { 0 };
-        let mut seen_think_close = think_close_token
-            .is_some_and(|close_id| first_token_id == close_id);
+        let mut seen_think_close =
+            think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
         // Pipelined decode loop: build step N+2 while GPU computes step N+1
         let (mut next_token, mut next_logprob_data) = Self::decode_step(

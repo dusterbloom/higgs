@@ -8,6 +8,7 @@ use higgs_engine::error::EngineError;
 use higgs_engine::simple::SimpleEngine;
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
+use higgs_models::turboquant::KvCacheConfig;
 use mlx_rs::Array;
 
 use crate::config::HiggsConfig;
@@ -25,11 +26,11 @@ pub enum Engine {
 
 impl Engine {
     pub fn load_simple<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
-        SimpleEngine::load(dir).map(|e| Self::Simple(Box::new(e)))
+        SimpleEngine::load(dir, KvCacheConfig::default()).map(|e| Self::Simple(Box::new(e)))
     }
 
     pub fn load_batch<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
-        BatchEngine::load(dir).map(|e| Self::Batch(Box::new(e)))
+        BatchEngine::load(dir, KvCacheConfig::default()).map(|e| Self::Batch(Box::new(e)))
     }
 
     #[cfg(test)]

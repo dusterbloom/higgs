@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
-use mlx_rs::{error::Exception, ops, ops::concatenate_axis, Array, Dtype, Stream};
+use mlx_rs::{Array, Dtype, Stream, error::Exception, ops, ops::concatenate_axis};
 
 use crate::turboquant::{
     KvCacheConfig, KvCacheMode, QuantizedKey, QuantizedValue, TurboQuantContext,
@@ -1351,7 +1351,7 @@ mod tests {
             .unwrap();
         let turbo = view.turboquant().unwrap();
         assert_eq!(turbo.seq_len, 3); // 2 prefill + 1 decode
-                                      // head_dim=8, key_bits=2: ceil(8*2/32) = 1 u32 word
+        // head_dim=8, key_bits=2: ceil(8*2/32) = 1 u32 word
         assert_eq!(turbo.key_codes.shape(), &[2, 3, 1]);
         // head_dim=8, bits=3: ceil(8*3/32) = 1 u32 word
         assert_eq!(turbo.value_codes.shape(), &[2, 3, 1]);

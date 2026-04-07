@@ -1493,7 +1493,7 @@ impl Qwen3NextAttention {
             self.rope.base,
             self.rope.scale,
         )?;
-        
+
         let keys_with_rope = apply_rope_manual(
             keys,
             positions,
@@ -1501,7 +1501,7 @@ impl Qwen3NextAttention {
             self.rope.base,
             self.rope.scale,
         )?;
-        
+
         Ok((queries_with_rope, keys_with_rope))
     }
 }
@@ -2889,18 +2889,18 @@ fn apply_rope_manual(
     scale: f32,
 ) -> Result<Array, Exception> {
     use mlx_rs::{Dtype, ops};
-    
+
     // x shape: [B, H, L, D] or [B, L, D]
     let shape = x.shape();
     let ndim = shape.len();
-    
+
     if ndim < 2 {
         return Err(Exception::custom("Input must have at least 2 dimensions"));
     }
-    
+
     let D = shape[ndim - 1] as i32;
     let half_dim = dimensions / 2;
-    
+
     // Compute frequencies: base^(-2i/dimensions) for i in [0, half_dim)
     let inv_freq: Vec<f32> = (0..half_dim)
         .map(|i| {
@@ -2909,7 +2909,7 @@ fn apply_rope_manual(
         })
         .collect();
     let inv_freq_arr = Array::from_slice(&inv_freq, &[half_dim as i32]);
-    
+
     // Get positions as [L] or [B, L]
     let pos_shape = positions.shape();
     let L = if pos_shape.len() == 1 {
@@ -2917,18 +2917,24 @@ fn apply_rope_manual(
     } else {
         pos_shape[pos_shape.len() - 1]
     };
-    
-    tracing::debug!("apply_rope_manual: x.shape={:?}, positions.shape={:?}, dimensions={}, base={}", x.shape(), positions.shape(), dimensions, base);
+
+    tracing::debug!(
+        "apply_rope_manual: x.shape={:?}, positions.shape={:?}, dimensions={}, base={}",
+        x.shape(),
+        positions.shape(),
+        dimensions,
+        base
+    );
     // Compute angles: positions * inv_freq
     // positions: [L], inv_freq: [half_dim] -> angles: [L, half_dim]
     let positions_expanded = positions.reshape(&[L, 1])?;
     let inv_freq_expanded = inv_freq_arr.reshape(&[1, half_dim as i32])?;
     let angles = ops::multiply(&positions_expanded, &inv_freq_expanded)?;
-    
+
     // Compute cos and sin
     let cos = ops::cos(&angles)?;
     let sin = ops::sin(&angles)?;
-    
+
     // Reshape for broadcasting: [1, 1, L, half_dim] or [1, L, half_dim]
     let cos_shape: Vec<i32> = if ndim == 4 {
         vec![1, 1, L, half_dim as i32]
@@ -2937,11 +2943,11 @@ fn apply_rope_manual(
     };
     let cos = cos.reshape(&cos_shape)?;
     let sin = sin.reshape(&cos_shape)?;
-    
+
     // Split x into two halves along last dimension
     let x_first = x.index((.., .., .., ..half_dim));
     let x_second = x.index((.., .., .., half_dim..));
-    
+
     // Apply RoPE rotation
     // output_first = x_first * cos - x_second * sin
     // output_second = x_first * sin + x_second * cos
@@ -2953,11 +2959,10 @@ fn apply_rope_manual(
         &ops::multiply(&x_first, &sin)?,
         &ops::multiply(&x_second, &cos)?,
     )?;
-    
+
     // Concatenate back
     ops::concatenate_axis(&[&output_first, &output_second], (ndim - 1) as i32)
 }
-
 
 impl Qwen3NextCausalLM {
     pub fn new(args: Qwen3NextModelArgs) -> Result<Self, Exception> {
@@ -3660,8 +3665,8 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
     // Load weights with GDN projection rearrangement: flat (qkv,z,b,a)
     // → per-head-grouped (qkvz,ba) for fused 2-dispatch forward path.
     // Respect use_separate_gdn_projections config flag or HIGGS_SEPARATE_GDN_PROJ env var.
-    let use_separate = args.use_separate_gdn_projections
-        || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
+    let use_separate =
+        args.use_separate_gdn_projections || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
     if use_separate {
         load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
         tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
@@ -13426,7 +13431,6 @@ mod tests {
     }
 }
 
-
 // ===========================================================================
 // Sparse Forward Pass with Custom RoPE Positions
 // ===========================================================================
@@ -13479,18 +13483,21 @@ fn forward_attention_sparse(
     // Apply RoPE at CUSTOM positions using rope_dynamic
     tracing::debug!(
         "forward_attention_sparse: queries.shape={:?}, keys.shape={:?}, positions.shape={:?}",
-        queries.shape(), keys.shape(), positions.shape()
+        queries.shape(),
+        keys.shape(),
+        positions.shape()
     );
-    let (queries_with_rope, keys_with_rope) = match attn.apply_rope_at_positions(&queries, &keys, positions) {
-        Ok(result) => {
-            tracing::debug!("rope_dynamic succeeded");
-            result
-        }
-        Err(e) => {
-            tracing::error!("rope_dynamic failed: {:?}", e);
-            return Err(e);
-        }
-    };
+    let (queries_with_rope, keys_with_rope) =
+        match attn.apply_rope_at_positions(&queries, &keys, positions) {
+            Ok(result) => {
+                tracing::debug!("rope_dynamic succeeded");
+                result
+            }
+            Err(e) => {
+                tracing::error!("rope_dynamic failed: {:?}", e);
+                return Err(e);
+            }
+        };
     queries = queries_with_rope;
     keys = keys_with_rope;
 
