@@ -253,6 +253,12 @@ impl AnyModel {
             .get(1)
             .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
 
+        if chunk_size <= 0 {
+            return Err(Exception::custom(format!(
+                "forward_chunked: chunk_size must be > 0, got {chunk_size}"
+            )));
+        }
+
         if chunk_size >= T {
             return self.forward(inputs, None, cache);
         }

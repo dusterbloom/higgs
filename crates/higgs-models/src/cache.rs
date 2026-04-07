@@ -481,6 +481,7 @@ impl SteppingKeyValueCache {
         offset: i32,
     ) -> Self {
         let capacity = key_codes.shape().get(1).copied().unwrap_or(0);
+        let config = context.config.clone();
         Self {
             keys: None,
             values: None,
@@ -493,10 +494,7 @@ impl SteppingKeyValueCache {
                 value_norms: Some(value_norms),
                 capacity,
             }),
-            config: KvCacheConfig {
-                mode: KvCacheMode::Turboquant,
-                ..KvCacheConfig::default()
-            },
+            config,
             offset,
             step: 256,
         }
@@ -589,15 +587,15 @@ impl SteppingKeyValueCache {
         values: Array,
         activate_at: i32,
     ) -> Result<KvCacheView, Exception> {
-        if keys.ndim() < 3 {
+        if keys.ndim() < 4 {
             return Err(Exception::custom(format!(
-                "update_and_view: keys must have ndim >= 3, got {}",
+                "update_and_view: keys must have ndim >= 4 (B, H, T, D), got {}",
                 keys.ndim()
             )));
         }
-        if values.ndim() < 3 {
+        if values.ndim() < 4 {
             return Err(Exception::custom(format!(
-                "update_and_view: values must have ndim >= 3, got {}",
+                "update_and_view: values must have ndim >= 4 (B, H, T, D), got {}",
                 values.ndim()
             )));
         }

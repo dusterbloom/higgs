@@ -82,7 +82,7 @@ impl PagedKvCache {
 
     /// Create a new session.
     pub fn create_session(&mut self, session_id: u64) -> Result<(), CacheError> {
-        if self.page_table.has_session(session_id) {
+        if self.session_tokens.contains_key(&session_id) {
             return Err(CacheError::SessionAlreadyExists(session_id));
         }
         self.session_tokens.insert(session_id, 0);

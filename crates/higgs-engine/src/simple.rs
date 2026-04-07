@@ -1093,16 +1093,6 @@ impl SimpleEngine {
             }
         }
 
-        // After the first decode step, TQ deferred quantization has activated:
-        // dense KV was bulk-quantized into TQ storage. Re-store the cache so the
-        // prefix cache gets the quantized blocks (the initial store after prefill
-        // only captured the dense pre-quantization state).
-        if self.kv_cache_config.is_turboquant() && prepared.pixel_values.is_none() {
-            if let Ok(mut pc) = self.prefix_cache.lock() {
-                pc.store(prompt_tokens, &prepared.cache);
-            }
-        }
-
         let mut total_forward_ns: u128 = 0;
         let mut total_eval_ns: u128 = 0;
         let mut total_item_ns: u128 = 0;
@@ -1813,14 +1803,18 @@ impl SimpleEngine {
             async_eval(eval_targets).map_err(EngineError::Mlx)?;
         }
 
-        // Re-store after TQ activation (see generate_inner for rationale).
-        if self.kv_cache_config.is_turboquant() && prepared.pixel_values.is_none() {
-            if let Ok(mut pc) = self.prefix_cache.lock() {
-                pc.store(prompt_tokens, &prepared.cache);
-            }
-        }
-
         loop {
+            // When constrained, extract the sampled token and advance the FSM
+            // before decode_step, so the mask is always applied at the correct
+            // FSM state (mirrors the non-streaming pattern in generate_inner).
+            let constrained_token_id: Option<u32> = constraint.is_some().then(|| {
+                let id: u32 = next_token.item();
+                if let Some(ref mut cg) = constraint {
+                    cg.advance(id);
+                }
+                id
+            });
+
             let (following, following_logprob_data) = Self::decode_step(
                 &next_token,
                 &mut prepared.model,
@@ -1835,10 +1829,14 @@ impl SimpleEngine {
                 if let Some(ref lp) = following_logprob_data {
                     eval_targets.extend(lp.eval_targets());
                 }
-                async_eval(eval_targets).map_err(EngineError::Mlx)?;
+                if constraint.is_some() {
+                    eval(eval_targets).map_err(EngineError::Mlx)?;
+                } else {
+                    async_eval(eval_targets).map_err(EngineError::Mlx)?;
+                }
             }
 
-            let mut token_id: u32 = next_token.item();
+            let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
 
             // Thinking budget: force </think> after N tokens if model hasn't closed it.
             // NOTE: same KV-cache discontinuity caveat as the non-streaming path.
@@ -1858,11 +1856,6 @@ impl SimpleEngine {
                         }
                     }
                 }
-            }
-
-            // Advance constrained generator state
-            if let Some(ref mut cg) = constraint {
-                cg.advance(token_id);
             }
 
             let token_logprob = next_logprob_data
