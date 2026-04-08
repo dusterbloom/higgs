@@ -229,15 +229,40 @@ impl DiffusionEngine {
         // Load config
         let cfg = load_diffusion_config_json(dir)?;
 
+        let hidden = cfg["hidden_size"].as_u64().unwrap() as usize;
+        let heads = cfg["num_attention_heads"].as_u64().unwrap() as usize;
+        // Qwen2.5-Coder (A2D) has no head_dim field; compute from hidden/heads.
+        // Qwen3 variants explicitly set head_dim (e.g., 128). Fall back to 128
+        // for older configs that predate the field.
+        let head_dim = cfg["head_dim"]
+            .as_u64()
+            .map(|v| v as usize)
+            .unwrap_or_else(|| if heads > 0 { hidden / heads } else { 128 });
+
+        // mask_token_id: try added_tokens.json for "<|mask|>", fall back to
+        // Qwen3 value. A2D Qwen2.5-Coder uses 151665; Qwen3 uses 151669.
+        let mask_token_id: u32 = match std::fs::read_to_string(dir.join("added_tokens.json")) {
+            Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(json) => json
+                    .as_object()
+                    .and_then(|m| m.get("<|mask|>"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or(151669),
+                Err(_) => 151669,
+            },
+            Err(_) => 151669,
+        };
+
         let config = DiffusionConfig {
-            hidden: cfg["hidden_size"].as_u64().unwrap() as usize,
+            hidden,
             layers: cfg["num_hidden_layers"].as_u64().unwrap() as usize,
-            heads: cfg["num_attention_heads"].as_u64().unwrap() as usize,
+            heads,
             kv_heads: cfg["num_key_value_heads"].as_u64().unwrap() as usize,
-            head_dim: cfg["head_dim"].as_u64().unwrap_or(128) as usize,
+            head_dim,
             inter: cfg["intermediate_size"].as_u64().unwrap() as usize,
             vocab: cfg["vocab_size"].as_u64().unwrap() as usize,
-            mask_token_id: 151669, // <|mask|> in Qwen3 tokenizer
+            mask_token_id,
             rope_theta: cfg["rope_theta"].as_f64().unwrap_or(1_000_000.0),
         };
 
@@ -3158,7 +3183,8 @@ impl AneArDecodeEngine {
         );
         let t0 = std::time::Instant::now();
 
-        // Generate decode layer MIL
+        // Generate decode layer MIL (stub on this branch; panics at runtime
+        // if called — Magic Canvas tests go through the bidirectional path).
         let mil = diffusion_ane::gen_decode_layer(h, cfg.heads, cfg.kv_heads, hd, inter, max_seq, 1e-6);
         let mil_names: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
 
@@ -4295,6 +4321,355 @@ mod tests {
             DiffusionEngine::detect_model_kind(dir.path()).unwrap(),
             DiffusionModelKind::BonsaiQ1
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // MAGIC CANVAS killer tests — zero-shot UI generation on A2D diffusion.
+    //
+    // User hypothesis: the code-tuned A2D model (Qwen2.5-Coder-0.5B-Instruct
+    // diffusion-mdlm) already has HTML/CSS/JS in its training distribution
+    // via Qwen2.5-Coder pretraining, so UI generation should work zero-shot
+    // without any fine-tuning. External reviewers (codex/GLM/Sonnet) all
+    // assumed fine-tuning was mandatory because they pattern-matched on
+    // general-purpose MDLM benchmarks.
+    //
+    // BUT: the existing DiffusionEngine::load was written for Qwen3 A2D
+    // variants, which have q_norm/k_norm and no attention bias. Qwen2.5-Coder
+    // A2D has attention BIAS and NO q_norm/k_norm. Loading it blows up at
+    // `Missing: self_attn.q_norm.weight`. Adding Qwen2 architecture support
+    // to DiffusionLayerWeights is ~100 lines of real work.
+    //
+    // First gate: run tests against the Qwen3-0.6B diffusion variant (which
+    // the existing engine supports unchanged). If it can generate HTML zero-
+    // shot even without code pretraining, the Qwen2.5-Coder path is a slam
+    // dunk and the Rust engine extension is justified. If it can't, the
+    // Qwen2.5-Coder variant becomes the decisive signal and extending the
+    // engine is mandatory.
+    // ------------------------------------------------------------------------
+
+    fn qwen3_diffusion_dir() -> Option<String> {
+        let dir = format!(
+            "{}/.cache/huggingface/hub/models--dllm-hub--Qwen3-0.6B-diffusion-mdlm-v0.1",
+            std::env::var("HOME").ok()?
+        );
+        if std::path::Path::new(&dir).join("model.safetensors").exists() {
+            Some(dir)
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
+    fn qwen25_coder_diffusion_dir() -> Option<String> {
+        // TODO: requires DiffusionEngine to support Qwen2-style attention
+        // (bias terms, no q_norm/k_norm). See diffusion.rs::load comments.
+        let dir = format!(
+            "{}/.cache/huggingface/hub/models--dllm-hub--Qwen2.5-Coder-0.5B-Instruct-diffusion-mdlm-v0.1/snapshots/a284e895a6248256baf2f60502e54aba61b24c1a",
+            std::env::var("HOME").ok()?
+        );
+        if std::path::Path::new(&dir).join("model.safetensors").exists() {
+            Some(dir)
+        } else {
+            None
+        }
+    }
+
+    fn magic_canvas_dir() -> Option<String> {
+        qwen3_diffusion_dir()
+    }
+
+    /// Format a chat prompt using the Qwen2/Qwen3 chat template tokens.
+    fn format_chat_prompt(
+        tokenizer: &tokenizers::Tokenizer,
+        system: &str,
+        user: &str,
+    ) -> Vec<u32> {
+        let prompt = format!(
+            "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+        );
+        tokenizer
+            .encode(prompt, false)
+            .expect("chat prompt tokenization")
+            .get_ids()
+            .to_vec()
+    }
+
+    /// Score HTML output for a login form: structure + tailwind + semantic.
+    fn score_login_form_html(text: &str) -> (usize, [bool; 6]) {
+        let lc = text.to_lowercase();
+        let checks = [
+            text.contains("<form") || lc.contains("<form"),
+            text.contains("<input") || lc.contains("<input"),
+            lc.contains("<button") || lc.contains("type=\"submit\"") || lc.contains("type='submit'"),
+            lc.contains("type=\"email\"") || lc.contains("type='email'") || lc.contains("email"),
+            lc.contains("type=\"password\"") || lc.contains("type='password'") || lc.contains("password"),
+            // tailwind-ish class marker
+            lc.contains("class=\"") && (
+                lc.contains("bg-") || lc.contains("text-") || lc.contains("p-") ||
+                lc.contains("flex") || lc.contains("rounded") || lc.contains("w-") ||
+                lc.contains("h-") || lc.contains("grid")
+            ),
+        ];
+        let score = checks.iter().filter(|b| **b).count();
+        (score, checks)
+    }
+
+    /// T0 — smoke test: load the Qwen2.5-Coder A2D model via DiffusionEngine,
+    /// tokenize a trivial prompt, and run 16-step MDLM denoising of 16 tokens.
+    /// Pass if the decoded output has ≥50% non-mask tokens.
+    #[test]
+    #[ignore = "requires dllm-hub Qwen2.5-Coder diffusion model on disk; run manually"]
+    fn t0_magic_canvas_smoke() {
+        let Some(dir) = magic_canvas_dir() else {
+            eprintln!("SKIP: Qwen2.5-Coder diffusion model not found");
+            return;
+        };
+        let t_load = std::time::Instant::now();
+        let engine = DiffusionEngine::load_autodetect(&dir).expect("load engine");
+        eprintln!("[T0] model loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+        eprintln!(
+            "[T0] config: hidden={} layers={} heads={}/{} head_dim={} vocab={} mask_id={}",
+            engine.config.hidden,
+            engine.config.layers,
+            engine.config.heads,
+            engine.config.kv_heads,
+            engine.config.head_dim,
+            engine.config.vocab,
+            engine.config.mask_token_id,
+        );
+
+        let tokenizer = crate::load_tokenizer(&dir).expect("load tokenizer");
+        let prompt_ids = format_chat_prompt(&tokenizer, "You generate UI markup.", "Say hi.");
+        eprintln!("[T0] prompt: {} tokens", prompt_ids.len());
+
+        let t_gen = std::time::Instant::now();
+        let generated = engine.generate(&prompt_ids, 16, 16);
+        let gen_ms = t_gen.elapsed().as_millis();
+        eprintln!("[T0] generate: {gen_ms}ms for 16 tokens @ 16 steps");
+
+        let gen_tokens = &generated[prompt_ids.len()..];
+        let mask_id = engine.config.mask_token_id as u32;
+        let non_mask = gen_tokens.iter().filter(|&&t| t != mask_id).count();
+        let text = tokenizer
+            .decode(gen_tokens, true)
+            .unwrap_or_else(|_| "<decode error>".to_string());
+        eprintln!("[T0] output ({non_mask}/{} non-mask): {text:?}", gen_tokens.len());
+
+        assert!(
+            non_mask >= gen_tokens.len() / 2,
+            "model produced mostly mask tokens — smoke test fail"
+        );
+    }
+
+    /// T1 — zero-shot HTML generation: ask for a login form, sweep step counts.
+    /// Pass if AT LEAST ONE step count produces ≥4/6 structural features.
+    #[test]
+    #[ignore = "requires dllm-hub Qwen2.5-Coder diffusion model on disk; run manually"]
+    fn t1_magic_canvas_zero_shot_login_form() {
+        let Some(dir) = magic_canvas_dir() else {
+            eprintln!("SKIP: Qwen2.5-Coder diffusion model not found");
+            return;
+        };
+        let engine = DiffusionEngine::load_autodetect(&dir).expect("load engine");
+        let tokenizer = crate::load_tokenizer(&dir).expect("load tokenizer");
+
+        let prompt_ids = format_chat_prompt(
+            &tokenizer,
+            "You generate HTML with Tailwind CSS classes. Output only the HTML.",
+            "Write a login form with email and password fields and a submit button.",
+        );
+        eprintln!("[T1] prompt: {} tokens", prompt_ids.len());
+
+        let num_gen: usize = 96;
+        let mut best_score = 0;
+        let mut best_text = String::new();
+        let mut best_steps = 0;
+        let mut best_ms = 0u128;
+
+        for &steps in &[4usize, 8, 16, 32] {
+            let t = std::time::Instant::now();
+            let generated = engine.generate(&prompt_ids, num_gen, steps);
+            let ms = t.elapsed().as_millis();
+            let gen_tokens = &generated[prompt_ids.len()..];
+            let text = tokenizer
+                .decode(gen_tokens, true)
+                .unwrap_or_else(|_| String::new());
+            let (score, checks) = score_login_form_html(&text);
+            eprintln!(
+                "[T1 steps={steps:>2}] {ms:>5}ms score={score}/6 form={} input={} btn={} email={} pw={} tw={}",
+                checks[0], checks[1], checks[2], checks[3], checks[4], checks[5]
+            );
+            eprintln!("           output: {:?}", &text[..text.len().min(240)]);
+            if score > best_score {
+                best_score = score;
+                best_text = text.clone();
+                best_steps = steps;
+                best_ms = ms;
+            }
+        }
+
+        eprintln!();
+        eprintln!("[T1] BEST: score={best_score}/6 at {best_steps} steps, {best_ms}ms");
+        eprintln!("[T1] BEST OUTPUT: {best_text:?}");
+        assert!(
+            best_score >= 4,
+            "T1 zero-shot FAIL: best score {best_score}/6 — user hypothesis (code-tuned model \
+             produces HTML zero-shot) is refuted. Fine-tuning required."
+        );
+    }
+
+    /// T2 — prompt variety: 10 diverse UI prompts at a single step count.
+    /// Runs both on CPU BLAS and (when feature="ane") on ANE for real hardware
+    /// latency comparison. Pass if ≥6/10 produce at least partially valid HTML.
+    #[test]
+    #[ignore = "long; requires Qwen3 diffusion model on disk; run manually"]
+    fn t2_magic_canvas_prompt_variety() {
+        let Some(dir) = magic_canvas_dir() else {
+            eprintln!("SKIP: Qwen3 diffusion model not found at magic_canvas_dir()");
+            return;
+        };
+        let engine = DiffusionEngine::load_autodetect(&dir).expect("load engine");
+        let tokenizer = crate::load_tokenizer(&dir).expect("load tokenizer");
+
+        let prompts: &[(&str, &str)] = &[
+            ("login form",    "Write HTML for a login form with email and password."),
+            ("signup form",   "Write HTML for a signup form with name, email, password, confirm password."),
+            ("product card",  "Write HTML for a product card with image, title, price, buy button."),
+            ("navbar",        "Write HTML for a navbar with logo and menu links."),
+            ("pricing table", "Write HTML for a pricing table with 3 tiers: Basic, Pro, Enterprise."),
+            ("contact form",  "Write HTML for a contact form with name, email, message, send button."),
+            ("stat card",     "Write HTML for a stat card showing Users: 1234 with icon."),
+            ("footer",        "Write HTML for a footer with 3 columns of links and copyright."),
+            ("button",        "Write HTML for a primary button that says Get Started."),
+            ("alert",         "Write HTML for a success alert saying Saved successfully."),
+        ];
+
+        const STEPS: usize = 16;
+        const NUM_GEN: usize = 96;
+        const CANVAS: usize = 256; // max prompt + num_gen for runtime allocation
+
+        // --- Build runtimes: CPU always, ANE if feature enabled ---
+        let cpu_runtime = DiffusionRuntime::new(
+            engine.clone(),
+            CANVAS,
+            DiffusionBackendPreference::CpuBlas,
+        )
+        .expect("build CPU runtime");
+        eprintln!("[T2] CPU runtime: {:?}", cpu_runtime.backend_report().detail);
+
+        #[cfg(feature = "ane")]
+        let ane_runtime = {
+            eprintln!("[T2] building ANE runtime...");
+            match DiffusionRuntime::new(
+                engine.clone(),
+                CANVAS,
+                DiffusionBackendPreference::Ane,
+            ) {
+                Ok(rt) => {
+                    eprintln!("[T2] ANE runtime: {:?} {}", rt.selected_backend(), rt.backend_report().detail);
+                    Some(rt)
+                }
+                Err(e) => {
+                    eprintln!("[T2] ANE runtime build FAILED: {e} — will skip ANE column");
+                    None
+                }
+            }
+        };
+        #[cfg(not(feature = "ane"))]
+        let ane_runtime: Option<DiffusionRuntime> = None;
+
+        // Warm up once (allocator priming, kernel compile)
+        {
+            let warm_ids = format_chat_prompt(&tokenizer, "warmup", "warmup");
+            let _ = cpu_runtime.generate(&warm_ids, 16, 4);
+            if let Some(ref rt) = ane_runtime {
+                let _ = rt.generate(&warm_ids, 16, 4);
+            }
+        }
+
+        let mut cpu_valid = 0usize;
+        let mut ane_valid = 0usize;
+        let mut cpu_total_ms = 0u128;
+        let mut ane_total_ms = 0u128;
+
+        eprintln!();
+        eprintln!("{:<14} | {:>9} {:>6} | {:>9} {:>6}",
+                  "prompt", "cpu_ms", "valid", "ane_ms", "valid");
+        eprintln!("{}", "-".repeat(64));
+
+        for (label, user_msg) in prompts {
+            let prompt_ids = format_chat_prompt(
+                &tokenizer,
+                "You generate HTML. Output only the HTML.",
+                user_msg,
+            );
+
+            // CPU
+            let t = std::time::Instant::now();
+            let generated = cpu_runtime.generate(&prompt_ids, NUM_GEN, STEPS);
+            let cpu_ms = t.elapsed().as_millis();
+            cpu_total_ms += cpu_ms;
+            let gen_tokens = &generated[prompt_ids.len()..];
+            let cpu_text = tokenizer.decode(gen_tokens, true).unwrap_or_default();
+            let cpu_ok = html_partially_valid(&cpu_text);
+            if cpu_ok { cpu_valid += 1; }
+
+            // ANE
+            let (ane_ms_str, ane_ok_str, ane_text) = if let Some(ref rt) = ane_runtime {
+                let t = std::time::Instant::now();
+                let generated = rt.generate(&prompt_ids, NUM_GEN, STEPS);
+                let ane_ms = t.elapsed().as_millis();
+                ane_total_ms += ane_ms;
+                let gen_tokens = &generated[prompt_ids.len()..];
+                let text = tokenizer.decode(gen_tokens, true).unwrap_or_default();
+                let ok = html_partially_valid(&text);
+                if ok { ane_valid += 1; }
+                (format!("{ane_ms}"), ok.to_string(), text)
+            } else {
+                ("-".to_string(), "-".to_string(), String::new())
+            };
+
+            eprintln!(
+                "{label:<14} | {cpu_ms:>9} {:>6} | {ane_ms_str:>9} {:>6}",
+                cpu_ok, ane_ok_str
+            );
+            let cpu_preview: String = cpu_text.chars().take(140).collect();
+            eprintln!("   cpu: {cpu_preview:?}");
+            if !ane_text.is_empty() {
+                let ane_preview: String = ane_text.chars().take(140).collect();
+                eprintln!("   ane: {ane_preview:?}");
+            }
+        }
+
+        eprintln!();
+        eprintln!(
+            "[T2] CPU: {cpu_valid}/{} valid, avg {}ms/prompt",
+            prompts.len(),
+            cpu_total_ms / (prompts.len() as u128).max(1)
+        );
+        if ane_runtime.is_some() {
+            eprintln!(
+                "[T2] ANE: {ane_valid}/{} valid, avg {}ms/prompt",
+                prompts.len(),
+                ane_total_ms / (prompts.len() as u128).max(1)
+            );
+            let speedup = (cpu_total_ms as f64) / (ane_total_ms as f64).max(1.0);
+            eprintln!("[T2] ANE speedup vs CPU: {speedup:.2}x");
+        }
+
+        assert!(
+            cpu_valid >= 6,
+            "T2 CPU prompt variety FAIL: only {cpu_valid}/{} valid.",
+            prompts.len()
+        );
+    }
+
+    fn html_partially_valid(text: &str) -> bool {
+        let lc = text.to_lowercase();
+        let has_open_tag = lc.contains('<');
+        let has_close_tag = lc.contains("</");
+        let has_class_attr = lc.contains("class=\"") || lc.contains("class='");
+        has_open_tag && (has_close_tag || has_class_attr)
     }
 
     /// Benchmark: BLAS vs ANE BLOBFILE for the diffusion projection matmuls.

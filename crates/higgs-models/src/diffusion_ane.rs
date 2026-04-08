@@ -17,6 +17,22 @@
 use crate::ane_mil::{FusedMil, ANE_MIN_SPATIAL, MIL_HEADER};
 use std::fmt::Write;
 
+/// STUB: gen_decode_layer was removed from this branch but call sites remain.
+/// Panics if invoked. Bidirectional Magic Canvas tests don't hit the
+/// `AneArDecodeEngine` path so this is dead code for those tests.
+#[allow(clippy::too_many_arguments)]
+pub fn gen_decode_layer(
+    _dim: usize,
+    _heads: usize,
+    _kv_heads: usize,
+    _hd: usize,
+    _inter: usize,
+    _max_seq: usize,
+    _eps: f64,
+) -> FusedMil {
+    panic!("gen_decode_layer: not implemented on this branch — AR-decode ANE path is dead");
+}
+
 /// Generate a fully-fused single transformer layer.
 ///
 /// Input:  `[1, dim, 1, seq]` fp32

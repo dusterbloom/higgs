@@ -509,18 +509,17 @@ impl AnyModel {
     /// verify a draft sequence in a single forward pass.
     pub fn forward_all_logits(
         &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut AnyCache,
+        _inputs: &Array,
+        _mask: Option<&Array>,
+        _cache: &mut AnyCache,
     ) -> Result<Array, Exception> {
-        let hidden = self.forward_hidden(inputs, mask, cache)?;
-        match self {
-            Self::Transformer(m) => m.apply_lm_head_all(&hidden),
-            Self::Qwen3Next(m) => m.apply_lm_head_all(&hidden),
-            _ => Err(Exception::custom(
-                "forward_all_logits not yet supported for this model type",
-            )),
-        }
+        // STUB: apply_lm_head_all was added on both models on an earlier branch
+        // but never committed. Stubbed out to unblock compilation. The tests
+        // that actually use this path (test_diffusion_draft_acceptance_rate)
+        // are #[ignore] so they won't run in CI. Re-implement when needed.
+        Err(Exception::custom(
+            "forward_all_logits: apply_lm_head_all not yet implemented on this branch",
+        ))
     }
 }
 
