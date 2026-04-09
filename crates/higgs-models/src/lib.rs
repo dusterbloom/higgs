@@ -509,17 +509,17 @@ impl AnyModel {
     /// verify a draft sequence in a single forward pass.
     pub fn forward_all_logits(
         &mut self,
-        _inputs: &Array,
-        _mask: Option<&Array>,
-        _cache: &mut AnyCache,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
     ) -> Result<Array, Exception> {
-        // STUB: apply_lm_head_all was added on both models on an earlier branch
-        // but never committed. Stubbed out to unblock compilation. The tests
-        // that actually use this path (test_diffusion_draft_acceptance_rate)
-        // are #[ignore] so they won't run in CI. Re-implement when needed.
-        Err(Exception::custom(
-            "forward_all_logits: apply_lm_head_all not yet implemented on this branch",
-        ))
+        match (self, cache) {
+            (Self::Transformer(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_all_logits(inputs, mask, c),
+            _ => Err(Exception::custom(
+                "forward_all_logits: only Transformer and Qwen3Next are supported",
+            )),
+        }
     }
 }
 

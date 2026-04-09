@@ -2000,6 +2000,23 @@ impl Qwen3NextCausalLM {
         self.model.norm.forward(&h)
     }
 
+    /// Forward pass returning logits for **all positions**.
+    ///
+    /// Returns shape `[B, T, vocab]`. Used by speculative decoding to verify
+    /// a draft sequence in a single forward pass.
+    pub fn forward_all_logits(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_hidden(inputs, mask, kv_cache)?;
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&h),
+            None => self.model.embed_tokens.as_linear(&h),
+        }
+    }
+
     /// Forward pass producing logits for the **last position only**.
     ///
     /// During inference only the last token's logits are sampled, so we
