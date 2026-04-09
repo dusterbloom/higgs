@@ -789,13 +789,32 @@ impl Qwen3NextAttention {
         keys = apply_rope(&keys, &self.rope, offset)?;
 
         let view = cache.update_and_view(keys, values)?;
-        let is_tq_decode = mask.is_none() && L == 1 && view.turboquant().is_some();
+        let is_tq_decode = view.turboquant().is_some();
 
         let output = if is_tq_decode {
             let tq_view = view.turboquant().unwrap();
             let scores = tq_view.decode_scores(&queries, self.num_attention_heads)?;
             let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
-            let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
+            let mut scaled = scores.multiply(&scale_arr)?;
+
+            // Apply causal mask for L>1 (block-K verify).
+            // At T=1: mask is None → skipped → existing behavior preserved.
+            // At T>1: mask is Some(Array([L, total_seq])) → additive -inf masking.
+            if let Some(m) = mask {
+                let mask_arr = match m {
+                    AttentionMask::Array(a) => a.clone(),
+                    AttentionMask::Causal => create_causal_mask(L, None)?,
+                };
+                // mask_arr: boolean [L, total_seq], True = attend
+                // Reshape → [1, L, total_seq] for broadcast with scores [H, L, total_seq]
+                let total_seq = *mask_arr.shape().last().unwrap_or(&1);
+                let mask_3d = mask_arr.reshape(&[1, L, total_seq])?;
+                let neg_inf =
+                    Array::from_f32(f32::NEG_INFINITY).as_dtype(scaled.dtype())?;
+                scaled = ops::r#where(&mask_3d, &scaled, &neg_inf)?;
+            }
+
+            let weights = ops::softmax_axis(&scaled, -1, true)?;
             tq_view.decode_values(&weights, self.num_attention_heads)?
                 .transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[B, L, -1])?
