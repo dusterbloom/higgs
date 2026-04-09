@@ -874,6 +874,8 @@ pub(crate) struct SwitchMlpWeights {
     up_proj: QLinear,
     #[param]
     down_proj: QLinear,
+    /// Lazily fused gate+up weights for MoE gather_qmm (3→2 calls per layer).
+    fused_gate_up: Option<(Array, Array, Array, i32)>,
 }
 
 impl SwitchMlpWeights {
@@ -883,6 +885,7 @@ impl SwitchMlpWeights {
             gate_proj,
             up_proj,
             down_proj,
+            fused_gate_up: None,
         })
     }
 
@@ -1021,6 +1024,105 @@ impl SwitchMlpWeights {
 
         let activated = swiglu(&gate_out, &up_out)?;
 
+        let down_out = gather_qmm(
+            &activated,
+            &self.down_proj.weight,
+            &self.down_proj.scales,
+            &self.down_proj.biases,
+            &idx_sorted,
+            true,
+            self.down_proj.group_size,
+            self.down_proj.bits,
+            true,
+        )?;
+
+        // down_out: [N, 1, D] -> squeeze M -> [N, D]
+        let out_flat = down_out.squeeze_axes(&[-2])?;
+
+        // --- Unsort: restore original token order ---
+        let out_unsorted = out_flat.take_axis(&inv_order, 0)?;
+
+        // Reshape back to [B, L, top_k, D]
+        out_unsorted.reshape(&[b, l, top_k, d])
+    }
+
+    /// Like `forward_gather_global_sort` but fuses gate+up into a single
+    /// `gather_qmm` call (3→2 per layer). Lazy-inits fused weights on first call.
+    pub(crate) fn forward_gather_fused(
+        &mut self,
+        x: &Array,
+        indices: &Array,
+    ) -> Result<Array, Exception> {
+        // Lazy-init: concatenate gate+up weights along axis 1 (intermediate dim).
+        // MoE weights are [num_experts, intermediate_packed, hidden].
+        if self.fused_gate_up.is_none() {
+            let intermediate = *self
+                .gate_proj
+                .weight
+                .shape()
+                .get(1)
+                .ok_or_else(|| Exception::custom("gate_proj weight missing dim 1"))?;
+            let fw =
+                ops::concatenate_axis(&[&*self.gate_proj.weight, &*self.up_proj.weight], 1)?;
+            let fs =
+                ops::concatenate_axis(&[&*self.gate_proj.scales, &*self.up_proj.scales], 1)?;
+            let fb =
+                ops::concatenate_axis(&[&*self.gate_proj.biases, &*self.up_proj.biases], 1)?;
+            fw.eval()?;
+            fs.eval()?;
+            fb.eval()?;
+            self.fused_gate_up = Some((fw, fs, fb, intermediate));
+        }
+        let (fw, fs, fb, intermediate) = self
+            .fused_gate_up
+            .as_ref()
+            .ok_or_else(|| Exception::custom("fused_gate_up missing after init"))?;
+
+        // --- Global sort (same as forward_gather_global_sort) ---
+        let x_shape = x.shape();
+        let err = || Exception::custom("forward_gather_fused input must be [B, L, D]");
+        let b = *x_shape.first().ok_or_else(err)?;
+        let l = *x_shape.get(1).ok_or_else(err)?;
+        let d = *x_shape.get(2).ok_or_else(err)?;
+        let top_k = *indices
+            .shape()
+            .last()
+            .ok_or_else(|| Exception::custom("indices must have last dim"))?;
+
+        let idx_flat = indices.flatten(None, None)?;
+        let order = ops::argsort_axis(&idx_flat, 0)?;
+        let inv_order = ops::argsort_axis(&order, 0)?;
+
+        let top_k_arr = Array::from_slice(&[top_k as u32], &[1]);
+        let token_idx = order.floor_divide(&top_k_arr)?;
+
+        let x_flat = x.reshape(&[b * l, 1, d])?;
+        let x_sorted = x_flat.take_axis(&token_idx, 0)?;
+        let idx_sorted = idx_flat.take_axis(&order, 0)?;
+
+        // --- Fused gate+up: ONE gather_qmm instead of TWO ---
+        let fused_out = gather_qmm(
+            &x_sorted,
+            fw,
+            fs,
+            fb,
+            &idx_sorted,
+            true,
+            self.gate_proj.group_size,
+            self.gate_proj.bits,
+            true,
+        )?;
+        // Split at intermediate boundary → gate_out, up_out
+        let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
+        let gate_out = parts
+            .first()
+            .ok_or_else(|| Exception::custom("fused split failed"))?;
+        let up_out = parts
+            .get(1)
+            .ok_or_else(|| Exception::custom("fused split failed"))?;
+        let activated = swiglu(gate_out, up_out)?;
+
+        // --- down_proj: unchanged ---
         let down_out = gather_qmm(
             &activated,
             &self.down_proj.weight,
@@ -1601,14 +1703,6 @@ impl FfnBlock {
                 .gate
                 .as_ref()
                 .ok_or_else(|| Exception::custom("MoE gate missing"))?;
-            let switch_ref = self
-                .switch_mlp
-                .as_ref()
-                .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
-            let se_ref = self
-                .shared_expert
-                .as_ref()
-                .ok_or_else(|| Exception::custom("MoE shared_expert missing"))?;
             let seg_ref = self
                 .shared_expert_gate
                 .as_ref()
@@ -1632,13 +1726,22 @@ impl FfnBlock {
                 scores
             };
 
-            let y = switch_ref.forward_gather_global_sort(x, &inds)?;
+            let switch_ref = self
+                .switch_mlp
+                .as_mut()
+                .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
+            let y = switch_ref.forward_gather_fused(x, &inds)?;
 
             let expert_sum = y
                 .multiply(&scores.expand_dims(-1)?)?
                 .sum_axes(&[-2], false)?;
 
+            let se_ref = self
+                .shared_expert
+                .as_ref()
+                .ok_or_else(|| Exception::custom("MoE shared_expert missing"))?;
             let shared_y = se_ref.forward(x)?;
+
             let shared_gate_val = nn::sigmoid(&seg_ref.forward(x)?)?;
             let shared_out = shared_y.multiply(&shared_gate_val)?;
 
@@ -3288,6 +3391,68 @@ mod tests {
     }
 
     #[test]
+    fn test_moe_gate_up_fusion_parity() {
+        // Fused gate+up (2 gather_qmm) must match unfused (3 gather_qmm).
+        // Uses random weights + distinct per-token inputs to stress sort/unsort.
+        let num_experts = 8;
+        let hidden = 64;
+        let top_k = 3;
+        let b = 1;
+        let l = 16;
+
+        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+
+        let gate_w =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
+                .unwrap();
+        let (gw, gs, gb) = quantize_weights(&gate_w, 64, 4);
+        *block.gate_proj.weight = gw;
+        *block.gate_proj.scales = gs;
+        *block.gate_proj.biases = gb;
+
+        let up_w =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
+                .unwrap();
+        let (uw, us, ub) = quantize_weights(&up_w, 64, 4);
+        *block.up_proj.weight = uw;
+        *block.up_proj.scales = us;
+        *block.up_proj.biases = ub;
+
+        let down_w =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
+                .unwrap();
+        let (dw, ds, db) = quantize_weights(&down_w, 64, 4);
+        *block.down_proj.weight = dw;
+        *block.down_proj.scales = ds;
+        *block.down_proj.biases = db;
+
+        let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[b, l, hidden], None).unwrap();
+        let idx_data: Vec<u32> = (0..(b * l * top_k) as u32)
+            .map(|i| i % num_experts as u32)
+            .collect();
+        let indices = Array::from_slice(&idx_data, &[b, l, top_k]);
+        x.eval().unwrap();
+        indices.eval().unwrap();
+
+        // Reference: unfused 3-call path
+        let reference = block.forward_gather_global_sort(&x, &indices).unwrap();
+        // Fused: 2-call path
+        let fused = block.forward_gather_fused(&x, &indices).unwrap();
+        reference.eval().unwrap();
+        fused.eval().unwrap();
+
+        assert_eq!(reference.shape(), fused.shape());
+        assert_eq!(fused.shape(), &[b, l, top_k, hidden]);
+
+        let diff = reference.subtract(&fused).unwrap().abs().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        assert!(
+            max_diff < 1e-5,
+            "fused gate+up differs from unfused by {max_diff}"
+        );
+    }
+
+    #[test]
     fn test_switch_mlp_forward_gather_shapes() {
         // Verify forward_gather produces the correct output shape with the
         // double expand_dims pattern matching Python's SwitchGLU.
@@ -4565,6 +4730,7 @@ mod tests {
                     gate_proj: make_switch_ql(d, d_inter),
                     up_proj: make_switch_ql(d, d_inter),
                     down_proj: make_switch_ql(d_inter, d),
+                    fused_gate_up: None,
                 },
                 shared_expert: Qwen3NextMLP {
                     gate_proj: make_ql(d, shared_inter * 2, gs, bits),
