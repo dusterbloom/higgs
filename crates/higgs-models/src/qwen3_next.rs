@@ -11258,4 +11258,494 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Block-K per-layer breakdown (real model, populated cache)
+    // -----------------------------------------------------------------------
+
+    /// Profile per-component cost of block-K verify against populated KV cache.
+    ///
+    /// Unlike `bench_prefill_breakdown` which starts from empty cache, this
+    /// prefills 256 tokens first, then instruments a block-K forward at S=16
+    /// with eval barriers between each component.
+    ///
+    /// ```bash
+    /// cargo test -p higgs-models --release -- bench_block_k_breakdown --nocapture --ignored
+    /// ```
+    #[test]
+    #[ignore = "requires 35B model on disk"]
+    fn bench_block_k_breakdown() {
+        use mlx_rs::transforms::eval;
+        use std::time::Instant;
+
+        let mut model = load_test_model();
+        let n_layers = model.args.num_hidden_layers;
+        let fa_interval = model.args.full_attention_interval;
+
+        // --- Prefill 256 tokens to populate cache ---
+        let prefill_len: i32 = 256;
+        let prompt_ids: Vec<u32> = (1..=prefill_len as u32).collect();
+        let prompt = Array::from_slice(&prompt_ids, &[1, prefill_len]);
+
+        let mut cache: Vec<Option<LayerCache>> = Vec::new();
+        let prefill_out = model.forward(&prompt, None, &mut cache).unwrap();
+        {
+            let mut tgts: Vec<&Array> = vec![&prefill_out];
+            for lc in &cache {
+                if let Some(LayerCache::Arrays(ac)) = lc {
+                    if let Some(ref s) = ac.ssm_state { tgts.push(s); }
+                    if let Some(ref c) = ac.conv_state { tgts.push(c); }
+                }
+            }
+            eval(tgts).unwrap();
+        }
+
+        // 2 warmup decode steps
+        let tok = ops::indexing::argmax_axis(
+            &prefill_out.index((.., -1, ..)), -1, false,
+        ).unwrap();
+        eval([&tok]).unwrap();
+        let mut current = tok;
+        for _ in 0..2 {
+            let inp = current.index((.., ops::indexing::NewAxis));
+            let out = model.forward(&inp, None, &mut cache).unwrap();
+            current = ops::indexing::argmax_axis(&out.index((.., -1, ..)), -1, false).unwrap();
+            eval([&current]).unwrap();
+        }
+
+        println!("Prefill done. Cache offset: {}", prefill_len + 2);
+        println!("Layers: {n_layers}, fa_interval: {fa_interval}");
+
+        for block_k in [1, 8, 16] {
+            let block_ids: Vec<u32> = (1..=block_k as u32).collect();
+            let input = Array::from_slice(&block_ids, &[1, block_k]);
+
+            // ----- Pass 1: wall-clock (no barriers) -----
+            // Use a copy of cache state for fair comparison
+            let t_wall = Instant::now();
+            let h_wall = model.forward_hidden(&input, None, &mut cache).unwrap();
+            eval([&h_wall]).unwrap();
+            let wall_ms = t_wall.elapsed().as_secs_f64() * 1000.0;
+
+            // ----- Pass 2: per-component with eval barriers -----
+            // NOTE: cache is now offset by block_k more. This is fine — we
+            // want the instrumented pass at the same populated-cache regime.
+
+            let kv_offset = cache
+                .iter()
+                .filter_map(|lc| match lc.as_ref()? {
+                    LayerCache::KV(kv) => Some(kv.offset()),
+                    _ => None,
+                })
+                .next()
+                .unwrap_or(0);
+
+            let fa_mask: Option<AttentionMask> = if block_k > 1 {
+                if kv_offset > block_k {
+                    Some(AttentionMask::Array(create_causal_mask(
+                        block_k, Some(kv_offset),
+                    ).unwrap()))
+                } else {
+                    Some(AttentionMask::Causal)
+                }
+            } else {
+                None
+            };
+
+            // Embed
+            let t0 = Instant::now();
+            let mut h = model.model.embed_tokens.forward(&input).unwrap();
+            eval([&h].into_iter()).unwrap();
+            let ns_embed = t0.elapsed().as_nanos();
+
+            let mut ns_gdn = 0u128;
+            let mut ns_attn = 0u128;
+            let mut ns_mlp = 0u128;
+            let mut ns_norm = 0u128;
+            let mut n_gdn = 0u32;
+            let mut n_attn = 0u32;
+
+            for (layer, layer_cache) in model.model.layers.iter_mut().zip(cache.iter_mut()) {
+                let lc = layer_cache.as_mut().unwrap();
+                let mask_ref = if layer.is_linear { None } else { fa_mask.as_ref() };
+
+                let t0 = Instant::now();
+                let normed = layer.input_layernorm.forward(&h).unwrap();
+                eval([&normed].into_iter()).unwrap();
+                ns_norm += t0.elapsed().as_nanos();
+
+                let t0 = Instant::now();
+                let r = if layer.is_linear {
+                    let gdn = layer.linear_attn.as_mut().unwrap();
+                    let LayerCache::Arrays(sc) = lc else { panic!("Expected ArraysCache"); };
+                    let out = gdn.forward(&normed, mask_ref, sc).unwrap();
+                    let mut tgts: Vec<&Array> = vec![&out];
+                    if let Some(ref s) = sc.ssm_state { tgts.push(s); }
+                    if let Some(ref c) = sc.conv_state { tgts.push(c); }
+                    eval(tgts).unwrap();
+                    n_gdn += 1;
+                    ns_gdn += t0.elapsed().as_nanos();
+                    out
+                } else {
+                    let attn = layer.self_attn.as_mut().unwrap();
+                    let LayerCache::KV(kvc) = lc else { panic!("Expected KVCache"); };
+                    let out = attn.forward(&normed, mask_ref, kvc).unwrap();
+                    eval([&out].into_iter()).unwrap();
+                    n_attn += 1;
+                    ns_attn += t0.elapsed().as_nanos();
+                    out
+                };
+
+                let t0 = Instant::now();
+                let h2 = h.add(r).unwrap();
+                let normed_post = layer.post_attention_layernorm.forward(&h2).unwrap();
+                eval([&normed_post].into_iter()).unwrap();
+                ns_norm += t0.elapsed().as_nanos();
+
+                let t0 = Instant::now();
+                let mlp_out = layer.mlp.forward(&normed_post).unwrap();
+                eval([&mlp_out].into_iter()).unwrap();
+                ns_mlp += t0.elapsed().as_nanos();
+
+                let t0 = Instant::now();
+                h = h2.add(mlp_out).unwrap();
+                eval([&h].into_iter()).unwrap();
+                ns_norm += t0.elapsed().as_nanos();
+            }
+
+            let t0 = Instant::now();
+            h = model.model.norm.forward(&h).unwrap();
+            eval([&h].into_iter()).unwrap();
+            ns_norm += t0.elapsed().as_nanos();
+
+            let t0 = Instant::now();
+            let _logits = match model.lm_head.as_ref() {
+                Some(head) => head.forward(&h).unwrap(),
+                None => model.model.embed_tokens.as_linear(&h).unwrap(),
+            };
+            eval([&_logits].into_iter()).unwrap();
+            let ns_lm = t0.elapsed().as_nanos();
+
+            let barrier_total = ns_embed + ns_gdn + ns_attn + ns_mlp + ns_norm + ns_lm;
+            let ms = |ns: u128| ns as f64 / 1e6;
+            let pct = |ns: u128| ns as f64 / barrier_total as f64 * 100.0;
+            let n_total = n_gdn + n_attn;
+
+            println!();
+            println!("==== Block-K = {block_k}, cache ~{kv_offset} ====");
+            println!("  Wall (no barriers):   {:>8.1}ms", wall_ms);
+            println!(
+                "  Sum  (eval barriers): {:>8.1}ms  (overhead: {:.1}ms)",
+                ms(barrier_total), ms(barrier_total) - wall_ms,
+            );
+            println!();
+            println!(
+                "  embed:            {:>8.1}ms  {:>5.1}%",
+                ms(ns_embed), pct(ns_embed),
+            );
+            println!(
+                "  GDN ({n_gdn:>2} layers): {:>8.1}ms  {:>5.1}%   [{:.2}ms/layer]",
+                ms(ns_gdn), pct(ns_gdn), ms(ns_gdn) / n_gdn.max(1) as f64,
+            );
+            println!(
+                "  Attn ({n_attn:>2} layers): {:>8.1}ms  {:>5.1}%   [{:.2}ms/layer]",
+                ms(ns_attn), pct(ns_attn), ms(ns_attn) / n_attn.max(1) as f64,
+            );
+            println!(
+                "  MLP/MoE:          {:>8.1}ms  {:>5.1}%   [{:.2}ms/layer]",
+                ms(ns_mlp), pct(ns_mlp), ms(ns_mlp) / n_total.max(1) as f64,
+            );
+            println!(
+                "  norms+residual:   {:>8.1}ms  {:>5.1}%",
+                ms(ns_norm), pct(ns_norm),
+            );
+            println!(
+                "  lm_head:          {:>8.1}ms  {:>5.1}%",
+                ms(ns_lm), pct(ns_lm),
+            );
+            println!(
+                "  ---- GDN share of wall: {:.1}%",
+                ms(ns_gdn) / wall_ms * 100.0,
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Block-K forward benchmark (real model)
+    // -----------------------------------------------------------------------
+
+    /// Benchmark `forward_hidden` at S=1 vs S=4,8,16 against cached state.
+    ///
+    /// This measures the true Rust-level forward cost, eliminating API/HTTP
+    /// overhead. Used to determine if DFlash block-K verify is viable.
+    ///
+    /// ```bash
+    /// cargo test -p higgs-models --release -- bench_block_k_verify --nocapture --ignored
+    /// ```
+    #[test]
+    #[ignore = "requires 35B model on disk"]
+    fn bench_block_k_verify() {
+        use mlx_rs::transforms::eval;
+        use std::time::Instant;
+
+        let mut model = load_test_model();
+
+        // --- Prefill 256 tokens to build KV cache ---
+        let prompt_len = 256;
+        let prompt_ids: Vec<u32> = (1..=prompt_len).collect();
+        let prompt = Array::from_slice(&prompt_ids, &[1, prompt_len as i32]);
+
+        let mut cache: Vec<Option<LayerCache>> = Vec::new();
+        let prefill_out = model.forward(&prompt, None, &mut cache).unwrap();
+        let mut to_eval: Vec<&Array> = vec![&prefill_out];
+        for lc in &cache {
+            if let Some(lc) = lc {
+                match lc {
+                    LayerCache::Arrays(ac) => {
+                        if let Some(ref s) = ac.ssm_state {
+                            to_eval.push(s);
+                        }
+                        if let Some(ref c) = ac.conv_state {
+                            to_eval.push(c);
+                        }
+                    }
+                    LayerCache::KV(_) => {}
+                }
+            }
+        }
+        eval(to_eval).unwrap();
+
+        // --- Warmup: 2 decode steps ---
+        let tok = ops::indexing::argmax_axis(
+            &prefill_out.index((.., -1, ..)),
+            -1,
+            false,
+        )
+        .unwrap();
+        eval([&tok]).unwrap();
+
+        let mut current = tok;
+        for _ in 0..2 {
+            let inp = current.index((.., ops::indexing::NewAxis));
+            let out = model.forward(&inp, None, &mut cache).unwrap();
+            current =
+                ops::indexing::argmax_axis(&out.index((.., -1, ..)), -1, false).unwrap();
+            eval([&current]).unwrap();
+        }
+
+        // Current cache offset after prefill + 2 warmup decodes
+        let cache_offset = prompt_len as i32 + 2;
+        println!("Cache offset after warmup: {cache_offset}");
+
+        // --- Benchmark S=1 baseline ---
+        let n_trials = 5;
+        let mut s1_times = Vec::with_capacity(n_trials);
+        for _ in 0..n_trials {
+            // Clone cache for fair comparison (each trial starts from same state)
+            // Actually we just do single-token decode which is non-destructive
+            let inp = current.index((.., ops::indexing::NewAxis));
+            let t0 = Instant::now();
+            let h = model.forward_hidden(&inp, None, &mut cache).unwrap();
+            eval([&h]).unwrap();
+            s1_times.push(t0.elapsed());
+            // Undo the cache advancement by continuing (cache already updated, but
+            // we measure the same workload each time — offset grows by 1 per trial)
+            current =
+                ops::indexing::argmax_axis(&h.index((.., -1, ..)), -1, false).unwrap();
+            eval([&current]).unwrap();
+        }
+        let s1_median_ms = {
+            let mut ms: Vec<f64> = s1_times.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ms[ms.len() / 2]
+        };
+
+        println!("\n==== S=1 (single-token decode) ====");
+        println!("  median: {s1_median_ms:.2} ms");
+
+        // --- Benchmark S=4,8,16 (block-K verify) ---
+        for block_k in [4, 8, 16] {
+            let block_ids: Vec<u32> = (1..=block_k).collect();
+            let block_input = Array::from_slice(&block_ids, &[1, block_k as i32]);
+
+            let mut bk_times = Vec::with_capacity(n_trials);
+            for _ in 0..n_trials {
+                let t0 = Instant::now();
+                let h = model
+                    .forward_hidden(&block_input, None, &mut cache)
+                    .unwrap();
+                eval([&h]).unwrap();
+                bk_times.push(t0.elapsed());
+                // Undo: cache offset grows by block_k each trial
+            }
+            let bk_median_ms = {
+                let mut ms: Vec<f64> =
+                    bk_times.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+                ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                ms[ms.len() / 2]
+            };
+            let ratio = bk_median_ms / s1_median_ms;
+            let ms_per_tok = bk_median_ms / block_k as f64;
+
+            println!("\n==== S={block_k} (block-K verify) ====");
+            println!("  median: {bk_median_ms:.2} ms  ({ratio:.1}x vs S=1)");
+            println!("  per-token: {ms_per_tok:.2} ms/tok");
+        }
+
+        // --- Also benchmark forward_all_logits at S=16 ---
+        {
+            let block_ids: Vec<u32> = (1..=16).collect();
+            let block_input = Array::from_slice(&block_ids, &[1, 16]);
+            let t0 = Instant::now();
+            let logits = model
+                .forward_all_logits(&block_input, None, &mut cache)
+                .unwrap();
+            eval([&logits]).unwrap();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let shape = logits.shape().to_vec();
+            println!("\n==== forward_all_logits S=16 ====");
+            println!("  time: {ms:.2} ms, shape: {shape:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Conv1d batch-K parity (unit test — no model files needed)
+    // -----------------------------------------------------------------------
+
+    /// Verify sliding-window loop matches native Conv1d for depthwise convolution.
+    ///
+    /// The S<=32 fast path in GatedDeltaNet::forward computes depthwise conv via
+    /// a loop of `window * wt → sum(axis=1)`, avoiding Conv1d kernel dispatch.
+    /// This test confirms it produces identical results to the native kernel.
+    #[test]
+    fn test_conv1d_batch_k_parity() {
+        use mlx_rs::transforms::eval;
+
+        let conv_dim = 64i32;
+        let kernel_size = 4i32;
+
+        // Depthwise Conv1d weight: [conv_dim, kernel_size, 1] (groups=conv_dim)
+        let weight = mlx_rs::random::uniform::<f32, f32>(
+            -1.0, 1.0, &[conv_dim, kernel_size, 1], None,
+        ).unwrap();
+        eval([&weight]).unwrap();
+
+        // Transposed weight for fast path: [kernel_size, conv_dim]
+        let wt = weight.squeeze_axes(&[-1]).unwrap().transpose().unwrap();
+        eval([&wt]).unwrap();
+
+        for s in [2, 4, 8, 16] {
+            let total_len = kernel_size - 1 + s;
+            let conv_input = mlx_rs::random::uniform::<f32, f32>(
+                -1.0, 1.0, &[1, total_len, conv_dim], None,
+            ).unwrap();
+            eval([&conv_input]).unwrap();
+
+            // Reference: native depthwise Conv1d kernel
+            let ref_out = ops::conv1d(&conv_input, &weight, 1, 0, 1, conv_dim).unwrap();
+            eval([&ref_out]).unwrap();
+
+            // Our fast path: sliding window loop (same as GatedDeltaNet S<=32 path)
+            let mut windows = Vec::with_capacity(s as usize);
+            for i in 0..s {
+                windows.push(
+                    conv_input
+                        .index((.., i..i + kernel_size, ..))
+                        .multiply(&wt)
+                        .unwrap()
+                        .sum_axes(&[1], true)
+                        .unwrap(),
+                );
+            }
+            let fast_out =
+                ops::concatenate_axis(&windows.iter().collect::<Vec<_>>(), 1).unwrap();
+            eval([&fast_out]).unwrap();
+
+            assert_eq!(ref_out.shape(), fast_out.shape(),
+                "shape mismatch at S={s}");
+
+            let diff = ref_out.subtract(&fast_out).unwrap().abs().unwrap();
+            let max_diff: f32 = diff.max(None).unwrap().item();
+            assert!(
+                max_diff < 1e-5,
+                "Conv1d batch-K parity failed at S={s}: max |diff| = {max_diff}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TQ block-K parity (requires 35B model on disk)
+    // -----------------------------------------------------------------------
+
+    /// Compare L=1 sequential decode (known-good TQ path) against L=16 block
+    /// forward (new TQ + causal mask path). Per-position logits must match.
+    ///
+    /// ```bash
+    /// cargo test -p higgs-models --release -- test_tq_block_k_parity --nocapture --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "requires 35B model on disk"]
+    fn test_tq_block_k_parity() {
+        use mlx_rs::transforms::eval;
+
+        let mut model = load_test_model();
+        let block_k = 16i32;
+
+        // --- Prefill short prompt ---
+        let prompt_len = 64i32;
+        let prompt_ids: Vec<u32> = (1..=prompt_len as u32).collect();
+        let prompt = Array::from_slice(&prompt_ids, &[1, prompt_len]);
+
+        let mut cache_a: Vec<Option<LayerCache>> = Vec::new();
+        let prefill_out = model.forward(&prompt, None, &mut cache_a).unwrap();
+        {
+            let mut tgts: Vec<&Array> = vec![&prefill_out];
+            for lc in &cache_a {
+                if let Some(LayerCache::Arrays(ac)) = lc {
+                    if let Some(ref s) = ac.ssm_state { tgts.push(s); }
+                    if let Some(ref c) = ac.conv_state { tgts.push(c); }
+                }
+            }
+            eval(tgts).unwrap();
+        }
+
+        // Clone cache for the block path (before sequential decode mutates it)
+        let cache_b = cache_a.clone();
+
+        // --- Path A: L=1 sequential decode × block_k steps ---
+        let decode_ids: Vec<u32> = (100..100 + block_k as u32).collect();
+        let mut seq_logits: Vec<Array> = Vec::with_capacity(block_k as usize);
+        for &tid in &decode_ids {
+            let inp = Array::from_slice(&[tid], &[1, 1]);
+            let logits = model.forward_all_logits(&inp, None, &mut cache_a).unwrap();
+            eval([&logits]).unwrap();
+            seq_logits.push(logits); // [1, 1, vocab]
+        }
+        // Stack → [1, block_k, vocab]
+        let seq_all = ops::concatenate_axis(
+            &seq_logits.iter().collect::<Vec<_>>(), 1,
+        ).unwrap();
+        eval([&seq_all]).unwrap();
+
+        // --- Path B: L=block_k block forward ---
+        cache_a = cache_b; // restore pre-decode state
+        let block_input = Array::from_slice(&decode_ids, &[1, block_k]);
+        let block_logits = model
+            .forward_all_logits(&block_input, None, &mut cache_a)
+            .unwrap();
+        eval([&block_logits]).unwrap();
+
+        // --- Compare per-position logits ---
+        let diff = seq_all.subtract(&block_logits).unwrap().abs().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        eprintln!("TQ block-K parity: max |diff| = {max_diff}  (block_k={block_k})");
+
+        // 3-bit quantization + bf16 accumulation allows some tolerance.
+        // Sequential and block paths use identical TQ Metal kernels; the only
+        // difference is causal masking. Tolerance generous for GDN state drift.
+        assert!(
+            max_diff < 2.0,
+            "TQ block-K parity failed: max |diff| = {max_diff} (expect <2.0)"
+        );
+    }
 }
