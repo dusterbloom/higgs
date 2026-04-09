@@ -1501,9 +1501,10 @@ impl GatedDeltaNet {
         let keep_start = conv_input_len - n_keep;
         cache.conv_state = Some(conv_input.index((.., keep_start.., ..)));
 
-        // Fast path for single-token decode: depthwise conv1d with T=kernel_size
-        // is just element-wise multiply + sum, avoiding full Conv1d kernel dispatch.
-        let conv_out = if S == 1 {
+        // Fast path: depthwise conv1d via element-wise multiply + sum.
+        // S==1: single window, no loop. S<=32 (block-K): sliding window loop.
+        // Both avoid full Conv1d kernel dispatch overhead (30 GDN layers).
+        let conv_out = if S <= 32 {
             let wt = match &self.conv_weight_t {
                 Some(w) => w.clone(),
                 None => {
@@ -1515,10 +1516,28 @@ impl GatedDeltaNet {
                     w
                 }
             };
-            // conv_input: [B, kernel_size, conv_dim], wt: [kernel_size, conv_dim]
-            // → multiply + sum over time axis → [B, 1, conv_dim]
-            silu_direct(&conv_input.multiply(&wt)?.sum_axes(&[1], true)?)?
+            if S == 1 {
+                // conv_input: [B, kernel_size, conv_dim], wt: [kernel_size, conv_dim]
+                // → multiply + sum over time axis → [B, 1, conv_dim]
+                silu_direct(&conv_input.multiply(&wt)?.sum_axes(&[1], true)?)?
+            } else {
+                // Sliding window: conv_input [B, K-1+S, D] → S windows of [B, K, D]
+                let ks = self.conv_kernel_size;
+                let mut windows = Vec::with_capacity(S as usize);
+                for i in 0..S {
+                    windows.push(
+                        conv_input
+                            .index((.., i..i + ks, ..))
+                            .multiply(&wt)?
+                            .sum_axes(&[1], true)?,
+                    );
+                }
+                silu_direct(
+                    &ops::concatenate_axis(&windows.iter().collect::<Vec<_>>(), 1)?,
+                )?
+            }
         } else {
+            // Large S (prefill): native Conv1d kernel is more efficient
             silu_direct(&self.conv1d.forward(&conv_input)?)?
         };
 
