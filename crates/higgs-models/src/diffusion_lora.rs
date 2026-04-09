@@ -307,15 +307,17 @@ pub fn forward_train(
         let q_pre_norm = q_buf.clone();
         let k_pre_norm = k_buf.clone();
 
-        // QK norm (per-head RMSNorm)
-        for s in 0..seq {
-            for head in 0..n_heads {
-                let off = s * q_dim + head * hd;
-                rms_norm_slice(&mut q_buf[off..off + hd], &layer.q_norm);
-            }
-            for head in 0..n_kv {
-                let off = s * kv_dim + head * hd;
-                rms_norm_slice(&mut k_buf[off..off + hd], &layer.k_norm);
+        // QK norm (per-head RMSNorm) — Qwen3 only
+        if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+            for s in 0..seq {
+                for head in 0..n_heads {
+                    let off = s * q_dim + head * hd;
+                    rms_norm_slice(&mut q_buf[off..off + hd], qn);
+                }
+                for head in 0..n_kv {
+                    let off = s * kv_dim + head * hd;
+                    rms_norm_slice(&mut k_buf[off..off + hd], kn);
+                }
             }
         }
 
@@ -880,26 +882,28 @@ pub fn backward(
         // --- QK-norm backward ---
         let mut dq_proj = vec![0.0f32; seq * q_dim];
         let mut dk_proj = vec![0.0f32; seq * kv_dim];
-        for s in 0..seq {
-            for head in 0..n_heads {
-                let off = s * q_dim + head * hd;
-                qk_norm_bwd_head(
-                    &mut dq_proj[off..off + hd],
-                    &dq_pre_rope[off..off + hd],
-                    &la.q_pre_norm[off..off + hd],
-                    &layer.q_norm,
-                    hd,
-                );
-            }
-            for head in 0..n_kv {
-                let off = s * kv_dim + head * hd;
-                qk_norm_bwd_head(
-                    &mut dk_proj[off..off + hd],
-                    &dk_pre_rope[off..off + hd],
-                    &la.k_pre_norm[off..off + hd],
-                    &layer.k_norm,
-                    hd,
-                );
+        if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+            for s in 0..seq {
+                for head in 0..n_heads {
+                    let off = s * q_dim + head * hd;
+                    qk_norm_bwd_head(
+                        &mut dq_proj[off..off + hd],
+                        &dq_pre_rope[off..off + hd],
+                        &la.q_pre_norm[off..off + hd],
+                        qn,
+                        hd,
+                    );
+                }
+                for head in 0..n_kv {
+                    let off = s * kv_dim + head * hd;
+                    qk_norm_bwd_head(
+                        &mut dk_proj[off..off + hd],
+                        &dk_pre_rope[off..off + hd],
+                        &la.k_pre_norm[off..off + hd],
+                        kn,
+                        hd,
+                    );
+                }
             }
         }
 

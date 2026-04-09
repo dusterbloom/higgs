@@ -695,7 +695,7 @@ impl AneLladaMoeEngine {
         let rope_sin_blob = build_weight_blob(&rope_sin, seq, half_hd);
 
         // Generate attention MIL (reuse diffusion attention — same arch: QK-norm, RoPE, bidir SDPA)
-        let mil = diffusion_ane::gen_diffusion_attention(h, heads, kv_heads, hd, seq, cfg.rms_norm_eps);
+        let mil = diffusion_ane::gen_diffusion_attention(h, heads, kv_heads, hd, seq, cfg.rms_norm_eps, true, false);
         let names: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
 
         // Pre-build attention weight blobs for all layers.

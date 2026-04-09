@@ -50,6 +50,8 @@ pub fn gen_fused_diffusion_layer(
     seq_len: usize,
     eps: f64,
     causal: bool,
+    has_qk_norm: bool,
+    has_qkv_bias: bool,
 ) -> FusedMil {
     let seq = seq_len.max(ANE_MIN_SPATIAL);
     let half_hd = hd / 2;
@@ -183,18 +185,34 @@ pub fn gen_fused_diffusion_layer(
         "        tensor<fp16, [1,1,{seq},{kv_dim}]> vm = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wv)[name=string(\"vm\")];"
     );
 
+
+    // Determine reshape input names (with or without bias)
+    let qt_to_reshape = if has_qkv_bias { "qt_b" } else { "qt" };
+    let kt_to_reshape = if has_qkv_bias { "kt_b" } else { "kt" };
+    let vt_to_reshape = if has_qkv_bias { "vt_b" } else { "vt" };
+
     // Reshape Q → [1, heads, seq, hd]
     let _ = writeln!(
         m,
         "        tensor<fp16, [1,1,{attn_dim},{seq}]> qt = transpose(perm=pm,x=qm)[name=string(\"qt\")];"
     );
+    if has_qkv_bias {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{attn_dim},1]> q_bias = const()[name=string(\"qb_w\"), val=tensor<fp16, [1,1,{attn_dim},1]>(BLOBFILE(path=string(\"@model_path/weights/q_bias.bin\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{attn_dim},{seq}]> qt_b = add(x=qt,y=q_bias)[name=string(\"qtb\")];"
+        );
+    }
     let _ = writeln!(
         m,
         "        tensor<int32, [4]> qsh = const()[name=string(\"qsh\"), val=tensor<int32, [4]>([1,{heads},{hd},{seq}])];"
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{heads},{hd},{seq}]> q4 = reshape(shape=qsh,x=qt)[name=string(\"rq\")];"
+        "        tensor<fp16, [1,{heads},{hd},{seq}]> q4 = reshape(shape=qsh,x={qt_to_reshape})[name=string(\"rq\")];"
     );
     let _ = writeln!(
         m,
@@ -206,13 +224,23 @@ pub fn gen_fused_diffusion_layer(
         m,
         "        tensor<fp16, [1,1,{kv_dim},{seq}]> kt = transpose(perm=pm,x=km)[name=string(\"kt\")];"
     );
+    if has_qkv_bias {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{kv_dim},1]> k_bias = const()[name=string(\"kb_w\"), val=tensor<fp16, [1,1,{kv_dim},1]>(BLOBFILE(path=string(\"@model_path/weights/k_bias.bin\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{kv_dim},{seq}]> kt_b = add(x=kt,y=k_bias)[name=string(\"ktb\")];"
+        );
+    }
     let _ = writeln!(
         m,
         "        tensor<int32, [4]> kvsh = const()[name=string(\"kvsh\"), val=tensor<int32, [4]>([1,{kv_heads},{hd},{seq}])];"
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> k4 = reshape(shape=kvsh,x=kt)[name=string(\"rk\")];"
+        "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> k4 = reshape(shape=kvsh,x={kt_to_reshape})[name=string(\"rk\")];"
     );
     let _ = writeln!(
         m,
@@ -224,78 +252,94 @@ pub fn gen_fused_diffusion_layer(
         m,
         "        tensor<fp16, [1,1,{kv_dim},{seq}]> vt = transpose(perm=pm,x=vm)[name=string(\"vt\")];"
     );
+    if has_qkv_bias {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{kv_dim},1]> v_bias = const()[name=string(\"vb_w\"), val=tensor<fp16, [1,1,{kv_dim},1]>(BLOBFILE(path=string(\"@model_path/weights/v_bias.bin\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{kv_dim},{seq}]> vt_b = add(x=vt,y=v_bias)[name=string(\"vtb\")];"
+        );
+    }
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> v4 = reshape(shape=kvsh,x=vt)[name=string(\"rv\")];"
+        "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> v4 = reshape(shape=kvsh,x={vt_to_reshape})[name=string(\"rv\")];"
     );
     let _ = writeln!(
         m,
         "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> v_kv = transpose(perm=pm,x=v4)[name=string(\"tv\")];"
     );
 
-    // === QK Norm (Qwen3-specific: per-head RMSNorm on Q and K) ===
-    let _ = writeln!(
-        m,
-        "        tensor<int32, [1]> hd_ax = const()[name=string(\"hdax\"), val=tensor<int32, [1]>([-1])];"
-    );
-    // Q norm
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},{hd}]> q_sq = mul(x=q,y=q)[name=string(\"qsq\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},1]> qn_m = reduce_mean(x=q_sq,axes=hd_ax,keep_dims=kd)[name=string(\"qnm\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},1]> qn_e = add(x=qn_m,y=eps_v)[name=string(\"qne\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},1]> qn_r = pow(x=qn_e,y=nhalf)[name=string(\"qnr\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},{hd}]> qn = mul(x=q,y=qn_r)[name=string(\"qn\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,1,{hd}]> qn_w = const()[name=string(\"qnw\"), val=tensor<fp16, [1,1,1,{hd}]>(BLOBFILE(path=string(\"@model_path/weights/q_norm.bin\"), offset=uint64(64)))];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},{hd}]> q_normed = mul(x=qn,y=qn_w)[name=string(\"qnormed\")];"
-    );
-    // K norm
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_sq = mul(x=k_kv,y=k_kv)[name=string(\"ksq\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_m = reduce_mean(x=k_sq,axes=hd_ax,keep_dims=kd)[name=string(\"knm\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_e = add(x=kn_m,y=eps_v)[name=string(\"kne\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_r = pow(x=kn_e,y=nhalf)[name=string(\"knr\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> kn = mul(x=k_kv,y=kn_r)[name=string(\"kn\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,1,{hd}]> kn_w = const()[name=string(\"knw\"), val=tensor<fp16, [1,1,1,{hd}]>(BLOBFILE(path=string(\"@model_path/weights/k_norm.bin\"), offset=uint64(64)))];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_normed = mul(x=kn,y=kn_w)[name=string(\"knormed\")];"
-    );
+    // QK Norm — Qwen3 has per-head RMSNorm; Qwen2 skips it.
+    let (q_to_rope, k_to_rope) = if has_qk_norm {
+        let _ = writeln!(
+            m,
+            "        tensor<int32, [1]> hd_ax = const()[name=string(\"hdax\"), val=tensor<int32, [1]>([-1])];"
+        );
+        // Q norm
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{hd}]> q_sq = mul(x=q,y=q)[name=string(\"qsq\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},1]> qn_m = reduce_mean(x=q_sq,axes=hd_ax,keep_dims=kd)[name=string(\"qnm\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},1]> qn_e = add(x=qn_m,y=eps_v)[name=string(\"qne\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},1]> qn_r = pow(x=qn_e,y=nhalf)[name=string(\"qnr\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{hd}]> qn = mul(x=q,y=qn_r)[name=string(\"qn\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,1,{hd}]> qn_w = const()[name=string(\"qnw\"), val=tensor<fp16, [1,1,1,{hd}]>(BLOBFILE(path=string(\"@model_path/weights/q_norm.bin\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{hd}]> q_normed = mul(x=qn,y=qn_w)[name=string(\"qnormed\")];"
+        );
+        // K norm
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_sq = mul(x=k_kv,y=k_kv)[name=string(\"ksq\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_m = reduce_mean(x=k_sq,axes=hd_ax,keep_dims=kd)[name=string(\"knm\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_e = add(x=kn_m,y=eps_v)[name=string(\"kne\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_r = pow(x=kn_e,y=nhalf)[name=string(\"knr\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> kn = mul(x=k_kv,y=kn_r)[name=string(\"kn\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,1,{hd}]> kn_w = const()[name=string(\"knw\"), val=tensor<fp16, [1,1,1,{hd}]>(BLOBFILE(path=string(\"@model_path/weights/k_norm.bin\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_normed = mul(x=kn,y=kn_w)[name=string(\"knormed\")];"
+        );
+        ("q_normed", "k_normed")
+    } else {
+        ("q", "k_kv")
+    };
+
 
     // === RoPE ===
     let _ = writeln!(
@@ -318,7 +362,7 @@ pub fn gen_fused_diffusion_layer(
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q1 = slice_by_size(x=q_normed,begin=rp_b0,size=rp_sh)[name=string(\"q1\")];"
+        "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q1 = slice_by_size(x={q_to_rope},begin=rp_b0,size=rp_sh)[name=string(\"q1\")];"
     );
     let _ = writeln!(
         m,
@@ -326,7 +370,7 @@ pub fn gen_fused_diffusion_layer(
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q2 = slice_by_size(x=q_normed,begin=rp_bh,size=rp_sh)[name=string(\"q2\")];"
+        "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q2 = slice_by_size(x={q_to_rope},begin=rp_bh,size=rp_sh)[name=string(\"q2\")];"
     );
     let _ = writeln!(
         m,
@@ -372,11 +416,11 @@ pub fn gen_fused_diffusion_layer(
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{kv_heads},{seq},{half_hd}]> k1 = slice_by_size(x=k_normed,begin=rp_b0,size=rp_ksh)[name=string(\"k1\")];"
+        "        tensor<fp16, [1,{kv_heads},{seq},{half_hd}]> k1 = slice_by_size(x={k_to_rope},begin=rp_b0,size=rp_ksh)[name=string(\"k1\")];"
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{kv_heads},{seq},{half_hd}]> k2 = slice_by_size(x=k_normed,begin=rp_bh,size=rp_ksh)[name=string(\"k2\")];"
+        "        tensor<fp16, [1,{kv_heads},{seq},{half_hd}]> k2 = slice_by_size(x={k_to_rope},begin=rp_bh,size=rp_ksh)[name=string(\"k2\")];"
     );
     let _ = writeln!(
         m,
@@ -407,82 +451,172 @@ pub fn gen_fused_diffusion_layer(
         "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_rot = concat(axis=rpax,interleave=rpid,values=(kr1,kr2))[name=string(\"krot\")];"
     );
 
-    // === GQA Bidirectional SDPA (NO causal mask) ===
-    // Q: [1,H,S,hd] → [kvH, hpg, S, hd]
-    // K: [1,kvH,S,hd] → [kvH, 1, S, hd]
-    let _ = writeln!(
-        m,
-        "        tensor<int32, [4]> rqb = const()[name=string(\"rqb\"), val=tensor<int32, [4]>([{kv_heads},{hpg},{seq},{hd}])];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [{kv_heads},{hpg},{seq},{hd}]> qb = reshape(shape=rqb,x=q_rot)[name=string(\"qb\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<int32, [4]> rkb = const()[name=string(\"rkb\"), val=tensor<int32, [4]>([{kv_heads},1,{seq},{hd}])];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [{kv_heads},1,{seq},{hd}]> kb = reshape(shape=rkb,x=k_rot)[name=string(\"kb\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [{kv_heads},1,{seq},{hd}]> vb = reshape(shape=rkb,x=v_kv)[name=string(\"vb\")];"
-    );
+    // === GQA SDPA ===
+    // Two strategies based on GQA ratio:
+    // - hpg <= 2: batch-GQA [kv_heads, hpg, seq, hd] (standard, proven on ANE)
+    // - hpg > 2:  expand K/V to all heads [1, heads, seq, hd] (avoids ANE dimension constraints)
+    let use_expanded_gqa = hpg > 2;
 
-    // Q@K^T scaled → softmax
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [{kv_heads},{hpg},{seq},{seq}]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=qb,y=kb)[name=string(\"mm1\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [{kv_heads},{hpg},{seq},{seq}]> sc2 = mul(x=sc1,y=scv)[name=string(\"scl\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];"
-    );
-
-    // Causal mask (when enabled)
-    if causal {
+    if use_expanded_gqa {
+        // Expand K/V: repeat each KV head `hpg` times via per-head slice + concat.
+        // Q stays as [1, heads, seq, hd]. K/V expand to [1, heads, seq, hd].
+        for kv_h in 0..kv_heads {
+            let _ = writeln!(
+                m,
+                "        tensor<int32, [4]> kslice_b{kv_h} = const()[name=string(\"ksb{kv_h}\"), val=tensor<int32, [4]>([0,{kv_h},0,0])];"
+            );
+            let _ = writeln!(
+                m,
+                "        tensor<int32, [4]> kslice_s = const()[name=string(\"kss\"), val=tensor<int32, [4]>([1,1,{seq},{hd}])];"
+            );
+            let _ = writeln!(
+                m,
+                "        tensor<fp16, [1,1,{seq},{hd}]> kh{kv_h} = slice_by_size(x=k_rot,begin=kslice_b{kv_h},size=kslice_s)[name=string(\"kh{kv_h}\")];"
+            );
+            let _ = writeln!(
+                m,
+                "        tensor<fp16, [1,1,{seq},{hd}]> vh{kv_h} = slice_by_size(x=v_kv,begin=kslice_b{kv_h},size=kslice_s)[name=string(\"vh{kv_h}\")];"
+            );
+        }
+        // Build concat argument lists: repeat each KV head hpg times
+        let mut k_parts = Vec::new();
+        let mut v_parts = Vec::new();
+        for kv_h in 0..kv_heads {
+            for _ in 0..hpg {
+                k_parts.push(format!("kh{kv_h}"));
+                v_parts.push(format!("vh{kv_h}"));
+            }
+        }
+        let k_concat_args = k_parts.join(",");
+        let v_concat_args = v_parts.join(",");
         let _ = writeln!(
             m,
-            "        tensor<fp16, [1,1,{seq},{seq}]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,{seq},{seq}]>(BLOBFILE(path=string(\"@model_path/weights/causal_mask.bin\"), offset=uint64(64)))];"
+            "        int32 gqa_ax = const()[name=string(\"gqax\"), val=int32(1)];"
         );
         let _ = writeln!(
             m,
-            "        tensor<fp16, [{kv_heads},{hpg},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];"
+            "        bool gqa_il = const()[name=string(\"gqil\"), val=bool(false)];"
         );
         let _ = writeln!(
             m,
-            "        tensor<fp16, [{kv_heads},{hpg},{seq},{seq}]> aw = softmax(axis=sax,x=ms)[name=string(\"sm\")];"
+            "        tensor<fp16, [1,{heads},{seq},{hd}]> k_exp = concat(axis=gqa_ax,interleave=gqa_il,values=({k_concat_args}))[name=string(\"kexp\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{hd}]> v_exp = concat(axis=gqa_ax,interleave=gqa_il,values=({v_concat_args}))[name=string(\"vexp\")];"
+        );
+
+        // Attention: Q[1,H,S,hd] @ K_exp^T[1,H,hd,S] → [1,H,S,S]
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{seq}]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=q_rot,y=k_exp)[name=string(\"mm1\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{seq}]> sc2 = mul(x=sc1,y=scv)[name=string(\"scl\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];"
+        );
+        if causal {
+            let _ = writeln!(
+                m,
+                "        tensor<fp16, [1,1,{seq},{seq}]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,{seq},{seq}]>(BLOBFILE(path=string(\"@model_path/weights/causal_mask.bin\"), offset=uint64(64)))];"
+            );
+            let _ = writeln!(
+                m,
+                "        tensor<fp16, [1,{heads},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];"
+            );
+            let _ = writeln!(
+                m,
+                "        tensor<fp16, [1,{heads},{seq},{seq}]> aw = softmax(axis=sax,x=ms)[name=string(\"sm\")];"
+            );
+        } else {
+            let _ = writeln!(
+                m,
+                "        tensor<fp16, [1,{heads},{seq},{seq}]> aw = softmax(axis=sax,x=sc2)[name=string(\"sm\")];"
+            );
+        }
+        // scores@V_exp → [1,H,S,hd]
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{hd}]> a_out = matmul(transpose_x=bF,transpose_y=bF,x=aw,y=v_exp)[name=string(\"mm2\")];"
         );
     } else {
+        // Standard batch-GQA: [kv_heads, hpg, seq, hd]
         let _ = writeln!(
             m,
-            "        tensor<fp16, [{kv_heads},{hpg},{seq},{seq}]> aw = softmax(axis=sax,x=sc2)[name=string(\"sm\")];"
+            "        tensor<int32, [4]> rqb = const()[name=string(\"rqb\"), val=tensor<int32, [4]>([{kv_heads},{hpg},{seq},{hd}])];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [{kv_heads},{hpg},{seq},{hd}]> qb = reshape(shape=rqb,x=q_rot)[name=string(\"qb\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<int32, [4]> rkb = const()[name=string(\"rkb\"), val=tensor<int32, [4]>([{kv_heads},1,{seq},{hd}])];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [{kv_heads},1,{seq},{hd}]> kb = reshape(shape=rkb,x=k_rot)[name=string(\"kb\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [{kv_heads},1,{seq},{hd}]> vb = reshape(shape=rkb,x=v_kv)[name=string(\"vb\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [{kv_heads},{hpg},{seq},{seq}]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=qb,y=kb)[name=string(\"mm1\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [{kv_heads},{hpg},{seq},{seq}]> sc2 = mul(x=sc1,y=scv)[name=string(\"scl\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];"
+        );
+        if causal {
+            let _ = writeln!(
+                m,
+                "        tensor<fp16, [1,1,{seq},{seq}]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,{seq},{seq}]>(BLOBFILE(path=string(\"@model_path/weights/causal_mask.bin\"), offset=uint64(64)))];"
+            );
+            let _ = writeln!(
+                m,
+                "        tensor<fp16, [{kv_heads},{hpg},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];"
+            );
+            let _ = writeln!(
+                m,
+                "        tensor<fp16, [{kv_heads},{hpg},{seq},{seq}]> aw = softmax(axis=sax,x=ms)[name=string(\"sm\")];"
+            );
+        } else {
+            let _ = writeln!(
+                m,
+                "        tensor<fp16, [{kv_heads},{hpg},{seq},{seq}]> aw = softmax(axis=sax,x=sc2)[name=string(\"sm\")];"
+            );
+        }
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [{kv_heads},{hpg},{seq},{hd}]> a4 = matmul(transpose_x=bF,transpose_y=bF,x=aw,y=vb)[name=string(\"mm2\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<int32, [4]> rha = const()[name=string(\"rha\"), val=tensor<int32, [4]>([1,{heads},{seq},{hd}])];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{hd}]> a_out = reshape(shape=rha,x=a4)[name=string(\"aout\")];"
         );
     }
-
-    // scores@V
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [{kv_heads},{hpg},{seq},{hd}]> a4 = matmul(transpose_x=bF,transpose_y=bF,x=aw,y=vb)[name=string(\"mm2\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<int32, [4]> rha = const()[name=string(\"rha\"), val=tensor<int32, [4]>([1,{heads},{seq},{hd}])];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},{hd}]> a_out = reshape(shape=rha,x=a4)[name=string(\"aout\")];"
-    );
 
     // Reshape attn output → [1, attn_dim, 1, seq]
     let _ = writeln!(
@@ -683,9 +817,16 @@ pub fn gen_fused_diffusion_layer(
         "@model_path/weights/down.bin".to_string(),
         "@model_path/weights/rope_cos.bin".to_string(),
         "@model_path/weights/rope_sin.bin".to_string(),
-        "@model_path/weights/q_norm.bin".to_string(),
-        "@model_path/weights/k_norm.bin".to_string(),
     ];
+    if has_qk_norm {
+        weight_names.push("@model_path/weights/q_norm.bin".to_string());
+        weight_names.push("@model_path/weights/k_norm.bin".to_string());
+    }
+    if has_qkv_bias {
+        weight_names.push("@model_path/weights/q_bias.bin".to_string());
+        weight_names.push("@model_path/weights/k_bias.bin".to_string());
+        weight_names.push("@model_path/weights/v_bias.bin".to_string());
+    }
     if causal {
         weight_names.push("@model_path/weights/causal_mask.bin".to_string());
     }
@@ -725,6 +866,8 @@ pub fn gen_diffusion_attention(
     hd: usize,
     seq_len: usize,
     eps: f64,
+    has_qk_norm: bool,
+    has_qkv_bias: bool,
 ) -> FusedMil {
     let seq = seq_len.max(ANE_MIN_SPATIAL);
     let half_hd = hd / 2;
@@ -858,18 +1001,34 @@ pub fn gen_diffusion_attention(
         "        tensor<fp16, [1,1,{seq},{kv_dim}]> vm = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wv)[name=string(\"vm\")];"
     );
 
+
+    // Determine reshape input names (with or without bias)
+    let qt_to_reshape = if has_qkv_bias { "qt_b" } else { "qt" };
+    let kt_to_reshape = if has_qkv_bias { "kt_b" } else { "kt" };
+    let vt_to_reshape = if has_qkv_bias { "vt_b" } else { "vt" };
+
     // Reshape Q → [1, heads, seq, hd]
     let _ = writeln!(
         m,
         "        tensor<fp16, [1,1,{attn_dim},{seq}]> qt = transpose(perm=pm,x=qm)[name=string(\"qt\")];"
     );
+    if has_qkv_bias {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{attn_dim},1]> q_bias = const()[name=string(\"qb_w\"), val=tensor<fp16, [1,1,{attn_dim},1]>(BLOBFILE(path=string(\"@model_path/weights/q_bias.bin\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{attn_dim},{seq}]> qt_b = add(x=qt,y=q_bias)[name=string(\"qtb\")];"
+        );
+    }
     let _ = writeln!(
         m,
         "        tensor<int32, [4]> qsh = const()[name=string(\"qsh\"), val=tensor<int32, [4]>([1,{heads},{hd},{seq}])];"
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{heads},{hd},{seq}]> q4 = reshape(shape=qsh,x=qt)[name=string(\"rq\")];"
+        "        tensor<fp16, [1,{heads},{hd},{seq}]> q4 = reshape(shape=qsh,x={qt_to_reshape})[name=string(\"rq\")];"
     );
     let _ = writeln!(
         m,
@@ -881,13 +1040,23 @@ pub fn gen_diffusion_attention(
         m,
         "        tensor<fp16, [1,1,{kv_dim},{seq}]> kt = transpose(perm=pm,x=km)[name=string(\"kt\")];"
     );
+    if has_qkv_bias {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{kv_dim},1]> k_bias = const()[name=string(\"kb_w\"), val=tensor<fp16, [1,1,{kv_dim},1]>(BLOBFILE(path=string(\"@model_path/weights/k_bias.bin\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{kv_dim},{seq}]> kt_b = add(x=kt,y=k_bias)[name=string(\"ktb\")];"
+        );
+    }
     let _ = writeln!(
         m,
         "        tensor<int32, [4]> kvsh = const()[name=string(\"kvsh\"), val=tensor<int32, [4]>([1,{kv_heads},{hd},{seq}])];"
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> k4 = reshape(shape=kvsh,x=kt)[name=string(\"rk\")];"
+        "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> k4 = reshape(shape=kvsh,x={kt_to_reshape})[name=string(\"rk\")];"
     );
     let _ = writeln!(
         m,
@@ -899,78 +1068,94 @@ pub fn gen_diffusion_attention(
         m,
         "        tensor<fp16, [1,1,{kv_dim},{seq}]> vt = transpose(perm=pm,x=vm)[name=string(\"vt\")];"
     );
+    if has_qkv_bias {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{kv_dim},1]> v_bias = const()[name=string(\"vb_w\"), val=tensor<fp16, [1,1,{kv_dim},1]>(BLOBFILE(path=string(\"@model_path/weights/v_bias.bin\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{kv_dim},{seq}]> vt_b = add(x=vt,y=v_bias)[name=string(\"vtb\")];"
+        );
+    }
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> v4 = reshape(shape=kvsh,x=vt)[name=string(\"rv\")];"
+        "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> v4 = reshape(shape=kvsh,x={vt_to_reshape})[name=string(\"rv\")];"
     );
     let _ = writeln!(
         m,
         "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> v_kv = transpose(perm=pm,x=v4)[name=string(\"tv\")];"
     );
 
-    // === QK Norm (Qwen3-specific: per-head RMSNorm on Q and K) ===
-    let _ = writeln!(
-        m,
-        "        tensor<int32, [1]> hd_ax = const()[name=string(\"hdax\"), val=tensor<int32, [1]>([-1])];"
-    );
-    // Q norm
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},{hd}]> q_sq = mul(x=q,y=q)[name=string(\"qsq\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},1]> qn_m = reduce_mean(x=q_sq,axes=hd_ax,keep_dims=kd)[name=string(\"qnm\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},1]> qn_e = add(x=qn_m,y=eps_v)[name=string(\"qne\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},1]> qn_r = pow(x=qn_e,y=nhalf)[name=string(\"qnr\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},{hd}]> qn = mul(x=q,y=qn_r)[name=string(\"qn\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,1,{hd}]> qn_w = const()[name=string(\"qnw\"), val=tensor<fp16, [1,1,1,{hd}]>(BLOBFILE(path=string(\"@model_path/weights/q_norm.bin\"), offset=uint64(64)))];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{heads},{seq},{hd}]> q_normed = mul(x=qn,y=qn_w)[name=string(\"qnormed\")];"
-    );
-    // K norm
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_sq = mul(x=k_kv,y=k_kv)[name=string(\"ksq\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_m = reduce_mean(x=k_sq,axes=hd_ax,keep_dims=kd)[name=string(\"knm\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_e = add(x=kn_m,y=eps_v)[name=string(\"kne\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_r = pow(x=kn_e,y=nhalf)[name=string(\"knr\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> kn = mul(x=k_kv,y=kn_r)[name=string(\"kn\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,1,{hd}]> kn_w = const()[name=string(\"knw\"), val=tensor<fp16, [1,1,1,{hd}]>(BLOBFILE(path=string(\"@model_path/weights/k_norm.bin\"), offset=uint64(64)))];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_normed = mul(x=kn,y=kn_w)[name=string(\"knormed\")];"
-    );
+    // QK Norm — Qwen3 has per-head RMSNorm; Qwen2 skips it.
+    let (q_to_rope, k_to_rope) = if has_qk_norm {
+        let _ = writeln!(
+            m,
+            "        tensor<int32, [1]> hd_ax = const()[name=string(\"hdax\"), val=tensor<int32, [1]>([-1])];"
+        );
+        // Q norm
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{hd}]> q_sq = mul(x=q,y=q)[name=string(\"qsq\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},1]> qn_m = reduce_mean(x=q_sq,axes=hd_ax,keep_dims=kd)[name=string(\"qnm\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},1]> qn_e = add(x=qn_m,y=eps_v)[name=string(\"qne\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},1]> qn_r = pow(x=qn_e,y=nhalf)[name=string(\"qnr\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{hd}]> qn = mul(x=q,y=qn_r)[name=string(\"qn\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,1,{hd}]> qn_w = const()[name=string(\"qnw\"), val=tensor<fp16, [1,1,1,{hd}]>(BLOBFILE(path=string(\"@model_path/weights/q_norm.bin\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{heads},{seq},{hd}]> q_normed = mul(x=qn,y=qn_w)[name=string(\"qnormed\")];"
+        );
+        // K norm
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_sq = mul(x=k_kv,y=k_kv)[name=string(\"ksq\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_m = reduce_mean(x=k_sq,axes=hd_ax,keep_dims=kd)[name=string(\"knm\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_e = add(x=kn_m,y=eps_v)[name=string(\"kne\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_r = pow(x=kn_e,y=nhalf)[name=string(\"knr\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> kn = mul(x=k_kv,y=kn_r)[name=string(\"kn\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,1,{hd}]> kn_w = const()[name=string(\"knw\"), val=tensor<fp16, [1,1,1,{hd}]>(BLOBFILE(path=string(\"@model_path/weights/k_norm.bin\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_normed = mul(x=kn,y=kn_w)[name=string(\"knormed\")];"
+        );
+        ("q_normed", "k_normed")
+    } else {
+        ("q", "k_kv")
+    };
+
 
     // === RoPE ===
     let _ = writeln!(
@@ -993,7 +1178,7 @@ pub fn gen_diffusion_attention(
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q1 = slice_by_size(x=q_normed,begin=rp_b0,size=rp_sh)[name=string(\"q1\")];"
+        "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q1 = slice_by_size(x={q_to_rope},begin=rp_b0,size=rp_sh)[name=string(\"q1\")];"
     );
     let _ = writeln!(
         m,
@@ -1001,7 +1186,7 @@ pub fn gen_diffusion_attention(
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q2 = slice_by_size(x=q_normed,begin=rp_bh,size=rp_sh)[name=string(\"q2\")];"
+        "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q2 = slice_by_size(x={q_to_rope},begin=rp_bh,size=rp_sh)[name=string(\"q2\")];"
     );
     let _ = writeln!(
         m,
@@ -1047,11 +1232,11 @@ pub fn gen_diffusion_attention(
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{kv_heads},{seq},{half_hd}]> k1 = slice_by_size(x=k_normed,begin=rp_b0,size=rp_ksh)[name=string(\"k1\")];"
+        "        tensor<fp16, [1,{kv_heads},{seq},{half_hd}]> k1 = slice_by_size(x={k_to_rope},begin=rp_b0,size=rp_ksh)[name=string(\"k1\")];"
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,{kv_heads},{seq},{half_hd}]> k2 = slice_by_size(x=k_normed,begin=rp_bh,size=rp_ksh)[name=string(\"k2\")];"
+        "        tensor<fp16, [1,{kv_heads},{seq},{half_hd}]> k2 = slice_by_size(x={k_to_rope},begin=rp_bh,size=rp_ksh)[name=string(\"k2\")];"
     );
     let _ = writeln!(
         m,
@@ -1196,19 +1381,28 @@ pub fn gen_diffusion_attention(
     let _ = writeln!(m, "    }} -> (y);");
     m.push_str("}\n");
 
+    let mut attn_weight_names = vec![
+        "@model_path/weights/rms_att.bin".to_string(),
+        "@model_path/weights/wq.bin".to_string(),
+        "@model_path/weights/wk.bin".to_string(),
+        "@model_path/weights/wv.bin".to_string(),
+        "@model_path/weights/wo.bin".to_string(),
+        "@model_path/weights/rope_cos.bin".to_string(),
+        "@model_path/weights/rope_sin.bin".to_string(),
+    ];
+    if has_qk_norm {
+        attn_weight_names.push("@model_path/weights/q_norm.bin".to_string());
+        attn_weight_names.push("@model_path/weights/k_norm.bin".to_string());
+    }
+    if has_qkv_bias {
+        attn_weight_names.push("@model_path/weights/q_bias.bin".to_string());
+        attn_weight_names.push("@model_path/weights/k_bias.bin".to_string());
+        attn_weight_names.push("@model_path/weights/v_bias.bin".to_string());
+    }
+
     FusedMil {
         mil_text: m,
-        weight_names: vec![
-            "@model_path/weights/rms_att.bin".to_string(),
-            "@model_path/weights/wq.bin".to_string(),
-            "@model_path/weights/wk.bin".to_string(),
-            "@model_path/weights/wv.bin".to_string(),
-            "@model_path/weights/wo.bin".to_string(),
-            "@model_path/weights/rope_cos.bin".to_string(),
-            "@model_path/weights/rope_sin.bin".to_string(),
-            "@model_path/weights/q_norm.bin".to_string(),
-            "@model_path/weights/k_norm.bin".to_string(),
-        ],
+        weight_names: attn_weight_names,
         input_bytes: dim * seq * 4,
         output_bytes: dim * seq * 4,
     }
@@ -2065,8 +2259,8 @@ mod tests {
         let down_blob = build_weight_blob_transposed(&lw.down_proj, cfg.hidden, cfg.inter);
         let rope_cos_blob = build_weight_blob(&rope_cos, seq, half_hd);
         let rope_sin_blob = build_weight_blob(&rope_sin, seq, half_hd);
-        let q_norm_blob = build_weight_blob(&lw.q_norm, 1, cfg.head_dim);
-        let k_norm_blob = build_weight_blob(&lw.k_norm, 1, cfg.head_dim);
+        let q_norm_blob = build_weight_blob(lw.q_norm.as_ref().expect("q_norm"), 1, cfg.head_dim);
+        let k_norm_blob = build_weight_blob(lw.k_norm.as_ref().expect("k_norm"), 1, cfg.head_dim);
 
         // === 1. Compile fused kernel (all 13 blobs) ===
         let fused_mil = gen_fused_diffusion_layer(
@@ -2078,6 +2272,8 @@ mod tests {
             seq,
             1e-6,
             false, // bidirectional for diffusion
+            true,  // Qwen3 has QK norm
+            false, // no QKV bias
         );
         let fused_blobs: Vec<&[u8]> = vec![
             &rms_att_blob,
@@ -2107,7 +2303,7 @@ mod tests {
 
         // === 2. Compile attention kernel (9 blobs) ===
         let attn_mil =
-            gen_diffusion_attention(cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim, seq, 1e-6);
+            gen_diffusion_attention(cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim, seq, 1e-6, true, false);
         let attn_blobs: Vec<&[u8]> = vec![
             &rms_att_blob,
             &wq_blob,
@@ -2269,6 +2465,8 @@ mod tests {
                 seq,
                 1e-6,
                 false, // bidirectional for diffusion
+                true,  // Qwen3 has QK norm
+                false, // no QKV bias
             );
             eprintln!(
                 "seq={seq}: MIL={} bytes, {} BLOBFILEs",
@@ -2305,8 +2503,8 @@ mod tests {
                 build_weight_blob_transposed(&lw.down_proj, cfg.hidden, cfg.inter), // down
                 build_weight_blob(&rope_cos, seq, half_hd), // rope_cos [seq, half_hd]
                 build_weight_blob(&rope_sin, seq, half_hd), // rope_sin
-                build_weight_blob(&lw.q_norm, 1, cfg.head_dim), // q_norm [1,1,1,hd]
-                build_weight_blob(&lw.k_norm, 1, cfg.head_dim), // k_norm
+                build_weight_blob(lw.q_norm.as_ref().expect("q_norm"), 1, cfg.head_dim), // q_norm [1,1,1,hd]
+                build_weight_blob(lw.k_norm.as_ref().expect("k_norm"), 1, cfg.head_dim), // k_norm
             ];
             let total_mb: f64 = blobs.iter().map(|b| b.len() as f64).sum::<f64>() / 1e6;
             eprintln!("seq={seq}: total BLOBFILE = {total_mb:.1}MB");
@@ -2375,7 +2573,7 @@ mod tests {
         let half_hd = hd / 2;
 
         // Generate MIL
-        let mil = gen_diffusion_attention(dim, heads, kv_heads, hd, seq, 1e-5);
+        let mil = gen_diffusion_attention(dim, heads, kv_heads, hd, seq, 1e-5, true, false);
         eprintln!("MIL generated for dim={dim}, heads={heads}, kv_heads={kv_heads}");
 
         // Create dummy weight blobs

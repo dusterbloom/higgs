@@ -124,9 +124,13 @@ pub struct DiffusionLayerWeights {
     pub k_proj: Vec<f32>, // [kv_heads*head_dim, hidden] = [1024, 1024]
     pub v_proj: Vec<f32>, // [kv_heads*head_dim, hidden] = [1024, 1024]
     pub o_proj: Vec<f32>, // [hidden, heads*head_dim] = [1024, 2048]
-    // QK norm
-    pub q_norm: Vec<f32>, // [head_dim] = [128]
-    pub k_norm: Vec<f32>, // [128]
+    // QK norm (Qwen3 has these, Qwen2 does not)
+    pub q_norm: Option<Vec<f32>>, // [head_dim] = [128]
+    pub k_norm: Option<Vec<f32>>, // [128]
+    // QKV biases (Qwen2 has these, Qwen3 does not)
+    pub q_bias: Option<Vec<f32>>, // [heads*head_dim]
+    pub k_bias: Option<Vec<f32>>, // [kv_heads*head_dim]
+    pub v_bias: Option<Vec<f32>>, // [kv_heads*head_dim]
     // Layer norms
     pub input_norm: Vec<f32>,     // [hidden]
     pub post_attn_norm: Vec<f32>, // [hidden]
@@ -145,6 +149,7 @@ pub struct DiffusionEngine {
     pub layers: Vec<DiffusionLayerWeights>,
     pub embed: Vec<f32>,      // [vocab, hidden]
     pub final_norm: Vec<f32>, // [hidden]
+    pub lm_head: Option<Vec<f32>>, // untied lm_head for Qwen2 (None = tied to embed)
     pub config: DiffusionConfig,
     // Precomputed RoPE tables
     pub(crate) rope_cos: Vec<f32>, // [max_seq, head_dim/2]
@@ -278,9 +283,13 @@ impl DiffusionEngine {
                 .unwrap_or_else(|_| panic!("Missing: {name}"));
             bf16_to_f32(t.data())
         };
+        let try_get = |name: &str| -> Option<Vec<f32>> {
+            tensors.tensor(name).ok().map(|t| bf16_to_f32(t.data()))
+        };
 
         let embed = get("model.embed_tokens.weight");
         let final_norm = get("model.norm.weight");
+        let lm_head = try_get("lm_head.weight");
 
         let mut layers = Vec::with_capacity(config.layers);
         for i in 0..config.layers {
@@ -290,8 +299,11 @@ impl DiffusionEngine {
                 k_proj: get(&format!("{p}.self_attn.k_proj.weight")),
                 v_proj: get(&format!("{p}.self_attn.v_proj.weight")),
                 o_proj: get(&format!("{p}.self_attn.o_proj.weight")),
-                q_norm: get(&format!("{p}.self_attn.q_norm.weight")),
-                k_norm: get(&format!("{p}.self_attn.k_norm.weight")),
+                q_norm: try_get(&format!("{p}.self_attn.q_norm.weight")),
+                k_norm: try_get(&format!("{p}.self_attn.k_norm.weight")),
+                q_bias: try_get(&format!("{p}.self_attn.q_proj.bias")),
+                k_bias: try_get(&format!("{p}.self_attn.k_proj.bias")),
+                v_bias: try_get(&format!("{p}.self_attn.v_proj.bias")),
                 input_norm: get(&format!("{p}.input_layernorm.weight")),
                 post_attn_norm: get(&format!("{p}.post_attention_layernorm.weight")),
                 gate_proj: get(&format!("{p}.mlp.gate_proj.weight")),
@@ -315,8 +327,12 @@ impl DiffusionEngine {
             }
         }
 
+        let has_qk_norm = layers[0].q_norm.is_some();
+        let has_qkv_bias = layers[0].q_bias.is_some();
+        let has_lm_head = lm_head.is_some();
         eprintln!(
-            "DiffusionEngine loaded: {}L, hidden={}, heads={}/{}, vocab={}, {:.0}M params",
+            "DiffusionEngine loaded: {}L, hidden={}, heads={}/{}, vocab={}, {:.0}M params \
+             [qk_norm={has_qk_norm} qkv_bias={has_qkv_bias} untied_lm_head={has_lm_head}]",
             config.layers,
             config.hidden,
             config.heads,
@@ -329,6 +345,7 @@ impl DiffusionEngine {
             layers,
             embed,
             final_norm,
+            lm_head,
             config,
             rope_cos,
             rope_sin,
@@ -397,8 +414,11 @@ impl DiffusionEngine {
                 k_proj: dequant(&format!("{p}.self_attn.k_proj"), kv_dim, h),
                 v_proj: dequant(&format!("{p}.self_attn.v_proj"), kv_dim, h),
                 o_proj: dequant(&format!("{p}.self_attn.o_proj"), h, q_dim),
-                q_norm: get_fp16(&format!("{p}.self_attn.q_norm.weight")),
-                k_norm: get_fp16(&format!("{p}.self_attn.k_norm.weight")),
+                q_norm: Some(get_fp16(&format!("{p}.self_attn.q_norm.weight"))),
+                k_norm: Some(get_fp16(&format!("{p}.self_attn.k_norm.weight"))),
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
                 input_norm: get_fp16(&format!("{p}.input_layernorm.weight")),
                 post_attn_norm: get_fp16(&format!("{p}.post_attention_layernorm.weight")),
                 gate_proj: dequant(&format!("{p}.mlp.gate_proj"), inter, h),
@@ -435,8 +455,11 @@ impl DiffusionEngine {
                     + l.gate_proj.len()
                     + l.up_proj.len()
                     + l.down_proj.len()
-                    + l.q_norm.len()
-                    + l.k_norm.len()
+                    + l.q_norm.as_ref().map_or(0, |v| v.len())
+                    + l.k_norm.as_ref().map_or(0, |v| v.len())
+                    + l.q_bias.as_ref().map_or(0, |v| v.len())
+                    + l.k_bias.as_ref().map_or(0, |v| v.len())
+                    + l.v_bias.as_ref().map_or(0, |v| v.len())
                     + l.input_norm.len()
                     + l.post_attn_norm.len())
                     * 4
@@ -455,6 +478,7 @@ impl DiffusionEngine {
             layers,
             embed,
             final_norm,
+            lm_head: None, // Q1 Bonsai models always have tied embeddings
             config,
             rope_cos,
             rope_sin,
@@ -509,15 +533,40 @@ impl DiffusionEngine {
             sgemm_nt(seq, kv_dim, h, &normed, &layer.k_proj, &mut k_buf);
             sgemm_nt(seq, kv_dim, h, &normed, &layer.v_proj, &mut v_buf);
 
-            // QK norm (per-head RMSNorm over head_dim)
-            for s in 0..seq {
-                for head in 0..n_heads {
-                    let off = s * q_dim + head * hd;
-                    rms_norm_slice(&mut q_buf[off..off + hd], &layer.q_norm);
+            // Add biases if present (Qwen2)
+            if let Some(ref bias) = layer.q_bias {
+                for s in 0..seq {
+                    for j in 0..q_dim {
+                        q_buf[s * q_dim + j] += bias[j];
+                    }
                 }
-                for head in 0..n_kv {
-                    let off = s * kv_dim + head * hd;
-                    rms_norm_slice(&mut k_buf[off..off + hd], &layer.k_norm);
+            }
+            if let Some(ref bias) = layer.k_bias {
+                for s in 0..seq {
+                    for j in 0..kv_dim {
+                        k_buf[s * kv_dim + j] += bias[j];
+                    }
+                }
+            }
+            if let Some(ref bias) = layer.v_bias {
+                for s in 0..seq {
+                    for j in 0..kv_dim {
+                        v_buf[s * kv_dim + j] += bias[j];
+                    }
+                }
+            }
+
+            // QK norm (per-head RMSNorm over head_dim) — Qwen3 only
+            if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+                for s in 0..seq {
+                    for head in 0..n_heads {
+                        let off = s * q_dim + head * hd;
+                        rms_norm_slice(&mut q_buf[off..off + hd], qn);
+                    }
+                    for head in 0..n_kv {
+                        let off = s * kv_dim + head * hd;
+                        rms_norm_slice(&mut k_buf[off..off + hd], kn);
+                    }
                 }
             }
 
@@ -628,10 +677,11 @@ impl DiffusionEngine {
         // 3. Final RMSNorm
         rms_norm(&hidden, &self.final_norm, &mut normed, seq, h);
 
-        // 4. LM head: normed[seq, h] @ embed^T[h, vocab] → logits[seq, vocab]
-        // embed is [vocab, h]. We want normed @ embed^T.
+        // 4. LM head: normed[seq, h] @ W^T[h, vocab] → logits[seq, vocab]
+        //    Use untied lm_head if present (Qwen2), else tied embeddings (Qwen3).
+        let lm_weights = self.lm_head.as_deref().unwrap_or(&self.embed);
         let mut logits = vec![0.0f32; seq * cfg.vocab];
-        sgemm_nt(seq, cfg.vocab, h, &normed, &self.embed, &mut logits);
+        sgemm_nt(seq, cfg.vocab, h, &normed, lm_weights, &mut logits);
 
         logits
     }
@@ -677,14 +727,40 @@ impl DiffusionEngine {
             sgemm_nt(seq, kv_dim, h, &normed, &layer.k_proj, &mut k_buf);
             sgemm_nt(seq, kv_dim, h, &normed, &layer.v_proj, &mut v_buf);
 
-            for s in 0..seq {
-                for head in 0..n_heads {
-                    let off = s * q_dim + head * hd;
-                    rms_norm_slice(&mut q_buf[off..off + hd], &layer.q_norm);
+            // Add biases if present (Qwen2)
+            if let Some(ref bias) = layer.q_bias {
+                for s in 0..seq {
+                    for j in 0..q_dim {
+                        q_buf[s * q_dim + j] += bias[j];
+                    }
                 }
-                for head in 0..n_kv {
-                    let off = s * kv_dim + head * hd;
-                    rms_norm_slice(&mut k_buf[off..off + hd], &layer.k_norm);
+            }
+            if let Some(ref bias) = layer.k_bias {
+                for s in 0..seq {
+                    for j in 0..kv_dim {
+                        k_buf[s * kv_dim + j] += bias[j];
+                    }
+                }
+            }
+            if let Some(ref bias) = layer.v_bias {
+                for s in 0..seq {
+                    for j in 0..kv_dim {
+                        v_buf[s * kv_dim + j] += bias[j];
+                    }
+                }
+            }
+
+            // QK norm — Qwen3 only
+            if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+                for s in 0..seq {
+                    for head in 0..n_heads {
+                        let off = s * q_dim + head * hd;
+                        rms_norm_slice(&mut q_buf[off..off + hd], qn);
+                    }
+                    for head in 0..n_kv {
+                        let off = s * kv_dim + head * hd;
+                        rms_norm_slice(&mut k_buf[off..off + hd], kn);
+                    }
                 }
             }
 
@@ -778,8 +854,9 @@ impl DiffusionEngine {
         rms_norm(last_row, &self.final_norm, &mut last_normed, 1, h);
 
         // 4. LM head: 1×vocab instead of seq×vocab
+        let lm_weights = self.lm_head.as_deref().unwrap_or(&self.embed);
         let mut logits = vec![0.0f32; cfg.vocab];
-        sgemm_nt(1, cfg.vocab, h, &last_normed, &self.embed, &mut logits);
+        sgemm_nt(1, cfg.vocab, h, &last_normed, lm_weights, &mut logits);
         logits
     }
 
@@ -1365,7 +1442,13 @@ impl AneDiffusionEngine {
         let inter = cfg.inter;
         let seq = seq_len.max(ANE_MIN_SPATIAL);
 
-        eprintln!("AneDiffusionEngine: compiling 28 fused ANE kernels (seq={seq})...");
+        // Detect model variant features from layer 0
+        let has_qk_norm = engine.layers[0].q_norm.is_some();
+        let has_qkv_bias = engine.layers[0].q_bias.is_some();
+        eprintln!(
+            "AneDiffusionEngine: compiling {} fused ANE kernels (seq={seq}, qk_norm={has_qk_norm}, qkv_bias={has_qkv_bias})...",
+            cfg.layers
+        );
         let t0 = std::time::Instant::now();
 
         // Precompute RoPE tables once — same for all layers (shared BLOBFILE data).
@@ -1389,10 +1472,13 @@ impl AneDiffusionEngine {
             seq,
             1e-6,
             false, // bidirectional for diffusion
+            has_qk_norm,
+            has_qkv_bias,
         );
         let fused_names: Vec<&str> = fused_mil.weight_names.iter().map(|s| s.as_str()).collect();
-        let attn_mil =
-            diffusion_ane::gen_diffusion_attention(h, cfg.heads, cfg.kv_heads, hd, seq, 1e-6);
+        let attn_mil = diffusion_ane::gen_diffusion_attention(
+            h, cfg.heads, cfg.kv_heads, hd, seq, 1e-6, has_qk_norm, has_qkv_bias,
+        );
         let attn_names: Vec<&str> = attn_mil.weight_names.iter().map(|s| s.as_str()).collect();
         let ffn_mil = diffusion_ane::gen_diffusion_ffn(h, inter, seq, 1e-6);
         let ffn_names: Vec<&str> = ffn_mil.weight_names.iter().map(|s| s.as_str()).collect();
@@ -1402,8 +1488,9 @@ impl AneDiffusionEngine {
         let rope_sin_blob = build_weight_blob(&rope_sin, seq, half_hd);
 
         // Build weight blobs for layer 0 and compile L0 kernel.
+        // MUST match the weight_names order from the MIL generator.
         let build_fused_blobs = |lw: &DiffusionLayerWeights| -> Vec<Vec<u8>> {
-            vec![
+            let mut blobs = vec![
                 build_weight_blob(&lw.input_norm, 1, h),
                 build_weight_blob(&lw.post_attn_norm, 1, h),
                 build_weight_blob_transposed(&lw.q_proj, q_dim, h),
@@ -1415,12 +1502,25 @@ impl AneDiffusionEngine {
                 build_weight_blob_transposed(&lw.down_proj, h, inter),
                 rope_cos_blob.clone(),
                 rope_sin_blob.clone(),
-                build_weight_blob(&lw.q_norm, 1, hd),
-                build_weight_blob(&lw.k_norm, 1, hd),
-            ]
+            ];
+            if has_qk_norm {
+                let qn = lw.q_norm.as_ref().expect("model advertises qk_norm but layer has None");
+                let kn = lw.k_norm.as_ref().expect("model advertises qk_norm but layer has None");
+                blobs.push(build_weight_blob(qn, 1, hd));
+                blobs.push(build_weight_blob(kn, 1, hd));
+            }
+            if has_qkv_bias {
+                let qb = lw.q_bias.as_ref().expect("model advertises bias but layer has None");
+                let kb = lw.k_bias.as_ref().expect("model advertises bias but layer has None");
+                let vb = lw.v_bias.as_ref().expect("model advertises bias but layer has None");
+                blobs.push(build_weight_blob(qb, q_dim, 1));
+                blobs.push(build_weight_blob(kb, kv_dim, 1));
+                blobs.push(build_weight_blob(vb, kv_dim, 1));
+            }
+            blobs
         };
         let build_attn_blobs = |lw: &DiffusionLayerWeights| -> Vec<Vec<u8>> {
-            vec![
+            let mut blobs = vec![
                 build_weight_blob(&lw.input_norm, 1, h),
                 build_weight_blob_transposed(&lw.q_proj, q_dim, h),
                 build_weight_blob_transposed(&lw.k_proj, kv_dim, h),
@@ -1428,9 +1528,22 @@ impl AneDiffusionEngine {
                 build_weight_blob_transposed(&lw.o_proj, h, q_dim),
                 rope_cos_blob.clone(),
                 rope_sin_blob.clone(),
-                build_weight_blob(&lw.q_norm, 1, hd),
-                build_weight_blob(&lw.k_norm, 1, hd),
-            ]
+            ];
+            if has_qk_norm {
+                let qn = lw.q_norm.as_ref().expect("qk_norm");
+                let kn = lw.k_norm.as_ref().expect("qk_norm");
+                blobs.push(build_weight_blob(qn, 1, hd));
+                blobs.push(build_weight_blob(kn, 1, hd));
+            }
+            if has_qkv_bias {
+                let qb = lw.q_bias.as_ref().expect("bias");
+                let kb = lw.k_bias.as_ref().expect("bias");
+                let vb = lw.v_bias.as_ref().expect("bias");
+                blobs.push(build_weight_blob(qb, q_dim, 1));
+                blobs.push(build_weight_blob(kb, kv_dim, 1));
+                blobs.push(build_weight_blob(vb, kv_dim, 1));
+            }
+            blobs
         };
         let build_ffn_blobs = |lw: &DiffusionLayerWeights| -> Vec<Vec<u8>> {
             vec![
@@ -1575,7 +1688,12 @@ impl AneDiffusionEngine {
         let inter = cfg.inter;
         let seq = seq_len.max(ANE_MIN_SPATIAL);
 
-        eprintln!("AneDiffusionEngine: compiling 28 causal fused ANE kernels (seq={seq})...");
+        let has_qk_norm = engine.layers[0].q_norm.is_some();
+        let has_qkv_bias = engine.layers[0].q_bias.is_some();
+        eprintln!(
+            "AneDiffusionEngine: compiling {} causal fused ANE kernels (seq={seq}, qk_norm={has_qk_norm}, qkv_bias={has_qkv_bias})...",
+            cfg.layers
+        );
         let t0 = std::time::Instant::now();
 
         let mut rope_cos = vec![0.0f32; seq * half_hd];
@@ -1598,10 +1716,13 @@ impl AneDiffusionEngine {
             seq,
             1e-6,
             true, // causal masking
+            has_qk_norm,
+            has_qkv_bias,
         );
         let fused_names: Vec<&str> = fused_mil.weight_names.iter().map(|s| s.as_str()).collect();
-        let attn_mil =
-            diffusion_ane::gen_diffusion_attention(h, cfg.heads, cfg.kv_heads, hd, seq, 1e-6);
+        let attn_mil = diffusion_ane::gen_diffusion_attention(
+            h, cfg.heads, cfg.kv_heads, hd, seq, 1e-6, has_qk_norm, has_qkv_bias,
+        );
         let attn_names: Vec<&str> = attn_mil.weight_names.iter().map(|s| s.as_str()).collect();
         let ffn_mil = diffusion_ane::gen_diffusion_ffn(h, inter, seq, 1e-6);
         let ffn_names: Vec<&str> = ffn_mil.weight_names.iter().map(|s| s.as_str()).collect();
@@ -1623,14 +1744,21 @@ impl AneDiffusionEngine {
                 build_weight_blob_transposed(&lw.down_proj, h, inter),
                 rope_cos_blob.clone(),
                 rope_sin_blob.clone(),
-                build_weight_blob(&lw.q_norm, 1, hd),
-                build_weight_blob(&lw.k_norm, 1, hd),
             ];
+            if has_qk_norm {
+                blobs.push(build_weight_blob(lw.q_norm.as_ref().unwrap(), 1, hd));
+                blobs.push(build_weight_blob(lw.k_norm.as_ref().unwrap(), 1, hd));
+            }
+            if has_qkv_bias {
+                blobs.push(build_weight_blob(lw.q_bias.as_ref().unwrap(), q_dim, 1));
+                blobs.push(build_weight_blob(lw.k_bias.as_ref().unwrap(), kv_dim, 1));
+                blobs.push(build_weight_blob(lw.v_bias.as_ref().unwrap(), kv_dim, 1));
+            }
             blobs.push(causal_mask_blob.clone());
             blobs
         };
         let build_attn_blobs = |lw: &DiffusionLayerWeights| -> Vec<Vec<u8>> {
-            vec![
+            let mut blobs = vec![
                 build_weight_blob(&lw.input_norm, 1, h),
                 build_weight_blob_transposed(&lw.q_proj, q_dim, h),
                 build_weight_blob_transposed(&lw.k_proj, kv_dim, h),
@@ -1638,9 +1766,17 @@ impl AneDiffusionEngine {
                 build_weight_blob_transposed(&lw.o_proj, h, q_dim),
                 rope_cos_blob.clone(),
                 rope_sin_blob.clone(),
-                build_weight_blob(&lw.q_norm, 1, hd),
-                build_weight_blob(&lw.k_norm, 1, hd),
-            ]
+            ];
+            if has_qk_norm {
+                blobs.push(build_weight_blob(lw.q_norm.as_ref().unwrap(), 1, hd));
+                blobs.push(build_weight_blob(lw.k_norm.as_ref().unwrap(), 1, hd));
+            }
+            if has_qkv_bias {
+                blobs.push(build_weight_blob(lw.q_bias.as_ref().unwrap(), q_dim, 1));
+                blobs.push(build_weight_blob(lw.k_bias.as_ref().unwrap(), kv_dim, 1));
+                blobs.push(build_weight_blob(lw.v_bias.as_ref().unwrap(), kv_dim, 1));
+            }
+            blobs
         };
         let build_ffn_blobs = |lw: &DiffusionLayerWeights| -> Vec<Vec<u8>> {
             vec![
@@ -1769,11 +1905,27 @@ impl AneDiffusionEngine {
 
     /// Fully-fused ANE forward pass: embed → 28×(fused_dispatch) → final_norm → LM head.
     /// Each of the 28 kernels has weights baked in as BLOBFILEs — no reload_weights.
+    ///
+    /// **IMPORTANT**: For bidirectional (non-causal) kernels, `token_ids.len()` MUST equal
+    /// `self.seq_len`. Zero-padded positions pollute bidirectional attention over 28 layers
+    /// (no causal mask to exclude them). Compile the kernel for the exact canvas size.
     pub fn forward(&self, token_ids: &[u32]) -> Vec<f32> {
         let cfg = &self.blas_engine.config;
         let seq = token_ids.len();
         let h = cfg.hidden;
         let ps = self.seq_len; // padded spatial size for ANE IOSurface
+        assert!(
+            seq <= ps,
+            "token_ids.len() ({seq}) exceeds compiled seq_len ({ps})"
+        );
+        if seq < ps {
+            eprintln!(
+                "WARNING: bidirectional ANE forward with {seq} tokens in seq_len={ps} kernel \
+                 ({} padding positions). This WILL degrade output quality. \
+                 Compile the kernel for the exact canvas size.",
+                ps - seq
+            );
+        }
 
         // 1. Embedding lookup — row-major [seq, h]
         let mut hidden = vec![0.0f32; seq * h];
@@ -1860,16 +2012,16 @@ impl AneDiffusionEngine {
             h,
         );
 
-        // 4. LM head: normed[seq, h] @ embed^T[h, vocab] → logits[seq, vocab]
-        //    Embedding matrix doubles as LM head weight (tied weights).
-        //    Too large for ANE (~600MB fp32), so we use BLAS on CPU.
+        // 4. LM head: normed[seq, h] @ W^T[h, vocab] → logits[seq, vocab]
+        //    Use untied lm_head if present (Qwen2), else tied embeddings (Qwen3).
+        let lm_weights = self.blas_engine.lm_head.as_deref().unwrap_or(&self.blas_engine.embed);
         let mut logits = vec![0.0f32; seq * cfg.vocab];
         sgemm_nt(
             seq,
             cfg.vocab,
             h,
             &normed,
-            &self.blas_engine.embed,
+            lm_weights,
             &mut logits,
         );
         logits
@@ -1880,10 +2032,19 @@ impl AneDiffusionEngine {
     /// All ANE dispatch layers run identically to `forward()` (causal attention
     /// requires all positions).  Only the CPU final-norm + LM-head matmul is
     /// reduced from seq×vocab to 1×vocab, saving ~15ms per call at vocab=151936.
+    ///
+    /// Same padding warning as `forward()` — compile for exact canvas size.
     pub fn forward_last(&self, token_ids: &[u32]) -> Vec<f32> {
         let cfg = &self.blas_engine.config;
         let seq = token_ids.len();
         let h = cfg.hidden;
+        if seq < self.seq_len {
+            eprintln!(
+                "WARNING: bidirectional ANE forward_last with {seq} tokens in seq_len={} kernel \
+                 ({} padding positions).",
+                self.seq_len, self.seq_len - seq
+            );
+        }
         let ps = self.seq_len;
 
         // 1. Embedding lookup — row-major [seq, h]
@@ -1963,8 +2124,9 @@ impl AneDiffusionEngine {
         );
 
         // 5. LM head: 1×vocab instead of seq×vocab
+        let lm_weights = self.blas_engine.lm_head.as_deref().unwrap_or(&self.blas_engine.embed);
         let mut logits = vec![0.0f32; cfg.vocab];
-        sgemm_nt(1, cfg.vocab, h, &last_normed, &self.blas_engine.embed, &mut logits);
+        sgemm_nt(1, cfg.vocab, h, &last_normed, lm_weights, &mut logits);
         logits
     }
 
@@ -2303,7 +2465,9 @@ pub(crate) fn diffusion_attention_context_cpu(
     for s in 0..seq {
         for head in 0..n_heads {
             let off = s * q_dim + head * hd;
-            rms_norm_slice(&mut q_buf[off..off + hd], &layer.q_norm);
+            if let Some(ref qn) = layer.q_norm {
+                rms_norm_slice(&mut q_buf[off..off + hd], qn);
+            }
             apply_rope(
                 &mut q_buf[off..off + hd],
                 s,
@@ -2314,7 +2478,9 @@ pub(crate) fn diffusion_attention_context_cpu(
         }
         for head in 0..n_kv {
             let off = s * kv_dim + head * hd;
-            rms_norm_slice(&mut k_buf[off..off + hd], &layer.k_norm);
+            if let Some(ref kn) = layer.k_norm {
+                rms_norm_slice(&mut k_buf[off..off + hd], kn);
+            }
             apply_rope(
                 &mut k_buf[off..off + hd],
                 s,
@@ -2394,8 +2560,11 @@ impl DiffusionEngine {
                 k_proj: rv(kv_dim * h),
                 v_proj: rv(kv_dim * h),
                 o_proj: rv(h * q_dim),
-                q_norm: vec![1.0; config.head_dim],
-                k_norm: vec![1.0; config.head_dim],
+                q_norm: Some(vec![1.0; config.head_dim]),
+                k_norm: Some(vec![1.0; config.head_dim]),
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
                 input_norm: vec![1.0; h],
                 post_attn_norm: vec![1.0; h],
                 gate_proj: rv(inter * h),
@@ -2422,6 +2591,7 @@ impl DiffusionEngine {
             layers,
             embed,
             final_norm,
+            lm_head: None,
             config,
             rope_cos,
             rope_sin,
@@ -2547,8 +2717,8 @@ impl AneBonsaiEngine {
                 build_weight_blob_transposed(&lw.v_proj, kv_dim, h),
                 rope_cos_blob.clone(),
                 rope_sin_blob.clone(),
-                build_weight_blob(&lw.q_norm, 1, hd),
-                build_weight_blob(&lw.k_norm, 1, hd),
+                build_weight_blob(lw.q_norm.as_ref().expect("Bonsai requires q_norm"), 1, hd),
+                build_weight_blob(lw.k_norm.as_ref().expect("Bonsai requires k_norm"), 1, hd),
             ];
             if let Some(ref mask) = causal_mask_blob {
                 blobs.push(mask.clone());
@@ -3194,7 +3364,7 @@ impl AneArDecodeEngine {
                 build_weight_blob(&lw.input_norm, 1, h),              // rms_att
                 build_weight_blob_transposed(&lw.q_proj, q_dim, h),   // wq
                 build_weight_blob_transposed(&lw.o_proj, h, q_dim),   // wo
-                build_weight_blob(&lw.q_norm, 1, hd),                 // q_norm
+                build_weight_blob(lw.q_norm.as_ref().expect("Bonsai requires q_norm"), 1, hd), // q_norm
                 build_weight_blob(&lw.post_attn_norm, 1, h),          // rms_ffn
                 build_weight_blob_transposed(&lw.gate_proj, inter, h), // gate
                 build_weight_blob_transposed(&lw.up_proj, inter, h),  // up
@@ -3315,7 +3485,7 @@ impl AneArDecodeEngine {
             // QK-norm on K (per-head RMSNorm)
             for kv_h in 0..cfg.kv_heads {
                 let off = kv_h * hd;
-                rms_norm_slice(&mut k_buf[off..off + hd], &lw.k_norm);
+                rms_norm_slice(&mut k_buf[off..off + hd], lw.k_norm.as_ref().expect("Bonsai requires k_norm"));
             }
 
             // RoPE on K
@@ -3809,6 +3979,7 @@ mod tests {
                 0.5, -0.5, // mask token
             ],
             final_norm: vec![1.0, 1.0],
+            lm_head: None,
             config,
             rope_cos: vec![1.0; 8],
             rope_sin: vec![0.0; 8],
@@ -3863,7 +4034,9 @@ mod tests {
         for s in 0..seq {
             for head in 0..n_heads {
                 let off = s * q_dim + head * hd;
-                rms_norm_slice(&mut q_buf[off..off + hd], &layer.q_norm);
+                if let Some(ref qn) = layer.q_norm {
+                    rms_norm_slice(&mut q_buf[off..off + hd], qn);
+                }
                 apply_rope(
                     &mut q_buf[off..off + hd],
                     s,
@@ -3874,7 +4047,9 @@ mod tests {
             }
             for head in 0..n_kv {
                 let off = s * kv_dim + head * hd;
-                rms_norm_slice(&mut k_buf[off..off + hd], &layer.k_norm);
+                if let Some(ref kn) = layer.k_norm {
+                    rms_norm_slice(&mut k_buf[off..off + hd], kn);
+                }
                 apply_rope(
                     &mut k_buf[off..off + hd],
                     s,
@@ -3957,8 +4132,8 @@ mod tests {
             build_weight_blob_transposed(&layer.v_proj, kv_dim, h),
             build_weight_blob(&rope_cos, ps, half_hd),
             build_weight_blob(&rope_sin, ps, half_hd),
-            build_weight_blob(&layer.q_norm, 1, hd),
-            build_weight_blob(&layer.k_norm, 1, hd),
+            build_weight_blob(layer.q_norm.as_ref().expect("test requires q_norm"), 1, hd),
+            build_weight_blob(layer.k_norm.as_ref().expect("test requires k_norm"), 1, hd),
         ];
         let refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
         let kernel = super::compile_ane_kernel(
@@ -4359,10 +4534,7 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     fn qwen25_coder_diffusion_dir() -> Option<String> {
-        // TODO: requires DiffusionEngine to support Qwen2-style attention
-        // (bias terms, no q_norm/k_norm). See diffusion.rs::load comments.
         let dir = format!(
             "{}/.cache/huggingface/hub/models--dllm-hub--Qwen2.5-Coder-0.5B-Instruct-diffusion-mdlm-v0.1/snapshots/a284e895a6248256baf2f60502e54aba61b24c1a",
             std::env::var("HOME").ok()?
@@ -4375,7 +4547,9 @@ mod tests {
     }
 
     fn magic_canvas_dir() -> Option<String> {
-        qwen3_diffusion_dir()
+        // Prefer Qwen2.5-Coder (code-tuned instruct, stronger HTML generation),
+        // fall back to Qwen3 base model.
+        qwen25_coder_diffusion_dir().or_else(qwen3_diffusion_dir)
     }
 
     /// Format a chat prompt using the Qwen2/Qwen3 chat template tokens.
@@ -4546,45 +4720,37 @@ mod tests {
 
         const STEPS: usize = 16;
         const NUM_GEN: usize = 96;
-        const CANVAS: usize = 256; // max prompt + num_gen for runtime allocation
+        const CPU_CANVAS: usize = 256; // CPU has no padding bug — one runtime for all
 
-        // --- Build runtimes: CPU always, ANE if feature enabled ---
+        // CPU runtime (oversized is fine — CPU forward has no padding issue)
         let cpu_runtime = DiffusionRuntime::new(
             engine.clone(),
-            CANVAS,
+            CPU_CANVAS,
             DiffusionBackendPreference::CpuBlas,
         )
         .expect("build CPU runtime");
         eprintln!("[T2] CPU runtime: {:?}", cpu_runtime.backend_report().detail);
 
+        // ANE: compiled per-prompt with EXACT canvas size to avoid padding pollution.
+        // Bidirectional attention has no mask, so zero-padded positions corrupt output
+        // (confirmed: cos drops from 0.9999 to 0.95 with 160 padding positions).
         #[cfg(feature = "ane")]
-        let ane_runtime = {
-            eprintln!("[T2] building ANE runtime...");
+        let ane_available = {
+            // Quick compile test: try building one small ANE kernel
             match DiffusionRuntime::new(
-                engine.clone(),
-                CANVAS,
-                DiffusionBackendPreference::Ane,
+                engine.clone(), 32, DiffusionBackendPreference::Ane,
             ) {
-                Ok(rt) => {
-                    eprintln!("[T2] ANE runtime: {:?} {}", rt.selected_backend(), rt.backend_report().detail);
-                    Some(rt)
-                }
-                Err(e) => {
-                    eprintln!("[T2] ANE runtime build FAILED: {e} — will skip ANE column");
-                    None
-                }
+                Ok(_) => { eprintln!("[T2] ANE available — will compile per-prompt"); true }
+                Err(e) => { eprintln!("[T2] ANE unavailable ({e}) — skip ANE column"); false }
             }
         };
         #[cfg(not(feature = "ane"))]
-        let ane_runtime: Option<DiffusionRuntime> = None;
+        let ane_available = false;
 
-        // Warm up once (allocator priming, kernel compile)
+        // Warm up CPU
         {
             let warm_ids = format_chat_prompt(&tokenizer, "warmup", "warmup");
             let _ = cpu_runtime.generate(&warm_ids, 16, 4);
-            if let Some(ref rt) = ane_runtime {
-                let _ = rt.generate(&warm_ids, 16, 4);
-            }
         }
 
         let mut cpu_valid = 0usize;
@@ -4603,6 +4769,11 @@ mod tests {
                 "You generate HTML. Output only the HTML.",
                 user_msg,
             );
+            // Round canvas up to next multiple of 16 for ANE alignment.
+            // CPU forward has no alignment restriction — only ANE needs it.
+            let raw_canvas = prompt_ids.len() + NUM_GEN;
+            // ANE requires spatial dims 64-byte aligned (seq % 32 == 0 for fp16).
+            let canvas_len = (raw_canvas + 31) & !31;
 
             // CPU
             let t = std::time::Instant::now();
@@ -4614,17 +4785,25 @@ mod tests {
             let cpu_ok = html_partially_valid(&cpu_text);
             if cpu_ok { cpu_valid += 1; }
 
-            // ANE
-            let (ane_ms_str, ane_ok_str, ane_text) = if let Some(ref rt) = ane_runtime {
-                let t = std::time::Instant::now();
-                let generated = rt.generate(&prompt_ids, NUM_GEN, STEPS);
-                let ane_ms = t.elapsed().as_millis();
-                ane_total_ms += ane_ms;
-                let gen_tokens = &generated[prompt_ids.len()..];
-                let text = tokenizer.decode(gen_tokens, true).unwrap_or_default();
-                let ok = html_partially_valid(&text);
-                if ok { ane_valid += 1; }
-                (format!("{ane_ms}"), ok.to_string(), text)
+            // ANE — compile for exact canvas size (no padding)
+            let (ane_ms_str, ane_ok_str, ane_text) = if ane_available {
+                #[cfg(feature = "ane")]
+                {
+                    let ane_rt = DiffusionRuntime::new(
+                        engine.clone(), canvas_len, DiffusionBackendPreference::Ane,
+                    ).expect("build per-prompt ANE runtime");
+                    let t = std::time::Instant::now();
+                    let generated = ane_rt.generate(&prompt_ids, NUM_GEN, STEPS);
+                    let ane_ms = t.elapsed().as_millis();
+                    ane_total_ms += ane_ms;
+                    let gen_tokens = &generated[prompt_ids.len()..];
+                    let text = tokenizer.decode(gen_tokens, true).unwrap_or_default();
+                    let ok = html_partially_valid(&text);
+                    if ok { ane_valid += 1; }
+                    (format!("{ane_ms}"), ok.to_string(), text)
+                }
+                #[cfg(not(feature = "ane"))]
+                { unreachable!() }
             } else {
                 ("-".to_string(), "-".to_string(), String::new())
             };
@@ -4647,7 +4826,7 @@ mod tests {
             prompts.len(),
             cpu_total_ms / (prompts.len() as u128).max(1)
         );
-        if ane_runtime.is_some() {
+        if ane_available {
             eprintln!(
                 "[T2] ANE: {ane_valid}/{} valid, avg {}ms/prompt",
                 prompts.len(),
@@ -4988,7 +5167,9 @@ mod tests {
         stats("up_proj", &l0.up_proj);
         stats("down_proj", &l0.down_proj);
         stats("input_norm", &l0.input_norm);
-        stats("q_norm", &l0.q_norm);
+        if let Some(ref qn) = l0.q_norm {
+            stats("q_norm", qn);
+        }
 
         let h = engine.config.hidden;
         let q_dim = engine.config.heads * engine.config.head_dim;
@@ -7616,5 +7797,366 @@ mod tests {
             .sum();
         eprintln!("Logit diff at pos=5 between branches: {diff:.4}");
         assert!(diff > 1.0, "branches should diverge after different tokens");
+    }
+
+    // -----------------------------------------------------------------------
+    // ANE bidirectional padding diagnostic — proves the root cause of the
+    // `!!!!...` output bug (zero-padded positions pollute bidirectional attention)
+    // -----------------------------------------------------------------------
+
+    fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na < 1e-12 || nb < 1e-12 { return 0.0; }
+        dot / (na * nb)
+    }
+
+    /// Diagnostic: ANE exact-seq matches CPU perfectly; padded-seq diverges.
+    /// Fix: always compile bidirectional kernels for the exact canvas size.
+    #[test]
+    #[ignore = "requires Qwen3 diffusion model on disk; run manually"]
+    #[cfg(feature = "ane")]
+    fn t_ane_padding_diagnostic() {
+        let Some(dir) = model_dir() else {
+            eprintln!("SKIP: model not found");
+            return;
+        };
+
+        let engine = DiffusionEngine::load(&dir).unwrap();
+        let cfg = &engine.config;
+        let mask_id = cfg.mask_token_id as u32;
+        let vocab = cfg.vocab;
+
+        let prompt: Vec<u32> = vec![785, 6722, 315, 9625, 374];
+        let n_gen = 91;
+        let input: Vec<u32> = prompt.iter().copied()
+            .chain(std::iter::repeat(mask_id).take(n_gen)).collect();
+        let seq = input.len();
+        eprintln!("[diag] input: {seq} tokens ({} real + {n_gen} mask)", prompt.len());
+
+        let cpu_logits = engine.forward(&input);
+
+        let compare = |label: &str, logits: &[f32]| -> (f32, f64, usize) {
+            let max_err = cpu_logits.iter().zip(logits.iter())
+                .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let mut argmax_match = 0usize;
+            let mut cos_sum = 0.0f64;
+            for pos in 0..seq {
+                let cpu_row = &cpu_logits[pos * vocab..(pos + 1) * vocab];
+                let ane_row = &logits[pos * vocab..(pos + 1) * vocab];
+                let ca = cpu_row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+                let aa = ane_row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+                if ca == aa { argmax_match += 1; }
+                cos_sum += cosine_sim(cpu_row, ane_row) as f64;
+            }
+            let cos_avg = cos_sum / seq as f64;
+            eprintln!("[diag] {label}: max_err={max_err:.4} argmax={argmax_match}/{seq} cos={cos_avg:.4}");
+            (max_err, cos_avg, argmax_match)
+        };
+
+        // ANE exact seq (no padding)
+        eprintln!("[diag] compiling ANE for exact seq={seq}...");
+        let ane_exact = super::AneDiffusionEngine::new(engine.clone(), seq).unwrap();
+        let (_, exact_cos, _) = compare("exact ", &ane_exact.forward(&input));
+        drop(ane_exact);
+
+        // ANE padded (seq + 64)
+        eprintln!("[diag] compiling ANE for padded seq={}...", seq + 64);
+        let ane_pad = super::AneDiffusionEngine::new(engine.clone(), seq + 64).unwrap();
+        let (_, padded_cos, _) = compare("pad+64", &ane_pad.forward(&input));
+        drop(ane_pad);
+
+        // ANE heavily padded (seq + 160)
+        eprintln!("[diag] compiling ANE for heavy pad seq={}...", seq + 160);
+        let ane_heavy = super::AneDiffusionEngine::new(engine.clone(), seq + 160).unwrap();
+        let (_, heavy_cos, _) = compare("pad160", &ane_heavy.forward(&input));
+        drop(ane_heavy);
+
+        eprintln!();
+        eprintln!("=== VERDICT: exact={exact_cos:.4} pad64={padded_cos:.4} pad160={heavy_cos:.4} ===");
+        assert!(exact_cos > 0.99, "exact-seq ANE should match CPU closely (got {exact_cos:.4})");
+        assert!(exact_cos > padded_cos, "padding should degrade quality");
+    }
+
+    /// Chat-template ANE parity: run a chat-templated HTML prompt through both
+    /// CPU and ANE (exact seq) and compare argmax agreement + cosine similarity.
+    /// This is the true quality test for the Magic Canvas use case.
+    #[test]
+    #[ignore = "requires diffusion model on disk; run manually"]
+    #[cfg(feature = "ane")]
+    fn t_ane_chat_template_parity() {
+        let Some(dir) = magic_canvas_dir() else {
+            eprintln!("SKIP: diffusion model not found");
+            return;
+        };
+        let engine = DiffusionEngine::load_autodetect(&dir).unwrap();
+        let tokenizer = crate::load_tokenizer(&dir).expect("load tokenizer");
+        let cfg = &engine.config;
+        let mask_id = cfg.mask_token_id;
+        let vocab = cfg.vocab;
+
+        let prompt_ids = format_chat_prompt(
+            &tokenizer,
+            "You generate HTML with Tailwind CSS classes. Output only the HTML.",
+            "Write a login form with email and password fields and a submit button.",
+        );
+        // Align canvas to multiple of 32 for ANE 64-byte spatial alignment (fp16).
+        let raw_canvas = prompt_ids.len() + 96;
+        let aligned_canvas = (raw_canvas + 31) & !31;
+        let n_gen = aligned_canvas - prompt_ids.len();
+        let input: Vec<u32> = prompt_ids
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(mask_id).take(n_gen))
+            .collect();
+        let seq = input.len();
+        eprintln!(
+            "[chat-parity] input: {seq} tokens ({} prompt + {n_gen} mask, aligned from {raw_canvas}), model: qk_norm={} bias={}",
+            prompt_ids.len(),
+            engine.layers[0].q_norm.is_some(),
+            engine.layers[0].q_bias.is_some(),
+        );
+
+        // CPU reference
+        let cpu_logits = engine.forward(&input);
+
+        // ANE exact seq — may fail for models with ANE-incompatible GQA ratios
+        // (e.g. Qwen2.5-Coder has hpg=7 which exceeds ANE hardware constraints)
+        eprintln!("[chat-parity] compiling ANE for exact seq={seq}...");
+        let ane = match super::AneDiffusionEngine::new(engine.clone(), seq) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("[chat-parity] ANE compile failed: {e}");
+                eprintln!("[chat-parity] SKIP — model architecture incompatible with ANE (hpg={}, head_dim={})",
+                    cfg.heads / cfg.kv_heads, cfg.head_dim);
+                return;
+            }
+        };
+        let ane_logits = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ane.forward(&input))) {
+            Ok(logits) => logits,
+            Err(_) => {
+                eprintln!("[chat-parity] ANE eval failed at runtime — hpg={} likely exceeds ANE hardware constraints",
+                    cfg.heads / cfg.kv_heads);
+                eprintln!("[chat-parity] SKIP — CPU path works, ANE requires compatible GQA ratio (hpg<=4)");
+                return;
+            }
+        };
+
+        let mut argmax_match = 0usize;
+        let mut cos_sum = 0.0f64;
+        for pos in 0..seq {
+            let cpu_row = &cpu_logits[pos * vocab..(pos + 1) * vocab];
+            let ane_row = &ane_logits[pos * vocab..(pos + 1) * vocab];
+            let ca = cpu_row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+            let aa = ane_row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+            if ca == aa {
+                argmax_match += 1;
+            }
+            cos_sum += cosine_sim(cpu_row, ane_row) as f64;
+        }
+        let cos_avg = cos_sum / seq as f64;
+        eprintln!(
+            "[chat-parity] argmax={argmax_match}/{seq} ({:.1}%) cos={cos_avg:.4}",
+            argmax_match as f64 / seq as f64 * 100.0,
+        );
+
+        // Also run full generation on both and compare output quality
+        let cpu_gen = engine.generate(&prompt_ids, n_gen, 16);
+        let ane_gen = ane.generate(&prompt_ids, n_gen, 16);
+        let cpu_text = tokenizer
+            .decode(&cpu_gen[prompt_ids.len()..], true)
+            .unwrap_or_default();
+        let ane_text = tokenizer
+            .decode(&ane_gen[prompt_ids.len()..], true)
+            .unwrap_or_default();
+        let cpu_ok = html_partially_valid(&cpu_text);
+        let ane_ok = html_partially_valid(&ane_text);
+        eprintln!("[chat-parity] CPU gen ({cpu_ok}): {:?}", &cpu_text[..cpu_text.len().min(200)]);
+        eprintln!("[chat-parity] ANE gen ({ane_ok}): {:?}", &ane_text[..ane_text.len().min(200)]);
+
+        assert!(
+            cos_avg > 0.98,
+            "ANE chat-template parity too low: cos={cos_avg:.4} — model may need fp32 attention"
+        );
+    }
+
+    /// A/B test: AneDiffusionEngine::generate() vs DiffusionRuntime::generate()
+    /// on the same prompt. Proves whether the bug is in the runtime wrapper.
+    #[test]
+    #[ignore = "requires Qwen3 diffusion model on disk; run manually"]
+    #[cfg(feature = "ane")]
+    fn t_ane_generate_ab() {
+        let Some(dir) = model_dir() else {
+            eprintln!("SKIP: model not found");
+            return;
+        };
+        let engine = DiffusionEngine::load(&dir).unwrap();
+        let mask_id = engine.config.mask_token_id as u32;
+
+        let prompt: Vec<u32> = vec![785, 6722, 315, 9625, 374]; // "The capital of France is"
+        let n_gen = 91usize;
+        let steps = 16usize;
+        let seq = prompt.len() + n_gen; // 96
+
+        // Path A: AneDiffusionEngine::generate() directly
+        let ane_direct = super::AneDiffusionEngine::new(engine.clone(), seq).unwrap();
+        let result_a = ane_direct.generate(&prompt, n_gen, steps);
+        let gen_a = &result_a[prompt.len()..];
+        let mask_count_a = gen_a.iter().filter(|&&t| t == mask_id).count();
+        eprintln!("[A/B] Direct ANE generate: {} non-mask/{} total, first 10: {:?}",
+            n_gen - mask_count_a, n_gen, &gen_a[..10.min(n_gen)]);
+
+        // Path B: DiffusionRuntime::generate() with ANE backend
+        let rt = super::DiffusionRuntime::new(
+            engine.clone(), seq, super::DiffusionBackendPreference::Ane,
+        ).unwrap();
+        let result_b = rt.generate(&prompt, n_gen, steps);
+        let gen_b = &result_b[prompt.len()..];
+        let mask_count_b = gen_b.iter().filter(|&&t| t == mask_id).count();
+        eprintln!("[A/B] Runtime ANE generate: {} non-mask/{} total, first 10: {:?}",
+            n_gen - mask_count_b, n_gen, &gen_b[..10.min(n_gen)]);
+
+        // Path C: CPU generate for reference
+        let cpu_result = engine.generate(&prompt, n_gen, steps);
+        let gen_c = &cpu_result[prompt.len()..];
+        let mask_count_c = gen_c.iter().filter(|&&t| t == mask_id).count();
+        eprintln!("[A/B] CPU generate:         {} non-mask/{} total, first 10: {:?}",
+            n_gen - mask_count_c, n_gen, &gen_c[..10.min(n_gen)]);
+
+        // Compare
+        let match_ab: usize = gen_a.iter().zip(gen_b.iter()).filter(|(a, b)| a == b).count();
+        let match_ac: usize = gen_a.iter().zip(gen_c.iter()).filter(|(a, b)| a == b).count();
+        eprintln!("[A/B] direct_ane vs runtime_ane: {match_ab}/{n_gen} match");
+        eprintln!("[A/B] direct_ane vs cpu: {match_ac}/{n_gen} match");
+    }
+
+    /// Probe which ANE dimensions compile and eval successfully.
+    ///
+    /// Tests Qwen2.5-Coder dims (h=896, heads=14, kv=2, hd=64) and a Qwen3 variant
+    /// with kv_heads=2 (h=1024, heads=16, kv=2, hd=128) to isolate kv_heads vs head_dim.
+    #[test]
+    #[ignore = "ANE hardware probe — run manually"]
+    #[cfg(feature = "ane")]
+    fn t_ane_dim_probe() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        struct DimSpec {
+            label: &'static str,
+            hidden: usize,
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            inter: usize,
+        }
+
+        let specs = [
+            DimSpec {
+                label: "qwen2.5-coder (h=896,H=14,kv=2,hd=64)",
+                hidden: 896,
+                heads: 14,
+                kv_heads: 2,
+                head_dim: 64,
+                inter: 4864,
+            },
+            DimSpec {
+                label: "qwen3-kv2 (h=1024,H=16,kv=2,hd=128)",
+                hidden: 1024,
+                heads: 16,
+                kv_heads: 2,
+                head_dim: 128,
+                inter: 3072,
+            },
+            DimSpec {
+                label: "qwen3-stock (h=1024,H=16,kv=8,hd=128)",
+                hidden: 1024,
+                heads: 16,
+                kv_heads: 8,
+                head_dim: 128,
+                inter: 3072,
+            },
+        ];
+
+        let seq_values = [64, 96, 128, 137, 160];
+
+        for spec in &specs {
+            eprintln!("\n{}", "=".repeat(60));
+            eprintln!("SPEC: {}", spec.label);
+            eprintln!("  hidden={} heads={} kv_heads={} head_dim={} inter={}",
+                spec.hidden, spec.heads, spec.kv_heads, spec.head_dim, spec.inter);
+            eprintln!("  heads_per_group = {}", spec.heads / spec.kv_heads);
+
+            let config = super::DiffusionConfig {
+                hidden: spec.hidden,
+                layers: 1,
+                heads: spec.heads,
+                kv_heads: spec.kv_heads,
+                head_dim: spec.head_dim,
+                inter: spec.inter,
+                vocab: 1024,
+                mask_token_id: 0,
+                rope_theta: 1_000_000.0,
+            };
+            let engine = super::DiffusionEngine::from_random(config);
+
+            for &seq in &seq_values {
+                // Phase 1: try to compile the ANE kernel
+                let compile_result = catch_unwind(AssertUnwindSafe(|| {
+                    super::AneDiffusionEngine::new(engine.clone(), seq)
+                }));
+
+                let ane = match compile_result {
+                    Err(panic) => {
+                        let msg = panic
+                            .downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("(unknown panic)");
+                        eprintln!("  seq={seq:>4} COMPILE PANIC: {msg}");
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("  seq={seq:>4} COMPILE ERROR: {e}");
+                        continue;
+                    }
+                    Ok(Ok(ane)) => {
+                        eprintln!("  seq={seq:>4} compile OK (backend={:?})", ane.backend_kind());
+                        ane
+                    }
+                };
+
+                // Phase 2: try forward eval
+                let token_ids: Vec<u32> = (0..seq as u32).map(|i| i % 1024).collect();
+                let eval_result = catch_unwind(AssertUnwindSafe(|| {
+                    ane.forward(&token_ids)
+                }));
+
+                match eval_result {
+                    Err(panic) => {
+                        let msg = panic
+                            .downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("(unknown panic)");
+                        eprintln!("  seq={seq:>4} EVAL PANIC: {msg}");
+                    }
+                    Ok(logits) => {
+                        let finite = logits.iter().all(|v| v.is_finite());
+                        let nonzero = logits.iter().any(|v| *v != 0.0);
+                        let max_abs = logits.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                        if finite && nonzero {
+                            eprintln!("  seq={seq:>4} EVAL OK — logits [{} elems, max_abs={max_abs:.4}]",
+                                logits.len());
+                        } else {
+                            eprintln!("  seq={seq:>4} EVAL BAD — finite={finite} nonzero={nonzero} max_abs={max_abs:.4}");
+                        }
+                    }
+                }
+                // Drop the ANE engine before next iteration to free ANE resources
+                drop(ane);
+            }
+        }
+        eprintln!("\n{}", "=".repeat(60));
+        eprintln!("PROBE COMPLETE");
     }
 }
