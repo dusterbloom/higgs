@@ -986,6 +986,8 @@ impl Drop for CachedMetalKernel {
 
 static SCORE_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static VALUE_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static SCORE_BLOCK_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static VALUE_BLOCK_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static PACK_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static PACK_SIGNS_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
@@ -1260,6 +1262,307 @@ fn configure_values_kernel(
         );
         config
     }
+}
+
+// ---------------------------------------------------------------------------
+// Block-L TurboQuant kernels — process L queries in one Metal dispatch.
+// Grid (T, HKV, L) for scores; (D, H, L) for values.
+// q_rot/q_qjl layout: [H, L, D].  scores layout: [H, L, T].
+// weights layout: [H, L, T].  out_rot layout: [H, L, D].
+// ---------------------------------------------------------------------------
+
+const TURBOQUANT_SCORES_BLOCK_KERNEL_SOURCE: &str = r"
+constexpr float kQjlScale = 1.2533141373155001f / float(D);
+constexpr int GQA = H / HKV;
+auto pos    = thread_position_in_grid.x;
+auto kv_head = thread_position_in_grid.y;
+auto l      = int(thread_position_in_grid.z);
+int  L_val  = int(*L);
+int  T_val  = int(*T);
+if (pos >= T_val) { return; }
+
+auto packed_index = kv_head * Capacity + pos;
+auto code_ptr = k_codes + packed_index * KWords;
+auto sign_ptr = k_qjl  + packed_index * QBytes;
+float norm_val  = float(k_norms [packed_index]);
+float gamma_val = float(k_gammas[packed_index]);
+
+float mse_acc[GQA];
+float res_acc[GQA];
+for (int g = 0; g < GQA; ++g) {
+  mse_acc[g] = 0.0f;
+  res_acc[g] = 0.0f;
+}
+
+for (int j = 0; j < D; ++j) {
+  auto bit_index  = j * KBits;
+  auto word_index = bit_index / 32;
+  auto shift      = bit_index % 32;
+  uint code = code_ptr[word_index] >> shift;
+  if (shift + KBits > 32) {
+    code |= code_ptr[word_index + 1] << (32 - shift);
+  }
+  code &= ((1u << KBits) - 1u);
+  float key_val = key_centroids[code];
+
+  auto byte_idx  = j / 8;
+  auto bit_shift = j % 8;
+  float sign_val = ((uint(sign_ptr[byte_idx]) >> bit_shift) & 1u) == 1u ? 1.0f : -1.0f;
+
+  for (int g = 0; g < GQA; ++g) {
+    int head = kv_head * GQA + g;
+    // q_rot / q_qjl: [H, L, D]
+    mse_acc[g] += float(q_rot [head * L_val * D + l * D + j]) * key_val;
+    res_acc[g] += sign_val * float(q_qjl[head * L_val * D + l * D + j]);
+  }
+}
+
+for (int g = 0; g < GQA; ++g) {
+  int head = kv_head * GQA + g;
+  // scores: [H, L, T]
+  scores[head * L_val * T_val + l * T_val + int(pos)] =
+      mse_acc[g] * norm_val + gamma_val * kQjlScale * res_acc[g];
+}
+";
+
+const TURBOQUANT_VALUES_BLOCK_KERNEL_SOURCE: &str = r"
+auto dim  = thread_position_in_grid.x;
+auto head = thread_position_in_grid.y;
+auto l    = int(thread_position_in_grid.z);
+if (dim >= D) { return; }
+int  L_val = int(*L);
+int  T_val = int(*T);
+auto kv_head = head / (H / HKV);
+
+float acc = 0.0f;
+for (int pos = 0; pos < T_val; ++pos) {
+  // weights: [H, L, T]
+  float w = float(weights[head * L_val * T_val + l * T_val + pos]);
+  if (w < 1e-6f) continue;
+  auto packed_index = kv_head * Capacity + pos;
+  auto bit_index    = dim * VBits;
+  auto word_index   = bit_index / 32;
+  auto shift        = bit_index % 32;
+  auto code_ptr     = v_codes + packed_index * VWords;
+  uint code = code_ptr[word_index] >> shift;
+  if (shift + VBits > 32) {
+    code |= code_ptr[word_index + 1] << (32 - shift);
+  }
+  code &= ((1u << VBits) - 1u);
+  acc += w * value_centroids[code] * float(v_norms[packed_index]);
+}
+// out_rot: [H, L, D]
+out_rot[head * L_val * D + l * D + int(dim)] = acc;
+";
+
+fn create_scores_block_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let input_names: [&std::ffi::CStr; 10] = [
+        c"q_rot", c"q_qjl", c"k_codes", c"k_norms", c"k_qjl", c"k_gammas",
+        c"key_centroids", c"Capacity", c"T", c"L",
+    ];
+    let output_names: [&std::ffi::CStr; 1] = [c"scores"];
+    let input_ptrs: Vec<*const c_char> =
+        input_names.iter().map(|n| n.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> =
+        output_names.iter().map(|n| n.as_ptr()).collect();
+    let source =
+        CString::new(TURBOQUANT_SCORES_BLOCK_KERNEL_SOURCE).unwrap_or_default();
+    #[allow(unsafe_code)]
+    unsafe {
+        let in_vec = mlx_sys::mlx_vector_string_new_data(
+            input_ptrs.as_ptr().cast_mut(), input_ptrs.len(),
+        );
+        let out_vec = mlx_sys::mlx_vector_string_new_data(
+            output_ptrs.as_ptr().cast_mut(), output_ptrs.len(),
+        );
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"turboquant_scores_block".as_ptr(),
+            in_vec, out_vec, source.as_ptr(), c"".as_ptr(), true, false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+fn create_values_block_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let input_names: [&std::ffi::CStr; 7] = [
+        c"weights", c"v_codes", c"v_norms", c"value_centroids",
+        c"Capacity", c"T", c"L",
+    ];
+    let output_names: [&std::ffi::CStr; 1] = [c"out_rot"];
+    let input_ptrs: Vec<*const c_char> =
+        input_names.iter().map(|n| n.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> =
+        output_names.iter().map(|n| n.as_ptr()).collect();
+    let source =
+        CString::new(TURBOQUANT_VALUES_BLOCK_KERNEL_SOURCE).unwrap_or_default();
+    #[allow(unsafe_code)]
+    unsafe {
+        let in_vec = mlx_sys::mlx_vector_string_new_data(
+            input_ptrs.as_ptr().cast_mut(), input_ptrs.len(),
+        );
+        let out_vec = mlx_sys::mlx_vector_string_new_data(
+            output_ptrs.as_ptr().cast_mut(), output_ptrs.len(),
+        );
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"turboquant_values_block".as_ptr(),
+            in_vec, out_vec, source.as_ptr(), c"".as_ptr(), true, false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+/// Decode TQ attention scores for a block of L query positions in one Metal dispatch.
+///
+/// `q_rot`  shape: `[H, L, D]`
+/// `q_qjl`  shape: `[H, L, D]`
+/// Returns  shape: `[H, L, seq_len]`
+#[allow(unsafe_code)]
+pub(crate) fn decode_scores_block(
+    q_rot: &Array,
+    q_qjl: &Array,
+    key_codes: &Array,
+    key_norms: &Array,
+    key_qjl: &Array,
+    key_gammas: &Array,
+    key_centroids: &Array,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    capacity: i32,
+    seq_len: i32,
+    num_queries: i32,
+    key_bits: u8,
+    key_code_words: i32,
+    sign_bytes: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let stream = Stream::task_local_or_default();
+    let kernel =
+        SCORE_BLOCK_KERNEL.get_or_init(|| CachedMetalKernel(create_scores_block_kernel()));
+
+    let config = unsafe {
+        let cfg = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"D".as_ptr(), head_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"H".as_ptr(), num_heads);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"HKV".as_ptr(), num_kv_heads);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"KBits".as_ptr(), i32::from(key_bits));
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"KWords".as_ptr(), key_code_words);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"QBytes".as_ptr(), sign_bytes);
+        // grid: (T, HKV, L) — all queries dispatched in z-axis
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(cfg, seq_len, num_kv_heads, num_queries);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1);
+        // output: [H, L, seq_len]
+        let shape = [num_heads, num_queries, seq_len];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            cfg, shape.as_ptr(), shape.len(), mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
+        cfg
+    };
+
+    let cap_scalar = unsafe { mlx_sys::mlx_array_new_int(capacity) };
+    let seq_scalar = unsafe { mlx_sys::mlx_array_new_int(seq_len) };
+    let l_scalar   = unsafe { mlx_sys::mlx_array_new_int(num_queries) };
+    let input_ptrs = [
+        q_rot.as_ptr(), q_qjl.as_ptr(),
+        key_codes.as_ptr(), key_norms.as_ptr(), key_qjl.as_ptr(), key_gammas.as_ptr(),
+        key_centroids.as_ptr(), cap_scalar, seq_scalar, l_scalar,
+    ];
+    let inputs_vec = unsafe {
+        mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len())
+    };
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec, kernel.0, inputs_vec, config, stream.as_ptr(),
+        )
+    };
+    let result = extract_single_output(status, outputs_vec, "turboquant_scores_block");
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(cap_scalar);
+        mlx_sys::mlx_array_free(seq_scalar);
+        mlx_sys::mlx_array_free(l_scalar);
+    }
+    result
+}
+
+/// Decode TQ weighted values for a block of L query positions in one Metal dispatch.
+///
+/// `weights` shape: `[H, L, seq_len]`
+/// Returns   shape: `[H, L, head_dim]`
+#[allow(unsafe_code)]
+pub(crate) fn decode_weighted_values_block(
+    weights: &Array,
+    value_codes: &Array,
+    value_norms: &Array,
+    value_centroids: &Array,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    capacity: i32,
+    seq_len: i32,
+    num_queries: i32,
+    value_bits: u8,
+    value_code_words: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let stream = Stream::task_local_or_default();
+    let kernel =
+        VALUE_BLOCK_KERNEL.get_or_init(|| CachedMetalKernel(create_values_block_kernel()));
+
+    let config = unsafe {
+        let cfg = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"D".as_ptr(), head_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"H".as_ptr(), num_heads);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"HKV".as_ptr(), num_kv_heads);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"VBits".as_ptr(), i32::from(value_bits));
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"VWords".as_ptr(), value_code_words);
+        // grid: (D, H, L)
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(cfg, head_dim, num_heads, num_queries);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1);
+        // output: [H, L, head_dim]
+        let shape = [num_heads, num_queries, head_dim];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            cfg, shape.as_ptr(), shape.len(), mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
+        cfg
+    };
+
+    let cap_scalar = unsafe { mlx_sys::mlx_array_new_int(capacity) };
+    let seq_scalar = unsafe { mlx_sys::mlx_array_new_int(seq_len) };
+    let l_scalar   = unsafe { mlx_sys::mlx_array_new_int(num_queries) };
+    let input_ptrs = [
+        weights.as_ptr(),
+        value_codes.as_ptr(), value_norms.as_ptr(), value_centroids.as_ptr(),
+        cap_scalar, seq_scalar, l_scalar,
+    ];
+    let inputs_vec = unsafe {
+        mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len())
+    };
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec, kernel.0, inputs_vec, config, stream.as_ptr(),
+        )
+    };
+    let result = extract_single_output(status, outputs_vec, "turboquant_values_block");
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(cap_scalar);
+        mlx_sys::mlx_array_free(seq_scalar);
+        mlx_sys::mlx_array_free(l_scalar);
+    }
+    result
 }
 
 #[allow(unsafe_code)]

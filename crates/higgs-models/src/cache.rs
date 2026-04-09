@@ -125,61 +125,126 @@ impl TurboQuantKvView {
 
     pub fn decode_scores(&self, queries: &Array, num_heads: i32) -> Result<Array, Exception> {
         let query_shape = queries.shape();
-        if query_shape != [1, num_heads, 1, self.context.head_dim] {
-            return Err(Exception::custom(
-                "TurboQuant decode expects [1, H, 1, D] queries",
-            ));
+        if query_shape.len() != 4
+            || query_shape[0] != 1
+            || query_shape[1] != num_heads
+            || query_shape[3] != self.context.head_dim
+        {
+            return Err(Exception::custom(format!(
+                "TurboQuant decode expects [1, H, L, D] queries, got {query_shape:?}",
+            )));
         }
+        let l = query_shape[2];
 
-        let queries = queries
-            .as_dtype(Dtype::Float32)?
-            .reshape(&[num_heads, self.context.head_dim])?;
-        let q_rot = self.context.rotate_queries(&queries)?;
-        let q_qjl = self.context.project_queries_qjl(&queries)?;
+        if l == 1 {
+            // Fast path: single query — no loop overhead.
+            let queries = queries
+                .as_dtype(Dtype::Float32)?
+                .reshape(&[num_heads, self.context.head_dim])?;
+            let q_rot = self.context.rotate_queries(&queries)?;
+            let q_qjl = self.context.project_queries_qjl(&queries)?;
 
-        crate::turboquant::decode_scores(
-            &q_rot,
-            &q_qjl,
-            &self.key_codes,
-            &self.key_norms,
-            &self.key_qjl_signs,
-            &self.key_gammas,
-            &self.context.key_centroids_array()?,
-            num_heads,
-            self.context.num_kv_heads,
-            self.context.head_dim,
-            self.seq_len,
-            self.seq_len,
-            self.context.config.key_bits(),
-            self.context.key_code_words,
-            self.context.sign_bytes,
-        )
+            crate::turboquant::decode_scores(
+                &q_rot,
+                &q_qjl,
+                &self.key_codes,
+                &self.key_norms,
+                &self.key_qjl_signs,
+                &self.key_gammas,
+                &self.context.key_centroids_array()?,
+                num_heads,
+                self.context.num_kv_heads,
+                self.context.head_dim,
+                self.seq_len,
+                self.seq_len,
+                self.context.config.key_bits(),
+                self.context.key_code_words,
+                self.context.sign_bytes,
+            )
+        } else {
+            // Block-K path: single Metal dispatch over all L queries.
+            // queries [1, H, L, D] → [H, L, D] for matmul broadcast.
+            let q_block = queries
+                .as_dtype(Dtype::Float32)?
+                .reshape(&[num_heads, l, self.context.head_dim])?;
+            let q_rot  = self.context.rotate_queries(&q_block)?;   // [H, L, D]
+            let q_qjl  = self.context.project_queries_qjl(&q_block)?; // [H, L, D]
+            // Returns [H, L, seq_len] — one Metal dispatch for all L queries.
+            crate::turboquant::decode_scores_block(
+                &q_rot,
+                &q_qjl,
+                &self.key_codes,
+                &self.key_norms,
+                &self.key_qjl_signs,
+                &self.key_gammas,
+                &self.context.key_centroids_array()?,
+                num_heads,
+                self.context.num_kv_heads,
+                self.context.head_dim,
+                self.seq_len,
+                self.seq_len,
+                l,
+                self.context.config.key_bits(),
+                self.context.key_code_words,
+                self.context.sign_bytes,
+            )
+        }
     }
 
     pub fn decode_values(&self, weights: &Array, num_heads: i32) -> Result<Array, Exception> {
-        let weights = weights
-            .as_dtype(Dtype::Float32)?
-            .reshape(&[num_heads, self.seq_len])?;
-        let out_rot = crate::turboquant::decode_weighted_values(
-            &weights,
-            &self.value_codes,
-            &self.value_norms,
-            &self.context.value_centroids_array()?,
-            num_heads,
-            self.context.num_kv_heads,
-            self.context.head_dim,
-            self.seq_len,
-            self.seq_len,
-            self.context.config.bits,
-            self.context.value_code_words,
-        )?;
+        let w_shape = weights.shape();
+        // Accept [H, seq_len] (L=1 legacy) or [H, L, seq_len] (block-K).
+        let l = if w_shape.len() == 2 { 1 } else { w_shape[1] };
 
-        out_rot.matmul(&self.context.rotation_array()?)?.reshape(&[
-            1,
-            num_heads,
-            1,
-            self.context.head_dim,
-        ])
+        if l == 1 {
+            // Fast path: single query position.
+            let weights = weights
+                .as_dtype(Dtype::Float32)?
+                .reshape(&[num_heads, self.seq_len])?;
+            let out_rot = crate::turboquant::decode_weighted_values(
+                &weights,
+                &self.value_codes,
+                &self.value_norms,
+                &self.context.value_centroids_array()?,
+                num_heads,
+                self.context.num_kv_heads,
+                self.context.head_dim,
+                self.seq_len,
+                self.seq_len,
+                self.context.config.bits,
+                self.context.value_code_words,
+            )?;
+
+            out_rot.matmul(&self.context.rotation_array()?)?.reshape(&[
+                1,
+                num_heads,
+                1,
+                self.context.head_dim,
+            ])
+        } else {
+            // Block-K path: single Metal dispatch over all L queries.
+            // weights: [H, L, seq_len] — already in block layout from decode_scores_block.
+            let weights_f32 = weights.as_dtype(Dtype::Float32)?;
+            // Returns [H, L, head_dim] — one Metal dispatch for all L queries.
+            let out_rot = crate::turboquant::decode_weighted_values_block(
+                &weights_f32,
+                &self.value_codes,
+                &self.value_norms,
+                &self.context.value_centroids_array()?,
+                num_heads,
+                self.context.num_kv_heads,
+                self.context.head_dim,
+                self.seq_len,
+                self.seq_len,
+                l,
+                self.context.config.bits,
+                self.context.value_code_words,
+            )?;
+            // Apply rotation: [H, L, D] @ [D, D] → [H, L, D], reshape → [1, H, L, D]
+            out_rot
+                .matmul(&self.context.rotation_array()?)?
+                .reshape(&[1, num_heads, l, self.context.head_dim])
+        }
     }
 }
 
