@@ -22,6 +22,22 @@ const ANE_SRAM_FP16_ELEMS: usize = 14_000_000;
 /// All BLOBFILE-weighted ops (conv, matmul) require spatial >= 16.
 pub const ANE_MIN_SPATIAL: usize = 16;
 
+/// Align a sequence length for ANE hardware.
+///
+/// Enforces two constraints:
+/// 1. Minimum spatial ≥ 16 (ANE rejects smaller at eval)
+/// 2. 64-byte alignment on the last axis: `seq * sizeof(fp16) % 64 == 0` → `seq % 32 == 0`
+///
+/// Unaligned spatial dimensions compile but fail at eval with `status=0x1d`.
+/// Confirmed empirically: seq=137 (prime) fails for ALL model configs; 64/96/128/160 pass.
+///
+/// Source: Apple "Deploying Transformers on the Neural Engine" — "the last axis of an ANE
+/// buffer is not packed; it must be contiguous and aligned to 64 bytes."
+pub fn ane_align_seq(seq: usize) -> usize {
+    let min = seq.max(ANE_MIN_SPATIAL);
+    (min + 31) & !31
+}
+
 /// MIL program header (version 1.3, matching CoreML toolchain on macOS 15+).
 pub const MIL_HEADER: &str = concat!(
     "program(1.3)\n",

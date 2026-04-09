@@ -1428,7 +1428,7 @@ impl AneDiffusionEngine {
     /// No reload_weights at runtime — each kernel is self-contained.
     pub fn new(engine: DiffusionEngine, seq_len: usize) -> Result<Self, String> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
-        use crate::ane_mil::ANE_MIN_SPATIAL;
+        use crate::ane_mil::{ane_align_seq, ANE_MIN_SPATIAL};
         use crate::diffusion_ane;
 
         ane_bridge::ane_init()?;
@@ -1440,7 +1440,7 @@ impl AneDiffusionEngine {
         let q_dim = cfg.heads * hd;
         let kv_dim = cfg.kv_heads * hd;
         let inter = cfg.inter;
-        let seq = seq_len.max(ANE_MIN_SPATIAL);
+        let seq = ane_align_seq(seq_len);
 
         // Detect model variant features from layer 0
         let has_qk_norm = engine.layers[0].q_norm.is_some();
@@ -1674,7 +1674,7 @@ impl AneDiffusionEngine {
     /// the causal mask BLOBFILE.
     pub fn new_causal(engine: DiffusionEngine, seq_len: usize) -> Result<Self, String> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
-        use crate::ane_mil::{build_causal_mask_blob, ANE_MIN_SPATIAL};
+        use crate::ane_mil::{ane_align_seq, build_causal_mask_blob, ANE_MIN_SPATIAL};
         use crate::diffusion_ane;
 
         ane_bridge::ane_init()?;
@@ -1686,7 +1686,7 @@ impl AneDiffusionEngine {
         let q_dim = cfg.heads * hd;
         let kv_dim = cfg.kv_heads * hd;
         let inter = cfg.inter;
-        let seq = seq_len.max(ANE_MIN_SPATIAL);
+        let seq = ane_align_seq(seq_len);
 
         let has_qk_norm = engine.layers[0].q_norm.is_some();
         let has_qkv_bias = engine.layers[0].q_bias.is_some();
@@ -2649,8 +2649,8 @@ impl AneBonsaiEngine {
     ) -> Result<Self, String> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
         use crate::ane_mil::{
-            build_causal_mask_blob, compute_blobfile_tile_plan, gen_blobfile_matmul,
-            gen_fused_silu_gate_up_proj,
+            ane_align_seq, build_causal_mask_blob, compute_blobfile_tile_plan,
+            gen_blobfile_matmul, gen_fused_silu_gate_up_proj,
             ANE_MIN_SPATIAL,
         };
         use crate::diffusion_ane;
@@ -2664,7 +2664,7 @@ impl AneBonsaiEngine {
         let q_dim = cfg.heads * hd;
         let kv_dim = cfg.kv_heads * hd;
         let inter = cfg.inter;
-        let seq = seq_len.max(ANE_MIN_SPATIAL);
+        let seq = ane_align_seq(seq_len);
 
         let w13_plan = compute_blobfile_tile_plan(h, inter);
         let label = if causal { "causal" } else { "bidirectional" };
@@ -3331,7 +3331,7 @@ impl AneArDecodeEngine {
     /// input buffer that holds x, K/V cache, rope, and mask in a single IOSurface.
     pub fn new(engine: DiffusionEngine, max_seq: usize) -> Result<Self, String> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
-        use crate::ane_mil::ANE_MIN_SPATIAL;
+        use crate::ane_mil::{ane_align_seq, ANE_MIN_SPATIAL};
         use crate::diffusion_ane;
 
         ane_bridge::ane_init()?;
@@ -4099,7 +4099,7 @@ mod tests {
     #[cfg(feature = "ane")]
     fn bonsai_l0_attention_context_ane(engine: &DiffusionEngine, token_ids: &[u32]) -> Vec<f32> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
-        use crate::ane_mil::ANE_MIN_SPATIAL;
+        use crate::ane_mil::{ane_align_seq, ANE_MIN_SPATIAL};
 
         ane_bridge::ane_init().unwrap();
 

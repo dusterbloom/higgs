@@ -14,7 +14,7 @@
 
 #![cfg(feature = "ane")]
 
-use crate::ane_mil::{FusedMil, ANE_MIN_SPATIAL, MIL_HEADER};
+use crate::ane_mil::{ane_align_seq, FusedMil, ANE_MIN_SPATIAL, MIL_HEADER};
 use std::fmt::Write;
 
 /// STUB: gen_decode_layer was removed from this branch but call sites remain.
@@ -53,7 +53,7 @@ pub fn gen_fused_diffusion_layer(
     has_qk_norm: bool,
     has_qkv_bias: bool,
 ) -> FusedMil {
-    let seq = seq_len.max(ANE_MIN_SPATIAL);
+    let seq = ane_align_seq(seq_len);
     let half_hd = hd / 2;
     let kv_dim = kv_heads * hd;
     let attn_dim = heads * hd;
@@ -869,7 +869,7 @@ pub fn gen_diffusion_attention(
     has_qk_norm: bool,
     has_qkv_bias: bool,
 ) -> FusedMil {
-    let seq = seq_len.max(ANE_MIN_SPATIAL);
+    let seq = ane_align_seq(seq_len);
     let half_hd = hd / 2;
     let kv_dim = kv_heads * hd;
     let attn_dim = heads * hd;
@@ -1422,7 +1422,7 @@ pub fn gen_bonsai_attention_projection(
     eps: f64,
     causal: bool,
 ) -> FusedMil {
-    let seq = seq_len.max(ANE_MIN_SPATIAL);
+    let seq = ane_align_seq(seq_len);
     let half_hd = hd / 2;
     let kv_dim = kv_heads * hd;
     let attn_dim = heads * hd;
@@ -1884,7 +1884,7 @@ pub fn gen_bonsai_attention_projection(
 /// 4 BLOBFILEs (~18MB at dim=1024/inter=3072):
 ///   rms_ffn, gate, up, down
 pub fn gen_diffusion_ffn(dim: usize, inter: usize, seq_len: usize, eps: f64) -> FusedMil {
-    let seq = seq_len.max(ANE_MIN_SPATIAL);
+    let seq = ane_align_seq(seq_len);
 
     let mut m = String::with_capacity(8192);
     m.push_str(MIL_HEADER);
