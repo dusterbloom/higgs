@@ -48,29 +48,13 @@ pub(crate) fn set_wired_limit_to_max() {
             if mlx_sys::mlx_device_info_get_size(&raw mut max_rec, info, key.as_ptr()) == 0
                 && max_rec > 0
             {
-                let mem_limit = max_rec * 3 / 4; // 75% of GPU max
-                let cache_limit = max_rec / 2; // 50% of GPU max
-
-                let mut prev_mem: usize = 0;
-                let mut prev_cache: usize = 0;
-
-                // Check env var to optionally disable memory limits for testing
-                let limits_enabled = std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
-
-                if limits_enabled {
-                    mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
-                    mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
-                }
-
+                // Let MLX manage its own memory. Setting mlx_set_cache_limit
+                // below the default forces buffer reallocation every decode
+                // step — 5× throughput loss (92ms vs 18ms on 35B MoE).
                 tracing::info!(
                     max_recommended_mb = max_rec / (1024 * 1024),
-                    memory_limit_mb = mem_limit / (1024 * 1024),
-                    cache_limit_mb = cache_limit / (1024 * 1024),
-                    limits_enabled,
-                    "MLX memory limits {} (prev mem={}MB, cache={}MB)",
-                    if limits_enabled { "set" } else { "skipped" },
-                    prev_mem / (1024 * 1024),
-                    prev_cache / (1024 * 1024),
+                    "MLX memory: letting framework manage limits (GPU max {}MB)",
+                    max_rec / (1024 * 1024),
                 );
             }
         }
@@ -860,6 +844,8 @@ impl SimpleEngine {
             let s = f64::from(steps);
             tracing::info!(
                 steps,
+                graph_build_ms = format!("{:.2}", forward_ns as f64 / s / 1e6),
+                device_eval_ms = format!("{:.2}", eval_ns as f64 / s / 1e6),
                 forward_ms = format!("{:.2}", forward_ns as f64 / s / 1e6),
                 eval_ms = format!("{:.2}", eval_ns as f64 / s / 1e6),
                 item_ms = format!("{:.2}", item_ns as f64 / s / 1e6),
@@ -868,7 +854,7 @@ impl SimpleEngine {
                     "{:.2}",
                     (forward_ns + eval_ns + item_ns + other_ns) as f64 / s / 1e6
                 ),
-                "Decode loop timing (per step avg)"
+                "Decode loop timing (per step avg; MLX forward builds a lazy graph, eval runs it)"
             );
         }
     }
