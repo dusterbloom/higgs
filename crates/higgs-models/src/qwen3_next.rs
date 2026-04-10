@@ -11074,7 +11074,11 @@ mod tests {
             eval([&out].into_iter()).unwrap();
         }
 
-        let seq_lengths: &[i32] = &[128, 512, 1024, 2048, 5120];
+        let max_seq: i32 = std::env::var("BENCH_MAX_SEQ")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let all_lens: &[i32] = &[128, 512, 1024, 2048, 5120];
+        let seq_lengths: Vec<i32> = all_lens.iter().copied().filter(|&t| t <= max_seq).collect();
+        let seq_lengths: &[i32] = &seq_lengths;
 
         for &seq_len in seq_lengths {
             let tokens: Vec<u32> = (0..seq_len as u32)
@@ -11747,5 +11751,146 @@ mod tests {
             max_diff < 2.0,
             "TQ block-K parity failed: max |diff| = {max_diff} (expect <2.0)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dense model decode benchmark (27B, requires model on disk)
+    // -----------------------------------------------------------------------
+
+    /// Measure S=1 decode + prefill for a dense Qwen3.5 model.
+    ///
+    /// ```bash
+    /// HIGGS_DENSE_MODEL_PATH=~/.cache/lm-studio/models/mlx-community/Qwen3.5-27B-4bit \
+    /// cargo test -p higgs-models --release -- bench_dense_model_decode --nocapture --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "requires dense Qwen3.5 model on disk"]
+    fn bench_dense_model_decode() {
+        use mlx_rs::transforms::eval;
+        use std::time::Instant;
+
+        let model_path = std::env::var("HIGGS_DENSE_MODEL_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap();
+            format!("{home}/.cache/lm-studio/models/mlx-community/Qwen3.5-27B-4bit")
+        });
+        if !std::path::Path::new(&model_path).exists() {
+            eprintln!("Dense model not found. Set HIGGS_DENSE_MODEL_PATH.");
+            return;
+        }
+        eprintln!("Loading dense model from {model_path}...");
+        let mut model = load_qwen3_5_model(&model_path).unwrap();
+        eprintln!(
+            "Loaded: {} layers, hidden={}, fa_interval={}",
+            model.args.num_hidden_layers,
+            model.args.hidden_size,
+            model.args.full_attention_interval,
+        );
+
+        // Warmup
+        {
+            let w = Array::from_slice(&[1u32, 2, 3, 4], &[1, 4]);
+            let mut wc: Vec<Option<LayerCache>> = Vec::new();
+            let out = model.forward(&w, None, &mut wc).unwrap();
+            eval([&out]).unwrap();
+        }
+
+        let prompt_len = 256i32;
+        let prompt_ids: Vec<u32> = (1..=prompt_len as u32).collect();
+        let prompt = Array::from_slice(&prompt_ids, &[1, prompt_len]);
+
+        // Prefill TTFT
+        let mut cache: Vec<Option<LayerCache>> = Vec::new();
+        let t0 = Instant::now();
+        let out = model.forward(&prompt, None, &mut cache).unwrap();
+        eval([&out]).unwrap();
+        let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // S=1 decode
+        let n = 20usize;
+        let tok = Array::from_slice(&[1u32], &[1, 1]);
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = Instant::now();
+            let o = model.forward(&tok, None, &mut cache).unwrap();
+            eval([&o]).unwrap();
+            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        let med = samples[n / 2];
+
+        println!("\n==== Dense 27B-4bit, ctx={prompt_len} ====");
+        println!("  Prefill TTFT: {prefill_ms:.1} ms");
+        println!("  S=1 decode median: {med:.2} ms  ({:.1} tok/s)", 1000.0 / med);
+    }
+
+    // -----------------------------------------------------------------------
+    // TurboQuant vs dense KV decode benchmark (real model)
+    // -----------------------------------------------------------------------
+
+    /// Compare S=1 decode speed: dense KV cache vs TurboQuant KV cache.
+    ///
+    /// Prefills at two context depths, then measures median S=1 decode with
+    /// each cache type. Shows TQ overhead at short context and benefit at long.
+    ///
+    /// ```bash
+    /// cargo test -p higgs-models --release -- bench_tq_vs_dense_decode --nocapture --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "requires 35B model on disk"]
+    fn bench_tq_vs_dense_decode() {
+        use crate::turboquant::{KvCacheConfig, KvCacheMode};
+        use mlx_rs::transforms::eval;
+        use std::time::Instant;
+
+        let tq_config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            ..KvCacheConfig::default()
+        };
+
+        let prompt_lengths: &[i32] = &[256, 2048];
+        let n_decode = 20usize;
+
+        println!("\n{:>8}  {:>10}  {:>10}  {:>8}", "ctx", "dense_ms", "tq_ms", "tq/dense");
+        println!("{}", "-".repeat(44));
+
+        for &prompt_len in prompt_lengths {
+            let mut model = load_test_model();
+            let prompt_ids: Vec<u32> = (1..=prompt_len as u32).collect();
+            let prompt = Array::from_slice(&prompt_ids, &[1, prompt_len]);
+
+            // --- Dense KV ---
+            let mut cache_dense: Vec<Option<LayerCache>> = Vec::new();
+            let out = model.forward(&prompt, None, &mut cache_dense).unwrap();
+            eval([&out]).unwrap();
+
+            let mut dense_samples = Vec::with_capacity(n_decode);
+            let tok = Array::from_slice(&[1u32], &[1, 1]);
+            for _ in 0..n_decode {
+                let t0 = Instant::now();
+                let o = model.forward(&tok, None, &mut cache_dense).unwrap();
+                eval([&o]).unwrap();
+                dense_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            dense_samples.sort_by(f64::total_cmp);
+            let dense_med = dense_samples[n_decode / 2];
+
+            // --- TurboQuant KV ---
+            let mut cache_tq = model.make_cache_turbo(tq_config).unwrap();
+            let out = model.forward(&prompt, None, &mut cache_tq).unwrap();
+            eval([&out]).unwrap();
+
+            let mut tq_samples = Vec::with_capacity(n_decode);
+            for _ in 0..n_decode {
+                let t0 = Instant::now();
+                let o = model.forward(&tok, None, &mut cache_tq).unwrap();
+                eval([&o]).unwrap();
+                tq_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            tq_samples.sort_by(f64::total_cmp);
+            let tq_med = tq_samples[n_decode / 2];
+
+            println!("{:>8}  {:>10.2}  {:>10.2}  {:>8.3}x",
+                prompt_len, dense_med, tq_med, tq_med / dense_med);
+        }
     }
 }
