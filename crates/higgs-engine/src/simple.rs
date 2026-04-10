@@ -148,13 +148,18 @@ pub(crate) fn set_wired_limit_to_max() {
                             "Configured MLX legacy memory/cache caps",
                         );
                     } else {
-                        mlx_sys::mlx_set_wired_limit(&raw mut prev_wired, max_rec);
+                        // Use 75% of max_recommended to leave headroom for macOS,
+                        // display compositor, and other apps. Setting 100% causes
+                        // Metal kIOGPUCommandBufferCallbackErrorOutOfMemory during
+                        // large MoE prefills (40 layers × 256 experts × temp buffers).
+                        let wired_limit = max_rec * 3 / 4;
+                        mlx_sys::mlx_set_wired_limit(&raw mut prev_wired, wired_limit);
                         tracing::info!(
                             mode = "mlx_wired_limit",
                             max_recommended_mb = max_rec / (1024 * 1024),
-                            wired_limit_mb = max_rec / (1024 * 1024),
+                            wired_limit_mb = wired_limit / (1024 * 1024),
                             prev_wired_mb = prev_wired / (1024 * 1024),
-                            "Configured MLX wired limit",
+                            "Configured MLX wired limit (75% of max_recommended)",
                         );
                     }
                 } else {
@@ -507,6 +512,16 @@ impl SimpleEngine {
         logprob_top_n: Option<u32>,
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
     ) -> Result<(Array, Option<LogprobArrays>), EngineError> {
+        // Release stale Metal buffers from previous requests before prefilling.
+        // Without this, MLX's allocator retains intermediate MoE buffers from the
+        // prior generation, and a large prefill (>20K tokens) can trigger Metal
+        // kIOGPUCommandBufferCallbackErrorOutOfMemory even though the live working
+        // set fits within the wired limit.
+        #[allow(unsafe_code)]
+        unsafe {
+            mlx_sys::mlx_clear_cache();
+        }
+
         let logits = if let Some(ref pixel_values) = prepared.pixel_values {
             // Multimodal path: full forward (VLMs need all tokens for vision)
             prepared

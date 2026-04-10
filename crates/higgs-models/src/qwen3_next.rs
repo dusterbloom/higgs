@@ -3589,6 +3589,7 @@ impl Qwen3NextCausalLM {
         // Cache states must be eval'd between chunks so the next chunk reads
         // materialized values (MLX is lazy).
         let mut offset = 0i32;
+        let mut chunk_count = 0u32;
         while offset + chunk_size < T {
             let chunk = inputs.index((.., offset..offset + chunk_size));
             let h = self.forward_hidden(&chunk, None, kv_cache)?;
@@ -3612,6 +3613,19 @@ impl Qwen3NextCausalLM {
                 }
             }
             mlx_rs::transforms::eval(targets)?;
+
+            // Release stale Metal buffer cache every 8 chunks (~4K tokens).
+            // Without this, MLX's allocator retains intermediate MoE buffers
+            // (50 MB/layer × 40 layers per chunk) across chunks, gradually
+            // filling GPU memory and triggering jetsam at long contexts.
+            chunk_count += 1;
+            if chunk_count % 8 == 0 {
+                #[allow(unsafe_code)]
+                unsafe {
+                    mlx_sys::mlx_clear_cache();
+                }
+            }
+
             offset += chunk_size;
         }
 
