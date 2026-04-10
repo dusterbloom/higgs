@@ -354,6 +354,9 @@ static COMPILED_GATING_ENABLED: OnceLock<bool> = OnceLock::new();
 static APPLE_CPU_BRAND: OnceLock<Option<String>> = OnceLock::new();
 static COMPILED_GDN_DECODE_ENABLED: OnceLock<bool> = OnceLock::new();
 static ASYNC_LAYER_STATE_EVAL_ENABLED: OnceLock<bool> = OnceLock::new();
+static HIGGS_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+static SPARSE_V_ENABLED: OnceLock<bool> = OnceLock::new();
+static SPARSE_V_K: OnceLock<i32> = OnceLock::new();
 
 fn parse_compiled_gating_enabled(raw: Option<&str>) -> bool {
     !matches!(
@@ -416,6 +419,23 @@ fn async_layer_state_eval_enabled() -> bool {
                 .as_deref(),
             Some("1" | "true" | "on" | "yes")
         )
+    })
+}
+
+fn higgs_profile_enabled() -> bool {
+    *HIGGS_PROFILE_ENABLED.get_or_init(|| std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1"))
+}
+
+fn sparse_v_enabled() -> bool {
+    *SPARSE_V_ENABLED.get_or_init(|| std::env::var("HIGGS_SPARSE_V").is_ok_and(|v| v == "1"))
+}
+
+fn sparse_v_k() -> i32 {
+    *SPARSE_V_K.get_or_init(|| {
+        std::env::var("HIGGS_SPARSE_V_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512)
     })
 }
 
@@ -1356,6 +1376,80 @@ pub struct Qwen3NextAttention {
     scale: f32,
 }
 
+/// TQ decode: scores → scale → softmax → weighted values → transpose → reshape.
+#[allow(non_snake_case)]
+fn tq_decode(
+    tq_view: &crate::cache::TurboQuantKvView,
+    queries: &Array,
+    num_heads: i32,
+    scale: f32,
+    B: i32,
+    L: i32,
+) -> Result<Array, Exception> {
+    let scores = tq_view.decode_scores(queries, num_heads)?;
+    let scale_arr = Array::from_f32(scale).as_dtype(scores.dtype())?;
+    let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
+    tq_view
+        .decode_values(&weights, num_heads)?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[B, L, -1])
+}
+
+/// Sparse TQ decode: full scores (cheap) → top-K → sparse value gather → K-position decode.
+/// Reduces values kernel bandwidth from O(T) to O(K) per FA layer.
+#[allow(non_snake_case)]
+fn tq_decode_sparse(
+    tq_view: &crate::cache::TurboQuantKvView,
+    queries: &Array,
+    num_heads: i32,
+    num_kv_heads: i32,
+    scale: f32,
+    B: i32,
+    L: i32,
+    top_k: i32,
+) -> Result<Array, Exception> {
+    // 1. Full scores via existing TQ kernel (cheap — reads packed 2-bit codes)
+    let scores = tq_view.decode_scores(queries, num_heads)?;
+    let scale_arr = Array::from_f32(scale).as_dtype(scores.dtype())?;
+    let scaled = scores.multiply(&scale_arr)?;
+    // scaled: [num_heads, seq_len]
+
+    let seq_len = tq_view.seq_len;
+    let gqa = num_heads / num_kv_heads;
+
+    // 2. Top-K per KV head: max across GQA group to find positions relevant to ANY query head
+    let per_kv = scaled.reshape(&[num_kv_heads, gqa, seq_len])?;
+    let max_per_kv = per_kv.max_axis(1, None)?; // [H_kv, T]
+
+    let neg_k = -top_k;
+    let all_inds = ops::argpartition_axis(&max_per_kv, neg_k, -1)?;
+    let top_start = seq_len - top_k;
+    let kv_positions = all_inds.index((.., top_start..)).as_dtype(Dtype::Int32)?;
+    // kv_positions: [H_kv, K]
+
+    // 3. Expand KV-head positions to per-query-head for score gathering
+    let kv_pos_for_heads = ops::broadcast_to(
+        &kv_positions.reshape(&[num_kv_heads, 1, top_k])?,
+        &[num_kv_heads, gqa, top_k],
+    )?
+    .reshape(&[num_heads, top_k])?;
+
+    // 4. Gather scaled scores at top-K positions, then softmax only over those
+    let top_scores = scaled.take_along_axis(&kv_pos_for_heads, -1)?;
+    let weights = ops::softmax_axis(&top_scores, -1, true)?;
+    // weights: [num_heads, K]
+
+    // 5. Gather sparse value arrays (the bandwidth win: K << T)
+    let sparse_view = tq_view.gather_values_sparse(&kv_positions, top_k)?;
+
+    // 6. Decode values on K positions — existing Metal kernel, just with seq_len=K
+    let weights_4d = weights.reshape(&[1, num_heads, 1, top_k])?;
+    sparse_view
+        .decode_values(&weights_4d, num_heads)?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[B, L, -1])
+}
+
 impl Qwen3NextAttention {
     fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
         let head_dim = args.head_dim;
@@ -1441,18 +1535,77 @@ impl Qwen3NextAttention {
         queries = apply_rope(&queries, &self.rope, offset)?;
         keys = apply_rope(&keys, &self.rope, offset)?;
 
+        let tq_profiling = higgs_profile_enabled() && L == 1 && cache.is_turbo_active();
+        let tq_prof_t0 = if tq_profiling {
+            mlx_rs::transforms::eval([&queries])?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let view = cache.update_and_view(keys, values)?;
         let try_tq_decode = mask.is_none() && L == 1;
 
         let output = match view {
             crate::cache::KvCacheView::TurboQuant(tq_view) if try_tq_decode => {
-                let scores = tq_view.decode_scores(&queries, self.num_attention_heads)?;
-                let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
-                let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
-                tq_view
-                    .decode_values(&weights, self.num_attention_heads)?
-                    .transpose_axes(&[0, 2, 1, 3])?
-                    .reshape(&[B, L, -1])?
+                let k = sparse_v_k();
+                let use_sparse = sparse_v_enabled() && tq_view.seq_len > k;
+
+                if let Some(t0) = tq_prof_t0 {
+                    mlx_rs::transforms::eval(tq_view.eval_refs())?;
+                    let append_us = t0.elapsed().as_micros();
+                    let t1 = std::time::Instant::now();
+                    let out = if use_sparse {
+                        tq_decode_sparse(
+                            &tq_view,
+                            &queries,
+                            self.num_attention_heads,
+                            self.num_key_value_heads,
+                            self.scale,
+                            B,
+                            L,
+                            k,
+                        )?
+                    } else {
+                        tq_decode(
+                            &tq_view,
+                            &queries,
+                            self.num_attention_heads,
+                            self.scale,
+                            B,
+                            L,
+                        )?
+                    };
+                    mlx_rs::transforms::eval([&out])?;
+                    tracing::info!(
+                        append_us = append_us,
+                        attn_us = t1.elapsed().as_micros(),
+                        seq_len = tq_view.seq_len,
+                        sparse = use_sparse,
+                        "PROFILE TQ: append vs attn"
+                    );
+                    out
+                } else if use_sparse {
+                    tq_decode_sparse(
+                        &tq_view,
+                        &queries,
+                        self.num_attention_heads,
+                        self.num_key_value_heads,
+                        self.scale,
+                        B,
+                        L,
+                        k,
+                    )?
+                } else {
+                    tq_decode(
+                        &tq_view,
+                        &queries,
+                        self.num_attention_heads,
+                        self.scale,
+                        B,
+                        L,
+                    )?
+                }
             }
             other @ (crate::cache::KvCacheView::Dense { .. }
             | crate::cache::KvCacheView::TurboQuant(_)) => {
@@ -1471,7 +1624,12 @@ impl Qwen3NextAttention {
             }
         };
 
-        if L == 1 && async_layer_state_eval_enabled() {
+        // Materialize TQ cache arrays after each attention layer during decode.
+        // Without this, each TQ append adds ~35 lazy slice_update nodes per layer.
+        // Over 10 FA layers × N decode tokens, the graph grows O(N) and MLX's
+        // scheduler chokes on the accumulated dependency chains.
+        // async_eval overlaps GPU work with CPU graph building for the next layer.
+        if L == 1 && (cache.is_turbo_active() || async_layer_state_eval_enabled()) {
             mlx_rs::transforms::async_eval(cache.eval_targets())?;
         }
 
@@ -1687,6 +1845,8 @@ pub(crate) struct SwitchMlpWeights {
     up_proj: QLinear,
     #[param]
     down_proj: QLinear,
+    /// Lazily fused gate+up weights for MoE gather_qmm (3→2 calls per layer).
+    fused_gate_up: Option<(Array, Array, Array, i32)>,
 }
 
 impl SwitchMlpWeights {
@@ -1696,6 +1856,7 @@ impl SwitchMlpWeights {
             gate_proj,
             up_proj,
             down_proj,
+            fused_gate_up: None,
         })
     }
 
@@ -1836,6 +1997,102 @@ impl SwitchMlpWeights {
 
         let activated = swiglu(&gate_out, &up_out)?;
 
+        let down_out = gather_qmm(
+            &activated,
+            &self.down_proj.weight,
+            &self.down_proj.scales,
+            &self.down_proj.biases,
+            &idx_sorted,
+            true,
+            self.down_proj.group_size,
+            self.down_proj.bits,
+            true,
+        )?;
+
+        // down_out: [N, 1, D] -> squeeze M -> [N, D]
+        let out_flat = down_out.squeeze_axes(&[-2])?;
+
+        // --- Unsort: restore original token order ---
+        let out_unsorted = out_flat.take_axis(&inv_order, 0)?;
+
+        // Reshape back to [B, L, top_k, D]
+        out_unsorted.reshape(&[b, l, top_k, d])
+    }
+
+    /// Like `forward_gather_global_sort` but fuses gate+up into a single
+    /// `gather_qmm` call (3→2 per layer). Lazy-inits fused weights on first call.
+    pub(crate) fn forward_gather_fused(
+        &mut self,
+        x: &Array,
+        indices: &Array,
+    ) -> Result<Array, Exception> {
+        // Lazy-init: concatenate gate+up weights along axis 1 (intermediate dim).
+        // MoE weights are [num_experts, intermediate_packed, hidden].
+        if self.fused_gate_up.is_none() {
+            let intermediate = *self
+                .gate_proj
+                .weight
+                .shape()
+                .get(1)
+                .ok_or_else(|| Exception::custom("gate_proj weight missing dim 1"))?;
+            let fw = ops::concatenate_axis(&[&*self.gate_proj.weight, &*self.up_proj.weight], 1)?;
+            let fs = ops::concatenate_axis(&[&*self.gate_proj.scales, &*self.up_proj.scales], 1)?;
+            let fb = ops::concatenate_axis(&[&*self.gate_proj.biases, &*self.up_proj.biases], 1)?;
+            fw.eval()?;
+            fs.eval()?;
+            fb.eval()?;
+            self.fused_gate_up = Some((fw, fs, fb, intermediate));
+        }
+        let (fw, fs, fb, intermediate) = self
+            .fused_gate_up
+            .as_ref()
+            .ok_or_else(|| Exception::custom("fused_gate_up missing after init"))?;
+
+        // --- Global sort (same as forward_gather_global_sort) ---
+        let x_shape = x.shape();
+        let err = || Exception::custom("forward_gather_fused input must be [B, L, D]");
+        let b = *x_shape.first().ok_or_else(err)?;
+        let l = *x_shape.get(1).ok_or_else(err)?;
+        let d = *x_shape.get(2).ok_or_else(err)?;
+        let top_k = *indices
+            .shape()
+            .last()
+            .ok_or_else(|| Exception::custom("indices must have last dim"))?;
+
+        let idx_flat = indices.flatten(None, None)?;
+        let order = ops::argsort_axis(&idx_flat, 0)?;
+        let inv_order = ops::argsort_axis(&order, 0)?;
+
+        let top_k_arr = Array::from_slice(&[top_k as u32], &[1]);
+        let token_idx = order.floor_divide(&top_k_arr)?;
+
+        let x_flat = x.reshape(&[b * l, 1, d])?;
+        let x_sorted = x_flat.take_axis(&token_idx, 0)?;
+        let idx_sorted = idx_flat.take_axis(&order, 0)?;
+
+        // --- Fused gate+up: ONE gather_qmm instead of TWO ---
+        let fused_out = gather_qmm(
+            &x_sorted,
+            fw,
+            fs,
+            fb,
+            &idx_sorted,
+            true,
+            self.gate_proj.group_size,
+            self.gate_proj.bits,
+            true,
+        )?;
+        // Split at intermediate boundary → gate_out, up_out
+        let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
+        let gate_out = parts
+            .first()
+            .ok_or_else(|| Exception::custom("fused split failed"))?;
+        let up_out = parts
+            .get(1)
+            .ok_or_else(|| Exception::custom("fused split failed"))?;
+        let activated = swiglu(gate_out, up_out)?;
+
+        // --- down_proj: unchanged ---
         let down_out = gather_qmm(
             &activated,
             &self.down_proj.weight,
@@ -2657,14 +2914,6 @@ impl FfnBlock {
                 .gate
                 .as_ref()
                 .ok_or_else(|| Exception::custom("MoE gate missing"))?;
-            let switch_ref = self
-                .switch_mlp
-                .as_ref()
-                .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
-            let se_ref = self
-                .shared_expert
-                .as_ref()
-                .ok_or_else(|| Exception::custom("MoE shared_expert missing"))?;
             let seg_ref = self
                 .shared_expert_gate
                 .as_ref()
@@ -2688,13 +2937,22 @@ impl FfnBlock {
                 raw_scores
             };
 
-            let y = switch_ref.forward_gather_global_sort(x, &inds)?;
+            let switch_ref = self
+                .switch_mlp
+                .as_mut()
+                .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
+            let y = switch_ref.forward_gather_fused(x, &inds)?;
 
             let expert_sum = y
                 .multiply(&scores.expand_dims(-1)?)?
                 .sum_axes(&[-2], false)?;
 
+            let se_ref = self
+                .shared_expert
+                .as_ref()
+                .ok_or_else(|| Exception::custom("MoE shared_expert missing"))?;
             let shared_y = se_ref.forward(x)?;
+
             let shared_gate_val = nn::sigmoid(&seg_ref.forward(x)?)?;
             let shared_out = shared_y.multiply(&shared_gate_val)?;
 
@@ -3123,7 +3381,7 @@ impl Qwen3NextCausalLM {
 
         // HIGGS_PROFILE=1: instrument per-layer timing with eval barriers.
         // Samples layers 0-3 (3 GDN + 1 FA), extrapolates to all 64 layers.
-        let profiling = std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1") && T == 1;
+        let profiling = higgs_profile_enabled() && T == 1;
         let mut prof_gdn_attn_ns: u128 = 0;
         let mut prof_gdn_mlp_ns: u128 = 0;
         let mut prof_fa_attn_ns: u128 = 0;
@@ -4751,6 +5009,68 @@ mod tests {
     }
 
     #[test]
+    fn test_moe_gate_up_fusion_parity() {
+        // Fused gate+up (2 gather_qmm) must match unfused (3 gather_qmm).
+        // Uses random weights + distinct per-token inputs to stress sort/unsort.
+        let num_experts = 8;
+        let hidden = 64;
+        let top_k = 3;
+        let b = 1;
+        let l = 16;
+
+        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+
+        let gate_w =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
+                .unwrap();
+        let (gw, gs, gb) = quantize_weights(&gate_w, 64, 4);
+        *block.gate_proj.weight = gw;
+        *block.gate_proj.scales = gs;
+        *block.gate_proj.biases = gb;
+
+        let up_w =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
+                .unwrap();
+        let (uw, us, ub) = quantize_weights(&up_w, 64, 4);
+        *block.up_proj.weight = uw;
+        *block.up_proj.scales = us;
+        *block.up_proj.biases = ub;
+
+        let down_w =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
+                .unwrap();
+        let (dw, ds, db) = quantize_weights(&down_w, 64, 4);
+        *block.down_proj.weight = dw;
+        *block.down_proj.scales = ds;
+        *block.down_proj.biases = db;
+
+        let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[b, l, hidden], None).unwrap();
+        let idx_data: Vec<u32> = (0..(b * l * top_k) as u32)
+            .map(|i| i % num_experts as u32)
+            .collect();
+        let indices = Array::from_slice(&idx_data, &[b, l, top_k]);
+        x.eval().unwrap();
+        indices.eval().unwrap();
+
+        // Reference: unfused 3-call path
+        let reference = block.forward_gather_global_sort(&x, &indices).unwrap();
+        // Fused: 2-call path
+        let fused = block.forward_gather_fused(&x, &indices).unwrap();
+        reference.eval().unwrap();
+        fused.eval().unwrap();
+
+        assert_eq!(reference.shape(), fused.shape());
+        assert_eq!(fused.shape(), &[b, l, top_k, hidden]);
+
+        let diff = reference.subtract(&fused).unwrap().abs().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        assert!(
+            max_diff < 1e-5,
+            "fused gate+up differs from unfused by {max_diff}"
+        );
+    }
+
+    #[test]
     fn test_switch_mlp_forward_gather_shapes() {
         // Verify forward_gather produces the correct output shape with the
         // double expand_dims pattern matching Python's SwitchGLU.
@@ -6148,6 +6468,7 @@ mod tests {
                     gate_proj: make_switch_ql(d, d_inter),
                     up_proj: make_switch_ql(d, d_inter),
                     down_proj: make_switch_ql(d_inter, d),
+                    fused_gate_up: None,
                 },
                 shared_expert: Qwen3NextMLP {
                     gate_proj: make_ql(d, shared_inter * 2, gs, bits),

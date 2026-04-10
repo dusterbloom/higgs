@@ -14,7 +14,11 @@ pub enum KvCacheView {
 }
 
 static TURBOQUANT_ACTIVATE_AT: OnceLock<i32> = OnceLock::new();
-const DEFAULT_TURBOQUANT_ACTIVATE_AT: i32 = 5000;
+/// Dense KV uses ~10 KB/token (10 FA layers × 2 KV heads × 128 dim × 2 bytes × K+V).
+/// At 100K that's only 1 GB of the typical 16 GB headroom on M4 32 GB.
+/// TQ custom Metal kernels are significantly slower than MLX's built-in SDPA,
+/// so delay activation until dense KV actually pressures memory.
+const DEFAULT_TURBOQUANT_ACTIVATE_AT: i32 = 100_000;
 
 fn parse_turboquant_activate_at(raw: Option<&str>) -> i32 {
     raw.and_then(|s| s.parse::<i32>().ok())
@@ -64,6 +68,48 @@ pub struct TurboQuantKvView {
 }
 
 impl TurboQuantKvView {
+    /// References to internal arrays for eval/profiling.
+    pub fn eval_refs(&self) -> Vec<&Array> {
+        vec![
+            &self.key_codes,
+            &self.key_norms,
+            &self.key_gammas,
+            &self.value_codes,
+            &self.value_norms,
+        ]
+    }
+
+    /// Gather only K value positions per KV head, returning a sparse view.
+    /// `kv_positions`: `[H_kv, K]` i32 indices along the sequence axis.
+    /// The returned view has `seq_len = k` so existing `decode_values` works
+    /// on K positions instead of T positions — the core bandwidth win.
+    pub fn gather_values_sparse(
+        &self,
+        kv_positions: &Array,
+        k: i32,
+    ) -> Result<TurboQuantKvView, Exception> {
+        let h = self.context.num_kv_heads;
+        let cw = self.context.value_code_words;
+
+        // value_codes: [H_kv, T, code_words] → gather axis 1 → [H_kv, K, code_words]
+        let pos_3d = kv_positions.reshape(&[h, k, 1])?;
+        let pos_for_codes = ops::broadcast_to(&pos_3d, &[h, k, cw])?;
+        let gathered_codes = self.value_codes.take_along_axis(&pos_for_codes, 1)?;
+
+        // value_norms: [H_kv, T] → gather axis 1 → [H_kv, K]
+        let gathered_norms = self.value_norms.take_along_axis(kv_positions, 1)?;
+
+        Ok(TurboQuantKvView {
+            context: Arc::clone(&self.context),
+            key_codes: self.key_codes.clone(),
+            key_norms: self.key_norms.clone(),
+            key_gammas: self.key_gammas.clone(),
+            value_codes: gathered_codes,
+            value_norms: gathered_norms,
+            seq_len: k,
+        })
+    }
+
     pub fn materialize_dense(&self) -> Result<(Array, Array), Exception> {
         let num_kv_heads = usize_from_i32(self.context.num_kv_heads, "num_kv_heads")?;
         let head_dim = usize_from_i32(self.context.head_dim, "head_dim")?;
@@ -756,43 +802,46 @@ impl TurboQuantStorage {
         let (v_norms, v_codes) = self.context.quantize_values_gpu(&values_3d)?;
         let (k_norms, k_gammas, k_codes) = self.context.quantize_keys_gpu(&keys_3d)?;
 
-        // slice_update into pre-allocated storage (all lazy GPU ops)
+        // slice_update into pre-allocated storage (all lazy GPU ops).
+        // stop_gradient cuts the backward graph — TQ cache arrays are write-once
+        // per position, never differentiated through. This prevents MLX from
+        // retaining the full quantization subgraph for each stored position.
         let err = || Exception::custom("TurboQuant storage not allocated");
-        self.value_norms = Some(slice_update_axis(
+        self.value_norms = Some(mlx_rs::stop_gradient(&slice_update_axis(
             self.value_norms.as_ref().ok_or_else(err)?,
             &v_norms,
             1,
             prev,
             new_tokens,
-        )?);
-        self.value_codes = Some(slice_update_axis(
+        )?)?);
+        self.value_codes = Some(mlx_rs::stop_gradient(&slice_update_axis(
             self.value_codes.as_ref().ok_or_else(err)?,
             &v_codes,
             1,
             prev,
             new_tokens,
-        )?);
-        self.key_norms = Some(slice_update_axis(
+        )?)?);
+        self.key_norms = Some(mlx_rs::stop_gradient(&slice_update_axis(
             self.key_norms.as_ref().ok_or_else(err)?,
             &k_norms,
             1,
             prev,
             new_tokens,
-        )?);
-        self.key_gammas = Some(slice_update_axis(
+        )?)?);
+        self.key_gammas = Some(mlx_rs::stop_gradient(&slice_update_axis(
             self.key_gammas.as_ref().ok_or_else(err)?,
             &k_gammas,
             1,
             prev,
             new_tokens,
-        )?);
-        self.key_codes = Some(slice_update_axis(
+        )?)?);
+        self.key_codes = Some(mlx_rs::stop_gradient(&slice_update_axis(
             self.key_codes.as_ref().ok_or_else(err)?,
             &k_codes,
             1,
             prev,
             new_tokens,
-        )?);
+        )?)?);
 
         self.view(prev + new_tokens)
     }
