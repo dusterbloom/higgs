@@ -25,6 +25,20 @@ use std::fmt::Write;
 /// When `causal=false`: bidirectional diffusion (13 BLOBFILE weights)
 /// When `causal=true`: causal language model (14 BLOBFILE weights, includes mask)
 /// ~30MB at dim=1024 (fits under 32MB ANE limit).
+///
+/// Legacy alias: `gen_decode_layer` (causal=true).
+pub fn gen_decode_layer(
+    dim: usize,
+    heads: usize,
+    kv_heads: usize,
+    hd: usize,
+    inter: usize,
+    seq_len: usize,
+    eps: f64,
+) -> FusedMil {
+    gen_fused_diffusion_layer(dim, heads, kv_heads, hd, inter, seq_len, eps, true)
+}
+
 pub fn gen_fused_diffusion_layer(
     dim: usize,
     heads: usize,

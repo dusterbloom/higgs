@@ -30,6 +30,8 @@ pub mod ane_mil;
 #[cfg(feature = "ane")]
 pub mod diffusion_ane;
 #[cfg(feature = "ane")]
+pub mod ane_gdn_prefill;
+#[cfg(feature = "ane")]
 pub mod diffusion_ane_bwd;
 
 use std::collections::{HashMap, HashSet};
