@@ -200,6 +200,12 @@ struct DFlashAneLayerKernels {
     v_proj_f32: Vec<f32>,
 }
 
+/// Pre-quantization scale applied to down_proj weights before they go to ANE,
+/// and inverted (multiply by 1/scale) on ANE output read-back.
+/// See compile_dflash_ane and forward() call sites.
+const DOWN_PROJ_ANE_SCALE: f32 = 0.5;
+const DOWN_PROJ_ANE_UNSCALE: f32 = 1.0 / DOWN_PROJ_ANE_SCALE;
+
 /// Convert bf16 raw bits to f32 (top 16 bits of f32 layout).
 fn bf16_u16_to_f32_vec(src: &[u16]) -> Vec<f32> {
     src.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect()
@@ -264,7 +270,15 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
         let o_f32 = bf16_u16_to_f32_vec(&lw.o_proj);
         let gate_f32 = bf16_u16_to_f32_vec(&lw.gate_proj);
         let up_f32 = bf16_u16_to_f32_vec(&lw.up_proj);
-        let down_f32 = bf16_u16_to_f32_vec(&lw.down_proj);
+        // down_proj: scale weights by 0.5 to halve ANE matmul output magnitude
+        // so the fp16 store doesn't saturate to Inf on wide MLPs (9B inter=12288).
+        // We multiply the post-ANE CPU output by 2.0 in forward() to restore value.
+        // Rationale documented in .planning/next-session-ane-9b-parity.md.
+        let down_scale_factor: f32 = DOWN_PROJ_ANE_SCALE;
+        let down_f32: Vec<f32> = bf16_u16_to_f32_vec(&lw.down_proj)
+            .into_iter()
+            .map(|w| w * down_scale_factor)
+            .collect();
 
         // Build weight blobs (PyTorch [out, in] → ANE [in, out] via transposed).
         // Each weight is split into N BLOBFILE tiles on the oc axis if it
@@ -692,9 +706,11 @@ impl DFlashAneExecutor {
                 }
             }
 
-            // Residual add
+            // Residual add. down weights were pre-scaled by DOWN_PROJ_ANE_SCALE
+            // so the ANE fp16 output stays in range; restore magnitude here in
+            // fp32 before accumulating into the hidden state.
             for i in 0..block * h {
-                hidden[i] += down_cpu[i];
+                hidden[i] += down_cpu[i] * DOWN_PROJ_ANE_UNSCALE;
             }
             tock!(t_norm_residual, t0);
         }
