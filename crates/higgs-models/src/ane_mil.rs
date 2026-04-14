@@ -157,6 +157,110 @@ pub fn compute_blobfile_tile_plan(ic: usize, oc: usize) -> TilePlan {
     }
 }
 
+/// Emit a MIL fragment for a BLOBFILE-weighted matmul, tiled on the output
+/// channel (oc) axis when the full weight exceeds the safe BLOBFILE budget.
+///
+/// Pre-conditions:
+/// - `input_var` names an `fp16[1,1,seq,ic]` tensor already in scope
+/// - `bF` (bool(false)) const is already declared
+/// - When tiling is required, an `int32(3)` const is emitted (or reused) as
+///   `cax3` on the first tile > 1. The caller is responsible for not declaring
+///   `cax3` elsewhere — this helper owns it.
+///
+/// Post-condition:
+/// - A tensor named `{output_var}` of shape `fp16[1,1,seq,oc]` is in scope
+/// - Weight file paths appended to `weight_names` in the order consumed by
+///   the compiler (one entry when untiled, `n_tiles` entries when tiled).
+///
+/// Unique MIL identifier prefix `{uid}` is used for all internal temporaries
+/// so callers can invoke this helper multiple times in one program without
+/// name collisions (e.g. Q/K/V each pass a different `uid`).
+pub fn emit_blobfile_matmul_tiled(
+    m: &mut String,
+    input_var: &str,
+    w_base: &str,
+    output_var: &str,
+    uid: &str,
+    ic: usize,
+    oc: usize,
+    seq: usize,
+    weight_names: &mut Vec<String>,
+    _cax3_emitted: &mut bool,
+) {
+    // Contract: produces `{output_var}` of shape fp16[1, oc, 1, seq] (channel-first).
+    // Requires in scope: `pm` (perm [0,1,3,2]), `bF` (bool false), `cax` (int32(1)).
+    //
+    // Per-tile we matmul then transpose+reshape to channel-first, then concat on
+    // channel axis (axis=1). ANE MIL concat on the innermost axis silently
+    // produces NaN — only axis=1 concat is reliable.
+    let plan = compute_blobfile_tile_plan(ic, oc);
+    if plan.n_tiles == 1 {
+        let w_var = format!("W_{uid}");
+        let wf = format!("@model_path/weights/{w_base}.bin");
+        let ym = format!("{output_var}_m");
+        let yt = format!("{output_var}_t");
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{ic},{oc}]> {w_var} = const()[name=string(\"{w_var}\"), val=tensor<fp16, [1,1,{ic},{oc}]>(BLOBFILE(path=string(\"{wf}\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{seq},{oc}]> {ym} = matmul(transpose_x=bF,transpose_y=bF,x={input_var},y={w_var})[name=string(\"{ym}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{oc},{seq}]> {yt} = transpose(perm=pm,x={ym})[name=string(\"{yt}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<int32, [4]> ro_{uid} = const()[name=string(\"ro_{uid}\"), val=tensor<int32, [4]>([1,{oc},1,{seq}])];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{oc},1,{seq}]> {output_var} = reshape(shape=ro_{uid},x={yt})[name=string(\"{output_var}\")];"
+        );
+        weight_names.push(wf);
+        return;
+    }
+    let mut part_names = Vec::with_capacity(plan.n_tiles);
+    for t in 0..plan.n_tiles {
+        let this_oc = plan.actual_tile_size(t);
+        let wf = format!("@model_path/weights/{w_base}_t{t}.bin");
+        let w_var = format!("W_{uid}_{t}");
+        let ym = format!("{output_var}_m{t}");
+        let yt = format!("{output_var}_t{t}");
+        let yp = format!("{output_var}_p{t}");
+        let ro = format!("ro_{uid}_{t}");
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{ic},{this_oc}]> {w_var} = const()[name=string(\"{w_var}\"), val=tensor<fp16, [1,1,{ic},{this_oc}]>(BLOBFILE(path=string(\"{wf}\"), offset=uint64(64)))];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{seq},{this_oc}]> {ym} = matmul(transpose_x=bF,transpose_y=bF,x={input_var},y={w_var})[name=string(\"{ym}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{this_oc},{seq}]> {yt} = transpose(perm=pm,x={ym})[name=string(\"{yt}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<int32, [4]> {ro} = const()[name=string(\"{ro}\"), val=tensor<int32, [4]>([1,{this_oc},1,{seq}])];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,{this_oc},1,{seq}]> {yp} = reshape(shape={ro},x={yt})[name=string(\"{yp}\")];"
+        );
+        weight_names.push(wf);
+        part_names.push(yp);
+    }
+    let vals = part_names.join(",");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{oc},1,{seq}]> {output_var} = concat(values=({vals}),axis=cax,interleave=bF)[name=string(\"{output_var}\")];"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // MIL config
 // ---------------------------------------------------------------------------
@@ -468,7 +572,6 @@ pub struct FusedMil {
 /// `seq` is padded to `ANE_MIN_SPATIAL` if smaller.
 pub fn gen_blobfile_matmul(ic: usize, oc: usize, seq_len: usize, name: &str) -> FusedMil {
     let seq = seq_len.max(ANE_MIN_SPATIAL);
-    let weight_file = format!("@model_path/weights/{name}.bin");
 
     let mut m = String::with_capacity(4096);
     m.push_str(MIL_HEADER);
@@ -493,10 +596,11 @@ pub fn gen_blobfile_matmul(ic: usize, oc: usize, seq_len: usize, name: &str) -> 
         m,
         "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
     );
-    // BLOBFILE weight
+    // cax for tiled-concat on channel axis (emitted unconditionally — a single
+    // unused const is free and keeps the tiled/untiled paths identical).
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,1,{ic},{oc}]> W = const()[name=string(\"W\"), val=tensor<fp16, [1,1,{ic},{oc}]>(BLOBFILE(path=string(\"{weight_file}\"), offset=uint64(64)))];"
+        "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];"
     );
     // Cast + reshape for matmul
     let _ = writeln!(
@@ -515,23 +619,13 @@ pub fn gen_blobfile_matmul(ic: usize, oc: usize, seq_len: usize, name: &str) -> 
         m,
         "        tensor<fp16, [1,1,{seq},{ic}]> xt = transpose(perm=pm,x=x2)[name=string(\"xt\")];"
     );
-    // matmul: [1,1,seq,ic] @ [1,1,ic,oc] → [1,1,seq,oc]
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{seq},{oc}]> yh = matmul(transpose_x=bF,transpose_y=bF,x=xt,y=W)[name=string(\"yh\")];"
-    );
-    // Transpose + reshape back to [1,oc,1,seq]
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{oc},{seq}]> yt = transpose(perm=pm,x=yh)[name=string(\"yt\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{oc},1,{seq}])];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{oc},1,{seq}]> yf = reshape(shape=ro,x=yt)[name=string(\"yf\")];"
+    // matmul: tiled when weight exceeds BLOBFILE safe budget. Helper produces
+    // `yf` directly in channel-first layout [1,oc,1,seq].
+    let mut weight_names = Vec::new();
+    let mut cax3_emitted = false;
+    emit_blobfile_matmul_tiled(
+        &mut m, "xt", name, "yf", "w", ic, oc, seq,
+        &mut weight_names, &mut cax3_emitted,
     );
     // Cast back to fp32
     let _ = writeln!(
@@ -543,7 +637,7 @@ pub fn gen_blobfile_matmul(ic: usize, oc: usize, seq_len: usize, name: &str) -> 
 
     FusedMil {
         mil_text: m,
-        weight_names: vec![weight_file],
+        weight_names,
         input_bytes: ic * seq * 4,
         output_bytes: oc * seq * 4,
     }
@@ -716,19 +810,6 @@ pub fn gen_fused_qkv_proj(ic: usize, q_dim: usize, kv_dim: usize, seq_len: usize
         m,
         "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];"
     );
-    // 3 BLOBFILE weights
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{ic},{q_dim}]> Wq = const()[name=string(\"Wq\"), val=tensor<fp16, [1,1,{ic},{q_dim}]>(BLOBFILE(path=string(\"@model_path/weights/wq.bin\"), offset=uint64(64)))];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{ic},{kv_dim}]> Wk = const()[name=string(\"Wk\"), val=tensor<fp16, [1,1,{ic},{kv_dim}]>(BLOBFILE(path=string(\"@model_path/weights/wk.bin\"), offset=uint64(64)))];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{ic},{kv_dim}]> Wv = const()[name=string(\"Wv\"), val=tensor<fp16, [1,1,{ic},{kv_dim}]>(BLOBFILE(path=string(\"@model_path/weights/wv.bin\"), offset=uint64(64)))];"
-    );
     // Cast + reshape
     let _ = writeln!(
         m,
@@ -746,56 +827,26 @@ pub fn gen_fused_qkv_proj(ic: usize, q_dim: usize, kv_dim: usize, seq_len: usize
         m,
         "        tensor<fp16, [1,1,{seq},{ic}]> xt = transpose(perm=pm,x=x2)[name=string(\"xt\")];"
     );
-    // 3 matmuls
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{seq},{q_dim}]> qm = matmul(transpose_x=bF,transpose_y=bF,x=xt,y=Wq)[name=string(\"qm\")];"
+    // 3 matmuls, each potentially tiled on oc.
+    let mut weight_names = Vec::new();
+    let mut cax3_emitted = false;
+    emit_blobfile_matmul_tiled(
+        &mut m, "xt", "wq", "qm", "q", ic, q_dim, seq,
+        &mut weight_names, &mut cax3_emitted,
     );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{seq},{kv_dim}]> km = matmul(transpose_x=bF,transpose_y=bF,x=xt,y=Wk)[name=string(\"km\")];"
+    emit_blobfile_matmul_tiled(
+        &mut m, "xt", "wk", "km", "k", ic, kv_dim, seq,
+        &mut weight_names, &mut cax3_emitted,
     );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{seq},{kv_dim}]> vm = matmul(transpose_x=bF,transpose_y=bF,x=xt,y=Wv)[name=string(\"vm\")];"
+    emit_blobfile_matmul_tiled(
+        &mut m, "xt", "wv", "vm", "v", ic, kv_dim, seq,
+        &mut weight_names, &mut cax3_emitted,
     );
-    // Transpose back + reshape to channel-first
+    // Helper outputs qm/km/vm already in channel-first [1,q_dim/kv_dim,1,seq].
+    // Concat Q|K|V directly on channel axis.
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,1,{q_dim},{seq}]> qt = transpose(perm=pm,x=qm)[name=string(\"qt\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{kv_dim},{seq}]> kt = transpose(perm=pm,x=km)[name=string(\"kt\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{kv_dim},{seq}]> vt = transpose(perm=pm,x=vm)[name=string(\"vt\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<int32, [4]> rq = const()[name=string(\"rq\"), val=tensor<int32, [4]>([1,{q_dim},1,{seq}])];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<int32, [4]> rk = const()[name=string(\"rk\"), val=tensor<int32, [4]>([1,{kv_dim},1,{seq}])];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{q_dim},1,{seq}]> qf = reshape(shape=rq,x=qt)[name=string(\"qf\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_dim},1,{seq}]> kf = reshape(shape=rk,x=kt)[name=string(\"kf\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{kv_dim},1,{seq}]> vf = reshape(shape=rk,x=vt)[name=string(\"vf\")];"
-    );
-    // Concat Q|K|V on channel axis
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{out_ch},1,{seq}]> cat = concat(values=(qf,kf,vf),axis=cax,interleave=bF)[name=string(\"cat\")];"
+        "        tensor<fp16, [1,{out_ch},1,{seq}]> cat = concat(values=(qm,km,vm),axis=cax,interleave=bF)[name=string(\"cat\")];"
     );
     let _ = writeln!(
         m,
@@ -806,11 +857,7 @@ pub fn gen_fused_qkv_proj(ic: usize, q_dim: usize, kv_dim: usize, seq_len: usize
 
     FusedMil {
         mil_text: m,
-        weight_names: vec![
-            "@model_path/weights/wq.bin".to_string(),
-            "@model_path/weights/wk.bin".to_string(),
-            "@model_path/weights/wv.bin".to_string(),
-        ],
+        weight_names,
         input_bytes: ic * seq * 4,
         output_bytes: out_ch * seq * 4,
     }
@@ -954,13 +1001,10 @@ pub fn gen_fused_silu_gate_up_proj(ic: usize, inter: usize, seq_len: usize) -> F
         m,
         "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
     );
+    // channel-axis concat const used by helper's tiled branch.
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,1,{ic},{inter}]> Wg = const()[name=string(\"Wg\"), val=tensor<fp16, [1,1,{ic},{inter}]>(BLOBFILE(path=string(\"@model_path/weights/wg.bin\"), offset=uint64(64)))];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{ic},{inter}]> Wu = const()[name=string(\"Wu\"), val=tensor<fp16, [1,1,{ic},{inter}]>(BLOBFILE(path=string(\"@model_path/weights/wu.bin\"), offset=uint64(64)))];"
+        "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];"
     );
     let _ = writeln!(
         m,
@@ -978,45 +1022,29 @@ pub fn gen_fused_silu_gate_up_proj(ic: usize, inter: usize, seq_len: usize) -> F
         m,
         "        tensor<fp16, [1,1,{seq},{ic}]> xt = transpose(perm=pm,x=x2)[name=string(\"xt\")];"
     );
+    // Wg and Wu each potentially tiled on oc=inter.
+    let mut weight_names = Vec::new();
+    let mut cax3_emitted = false;
+    emit_blobfile_matmul_tiled(
+        &mut m, "xt", "wg", "gm", "g", ic, inter, seq,
+        &mut weight_names, &mut cax3_emitted,
+    );
+    emit_blobfile_matmul_tiled(
+        &mut m, "xt", "wu", "um", "u", ic, inter, seq,
+        &mut weight_names, &mut cax3_emitted,
+    );
+    // Helper emits gm/um already in channel-first [1,inter,1,seq]; feed directly into sigmoid+mul.
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,1,{seq},{inter}]> gm = matmul(transpose_x=bF,transpose_y=bF,x=xt,y=Wg)[name=string(\"gm\")];"
+        "        tensor<fp16, [1,{inter},1,{seq}]> sig = sigmoid(x=gm)[name=string(\"sg\")];"
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,1,{seq},{inter}]> um = matmul(transpose_x=bF,transpose_y=bF,x=xt,y=Wu)[name=string(\"um\")];"
+        "        tensor<fp16, [1,{inter},1,{seq}]> silu = mul(x=gm,y=sig)[name=string(\"si\")];"
     );
     let _ = writeln!(
         m,
-        "        tensor<fp16, [1,1,{inter},{seq}]> gt = transpose(perm=pm,x=gm)[name=string(\"gt\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,1,{inter},{seq}]> ut = transpose(perm=pm,x=um)[name=string(\"ut\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{inter},1,{seq}])];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{inter},1,{seq}]> gf = reshape(shape=ro,x=gt)[name=string(\"gf\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{inter},1,{seq}]> uf = reshape(shape=ro,x=ut)[name=string(\"uf\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{inter},1,{seq}]> sig = sigmoid(x=gf)[name=string(\"sg\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{inter},1,{seq}]> silu = mul(x=gf,y=sig)[name=string(\"si\")];"
-    );
-    let _ = writeln!(
-        m,
-        "        tensor<fp16, [1,{inter},1,{seq}]> gated = mul(x=silu,y=uf)[name=string(\"gated\")];"
+        "        tensor<fp16, [1,{inter},1,{seq}]> gated = mul(x=silu,y=um)[name=string(\"gated\")];"
     );
     let _ = writeln!(
         m,
@@ -1027,10 +1055,7 @@ pub fn gen_fused_silu_gate_up_proj(ic: usize, inter: usize, seq_len: usize) -> F
 
     FusedMil {
         mil_text: m,
-        weight_names: vec![
-            "@model_path/weights/wg.bin".to_string(),
-            "@model_path/weights/wu.bin".to_string(),
-        ],
+        weight_names,
         input_bytes: ic * seq * 4,
         output_bytes: inter * seq * 4,
     }

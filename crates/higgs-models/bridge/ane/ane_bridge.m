@@ -17,6 +17,27 @@
 #include <arm_neon.h>
 #endif
 
+// fp16 positive max. Any |x| > 65504 overflows to ±inf when cast to _Float16,
+// which then silently poisons BLOBFILE weights and produces NaN after matmul
+// on ANE. Clamp all f32→fp16 weight conversions to the representable range.
+#define ANE_FP16_MAX 65504.0f
+
+static inline _Float16 f32_to_f16_clamped(float x) {
+    if (x > ANE_FP16_MAX) x = ANE_FP16_MAX;
+    else if (x < -ANE_FP16_MAX) x = -ANE_FP16_MAX;
+    return (_Float16)x;
+}
+
+#if defined(__aarch64__)
+static inline float16x4_t vcvt_clamp_f16_f32(float32x4_t v) {
+    const float32x4_t vmax = vdupq_n_f32(ANE_FP16_MAX);
+    const float32x4_t vmin = vdupq_n_f32(-ANE_FP16_MAX);
+    v = vminq_f32(v, vmax);
+    v = vmaxq_f32(v, vmin);
+    return vcvt_f16_f32(v);
+}
+#endif
+
 // --- Private class references ---
 static Class g_ANEDesc = nil;
 static Class g_ANEInMem = nil;
@@ -267,8 +288,22 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
             // Full compile (cold path)
             if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
                     mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
-                if (!g_quiet) fprintf(stderr, "ane_bridge: ANE compile failed: %s\n",
-                        e ? [[e description] UTF8String] : "unknown");
+                if (!g_quiet) {
+                    size_t total_w = 0;
+                    for (int i = 0; i < n_weights; i++) total_w += weight_lens[i];
+                    fprintf(stderr,
+                        "ane_bridge: ANE compile FAILED (cold, hx=%s, mil=%zu, n_weights=%d, w_bytes=%zu, td=%s)\n",
+                        [hx UTF8String], mil_len, n_weights, total_w, [td UTF8String]);
+                    if (e) {
+                        NSLog(@"[ane_bridge] compile error: domain=%@ code=%ld description=%@ userInfo=%@",
+                              e.domain, (long)e.code, [e localizedDescription], e.userInfo);
+                        fprintf(stderr, "ane_bridge:   -> domain=%s code=%ld desc=%s\n",
+                                [e.domain UTF8String], (long)e.code,
+                                [[e localizedDescription] UTF8String] ?: "(nil)");
+                    } else {
+                        fprintf(stderr, "ane_bridge:   -> NSError was nil; inspect Console.app for ANECompilerService / com.apple.ane logs\n");
+                    }
+                }
                 [fm removeItemAtPath:td error:nil];
                 return NULL;
             }
@@ -287,8 +322,20 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
                 e = nil;
                 if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
                         mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
-                    if (!g_quiet) fprintf(stderr, "ane_bridge: ANE fallback compile failed: %s\n",
-                            e ? [[e description] UTF8String] : "unknown");
+                    if (!g_quiet) {
+                        fprintf(stderr,
+                            "ane_bridge: ANE compile FAILED (fallback-after-stale-cache, hx=%s, mil=%zu, n_weights=%d, td=%s)\n",
+                            [hx UTF8String], mil_len, n_weights, [td UTF8String]);
+                        if (e) {
+                            NSLog(@"[ane_bridge] fallback compile error: domain=%@ code=%ld description=%@ userInfo=%@",
+                                  e.domain, (long)e.code, [e localizedDescription], e.userInfo);
+                            fprintf(stderr, "ane_bridge:   -> domain=%s code=%ld desc=%s\n",
+                                    [e.domain UTF8String], (long)e.code,
+                                    [[e localizedDescription] UTF8String] ?: "(nil)");
+                        } else {
+                            fprintf(stderr, "ane_bridge:   -> NSError was nil; inspect Console.app for ANECompilerService / com.apple.ane logs\n");
+                        }
+                    }
                     [fm removeItemAtPath:td error:nil];
                     return NULL;
                 }
@@ -1365,15 +1412,15 @@ uint8_t *ane_bridge_build_weight_blob(const float *src, int rows, int cols,
     int i = 0;
     for (; i + 3 < count; i += 4) {
         float32x4_t v = vld1q_f32(src + i);
-        float16x4_t h = vcvt_f16_f32(v);
+        float16x4_t h = vcvt_clamp_f16_f32(v);
         vst1_f16((__fp16 *)(fp16 + i), h);
     }
     for (; i < count; i++) {
-        fp16[i] = (_Float16)src[i];
+        fp16[i] = f32_to_f16_clamped(src[i]);
     }
 #else
     for (int i = 0; i < count; i++) {
-        fp16[i] = (_Float16)src[i];
+        fp16[i] = f32_to_f16_clamped(src[i]);
     }
 #endif
 
@@ -1400,7 +1447,7 @@ uint8_t *ane_bridge_build_weight_blob_transposed(const float *src, int rows, int
         int j = 0;
         for (; j + 3 < cols; j += 4) {
             float32x4_t v = vld1q_f32(src + i * cols + j);
-            float16x4_t h = vcvt_f16_f32(v);
+            float16x4_t h = vcvt_clamp_f16_f32(v);
             // Scatter-store transposed (can't vectorize the scatter)
             __fp16 tmp[4];
             vst1_f16(tmp, h);
@@ -1410,13 +1457,13 @@ uint8_t *ane_bridge_build_weight_blob_transposed(const float *src, int rows, int
             fp16[(j+3) * rows + i] = (_Float16)tmp[3];
         }
         for (; j < cols; j++) {
-            fp16[j * rows + i] = (_Float16)src[i * cols + j];
+            fp16[j * rows + i] = f32_to_f16_clamped(src[i * cols + j]);
         }
     }
 #else
     for (int i = 0; i < rows; i++)
         for (int j = 0; j < cols; j++)
-            fp16[j * rows + i] = (_Float16)src[i * cols + j];
+            fp16[j * rows + i] = f32_to_f16_clamped(src[i * cols + j]);
 #endif
 
     *out_len = total;
