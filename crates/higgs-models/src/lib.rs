@@ -13,6 +13,8 @@ pub mod transformer;
 pub mod turboquant;
 pub mod utils;
 
+pub mod dflash;
+pub mod dflash_cpu;
 pub mod diffusion;
 pub mod diffusion_lora;
 pub mod diffusion_train;
@@ -27,6 +29,8 @@ pub mod ane_extract;
 pub mod ane_forward;
 #[cfg(feature = "ane")]
 pub mod ane_mil;
+#[cfg(feature = "ane")]
+pub mod dflash_ane;
 #[cfg(feature = "ane")]
 pub mod diffusion_ane;
 #[cfg(feature = "ane")]
@@ -142,6 +146,22 @@ impl AnyCache {
             }
         }
         Ok(())
+    }
+
+    /// Borrow the inner hybrid cache layers. Panics if not `Hybrid`.
+    pub fn as_hybrid(&self) -> &[Option<LayerCache>] {
+        match self {
+            Self::Hybrid(layers) => layers,
+            _ => panic!("AnyCache::as_hybrid called on non-Hybrid cache"),
+        }
+    }
+
+    /// Mutably borrow the inner hybrid cache layers. Panics if not `Hybrid`.
+    pub fn as_hybrid_mut(&mut self) -> &mut [Option<LayerCache>] {
+        match self {
+            Self::Hybrid(layers) => layers,
+            _ => panic!("AnyCache::as_hybrid_mut called on non-Hybrid cache"),
+        }
     }
 }
 
@@ -518,6 +538,97 @@ impl AnyModel {
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_all_logits(inputs, mask, c),
             _ => Err(Exception::custom(
                 "forward_all_logits: only Transformer and Qwen3Next are supported",
+            )),
+        }
+    }
+
+    /// Forward pass returning logits + hidden states at specified tap layers.
+    ///
+    /// Used by DFlash speculative decoding: the target model produces logits
+    /// AND collects intermediate hidden states that condition the drafter.
+    pub fn forward_with_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps: only Qwen3Next is supported",
+            )),
+        }
+    }
+
+    /// Tape-recording verify: forward with taps AND GDN innovation tapes.
+    ///
+    /// State IS updated (like normal forward). On full acceptance, zero extra
+    /// work. On partial rejection, use `replay_tape_rollback` to cheaply
+    /// restore+replay instead of a full model rerun.
+    pub fn forward_with_taps_tape(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>, Vec<Option<qwen3_next::GdnLayerTape>>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps_tape(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps_tape: only Qwen3Next is supported",
+            )),
+        }
+    }
+
+    /// Replay accepted steps from recorded tape on partial rejection.
+    /// Restores GDN state from snapshots, replays tape[:n_accepted],
+    /// and rolls back KV cache for rejected positions.
+    pub fn replay_tape_rollback(
+        &self,
+        layer_tapes: &[Option<qwen3_next::GdnLayerTape>],
+        snapshots: &[(Option<Array>, Option<Array>, i32)],
+        cache: &mut AnyCache,
+        n_accepted: i32,
+        kv_rollback: i32,
+    ) -> Result<(), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.replay_tape_rollback(layer_tapes, snapshots, c, n_accepted, kv_rollback)
+            }
+            _ => Err(Exception::custom(
+                "replay_tape_rollback: only Qwen3Next is supported",
+            )),
+        }
+    }
+
+    /// Embed raw token IDs through the target model's embedding layer.
+    ///
+    /// Used by DFlash to convert `[anchor, mask, mask, ...]` into
+    /// the embedding space expected by the drafter.
+    pub fn embed_token_ids(&self, token_ids: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.embed_token_ids(token_ids),
+            _ => Err(Exception::custom(
+                "embed_token_ids: only Qwen3Next is supported",
+            )),
+        }
+    }
+
+    /// Apply the LM head to pre-computed hidden states.
+    ///
+    /// Used by DFlash: the drafter produces hidden states in the target
+    /// model's hidden space; we project them through the target's lm_head.
+    /// Input: `[B, T, hidden_size]`. Returns: `[B, T, vocab_size]`.
+    pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.forward_all_logits_from_hidden(hidden),
+            _ => Err(Exception::custom(
+                "forward_all_logits_from_hidden: only Qwen3Next is supported",
             )),
         }
     }

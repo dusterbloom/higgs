@@ -3,7 +3,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
-    dflash::{DFlashDrafter, GdnStateBackup, crop_drafter_cache},
+    dflash::{DFlashDrafter, crop_drafter_cache},
     diffusion::accept_prefix,
     turboquant::KvCacheConfig,
 };
@@ -1111,13 +1111,19 @@ impl SimpleEngine {
             let verify_len = verify_tokens.len() as i32;
             let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
 
-            // g. Save GDN state for rollback
-            let gdn_backup = GdnStateBackup::save(cache.as_hybrid())
-                .map_err(EngineError::Mlx)?;
+            // g. Snapshot GDN state for tape replay on partial rejection
+            let snapshots: Vec<(Option<Array>, Option<Array>, i32)> =
+                cache.as_hybrid().iter().map(|lc| match lc {
+                    Some(higgs_models::qwen3_next::LayerCache::Arrays(ac)) => {
+                        ac.eval_arrays().expect("eval_arrays");
+                        (ac.conv_state.clone(), ac.ssm_state.clone(), ac.offset)
+                    }
+                    _ => (None, None, 0),
+                }).collect();
 
-            // h. Verify: target forward_with_taps
-            let (verify_logits, verify_taps) = model
-                .forward_with_taps(&verify_input, None, &mut cache, &dflash.tap_layers)
+            // h. Tape-recording verify: forward with taps + GDN innovation tapes
+            let (verify_logits, verify_taps, layer_tapes) = model
+                .forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
                 .map_err(EngineError::Mlx)?;
             eval([&verify_logits]).map_err(EngineError::Mlx)?;
 
@@ -1133,32 +1139,33 @@ impl SimpleEngine {
             let accepted = accept_prefix(&draft_u32, &verify_flat);
             let n_accepted = accepted.len() as i32;
 
-            // j. Rollback on partial accept — restore GDN state and rerun
-            //    accepted tokens so recurrent (GDN) layers advance correctly.
-            //    Without replay, GDN state stays at pre-verify (missing the
-            //    accepted tokens' updates), causing cascading state corruption.
+            // j. Partial accept — GDN-only replay from tape (no full rerun)
+            //    Tape-recording verify already advanced state for ALL positions.
+            //    On partial rejection: restore GDN snapshots, replay only accepted
+            //    positions through the cheap tape kernel, rollback KV for rejected.
             if n_accepted < block_size {
-                gdn_backup.restore_and_rollback(cache.as_hybrid_mut(), verify_len);
-                let rerun_input = Array::from_slice(
-                    &verify_tokens[..n_accepted as usize],
-                    &[1, n_accepted],
-                );
-                let (rerun_logits, rerun_taps) = model
-                    .forward_with_taps(
-                        &rerun_input,
-                        None,
-                        &mut cache,
-                        &dflash.tap_layers,
-                    )
-                    .map_err(EngineError::Mlx)?;
-                eval([&rerun_logits]).map_err(EngineError::Mlx)?;
-                current_taps = rerun_taps;
-            } else {
-                current_taps = verify_taps
-                    .into_iter()
-                    .map(|tap| tap.index((.., ..n_accepted, ..)))
+                let kv_rollback = verify_len - n_accepted;
+                model.replay_tape_rollback(
+                    &layer_tapes, &snapshots, &mut cache,
+                    n_accepted, kv_rollback,
+                ).map_err(EngineError::Mlx)?;
+                // Batch-eval all replayed GDN states in one call
+                let replay_states: Vec<&Array> = cache.as_hybrid().iter()
+                    .filter_map(|lc| match lc {
+                        Some(higgs_models::qwen3_next::LayerCache::Arrays(ac)) => ac.ssm_state.as_ref(),
+                        _ => None,
+                    })
                     .collect();
+                if !replay_states.is_empty() {
+                    eval(replay_states).map_err(EngineError::Mlx)?;
+                }
             }
+            // Taps: slice verify taps to accepted positions (valid for both
+            // full and partial accept — causal model, earlier positions don't
+            // depend on later ones)
+            current_taps = verify_taps.into_iter()
+                .map(|tap| tap.index((.., ..n_accepted, ..)))
+                .collect();
 
             // k. Update state
             for &tok in &accepted {
