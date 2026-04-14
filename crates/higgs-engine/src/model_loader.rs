@@ -90,6 +90,24 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
     }
 }
 
+// NOTE: HIGGS_TARGET_ANE_GDN env-var wiring is deferred to Wave 4.
+//
+// `Qwen3NextCausalLM::enable_ane_gdn_all_layers` exists in higgs-models and is
+// exercised via `test_9b_gdn_all_layers_ane_parity`, but model_loader can't
+// call it yet because the model is moved into a worker thread at
+// `batch_engine.rs:117` (and similar in simple.rs), and `AneKernel` is `!Send`
+// by design (the IOSurface handle is thread-bound). Wave 4 introduces a
+// dedicated GDN ANE worker thread (mirroring `dflash_ane::spawn_ane_worker`)
+// whose `Send + Sync` handle replaces the inline `Arc<GdnAneLayerKernels>` —
+// at that point the env var hook lands here.
+
+/// Load a DFlash block-diffusion drafter from a model directory.
+pub fn load_dflash_drafter<P: AsRef<Path>>(
+    model_dir: P,
+) -> Result<higgs_models::dflash::DFlashDrafter, EngineError> {
+    higgs_models::dflash::load_dflash_drafter(model_dir.as_ref()).map_err(EngineError::Model)
+}
+
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokenizer, EngineError> {
     shared_load_tokenizer(model_dir).map_err(|e| EngineError::Tokenization(e.to_string()))

@@ -117,6 +117,66 @@ pub fn compile_proj(
     })
 }
 
+/// Compile a new ANE projection kernel by patching weights into the donor's
+/// already-compiled microcode (skips MIL compileWithQoS — only loadWithQoS).
+///
+/// The donor must have been compiled with the same `in_dim`, `out_dim`,
+/// `seq_len`, and `name` as the new kernel will use — those parameters fully
+/// determine the MIL text and tile layout, so the donor's microcode is
+/// reusable. New weights `w_f32` are `[out_dim, in_dim]` row-major f32.
+///
+/// Used by Wave 2 to share microcode across all 24 GDN layers (one full
+/// compile on layer 0; layers 1..23 patch in O(load) rather than O(compile)).
+pub fn compile_proj_from_donor(
+    donor: &AneProjKernel,
+    w_f32: &[f32],
+) -> Result<AneProjKernel, String> {
+    let in_dim = donor.in_dim;
+    let out_dim = donor.out_dim;
+    let seq_len = donor.seq_len;
+    let name = donor.name;
+    if w_f32.len() != out_dim * in_dim {
+        return Err(format!(
+            "{name} donor patch weight size mismatch: got {}, expected {out_dim}*{in_dim}={}",
+            w_f32.len(),
+            out_dim * in_dim
+        ));
+    }
+
+    // Regenerate the donor's MIL + tile plan deterministically from dims.
+    let mil: FusedMil = ane_mil::gen_blobfile_matmul(in_dim, out_dim, seq_len, name);
+    let plan = ane_mil::compute_blobfile_tile_plan(in_dim, out_dim);
+    let mut tile_blobs: Vec<Vec<u8>> = Vec::with_capacity(plan.n_tiles);
+    for t in 0..plan.n_tiles {
+        let start = plan.tile_start(t);
+        let this_oc = plan.actual_tile_size(t);
+        let slice = &w_f32[start * in_dim..(start + this_oc) * in_dim];
+        tile_blobs.push(ane_bridge::build_weight_blob_transposed(
+            slice, this_oc, in_dim,
+        ));
+    }
+    let blob_refs: Vec<&[u8]> = tile_blobs.iter().map(|v| v.as_slice()).collect();
+    let name_refs: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
+
+    let kernel = donor.kernel.patch_from_donor(
+        &mil.mil_text,
+        &name_refs,
+        &blob_refs,
+        &[mil.input_bytes],
+        &[mil.output_bytes],
+    )?;
+
+    Ok(AneProjKernel {
+        kernel,
+        name,
+        in_dim,
+        out_dim,
+        seq_len,
+        input_bytes: mil.input_bytes,
+        output_bytes: mil.output_bytes,
+    })
+}
+
 impl AneProjKernel {
     /// Run `x @ W^T` on ANE.
     ///
@@ -292,6 +352,97 @@ mod tests {
         assert!(
             max_diff < 0.05,
             "ANE proj parity: max_diff={max_diff} max_rel={max_rel} (budget 0.05)"
+        );
+    }
+
+    /// Donor-patch parity: compile a donor with weights W1, patch with weights
+    /// W2, and verify each kernel reproduces its own matmul. This validates the
+    /// Wave 2 patch_from_donor path on synthetic data before the full 9B test.
+    ///
+    /// Also checks that `patch_from_donor` does NOT increment `compile_count()`
+    /// — the whole point of donor patching is to skip MIL compilation.
+    #[test]
+    fn ane_proj_donor_patch_parity_synthetic() {
+        let in_dim: usize = 512;
+        let out_dim: usize = 1024;
+        let s: usize = 17;
+        let pad: usize = 32;
+
+        let w1 = random::uniform::<f32, f32>(-0.05, 0.05, &[out_dim as i32, in_dim as i32], None)
+            .expect("random w1");
+        w1.eval().unwrap();
+        let w1_vec = w1.as_slice::<f32>().to_vec();
+
+        let w2 = random::uniform::<f32, f32>(-0.05, 0.05, &[out_dim as i32, in_dim as i32], None)
+            .expect("random w2");
+        w2.eval().unwrap();
+        let w2_vec = w2.as_slice::<f32>().to_vec();
+
+        let x = random::uniform::<f32, f32>(-1.0, 1.0, &[1, s as i32, in_dim as i32], None)
+            .expect("random x");
+        x.eval().unwrap();
+
+        let donor = compile_proj(&w1_vec, in_dim, out_dim, pad, "donor")
+            .expect("compile_proj donor failed");
+        let compile_before = ane_bridge::compile_count();
+        let patched = compile_proj_from_donor(&donor, &w2_vec)
+            .expect("compile_proj_from_donor failed");
+        let compile_after = ane_bridge::compile_count();
+        assert_eq!(
+            compile_before, compile_after,
+            "patch_from_donor must not trigger fresh MIL compile (before={compile_before}, \
+             after={compile_after})"
+        );
+
+        // Donor reproduces W1 matmul.
+        let y_donor_ane = donor.dispatch(&x).unwrap();
+        y_donor_ane.eval().unwrap();
+        let y_donor_ref = mlx_rs::ops::matmul(&x, &w1.t()).unwrap();
+        y_donor_ref.eval().unwrap();
+        let max_diff_donor: f32 = y_donor_ref
+            .subtract(&y_donor_ane)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        assert!(
+            max_diff_donor < 0.05,
+            "donor kernel parity: max_diff={max_diff_donor}"
+        );
+
+        // Patched reproduces W2 matmul (NOT W1 — proves weights actually swapped).
+        let y_patched_ane = patched.dispatch(&x).unwrap();
+        y_patched_ane.eval().unwrap();
+        let y_patched_ref = mlx_rs::ops::matmul(&x, &w2.t()).unwrap();
+        y_patched_ref.eval().unwrap();
+        let max_diff_patched: f32 = y_patched_ref
+            .subtract(&y_patched_ane)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        assert!(
+            max_diff_patched < 0.05,
+            "patched kernel parity: max_diff={max_diff_patched}"
+        );
+
+        // And to be paranoid: patched output should differ materially from donor
+        // matmul (otherwise the swap was a no-op).
+        let cross = y_patched_ane
+            .subtract(&y_donor_ref)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(
+            cross > 0.05,
+            "patched output indistinguishable from donor weights — patch likely failed (max_diff={cross})"
         );
     }
 }
