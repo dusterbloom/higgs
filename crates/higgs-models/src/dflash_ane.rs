@@ -816,15 +816,17 @@ impl DFlashAneWorkerHandle {
     }
 }
 
-impl Drop for DFlashAneWorkerHandle {
-    fn drop(&mut self) {
-        // Best-effort shutdown.  If this is the last sender clone the worker
-        // will exit on channel close; the explicit Shutdown message just
-        // short-circuits the `recv()` wait when other clones outlive the
-        // request traffic.
-        let _ = self.tx.send(AneWorkerMsg::Shutdown);
-    }
-}
+// NOTE: We deliberately do NOT implement Drop to send Shutdown.
+// `DFlashAneWorkerHandle` is `Clone`, and clones routinely outlive a single
+// request (e.g. simple.rs pipeline path clones the handle into a background
+// thread every round). If Drop sent Shutdown unconditionally, the FIRST
+// clone to drop would kill the worker, breaking every subsequent round
+// (`tx.send` panics with `SendError` on round 3 onward).
+//
+// The mpsc channel handles cleanup correctly without explicit Shutdown:
+// when the LAST tx clone drops, `rx.recv()` returns Err and the worker
+// loop exits cleanly. The `AneWorkerMsg::Shutdown` variant is retained
+// for callers that want explicit, immediate worker termination.
 
 /// Spawn a DFlash ANE worker thread that owns a freshly-compiled executor.
 ///
@@ -854,6 +856,7 @@ pub fn spawn_ane_worker(
             };
             let _ = init_tx.send(Ok(()));
 
+            let mut round: u64 = 0;
             while let Ok(msg) = rx.recv() {
                 match msg {
                     AneWorkerMsg::Forward {
@@ -863,10 +866,44 @@ pub fn spawn_ane_worker(
                         mut cache,
                         reply,
                     } => {
+                        round += 1;
                         let tap_slices: Vec<&[f32]> =
                             taps.iter().map(Vec::as_slice).collect();
-                        let out = executor.forward(&noise, &tap_slices, ctx_len, &mut cache);
-                        let _ = reply.send((out, cache));
+                        eprintln!(
+                            "[ane-worker] round={round} ctx_len={ctx_len} BEGIN forward (noise={} taps={})",
+                            noise.len(),
+                            taps.len()
+                        );
+                        let result = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| {
+                                executor.forward(&noise, &tap_slices, ctx_len, &mut cache)
+                            }),
+                        );
+                        match result {
+                            Ok(out) => {
+                                eprintln!(
+                                    "[ane-worker] round={round} END forward ok (out={})",
+                                    out.len()
+                                );
+                                let _ = reply.send((out, cache));
+                            }
+                            Err(payload) => {
+                                let msg = if let Some(s) =
+                                    payload.downcast_ref::<&'static str>()
+                                {
+                                    (*s).to_owned()
+                                } else if let Some(s) = payload.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "non-string panic payload".to_owned()
+                                };
+                                eprintln!(
+                                    "[ane-worker] round={round} PANIC in forward: {msg}"
+                                );
+                                tracing::error!(round, msg = %msg, "DFlash ANE forward() panicked");
+                                // Drop reply — caller sees RecvError; worker stays alive.
+                            }
+                        }
                     }
                     AneWorkerMsg::Shutdown => break,
                 }
