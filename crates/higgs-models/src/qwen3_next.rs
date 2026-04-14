@@ -2074,6 +2074,12 @@ struct GatedDeltaNet {
     qk_norm_weight_k: Array,
     /// Pre-transposed conv weight for fast T=1 decode: [kernel_size, conv_dim].
     conv_weight_t: Option<Array>,
+    /// Optional compiled ANE kernels for the layer's three dense projections
+    /// (`in_proj_qkvz`, `in_proj_ba`, `out_proj`). `None` = Metal matmul as
+    /// before. Only used when `!use_separate_projections` and runtime
+    /// `S <= kernels.qkvz.seq_len`.
+    #[cfg(feature = "ane")]
+    ane_kernels: Option<std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>>,
 }
 
 impl GatedDeltaNet {
@@ -2151,6 +2157,8 @@ impl GatedDeltaNet {
                 w
             },
             conv_weight_t: None,
+            #[cfg(feature = "ane")]
+            ane_kernels: None,
         })
     }
 
@@ -2586,8 +2594,24 @@ impl GatedDeltaNet {
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
             (q, k, v, z, b, a)
         } else {
-            let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
-            let mixed_ba = self.in_proj_ba.forward(inputs)?;
+            // ANE-offload path (feature-gated): when `ane_kernels` is set and
+            // the runtime seq fits the compiled kernel, run `in_proj_qkvz` and
+            // `in_proj_ba` on ANE. Any mismatch falls back to Metal.
+            #[cfg(feature = "ane")]
+            let (mixed_qkvz, mixed_ba) = match self.ane_kernels.as_ref() {
+                Some(k) if (S as usize) <= k.qkvz.seq_len => {
+                    (k.qkvz.dispatch(inputs)?, k.ba.dispatch(inputs)?)
+                }
+                _ => (
+                    self.in_proj_qkvz.forward(inputs)?,
+                    self.in_proj_ba.forward(inputs)?,
+                ),
+            };
+            #[cfg(not(feature = "ane"))]
+            let (mixed_qkvz, mixed_ba) = (
+                self.in_proj_qkvz.forward(inputs)?,
+                self.in_proj_ba.forward(inputs)?,
+            );
             self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?
         };
 
@@ -2696,6 +2720,12 @@ impl GatedDeltaNet {
         let normed = self.norm.forward(&y)?;
         let gated_out = swiglu(&z, &normed)?;
         let out_flat = gated_out.reshape(&[B, S, -1])?;
+        #[cfg(feature = "ane")]
+        let output = match self.ane_kernels.as_ref() {
+            Some(k) if (S as usize) <= k.out_proj.seq_len => k.out_proj.dispatch(&out_flat)?,
+            _ => self.out_proj.forward(&out_flat)?,
+        };
+        #[cfg(not(feature = "ane"))]
         let output = self.out_proj.forward(&out_flat)?;
 
         let tape = GdnLayerTape {
@@ -2822,6 +2852,74 @@ impl GatedDeltaNet {
 
         Ok((q, k, v, z, b, a))
     }
+
+    /// Compile and attach ANE kernels for this layer's three GDN projections
+    /// (`in_proj_qkvz`, `in_proj_ba`, `out_proj`) at the given seq.
+    ///
+    /// After this call, `forward_with_tape` will run all three projections on
+    /// ANE when `runtime S <= seq_len` and `!use_separate_projections`. All
+    /// other operations (conv, norm, delta kernel) remain on Metal.
+    ///
+    /// Returns an error if any weight is not rank-2 or cannot be dequantized.
+    #[cfg(feature = "ane")]
+    pub fn enable_ane_gdn(&mut self, seq_len: i32) -> Result<(), Exception> {
+        use std::sync::Arc;
+        if self.use_separate_projections {
+            return Err(Exception::custom(
+                "enable_ane_gdn: use_separate_projections=true not supported in Wave 1",
+            ));
+        }
+        let qkvz = compile_proj_from_qlinear(&self.in_proj_qkvz, seq_len, "qkvz")?;
+        let ba = compile_proj_from_qlinear(&self.in_proj_ba, seq_len, "ba")?;
+        let out_proj = compile_proj_from_qlinear(&self.out_proj, seq_len, "out_proj")?;
+        self.ane_kernels = Some(Arc::new(crate::qwen3_next_ane::GdnAneLayerKernels {
+            qkvz: Arc::new(qkvz),
+            ba: Arc::new(ba),
+            out_proj: Arc::new(out_proj),
+        }));
+        Ok(())
+    }
+}
+
+/// Helper: dequantize a `QLinear` weight and compile an `AneProjKernel` for it.
+#[cfg(feature = "ane")]
+fn compile_proj_from_qlinear(
+    ql: &QLinear,
+    seq_len: i32,
+    name: &'static str,
+) -> Result<crate::qwen3_next_ane::AneProjKernel, Exception> {
+    let wshape = ql.weight.shape();
+    if wshape.len() != 2 {
+        return Err(Exception::custom(format!(
+            "enable_ane_gdn({name}): expected rank-2 weight, got {wshape:?}"
+        )));
+    }
+    let out_dim = wshape[0] as usize;
+    // For Uint32 packed weights, inner dim is oc * ic_packed*8/bits;
+    // `ops::dequantize` expands this for us, so read the dim from the
+    // dequant output instead of the packed shape.
+    let w_f32 = crate::qwen3_next_ane::dequantize_qlinear_to_f32(
+        &ql.weight,
+        &ql.scales,
+        &ql.biases,
+        ql.group_size,
+        ql.bits,
+    )?;
+    if out_dim == 0 || w_f32.is_empty() {
+        return Err(Exception::custom(format!(
+            "enable_ane_gdn({name}): empty weight"
+        )));
+    }
+    let in_dim = w_f32.len() / out_dim;
+    if in_dim * out_dim != w_f32.len() {
+        return Err(Exception::custom(format!(
+            "enable_ane_gdn({name}): weight len {} not divisible by oc {}",
+            w_f32.len(),
+            out_dim
+        )));
+    }
+    crate::qwen3_next_ane::compile_proj(&w_f32, in_dim, out_dim, seq_len as usize, name)
+        .map_err(Exception::custom)
 }
 
 /// Reference implementation of gate computation (used by tests).
@@ -3676,6 +3774,143 @@ impl Qwen3NextCausalLM {
         Ok((logits, taps, layer_tapes))
     }
 
+    /// Number of transformer layers in the model.
+    pub fn num_layers(&self) -> usize {
+        self.model.layers.len()
+    }
+
+    /// Like [`forward_with_taps_tape`] but inserts `eval()` every
+    /// `layer_chunk_size` layers so Metal can retire intermediate buffers.
+    /// This prevents OOM on large models (27B+) where the full 64-layer
+    /// lazy graph exceeds GPU memory.
+    ///
+    /// Also captures GDN snapshots incrementally (per-chunk) instead of
+    /// requiring a separate upfront clone of all SSM states.
+    #[allow(non_snake_case, clippy::type_complexity)]
+    pub fn forward_with_taps_tape_chunked(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+        layer_chunk_size: usize,
+    ) -> Result<(
+        Array,
+        Vec<Array>,
+        Vec<Option<GdnLayerTape>>,
+        Vec<(Option<Array>, Option<Array>, i32)>,
+    ), Exception> {
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        if kv_cache.is_empty() {
+            *kv_cache = self.make_cache();
+        }
+
+        if kv_cache.len() != self.model.layers.len() {
+            return Err(Exception::custom(format!(
+                "cache length ({}) must match num layers ({})",
+                kv_cache.len(), self.model.layers.len()
+            )));
+        }
+
+        let shape = h.shape();
+        let T = *shape.get(1)
+            .ok_or_else(|| Exception::custom("Hidden state must have >= 2 dims"))?;
+
+        let fa_mask: Option<AttentionMask> = if T > 1 {
+            let kv_offset = kv_cache.iter()
+                .filter_map(|lc| match lc.as_ref()? {
+                    LayerCache::KV(kv) => Some(kv.offset()),
+                    _ => None,
+                })
+                .next()
+                .unwrap_or(0);
+
+            if kv_offset > 0 {
+                Some(AttentionMask::Array(create_causal_mask(T, Some(kv_offset))?))
+            } else {
+                Some(AttentionMask::Causal)
+            }
+        } else {
+            None
+        };
+
+        let num_layers = self.model.layers.len();
+        let mut taps = Vec::with_capacity(tap_layers.len());
+        let mut layer_tapes: Vec<Option<GdnLayerTape>> = Vec::with_capacity(num_layers);
+        let mut snapshots: Vec<(Option<Array>, Option<Array>, i32)> = Vec::with_capacity(num_layers);
+
+        for (layer_idx, (layer, layer_cache)) in self.model.layers.iter_mut()
+            .zip(kv_cache.iter_mut()).enumerate()
+        {
+            let cache = layer_cache.as_mut()
+                .ok_or_else(|| Exception::custom("Layer cache is None"))?;
+
+            // Snapshot GDN state BEFORE this layer's forward mutates it.
+            let snap = match cache {
+                LayerCache::Arrays(ac) => {
+                    ac.eval_arrays().expect("eval_arrays");
+                    (ac.conv_state.clone(), ac.ssm_state.clone(), ac.offset)
+                }
+                _ => (None, None, 0),
+            };
+            snapshots.push(snap);
+
+            let mask_ref = if layer.is_linear { None } else { fa_mask.as_ref() };
+
+            let normed = layer.input_layernorm.forward(&h)?;
+
+            let (r, tape) = if layer.is_linear {
+                let attn = layer.linear_attn.as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing"))?;
+                let LayerCache::Arrays(ssm_cache) = cache else {
+                    return Err(Exception::custom("Expected ArraysCache"));
+                };
+                let (out, tape) = attn.forward_with_tape(&normed, mask_ref, ssm_cache)?;
+                (out, Some(tape))
+            } else {
+                let attn = layer.self_attn.as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing"))?;
+                let LayerCache::KV(layer_kv) = cache else {
+                    return Err(Exception::custom("Expected KVCache"));
+                };
+                (attn.forward(&normed, mask_ref, layer_kv)?, None)
+            };
+
+            layer_tapes.push(tape);
+
+            let h2 = h.add(r)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            h = h2.add(mlp_out)?;
+
+            if tap_layers.contains(&layer_idx) {
+                taps.push(h.clone());
+            }
+
+            // Chunk boundary: eval h + tapes + taps to retire intermediate
+            // Metal buffers (layernorm, projections, MLP intermediates).
+            if (layer_idx + 1) % layer_chunk_size == 0 && layer_idx + 1 < num_layers {
+                let mut targets: Vec<&Array> = vec![&h];
+                for lt in layer_tapes.iter().skip(layer_idx + 1 - layer_chunk_size).flatten() {
+                    targets.push(&lt.delta_tape);
+                    targets.push(&lt.norm_k);
+                    targets.push(&lt.a_proj);
+                    targets.push(&lt.qkv_input);
+                }
+                for tap in &taps {
+                    targets.push(tap);
+                }
+                mlx_rs::transforms::eval(targets)?;
+            }
+        }
+
+        let normed = self.model.norm.forward(&h)?;
+        let logits = self.project_logits(&normed)?;
+
+        Ok((logits, taps, layer_tapes, snapshots))
+    }
+
     /// Replay accepted steps from recorded tape data on partial rejection.
     /// Restores GDN state from `snapshots`, replays tape[:n_accepted],
     /// and rolls back KV cache for rejected positions.
@@ -4001,9 +4236,11 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     let file = std::fs::File::open(config_path)?;
     let config: serde_json::Value = serde_json::from_reader(file)?;
 
-    let text_config = config
-        .get("text_config")
-        .ok_or_else(|| ModelError::UnsupportedModel("missing text_config in config.json".into()))?;
+    // VLM-wrapped checkpoints nest the language-model args under `text_config`.
+    // Flat-layout checkpoints (e.g. Carnice-9b-MLX) put the same fields at the
+    // top level of config.json. Fall back to the top-level object when the
+    // wrapper is absent so both packagings are accepted.
+    let text_config = config.get("text_config").unwrap_or(&config);
 
     let mut obj = text_config.clone();
     let map = obj
@@ -12437,6 +12674,25 @@ mod tests {
         assert_eq!(args.num_experts, 0);
     }
 
+    /// Flat-layout qwen3_5 checkpoints (e.g. Carnice-9b-MLX) put model args at
+    /// the top level of config.json instead of nested under `text_config`.
+    /// The parser must accept both packagings and still populate the same args.
+    #[test]
+    fn test_load_qwen35_flat_config_parses_like_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        // Same fields as qwen35_dense_text_config(), written flat (no wrapper).
+        let flat = qwen35_dense_text_config();
+        // Add the top-level tie_word_embeddings the VLM wrapper normally supplies
+        // so both code paths end up with identical args.
+        let flat_with_tie = flat.trim_end_matches('}').to_string() + r#", "tie_word_embeddings": false}"#;
+        std::fs::write(dir.path().join("config.json"), &flat_with_tie).unwrap();
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+        assert_eq!(args.num_hidden_layers, 4);
+        assert_eq!(args.hidden_size, 256);
+        assert_eq!(args.num_experts, 0);
+        assert_eq!(args.decoder_sparse_step, 0);
+    }
+
     /// GQA ratio: `num_v_heads` must be divisible by `num_k_heads`.
     /// This validates the assumption used in test/bench GDN recurrence loops.
     #[test]
@@ -14108,5 +14364,116 @@ mod tests {
 
         let max_diff: f32 = chunk_y.subtract(&seq_y).unwrap().abs().unwrap().max(None).unwrap().item();
         eprintln!("max |chunk - seq| = {:.6}", max_diff);
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end GDN layer 0 ANE parity (Wave 1 acceptance)
+    // -----------------------------------------------------------------------
+
+    /// Load a real BF16 Qwen3.5-9B model, enable ANE on all three GDN
+    /// projections of layer 0 (`in_proj_qkvz`, `in_proj_ba`, `out_proj`), and
+    /// verify the layer output matches the all-Metal baseline to within 0.05
+    /// absolute. This closes the Phase 1 acceptance gap (which proved only a
+    /// single projection on synthetic weights).
+    ///
+    /// ```bash
+    /// HIGGS_BF16_MODEL_PATH=~/AI-Models/shared/huggingface/hub/models--Qwen--Qwen3.5-9B \
+    ///   cargo test -p higgs-models --release --features ane -- \
+    ///     test_9b_gdn_layer0_ane_parity --nocapture --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "requires BF16 Qwen3.5-9B model on disk"]
+    fn test_9b_gdn_layer0_ane_parity() {
+        use mlx_rs::transforms::eval;
+
+        let model_path = std::env::var("HIGGS_BF16_MODEL_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap();
+            format!("{home}/AI-Models/shared/huggingface/hub/models--Qwen--Qwen3.5-9B")
+        });
+        if !std::path::Path::new(&model_path).exists() {
+            panic!("BF16 model not found at {model_path}. Set HIGGS_BF16_MODEL_PATH.");
+        }
+        eprintln!("Loading BF16 model from {model_path}...");
+        let mut model = load_qwen3_5_model(&model_path).unwrap();
+        let hidden = model.args.hidden_size;
+        eprintln!(
+            "Loaded: {} layers, hidden={hidden}, fa_interval={}",
+            model.args.num_hidden_layers, model.args.full_attention_interval,
+        );
+
+        // Layer 0 must be a GDN (linear attention) layer.
+        let layer = &mut model.model.layers[0];
+        assert!(
+            layer.is_linear,
+            "Layer 0 is not a GDN linear-attention layer — model config changed?"
+        );
+        let gdn = layer
+            .linear_attn
+            .as_mut()
+            .expect("layer 0 linear_attn missing");
+        assert!(
+            !gdn.use_separate_projections,
+            "Wave 1 ANE parity requires the fused qkvz/ba projection path \
+             (set HIGGS_SEPARATE_GDN_PROJ unset)"
+        );
+
+        // Shared deterministic-per-run input at the expected post-layernorm
+        // magnitude (~unit variance). bf16 to match the model dtype.
+        let s = 16i32;
+        let x_f32 = mlx_rs::random::normal::<f32>(&[1, s, hidden], None, None, None).unwrap();
+        let x = x_f32.as_dtype(Dtype::Bfloat16).unwrap();
+        x.eval().unwrap();
+
+        // ── Baseline: all-Metal forward (ane_kernels=None by default) ──
+        let mut cache_ref = ArraysCache::default();
+        let (out_ref, _tape_ref) = gdn
+            .forward_with_tape(&x, None, &mut cache_ref)
+            .expect("baseline Metal forward failed");
+        eval([&out_ref]).unwrap();
+        let ref_max: f32 = out_ref.abs().unwrap().max(None).unwrap().item();
+        eprintln!(
+            "Metal baseline: out shape={:?}, dtype={:?}, |out|_max={:.4}",
+            out_ref.shape(),
+            out_ref.dtype(),
+            ref_max
+        );
+        assert!(
+            ref_max.is_finite() && ref_max > 0.0,
+            "Dead Metal baseline: max={ref_max}"
+        );
+
+        // ── Enable ANE on all three GDN projections at compile seq = S ──
+        gdn.enable_ane_gdn(s).expect("enable_ane_gdn failed");
+
+        let mut cache_ane = ArraysCache::default();
+        let (out_ane, _tape_ane) = gdn
+            .forward_with_tape(&x, None, &mut cache_ane)
+            .expect("ANE forward failed");
+        eval([&out_ane]).unwrap();
+
+        // ── Compare elementwise in f32 ──
+        let diff = out_ref
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .subtract(out_ane.as_dtype(Dtype::Float32).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap();
+        diff.eval().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        let mean_diff: f32 = diff.mean(None).unwrap().item();
+        eprintln!(
+            "GDN layer 0 ANE parity: max_diff={max_diff:.6}, \
+             mean_diff={mean_diff:.6} (budget 0.05)"
+        );
+        assert!(
+            max_diff.is_finite(),
+            "ANE output contains NaN/Inf: max_diff={max_diff}"
+        );
+        assert!(
+            max_diff < 0.05,
+            "GDN layer 0 ANE parity failed: max_diff={max_diff} exceeds 0.05 budget"
+        );
     }
 }
