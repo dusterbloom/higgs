@@ -31,9 +31,19 @@ impl ModelConfig {
 }
 
 /// Load a model from a directory, auto-detecting the architecture.
+///
+/// Once the model is constructed, `maybe_enable_ane_gdn` runs and — if
+/// `HIGGS_TARGET_ANE_GDN=1` and the model is Qwen3-Next-family — attaches
+/// the GDN ANE worker thread to every linear layer.
 pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError> {
     let config = ModelConfig::from_dir(&model_dir)?;
 
+    let mut model = load_model_inner(&config)?;
+    maybe_enable_ane_gdn(&mut model);
+    Ok(model)
+}
+
+fn load_model_inner(config: &ModelConfig) -> Result<AnyModel, EngineError> {
     match config.model_type.as_str() {
         "qwen2" | "qwen3" | "llama" | "mistral" => {
             let model = transformer::load_model(&config.model_dir).map_err(EngineError::Model)?;
@@ -90,16 +100,58 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
     }
 }
 
-// NOTE: HIGGS_TARGET_ANE_GDN env-var wiring is deferred to Wave 4.
-//
-// `Qwen3NextCausalLM::enable_ane_gdn_all_layers` exists in higgs-models and is
-// exercised via `test_9b_gdn_all_layers_ane_parity`, but model_loader can't
-// call it yet because the model is moved into a worker thread at
-// `batch_engine.rs:117` (and similar in simple.rs), and `AneKernel` is `!Send`
-// by design (the IOSurface handle is thread-bound). Wave 4 introduces a
-// dedicated GDN ANE worker thread (mirroring `dflash_ane::spawn_ane_worker`)
-// whose `Send + Sync` handle replaces the inline `Arc<GdnAneLayerKernels>` —
-// at that point the env var hook lands here.
+/// Wave 4: opt-in GDN-on-ANE offload via env-var.
+///
+/// When `HIGGS_TARGET_ANE_GDN=1`, attaches the model-wide
+/// `qwen-gdn-ane-worker` thread to every linear layer of a Qwen3-Next-family
+/// model. The worker handle is `Send + Sync`, so unlike the inline
+/// `Vec<Arc<GdnAneLayerKernels>>` path (Wave 1/2), this survives the model
+/// being moved into the inference worker thread (`batch_engine.rs:117`,
+/// `simple.rs`).
+///
+/// Single-bucket only — `seq_len=32` is hard-coded for now (covers the
+/// drafter target verify shape; runtime seqs > 32 fall back to Metal). When
+/// Wave 3's bridge bug is fixed and multi-bucket lands, this becomes a
+/// configurable bucket list. Other model families silently no-op — this hook
+/// only fires for `AnyModel::Qwen3Next`.
+#[cfg(feature = "ane")]
+fn maybe_enable_ane_gdn(model: &mut AnyModel) {
+    if std::env::var("HIGGS_TARGET_ANE_GDN").as_deref() != Ok("1") {
+        return;
+    }
+    let AnyModel::Qwen3Next(qwen) = model else {
+        tracing::debug!(
+            "HIGGS_TARGET_ANE_GDN=1 set but model is not Qwen3Next — skipping ANE GDN setup"
+        );
+        return;
+    };
+    const ANE_GDN_SEQ_LEN: i32 = 32;
+    match qwen.enable_ane_gdn_all_layers_via_worker(ANE_GDN_SEQ_LEN) {
+        Ok(report) => {
+            tracing::info!(
+                ?report,
+                seq_len = ANE_GDN_SEQ_LEN,
+                "ANE GDN worker enabled — all linear layers offloaded"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "HIGGS_TARGET_ANE_GDN=1 set but enable_ane_gdn_all_layers_via_worker failed — \
+                 falling back to Metal"
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "ane"))]
+fn maybe_enable_ane_gdn(_model: &mut AnyModel) {
+    if std::env::var("HIGGS_TARGET_ANE_GDN").as_deref() == Ok("1") {
+        tracing::warn!(
+            "HIGGS_TARGET_ANE_GDN=1 set but binary built without `ane` feature — ignoring"
+        );
+    }
+}
 
 /// Load a DFlash block-diffusion drafter from a model directory.
 pub fn load_dflash_drafter<P: AsRef<Path>>(
