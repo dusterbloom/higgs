@@ -323,10 +323,49 @@ impl QEmbedding {
 // SwiGLU activation
 // ---------------------------------------------------------------------------
 
-/// SiLU(gate) * x — uses nn::silu (compiled/fused sigmoid+multiply) to reduce
-/// dispatch count from 3 unfused ops to 2 (silu is 1 fused kernel + 1 multiply).
+/// Reads `HIGGS_TARGET_COMPILE` once and caches the result.
+///
+/// When `=1`, [`swiglu`] routes through `mlx_rs::transforms::compile::compile`
+/// so MLX can fuse `sigmoid + multiply(gate) + multiply(x)` into a single
+/// Metal kernel, trimming ~1 dispatch per MLP per layer. Default off — we
+/// want opt-in until A/B confirms a win. See
+/// `.planning/next-session-verify-bottleneck.md` for context.
+fn target_compile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = std::env::var("HIGGS_TARGET_COMPILE").as_deref() == Ok("1");
+        if on {
+            tracing::info!("HIGGS_TARGET_COMPILE=1 — swiglu routed through mlx_rs::compile()");
+        }
+        on
+    })
+}
+
+/// SiLU(gate) * x — uses `nn::silu` (compiled/fused sigmoid+multiply) to
+/// reduce dispatch count from 3 unfused ops to 2 (silu is 1 fused kernel + 1
+/// multiply).
+///
+/// When `HIGGS_TARGET_COMPILE=1`, the whole `silu(g) * u` chain is wrapped in
+/// `mlx_rs::transforms::compile::compile` so MLX fuses all three element-wise
+/// ops into a single dispatch. Numerical equivalence is enforced by the A/B
+/// parity gate before merge.
 pub(crate) fn swiglu(gate: &Array, x: &Array) -> Result<Array, Exception> {
-    nn::silu(gate)?.multiply(x)
+    if target_compile_enabled() {
+        // MLX caches compiled graphs internally by the closure's TypeId. The
+        // closure captures nothing, so its type is stable across calls and
+        // every re-call hits the MLX cache after the first warmup.
+        //
+        // `shapeless=false` (None → default) is the right choice for
+        // DFlash verify: seq is fixed per block_size, so per-shape caching
+        // compiles exactly once per stable shape we see.
+        let mut compiled = mlx_rs::transforms::compile::compile(
+            |(g, u): (&Array, &Array)| -> Result<Array, Exception> { nn::silu(g)?.multiply(u) },
+            None,
+        );
+        compiled((gate, x))
+    } else {
+        nn::silu(gate)?.multiply(x)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2034,6 +2073,12 @@ pub struct GdnLayerTape {
     pub a_proj: Array,
     /// Raw QKV input to conv1d (for conv_state rebuild): `[B, T, conv_dim]`
     pub qkv_input: Array,
+    /// Pre-forward conv_state for rollback: `[B, K-1, conv_dim]`
+    pub conv_state_init: Option<Array>,
+    /// Pre-forward ssm_state for rollback: `[B, Hv, Dv, Dk]`
+    pub ssm_state_init: Option<Array>,
+    /// Pre-forward cache offset for rollback
+    pub offset_init: i32,
 }
 
 #[allow(non_snake_case)]
@@ -2675,6 +2720,11 @@ impl GatedDeltaNet {
         // Save qkv for conv_state rebuild on replay
         let qkv_for_replay = mixed_qkv.clone();
 
+        // Capture initial state for rollback (Python _GDNStateCapture equivalent)
+        let conv_state_init = cache.conv_state.clone();
+        let ssm_state_init = cache.ssm_state.clone();
+        let offset_init = cache.offset;
+
         let conv_state = match cache.conv_state.take() {
             Some(state) => state,
             None => ops::zeros_dtype(
@@ -2796,6 +2846,9 @@ impl GatedDeltaNet {
             norm_k: norm_k_for_replay,
             a_proj: a_for_replay,
             qkv_input: qkv_for_replay,
+            conv_state_init,
+            ssm_state_init,
+            offset_init,
         };
 
         Ok((output, tape))
@@ -3519,6 +3572,13 @@ pub struct Qwen3NextCausalLM {
     lm_head: Option<QLinear>,
     #[param]
     dense_lm_head: Option<nn::Linear>,
+    /// Optional compiled ANE kernel for `lm_head` (`y = hidden @ W_lm^T`).
+    /// Populated by [`Self::finalize_ane_lm_head_inline`] on the inference
+    /// thread when `HIGGS_TARGET_ANE_LM_HEAD=1`. Single seq bucket — runtime
+    /// seqs `> seq_len` fall back to the Metal/QLinear path. Mirrors the
+    /// inline GDN `ane_kernels` design, but with one kernel (not per-layer).
+    #[cfg(feature = "ane")]
+    lm_head_ane: Option<std::sync::Arc<crate::qwen3_next_ane::AneProjKernel>>,
 }
 
 impl Qwen3NextCausalLM {
@@ -3557,10 +3617,22 @@ impl Qwen3NextCausalLM {
             model,
             lm_head,
             dense_lm_head,
+            #[cfg(feature = "ane")]
+            lm_head_ane: None,
         })
     }
 
     fn project_logits(&self, hidden: &Array) -> Result<Array, Exception> {
+        // ANE fast path: compiled `lm_head` kernel populated by
+        // `finalize_ane_lm_head_inline`. Only used when seq <= compile seq_len;
+        // larger seqs (e.g. long prefill) fall through to the Metal path below.
+        #[cfg(feature = "ane")]
+        if let Some(ane) = self.lm_head_ane.as_ref() {
+            let shape = hidden.shape();
+            if shape.len() == 3 && (shape[1] as usize) <= ane.seq_len {
+                return ane.dispatch(hidden);
+            }
+        }
         if let Some(head) = self.dense_lm_head.as_ref() {
             return ops::matmul(hidden, head.weight.value.t());
         }
@@ -3900,6 +3972,403 @@ impl Qwen3NextCausalLM {
             );
         }
         Ok(report)
+    }
+
+    /// Inference-thread-safe prep for ANE GDN offload (P0.8 Stage 2).
+    ///
+    /// Dequantizes weights for every linear layer's three projections and
+    /// returns them in a Send-safe `Vec<GdnLayerWeights>`. NO ANE
+    /// compilation here — the returned weights can travel across a thread
+    /// boundary into the inference worker, which then calls
+    /// [`Self::finalize_ane_gdn_inline`] to compile the kernels on THAT
+    /// thread.
+    ///
+    /// Splits Step 1 of [`Self::enable_ane_gdn_all_layers_via_worker`] out
+    /// from the spawn+attach phase, so dispatches avoid the mpsc roundtrip
+    /// (~42 % slower than Metal on dflash_4b at 4 B —
+    /// `.planning/next-session-p08-stage2-kill-mpsc.md`).
+    #[cfg(feature = "ane")]
+    pub fn prepare_ane_gdn_weights(
+        &self,
+        seq_len: i32,
+    ) -> Result<(Vec<crate::qwen3_next_ane_worker::GdnLayerWeights>, i32), Exception>
+    {
+        if seq_len <= 0 {
+            return Err(Exception::custom(format!(
+                "prepare_ane_gdn_weights: non-positive seq_len {seq_len}"
+            )));
+        }
+        let mut layer_weights: Vec<crate::qwen3_next_ane_worker::GdnLayerWeights> =
+            Vec::new();
+        for (idx, layer) in self.model.layers.iter().enumerate() {
+            if !layer.is_linear {
+                continue;
+            }
+            let gdn = layer.linear_attn.as_ref().ok_or_else(|| {
+                Exception::custom(format!(
+                    "prepare_ane_gdn_weights: layer {idx} is_linear but linear_attn=None"
+                ))
+            })?;
+            if gdn.use_separate_projections {
+                return Err(Exception::custom(format!(
+                    "prepare_ane_gdn_weights: layer {idx} use_separate_projections=true \
+                     not supported"
+                )));
+            }
+            let (qkvz_w, qkvz_in, qkvz_out) =
+                dequantize_gdn_qlinear(&gdn.in_proj_qkvz, "qkvz", idx)?;
+            let (ba_w, ba_in, ba_out) =
+                dequantize_gdn_qlinear(&gdn.in_proj_ba, "ba", idx)?;
+            let (out_w, out_in, out_out) =
+                dequantize_gdn_qlinear(&gdn.out_proj, "out_proj", idx)?;
+            layer_weights.push(crate::qwen3_next_ane_worker::GdnLayerWeights {
+                qkvz_w_f32: qkvz_w,
+                qkvz_in,
+                qkvz_out,
+                ba_w_f32: ba_w,
+                ba_in,
+                ba_out,
+                out_w_f32: out_w,
+                out_in,
+                out_out,
+            });
+        }
+        if layer_weights.is_empty() {
+            return Err(Exception::custom(
+                "prepare_ane_gdn_weights: model has no linear-attention layers",
+            ));
+        }
+        Ok((layer_weights, seq_len))
+    }
+
+    /// Inference-thread finalize: compile ANE kernels for every linear
+    /// layer using the pre-dequantized weights from
+    /// [`Self::prepare_ane_gdn_weights`], install them as inline
+    /// `ane_kernels` (NOT `ane_handle` — no mpsc, no thread crossing per
+    /// dispatch).
+    ///
+    /// MUST be called on the thread that will later call
+    /// `forward_with_tape`. `AneProjKernel`'s IOSurface handles are
+    /// thread-bound, so compiling on the same thread that dispatches keeps
+    /// the realtime path warm.
+    ///
+    /// After compile, enters realtime mode for this thread (one-shot —
+    /// never exited; the inference thread lives for the daemon's
+    /// lifetime). Mirrors `qwen3_next_ane_worker.rs:350` and
+    /// `dflash_ane.rs:481`.
+    #[cfg(feature = "ane")]
+    pub fn finalize_ane_gdn_inline(
+        &mut self,
+        weights: Vec<crate::qwen3_next_ane_worker::GdnLayerWeights>,
+        seq_len: i32,
+    ) -> Result<(), Exception> {
+        use std::sync::Arc;
+        use std::time::Instant;
+        if weights.is_empty() {
+            return Err(Exception::custom("finalize_ane_gdn_inline: weights empty"));
+        }
+        if seq_len <= 0 {
+            return Err(Exception::custom(format!(
+                "finalize_ane_gdn_inline: non-positive seq_len {seq_len}"
+            )));
+        }
+
+        let load_before = crate::ane_bridge::load_count();
+        let compile_before = crate::ane_bridge::compile_count();
+        let t_compile = Instant::now();
+
+        let linear_indices: Vec<usize> = self
+            .model
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, layer)| if layer.is_linear { Some(idx) } else { None })
+            .collect();
+        if linear_indices.len() != weights.len() {
+            return Err(Exception::custom(format!(
+                "finalize_ane_gdn_inline: weights len {} != model linear layers {}",
+                weights.len(),
+                linear_indices.len()
+            )));
+        }
+
+        // Layer 0 full compile (donor for the rest).
+        let pad = seq_len as usize;
+        let w0 = &weights[0];
+        let qkvz0 = crate::qwen3_next_ane::compile_proj(
+            &w0.qkvz_w_f32, w0.qkvz_in, w0.qkvz_out, pad, "qkvz",
+        )
+        .map_err(|e| Exception::custom(format!("finalize: layer 0 qkvz compile: {e}")))?;
+        let ba0 = crate::qwen3_next_ane::compile_proj(
+            &w0.ba_w_f32, w0.ba_in, w0.ba_out, pad, "ba",
+        )
+        .map_err(|e| Exception::custom(format!("finalize: layer 0 ba compile: {e}")))?;
+        let out0 = crate::qwen3_next_ane::compile_proj(
+            &w0.out_w_f32, w0.out_in, w0.out_out, pad, "out_proj",
+        )
+        .map_err(|e| Exception::custom(format!("finalize: layer 0 out_proj compile: {e}")))?;
+
+        // Patch layers 1..N from layer 0's donors. loadWithQoS only,
+        // no MIL recompile (the Wave 2 invariant).
+        let mut tail: Vec<(
+            crate::qwen3_next_ane::AneProjKernel,
+            crate::qwen3_next_ane::AneProjKernel,
+            crate::qwen3_next_ane::AneProjKernel,
+        )> = Vec::with_capacity(weights.len().saturating_sub(1));
+        for (idx, w) in weights.iter().enumerate().skip(1) {
+            if w.qkvz_in != w0.qkvz_in
+                || w.qkvz_out != w0.qkvz_out
+                || w.ba_in != w0.ba_in
+                || w.ba_out != w0.ba_out
+                || w.out_in != w0.out_in
+                || w.out_out != w0.out_out
+            {
+                return Err(Exception::custom(format!(
+                    "finalize: layer {idx}: shapes diverge from layer 0 — donor patching \
+                     requires identical (in,out) per projection"
+                )));
+            }
+            let qkvz_i =
+                crate::qwen3_next_ane::compile_proj_from_donor(&qkvz0, &w.qkvz_w_f32)
+                    .map_err(|e| {
+                        Exception::custom(format!("finalize: layer {idx} qkvz patch: {e}"))
+                    })?;
+            let ba_i =
+                crate::qwen3_next_ane::compile_proj_from_donor(&ba0, &w.ba_w_f32)
+                    .map_err(|e| {
+                        Exception::custom(format!("finalize: layer {idx} ba patch: {e}"))
+                    })?;
+            let out_i =
+                crate::qwen3_next_ane::compile_proj_from_donor(&out0, &w.out_w_f32)
+                    .map_err(|e| {
+                        Exception::custom(format!(
+                            "finalize: layer {idx} out_proj patch: {e}"
+                        ))
+                    })?;
+            tail.push((qkvz_i, ba_i, out_i));
+        }
+        let mut compiled: Vec<(
+            crate::qwen3_next_ane::AneProjKernel,
+            crate::qwen3_next_ane::AneProjKernel,
+            crate::qwen3_next_ane::AneProjKernel,
+        )> = Vec::with_capacity(weights.len());
+        compiled.push((qkvz0, ba0, out0));
+        compiled.extend(tail);
+        let compile_ms = t_compile.elapsed().as_millis() as u64;
+
+        // Drop the dequantized f32 weights ASAP — they're now baked into
+        // the ANE BLOBFILEs (~24 × (qkvz+ba+out) × 4B/element otherwise).
+        drop(weights);
+
+        // Attach inline kernels to each linear layer; clear any pre-existing
+        // ane_handle so forward_with_tape picks the inline path (it checks
+        // ane_handle FIRST, ane_kernels SECOND).
+        for ((linear_idx, &model_layer_idx), (qkvz_k, ba_k, out_k)) in
+            linear_indices.iter().enumerate().zip(compiled.into_iter())
+        {
+            let layer = &mut self.model.layers[model_layer_idx];
+            let gdn = layer.linear_attn.as_mut().ok_or_else(|| {
+                Exception::custom(format!(
+                    "finalize: layer {model_layer_idx} linear_attn vanished"
+                ))
+            })?;
+            gdn.ane_handle = None;
+            gdn.ane_linear_layer_idx = linear_idx;
+            let layer_kernels = Arc::new(crate::qwen3_next_ane::GdnAneLayerKernels {
+                qkvz: Arc::new(qkvz_k),
+                ba: Arc::new(ba_k),
+                out_proj: Arc::new(out_k),
+            });
+            gdn.ane_kernels = Some(vec![layer_kernels]);
+        }
+
+        // Enter realtime mode for this thread (one-shot). Mirrors the
+        // worker thread setup at qwen3_next_ane_worker.rs:350. The
+        // inference thread lives for the daemon's lifetime — never call
+        // end_realtime.
+        let rt_enabled = crate::ane_bridge::AneKernel::begin_realtime();
+
+        let load_after = crate::ane_bridge::load_count();
+        let compile_after = crate::ane_bridge::compile_count();
+        let compile_delta = compile_after - compile_before;
+        if compile_delta != 3 {
+            eprintln!(
+                "WARN: finalize_ane_gdn_inline: expected compile_count delta=3, \
+                 got {compile_delta}"
+            );
+        }
+        tracing::info!(
+            n_layers = linear_indices.len(),
+            compile_ms,
+            load_before,
+            load_after,
+            compile_before,
+            compile_after,
+            rt_enabled,
+            "ANE GDN inline finalize complete on inference thread"
+        );
+
+        Ok(())
+    }
+
+    /// Main-thread prep: dequantize `lm_head` weights to contiguous f32.
+    ///
+    /// Returns `Ok(None)` when the model has tied word embeddings (no explicit
+    /// `lm_head` to offload — would need to dequant `embed_tokens` which is
+    /// out of scope for step 1). Returns `Ok(Some((w_f32, hidden, vocab)))`
+    /// otherwise. `w_f32` is row-major `[vocab * hidden]` — exactly the layout
+    /// [`crate::qwen3_next_ane::compile_proj`] expects
+    /// (`out_dim=vocab, in_dim=hidden`).
+    ///
+    /// Send-safe (returns plain `Vec<f32>`). Ships across the inference-thread
+    /// move; finalize on that thread via [`Self::finalize_ane_lm_head_inline`].
+    #[cfg(feature = "ane")]
+    pub fn prepare_lm_head_weights(
+        &self,
+    ) -> Result<Option<(Vec<f32>, usize, usize)>, Exception> {
+        let hidden = self.args.hidden_size as usize;
+        let vocab = self.args.vocab_size as usize;
+
+        if let Some(head) = self.dense_lm_head.as_ref() {
+            let w = &head.weight.value;
+            let shape = w.shape();
+            if shape.len() != 2
+                || shape[0] as usize != vocab
+                || shape[1] as usize != hidden
+            {
+                return Err(Exception::custom(format!(
+                    "prepare_lm_head_weights: dense_lm_head shape {:?} != [{vocab}, {hidden}]",
+                    shape
+                )));
+            }
+            let w_f32 = w.as_dtype(Dtype::Float32)?;
+            w_f32.eval()?;
+            return Ok(Some((w_f32.as_slice::<f32>().to_vec(), hidden, vocab)));
+        }
+
+        if let Some(head) = self.lm_head.as_ref() {
+            let w_f32 = crate::qwen3_next_ane::dequantize_qlinear_to_f32(
+                &head.weight.value,
+                &head.scales.value,
+                &head.biases.value,
+                head.group_size,
+                head.bits,
+            )?;
+            if w_f32.len() != vocab * hidden {
+                return Err(Exception::custom(format!(
+                    "prepare_lm_head_weights: QLinear dequant len {} != vocab*hidden {}",
+                    w_f32.len(),
+                    vocab * hidden
+                )));
+            }
+            return Ok(Some((w_f32, hidden, vocab)));
+        }
+
+        // Tied-embedding path: `project_logits` uses `embed_tokens.as_linear(hidden)`,
+        // which is identical to `hidden @ W_embed^T` where `W_embed` is
+        // `[vocab, hidden]` — same layout `compile_proj` wants. Dequant the
+        // QEmbedding weight the same way as QLinear.
+        let embed = &self.model.embed_tokens;
+        let w_f32 = crate::qwen3_next_ane::dequantize_qlinear_to_f32(
+            &embed.weight.value,
+            &embed.scales.value,
+            &embed.biases.value,
+            embed.group_size,
+            embed.bits,
+        )?;
+        if w_f32.len() != vocab * hidden {
+            return Err(Exception::custom(format!(
+                "prepare_lm_head_weights: tied QEmbedding dequant len {} != vocab*hidden {}",
+                w_f32.len(),
+                vocab * hidden
+            )));
+        }
+        Ok(Some((w_f32, hidden, vocab)))
+    }
+
+    /// Inference-thread finalize: compile the ANE `lm_head` kernel from the
+    /// pre-dequantized weights produced by [`Self::prepare_lm_head_weights`]
+    /// and install it as `lm_head_ane`.
+    ///
+    /// MUST be called on the thread that will later call `project_logits`
+    /// (e.g. inside the inference worker thread spawn in `batch_engine.rs` /
+    /// `simple.rs`). `AneProjKernel`'s IOSurface handles are thread-bound,
+    /// matching the GDN inline pattern at [`Self::finalize_ane_gdn_inline`].
+    ///
+    /// Enters realtime mode (one-shot — never exited, matching the inference
+    /// thread's daemon-lifetime assumption) so `AneProjKernel::dispatch`'s
+    /// `eval_realtime()` path stays on the hot code path. Safe to call after
+    /// [`Self::finalize_ane_gdn_inline`] has already entered the mode —
+    /// `begin_realtime` is a no-op if already active on this thread.
+    #[cfg(feature = "ane")]
+    pub fn finalize_ane_lm_head_inline(
+        &mut self,
+        w_f32: Vec<f32>,
+        hidden: usize,
+        vocab: usize,
+        seq_len: i32,
+    ) -> Result<(), Exception> {
+        use std::sync::Arc;
+        use std::time::Instant;
+        if seq_len <= 0 {
+            return Err(Exception::custom(format!(
+                "finalize_ane_lm_head_inline: non-positive seq_len {seq_len}"
+            )));
+        }
+        if w_f32.len() != vocab * hidden {
+            return Err(Exception::custom(format!(
+                "finalize_ane_lm_head_inline: weight len {} != vocab*hidden {} ({vocab}*{hidden})",
+                w_f32.len(),
+                vocab * hidden
+            )));
+        }
+
+        let load_before = crate::ane_bridge::load_count();
+        let compile_before = crate::ane_bridge::compile_count();
+        let t_compile = Instant::now();
+
+        let pad = seq_len as usize;
+        let kernel =
+            crate::qwen3_next_ane::compile_proj(&w_f32, hidden, vocab, pad, "lm_head")
+                .map_err(|e| {
+                    Exception::custom(format!("finalize_ane_lm_head_inline: compile: {e}"))
+                })?;
+        let compile_ms = t_compile.elapsed().as_millis() as u64;
+
+        // Drop the dequantized weights ASAP — they're now baked into the ANE
+        // BLOBFILE (~vocab * hidden * 4 bytes otherwise — ~1.2 GB at Qwen3).
+        drop(w_f32);
+
+        self.lm_head_ane = Some(Arc::new(kernel));
+
+        // Enter realtime mode one-shot for the inference thread. Idempotent
+        // if `finalize_ane_gdn_inline` already called it — the ane_bridge
+        // flag tracks per-thread state and re-entering is a no-op.
+        let rt_enabled = crate::ane_bridge::AneKernel::begin_realtime();
+
+        let load_after = crate::ane_bridge::load_count();
+        let compile_after = crate::ane_bridge::compile_count();
+        let compile_delta = compile_after - compile_before;
+        if compile_delta != 1 {
+            eprintln!(
+                "WARN: finalize_ane_lm_head_inline: expected compile_count delta=1, \
+                 got {compile_delta}"
+            );
+        }
+        tracing::info!(
+            hidden,
+            vocab,
+            seq_len = pad,
+            compile_ms,
+            load_before,
+            load_after,
+            compile_before,
+            compile_after,
+            rt_enabled,
+            "ANE lm_head inline finalize complete on inference thread"
+        );
+
+        Ok(())
     }
 
     /// Forward pass returning hidden states before the LM head.
@@ -4298,16 +4767,34 @@ impl Qwen3NextCausalLM {
         let mut taps = Vec::with_capacity(tap_layers.len());
         let mut layer_tapes: Vec<Option<GdnLayerTape>> = Vec::with_capacity(self.model.layers.len());
 
+        // Optional per-layer GDN/FA timing. Gated by env to avoid the eval()
+        // stalls (which serialize the GPU pipeline) in normal runs. Numbers
+        // produced under timing are upper bounds: they include synchronization
+        // cost that real execution overlaps. Useful for the GDN-vs-FA ratio.
+        let layer_timing = std::env::var("HIGGS_DFLASH_LAYER_TIMING")
+            .map(|v| v == "1").unwrap_or(false);
+        let mut gdn_total_ms = 0.0_f64;
+        let mut fa_total_ms = 0.0_f64;
+        let mut gdn_count = 0usize;
+        let mut fa_count = 0usize;
+        let mut layer_ckpt = if layer_timing {
+            mlx_rs::transforms::eval([&h])?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         for (layer_idx, (layer, layer_cache)) in self.model.layers.iter_mut()
             .zip(kv_cache.iter_mut()).enumerate()
         {
             let cache = layer_cache.as_mut()
                 .ok_or_else(|| Exception::custom("Layer cache is None"))?;
-            let mask_ref = if layer.is_linear { None } else { fa_mask.as_ref() };
+            let is_linear = layer.is_linear;
+            let mask_ref = if is_linear { None } else { fa_mask.as_ref() };
 
             let normed = layer.input_layernorm.forward(&h)?;
 
-            let (r, tape) = if layer.is_linear {
+            let (r, tape) = if is_linear {
                 let attn = layer.linear_attn.as_mut()
                     .ok_or_else(|| Exception::custom("linear_attn missing"))?;
                 let LayerCache::Arrays(ssm_cache) = cache else {
@@ -4334,10 +4821,37 @@ impl Qwen3NextCausalLM {
             if tap_layers.contains(&layer_idx) {
                 taps.push(h.clone());
             }
+
+            if let Some(ckpt) = layer_ckpt.as_mut() {
+                mlx_rs::transforms::eval([&h])?;
+                let now = std::time::Instant::now();
+                let dt_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                if is_linear {
+                    gdn_total_ms += dt_ms;
+                    gdn_count += 1;
+                } else {
+                    fa_total_ms += dt_ms;
+                    fa_count += 1;
+                }
+                *ckpt = now;
+            }
         }
 
         let normed = self.model.norm.forward(&h)?;
         let logits = self.project_logits(&normed)?;
+
+        if layer_timing {
+            mlx_rs::transforms::eval([&logits])?;
+            let tail_ms = layer_ckpt
+                .map(|c| c.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            tracing::info!(
+                "dflash_layer_timing seq={} gdn_layers={} gdn_total_ms={:.1} gdn_avg={:.2}ms \
+                 fa_layers={} fa_total_ms={:.1} fa_avg={:.2}ms tail_ms={:.1}",
+                T, gdn_count, gdn_total_ms, gdn_total_ms / gdn_count.max(1) as f64,
+                fa_count, fa_total_ms, fa_total_ms / fa_count.max(1) as f64, tail_ms,
+            );
+        }
 
         Ok((logits, taps, layer_tapes))
     }
@@ -4366,7 +4880,6 @@ impl Qwen3NextCausalLM {
         Array,
         Vec<Array>,
         Vec<Option<GdnLayerTape>>,
-        Vec<(Option<Array>, Option<Array>, i32)>,
     ), Exception> {
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
@@ -4406,7 +4919,20 @@ impl Qwen3NextCausalLM {
         let num_layers = self.model.layers.len();
         let mut taps = Vec::with_capacity(tap_layers.len());
         let mut layer_tapes: Vec<Option<GdnLayerTape>> = Vec::with_capacity(num_layers);
-        let mut snapshots: Vec<(Option<Array>, Option<Array>, i32)> = Vec::with_capacity(num_layers);
+
+        // See `forward_with_taps_tape` for caveats on per-layer timing.
+        let layer_timing = std::env::var("HIGGS_DFLASH_LAYER_TIMING")
+            .map(|v| v == "1").unwrap_or(false);
+        let mut gdn_total_ms = 0.0_f64;
+        let mut fa_total_ms = 0.0_f64;
+        let mut gdn_count = 0usize;
+        let mut fa_count = 0usize;
+        let mut layer_ckpt = if layer_timing {
+            mlx_rs::transforms::eval([&h])?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         for (layer_idx, (layer, layer_cache)) in self.model.layers.iter_mut()
             .zip(kv_cache.iter_mut()).enumerate()
@@ -4414,21 +4940,12 @@ impl Qwen3NextCausalLM {
             let cache = layer_cache.as_mut()
                 .ok_or_else(|| Exception::custom("Layer cache is None"))?;
 
-            // Snapshot GDN state BEFORE this layer's forward mutates it.
-            let snap = match cache {
-                LayerCache::Arrays(ac) => {
-                    ac.eval_arrays().expect("eval_arrays");
-                    (ac.conv_state.clone(), ac.ssm_state.clone(), ac.offset)
-                }
-                _ => (None, None, 0),
-            };
-            snapshots.push(snap);
-
-            let mask_ref = if layer.is_linear { None } else { fa_mask.as_ref() };
+            let is_linear = layer.is_linear;
+            let mask_ref = if is_linear { None } else { fa_mask.as_ref() };
 
             let normed = layer.input_layernorm.forward(&h)?;
 
-            let (r, tape) = if layer.is_linear {
+            let (r, tape) = if is_linear {
                 let attn = layer.linear_attn.as_mut()
                     .ok_or_else(|| Exception::custom("linear_attn missing"))?;
                 let LayerCache::Arrays(ssm_cache) = cache else {
@@ -4456,6 +4973,20 @@ impl Qwen3NextCausalLM {
                 taps.push(h.clone());
             }
 
+            if let Some(ckpt) = layer_ckpt.as_mut() {
+                mlx_rs::transforms::eval([&h])?;
+                let now = std::time::Instant::now();
+                let dt_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                if is_linear {
+                    gdn_total_ms += dt_ms;
+                    gdn_count += 1;
+                } else {
+                    fa_total_ms += dt_ms;
+                    fa_count += 1;
+                }
+                *ckpt = now;
+            }
+
             // Chunk boundary: eval h + tapes + taps to retire intermediate
             // Metal buffers (layernorm, projections, MLP intermediates).
             if (layer_idx + 1) % layer_chunk_size == 0 && layer_idx + 1 < num_layers {
@@ -4476,7 +5007,20 @@ impl Qwen3NextCausalLM {
         let normed = self.model.norm.forward(&h)?;
         let logits = self.project_logits(&normed)?;
 
-        Ok((logits, taps, layer_tapes, snapshots))
+        if layer_timing {
+            mlx_rs::transforms::eval([&logits])?;
+            let tail_ms = layer_ckpt
+                .map(|c| c.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            tracing::info!(
+                "dflash_layer_timing_chunked seq={} gdn_layers={} gdn_total_ms={:.1} gdn_avg={:.2}ms \
+                 fa_layers={} fa_total_ms={:.1} fa_avg={:.2}ms tail_ms={:.1}",
+                T, gdn_count, gdn_total_ms, gdn_total_ms / gdn_count.max(1) as f64,
+                fa_count, fa_total_ms, fa_total_ms / fa_count.max(1) as f64, tail_ms,
+            );
+        }
+
+        Ok((logits, taps, layer_tapes))
     }
 
     /// Replay accepted steps from recorded tape data on partial rejection.
@@ -4489,32 +5033,11 @@ impl Qwen3NextCausalLM {
     pub fn replay_tape_rollback(
         &self,
         layer_tapes: &[Option<GdnLayerTape>],
-        snapshots: &[(Option<Array>, Option<Array>, i32)],
         kv_cache: &mut [Option<LayerCache>],
         n_accepted: i32,
         kv_rollback: i32,
     ) -> Result<(), Exception> {
         use mlx_rs::ops;
-
-        if n_accepted <= 0 {
-            // Just restore snapshots and rollback KV
-            for (lc, (snap_conv, snap_ssm, snap_offset)) in
-                kv_cache.iter_mut().zip(snapshots.iter())
-            {
-                match lc {
-                    Some(LayerCache::Arrays(ac)) => {
-                        ac.conv_state = snap_conv.clone();
-                        ac.ssm_state = snap_ssm.clone();
-                        ac.offset = *snap_offset;
-                    }
-                    Some(LayerCache::KV(kv)) => {
-                        if kv_rollback > 0 { kv.rollback(kv_rollback); }
-                    }
-                    _ => {}
-                }
-            }
-            return Ok(());
-        }
 
         // Collect GDN layer data for batched replay
         struct GdnReplayEntry<'a> {
@@ -4526,21 +5049,20 @@ impl Qwen3NextCausalLM {
 
         let mut gdn_entries: Vec<GdnReplayEntry> = Vec::new();
 
-        // First pass: restore all snapshots, rollback KV, collect GDN entries
-        for (i, (lc, (snap_conv, snap_ssm, snap_offset))) in
-            kv_cache.iter_mut().zip(snapshots.iter()).enumerate()
-        {
+        // First pass: restore state from tape's initial snapshot, rollback KV, collect GDN entries
+        for (i, lc) in kv_cache.iter_mut().enumerate() {
             match lc {
                 Some(LayerCache::Arrays(ac)) => {
-                    ac.conv_state = snap_conv.clone();
-                    ac.ssm_state = snap_ssm.clone();
-                    ac.offset = *snap_offset;
-
                     if let Some(Some(tape)) = layer_tapes.get(i) {
+                        // Restore from tape-captured initial state (Python _GDNStateCapture equivalent)
+                        ac.conv_state = tape.conv_state_init.clone();
+                        ac.ssm_state = tape.ssm_state_init.clone();
+                        ac.offset = tape.offset_init;
+
                         let gdn_layer = self.model.layers[i].linear_attn.as_ref()
                             .ok_or_else(|| Exception::custom("linear_attn missing for replay"))?;
 
-                        let state = ac.ssm_state.clone().unwrap_or_else(|| {
+                        let state = tape.ssm_state_init.clone().unwrap_or_else(|| {
                             let dt = tape.delta_tape.dtype();
                             ops::zeros_dtype(
                                 &[1, gdn_layer.num_v_heads, gdn_layer.head_v_dim, gdn_layer.head_k_dim], dt,

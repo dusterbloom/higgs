@@ -100,7 +100,7 @@ impl BatchEngine {
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model (batch engine)");
 
-        let model = model_loader::load_model(model_dir)?;
+        let (model, pending_ane_gdn, pending_ane_lm_head) = model_loader::load_model(model_dir)?;
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
         let template = ChatTemplateRenderer::from_model_dir(model_dir)?;
         let eos_token_ids = crate::simple::extract_eos_tokens(model_dir);
@@ -115,7 +115,49 @@ impl BatchEngine {
         std::thread::Builder::new()
             .name("batch-engine".into())
             .spawn(move || {
-                worker_loop(model, &tok, &eos_ids, request_rx);
+                // P0.8 Stage 2: finalize ANE GDN on the inference thread so
+                // AneProjKernel IOSurfaces are bound here (where dispatch
+                // happens), and enter realtime mode for this thread once.
+                #[cfg(feature = "ane")]
+                {
+                    let mut model = model;
+                    if let Some(pending) = pending_ane_gdn {
+                        if let higgs_models::AnyModel::Qwen3Next(qwen) = &mut model {
+                            if let Err(e) =
+                                qwen.finalize_ane_gdn_inline(pending.weights, pending.seq_len)
+                            {
+                                tracing::error!(
+                                    error = %e,
+                                    "finalize_ane_gdn_inline failed on inference thread — \
+                                     falling back to Metal"
+                                );
+                            }
+                        }
+                    }
+                    if let Some(pending) = pending_ane_lm_head {
+                        if let higgs_models::AnyModel::Qwen3Next(qwen) = &mut model {
+                            if let Err(e) = qwen.finalize_ane_lm_head_inline(
+                                pending.weights,
+                                pending.hidden,
+                                pending.vocab,
+                                pending.seq_len,
+                            ) {
+                                tracing::error!(
+                                    error = %e,
+                                    "finalize_ane_lm_head_inline failed on inference thread — \
+                                     falling back to Metal"
+                                );
+                            }
+                        }
+                    }
+                    worker_loop(model, &tok, &eos_ids, request_rx);
+                }
+                #[cfg(not(feature = "ane"))]
+                {
+                    let _ = pending_ane_gdn;
+                    let _ = pending_ane_lm_head;
+                    worker_loop(model, &tok, &eos_ids, request_rx);
+                }
             })
             .map_err(|e| EngineError::Generation(format!("Failed to spawn worker: {e}")))?;
 
