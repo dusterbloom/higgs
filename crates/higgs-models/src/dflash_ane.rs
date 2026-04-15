@@ -40,7 +40,7 @@ use crate::diffusion::{
 /// Transpose CPU [seq, ch] → ANE [ch, seq] and convert to raw bytes.
 ///
 /// Uses NEON 4x4 block transpose for the aligned interior and scalar for edges.
-fn cpu_to_ane(data: &[f32], seq: usize, ch: usize) -> Vec<u8> {
+pub(crate) fn cpu_to_ane(data: &[f32], seq: usize, ch: usize) -> Vec<u8> {
     debug_assert_eq!(data.len(), seq * ch);
     let mut out = vec![0u8; seq * ch * 4];
     let out_f32 =
@@ -52,7 +52,7 @@ fn cpu_to_ane(data: &[f32], seq: usize, ch: usize) -> Vec<u8> {
 /// Transpose ANE [ch, seq] bytes → CPU [seq, ch] f32.
 ///
 /// Uses NEON 4x4 block transpose for the aligned interior and scalar for edges.
-fn ane_to_cpu(bytes: &[u8], seq: usize, ch: usize) -> Vec<f32> {
+pub(crate) fn ane_to_cpu(bytes: &[u8], seq: usize, ch: usize) -> Vec<f32> {
     debug_assert_eq!(bytes.len(), seq * ch * 4);
     let src =
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, seq * ch) };
@@ -206,6 +206,21 @@ struct DFlashAneLayerKernels {
 const DOWN_PROJ_ANE_SCALE: f32 = 0.5;
 const DOWN_PROJ_ANE_UNSCALE: f32 = 1.0 / DOWN_PROJ_ANE_SCALE;
 
+/// Pre-quantization scale applied to `up_proj` weights — the *upstream* mirror
+/// of `DOWN_PROJ_ANE_SCALE`. The fused `silu_gate_up` MIL (see
+/// `ane_mil::gen_fused_silu_gate_up_proj`) computes `gated = silu(gate@x) * up@x`
+/// in **fp16** before casting back to fp32 at the IOSurface boundary. On 9B
+/// (`inter=12288`) the `silu * um` product can saturate fp16 the same way the
+/// down accumulator did pre-`c95a80c7`. Halving `up_proj` halves `um`, halving
+/// the product. Compensation is applied alongside the down unscale at the
+/// CPU residual (`forward()` below), giving a combined `× 4.0` factor.
+///
+/// We deliberately scale `up_proj` and **NOT** `gate_proj`: `silu(0.5·gm) ≠
+/// 0.5·silu(gm)`, so scaling the gate side breaks the round-trip math.
+/// `silu(gm) · (0.5·um) = 0.5·(silu(gm) · um)` is exact.
+const UP_PROJ_ANE_SCALE: f32 = 0.5;
+const UP_PROJ_ANE_UNSCALE: f32 = 1.0 / UP_PROJ_ANE_SCALE;
+
 /// Convert bf16 raw bits to f32 (top 16 bits of f32 layout).
 fn bf16_u16_to_f32_vec(src: &[u16]) -> Vec<f32> {
     src.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect()
@@ -269,7 +284,15 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
         let v_f32 = bf16_u16_to_f32_vec(&lw.v_proj);
         let o_f32 = bf16_u16_to_f32_vec(&lw.o_proj);
         let gate_f32 = bf16_u16_to_f32_vec(&lw.gate_proj);
-        let up_f32 = bf16_u16_to_f32_vec(&lw.up_proj);
+        // up_proj: scale weights by `UP_PROJ_ANE_SCALE` (the upstream mirror of
+        // the down_proj fix) to halve the fp16 `silu * um` product inside the
+        // fused silu_gate_up kernel. See the constant's docstring above. The
+        // matching `× UP_PROJ_ANE_UNSCALE` is folded into the down readback in
+        // forward().
+        let up_f32: Vec<f32> = bf16_u16_to_f32_vec(&lw.up_proj)
+            .into_iter()
+            .map(|w| w * UP_PROJ_ANE_SCALE)
+            .collect();
         // down_proj: scale weights by 0.5 to halve ANE matmul output magnitude
         // so the fp16 store doesn't saturate to Inf on wide MLPs (9B inter=12288).
         // We multiply the post-ANE CPU output by 2.0 in forward() to restore value.
@@ -706,11 +729,17 @@ impl DFlashAneExecutor {
                 }
             }
 
-            // Residual add. down weights were pre-scaled by DOWN_PROJ_ANE_SCALE
-            // so the ANE fp16 output stays in range; restore magnitude here in
-            // fp32 before accumulating into the hidden state.
+            // Residual add. Two pre-scales are applied at compile time to keep
+            // the fp16 path in range:
+            //   * up_proj  × UP_PROJ_ANE_SCALE   (halves silu * um inside the
+            //                                    fused silu_gate_up kernel)
+            //   * down_proj × DOWN_PROJ_ANE_SCALE (halves the down accumulator)
+            // Both are linear, so the combined unscale (= UP_UNSCALE × DOWN_UNSCALE
+            // = 4.0 today) fully restores magnitude in fp32 here, before the
+            // residual add into the hidden state.
+            let mlp_unscale = DOWN_PROJ_ANE_UNSCALE * UP_PROJ_ANE_UNSCALE;
             for i in 0..block * h {
-                hidden[i] += down_cpu[i] * DOWN_PROJ_ANE_UNSCALE;
+                hidden[i] += down_cpu[i] * mlp_unscale;
             }
             tock!(t_norm_residual, t0);
         }
