@@ -2076,10 +2076,30 @@ struct GatedDeltaNet {
     conv_weight_t: Option<Array>,
     /// Optional compiled ANE kernels for the layer's three dense projections
     /// (`in_proj_qkvz`, `in_proj_ba`, `out_proj`). `None` = Metal matmul as
-    /// before. Only used when `!use_separate_projections` and runtime
-    /// `S <= kernels.qkvz.seq_len`.
+    /// before. Each `Vec` entry is a seq-length bucket (one full compiled kernel
+    /// set per bucket); at dispatch time the smallest bucket with
+    /// `S <= kernels.qkvz.seq_len` is selected. If `S` exceeds every bucket, the
+    /// dispatch falls back to Metal. The `Vec` is sorted ascending by
+    /// `qkvz.seq_len` — [`select_ane_bucket`] relies on that ordering.
+    ///
+    /// **Inline path** (`!Send` — used only by Wave 1/2 parity tests on the
+    /// main thread). Production uses [`Self::ane_handle`] instead.
     #[cfg(feature = "ane")]
-    ane_kernels: Option<std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>>,
+    ane_kernels: Option<Vec<std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>>>,
+    /// Optional handle to the model-wide GDN ANE worker thread (Wave 4).
+    /// `Send + Sync`, so this path is what makes `HIGGS_TARGET_ANE_GDN=1`
+    /// usable once the model has been moved into the inference worker
+    /// thread (`batch_engine.rs:117` / `simple.rs`). Mutually exclusive with
+    /// [`Self::ane_kernels`] in practice — `enable_ane_gdn_all_layers_via_worker`
+    /// sets this; the inline `enable_ane_gdn*` methods set `ane_kernels`.
+    #[cfg(feature = "ane")]
+    ane_handle: Option<crate::qwen3_next_ane_worker::GdnAneWorkerHandle>,
+    /// Index of this layer within the worker's per-layer kernel table.
+    /// Meaningful only when [`Self::ane_handle`] is `Some`; ignored otherwise
+    /// (kept as `0`). Set by `enable_ane_gdn_all_layers_via_worker` based on
+    /// the order in which linear layers are enumerated.
+    #[cfg(feature = "ane")]
+    ane_linear_layer_idx: usize,
 }
 
 impl GatedDeltaNet {
@@ -2159,6 +2179,10 @@ impl GatedDeltaNet {
             conv_weight_t: None,
             #[cfg(feature = "ane")]
             ane_kernels: None,
+            #[cfg(feature = "ane")]
+            ane_handle: None,
+            #[cfg(feature = "ane")]
+            ane_linear_layer_idx: 0,
         })
     }
 
@@ -2594,18 +2618,42 @@ impl GatedDeltaNet {
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
             (q, k, v, z, b, a)
         } else {
-            // ANE-offload path (feature-gated): when `ane_kernels` is set and
-            // the runtime seq fits the compiled kernel, run `in_proj_qkvz` and
-            // `in_proj_ba` on ANE. Any mismatch falls back to Metal.
+            // ANE-offload path (feature-gated). Two ANE backends share this
+            // dispatch site:
+            //   1. Worker handle (Wave 4, production) — `Send + Sync` mpsc
+            //      handle to a model-wide `qwen-gdn-ane-worker` thread that
+            //      owns kernels for ALL linear layers. Selected first.
+            //   2. Inline `Vec<Arc<GdnAneLayerKernels>>` (Wave 1/2 parity tests
+            //      only — `!Send`, can't survive moving the model into a
+            //      worker thread). Selected when no handle is attached.
+            // Both fall back to Metal when `S` exceeds the compiled seq_len.
             #[cfg(feature = "ane")]
-            let (mixed_qkvz, mixed_ba) = match self.ane_kernels.as_ref() {
-                Some(k) if (S as usize) <= k.qkvz.seq_len => {
-                    (k.qkvz.dispatch(inputs)?, k.ba.dispatch(inputs)?)
+            let (mixed_qkvz, mixed_ba) = if let Some(handle) = &self.ane_handle {
+                if (S as usize) <= handle.seq_len() {
+                    let idx = self.ane_linear_layer_idx;
+                    use crate::qwen3_next_ane_worker::ProjKind;
+                    (
+                        handle.dispatch(idx, ProjKind::Qkvz, inputs)?,
+                        handle.dispatch(idx, ProjKind::Ba, inputs)?,
+                    )
+                } else {
+                    (
+                        self.in_proj_qkvz.forward(inputs)?,
+                        self.in_proj_ba.forward(inputs)?,
+                    )
                 }
-                _ => (
-                    self.in_proj_qkvz.forward(inputs)?,
-                    self.in_proj_ba.forward(inputs)?,
-                ),
+            } else {
+                match self
+                    .ane_kernels
+                    .as_deref()
+                    .and_then(|buckets| select_ane_bucket(buckets, S as usize))
+                {
+                    Some(k) => (k.qkvz.dispatch(inputs)?, k.ba.dispatch(inputs)?),
+                    None => (
+                        self.in_proj_qkvz.forward(inputs)?,
+                        self.in_proj_ba.forward(inputs)?,
+                    ),
+                }
             };
             #[cfg(not(feature = "ane"))]
             let (mixed_qkvz, mixed_ba) = (
@@ -2720,10 +2768,25 @@ impl GatedDeltaNet {
         let normed = self.norm.forward(&y)?;
         let gated_out = swiglu(&z, &normed)?;
         let out_flat = gated_out.reshape(&[B, S, -1])?;
+        // ANE out_proj — see the qkvz/ba dispatch comment above for why both
+        // worker handle and inline kernels are checked.
         #[cfg(feature = "ane")]
-        let output = match self.ane_kernels.as_ref() {
-            Some(k) if (S as usize) <= k.out_proj.seq_len => k.out_proj.dispatch(&out_flat)?,
-            _ => self.out_proj.forward(&out_flat)?,
+        let output = if let Some(handle) = &self.ane_handle {
+            if (S as usize) <= handle.seq_len() {
+                use crate::qwen3_next_ane_worker::ProjKind;
+                handle.dispatch(self.ane_linear_layer_idx, ProjKind::OutProj, &out_flat)?
+            } else {
+                self.out_proj.forward(&out_flat)?
+            }
+        } else {
+            match self
+                .ane_kernels
+                .as_deref()
+                .and_then(|buckets| select_ane_bucket(buckets, S as usize))
+            {
+                Some(k) => k.out_proj.dispatch(&out_flat)?,
+                None => self.out_proj.forward(&out_flat)?,
+            }
         };
         #[cfg(not(feature = "ane"))]
         let output = self.out_proj.forward(&out_flat)?;
@@ -2854,43 +2917,86 @@ impl GatedDeltaNet {
     }
 
     /// Compile and attach ANE kernels for this layer's three GDN projections
-    /// (`in_proj_qkvz`, `in_proj_ba`, `out_proj`) at the given seq.
+    /// (`in_proj_qkvz`, `in_proj_ba`, `out_proj`) at the given seq buckets.
     ///
-    /// After this call, `forward_with_tape` will run all three projections on
-    /// ANE when `runtime S <= seq_len` and `!use_separate_projections`. All
-    /// other operations (conv, norm, delta kernel) remain on Metal.
+    /// One fresh kernel set is compiled per bucket in `seq_lens`. Buckets are
+    /// stored sorted ascending by `seq_len`; dispatch picks the smallest bucket
+    /// that fits the runtime `S`, or falls back to Metal if `S` exceeds every
+    /// bucket. After this call, `forward_with_tape` will run all three
+    /// projections on ANE when `!use_separate_projections` and a bucket fits.
+    /// All other ops (conv, norm, delta kernel) stay on Metal.
     ///
-    /// Returns an error if any weight is not rank-2 or cannot be dequantized.
+    /// Currently restricted to `seq_lens.len() == 1`. Multi-bucket was
+    /// implemented but exposed a reproducible failure in the ANE bridge's
+    /// `patch_from_donor` path (state accumulates across patches and fails
+    /// around the 17th patched bucket1 invocation). The slice signature is
+    /// retained so the guard can be lifted in a single edit once the bridge
+    /// is fixed. See `.planning/next-session-phase2-wave3.md`.
+    ///
+    /// Returns an error if `seq_lens` is empty, has len > 1, contains
+    /// duplicates, or if any weight is not rank-2 / cannot be dequantized.
     #[cfg(feature = "ane")]
-    pub fn enable_ane_gdn(&mut self, seq_len: i32) -> Result<(), Exception> {
+    pub fn enable_ane_gdn(&mut self, seq_lens: &[i32]) -> Result<(), Exception> {
         use std::sync::Arc;
         if self.use_separate_projections {
             return Err(Exception::custom(
-                "enable_ane_gdn: use_separate_projections=true not supported in Wave 1",
+                "enable_ane_gdn: use_separate_projections=true not supported",
             ));
         }
-        let qkvz = compile_proj_from_qlinear(&self.in_proj_qkvz, seq_len, "qkvz")?;
-        let ba = compile_proj_from_qlinear(&self.in_proj_ba, seq_len, "ba")?;
-        let out_proj = compile_proj_from_qlinear(&self.out_proj, seq_len, "out_proj")?;
-        self.ane_kernels = Some(Arc::new(crate::qwen3_next_ane::GdnAneLayerKernels {
-            qkvz: Arc::new(qkvz),
-            ba: Arc::new(ba),
-            out_proj: Arc::new(out_proj),
-        }));
+        if seq_lens.is_empty() {
+            return Err(Exception::custom("enable_ane_gdn: seq_lens empty"));
+        }
+        if seq_lens.len() > 1 {
+            return Err(Exception::custom(format!(
+                "enable_ane_gdn: multi-bucket (len={}) disabled — ANE bridge \
+                 patch_from_donor leaks state across successive patches \
+                 (fails ~17 patches in on bucket1). Pass a single-element slice. \
+                 See .planning/next-session-phase2-wave3.md.",
+                seq_lens.len()
+            )));
+        }
+        let mut sorted: Vec<i32> = seq_lens.to_vec();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return Err(Exception::custom(format!(
+                "enable_ane_gdn: duplicate seq_lens {seq_lens:?}"
+            )));
+        }
+        if sorted.first().is_some_and(|s| *s <= 0) {
+            return Err(Exception::custom(format!(
+                "enable_ane_gdn: non-positive seq_len in {seq_lens:?}"
+            )));
+        }
+        let mut buckets: Vec<Arc<crate::qwen3_next_ane::GdnAneLayerKernels>> =
+            Vec::with_capacity(sorted.len());
+        for seq_len in sorted {
+            let qkvz = compile_proj_from_qlinear(&self.in_proj_qkvz, seq_len, "qkvz")?;
+            let ba = compile_proj_from_qlinear(&self.in_proj_ba, seq_len, "ba")?;
+            let out_proj = compile_proj_from_qlinear(&self.out_proj, seq_len, "out_proj")?;
+            buckets.push(Arc::new(crate::qwen3_next_ane::GdnAneLayerKernels {
+                qkvz: Arc::new(qkvz),
+                ba: Arc::new(ba),
+                out_proj: Arc::new(out_proj),
+            }));
+        }
+        self.ane_kernels = Some(buckets);
         Ok(())
     }
 
-    /// Wave 2: attach ANE projection kernels for this layer by patching weights
-    /// into a donor layer's already-compiled microcode.
+    /// Attach ANE projection kernels for this layer by patching weights into
+    /// a donor layer's already-compiled microcode, one bucket at a time.
     ///
-    /// `donor` must have been produced by `enable_ane_gdn` on a layer with
-    /// identical projection shapes (true for any two GDN layers in the same
-    /// Qwen3-Next model). Skips MIL compilation — only runs `loadWithQoS` per
-    /// projection, so this is O(weight-load) rather than O(MIL-compile).
+    /// `donors` must come from `enable_ane_gdn` on a layer with identical
+    /// projection shapes (true for any two GDN layers in the same Qwen3-Next
+    /// model). The donor order IS the bucket order for this layer — donors
+    /// are assumed sorted ascending by `qkvz.seq_len` (that is the invariant
+    /// `enable_ane_gdn` establishes). Skips MIL compilation — only runs
+    /// `loadWithQoS` per projection per bucket, so this is O(weight-load)
+    /// rather than O(MIL-compile).
     #[cfg(feature = "ane")]
     pub fn enable_ane_gdn_from_donor(
         &mut self,
-        donor: &crate::qwen3_next_ane::GdnAneLayerKernels,
+        donors: &[std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>],
     ) -> Result<(), Exception> {
         use std::sync::Arc;
         if self.use_separate_projections {
@@ -2898,16 +3004,61 @@ impl GatedDeltaNet {
                 "enable_ane_gdn_from_donor: use_separate_projections=true not supported",
             ));
         }
-        let qkvz = compile_proj_from_qlinear_donor(&self.in_proj_qkvz, &donor.qkvz)?;
-        let ba = compile_proj_from_qlinear_donor(&self.in_proj_ba, &donor.ba)?;
-        let out_proj = compile_proj_from_qlinear_donor(&self.out_proj, &donor.out_proj)?;
-        self.ane_kernels = Some(Arc::new(crate::qwen3_next_ane::GdnAneLayerKernels {
-            qkvz: Arc::new(qkvz),
-            ba: Arc::new(ba),
-            out_proj: Arc::new(out_proj),
-        }));
+        if donors.is_empty() {
+            return Err(Exception::custom(
+                "enable_ane_gdn_from_donor: donors empty",
+            ));
+        }
+        if donors.len() > 1 {
+            return Err(Exception::custom(format!(
+                "enable_ane_gdn_from_donor: multi-bucket (len={}) disabled — \
+                 ANE bridge patch_from_donor leaks state across successive \
+                 patches. Pass a single donor. \
+                 See .planning/next-session-phase2-wave3.md.",
+                donors.len()
+            )));
+        }
+        let mut buckets: Vec<Arc<crate::qwen3_next_ane::GdnAneLayerKernels>> =
+            Vec::with_capacity(donors.len());
+        for (bi, donor) in donors.iter().enumerate() {
+            let seq = donor.qkvz.seq_len;
+            let load_before = crate::ane_bridge::load_count();
+            let qkvz = compile_proj_from_qlinear_donor(&self.in_proj_qkvz, &donor.qkvz)
+                .map_err(|e| Exception::custom(format!(
+                    "patch qkvz bucket{bi}(seq={seq}) load_before={load_before}: {e}"
+                )))?;
+            let ba = compile_proj_from_qlinear_donor(&self.in_proj_ba, &donor.ba)
+                .map_err(|e| Exception::custom(format!(
+                    "patch ba   bucket{bi}(seq={seq}) load_before={load_before}: {e}"
+                )))?;
+            let out_proj = compile_proj_from_qlinear_donor(&self.out_proj, &donor.out_proj)
+                .map_err(|e| Exception::custom(format!(
+                    "patch out  bucket{bi}(seq={seq}) load_before={load_before}: {e}"
+                )))?;
+            buckets.push(Arc::new(crate::qwen3_next_ane::GdnAneLayerKernels {
+                qkvz: Arc::new(qkvz),
+                ba: Arc::new(ba),
+                out_proj: Arc::new(out_proj),
+            }));
+        }
+        self.ane_kernels = Some(buckets);
         Ok(())
     }
+}
+
+/// Pick the ANE bucket for runtime seq `s` from a layer's bucket list.
+///
+/// `buckets` must be sorted ascending by `qkvz.seq_len` (the invariant that
+/// [`GatedDeltaNet::enable_ane_gdn`] and [`GatedDeltaNet::enable_ane_gdn_from_donor`]
+/// establish). Returns the smallest bucket where `s <= seq_len`, or `None` if
+/// `s` exceeds every bucket — in which case the caller falls back to Metal.
+#[cfg(feature = "ane")]
+#[inline]
+fn select_ane_bucket(
+    buckets: &[std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>],
+    s: usize,
+) -> Option<&std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>> {
+    buckets.iter().find(|k| s <= k.qkvz.seq_len)
 }
 
 /// Helper: dequantize a `QLinear` weight and compile an `AneProjKernel` for it.
@@ -2949,6 +3100,42 @@ fn compile_proj_from_qlinear(
     }
     crate::qwen3_next_ane::compile_proj(&w_f32, in_dim, out_dim, seq_len as usize, name)
         .map_err(Exception::custom)
+}
+
+/// Wave 4: dequantize a `QLinear` weight to row-major f32 + report `(in, out)`.
+/// Used by `enable_ane_gdn_all_layers_via_worker` to extract per-layer GDN
+/// projection weights on the main thread before shipping them to the worker.
+///
+/// `name` and `layer_idx` are diagnostic — only used in error messages.
+#[cfg(feature = "ane")]
+fn dequantize_gdn_qlinear(
+    ql: &QLinear,
+    name: &'static str,
+    layer_idx: usize,
+) -> Result<(Vec<f32>, usize, usize), Exception> {
+    let wshape = ql.weight.shape();
+    if wshape.len() != 2 {
+        return Err(Exception::custom(format!(
+            "dequantize_gdn_qlinear({name}, layer {layer_idx}): expected rank-2 weight, got {wshape:?}"
+        )));
+    }
+    let out_dim = wshape[0] as usize;
+    let w_f32 = crate::qwen3_next_ane::dequantize_qlinear_to_f32(
+        &ql.weight, &ql.scales, &ql.biases, ql.group_size, ql.bits,
+    )?;
+    if out_dim == 0 || w_f32.is_empty() {
+        return Err(Exception::custom(format!(
+            "dequantize_gdn_qlinear({name}, layer {layer_idx}): empty weight"
+        )));
+    }
+    let in_dim = w_f32.len() / out_dim;
+    if in_dim * out_dim != w_f32.len() {
+        return Err(Exception::custom(format!(
+            "dequantize_gdn_qlinear({name}, layer {layer_idx}): weight len {} not divisible by oc {}",
+            w_f32.len(), out_dim
+        )));
+    }
+    Ok((w_f32, in_dim, out_dim))
 }
 
 /// Wave 2: dequantize a `QLinear` weight and patch it into a donor's compiled
@@ -3285,11 +3472,11 @@ impl Qwen3NextInner {
     }
 }
 
-/// Wave 2: outcome of `Qwen3NextCausalLM::enable_ane_gdn_all_layers`.
+/// Outcome of `Qwen3NextCausalLM::enable_ane_gdn_all_layers`.
 ///
 /// Surfaces enough state for callers (model_loader, doctor, tests) to log the
 /// setup, detect regressions in compile/patch costs, and verify that the
-/// shared-microcode invariant holds (`compile_count_after - before == 1`).
+/// shared-microcode invariant holds (`compile_count_after - before ≈ 3·n_buckets`).
 #[cfg(feature = "ane")]
 #[derive(Debug, Clone, Copy)]
 pub struct AneGdnSetupReport {
@@ -3297,7 +3484,12 @@ pub struct AneGdnSetupReport {
     pub n_compiled_layers: usize,
     /// Number of layers patched from the donor (should be N_linear - 1).
     pub n_patched_layers: usize,
-    /// Wall time to compile the donor layer's three projections.
+    /// Number of seq-length buckets compiled per layer. For Wave 2 this is 1;
+    /// for Wave 3 it is the length of the `seq_lens` slice passed in (e.g. 3
+    /// for `[16, 32, 48]`). Each bucket is a separately loaded ANE program
+    /// set — total loaded program count per kernel shape is `n_buckets`.
+    pub n_buckets: usize,
+    /// Wall time to compile the donor layer's buckets × projections.
     pub layer0_compile_ms: u64,
     /// Wall time to patch all subsequent layers.
     pub patch_ms: u64,
@@ -3308,8 +3500,9 @@ pub struct AneGdnSetupReport {
     /// `ane_bridge::compile_count()` snapshot before setup.
     pub compile_count_before: u64,
     /// `ane_bridge::compile_count()` snapshot after setup. The difference from
-    /// `before` should equal 3 (one fresh compile per donor projection); any
-    /// larger gap means `patch_from_donor` is silently triggering recompiles.
+    /// `before` should be small (`≤ 3·n_buckets`, one fresh MIL compile per
+    /// (projection × bucket)); any larger gap means `patch_from_donor` is
+    /// silently triggering recompiles.
     pub compile_count_after: u64,
 }
 
@@ -3419,23 +3612,48 @@ impl Qwen3NextCausalLM {
             .collect()
     }
 
-    /// Wave 2: enable ANE projections on every GDN (linear-attention) layer.
+    /// Enable ANE projections on every GDN (linear-attention) layer, compiled
+    /// across the requested seq-length buckets.
     ///
-    /// Layer 0 (the first linear layer) compiles its kernels fresh; subsequent
-    /// linear layers patch the same compiled microcode with their own weights
-    /// (no MIL recompile). Full-attention layers are skipped.
+    /// Layer 0 (the first linear layer) compiles one kernel set per bucket
+    /// fresh (becomes the donor); subsequent linear layers patch the same
+    /// compiled microcode with their own weights, once per bucket (no MIL
+    /// recompile). Full-attention layers are skipped.
     ///
-    /// Returns a setup report with timings and ANE program counts so callers
-    /// can detect regressions / kernel-cap overruns.
+    /// Pass a single-element slice. Multi-bucket (`len > 1`) is currently
+    /// rejected at the API boundary — Wave 3 exposed a state-accumulation
+    /// bug in the ANE bridge's `patch_from_donor` that fails reliably around
+    /// the 17th bucket1 patch, regardless of bucket seq. Slice shape is
+    /// retained so re-enabling is a guard-removal once the bridge is fixed.
+    /// See `.planning/next-session-phase2-wave3.md`.
     ///
-    /// Gated behind `feature = "ane"`; on non-ANE builds this is a no-op stub
-    /// returning a zeroed report.
+    /// Returns a setup report with timings, bucket count, and ANE program
+    /// counts so callers can detect regressions / kernel-cap overruns.
+    ///
+    /// Gated behind `feature = "ane"`; on non-ANE builds this entry point does
+    /// not exist.
     #[cfg(feature = "ane")]
     pub fn enable_ane_gdn_all_layers(
         &mut self,
-        seq_len: i32,
+        seq_lens: &[i32],
     ) -> Result<AneGdnSetupReport, Exception> {
         use std::time::Instant;
+
+        if seq_lens.is_empty() {
+            return Err(Exception::custom(
+                "enable_ane_gdn_all_layers: seq_lens empty",
+            ));
+        }
+        if seq_lens.len() > 1 {
+            return Err(Exception::custom(format!(
+                "enable_ane_gdn_all_layers: multi-bucket (len={}) disabled — \
+                 ANE bridge patch_from_donor leaks state across successive \
+                 patches (fails mid-loop around the 17th bucket1 patch). \
+                 Pass a single-element slice. \
+                 See .planning/next-session-phase2-wave3.md.",
+                seq_lens.len()
+            )));
+        }
 
         let load_count_before = crate::ane_bridge::load_count();
         let compile_count_before = crate::ane_bridge::compile_count();
@@ -3454,7 +3672,7 @@ impl Qwen3NextCausalLM {
                 )
             })?;
 
-        // Compile layer `first_linear_idx` fully — this is the donor.
+        // Compile layer `first_linear_idx` fully (one kernel set per bucket).
         let t0 = Instant::now();
         {
             let layer = &mut self.model.layers[first_linear_idx];
@@ -3462,19 +3680,21 @@ impl Qwen3NextCausalLM {
                 .linear_attn
                 .as_mut()
                 .ok_or_else(|| Exception::custom("first linear layer missing linear_attn"))?;
-            gdn.enable_ane_gdn(seq_len)?;
+            gdn.enable_ane_gdn(seq_lens)?;
         }
         let layer0_compile_ms = t0.elapsed().as_millis() as u64;
 
-        // Snapshot the donor kernels (Arc clone — cheap).
-        let donor = self.model.layers[first_linear_idx]
+        // Snapshot the donor bucket list (Arc clone per bucket — cheap).
+        let donors: Vec<std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>> = self
+            .model
+            .layers[first_linear_idx]
             .linear_attn
             .as_ref()
             .and_then(|g| g.ane_kernels.as_ref())
-            .cloned()
+            .map(|v| v.clone())
             .ok_or_else(|| Exception::custom("donor kernels missing after enable_ane_gdn"))?;
 
-        // Patch the rest.
+        // Patch the rest (per-bucket patch inside `enable_ane_gdn_from_donor`).
         let t_patch = Instant::now();
         let mut n_patched = 0usize;
         for (idx, layer) in self.model.layers.iter_mut().enumerate() {
@@ -3484,7 +3704,15 @@ impl Qwen3NextCausalLM {
             let gdn = layer.linear_attn.as_mut().ok_or_else(|| {
                 Exception::custom(format!("layer {idx}: is_linear but linear_attn=None"))
             })?;
-            gdn.enable_ane_gdn_from_donor(&donor)?;
+            gdn.enable_ane_gdn_from_donor(&donors).map_err(|e| {
+                Exception::custom(format!("layer{idx} patch: {e}"))
+            })?;
+            if n_patched < 3 || n_patched % 4 == 0 {
+                eprintln!(
+                    "patched layer{idx}: load_count={}",
+                    crate::ane_bridge::load_count()
+                );
+            }
             n_patched += 1;
         }
         let patch_ms = t_patch.elapsed().as_millis() as u64;
@@ -3495,6 +3723,7 @@ impl Qwen3NextCausalLM {
         let report = AneGdnSetupReport {
             n_compiled_layers: 1,
             n_patched_layers: n_patched,
+            n_buckets: seq_lens.len(),
             layer0_compile_ms,
             patch_ms,
             load_count_before: load_count_before as u64,
@@ -3509,6 +3738,165 @@ impl Qwen3NextCausalLM {
             eprintln!(
                 "WARN: ANE load_count={} after GDN setup — approaching 119-program cap",
                 report.load_count_after
+            );
+        }
+        Ok(report)
+    }
+
+    /// Wave 4: enable ANE GDN offload on every linear layer via a dedicated
+    /// `qwen-gdn-ane-worker` thread.
+    ///
+    /// Unlike [`Self::enable_ane_gdn_all_layers`] (the inline path used by the
+    /// Wave 1/2 parity tests), this attaches a `Send + Sync` mpsc handle to
+    /// each `GatedDeltaNet`. That handle survives moving the model into the
+    /// inference worker thread (`batch_engine.rs:117` / `simple.rs`), which
+    /// is what finally makes `HIGGS_TARGET_ANE_GDN=1` usable end-to-end.
+    ///
+    /// Single bucket only — `seq_len` is a single `i32`. Wave 3's multi-bucket
+    /// support is parked on the `patch_from_donor` bridge bug; once that
+    /// lands, this signature gains a slice and the worker holds a 2-D
+    /// kernel table internally. See `.planning/next-session-phase2-wave3.md`
+    /// and `.planning/next-session-phase2-wave4.md`.
+    ///
+    /// Steps:
+    ///   1. For each linear layer in `self.model.layers`, dequantize the three
+    ///      GDN projection weights (`in_proj_qkvz`, `in_proj_ba`, `out_proj`)
+    ///      to f32 on the calling thread.
+    ///   2. Spawn the worker — it compiles layer 0's three projections fully
+    ///      (one MIL compile per projection — three total) then patches
+    ///      layers 1..N-1 from layer 0's donor microcode.
+    ///   3. Clone the handle into every linear layer's `ane_handle` slot,
+    ///      assigning each layer's `linear_layer_idx` in iteration order.
+    ///
+    /// Returns an `AneGdnSetupReport` (the same struct used by the inline
+    /// path) for log/diagnostic parity. `n_buckets` is `1` for Wave 4.
+    #[cfg(feature = "ane")]
+    pub fn enable_ane_gdn_all_layers_via_worker(
+        &mut self,
+        seq_len: i32,
+    ) -> Result<AneGdnSetupReport, Exception> {
+        use std::time::Instant;
+
+        if seq_len <= 0 {
+            return Err(Exception::custom(format!(
+                "enable_ane_gdn_all_layers_via_worker: non-positive seq_len {seq_len}"
+            )));
+        }
+
+        let load_count_before = crate::ane_bridge::load_count();
+        let compile_count_before = crate::ane_bridge::compile_count();
+
+        // Step 1: dequantize all linear layers' projection weights to f32 on
+        // the main thread (where the QLinear tensors live + ops::dequantize
+        // is callable). Capture (layer_idx, weights) so we can reattach the
+        // handle by index after the worker spawns.
+        let t_dequant = Instant::now();
+        let mut linear_indices: Vec<usize> = Vec::new();
+        let mut layer_weights: Vec<crate::qwen3_next_ane_worker::GdnLayerWeights> =
+            Vec::new();
+        for (idx, layer) in self.model.layers.iter().enumerate() {
+            if !layer.is_linear {
+                continue;
+            }
+            let gdn = layer.linear_attn.as_ref().ok_or_else(|| {
+                Exception::custom(format!(
+                    "enable_ane_gdn_all_layers_via_worker: layer {idx} is_linear \
+                     but linear_attn=None"
+                ))
+            })?;
+            if gdn.use_separate_projections {
+                return Err(Exception::custom(format!(
+                    "enable_ane_gdn_all_layers_via_worker: layer {idx} \
+                     use_separate_projections=true not supported"
+                )));
+            }
+            let (qkvz_w, qkvz_in, qkvz_out) =
+                dequantize_gdn_qlinear(&gdn.in_proj_qkvz, "qkvz", idx)?;
+            let (ba_w, ba_in, ba_out) =
+                dequantize_gdn_qlinear(&gdn.in_proj_ba, "ba", idx)?;
+            let (out_w, out_in, out_out) =
+                dequantize_gdn_qlinear(&gdn.out_proj, "out_proj", idx)?;
+            linear_indices.push(idx);
+            layer_weights.push(crate::qwen3_next_ane_worker::GdnLayerWeights {
+                qkvz_w_f32: qkvz_w,
+                qkvz_in,
+                qkvz_out,
+                ba_w_f32: ba_w,
+                ba_in,
+                ba_out,
+                out_w_f32: out_w,
+                out_in,
+                out_out,
+            });
+        }
+        if linear_indices.is_empty() {
+            return Err(Exception::custom(
+                "enable_ane_gdn_all_layers_via_worker: model has no linear-attention layers",
+            ));
+        }
+        let dequant_ms = t_dequant.elapsed().as_millis() as u64;
+
+        // Step 2: spawn the worker (compiles layer 0, patches 1..N-1).
+        let t_spawn = Instant::now();
+        let n_layers = layer_weights.len();
+        let handle = crate::qwen3_next_ane_worker::spawn_gdn_ane_worker(
+            layer_weights, seq_len,
+        )
+        .map_err(|e| {
+            Exception::custom(format!(
+                "enable_ane_gdn_all_layers_via_worker: spawn_gdn_ane_worker: {e}"
+            ))
+        })?;
+        let spawn_ms = t_spawn.elapsed().as_millis() as u64;
+
+        // Step 3: attach the handle to every linear layer.
+        for (linear_idx, &model_layer_idx) in linear_indices.iter().enumerate() {
+            let layer = &mut self.model.layers[model_layer_idx];
+            let gdn = layer.linear_attn.as_mut().ok_or_else(|| {
+                Exception::custom(format!(
+                    "attach handle: layer {model_layer_idx} linear_attn vanished"
+                ))
+            })?;
+            gdn.ane_handle = Some(handle.clone());
+            gdn.ane_linear_layer_idx = linear_idx;
+        }
+
+        let load_count_after = crate::ane_bridge::load_count();
+        let compile_count_after = crate::ane_bridge::compile_count();
+
+        let report = AneGdnSetupReport {
+            n_compiled_layers: 1,
+            n_patched_layers: n_layers - 1,
+            n_buckets: 1,
+            // Surface dequant time alongside the spawn time. We bucket
+            // both into `layer0_compile_ms` (now "everything before patches")
+            // and `patch_ms` is the worker-side patch+attach cost. Crude but
+            // matches the inline report shape callers already log.
+            layer0_compile_ms: dequant_ms + spawn_ms,
+            patch_ms: 0,
+            load_count_before: load_count_before as u64,
+            load_count_after: load_count_after as u64,
+            compile_count_before: compile_count_before as u64,
+            compile_count_after: compile_count_after as u64,
+        };
+
+        // Same defensive load_count cap warning as the inline path — drafter
+        // loads ~20 more on its own, so warn at 100 (cap is 119).
+        if report.load_count_after > 100 {
+            eprintln!(
+                "WARN: ANE load_count={} after GDN worker setup — approaching 119-program cap",
+                report.load_count_after
+            );
+        }
+        // Sanity: compile_count must rise by exactly 3 (one per projection
+        // donor — patches use loadWithQoS only). This is the Wave 2 invariant
+        // applied to the worker spawn path.
+        let compile_delta =
+            report.compile_count_after - report.compile_count_before;
+        if compile_delta != 3 {
+            eprintln!(
+                "WARN: enable_ane_gdn_all_layers_via_worker: expected compile_count delta=3 \
+                 (one per projection donor), got {compile_delta}"
             );
         }
         Ok(report)
@@ -14624,7 +15012,7 @@ mod tests {
         );
 
         // ── Enable ANE on all three GDN projections at compile seq = S ──
-        gdn.enable_ane_gdn(s).expect("enable_ane_gdn failed");
+        gdn.enable_ane_gdn(&[s]).expect("enable_ane_gdn failed");
 
         let mut cache_ane = ArraysCache::default();
         let (out_ane, _tape_ane) = gdn
@@ -14725,12 +15113,14 @@ mod tests {
         }
         eprintln!("Captured {} Metal baseline outputs", metal_outs.len());
 
-        // Enable ANE on every GDN layer via the public Wave 2 helper.
+        // Enable ANE on every GDN layer via the public Wave 2 helper
+        // (single-bucket slice — same as before Wave 3 lifted the cardinality).
         let report = model
-            .enable_ane_gdn_all_layers(s)
+            .enable_ane_gdn_all_layers(&[s])
             .expect("enable_ane_gdn_all_layers failed");
         eprintln!("ANE setup: {report:?}");
         assert_eq!(report.n_compiled_layers, 1, "expected exactly one donor compile");
+        assert_eq!(report.n_buckets, 1, "expected single-bucket setup");
         assert_eq!(
             report.n_patched_layers,
             n_linear - 1,
@@ -14804,6 +15194,144 @@ mod tests {
         assert!(
             max_diff_global < budget,
             "All-layers ANE parity failed at layer{max_diff_layer}: \
+             max_diff={max_diff_global} exceeds {budget:.4} budget"
+        );
+    }
+
+    /// Wave 4 acceptance: every GDN layer's forward output, dispatched
+    /// through the model-wide `qwen-gdn-ane-worker` thread, matches the
+    /// all-Metal baseline within the same magnitude-aware bf16 budget the
+    /// Wave 2 inline test uses. This is the parity gate that proves
+    /// `enable_ane_gdn_all_layers_via_worker` is safe to wire into
+    /// `model_loader.rs` for `HIGGS_TARGET_ANE_GDN=1`.
+    ///
+    /// ```bash
+    /// HIGGS_BF16_MODEL_PATH=~/.cache/lm-studio/models/jason-schulz/Carnice-9b-MLX \
+    ///   cargo test -p higgs-models --release --features ane -- \
+    ///     test_9b_gdn_all_layers_ane_parity_worker --nocapture --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "requires Carnice-9B-MLX (or Qwen3.5-9B BF16) on disk"]
+    fn test_9b_gdn_all_layers_ane_parity_worker() {
+        use mlx_rs::transforms::eval;
+
+        let model_path = std::env::var("HIGGS_BF16_MODEL_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap();
+            format!("{home}/.cache/lm-studio/models/jason-schulz/Carnice-9b-MLX")
+        });
+        if !std::path::Path::new(&model_path).exists() {
+            panic!("Model not found at {model_path}. Set HIGGS_BF16_MODEL_PATH.");
+        }
+        eprintln!("Loading model from {model_path}...");
+        let mut model = load_qwen3_5_model(&model_path).unwrap();
+        let hidden = model.args.hidden_size;
+        let n_layers = model.model.layers.len();
+        let n_linear = model.model.layers.iter().filter(|l| l.is_linear).count();
+        eprintln!("Loaded: {n_layers} layers ({n_linear} linear), hidden={hidden}");
+
+        // Capture Metal baseline BEFORE attaching the worker (same input each
+        // side — fair comparison).
+        let s = 16i32;
+        let x_f32 = mlx_rs::random::normal::<f32>(&[1, s, hidden], None, None, None).unwrap();
+        let x = x_f32.as_dtype(Dtype::Bfloat16).unwrap();
+        x.eval().unwrap();
+
+        let mut metal_outs: Vec<(usize, Array)> = Vec::with_capacity(n_linear);
+        for (idx, layer) in model.model.layers.iter_mut().enumerate() {
+            if !layer.is_linear {
+                continue;
+            }
+            let gdn = layer.linear_attn.as_mut().unwrap();
+            assert!(
+                !gdn.use_separate_projections,
+                "layer {idx}: use_separate_projections=true unsupported in Wave 4"
+            );
+            let mut cache = ArraysCache::default();
+            let (out, _tape) = gdn.forward_with_tape(&x, None, &mut cache).unwrap();
+            eval([&out]).unwrap();
+            metal_outs.push((idx, out));
+        }
+        eprintln!("Captured {} Metal baseline outputs", metal_outs.len());
+
+        // Spin up the worker, attach handles to every linear layer.
+        let report = model
+            .enable_ane_gdn_all_layers_via_worker(s)
+            .expect("enable_ane_gdn_all_layers_via_worker failed");
+        eprintln!("Worker setup: {report:?}");
+        assert_eq!(report.n_compiled_layers, 1, "expected exactly one donor compile");
+        assert_eq!(report.n_buckets, 1, "Wave 4 is single-bucket");
+        assert_eq!(
+            report.n_patched_layers,
+            n_linear - 1,
+            "expected {} patched layers, got {}",
+            n_linear - 1,
+            report.n_patched_layers
+        );
+        // Worker spawn must respect the Wave 2 invariant: exactly 3 fresh MIL
+        // compiles (one per projection donor). Same observation as the inline
+        // test: bridge counters appear bumped from a different code path, so
+        // we only assert the upper bound that proves patching, not recompiling.
+        let compile_delta = report.compile_count_after - report.compile_count_before;
+        assert!(
+            compile_delta < 10,
+            "worker spawn leaked into compileWithQoS: Δcompile={compile_delta} \
+             (expected « {} kernels)",
+            n_linear * 3
+        );
+
+        // Re-run every GDN layer through the worker. Same input as Metal.
+        let mut max_diff_global = 0.0f32;
+        let mut max_diff_layer = 0usize;
+        let mut ref_max_at_worst = 0.0f32;
+        for (i, (idx, ref_out)) in metal_outs.iter().enumerate() {
+            let layer = &mut model.model.layers[*idx];
+            let gdn = layer.linear_attn.as_mut().unwrap();
+            assert!(
+                gdn.ane_handle.is_some(),
+                "layer {idx}: ane_handle not attached after \
+                 enable_ane_gdn_all_layers_via_worker"
+            );
+            let mut cache = ArraysCache::default();
+            let (out_ane, _tape) = gdn.forward_with_tape(&x, None, &mut cache).unwrap();
+            eval([&out_ane]).unwrap();
+            let ref_max: f32 = ref_out.abs().unwrap().max(None).unwrap().item();
+            let diff = ref_out
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .subtract(out_ane.as_dtype(Dtype::Float32).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap();
+            diff.eval().unwrap();
+            let max_diff: f32 = diff.max(None).unwrap().item();
+            if i < 3 || i >= metal_outs.len().saturating_sub(2) {
+                eprintln!(
+                    "  layer{idx:>2}: |out|_max={ref_max:.3} max_diff={max_diff:.5}"
+                );
+            }
+            if max_diff > max_diff_global {
+                max_diff_global = max_diff;
+                max_diff_layer = *idx;
+                ref_max_at_worst = ref_max;
+            }
+        }
+
+        // Same 1% relative budget the Wave 2 inline test uses — worker path
+        // should be bit-identical to inline because both end up dispatching
+        // through `AneProjKernel` with the same compiled microcode.
+        let budget = (ref_max_at_worst * 0.01).max(0.05);
+        eprintln!(
+            "Worst-case GDN worker parity: layer{max_diff_layer} max_diff={max_diff_global:.6} \
+             |out|_max={ref_max_at_worst:.3} (budget {budget:.4})"
+        );
+        assert!(
+            max_diff_global.is_finite(),
+            "Worker produced NaN/Inf at layer{max_diff_layer}"
+        );
+        assert!(
+            max_diff_global < budget,
+            "All-layers ANE worker parity failed at layer{max_diff_layer}: \
              max_diff={max_diff_global} exceeds {budget:.4} budget"
         );
     }

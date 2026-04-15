@@ -47,6 +47,26 @@ pub struct AneProjKernel {
     output_bytes: usize,
 }
 
+// SAFETY: `AneKernel` is structurally `!Send + !Sync` (contains a raw IOSurface
+// pointer that is thread-bound). The inline `Vec<Arc<GdnAneLayerKernels>>`
+// field on `GatedDeltaNet` is populated only by `enable_ane_gdn*` methods,
+// which are documented as main-thread-only and exercised exclusively by the
+// Wave 1/2 parity tests. Production (`HIGGS_TARGET_ANE_GDN=1`) goes through
+// `qwen3_next_ane_worker::GdnAneWorkerHandle`, whose mpsc-handle path never
+// crosses an `AneKernel` between threads — the kernel is created and
+// dropped on the same `qwen-gdn-ane-worker` thread.
+//
+// The unsafe impls below let `Qwen3NextCausalLM` stay `Send + Sync` so it can
+// be moved into `batch_engine`'s worker thread (`batch_engine.rs:117`) even
+// when the `ane` feature is on. Callers MUST NOT mutate / dispatch through
+// `ane_kernels` from a thread other than where it was populated.
+#[allow(unsafe_code)]
+// SAFETY: see comment above.
+unsafe impl Send for AneProjKernel {}
+#[allow(unsafe_code)]
+// SAFETY: see comment above.
+unsafe impl Sync for AneProjKernel {}
+
 impl std::fmt::Debug for AneProjKernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AneProjKernel")

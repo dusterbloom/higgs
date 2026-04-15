@@ -35,6 +35,10 @@ pub mod dflash_ane;
 pub mod diffusion_ane;
 #[cfg(feature = "ane")]
 pub mod diffusion_ane_bwd;
+#[cfg(feature = "ane")]
+pub mod qwen3_next_ane;
+#[cfg(feature = "ane")]
+pub mod qwen3_next_ane_worker;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -563,6 +567,40 @@ impl AnyModel {
         }
     }
 
+    /// Number of transformer layers.
+    pub fn num_layers(&self) -> usize {
+        match self {
+            Self::Qwen3Next(m) => m.num_layers(),
+            _ => 0,
+        }
+    }
+
+    /// Chunked tape-recording verify: evals every `layer_chunk_size` layers
+    /// to bound peak GPU memory. Also returns integrated snapshots.
+    #[allow(clippy::type_complexity)]
+    pub fn forward_with_taps_tape_chunked(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+        layer_chunk_size: usize,
+    ) -> Result<(
+        Array,
+        Vec<Array>,
+        Vec<Option<qwen3_next::GdnLayerTape>>,
+        Vec<(Option<Array>, Option<Array>, i32)>,
+    ), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps_tape_chunked(inputs, mask, c, tap_layers, layer_chunk_size)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps_tape_chunked: only Qwen3Next is supported",
+            )),
+        }
+    }
+
     /// Tape-recording verify: forward with taps AND GDN innovation tapes.
     ///
     /// State IS updated (like normal forward). On full acceptance, zero extra
@@ -963,6 +1001,30 @@ pub fn load_safetensors_weights<M: ModuleParametersExt>(
     load_quantized_safetensors_weights(model, model_path, false)
 }
 
+/// Load safetensors weights without calling `model.eval()`.
+///
+/// Useful when the caller will immediately extract weights to CPU (e.g. DFlash
+/// drafter) and doesn't need them materialized on GPU first. Avoids a peak
+/// memory spike from having both GPU and CPU copies simultaneously.
+pub fn load_safetensors_weights_lazy<M: ModuleParametersExt>(
+    model: &mut M,
+    model_path: &Path,
+) -> Result<(), ModelError> {
+    let safetensors_files = collect_safetensors_files(model_path)?;
+    let mut params = model.parameters_mut().flatten();
+    for file_path in &safetensors_files {
+        tracing::debug!(file = %file_path.display(), "Loading weights (lazy)");
+        let loaded = Array::load_safetensors(file_path)
+            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        for (key, value) in loaded {
+            if let Some(param) = params.get_mut(&*key) {
+                **param = value;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Load safetensors weights with optional name remapping for quantized models.
 ///
 /// Pre-quantized MLX models store weights with flat names (e.g., `q_proj.weight`)
@@ -1078,7 +1140,7 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
 }
 
 /// Collect safetensors file paths from a model directory.
-fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
+pub(crate) fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
     let index_path = model_path.join("model.safetensors.index.json");
     if index_path.exists() {
         let json = std::fs::read_to_string(&index_path)?;
