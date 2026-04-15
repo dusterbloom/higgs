@@ -45,7 +45,7 @@
     clippy::shadow_unrelated,
     clippy::too_long_first_doc_paragraph,
     clippy::too_many_arguments,
-    clippy::too_many_lines,
+    clippy::too_many_lines
 )]
 
 use std::sync::mpsc;
@@ -53,9 +53,8 @@ use std::sync::mpsc;
 use mlx_rs::error::Exception;
 use mlx_rs::{Array, Dtype};
 
-use crate::qwen3_next_ane::{
-    AneProjKernel, compile_proj, compile_proj_from_donor,
-};
+use crate::ane_bridge::AneKernel;
+use crate::qwen3_next_ane::{AneProjKernel, compile_proj, compile_proj_from_donor};
 
 /// Which of the three GDN dense projections to dispatch on the worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,9 +246,7 @@ impl GdnAneWorkerHandle {
                 in_dim,
                 reply: reply_tx,
             })
-            .map_err(|e| {
-                Exception::custom(format!("GDN ANE worker terminated: {e}"))
-            })?;
+            .map_err(|e| Exception::custom(format!("GDN ANE worker terminated: {e}")))?;
         let out_vec = reply_rx
             .recv()
             .map_err(|e| {
@@ -269,10 +266,7 @@ impl GdnAneWorkerHandle {
                 expected_len,
             )));
         }
-        let out = Array::from_slice(
-            &out_vec,
-            &[b as i32, s as i32, expected_out as i32],
-        );
+        let out = Array::from_slice(&out_vec, &[b as i32, s as i32, expected_out as i32]);
         if original_dtype == Dtype::Float32 {
             Ok(out)
         } else {
@@ -348,6 +342,12 @@ pub fn spawn_gdn_ane_worker(
             // the ANE BLOBFILEs and we hold ~24 * (qkvz + ba + out) * 4B per
             // element extra otherwise.
             drop(layer_weights);
+            // Enter ANE realtime dispatch mode for this worker thread. Realtime
+            // state is thread-local in the bridge, so begin/end must happen on
+            // this same thread — which the lifetime of the worker guarantees.
+            // `AneProjKernel::dispatch` prefers `eval_realtime` with fallback,
+            // so this is a zero-risk speed-up for the dispatch hot path.
+            let rt_enabled = AneKernel::begin_realtime();
             let _ = init_tx.send(Ok(()));
 
             let mut round: u64 = 0;
@@ -380,16 +380,13 @@ pub fn spawn_gdn_ane_worker(
                         // Build the input Array on this thread; pass through
                         // AneProjKernel::dispatch (the f32-fast path, since
                         // we already coerced upstream).
-                        let result =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                let arr = Array::from_slice(
-                                    &input,
-                                    &[b as i32, s as i32, in_dim as i32],
-                                );
-                                let out = kernel.dispatch(&arr)?;
-                                out.eval()?;
-                                Ok::<Vec<f32>, Exception>(out.as_slice::<f32>().to_vec())
-                            }));
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let arr =
+                                Array::from_slice(&input, &[b as i32, s as i32, in_dim as i32]);
+                            let out = kernel.dispatch(&arr)?;
+                            out.eval()?;
+                            Ok::<Vec<f32>, Exception>(out.as_slice::<f32>().to_vec())
+                        }));
                         let send_result = match result {
                             Ok(Ok(v)) => Ok(v),
                             Ok(Err(e)) => Err(format!(
@@ -397,9 +394,7 @@ pub fn spawn_gdn_ane_worker(
                                 proj.name()
                             )),
                             Err(payload) => {
-                                let msg = if let Some(s) =
-                                    payload.downcast_ref::<&'static str>()
-                                {
+                                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
                                     (*s).to_owned()
                                 } else if let Some(s) = payload.downcast_ref::<String>() {
                                     s.clone()
@@ -424,6 +419,12 @@ pub fn spawn_gdn_ane_worker(
                     GdnAneMsg::Shutdown => break,
                 }
             }
+            // Exit realtime mode on thread shutdown (channel closed or
+            // Shutdown message). Paired with begin_realtime above; safe no-op
+            // if begin_realtime had returned false.
+            if rt_enabled {
+                AneKernel::end_realtime();
+            }
         })
         .map_err(|e| format!("failed to spawn GDN ANE worker thread: {e}"))?;
 
@@ -447,8 +448,7 @@ fn compile_all_layers(
     pad: usize,
 ) -> Result<Vec<(AneProjKernel, AneProjKernel, AneProjKernel)>, String> {
     let n = layer_weights.len();
-    let mut out: Vec<(AneProjKernel, AneProjKernel, AneProjKernel)> =
-        Vec::with_capacity(n);
+    let mut out: Vec<(AneProjKernel, AneProjKernel, AneProjKernel)> = Vec::with_capacity(n);
 
     // Layer 0: full compile (becomes the donor for layers 1..n-1).
     let w0 = &layer_weights[0];
@@ -504,31 +504,36 @@ mod tests {
     /// distinct random weights. Tiny dims so the test runs in seconds.
     fn synthetic_layer_weights(
         n_layers: usize,
-        qkvz_in: usize, qkvz_out: usize,
-        ba_in: usize, ba_out: usize,
-        out_in: usize, out_out: usize,
+        qkvz_in: usize,
+        qkvz_out: usize,
+        ba_in: usize,
+        ba_out: usize,
+        out_in: usize,
+        out_out: usize,
     ) -> Vec<GdnLayerWeights> {
         let mut v = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
-            let qkvz = random::uniform::<f32, f32>(
-                -0.05, 0.05, &[qkvz_out as i32, qkvz_in as i32], None,
-            ).unwrap();
+            let qkvz =
+                random::uniform::<f32, f32>(-0.05, 0.05, &[qkvz_out as i32, qkvz_in as i32], None)
+                    .unwrap();
             qkvz.eval().unwrap();
-            let ba = random::uniform::<f32, f32>(
-                -0.05, 0.05, &[ba_out as i32, ba_in as i32], None,
-            ).unwrap();
+            let ba = random::uniform::<f32, f32>(-0.05, 0.05, &[ba_out as i32, ba_in as i32], None)
+                .unwrap();
             ba.eval().unwrap();
-            let outp = random::uniform::<f32, f32>(
-                -0.05, 0.05, &[out_out as i32, out_in as i32], None,
-            ).unwrap();
+            let outp =
+                random::uniform::<f32, f32>(-0.05, 0.05, &[out_out as i32, out_in as i32], None)
+                    .unwrap();
             outp.eval().unwrap();
             v.push(GdnLayerWeights {
                 qkvz_w_f32: qkvz.as_slice::<f32>().to_vec(),
-                qkvz_in, qkvz_out,
+                qkvz_in,
+                qkvz_out,
                 ba_w_f32: ba.as_slice::<f32>().to_vec(),
-                ba_in, ba_out,
+                ba_in,
+                ba_out,
                 out_w_f32: outp.as_slice::<f32>().to_vec(),
-                out_in, out_out,
+                out_in,
+                out_out,
             });
         }
         v
@@ -544,15 +549,12 @@ mod tests {
 
         // Build layer 0 weights and capture them so we can build a reference.
         let weights = synthetic_layer_weights(
-            2,
-            in_dim, out_dim,   // qkvz
-            in_dim, out_dim,   // ba (same shape — just for the test)
-            in_dim, out_dim,   // out_proj
+            2, in_dim, out_dim, // qkvz
+            in_dim, out_dim, // ba (same shape — just for the test)
+            in_dim, out_dim, // out_proj
         );
-        let qkvz_w0_ref = Array::from_slice(
-            &weights[0].qkvz_w_f32,
-            &[out_dim as i32, in_dim as i32],
-        );
+        let qkvz_w0_ref =
+            Array::from_slice(&weights[0].qkvz_w_f32, &[out_dim as i32, in_dim as i32]);
         qkvz_w0_ref.eval().unwrap();
 
         let compile_before = crate::ane_bridge::compile_count();
@@ -575,9 +577,8 @@ mod tests {
         assert_eq!(handle.seq_len(), pad as usize);
 
         let s = 17_usize;
-        let x = random::uniform::<f32, f32>(
-            -1.0, 1.0, &[1, s as i32, in_dim as i32], None,
-        ).unwrap();
+        let x =
+            random::uniform::<f32, f32>(-1.0, 1.0, &[1, s as i32, in_dim as i32], None).unwrap();
         x.eval().unwrap();
 
         // Reference: x @ W^T against layer 0's qkvz weight.
@@ -613,18 +614,13 @@ mod tests {
         let pad = 32_i32;
         let n_layers = 4_usize;
 
-        let weights = synthetic_layer_weights(
-            n_layers,
-            in_dim, out_dim,
-            in_dim, out_dim,
-            in_dim, out_dim,
-        );
+        let weights =
+            synthetic_layer_weights(n_layers, in_dim, out_dim, in_dim, out_dim, in_dim, out_dim);
         let handle = spawn_gdn_ane_worker(weights, pad).expect("spawn");
 
         let s = 8_usize;
-        let x = random::uniform::<f32, f32>(
-            -1.0, 1.0, &[1, s as i32, in_dim as i32], None,
-        ).unwrap();
+        let x =
+            random::uniform::<f32, f32>(-1.0, 1.0, &[1, s as i32, in_dim as i32], None).unwrap();
         x.eval().unwrap();
 
         let projs = [ProjKind::Qkvz, ProjKind::Ba, ProjKind::OutProj];
@@ -643,7 +639,10 @@ mod tests {
         eprintln!(
             "[gdn_ane_worker_1000_rounds] {} rounds × {} layers × {} projections in {} ms \
              ({:.2} ms/dispatch)",
-            1000, n_layers, projs.len(), elapsed_ms,
+            1000,
+            n_layers,
+            projs.len(),
+            elapsed_ms,
             elapsed_ms as f64 / 1000.0,
         );
     }
@@ -657,27 +656,25 @@ mod tests {
         let out_dim = 256_usize;
         let pad = 16_i32;
 
-        let weights = synthetic_layer_weights(
-            2,
-            in_dim, out_dim,
-            in_dim, out_dim,
-            in_dim, out_dim,
-        );
+        let weights = synthetic_layer_weights(2, in_dim, out_dim, in_dim, out_dim, in_dim, out_dim);
         let handle = spawn_gdn_ane_worker(weights, pad).expect("spawn");
 
         let s = 4_usize;
-        let x = random::uniform::<f32, f32>(
-            -1.0, 1.0, &[1, s as i32, in_dim as i32], None,
-        ).unwrap();
+        let x =
+            random::uniform::<f32, f32>(-1.0, 1.0, &[1, s as i32, in_dim as i32], None).unwrap();
         x.eval().unwrap();
 
         // Take a clone, use it, drop it.
         {
             let h2 = handle.clone();
-            let _ = h2.dispatch(0, ProjKind::Qkvz, &x).expect("dispatch via clone");
+            let _ = h2
+                .dispatch(0, ProjKind::Qkvz, &x)
+                .expect("dispatch via clone");
         }
         // Original handle must still work after the clone has been dropped.
-        let y = handle.dispatch(1, ProjKind::Ba, &x).expect("dispatch via original");
+        let y = handle
+            .dispatch(1, ProjKind::Ba, &x)
+            .expect("dispatch via original");
         y.eval().unwrap();
     }
 }

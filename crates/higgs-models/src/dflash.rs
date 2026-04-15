@@ -2259,7 +2259,7 @@ mod tests {
             if n_accepted < block_size {
                 let kv_rollback = verify_len - n_accepted;
                 target.replay_tape_rollback(
-                    &layer_tapes, &snapshots, &mut kv_cache,
+                    &layer_tapes, &mut kv_cache,
                     n_accepted, kv_rollback,
                 ).unwrap();
                 let replay_states: Vec<&Array> = kv_cache.iter()
@@ -2470,7 +2470,7 @@ mod tests {
                 if n_accepted < block_size {
                     let kv_rollback = verify_len - n_accepted;
                     target.replay_tape_rollback(
-                        &layer_tapes, &snapshots, &mut kv,
+                        &layer_tapes, &mut kv,
                         n_accepted, kv_rollback,
                     ).unwrap();
                     let replay_states: Vec<&Array> = kv.iter()
@@ -2896,7 +2896,7 @@ mod tests {
             if (n_accepted as i32) < block_size {
                 let kv_rollback = verify_len - n_accepted as i32;
                 target.replay_tape_rollback(
-                    &layer_tapes, &snapshots, &mut kv_cache,
+                    &layer_tapes, &mut kv_cache,
                     n_accepted as i32, kv_rollback,
                 ).unwrap();
                 for lc in kv_cache.iter() {
@@ -3580,7 +3580,7 @@ mod tests {
                 // Partial rejection — restore + replay accepted from tape
                 let kv_rollback = verify_len - keep;
                 target.replay_tape_rollback(
-                    &layer_tapes, &snapshots, &mut kv_cache,
+                    &layer_tapes, &mut kv_cache,
                     keep, // replay keep tokens (anchor + accepted drafts)
                     kv_rollback,
                 ).unwrap();
@@ -3803,7 +3803,7 @@ mod tests {
             if keep < verify_len {
                 let kv_rollback = verify_len - keep;
                 target.replay_tape_rollback(
-                    &layer_tapes, &snapshots, &mut kv_cache,
+                    &layer_tapes, &mut kv_cache,
                     keep, kv_rollback,
                 ).unwrap();
                 for lc in kv_cache.iter() {

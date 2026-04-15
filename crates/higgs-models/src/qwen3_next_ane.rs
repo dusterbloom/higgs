@@ -17,7 +17,11 @@
 //! - `ane_mil::gen_blobfile_matmul` — MIL generator for `y = x @ W`
 //! - `.planning/dflash-forensics-and-ane-target-plan.md` — why we're doing this
 
-#![allow(clippy::too_many_arguments, clippy::as_conversions, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::too_many_arguments,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation
+)]
 
 use std::sync::Arc;
 
@@ -259,7 +263,15 @@ impl AneProjKernel {
             let ane_in = cpu_to_ane(&padded, pad, h);
             debug_assert_eq!(ane_in.len(), self.input_bytes);
             self.kernel.write_input(0, &ane_in);
-            self.kernel.eval().map_err(Exception::custom)?;
+            // Prefer realtime eval (lower per-dispatch latency). Falls back to
+            // standard eval if the caller hasn't entered realtime mode via
+            // `AneKernel::begin_realtime()` — matches the dflash/diffusion
+            // convention at `diffusion.rs:3027-3032`. When the GDN ANE worker
+            // (or an inline inference-thread caller) has called
+            // `begin_realtime`, this saves a Metal commit per dispatch.
+            if self.kernel.eval_realtime().is_err() {
+                self.kernel.eval().map_err(Exception::custom)?;
+            }
             self.kernel.read_output(0, &mut out_bytes);
 
             // ANE output layout is [oc, pad]; transpose + slice back to [s, oc].
@@ -405,8 +417,8 @@ mod tests {
         let donor = compile_proj(&w1_vec, in_dim, out_dim, pad, "donor")
             .expect("compile_proj donor failed");
         let compile_before = ane_bridge::compile_count();
-        let patched = compile_proj_from_donor(&donor, &w2_vec)
-            .expect("compile_proj_from_donor failed");
+        let patched =
+            compile_proj_from_donor(&donor, &w2_vec).expect("compile_proj_from_donor failed");
         let compile_after = ane_bridge::compile_count();
         assert_eq!(
             compile_before, compile_after,
