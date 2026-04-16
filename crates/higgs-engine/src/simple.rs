@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use higgs_models::{
-    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
-    diffusion::accept_prefix,
+    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, compute_probs,
+    diffusion::{accept_prefix, accept_prefix_rs},
+    sample, sample_from_probs,
     turboquant::KvCacheConfig,
 };
 use mlx_rs::{
@@ -146,9 +147,7 @@ impl SimpleEngine {
         {
             if let Some(pending) = pending_ane_gdn {
                 if let AnyModel::Qwen3Next(qwen) = &mut model {
-                    if let Err(e) =
-                        qwen.finalize_ane_gdn_inline(pending.weights, pending.seq_len)
-                    {
+                    if let Err(e) = qwen.finalize_ane_gdn_inline(pending.weights, pending.seq_len) {
                         tracing::error!(
                             error = %e,
                             "SimpleEngine: finalize_ane_gdn_inline failed — \
@@ -228,15 +227,17 @@ impl SimpleEngine {
         // Load DFlash drafter if path provided or HIGGS_DFLASH_PATH env var set.
         // Reads safetensors directly into CPU f32 vecs — no MLX arrays, no GPU
         // memory used for drafter weights.
-        let dflash_resolved = dflash_path
-            .map(|p| p.to_path_buf())
-            .or_else(|| std::env::var("HIGGS_DFLASH_PATH").ok().map(std::path::PathBuf::from));
+        let dflash_resolved = dflash_path.map(|p| p.to_path_buf()).or_else(|| {
+            std::env::var("HIGGS_DFLASH_PATH")
+                .ok()
+                .map(std::path::PathBuf::from)
+        });
         let dflash = if let Some(ref dp) = dflash_resolved {
             // Load GPU drafter (MLX ops, no CPU↔GPU transfer)
             tracing::info!(drafter = %dp.display(), "Loading DFlash drafter (GPU)");
             let t0 = std::time::Instant::now();
-            let mut gpu_drafter = higgs_models::dflash::load_dflash_drafter(dp)
-                .map_err(EngineError::Model)?;
+            let mut gpu_drafter =
+                higgs_models::dflash::load_dflash_drafter(dp).map_err(EngineError::Model)?;
             let cfg = gpu_drafter.config.clone();
             let tap_layers = cfg.target_layer_ids().to_vec();
             let configured_block_size = cfg.block_size;
@@ -295,7 +296,11 @@ impl SimpleEngine {
             };
 
             #[cfg(feature = "ane")]
-            let backend = if ane_worker.is_some() { "ANE+CPU" } else { "CPU BLAS" };
+            let backend = if ane_worker.is_some() {
+                "ANE+CPU"
+            } else {
+                "CPU BLAS"
+            };
             #[cfg(not(feature = "ane"))]
             let backend = "CPU BLAS";
             tracing::info!(
@@ -742,9 +747,7 @@ impl SimpleEngine {
         // DFlash speculative decoding: use draft-verify loop when available,
         // no constraints active, and no multimodal input.
         if self.dflash.is_some() && constraint.is_none() && pixel_values.is_none() {
-            return self.generate_dflash_inner(
-                prompt_tokens, max_tokens, params, stop_sequences,
-            );
+            return self.generate_dflash_inner(prompt_tokens, max_tokens, params, stop_sequences);
         }
 
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
@@ -1053,8 +1056,7 @@ impl SimpleEngine {
             .map_err(EngineError::Mlx)?;
 
         // Prefill with taps
-        let prompt_array =
-            Array::from(prompt_tokens).index(NewAxis);
+        let prompt_array = Array::from(prompt_tokens).index(NewAxis);
         let (prefill_logits, taps) = model
             .forward_with_taps(&prompt_array, None, &mut cache, &dflash.tap_layers)
             .map_err(EngineError::Mlx)?;
@@ -1138,10 +1140,15 @@ impl SimpleEngine {
                 if kv_debug {
                     eprintln!(
                         "KV_ROUND round={} path=pipelined start={} cache_len={}",
-                        round_idx + 1, start, cpu_cache.len,
+                        round_idx + 1,
+                        start,
+                        cpu_cache.len,
                     );
                 }
-                (Array::from_slice(&out_f32, &[1, block_size, hidden_dim]), 0.0)
+                (
+                    Array::from_slice(&out_f32, &[1, block_size, hidden_dim]),
+                    0.0,
+                )
             } else {
                 // First round or pipeline disabled: GPU drafter forward (no CPU transfer)
                 // a. Build block: [anchor, mask, mask, ...]
@@ -1170,8 +1177,11 @@ impl SimpleEngine {
                 if kv_debug {
                     eprintln!(
                         "KV_ROUND round={} path=gpu_drafter start={} cache_len={}",
-                        round_idx + 1, start,
-                        drafter_cache.first().and_then(|c| c.as_ref())
+                        round_idx + 1,
+                        start,
+                        drafter_cache
+                            .first()
+                            .and_then(|c| c.as_ref())
                             .map_or(0, |(k, _)| k.shape()[2]),
                     );
                 }
@@ -1180,7 +1190,8 @@ impl SimpleEngine {
             };
             let draft_ms = t_draft.elapsed().as_secs_f64() * 1000.0;
 
-            // e. Target lm_head on sliced hidden → argmax draft tokens
+            // e. Target lm_head on sliced hidden → sample draft tokens
+            //    (greedy argmax when temperature=0, rejection sampling otherwise)
             let t_lm_draft = Instant::now();
             let t_slice = Instant::now();
             let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
@@ -1190,21 +1201,39 @@ impl SimpleEngine {
                 .forward_all_logits_from_hidden(&draft_hidden_sliced)
                 .map_err(EngineError::Mlx)?;
             let logits_ms = t_logits.elapsed().as_secs_f64() * 1000.0;
-            let t_argmax = Instant::now();
-            let draft_token_arr = mlx_rs::argmax_axis!(draft_logits, -1)
-                .map_err(EngineError::Mlx)?;
-            let argmax_build_ms = t_argmax.elapsed().as_secs_f64() * 1000.0;
-            let t_eval_done = Instant::now();
-            eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
-            let eval_block_ms = t_eval_done.elapsed().as_secs_f64() * 1000.0;
-            let t_draft_transfer = Instant::now();
-            let draft_u32: Vec<u32> = draft_token_arr
-                .reshape(&[-1])
-                .map_err(EngineError::Mlx)?
-                .as_slice::<u32>()
-                .to_vec();
-            let draft_i32: Vec<i32> = draft_u32.iter().map(|&x| x as i32).collect();
-            let draft_transfer_ms = t_draft_transfer.elapsed().as_secs_f64() * 1000.0;
+
+            let (draft_u32, draft_i32, rs_state, argmax_build_ms, eval_block_ms, draft_transfer_ms) =
+                if params.temperature == 0.0 {
+                    let t_argmax = Instant::now();
+                    let draft_token_arr =
+                        mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
+                    let argmax_build_ms = t_argmax.elapsed().as_secs_f64() * 1000.0;
+                    let t_eval_done = Instant::now();
+                    eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
+                    let eval_block_ms = t_eval_done.elapsed().as_secs_f64() * 1000.0;
+                    let t_draft_transfer = Instant::now();
+                    let du32: Vec<u32> = draft_token_arr
+                        .reshape(&[-1])
+                        .map_err(EngineError::Mlx)?
+                        .as_slice::<u32>()
+                        .to_vec();
+                    let di32: Vec<i32> = du32.iter().map(|&x| x as i32).collect();
+                    let draft_transfer_ms = t_draft_transfer.elapsed().as_secs_f64() * 1000.0;
+                    (
+                        du32,
+                        di32,
+                        None,
+                        argmax_build_ms,
+                        eval_block_ms,
+                        draft_transfer_ms,
+                    )
+                } else {
+                    let t_rs = Instant::now();
+                    let (du32, di32, arr, q) = rs_draft_sample(&draft_logits, params)?;
+                    let rs_ms = t_rs.elapsed().as_secs_f64() * 1000.0;
+                    (du32, di32, Some((arr, q)), 0.0, 0.0, rs_ms)
+                };
+            let _ = eval_block_ms; // kept for trace format compatibility
             let lm_draft_ms = t_lm_draft.elapsed().as_secs_f64() * 1000.0;
 
             // f. Build verify input: [anchor, draft_0..draft_14]
@@ -1225,14 +1254,17 @@ impl SimpleEngine {
             // Diagnostic only — adds one full forward per round.
             let no_tape_fwd_ms = if std::env::var("HIGGS_DFLASH_NO_TAPE").as_deref() == Ok("1") {
                 // Snapshot GDN state so we can restore after the probe forward.
-                let probe_snapshots: Vec<(Option<Array>, Option<Array>, i32)> =
-                    cache.as_hybrid().iter().map(|lc| match lc {
+                let probe_snapshots: Vec<(Option<Array>, Option<Array>, i32)> = cache
+                    .as_hybrid()
+                    .iter()
+                    .map(|lc| match lc {
                         Some(higgs_models::qwen3_next::LayerCache::Arrays(ac)) => {
                             ac.eval_arrays().expect("eval_arrays");
                             (ac.conv_state.clone(), ac.ssm_state.clone(), ac.offset)
                         }
                         _ => (None, None, 0),
-                    }).collect();
+                    })
+                    .collect();
                 let t = Instant::now();
                 let (logits_nt, _taps_nt) = model
                     .forward_with_taps(&verify_input, None, &mut cache, &dflash.tap_layers)
@@ -1278,11 +1310,18 @@ impl SimpleEngine {
             // The verify_build_ms field in the trace captures this hidden cost.
             let t_verify_build = Instant::now();
             let (verify_logits, verify_taps, layer_tapes) = if verify_layer_chunk > 0 {
-                model.forward_with_taps_tape_chunked(
-                    &verify_input, None, &mut cache, &dflash.tap_layers, verify_layer_chunk,
-                ).map_err(EngineError::Mlx)?
+                model
+                    .forward_with_taps_tape_chunked(
+                        &verify_input,
+                        None,
+                        &mut cache,
+                        &dflash.tap_layers,
+                        verify_layer_chunk,
+                    )
+                    .map_err(EngineError::Mlx)?
             } else {
-                model.forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
+                model
+                    .forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
                     .map_err(EngineError::Mlx)?
             };
             let verify_build_ms = t_verify_build.elapsed().as_secs_f64() * 1000.0;
@@ -1295,23 +1334,40 @@ impl SimpleEngine {
             eval([&verify_logits]).map_err(EngineError::Mlx)?;
             let verify_fwd_ms = t_verify_fwd.elapsed().as_secs_f64() * 1000.0;
 
-            let t_verify_argmax = Instant::now();
-            let verify_argmax = mlx_rs::argmax_axis!(verify_logits, -1)
-                .map_err(EngineError::Mlx)?;
-            eval([&verify_argmax]).map_err(EngineError::Mlx)?;
-            let verify_argmax_ms = t_verify_argmax.elapsed().as_secs_f64() * 1000.0;
+            // i. Accept: greedy argmax+accept_prefix when temp=0, else rejection sampling
+            let (verify_argmax_ms, accept_ms, accepted) = match rs_state {
+                None => {
+                    let t_verify_argmax = Instant::now();
+                    let verify_argmax =
+                        mlx_rs::argmax_axis!(verify_logits, -1).map_err(EngineError::Mlx)?;
+                    eval([&verify_argmax]).map_err(EngineError::Mlx)?;
+                    let v_ms = t_verify_argmax.elapsed().as_secs_f64() * 1000.0;
+                    let t_accept = Instant::now();
+                    let verify_flat: Vec<u32> = verify_argmax
+                        .reshape(&[-1])
+                        .map_err(EngineError::Mlx)?
+                        .as_slice::<u32>()
+                        .to_vec();
+                    let acc = accept_prefix(&draft_u32, &verify_flat);
+                    let a_ms = t_accept.elapsed().as_secs_f64() * 1000.0;
+                    (v_ms, a_ms, acc)
+                }
+                Some((draft_arr, q_probs)) => {
+                    let t_accept = Instant::now();
+                    let acc = rs_verify_accept(
+                        &draft_u32,
+                        &draft_arr,
+                        &q_probs,
+                        &verify_logits,
+                        params,
+                        block_size,
+                    )?;
+                    let a_ms = t_accept.elapsed().as_secs_f64() * 1000.0;
+                    (0.0, a_ms, acc)
+                }
+            };
             let verify_ms = verify_fwd_ms + verify_argmax_ms;
-
-            // i. Accept prefix
-            let t_accept = Instant::now();
-            let verify_flat: Vec<u32> = verify_argmax
-                .reshape(&[-1])
-                .map_err(EngineError::Mlx)?
-                .as_slice::<u32>()
-                .to_vec();
-            let accepted = accept_prefix(&draft_u32, &verify_flat);
             let n_accepted = accepted.len() as i32;
-            let accept_ms = t_accept.elapsed().as_secs_f64() * 1000.0;
 
             // j. Partial accept — GDN-only replay from tape (no full rerun)
             //    Tape-recording verify already advanced state for ALL positions.
@@ -1320,14 +1376,17 @@ impl SimpleEngine {
             let t_replay = Instant::now();
             if n_accepted < block_size {
                 let kv_rollback = verify_len - n_accepted;
-                model.replay_tape_rollback(
-                    &layer_tapes, &mut cache,
-                    n_accepted, kv_rollback,
-                ).map_err(EngineError::Mlx)?;
+                model
+                    .replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
+                    .map_err(EngineError::Mlx)?;
                 // Batch-eval all replayed GDN states in one call
-                let replay_states: Vec<&Array> = cache.as_hybrid().iter()
+                let replay_states: Vec<&Array> = cache
+                    .as_hybrid()
+                    .iter()
                     .filter_map(|lc| match lc {
-                        Some(higgs_models::qwen3_next::LayerCache::Arrays(ac)) => ac.ssm_state.as_ref(),
+                        Some(higgs_models::qwen3_next::LayerCache::Arrays(ac)) => {
+                            ac.ssm_state.as_ref()
+                        }
                         _ => None,
                     })
                     .collect();
@@ -1341,7 +1400,8 @@ impl SimpleEngine {
             // full and partial accept — causal model, earlier positions don't
             // depend on later ones)
             let t_tap_slice = Instant::now();
-            current_taps = verify_taps.into_iter()
+            current_taps = verify_taps
+                .into_iter()
                 .map(|tap| tap.index((.., ..n_accepted, ..)))
                 .collect();
             let tap_slice_ms = t_tap_slice.elapsed().as_secs_f64() * 1000.0;
@@ -1357,7 +1417,11 @@ impl SimpleEngine {
             if kv_debug {
                 eprintln!(
                     "KV_ROUND round={} n_accepted={}/{} post_accept_start={} cpu_cache_len={}",
-                    round_idx + 1, n_accepted, block_size, start, cpu_cache.len,
+                    round_idx + 1,
+                    n_accepted,
+                    block_size,
+                    start,
+                    cpu_cache.len,
                 );
             }
 
@@ -1371,7 +1435,8 @@ impl SimpleEngine {
                 let next_block_ids = Array::from_slice(&next_block, &[1, block_size]);
 
                 // Embed (GPU, fast <1ms) + eval taps
-                let next_noise = model.embed_token_ids(&next_block_ids)
+                let next_noise = model
+                    .embed_token_ids(&next_block_ids)
                     .map_err(EngineError::Mlx)?;
                 let mut to_eval: Vec<&Array> = vec![&next_noise];
                 to_eval.extend(current_taps.iter());
@@ -1397,9 +1462,8 @@ impl SimpleEngine {
                     })
                     .collect();
                 let ctx_len = current_taps[0].shape()[1] as usize;
-                let mut draft_cache = std::mem::replace(
-                    &mut cpu_cache, dflash.cpu_engine.make_cache(),
-                );
+                let mut draft_cache =
+                    std::mem::replace(&mut cpu_cache, dflash.cpu_engine.make_cache());
 
                 let (tx, rx) = std::sync::mpsc::channel();
 
@@ -1462,17 +1526,38 @@ impl SimpleEngine {
                 let round_ms = t_round.elapsed().as_secs_f64() * 1000.0;
                 let avg_accept = total_accepted as f64 / f64::from(round_idx);
                 let elapsed_s = t_start.elapsed().as_secs_f64();
-                let eff_tps = if elapsed_s > 0.0 { tokens.len() as f64 / elapsed_s } else { 0.0 };
+                let eff_tps = if elapsed_s > 0.0 {
+                    tokens.len() as f64 / elapsed_s
+                } else {
+                    0.0
+                };
                 tracing::info!(
                     "dflash_trace round={} embed={:.1}ms draft={:.1}ms lm_draft={:.1}ms(slice={:.1}ms logits={:.1}ms argmax_build={:.1}ms transfer={:.1}ms) \
                      gap={:.1}ms verify_build={:.1}ms verify={:.1}ms verify_fwd={:.1}ms verify_argmax={:.1}ms \
                      no_tape_fwd={:.1}ms accept={:.1}ms replay={:.1}ms tap_slice={:.1}ms end={:.1}ms \
                      round_total={:.1}ms accepted={} avg_accept={:.1} eff_tps={:.1}",
-                    round_idx, embed_ms, draft_ms, lm_draft_ms,
-                    slice_ms, logits_ms, argmax_build_ms, draft_transfer_ms,
-                    gap_ms, verify_build_ms, verify_ms, verify_fwd_ms, verify_argmax_ms,
-                    no_tape_fwd_ms.unwrap_or(0.0), accept_ms, replay_ms, tap_slice_ms, end_ms,
-                    round_ms, n_accepted, avg_accept, eff_tps,
+                    round_idx,
+                    embed_ms,
+                    draft_ms,
+                    lm_draft_ms,
+                    slice_ms,
+                    logits_ms,
+                    argmax_build_ms,
+                    draft_transfer_ms,
+                    gap_ms,
+                    verify_build_ms,
+                    verify_ms,
+                    verify_fwd_ms,
+                    verify_argmax_ms,
+                    no_tape_fwd_ms.unwrap_or(0.0),
+                    accept_ms,
+                    replay_ms,
+                    tap_slice_ms,
+                    end_ms,
+                    round_ms,
+                    n_accepted,
+                    avg_accept,
+                    eff_tps,
                 );
             }
 
@@ -1581,18 +1666,31 @@ impl SimpleEngine {
 
         let is_eos = self.eos_token_ids.contains(&first_token_id);
         let is_done = is_eos || max_tokens <= 1;
-        let finish_reason = if is_eos { Some("stop".to_owned()) } else if max_tokens <= 1 { Some("length".to_owned()) } else { None };
+        let finish_reason = if is_eos {
+            Some("stop".to_owned())
+        } else if max_tokens <= 1 {
+            Some("length".to_owned())
+        } else {
+            None
+        };
 
-        if sender.blocking_send(StreamingOutput {
-            new_text,
-            finished: is_done,
-            finish_reason,
-            prompt_tokens: prompt_len,
-            completion_tokens: 1,
-            token_logprob: None,
-        }).is_err() { return Ok(()); }
+        if sender
+            .blocking_send(StreamingOutput {
+                new_text,
+                finished: is_done,
+                finish_reason,
+                prompt_tokens: prompt_len,
+                completion_tokens: 1,
+                token_logprob: None,
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
 
-        if is_done { return Ok(()); }
+        if is_done {
+            return Ok(());
+        }
 
         let mut current_taps = taps;
         let mut cpu_cache = dflash.cpu_engine.make_cache();
@@ -1612,7 +1710,9 @@ impl SimpleEngine {
             block_tokens[0] = last_token;
             let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
 
-            let noise_embedding = model.embed_token_ids(&block_ids).map_err(EngineError::Mlx)?;
+            let noise_embedding = model
+                .embed_token_ids(&block_ids)
+                .map_err(EngineError::Mlx)?;
 
             let draft_hidden = {
                 let mut to_eval: Vec<&Array> = vec![&noise_embedding];
@@ -1620,12 +1720,23 @@ impl SimpleEngine {
                 eval(to_eval).map_err(EngineError::Mlx)?;
 
                 let noise_f32: Vec<f32> = noise_embedding
-                    .as_dtype(Dtype::Float32).map_err(EngineError::Mlx)?
-                    .reshape(&[-1]).map_err(EngineError::Mlx)?
-                    .as_slice::<f32>().to_vec();
+                    .as_dtype(Dtype::Float32)
+                    .map_err(EngineError::Mlx)?
+                    .reshape(&[-1])
+                    .map_err(EngineError::Mlx)?
+                    .as_slice::<f32>()
+                    .to_vec();
 
-                let taps_f32: Vec<Vec<f32>> = current_taps.iter()
-                    .map(|t| t.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap().as_slice::<f32>().to_vec())
+                let taps_f32: Vec<Vec<f32>> = current_taps
+                    .iter()
+                    .map(|t| {
+                        t.as_dtype(Dtype::Float32)
+                            .unwrap()
+                            .reshape(&[-1])
+                            .unwrap()
+                            .as_slice::<f32>()
+                            .to_vec()
+                    })
                     .collect();
                 let ctx_len = current_taps[0].shape()[1] as usize;
 
@@ -1633,36 +1744,49 @@ impl SimpleEngine {
                 // inputs + cache into the worker thread; cache is swapped back.
                 #[cfg(feature = "ane")]
                 let out_f32 = if let Some(ref worker) = dflash.ane_worker {
-                    let cache_owned = std::mem::replace(
-                        &mut cpu_cache,
-                        dflash.cpu_engine.make_cache(),
-                    );
+                    let cache_owned =
+                        std::mem::replace(&mut cpu_cache, dflash.cpu_engine.make_cache());
                     let (out, cache_back) =
                         worker.forward(noise_f32, taps_f32, ctx_len, cache_owned);
                     cpu_cache = cache_back;
                     out
                 } else {
-                    let tap_slices: Vec<&[f32]> =
-                        taps_f32.iter().map(Vec::as_slice).collect();
-                    dflash.cpu_engine.forward(&noise_f32, &tap_slices, ctx_len, &mut cpu_cache)
+                    let tap_slices: Vec<&[f32]> = taps_f32.iter().map(Vec::as_slice).collect();
+                    dflash
+                        .cpu_engine
+                        .forward(&noise_f32, &tap_slices, ctx_len, &mut cpu_cache)
                 };
                 #[cfg(not(feature = "ane"))]
                 let out_f32 = {
-                    let tap_slices: Vec<&[f32]> =
-                        taps_f32.iter().map(Vec::as_slice).collect();
-                    dflash.cpu_engine.forward(&noise_f32, &tap_slices, ctx_len, &mut cpu_cache)
+                    let tap_slices: Vec<&[f32]> = taps_f32.iter().map(Vec::as_slice).collect();
+                    dflash
+                        .cpu_engine
+                        .forward(&noise_f32, &tap_slices, ctx_len, &mut cpu_cache)
                 };
                 // Context-only cache: no crop needed.
                 Array::from_slice(&out_f32, &[1, block_size, hidden_dim])
             };
 
-            // Draft lm_head + argmax
+            // Draft lm_head: greedy argmax (temp=0) or rejection sampling (temp>0)
             let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
-            let draft_logits = model.forward_all_logits_from_hidden(&draft_hidden_sliced).map_err(EngineError::Mlx)?;
-            let draft_token_arr = mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
-            eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
-            let draft_u32: Vec<u32> = draft_token_arr.reshape(&[-1]).map_err(EngineError::Mlx)?.as_slice::<u32>().to_vec();
-            let draft_i32: Vec<i32> = draft_u32.iter().map(|&x| x as i32).collect();
+            let draft_logits = model
+                .forward_all_logits_from_hidden(&draft_hidden_sliced)
+                .map_err(EngineError::Mlx)?;
+            let (draft_u32, draft_i32, rs_state) = if params.temperature == 0.0 {
+                let draft_token_arr =
+                    mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
+                eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
+                let du32: Vec<u32> = draft_token_arr
+                    .reshape(&[-1])
+                    .map_err(EngineError::Mlx)?
+                    .as_slice::<u32>()
+                    .to_vec();
+                let di32: Vec<i32> = du32.iter().map(|&x| x as i32).collect();
+                (du32, di32, None)
+            } else {
+                let (du32, di32, arr, q) = rs_draft_sample(&draft_logits, params)?;
+                (du32, di32, Some((arr, q)))
+            };
 
             // Verify
             let mut verify_tokens = vec![last_token];
@@ -1674,40 +1798,74 @@ impl SimpleEngine {
             drop(draft_hidden);
 
             let (verify_logits, verify_taps, layer_tapes) = if verify_layer_chunk > 0 {
-                model.forward_with_taps_tape_chunked(
-                    &verify_input, None, &mut cache, &dflash.tap_layers, verify_layer_chunk,
-                ).map_err(EngineError::Mlx)?
+                model
+                    .forward_with_taps_tape_chunked(
+                        &verify_input,
+                        None,
+                        &mut cache,
+                        &dflash.tap_layers,
+                        verify_layer_chunk,
+                    )
+                    .map_err(EngineError::Mlx)?
             } else {
-                model.forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
+                model
+                    .forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
                     .map_err(EngineError::Mlx)?
             };
-            let verify_argmax = mlx_rs::argmax_axis!(verify_logits, -1).map_err(EngineError::Mlx)?;
-            eval([&verify_argmax]).map_err(EngineError::Mlx)?;
-
-            // Accept
-            let verify_flat: Vec<u32> = verify_argmax.reshape(&[-1]).map_err(EngineError::Mlx)?.as_slice::<u32>().to_vec();
-            let accepted = accept_prefix(&draft_u32, &verify_flat);
+            // Accept: greedy argmax+accept_prefix (temp=0) or rejection sampling (temp>0)
+            let accepted = match rs_state {
+                None => {
+                    let verify_argmax =
+                        mlx_rs::argmax_axis!(verify_logits, -1).map_err(EngineError::Mlx)?;
+                    eval([&verify_argmax]).map_err(EngineError::Mlx)?;
+                    let verify_flat: Vec<u32> = verify_argmax
+                        .reshape(&[-1])
+                        .map_err(EngineError::Mlx)?
+                        .as_slice::<u32>()
+                        .to_vec();
+                    accept_prefix(&draft_u32, &verify_flat)
+                }
+                Some((draft_arr, q_probs)) => rs_verify_accept(
+                    &draft_u32,
+                    &draft_arr,
+                    &q_probs,
+                    &verify_logits,
+                    params,
+                    block_size,
+                )?,
+            };
             let n_accepted = accepted.len() as i32;
 
             // Tape replay on partial rejection
             if n_accepted < block_size {
                 let kv_rollback = verify_len - n_accepted;
-                model.replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
+                model
+                    .replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
                     .map_err(EngineError::Mlx)?;
-                let replay_states: Vec<&Array> = cache.as_hybrid().iter()
+                let replay_states: Vec<&Array> = cache
+                    .as_hybrid()
+                    .iter()
                     .filter_map(|lc| match lc {
-                        Some(higgs_models::qwen3_next::LayerCache::Arrays(ac)) => ac.ssm_state.as_ref(),
+                        Some(higgs_models::qwen3_next::LayerCache::Arrays(ac)) => {
+                            ac.ssm_state.as_ref()
+                        }
                         _ => None,
-                    }).collect();
-                if !replay_states.is_empty() { eval(replay_states).map_err(EngineError::Mlx)?; }
+                    })
+                    .collect();
+                if !replay_states.is_empty() {
+                    eval(replay_states).map_err(EngineError::Mlx)?;
+                }
             }
 
-            current_taps = verify_taps.into_iter()
+            current_taps = verify_taps
+                .into_iter()
                 .map(|tap| tap.index((.., ..n_accepted, ..)))
                 .collect();
 
             // Stream accepted tokens
-            for &tok in &accepted { tokens.push(tok); }
+            for &tok in &accepted {
+                tokens.push(tok);
+            }
             last_token = *accepted.last().expect("accept_prefix always returns >= 1") as i32;
             start += n_accepted;
 
@@ -1723,7 +1881,10 @@ impl SimpleEngine {
                 check_stop_sequences(&full_text, stop_sequences).map_or(
                     (new_text, false),
                     |truncated| {
-                        let emit = truncated.get(old_decoded_len..).unwrap_or_default().to_owned();
+                        let emit = truncated
+                            .get(old_decoded_len..)
+                            .unwrap_or_default()
+                            .to_owned();
                         (emit, true)
                     },
                 )
@@ -1741,16 +1902,23 @@ impl SimpleEngine {
                 None
             };
 
-            if sender.blocking_send(StreamingOutput {
-                new_text: final_new_text,
-                finished: step_finished,
-                finish_reason,
-                prompt_tokens: prompt_len,
-                completion_tokens: completion_len,
-                token_logprob: None,
-            }).is_err() { return Ok(()); }
+            if sender
+                .blocking_send(StreamingOutput {
+                    new_text: final_new_text,
+                    finished: step_finished,
+                    finish_reason,
+                    prompt_tokens: prompt_len,
+                    completion_tokens: completion_len,
+                    token_logprob: None,
+                })
+                .is_err()
+            {
+                return Ok(());
+            }
 
-            if step_finished { break; }
+            if step_finished {
+                break;
+            }
         }
         Ok(())
     }
@@ -1853,7 +2021,11 @@ impl SimpleEngine {
         // DFlash speculative decoding: use draft-verify streaming when available.
         if self.dflash.is_some() && constraint.is_none() && pixel_values.is_none() {
             return self.generate_dflash_streaming_inner(
-                prompt_tokens, max_tokens, params, stop_sequences, sender,
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                sender,
             );
         }
 
@@ -2070,6 +2242,142 @@ impl SimpleEngine {
 
         Ok(())
     }
+}
+
+/// Stochastic draft sampling for DFlash speculative decoding.
+///
+/// Computes the drafter's probability distribution `q` from logits and samples
+/// one token per position. Returns host copies (for building verify_input) and
+/// the on-device arrays needed by the rejection-sampling accept step.
+///
+/// Used in both DFlash loops when `params.temperature > 0`. For temperature=0
+/// callers keep the greedy argmax path.
+fn rs_draft_sample(
+    draft_logits: &Array,
+    params: &SamplingParams,
+) -> Result<(Vec<u32>, Vec<i32>, Array, Array), EngineError> {
+    // draft_logits: [1, K-1, V] → q_probs: [1, K-1, V] (normalized, vocab order)
+    let q_probs = compute_probs(draft_logits, params).map_err(EngineError::Mlx)?;
+    let draft_tokens_arr = sample_from_probs(&q_probs).map_err(EngineError::Mlx)?; // [1, K-1]
+
+    // Only draft tokens need host transfer now (to build verify_input).
+    // q_probs + draft_tokens_arr stay on device for the accept phase.
+    eval([&draft_tokens_arr]).map_err(EngineError::Mlx)?;
+
+    let draft_u32: Vec<u32> = draft_tokens_arr
+        .reshape(&[-1])
+        .map_err(EngineError::Mlx)?
+        .as_slice::<u32>()
+        .to_vec();
+    let draft_i32: Vec<i32> = draft_u32.iter().map(|&x| x as i32).collect();
+
+    Ok((draft_u32, draft_i32, draft_tokens_arr, q_probs))
+}
+
+/// Rejection-sampling accept for DFlash (Leviathan et al. 2023, Algorithm 2).
+///
+/// Given the drafter's stochastic draft + its `q` distribution and the target's
+/// verify logits, decides how many tokens to accept via min(1, p/q) and emits
+/// either a residual sample (on first rejection) or a bonus sample (on full
+/// acceptance). Returns the accepted prefix (length 1..=block_size).
+///
+/// Called after the verify forward pass. The greedy path (temp=0) should use
+/// `accept_prefix` on the verify argmax instead.
+fn rs_verify_accept(
+    draft_u32: &[u32],
+    draft_tokens_arr: &Array,
+    q_probs: &Array,
+    verify_logits: &Array,
+    params: &SamplingParams,
+    block_size: i32,
+) -> Result<Vec<u32>, EngineError> {
+    use mlx_rs::ops::maximum;
+    use rand::Rng;
+
+    let k_minus_1 = block_size - 1;
+
+    // Target's probability distribution: [1, K, V]
+    let verify_probs = compute_probs(verify_logits, params).map_err(EngineError::Mlx)?;
+
+    // Align first K-1 verify positions with the K-1 draft positions.
+    // .index() returns bare Array (not Result).
+    let verify_probs_for_drafts = verify_probs.index((.., 0..k_minus_1, ..)); // [1, K-1, V]
+
+    // Build gather index: [1, K-1, 1]. expand_dims takes a single i32.
+    let draft_idx = draft_tokens_arr.expand_dims(-1).map_err(EngineError::Mlx)?;
+
+    // Gather q(drafted_i) at drafted positions — [1, K-1, 1] → squeeze → [1, K-1].
+    let q_at_draft = q_probs
+        .take_along_axis(&draft_idx, -1)
+        .map_err(EngineError::Mlx)?
+        .squeeze_axes(&[-1])
+        .map_err(EngineError::Mlx)?;
+
+    // Gather p(drafted_i) similarly
+    let p_at_draft = verify_probs_for_drafts
+        .take_along_axis(&draft_idx, -1)
+        .map_err(EngineError::Mlx)?
+        .squeeze_axes(&[-1])
+        .map_err(EngineError::Mlx)?;
+
+    // Residual distribution: (p - q)_+ normalized per row
+    let diff = verify_probs_for_drafts
+        .subtract(q_probs)
+        .map_err(EngineError::Mlx)?;
+    let zero = Array::from_slice(&[0.0_f32], &[1]);
+    let residual_raw = maximum(&diff, &zero).map_err(EngineError::Mlx)?; // [1, K-1, V]
+
+    let residual_sum = residual_raw
+        .sum_axes(&[-1], true)
+        .map_err(EngineError::Mlx)?; // [1, K-1, 1]
+    let eps = Array::from_slice(&[1e-10_f32], &[1]);
+    let residual_sum_safe = residual_sum.add(&eps).map_err(EngineError::Mlx)?;
+    let residual_normalized = residual_raw
+        .divide(&residual_sum_safe)
+        .map_err(EngineError::Mlx)?; // broadcasts [1, K-1, 1] → [1, K-1, V]
+
+    // One residual token per draft position
+    let residual_tokens = sample_from_probs(&residual_normalized).map_err(EngineError::Mlx)?; // [1, K-1]
+
+    // Bonus: sample from verify distribution at position K-1
+    let bonus_slice = verify_probs.index((.., k_minus_1..k_minus_1 + 1, ..)); // [1, 1, V]
+    let bonus_token_arr = sample_from_probs(&bonus_slice).map_err(EngineError::Mlx)?; // [1, 1]
+
+    // Single eval — batch all host-bound tensors
+    eval([&q_at_draft, &p_at_draft, &residual_tokens, &bonus_token_arr])
+        .map_err(EngineError::Mlx)?;
+
+    // Host transfer
+    let q_f32: Vec<f32> = q_at_draft
+        .reshape(&[-1])
+        .map_err(EngineError::Mlx)?
+        .as_slice::<f32>()
+        .to_vec();
+    let p_f32: Vec<f32> = p_at_draft
+        .reshape(&[-1])
+        .map_err(EngineError::Mlx)?
+        .as_slice::<f32>()
+        .to_vec();
+    let residual_u32: Vec<u32> = residual_tokens
+        .reshape(&[-1])
+        .map_err(EngineError::Mlx)?
+        .as_slice::<u32>()
+        .to_vec();
+    let bonus_flat = bonus_token_arr.reshape(&[-1]).map_err(EngineError::Mlx)?;
+    let bonus_u32: u32 = bonus_flat.as_slice::<u32>()[0];
+
+    // CPU uniforms — one per draft slot. Cheap vs. device RNG round-trip.
+    let mut rng = rand::rng();
+    let rand_uniform: Vec<f32> = (0..draft_u32.len()).map(|_| rng.random::<f32>()).collect();
+
+    Ok(accept_prefix_rs(
+        draft_u32,
+        &q_f32,
+        &p_f32,
+        &residual_u32,
+        bonus_u32,
+        &rand_uniform,
+    ))
 }
 
 /// Check if any stop sequence appears in the generated text.

@@ -865,6 +865,115 @@ fn sample_filtered(logits: &Array, params: &SamplingParams) -> Result<Array, Exc
         .squeeze_axes(&[-1])
 }
 
+/// Compute the filtered normalized probability distribution in original vocab
+/// order. Applies temperature, top_k, top_p, and min_p.
+///
+/// DFlash rejection sampling needs per-position probabilities for both the
+/// drafter (q) and target (p) distributions at the same vocabulary indices.
+/// `sample_filtered` sorts internally and only returns a sampled token; this
+/// returns the full distribution re-scattered into the original ordering so
+/// callers can `take_along_axis` with drafted-token indices.
+///
+/// # Shape
+/// Input `[*, V]`, output `[*, V]` with the same leading dims.
+///
+/// # Panics (debug)
+/// Requires `params.temperature > 0.0`. Caller handles temp=0 via argmax
+/// (one-hot degenerate case).
+pub fn compute_probs(logits: &Array, params: &SamplingParams) -> Result<Array, Exception> {
+    use mlx_rs::ops::{argsort_axis, concatenate_axis, maximum, softmax_axis};
+
+    debug_assert!(
+        params.temperature > 0.0,
+        "compute_probs: caller must handle temperature=0 via argmax",
+    );
+
+    // Scale then softmax. Divide-by-temp is equivalent to multiply-by-inv-temp.
+    let scaled = logits.multiply(array!(1.0 / params.temperature))?;
+    let probs = softmax_axis(&scaled, -1, None)?;
+
+    // No filtering ⇒ return softmax directly.
+    if !params.needs_filtering() {
+        return Ok(probs);
+    }
+
+    let n_vocab_i32 = *probs
+        .shape()
+        .last()
+        .ok_or_else(|| Exception::custom("logits must have at least 1 dimension"))?;
+    let n_vocab =
+        usize::try_from(n_vocab_i32).map_err(|_| Exception::custom("negative vocab size"))?;
+
+    // Sort descending (same as `sample_filtered`).
+    let neg_probs = probs.negative()?;
+    let sorted_indices = argsort_axis(&neg_probs, -1)?;
+    let sorted_probs = probs.take_along_axis(&sorted_indices, -1)?;
+
+    // Top-k mask in sorted order (rank ≥ k → drop).
+    let k = params.top_k.map_or(n_vocab, |k| {
+        usize::try_from(k).unwrap_or(1).clamp(1, n_vocab)
+    });
+    let mut rank_mask_vec = vec![1.0f32; n_vocab];
+    for slot in rank_mask_vec.get_mut(k..).into_iter().flatten() {
+        *slot = 0.0;
+    }
+    let rank_mask = if probs.ndim() > 1 {
+        Array::from_slice(&rank_mask_vec, &[n_vocab_i32]).reshape(&[1, -1])?
+    } else {
+        Array::from_slice(&rank_mask_vec, &[n_vocab_i32])
+    };
+
+    // Top-p mask: cumulative sum ≤ top_p, always keep rank 0.
+    let cumsum = sorted_probs.cumsum(-1, None, None)?;
+    let cumsum_mask = cumsum.le(array!(params.top_p))?;
+    let ones = Array::ones::<f32>(&[1])?;
+    let zeros = Array::zeros::<f32>(&[n_vocab_i32 - 1])?;
+    let first_token_mask = if probs.ndim() > 1 {
+        concatenate_axis(&[&ones, &zeros], 0)?.reshape(&[1, -1])?
+    } else {
+        concatenate_axis(&[&ones, &zeros], 0)?
+    };
+    let top_p_mask = maximum(&cumsum_mask, &first_token_mask)?;
+
+    // Optional min-p on top.
+    let combined = if let Some(min_p) = params.min_p.map(|v| v.clamp(0.0, 1.0)) {
+        let max_prob = sorted_probs.max_axes(&[-1], true)?;
+        let threshold = max_prob.multiply(array!(min_p))?;
+        let min_p_mask = sorted_probs.ge(threshold)?;
+        rank_mask.multiply(top_p_mask)?.multiply(min_p_mask)?
+    } else {
+        rank_mask.multiply(top_p_mask)?
+    };
+
+    let filtered_sorted = sorted_probs.multiply(combined)?;
+    let sum = filtered_sorted.sum_axes(&[-1], true)?;
+    let normalized_sorted = filtered_sorted.divide(sum)?;
+
+    // Scatter back to original vocab order. `argsort(sorted_indices)` is the
+    // inverse permutation: `inv_perm[j] = position of original index j in sorted order`.
+    // Then `take_along_axis(normalized_sorted, inv_perm, -1)[j] = normalized_sorted[inv_perm[j]]`
+    // which is the filtered probability of original-vocab token `j`.
+    let inv_perm = argsort_axis(&sorted_indices, -1)?;
+    normalized_sorted.take_along_axis(&inv_perm, -1)
+}
+
+/// Sample one token per row from an already-normalized probability distribution.
+///
+/// Uses `categorical` on log-probabilities. `categorical` applies softmax
+/// internally; since `softmax(log p) = p` up to normalization, this samples
+/// faithfully from `probs`. Zero entries (log = -∞) stay at zero after softmax.
+///
+/// # Shape
+/// Input `[*, V]`, output `[*]` (last axis reduced).
+pub fn sample_from_probs(probs: &Array) -> Result<Array, Exception> {
+    // +eps guards against log(0) producing NaN downstream. The categorical
+    // path handles -∞ correctly, but on some MLX backends NaN can leak through
+    // if all entries are zero (which can happen at a padding position that
+    // was filtered out). eps=1e-20 is far below any meaningful probability.
+    let log_probs = probs.add(array!(1e-20_f32))?.log()?;
+    categorical!(log_probs)
+}
+
 // ---------------------------------------------------------------------------
 // Logprob computation
 // ---------------------------------------------------------------------------

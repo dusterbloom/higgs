@@ -3789,6 +3789,67 @@ pub fn accept_prefix(draft: &[u32], verify_argmax: &[u32]) -> Vec<u32> {
     out
 }
 
+/// Rejection-sampling acceptance for speculative decode (Leviathan et al. 2023, Alg. 2).
+///
+/// Extends `accept_prefix` to non-greedy (temp>0, top_p/top_k/min_p) sampling.
+/// At temperature 0 the mathematically equivalent path is `accept_prefix`.
+///
+/// For each drafted token `x_i`, accepts with probability `min(1, p_i(x_i) / q_i(x_i))`
+/// where `q` is the drafter's distribution and `p` the target's. On first rejection,
+/// emits a sample from the normalized residual `(p_i - q_i)_+` distribution
+/// (precomputed by the caller on GPU). If all draft tokens are accepted, emits
+/// a bonus token sampled from `p_{K}` (one position past the last draft).
+///
+/// # Arguments
+/// - `draft`: K drafted tokens sampled from `q`.
+/// - `q_at_draft`: `q_i(x_i)` — probability of each drafted token under the drafter.
+/// - `p_at_draft`: `p_i(x_i)` — probability of each drafted token under the target.
+/// - `residual_samples`: K precomputed samples from `normalize((p_i - q_i)_+)`.
+///   The caller computes these on device because sampling one token from
+///   a vocab-sized residual is cheap batched and dodges the need for a second
+///   round-trip after rejection.
+/// - `bonus_sample`: single sample from `p_K`, used only if all drafts accept.
+/// - `rand_uniform`: K independent samples from `U[0, 1)`.
+///
+/// Returns the accepted prefix: at least 1 token (either a residual on first
+/// rejection or the bonus on full accept), at most `draft.len() + 1`.
+///
+/// # Panics
+/// Panics (in debug) if any `&[T]` arg has a length other than `draft.len()`.
+pub fn accept_prefix_rs(
+    draft: &[u32],
+    q_at_draft: &[f32],
+    p_at_draft: &[f32],
+    residual_samples: &[u32],
+    bonus_sample: u32,
+    rand_uniform: &[f32],
+) -> Vec<u32> {
+    debug_assert_eq!(q_at_draft.len(), draft.len());
+    debug_assert_eq!(p_at_draft.len(), draft.len());
+    debug_assert_eq!(residual_samples.len(), draft.len());
+    debug_assert_eq!(rand_uniform.len(), draft.len());
+
+    let mut accepted: Vec<u32> = Vec::with_capacity(draft.len() + 1);
+    for i in 0..draft.len() {
+        // Defensive: q can be numerically 0 if the drafter was post-filtered
+        // (top_p/top_k zeroed the slot the token landed in after renorm).
+        // Treat q=0 as "accept" — we can't do worse than the drafter's own
+        // choice, and the residual would be undefined.
+        let q = q_at_draft[i];
+        let p = p_at_draft[i];
+        let ratio = if q <= 0.0 { 1.0 } else { (p / q).min(1.0) };
+
+        if rand_uniform[i] < ratio {
+            accepted.push(draft[i]);
+        } else {
+            accepted.push(residual_samples[i]);
+            return accepted;
+        }
+    }
+    accepted.push(bonus_sample);
+    accepted
+}
+
 /// ANE-based causal drafter for speculative decoding.
 ///
 /// Wraps a `DiffusionRuntime` compiled with causal masking. Each `draft()` call
@@ -7654,6 +7715,80 @@ mod tests {
 
         // Empty draft → just the correction/bonus
         assert_eq!(super::accept_prefix(&[], &[42]), vec![42]);
+    }
+
+    #[test]
+    fn test_accept_prefix_rs() {
+        // All accept: p == q at every draft → ratio = 1, rand < 1 always accepts.
+        // Full draft prefix + bonus.
+        assert_eq!(
+            super::accept_prefix_rs(
+                &[1, 2, 3],
+                &[0.5, 0.5, 0.5],
+                &[0.5, 0.5, 0.5],
+                &[99, 99, 99],
+                42,
+                &[0.99, 0.99, 0.99],
+            ),
+            vec![1, 2, 3, 42],
+        );
+
+        // First reject: p = 0 at first position, residual[0] emitted, stop.
+        assert_eq!(
+            super::accept_prefix_rs(
+                &[1, 2, 3],
+                &[0.5, 0.5, 0.5],
+                &[0.0, 0.5, 0.5],
+                &[77, 88, 99],
+                42,
+                &[0.01, 0.01, 0.01],
+            ),
+            vec![77],
+        );
+
+        // Partial: first two accept, third rejects — return [d0, d1, residual[2]].
+        assert_eq!(
+            super::accept_prefix_rs(
+                &[1, 2, 3],
+                &[0.5, 0.5, 0.5],
+                &[0.5, 0.5, 0.0],
+                &[0, 0, 99],
+                42,
+                &[0.01, 0.01, 0.5],
+            ),
+            vec![1, 2, 99],
+        );
+
+        // Temp=0 equivalence: greedy degenerate case. The drafter and target are
+        // both one-hot on their respective argmax tokens. Sampled tokens == argmax.
+        // When they match (q=p=1), ratio=1, accept. When they mismatch (p=0),
+        // ratio=0, reject, emit residual (which equals target's argmax).
+        // This should behave like `accept_prefix` with argmax inputs.
+        assert_eq!(
+            super::accept_prefix_rs(
+                &[5, 3, 9], // drafter says 5, 3, 9
+                &[1.0, 1.0, 1.0],
+                &[1.0, 1.0, 0.0], // target matches at 0,1 but not at 2
+                &[0, 0, 7], // residual[2] = target's argmax at position 2
+                42,
+                &[0.0, 0.0, 0.5],
+            ),
+            vec![5, 3, 7], // matches `accept_prefix(&[5,3,9], &[5,3,7,..])`
+        );
+
+        // Defensive q=0 edge: residual undefined, accept drafter's token rather
+        // than fail. Continues to next position.
+        assert_eq!(
+            super::accept_prefix_rs(
+                &[1],
+                &[0.0], // q=0, defensive accept
+                &[0.5],
+                &[99],
+                42,
+                &[0.5],
+            ),
+            vec![1, 42],
+        );
     }
 
     // -----------------------------------------------------------------------
