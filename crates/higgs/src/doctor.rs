@@ -75,6 +75,21 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             Ok(_) => pass(&format!("model {label} resolvable"), result),
             Err(err) => fail(&format!("model {label} not found: {err}"), result),
         }
+        if let Some(ref dflash_path) = model.dflash {
+            match model_resolver::resolve(dflash_path) {
+                Ok(p) => {
+                    if p.join("config.json").exists() {
+                        pass(&format!("dflash drafter for {label} resolvable"), result);
+                    } else {
+                        fail(
+                            &format!("dflash drafter for {label}: no config.json in {}", p.display()),
+                            result,
+                        );
+                    }
+                }
+                Err(err) => fail(&format!("dflash drafter for {label} not found: {err}"), result),
+            }
+        }
     }
 }
 
@@ -340,6 +355,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                dflash: None,
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
@@ -348,6 +364,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                dflash: None,
                 },
             ],
             ..HiggsConfig::default()
@@ -369,6 +386,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                dflash: None,
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
@@ -377,6 +395,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                dflash: None,
                 },
             ],
             ..HiggsConfig::default()
@@ -628,6 +647,7 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                dflash: None,
             }],
             ..HiggsConfig::default()
         };
@@ -653,6 +673,7 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                dflash: None,
             }],
             ..HiggsConfig::default()
         };
@@ -680,6 +701,7 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                dflash: None,
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),
@@ -720,5 +742,100 @@ mod tests {
         check_providers(&config, &mut result).await;
         assert_eq!(result.warnings, 1);
         assert_eq!(result.passes, 0);
+    }
+
+    // -- DFlash drafter validation --
+
+    #[test]
+    fn test_dflash_resolve_with_config_json_passes() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let dflash_dir = tempfile::tempdir().unwrap();
+        std::fs::write(dflash_dir.path().join("config.json"), "{}").unwrap();
+
+        let config = HiggsConfig {
+            models: vec![ModelConfig {
+                path: model_dir.path().to_str().unwrap().to_owned(),
+                name: None,
+                batch: false,
+                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                kv_bits: 3,
+                kv_seed: 0,
+                dflash: Some(dflash_dir.path().to_str().unwrap().to_owned()),
+            }],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_models(&config, &mut result);
+        assert_eq!(result.passes, 2);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_dflash_resolve_without_config_json_fails() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let dflash_dir = tempfile::tempdir().unwrap();
+        // dflash_dir exists but has no config.json
+
+        let config = HiggsConfig {
+            models: vec![ModelConfig {
+                path: model_dir.path().to_str().unwrap().to_owned(),
+                name: None,
+                batch: false,
+                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                kv_bits: 3,
+                kv_seed: 0,
+                dflash: Some(dflash_dir.path().to_str().unwrap().to_owned()),
+            }],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_models(&config, &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_dflash_resolve_path_not_found_fails() {
+        let model_dir = tempfile::tempdir().unwrap();
+
+        let config = HiggsConfig {
+            models: vec![ModelConfig {
+                path: model_dir.path().to_str().unwrap().to_owned(),
+                name: None,
+                batch: false,
+                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                kv_bits: 3,
+                kv_seed: 0,
+                dflash: Some("/nonexistent/dflash/drafter".to_owned()),
+            }],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_models(&config, &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_dflash_none_no_extra_checks() {
+        let model_dir = tempfile::tempdir().unwrap();
+
+        let config = HiggsConfig {
+            models: vec![ModelConfig {
+                path: model_dir.path().to_str().unwrap().to_owned(),
+                name: None,
+                batch: false,
+                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                kv_bits: 3,
+                kv_seed: 0,
+                dflash: None,
+            }],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_models(&config, &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.warnings, 0);
     }
 }

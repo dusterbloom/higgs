@@ -31,6 +31,7 @@ use mlx_rs::{Array, Dtype};
 
 use crate::ane_bridge::{self, AneKernel};
 use crate::ane_mil::{self, FusedMil};
+use crate::ane_mlmodel::AneLmHeadLut6Kernel;
 use crate::dflash_ane::{ane_to_cpu, cpu_to_ane};
 
 /// A compiled ANE kernel for a single dense projection `y = x @ W^T`.
@@ -324,6 +325,127 @@ pub(crate) fn dequantize_qlinear_to_f32(
 }
 
 // ---------------------------------------------------------------------------
+// LUT6 lm_head compile path (public CoreML MLModel + coremltools palettize)
+// ---------------------------------------------------------------------------
+
+/// Content hash for the on-disk `.mlmodelc` cache key.
+///
+/// Uses FNV-1a on the f32 weight bytes — collision-free enough for cache
+/// invalidation (we're not signing anything). Returns a lowercase hex string.
+fn lut6_weight_hash(w_f32: &[f32]) -> String {
+    // FNV-1a 64-bit.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in w_f32 {
+        for &b in &v.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+    format!("{h:016x}")
+}
+
+/// Root directory for compiled LUT6 `lm_head` bundles.
+/// Mirrors `ane_bridge.m::ane_cache_dir` (`~/.nanobot/ane_cache`) but scoped
+/// to a subdir so the dense microcode cache and the LUT6 bundle cache
+/// don't collide.
+fn lut6_cache_root() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
+    let mut p = std::path::PathBuf::from(home);
+    p.push(".nanobot");
+    p.push("ane_cache");
+    p.push("lm_head_lut6");
+    p
+}
+
+/// Compile (or load from cache) a 6-bit palettized MLModel for `lm_head`.
+///
+/// Spawns `scripts/palettize_lm_head.py` on first use for the given content
+/// hash; subsequent calls with identical weights hit the filesystem cache
+/// under `~/.nanobot/ane_cache/lm_head_lut6/`.
+///
+/// `w_f32` is row-major `[out_dim * in_dim]` — same layout as
+/// [`compile_proj`]. `seq_len` is the compile-time sequence bucket; runtime
+/// seqs must be `<= seq_len`.
+pub fn compile_proj_lut6(
+    w_f32: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    seq_len: usize,
+    _name: &'static str,
+) -> Result<AneLmHeadLut6Kernel, String> {
+    use std::fs;
+    if w_f32.len() != out_dim * in_dim {
+        return Err(format!(
+            "compile_proj_lut6: weight size {}, expected {out_dim}*{in_dim}={}",
+            w_f32.len(),
+            out_dim * in_dim
+        ));
+    }
+
+    let hash = lut6_weight_hash(w_f32);
+    let cache_slot = lut6_cache_root()
+        .join(format!("{hash}_{out_dim}x{in_dim}_s{seq_len}"));
+    let cache_mlmodelc = cache_slot.join("model.mlmodelc");
+
+    if !cache_mlmodelc.is_dir() {
+        fs::create_dir_all(&cache_slot)
+            .map_err(|e| format!("compile_proj_lut6: create cache slot: {e}"))?;
+
+        // Stage in a sibling temp dir, then atomically rename into place.
+        let staging = cache_slot.with_extension("staging");
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging)
+            .map_err(|e| format!("compile_proj_lut6: create staging: {e}"))?;
+
+        let weights_bin = staging.join("w.bin");
+        {
+            let mut bytes = Vec::with_capacity(w_f32.len() * 4);
+            for v in w_f32 {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            fs::write(&weights_bin, &bytes)
+                .map_err(|e| format!("compile_proj_lut6: write weights: {e}"))?;
+        }
+
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/palettize_lm_head.py");
+        let out = std::process::Command::new("python3")
+            .arg(script)
+            .arg("--weights-bin").arg(&weights_bin)
+            .arg("--vocab").arg(out_dim.to_string())
+            .arg("--hidden").arg(in_dim.to_string())
+            .arg("--seq-len").arg(seq_len.to_string())
+            .arg("--out-dir").arg(&staging)
+            .output()
+            .map_err(|e| format!("compile_proj_lut6: spawn python3: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "compile_proj_lut6: palettize_lm_head.py failed (exit={}): {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+
+        let staged = staging.join("model.mlmodelc");
+        if !staged.is_dir() {
+            return Err(format!(
+                "compile_proj_lut6: script did not produce {}",
+                staged.display()
+            ));
+        }
+        // Clean up the weights file before sealing the cache slot.
+        let _ = fs::remove_file(&weights_bin);
+        fs::rename(&staged, &cache_mlmodelc)
+            .map_err(|e| format!("compile_proj_lut6: rename to cache: {e}"))?;
+        let _ = fs::remove_dir_all(&staging);
+    }
+
+    let path_str = cache_mlmodelc
+        .to_str()
+        .ok_or_else(|| "compile_proj_lut6: cache path not UTF-8".to_string())?;
+    AneLmHeadLut6Kernel::load(path_str, out_dim, in_dim, seq_len)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -476,5 +598,93 @@ mod tests {
             cross > 0.05,
             "patched output indistinguishable from donor weights — patch likely failed (max_diff={cross})"
         );
+    }
+
+    /// LUT6 probe: does ANE `compile_direct` accept `constexpr_lut_to_dense`?
+    ///
+    /// Minimal MIL program: 16×16 weight represented as uint8 indices into a
+    /// 64-entry fp16 palette (scalar palettization, LUT shape [1,1,64,1]).
+    /// If the op compiles and evals, the Rust-MIL LUT6 path is viable. If it
+    /// fails with "op not supported" or parse error, we fall back to porting
+    /// Shipstuff's Python .mlmodelc pipeline.
+    ///
+    /// The probe uses **inline const** uint8 indices and fp16 LUT values to
+    /// avoid BLOBFILE format uncertainty — isolates the variable to "does the
+    /// ANE compiler accept this MIL op?"
+    ///
+    /// Run:
+    ///   cargo test -p higgs-models --features ane \
+    ///     qwen3_next_ane::tests::probe_lut6_constexpr -- --nocapture
+    #[test]
+    #[ignore = "probe — run explicitly to decide LUT6 implementation path"]
+    fn probe_lut6_constexpr() {
+        use crate::ane_bridge::{self, AneKernel};
+        use crate::ane_mil::MIL_HEADER;
+
+        ane_bridge::ane_init().expect("ANE init");
+        ane_bridge::set_quiet(false);
+
+        // 16×16 weight, all-zero indices → W reconstructed to all lut[0]
+        let oc = 16usize;
+        let ic = 16usize;
+
+        // Indices via BLOBFILE: 256 uint8 values, LSB-packed = 192 bytes of 0.
+        // Blob layout follows the int8 builder: 64-byte header (magic DEADBEEF,
+        // width marker at buf[10]) + packed data starting at offset 64.
+        let idx_count = oc * ic; // 256
+        let idx_bytes = idx_count; // uint8 = 1 byte per index
+        let mut idx_blob = vec![0u8; 64 + idx_bytes];
+        idx_blob[0] = 0xEF;
+        idx_blob[1] = 0xBE;
+        idx_blob[2] = 0xAD;
+        idx_blob[3] = 0xDE;
+        idx_blob[4] = 0x01;
+        idx_blob[10] = 0x08; // 8-bit marker (uint8; mirrors int8 format)
+        // packed data is already zero from vec![0u8; ...]
+
+        // Inline fp16 LUT: 256 values for uint8 (NUM_PALETTES = 2^8), all 0.0.
+        let lut_vals: String = (0..256).map(|_| "0x0000").collect::<Vec<_>>().join(",");
+
+        let mil = format!(
+            "{MIL_HEADER}    func main<ios18>(tensor<fp16, [{oc}, {ic}]> x) {{\n\
+        tensor<uint8, [{oc},{ic}]> ind = const()[name=string(\"ind\"), val=tensor<uint8, [{oc},{ic}]>(BLOBFILE(path=string(\"@model_path/weights/ind.bin\"), offset=uint84(64)))];\n\
+        tensor<fp16, [1,1,256,1]> lut = const()[name=string(\"lut\"), val=tensor<fp16, [1,1,256,1]>([{lut_vals}])];\n\
+        tensor<fp16, [{oc},{ic}]> W = constexpr_lut_to_dense(indices=ind, lut=lut)[name=string(\"W\")];\n\
+        tensor<fp16, [{oc},{ic}]> y = add(x=x, y=W)[name=string(\"y\")];\n\
+    }} -> (y);\n}}\n"
+        );
+
+        eprintln!("--- LUT6 probe MIL (BLOBFILE indices) ---\n{mil}\n---");
+
+        let names: Vec<&str> = vec!["@model_path/weights/ind.bin"];
+        let blob_refs: Vec<&[u8]> = vec![&idx_blob];
+        let bytes = oc * ic * 2; // fp16
+
+        eprintln!("\n[probe] compile_direct (full op set)...");
+        let direct_res =
+            AneKernel::compile_direct(&mil, &names, &blob_refs, &[bytes], &[bytes]);
+        let direct_ok = direct_res.is_ok();
+        match &direct_res {
+            Ok(_) => eprintln!("PASS: compile_direct accepts constexpr_lut_to_dense"),
+            Err(e) => eprintln!("FAIL compile_direct: {e}"),
+        }
+
+        eprintln!("\n[probe] compile_multi_weights...");
+        let multi_res = AneKernel::compile_multi_weights(
+            &mil, &names, &blob_refs, &[bytes], &[bytes],
+        );
+        let multi_ok = multi_res.is_ok();
+        match &multi_res {
+            Ok(_) => eprintln!("PASS: compile_multi_weights accepts constexpr_lut_to_dense"),
+            Err(e) => eprintln!("FAIL compile_multi_weights: {e}"),
+        }
+
+        if !direct_ok && !multi_ok {
+            panic!(
+                "constexpr_lut_to_dense rejected by BOTH compile paths (BLOBFILE uint8). \
+                 Rust-MIL LUT6 path not viable — fall back to Python .mlmodelc pipeline."
+            );
+        }
+        eprintln!("\n[probe] LUT6 VIABLE — at least one compile path accepted the op.");
     }
 }

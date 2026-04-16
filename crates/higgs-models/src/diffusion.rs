@@ -147,8 +147,8 @@ pub struct DiffusionLayerWeights {
 #[derive(Clone)]
 pub struct DiffusionEngine {
     pub layers: Vec<DiffusionLayerWeights>,
-    pub embed: Vec<f32>,      // [vocab, hidden]
-    pub final_norm: Vec<f32>, // [hidden]
+    pub embed: Vec<f32>,           // [vocab, hidden]
+    pub final_norm: Vec<f32>,      // [hidden]
     pub lm_head: Option<Vec<f32>>, // untied lm_head for Qwen2 (None = tied to embed)
     pub config: DiffusionConfig,
     // Precomputed RoPE tables
@@ -1477,7 +1477,14 @@ impl AneDiffusionEngine {
         );
         let fused_names: Vec<&str> = fused_mil.weight_names.iter().map(|s| s.as_str()).collect();
         let attn_mil = diffusion_ane::gen_diffusion_attention(
-            h, cfg.heads, cfg.kv_heads, hd, seq, 1e-6, has_qk_norm, has_qkv_bias,
+            h,
+            cfg.heads,
+            cfg.kv_heads,
+            hd,
+            seq,
+            1e-6,
+            has_qk_norm,
+            has_qkv_bias,
         );
         let attn_names: Vec<&str> = attn_mil.weight_names.iter().map(|s| s.as_str()).collect();
         let ffn_mil = diffusion_ane::gen_diffusion_ffn(h, inter, seq, 1e-6);
@@ -1504,15 +1511,30 @@ impl AneDiffusionEngine {
                 rope_sin_blob.clone(),
             ];
             if has_qk_norm {
-                let qn = lw.q_norm.as_ref().expect("model advertises qk_norm but layer has None");
-                let kn = lw.k_norm.as_ref().expect("model advertises qk_norm but layer has None");
+                let qn = lw
+                    .q_norm
+                    .as_ref()
+                    .expect("model advertises qk_norm but layer has None");
+                let kn = lw
+                    .k_norm
+                    .as_ref()
+                    .expect("model advertises qk_norm but layer has None");
                 blobs.push(build_weight_blob(qn, 1, hd));
                 blobs.push(build_weight_blob(kn, 1, hd));
             }
             if has_qkv_bias {
-                let qb = lw.q_bias.as_ref().expect("model advertises bias but layer has None");
-                let kb = lw.k_bias.as_ref().expect("model advertises bias but layer has None");
-                let vb = lw.v_bias.as_ref().expect("model advertises bias but layer has None");
+                let qb = lw
+                    .q_bias
+                    .as_ref()
+                    .expect("model advertises bias but layer has None");
+                let kb = lw
+                    .k_bias
+                    .as_ref()
+                    .expect("model advertises bias but layer has None");
+                let vb = lw
+                    .v_bias
+                    .as_ref()
+                    .expect("model advertises bias but layer has None");
                 blobs.push(build_weight_blob(qb, q_dim, 1));
                 blobs.push(build_weight_blob(kb, kv_dim, 1));
                 blobs.push(build_weight_blob(vb, kv_dim, 1));
@@ -1721,7 +1743,14 @@ impl AneDiffusionEngine {
         );
         let fused_names: Vec<&str> = fused_mil.weight_names.iter().map(|s| s.as_str()).collect();
         let attn_mil = diffusion_ane::gen_diffusion_attention(
-            h, cfg.heads, cfg.kv_heads, hd, seq, 1e-6, has_qk_norm, has_qkv_bias,
+            h,
+            cfg.heads,
+            cfg.kv_heads,
+            hd,
+            seq,
+            1e-6,
+            has_qk_norm,
+            has_qkv_bias,
         );
         let attn_names: Vec<&str> = attn_mil.weight_names.iter().map(|s| s.as_str()).collect();
         let ffn_mil = diffusion_ane::gen_diffusion_ffn(h, inter, seq, 1e-6);
@@ -2014,16 +2043,13 @@ impl AneDiffusionEngine {
 
         // 4. LM head: normed[seq, h] @ W^T[h, vocab] → logits[seq, vocab]
         //    Use untied lm_head if present (Qwen2), else tied embeddings (Qwen3).
-        let lm_weights = self.blas_engine.lm_head.as_deref().unwrap_or(&self.blas_engine.embed);
+        let lm_weights = self
+            .blas_engine
+            .lm_head
+            .as_deref()
+            .unwrap_or(&self.blas_engine.embed);
         let mut logits = vec![0.0f32; seq * cfg.vocab];
-        sgemm_nt(
-            seq,
-            cfg.vocab,
-            h,
-            &normed,
-            lm_weights,
-            &mut logits,
-        );
+        sgemm_nt(seq, cfg.vocab, h, &normed, lm_weights, &mut logits);
         logits
     }
 
@@ -2042,7 +2068,8 @@ impl AneDiffusionEngine {
             eprintln!(
                 "WARNING: bidirectional ANE forward_last with {seq} tokens in seq_len={} kernel \
                  ({} padding positions).",
-                self.seq_len, self.seq_len - seq
+                self.seq_len,
+                self.seq_len - seq
             );
         }
         let ps = self.seq_len;
@@ -2124,7 +2151,11 @@ impl AneDiffusionEngine {
         );
 
         // 5. LM head: 1×vocab instead of seq×vocab
-        let lm_weights = self.blas_engine.lm_head.as_deref().unwrap_or(&self.blas_engine.embed);
+        let lm_weights = self
+            .blas_engine
+            .lm_head
+            .as_deref()
+            .unwrap_or(&self.blas_engine.embed);
         let mut logits = vec![0.0f32; cfg.vocab];
         sgemm_nt(1, cfg.vocab, h, &last_normed, lm_weights, &mut logits);
         logits
@@ -2649,9 +2680,8 @@ impl AneBonsaiEngine {
     ) -> Result<Self, String> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
         use crate::ane_mil::{
-            ane_align_seq, build_causal_mask_blob, compute_blobfile_tile_plan,
-            gen_blobfile_matmul, gen_fused_silu_gate_up_proj,
-            ANE_MIN_SPATIAL,
+            ane_align_seq, build_causal_mask_blob, compute_blobfile_tile_plan, gen_blobfile_matmul,
+            gen_fused_silu_gate_up_proj, ANE_MIN_SPATIAL,
         };
         use crate::diffusion_ane;
 
@@ -2810,7 +2840,8 @@ impl AneBonsaiEngine {
         // Compile L0 tile 0 kernels
         let gate_l0_t0_blob = build_w13_tile_blob(&engine.layers[0].gate_proj, 0);
         let up_l0_t0_blob = build_w13_tile_blob(&engine.layers[0].up_proj, 0);
-        let gated_l0_t0_refs: Vec<&[u8]> = vec![gate_l0_t0_blob.as_slice(), up_l0_t0_blob.as_slice()];
+        let gated_l0_t0_refs: Vec<&[u8]> =
+            vec![gate_l0_t0_blob.as_slice(), up_l0_t0_blob.as_slice()];
 
         let gated_base = compile_ane_kernel(
             "L0 gated tile0",
@@ -2924,57 +2955,54 @@ impl AneBonsaiEngine {
             }
         };
 
-        let write_input_cf32 =
-            |kernel: &crate::ane_bridge::AneKernel, data: &[f32], dim: usize| {
-                let base = kernel.get_input_base(0) as *mut f32;
-                assert!(!base.is_null(), "ANE input base should not be null");
-                unsafe {
-                    for c in 0..dim {
-                        let dst = std::slice::from_raw_parts_mut(base.add(c * ps), ps);
-                        for s in 0..seq {
-                            dst[s] = data[s * dim + c];
-                        }
+        let write_input_cf32 = |kernel: &crate::ane_bridge::AneKernel, data: &[f32], dim: usize| {
+            let base = kernel.get_input_base(0) as *mut f32;
+            assert!(!base.is_null(), "ANE input base should not be null");
+            unsafe {
+                for c in 0..dim {
+                    let dst = std::slice::from_raw_parts_mut(base.add(c * ps), ps);
+                    for s in 0..seq {
+                        dst[s] = data[s * dim + c];
                     }
                 }
-                ane_dsb_sy();
-            };
+            }
+            ane_dsb_sy();
+        };
 
-        let scatter_output_cf32 =
-            |kernel: &crate::ane_bridge::AneKernel,
-             actual_dim: usize,
-             start: usize,
-             dst: &mut [f32],
-             dst_stride: usize| {
-                let base = kernel.get_output_base(0) as *const f32;
-                assert!(!base.is_null(), "ANE output base should not be null");
-                ane_dsb_sy();
-                unsafe {
-                    for c in 0..actual_dim {
-                        let src = std::slice::from_raw_parts(base.add(c * ps), ps);
-                        for s in 0..seq {
-                            dst[s * dst_stride + start + c] = src[s];
-                        }
+        let scatter_output_cf32 = |kernel: &crate::ane_bridge::AneKernel,
+                                   actual_dim: usize,
+                                   start: usize,
+                                   dst: &mut [f32],
+                                   dst_stride: usize| {
+            let base = kernel.get_output_base(0) as *const f32;
+            assert!(!base.is_null(), "ANE output base should not be null");
+            ane_dsb_sy();
+            unsafe {
+                for c in 0..actual_dim {
+                    let src = std::slice::from_raw_parts(base.add(c * ps), ps);
+                    for s in 0..seq {
+                        dst[s * dst_stride + start + c] = src[s];
                     }
                 }
-            };
+            }
+        };
 
-        let accumulate_output_cf32 =
-            |kernel: &crate::ane_bridge::AneKernel,
-             actual_dim: usize,
-             dst: &mut [f32],
-             dst_stride: usize| {
-                let base = kernel.get_output_base(0) as *const f32;
-                assert!(!base.is_null(), "ANE output base should not be null");
-                ane_dsb_sy();
-                unsafe {
-                    for c in 0..actual_dim {
-                        let src = std::slice::from_raw_parts(base.add(c * ps), ps);
-                        for s in 0..seq {
-                            dst[s * dst_stride + c] += src[s];
-                        }
+        let accumulate_output_cf32 = |kernel: &crate::ane_bridge::AneKernel,
+                                      actual_dim: usize,
+                                      dst: &mut [f32],
+                                      dst_stride: usize| {
+            let base = kernel.get_output_base(0) as *const f32;
+            assert!(!base.is_null(), "ANE output base should not be null");
+            ane_dsb_sy();
+            unsafe {
+                for c in 0..actual_dim {
+                    let src = std::slice::from_raw_parts(base.add(c * ps), ps);
+                    for s in 0..seq {
+                        dst[s * dst_stride + c] += src[s];
                     }
                 }
-            };
+            }
+        };
 
         let mut normed = vec![0.0f32; seq * h];
         let mut attn_proj = vec![0.0f32; seq * h];
@@ -3020,8 +3048,12 @@ impl AneBonsaiEngine {
             let layer = &self.blas_engine.layers[layer_idx];
             let residual = hidden.clone();
             if cpu_layers.contains(&layer_idx) {
-                let cpu_ctx =
-                    diffusion_attention_context_cpu(&self.blas_engine, layer_idx, &hidden, self.eps);
+                let cpu_ctx = diffusion_attention_context_cpu(
+                    &self.blas_engine,
+                    layer_idx,
+                    &hidden,
+                    self.eps,
+                );
                 attn_ctx_buf.copy_from_slice(&cpu_ctx);
             } else {
                 write_input_cf32(kernel, &hidden, h);
@@ -3151,57 +3183,54 @@ impl AneBonsaiEngine {
             }
         };
 
-        let write_input_cf32 =
-            |kernel: &crate::ane_bridge::AneKernel, data: &[f32], dim: usize| {
-                let base = kernel.get_input_base(0) as *mut f32;
-                assert!(!base.is_null(), "ANE input base should not be null");
-                unsafe {
-                    for c in 0..dim {
-                        let dst = std::slice::from_raw_parts_mut(base.add(c * ps), ps);
-                        for s in 0..seq {
-                            dst[s] = data[s * dim + c];
-                        }
+        let write_input_cf32 = |kernel: &crate::ane_bridge::AneKernel, data: &[f32], dim: usize| {
+            let base = kernel.get_input_base(0) as *mut f32;
+            assert!(!base.is_null(), "ANE input base should not be null");
+            unsafe {
+                for c in 0..dim {
+                    let dst = std::slice::from_raw_parts_mut(base.add(c * ps), ps);
+                    for s in 0..seq {
+                        dst[s] = data[s * dim + c];
                     }
                 }
-                ane_dsb_sy();
-            };
+            }
+            ane_dsb_sy();
+        };
 
-        let scatter_output_cf32 =
-            |kernel: &crate::ane_bridge::AneKernel,
-             actual_dim: usize,
-             start: usize,
-             dst: &mut [f32],
-             dst_stride: usize| {
-                let base = kernel.get_output_base(0) as *const f32;
-                assert!(!base.is_null(), "ANE output base should not be null");
-                ane_dsb_sy();
-                unsafe {
-                    for c in 0..actual_dim {
-                        let src = std::slice::from_raw_parts(base.add(c * ps), ps);
-                        for s in 0..seq {
-                            dst[s * dst_stride + start + c] = src[s];
-                        }
+        let scatter_output_cf32 = |kernel: &crate::ane_bridge::AneKernel,
+                                   actual_dim: usize,
+                                   start: usize,
+                                   dst: &mut [f32],
+                                   dst_stride: usize| {
+            let base = kernel.get_output_base(0) as *const f32;
+            assert!(!base.is_null(), "ANE output base should not be null");
+            ane_dsb_sy();
+            unsafe {
+                for c in 0..actual_dim {
+                    let src = std::slice::from_raw_parts(base.add(c * ps), ps);
+                    for s in 0..seq {
+                        dst[s * dst_stride + start + c] = src[s];
                     }
                 }
-            };
+            }
+        };
 
-        let accumulate_output_cf32 =
-            |kernel: &crate::ane_bridge::AneKernel,
-             actual_dim: usize,
-             dst: &mut [f32],
-             dst_stride: usize| {
-                let base = kernel.get_output_base(0) as *const f32;
-                assert!(!base.is_null(), "ANE output base should not be null");
-                ane_dsb_sy();
-                unsafe {
-                    for c in 0..actual_dim {
-                        let src = std::slice::from_raw_parts(base.add(c * ps), ps);
-                        for s in 0..seq {
-                            dst[s * dst_stride + c] += src[s];
-                        }
+        let accumulate_output_cf32 = |kernel: &crate::ane_bridge::AneKernel,
+                                      actual_dim: usize,
+                                      dst: &mut [f32],
+                                      dst_stride: usize| {
+            let base = kernel.get_output_base(0) as *const f32;
+            assert!(!base.is_null(), "ANE output base should not be null");
+            ane_dsb_sy();
+            unsafe {
+                for c in 0..actual_dim {
+                    let src = std::slice::from_raw_parts(base.add(c * ps), ps);
+                    for s in 0..seq {
+                        dst[s * dst_stride + c] += src[s];
                     }
                 }
-            };
+            }
+        };
 
         let mut normed = vec![0.0f32; seq * h];
         let mut attn_proj = vec![0.0f32; seq * h];
@@ -3241,8 +3270,12 @@ impl AneBonsaiEngine {
             let layer = &self.blas_engine.layers[layer_idx];
             let residual = hidden.clone();
             if cpu_layers.contains(&layer_idx) {
-                let cpu_ctx =
-                    diffusion_attention_context_cpu(&self.blas_engine, layer_idx, &hidden, self.eps);
+                let cpu_ctx = diffusion_attention_context_cpu(
+                    &self.blas_engine,
+                    layer_idx,
+                    &hidden,
+                    self.eps,
+                );
                 attn_ctx_buf.copy_from_slice(&cpu_ctx);
             } else {
                 write_input_cf32(kernel, &hidden, h);
@@ -3286,11 +3319,25 @@ impl AneBonsaiEngine {
         // Final RMSNorm — LAST POSITION ONLY
         let last_row = &hidden[(seq - 1) * h..seq * h];
         let mut last_normed = vec![0.0f32; h];
-        rms_norm_eps(last_row, &self.blas_engine.final_norm, &mut last_normed, 1, h, self.eps);
+        rms_norm_eps(
+            last_row,
+            &self.blas_engine.final_norm,
+            &mut last_normed,
+            1,
+            h,
+            self.eps,
+        );
 
         // LM head: 1×vocab
         let mut logits = vec![0.0f32; cfg.vocab];
-        sgemm_nt(1, cfg.vocab, h, &last_normed, &self.blas_engine.embed, &mut logits);
+        sgemm_nt(
+            1,
+            cfg.vocab,
+            h,
+            &last_normed,
+            &self.blas_engine.embed,
+            &mut logits,
+        );
         logits
     }
 }
@@ -3344,8 +3391,14 @@ impl AneArDecodeEngine {
         let kv_dim = cfg.kv_heads * hd;
         let total_ch = h + 2 * kv_dim + hd + 1;
 
-        assert!(max_seq >= ANE_MIN_SPATIAL, "max_seq must be >= {ANE_MIN_SPATIAL}");
-        assert!(hd >= ANE_MIN_SPATIAL, "head_dim must be >= {ANE_MIN_SPATIAL}");
+        assert!(
+            max_seq >= ANE_MIN_SPATIAL,
+            "max_seq must be >= {ANE_MIN_SPATIAL}"
+        );
+        assert!(
+            hd >= ANE_MIN_SPATIAL,
+            "head_dim must be >= {ANE_MIN_SPATIAL}"
+        );
 
         eprintln!(
             "AneArDecodeEngine: compiling {} decode kernels (max_seq={max_seq}, total_ch={total_ch})...",
@@ -3355,19 +3408,20 @@ impl AneArDecodeEngine {
 
         // Generate decode layer MIL (stub on this branch; panics at runtime
         // if called — Magic Canvas tests go through the bidirectional path).
-        let mil = diffusion_ane::gen_decode_layer(h, cfg.heads, cfg.kv_heads, hd, inter, max_seq, 1e-6);
+        let mil =
+            diffusion_ane::gen_decode_layer(h, cfg.heads, cfg.kv_heads, hd, inter, max_seq, 1e-6);
         let mil_names: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
 
         // Build weight blobs for each layer (8 BLOBFILEs per layer)
         let build_decode_blobs = |lw: &DiffusionLayerWeights| -> Vec<Vec<u8>> {
             vec![
-                build_weight_blob(&lw.input_norm, 1, h),              // rms_att
-                build_weight_blob_transposed(&lw.q_proj, q_dim, h),   // wq
-                build_weight_blob_transposed(&lw.o_proj, h, q_dim),   // wo
+                build_weight_blob(&lw.input_norm, 1, h),            // rms_att
+                build_weight_blob_transposed(&lw.q_proj, q_dim, h), // wq
+                build_weight_blob_transposed(&lw.o_proj, h, q_dim), // wo
                 build_weight_blob(lw.q_norm.as_ref().expect("Bonsai requires q_norm"), 1, hd), // q_norm
-                build_weight_blob(&lw.post_attn_norm, 1, h),          // rms_ffn
+                build_weight_blob(&lw.post_attn_norm, 1, h), // rms_ffn
                 build_weight_blob_transposed(&lw.gate_proj, inter, h), // gate
-                build_weight_blob_transposed(&lw.up_proj, inter, h),  // up
+                build_weight_blob_transposed(&lw.up_proj, inter, h), // up
                 build_weight_blob_transposed(&lw.down_proj, h, inter), // down
             ]
         };
@@ -3457,8 +3511,7 @@ impl AneArDecodeEngine {
         let mut rope_cos = vec![0.0f32; half_hd];
         let mut rope_sin = vec![0.0f32; half_hd];
         for d in 0..half_hd {
-            let freq =
-                1.0 / (cfg.rope_theta as f32).powf(2.0 * d as f32 / hd as f32);
+            let freq = 1.0 / (cfg.rope_theta as f32).powf(2.0 * d as f32 / hd as f32);
             let angle = pos as f32 * freq;
             rope_cos[d] = angle.cos();
             rope_sin[d] = angle.sin();
@@ -3485,13 +3538,22 @@ impl AneArDecodeEngine {
             // QK-norm on K (per-head RMSNorm)
             for kv_h in 0..cfg.kv_heads {
                 let off = kv_h * hd;
-                rms_norm_slice(&mut k_buf[off..off + hd], lw.k_norm.as_ref().expect("Bonsai requires k_norm"));
+                rms_norm_slice(
+                    &mut k_buf[off..off + hd],
+                    lw.k_norm.as_ref().expect("Bonsai requires k_norm"),
+                );
             }
 
             // RoPE on K
             for kv_h in 0..cfg.kv_heads {
                 let off = kv_h * hd;
-                apply_rope(&mut k_buf[off..off + hd], pos, half_hd, &self.blas_engine.rope_cos, &self.blas_engine.rope_sin);
+                apply_rope(
+                    &mut k_buf[off..off + hd],
+                    pos,
+                    half_hd,
+                    &self.blas_engine.rope_cos,
+                    &self.blas_engine.rope_sin,
+                );
             }
 
             // --- Update persistent input buffer (single packed IOSurface) ---
@@ -3539,7 +3601,9 @@ impl AneArDecodeEngine {
             self.kernels[layer_idx].write_input(0, &bytes);
 
             // ANE eval
-            self.kernels[layer_idx].eval().unwrap_or_else(|e| panic!("L{layer_idx} decode eval failed: {e}"));
+            self.kernels[layer_idx]
+                .eval()
+                .unwrap_or_else(|e| panic!("L{layer_idx} decode eval failed: {e}"));
 
             // Read output: [1, dim, 1, ms] fp32 — position 0 only
             hidden = self.kernels[layer_idx].read_output_zerocopy(0, h, ms);
@@ -3552,7 +3616,14 @@ impl AneArDecodeEngine {
         // logits = embed^T @ final_normed (vocab, hidden) @ (hidden,) → (vocab,)
         let vocab = cfg.vocab;
         let mut logits = vec![0.0f32; vocab];
-        sgemm_at(vocab, 1, h, &self.blas_engine.embed, &final_normed, &mut logits);
+        sgemm_at(
+            vocab,
+            1,
+            h,
+            &self.blas_engine.embed,
+            &final_normed,
+            &mut logits,
+        );
 
         self.pos += 1;
         logits
@@ -4527,7 +4598,10 @@ mod tests {
             "{}/.cache/huggingface/hub/models--dllm-hub--Qwen3-0.6B-diffusion-mdlm-v0.1",
             std::env::var("HOME").ok()?
         );
-        if std::path::Path::new(&dir).join("model.safetensors").exists() {
+        if std::path::Path::new(&dir)
+            .join("model.safetensors")
+            .exists()
+        {
             Some(dir)
         } else {
             None
@@ -4539,7 +4613,10 @@ mod tests {
             "{}/.cache/huggingface/hub/models--dllm-hub--Qwen2.5-Coder-0.5B-Instruct-diffusion-mdlm-v0.1/snapshots/a284e895a6248256baf2f60502e54aba61b24c1a",
             std::env::var("HOME").ok()?
         );
-        if std::path::Path::new(&dir).join("model.safetensors").exists() {
+        if std::path::Path::new(&dir)
+            .join("model.safetensors")
+            .exists()
+        {
             Some(dir)
         } else {
             None
@@ -4553,11 +4630,7 @@ mod tests {
     }
 
     /// Format a chat prompt using the Qwen2/Qwen3 chat template tokens.
-    fn format_chat_prompt(
-        tokenizer: &tokenizers::Tokenizer,
-        system: &str,
-        user: &str,
-    ) -> Vec<u32> {
+    fn format_chat_prompt(tokenizer: &tokenizers::Tokenizer, system: &str, user: &str) -> Vec<u32> {
         let prompt = format!(
             "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
         );
@@ -4574,15 +4647,23 @@ mod tests {
         let checks = [
             text.contains("<form") || lc.contains("<form"),
             text.contains("<input") || lc.contains("<input"),
-            lc.contains("<button") || lc.contains("type=\"submit\"") || lc.contains("type='submit'"),
+            lc.contains("<button")
+                || lc.contains("type=\"submit\"")
+                || lc.contains("type='submit'"),
             lc.contains("type=\"email\"") || lc.contains("type='email'") || lc.contains("email"),
-            lc.contains("type=\"password\"") || lc.contains("type='password'") || lc.contains("password"),
+            lc.contains("type=\"password\"")
+                || lc.contains("type='password'")
+                || lc.contains("password"),
             // tailwind-ish class marker
-            lc.contains("class=\"") && (
-                lc.contains("bg-") || lc.contains("text-") || lc.contains("p-") ||
-                lc.contains("flex") || lc.contains("rounded") || lc.contains("w-") ||
-                lc.contains("h-") || lc.contains("grid")
-            ),
+            lc.contains("class=\"")
+                && (lc.contains("bg-")
+                    || lc.contains("text-")
+                    || lc.contains("p-")
+                    || lc.contains("flex")
+                    || lc.contains("rounded")
+                    || lc.contains("w-")
+                    || lc.contains("h-")
+                    || lc.contains("grid")),
         ];
         let score = checks.iter().filter(|b| **b).count();
         (score, checks)
@@ -4600,7 +4681,10 @@ mod tests {
         };
         let t_load = std::time::Instant::now();
         let engine = DiffusionEngine::load_autodetect(&dir).expect("load engine");
-        eprintln!("[T0] model loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+        eprintln!(
+            "[T0] model loaded in {:.1}s",
+            t_load.elapsed().as_secs_f64()
+        );
         eprintln!(
             "[T0] config: hidden={} layers={} heads={}/{} head_dim={} vocab={} mask_id={}",
             engine.config.hidden,
@@ -4627,7 +4711,10 @@ mod tests {
         let text = tokenizer
             .decode(gen_tokens, true)
             .unwrap_or_else(|_| "<decode error>".to_string());
-        eprintln!("[T0] output ({non_mask}/{} non-mask): {text:?}", gen_tokens.len());
+        eprintln!(
+            "[T0] output ({non_mask}/{} non-mask): {text:?}",
+            gen_tokens.len()
+        );
 
         assert!(
             non_mask >= gen_tokens.len() / 2,
@@ -4706,16 +4793,46 @@ mod tests {
         let tokenizer = crate::load_tokenizer(&dir).expect("load tokenizer");
 
         let prompts: &[(&str, &str)] = &[
-            ("login form",    "Write HTML for a login form with email and password."),
-            ("signup form",   "Write HTML for a signup form with name, email, password, confirm password."),
-            ("product card",  "Write HTML for a product card with image, title, price, buy button."),
-            ("navbar",        "Write HTML for a navbar with logo and menu links."),
-            ("pricing table", "Write HTML for a pricing table with 3 tiers: Basic, Pro, Enterprise."),
-            ("contact form",  "Write HTML for a contact form with name, email, message, send button."),
-            ("stat card",     "Write HTML for a stat card showing Users: 1234 with icon."),
-            ("footer",        "Write HTML for a footer with 3 columns of links and copyright."),
-            ("button",        "Write HTML for a primary button that says Get Started."),
-            ("alert",         "Write HTML for a success alert saying Saved successfully."),
+            (
+                "login form",
+                "Write HTML for a login form with email and password.",
+            ),
+            (
+                "signup form",
+                "Write HTML for a signup form with name, email, password, confirm password.",
+            ),
+            (
+                "product card",
+                "Write HTML for a product card with image, title, price, buy button.",
+            ),
+            (
+                "navbar",
+                "Write HTML for a navbar with logo and menu links.",
+            ),
+            (
+                "pricing table",
+                "Write HTML for a pricing table with 3 tiers: Basic, Pro, Enterprise.",
+            ),
+            (
+                "contact form",
+                "Write HTML for a contact form with name, email, message, send button.",
+            ),
+            (
+                "stat card",
+                "Write HTML for a stat card showing Users: 1234 with icon.",
+            ),
+            (
+                "footer",
+                "Write HTML for a footer with 3 columns of links and copyright.",
+            ),
+            (
+                "button",
+                "Write HTML for a primary button that says Get Started.",
+            ),
+            (
+                "alert",
+                "Write HTML for a success alert saying Saved successfully.",
+            ),
         ];
 
         const STEPS: usize = 16;
@@ -4729,7 +4846,10 @@ mod tests {
             DiffusionBackendPreference::CpuBlas,
         )
         .expect("build CPU runtime");
-        eprintln!("[T2] CPU runtime: {:?}", cpu_runtime.backend_report().detail);
+        eprintln!(
+            "[T2] CPU runtime: {:?}",
+            cpu_runtime.backend_report().detail
+        );
 
         // ANE: compiled per-prompt with EXACT canvas size to avoid padding pollution.
         // Bidirectional attention has no mask, so zero-padded positions corrupt output
@@ -4737,11 +4857,15 @@ mod tests {
         #[cfg(feature = "ane")]
         let ane_available = {
             // Quick compile test: try building one small ANE kernel
-            match DiffusionRuntime::new(
-                engine.clone(), 32, DiffusionBackendPreference::Ane,
-            ) {
-                Ok(_) => { eprintln!("[T2] ANE available — will compile per-prompt"); true }
-                Err(e) => { eprintln!("[T2] ANE unavailable ({e}) — skip ANE column"); false }
+            match DiffusionRuntime::new(engine.clone(), 32, DiffusionBackendPreference::Ane) {
+                Ok(_) => {
+                    eprintln!("[T2] ANE available — will compile per-prompt");
+                    true
+                }
+                Err(e) => {
+                    eprintln!("[T2] ANE unavailable ({e}) — skip ANE column");
+                    false
+                }
             }
         };
         #[cfg(not(feature = "ane"))]
@@ -4759,8 +4883,10 @@ mod tests {
         let mut ane_total_ms = 0u128;
 
         eprintln!();
-        eprintln!("{:<14} | {:>9} {:>6} | {:>9} {:>6}",
-                  "prompt", "cpu_ms", "valid", "ane_ms", "valid");
+        eprintln!(
+            "{:<14} | {:>9} {:>6} | {:>9} {:>6}",
+            "prompt", "cpu_ms", "valid", "ane_ms", "valid"
+        );
         eprintln!("{}", "-".repeat(64));
 
         for (label, user_msg) in prompts {
@@ -4783,15 +4909,20 @@ mod tests {
             let gen_tokens = &generated[prompt_ids.len()..];
             let cpu_text = tokenizer.decode(gen_tokens, true).unwrap_or_default();
             let cpu_ok = html_partially_valid(&cpu_text);
-            if cpu_ok { cpu_valid += 1; }
+            if cpu_ok {
+                cpu_valid += 1;
+            }
 
             // ANE — compile for exact canvas size (no padding)
             let (ane_ms_str, ane_ok_str, ane_text) = if ane_available {
                 #[cfg(feature = "ane")]
                 {
                     let ane_rt = DiffusionRuntime::new(
-                        engine.clone(), canvas_len, DiffusionBackendPreference::Ane,
-                    ).expect("build per-prompt ANE runtime");
+                        engine.clone(),
+                        canvas_len,
+                        DiffusionBackendPreference::Ane,
+                    )
+                    .expect("build per-prompt ANE runtime");
                     let t = std::time::Instant::now();
                     let generated = ane_rt.generate(&prompt_ids, NUM_GEN, STEPS);
                     let ane_ms = t.elapsed().as_millis();
@@ -4799,11 +4930,15 @@ mod tests {
                     let gen_tokens = &generated[prompt_ids.len()..];
                     let text = tokenizer.decode(gen_tokens, true).unwrap_or_default();
                     let ok = html_partially_valid(&text);
-                    if ok { ane_valid += 1; }
+                    if ok {
+                        ane_valid += 1;
+                    }
                     (format!("{ane_ms}"), ok.to_string(), text)
                 }
                 #[cfg(not(feature = "ane"))]
-                { unreachable!() }
+                {
+                    unreachable!()
+                }
             } else {
                 ("-".to_string(), "-".to_string(), String::new())
             };
@@ -5399,7 +5534,13 @@ mod tests {
 
             // Build input
             let input: Vec<u32> = (0..seq)
-                .map(|i| if i < 5 { 785u32 + i as u32 } else { 1000u32 + i as u32 })
+                .map(|i| {
+                    if i < 5 {
+                        785u32 + i as u32
+                    } else {
+                        1000u32 + i as u32
+                    }
+                })
                 .collect();
 
             // Compile ANE engine
@@ -6401,7 +6542,13 @@ mod tests {
 
         for seq in [64usize, 128] {
             let input: Vec<u32> = (0..seq)
-                .map(|i| if i < 5 { 785u32 + i as u32 } else { 1000u32 + i as u32 })
+                .map(|i| {
+                    if i < 5 {
+                        785u32 + i as u32
+                    } else {
+                        1000u32 + i as u32
+                    }
+                })
                 .collect();
 
             eprintln!("\n=== Bonsai-1.7B OC-tiled ANE benchmark (seq={seq}) ===");
@@ -6429,7 +6576,8 @@ mod tests {
             let mut hidden0 = vec![0.0f32; seq * h];
             for (i, &tid) in input.iter().enumerate() {
                 let off = tid as usize * h;
-                hidden0[i * h..(i + 1) * h].copy_from_slice(&ane_engine.blas_engine.embed[off..off + h]);
+                hidden0[i * h..(i + 1) * h]
+                    .copy_from_slice(&ane_engine.blas_engine.embed[off..off + h]);
             }
 
             #[cfg(target_arch = "aarch64")]
@@ -6440,38 +6588,38 @@ mod tests {
             #[cfg(not(target_arch = "aarch64"))]
             fn ane_dsb_sy() {}
 
-            let write_input_cf32 = |kernel: &crate::ane_bridge::AneKernel, data: &[f32], dim: usize| {
-                let base = kernel.get_input_base(0) as *mut f32;
-                assert!(!base.is_null(), "ANE input base should not be null");
-                unsafe {
-                    for c in 0..dim {
-                        let dst = std::slice::from_raw_parts_mut(base.add(c * ps), ps);
-                        for s in 0..seq {
-                            dst[s] = data[s * dim + c];
-                        }
-                    }
-                }
-                ane_dsb_sy();
-            };
-
-            let scatter_output_cf32 =
-                |kernel: &crate::ane_bridge::AneKernel,
-                 actual_dim: usize,
-                 start: usize,
-                 dst_row_major: &mut [f32],
-                 dst_stride: usize| {
-                    let base = kernel.get_output_base(0) as *const f32;
-                    assert!(!base.is_null(), "ANE output base should not be null");
-                    ane_dsb_sy();
+            let write_input_cf32 =
+                |kernel: &crate::ane_bridge::AneKernel, data: &[f32], dim: usize| {
+                    let base = kernel.get_input_base(0) as *mut f32;
+                    assert!(!base.is_null(), "ANE input base should not be null");
                     unsafe {
-                        for c in 0..actual_dim {
-                            let src = std::slice::from_raw_parts(base.add(c * ps), ps);
+                        for c in 0..dim {
+                            let dst = std::slice::from_raw_parts_mut(base.add(c * ps), ps);
                             for s in 0..seq {
-                                dst_row_major[s * dst_stride + start + c] = src[s];
+                                dst[s] = data[s * dim + c];
                             }
                         }
                     }
+                    ane_dsb_sy();
                 };
+
+            let scatter_output_cf32 = |kernel: &crate::ane_bridge::AneKernel,
+                                       actual_dim: usize,
+                                       start: usize,
+                                       dst_row_major: &mut [f32],
+                                       dst_stride: usize| {
+                let base = kernel.get_output_base(0) as *const f32;
+                assert!(!base.is_null(), "ANE output base should not be null");
+                ane_dsb_sy();
+                unsafe {
+                    for c in 0..actual_dim {
+                        let src = std::slice::from_raw_parts(base.add(c * ps), ps);
+                        for s in 0..seq {
+                            dst_row_major[s * dst_stride + start + c] = src[s];
+                        }
+                    }
+                }
+            };
 
             let accumulate_output_cf32 =
                 |kernel: &crate::ane_bridge::AneKernel,
@@ -6533,11 +6681,25 @@ mod tests {
                         h,
                         eps,
                     );
-                    sgemm_nt(seq, inter, h, &scratch.normed, &layer.gate_proj, &mut scratch.gate);
+                    sgemm_nt(
+                        seq,
+                        inter,
+                        h,
+                        &scratch.normed,
+                        &layer.gate_proj,
+                        &mut scratch.gate,
+                    );
                     for v in scratch.gate.iter_mut() {
                         *v *= 1.0 / (1.0 + (-*v).exp());
                     }
-                    sgemm_nt(seq, inter, h, &scratch.normed, &layer.up_proj, &mut scratch.up);
+                    sgemm_nt(
+                        seq,
+                        inter,
+                        h,
+                        &scratch.normed,
+                        &layer.up_proj,
+                        &mut scratch.up,
+                    );
                     for (g, u) in scratch.gate.iter_mut().zip(scratch.up.iter()) {
                         *g *= u;
                     }
@@ -6588,11 +6750,8 @@ mod tests {
                                 .unwrap()
                             });
                         } else {
-                            crate::ane_bridge::AneKernel::eval_chain(&[
-                                gated_kernel,
-                                down_kernel,
-                            ])
-                            .unwrap();
+                            crate::ane_bridge::AneKernel::eval_chain(&[gated_kernel, down_kernel])
+                                .unwrap();
                         }
                         accumulate_output_cf32(down_kernel, h, &mut scratch.out, h);
                     }
@@ -6712,11 +6871,7 @@ mod tests {
         // Tokenize prompt using the diffusion model's tokenizer (shared Qwen3 vocab)
         let tokenizer = crate::load_tokenizer(&diff_dir).unwrap();
         let prompt = "Explain quantum computing in simple terms";
-        let prompt_ids: Vec<u32> = tokenizer
-            .encode(prompt, false)
-            .unwrap()
-            .get_ids()
-            .to_vec();
+        let prompt_ids: Vec<u32> = tokenizer.encode(prompt, false).unwrap().get_ids().to_vec();
         eprintln!("Prompt: {prompt:?} ({} tokens)", prompt_ids.len());
 
         // --- Target model specs ---
@@ -6759,11 +6914,9 @@ mod tests {
                     "qwen3_5" => crate::qwen3_next::load_qwen3_5_model(dir)
                         .map(crate::AnyModel::Qwen3Next)
                         .map_err(|e| e.to_string()),
-                    "qwen2" | "qwen3" | "llama" | "mistral" => {
-                        crate::transformer::load_model(dir)
-                            .map(crate::AnyModel::Transformer)
-                            .map_err(|e| e.to_string())
-                    }
+                    "qwen2" | "qwen3" | "llama" | "mistral" => crate::transformer::load_model(dir)
+                        .map(crate::AnyModel::Transformer)
+                        .map_err(|e| e.to_string()),
                     other => Err(format!("Unsupported model_type={other}")),
                 }
             }));
@@ -6939,10 +7092,7 @@ mod tests {
         let t_load = std::time::Instant::now();
         let verify_model = crate::qwen3_next::load_qwen3_5_model(&verify_dir).unwrap();
         let mut verify = crate::AnyModel::Qwen3Next(verify_model);
-        eprintln!(
-            "  Verify loaded in {:.1}s",
-            t_load.elapsed().as_secs_f64()
-        );
+        eprintln!("  Verify loaded in {:.1}s", t_load.elapsed().as_secs_f64());
 
         // Shared tokenizer (same vocab)
         let tokenizer = crate::load_tokenizer(&draft_dir).unwrap();
@@ -6956,11 +7106,7 @@ mod tests {
         for prompt in &prompts {
             eprintln!("\n=== Prompt: {prompt:?} ===");
 
-            let prompt_ids: Vec<u32> = tokenizer
-                .encode(*prompt, false)
-                .unwrap()
-                .get_ids()
-                .to_vec();
+            let prompt_ids: Vec<u32> = tokenizer.encode(*prompt, false).unwrap().get_ids().to_vec();
             eprintln!("  Tokenized: {} tokens", prompt_ids.len());
 
             let mut context = prompt_ids.clone();
@@ -7115,12 +7261,9 @@ mod tests {
                     verify_cache.eval_for_clone().unwrap();
                 } else {
                     // SLOW PATH: partial accept — restore snapshots and re-feed.
-                    let advance_input: Vec<i32> =
-                        new_tokens.iter().map(|&t| t as i32).collect();
-                    let advance_arr = mlx_rs::Array::from_slice(
-                        &advance_input,
-                        &[1, advance_input.len() as i32],
-                    );
+                    let advance_input: Vec<i32> = new_tokens.iter().map(|&t| t as i32).collect();
+                    let advance_arr =
+                        mlx_rs::Array::from_slice(&advance_input, &[1, advance_input.len() as i32]);
 
                     draft_cache = draft_snapshot;
                     saved_draft_logits =
@@ -7129,8 +7272,9 @@ mod tests {
                     draft_cache.eval_for_clone().unwrap();
 
                     verify_cache = verify_snapshot;
-                    saved_verify_logits =
-                        verify.forward(&advance_arr, None, &mut verify_cache).unwrap();
+                    saved_verify_logits = verify
+                        .forward(&advance_arr, None, &mut verify_cache)
+                        .unwrap();
                     mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
                     verify_cache.eval_for_clone().unwrap();
                 }
@@ -7216,10 +7360,7 @@ mod tests {
         let t_load = std::time::Instant::now();
         let verify_model = crate::qwen3_next::load_qwen3_5_model(&verify_dir).unwrap();
         let mut verify = crate::AnyModel::Qwen3Next(verify_model);
-        eprintln!(
-            "  Verify loaded in {:.1}s",
-            t_load.elapsed().as_secs_f64()
-        );
+        eprintln!("  Verify loaded in {:.1}s", t_load.elapsed().as_secs_f64());
 
         // Shared tokenizer (same vocab)
         let tokenizer = crate::load_tokenizer(&draft_dir).unwrap();
@@ -7233,11 +7374,7 @@ mod tests {
         for prompt in &prompts {
             eprintln!("\n=== Adaptive K — Prompt: {prompt:?} ===");
 
-            let prompt_ids: Vec<u32> = tokenizer
-                .encode(*prompt, false)
-                .unwrap()
-                .get_ids()
-                .to_vec();
+            let prompt_ids: Vec<u32> = tokenizer.encode(*prompt, false).unwrap().get_ids().to_vec();
             eprintln!("  Tokenized: {} tokens", prompt_ids.len());
 
             let mut context = prompt_ids.clone();
@@ -7372,12 +7509,9 @@ mod tests {
                     mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
                     verify_cache.eval_for_clone().unwrap();
                 } else {
-                    let advance_input: Vec<i32> =
-                        new_tokens.iter().map(|&t| t as i32).collect();
-                    let advance_arr = mlx_rs::Array::from_slice(
-                        &advance_input,
-                        &[1, advance_input.len() as i32],
-                    );
+                    let advance_input: Vec<i32> = new_tokens.iter().map(|&t| t as i32).collect();
+                    let advance_arr =
+                        mlx_rs::Array::from_slice(&advance_input, &[1, advance_input.len() as i32]);
 
                     draft_cache = draft_snapshot;
                     saved_draft_logits =
@@ -7386,8 +7520,9 @@ mod tests {
                     draft_cache.eval_for_clone().unwrap();
 
                     verify_cache = verify_snapshot;
-                    saved_verify_logits =
-                        verify.forward(&advance_arr, None, &mut verify_cache).unwrap();
+                    saved_verify_logits = verify
+                        .forward(&advance_arr, None, &mut verify_cache)
+                        .unwrap();
                     mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
                     verify_cache.eval_for_clone().unwrap();
                 }
@@ -7503,10 +7638,7 @@ mod tests {
         );
 
         // First mismatch → correction only
-        assert_eq!(
-            super::accept_prefix(&[5, 3, 7], &[9, 1, 2, 0]),
-            vec![9]
-        );
+        assert_eq!(super::accept_prefix(&[5, 3, 7], &[9, 1, 2, 0]), vec![9]);
 
         // Mid mismatch → accepted prefix + correction
         assert_eq!(
@@ -7547,7 +7679,11 @@ mod tests {
         let t1 = std::time::Instant::now();
         let tokens = drafter.draft(&prefix, 4);
         let draft_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("  Got {} tokens in {draft_ms:.0}ms: {:?}", tokens.len(), tokens);
+        eprintln!(
+            "  Got {} tokens in {draft_ms:.0}ms: {:?}",
+            tokens.len(),
+            tokens
+        );
 
         assert_eq!(tokens.len(), 4, "should produce exactly 4 draft tokens");
         assert!(
@@ -7586,14 +7722,7 @@ mod tests {
 
         eprintln!("Running speculative_generate (max_tokens=20, k=4..8)...");
         let t1 = std::time::Instant::now();
-        let tokens = super::speculative_generate(
-            &drafter,
-            &mut verifier,
-            &prompt,
-            20,
-            4,
-            8,
-        );
+        let tokens = super::speculative_generate(&drafter, &mut verifier, &prompt, 20, 4, 8);
         let gen_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let tps = if gen_ms > 0.0 {
             tokens.len() as f64 / gen_ms * 1000.0
@@ -7735,7 +7864,10 @@ mod tests {
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .unwrap();
-        eprintln!("After 5+1 tokens, argmax={} logit={:.4}", argmax.0, argmax.1);
+        eprintln!(
+            "After 5+1 tokens, argmax={} logit={:.4}",
+            argmax.0, argmax.1
+        );
         assert!(argmax.1.abs() > 0.1, "logits suspiciously near zero");
     }
 
@@ -7808,7 +7940,9 @@ mod tests {
         let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
         let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if na < 1e-12 || nb < 1e-12 { return 0.0; }
+        if na < 1e-12 || nb < 1e-12 {
+            return 0.0;
+        }
         dot / (na * nb)
     }
 
@@ -7830,28 +7964,51 @@ mod tests {
 
         let prompt: Vec<u32> = vec![785, 6722, 315, 9625, 374];
         let n_gen = 91;
-        let input: Vec<u32> = prompt.iter().copied()
-            .chain(std::iter::repeat(mask_id).take(n_gen)).collect();
+        let input: Vec<u32> = prompt
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(mask_id).take(n_gen))
+            .collect();
         let seq = input.len();
-        eprintln!("[diag] input: {seq} tokens ({} real + {n_gen} mask)", prompt.len());
+        eprintln!(
+            "[diag] input: {seq} tokens ({} real + {n_gen} mask)",
+            prompt.len()
+        );
 
         let cpu_logits = engine.forward(&input);
 
         let compare = |label: &str, logits: &[f32]| -> (f32, f64, usize) {
-            let max_err = cpu_logits.iter().zip(logits.iter())
-                .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let max_err = cpu_logits
+                .iter()
+                .zip(logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
             let mut argmax_match = 0usize;
             let mut cos_sum = 0.0f64;
             for pos in 0..seq {
                 let cpu_row = &cpu_logits[pos * vocab..(pos + 1) * vocab];
                 let ane_row = &logits[pos * vocab..(pos + 1) * vocab];
-                let ca = cpu_row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
-                let aa = ane_row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
-                if ca == aa { argmax_match += 1; }
+                let ca = cpu_row
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .unwrap()
+                    .0;
+                let aa = ane_row
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .unwrap()
+                    .0;
+                if ca == aa {
+                    argmax_match += 1;
+                }
                 cos_sum += cosine_sim(cpu_row, ane_row) as f64;
             }
             let cos_avg = cos_sum / seq as f64;
-            eprintln!("[diag] {label}: max_err={max_err:.4} argmax={argmax_match}/{seq} cos={cos_avg:.4}");
+            eprintln!(
+                "[diag] {label}: max_err={max_err:.4} argmax={argmax_match}/{seq} cos={cos_avg:.4}"
+            );
             (max_err, cos_avg, argmax_match)
         };
 
@@ -7874,8 +8031,13 @@ mod tests {
         drop(ane_heavy);
 
         eprintln!();
-        eprintln!("=== VERDICT: exact={exact_cos:.4} pad64={padded_cos:.4} pad160={heavy_cos:.4} ===");
-        assert!(exact_cos > 0.99, "exact-seq ANE should match CPU closely (got {exact_cos:.4})");
+        eprintln!(
+            "=== VERDICT: exact={exact_cos:.4} pad64={padded_cos:.4} pad160={heavy_cos:.4} ==="
+        );
+        assert!(
+            exact_cos > 0.99,
+            "exact-seq ANE should match CPU closely (got {exact_cos:.4})"
+        );
         assert!(exact_cos > padded_cos, "padding should degrade quality");
     }
 
@@ -7933,7 +8095,9 @@ mod tests {
                 return;
             }
         };
-        let ane_logits = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ane.forward(&input))) {
+        let ane_logits = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ane.forward(&input)
+        })) {
             Ok(logits) => logits,
             Err(_) => {
                 eprintln!("[chat-parity] ANE eval failed at runtime — hpg={} likely exceeds ANE hardware constraints",
@@ -7948,8 +8112,18 @@ mod tests {
         for pos in 0..seq {
             let cpu_row = &cpu_logits[pos * vocab..(pos + 1) * vocab];
             let ane_row = &ane_logits[pos * vocab..(pos + 1) * vocab];
-            let ca = cpu_row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
-            let aa = ane_row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+            let ca = cpu_row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0;
+            let aa = ane_row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0;
             if ca == aa {
                 argmax_match += 1;
             }
@@ -7972,8 +8146,14 @@ mod tests {
             .unwrap_or_default();
         let cpu_ok = html_partially_valid(&cpu_text);
         let ane_ok = html_partially_valid(&ane_text);
-        eprintln!("[chat-parity] CPU gen ({cpu_ok}): {:?}", &cpu_text[..cpu_text.len().min(200)]);
-        eprintln!("[chat-parity] ANE gen ({ane_ok}): {:?}", &ane_text[..ane_text.len().min(200)]);
+        eprintln!(
+            "[chat-parity] CPU gen ({cpu_ok}): {:?}",
+            &cpu_text[..cpu_text.len().min(200)]
+        );
+        eprintln!(
+            "[chat-parity] ANE gen ({ane_ok}): {:?}",
+            &ane_text[..ane_text.len().min(200)]
+        );
 
         assert!(
             cos_avg > 0.98,
@@ -8004,29 +8184,52 @@ mod tests {
         let result_a = ane_direct.generate(&prompt, n_gen, steps);
         let gen_a = &result_a[prompt.len()..];
         let mask_count_a = gen_a.iter().filter(|&&t| t == mask_id).count();
-        eprintln!("[A/B] Direct ANE generate: {} non-mask/{} total, first 10: {:?}",
-            n_gen - mask_count_a, n_gen, &gen_a[..10.min(n_gen)]);
+        eprintln!(
+            "[A/B] Direct ANE generate: {} non-mask/{} total, first 10: {:?}",
+            n_gen - mask_count_a,
+            n_gen,
+            &gen_a[..10.min(n_gen)]
+        );
 
         // Path B: DiffusionRuntime::generate() with ANE backend
         let rt = super::DiffusionRuntime::new(
-            engine.clone(), seq, super::DiffusionBackendPreference::Ane,
-        ).unwrap();
+            engine.clone(),
+            seq,
+            super::DiffusionBackendPreference::Ane,
+        )
+        .unwrap();
         let result_b = rt.generate(&prompt, n_gen, steps);
         let gen_b = &result_b[prompt.len()..];
         let mask_count_b = gen_b.iter().filter(|&&t| t == mask_id).count();
-        eprintln!("[A/B] Runtime ANE generate: {} non-mask/{} total, first 10: {:?}",
-            n_gen - mask_count_b, n_gen, &gen_b[..10.min(n_gen)]);
+        eprintln!(
+            "[A/B] Runtime ANE generate: {} non-mask/{} total, first 10: {:?}",
+            n_gen - mask_count_b,
+            n_gen,
+            &gen_b[..10.min(n_gen)]
+        );
 
         // Path C: CPU generate for reference
         let cpu_result = engine.generate(&prompt, n_gen, steps);
         let gen_c = &cpu_result[prompt.len()..];
         let mask_count_c = gen_c.iter().filter(|&&t| t == mask_id).count();
-        eprintln!("[A/B] CPU generate:         {} non-mask/{} total, first 10: {:?}",
-            n_gen - mask_count_c, n_gen, &gen_c[..10.min(n_gen)]);
+        eprintln!(
+            "[A/B] CPU generate:         {} non-mask/{} total, first 10: {:?}",
+            n_gen - mask_count_c,
+            n_gen,
+            &gen_c[..10.min(n_gen)]
+        );
 
         // Compare
-        let match_ab: usize = gen_a.iter().zip(gen_b.iter()).filter(|(a, b)| a == b).count();
-        let match_ac: usize = gen_a.iter().zip(gen_c.iter()).filter(|(a, b)| a == b).count();
+        let match_ab: usize = gen_a
+            .iter()
+            .zip(gen_b.iter())
+            .filter(|(a, b)| a == b)
+            .count();
+        let match_ac: usize = gen_a
+            .iter()
+            .zip(gen_c.iter())
+            .filter(|(a, b)| a == b)
+            .count();
         eprintln!("[A/B] direct_ane vs runtime_ane: {match_ab}/{n_gen} match");
         eprintln!("[A/B] direct_ane vs cpu: {match_ac}/{n_gen} match");
     }
@@ -8082,8 +8285,10 @@ mod tests {
         for spec in &specs {
             eprintln!("\n{}", "=".repeat(60));
             eprintln!("SPEC: {}", spec.label);
-            eprintln!("  hidden={} heads={} kv_heads={} head_dim={} inter={}",
-                spec.hidden, spec.heads, spec.kv_heads, spec.head_dim, spec.inter);
+            eprintln!(
+                "  hidden={} heads={} kv_heads={} head_dim={} inter={}",
+                spec.hidden, spec.heads, spec.kv_heads, spec.head_dim, spec.inter
+            );
             eprintln!("  heads_per_group = {}", spec.heads / spec.kv_heads);
 
             let config = super::DiffusionConfig {
@@ -8120,16 +8325,17 @@ mod tests {
                         continue;
                     }
                     Ok(Ok(ane)) => {
-                        eprintln!("  seq={seq:>4} compile OK (backend={:?})", ane.backend_kind());
+                        eprintln!(
+                            "  seq={seq:>4} compile OK (backend={:?})",
+                            ane.backend_kind()
+                        );
                         ane
                     }
                 };
 
                 // Phase 2: try forward eval
                 let token_ids: Vec<u32> = (0..seq as u32).map(|i| i % 1024).collect();
-                let eval_result = catch_unwind(AssertUnwindSafe(|| {
-                    ane.forward(&token_ids)
-                }));
+                let eval_result = catch_unwind(AssertUnwindSafe(|| ane.forward(&token_ids)));
 
                 match eval_result {
                     Err(panic) => {
@@ -8145,8 +8351,10 @@ mod tests {
                         let nonzero = logits.iter().any(|v| *v != 0.0);
                         let max_abs = logits.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
                         if finite && nonzero {
-                            eprintln!("  seq={seq:>4} EVAL OK — logits [{} elems, max_abs={max_abs:.4}]",
-                                logits.len());
+                            eprintln!(
+                                "  seq={seq:>4} EVAL OK — logits [{} elems, max_abs={max_abs:.4}]",
+                                logits.len()
+                            );
                         } else {
                             eprintln!("  seq={seq:>4} EVAL BAD — finite={finite} nonzero={nonzero} max_abs={max_abs:.4}");
                         }
@@ -8158,5 +8366,706 @@ mod tests {
         }
         eprintln!("\n{}", "=".repeat(60));
         eprintln!("PROBE COMPLETE");
+    }
+
+    /// **Reverse** speculative decoding: 35B-A3B (draft) → 9B dense (verify).
+    ///
+    /// Novel pairing: the 35B-A3B is a MoE with only ~3B active params per
+    /// token, making it fast per-token while producing high-quality predictions.
+    /// The 9B dense target verifies in batched forward.  Since the drafter is
+    /// "smarter" than the verifier, acceptance should be very high.
+    #[test]
+    #[ignore]
+    fn test_ar_spec_decode_35b_drafts_for_9b() {
+        const K: usize = 8;
+        const N_ROUNDS: usize = 20;
+
+        let draft_dir = std::path::PathBuf::from(
+            "/Users/peppi/.cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit",
+        );
+        let verify_dir = std::path::PathBuf::from(
+            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-9B-MLX-4bit",
+        );
+
+        assert!(
+            draft_dir.join("config.json").exists(),
+            "draft model not found: {:?}",
+            draft_dir
+        );
+        assert!(
+            verify_dir.join("config.json").exists(),
+            "verify model not found: {:?}",
+            verify_dir
+        );
+
+        eprintln!("Loading draft model (35B-A3B-3bit)...");
+        let t_load = std::time::Instant::now();
+        let draft_model = crate::qwen3_next::load_qwen3_5_model(&draft_dir).unwrap();
+        let mut draft = crate::AnyModel::Qwen3Next(draft_model);
+        eprintln!("  Draft loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+
+        eprintln!("Loading verify model (9B-4bit)...");
+        let t_load = std::time::Instant::now();
+        let verify_model = crate::qwen3_next::load_qwen3_5_model(&verify_dir).unwrap();
+        let mut verify = crate::AnyModel::Qwen3Next(verify_model);
+        eprintln!("  Verify loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+
+        let tokenizer = crate::load_tokenizer(&draft_dir).unwrap();
+
+        let prompts = [
+            "The capital of France is",
+            "Explain quantum computing in simple terms:",
+        ];
+
+        for prompt in &prompts {
+            eprintln!("\n=== Prompt: {prompt:?} ===");
+
+            let prompt_ids: Vec<u32> = tokenizer.encode(*prompt, false).unwrap().get_ids().to_vec();
+            eprintln!("  Tokenized: {} tokens", prompt_ids.len());
+
+            let mut context = prompt_ids.clone();
+            let mut total_accepted: usize = 0;
+            let mut total_drafted: usize = 0;
+            let mut draft_time_ms: f64 = 0.0;
+            let mut verify_time_ms: f64 = 0.0;
+            let mut advance_time_ms: f64 = 0.0;
+
+            let mut draft_cache = draft.make_cache();
+            let mut verify_cache = verify.make_cache();
+
+            let ctx_input: Vec<i32> = prompt_ids.iter().map(|&id| id as i32).collect();
+            let ctx_len = ctx_input.len() as i32;
+            let ctx_arr = mlx_rs::Array::from_slice(&ctx_input, &[1, ctx_len]);
+
+            let t_prefill = std::time::Instant::now();
+            let mut saved_draft_logits = draft.forward(&ctx_arr, None, &mut draft_cache).unwrap();
+            mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+            let mut saved_verify_logits =
+                verify.forward(&ctx_arr, None, &mut verify_cache).unwrap();
+            mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+            draft_cache.eval_for_clone().unwrap();
+            verify_cache.eval_for_clone().unwrap();
+            let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("  Prefill: {prefill_ms:.0}ms (both models)");
+
+            for round in 0..N_ROUNDS {
+                let t_draft = std::time::Instant::now();
+
+                let draft_snapshot = draft_cache.clone();
+
+                let mut draft_tokens: Vec<u32> = Vec::with_capacity(K);
+                {
+                    use mlx_rs::ops::indexing as ix;
+                    let pred = ix::argmax_axis(&saved_draft_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&pred]).unwrap();
+                    draft_tokens.push(pred.item::<i32>() as u32);
+                }
+
+                for _ in 1..K {
+                    use mlx_rs::ops::indexing as ix;
+                    let tok = *draft_tokens.last().unwrap() as i32;
+                    let input = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+                    let logits = draft.forward(&input, None, &mut draft_cache).unwrap();
+                    mlx_rs::transforms::eval([&logits]).unwrap();
+                    let pred = ix::argmax_axis(&logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&pred]).unwrap();
+                    draft_tokens.push(pred.item::<i32>() as u32);
+                }
+
+                draft_time_ms += t_draft.elapsed().as_secs_f64() * 1000.0;
+
+                let t_verify = std::time::Instant::now();
+
+                let verify_snapshot = verify_cache.clone();
+
+                let draft_input: Vec<i32> = draft_tokens.iter().map(|&d| d as i32).collect();
+                let draft_arr =
+                    mlx_rs::Array::from_slice(&draft_input, &[1, draft_input.len() as i32]);
+                let all_logits = verify
+                    .forward_all_logits(&draft_arr, None, &mut verify_cache)
+                    .unwrap();
+                mlx_rs::transforms::eval([&all_logits]).unwrap();
+
+                verify_time_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
+
+                use mlx_rs::ops::indexing::{self as ix, IndexOp};
+                let new_2d = all_logits.squeeze_axes(&[0]).unwrap();
+
+                let first_pred = {
+                    let p = ix::argmax_axis(&saved_verify_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&p]).unwrap();
+                    p.item::<i32>() as u32
+                };
+
+                let mut accepted = 0usize;
+                if first_pred == draft_tokens[0] {
+                    accepted = 1;
+                    let new_preds = ix::argmax_axis(&new_2d, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&new_preds]).unwrap();
+                    for i in 1..K {
+                        let pred_id = new_preds.index((i - 1) as i32).item::<i32>() as u32;
+                        if pred_id == draft_tokens[i] {
+                            accepted += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                let correction_or_bonus = if accepted == K {
+                    let bonus_logits = new_2d.index((K - 1) as i32);
+                    let p = ix::argmax_axis(&bonus_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&p]).unwrap();
+                    p.item::<i32>() as u32
+                } else if accepted == 0 {
+                    first_pred
+                } else {
+                    let corr_logits = new_2d.index((accepted - 1) as i32);
+                    let p = ix::argmax_axis(&corr_logits, -1, false).unwrap();
+                    mlx_rs::transforms::eval([&p]).unwrap();
+                    p.item::<i32>() as u32
+                };
+
+                let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
+                new_tokens.push(correction_or_bonus);
+                context.extend_from_slice(&new_tokens);
+
+                let t_advance = std::time::Instant::now();
+
+                if accepted == K {
+                    let catchup: Vec<i32> =
+                        vec![draft_tokens[K - 1] as i32, correction_or_bonus as i32];
+                    let catchup_arr = mlx_rs::Array::from_slice(&catchup, &[1, 2]);
+                    saved_draft_logits =
+                        draft.forward(&catchup_arr, None, &mut draft_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                    draft_cache.eval_for_clone().unwrap();
+
+                    let bonus_arr =
+                        mlx_rs::Array::from_slice(&[correction_or_bonus as i32], &[1, 1]);
+                    saved_verify_logits =
+                        verify.forward(&bonus_arr, None, &mut verify_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                    verify_cache.eval_for_clone().unwrap();
+                } else {
+                    let advance_input: Vec<i32> = new_tokens.iter().map(|&t| t as i32).collect();
+                    let advance_arr =
+                        mlx_rs::Array::from_slice(&advance_input, &[1, advance_input.len() as i32]);
+
+                    draft_cache = draft_snapshot;
+                    saved_draft_logits =
+                        draft.forward(&advance_arr, None, &mut draft_cache).unwrap();
+                    mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                    draft_cache.eval_for_clone().unwrap();
+
+                    verify_cache = verify_snapshot;
+                    saved_verify_logits = verify
+                        .forward(&advance_arr, None, &mut verify_cache)
+                        .unwrap();
+                    mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                    verify_cache.eval_for_clone().unwrap();
+                }
+
+                advance_time_ms += t_advance.elapsed().as_secs_f64() * 1000.0;
+
+                total_accepted += accepted;
+                total_drafted += K;
+
+                let draft_toks_str: Vec<String> =
+                    draft_tokens.iter().map(|t| t.to_string()).collect();
+                eprintln!(
+                    "  Round {:2}: accepted {}/{K} (+{} new) | drafted [{}]",
+                    round + 1,
+                    accepted,
+                    new_tokens.len(),
+                    draft_toks_str.join(", ")
+                );
+            }
+
+            let acceptance_rate = total_accepted as f64 / total_drafted as f64 * 100.0;
+            let avg_per_round = total_accepted as f64 / N_ROUNDS as f64;
+            let total_new = context.len() - prompt_ids.len();
+            let total_ms = draft_time_ms + verify_time_ms + advance_time_ms;
+            let eff_tps = if total_ms > 0.0 {
+                total_new as f64 / total_ms * 1000.0
+            } else {
+                0.0
+            };
+
+            eprintln!("\n  --- Results for {prompt:?} ---");
+            eprintln!("  Acceptance rate:     {acceptance_rate:.1}%");
+            eprintln!("  Avg accepted/round:  {avg_per_round:.1}/{K}");
+            eprintln!("  Total new tokens:    {total_new}");
+            eprintln!(
+                "  Draft time:    {draft_time_ms:.0}ms ({:.1}ms/round)",
+                draft_time_ms / N_ROUNDS as f64
+            );
+            eprintln!(
+                "  Verify time:   {verify_time_ms:.0}ms ({:.1}ms/round)",
+                verify_time_ms / N_ROUNDS as f64
+            );
+            eprintln!(
+                "  Advance time:  {advance_time_ms:.0}ms ({:.1}ms/round)",
+                advance_time_ms / N_ROUNDS as f64
+            );
+            eprintln!("  Effective throughput: {eff_tps:.1} tok/s");
+
+            if let Ok(decoded) = tokenizer.decode(&context[prompt_ids.len()..], true) {
+                eprintln!("  Generated text: {decoded:?}");
+            }
+        }
+    }
+
+    /// K-sweep: 0.8B → 9B spec decode across K=16,32,48,64.
+    ///
+    /// Tests whether high-K speculation can beat the 9B baseline (~12 tok/s)
+    /// on code prompts where the 0.8B drafter tracks well.
+    #[test]
+    #[ignore]
+    fn test_spec_decode_0_8b_to_9b_k_sweep() {
+        use std::time::Instant;
+
+        let draft_dir = std::path::PathBuf::from(
+            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit",
+        );
+        let verify_dir = std::path::PathBuf::from(
+            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-9B-MLX-4bit",
+        );
+        assert!(draft_dir.join("config.json").exists(), "draft not found");
+        assert!(verify_dir.join("config.json").exists(), "verify not found");
+
+        eprintln!("Loading draft (0.8B-8bit)...");
+        let t0 = Instant::now();
+        let draft_model = crate::qwen3_next::load_qwen3_5_model(&draft_dir).unwrap();
+        let mut draft = crate::AnyModel::Qwen3Next(draft_model);
+        eprintln!("  {:.1}s", t0.elapsed().as_secs_f64());
+
+        eprintln!("Loading verify (9B-4bit)...");
+        let t0 = Instant::now();
+        let verify_model = crate::qwen3_next::load_qwen3_5_model(&verify_dir).unwrap();
+        let mut verify = crate::AnyModel::Qwen3Next(verify_model);
+        eprintln!("  {:.1}s", t0.elapsed().as_secs_f64());
+
+        let tokenizer = crate::load_tokenizer(&draft_dir).unwrap();
+
+        let prompts = [
+            ("code", "fn fibonacci(n: u64) -> u64 {"),
+            ("factual", "The capital of France is"),
+        ];
+
+        for (label, prompt) in &prompts {
+            let prompt_ids: Vec<u32> = tokenizer.encode(*prompt, false).unwrap().get_ids().to_vec();
+
+            for &k in &[16usize, 32, 48, 64] {
+                eprintln!("\n{}", "=".repeat(60));
+                eprintln!("=== {label} K={k} ===");
+
+                let mut context = prompt_ids.clone();
+                let mut total_accepted: usize = 0;
+                let mut total_drafted: usize = 0;
+                let mut draft_ms: f64 = 0.0;
+                let mut verify_ms: f64 = 0.0;
+                let mut advance_ms: f64 = 0.0;
+                let n_rounds = 15;
+
+                let mut draft_cache = draft.make_cache();
+                let mut verify_cache = verify.make_cache();
+
+                let ctx_input: Vec<i32> = prompt_ids.iter().map(|&id| id as i32).collect();
+                let ctx_arr = mlx_rs::Array::from_slice(&ctx_input, &[1, ctx_input.len() as i32]);
+
+                let mut saved_draft_logits =
+                    draft.forward(&ctx_arr, None, &mut draft_cache).unwrap();
+                mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                let mut saved_verify_logits =
+                    verify.forward(&ctx_arr, None, &mut verify_cache).unwrap();
+                mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                draft_cache.eval_for_clone().unwrap();
+                verify_cache.eval_for_clone().unwrap();
+
+                for round in 0..n_rounds {
+                    let t_d = Instant::now();
+                    let draft_snapshot = draft_cache.clone();
+
+                    let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
+                    {
+                        use mlx_rs::ops::indexing as ix;
+                        let pred = ix::argmax_axis(&saved_draft_logits, -1, false).unwrap();
+                        mlx_rs::transforms::eval([&pred]).unwrap();
+                        draft_tokens.push(pred.item::<i32>() as u32);
+                    }
+                    for _ in 1..k {
+                        use mlx_rs::ops::indexing as ix;
+                        let tok = *draft_tokens.last().unwrap() as i32;
+                        let input = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+                        let logits = draft.forward(&input, None, &mut draft_cache).unwrap();
+                        mlx_rs::transforms::eval([&logits]).unwrap();
+                        let pred = ix::argmax_axis(&logits, -1, false).unwrap();
+                        mlx_rs::transforms::eval([&pred]).unwrap();
+                        draft_tokens.push(pred.item::<i32>() as u32);
+                    }
+                    draft_ms += t_d.elapsed().as_secs_f64() * 1000.0;
+
+                    let t_v = Instant::now();
+                    let verify_snapshot = verify_cache.clone();
+                    let draft_input: Vec<i32> = draft_tokens.iter().map(|&d| d as i32).collect();
+                    let draft_arr =
+                        mlx_rs::Array::from_slice(&draft_input, &[1, draft_input.len() as i32]);
+                    let all_logits = verify
+                        .forward_all_logits(&draft_arr, None, &mut verify_cache)
+                        .unwrap();
+                    mlx_rs::transforms::eval([&all_logits]).unwrap();
+                    verify_ms += t_v.elapsed().as_secs_f64() * 1000.0;
+
+                    use mlx_rs::ops::indexing::{self as ix, IndexOp};
+                    let new_2d = all_logits.squeeze_axes(&[0]).unwrap();
+                    let first_pred = {
+                        let p = ix::argmax_axis(&saved_verify_logits, -1, false).unwrap();
+                        mlx_rs::transforms::eval([&p]).unwrap();
+                        p.item::<i32>() as u32
+                    };
+
+                    let mut accepted = 0usize;
+                    if first_pred == draft_tokens[0] {
+                        accepted = 1;
+                        let new_preds = ix::argmax_axis(&new_2d, -1, false).unwrap();
+                        mlx_rs::transforms::eval([&new_preds]).unwrap();
+                        for i in 1..k {
+                            let pred_id = new_preds.index((i - 1) as i32).item::<i32>() as u32;
+                            if pred_id == draft_tokens[i] {
+                                accepted += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    let correction_or_bonus = if accepted == k {
+                        let p = ix::argmax_axis(&new_2d.index((k - 1) as i32), -1, false).unwrap();
+                        mlx_rs::transforms::eval([&p]).unwrap();
+                        p.item::<i32>() as u32
+                    } else if accepted == 0 {
+                        first_pred
+                    } else {
+                        let p = ix::argmax_axis(&new_2d.index((accepted - 1) as i32), -1, false)
+                            .unwrap();
+                        mlx_rs::transforms::eval([&p]).unwrap();
+                        p.item::<i32>() as u32
+                    };
+
+                    let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
+                    new_tokens.push(correction_or_bonus);
+                    context.extend_from_slice(&new_tokens);
+
+                    let t_a = Instant::now();
+                    if accepted == k {
+                        let catchup: Vec<i32> =
+                            vec![draft_tokens[k - 1] as i32, correction_or_bonus as i32];
+                        let catchup_arr = mlx_rs::Array::from_slice(&catchup, &[1, 2]);
+                        saved_draft_logits =
+                            draft.forward(&catchup_arr, None, &mut draft_cache).unwrap();
+                        mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                        draft_cache.eval_for_clone().unwrap();
+                        let bonus_arr =
+                            mlx_rs::Array::from_slice(&[correction_or_bonus as i32], &[1, 1]);
+                        saved_verify_logits =
+                            verify.forward(&bonus_arr, None, &mut verify_cache).unwrap();
+                        mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                        verify_cache.eval_for_clone().unwrap();
+                    } else {
+                        let advance_input: Vec<i32> =
+                            new_tokens.iter().map(|&t| t as i32).collect();
+                        let advance_arr = mlx_rs::Array::from_slice(
+                            &advance_input,
+                            &[1, advance_input.len() as i32],
+                        );
+                        draft_cache = draft_snapshot;
+                        saved_draft_logits =
+                            draft.forward(&advance_arr, None, &mut draft_cache).unwrap();
+                        mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                        draft_cache.eval_for_clone().unwrap();
+                        verify_cache = verify_snapshot;
+                        saved_verify_logits = verify
+                            .forward(&advance_arr, None, &mut verify_cache)
+                            .unwrap();
+                        mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                        verify_cache.eval_for_clone().unwrap();
+                    }
+                    advance_ms += t_a.elapsed().as_secs_f64() * 1000.0;
+
+                    total_accepted += accepted;
+                    total_drafted += k;
+
+                    eprintln!(
+                        "  R{:2}: {accepted}/{k} (+{} new)",
+                        round + 1,
+                        new_tokens.len(),
+                    );
+                }
+
+                let total_new = context.len() - prompt_ids.len();
+                let total_ms = draft_ms + verify_ms + advance_ms;
+                let tps = if total_ms > 0.0 {
+                    total_new as f64 / total_ms * 1000.0
+                } else {
+                    0.0
+                };
+                let accept_pct = total_accepted as f64 / total_drafted as f64 * 100.0;
+                let avg_acc = total_accepted as f64 / n_rounds as f64;
+
+                eprintln!("\n  --- {label} K={k} Results ---");
+                eprintln!("  Acceptance: {accept_pct:.1}% (avg {avg_acc:.1}/{k})");
+                eprintln!("  Total new tokens: {total_new}");
+                eprintln!(
+                    "  Draft:  {draft_ms:.0}ms ({:.1}/round)",
+                    draft_ms / n_rounds as f64
+                );
+                eprintln!(
+                    "  Verify: {verify_ms:.0}ms ({:.1}/round)",
+                    verify_ms / n_rounds as f64
+                );
+                eprintln!(
+                    "  Advance:{advance_ms:.0}ms ({:.1}/round)",
+                    advance_ms / n_rounds as f64
+                );
+                eprintln!("  Throughput: {tps:.1} tok/s");
+
+                if let Ok(decoded) = tokenizer.decode(&context[prompt_ids.len()..], true) {
+                    eprintln!("  Text: {decoded:?}");
+                }
+            }
+        }
+    }
+
+    /// K-sweep: 0.8B → 27B spec decode across K=8,16,32,48,64.
+    ///
+    /// This was the best pairing: 83.8% acceptance at K=8 on code, 2x speedup.
+    /// Testing if higher K can push further since the 27B baseline is only ~6-7 tok/s.
+    #[test]
+    #[ignore]
+    fn test_spec_decode_0_8b_to_27b_k_sweep() {
+        use std::time::Instant;
+
+        let draft_dir = std::path::PathBuf::from(
+            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit",
+        );
+        let verify_dir = std::path::PathBuf::from(
+            "/Users/peppi/.cache/lm-studio/models/Brooooooklyn/Qwen3.5-27B-unsloth-mlx",
+        );
+        assert!(
+            draft_dir.join("config.json").exists(),
+            "draft not found: {:?}",
+            draft_dir
+        );
+        assert!(
+            verify_dir.join("config.json").exists(),
+            "verify not found: {:?}",
+            verify_dir
+        );
+
+        eprintln!("Loading draft (0.8B-8bit)...");
+        let t0 = Instant::now();
+        let draft_model = crate::qwen3_next::load_qwen3_5_model(&draft_dir).unwrap();
+        let mut draft = crate::AnyModel::Qwen3Next(draft_model);
+        eprintln!("  {:.1}s", t0.elapsed().as_secs_f64());
+
+        eprintln!("Loading verify (27B)...");
+        let t0 = Instant::now();
+        let verify_model = crate::qwen3_next::load_qwen3_5_model(&verify_dir).unwrap();
+        let mut verify = crate::AnyModel::Qwen3Next(verify_model);
+        eprintln!("  {:.1}s", t0.elapsed().as_secs_f64());
+
+        let tokenizer = crate::load_tokenizer(&draft_dir).unwrap();
+
+        let prompts = [
+            ("code", "fn fibonacci(n: u64) -> u64 {"),
+            ("factual", "The capital of France is"),
+        ];
+
+        for (label, prompt) in &prompts {
+            let prompt_ids: Vec<u32> = tokenizer.encode(*prompt, false).unwrap().get_ids().to_vec();
+
+            for &k in &[8usize, 16, 32, 48, 64] {
+                eprintln!("\n{}", "=".repeat(60));
+                eprintln!("=== {label} K={k} ===");
+
+                let mut context = prompt_ids.clone();
+                let mut total_accepted: usize = 0;
+                let mut total_drafted: usize = 0;
+                let mut draft_ms: f64 = 0.0;
+                let mut verify_ms: f64 = 0.0;
+                let mut advance_ms: f64 = 0.0;
+                let n_rounds = 15;
+
+                let mut draft_cache = draft.make_cache();
+                let mut verify_cache = verify.make_cache();
+
+                let ctx_input: Vec<i32> = prompt_ids.iter().map(|&id| id as i32).collect();
+                let ctx_arr = mlx_rs::Array::from_slice(&ctx_input, &[1, ctx_input.len() as i32]);
+
+                let t_pf = Instant::now();
+                let mut saved_draft_logits =
+                    draft.forward(&ctx_arr, None, &mut draft_cache).unwrap();
+                mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                let mut saved_verify_logits =
+                    verify.forward(&ctx_arr, None, &mut verify_cache).unwrap();
+                mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                draft_cache.eval_for_clone().unwrap();
+                verify_cache.eval_for_clone().unwrap();
+                eprintln!("  Prefill: {:.0}ms", t_pf.elapsed().as_secs_f64() * 1000.0);
+
+                for round in 0..n_rounds {
+                    let t_d = Instant::now();
+                    let draft_snapshot = draft_cache.clone();
+
+                    let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
+                    {
+                        use mlx_rs::ops::indexing as ix;
+                        let pred = ix::argmax_axis(&saved_draft_logits, -1, false).unwrap();
+                        mlx_rs::transforms::eval([&pred]).unwrap();
+                        draft_tokens.push(pred.item::<i32>() as u32);
+                    }
+                    for _ in 1..k {
+                        use mlx_rs::ops::indexing as ix;
+                        let tok = *draft_tokens.last().unwrap() as i32;
+                        let input = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+                        let logits = draft.forward(&input, None, &mut draft_cache).unwrap();
+                        mlx_rs::transforms::eval([&logits]).unwrap();
+                        let pred = ix::argmax_axis(&logits, -1, false).unwrap();
+                        mlx_rs::transforms::eval([&pred]).unwrap();
+                        draft_tokens.push(pred.item::<i32>() as u32);
+                    }
+                    draft_ms += t_d.elapsed().as_secs_f64() * 1000.0;
+
+                    let t_v = Instant::now();
+                    let verify_snapshot = verify_cache.clone();
+                    let draft_input: Vec<i32> = draft_tokens.iter().map(|&d| d as i32).collect();
+                    let draft_arr =
+                        mlx_rs::Array::from_slice(&draft_input, &[1, draft_input.len() as i32]);
+                    let all_logits = verify
+                        .forward_all_logits(&draft_arr, None, &mut verify_cache)
+                        .unwrap();
+                    mlx_rs::transforms::eval([&all_logits]).unwrap();
+                    verify_ms += t_v.elapsed().as_secs_f64() * 1000.0;
+
+                    use mlx_rs::ops::indexing::{self as ix, IndexOp};
+                    let new_2d = all_logits.squeeze_axes(&[0]).unwrap();
+                    let first_pred = {
+                        let p = ix::argmax_axis(&saved_verify_logits, -1, false).unwrap();
+                        mlx_rs::transforms::eval([&p]).unwrap();
+                        p.item::<i32>() as u32
+                    };
+
+                    let mut accepted = 0usize;
+                    if first_pred == draft_tokens[0] {
+                        accepted = 1;
+                        let new_preds = ix::argmax_axis(&new_2d, -1, false).unwrap();
+                        mlx_rs::transforms::eval([&new_preds]).unwrap();
+                        for i in 1..k {
+                            let pred_id = new_preds.index((i - 1) as i32).item::<i32>() as u32;
+                            if pred_id == draft_tokens[i] {
+                                accepted += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    let correction_or_bonus = if accepted == k {
+                        let p = ix::argmax_axis(&new_2d.index((k - 1) as i32), -1, false).unwrap();
+                        mlx_rs::transforms::eval([&p]).unwrap();
+                        p.item::<i32>() as u32
+                    } else if accepted == 0 {
+                        first_pred
+                    } else {
+                        let p = ix::argmax_axis(&new_2d.index((accepted - 1) as i32), -1, false)
+                            .unwrap();
+                        mlx_rs::transforms::eval([&p]).unwrap();
+                        p.item::<i32>() as u32
+                    };
+
+                    let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
+                    new_tokens.push(correction_or_bonus);
+                    context.extend_from_slice(&new_tokens);
+
+                    let t_a = Instant::now();
+                    if accepted == k {
+                        let catchup: Vec<i32> =
+                            vec![draft_tokens[k - 1] as i32, correction_or_bonus as i32];
+                        let catchup_arr = mlx_rs::Array::from_slice(&catchup, &[1, 2]);
+                        saved_draft_logits =
+                            draft.forward(&catchup_arr, None, &mut draft_cache).unwrap();
+                        mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                        draft_cache.eval_for_clone().unwrap();
+                        let bonus_arr =
+                            mlx_rs::Array::from_slice(&[correction_or_bonus as i32], &[1, 1]);
+                        saved_verify_logits =
+                            verify.forward(&bonus_arr, None, &mut verify_cache).unwrap();
+                        mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                        verify_cache.eval_for_clone().unwrap();
+                    } else {
+                        let advance_input: Vec<i32> =
+                            new_tokens.iter().map(|&t| t as i32).collect();
+                        let advance_arr = mlx_rs::Array::from_slice(
+                            &advance_input,
+                            &[1, advance_input.len() as i32],
+                        );
+                        draft_cache = draft_snapshot;
+                        saved_draft_logits =
+                            draft.forward(&advance_arr, None, &mut draft_cache).unwrap();
+                        mlx_rs::transforms::eval([&saved_draft_logits]).unwrap();
+                        draft_cache.eval_for_clone().unwrap();
+                        verify_cache = verify_snapshot;
+                        saved_verify_logits = verify
+                            .forward(&advance_arr, None, &mut verify_cache)
+                            .unwrap();
+                        mlx_rs::transforms::eval([&saved_verify_logits]).unwrap();
+                        verify_cache.eval_for_clone().unwrap();
+                    }
+                    advance_ms += t_a.elapsed().as_secs_f64() * 1000.0;
+
+                    total_accepted += accepted;
+                    total_drafted += k;
+
+                    eprintln!(
+                        "  R{:2}: {accepted}/{k} (+{} new)",
+                        round + 1,
+                        new_tokens.len(),
+                    );
+                }
+
+                let total_new = context.len() - prompt_ids.len();
+                let total_ms = draft_ms + verify_ms + advance_ms;
+                let tps = if total_ms > 0.0 {
+                    total_new as f64 / total_ms * 1000.0
+                } else {
+                    0.0
+                };
+                let accept_pct = total_accepted as f64 / total_drafted as f64 * 100.0;
+                let avg_acc = total_accepted as f64 / n_rounds as f64;
+
+                eprintln!("\n  --- {label} K={k} Results ---");
+                eprintln!("  Acceptance: {accept_pct:.1}% (avg {avg_acc:.1}/{k})");
+                eprintln!("  Total new tokens: {total_new}");
+                eprintln!(
+                    "  Draft:  {draft_ms:.0}ms ({:.1}/round)",
+                    draft_ms / n_rounds as f64
+                );
+                eprintln!(
+                    "  Verify: {verify_ms:.0}ms ({:.1}/round)",
+                    verify_ms / n_rounds as f64
+                );
+                eprintln!(
+                    "  Advance:{advance_ms:.0}ms ({:.1}/round)",
+                    advance_ms / n_rounds as f64
+                );
+                eprintln!("  Throughput: {tps:.1} tok/s");
+
+                if let Ok(decoded) = tokenizer.decode(&context[prompt_ids.len()..], true) {
+                    let preview: String = decoded.chars().take(200).collect();
+                    eprintln!("  Text: {preview:?}...");
+                }
+            }
+        }
     }
 }

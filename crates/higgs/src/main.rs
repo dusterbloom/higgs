@@ -119,6 +119,7 @@ fn load_config_for_command(cli: &Cli) -> Result<HiggsConfig, Box<dyn std::error:
 
 async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     init_tracing(cli.verbose);
+    install_crash_diagnostics();
 
     let profile = cli.profile.as_deref();
     let simple_mode = config::is_simple_mode(cli, args);
@@ -249,10 +250,19 @@ fn load_engines(
 
         tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
         let kv_cache_config = model_cfg.kv_cache_config();
+        let dflash_path = model_cfg.dflash.as_ref().and_then(|p| {
+            match model_resolver::resolve(p) {
+                Ok(resolved) => Some(resolved),
+                Err(e) => {
+                    tracing::warn!(dflash = %p, "DFlash drafter not found, skipping: {e}");
+                    None
+                }
+            }
+        });
         let engine = if model_cfg.batch {
             Engine::load_batch(&resolved, kv_cache_config)?
         } else {
-            Engine::load_simple(&resolved, kv_cache_config)?
+            Engine::load_simple_with_dflash(&resolved, kv_cache_config, dflash_path.as_deref())?
         };
         let name = model_cfg
             .name
@@ -306,4 +316,132 @@ fn init_tracing(verbose: bool) {
             }),
         )
         .init();
+}
+
+/// Crash diagnostic: install panic hook, SIGABRT/SEGV/BUS handlers, and atexit.
+/// Writes to `/tmp/higgs_crash_<pid>.log`. Enabled via `HIGGS_CRASH_DIAG=1`.
+#[allow(unsafe_code, clippy::print_stderr)]
+fn install_crash_diagnostics() {
+    use std::io::Write;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::sync::OnceLock;
+
+    static DIAG_FD: OnceLock<i32> = OnceLock::new();
+    static DIAG_PATH: OnceLock<String> = OnceLock::new();
+
+    if std::env::var("HIGGS_CRASH_DIAG").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let pid = std::process::id();
+    let path = format!("/tmp/higgs_crash_{pid}.log");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("crash_diag: failed to open {path}: {e}");
+            return;
+        }
+    };
+    let fd = file.as_raw_fd();
+    // Leak the file so fd stays valid for signal handlers
+    std::mem::forget(file);
+    let _ = DIAG_FD.set(fd);
+    let _ = DIAG_PATH.set(path.clone());
+
+    eprintln!("crash_diag: writing to {path}");
+
+    // Write a startup banner
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let _ = writeln!(
+        f,
+        "=== STARTUP pid={pid} time={} ===",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let _ = f.flush();
+    std::mem::forget(f); // don't close fd
+
+    // Panic hook -> file + stderr
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!(
+            "=== PANIC pid={pid} at {} ===\n{info}\n{}\n",
+            info.location()
+                .map_or("?".to_owned(), |l| format!("{}:{}", l.file(), l.line())),
+            std::backtrace::Backtrace::force_capture()
+        );
+        eprintln!("{msg}");
+        if let Some(&fd) = DIAG_FD.get() {
+            let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+            let _ = f.write_all(msg.as_bytes());
+            let _ = f.flush();
+            std::mem::forget(f);
+        }
+    }));
+
+    // Signal handlers for SIGABRT/SEGV/BUS/TERM/HUP
+    extern "C" fn sig_handler(sig: libc::c_int) {
+        // Async-signal-safe: only use write(2) to our fd
+        if let Some(&fd) = DIAG_FD.get() {
+            let name = match sig {
+                libc::SIGABRT => "SIGABRT",
+                libc::SIGSEGV => "SIGSEGV",
+                libc::SIGBUS => "SIGBUS",
+                libc::SIGTERM => "SIGTERM",
+                libc::SIGHUP => "SIGHUP",
+                libc::SIGPIPE => "SIGPIPE",
+                libc::SIGILL => "SIGILL",
+                _ => "UNKNOWN",
+            };
+            let msg = format!("=== SIGNAL {name} ({sig}) ===\n");
+            unsafe {
+                libc::write(fd, msg.as_ptr().cast(), msg.len());
+                libc::fsync(fd);
+            }
+        }
+        // Re-raise with default handler to get core/termination
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+            libc::raise(sig);
+        }
+    }
+
+    for &sig in &[
+        libc::SIGABRT,
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGILL,
+        libc::SIGTERM,
+        libc::SIGHUP,
+        libc::SIGPIPE,
+    ] {
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = sig_handler as usize;
+            sa.sa_flags = libc::SA_RESETHAND;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+
+    // atexit for normal exits
+    extern "C" fn at_exit() {
+        if let Some(&fd) = DIAG_FD.get() {
+            let msg = b"=== CLEAN EXIT ===\n";
+            unsafe {
+                libc::write(fd, msg.as_ptr().cast(), msg.len());
+                libc::fsync(fd);
+            }
+        }
+    }
+    unsafe {
+        libc::atexit(at_exit);
+    }
 }

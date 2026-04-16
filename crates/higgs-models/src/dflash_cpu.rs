@@ -119,15 +119,20 @@ pub struct DFlashCpuEngine {
 /// predictions ("dual-stream attention" memory).
 ///
 /// Layout per layer: flat `[cached_len * kv_dim]` where `kv_dim = kv_heads * head_dim`.
-/// Each round appends `ctx_len + block` positions: first the target context
-/// K/V then the noise K/V, so `len` advances by `ctx_len + block` per round.
+/// Each round appends only `ctx_len` positions of target-context K/V (derived
+/// from taps of the target's verified hidden states). Noise K/V are never
+/// persisted — they exist only inside a single round's forward to serve SDPA,
+/// then are discarded. `cache.len` therefore equals the absolute sequence
+/// position where the next round's context will be written, keeping RoPE
+/// offsets in lockstep with the real token positions. This mirrors
+/// `ContextOnlyDraftKVCache` in the dflash-mlx reference.
 pub struct DFlashCpuCache {
-    /// Per-layer K cache (target context K/V followed by noise K/V per round).
+    /// Per-layer K cache (target-context positions only; no noise).
     pub(crate) k: Vec<Vec<f32>>,
-    /// Per-layer V cache (target context K/V followed by noise K/V per round).
+    /// Per-layer V cache (target-context positions only; no noise).
     pub(crate) v: Vec<Vec<f32>>,
     /// Number of cached sequence positions (same for all layers).
-    /// Advances by `ctx_len + block` per round.
+    /// Advances by `ctx_len` per round.
     pub len: usize,
     kv_dim: usize,
 }
@@ -629,30 +634,38 @@ impl DFlashCpuEngine {
                 }
             }
 
-            // Append target context K/V then noise K/V to cache.
-            // Order matches the SDPA concat order: [cached..., ctx_k, noise_k].
-            // After this append, the cache for layer li has grown by ctx_len + block positions.
+            // Append ONLY target context K/V to the persistent cache.
+            // Noise K/V are used locally this round via k_noise_buf/v_noise_buf
+            // and intentionally discarded after the round — persisting them
+            // would poison RoPE offsets in subsequent rounds (see struct doc).
             cache.k[li].extend_from_slice(&k_ctx_buf[..ctx_len * kv_dim]);
             cache.v[li].extend_from_slice(&v_ctx_buf[..ctx_len * kv_dim]);
-            cache.k[li].extend_from_slice(&k_noise_buf[..block * kv_dim]);
-            cache.v[li].extend_from_slice(&v_noise_buf[..block * kv_dim]);
 
-            // SDPA: Q attends to full cache (which now includes prior cached
-            // positions plus this round's ctx and noise K/V just appended above).
-            // total_kv_len = prior_cached + ctx_len + block = new cache length.
-            let total_kv_len = cache.len + ctx_len + block;
+            // SDPA: Q attends to [prior_cached | this-round ctx | this-round noise].
+            // The first two now live in cache (cache.len + ctx_len entries);
+            // the noise K/V live in the local _noise_buf and are concat'd on the fly.
+            let kv_cached_len = cache.len + ctx_len;
+            let total_kv_len = kv_cached_len + block;
             for kv_h in 0..n_kv {
                 // Build K_full and V_full for this KV head: [total_kv_len, hd].
-                // The cache already contains [prior_cached | ctx_k | noise_k] for this layer.
+                // [0..kv_cached_len) from persistent cache; [kv_cached_len..total] from local noise.
                 let mut k_full = vec![0.0f32; total_kv_len * hd];
                 let mut v_full = vec![0.0f32; total_kv_len * hd];
 
-                for s in 0..total_kv_len {
+                for s in 0..kv_cached_len {
                     let src_off = s * kv_dim + kv_h * hd;
                     k_full[s * hd..(s + 1) * hd]
                         .copy_from_slice(&cache.k[li][src_off..src_off + hd]);
                     v_full[s * hd..(s + 1) * hd]
                         .copy_from_slice(&cache.v[li][src_off..src_off + hd]);
+                }
+                for s in 0..block {
+                    let src_off = s * kv_dim + kv_h * hd;
+                    let dst = kv_cached_len + s;
+                    k_full[dst * hd..(dst + 1) * hd]
+                        .copy_from_slice(&k_noise_buf[src_off..src_off + hd]);
+                    v_full[dst * hd..(dst + 1) * hd]
+                        .copy_from_slice(&v_noise_buf[src_off..src_off + hd]);
                 }
 
                 // For each Q head in this GQA group
@@ -722,9 +735,9 @@ impl DFlashCpuEngine {
             }
         }
 
-        // Update cache length: each layer got ctx_len + block new entries this round
-        // (target context K/V followed by noise K/V).
-        cache.len += ctx_len + block;
+        // Update cache length: each layer got ctx_len new entries this round
+        // (target context K/V only — noise is not persisted).
+        cache.len += ctx_len;
 
         // Final RMSNorm
         let mut output = vec![0.0f32; block * h];

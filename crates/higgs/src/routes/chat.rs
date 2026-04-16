@@ -480,19 +480,32 @@ fn chat_completions_stream(
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     tokio::task::spawn_blocking(move || {
-        let result = engine.generate_streaming(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
-            &tx,
-            constraint,
-            pixel_values,
-        );
-        if let Err(e) = result {
-            tracing::error!(error = %e, "Generation error during streaming");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.generate_streaming(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                want_logprobs,
+                top_logprobs,
+                &tx,
+                constraint,
+                pixel_values,
+            )
+        }));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(error = %e, "Generation error during streaming"),
+            Err(panic_info) => {
+                let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    (*s).to_owned()
+                } else {
+                    "unknown panic".to_owned()
+                };
+                tracing::error!(panic = %msg, "PANIC in streaming generation");
+            }
         }
     });
 

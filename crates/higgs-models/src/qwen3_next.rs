@@ -3578,7 +3578,7 @@ pub struct Qwen3NextCausalLM {
     /// seqs `> seq_len` fall back to the Metal/QLinear path. Mirrors the
     /// inline GDN `ane_kernels` design, but with one kernel (not per-layer).
     #[cfg(feature = "ane")]
-    lm_head_ane: Option<std::sync::Arc<crate::qwen3_next_ane::AneProjKernel>>,
+    lm_head_ane: Option<std::sync::Arc<crate::ane_mlmodel::AneLmHeadLut6Kernel>>,
 }
 
 impl Qwen3NextCausalLM {
@@ -4328,11 +4328,12 @@ impl Qwen3NextCausalLM {
         let t_compile = Instant::now();
 
         let pad = seq_len as usize;
-        let kernel =
-            crate::qwen3_next_ane::compile_proj(&w_f32, hidden, vocab, pad, "lm_head")
-                .map_err(|e| {
-                    Exception::custom(format!("finalize_ane_lm_head_inline: compile: {e}"))
-                })?;
+        let kernel = crate::qwen3_next_ane::compile_proj_lut6(
+            &w_f32, hidden, vocab, pad, "lm_head",
+        )
+        .map_err(|e| {
+            Exception::custom(format!("finalize_ane_lm_head_inline: compile: {e}"))
+        })?;
         let compile_ms = t_compile.elapsed().as_millis() as u64;
 
         // Drop the dequantized weights ASAP — they're now baked into the ANE
@@ -4348,13 +4349,11 @@ impl Qwen3NextCausalLM {
 
         let load_after = crate::ane_bridge::load_count();
         let compile_after = crate::ane_bridge::compile_count();
-        let compile_delta = compile_after - compile_before;
-        if compile_delta != 1 {
-            eprintln!(
-                "WARN: finalize_ane_lm_head_inline: expected compile_count delta=1, \
-                 got {compile_delta}"
-            );
-        }
+        // Note: the LUT6 path goes through the public MLModel API, not the
+        // private `_ANEInMemoryModel.compileWithQoS:` that `ane_bridge.m`
+        // instruments — so `compile_count` does NOT increment here. The
+        // previous delta==1 assertion was specific to the dense fp16 path;
+        // leaving the metric unchanged here is expected.
         tracing::info!(
             hidden,
             vocab,

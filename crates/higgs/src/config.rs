@@ -221,6 +221,11 @@ pub struct ModelConfig {
     pub kv_bits: u8,
     #[serde(default)]
     pub kv_seed: u64,
+    /// Path to a DFlash block-diffusion drafter model (e.g. z-lab/Qwen3.5-27B-DFlash).
+    /// Enables speculative decoding with ~1.5-1.8x throughput on dense Qwen3.5 models.
+    /// Override per-request with `HIGGS_DFLASH_PATH` env var.
+    #[serde(default)]
+    pub dflash: Option<String>,
 }
 
 const fn default_kv_bits() -> u8 {
@@ -428,6 +433,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_cache,
             kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
             kv_seed: args.kv_seed.unwrap_or_default(),
+            dflash: None,
         })
         .collect();
 
@@ -507,6 +513,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_cache,
                     kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
+                    dflash: None,
                 })
                 .collect();
             figment = figment.merge(Serialized::default("models", &extra));
@@ -627,6 +634,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_cache: KvCacheMode::Off,
         kv_bits: default_kv_bits(),
         kv_seed: 0,
+        dflash: None,
     });
     config.auto_router.model = name;
 }
@@ -1458,5 +1466,31 @@ mod tests {
         assert_ne!(default, profiled);
         assert!(default.to_str().unwrap().contains("higgs.log"));
         assert!(profiled.to_str().unwrap().contains("higgs.dev.log"));
+    }
+
+    #[test]
+    fn test_config_file_parses_dflash_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "some/model"
+            dflash = "z-lab/Qwen3.5-27B-DFlash"
+
+            [[models]]
+            path = "another/model"
+            "#,
+        )
+        .unwrap();
+
+        let config = load_config_file(&path, None).unwrap();
+        assert_eq!(config.models.len(), 2);
+        assert_eq!(
+            config.models[0].dflash,
+            Some("z-lab/Qwen3.5-27B-DFlash".to_owned())
+        );
+        assert_eq!(config.models[1].dflash, None);
     }
 }

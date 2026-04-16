@@ -608,27 +608,35 @@ impl DFlashAneExecutor {
             }
             tock!(t_qk_norm_rope, t0);
 
-            // 6. Append target context K/V then noise K/V to cache.
-            // Order: [prior_cached | ctx_k | noise_k] — matches CPU engine and MLX drafter.
+            // 6. Append ONLY target context K/V to persistent cache.
+            // Noise K/V are used locally via _noise_buf and never persisted —
+            // keeping them would drift RoPE offsets by n_accepted per round.
             cache.k[li].extend_from_slice(&k_ctx_buf[..ctx_len * kv_dim]);
             cache.v[li].extend_from_slice(&v_ctx_buf[..ctx_len * kv_dim]);
-            cache.k[li].extend_from_slice(&k_noise_buf[..block * kv_dim]);
-            cache.v[li].extend_from_slice(&v_noise_buf[..block * kv_dim]);
 
-            // 7. SDPA: Q attends to full cache (prior + ctx + noise) — non-causal.
-            // total_kv_len = prior_cached + ctx_len + block = new cache length.
+            // 7. SDPA: Q attends to [prior_cached | this-round ctx | this-round noise].
+            // First two live in cache (cache.len + ctx_len entries); noise is concat'd on the fly.
             let t0 = tick!();
-            let total_kv_len = cache.len + ctx_len + block;
+            let kv_cached_len = cache.len + ctx_len;
+            let total_kv_len = kv_cached_len + block;
             for kv_h in 0..n_kv {
                 let mut k_full = vec![0.0f32; total_kv_len * hd];
                 let mut v_full = vec![0.0f32; total_kv_len * hd];
 
-                for s in 0..total_kv_len {
+                for s in 0..kv_cached_len {
                     let src_off = s * kv_dim + kv_h * hd;
                     k_full[s * hd..(s + 1) * hd]
                         .copy_from_slice(&cache.k[li][src_off..src_off + hd]);
                     v_full[s * hd..(s + 1) * hd]
                         .copy_from_slice(&cache.v[li][src_off..src_off + hd]);
+                }
+                for s in 0..block {
+                    let src_off = s * kv_dim + kv_h * hd;
+                    let dst = kv_cached_len + s;
+                    k_full[dst * hd..(dst + 1) * hd]
+                        .copy_from_slice(&k_noise_buf[src_off..src_off + hd]);
+                    v_full[dst * hd..(dst + 1) * hd]
+                        .copy_from_slice(&v_noise_buf[src_off..src_off + hd]);
                 }
 
                 for g in 0..gqa_ratio {
@@ -764,9 +772,9 @@ impl DFlashAneExecutor {
             eprintln!("    TOTAL:         {:>8.0}us", us(total));
         }
 
-        // Update cache length: each layer got ctx_len + block new entries this round
-        // (target context K/V followed by noise K/V).
-        cache.len += ctx_len + block;
+        // Update cache length: each layer got ctx_len new entries this round
+        // (target context K/V only — noise is discarded, not persisted).
+        cache.len += ctx_len;
 
         // Final RMSNorm
         let mut output = vec![0.0f32; block * h];
@@ -1316,7 +1324,7 @@ mod tests {
                 let tap_slices: Vec<&[f32]> = taps_f32.iter().map(|t| t.as_slice()).collect();
                 let ctx_len = current_taps[0].shape()[1] as usize;
                 let out_f32 = forward_fn(&noise_f32, &tap_slices, ctx_len, &mut cpu_cache);
-                cpu_cache.crop(start as usize);
+                // Context-only cache: no crop needed.
                 let draft_hidden = mlx_rs::Array::from_slice(
                     &out_f32, &[1, block_size, hidden_dim as i32]);
                 let draft_ms = t0.elapsed().as_millis();
@@ -1514,7 +1522,7 @@ mod tests {
                 let tap_slices: Vec<&[f32]> = taps_f32.iter().map(|t| t.as_slice()).collect();
                 let ctx_len = current_taps[0].shape()[1] as usize;
                 let out_f32 = ane_executor.forward(&noise_f32, &tap_slices, ctx_len, &mut cpu_cache);
-                cpu_cache.crop(start as usize);
+                // Context-only cache: no crop needed.
                 let h = ane_executor.cpu_engine.config.hidden;
                 let draft_hidden = mlx_rs::Array::from_slice(
                     &out_f32, &[1, block_size, h as i32]);

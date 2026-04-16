@@ -30,6 +30,8 @@ pub mod ane_forward;
 #[cfg(feature = "ane")]
 pub mod ane_mil;
 #[cfg(feature = "ane")]
+pub mod ane_mlmodel;
+#[cfg(feature = "ane")]
 pub mod dflash_ane;
 #[cfg(feature = "ane")]
 pub mod diffusion_ane;
@@ -589,7 +591,6 @@ impl AnyModel {
         Array,
         Vec<Array>,
         Vec<Option<qwen3_next::GdnLayerTape>>,
-        Vec<(Option<Array>, Option<Array>, i32)>,
     ), Exception> {
         match (self, cache) {
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
@@ -629,14 +630,13 @@ impl AnyModel {
     pub fn replay_tape_rollback(
         &self,
         layer_tapes: &[Option<qwen3_next::GdnLayerTape>],
-        snapshots: &[(Option<Array>, Option<Array>, i32)],
         cache: &mut AnyCache,
         n_accepted: i32,
         kv_rollback: i32,
     ) -> Result<(), Exception> {
         match (self, cache) {
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
-                m.replay_tape_rollback(layer_tapes, snapshots, c, n_accepted, kv_rollback)
+                m.replay_tape_rollback(layer_tapes, c, n_accepted, kv_rollback)
             }
             _ => Err(Exception::custom(
                 "replay_tape_rollback: only Qwen3Next is supported",

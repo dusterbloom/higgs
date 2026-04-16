@@ -32,6 +32,15 @@ impl Engine {
         SimpleEngine::load(dir, kv_cache_config).map(|e| Self::Simple(Box::new(e)))
     }
 
+    pub fn load_simple_with_dflash<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+        dflash_path: Option<&Path>,
+    ) -> Result<Self, EngineError> {
+        SimpleEngine::load_with_dflash(dir, kv_cache_config, dflash_path)
+            .map(|e| Self::Simple(Box::new(e)))
+    }
+
     pub fn load_batch<P: AsRef<Path>>(
         dir: P,
         kv_cache_config: KvCacheConfig,

@@ -10,6 +10,11 @@ homepage.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Build with Apple Neural Engine backend for the DFlash drafter.
+# Forwards through to higgs-engine → higgs-models.
+ane = ["higgs-engine/ane"]
+
 [dependencies]
 higgs-engine.workspace = true
 higgs-models.workspace = true
@@ -39,6 +44,7 @@ http.workspace = true
 futures.workspace = true
 toml_edit.workspace = true
 nix.workspace = true
+libc = "0.2"
 ctrlc.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true

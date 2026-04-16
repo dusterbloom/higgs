@@ -570,6 +570,7 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                dflash: None,
             }],
             ..HiggsConfig::default()
         }

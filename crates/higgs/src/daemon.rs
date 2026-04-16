@@ -114,6 +114,7 @@ port = 8000
 # path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # name = "llama"
 # batch = false
+# dflash = "z-lab/Qwen3.5-27B-DFlash"  # optional DFlash drafter for spec decode
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.

@@ -464,6 +464,13 @@ impl SteppingKeyValueCache {
         targets
     }
 
+    /// Roll back the cache by `n` positions (used by speculative decode on
+    /// partial accept). Stale K/V data beyond the new offset is harmless —
+    /// it lives in pre-allocated slots and will be overwritten on next insert.
+    pub fn rollback(&mut self, n: i32) {
+        self.offset = (self.offset - n).max(0);
+    }
+
     /// Read-only access to internal key array (includes allocated-but-unused slots).
     pub fn keys(&self) -> Option<&Array> {
         self.keys.as_ref()
