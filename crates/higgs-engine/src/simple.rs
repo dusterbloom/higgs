@@ -1094,7 +1094,16 @@ impl SimpleEngine {
         let t_start = Instant::now();
         let trace = std::env::var("HIGGS_DFLASH_TRACE").map_or(false, |v| v == "1");
         let kv_debug = std::env::var("HIGGS_DFLASH_DEBUG_KV").map_or(false, |v| v == "1");
-        // GPU drafter must run on main thread (MLX arrays aren't Send), so disable pipelining.
+        // Pipelining the CPU/ANE drafter against the target verify was attempted and
+        // REGRESSED throughput (422ms round_total vs 311ms, accept 5.5→4.0, 13→8.7 tok/s):
+        // the pipeline path uses the CPU/ANE drafter which (a) is slower than the lazy
+        // GPU drafter the non-pipeline path uses implicitly, (b) contends with the
+        // target's ANE GDN verify for the ANE worker queue, and (c) produces lower-
+        // quality drafts than the 9B GPU drafter. The implicit overlap between the
+        // lazy GPU drafter graph (evaluated during the draft token eval) and the
+        // synchronous ANE GDN dispatches in verify is the design that actually works.
+        // Keep the pipeline code path in case a future config (smaller ANE drafter,
+        // dim-matched 4B target) makes it win.
         let pipeline = false;
         let verify_layer_chunk: usize = std::env::var("HIGGS_DFLASH_LAYER_CHUNK")
             .ok()
@@ -1255,6 +1264,14 @@ impl SimpleEngine {
             // We now clone handles only; if partial-accept triggers rollback, the
             // `eval(replay_states)` at the end of that branch will materialize the
             // restored state lazily, walking back through the original graph.
+            //
+            // IMPORTANT: When HIGGS_TARGET_ANE_GDN=1 is active, forward_with_taps_tape
+            // is NOT lazy — each GDN layer makes 3 blocking ANE dispatch calls
+            // (GdnAneWorkerHandle::dispatch: eval input, send to worker, recv result).
+            // For a 32-layer model with 24 GDN layers this is 72 synchronous round-trips
+            // per verify, accounting for ~228ms/round that does not appear in any sub-timer.
+            // The verify_build_ms field in the trace captures this hidden cost.
+            let t_verify_build = Instant::now();
             let (verify_logits, verify_taps, layer_tapes) = if verify_layer_chunk > 0 {
                 model.forward_with_taps_tape_chunked(
                     &verify_input, None, &mut cache, &dflash.tap_layers, verify_layer_chunk,
@@ -1263,6 +1280,7 @@ impl SimpleEngine {
                 model.forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
                     .map_err(EngineError::Mlx)?
             };
+            let verify_build_ms = t_verify_build.elapsed().as_secs_f64() * 1000.0;
 
             // Force the deferred forward pass first so we can attribute its
             // cost independently of the argmax + final sync. MLX is lazy:
@@ -1442,12 +1460,12 @@ impl SimpleEngine {
                 let eff_tps = if elapsed_s > 0.0 { tokens.len() as f64 / elapsed_s } else { 0.0 };
                 tracing::info!(
                     "dflash_trace round={} embed={:.1}ms draft={:.1}ms lm_draft={:.1}ms(slice={:.1}ms logits={:.1}ms argmax_build={:.1}ms transfer={:.1}ms) \
-                     gap={:.1}ms verify={:.1}ms verify_fwd={:.1}ms verify_argmax={:.1}ms \
+                     gap={:.1}ms verify_build={:.1}ms verify={:.1}ms verify_fwd={:.1}ms verify_argmax={:.1}ms \
                      no_tape_fwd={:.1}ms accept={:.1}ms replay={:.1}ms tap_slice={:.1}ms end={:.1}ms \
                      round_total={:.1}ms accepted={} avg_accept={:.1} eff_tps={:.1}",
                     round_idx, embed_ms, draft_ms, lm_draft_ms,
                     slice_ms, logits_ms, argmax_build_ms, draft_transfer_ms,
-                    gap_ms, verify_ms, verify_fwd_ms, verify_argmax_ms,
+                    gap_ms, verify_build_ms, verify_ms, verify_fwd_ms, verify_argmax_ms,
                     no_tape_fwd_ms.unwrap_or(0.0), accept_ms, replay_ms, tap_slice_ms, end_ms,
                     round_ms, n_accepted, avg_accept, eff_tps,
                 );
