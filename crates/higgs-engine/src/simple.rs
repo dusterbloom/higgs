@@ -1104,7 +1104,12 @@ impl SimpleEngine {
         // synchronous ANE GDN dispatches in verify is the design that actually works.
         // Keep the pipeline code path in case a future config (smaller ANE drafter,
         // dim-matched 4B target) makes it win.
-        let pipeline = false;
+        //
+        // 2026-04-16: opt-in via HIGGS_DFLASH_PIPELINE=1 so we can re-evaluate
+        // under topology B (GDN on GPU, ANE queue free) without a rebuild.
+        let pipeline = std::env::var("HIGGS_DFLASH_PIPELINE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let verify_layer_chunk: usize = std::env::var("HIGGS_DFLASH_LAYER_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
