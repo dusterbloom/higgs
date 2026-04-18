@@ -1494,4 +1494,162 @@ mod tests {
             );
         }
     }
+
+    /// Qwen3-9B prefill go/no-go probe. Compares ANE int8 mlpackage forward
+    /// vs MLX f32 matmul at the actual gate_proj shape used by Carnice-9B
+    /// (hidden=4096, intermediate=12288) at seq=128.
+    ///
+    /// Decision rule: ANE int8 must beat MLX f32 matmul to justify the
+    /// multi-session prefill wiring. MLX q4 (production path) is faster than
+    /// f32 matmul, so f32 is a generous upper bound for "MLX baseline" — if
+    /// ANE loses to f32 matmul, it loses harder to q4.
+    ///
+    /// Reports both wall-clock and parity of ANE int8 vs the f32 reference.
+    #[test]
+    #[ignore = "go/no-go probe; set HIGGS_CORETOOLS_PYTHON"]
+    fn qwen3_9b_mlp_int8_vs_mlx_probe() {
+        use mlx_rs::{ops::matmul, random};
+        use std::fs;
+        use std::process::Command;
+        use std::time::Instant;
+
+        let py = std::env::var("HIGGS_CORETOOLS_PYTHON")
+            .expect("set HIGGS_CORETOOLS_PYTHON");
+        // Carnice-9B (qwen3_5) MLP gate_proj shape.
+        let in_dim: usize = 4096;
+        let out_dim: usize = 12288;
+        let seq: usize = 128;
+        let iters: usize = 30;
+        let warmup: usize = 5;
+
+        // --- Synthetic weight + activation ---
+        let w = random::uniform::<f32, f32>(-0.05, 0.05,
+            &[out_dim as i32, in_dim as i32], None).expect("random W");
+        w.eval().unwrap();
+        let w_vec: Vec<f32> = w.as_slice::<f32>().to_vec();
+
+        let x = random::uniform::<f32, f32>(-1.0, 1.0,
+            &[1, seq as i32, in_dim as i32], None).expect("random x");
+        x.eval().unwrap();
+        let x_vec: Vec<f32> = x.as_slice::<f32>().to_vec();
+
+        // --- Build int8 mlpackage ---
+        let tmp = tempfile::tempdir().unwrap();
+        let weights_bin = tmp.path().join("w.bin");
+        let out_dir = tmp.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let mut bytes = Vec::with_capacity(w_vec.len() * 4);
+        for v in &w_vec { bytes.extend_from_slice(&v.to_le_bytes()); }
+        fs::write(&weights_bin, &bytes).unwrap();
+
+        let script = env!("CARGO_MANIFEST_DIR").to_string()
+            + "/scripts/quantize_int8_proj.py";
+        let out = Command::new(&py)
+            .arg(&script)
+            .arg("--weights-bin").arg(&weights_bin)
+            .arg("--out-features").arg(out_dim.to_string())
+            .arg("--in-features").arg(in_dim.to_string())
+            .arg("--seq-len").arg(seq.to_string())
+            .arg("--out-dir").arg(&out_dir)
+            .output().expect("spawn python");
+        assert!(out.status.success(),
+            "quantize failed\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr));
+        let resp: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("json");
+        let mlmodelc = resp["mlmodelc"].as_str().unwrap();
+        let in_name = resp["input_name"].as_str().unwrap();
+        let out_name = resp["output_name"].as_str().unwrap();
+
+        // --- Load + verify ANE ---
+        let input_shape: Vec<i64> = vec![1, in_dim as i64, 1, seq as i64];
+        let output_shape: Vec<i64> = vec![1, out_dim as i64, 1, seq as i64];
+        let kernel = AneMlPackageKernel::load(
+            mlmodelc, in_name, out_name, input_shape, output_shape,
+        ).expect("load");
+        let (on_ane, report) = kernel.verify_ane_dispatch().expect("verify");
+        eprintln!("{report}");
+        assert!(on_ane, "shape should dispatch to ANE — got:\n{report}");
+
+        // --- Pack input into conv1x1 layout fp16 ---
+        let pin = in_dim * seq;
+        let pout = out_dim * seq;
+        let mut x_fp16 = vec![0u16; pin];
+        for t in 0..seq {
+            for ci in 0..in_dim {
+                let src = x_vec[t * in_dim + ci];
+                x_fp16[ci * seq + t] = f16::from_f32(src).to_bits();
+            }
+        }
+        let mut y_fp16 = vec![0u16; pout];
+
+        // --- Bench ANE ---
+        for _ in 0..warmup {
+            kernel.predict_fp16(&x_fp16, &mut y_fp16).expect("predict");
+        }
+        let mut ane_samples: Vec<u128> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            kernel.predict_fp16(&x_fp16, &mut y_fp16).expect("predict");
+            ane_samples.push(t0.elapsed().as_micros());
+        }
+        ane_samples.sort_unstable();
+        let ane_min_ms = ane_samples[0] as f64 / 1000.0;
+        let ane_med_ms = ane_samples[iters / 2] as f64 / 1000.0;
+
+        // --- Bench MLX f32 matmul (generous baseline; q4 would be faster) ---
+        // y = x @ W^T, x:[1,seq,in], W^T:[in,out] → [1,seq,out]
+        let wt = w.t();
+        wt.eval().unwrap();
+        for _ in 0..warmup {
+            let y = matmul(&x, &wt).expect("matmul");
+            y.eval().unwrap();
+        }
+        let mut mlx_samples: Vec<u128> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let y = matmul(&x, &wt).expect("matmul");
+            y.eval().unwrap();
+            mlx_samples.push(t0.elapsed().as_micros());
+        }
+        mlx_samples.sort_unstable();
+        let mlx_min_ms = mlx_samples[0] as f64 / 1000.0;
+        let mlx_med_ms = mlx_samples[iters / 2] as f64 / 1000.0;
+
+        // --- Parity ---
+        let mut y_ane = vec![0.0f32; seq * out_dim];
+        for co in 0..out_dim {
+            for t in 0..seq {
+                y_ane[t * out_dim + co] =
+                    f16::from_bits(y_fp16[co * seq + t]).to_f32();
+            }
+        }
+        let y_ref = matmul(&x, &wt).expect("matmul");
+        y_ref.eval().unwrap();
+        let y_ref_vec: Vec<f32> = y_ref.as_slice::<f32>().to_vec();
+        let mut max_diff = 0.0f32;
+        let mut max_abs_ref = 0.0f32;
+        for (a, b) in y_ane.iter().zip(y_ref_vec.iter()) {
+            let d = (a - b).abs();
+            if d > max_diff { max_diff = d; }
+            let ab = b.abs();
+            if ab > max_abs_ref { max_abs_ref = ab; }
+        }
+
+        let w_bytes = (in_dim * out_dim) as f64;
+        let ane_int8_gbs = w_bytes / (ane_min_ms * 1e-3) / 1e9;
+        let speedup = mlx_min_ms / ane_min_ms;
+
+        eprintln!("");
+        eprintln!("=== Qwen3-9B gate_proj prefill probe ({out_dim}×{in_dim} seq={seq}) ===");
+        eprintln!("ANE int8: min={ane_min_ms:.3} ms  med={ane_med_ms:.3} ms  ({ane_int8_gbs:.1} GB/s int8)");
+        eprintln!("MLX f32 : min={mlx_min_ms:.3} ms  med={mlx_med_ms:.3} ms");
+        eprintln!("speedup : {speedup:.2}x  (ANE wins if >1.0; q4 baseline is faster than f32, so need decisive margin)");
+        eprintln!("parity  : max_diff={max_diff:.4}  max|ref|={max_abs_ref:.2}");
+        eprintln!("");
+
+        // Informational — never panic. The verdict is the printed numbers.
+        assert!(max_diff <= 0.5,
+            "parity sanity: max_diff={max_diff} exceeds 0.5 (something is wrong)");
+    }
 }
