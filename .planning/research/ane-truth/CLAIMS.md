@@ -103,6 +103,22 @@
 | R9 | Estimated realistic prefill gain from ANE: +20-40% tok/s (316→380-440) | I | roofline.md:591 |
 | R10 | ANE sync overhead estimated 3-5 ms/layer × 40 layers = 160 ms at M=1024 | I | roofline.md:416-418 |
 
+## ANE int8 Weight Path (re-measured 2026-04-18)
+
+| # | Claim | Tier | Source |
+|---|---|---|---|
+| AB1 | DFlash-4B drafter fp16 forward: 1010 MB / 18.5 ms = 54.6 GB/s = 45% of M4 peak (bandwidth-bound) | E | ARCHAEOLOGY.md §AB + `memory/dflash-ane-projections-v2-handoff.md` |
+| AB2 | v1→v2 scheduling tricks moved ctx=16 by only 3.4% — diminishing returns against the wall | E | ARCHAEOLOGY.md §AB |
+| AB3 | int8 weight blobs (1010→505 MB) project ~9.2 ms ANE floor at same 54.6 GB/s → ~12-13 ms total | I | ARCHAEOLOGY.md §AB |
+| AB4 | ~~`build_weight_blob_int8` + `constexpr_affine_dequantize` in `ane_mil.rs` emits the int8 path~~ **SUPERSEDED** by AB5/AB6 | D→X | see below |
+| AB5 | Raw-MIL `_ANEDesc modelWithMILText:` (engine's current bridge) rejects `tensor<int8>` + `constexpr_affine_dequantize` with `InvalidMILProgram` | **E** | `diffusion_ane::tests::test_int8_conv1x1_nanobot_pattern` re-run 2026-04-18 · macOS 26.3.1 · coremlc 3510.2.1 |
+| AB6 | `.mlpackage` → `xcrun coremlcompiler compile` → `MLModel(.cpuAndNeuralEngine)` path ACCEPTS the same op chain; `MLComputePlan` lists ANE in `supported_compute_devices` | **E** | `/tmp/higgs_int8_probe/compute_plan.py` · `plan_4b.py` |
+| AB7 | CoreML scheduler picks ANE only above a shape threshold: toy 64×64 seq=16 → CPU (cost 0.96); DFlash-4B o_proj 3072×3072 seq=16 → ANE (cost 0.54) | **E** | `/tmp/higgs_int8_probe/plan_4b.py` |
+| AB8 | int8 path requires a NEW bridge (`AneKernel::from_mlpackage`), not an edit to `ane_mil.rs`. The two paths coexist — raw-MIL emitter stays for fp16. | D | implication of AB5 + AB6 |
+| AB9 | The *other* raw-MIL bridge (`compile_direct` → `_ANEClient compileModel:options:qos:` with `kANEFModelMIL`, documented "full op support") ALSO rejects `tensor<int8>` + `constexpr_affine_dequantize` with the identical `InvalidMILProgram` error. Both raw-MIL entry points fail; the mlpackage path works only because `xcrun coremlcompiler compile` runs an op-lowering pre-pass before producing `.mlmodelc`. | **E** | `diffusion_ane::tests::probe_int8_conv1x1_compile_direct` 2026-04-18 · macOS 26.3.1 · Xcode 26.0.1 · coremlc-MIL 3510.2.1 |
+| AB10 | int8-mlpackage decode for DFlash-4B drafter LOSES to fp16 raw-MIL by 1-3 ms even with layer-fusion (Step 3 result): 20 dispatches × 88 µs overhead + 11.1 ms compute (already at 61 GB/s ANE peak) ≈ 12.9 ms vs ~9 ms fp16 baseline. Per-dispatch wrapper savings (hypothetical fallback #3.5) cannot close gap because compute floor is hardware-saturated. | **E** | `dflash_ane_full_layer_int8_probe` + roofline math, see `next-session-int8-e2e-decode.md` |
+| AB11 | Shipping verdict: int8 mlpackage is a **prefill-only** story on this drafter. Decode stays on fp16 raw-MIL. Wire int8 into prefill paths that see seq ≥ 32 naturally (non-drafter inference). | D | AB10 + handoff fallback #4 |
+
 ## Contradictions Between Sources
 
 | # | Topic | Source A | Source B | Status |

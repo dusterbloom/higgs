@@ -2211,6 +2211,115 @@ mod tests {
         }
     }
 
+    /// AB5/AB9 cross-path probe: does the *other* raw-MIL bridge accept int8?
+    ///
+    /// Background: AB5 proved `_ANEInMemoryModel modelWithMILText:`
+    /// (`compile_multi_weights`) rejects `tensor<int8>` + `constexpr_affine_dequantize`
+    /// with `InvalidMILProgram`. But there is a second raw-MIL entry point —
+    /// `compile_direct` — which routes through `_ANEClient compileModel:options:qos:`
+    /// (the `kANEFModelMIL` selector) and is documented as "full op support — conv
+    /// works here". That path was never exercised for int8.
+    ///
+    /// If `compile_direct` accepts the int8 op chain, fallback #3 from the
+    /// 2026-04-18 handoff opens up: int8 weights can ship in the raw-MIL bridge,
+    /// preserving microcode caching and avoiding the 88 µs/dispatch mlpackage tax
+    /// that killed the public-MLModel fanout route.
+    ///
+    /// Same MIL as `test_int8_conv1x1_nanobot_pattern` — only the compile API differs.
+    #[test]
+    #[ignore = "probe — run explicitly to decide if int8 can ship in raw-MIL bridge"]
+    fn probe_int8_conv1x1_compile_direct() {
+        use crate::ane_bridge::{self, build_weight_blob_int8, AneKernel};
+        use crate::ane_mil::MIL_HEADER;
+
+        ane_bridge::ane_init().expect("ANE init");
+        ane_bridge::set_quiet(false);
+
+        let c_in = 64usize;
+        let c_out = 64usize;
+        let seq = 16usize;
+        let scale_bits: u16 = half::f16::from_f32(0.01).to_bits();
+
+        let mil = format!(
+            "{MIL_HEADER}\
+    func main<ios18>(tensor<fp32, [1, {c_in}, 1, {seq}]> x) {{\n\
+        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];\n\
+        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];\n\
+        string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n\
+        tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n\
+        tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n\
+        tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n\
+        int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n\
+        fp16 dq_scale = const()[name=string(\"dq_scale\"), val=fp16(0x{scale_bits:04X})];\n\
+        int8 dq_zero = const()[name=string(\"dq_zero\"), val=int8(0)];\n\
+        int32 dq_axis = const()[name=string(\"dq_axis\"), val=int32(0)];\n\
+        tensor<int8, [{c_out},{c_in},1,1]> W_q = const()[name=string(\"W_q\"), val=tensor<int8, [{c_out},{c_in},1,1]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];\n\
+        tensor<fp16, [{c_out},{c_in},1,1]> W = constexpr_affine_dequantize(axis=dq_axis,quantized_data=W_q,scale=dq_scale,zero_point=dq_zero)[name=string(\"dequant\")];\n\
+        tensor<fp16, [1,{c_in},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];\n\
+        tensor<fp16, [1,{c_out},1,{seq}]> yh = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=xh)[name=string(\"conv\")];\n\
+        tensor<fp32, [1,{c_out},1,{seq}]> y = cast(dtype=to32,x=yh)[name=string(\"cout\")];\n\
+    }} -> (y);\n}}\n"
+        );
+
+        eprintln!("--- MIL (int8 conv1x1, probe via compile_direct) ---");
+        eprintln!("{mil}");
+        eprintln!("---");
+
+        let int8_data: Vec<i8> = (0..c_out * c_in).map(|i| ((i % 127) as i8 - 63)).collect();
+        let blob = build_weight_blob_int8(&int8_data, c_out, c_in);
+        let names = ["@model_path/weights/w.bin"];
+        let name_ptrs: Vec<&str> = names.iter().copied().collect();
+        let blob_refs: [&[u8]; 1] = [blob.as_slice()];
+
+        eprintln!("\n[probe] compile_direct (_ANEClient compileModel:, full op set)...");
+        let direct_res = AneKernel::compile_direct(
+            &mil,
+            &name_ptrs,
+            &blob_refs,
+            &[c_in * seq * 4],
+            &[c_out * seq * 4],
+        );
+        let direct_ok = direct_res.is_ok();
+        match &direct_res {
+            Ok(kernel) => {
+                eprintln!("PASS: compile_direct ACCEPTS int8 conv1x1!");
+                let input: Vec<f32> = (0..c_in * seq).map(|i| (i as f32 * 0.01).sin()).collect();
+                let input_bytes: Vec<u8> = input.iter().flat_map(|f| f.to_le_bytes()).collect();
+                kernel.write_input(0, &input_bytes);
+                match kernel.eval() {
+                    Ok(()) => eprintln!("PASS: compile_direct eval succeeded"),
+                    Err(e) => eprintln!("FAIL: compile_direct eval failed: {e}"),
+                }
+            }
+            Err(e) => eprintln!("FAIL compile_direct: {e}"),
+        }
+
+        eprintln!("\n[probe] compile_multi_weights (_ANEInMemoryModel, AB5 control)...");
+        let multi_res = AneKernel::compile_multi_weights(
+            &mil,
+            &name_ptrs,
+            &blob_refs,
+            &[c_in * seq * 4],
+            &[c_out * seq * 4],
+        );
+        let multi_ok = multi_res.is_ok();
+        match &multi_res {
+            Ok(_) => eprintln!("UNEXPECTED PASS: compile_multi_weights now accepts int8 (AB5 reversed)"),
+            Err(e) => eprintln!("EXPECTED FAIL compile_multi_weights: {e}"),
+        }
+
+        eprintln!(
+            "\n[probe summary] compile_direct={direct_ok} compile_multi_weights={multi_ok}"
+        );
+
+        if !direct_ok {
+            panic!(
+                "int8 conv1x1 rejected by BOTH raw-MIL bridges. \
+                 Fallback #3 dead — must commit to fallback #4 (prefill-only int8 via mlpackage)."
+            );
+        }
+    }
+
     /// Multi-dispatch correctness: verify chained (attention + FFN) matches fused single dispatch.
     /// Also benchmarks 28 fused dispatches vs 56 multi-dispatches at seq=128.
     #[test]
