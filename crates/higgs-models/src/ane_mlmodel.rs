@@ -1597,8 +1597,7 @@ mod tests {
         let ane_min_ms = ane_samples[0] as f64 / 1000.0;
         let ane_med_ms = ane_samples[iters / 2] as f64 / 1000.0;
 
-        // --- Bench MLX f32 matmul (generous baseline; q4 would be faster) ---
-        // y = x @ W^T, x:[1,seq,in], W^T:[in,out] → [1,seq,out]
+        // --- Bench MLX f32 matmul (generous upper bound) ---
         let wt = w.t();
         wt.eval().unwrap();
         for _ in 0..warmup {
@@ -1615,6 +1614,26 @@ mod tests {
         mlx_samples.sort_unstable();
         let mlx_min_ms = mlx_samples[0] as f64 / 1000.0;
         let mlx_med_ms = mlx_samples[iters / 2] as f64 / 1000.0;
+
+        // --- Bench MLX q4 matmul (production baseline; group_size=64 bits=4) ---
+        let (qw, qs, qb) = mlx_rs::ops::quantize(&w, 64, 4).expect("quantize q4");
+        qw.eval().unwrap(); qs.eval().unwrap(); qb.eval().unwrap();
+        for _ in 0..warmup {
+            let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4)
+                .expect("qmm");
+            y.eval().unwrap();
+        }
+        let mut q4_samples: Vec<u128> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4)
+                .expect("qmm");
+            y.eval().unwrap();
+            q4_samples.push(t0.elapsed().as_micros());
+        }
+        q4_samples.sort_unstable();
+        let q4_min_ms = q4_samples[0] as f64 / 1000.0;
+        let q4_med_ms = q4_samples[iters / 2] as f64 / 1000.0;
 
         // --- Parity ---
         let mut y_ane = vec![0.0f32; seq * out_dim];
@@ -1638,13 +1657,16 @@ mod tests {
 
         let w_bytes = (in_dim * out_dim) as f64;
         let ane_int8_gbs = w_bytes / (ane_min_ms * 1e-3) / 1e9;
-        let speedup = mlx_min_ms / ane_min_ms;
+        let speedup_f32 = mlx_min_ms / ane_min_ms;
+        let speedup_q4 = q4_min_ms / ane_min_ms;
 
         eprintln!("");
         eprintln!("=== Qwen3-9B gate_proj prefill probe ({out_dim}×{in_dim} seq={seq}) ===");
         eprintln!("ANE int8: min={ane_min_ms:.3} ms  med={ane_med_ms:.3} ms  ({ane_int8_gbs:.1} GB/s int8)");
         eprintln!("MLX f32 : min={mlx_min_ms:.3} ms  med={mlx_med_ms:.3} ms");
-        eprintln!("speedup : {speedup:.2}x  (ANE wins if >1.0; q4 baseline is faster than f32, so need decisive margin)");
+        eprintln!("MLX q4  : min={q4_min_ms:.3} ms  med={q4_med_ms:.3} ms  (production baseline)");
+        eprintln!("speedup vs f32: {speedup_f32:.2}x");
+        eprintln!("speedup vs q4 : {speedup_q4:.2}x  <-- DECISION GATE (need >1.5x to wire)");
         eprintln!("parity  : max_diff={max_diff:.4}  max|ref|={max_abs_ref:.2}");
         eprintln!("");
 
