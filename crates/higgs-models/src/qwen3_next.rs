@@ -1665,6 +1665,7 @@ impl Qwen3NextMLP {
 /// output transposed back. Seqs shorter than the compiled bucket are
 /// zero-padded in the seq dimension.
 #[cfg(feature = "ane")]
+#[allow(unsafe_code)]
 pub(crate) fn forward_ane_int8_mlp(
     x: &Array,
     gate: &std::sync::Arc<crate::ane_mlmodel::AneMlPackageKernel>,
@@ -1709,49 +1710,44 @@ pub(crate) fn forward_ane_int8_mlp(
         .map_err(|e| Exception::custom(format!("forward_ane_int8_mlp: up: {e}")))?;
     drop(x_fp16);
 
-    // --- Unpack gate/up [inter, bucket] → [S, inter] fp16 in parallel. ---
-    // Parallelise over sequence rows so writes are sequential; reads are
-    // strided by `bucket` but each thread's working set stays in L1.
-    let mut gate_f16: Vec<f16> = vec![f16::ZERO; s * inter];
-    let mut up_f16: Vec<f16> = vec![f16::ZERO; s * inter];
-    gate_f16
-        .par_chunks_mut(inter)
-        .zip(up_f16.par_chunks_mut(inter))
-        .enumerate()
-        .for_each(|(t, (grow, urow))| {
-            for co in 0..inter {
-                grow[co] = f16::from_bits(gate_fp16[co * bucket + t]);
-                urow[co] = f16::from_bits(up_fp16[co * bucket + t]);
-            }
-        });
+    // --- SwiGLU directly in ANE native layout [1, inter, 1, bucket]. ---
+    // Gate/up outputs already sit in [inter, bucket] channel-major u16; down's
+    // input wants the same layout. SwiGLU is elementwise, so we skip both the
+    // [inter,bucket]→[S,inter] unpack and the [S,inter]→[inter,bucket] pack.
+    // Padded [s..bucket] seq cols are zero in gate+up (conv1x1 of zero input);
+    // silu(0)·0 = 0, so padding stays zero through SwiGLU.
+    //
+    // SAFETY: `half::f16` is `#[repr(transparent)]` over `u16`, so a
+    // `&[u16]` of fp16 bits is layout-identical to a `&[f16]`.
+    let gate_as_f16: &[f16] = unsafe {
+        std::slice::from_raw_parts(gate_fp16.as_ptr().cast::<f16>(), gate_fp16.len())
+    };
+    let up_as_f16: &[f16] = unsafe {
+        std::slice::from_raw_parts(up_fp16.as_ptr().cast::<f16>(), up_fp16.len())
+    };
+    let gate_arr = Array::from_slice(
+        gate_as_f16,
+        &[1, inter as i32, 1, bucket as i32],
+    );
+    let up_arr = Array::from_slice(
+        up_as_f16,
+        &[1, inter as i32, 1, bucket as i32],
+    );
     drop(gate_fp16);
     drop(up_fp16);
-
-    // --- SwiGLU in fp16 (swiglu is dtype-agnostic). ---
-    let gate_arr = Array::from_slice(&gate_f16, &[1, s as i32, inter as i32]);
-    let up_arr = Array::from_slice(&up_f16, &[1, s as i32, inter as i32]);
-    drop(gate_f16);
-    drop(up_f16);
     let activated = swiglu(&gate_arr, &up_arr)?;
     activated.eval()?;
 
-    // --- Pack activated [1, S, inter] fp16 → [inter, bucket] u16. ---
+    // --- down projection: consume activated fp16 buffer as u16 bits. ---
+    // SAFETY: activated is Dtype::Float16 with len inter*bucket;
+    // `as_slice::<f16>` is contiguous and f16↔u16 are repr-identical.
     let act_f16 = activated.as_slice::<f16>();
-    let mut down_in_fp16 = vec![0u16; inter * bucket];
-    down_in_fp16
-        .par_chunks_mut(bucket)
-        .enumerate()
-        .for_each(|(ci, row)| {
-            for t in 0..s {
-                row[t] = act_f16[t * inter + ci].to_bits();
-            }
-        });
-
-    // --- down projection ---
+    let act_u16: &[u16] = unsafe {
+        std::slice::from_raw_parts(act_f16.as_ptr().cast::<u16>(), act_f16.len())
+    };
     let mut down_fp16 = vec![0u16; h * bucket];
-    down.predict_fp16(&down_in_fp16, &mut down_fp16)
+    down.predict_fp16(act_u16, &mut down_fp16)
         .map_err(|e| Exception::custom(format!("forward_ane_int8_mlp: down: {e}")))?;
-    drop(down_in_fp16);
 
     // --- Unpack [H, bucket] → [S, H] fp16, return as Dtype::Float16. ---
     // Caller adds residual against bf16 hidden; MLX upcasts automatically.
