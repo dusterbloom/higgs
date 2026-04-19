@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["benchmarks/ane_matmul_bench"]
 resolver = "2"
 
 [workspace.package]
@@ -125,6 +126,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Error handling
 thiserror = "2"
+
+# Parallelism
+rayon = "1"
 
 # Async streaming
 async-stream = "0.3"

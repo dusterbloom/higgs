@@ -23,6 +23,7 @@ rand.workspace = true
 safetensors = "0.4"
 half = "2.4"
 memmap2 = "0.9"
+rayon.workspace = true
 
 [features]
 ane = ["dep:cc"]

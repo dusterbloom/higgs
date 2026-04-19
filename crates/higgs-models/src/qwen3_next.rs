@@ -1665,13 +1665,14 @@ impl Qwen3NextMLP {
 /// output transposed back. Seqs shorter than the compiled bucket are
 /// zero-padded in the seq dimension.
 #[cfg(feature = "ane")]
-fn forward_ane_int8_mlp(
+pub(crate) fn forward_ane_int8_mlp(
     x: &Array,
     gate: &std::sync::Arc<crate::ane_mlmodel::AneMlPackageKernel>,
     up: &std::sync::Arc<crate::ane_mlmodel::AneMlPackageKernel>,
     down: &std::sync::Arc<crate::ane_mlmodel::AneMlPackageKernel>,
 ) -> Result<Array, Exception> {
     use half::f16;
+    use rayon::prelude::*;
 
     let shape = x.shape().to_vec(); // [1, S, H]
     let s = shape[1] as usize;
@@ -1685,20 +1686,19 @@ fn forward_ane_int8_mlp(
     debug_assert_eq!(down.input_shape[1] as usize, inter, "down in_dim mismatch");
     debug_assert_eq!(down.output_shape[1] as usize, h, "down out_dim mismatch");
 
-    // --- Pack input to fp16 [1, H, 1, bucket] (seq-padded on the right) ---
-    let x_f32_arr = x.as_dtype(Dtype::Float32)?;
-    x_f32_arr.eval()?;
-    let x_f32 = x_f32_arr.as_slice::<f32>();
+    // --- Pack input: cast bf16→fp16 once, transpose [1,S,H] → [H,bucket] ---
+    // Strided transpose parallelised over channel rows. Trailing [s..bucket]
+    // columns stay zero (vec! default); conv1x1 at those cols contributes 0.
+    let x_f16_arr = x.as_dtype(Dtype::Float16)?;
+    x_f16_arr.eval()?;
+    let x_f16 = x_f16_arr.as_slice::<f16>();
 
     let mut x_fp16 = vec![0u16; h * bucket];
-    for t in 0..s {
-        let row_off = t * h;
-        for ci in 0..h {
-            x_fp16[ci * bucket + t] = f16::from_f32(x_f32[row_off + ci]).to_bits();
+    x_fp16.par_chunks_mut(bucket).enumerate().for_each(|(ci, row)| {
+        for t in 0..s {
+            row[t] = x_f16[t * h + ci].to_bits();
         }
-    }
-    // trailing [s..bucket] already zero-initialised — conv1x1 at those columns
-    // contributes zero input × weight = zero output; safe to discard.
+    });
 
     // --- gate / up projections ---
     let mut gate_fp16 = vec![0u16; inter * bucket];
@@ -1707,53 +1707,64 @@ fn forward_ane_int8_mlp(
     let mut up_fp16 = vec![0u16; inter * bucket];
     up.predict_fp16(&x_fp16, &mut up_fp16)
         .map_err(|e| Exception::custom(format!("forward_ane_int8_mlp: up: {e}")))?;
-
-    // --- Unpack to row-major [1, S, inter] f32, SwiGLU, then repack ---
-    // Only read the first `s` cols of the bucket.
-    let mut gate_mat = vec![0f32; s * inter];
-    let mut up_mat = vec![0f32; s * inter];
-    for co in 0..inter {
-        let col_off = co * bucket;
-        for t in 0..s {
-            gate_mat[t * inter + co] = f16::from_bits(gate_fp16[col_off + t]).to_f32();
-            up_mat[t * inter + co] = f16::from_bits(up_fp16[col_off + t]).to_f32();
-        }
-    }
     drop(x_fp16);
+
+    // --- Unpack gate/up [inter, bucket] → [S, inter] fp16 in parallel. ---
+    // Parallelise over sequence rows so writes are sequential; reads are
+    // strided by `bucket` but each thread's working set stays in L1.
+    let mut gate_f16: Vec<f16> = vec![f16::ZERO; s * inter];
+    let mut up_f16: Vec<f16> = vec![f16::ZERO; s * inter];
+    gate_f16
+        .par_chunks_mut(inter)
+        .zip(up_f16.par_chunks_mut(inter))
+        .enumerate()
+        .for_each(|(t, (grow, urow))| {
+            for co in 0..inter {
+                grow[co] = f16::from_bits(gate_fp16[co * bucket + t]);
+                urow[co] = f16::from_bits(up_fp16[co * bucket + t]);
+            }
+        });
     drop(gate_fp16);
     drop(up_fp16);
 
-    let gate_arr = Array::from_slice(&gate_mat, &[1, s as i32, inter as i32]);
-    let up_arr = Array::from_slice(&up_mat, &[1, s as i32, inter as i32]);
+    // --- SwiGLU in fp16 (swiglu is dtype-agnostic). ---
+    let gate_arr = Array::from_slice(&gate_f16, &[1, s as i32, inter as i32]);
+    let up_arr = Array::from_slice(&up_f16, &[1, s as i32, inter as i32]);
+    drop(gate_f16);
+    drop(up_f16);
     let activated = swiglu(&gate_arr, &up_arr)?;
     activated.eval()?;
 
-    // --- Pack activated [1, S, inter] → fp16 [1, inter, 1, bucket] ---
-    let act_f32 = activated.as_dtype(Dtype::Float32)?;
-    act_f32.eval()?;
-    let act_slice = act_f32.as_slice::<f32>();
+    // --- Pack activated [1, S, inter] fp16 → [inter, bucket] u16. ---
+    let act_f16 = activated.as_slice::<f16>();
     let mut down_in_fp16 = vec![0u16; inter * bucket];
-    for t in 0..s {
-        let row_off = t * inter;
-        for ci in 0..inter {
-            down_in_fp16[ci * bucket + t] = f16::from_f32(act_slice[row_off + ci]).to_bits();
-        }
-    }
+    down_in_fp16
+        .par_chunks_mut(bucket)
+        .enumerate()
+        .for_each(|(ci, row)| {
+            for t in 0..s {
+                row[t] = act_f16[t * inter + ci].to_bits();
+            }
+        });
 
     // --- down projection ---
     let mut down_fp16 = vec![0u16; h * bucket];
     down.predict_fp16(&down_in_fp16, &mut down_fp16)
         .map_err(|e| Exception::custom(format!("forward_ane_int8_mlp: down: {e}")))?;
+    drop(down_in_fp16);
 
-    // --- Unpack to [1, S, H] f32 ---
-    let mut out_f32 = vec![0f32; s * h];
-    for co in 0..h {
-        let col_off = co * bucket;
-        for t in 0..s {
-            out_f32[t * h + co] = f16::from_bits(down_fp16[col_off + t]).to_f32();
-        }
-    }
-    Ok(Array::from_slice(&out_f32, &[1, s as i32, h as i32]))
+    // --- Unpack [H, bucket] → [S, H] fp16, return as Dtype::Float16. ---
+    // Caller adds residual against bf16 hidden; MLX upcasts automatically.
+    let mut out_f16: Vec<f16> = vec![f16::ZERO; s * h];
+    out_f16
+        .par_chunks_mut(h)
+        .enumerate()
+        .for_each(|(t, row)| {
+            for co in 0..h {
+                row[co] = f16::from_bits(down_fp16[co * bucket + t]);
+            }
+        });
+    Ok(Array::from_slice(&out_f16, &[1, s as i32, h as i32]))
 }
 
 // ---------------------------------------------------------------------------
@@ -16322,6 +16333,81 @@ mod tests {
             max_diff < budget,
             "MLP layer 0 int8 ANE parity failed: max_diff={max_diff} exceeds {budget:.4} budget \
              (|out|_max={ref_max:.2}, mean_diff={mean_diff:.6})"
+        );
+    }
+
+    /// Micro-bench for `forward_ane_int8_mlp` at the handoff-gate shape
+    /// (bucket=512, Carnice-9B dims). Reports min/median/mean over N iters
+    /// after warmup. Use to establish a baseline before any perf change and
+    /// to gate the ≥20% improvement target from
+    /// `.planning/next-session-ane-int8-mlp-zerocopy.md`.
+    ///
+    /// ```bash
+    /// HIGGS_BF16_MODEL_PATH=~/.cache/lm-studio/models/jason-schulz/Carnice-9b-MLX \
+    /// HIGGS_CORETOOLS_PYTHON=/path/to/venv/bin/python \
+    ///   cargo test -p higgs-models --release --features ane -- \
+    ///     forward_ane_int8_mlp_bench --nocapture --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "requires Carnice-9B-MLX + HIGGS_CORETOOLS_PYTHON"]
+    fn forward_ane_int8_mlp_bench() {
+        use mlx_rs::transforms::eval;
+        use std::time::Instant;
+
+        let model_path = std::env::var("HIGGS_BF16_MODEL_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap();
+            format!("{home}/.cache/lm-studio/models/jason-schulz/Carnice-9b-MLX")
+        });
+        assert!(
+            std::path::Path::new(&model_path).exists(),
+            "Model not found at {model_path}. Set HIGGS_BF16_MODEL_PATH."
+        );
+        let mut model = load_qwen3_5_model(&model_path).unwrap();
+        let hidden = model.args.hidden_size;
+        let inter = model.args.intermediate_size;
+
+        let seq: i32 = 512;
+        let iters: usize = 50;
+        let warmup: usize = 5;
+
+        let x_f32 =
+            mlx_rs::random::normal::<f32>(&[1, seq, hidden], None, None, None).unwrap();
+        let x = x_f32.as_dtype(Dtype::Bfloat16).unwrap();
+        x.eval().unwrap();
+
+        let (g, u, d, h, i) = model
+            .prepare_mlp_layer0_int8_weights()
+            .expect("prepare")
+            .expect("layer 0 must be dense");
+        assert_eq!(h, hidden as usize);
+        assert_eq!(i, inter as usize);
+        model
+            .finalize_ane_mlp_layer0_int8_inline(g, u, d, h, i, seq)
+            .expect("finalize");
+
+        let ffn = &mut model.model.layers[0].mlp;
+
+        for _ in 0..warmup {
+            let y = ffn.forward(&x).expect("warmup forward");
+            eval([&y]).unwrap();
+        }
+
+        let mut samples: Vec<u128> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let y = ffn.forward(&x).expect("bench forward");
+            eval([&y]).unwrap();
+            samples.push(t0.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        let min_ms = samples[0] as f64 / 1000.0;
+        let med_ms = samples[iters / 2] as f64 / 1000.0;
+        let mean_us: u128 = samples.iter().sum();
+        let mean_ms = mean_us as f64 / (iters as f64 * 1000.0);
+        eprintln!(
+            "forward_ane_int8_mlp_bench seq={seq} bucket={seq} hidden={hidden} inter={inter}: \
+             min={min_ms:.3}ms  median={med_ms:.3}ms  mean={mean_ms:.3}ms  (n={iters})"
         );
     }
 }
