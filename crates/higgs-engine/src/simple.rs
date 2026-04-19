@@ -137,7 +137,7 @@ impl SimpleEngine {
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model");
 
-        let (mut model, pending_ane_gdn, pending_ane_lm_head) =
+        let (mut model, pending_ane_gdn, pending_ane_lm_head, pending_ane_mlp_int8) =
             model_loader::load_model(model_dir)?;
         // P0.8 Stage 2: SimpleEngine has no dedicated inference thread (model
         // lives in Mutex shared across Tokio threads). Finalize immediately on
@@ -172,11 +172,30 @@ impl SimpleEngine {
                     }
                 }
             }
+            if let Some(pending) = pending_ane_mlp_int8 {
+                if let AnyModel::Qwen3Next(qwen) = &mut model {
+                    if let Err(e) = qwen.finalize_ane_mlp_layer0_int8_inline(
+                        pending.gate_f32,
+                        pending.up_f32,
+                        pending.down_f32,
+                        pending.hidden,
+                        pending.inter,
+                        pending.seq_len,
+                    ) {
+                        tracing::error!(
+                            error = %e,
+                            "SimpleEngine: finalize_ane_mlp_layer0_int8_inline failed — \
+                             falling back to Metal"
+                        );
+                    }
+                }
+            }
         }
         #[cfg(not(feature = "ane"))]
         {
             let _ = pending_ane_gdn;
             let _ = pending_ane_lm_head;
+            let _ = pending_ane_mlp_int8;
         }
         let _ = model
             .make_cache_with_config(kv_cache_config)

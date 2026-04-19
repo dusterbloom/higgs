@@ -47,6 +47,7 @@ pub async fn run_doctor(config: &HiggsConfig) -> DoctorResult {
     check_auto_router(config, &mut result);
     check_port_availability(config, &mut result);
     check_orphaned_providers(config, &mut result);
+    check_ane_int8_mlp(&mut result);
 
     eprintln!(
         "\n{} passed, {} warnings, {} failures",
@@ -269,6 +270,60 @@ fn check_port_availability(config: &HiggsConfig, result: &mut DoctorResult) {
             &format!("port {} unavailable: {err}", config.server.port),
             result,
         ),
+    }
+}
+
+/// Validate env flags that gate the experimental ANE int8 MLP layer-0 prefill path.
+///
+/// - `HIGGS_TARGET_ANE_INT8_MLP=1` enables compiling MLP layer 0 as int8 mlpackage
+///   kernels and dispatching prefill through the ANE. Requires the `ane` feature.
+/// - `HIGGS_ANE_INT8_MLP_SEQ=<int>` sets the seq bucket (default 128). Runtime seqs
+///   outside `(1, bucket]` fall back to the MLX q4 path.
+fn check_ane_int8_mlp(result: &mut DoctorResult) {
+    let target = std::env::var("HIGGS_TARGET_ANE_INT8_MLP").ok();
+    let seq = std::env::var("HIGGS_ANE_INT8_MLP_SEQ").ok();
+
+    let target_enabled = target.as_deref() == Some("1");
+
+    if target_enabled {
+        #[cfg(feature = "ane")]
+        pass("HIGGS_TARGET_ANE_INT8_MLP=1 (ANE feature enabled)", result);
+        #[cfg(not(feature = "ane"))]
+        warn(
+            "HIGGS_TARGET_ANE_INT8_MLP=1 set but binary built without the `ane` feature \
+             — flag will be a no-op",
+            result,
+        );
+    }
+
+    if let Some(ref raw) = seq {
+        if !target_enabled {
+            warn(
+                &format!(
+                    "HIGGS_ANE_INT8_MLP_SEQ={raw} set but HIGGS_TARGET_ANE_INT8_MLP != 1 \
+                     — flag will be a no-op"
+                ),
+                result,
+            );
+        }
+        match raw.parse::<i32>() {
+            Ok(n) if n > 1 => {
+                if target_enabled {
+                    pass(
+                        &format!("HIGGS_ANE_INT8_MLP_SEQ={n} (valid bucket)"),
+                        result,
+                    );
+                }
+            }
+            Ok(n) => warn(
+                &format!("HIGGS_ANE_INT8_MLP_SEQ={n} is not > 1 (must be a prefill bucket)"),
+                result,
+            ),
+            Err(_) => warn(
+                &format!("HIGGS_ANE_INT8_MLP_SEQ={raw} is not a valid integer"),
+                result,
+            ),
+        }
     }
 }
 

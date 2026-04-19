@@ -74,6 +74,29 @@ pub struct PendingAneLmHead {
 #[cfg(not(feature = "ane"))]
 pub struct PendingAneLmHead;
 
+/// Pending ANE int8 MLP layer-0 setup work that must complete on the
+/// inference worker thread. Carries Send-safe dequantized gate/up/down
+/// projection weights produced on the main thread; the consumer calls
+/// [`higgs_models::qwen3_next::Qwen3NextCausalLM::finalize_ane_mlp_layer0_int8_inline`]
+/// on the inference thread to compile + install the three mlpackage kernels
+/// and enter realtime mode.
+///
+/// `None` from [`load_model`] means either ANE int8 MLP is disabled
+/// (`HIGGS_TARGET_ANE_INT8_MLP!=1`), the model is non–Qwen3-Next, layer 0
+/// is MoE (out of scope for step 1), or prep failed.
+#[cfg(feature = "ane")]
+pub struct PendingAneMlpInt8Layer0 {
+    pub gate_f32: Vec<f32>,
+    pub up_f32: Vec<f32>,
+    pub down_f32: Vec<f32>,
+    pub hidden: usize,
+    pub inter: usize,
+    pub seq_len: i32,
+}
+
+#[cfg(not(feature = "ane"))]
+pub struct PendingAneMlpInt8Layer0;
+
 /// Load a model from a directory, auto-detecting the architecture.
 ///
 /// Once the model is constructed, `maybe_enable_ane_gdn` runs and — if
@@ -85,13 +108,22 @@ pub struct PendingAneLmHead;
 /// regression safety valve).
 pub fn load_model<P: AsRef<Path>>(
     model_dir: P,
-) -> Result<(AnyModel, Option<PendingAneGdn>, Option<PendingAneLmHead>), EngineError> {
+) -> Result<
+    (
+        AnyModel,
+        Option<PendingAneGdn>,
+        Option<PendingAneLmHead>,
+        Option<PendingAneMlpInt8Layer0>,
+    ),
+    EngineError,
+> {
     let config = ModelConfig::from_dir(&model_dir)?;
 
     let mut model = load_model_inner(&config)?;
     let pending_gdn = maybe_enable_ane_gdn(&mut model);
     let pending_lm_head = maybe_enable_ane_lm_head(&mut model);
-    Ok((model, pending_gdn, pending_lm_head))
+    let pending_mlp_int8 = maybe_enable_ane_mlp_int8_layer0(&mut model);
+    Ok((model, pending_gdn, pending_lm_head, pending_mlp_int8))
 }
 
 fn load_model_inner(config: &ModelConfig) -> Result<AnyModel, EngineError> {
@@ -176,6 +208,15 @@ fn maybe_enable_ane_gdn(model: &mut AnyModel) -> Option<PendingAneGdn> {
         );
         return None;
     };
+    tracing::error!(
+        "HIGGS_TARGET_ANE_GDN=1 active — known to regress prefill ~3× (and decode ~38% on dFlash) \
+        due to per-projection GPU→CPU→GPU mpsc round-trips in \
+        qwen3_next_ane_worker::GdnAneWorkerHandle::dispatch \
+        (72 dispatches × ~3.2ms = ~228ms/round). \
+        Safe to enable only for A/B testing until worker batching lands. \
+        See .planning/next-session-ane-synergy-handoff.md and \
+        memory/dflash-regression-bee1ee20-handoff.md."
+    );
     const ANE_GDN_SEQ_LEN: i32 = 32;
 
     // Regression safety valve: HIGGS_ANE_GDN_WORKER=1 forces the legacy
@@ -300,6 +341,83 @@ fn maybe_enable_ane_lm_head(_model: &mut AnyModel) -> Option<PendingAneLmHead> {
     if std::env::var("HIGGS_TARGET_ANE_LM_HEAD").as_deref() == Ok("1") {
         tracing::warn!(
             "HIGGS_TARGET_ANE_LM_HEAD=1 set but binary built without `ane` feature — ignoring"
+        );
+    }
+    None
+}
+
+/// Opt-in int8-MLP-on-ANE offload (layer 0 only, prefill bucket only).
+///
+/// When `HIGGS_TARGET_ANE_INT8_MLP=1` and the model is Qwen3-Next-family with
+/// a dense (non-MoE) layer 0, dequantize the three gate/up/down projections
+/// on the main thread and hand the compile+install step to the inference
+/// worker (same pattern as [`maybe_enable_ane_gdn`] / [`maybe_enable_ane_lm_head`]).
+/// Seq bucket defaults to 128 (matches the `qwen3_9b_mlp_int8_vs_mlx_probe`
+/// GREEN measurement — 2.23× over MLX q4 at that shape). Override with
+/// `HIGGS_ANE_INT8_MLP_SEQ`. Runtime seqs outside `(1, bucket]` fall back to
+/// the Metal QLinear path inside `FfnBlock::forward`.
+#[cfg(feature = "ane")]
+fn maybe_enable_ane_mlp_int8_layer0(model: &mut AnyModel) -> Option<PendingAneMlpInt8Layer0> {
+    if std::env::var("HIGGS_TARGET_ANE_INT8_MLP").as_deref() != Ok("1") {
+        return None;
+    }
+    let AnyModel::Qwen3Next(qwen) = model else {
+        tracing::debug!(
+            "HIGGS_TARGET_ANE_INT8_MLP=1 set but model is not Qwen3Next — skipping ANE int8 MLP setup"
+        );
+        return None;
+    };
+    // Default matches the engine's chunked-prefill size (see
+    // `compute_prefill_chunk_size` in simple.rs / batch_engine.rs). Long prompts
+    // are already split into ≤chunk-size slices before they reach `forward`, so
+    // bucket=512 covers 100% of layer-0 prefill dispatches with one ANE kernel
+    // per chunk. Raise via env for bigger engine chunks on high-VRAM devices.
+    let seq_len: i32 = std::env::var("HIGGS_ANE_INT8_MLP_SEQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+
+    match qwen.prepare_mlp_layer0_int8_weights() {
+        Ok(Some((gate_f32, up_f32, down_f32, hidden, inter))) => {
+            tracing::info!(
+                hidden,
+                inter,
+                seq_len,
+                weight_bytes = (gate_f32.len() + up_f32.len() + down_f32.len()) * 4,
+                "ANE int8 MLP layer-0 prep complete on main thread — finalize pending on inference worker"
+            );
+            Some(PendingAneMlpInt8Layer0 {
+                gate_f32,
+                up_f32,
+                down_f32,
+                hidden,
+                inter,
+                seq_len,
+            })
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "HIGGS_TARGET_ANE_INT8_MLP=1 set but layer 0 is MoE — \
+                 skipping (dense path only in step 1)"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "HIGGS_TARGET_ANE_INT8_MLP=1 set but prepare_mlp_layer0_int8_weights failed — \
+                 falling back to Metal"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "ane"))]
+fn maybe_enable_ane_mlp_int8_layer0(_model: &mut AnyModel) -> Option<PendingAneMlpInt8Layer0> {
+    if std::env::var("HIGGS_TARGET_ANE_INT8_MLP").as_deref() == Ok("1") {
+        tracing::warn!(
+            "HIGGS_TARGET_ANE_INT8_MLP=1 set but binary built without `ane` feature — ignoring"
         );
     }
     None

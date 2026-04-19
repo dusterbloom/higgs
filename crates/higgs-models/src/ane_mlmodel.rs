@@ -1674,4 +1674,185 @@ mod tests {
         assert!(max_diff <= 0.5,
             "parity sanity: max_diff={max_diff} exceeds 0.5 (something is wrong)");
     }
+
+    /// Layer-0 MLP projection sweep — runs the int8-vs-q4 probe for BOTH
+    /// shape orientations used by Qwen3-9B MLP:
+    ///   gate/up : in=4096, out=12288  (hidden → intermediate)
+    ///   down    : in=12288, out=4096  (intermediate → hidden)
+    ///
+    /// The original probe only covered gate/up. Before wiring all three
+    /// projections we need confirmation that the reverse orientation also
+    /// clears the >1.5× gate vs MLX q4 (bandwidth argument predicts yes
+    /// — 50M weights either way — but compute-cliff behavior can differ).
+    #[test]
+    #[ignore = "go/no-go probe; set HIGGS_CORETOOLS_PYTHON"]
+    fn qwen3_9b_mlp_projections_probe() {
+        use mlx_rs::{ops::matmul, random};
+        use std::fs;
+        use std::process::Command;
+        use std::time::Instant;
+
+        let py = std::env::var("HIGGS_CORETOOLS_PYTHON")
+            .expect("set HIGGS_CORETOOLS_PYTHON");
+        let seq: usize = std::env::var("HIGGS_ANE_INT8_PROBE_SEQ")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+        let iters: usize = 30;
+        let warmup: usize = 5;
+
+        // Qwen3-9B MLP projection shapes. hidden=4096, intermediate=12288.
+        let cases: &[(usize, usize, &str)] = &[
+            (4096, 12288, "gate/up"),
+            (12288, 4096, "down"),
+        ];
+
+        eprintln!("");
+        eprintln!("=== Qwen3-9B MLP projections probe (seq={seq}) ===");
+        eprintln!("| proj    | shape         | ANE int8 | MLX f32  | MLX q4   | vs q4  | on_ane | max_diff |");
+        eprintln!("|---------|---------------|----------|----------|----------|--------|--------|----------|");
+
+        let mut all_pass = true;
+        for &(in_dim, out_dim, label) in cases {
+            // --- Synthetic weight + activation ---
+            let w = random::uniform::<f32, f32>(-0.05, 0.05,
+                &[out_dim as i32, in_dim as i32], None).expect("random W");
+            w.eval().unwrap();
+            let w_vec: Vec<f32> = w.as_slice::<f32>().to_vec();
+
+            let x = random::uniform::<f32, f32>(-1.0, 1.0,
+                &[1, seq as i32, in_dim as i32], None).expect("random x");
+            x.eval().unwrap();
+            let x_vec: Vec<f32> = x.as_slice::<f32>().to_vec();
+
+            // --- Build int8 mlpackage ---
+            let tmp = tempfile::tempdir().unwrap();
+            let weights_bin = tmp.path().join("w.bin");
+            let out_dir = tmp.path().join("out");
+            fs::create_dir_all(&out_dir).unwrap();
+            let mut bytes = Vec::with_capacity(w_vec.len() * 4);
+            for v in &w_vec { bytes.extend_from_slice(&v.to_le_bytes()); }
+            fs::write(&weights_bin, &bytes).unwrap();
+
+            let script = env!("CARGO_MANIFEST_DIR").to_string()
+                + "/scripts/quantize_int8_proj.py";
+            let out = Command::new(&py)
+                .arg(&script)
+                .arg("--weights-bin").arg(&weights_bin)
+                .arg("--out-features").arg(out_dim.to_string())
+                .arg("--in-features").arg(in_dim.to_string())
+                .arg("--seq-len").arg(seq.to_string())
+                .arg("--out-dir").arg(&out_dir)
+                .output().expect("spawn python");
+            assert!(out.status.success(),
+                "quantize failed ({label})\nstderr: {}",
+                String::from_utf8_lossy(&out.stderr));
+            let resp: serde_json::Value =
+                serde_json::from_slice(&out.stdout).expect("json");
+            let mlmodelc = resp["mlmodelc"].as_str().unwrap();
+            let in_name = resp["input_name"].as_str().unwrap();
+            let out_name = resp["output_name"].as_str().unwrap();
+
+            // --- Load + verify ANE ---
+            let input_shape: Vec<i64> = vec![1, in_dim as i64, 1, seq as i64];
+            let output_shape: Vec<i64> = vec![1, out_dim as i64, 1, seq as i64];
+            let kernel = AneMlPackageKernel::load(
+                mlmodelc, in_name, out_name, input_shape, output_shape,
+            ).expect("load");
+            let (on_ane, _report) = kernel.verify_ane_dispatch().expect("verify");
+
+            // --- Pack input into conv1x1 layout fp16 ---
+            let pin = in_dim * seq;
+            let pout = out_dim * seq;
+            let mut x_fp16 = vec![0u16; pin];
+            for t in 0..seq {
+                for ci in 0..in_dim {
+                    let src = x_vec[t * in_dim + ci];
+                    x_fp16[ci * seq + t] = f16::from_f32(src).to_bits();
+                }
+            }
+            let mut y_fp16 = vec![0u16; pout];
+
+            // --- Bench ANE ---
+            for _ in 0..warmup {
+                kernel.predict_fp16(&x_fp16, &mut y_fp16).expect("predict");
+            }
+            let mut ane_samples: Vec<u128> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = Instant::now();
+                kernel.predict_fp16(&x_fp16, &mut y_fp16).expect("predict");
+                ane_samples.push(t0.elapsed().as_micros());
+            }
+            ane_samples.sort_unstable();
+            let ane_min_ms = ane_samples[0] as f64 / 1000.0;
+
+            // --- Bench MLX f32 matmul ---
+            let wt = w.t();
+            wt.eval().unwrap();
+            for _ in 0..warmup {
+                let y = matmul(&x, &wt).expect("matmul");
+                y.eval().unwrap();
+            }
+            let mut mlx_samples: Vec<u128> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = Instant::now();
+                let y = matmul(&x, &wt).expect("matmul");
+                y.eval().unwrap();
+                mlx_samples.push(t0.elapsed().as_micros());
+            }
+            mlx_samples.sort_unstable();
+            let mlx_min_ms = mlx_samples[0] as f64 / 1000.0;
+
+            // --- Bench MLX q4 (production baseline; group_size=64 bits=4) ---
+            let (qw, qs, qb) = mlx_rs::ops::quantize(&w, 64, 4).expect("quantize q4");
+            qw.eval().unwrap(); qs.eval().unwrap(); qb.eval().unwrap();
+            for _ in 0..warmup {
+                let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4)
+                    .expect("qmm");
+                y.eval().unwrap();
+            }
+            let mut q4_samples: Vec<u128> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = Instant::now();
+                let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4)
+                    .expect("qmm");
+                y.eval().unwrap();
+                q4_samples.push(t0.elapsed().as_micros());
+            }
+            q4_samples.sort_unstable();
+            let q4_min_ms = q4_samples[0] as f64 / 1000.0;
+
+            // --- Parity ---
+            let mut y_ane = vec![0.0f32; seq * out_dim];
+            for co in 0..out_dim {
+                for t in 0..seq {
+                    y_ane[t * out_dim + co] =
+                        f16::from_bits(y_fp16[co * seq + t]).to_f32();
+                }
+            }
+            let y_ref = matmul(&x, &wt).expect("matmul");
+            y_ref.eval().unwrap();
+            let y_ref_vec: Vec<f32> = y_ref.as_slice::<f32>().to_vec();
+            let mut max_diff = 0.0f32;
+            for (a, b) in y_ane.iter().zip(y_ref_vec.iter()) {
+                let d = (a - b).abs();
+                if d > max_diff { max_diff = d; }
+            }
+
+            let speedup_q4 = q4_min_ms / ane_min_ms;
+            let shape = format!("{out_dim}×{in_dim}");
+            eprintln!(
+                "| {label:<7} | {shape:<13} | {ane_min_ms:>6.3} ms | {mlx_min_ms:>6.3} ms | {q4_min_ms:>6.3} ms | {speedup_q4:>5.2}x | {on_ane:>6} | {max_diff:>8.4} |",
+            );
+
+            if speedup_q4 < 1.5 || !on_ane {
+                all_pass = false;
+            }
+            assert!(max_diff <= 0.5,
+                "parity sanity ({label}): max_diff={max_diff} exceeds 0.5");
+        }
+        eprintln!("");
+        eprintln!("DECISION GATE: all shapes must clear >1.5x vs q4 and dispatch on ANE.");
+        if !all_pass {
+            eprintln!("WARN: at least one projection did not clear the gate — probe informational, not a hard fail.");
+        }
+    }
 }

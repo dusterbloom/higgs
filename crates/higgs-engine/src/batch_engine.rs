@@ -100,7 +100,8 @@ impl BatchEngine {
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model (batch engine)");
 
-        let (model, pending_ane_gdn, pending_ane_lm_head) = model_loader::load_model(model_dir)?;
+        let (model, pending_ane_gdn, pending_ane_lm_head, pending_ane_mlp_int8) =
+            model_loader::load_model(model_dir)?;
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
         let template = ChatTemplateRenderer::from_model_dir(model_dir)?;
         let eos_token_ids = crate::simple::extract_eos_tokens(model_dir);
@@ -150,12 +151,31 @@ impl BatchEngine {
                             }
                         }
                     }
+                    if let Some(pending) = pending_ane_mlp_int8 {
+                        if let higgs_models::AnyModel::Qwen3Next(qwen) = &mut model {
+                            if let Err(e) = qwen.finalize_ane_mlp_layer0_int8_inline(
+                                pending.gate_f32,
+                                pending.up_f32,
+                                pending.down_f32,
+                                pending.hidden,
+                                pending.inter,
+                                pending.seq_len,
+                            ) {
+                                tracing::error!(
+                                    error = %e,
+                                    "finalize_ane_mlp_layer0_int8_inline failed on inference thread — \
+                                     falling back to Metal"
+                                );
+                            }
+                        }
+                    }
                     worker_loop(model, &tok, &eos_ids, request_rx);
                 }
                 #[cfg(not(feature = "ane"))]
                 {
                     let _ = pending_ane_gdn;
                     let _ = pending_ane_lm_head;
+                    let _ = pending_ane_mlp_int8;
                     worker_loop(model, &tok, &eos_ids, request_rx);
                 }
             })

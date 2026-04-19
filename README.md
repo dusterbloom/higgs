@@ -330,6 +330,18 @@ Measured on DeepSeek-V2-Lite-4bit (64 experts, top_k=6). Global batch sort reord
 | Reasoning extraction (5 questions, Qwen3) | 5/5 | 4/5 |
 | All architectures produce coherent output | Yes | Yes |
 
+## Experimental: ANE env flags
+
+Build with the `ane` feature to enable Apple Neural Engine offload paths. These
+flags are opt-in; all default to disabled (no-op without the feature).
+
+| Env var | Default | Effect |
+|---|---|---|
+| `HIGGS_TARGET_ANE_INT8_MLP` | unset | When `=1`, compiles MLP layer 0 (dense only) as int8 mlpackage kernels and dispatches prefill through the ANE. Decode and seq outside `(1, bucket]` fall back to the MLX q4 path. |
+| `HIGGS_ANE_INT8_MLP_SEQ` | `512` | Seq bucket for the int8 MLP kernel compile. Must be > 1. Default matches the engine's chunked-prefill size so arbitrarily long prompts (30k+) dispatch through ANE one chunk at a time. Raise (e.g. 1024/2048) if you bump the engine chunk size and want to keep a single kernel per chunk. Only meaningful with `HIGGS_TARGET_ANE_INT8_MLP=1`. |
+
+Run `higgs doctor` to validate the combination before serving.
+
 ## Development
 
 ```bash

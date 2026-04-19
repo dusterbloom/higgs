@@ -1651,6 +1651,111 @@ impl Qwen3NextMLP {
     }
 }
 
+/// ANE int8 MLP forward for a single layer.
+///
+/// Shapes (row-major unless noted):
+///   x            : [1, S, H] f32 (or fp16; converted)
+///   gate weight  : compiled at [inter, H]  → kernel input [1, H,     1, seq_bucket]
+///   up   weight  : compiled at [inter, H]  → kernel input [1, H,     1, seq_bucket]
+///   down weight  : compiled at [H,     inter] → kernel input [1, inter, 1, seq_bucket]
+///
+/// Layout marshaling mirrors the probe (`ane_mlmodel::tests::
+/// qwen3_9b_mlp_int8_vs_mlx_probe` lines 1574-1645): row-major `[S, C]` must
+/// be transposed to `[C, 1, S]` fp16 for the conv1x1 mlpackage, and the
+/// output transposed back. Seqs shorter than the compiled bucket are
+/// zero-padded in the seq dimension.
+#[cfg(feature = "ane")]
+fn forward_ane_int8_mlp(
+    x: &Array,
+    gate: &std::sync::Arc<crate::ane_mlmodel::AneMlPackageKernel>,
+    up: &std::sync::Arc<crate::ane_mlmodel::AneMlPackageKernel>,
+    down: &std::sync::Arc<crate::ane_mlmodel::AneMlPackageKernel>,
+) -> Result<Array, Exception> {
+    use half::f16;
+
+    let shape = x.shape().to_vec(); // [1, S, H]
+    let s = shape[1] as usize;
+    let h = shape[2] as usize;
+    let bucket = gate.input_shape[3] as usize;
+    let inter = gate.output_shape[1] as usize;
+
+    debug_assert_eq!(gate.input_shape[1] as usize, h, "gate in_dim mismatch");
+    debug_assert_eq!(up.input_shape[1] as usize, h, "up in_dim mismatch");
+    debug_assert_eq!(up.output_shape[1] as usize, inter, "up inter mismatch");
+    debug_assert_eq!(down.input_shape[1] as usize, inter, "down in_dim mismatch");
+    debug_assert_eq!(down.output_shape[1] as usize, h, "down out_dim mismatch");
+
+    // --- Pack input to fp16 [1, H, 1, bucket] (seq-padded on the right) ---
+    let x_f32_arr = x.as_dtype(Dtype::Float32)?;
+    x_f32_arr.eval()?;
+    let x_f32 = x_f32_arr.as_slice::<f32>();
+
+    let mut x_fp16 = vec![0u16; h * bucket];
+    for t in 0..s {
+        let row_off = t * h;
+        for ci in 0..h {
+            x_fp16[ci * bucket + t] = f16::from_f32(x_f32[row_off + ci]).to_bits();
+        }
+    }
+    // trailing [s..bucket] already zero-initialised — conv1x1 at those columns
+    // contributes zero input × weight = zero output; safe to discard.
+
+    // --- gate / up projections ---
+    let mut gate_fp16 = vec![0u16; inter * bucket];
+    gate.predict_fp16(&x_fp16, &mut gate_fp16)
+        .map_err(|e| Exception::custom(format!("forward_ane_int8_mlp: gate: {e}")))?;
+    let mut up_fp16 = vec![0u16; inter * bucket];
+    up.predict_fp16(&x_fp16, &mut up_fp16)
+        .map_err(|e| Exception::custom(format!("forward_ane_int8_mlp: up: {e}")))?;
+
+    // --- Unpack to row-major [1, S, inter] f32, SwiGLU, then repack ---
+    // Only read the first `s` cols of the bucket.
+    let mut gate_mat = vec![0f32; s * inter];
+    let mut up_mat = vec![0f32; s * inter];
+    for co in 0..inter {
+        let col_off = co * bucket;
+        for t in 0..s {
+            gate_mat[t * inter + co] = f16::from_bits(gate_fp16[col_off + t]).to_f32();
+            up_mat[t * inter + co] = f16::from_bits(up_fp16[col_off + t]).to_f32();
+        }
+    }
+    drop(x_fp16);
+    drop(gate_fp16);
+    drop(up_fp16);
+
+    let gate_arr = Array::from_slice(&gate_mat, &[1, s as i32, inter as i32]);
+    let up_arr = Array::from_slice(&up_mat, &[1, s as i32, inter as i32]);
+    let activated = swiglu(&gate_arr, &up_arr)?;
+    activated.eval()?;
+
+    // --- Pack activated [1, S, inter] → fp16 [1, inter, 1, bucket] ---
+    let act_f32 = activated.as_dtype(Dtype::Float32)?;
+    act_f32.eval()?;
+    let act_slice = act_f32.as_slice::<f32>();
+    let mut down_in_fp16 = vec![0u16; inter * bucket];
+    for t in 0..s {
+        let row_off = t * inter;
+        for ci in 0..inter {
+            down_in_fp16[ci * bucket + t] = f16::from_f32(act_slice[row_off + ci]).to_bits();
+        }
+    }
+
+    // --- down projection ---
+    let mut down_fp16 = vec![0u16; h * bucket];
+    down.predict_fp16(&down_in_fp16, &mut down_fp16)
+        .map_err(|e| Exception::custom(format!("forward_ane_int8_mlp: down: {e}")))?;
+
+    // --- Unpack to [1, S, H] f32 ---
+    let mut out_f32 = vec![0f32; s * h];
+    for co in 0..h {
+        let col_off = co * bucket;
+        for t in 0..s {
+            out_f32[t * h + co] = f16::from_bits(down_fp16[col_off + t]).to_f32();
+        }
+    }
+    Ok(Array::from_slice(&out_f32, &[1, s as i32, h as i32]))
+}
+
 // ---------------------------------------------------------------------------
 // SwitchMLP weights (stacked expert weights for MoE)
 // ---------------------------------------------------------------------------
@@ -2676,11 +2781,8 @@ impl GatedDeltaNet {
             let (mixed_qkvz, mixed_ba) = if let Some(handle) = &self.ane_handle {
                 if (S as usize) <= handle.seq_len() {
                     let idx = self.ane_linear_layer_idx;
-                    use crate::qwen3_next_ane_worker::ProjKind;
-                    (
-                        handle.dispatch(idx, ProjKind::Qkvz, inputs)?,
-                        handle.dispatch(idx, ProjKind::Ba, inputs)?,
-                    )
+                    // Fused dispatch: single ANE eval for both qkvz+ba.
+                    handle.dispatch_fused(idx, inputs)?
                 } else {
                     (
                         self.in_proj_qkvz.forward(inputs)?,
@@ -3257,6 +3359,17 @@ struct FfnBlock {
     norm_topk_prob: bool,
     /// Cached fused gate+up weights for dense layers (lazily computed on first forward).
     fused_gate_up: Option<(Array, Array, Array, i32)>,
+    /// Optional int8-mlpackage kernels for the three dense projections.
+    /// Populated by [`Qwen3NextCausalLM::finalize_ane_mlp_layer0_int8_inline`]
+    /// when `HIGGS_TARGET_ANE_INT8_MLP=1`. Dispatched in the dense forward
+    /// path only for prefill shapes (`1 < seq <= compiled bucket`); decode
+    /// (seq=1) stays on the QLinear path. MoE layers ignore these fields.
+    #[cfg(feature = "ane")]
+    gate_proj_ane: Option<std::sync::Arc<crate::ane_mlmodel::AneMlPackageKernel>>,
+    #[cfg(feature = "ane")]
+    up_proj_ane: Option<std::sync::Arc<crate::ane_mlmodel::AneMlPackageKernel>>,
+    #[cfg(feature = "ane")]
+    down_proj_ane: Option<std::sync::Arc<crate::ane_mlmodel::AneMlPackageKernel>>,
 }
 
 impl FfnBlock {
@@ -3274,6 +3387,12 @@ impl FfnBlock {
             top_k: moe.top_k,
             norm_topk_prob: moe.norm_topk_prob,
             fused_gate_up: None,
+            #[cfg(feature = "ane")]
+            gate_proj_ane: None,
+            #[cfg(feature = "ane")]
+            up_proj_ane: None,
+            #[cfg(feature = "ane")]
+            down_proj_ane: None,
         })
     }
 
@@ -3290,6 +3409,12 @@ impl FfnBlock {
             top_k: 0,
             norm_topk_prob: false,
             fused_gate_up: None,
+            #[cfg(feature = "ane")]
+            gate_proj_ane: None,
+            #[cfg(feature = "ane")]
+            up_proj_ane: None,
+            #[cfg(feature = "ane")]
+            down_proj_ane: None,
         })
     }
 
@@ -3358,6 +3483,24 @@ impl FfnBlock {
                 .up_proj
                 .as_ref()
                 .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
+
+            // ANE int8 fast path — prefill only (1 < S <= compiled seq bucket).
+            // Populated by `Qwen3NextCausalLM::finalize_ane_mlp_layer0_int8_inline`.
+            #[cfg(feature = "ane")]
+            if let (Some(g), Some(u), Some(d)) = (
+                self.gate_proj_ane.as_ref(),
+                self.up_proj_ane.as_ref(),
+                self.down_proj_ane.as_ref(),
+            ) {
+                let shape = x.shape();
+                if shape.len() == 3 && (shape[0] as usize) == 1 {
+                    let s = shape[1] as usize;
+                    let bucket = g.input_shape.get(3).copied().unwrap_or(0) as usize;
+                    if s > 1 && bucket > 0 && s <= bucket {
+                        return forward_ane_int8_mlp(x, g, u, d);
+                    }
+                }
+            }
 
             if gp.weight.dtype() != Dtype::Uint32 || up.weight.dtype() != Dtype::Uint32 {
                 let gate_out = gp.forward(x)?;
@@ -3912,7 +4055,7 @@ impl Qwen3NextCausalLM {
         let t_spawn = Instant::now();
         let n_layers = layer_weights.len();
         let handle = crate::qwen3_next_ane_worker::spawn_gdn_ane_worker(
-            layer_weights, seq_len,
+            layer_weights, seq_len, None,
         )
         .map_err(|e| {
             Exception::custom(format!(
@@ -4365,6 +4508,192 @@ impl Qwen3NextCausalLM {
             compile_after,
             rt_enabled,
             "ANE lm_head inline finalize complete on inference thread"
+        );
+
+        Ok(())
+    }
+
+    /// Main-thread prep: dequantize layer-0 MLP (gate/up/down) projections to
+    /// contiguous f32 buffers for ANE int8 mlpackage compilation.
+    ///
+    /// Returns `Ok(None)` when layer 0 is an MoE block (no direct
+    /// gate/up/down QLinear triple to dequantize — out of scope for step 1).
+    /// Returns `Ok(Some((gate, up, down, hidden, intermediate)))` otherwise;
+    /// each buffer is row-major `[out * in]` matching what
+    /// [`crate::qwen3_next_ane::compile_proj_int8_mlpkg`] expects.
+    ///
+    /// Send-safe — all three buffers are plain `Vec<f32>` that ship across
+    /// the inference-thread move, same pattern as
+    /// [`Self::prepare_lm_head_weights`].
+    #[cfg(feature = "ane")]
+    #[allow(clippy::type_complexity)]
+    pub fn prepare_mlp_layer0_int8_weights(
+        &self,
+    ) -> Result<Option<(Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)>, Exception> {
+        let hidden = self.args.hidden_size as usize;
+        let inter = self.args.intermediate_size as usize;
+        if hidden == 0 || inter == 0 {
+            return Err(Exception::custom(format!(
+                "prepare_mlp_layer0_int8_weights: zero dim (hidden={hidden}, inter={inter})"
+            )));
+        }
+
+        let layer0 = self.model.layers.first().ok_or_else(|| {
+            Exception::custom("prepare_mlp_layer0_int8_weights: model has no layers")
+        })?;
+        let mlp = &layer0.mlp;
+        if mlp.is_moe {
+            tracing::info!(
+                "prepare_mlp_layer0_int8_weights: layer 0 is MoE — skipping (dense path only)"
+            );
+            return Ok(None);
+        }
+        let gp = mlp.gate_proj.as_ref().ok_or_else(|| {
+            Exception::custom("prepare_mlp_layer0_int8_weights: dense gate_proj missing")
+        })?;
+        let up = mlp.up_proj.as_ref().ok_or_else(|| {
+            Exception::custom("prepare_mlp_layer0_int8_weights: dense up_proj missing")
+        })?;
+        let dp = mlp.down_proj.as_ref().ok_or_else(|| {
+            Exception::custom("prepare_mlp_layer0_int8_weights: dense down_proj missing")
+        })?;
+
+        let gate_f32 = crate::qwen3_next_ane::dequantize_qlinear_to_f32(
+            &gp.weight.value,
+            &gp.scales.value,
+            &gp.biases.value,
+            gp.group_size,
+            gp.bits,
+        )?;
+        if gate_f32.len() != inter * hidden {
+            return Err(Exception::custom(format!(
+                "prepare_mlp_layer0_int8_weights: gate len {} != inter*hidden {}",
+                gate_f32.len(),
+                inter * hidden
+            )));
+        }
+        let up_f32 = crate::qwen3_next_ane::dequantize_qlinear_to_f32(
+            &up.weight.value,
+            &up.scales.value,
+            &up.biases.value,
+            up.group_size,
+            up.bits,
+        )?;
+        if up_f32.len() != inter * hidden {
+            return Err(Exception::custom(format!(
+                "prepare_mlp_layer0_int8_weights: up len {} != inter*hidden {}",
+                up_f32.len(),
+                inter * hidden
+            )));
+        }
+        let down_f32 = crate::qwen3_next_ane::dequantize_qlinear_to_f32(
+            &dp.weight.value,
+            &dp.scales.value,
+            &dp.biases.value,
+            dp.group_size,
+            dp.bits,
+        )?;
+        if down_f32.len() != hidden * inter {
+            return Err(Exception::custom(format!(
+                "prepare_mlp_layer0_int8_weights: down len {} != hidden*inter {}",
+                down_f32.len(),
+                hidden * inter
+            )));
+        }
+        Ok(Some((gate_f32, up_f32, down_f32, hidden, inter)))
+    }
+
+    /// Inference-thread finalize: compile ANE int8 mlpackage kernels for
+    /// layer 0's `gate_proj` / `up_proj` / `down_proj` from the pre-dequantized
+    /// weights produced by [`Self::prepare_mlp_layer0_int8_weights`], and
+    /// install them on `self.model.layers[0].mlp`.
+    ///
+    /// MUST be called on the inference worker thread — kernel IOSurfaces bind
+    /// to the compiling thread (same invariant as
+    /// [`Self::finalize_ane_lm_head_inline`]). Also enters realtime mode
+    /// one-shot (idempotent if already active).
+    #[cfg(feature = "ane")]
+    pub fn finalize_ane_mlp_layer0_int8_inline(
+        &mut self,
+        gate_f32: Vec<f32>,
+        up_f32: Vec<f32>,
+        down_f32: Vec<f32>,
+        hidden: usize,
+        inter: usize,
+        seq_len: i32,
+    ) -> Result<(), Exception> {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        if seq_len <= 0 {
+            return Err(Exception::custom(format!(
+                "finalize_ane_mlp_layer0_int8_inline: non-positive seq_len {seq_len}"
+            )));
+        }
+        if gate_f32.len() != inter * hidden
+            || up_f32.len() != inter * hidden
+            || down_f32.len() != hidden * inter
+        {
+            return Err(Exception::custom(format!(
+                "finalize_ane_mlp_layer0_int8_inline: weight size mismatch \
+                 (gate={}, up={}, down={}, expected inter*hidden={} / hidden*inter={})",
+                gate_f32.len(),
+                up_f32.len(),
+                down_f32.len(),
+                inter * hidden,
+                hidden * inter
+            )));
+        }
+
+        let pad = seq_len as usize;
+
+        let t = Instant::now();
+        let gate_k = crate::qwen3_next_ane::compile_proj_int8_mlpkg(
+            &gate_f32, hidden, inter, pad, "mlp0.gate",
+        )
+        .map_err(|e| Exception::custom(format!("finalize_ane_mlp_layer0_int8_inline: gate: {e}")))?;
+        let gate_ms = t.elapsed().as_millis() as u64;
+        drop(gate_f32);
+
+        let t = Instant::now();
+        let up_k = crate::qwen3_next_ane::compile_proj_int8_mlpkg(
+            &up_f32, hidden, inter, pad, "mlp0.up",
+        )
+        .map_err(|e| Exception::custom(format!("finalize_ane_mlp_layer0_int8_inline: up: {e}")))?;
+        let up_ms = t.elapsed().as_millis() as u64;
+        drop(up_f32);
+
+        let t = Instant::now();
+        let down_k = crate::qwen3_next_ane::compile_proj_int8_mlpkg(
+            &down_f32, inter, hidden, pad, "mlp0.down",
+        )
+        .map_err(|e| Exception::custom(format!("finalize_ane_mlp_layer0_int8_inline: down: {e}")))?;
+        let down_ms = t.elapsed().as_millis() as u64;
+        drop(down_f32);
+
+        let layer0 = self.model.layers.first_mut().ok_or_else(|| {
+            Exception::custom("finalize_ane_mlp_layer0_int8_inline: model has no layers")
+        })?;
+        if layer0.mlp.is_moe {
+            return Err(Exception::custom(
+                "finalize_ane_mlp_layer0_int8_inline: layer 0 is MoE — dense path only",
+            ));
+        }
+        layer0.mlp.gate_proj_ane = Some(Arc::new(gate_k));
+        layer0.mlp.up_proj_ane = Some(Arc::new(up_k));
+        layer0.mlp.down_proj_ane = Some(Arc::new(down_k));
+
+        let rt_enabled = crate::ane_bridge::AneKernel::begin_realtime();
+
+        tracing::info!(
+            hidden,
+            inter,
+            seq_len = pad,
+            gate_ms,
+            up_ms,
+            down_ms,
+            rt_enabled,
+            "ANE int8 MLP layer-0 finalize complete on inference thread"
         );
 
         Ok(())
@@ -15854,6 +16183,145 @@ mod tests {
             max_diff_global < budget,
             "All-layers ANE worker parity failed at layer{max_diff_layer}: \
              max_diff={max_diff_global} exceeds {budget:.4} budget"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MLP layer 0 ANE int8 parity (dense SwiGLU path)
+    // -----------------------------------------------------------------------
+
+    /// Load a real BF16 9B dense model (Carnice-9B-MLX), capture the layer 0
+    /// MLP output via the all-Metal SwiGLU path, install the ANE int8 kernels
+    /// for `gate_proj` / `up_proj` / `down_proj`, forward again, and compare.
+    ///
+    /// Tolerance is magnitude-aware and looser than the GDN parity gate —
+    /// int8 dequant is noisier than q4 dequant plus an extra fp16 round-trip
+    /// through the conv1x1 mlpackage.
+    ///
+    /// ```bash
+    /// HIGGS_BF16_MODEL_PATH=~/.cache/lm-studio/models/jason-schulz/Carnice-9b-MLX \
+    ///   cargo test -p higgs-models --release --features ane -- \
+    ///     test_9b_mlp_layer0_int8_ane_parity --nocapture --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[cfg(feature = "ane")]
+    #[ignore = "requires Carnice-9B-MLX (or another dense-layer-0 BF16 9B) on disk"]
+    fn test_9b_mlp_layer0_int8_ane_parity() {
+        use mlx_rs::transforms::eval;
+
+        let model_path = std::env::var("HIGGS_BF16_MODEL_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap();
+            format!("{home}/.cache/lm-studio/models/jason-schulz/Carnice-9b-MLX")
+        });
+        if !std::path::Path::new(&model_path).exists() {
+            panic!("Model not found at {model_path}. Set HIGGS_BF16_MODEL_PATH.");
+        }
+        eprintln!("Loading model from {model_path}...");
+        let mut model = load_qwen3_5_model(&model_path).unwrap();
+        let hidden = model.args.hidden_size;
+        let inter = model.args.intermediate_size;
+        eprintln!(
+            "Loaded: {} layers, hidden={hidden}, intermediate={inter}",
+            model.model.layers.len()
+        );
+
+        assert!(
+            !model.model.layers[0].mlp.is_moe,
+            "Layer 0 MLP must be dense for this parity gate (model config changed?)"
+        );
+
+        let s = 128i32;
+        let x_f32 = mlx_rs::random::normal::<f32>(&[1, s, hidden], None, None, None).unwrap();
+        let x = x_f32.as_dtype(Dtype::Bfloat16).unwrap();
+        x.eval().unwrap();
+
+        // ── Baseline: all-Metal dense MLP forward ──
+        let out_ref = {
+            let ffn = &mut model.model.layers[0].mlp;
+            let out = ffn.forward(&x).expect("baseline dense MLP forward failed");
+            eval([&out]).unwrap();
+            out
+        };
+        let ref_max: f32 = out_ref
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        eprintln!(
+            "Metal baseline: out shape={:?}, dtype={:?}, |out|_max={:.4}",
+            out_ref.shape(),
+            out_ref.dtype(),
+            ref_max
+        );
+        assert!(
+            ref_max.is_finite() && ref_max > 0.0,
+            "Dead Metal baseline: max={ref_max}"
+        );
+
+        // ── Install ANE int8 kernels on layer 0 ──
+        let (g, u, d, h, i) = model
+            .prepare_mlp_layer0_int8_weights()
+            .expect("prepare_mlp_layer0_int8_weights failed")
+            .expect("layer 0 is MoE — test requires a dense MLP at layer 0");
+        assert_eq!(h, hidden as usize);
+        assert_eq!(i, inter as usize);
+        model
+            .finalize_ane_mlp_layer0_int8_inline(g, u, d, h, i, s)
+            .expect("finalize_ane_mlp_layer0_int8_inline failed");
+
+        // ── ANE forward on the same input ──
+        let out_ane = {
+            let ffn = &mut model.model.layers[0].mlp;
+            let out = ffn.forward(&x).expect("ANE dense MLP forward failed");
+            eval([&out]).unwrap();
+            out
+        };
+        assert_eq!(out_ane.shape(), out_ref.shape());
+
+        // ── Compare elementwise in f32 ──
+        let diff = out_ref
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .subtract(out_ane.as_dtype(Dtype::Float32).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap();
+        diff.eval().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        let mean_diff: f32 = diff.mean(None).unwrap().item();
+        // int8 dequant adds ~|w|*2^-7 error per element; three projections +
+        // fp16 conv1x1 boundaries stack to ~3% worst-element noise at
+        // |out|_max (mean stays <0.5%). Budget is 3% of the output magnitude
+        // (vs. 0.5% for the single-hop GDN parity gate), floored at 0.2
+        // absolute so tiny-output layers don't gate on fp16 ULP noise. An
+        // axis/transpose bug would show up in mean, not just max.
+        let budget = (ref_max * 0.03).max(0.2);
+        eprintln!(
+            "MLP layer 0 int8 ANE parity: max_diff={max_diff:.6}, \
+             mean_diff={mean_diff:.6} (budget {budget:.4} = max(0.03·|out|_max, 0.2))"
+        );
+        // Mean-diff sanity gate: a real algorithmic bug (wrong axis order,
+        // swapped gate/up, stale weight binding) shifts the whole output and
+        // pushes mean_diff to the same order as max_diff. Guard at 1% of
+        // |out|_max — 5× the observed ~0.2% int8 noise floor.
+        let mean_budget = (ref_max * 0.01).max(0.05);
+        assert!(
+            mean_diff < mean_budget,
+            "MLP layer 0 int8 ANE parity mean_diff={mean_diff} exceeds {mean_budget:.4} \
+             (likely algorithmic bug, not quantization noise; max_diff={max_diff}, \
+             |out|_max={ref_max:.2})"
+        );
+        assert!(
+            max_diff.is_finite(),
+            "ANE output contains NaN/Inf: max_diff={max_diff}"
+        );
+        assert!(
+            max_diff < budget,
+            "MLP layer 0 int8 ANE parity failed: max_diff={max_diff} exceeds {budget:.4} budget \
+             (|out|_max={ref_max:.2}, mean_diff={mean_diff:.6})"
         );
     }
 }
