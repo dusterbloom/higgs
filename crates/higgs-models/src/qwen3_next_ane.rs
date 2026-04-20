@@ -516,9 +516,7 @@ impl FusedGdnProjKernel {
             x.as_dtype(Dtype::Float32)?
         };
         let t_cast = prof.then(std::time::Instant::now);
-        // Async-eval so the MLX queue starts draining without blocking
-        // this thread; the real fence happens at `as_slice::<f32>()` below.
-        let _ = mlx_rs::transforms::async_eval([&x_f32]);
+        x_f32.eval()?;
         let t_fence = prof.then(std::time::Instant::now);
         let x_slice: &[f32] = x_f32.as_slice::<f32>();
         let t_phase1 = prof.then(std::time::Instant::now);
