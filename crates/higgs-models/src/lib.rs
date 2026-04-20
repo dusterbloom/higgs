@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod decode_trace;
 pub mod deepseek_v2;
 pub mod error;
 pub mod gemma2;

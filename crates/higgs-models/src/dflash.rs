@@ -78,6 +78,13 @@ const fn default_block_size() -> i32 {
     16
 }
 
+/// Runtime decode block_size used at inference. Overridable via
+/// `HIGGS_DFLASH_BLOCK_SIZE`. Diverges from the drafter's trained
+/// block_size (16) because acceptance rate plateaus at ~3 tokens
+/// and smaller blocks amortize verify cost better. See bench data
+/// in `.planning/next-session-dflash-default-block-size.md`.
+pub const DEFAULT_DECODE_BLOCK_SIZE: i32 = 4;
+
 // ---------------------------------------------------------------------------
 // SwiGLU MLP (non-quantized)
 // ---------------------------------------------------------------------------

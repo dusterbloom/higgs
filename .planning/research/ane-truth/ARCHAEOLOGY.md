@@ -238,9 +238,41 @@ The DFlash-ANE-projections-v2 handoff measures the **exact bandwidth ceiling** f
 
 **Claim AB3 (I):** The ONLY path below the 18.5 ms floor is **int8 weight blobs**: halving 1010 MB fp16 → ~505 MB int8 → ~9.2 ms ANE floor at the same 54.6 GB/s. Combined with existing CPU overlap: **estimated ~12-13 ms total forward.** 30-35% headroom.
 
-**Claim AB4 (D):** The infrastructure already exists: `build_weight_blob_int8` in `ane_bridge.rs:332`, MIL op `constexpr_affine_dequantize` handles int8→fp16 at eval time. Blocker is per-channel/per-tensor scale+zero_point plumbing and MIL generators updated to emit the int8 weight path.
+**Claim AB4 (D — SUPERSEDED 2026-04-18):** ~~The infrastructure already exists: `build_weight_blob_int8` in `ane_bridge.rs:332`, MIL op `constexpr_affine_dequantize` handles int8→fp16 at eval time. Blocker is per-channel/per-tensor scale+zero_point plumbing and MIL generators updated to emit the int8 weight path.~~
+
+Superseded by AB5/AB6 below — the `ane_mil.rs` emitter approach does NOT work on the engine's current ANE bridge, but a .mlpackage-based approach DOES.
 
 **Source:** `memory/dflash-ane-projections-v2-handoff.md:1-70`.
+
+### AB5 — Raw-MIL int8 path is dead (Tier E, re-measured 2026-04-18)
+
+**Claim AB5 (E):** `constexpr_affine_dequantize` + `tensor<int8>` weights submitted through `_ANEDesc modelWithMILText:` (the engine's current `AneKernel::compile_multi_weights` path via `crates/higgs-models/bridge/ane/ane_bridge.m`) fails compile with `ANECCompile() FAILED: err=(InvalidMILProgram)`.
+
+**Toolchain under test:** macOS 26.3.1 (25D771280a) · Xcode 26.0.1 (17A400) · coremlc 3505.4.1 / MIL 3510.2.1 · coremltools 9.0.
+
+**Test reproduced:** `diffusion_ane::tests::test_int8_conv1x1_nanobot_pattern` (c_in=c_out=64, seq=16, conv1x1 + constexpr_affine_dequantize, scale=0.01, axis=0). The test was `#[ignore]`'d on 2026-04-03 with the same failure; 15 days and an Xcode bump did not change the outcome. Failure hash: `4E71B9B165...`.
+
+**Scope of kill:** raw-MIL entry point only. Does NOT rule out int8 via other CoreML entry points. See AB6.
+
+### AB6 — mlpackage int8 path is alive (Tier E, new 2026-04-18)
+
+**Claim AB6 (E):** The same int8 weight + `constexpr_affine_dequantize` + conv1x1 chain builds, compiles, and schedules on ANE when delivered as an `.mlpackage` via coremltools' typed `mlprogram` path instead of raw-MIL text.
+
+**Evidence:**
+- `ct.convert(..., opset_version=ct.target.iOS18)` emits the mlpackage without warnings.
+- `xcrun coremlcompiler compile` converts the mlpackage to `.mlmodelc` without errors.
+- `MLComputePlan.load_from_path(..., compute_units=CPU_AND_NE)` reports: `conv` op `supported_compute_devices = [CPU, NeuralEngine]`.
+- At toy shape (c_in=c_out=64, seq=16): `preferred_compute_device = MLCPUComputeDevice` (cost 0.96) — scheduler picks CPU for kernels too small to amortize ANE dispatch.
+- At DFlash-4B o_proj shape (c_in=c_out=3072, seq=16, 9.4 MB int8 weights): **`preferred_compute_device = MLNeuralEngineComputeDevice`** (cost 0.54). The scheduler flips to ANE once the kernel is big enough.
+
+**Probe artifacts:** `/tmp/higgs_int8_probe/` — `build_int8_mlpackage.py`, `build_realistic.py`, `compute_plan.py`, `plan_4b.py`, plus generated `.mlpackage` / `.mlmodelc` directories. Python 3.13 sidecar venv required because Python 3.14 wheels lack `libcoremlpython` (confirms CLAIMS.md T1).
+
+**What this does NOT prove yet:**
+1. Parity vs CPU reference at realistic shapes (toy-shape `predict()` path has a loader quirk — blocked on the MLModel-wrapper rather than the compute-plan API).
+2. Latency at realistic shapes — compute-plan preferred-device is not a wall-clock measurement. The ANE could still be bandwidth-bound at the same 54.6 GB/s, or the scheduler could drop back to CPU under different `configuration.computeUnits` combinations.
+3. Scalability to the MLP chain (ic=3072, oc=9728 per up/gate; 17408 for down on 27B where AB3 originally targeted 505 MB).
+
+**Consequence for AB3:** AB3 (int8 halves bandwidth → ~9.2 ms floor) remains a live target. AB4 was wrong about *where* in the codebase the plumbing lives: NOT `ane_mil.rs` emitters, but a new `.mlpackage`-based bridge alongside the existing `_ANEDesc modelWithMILText:` path. See rewritten plan at `.planning/next-session-dflash-int8-weights.md`.
 
 ### Important cross-reference with CLAIMS.md R3
 

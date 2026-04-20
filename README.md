@@ -342,6 +342,12 @@ flags are opt-in; all default to disabled (no-op without the feature).
 
 Run `higgs doctor` to validate the combination before serving.
 
+## DFlash env flags
+
+| Env var | Default | Effect |
+|---|---|---|
+| `HIGGS_DFLASH_BLOCK_SIZE` | `4` | Runtime decode block size for speculative drafting. Drafters are trained at 16, but acceptance plateaus at ~3 tokens — smaller blocks amortize verify cost better. Set to `3` for a slight edge at short contexts, `2` lower bound. |
+
 ## Development
 
 ```bash

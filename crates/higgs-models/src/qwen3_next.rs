@@ -2802,7 +2802,23 @@ impl GatedDeltaNet {
                     .as_deref()
                     .and_then(|buckets| select_ane_bucket(buckets, S as usize))
                 {
-                    Some(k) => (k.qkvz.dispatch(inputs)?, k.ba.dispatch(inputs)?),
+                    Some(k) => {
+                        if let Some(fused) = k.qkvz_ba_fused.as_ref() {
+                            fused.dispatch(inputs)?
+                        } else {
+                            let qkvz = k.qkvz.as_ref().ok_or_else(|| {
+                                Exception::custom(
+                                    "ane_kernels bucket has neither fused nor separate qkvz",
+                                )
+                            })?;
+                            let ba = k.ba.as_ref().ok_or_else(|| {
+                                Exception::custom(
+                                    "ane_kernels bucket has neither fused nor separate ba",
+                                )
+                            })?;
+                            (qkvz.dispatch(inputs)?, ba.dispatch(inputs)?)
+                        }
+                    }
                     None => (
                         self.in_proj_qkvz.forward(inputs)?,
                         self.in_proj_ba.forward(inputs)?,
@@ -3136,8 +3152,10 @@ impl GatedDeltaNet {
             let ba = compile_proj_from_qlinear(&self.in_proj_ba, seq_len, "ba")?;
             let out_proj = compile_proj_from_qlinear(&self.out_proj, seq_len, "out_proj")?;
             buckets.push(Arc::new(crate::qwen3_next_ane::GdnAneLayerKernels {
-                qkvz: Arc::new(qkvz),
-                ba: Arc::new(ba),
+                seq_len: qkvz.seq_len,
+                qkvz: Some(Arc::new(qkvz)),
+                ba: Some(Arc::new(ba)),
+                qkvz_ba_fused: None,
                 out_proj: Arc::new(out_proj),
             }));
         }
@@ -3183,13 +3201,20 @@ impl GatedDeltaNet {
         let mut buckets: Vec<Arc<crate::qwen3_next_ane::GdnAneLayerKernels>> =
             Vec::with_capacity(donors.len());
         for (bi, donor) in donors.iter().enumerate() {
-            let seq = donor.qkvz.seq_len;
+            let seq = donor.seq_len;
+            let donor_qkvz = donor.qkvz.as_ref().ok_or_else(|| Exception::custom(
+                "enable_ane_gdn_from_donor: donor missing separate qkvz kernel \
+                 (was compiled with fused layout — not supported for multi-bucket patching)"
+            ))?;
+            let donor_ba = donor.ba.as_ref().ok_or_else(|| Exception::custom(
+                "enable_ane_gdn_from_donor: donor missing separate ba kernel"
+            ))?;
             let load_before = crate::ane_bridge::load_count();
-            let qkvz = compile_proj_from_qlinear_donor(&self.in_proj_qkvz, &donor.qkvz)
+            let qkvz = compile_proj_from_qlinear_donor(&self.in_proj_qkvz, donor_qkvz)
                 .map_err(|e| Exception::custom(format!(
                     "patch qkvz bucket{bi}(seq={seq}) load_before={load_before}: {e}"
                 )))?;
-            let ba = compile_proj_from_qlinear_donor(&self.in_proj_ba, &donor.ba)
+            let ba = compile_proj_from_qlinear_donor(&self.in_proj_ba, donor_ba)
                 .map_err(|e| Exception::custom(format!(
                     "patch ba   bucket{bi}(seq={seq}) load_before={load_before}: {e}"
                 )))?;
@@ -3198,8 +3223,10 @@ impl GatedDeltaNet {
                     "patch out  bucket{bi}(seq={seq}) load_before={load_before}: {e}"
                 )))?;
             buckets.push(Arc::new(crate::qwen3_next_ane::GdnAneLayerKernels {
-                qkvz: Arc::new(qkvz),
-                ba: Arc::new(ba),
+                seq_len: qkvz.seq_len,
+                qkvz: Some(Arc::new(qkvz)),
+                ba: Some(Arc::new(ba)),
+                qkvz_ba_fused: None,
                 out_proj: Arc::new(out_proj),
             }));
         }
@@ -3220,7 +3247,7 @@ fn select_ane_bucket(
     buckets: &[std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>],
     s: usize,
 ) -> Option<&std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>> {
-    buckets.iter().find(|k| s <= k.qkvz.seq_len)
+    buckets.iter().find(|k| s <= k.seq_len)
 }
 
 /// Helper: dequantize a `QLinear` weight and compile an `AneProjKernel` for it.
@@ -3423,6 +3450,33 @@ impl FfnBlock {
             #[cfg(feature = "ane")]
             down_proj_ane: None,
         })
+    }
+
+    /// Return a `'static` string naming the path `forward` will take for
+    /// input of shape `[1, seq_len, hidden]`. Used by the decode tracer.
+    fn selected_path(&self, seq_len: usize) -> &'static str {
+        if self.is_moe {
+            return "moe";
+        }
+        #[cfg(feature = "ane")]
+        if let (Some(g), Some(_u), Some(_d)) = (
+            self.gate_proj_ane.as_ref(),
+            self.up_proj_ane.as_ref(),
+            self.down_proj_ane.as_ref(),
+        ) {
+            let bucket = g.input_shape.get(3).copied().unwrap_or(0) as usize;
+            if seq_len > 1 && bucket > 0 && seq_len <= bucket {
+                return "ane_int8";
+            }
+        }
+        match (self.gate_proj.as_ref(), self.up_proj.as_ref()) {
+            (Some(gp), Some(up))
+                if gp.weight.dtype() != Dtype::Uint32 || up.weight.dtype() != Dtype::Uint32 =>
+            {
+                "fp16_dense"
+            }
+            _ => "quantized_fused",
+        }
     }
 
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
@@ -4242,17 +4296,17 @@ impl Qwen3NextCausalLM {
             )));
         }
 
-        // Layer 0 full compile (donor for the rest).
+        // Layer 0 full compile. Fused qkvz+ba in a single ANE program (one
+        // dispatch vs two) — mirrors `qwen3_next_ane_worker::compile_all_layers`.
+        // Halves bridge state accumulation (2 kernels/layer instead of 3),
+        // which also avoids the `patch_from_donor LOAD FAILED at layer ~18`
+        // condition on 9B models.
         let pad = seq_len as usize;
         let w0 = &weights[0];
-        let qkvz0 = crate::qwen3_next_ane::compile_proj(
-            &w0.qkvz_w_f32, w0.qkvz_in, w0.qkvz_out, pad, "qkvz",
+        let fused0 = crate::qwen3_next_ane::compile_fused_gdn_proj(
+            &w0.qkvz_w_f32, &w0.ba_w_f32, w0.qkvz_in, w0.qkvz_out, w0.ba_out, pad,
         )
-        .map_err(|e| Exception::custom(format!("finalize: layer 0 qkvz compile: {e}")))?;
-        let ba0 = crate::qwen3_next_ane::compile_proj(
-            &w0.ba_w_f32, w0.ba_in, w0.ba_out, pad, "ba",
-        )
-        .map_err(|e| Exception::custom(format!("finalize: layer 0 ba compile: {e}")))?;
+        .map_err(|e| Exception::custom(format!("finalize: layer 0 fused compile: {e}")))?;
         let out0 = crate::qwen3_next_ane::compile_proj(
             &w0.out_w_f32, w0.out_in, w0.out_out, pad, "out_proj",
         )
@@ -4261,8 +4315,7 @@ impl Qwen3NextCausalLM {
         // Patch layers 1..N from layer 0's donors. loadWithQoS only,
         // no MIL recompile (the Wave 2 invariant).
         let mut tail: Vec<(
-            crate::qwen3_next_ane::AneProjKernel,
-            crate::qwen3_next_ane::AneProjKernel,
+            crate::qwen3_next_ane::FusedGdnProjKernel,
             crate::qwen3_next_ane::AneProjKernel,
         )> = Vec::with_capacity(weights.len().saturating_sub(1));
         for (idx, w) in weights.iter().enumerate().skip(1) {
@@ -4278,16 +4331,12 @@ impl Qwen3NextCausalLM {
                      requires identical (in,out) per projection"
                 )));
             }
-            let qkvz_i =
-                crate::qwen3_next_ane::compile_proj_from_donor(&qkvz0, &w.qkvz_w_f32)
-                    .map_err(|e| {
-                        Exception::custom(format!("finalize: layer {idx} qkvz patch: {e}"))
-                    })?;
-            let ba_i =
-                crate::qwen3_next_ane::compile_proj_from_donor(&ba0, &w.ba_w_f32)
-                    .map_err(|e| {
-                        Exception::custom(format!("finalize: layer {idx} ba patch: {e}"))
-                    })?;
+            let fused_i = crate::qwen3_next_ane::compile_fused_gdn_proj_from_donor(
+                &fused0, &w.qkvz_w_f32, &w.ba_w_f32,
+            )
+            .map_err(|e| {
+                Exception::custom(format!("finalize: layer {idx} fused patch: {e}"))
+            })?;
             let out_i =
                 crate::qwen3_next_ane::compile_proj_from_donor(&out0, &w.out_w_f32)
                     .map_err(|e| {
@@ -4295,14 +4344,13 @@ impl Qwen3NextCausalLM {
                             "finalize: layer {idx} out_proj patch: {e}"
                         ))
                     })?;
-            tail.push((qkvz_i, ba_i, out_i));
+            tail.push((fused_i, out_i));
         }
         let mut compiled: Vec<(
-            crate::qwen3_next_ane::AneProjKernel,
-            crate::qwen3_next_ane::AneProjKernel,
+            crate::qwen3_next_ane::FusedGdnProjKernel,
             crate::qwen3_next_ane::AneProjKernel,
         )> = Vec::with_capacity(weights.len());
-        compiled.push((qkvz0, ba0, out0));
+        compiled.push((fused0, out0));
         compiled.extend(tail);
         let compile_ms = t_compile.elapsed().as_millis() as u64;
 
@@ -4313,7 +4361,7 @@ impl Qwen3NextCausalLM {
         // Attach inline kernels to each linear layer; clear any pre-existing
         // ane_handle so forward_with_tape picks the inline path (it checks
         // ane_handle FIRST, ane_kernels SECOND).
-        for ((linear_idx, &model_layer_idx), (qkvz_k, ba_k, out_k)) in
+        for ((linear_idx, &model_layer_idx), (fused_k, out_k)) in
             linear_indices.iter().enumerate().zip(compiled.into_iter())
         {
             let layer = &mut self.model.layers[model_layer_idx];
@@ -4325,8 +4373,10 @@ impl Qwen3NextCausalLM {
             gdn.ane_handle = None;
             gdn.ane_linear_layer_idx = linear_idx;
             let layer_kernels = Arc::new(crate::qwen3_next_ane::GdnAneLayerKernels {
-                qkvz: Arc::new(qkvz_k),
-                ba: Arc::new(ba_k),
+                seq_len: fused_k.seq_len,
+                qkvz: None,
+                ba: None,
+                qkvz_ba_fused: Some(Arc::new(fused_k)),
                 out_proj: Arc::new(out_k),
             });
             gdn.ane_kernels = Some(vec![layer_kernels]);
@@ -4341,10 +4391,10 @@ impl Qwen3NextCausalLM {
         let load_after = crate::ane_bridge::load_count();
         let compile_after = crate::ane_bridge::compile_count();
         let compile_delta = compile_after - compile_before;
-        if compile_delta != 3 {
+        if compile_delta != 2 {
             eprintln!(
-                "WARN: finalize_ane_gdn_inline: expected compile_count delta=3, \
-                 got {compile_delta}"
+                "WARN: finalize_ane_gdn_inline: expected compile_count delta=2 \
+                 (fused qkvz+ba + out_proj), got {compile_delta}"
             );
         }
         tracing::info!(
@@ -4761,7 +4811,20 @@ impl Qwen3NextCausalLM {
             None
         };
 
-        for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()) {
+        let trace_on = crate::decode_trace::is_active();
+        let tok = if trace_on {
+            crate::decode_trace::begin_forward(T as usize)
+        } else {
+            0
+        };
+        let trace_sync = trace_on
+            && std::env::var("HIGGS_DECODE_TRACE_SYNC")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+        for (layer_idx, (layer, layer_cache)) in
+            self.model.layers.iter_mut().zip(kv_cache.iter_mut()).enumerate()
+        {
             let cache = layer_cache
                 .as_mut()
                 .ok_or_else(|| Exception::custom("Layer cache is None"))?;
@@ -4770,6 +4833,8 @@ impl Qwen3NextCausalLM {
             } else {
                 fa_mask.as_ref()
             };
+
+            let t0 = trace_on.then(std::time::Instant::now);
 
             let normed = layer.input_layernorm.forward(&h)?;
             let r = if layer.is_linear {
@@ -4794,8 +4859,35 @@ impl Qwen3NextCausalLM {
 
             let h2 = h.add(r)?;
             let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_path = if trace_on {
+                layer.mlp.selected_path(T as usize)
+            } else {
+                ""
+            };
             let mlp_out = layer.mlp.forward(&normed_post)?;
             h = h2.add(mlp_out)?;
+
+            if let Some(t0) = t0 {
+                if trace_sync {
+                    mlx_rs::transforms::eval([&h])?;
+                }
+                let ns = t0.elapsed().as_nanos() as u64;
+                let kind = if layer.is_linear { "attn_linear" } else { "attn_full" };
+                let hidden = h.shape().last().copied().unwrap_or(0) as usize;
+                crate::decode_trace::record_layer(
+                    tok,
+                    layer_idx,
+                    kind,
+                    mlp_path,
+                    T as usize,
+                    hidden,
+                    ns,
+                );
+            }
+        }
+
+        if trace_on {
+            crate::decode_trace::flush();
         }
 
         self.model.norm.forward(&h)

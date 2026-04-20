@@ -33,7 +33,7 @@ run_one() {
 
     env \
         HIGGS_ENABLE_THINKING=1 \
-        HIGGS_TARGET_ANE_GDN=1 \
+        HIGGS_TARGET_ANE_GDN=${HIGGS_TARGET_ANE_GDN:-0} \
         HIGGS_TARGET_COMPILE=1 \
         HIGGS_DFLASH_PATH="$DRAFTER" \
         HIGGS_DFLASH_TRACE=1 \

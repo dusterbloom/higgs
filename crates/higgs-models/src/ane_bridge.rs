@@ -772,6 +772,99 @@ impl AneKernel {
         }
     }
 
+    /// Transpose + write `[seq, ch]` row-major f32 data into the input
+    /// IOSurface at `idx` (laid out as `[1, ch, 1, pad]`, channel-major) in
+    /// one pass, using the zero-copy base-pointer + `dsb sy` protocol.
+    ///
+    /// This skips the IOSurface lock/unlock that `write_input` performs and
+    /// the intermediate `Vec<u8>` that [`crate::dflash_ane::cpu_to_ane`]
+    /// would allocate, so a full dispatch's input side becomes one strided
+    /// transpose with no heap traffic.
+    ///
+    /// Only the first `seq` positions of each channel are written; the
+    /// trailing `pad - seq` positions are left at whatever value they held
+    /// from the previous dispatch. The ANE channel-wise matmul reads input
+    /// position `p` only when producing output position `p`, so stale tail
+    /// data never pollutes the first `seq` output positions — and the
+    /// dispatch already only reads back the first `seq` output positions.
+    ///
+    /// Returns `false` if the base pointer is unavailable (the kernel was
+    /// freed or `idx` is out of range). Callers should fall back to the
+    /// lock-based `write_input` path in that case.
+    pub fn write_input_strided_fp32(
+        &self,
+        idx: usize,
+        src: &[f32],
+        seq: usize,
+        ch: usize,
+        pad: usize,
+    ) -> bool {
+        debug_assert_eq!(src.len(), seq * ch);
+        debug_assert!(seq <= pad);
+        let base = self.get_input_base(idx) as *mut f32;
+        if base.is_null() {
+            return false;
+        }
+        unsafe {
+            crate::dflash_ane::write_strided_rc_to_cr_ptr(src, seq, ch, base, pad);
+            #[cfg(target_arch = "aarch64")]
+            std::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+        true
+    }
+
+    /// Counterpart to [`Self::write_input_strided_fp32`] for the output
+    /// side. Reads the first `seq` positions of each of the `ch` channels
+    /// from the output IOSurface at `idx` (laid out as `[1, ch, 1, pad]`)
+    /// directly into `dst` as row-major `[seq, ch]` f32.
+    ///
+    /// Skips the `read_output` IOSurface lock/unlock and the `ane_to_cpu`
+    /// `Vec<f32>` allocation.
+    ///
+    /// Returns `false` if the base pointer is unavailable.
+    pub fn read_output_strided_fp32(
+        &self,
+        idx: usize,
+        dst: &mut [f32],
+        seq: usize,
+        ch: usize,
+        pad: usize,
+    ) -> bool {
+        self.read_output_strided_fp32_range(idx, dst, seq, 0, ch, pad)
+    }
+
+    /// Channel-range variant of [`Self::read_output_strided_fp32`]. Reads
+    /// channels `ch_start..ch_start + ch` from the output IOSurface at `idx`
+    /// into `dst` as row-major `[seq, ch]`.
+    ///
+    /// Use this when the ANE program concatenates multiple projections along
+    /// the channel axis (e.g. fused `qkvz + ba` in [`crate::qwen3_next_ane`])
+    /// and the caller wants each projection split directly into its own
+    /// destination buffer without an intermediate gather.
+    pub fn read_output_strided_fp32_range(
+        &self,
+        idx: usize,
+        dst: &mut [f32],
+        seq: usize,
+        ch_start: usize,
+        ch: usize,
+        pad: usize,
+    ) -> bool {
+        debug_assert_eq!(dst.len(), seq * ch);
+        debug_assert!(seq <= pad);
+        let base = self.get_output_base(idx) as *const f32;
+        if base.is_null() {
+            return false;
+        }
+        unsafe {
+            #[cfg(target_arch = "aarch64")]
+            std::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            let offset_ptr = base.add(ch_start * pad);
+            crate::dflash_ane::read_strided_cr_to_rc_ptr(offset_ptr, seq, ch, pad, dst);
+        }
+        true
+    }
+
     /// Reload weights without recompiling (Orion-style delta compilation).
     ///
     /// Unloads the model from ANE, writes new weight BLOBFILEs to disk,

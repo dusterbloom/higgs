@@ -515,7 +515,9 @@ impl FusedGdnProjKernel {
         } else {
             x.as_dtype(Dtype::Float32)?
         };
+        let t_cast = prof.then(std::time::Instant::now);
         x_f32.eval()?;
+        let t_fence = prof.then(std::time::Instant::now);
         let x_slice: &[f32] = x_f32.as_slice::<f32>();
         let t_phase1 = prof.then(std::time::Instant::now);
 
@@ -628,6 +630,9 @@ impl FusedGdnProjKernel {
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             static TE: AtomicU64 = AtomicU64::new(0);
+            static TC: AtomicU64 = AtomicU64::new(0);
+            static TF: AtomicU64 = AtomicU64::new(0);
+            static TS: AtomicU64 = AtomicU64::new(0);
             static TW: AtomicU64 = AtomicU64::new(0);
             static TA: AtomicU64 = AtomicU64::new(0);
             static TR: AtomicU64 = AtomicU64::new(0);
@@ -637,8 +642,23 @@ impl FusedGdnProjKernel {
                 .zip(t_phase1)
                 .map(|(a, b)| (b - a).as_nanos() as u64)
                 .unwrap_or(0);
+            let tc = t_phase0
+                .zip(t_cast)
+                .map(|(a, b)| (b - a).as_nanos() as u64)
+                .unwrap_or(0);
+            let tf = t_cast
+                .zip(t_fence)
+                .map(|(a, b)| (b - a).as_nanos() as u64)
+                .unwrap_or(0);
+            let ts = t_fence
+                .zip(t_phase1)
+                .map(|(a, b)| (b - a).as_nanos() as u64)
+                .unwrap_or(0);
             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
             TE.fetch_add(te, Ordering::Relaxed);
+            TC.fetch_add(tc, Ordering::Relaxed);
+            TF.fetch_add(tf, Ordering::Relaxed);
+            TS.fetch_add(ts, Ordering::Relaxed);
             TW.fetch_add(tw, Ordering::Relaxed);
             TA.fetch_add(ta, Ordering::Relaxed);
             TR.fetch_add(tr, Ordering::Relaxed);
@@ -646,8 +666,11 @@ impl FusedGdnProjKernel {
             FR.fetch_add(fb_r, Ordering::Relaxed);
             if n % 200 == 0 {
                 eprintln!(
-                    "[gdn_prof] n={n} s={s} eval={:.1}us wr={:.1}us ane={:.1}us rd={:.1}us fb_w={} fb_r={}",
+                    "[gdn_prof] n={n} s={s} eval={:.1}us (cast={:.1} fence={:.1} slice={:.1}) wr={:.1}us ane={:.1}us rd={:.1}us fb_w={} fb_r={}",
                     TE.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+                    TC.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+                    TF.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+                    TS.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
                     TW.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
                     TA.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
                     TR.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,

@@ -118,6 +118,137 @@ fn ane_split_to_cpu(bytes: &[u8], seq: usize, total_ch: usize, ch_start: usize, 
     out
 }
 
+/// Strided variant of the [seq,ch]→[ch,pad] transpose that writes directly at
+/// `dst_ptr` using a caller-provided row stride `pad >= seq`.
+///
+/// Used by the zero-copy ANE input write path: `dst_ptr` points at an
+/// IOSurface base laid out as `[1, ch, 1, pad]`. Only the first `seq`
+/// positions of each channel are written; the trailing `pad - seq`
+/// positions are left untouched (and are ignored by the downstream
+/// channel-wise matmul, which only reads position `p` when producing
+/// output position `p`).
+///
+/// # Safety
+/// `dst_ptr` must be valid for `ch * pad` f32 writes and properly aligned.
+pub(crate) unsafe fn write_strided_rc_to_cr_ptr(
+    src: &[f32],
+    seq: usize,
+    ch: usize,
+    dst_ptr: *mut f32,
+    pad: usize,
+) {
+    debug_assert_eq!(src.len(), seq * ch);
+    debug_assert!(seq <= pad);
+    let rows_4 = seq & !3;
+    let cols_4 = ch & !3;
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        for r in (0..rows_4).step_by(4) {
+            for c in (0..cols_4).step_by(4) {
+                let r0 = vld1q_f32(src.as_ptr().add((r) * ch + c));
+                let r1 = vld1q_f32(src.as_ptr().add((r + 1) * ch + c));
+                let r2 = vld1q_f32(src.as_ptr().add((r + 2) * ch + c));
+                let r3 = vld1q_f32(src.as_ptr().add((r + 3) * ch + c));
+                let t01 = vtrnq_f32(r0, r1);
+                let t23 = vtrnq_f32(r2, r3);
+                let o0 = vcombine_f32(vget_low_f32(t01.0), vget_low_f32(t23.0));
+                let o1 = vcombine_f32(vget_low_f32(t01.1), vget_low_f32(t23.1));
+                let o2 = vcombine_f32(vget_high_f32(t01.0), vget_high_f32(t23.0));
+                let o3 = vcombine_f32(vget_high_f32(t01.1), vget_high_f32(t23.1));
+                vst1q_f32(dst_ptr.add((c) * pad + r), o0);
+                vst1q_f32(dst_ptr.add((c + 1) * pad + r), o1);
+                vst1q_f32(dst_ptr.add((c + 2) * pad + r), o2);
+                vst1q_f32(dst_ptr.add((c + 3) * pad + r), o3);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (rows_4, cols_4);
+        for r in 0..seq {
+            for c in 0..ch {
+                *dst_ptr.add(c * pad + r) = src[r * ch + c];
+            }
+        }
+        return;
+    }
+    for r in 0..seq.min(rows_4) {
+        for c in cols_4..ch {
+            *dst_ptr.add(c * pad + r) = src[r * ch + c];
+        }
+    }
+    for r in rows_4..seq {
+        for c in 0..ch {
+            *dst_ptr.add(c * pad + r) = src[r * ch + c];
+        }
+    }
+}
+
+/// Strided variant of the [ch,pad]→[seq,ch] transpose that reads directly
+/// from `src_ptr` using a caller-provided row stride `pad >= seq`. Reads only
+/// the first `seq` positions per channel.
+///
+/// Used by the zero-copy ANE output read path: `src_ptr` points at an
+/// IOSurface base laid out as `[1, ch, 1, pad]`.
+///
+/// # Safety
+/// `src_ptr` must be valid for `ch * pad` f32 reads and properly aligned.
+pub(crate) unsafe fn read_strided_cr_to_rc_ptr(
+    src_ptr: *const f32,
+    seq: usize,
+    ch: usize,
+    pad: usize,
+    dst: &mut [f32],
+) {
+    debug_assert_eq!(dst.len(), seq * ch);
+    debug_assert!(seq <= pad);
+    let rows_4 = ch & !3;
+    let cols_4 = seq & !3;
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        for r in (0..rows_4).step_by(4) {
+            for c in (0..cols_4).step_by(4) {
+                let r0 = vld1q_f32(src_ptr.add((r) * pad + c));
+                let r1 = vld1q_f32(src_ptr.add((r + 1) * pad + c));
+                let r2 = vld1q_f32(src_ptr.add((r + 2) * pad + c));
+                let r3 = vld1q_f32(src_ptr.add((r + 3) * pad + c));
+                let t01 = vtrnq_f32(r0, r1);
+                let t23 = vtrnq_f32(r2, r3);
+                let o0 = vcombine_f32(vget_low_f32(t01.0), vget_low_f32(t23.0));
+                let o1 = vcombine_f32(vget_low_f32(t01.1), vget_low_f32(t23.1));
+                let o2 = vcombine_f32(vget_high_f32(t01.0), vget_high_f32(t23.0));
+                let o3 = vcombine_f32(vget_high_f32(t01.1), vget_high_f32(t23.1));
+                vst1q_f32(dst.as_mut_ptr().add((c) * ch + r), o0);
+                vst1q_f32(dst.as_mut_ptr().add((c + 1) * ch + r), o1);
+                vst1q_f32(dst.as_mut_ptr().add((c + 2) * ch + r), o2);
+                vst1q_f32(dst.as_mut_ptr().add((c + 3) * ch + r), o3);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (rows_4, cols_4);
+        for r in 0..ch {
+            for c in 0..seq {
+                dst[c * ch + r] = *src_ptr.add(r * pad + c);
+            }
+        }
+        return;
+    }
+    for r in 0..ch.min(rows_4) {
+        for c in cols_4..seq {
+            dst[c * ch + r] = *src_ptr.add(r * pad + c);
+        }
+    }
+    for r in rows_4..ch {
+        for c in 0..seq {
+            dst[c * ch + r] = *src_ptr.add(r * pad + c);
+        }
+    }
+}
+
 /// NEON-accelerated transpose: src[rows, cols] → dst[cols, rows].
 ///
 /// Processes 4x4 blocks with NEON intrinsics, scalar fallback for edges.
@@ -188,9 +319,14 @@ struct DFlashAneLayerKernels {
     /// O projection (attn_out → hidden).
     o_proj: AneKernel,
     o_out_bytes: usize,
-    /// Fused SiLU(gate)*up from post-attn normed hidden.
-    silu_gate_up: AneKernel,
-    silu_out_bytes: usize,
+    /// Gate projection (normed hidden → gate activations). CPU applies SiLU
+    /// and fuses with up-proj output before down.
+    gate_proj: AneKernel,
+    gate_out_bytes: usize,
+    /// Up projection (normed hidden → up activations). CPU multiplies with
+    /// SiLU(gate) before feeding down.
+    up_proj: AneKernel,
+    up_out_bytes: usize,
     /// Down projection (activated → hidden).
     down: AneKernel,
     down_out_bytes: usize,
@@ -207,13 +343,16 @@ const DOWN_PROJ_ANE_SCALE: f32 = 0.5;
 const DOWN_PROJ_ANE_UNSCALE: f32 = 1.0 / DOWN_PROJ_ANE_SCALE;
 
 /// Pre-quantization scale applied to `up_proj` weights — the *upstream* mirror
-/// of `DOWN_PROJ_ANE_SCALE`. The fused `silu_gate_up` MIL (see
-/// `ane_mil::gen_fused_silu_gate_up_proj`) computes `gated = silu(gate@x) * up@x`
-/// in **fp16** before casting back to fp32 at the IOSurface boundary. On 9B
-/// (`inter=12288`) the `silu * um` product can saturate fp16 the same way the
-/// down accumulator did pre-`c95a80c7`. Halving `up_proj` halves `um`, halving
-/// the product. Compensation is applied alongside the down unscale at the
-/// CPU residual (`forward()` below), giving a combined `× 4.0` factor.
+/// of `DOWN_PROJ_ANE_SCALE`. Historically the fused `silu_gate_up` MIL computed
+/// `gated = silu(gate@x) * up@x` in fp16 before casting back to fp32, and on
+/// 9B (`inter=12288`) that `silu * um` product could saturate fp16 the same
+/// way the down accumulator did pre-`c95a80c7`. After the gate/up MIL split
+/// (2026-04-16) the fused product happens in fp32 on CPU, so product-saturation
+/// is no longer the motivation — but each up-proj kernel still emits fp16 at
+/// the IOSurface boundary, so halving `up_proj` keeps the raw ANE output in
+/// range. Compensation is applied alongside the down unscale at the CPU
+/// residual (`forward()` below), giving a combined `× 4.0` factor. Scaling to
+/// 1.0 is a follow-up once split-kernel parity is confirmed.
 ///
 /// We deliberately scale `up_proj` and **NOT** `gate_proj`: `silu(0.5·gm) ≠
 /// 0.5·silu(gm)`, so scaling the gate side breaks the round-trip math.
@@ -260,12 +399,18 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
     // Generate MIL programs (same for all layers — dimensions are identical).
     let qkv_mil = ane_mil::gen_fused_qkv_proj(h, q_dim, kv_dim, block);
     let o_mil = ane_mil::gen_blobfile_matmul(q_dim, h, block, "o");
-    let silu_mil = ane_mil::gen_fused_silu_gate_up_proj(h, inter, block);
+    // Gate and up are separate matmul kernels; CPU fuses silu(gate) * up.
+    // The previous fused SiLU*Up kernel carried ~32 BLOBFILE weights and
+    // failed to compile (InvalidMILProgram). DOWN ships at 20 weights and
+    // each of GATE/UP now ships at 16 — both below the ANE compiler cap.
+    let gate_mil = ane_mil::gen_blobfile_matmul(h, inter, block, "g");
+    let up_mil = ane_mil::gen_blobfile_matmul(h, inter, block, "u");
     let down_mil = ane_mil::gen_blobfile_matmul(inter, h, block, "d");
     if std::env::var_os("HIGGS_ANE_DUMP_MIL").is_some() {
         eprintln!("=== QKV MIL ({} weights) ===\n{}", qkv_mil.weight_names.len(), qkv_mil.mil_text);
         eprintln!("=== O MIL ({} weights) ===\n{}", o_mil.weight_names.len(), o_mil.mil_text);
-        eprintln!("=== SILU MIL ({} weights) ===\n{}", silu_mil.weight_names.len(), silu_mil.mil_text);
+        eprintln!("=== GATE MIL ({} weights) ===\n{}", gate_mil.weight_names.len(), gate_mil.mil_text);
+        eprintln!("=== UP MIL ({} weights) ===\n{}", up_mil.weight_names.len(), up_mil.mil_text);
         eprintln!("=== DOWN MIL ({} weights) ===\n{}", down_mil.weight_names.len(), down_mil.mil_text);
     }
 
@@ -285,10 +430,11 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
         let o_f32 = bf16_u16_to_f32_vec(&lw.o_proj);
         let gate_f32 = bf16_u16_to_f32_vec(&lw.gate_proj);
         // up_proj: scale weights by `UP_PROJ_ANE_SCALE` (the upstream mirror of
-        // the down_proj fix) to halve the fp16 `silu * um` product inside the
-        // fused silu_gate_up kernel. See the constant's docstring above. The
-        // matching `× UP_PROJ_ANE_UNSCALE` is folded into the down readback in
-        // forward().
+        // the down_proj fix) to keep the up-proj fp16 kernel output in range.
+        // After the gate/up MIL split the silu(gate)*up fuse is done on CPU in
+        // fp32, so the scale is no longer load-bearing for product saturation —
+        // but it still matters for the raw ANE fp16 store. The matching
+        // `× UP_PROJ_ANE_UNSCALE` is folded into the down readback in forward().
         let up_f32: Vec<f32> = bf16_u16_to_f32_vec(&lw.up_proj)
             .into_iter()
             .map(|w| w * UP_PROJ_ANE_SCALE)
@@ -315,19 +461,22 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
         let bu_tiles = build_tiled_weight_blobs(&up_f32, inter, h);
         let bd_tiles = build_tiled_weight_blobs(&down_f32, h, inter);
 
-        // Flatten per-kernel: QKV takes q||k||v, silu_gate_up takes g||u.
+        // Flatten per-kernel: QKV takes q||k||v. Gate and up are now separate
+        // kernels (each <= 16 tiles, under the ANE compiler cap); CPU fuses
+        // silu(g) * u between them, so their blobs are NOT chained.
         let qkv_blobs: Vec<&[u8]> = bq_tiles.iter().chain(bk_tiles.iter())
             .chain(bv_tiles.iter()).map(|v| v.as_slice()).collect();
         let o_blobs: Vec<&[u8]> = bo_tiles.iter().map(|v| v.as_slice()).collect();
-        let silu_blobs: Vec<&[u8]> = bg_tiles.iter().chain(bu_tiles.iter())
-            .map(|v| v.as_slice()).collect();
+        let gate_blobs: Vec<&[u8]> = bg_tiles.iter().map(|v| v.as_slice()).collect();
+        let up_blobs: Vec<&[u8]> = bu_tiles.iter().map(|v| v.as_slice()).collect();
         let down_blobs: Vec<&[u8]> = bd_tiles.iter().map(|v| v.as_slice()).collect();
 
         if li == 0 {
             // Full compile for layer 0.
             let qkv = compile_kernel(&qkv_mil, &qkv_blobs)?;
             let o_proj = compile_kernel(&o_mil, &o_blobs)?;
-            let silu_gate_up = compile_kernel(&silu_mil, &silu_blobs)?;
+            let gate_proj = compile_kernel(&gate_mil, &gate_blobs)?;
+            let up_proj = compile_kernel(&up_mil, &up_blobs)?;
             let down = compile_kernel(&down_mil, &down_blobs)?;
 
             layer_kernels.push(DFlashAneLayerKernels {
@@ -335,8 +484,10 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
                 qkv_out_bytes: qkv_mil.output_bytes,
                 o_proj,
                 o_out_bytes: o_mil.output_bytes,
-                silu_gate_up,
-                silu_out_bytes: silu_mil.output_bytes,
+                gate_proj,
+                gate_out_bytes: gate_mil.output_bytes,
+                up_proj,
+                up_out_bytes: up_mil.output_bytes,
                 down,
                 down_out_bytes: down_mil.output_bytes,
                 k_proj_f32: k_f32,
@@ -347,7 +498,8 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
             let donor = &layer_kernels[0];
             let qkv = patch_kernel(&donor.qkv, &qkv_mil, &qkv_blobs)?;
             let o_proj = patch_kernel(&donor.o_proj, &o_mil, &o_blobs)?;
-            let silu_gate_up = patch_kernel(&donor.silu_gate_up, &silu_mil, &silu_blobs)?;
+            let gate_proj = patch_kernel(&donor.gate_proj, &gate_mil, &gate_blobs)?;
+            let up_proj = patch_kernel(&donor.up_proj, &up_mil, &up_blobs)?;
             let down = patch_kernel(&donor.down, &down_mil, &down_blobs)?;
 
             layer_kernels.push(DFlashAneLayerKernels {
@@ -355,8 +507,10 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
                 qkv_out_bytes: qkv_mil.output_bytes,
                 o_proj,
                 o_out_bytes: o_mil.output_bytes,
-                silu_gate_up,
-                silu_out_bytes: silu_mil.output_bytes,
+                gate_proj,
+                gate_out_bytes: gate_mil.output_bytes,
+                up_proj,
+                up_out_bytes: up_mil.output_bytes,
                 down,
                 down_out_bytes: down_mil.output_bytes,
                 k_proj_f32: k_f32,
@@ -365,12 +519,11 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
         }
     }
 
-    // Wire silu_gate_up → down chain: share ANE IOSurface directly,
-    // eliminating the CPU round-trip (read silu output + write to down input).
-    for lk in &layer_kernels {
-        lk.silu_gate_up.share_output_to(0, &lk.down, 0)
-            .map_err(|e| format!("silu→down share_output_to failed: {e}"))?;
-    }
+    // No silu→down IOSurface chain: after the gate/up split, the fused
+    // silu(gate)*up product happens in fp32 on CPU, which means we have to
+    // round-trip through CPU between up_proj and down anyway. The extra
+    // ane_to_cpu + cpu_to_ane adds ~100 μs/layer; the win is that the MLP
+    // projections now actually compile on ANE.
 
     let config = engine.config.clone();
     // f32 shadow of the fc weight for the hot-path ctx BLAS at forward start.
@@ -457,6 +610,7 @@ impl DFlashAneExecutor {
         let n_kv = cfg.kv_heads;
         let q_dim = n_heads * hd;
         let kv_dim = n_kv * hd;
+        let inter = cfg.inter;
         let gqa_ratio = n_heads / n_kv;
         let scale = 1.0 / (hd as f32).sqrt();
         let cache_offset = cache.len;
@@ -707,17 +861,51 @@ impl DFlashAneExecutor {
             rms_norm(&hidden, &lw.post_attn_norm, &mut normed, block, h);
             tock!(t_norm_residual, t0);
 
-            // 10-11. ANE: fused SiLU(gate)*up → down via chained eval.
-            // silu_gate_up output IOSurface is wired directly to down input
-            // (share_output_to at compile time), so no CPU round-trip between them.
+            // 10-11. ANE: gate_proj + up_proj as SEPARATE kernels, CPU fuses
+            // silu(gate)*up in fp32, then ANE down. Split because the previous
+            // fused silu_gate_up MIL (~32 BLOBFILE weights) failed to compile
+            // on ANE (InvalidMILProgram). Splitting trades the silu→down
+            // IOSurface chain for a CPU round-trip (~100 μs/layer) but gets
+            // the MLP projections back onto ANE instead of CPU BLAS fallback.
             let t0 = tick!();
             let normed_ane = cpu_to_ane(&normed, block, h);
             tock!(t_transpose, t0);
 
             let t0 = tick!();
-            lk.silu_gate_up.write_input(0, &normed_ane);
-            AneKernel::eval_chain_realtime(&[&lk.silu_gate_up, &lk.down])
-                .expect("ANE silu→down chain eval failed");
+            lk.gate_proj.write_input(0, &normed_ane);
+            lk.gate_proj.eval_realtime().expect("ANE gate eval failed");
+            let mut gate_out = vec![0u8; lk.gate_out_bytes];
+            lk.gate_proj.read_output(0, &mut gate_out);
+
+            lk.up_proj.write_input(0, &normed_ane);
+            lk.up_proj.eval_realtime().expect("ANE up eval failed");
+            let mut up_out = vec![0u8; lk.up_out_bytes];
+            lk.up_proj.read_output(0, &mut up_out);
+            tock!(t_ane_mlp, t0);
+
+            // CPU fuse: silu(gate) * up in fp32. ~87K multiplies total
+            // (5 layers × 17408 × block=2 on 9B), scalar is fine.
+            let t0 = tick!();
+            let gate_cpu = ane_to_cpu(&gate_out, block, inter);
+            let up_cpu = ane_to_cpu(&up_out, block, inter);
+            tock!(t_transpose, t0);
+
+            let t0 = tick!();
+            let mut gated = vec![0.0f32; block * inter];
+            for i in 0..block * inter {
+                let g = gate_cpu[i];
+                let sig = 1.0 / (1.0 + (-g).exp());
+                gated[i] = g * sig * up_cpu[i];
+            }
+            tock!(t_ane_mlp, t0);
+
+            let t0 = tick!();
+            let gated_ane = cpu_to_ane(&gated, block, inter);
+            tock!(t_transpose, t0);
+
+            let t0 = tick!();
+            lk.down.write_input(0, &gated_ane);
+            lk.down.eval_realtime().expect("ANE down eval failed");
             let mut down_out = vec![0u8; lk.down_out_bytes];
             lk.down.read_output(0, &mut down_out);
             tock!(t_ane_mlp, t0);
@@ -738,13 +926,15 @@ impl DFlashAneExecutor {
             }
 
             // Residual add. Two pre-scales are applied at compile time to keep
-            // the fp16 path in range:
-            //   * up_proj  × UP_PROJ_ANE_SCALE   (halves silu * um inside the
-            //                                    fused silu_gate_up kernel)
+            // the ANE fp16 path in range:
+            //   * up_proj  × UP_PROJ_ANE_SCALE   (halves up_proj kernel output
+            //                                    so its fp16 store stays in range)
             //   * down_proj × DOWN_PROJ_ANE_SCALE (halves the down accumulator)
-            // Both are linear, so the combined unscale (= UP_UNSCALE × DOWN_UNSCALE
-            // = 4.0 today) fully restores magnitude in fp32 here, before the
-            // residual add into the hidden state.
+            // Both are linear: up-scale propagates through `silu(g) * (0.5·u)`
+            // as a 0.5 factor on the product (CPU fp32 fuse), and down-scale
+            // rides straight through the down matmul. The combined unscale
+            // (= UP_UNSCALE × DOWN_UNSCALE = 4.0) fully restores magnitude in
+            // fp32 here, before the residual add into the hidden state.
             let mlp_unscale = DOWN_PROJ_ANE_UNSCALE * UP_PROJ_ANE_UNSCALE;
             for i in 0..block * h {
                 hidden[i] += down_cpu[i] * mlp_unscale;
