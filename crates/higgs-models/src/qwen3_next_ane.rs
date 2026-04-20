@@ -250,20 +250,24 @@ impl AneProjKernel {
         let pad = self.seq_len;
 
         let mut out_all = vec![0.0f32; b * s * oc];
-        let mut padded = vec![0.0f32; pad * h];
-        let mut out_bytes = vec![0u8; self.output_bytes];
 
         for bi in 0..b {
-            // Copy S rows into the first S rows of the [pad, h] buffer; rest are zero.
             let src = &x_slice[bi * s * h..(bi + 1) * s * h];
-            padded[..s * h].copy_from_slice(src);
-            for v in &mut padded[s * h..] {
-                *v = 0.0;
-            }
 
-            let ane_in = cpu_to_ane(&padded, pad, h);
-            debug_assert_eq!(ane_in.len(), self.input_bytes);
-            self.kernel.write_input(0, &ane_in);
+            // Zero-copy strided write: transpose [s, h] directly into the
+            // input IOSurface [1, h, 1, pad] via `get_input_base` + `dsb sy`,
+            // skipping both the `Vec<u8>` allocation in `cpu_to_ane` and the
+            // `IOSurfaceLock/Unlock` pair in `write_input`. Trailing pad
+            // positions (s..pad) are left stale — the ANE channel-wise
+            // matmul only reads position `p` to produce output position `p`,
+            // so stale tails never leak into the first `s` output positions.
+            if !self.kernel.write_input_strided_fp32(0, src, s, h, pad) {
+                let mut padded = vec![0.0f32; pad * h];
+                padded[..s * h].copy_from_slice(src);
+                let ane_in = cpu_to_ane(&padded, pad, h);
+                debug_assert_eq!(ane_in.len(), self.input_bytes);
+                self.kernel.write_input(0, &ane_in);
+            }
             // Prefer realtime eval (lower per-dispatch latency). Falls back to
             // standard eval if the caller hasn't entered realtime mode via
             // `AneKernel::begin_realtime()` — matches the dflash/diffusion
@@ -273,11 +277,13 @@ impl AneProjKernel {
             if self.kernel.eval_realtime().is_err() {
                 self.kernel.eval().map_err(Exception::custom)?;
             }
-            self.kernel.read_output(0, &mut out_bytes);
-
-            // ANE output layout is [oc, pad]; transpose + slice back to [s, oc].
-            let out_padded = ane_to_cpu(&out_bytes, pad, oc);
-            out_all[bi * s * oc..(bi + 1) * s * oc].copy_from_slice(&out_padded[..s * oc]);
+            let out_slice = &mut out_all[bi * s * oc..(bi + 1) * s * oc];
+            if !self.kernel.read_output_strided_fp32(0, out_slice, s, oc, pad) {
+                let mut out_bytes = vec![0u8; self.output_bytes];
+                self.kernel.read_output(0, &mut out_bytes);
+                let out_padded = ane_to_cpu(&out_bytes, pad, oc);
+                out_slice.copy_from_slice(&out_padded[..s * oc]);
+            }
         }
 
         let out = Array::from_slice(&out_all, &[b as i32, s as i32, oc as i32]);
@@ -291,13 +297,26 @@ impl AneProjKernel {
 
 /// Compiled ANE kernels for one GDN layer's three dense projections.
 ///
-/// Populated by `enable_ane_gdn` on `GatedDeltaNet`. When present, the layer's
-/// `forward_with_tape` dispatches `in_proj_qkvz`, `in_proj_ba`, and `out_proj`
-/// on ANE instead of Metal matmul.
+/// Populated by `enable_ane_gdn*` on `GatedDeltaNet`. Two layouts share this
+/// struct:
+///
+/// * **Separate** (Wave 1/2, multi-bucket tests): `qkvz` and `ba` are
+///   `Some(..)`; `qkvz_ba_fused` is `None`. Two separate dispatches per layer.
+/// * **Fused** (P0.8 Stage 3, inline path): `qkvz_ba_fused` is `Some(..)`;
+///   `qkvz` and `ba` are `None`. One dispatch per layer covering both
+///   projections. Mirrors the worker-thread layout in
+///   [`crate::qwen3_next_ane_worker::compile_all_layers`].
+///
+/// `out_proj` is always a separate kernel (it consumes a different input).
 #[derive(Debug)]
 pub struct GdnAneLayerKernels {
-    pub qkvz: Arc<AneProjKernel>,
-    pub ba: Arc<AneProjKernel>,
+    /// Compile-time seq dim for this bucket — always equal to the underlying
+    /// kernel's `seq_len` regardless of which variant is populated.
+    pub seq_len: usize,
+    pub qkvz: Option<Arc<AneProjKernel>>,
+    pub ba: Option<Arc<AneProjKernel>>,
+    /// Fused qkvz+ba kernel — preferred when present (one ANE dispatch vs two).
+    pub qkvz_ba_fused: Option<Arc<FusedGdnProjKernel>>,
     pub out_proj: Arc<AneProjKernel>,
 }
 
@@ -319,6 +338,10 @@ pub struct FusedGdnProjKernel {
     pub seq_len: usize,
     input_bytes: usize,
     output_bytes: usize,
+    /// Matches `ane_mil::gdn_output_rowwise()` at compile time — determines
+    /// whether dispatch uses a per-row memcpy (rowwise) or a NEON strided
+    /// transpose (channel-major) on readback.
+    output_rowwise: bool,
 }
 
 #[allow(unsafe_code)]
@@ -403,6 +426,7 @@ pub fn compile_fused_gdn_proj(
         seq_len,
         input_bytes: mil.input_bytes,
         output_bytes: mil.output_bytes,
+        output_rowwise: ane_mil::gdn_output_rowwise(),
     })
 }
 
@@ -453,6 +477,7 @@ pub fn compile_fused_gdn_proj_from_donor(
         seq_len,
         input_bytes: mil.input_bytes,
         output_bytes: mil.output_bytes,
+        output_rowwise: ane_mil::gdn_output_rowwise(),
     })
 }
 
@@ -482,6 +507,9 @@ impl FusedGdnProjKernel {
             )));
         }
 
+        let prof = std::env::var("HIGGS_ANE_GDN_PROFILE").map(|v| v == "1").unwrap_or(false);
+        let t_phase0 = prof.then(std::time::Instant::now);
+
         let x_f32 = if x.dtype() == Dtype::Float32 {
             x.clone()
         } else {
@@ -489,42 +517,143 @@ impl FusedGdnProjKernel {
         };
         x_f32.eval()?;
         let x_slice: &[f32] = x_f32.as_slice::<f32>();
+        let t_phase1 = prof.then(std::time::Instant::now);
 
         let total_oc = self.qkvz_oc + self.ba_oc;
         let pad = self.seq_len;
 
         let mut out_qkvz = vec![0.0f32; b * s * self.qkvz_oc];
         let mut out_ba = vec![0.0f32; b * s * self.ba_oc];
-        let mut padded = vec![0.0f32; pad * h];
-        let mut out_bytes = vec![0u8; self.output_bytes];
 
+        let mut tw = 0u64;
+        let mut ta = 0u64;
+        let mut tr = 0u64;
+        let mut fb_w = 0u64;
+        let mut fb_r = 0u64;
         for bi in 0..b {
             let src = &x_slice[bi * s * h..(bi + 1) * s * h];
-            padded[..s * h].copy_from_slice(src);
-            for v in &mut padded[s * h..] {
-                *v = 0.0;
-            }
 
-            let ane_in = cpu_to_ane(&padded, pad, h);
-            debug_assert_eq!(ane_in.len(), self.input_bytes);
-            self.kernel.write_input(0, &ane_in);
+            let tw0 = prof.then(std::time::Instant::now);
+            let write_ok = self.kernel.write_input_strided_fp32(0, src, s, h, pad);
+            if !write_ok {
+                fb_w += 1;
+                let mut padded = vec![0.0f32; pad * h];
+                padded[..s * h].copy_from_slice(src);
+                let ane_in = cpu_to_ane(&padded, pad, h);
+                debug_assert_eq!(ane_in.len(), self.input_bytes);
+                self.kernel.write_input(0, &ane_in);
+            }
+            if let Some(t) = tw0 { tw += t.elapsed().as_nanos() as u64; }
+            let ta0 = prof.then(std::time::Instant::now);
             if self.kernel.eval_realtime().is_err() {
                 self.kernel.eval().map_err(Exception::custom)?;
             }
-            self.kernel.read_output(0, &mut out_bytes);
+            if let Some(t) = ta0 { ta += t.elapsed().as_nanos() as u64; }
 
-            // ANE output: channel-first [total_oc, pad] fp32. Transpose to [pad, total_oc].
-            let out_padded = ane_to_cpu(&out_bytes, pad, total_oc);
-
-            // Split: first qkvz_oc channels, then ba_oc channels (per row).
-            for si in 0..s {
-                let row_start = si * total_oc;
-                let dst_q = bi * s * self.qkvz_oc + si * self.qkvz_oc;
-                out_qkvz[dst_q..dst_q + self.qkvz_oc]
-                    .copy_from_slice(&out_padded[row_start..row_start + self.qkvz_oc]);
-                let dst_b = bi * s * self.ba_oc + si * self.ba_oc;
-                out_ba[dst_b..dst_b + self.ba_oc]
-                    .copy_from_slice(&out_padded[row_start + self.qkvz_oc..row_start + total_oc]);
+            let tr0 = prof.then(std::time::Instant::now);
+            let out_q = &mut out_qkvz
+                [bi * s * self.qkvz_oc..(bi + 1) * s * self.qkvz_oc];
+            let out_b = &mut out_ba[bi * s * self.ba_oc..(bi + 1) * s * self.ba_oc];
+            if self.output_rowwise {
+                // MIL output is [1, 1, pad, total_oc] fp32 — row-major.
+                // Per-row memcpy splits qkvz / ba without a NEON transpose.
+                let base = self.kernel.get_output_base(0) as *const f32;
+                if base.is_null() {
+                    fb_r += 1;
+                    let mut out_bytes = vec![0u8; self.output_bytes];
+                    self.kernel.read_output(0, &mut out_bytes);
+                    #[allow(unsafe_code)]
+                    let all_f32: &[f32] = unsafe {
+                        std::slice::from_raw_parts(
+                            out_bytes.as_ptr() as *const f32,
+                            out_bytes.len() / 4,
+                        )
+                    };
+                    for si in 0..s {
+                        let row_start = si * total_oc;
+                        out_q[si * self.qkvz_oc..(si + 1) * self.qkvz_oc]
+                            .copy_from_slice(&all_f32[row_start..row_start + self.qkvz_oc]);
+                        out_b[si * self.ba_oc..(si + 1) * self.ba_oc]
+                            .copy_from_slice(
+                                &all_f32[row_start + self.qkvz_oc..row_start + total_oc],
+                            );
+                    }
+                } else {
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        #[cfg(target_arch = "aarch64")]
+                        std::arch::asm!("dsb sy", options(nostack, preserves_flags));
+                        for si in 0..s {
+                            let row_ptr = base.add(si * total_oc);
+                            std::ptr::copy_nonoverlapping(
+                                row_ptr,
+                                out_q.as_mut_ptr().add(si * self.qkvz_oc),
+                                self.qkvz_oc,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                row_ptr.add(self.qkvz_oc),
+                                out_b.as_mut_ptr().add(si * self.ba_oc),
+                                self.ba_oc,
+                            );
+                        }
+                    }
+                }
+            } else {
+                let ok_q = self.kernel.read_output_strided_fp32_range(
+                    0, out_q, s, 0, self.qkvz_oc, pad,
+                );
+                let ok_b = self.kernel.read_output_strided_fp32_range(
+                    0, out_b, s, self.qkvz_oc, self.ba_oc, pad,
+                );
+                if !(ok_q && ok_b) {
+                    fb_r += 1;
+                    let mut out_bytes = vec![0u8; self.output_bytes];
+                    self.kernel.read_output(0, &mut out_bytes);
+                    let out_padded = ane_to_cpu(&out_bytes, pad, total_oc);
+                    for si in 0..s {
+                        let row_start = si * total_oc;
+                        let dst_q = si * self.qkvz_oc;
+                        out_q[dst_q..dst_q + self.qkvz_oc]
+                            .copy_from_slice(&out_padded[row_start..row_start + self.qkvz_oc]);
+                        let dst_b = si * self.ba_oc;
+                        out_b[dst_b..dst_b + self.ba_oc].copy_from_slice(
+                            &out_padded[row_start + self.qkvz_oc..row_start + total_oc],
+                        );
+                    }
+                }
+            }
+            if prof { let _ = tr0.map(|t| tr += t.elapsed().as_nanos() as u64); }
+        }
+        if prof {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            static TE: AtomicU64 = AtomicU64::new(0);
+            static TW: AtomicU64 = AtomicU64::new(0);
+            static TA: AtomicU64 = AtomicU64::new(0);
+            static TR: AtomicU64 = AtomicU64::new(0);
+            static FW: AtomicU64 = AtomicU64::new(0);
+            static FR: AtomicU64 = AtomicU64::new(0);
+            let te = t_phase0
+                .zip(t_phase1)
+                .map(|(a, b)| (b - a).as_nanos() as u64)
+                .unwrap_or(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            TE.fetch_add(te, Ordering::Relaxed);
+            TW.fetch_add(tw, Ordering::Relaxed);
+            TA.fetch_add(ta, Ordering::Relaxed);
+            TR.fetch_add(tr, Ordering::Relaxed);
+            FW.fetch_add(fb_w, Ordering::Relaxed);
+            FR.fetch_add(fb_r, Ordering::Relaxed);
+            if n % 200 == 0 {
+                eprintln!(
+                    "[gdn_prof] n={n} s={s} eval={:.1}us wr={:.1}us ane={:.1}us rd={:.1}us fb_w={} fb_r={}",
+                    TE.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+                    TW.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+                    TA.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+                    TR.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+                    FW.load(Ordering::Relaxed),
+                    FR.load(Ordering::Relaxed),
+                );
             }
         }
 

@@ -135,7 +135,12 @@ pub fn compute_ic_tile_plan(ic: usize, oc: usize, seq_len: usize) -> TilePlan {
 /// and avoid hugging the hard ceiling. The 12 MiB budget here matches the
 /// known-good Bonsai FFN tiling (2048->6144 => 3072+3072).
 pub fn compute_blobfile_tile_plan(ic: usize, oc: usize) -> TilePlan {
-    const ANE_SAFE_BLOBFILE_BYTES: usize = 12 * 1024 * 1024;
+    // 2026-04-16: bumped from 12 MB → 16 MB. At 12 MB, 27B DOWN (ic=17408,
+    // oc=5120) yielded 20 BLOBFILE tiles, above the ANE compiler's (empirical)
+    // ~16-tile cap: InvalidMILProgram. 16 MB lets DOWN ship at 14 tiles and
+    // GATE/UP at 12 tiles — both below the cap. No other kernel on today's
+    // shapes exercises the tiled path, so the budget bump is cheap.
+    const ANE_SAFE_BLOBFILE_BYTES: usize = 16 * 1024 * 1024;
     let max_elements = ANE_SAFE_BLOBFILE_BYTES / 2; // fp16
     let max_oc = max_elements / ic;
     if oc <= max_oc {
@@ -1261,6 +1266,302 @@ pub fn gen_full_layer_projections(
         ],
         input_bytes: hidden * seq * 4,
         output_bytes: out_ch * seq * 4,
+    }
+}
+
+/// Runtime switch: if `HIGGS_ANE_GDN_OUT_ROWWISE=1`, emit output in
+/// `[1, 1, seq, out_ch]` layout so CPU readback is a plain memcpy per row
+/// instead of a NEON `[ch, pad] -> [seq, ch]` transpose. Compile-time probe;
+/// the caller must store the same flag and use the matching readback path.
+pub fn gdn_output_rowwise() -> bool {
+    std::env::var("HIGGS_ANE_GDN_OUT_ROWWISE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Generate a fused QKVZ+BA BLOBFILE projection for GDN layers: 2 matmuls in
+/// one ANE dispatch.
+///
+/// Input:  `[1, ic, 1, seq]` fp32  (normalized hidden state)
+/// Output (default):    `[1, qkvz_oc + ba_oc, 1, seq]` fp32  (channel-major)
+/// Output (rowwise env): `[1, 1, seq, qkvz_oc + ba_oc]` fp32  (row-major)
+///
+/// Weights are baked as BLOBFILEs, tiled via [`emit_blobfile_matmul_tiled`].
+/// At Carnice 9B dims (ic=4096, qkvz_oc=12288, ba_oc=2064) this yields
+/// 6 + 2 = 8 BLOBFILEs — well under the ~16-tile compiler cap.
+pub fn gen_fused_gdn_qkvz_ba_proj(
+    ic: usize,
+    qkvz_oc: usize,
+    ba_oc: usize,
+    seq_len: usize,
+) -> FusedMil {
+    let rowwise = gdn_output_rowwise();
+    let seq = seq_len.max(ANE_MIN_SPATIAL);
+    let out_ch = qkvz_oc + ba_oc;
+
+    let mut m = String::with_capacity(8192);
+    m.push_str(MIL_HEADER);
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1,{ic},1,{seq}]> x) {{"
+    );
+    // Shared constants
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
+    let _ = writeln!(
+        m,
+        "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];"
+    );
+    // Cast + reshape input to matmul layout [1,1,seq,ic]
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{ic},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<int32, [4]> ri = const()[name=string(\"ri\"), val=tensor<int32, [4]>([1,1,{ic},{seq}])];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ic},{seq}]> x2 = reshape(shape=ri,x=xh)[name=string(\"x2\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{seq},{ic}]> xt = transpose(perm=pm,x=x2)[name=string(\"xt\")];"
+    );
+    // Two matmuls from same input, each potentially tiled on oc.
+    let mut weight_names = Vec::new();
+    let mut cax3_emitted = false;
+    emit_blobfile_matmul_tiled(
+        &mut m, "xt", "wqkvz", "qkvzm", "qkvz", ic, qkvz_oc, seq,
+        &mut weight_names, &mut cax3_emitted,
+    );
+    emit_blobfile_matmul_tiled(
+        &mut m, "xt", "wba", "bam", "ba", ic, ba_oc, seq,
+        &mut weight_names, &mut cax3_emitted,
+    );
+    // Concat qkvz|ba on channel axis
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{out_ch},1,{seq}]> cat = concat(values=(qkvzm,bam),axis=cax,interleave=bF)[name=string(\"cat\")];"
+    );
+    if rowwise {
+        // Transpose [1, out_ch, 1, seq] -> [1, 1, seq, out_ch] so CPU readback
+        // can memcpy per row instead of running a NEON channel-major transpose.
+        // Perm [0,2,3,1]: N stays, C(=1 post) becomes the source axis 1, H(=seq) and W(=out_ch) swap in.
+        let _ = writeln!(
+            m,
+            "        tensor<int32, [4]> pmr = const()[name=string(\"pmr\"), val=tensor<int32, [4]>([0,2,3,1])];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{seq},{out_ch}]> cat_r = transpose(perm=pmr,x=cat)[name=string(\"cat_r\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp32, [1,1,{seq},{out_ch}]> out = cast(dtype=to32,x=cat_r)[name=string(\"cout\")];"
+        );
+    } else {
+        let _ = writeln!(
+            m,
+            "        tensor<fp32, [1,{out_ch},1,{seq}]> out = cast(dtype=to32,x=cat)[name=string(\"cout\")];"
+        );
+    }
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    FusedMil {
+        mil_text: m,
+        weight_names,
+        input_bytes: ic * seq * 4,
+        output_bytes: out_ch * seq * 4,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GDN recurrence state update (Gate 1 — split architecture)
+// ---------------------------------------------------------------------------
+
+/// MIL output for the GDN recurrence state-update kernel.
+///
+/// Gate/beta are computed on Metal; these two kernels handle the heavy state math.
+/// Layout: `[1, Dk, 1, flat_w]` — Dk in channels, Hv*Dv flattened into spatial (W).
+///
+/// Split into 2 kernels to stay under ANE op-count limit (~16):
+///   - **state_update**: `(st, g, beta, k, v) → new_state`  (5 inputs, 1 output)
+///   - **readout**:      `(new_state, q)       → y`          (2 inputs, 1 output)
+pub struct RecurrenceKernels {
+    /// Kernel A: state update MIL text.
+    pub state_update_mil: String,
+    /// Kernel B: readout MIL text.
+    pub readout_mil: String,
+    /// Per-input IOSurface byte sizes for state_update: [st, g, beta, k, v].
+    pub state_input_sizes: Vec<usize>,
+    /// Per-output IOSurface byte sizes for state_update: [new_state].
+    pub state_output_sizes: Vec<usize>,
+    /// Per-input IOSurface byte sizes for readout: [new_state, q].
+    pub readout_input_sizes: Vec<usize>,
+    /// Per-output IOSurface byte sizes for readout: [y].
+    pub readout_output_sizes: Vec<usize>,
+    pub num_v_heads: usize,
+    pub head_k_dim: usize,
+    pub head_v_dim: usize,
+    /// Flat spatial width = ane_align_seq(Hv * Dv). Heads and value dim
+    /// are flattened into W because ANE requires H=1 for elementwise ops.
+    pub flat_w: usize,
+}
+
+/// Generate a MIL program for the GDN recurrence state update.
+///
+/// **Split architecture**: gate `g` and `beta` are precomputed on Metal (they
+/// need sigmoid/exp which fail at small spatial dims on ANE). This kernel
+/// handles the state-update math using only `mul`, `add`, `sub`, `reduce_sum`
+/// — all confirmed viable on ANE at these dimensions.
+///
+/// ANE layout `[1, Dk, Hv, Dv]` puts the key dimension in channels so that
+/// `reduce_sum(axis=1)` gives the Dk contraction (channel reduce is the most
+/// efficient reduction path on ANE hardware). Dv sits in the W (spatial)
+/// position — always >= 16, satisfying `ANE_MIN_SPATIAL`.
+///
+/// **Inputs** (all fp16, all dynamic IOSurfaces — no baked weights):
+///   0. `st`:     `[1, Dk, Hv, Dv]`  — current recurrence state
+///   1. `g`:      `[1,  1,  1, Dv]`  — gate decay (broadcast on Dk, Hv)
+///   2. `beta`:   `[1,  1,  1, Dv]`  — sigmoid(b) (broadcast on Dk, Hv)
+///   3. `k`:      `[1, Dk,  1, Dv]`  — key (broadcast on Hv)
+///   4. `v`:      `[1,  1, Hv, Dv]`  — value (broadcast on Dk)
+///   5. `q`:      `[1, Dk,  1, Dv]`  — query (broadcast on Hv)
+///
+/// Wait — g and beta are per-head scalars `[Hv]`, not per-Dv. With the swapped
+/// layout they broadcast as `[1, 1, Hv, 1]`, and k/q are `[1, Dk, 1, 1]` per
+/// head = `[1, Dk, Hv, 1]`.
+///
+/// Corrected layout after swap:
+///   0. `st`:     `[1, Dk, Hv, Dv]`  — current recurrence state
+///   1. `g`:      `[1,  1, Hv,  1]`  — gate decay (broadcast on Dk, Dv)
+///   2. `beta`:   `[1,  1, Hv,  1]`  — sigmoid(b) (broadcast on Dk, Dv)
+///   3. `k`:      `[1, Dk, Hv,  1]`  — key (broadcast on Dv)
+///   4. `v`:      `[1,  1, Hv, Dv]`  — value (broadcast on Dk)
+///   5. `q`:      `[1, Dk, Hv,  1]`  — query (broadcast on Dv)
+///
+/// **Outputs** (fp16):
+///   0. concat(`new_state`, `y`) on channel axis: `[1, Dk+1, Hv, Dv]`
+///
+/// **Operations** (8 ops, 0 BLOBFILEs):
+///   1. decay     = st * g             (broadcast on Dk, Dv)
+///   2. sk        = decay * k          (broadcast on Dv)
+///   3. kv_mem    = reduce_sum(sk, Dk) (channel reduce → [1,1,Hv,Dv])
+///   4. diff      = v - kv_mem         (sub — no const needed)
+///   5. delta     = diff * beta        (broadcast on Dk, Dv)
+///   6. kd_outer  = k * delta          (outer product via broadcast)
+///   7. new_state = decay + kd_outer
+///   8. sq        = new_state * q      (broadcast on Dv)
+///   9. y         = reduce_sum(sq, Dk) (channel reduce)
+pub fn gen_gdn_recurrence_step(
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+) -> RecurrenceKernels {
+    let hv = num_v_heads;
+    let dk = head_k_dim;
+    let dv = head_v_dim;
+
+    // Layout: [1, C=Dk, 1, W=Hv*Dv_padded] — flatten Hv into spatial.
+    // ANE requires H=1 for non-conv elementwise ops (H>1 → 0x1d eval error).
+    // W must be 64-byte aligned for fp16: W % 32 == 0.
+    let flat_w = ane_align_seq(hv * dv);
+
+    // IOSurface sizes in fp32 bytes (ANE requires fp32 IOSurfaces).
+    // CRITICAL: all inputs must have the same channel dim (Dk).
+    // ANE 0x1d at eval when 3+ IOSurfaces mix C=1 and C=Dk.
+    // Caller must expand g/beta/v to [1, Dk, 1, flat_w] before writing.
+    let big = dk * flat_w * 4; // [1, Dk, 1, flat_w] fp32
+    let small = flat_w * 4;    // [1, 1,  1, flat_w] fp32 (readout output only)
+
+    // ── Kernel A: state_update ──
+    // (st, g, beta, k, v) → new_state — all inputs [1, Dk, 1, flat_w]
+    // g/beta/v are logically per-head but caller replicates across Dk channels.
+    // CRITICAL: ANE compiler reorders IOSurface bindings — likely alphabetically
+    // by parameter name. Use a0..a4 so alphabetical = declaration = write order.
+    // Mapping: a0=st, a1=g, a2=k, a3=v, a4=beta (dataflow first-use order).
+    let mut a = String::with_capacity(2048);
+    a.push_str(MIL_HEADER);
+    let _ = writeln!(a, "    func main<ios18>(");
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a0,");  // st
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a1,");  // g
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a2,");  // k
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a3,");  // v
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a4");   // beta
+    let _ = writeln!(a, "    ) {{");
+    let _ = writeln!(a, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(a, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> st = cast(dtype=to16,x=a0)[name=string(\"c0\")];");
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> g = cast(dtype=to16,x=a1)[name=string(\"c1\")];");
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> k = cast(dtype=to16,x=a2)[name=string(\"c2\")];");
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> v = cast(dtype=to16,x=a3)[name=string(\"c3\")];");
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> beta = cast(dtype=to16,x=a4)[name=string(\"c4\")];");
+    let _ = writeln!(a, "        tensor<int32, [1]> c_ax = const()[name=string(\"cax\"), val=tensor<int32, [1]>([1])];");
+    let _ = writeln!(a, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
+    // Compute: 7 ops — no broadcast needed, all same shape [1,Dk,1,flat_w]
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> decay = mul(x=st,y=g)[name=string(\"dc\")];");
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> sk = mul(x=decay,y=k)[name=string(\"sk\")];");
+    let _ = writeln!(a, "        tensor<fp16, [1,1,1,{flat_w}]> kvm = reduce_sum(x=sk,axes=c_ax,keep_dims=kd)[name=string(\"kvm\")];");
+    // After reduce_sum, kvm is [1,1,1,flat_w]. sub(v,kvm) needs same shape.
+    // v is [1,Dk,1,flat_w] (caller-expanded). kvm broadcasts on channel axis.
+    // Internal broadcast (not IOSurface) should be fine per P3 probe.
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> diff = sub(x=v,y=kvm)[name=string(\"diff\")];");
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> delta = mul(x=diff,y=beta)[name=string(\"dl\")];");
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> kdo = mul(x=k,y=delta)[name=string(\"kdo\")];");
+    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> ns = add(x=decay,y=kdo)[name=string(\"ns\")];");
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> out = cast(dtype=to32,x=ns)[name=string(\"out\")];");
+    let _ = writeln!(a, "    }} -> (out);");
+    a.push_str("}\n");
+
+    // ── Kernel B: readout ──
+    // (new_state, q) → y
+    // Ops: 2 casts + mul + reduce_sum + 1 output cast = 5 non-const ops
+    let mut b = String::with_capacity(1024);
+    b.push_str(MIL_HEADER);
+    let _ = writeln!(b, "    func main<ios18>(");
+    let _ = writeln!(b, "        tensor<fp32, [1,{dk},1,{flat_w}]> ns_f,");
+    let _ = writeln!(b, "        tensor<fp32, [1,{dk},1,{flat_w}]> q_f");
+    let _ = writeln!(b, "    ) {{");
+    let _ = writeln!(b, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(b, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(b, "        tensor<fp16, [1,{dk},1,{flat_w}]> ns = cast(dtype=to16,x=ns_f)[name=string(\"c0\")];");
+    let _ = writeln!(b, "        tensor<fp16, [1,{dk},1,{flat_w}]> q = cast(dtype=to16,x=q_f)[name=string(\"c1\")];");
+    let _ = writeln!(b, "        tensor<int32, [1]> c_ax = const()[name=string(\"cax\"), val=tensor<int32, [1]>([1])];");
+    let _ = writeln!(b, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
+    let _ = writeln!(b, "        tensor<fp16, [1,{dk},1,{flat_w}]> sq = mul(x=ns,y=q)[name=string(\"sq\")];");
+    let _ = writeln!(b, "        tensor<fp16, [1,1,1,{flat_w}]> yr = reduce_sum(x=sq,axes=c_ax,keep_dims=kd)[name=string(\"yr\")];");
+    let _ = writeln!(b, "        tensor<fp32, [1,1,1,{flat_w}]> out = cast(dtype=to32,x=yr)[name=string(\"out\")];");
+    let _ = writeln!(b, "    }} -> (out);");
+    b.push_str("}\n");
+
+    RecurrenceKernels {
+        state_update_mil: a,
+        readout_mil: b,
+        state_input_sizes: vec![big, big, big, big, big], // [st, g, k, v, beta] all [1,Dk,1,flat_w] fp32
+        state_output_sizes: vec![big],
+        readout_input_sizes: vec![big, big],               // ns + q
+        readout_output_sizes: vec![small],                  // y is [1,1,1,flat_w] fp32
+        num_v_heads: hv,
+        head_k_dim: dk,
+        head_v_dim: dv,
+        flat_w,
     }
 }
 
