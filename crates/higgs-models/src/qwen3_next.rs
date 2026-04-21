@@ -368,6 +368,24 @@ pub(crate) fn swiglu(gate: &Array, x: &Array) -> Result<Array, Exception> {
     }
 }
 
+/// sigmoid(gate) * x — element-wise sigmoid gating. When
+/// `HIGGS_TARGET_COMPILE=1`, the sigmoid+multiply pair fuses into one dispatch.
+/// Used in attention output gating (2048d per decode token) and in MoE
+/// shared-expert gating (one scalar per expert output).
+pub(crate) fn sigmoid_mul(gate: &Array, x: &Array) -> Result<Array, Exception> {
+    if target_compile_enabled() {
+        let mut compiled = mlx_rs::transforms::compile::compile(
+            |(g, u): (&Array, &Array)| -> Result<Array, Exception> {
+                nn::sigmoid(g)?.multiply(u)
+            },
+            None,
+        );
+        compiled((gate, x))
+    } else {
+        nn::sigmoid(gate)?.multiply(x)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // gather_qmm FFI wrapper
 // ---------------------------------------------------------------------------
@@ -1603,7 +1621,7 @@ impl Qwen3NextAttention {
             .reshape(&[B, L, -1])?
         };
 
-        let gated = output.multiply(nn::sigmoid(&gate)?)?;
+        let gated = sigmoid_mul(&gate, &output)?;
         self.o_proj.forward(&gated)
     }
 }
@@ -3525,8 +3543,8 @@ impl FfnBlock {
                 .ok_or_else(|| Exception::custom("MoE shared_expert missing"))?;
             let shared_y = se_ref.forward(x)?;
 
-            let shared_gate_val = nn::sigmoid(&seg_ref.forward(x)?)?;
-            let shared_out = shared_y.multiply(&shared_gate_val)?;
+            let shared_gate_logit = seg_ref.forward(x)?;
+            let shared_out = sigmoid_mul(&shared_gate_logit, &shared_y)?;
 
             expert_sum.add(shared_out)
         } else {
