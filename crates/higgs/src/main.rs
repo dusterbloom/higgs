@@ -420,7 +420,6 @@ fn install_crash_diagnostics() {
         libc::SIGILL,
         libc::SIGTERM,
         libc::SIGHUP,
-        libc::SIGPIPE,
     ] {
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();

@@ -33,12 +33,9 @@ const CHUNKED_PREFILL_THRESHOLD: i32 = 512;
 /// Number of tokens per chunk during chunked prefill.
 const CHUNKED_PREFILL_CHUNK_SIZE: i32 = 512;
 
-/// Cap MLX memory allocations to avoid Metal OOM on constrained GPUs.
-///
-/// Sets `mlx_set_memory_limit` to 75% of `max_recommended_working_set_size`
-/// and `mlx_set_cache_limit` to 50%. This lets MLX manage memory within
-/// bounds instead of the OS killing the process when Metal command buffers
-/// exceed GPU capacity (the root cause of 35B crashes on 32GB machines).
+/// Log GPU limits. No cap by default — `e5c47264` removed the cap because it
+/// cost 5× throughput on 35B MoE decode. Use [`set_mlx_memory_cap`] when
+/// targeting 27B+DFlash where the tape-verify allocator SIGKILLs otherwise.
 #[allow(unsafe_code)]
 pub(crate) fn set_wired_limit_to_max() {
     unsafe {
@@ -51,13 +48,46 @@ pub(crate) fn set_wired_limit_to_max() {
             if mlx_sys::mlx_device_info_get_size(&raw mut max_rec, info, key.as_ptr()) == 0
                 && max_rec > 0
             {
-                // Let MLX manage its own memory. Setting mlx_set_cache_limit
-                // below the default forces buffer reallocation every decode
-                // step — 5× throughput loss (92ms vs 18ms on 35B MoE).
                 tracing::info!(
                     max_recommended_mb = max_rec / (1024 * 1024),
                     "MLX memory: letting framework manage limits (GPU max {}MB)",
                     max_rec / (1024 * 1024),
+                );
+            }
+        }
+        mlx_sys::mlx_device_info_free(info);
+        mlx_sys::mlx_device_free(dev);
+    }
+}
+
+/// Cap MLX memory at `cap_fraction * max_recommended_working_set_size`.
+/// Required for 27B/35B-dense + DFlash to avoid Metal silent SIGKILL on
+/// verify-tape allocations. Only call on dense large models with DFlash.
+#[allow(unsafe_code)]
+pub(crate) fn set_mlx_memory_cap(cap_fraction: f64) {
+    unsafe {
+        let mut info = mlx_sys::mlx_device_info_new();
+        let mut dev = mlx_sys::mlx_device_new();
+        mlx_sys::mlx_get_default_device(&raw mut dev);
+        if mlx_sys::mlx_device_info_get(&raw mut info, dev) == 0 {
+            let mut max_rec: usize = 0;
+            let key = c"max_recommended_working_set_size";
+            if mlx_sys::mlx_device_info_get_size(&raw mut max_rec, info, key.as_ptr()) == 0
+                && max_rec > 0
+            {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let cap = ((max_rec as f64) * cap_fraction) as usize;
+                let mut prev: usize = 0;
+                let _ = mlx_sys::mlx_set_memory_limit(&raw mut prev, cap);
+                tracing::info!(
+                    cap_mb = cap / (1024 * 1024),
+                    max_recommended_mb = max_rec / (1024 * 1024),
+                    cap_fraction,
+                    "MLX memory: cap enabled for DFlash large-dense stability"
                 );
             }
         }
@@ -76,7 +106,11 @@ struct DFlashState {
     /// Wrapped in Mutex for interior mutability (drafter.forward is &mut).
     gpu_drafter: std::sync::Mutex<higgs_models::dflash::DFlashDrafter>,
     /// CPU BLAS engine for off-GPU drafter forward (Arc for pipeline thread sharing).
-    cpu_engine: Arc<higgs_models::dflash_cpu::DFlashCpuEngine>,
+    /// `None` when the CPU engine is not needed at runtime — i.e. ANE is active
+    /// (the ANE worker owns its own copy) AND pipelined drafting is disabled.
+    /// Avoids a ~3 GB heap tax on 27B when `HIGGS_DFLASH_DISABLE_ANE=1` with
+    /// pipeline off.
+    cpu_engine: Option<Arc<higgs_models::dflash_cpu::DFlashCpuEngine>>,
     /// ANE+CPU hybrid executor — pinned to a dedicated worker thread so its
     /// `!Send` IOSurface handles never cross threads. Handle is `Send + Sync`.
     /// When present, preferred over cpu_engine.
@@ -279,19 +313,41 @@ impl SimpleEngine {
                 "DFlash GPU drafter loaded from safetensors"
             );
 
-            // Also load CPU engine for ANE worker compilation
-            tracing::info!(drafter = %dp.display(), "Loading DFlash CPU engine (for ANE compilation)");
-            let t1 = std::time::Instant::now();
-            let (mut cpu_engine, _cfg) =
-                higgs_models::dflash_cpu::load_dflash_cpu_engine_from_safetensors(dp)
-                    .map_err(EngineError::Model)?;
-            if block_size as usize != cpu_engine.config.block_size {
-                cpu_engine.config.block_size = block_size as usize;
-            }
-            tracing::info!(
-                elapsed_ms = t1.elapsed().as_millis(),
-                "DFlash CPU engine loaded from safetensors"
-            );
+            // Decide whether to load the CPU engine at all. It's needed only when:
+            //   - ANE is active (for one-time compile into the ANE worker), OR
+            //   - HIGGS_DFLASH_PIPELINE=1 (pipelined drafter uses it at runtime).
+            // Loading eats ~3 GB heap on 27B (bf16 weight copies); skip when
+            // neither path will touch it.
+            let pipeline_enabled = std::env::var("HIGGS_DFLASH_PIPELINE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            #[cfg(feature = "ane")]
+            let ane_wanted = std::env::var_os("HIGGS_DFLASH_DISABLE_ANE").is_none();
+            #[cfg(not(feature = "ane"))]
+            let ane_wanted = false;
+            let needs_cpu_engine = ane_wanted || pipeline_enabled;
+
+            let mut cpu_engine_loaded = if needs_cpu_engine {
+                tracing::info!(drafter = %dp.display(), "Loading DFlash CPU engine (for ANE compile / pipeline drafter)");
+                let t1 = std::time::Instant::now();
+                let (mut cpu_engine, _cfg) =
+                    higgs_models::dflash_cpu::load_dflash_cpu_engine_from_safetensors(dp)
+                        .map_err(EngineError::Model)?;
+                if block_size as usize != cpu_engine.config.block_size {
+                    cpu_engine.config.block_size = block_size as usize;
+                }
+                tracing::info!(
+                    elapsed_ms = t1.elapsed().as_millis(),
+                    "DFlash CPU engine loaded from safetensors"
+                );
+                Some(cpu_engine)
+            } else {
+                tracing::info!(
+                    "Skipping DFlash CPU engine load \
+                     (ANE disabled + HIGGS_DFLASH_PIPELINE!=1) — saves ~3 GB heap"
+                );
+                None
+            };
 
             // Compile ANE+CPU hybrid executor if available.
             // Spawn a dedicated worker thread that owns the executor — the
@@ -300,12 +356,23 @@ impl SimpleEngine {
             let ane_worker = if std::env::var_os("HIGGS_DFLASH_DISABLE_ANE").is_some() {
                 tracing::warn!("HIGGS_DFLASH_DISABLE_ANE set — forcing CPU BLAS fallback");
                 None
-            } else {
+            } else if cpu_engine_loaded.is_some() {
                 let t0 = std::time::Instant::now();
-                match higgs_models::dflash_ane::spawn_ane_worker(cpu_engine.clone()) {
+                // When pipeline is off, move the engine into the ANE worker
+                // instead of cloning — the worker's copy is sufficient, and
+                // holding a redundant copy on the engine side raises peak RSS
+                // by ~3 GB during ANE compile (jetsam fires ~23.5 GB on 27B).
+                // See .planning/phase1-ane-memory-surgery-plan.md.
+                let engine_for_worker = if pipeline_enabled {
+                    cpu_engine_loaded.as_ref().unwrap().clone()
+                } else {
+                    cpu_engine_loaded.take().unwrap()
+                };
+                match higgs_models::dflash_ane::spawn_ane_worker(engine_for_worker) {
                     Ok(handle) => {
                         tracing::info!(
                             elapsed_ms = t0.elapsed().as_millis(),
+                            moved_engine = !pipeline_enabled,
                             "DFlash ANE worker spawned (executor compiled on worker thread)"
                         );
                         Some(handle)
@@ -315,6 +382,18 @@ impl SimpleEngine {
                         None
                     }
                 }
+            } else {
+                None
+            };
+
+            // Retain the CPU engine only when pipelined drafting will use it at
+            // runtime. When ANE is active and pipeline is off, the ANE worker
+            // already owns its own copy — drop ours to reclaim ~3 GB.
+            let cpu_engine_retained = if pipeline_enabled {
+                cpu_engine_loaded.map(Arc::new)
+            } else {
+                drop(cpu_engine_loaded);
+                None
             };
 
             #[cfg(feature = "ane")]
@@ -334,7 +413,7 @@ impl SimpleEngine {
             );
             Some(DFlashState {
                 gpu_drafter: std::sync::Mutex::new(gpu_drafter),
-                cpu_engine: Arc::new(cpu_engine),
+                cpu_engine: cpu_engine_retained,
                 #[cfg(feature = "ane")]
                 ane_worker,
                 tap_layers,
@@ -344,6 +423,21 @@ impl SimpleEngine {
         } else {
             None
         };
+
+        // Cap MLX memory for large-dense + DFlash to prevent Metal silent
+        // SIGKILL on verify-tape allocations at long contexts (crash fix per
+        // .planning/next-session-27b-dflash-crash.md). Override with
+        // HIGGS_MLX_CAP_FRACTION=0 (disable) or e.g. 0.80 (tighter).
+        if dflash.is_some() && model.num_layers() > 32 {
+            let cap_frac = std::env::var("HIGGS_MLX_CAP_FRACTION")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|f| (0.0..=1.0).contains(f))
+                .unwrap_or(0.88);
+            if cap_frac > 0.0 {
+                set_mlx_memory_cap(cap_frac);
+            }
+        }
 
         Ok(Self {
             model: Mutex::new(model),
@@ -1109,7 +1203,11 @@ impl SimpleEngine {
 
         let mut current_taps = taps;
         let mut drafter_cache = dflash.gpu_drafter.lock().unwrap().make_cache();
-        let mut cpu_cache = dflash.cpu_engine.make_cache();
+        // Pipelined drafting is the only path that needs a CPU cache. When
+        // pipeline is off, `dflash.cpu_engine` is `None`; we never touch the
+        // CPU cache below that branch.
+        let mut cpu_cache: Option<higgs_models::dflash_cpu::DFlashCpuCache> =
+            dflash.cpu_engine.as_ref().map(|e| e.make_cache());
         let mut last_token = first_token_id as i32;
         let mut start = prompt_len as i32;
         let block_size = dflash.block_size;
@@ -1157,14 +1255,14 @@ impl SimpleEngine {
             let (draft_hidden, embed_ms) = if let Some(rx) = pending_draft.take() {
                 // Pipelined: drafter was already running in background (embed done at spawn time)
                 let (out_f32, returned_cache) = rx.recv().expect("drafter thread panicked");
-                cpu_cache = returned_cache;
+                cpu_cache = Some(returned_cache);
                 // Context-only cache: no crop needed — only ctx positions were persisted.
                 if kv_debug {
                     eprintln!(
                         "KV_ROUND round={} path=pipelined start={} cache_len={}",
                         round_idx + 1,
                         start,
-                        cpu_cache.len,
+                        cpu_cache.as_ref().map_or(0, |c| c.len),
                     );
                 }
                 (
@@ -1453,7 +1551,7 @@ impl SimpleEngine {
                     n_accepted,
                     block_size,
                     start,
-                    cpu_cache.len,
+                    cpu_cache.as_ref().map_or(0, |c| c.len),
                 );
             }
 
@@ -1494,8 +1592,15 @@ impl SimpleEngine {
                     })
                     .collect();
                 let ctx_len = current_taps[0].shape()[1] as usize;
-                let mut draft_cache =
-                    std::mem::replace(&mut cpu_cache, dflash.cpu_engine.make_cache());
+                // Pipeline=1 requires cpu_engine to have been loaded.
+                let pipe_engine = dflash
+                    .cpu_engine
+                    .as_ref()
+                    .expect("HIGGS_DFLASH_PIPELINE=1 but CPU engine was not loaded");
+                let fresh_cache = pipe_engine.make_cache();
+                let mut draft_cache = cpu_cache
+                    .replace(fresh_cache)
+                    .unwrap_or_else(|| pipe_engine.make_cache());
 
                 let (tx, rx) = std::sync::mpsc::channel();
 
@@ -1511,7 +1616,7 @@ impl SimpleEngine {
                 // spawned thread as before.
                 #[cfg(feature = "ane")]
                 let ane_worker = dflash.ane_worker.clone();
-                let cpu_engine = Arc::clone(&dflash.cpu_engine);
+                let cpu_engine = Arc::clone(pipe_engine);
 
                 std::thread::spawn(move || {
                     let out_f32_and_cache = {
