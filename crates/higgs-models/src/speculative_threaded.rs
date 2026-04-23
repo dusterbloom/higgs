@@ -66,6 +66,18 @@ fn drafter_thread_loop(
     rx: &Receiver<DraftReq>,
     tx: &Sender<DraftResp>,
 ) {
+    // Finalize inline ANE GDN (if HIGGS_DRAFTER_ANE_GDN_INLINE=1 stashed a
+    // payload on load) on THIS thread before any forward. IOSurfaces are
+    // thread-bound, so the compile thread must match the dispatch thread —
+    // here, the scoped drafter worker. See
+    // `QwenNextCausalDrafter::finalize_pending_ane_gdn`.
+    if let Err(e) = drafter.finalize_pending_ane_gdn() {
+        let _ = tx.send(DraftResp::Err(format!(
+            "finalize drafter ANE GDN inline (threaded path): {e}"
+        )));
+        return;
+    }
+
     let max_seq = drafter.max_seq;
     let mut d_cache: Vec<Option<LayerCache>> = drafter.model.make_cache();
     let mut saved_logits: Option<mlx_rs::Array> = None;

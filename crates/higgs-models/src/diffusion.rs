@@ -4101,12 +4101,30 @@ pub struct QwenNextCausalDrafter {
     pub model: crate::qwen3_next::Qwen3NextCausalLM,
     pub vocab: usize,
     pub max_seq: usize,
+    /// Inline ANE GDN payload prepared on the thread that called
+    /// [`Self::from_dir`]. Must be taken + finalized on the thread that will
+    /// subsequently call [`crate::qwen3_next::Qwen3NextCausalLM::forward`]
+    /// (IOSurfaces are thread-bound). See [`Self::finalize_pending_ane_gdn`].
+    #[cfg(feature = "ane")]
+    pending_ane_gdn: Option<(Vec<crate::qwen3_next_ane_worker::GdnLayerWeights>, i32)>,
 }
 
 impl QwenNextCausalDrafter {
     /// Load a Qwen3.5 dense drafter (e.g. Qwen3.5-0.8B-8bit) from a model
     /// directory. Uses [`crate::qwen3_next::load_qwen3_5_model`] which handles
     /// nested `text_config` and the `language_model.` weight prefix.
+    ///
+    /// ANE GDN offload gating:
+    /// - `HIGGS_DRAFTER_ANE_GDN_INLINE=1` (preferred): dequantize projection
+    ///   weights on this thread and stash them in `pending_ane_gdn`. The
+    ///   consumer (serial `speculative_generate_next` or the drafter worker
+    ///   thread) calls [`Self::finalize_pending_ane_gdn`] on its own thread
+    ///   before the first `forward`, binding IOSurfaces there — zero-copy,
+    ///   no mpsc round-trip per dispatch.
+    /// - `HIGGS_DRAFTER_ANE_GDN=1` (legacy / Send+Sync fallback): compile
+    ///   and attach on a dedicated worker thread via
+    ///   `enable_ane_gdn_all_layers_via_worker`. ~3.2ms GPU sync per
+    ///   dispatch — kept as a safety valve for debugging the inline path.
     pub fn from_dir(
         model_dir: &Path,
         max_seq: usize,
@@ -4114,33 +4132,79 @@ impl QwenNextCausalDrafter {
         #[allow(unused_mut)]
         let mut model = crate::qwen3_next::load_qwen3_5_model(model_dir)?;
         #[cfg(feature = "ane")]
-        {
-            if std::env::var("HIGGS_DRAFTER_ANE_GDN").as_deref() == Ok("1") {
-                // Use the worker path: Send+Sync handle, attachable from any
-                // thread (main or scoped drafter thread). Inline path would
-                // require finalize on the thread that calls forward, which we
-                // can't guarantee for drafter under both serial and threaded
-                // dispatch modes.
-                const ANE_GDN_SEQ_LEN: i32 = 32;
+        let pending_ane_gdn = {
+            const ANE_GDN_SEQ_LEN: i32 = 32;
+            let inline = std::env::var("HIGGS_DRAFTER_ANE_GDN_INLINE").as_deref() == Ok("1");
+            let worker = std::env::var("HIGGS_DRAFTER_ANE_GDN").as_deref() == Ok("1");
+            if inline {
+                match model.prepare_ane_gdn_weights(ANE_GDN_SEQ_LEN) {
+                    Ok(payload) => {
+                        tracing::info!(
+                            n_layers = payload.0.len(),
+                            seq_len = ANE_GDN_SEQ_LEN,
+                            "drafter ANE GDN inline prep complete on load thread — finalize pending on drafter dispatch thread"
+                        );
+                        Some(payload)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "HIGGS_DRAFTER_ANE_GDN_INLINE=1 set but prepare_ane_gdn_weights failed — falling back to Metal"
+                        );
+                        None
+                    }
+                }
+            } else if worker {
                 match model.enable_ane_gdn_all_layers_via_worker(ANE_GDN_SEQ_LEN) {
                     Ok(report) => tracing::info!(
                         ?report,
                         seq_len = ANE_GDN_SEQ_LEN,
-                        "drafter ANE GDN worker enabled (HIGGS_DRAFTER_ANE_GDN=1)"
+                        "drafter ANE GDN worker enabled (HIGGS_DRAFTER_ANE_GDN=1; legacy fallback path)"
                     ),
                     Err(e) => tracing::error!(
                         error = %e,
                         "HIGGS_DRAFTER_ANE_GDN=1 set but enable_ane_gdn_all_layers_via_worker failed — falling back to Metal"
                     ),
                 }
+                None
+            } else {
+                None
             }
-        }
+        };
         let vocab = model.args.vocab_size as usize;
         Ok(Self {
             model,
             vocab,
             max_seq,
+            #[cfg(feature = "ane")]
+            pending_ane_gdn,
         })
+    }
+
+    /// Consume any stashed inline ANE GDN payload (from `HIGGS_DRAFTER_ANE_GDN_INLINE=1`)
+    /// and compile/install the kernels on the current thread.
+    ///
+    /// MUST be called on the thread that will subsequently call
+    /// `self.model.forward` — IOSurface handles are thread-bound, so the
+    /// compile thread and the dispatch thread must match. Idempotent: the
+    /// payload is taken on first call, so subsequent calls are no-ops.
+    ///
+    /// Invoked by both [`speculative_generate_next`] (serial path) and
+    /// [`crate::speculative_threaded::speculative_generate_next_threaded`]
+    /// (threaded path, inside the drafter worker thread).
+    pub fn finalize_pending_ane_gdn(&mut self) -> Result<(), mlx_rs::error::Exception> {
+        #[cfg(feature = "ane")]
+        {
+            if let Some((weights, seq_len)) = self.pending_ane_gdn.take() {
+                tracing::info!(
+                    seq_len,
+                    thread = ?std::thread::current().id(),
+                    "finalizing drafter ANE GDN inline on current thread"
+                );
+                self.model.finalize_ane_gdn_inline(weights, seq_len)?;
+            }
+        }
+        Ok(())
     }
 
     /// Full-sequence forward with a fresh KV+SSM cache. Returns
@@ -4235,6 +4299,13 @@ pub fn speculative_generate_next(
         );
     }
     use mlx_rs::ops::indexing::{self as ix, IndexOp};
+
+    // Finalize inline ANE GDN (if HIGGS_DRAFTER_ANE_GDN_INLINE=1 stashed a
+    // payload on load) on this thread before any drafter forward. Serial
+    // path: caller thread is the dispatch thread.
+    drafter
+        .finalize_pending_ane_gdn()
+        .expect("finalize drafter ANE GDN inline (serial path)");
 
     let mut context: Vec<u32> = prompt.to_vec();
     let mut generated: Vec<u32> = Vec::new();
@@ -8333,10 +8404,22 @@ mod tests {
     #[ignore = "Needs Qwen3.5-0.8B-8bit + Qwen3.6-27B-4bit on disk; loads ~14GB"]
     fn test_speculative_generate_next_natural_prompts() {
         let home = std::env::var("HOME").expect("HOME set");
-        let drafter_dir = std::path::PathBuf::from(&home)
-            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit");
-        let verifier_dir = std::path::PathBuf::from(&home)
-            .join(".cache/lm-studio/models/NexVeridian/Qwen3.6-27B-4bit");
+        // Drafter/verifier overrides (HIGGS_SPEC_TEST_DRAFTER_DIR /
+        // _VERIFIER_DIR) — use smaller or larger same-arch models to probe
+        // different drafter/verifier size ratios. Default pair is the
+        // historical 0.8B↔27B baseline.
+        let drafter_dir = std::env::var("HIGGS_SPEC_TEST_DRAFTER_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(&home)
+                    .join(".cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit")
+            });
+        let verifier_dir = std::env::var("HIGGS_SPEC_TEST_VERIFIER_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(&home)
+                    .join(".cache/lm-studio/models/NexVeridian/Qwen3.6-27B-4bit")
+            });
         if !drafter_dir.join("config.json").exists() {
             eprintln!("SKIP: drafter not found at {}", drafter_dir.display());
             return;
@@ -8347,10 +8430,36 @@ mod tests {
         }
 
         let tokenizer = crate::load_tokenizer(&drafter_dir).expect("load tokenizer");
+        // Drafter max_seq overridable via HIGGS_SPEC_TEST_DRAFTER_MAX_SEQ.
+        // ANE GDN sweet-spot is ≤ 4k; beyond that CoreML dispatch cost grows
+        // super-linearly. Default bumped from 1024 → 2048 to give longer
+        // prompts headroom while staying well under the 4k ceiling.
+        let drafter_max_seq: usize = std::env::var("HIGGS_SPEC_TEST_DRAFTER_MAX_SEQ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2048);
         let mut drafter =
-            super::QwenNextCausalDrafter::from_dir(&drafter_dir, 1024).expect("build drafter");
-        let verify_model =
-            crate::qwen3_next::load_qwen3_5_model(&verifier_dir).expect("load 27B verifier");
+            super::QwenNextCausalDrafter::from_dir(&drafter_dir, drafter_max_seq)
+                .expect("build drafter");
+        // Dispatch loader by config.json model_type so MoE variants
+        // (qwen3_5_moe, e.g. Qwen3.6-35B-A3B-4bit) load via the MoE path.
+        let model_type: String = {
+            let cfg: serde_json::Value = serde_json::from_reader(
+                std::fs::File::open(verifier_dir.join("config.json"))
+                    .expect("open verifier config"),
+            )
+            .expect("parse verifier config");
+            cfg.get("model_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("qwen3_5")
+                .to_string()
+        };
+        let verify_model = if model_type == "qwen3_5_moe" {
+            crate::qwen3_next::load_qwen3_5_moe_model(&verifier_dir)
+                .expect("load qwen3_5_moe verifier")
+        } else {
+            crate::qwen3_next::load_qwen3_5_model(&verifier_dir).expect("load verifier")
+        };
         let mut verifier = crate::AnyModel::Qwen3Next(verify_model);
 
         let prompts = [
@@ -8372,14 +8481,27 @@ mod tests {
                 prompt_ids.len()
             );
 
+            // K window overridable via HIGGS_SPEC_TEST_K_LOW/HIGH.
+            // Default bumped from 8..16 → 16..24 to give ANE drafter more
+            // work per round (amortizes dispatch overhead) and to test
+            // the hypothesis that longer drafts still produce usable
+            // accepted prefixes on the 0.8B↔27B pairing.
+            let k_low: usize = std::env::var("HIGGS_SPEC_TEST_K_LOW")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(16);
+            let k_high: usize = std::env::var("HIGGS_SPEC_TEST_K_HIGH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24);
             let t2 = std::time::Instant::now();
             let tokens = super::speculative_generate_next(
                 &mut drafter,
                 &mut verifier,
                 &prompt_ids,
                 60,
-                8,
-                16,
+                k_low,
+                k_high,
                 &[],
             );
             let gen_ms = t2.elapsed().as_secs_f64() * 1000.0;
