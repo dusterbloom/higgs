@@ -14,10 +14,12 @@ pub mod transformer;
 pub mod turboquant;
 pub mod utils;
 
+pub mod bd3lm_qwen3;
 pub mod dflash;
 pub mod dflash_cpu;
 pub mod diffusion;
 pub mod diffusion_lora;
+pub mod speculative_threaded;
 pub mod diffusion_train;
 pub mod llada_moe;
 pub mod rwkv7;
@@ -190,6 +192,8 @@ pub enum AnyModel {
     LlavaQwen2(llava_qwen2::LlavaQwen2Model),
     /// DeepSeek-V2 with Multi-head Latent Attention and sparse `MoE`.
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
+    /// BD3LM block-diffusion LM on top of Qwen3.
+    Bd3lmQwen3(bd3lm_qwen3::Bd3lmQwen3CausalLM),
 }
 
 fn checked_head_dim(hidden_size: i32, num_attention_heads: i32) -> Result<i32, Exception> {
@@ -259,6 +263,9 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
+            (Self::Bd3lmQwen3(_), AnyCache::KV(_)) => {
+                Err(Exception::custom("Bd3lmQwen3: use generate_bd3lm_inner"))
+            }
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -279,6 +286,9 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_hidden(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
+            (Self::Bd3lmQwen3(_), AnyCache::KV(_)) => {
+                Err(Exception::custom("Bd3lmQwen3: use generate_bd3lm_inner"))
+            }
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -361,7 +371,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom(
+            | Self::DeepSeekV2(_)
+            | Self::Bd3lmQwen3(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer models",
             )),
         }
@@ -370,6 +381,13 @@ impl AnyModel {
     /// Whether this model supports batched decode.
     pub const fn supports_batched_decode(&self) -> bool {
         matches!(self, Self::Transformer(_))
+    }
+
+    /// Whether this is a BD3LM block-diffusion LM (requires the dedicated
+    /// `generate_bd3lm_inner` generation loop — standard causal forward is
+    /// unsupported for this variant).
+    pub const fn is_bd3lm(&self) -> bool {
+        matches!(self, Self::Bd3lmQwen3(_))
     }
 
     /// The model's hidden dimension.
@@ -383,6 +401,7 @@ impl AnyModel {
             Self::Starcoder2(m) => m.args.hidden_size,
             Self::LlavaQwen2(m) => m.hidden_size(),
             Self::DeepSeekV2(m) => m.args.hidden_size,
+            Self::Bd3lmQwen3(m) => m.hidden_size(),
         }
     }
 
@@ -480,6 +499,14 @@ impl AnyModel {
                 }
                 Ok(make_kv_cache(m.args.num_hidden_layers))
             }
+            Self::Bd3lmQwen3(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not supported for Bd3lmQwen3 models",
+                    ));
+                }
+                Ok(make_kv_cache(m.num_hidden_layers()))
+            }
             Self::Qwen3Next(m) => {
                 if kv_cache_config.is_turboquant() {
                     Ok(AnyCache::Hybrid(m.make_cache_turbo(kv_cache_config)?))
@@ -505,7 +532,8 @@ impl AnyModel {
             | Self::Gemma2(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
-            | Self::DeepSeekV2(_) => None,
+            | Self::DeepSeekV2(_)
+            | Self::Bd3lmQwen3(_) => None,
         }
     }
 
@@ -574,6 +602,7 @@ impl AnyModel {
     pub fn num_layers(&self) -> usize {
         match self {
             Self::Qwen3Next(m) => m.num_layers(),
+            Self::Bd3lmQwen3(m) => m.num_hidden_layers() as usize,
             _ => 0,
         }
     }

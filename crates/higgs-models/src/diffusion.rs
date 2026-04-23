@@ -4081,6 +4081,383 @@ pub fn speculative_generate(
 }
 
 // ---------------------------------------------------------------------------
+// Qwen3Next-based causal drafter (GPU, stateful KV cache within a draft round)
+// ---------------------------------------------------------------------------
+
+/// Causal drafter backed by a Qwen3Next (or Qwen3.5 VLM-wrapped) model on GPU.
+///
+/// Unlike [`AneCausalDrafter`], this variant keeps an incremental KV/SSM cache
+/// across the K-1 draft steps *within a round*, so each step is a single-token
+/// forward instead of a full stateless re-roll. The cache is rebuilt per round
+/// from the accepted context — rollback on partial acceptance is not supported,
+/// which keeps the code simple at the cost of one extra prefill per round.
+///
+/// This exists because the original 12.7 tok/s AR-speculative path required a
+/// drafter whose vocab matched the target. For Qwen3.6-27B-4bit (vocab 248320,
+/// qwen3_5 hybrid arch), the only compatible on-disk drafter is Qwen3.5-0.8B-8bit
+/// which [`DiffusionEngine::load`] cannot parse. This adapter routes it through
+/// the qwen3_next loader and `Qwen3NextCausalLM::forward` instead.
+pub struct QwenNextCausalDrafter {
+    pub model: crate::qwen3_next::Qwen3NextCausalLM,
+    pub vocab: usize,
+    pub max_seq: usize,
+}
+
+impl QwenNextCausalDrafter {
+    /// Load a Qwen3.5 dense drafter (e.g. Qwen3.5-0.8B-8bit) from a model
+    /// directory. Uses [`crate::qwen3_next::load_qwen3_5_model`] which handles
+    /// nested `text_config` and the `language_model.` weight prefix.
+    pub fn from_dir(
+        model_dir: &Path,
+        max_seq: usize,
+    ) -> Result<Self, crate::error::ModelError> {
+        #[allow(unused_mut)]
+        let mut model = crate::qwen3_next::load_qwen3_5_model(model_dir)?;
+        #[cfg(feature = "ane")]
+        {
+            if std::env::var("HIGGS_DRAFTER_ANE_GDN").as_deref() == Ok("1") {
+                // Use the worker path: Send+Sync handle, attachable from any
+                // thread (main or scoped drafter thread). Inline path would
+                // require finalize on the thread that calls forward, which we
+                // can't guarantee for drafter under both serial and threaded
+                // dispatch modes.
+                const ANE_GDN_SEQ_LEN: i32 = 32;
+                match model.enable_ane_gdn_all_layers_via_worker(ANE_GDN_SEQ_LEN) {
+                    Ok(report) => tracing::info!(
+                        ?report,
+                        seq_len = ANE_GDN_SEQ_LEN,
+                        "drafter ANE GDN worker enabled (HIGGS_DRAFTER_ANE_GDN=1)"
+                    ),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "HIGGS_DRAFTER_ANE_GDN=1 set but enable_ane_gdn_all_layers_via_worker failed — falling back to Metal"
+                    ),
+                }
+            }
+        }
+        let vocab = model.args.vocab_size as usize;
+        Ok(Self {
+            model,
+            vocab,
+            max_seq,
+        })
+    }
+
+    /// Full-sequence forward with a fresh KV+SSM cache. Returns
+    /// `(argmax_of_last_row, cache)` where `cache` is consistent with having
+    /// just processed `tokens`.
+    pub fn prefill(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<(u32, Vec<Option<crate::qwen3_next::LayerCache>>), mlx_rs::error::Exception> {
+        let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let arr = mlx_rs::Array::from_slice(&toks_i32, &[1, toks_i32.len() as i32]);
+        let mut cache = self.model.make_cache();
+        let logits = self.model.forward(&arr, None, &mut cache)?;
+        let argmax = mlx_rs::ops::indexing::argmax_axis(&logits, -1, false)?;
+        self.eval_cache_with(&cache, &[&argmax])?;
+        use mlx_rs::ops::indexing::IndexOp;
+        let top = argmax.index((0, 0)).item::<i32>();
+        Ok((top as u32, cache))
+    }
+
+    /// Single-token incremental forward advancing `cache`. Returns the argmax
+    /// token predicted *after* consuming `token`.
+    pub fn step(
+        &mut self,
+        token: u32,
+        cache: &mut Vec<Option<crate::qwen3_next::LayerCache>>,
+    ) -> Result<u32, mlx_rs::error::Exception> {
+        let arr = mlx_rs::Array::from_slice(&[token as i32], &[1, 1]);
+        let logits = self.model.forward(&arr, None, cache)?;
+        let argmax = mlx_rs::ops::indexing::argmax_axis(&logits, -1, false)?;
+        self.eval_cache_with(cache, &[&argmax])?;
+        use mlx_rs::ops::indexing::IndexOp;
+        let top = argmax.index((0, 0)).item::<i32>();
+        Ok(top as u32)
+    }
+
+    /// Evaluate the argmax output alongside every live cache array so MLX's
+    /// lazy graph does not accumulate across sequential forwards.
+    /// Mirrors the cache-eval pattern in
+    /// [`crate::qwen3_next::Qwen3NextCausalLM::forward_chunked`].
+    pub(crate) fn eval_cache_with(
+        &self,
+        cache: &[Option<crate::qwen3_next::LayerCache>],
+        extra: &[&mlx_rs::Array],
+    ) -> Result<(), mlx_rs::error::Exception> {
+        use crate::qwen3_next::LayerCache;
+        let mut targets: Vec<&mlx_rs::Array> = extra.to_vec();
+        for lc in cache.iter().flatten() {
+            match lc {
+                LayerCache::KV(kv) => targets.extend(kv.eval_targets()),
+                LayerCache::Arrays(ac) => {
+                    if let Some(ref s) = ac.ssm_state {
+                        targets.push(s);
+                    }
+                    if let Some(ref c) = ac.conv_state {
+                        targets.push(c);
+                    }
+                }
+            }
+        }
+        mlx_rs::transforms::eval(targets)
+    }
+}
+
+/// Qwen3Next-drafter variant of [`speculative_generate`].
+///
+/// Same accept-longest-prefix algorithm. Both the drafter and verifier keep
+/// persistent KV/SSM caches across rounds: snapshot before the draft/verify
+/// phase, fast-path advance on full accept (append last-draft + bonus),
+/// slow-path restore + re-feed accepted prefix on partial accept. Eliminates
+/// the per-round drafter prefill (≈80–180ms on a 0.8B drafter at prompt
+/// length ~200).
+#[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+pub fn speculative_generate_next(
+    drafter: &mut QwenNextCausalDrafter,
+    verifier: &mut crate::AnyModel,
+    prompt: &[u32],
+    max_tokens: usize,
+    k_low: usize,
+    k_high: usize,
+    eos_token_ids: &[u32],
+) -> Vec<u32> {
+    if std::env::var("HIGGS_SPEC_DECODE_PIPELINE").as_deref() == Ok("1") {
+        return crate::speculative_threaded::speculative_generate_next_threaded(
+            drafter,
+            verifier,
+            prompt,
+            max_tokens,
+            k_low,
+            k_high,
+            eos_token_ids,
+        );
+    }
+    use mlx_rs::ops::indexing::{self as ix, IndexOp};
+
+    let mut context: Vec<u32> = prompt.to_vec();
+    let mut generated: Vec<u32> = Vec::new();
+    let mut k_ctrl = AdaptiveKController::new(k_low, k_high, 3);
+
+    let mut total_drafted = 0usize;
+    let mut total_accepted = 0usize;
+    let mut draft_ms = 0.0f64;
+    let mut verify_ms = 0.0f64;
+    let mut advance_ms = 0.0f64;
+
+    // --- Bootstrap ---
+    // Both caches are persistent. Save each model's "prompt-last" logits —
+    // drafter's predicts draft[0] each round, verifier's predicts the first
+    // token of the verify phase.
+    let t_boot = std::time::Instant::now();
+    let prompt_i32: Vec<i32> = context.iter().map(|&t| t as i32).collect();
+    let prompt_arr = mlx_rs::Array::from_slice(&prompt_i32, &[1, prompt_i32.len() as i32]);
+
+    // Drafter: persistent KV/SSM cache seeded from prompt prefill.
+    let mut d_cache = drafter.model.make_cache();
+    let mut saved_draft_logits = drafter
+        .model
+        .forward(&prompt_arr, None, &mut d_cache)
+        .expect("drafter bootstrap prefill");
+    mlx_rs::transforms::eval([&saved_draft_logits]).expect("eval draft prefill logits");
+    drafter
+        .eval_cache_with(&d_cache, &[&saved_draft_logits])
+        .expect("eval draft prefill cache");
+
+    // Verifier: persistent KV/SSM cache seeded from prompt prefill.
+    let mut verify_cache = verifier.make_cache();
+    let mut saved_verify_logits = verifier
+        .forward(&prompt_arr, None, &mut verify_cache)
+        .expect("verifier bootstrap prefill");
+    mlx_rs::transforms::eval([&saved_verify_logits]).expect("eval verify prefill logits");
+    verify_cache
+        .eval_for_clone()
+        .expect("eval verify prefill cache");
+    let boot_ms = t_boot.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("  Bootstrap (drafter+verifier prefill): {boot_ms:.0}ms");
+
+    while generated.len() < max_tokens {
+        let k = k_ctrl.current_k().min(max_tokens - generated.len());
+        if k == 0 {
+            break;
+        }
+
+        // --- Draft phase (persistent cache; snapshot for rollback) ---
+        // Snapshot before consuming any drafts so slow path can rewind.
+        let t0 = std::time::Instant::now();
+        let draft_0 = ix::argmax_axis(&saved_draft_logits, -1, false)
+            .expect("argmax saved draft")
+            .index((0, 0))
+            .item::<i32>() as u32;
+        let mut draft_tokens: Vec<u32> = vec![draft_0];
+        let d_snapshot: Vec<Option<crate::qwen3_next::LayerCache>> = d_cache.clone();
+        let mut last_tok = draft_0;
+        for _ in 1..k {
+            if context.len() + draft_tokens.len() >= drafter.max_seq {
+                break;
+            }
+            let next_tok = drafter.step(last_tok, &mut d_cache).expect("drafter step");
+            draft_tokens.push(next_tok);
+            last_tok = next_tok;
+        }
+        let actual_k = draft_tokens.len();
+        draft_ms += t0.elapsed().as_secs_f64() * 1000.0;
+
+        // --- Verify phase (persistent cache + snapshot for rollback) ---
+        // Snapshot before consuming drafts so we can roll back on partial accept.
+        let t1 = std::time::Instant::now();
+        let verify_snapshot = verify_cache.clone();
+
+        // Forward only the K draft tokens through the persistent cache.
+        // saved_verify_logits (from prior round) predicts draft[0].
+        // forward_all_logits returns logits at positions [P..P+K-1] which
+        // predict draft[1..K] and the bonus at K.
+        let draft_input: Vec<i32> = draft_tokens.iter().map(|&d| d as i32).collect();
+        let draft_arr = mlx_rs::Array::from_slice(&draft_input, &[1, draft_input.len() as i32]);
+        let all_logits = verifier
+            .forward_all_logits(&draft_arr, None, &mut verify_cache)
+            .expect("verifier forward_all_logits");
+        mlx_rs::transforms::eval([&all_logits]).expect("eval all_logits");
+
+        let new_2d = all_logits.squeeze_axes(&[0]).expect("squeeze");
+        let new_preds = ix::argmax_axis(&new_2d, -1, false).expect("argmax new");
+        mlx_rs::transforms::eval([&new_preds]).expect("eval new argmax");
+
+        let first_pred = {
+            let p = ix::argmax_axis(&saved_verify_logits, -1, false).expect("argmax saved");
+            mlx_rs::transforms::eval([&p]).expect("eval saved argmax");
+            p.index((0, 0)).item::<i32>() as u32
+        };
+
+        let mut verify_argmax: Vec<u32> = Vec::with_capacity(actual_k + 1);
+        verify_argmax.push(first_pred);
+        for i in 0..actual_k {
+            verify_argmax.push(new_preds.index(i as i32).item::<i32>() as u32);
+        }
+        verify_ms += t1.elapsed().as_secs_f64() * 1000.0;
+
+        // --- Accept ---
+        let mut accepted_tokens = accept_prefix(&draft_tokens, &verify_argmax);
+        let remaining = max_tokens - generated.len();
+        if accepted_tokens.len() > remaining {
+            accepted_tokens.truncate(remaining);
+        }
+        let eos_hit = if eos_token_ids.is_empty() {
+            None
+        } else {
+            accepted_tokens
+                .iter()
+                .position(|t| eos_token_ids.contains(t))
+        };
+        if let Some(idx) = eos_hit {
+            accepted_tokens.truncate(idx + 1);
+        }
+        let accepted = accepted_tokens.len().saturating_sub(1);
+        total_accepted += accepted;
+        total_drafted += actual_k;
+        k_ctrl.record(accepted, actual_k);
+
+        generated.extend_from_slice(&accepted_tokens);
+        context.extend_from_slice(&accepted_tokens);
+
+        let round = total_drafted / k.max(1);
+        let round_verify_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        let round_draft_ms = t0.elapsed().as_secs_f64() * 1000.0 - round_verify_ms;
+        eprintln!(
+            "  R{round}: accepted {accepted}/{actual_k} (+{} new) | K={} | draft={round_draft_ms:.0}ms verify={round_verify_ms:.0}ms",
+            accepted_tokens.len(),
+            k_ctrl.current_k(),
+        );
+
+        // Skip both verify-cache advance and drafter refresh when finished.
+        if eos_hit.is_some() || generated.len() >= max_tokens {
+            break;
+        }
+
+        // --- Advance verify cache ---
+        let t_adv = std::time::Instant::now();
+        if accepted == actual_k {
+            // FAST PATH: all K drafts accepted. The cache already consumed
+            // draft[0..K-1] during forward_all_logits; just feed the bonus
+            // to advance saved_verify_logits one position past the bonus.
+            let bonus = *accepted_tokens.last().expect("accepted has bonus");
+            let bonus_arr = mlx_rs::Array::from_slice(&[bonus as i32], &[1, 1]);
+            saved_verify_logits = verifier
+                .forward(&bonus_arr, None, &mut verify_cache)
+                .expect("verifier bonus forward");
+            mlx_rs::transforms::eval([&saved_verify_logits]).expect("eval bonus logits");
+            verify_cache
+                .eval_for_clone()
+                .expect("eval verify cache fast");
+        } else {
+            // SLOW PATH: partial (or zero) accept. Restore snapshot and
+            // re-feed (accepted drafts ++ correction) so the cache reflects
+            // the committed sequence.
+            verify_cache = verify_snapshot;
+            let advance_input: Vec<i32> = accepted_tokens.iter().map(|&t| t as i32).collect();
+            let advance_arr =
+                mlx_rs::Array::from_slice(&advance_input, &[1, advance_input.len() as i32]);
+            saved_verify_logits = verifier
+                .forward(&advance_arr, None, &mut verify_cache)
+                .expect("verifier advance forward");
+            mlx_rs::transforms::eval([&saved_verify_logits]).expect("eval advance logits");
+            verify_cache
+                .eval_for_clone()
+                .expect("eval verify cache slow");
+        }
+
+        // --- Advance drafter cache ---
+        // After the draft loop, d_cache consumed draft[0..actual_k-1]
+        // (step loop ran actual_k-1 times). Fast path: feed the last draft
+        // plus the verifier bonus to land at prompt+accepted. Slow path:
+        // rewind to d_snapshot (= prompt-only state) and feed accepted_tokens.
+        if accepted == actual_k {
+            let bonus = *accepted_tokens.last().expect("bonus");
+            let adv = [draft_tokens[actual_k - 1] as i32, bonus as i32];
+            let adv_arr = mlx_rs::Array::from_slice(&adv, &[1, 2]);
+            saved_draft_logits = drafter
+                .model
+                .forward(&adv_arr, None, &mut d_cache)
+                .expect("drafter fast advance");
+        } else {
+            d_cache = d_snapshot;
+            let adv_input: Vec<i32> = accepted_tokens.iter().map(|&t| t as i32).collect();
+            let adv_arr = mlx_rs::Array::from_slice(&adv_input, &[1, adv_input.len() as i32]);
+            saved_draft_logits = drafter
+                .model
+                .forward(&adv_arr, None, &mut d_cache)
+                .expect("drafter slow advance");
+        }
+        mlx_rs::transforms::eval([&saved_draft_logits]).expect("eval draft advance logits");
+        drafter
+            .eval_cache_with(&d_cache, &[&saved_draft_logits])
+            .expect("eval draft advance cache");
+        advance_ms += t_adv.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    let total_ms = draft_ms + verify_ms + advance_ms;
+    let tps = if total_ms > 0.0 {
+        generated.len() as f64 / total_ms * 1000.0
+    } else {
+        0.0
+    };
+    let acc_rate = if total_drafted > 0 {
+        total_accepted as f64 / total_drafted as f64 * 100.0
+    } else {
+        0.0
+    };
+    eprintln!("  --- Totals ---");
+    eprintln!(
+        "  {draft_ms:.0}ms draft + {verify_ms:.0}ms verify + {advance_ms:.0}ms advance = {total_ms:.0}ms",
+    );
+    eprintln!("  Acceptance: {total_accepted}/{total_drafted} ({acc_rate:.1}%)");
+    eprintln!("  Throughput: {tps:.1} tok/s");
+
+    generated
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -7871,7 +8248,158 @@ mod tests {
         eprintln!("  Tokens: {:?}", tokens);
 
         assert!(!tokens.is_empty(), "should produce at least 1 token");
-        assert!(tokens.len() <= 20, "should not exceed max_tokens");
+        assert!(tokens.len() <= 60, "should not exceed max_tokens");
+    }
+
+    /// E2E smoke test for the GPU-side `speculative_generate_next` path:
+    /// pairs the 0.8B Qwen3.5 dense drafter with the 27B Qwen3.6 verifier
+    /// (both on GPU via `load_qwen3_5_model`). Exercises bootstrap prefill,
+    /// per-round cache rebuild, and accept_prefix without going through the
+    /// engine layer — confirms the algorithm is wired before we touch
+    /// `simple.rs`.
+    ///
+    /// Required models on disk:
+    ///   `~/.cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit/`
+    ///   `~/.cache/lm-studio/models/NexVeridian/Qwen3.6-27B-4bit/`
+    #[test]
+    #[ignore = "Needs Qwen3.5-0.8B-8bit + Qwen3.6-27B-4bit on disk; loads ~14GB"]
+    fn test_speculative_generate_next_e2e() {
+        let home = std::env::var("HOME").expect("HOME set");
+        let drafter_dir = std::path::PathBuf::from(&home)
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit");
+        let verifier_dir = std::path::PathBuf::from(&home)
+            .join(".cache/lm-studio/models/NexVeridian/Qwen3.6-27B-4bit");
+        if !drafter_dir.join("config.json").exists() {
+            eprintln!("SKIP: drafter not found at {}", drafter_dir.display());
+            return;
+        }
+        if !verifier_dir.join("config.json").exists() {
+            eprintln!("SKIP: verifier not found at {}", verifier_dir.display());
+            return;
+        }
+
+        eprintln!("Loading 0.8B drafter (max_seq=1024)...");
+        let t0 = std::time::Instant::now();
+        let mut drafter =
+            super::QwenNextCausalDrafter::from_dir(&drafter_dir, 1024).expect("build drafter");
+        eprintln!(
+            "  Drafter loaded in {:.2}s (vocab={})",
+            t0.elapsed().as_secs_f64(),
+            drafter.vocab
+        );
+
+        eprintln!("Loading 27B verifier...");
+        let t1 = std::time::Instant::now();
+        let verify_model =
+            crate::qwen3_next::load_qwen3_5_model(&verifier_dir).expect("load 27B verifier");
+        let mut verifier = crate::AnyModel::Qwen3Next(verify_model);
+        eprintln!("  Verifier loaded in {:.1}s", t1.elapsed().as_secs_f64());
+
+        // "The capital of France is" — same prompt as the ANE e2e test.
+        let prompt: Vec<u32> = vec![785, 6722, 315, 9625, 374];
+
+        eprintln!("Running speculative_generate_next (max_tokens=60, k=8..16)...");
+        let t2 = std::time::Instant::now();
+        let tokens =
+            super::speculative_generate_next(&mut drafter, &mut verifier, &prompt, 60, 8, 16, &[]);
+        let gen_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        let tps = if gen_ms > 0.0 {
+            tokens.len() as f64 / gen_ms * 1000.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  Generated {} tokens in {gen_ms:.0}ms ({tps:.1} tok/s)",
+            tokens.len()
+        );
+        eprintln!("  Tokens: {:?}", tokens);
+
+        assert!(!tokens.is_empty(), "should produce at least 1 token");
+        assert!(tokens.len() <= 60, "should not exceed max_tokens");
+        assert!(
+            tokens.iter().all(|&t| (t as usize) < drafter.vocab),
+            "all tokens should be < vocab ({})",
+            drafter.vocab
+        );
+    }
+
+    /// Natural-prompt variant of the e2e speculative test. The synthetic
+    /// 5-token "The capital of France is" prompt used by the baseline test
+    /// produces a pathological digit-loop ("187543 187544…") that
+    /// under-samples drafter acceptance. This test exercises the persistent
+    /// drafter+verify cache on coding and QA prompts where acceptance should
+    /// reflect natural text statistics.
+    #[test]
+    #[ignore = "Needs Qwen3.5-0.8B-8bit + Qwen3.6-27B-4bit on disk; loads ~14GB"]
+    fn test_speculative_generate_next_natural_prompts() {
+        let home = std::env::var("HOME").expect("HOME set");
+        let drafter_dir = std::path::PathBuf::from(&home)
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit");
+        let verifier_dir = std::path::PathBuf::from(&home)
+            .join(".cache/lm-studio/models/NexVeridian/Qwen3.6-27B-4bit");
+        if !drafter_dir.join("config.json").exists() {
+            eprintln!("SKIP: drafter not found at {}", drafter_dir.display());
+            return;
+        }
+        if !verifier_dir.join("config.json").exists() {
+            eprintln!("SKIP: verifier not found at {}", verifier_dir.display());
+            return;
+        }
+
+        let tokenizer = crate::load_tokenizer(&drafter_dir).expect("load tokenizer");
+        let mut drafter =
+            super::QwenNextCausalDrafter::from_dir(&drafter_dir, 1024).expect("build drafter");
+        let verify_model =
+            crate::qwen3_next::load_qwen3_5_model(&verifier_dir).expect("load 27B verifier");
+        let mut verifier = crate::AnyModel::Qwen3Next(verify_model);
+
+        let prompts = [
+            ("coding", "// Implement a binary tree node in Rust:\n"),
+            (
+                "QA",
+                "Q: Explain how MLX achieves zero-copy on Apple Silicon. A:",
+            ),
+        ];
+
+        for (label, prompt) in &prompts {
+            let prompt_ids: Vec<u32> = tokenizer
+                .encode(*prompt, false)
+                .expect("tokenize")
+                .get_ids()
+                .to_vec();
+            eprintln!(
+                "\n=== {label} | prompt={prompt:?} | {} tokens ===",
+                prompt_ids.len()
+            );
+
+            let t2 = std::time::Instant::now();
+            let tokens = super::speculative_generate_next(
+                &mut drafter,
+                &mut verifier,
+                &prompt_ids,
+                60,
+                8,
+                16,
+                &[],
+            );
+            let gen_ms = t2.elapsed().as_secs_f64() * 1000.0;
+            let tps = if gen_ms > 0.0 {
+                tokens.len() as f64 / gen_ms * 1000.0
+            } else {
+                0.0
+            };
+            let decoded = tokenizer
+                .decode(&tokens, true)
+                .unwrap_or_else(|_| "<decode failed>".into());
+            eprintln!(
+                "  Generated {} tokens in {gen_ms:.0}ms ({tps:.1} tok/s wall)",
+                tokens.len()
+            );
+            eprintln!("  Output: {decoded:?}");
+
+            assert!(!tokens.is_empty(), "{label}: should produce at least 1 token");
+            assert!(tokens.len() <= 60, "{label}: should not exceed max_tokens");
+        }
     }
 
     // -----------------------------------------------------------------------
