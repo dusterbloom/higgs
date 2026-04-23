@@ -1,0 +1,1 @@
+{"id":"chatcmpl-45e12189-c697-4d84-a53a-f48867142c04","object":"chat.completion","created":1776939153,"model":"Qwen3.6-27B-4bit","choices":[{"index":0,"message":{"role":"assistant","content":"Hello! How can I help you today?\n"},"finish_reason":"stop"}],"usage":{"prompt_tokens":13,"completion_tokens":11,"total_tokens":24}}

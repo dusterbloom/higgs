@@ -1,0 +1,37 @@
+[2m2026-04-23T10:11:30.870773Z[0m [32m INFO[0m [2mhiggs[0m[2m:[0m Resolving model path [3mmodel[0m[2m=[0m/Users/peppi/.cache/lm-studio/models/NexVeridian/Qwen3.6-27B-4bit
+[2m2026-04-23T10:11:30.870827Z[0m [32m INFO[0m [2mhiggs[0m[2m:[0m Loading model [3mmodel[0m[2m=[0m/Users/peppi/.cache/lm-studio/models/NexVeridian/Qwen3.6-27B-4bit [3mresolved[0m[2m=[0m/Users/peppi/.cache/lm-studio/models/NexVeridian/Qwen3.6-27B-4bit
+[2m2026-04-23T10:11:30.870837Z[0m [32m INFO[0m [2mhiggs_engine::simple[0m[2m:[0m Loading model [3mmodel_dir[0m[2m=[0m/Users/peppi/.cache/lm-studio/models/NexVeridian/Qwen3.6-27B-4bit
+[2m2026-04-23T10:11:30.873767Z[0m [32m INFO[0m [2mhiggs_models::qwen3_next[0m[2m:[0m Loading qwen3_5 dense model (VLM text backbone via qwen3_next) [3mhidden_size[0m[2m=[0m5120 [3mnum_layers[0m[2m=[0m64 [3mnum_heads[0m[2m=[0m24 [3mnum_kv_heads[0m[2m=[0m4 [3mvocab_size[0m[2m=[0m248320 [3mfull_attention_interval[0m[2m=[0m4
+[2m2026-04-23T10:11:30.927282Z[0m [32m INFO[0m [2mhiggs_models::qwen3_next[0m[2m:[0m Fused GDN projections (4→2 dispatches per layer) [3mfused_count[0m[2m=[0m288 [3mtotal_pairs[0m[2m=[0m288
+[2m2026-04-23T10:11:38.089065Z[0m [32m INFO[0m [2mhiggs_models::qwen3_next[0m[2m:[0m Qwen3.5 dense model loaded successfully
+[2m2026-04-23T10:11:38.320071Z[0m [32m INFO[0m [2mhiggs_engine::simple[0m[2m:[0m MLX memory: letting framework manage limits (GPU max 25559MB) [3mmax_recommended_mb[0m[2m=[0m25559
+[2m2026-04-23T10:11:38.320098Z[0m [32m INFO[0m [2mhiggs_engine::simple[0m[2m:[0m Engine ready [3mmodel_name[0m[2m=[0mQwen3.6-27B-4bit [3meos_tokens[0m[2m=[0m[248046, 248044]
+[2m2026-04-23T10:11:38.320104Z[0m [32m INFO[0m [2mhiggs_engine::simple[0m[2m:[0m Loading DFlash drafter (GPU) [3mdrafter[0m[2m=[0m/Users/peppi/AI-Models/shared/huggingface/hub/models--z-lab--Qwen3.5-27B-DFlash/snapshots/b0400439c04be32c24e04d9dce3821b582c1a68a
+[2m2026-04-23T10:11:40.058110Z[0m [32m INFO[0m [2mhiggs_engine::simple[0m[2m:[0m DFlash decode block_size differs from drafter's trained value (override HIGGS_DFLASH_BLOCK_SIZE to tune) [3mtrained[0m[2m=[0m16 [3mruntime[0m[2m=[0m12
+[2m2026-04-23T10:11:40.058151Z[0m [32m INFO[0m [2mhiggs_engine::simple[0m[2m:[0m DFlash GPU drafter loaded from safetensors [3melapsed_ms[0m[2m=[0m1738
+[2m2026-04-23T10:11:40.058157Z[0m [32m INFO[0m [2mhiggs_engine::simple[0m[2m:[0m Skipping DFlash CPU engine load (ANE disabled + HIGGS_DFLASH_PIPELINE!=1) — saves ~3 GB heap
+[2m2026-04-23T10:11:40.058161Z[0m [33m WARN[0m [2mhiggs_engine::simple[0m[2m:[0m HIGGS_DFLASH_DISABLE_ANE set — forcing CPU BLAS fallback
+[2m2026-04-23T10:11:40.058164Z[0m [32m INFO[0m [2mhiggs_engine::simple[0m[2m:[0m DFlash drafter loaded — speculative decoding enabled [3mtap_layers[0m[2m=[0m[1, 16, 31, 46, 61] [3mblock_size[0m[2m=[0m12 [3mmask_token_id[0m[2m=[0m248070 [3mbackend[0m[2m=[0m"CPU BLAS"
+[2m2026-04-23T10:11:40.058209Z[0m [32m INFO[0m [2mhiggs_engine::simple[0m[2m:[0m MLX memory: cap enabled for DFlash large-dense stability [3mcap_mb[0m[2m=[0m22491 [3mmax_recommended_mb[0m[2m=[0m25559 [3mcap_fraction[0m[2m=[0m0.88
+[2m2026-04-23T10:11:40.058227Z[0m [32m INFO[0m [2mhiggs[0m[2m:[0m Model loaded [3mmodel_name[0m[2m=[0mQwen3.6-27B-4bit
+[2m2026-04-23T10:11:40.060285Z[0m [32m INFO[0m [2mhiggs[0m[2m:[0m Starting server [3maddr[0m[2m=[0m0.0.0.0:8911
+time: command terminated abnormally
+       37.71 real         8.30 user         8.64 sys
+          5624528896  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1166099  page reclaims
+                 158  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   2  messages received
+                   0  signals received
+              103305  voluntary context switches
+              492119  involuntary context switches
+        268247145347  instructions retired
+         63847288528  cycles elapsed
+         25266927200  peak memory footprint
+time: signal: Invalid argument
