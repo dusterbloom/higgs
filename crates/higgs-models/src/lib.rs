@@ -620,8 +620,10 @@ impl AnyModel {
         match (self, cache) {
             (Self::Transformer(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_all_logits(inputs, mask, c),
+            // BonsaiQ1 builds its causal mask internally; external mask ignored.
+            (Self::BonsaiQ1(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, c),
             _ => Err(Exception::custom(
-                "forward_all_logits: only Transformer and Qwen3Next are supported",
+                "forward_all_logits: only Transformer, Qwen3Next, and BonsaiQ1 are supported",
             )),
         }
     }

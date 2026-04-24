@@ -524,10 +524,11 @@ impl BonsaiQ1Gpu {
         )
     }
 
-    /// Causal forward. `inputs` is `[B, L]` int32 token IDs. Returns logits
-    /// `[B, 1, vocab]` for the last position (mlx_lm convention).
+    /// Run the decoder trunk and return final-normed hidden `[B, T, hidden]`.
+    /// Shared body for `forward` (last-position logits) and
+    /// `forward_all_logits` (all-position logits, used by spec-decode verify).
     #[allow(non_snake_case)]
-    pub fn forward(
+    fn forward_trunk(
         &self,
         inputs: &Array,
         cache: &mut Vec<Option<SteppingKeyValueCache>>,
@@ -629,14 +630,43 @@ impl BonsaiQ1Gpu {
             h = h_post_attn.add(&mlp_out)?;
         }
 
-        let h = fast::rms_norm(&h, &self.final_norm, rms_eps)?;
+        fast::rms_norm(&h, &self.final_norm, rms_eps)
+    }
 
-        // Last-position slice + LM head.
-        let last = if T > 1 { h.index((.., -1.., ..)) } else { h };
+    /// Apply LM head (or tied embed) to `[B, T, hidden]` → `[B, T, vocab]`.
+    fn project_logits(&self, h: &Array) -> Result<Array, Exception> {
         match &self.lm_head {
-            Some(head) => head.forward(&last),
-            None => self.embed.forward(&last),
+            Some(head) => head.forward(h),
+            None => self.embed.forward(h),
         }
+    }
+
+    /// Causal forward. Returns logits `[B, 1, vocab]` for the last position
+    /// (mlx_lm convention).
+    pub fn forward(
+        &self,
+        inputs: &Array,
+        cache: &mut Vec<Option<SteppingKeyValueCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_trunk(inputs, cache)?;
+        let t = *h
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("trunk hidden missing T dim"))?;
+        let last = if t > 1 { h.index((.., -1.., ..)) } else { h };
+        self.project_logits(&last)
+    }
+
+    /// Causal forward returning logits at **every** position `[B, T, vocab]`.
+    /// Used by speculative-decode target verify: given the draft prefix,
+    /// obtain one logits row per proposed token in a single forward pass.
+    pub fn forward_all_logits(
+        &self,
+        inputs: &Array,
+        cache: &mut Vec<Option<SteppingKeyValueCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_trunk(inputs, cache)?;
+        self.project_logits(&h)
     }
 }
 
@@ -1041,5 +1071,57 @@ mod tests {
             "AnyModel BonsaiQ1 logits contain NaN/Inf"
         );
         eprintln!("P5 AnyModel::BonsaiQ1 forward OK: shape=[1,1,{vocab}]");
+    }
+
+    /// Path-A blocker removal: verify `AnyModel::forward_all_logits` returns
+    /// `[B, T, vocab]` on BonsaiQ1 so the spec-decode target verify path
+    /// (`simple.rs::speculative_generate` L2721) can use Bonsai-8B as target.
+    /// Also asserts the last-position row matches `forward`'s logits (shared
+    /// trunk correctness).
+    #[test]
+    fn test_bonsai_q1_forward_all_logits() {
+        use crate::AnyModel;
+
+        let Some(dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+        let gpu = load_bonsai_q1(&dir).expect("load");
+        let vocab = gpu.config.vocab as i32;
+        let mut model = AnyModel::BonsaiQ1(gpu);
+
+        let ids: Vec<i32> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let x = mlx_rs::Array::from_slice(&ids, &[1, 8]);
+
+        // All-logits path (spec-decode verify uses this).
+        let mut c = model.make_cache();
+        let all = model
+            .forward_all_logits(&x, None, &mut c)
+            .expect("forward_all_logits");
+        all.eval().unwrap();
+        assert_eq!(
+            all.shape().to_vec(),
+            &[1, 8, vocab],
+            "all-logits shape mismatch"
+        );
+        let all_flat: &[f32] = all.as_slice::<f32>();
+        let last_row = &all_flat[7 * vocab as usize..8 * vocab as usize];
+
+        // Last-position path (must match all-logits row 7).
+        let mut c2 = model.make_cache();
+        let last = model.forward(&x, None, &mut c2).expect("forward");
+        last.eval().unwrap();
+        assert_eq!(last.shape().to_vec(), &[1, 1, vocab]);
+        let last_slice: &[f32] = last.as_slice::<f32>();
+        assert_eq!(last_slice.len(), vocab as usize);
+
+        // Shared-trunk check: last-position logits must be bitwise-identical.
+        assert_eq!(
+            last_slice, last_row,
+            "forward vs forward_all_logits[-1] diverge"
+        );
+        eprintln!(
+            "forward_all_logits OK: shape=[1,8,{vocab}], row[-1] matches forward()"
+        );
     }
 }
