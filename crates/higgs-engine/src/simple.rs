@@ -545,6 +545,8 @@ impl SimpleEngine {
             "Loading draft model for speculative decoding"
         );
 
+        Self::check_tokenizer_compat(dir.as_ref(), dp)?;
+
         let draft = Self::build_bonsai_draft(dp)?;
         engine.draft = Some(Mutex::new(draft));
         engine.num_draft = num_draft;
@@ -582,6 +584,34 @@ impl SimpleEngine {
             "draft_model requires the `ane` feature (Bonsai drafter runs on Apple Neural Engine)"
                 .into(),
         ))
+    }
+
+    /// Verify target and draft tokenizers match by hashing their vocab+merges.
+    /// Speculative decode is unsound if the two models don't share vocabulary
+    /// (a draft token ID means different text to the target). Set
+    /// HIGGS_SPEC_ALLOW_TOKENIZER_MISMATCH=1 to override at own risk.
+    fn check_tokenizer_compat(target_dir: &Path, draft_dir: &Path) -> Result<(), EngineError> {
+        let target_hash = tokenizer_hash(target_dir)?;
+        let draft_hash = tokenizer_hash(draft_dir)?;
+        if target_hash == draft_hash {
+            tracing::info!(hash = %target_hash, "tokenizers match");
+            return Ok(());
+        }
+        if std::env::var("HIGGS_SPEC_ALLOW_TOKENIZER_MISMATCH").ok().as_deref()
+            == Some("1")
+        {
+            tracing::warn!(
+                target = %target_hash,
+                draft = %draft_hash,
+                "tokenizer mismatch, but HIGGS_SPEC_ALLOW_TOKENIZER_MISMATCH=1; proceeding \
+                 (speculative decode correctness not guaranteed)"
+            );
+            return Ok(());
+        }
+        Err(EngineError::Generation(format!(
+            "tokenizer mismatch between target ({target_hash}) and draft ({draft_hash}); \
+             set HIGGS_SPEC_ALLOW_TOKENIZER_MISMATCH=1 to override"
+        )))
     }
 
     /// Get the model name.
@@ -2898,6 +2928,19 @@ impl SimpleEngine {
 
         Ok(())
     }
+}
+
+/// Hash a tokenizer's vocab file bytes. Used to verify speculative-decode
+/// drafter/target tokenizer compatibility.
+fn tokenizer_hash(model_dir: &Path) -> Result<String, EngineError> {
+    use std::hash::{Hash, Hasher};
+    let path = model_dir.join("tokenizer.json");
+    let bytes = std::fs::read(&path).map_err(|e| {
+        EngineError::Generation(format!("read {}: {e}", path.display()))
+    })?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Ok(format!("{:016x}", h.finish()))
 }
 
 /// Stochastic draft sampling for DFlash speculative decoding.
