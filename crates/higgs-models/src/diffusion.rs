@@ -2667,6 +2667,33 @@ impl AneBonsaiEngine {
         Self::new_inner(engine, seq_len, eps, false)
     }
 
+    /// Free the fp32 FFN weights (gate/up/down) in every layer of
+    /// `blas_engine`. These are baked into the compiled ANE FFN tile
+    /// kernels and never read again from the BLAS side — `forward_last`
+    /// (causal path) only reads `o_proj`, `post_attn_norm`, and for the
+    /// CPU-attention layers `q_proj`/`k_proj`/`v_proj`/`q_norm`/`k_norm`/
+    /// `input_norm` via `diffusion_attention_context_cpu`. FFN alone is
+    /// ~150 MB × `num_layers` for a 1.7B drafter (≈4.2 GB total), which
+    /// is enough to stop jetsam from killing the host when combined with
+    /// a 27B-4bit target on 32 GB machines.
+    pub fn drop_blas_layers(&mut self) {
+        let mut freed_bytes: usize = 0;
+        for layer in self.blas_engine.layers.iter_mut() {
+            freed_bytes += (layer.gate_proj.len()
+                + layer.up_proj.len()
+                + layer.down_proj.len())
+                * std::mem::size_of::<f32>();
+            layer.gate_proj = Vec::new();
+            layer.up_proj = Vec::new();
+            layer.down_proj = Vec::new();
+        }
+        eprintln!(
+            "AneBonsaiEngine: dropped FFN fp32 weights from {} layers ({:.1} MB freed; ANE FFN kernels retain them)",
+            self.blas_engine.layers.len(),
+            freed_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
+
     /// Build 28 attention-only ANE kernels with causal masking.
     pub fn new_causal(engine: DiffusionEngine, seq_len: usize, eps: f32) -> Result<Self, String> {
         Self::new_inner(engine, seq_len, eps, true)
@@ -3171,8 +3198,13 @@ impl AneBonsaiEngine {
         let verbose_trace = std::env::var_os("HIGGS_BONSAI_ANE_TRACE").is_some();
 
         let mut hidden = vec![0.0f32; seq * h];
+        let vocab = self.blas_engine.embed.len() / h;
         for (i, &tid) in token_ids.iter().enumerate() {
-            let off = tid as usize * h;
+            // Tokenizer-mismatch guard: target-vocab ids may exceed drafter
+            // vocab. Clamp rather than panic; correctness under mismatch is
+            // already not guaranteed.
+            let tid_c = (tid as usize).min(vocab - 1);
+            let off = tid_c * h;
             hidden[i * h..(i + 1) * h].copy_from_slice(&self.blas_engine.embed[off..off + h]);
         }
 

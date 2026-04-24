@@ -572,9 +572,13 @@ impl SimpleEngine {
             .unwrap_or(1e-6);
         let diffusion = higgs_models::diffusion::DiffusionEngine::load_q1(draft_dir)
             .map_err(|e| EngineError::Generation(format!("load Bonsai drafter: {e}")))?;
-        let ane_engine =
+        let mut ane_engine =
             higgs_models::diffusion::AneBonsaiEngine::new_causal(diffusion, seq_len, eps)
                 .map_err(|e| EngineError::Generation(format!("build AneBonsaiEngine: {e}")))?;
+        // Free the fp32 per-layer weights now that ANE kernels own them.
+        // Without this, a 1.7B-q1 drafter pins ~6.5 GB of redundant fp32,
+        // which jetsam-kills the host when combined with a 27B target.
+        ane_engine.drop_blas_layers();
         Ok(Box::new(AneBonsaiDraftModel::new(ane_engine)))
     }
 
@@ -2714,7 +2718,7 @@ impl SimpleEngine {
                         .map_err(|_| EngineError::Generation("verify batch overflow".into()))?;
                     let input = Array::from_slice(batch, &[1, batch_len]);
                     let logits = model
-                        .forward(&input, None, cache)
+                        .forward_all_logits(&input, None, cache)
                         .map_err(EngineError::Mlx)?;
                     eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
 
@@ -2852,7 +2856,7 @@ impl SimpleEngine {
                         .map_err(|_| EngineError::Generation("verify batch overflow".into()))?;
                     let input = Array::from_slice(batch, &[1, batch_len]);
                     let logits = model
-                        .forward(&input, None, cache)
+                        .forward_all_logits(&input, None, cache)
                         .map_err(EngineError::Mlx)?;
                     eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
 
