@@ -2703,10 +2703,13 @@ impl SimpleEngine {
                 break;
             }
 
+            let cycle_start = Instant::now();
+            let mut verify_ms: f64 = 0.0;
             let mut actual_k = 0usize;
             let accepted =
                 speculative::speculative_step(draft, current, k, |batch: &[u32]| {
                     actual_k = batch.len() - 1;
+                    let verify_start = Instant::now();
                     let batch_len = i32::try_from(batch.len())
                         .map_err(|_| EngineError::Generation("verify batch overflow".into()))?;
                     let input = Array::from_slice(batch, &[1, batch_len]);
@@ -2724,8 +2727,19 @@ impl SimpleEngine {
                         eval(std::slice::from_ref(&token)).map_err(EngineError::Mlx)?;
                         ids.push(token.item());
                     }
+                    verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
                     Ok(ids)
                 })?;
+            let total_ms = cycle_start.elapsed().as_secs_f64() * 1000.0;
+            let draft_ms = (total_ms - verify_ms).max(0.0);
+            tracing::info!(
+                target: "spec_decode",
+                k = actual_k,
+                accepted = accepted.len(),
+                draft_ms = draft_ms,
+                verify_ms = verify_ms,
+                "cycle"
+            );
 
             let trim = (actual_k + 1) - accepted.len();
             if trim > 0 {
@@ -2827,10 +2841,13 @@ impl SimpleEngine {
                 break;
             }
 
+            let cycle_start = Instant::now();
+            let mut verify_ms: f64 = 0.0;
             let mut actual_k = 0usize;
             let accepted =
                 speculative::speculative_step(draft, current, k, |batch: &[u32]| {
                     actual_k = batch.len() - 1;
+                    let verify_start = Instant::now();
                     let batch_len = i32::try_from(batch.len())
                         .map_err(|_| EngineError::Generation("verify batch overflow".into()))?;
                     let input = Array::from_slice(batch, &[1, batch_len]);
@@ -2848,8 +2865,19 @@ impl SimpleEngine {
                         eval(std::slice::from_ref(&token)).map_err(EngineError::Mlx)?;
                         ids.push(token.item());
                     }
+                    verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
                     Ok(ids)
                 })?;
+            let total_ms = cycle_start.elapsed().as_secs_f64() * 1000.0;
+            let draft_ms = (total_ms - verify_ms).max(0.0);
+            tracing::info!(
+                target: "spec_decode",
+                k = actual_k,
+                accepted = accepted.len(),
+                draft_ms = draft_ms,
+                verify_ms = verify_ms,
+                "cycle"
+            );
 
             let trim = (actual_k + 1) - accepted.len();
             if trim > 0 {
