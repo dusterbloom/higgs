@@ -527,118 +527,28 @@ impl BonsaiQ1Gpu {
     /// Run the decoder trunk and return final-normed hidden `[B, T, hidden]`.
     /// Shared body for `forward` (last-position logits) and
     /// `forward_all_logits` (all-position logits, used by spec-decode verify).
-    #[allow(non_snake_case)]
+    ///
+    /// Body lives in [`forward_trunk_free`] so `compile_with_state` can wrap
+    /// it via a free-fn pointer (the `Copy + 'static` closure constraint
+    /// forbids capturing `&self`).
     fn forward_trunk(
         &self,
         inputs: &Array,
         cache: &mut Vec<Option<SteppingKeyValueCache>>,
     ) -> Result<Array, Exception> {
-        let shape = inputs.shape();
-        let B = *shape
-            .first()
-            .ok_or_else(|| Exception::custom("inputs must have >= 2 dims"))?;
-        let T = *shape
-            .get(1)
-            .ok_or_else(|| Exception::custom("inputs must have >= 2 dims"))?;
-
-        if cache.is_empty() {
-            *cache = (0..self.layers.len())
-                .map(|_| Some(SteppingKeyValueCache::new()))
-                .collect();
-        } else if cache.len() != self.layers.len() {
-            return Err(Exception::custom(format!(
-                "cache len {} != num_layers {}",
-                cache.len(),
-                self.layers.len()
-            )));
-        }
-
-        let mut h = self.embed_rows(inputs)?; // [B, L, hidden]
-
-        let mask = create_attention_mask(&h, cache, None)?;
-
-        let heads = i32::try_from(self.config.heads)
-            .map_err(|_| Exception::custom("heads overflows i32"))?;
-        let kv_heads = i32::try_from(self.config.kv_heads)
-            .map_err(|_| Exception::custom("kv_heads overflows i32"))?;
-        let rms_eps = self.config.rms_norm_eps;
-
-        for (layer, layer_cache) in self.layers.iter().zip(cache.iter_mut()) {
-            let normed = fast::rms_norm(&h, &layer.input_norm, rms_eps)?;
-
-            // q/k/v projections
-            let q = layer.q_proj.forward(&normed)?;
-            let k = layer.k_proj.forward(&normed)?;
-            let v = layer.v_proj.forward(&normed)?;
-
-            // Reshape to [B, L, n_heads, head_dim] then transpose to [B, n_heads, L, head_dim].
-            let q = q
-                .reshape(&[B, T, heads, -1])?
-                .transpose_axes(&[0, 2, 1, 3])?;
-            let k = k
-                .reshape(&[B, T, kv_heads, -1])?
-                .transpose_axes(&[0, 2, 1, 3])?;
-            let v = v
-                .reshape(&[B, T, kv_heads, -1])?
-                .transpose_axes(&[0, 2, 1, 3])?;
-
-            // QK-norm along last axis (per head_dim), then RoPE.
-            let q = fast::rms_norm(&q, &layer.q_norm, rms_eps)?;
-            let k = fast::rms_norm(&k, &layer.k_norm, rms_eps)?;
-
-            let offset = layer_cache.as_ref().map_or(0, KeyValueCache::offset);
-            let q = self.apply_rope(&q, offset)?;
-            let k = self.apply_rope(&k, offset)?;
-
-            let mask_arr = match &mask {
-                Some(crate::utils::AttentionMask::Array(a)) => Some(a),
-                _ => None,
-            };
-            let mask_arr_opt: Option<&Array> = mask_arr;
-
-            let attn_out = match layer_cache.as_mut() {
-                Some(c) => cached_scaled_dot_product_attention(
-                    q,
-                    c,
-                    k,
-                    v,
-                    self.attention_scale,
-                    mask_arr_opt,
-                )?,
-                None => fast::scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    self.attention_scale,
-                    mask_arr_opt.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
-                    None::<&Array>,
-                )?,
-            };
-
-            let attn_out = attn_out
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[B, T, -1])?;
-            let attn_out = layer.o_proj.forward(&attn_out)?;
-            let h_post_attn = h.add(&attn_out)?;
-
-            let normed_post = fast::rms_norm(&h_post_attn, &layer.post_attn_norm, rms_eps)?;
-            let gate = layer.gate_proj.forward(&normed_post)?;
-            let up = layer.up_proj.forward(&normed_post)?;
-            let mlp_hidden = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
-            let mlp_out = layer.down_proj.forward(&mlp_hidden)?;
-
-            h = h_post_attn.add(&mlp_out)?;
-        }
-
-        fast::rms_norm(&h, &self.final_norm, rms_eps)
+        forward_trunk_free(self, cache, inputs)
     }
 
     /// Apply LM head (or tied embed) to `[B, T, hidden]` → `[B, T, vocab]`.
     fn project_logits(&self, h: &Array) -> Result<Array, Exception> {
-        match &self.lm_head {
-            Some(head) => head.forward(h),
-            None => self.embed.forward(h),
-        }
+        let logits = match &self.lm_head {
+            Some(head) => head.forward(h)?,
+            None => self.embed.forward(h)?,
+        };
+        // Logits are returned as f32 by API contract (callers do as_slice::<f32>
+        // for argmax / softmax). The trunk now stays in fp16 throughout (after
+        // the apply_yarn_rope dtype fix), so we cast here at the boundary.
+        logits.as_dtype(Dtype::Float32)
     }
 
     /// Causal forward. Returns logits `[B, 1, vocab]` for the last position
@@ -862,6 +772,288 @@ impl BonsaiQ1Gpu {
         times.add("final_norm", t0.elapsed().as_nanos());
         Ok(out)
     }
+}
+
+/// Free-function body of the decoder trunk.
+///
+/// Lives at module scope (not as a method) so a **function pointer** to
+/// [`decode_step_free`] satisfies `compile_with_state`'s
+/// `F: Copy + 'static` bound — a closure capturing `&self` would not.
+/// All `self.xxx` access is replaced with `gpu.xxx`; `embed_rows`,
+/// `apply_rope`, and `project_logits` are called as methods on `gpu`
+/// (they are already `&self`-only, so no further plumbing is needed).
+#[allow(non_snake_case)]
+pub fn forward_trunk_free(
+    gpu: &BonsaiQ1Gpu,
+    cache: &mut Vec<Option<SteppingKeyValueCache>>,
+    inputs: &Array,
+) -> Result<Array, Exception> {
+    let shape = inputs.shape();
+    let B = *shape
+        .first()
+        .ok_or_else(|| Exception::custom("inputs must have >= 2 dims"))?;
+    let T = *shape
+        .get(1)
+        .ok_or_else(|| Exception::custom("inputs must have >= 2 dims"))?;
+
+    if cache.is_empty() {
+        *cache = (0..gpu.layers.len())
+            .map(|_| Some(SteppingKeyValueCache::new()))
+            .collect();
+    } else if cache.len() != gpu.layers.len() {
+        return Err(Exception::custom(format!(
+            "cache len {} != num_layers {}",
+            cache.len(),
+            gpu.layers.len()
+        )));
+    }
+
+    let mut h = gpu.embed_rows(inputs)?; // [B, L, hidden]
+
+    let mask = create_attention_mask(&h, cache, None)?;
+
+    let heads =
+        i32::try_from(gpu.config.heads).map_err(|_| Exception::custom("heads overflows i32"))?;
+    let kv_heads = i32::try_from(gpu.config.kv_heads)
+        .map_err(|_| Exception::custom("kv_heads overflows i32"))?;
+    let rms_eps = gpu.config.rms_norm_eps;
+
+    for (layer, layer_cache) in gpu.layers.iter().zip(cache.iter_mut()) {
+        let normed = fast::rms_norm(&h, &layer.input_norm, rms_eps)?;
+
+        let q = layer.q_proj.forward(&normed)?;
+        let k = layer.k_proj.forward(&normed)?;
+        let v = layer.v_proj.forward(&normed)?;
+
+        let q = q
+            .reshape(&[B, T, heads, -1])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k = k
+            .reshape(&[B, T, kv_heads, -1])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let v = v
+            .reshape(&[B, T, kv_heads, -1])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        let q = fast::rms_norm(&q, &layer.q_norm, rms_eps)?;
+        let k = fast::rms_norm(&k, &layer.k_norm, rms_eps)?;
+
+        let offset = layer_cache.as_ref().map_or(0, KeyValueCache::offset);
+        let q = gpu.apply_rope(&q, offset)?;
+        let k = gpu.apply_rope(&k, offset)?;
+
+        let mask_arr = match &mask {
+            Some(crate::utils::AttentionMask::Array(a)) => Some(a),
+            _ => None,
+        };
+        let mask_arr_opt: Option<&Array> = mask_arr;
+
+        let attn_out = match layer_cache.as_mut() {
+            Some(c) => {
+                cached_scaled_dot_product_attention(q, c, k, v, gpu.attention_scale, mask_arr_opt)?
+            }
+            None => fast::scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                gpu.attention_scale,
+                mask_arr_opt.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
+                None::<&Array>,
+            )?,
+        };
+
+        let attn_out = attn_out
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[B, T, -1])?;
+        let attn_out = layer.o_proj.forward(&attn_out)?;
+        let h_post_attn = h.add(&attn_out)?;
+
+        let normed_post = fast::rms_norm(&h_post_attn, &layer.post_attn_norm, rms_eps)?;
+        let gate = layer.gate_proj.forward(&normed_post)?;
+        let up = layer.up_proj.forward(&normed_post)?;
+        let mlp_hidden = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
+        let mlp_out = layer.down_proj.forward(&mlp_hidden)?;
+
+        h = h_post_attn.add(&mlp_out)?;
+    }
+
+    fast::rms_norm(&h, &gpu.final_norm, rms_eps)
+}
+
+/// Owned state wrapper for [`compile_with_state`]-driven decoding.
+///
+/// `compile_with_state` takes the state by `&mut U` where `U: Updatable`.
+/// Wrapping the model **and** the per-layer KV cache in one owned struct
+/// lets us hand-roll a single `Updatable` impl whose positional iteration
+/// order covers both — safer than fighting lifetimes on `(&mut gpu, cache)`
+/// tuples. See session-25 recap for the design rationale.
+///
+/// Expected construction: after prefill, move `gpu` and the filled cache
+/// vector into this struct, run the decode loop with a compiled step,
+/// then destructure back out when done.
+pub struct BonsaiQ1DecodeState {
+    pub gpu: BonsaiQ1Gpu,
+    pub cache: Vec<Option<SteppingKeyValueCache>>,
+}
+
+/// Number of updatable `Array`s per decoder layer:
+/// - `input_norm` + 3×(w,s,b) qkv + `q_norm` + `k_norm` + 3×(w,s,b) o_proj
+///   ... wait: 1 + 3×3 + 2 + 3 + 1 + 3×3 = 1+9+2+3+1+9 = **25**.
+/// Corresponds to the array push order in [`BonsaiQ1DecodeState::updatable_states`].
+const PER_LAYER_UPDATABLE: usize = 25;
+
+impl mlx_rs::utils::Updatable for BonsaiQ1DecodeState {
+    fn updatable_states_len(&self) -> usize {
+        let mut n = 3 // embed (w, scales, biases)
+            + self.gpu.layers.len() * PER_LAYER_UPDATABLE
+            + 1; // final_norm
+        if self.gpu.lm_head.is_some() {
+            n += 3;
+        }
+        if self.gpu.yarn_freqs.is_some() {
+            n += 1;
+        }
+        for slot in &self.cache {
+            if let Some(c) = slot {
+                if c.keys().is_some() {
+                    n += 1;
+                }
+                if c.values().is_some() {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn updatable_states(&self) -> impl IntoIterator<Item = &Array> {
+        let mut v: Vec<&Array> = Vec::with_capacity(self.updatable_states_len());
+        v.push(&self.gpu.embed.w);
+        v.push(&self.gpu.embed.scales);
+        v.push(&self.gpu.embed.biases);
+        for layer in &self.gpu.layers {
+            v.push(&layer.input_norm);
+            v.push(&layer.q_proj.w);
+            v.push(&layer.q_proj.scales);
+            v.push(&layer.q_proj.biases);
+            v.push(&layer.k_proj.w);
+            v.push(&layer.k_proj.scales);
+            v.push(&layer.k_proj.biases);
+            v.push(&layer.v_proj.w);
+            v.push(&layer.v_proj.scales);
+            v.push(&layer.v_proj.biases);
+            v.push(&layer.q_norm);
+            v.push(&layer.k_norm);
+            v.push(&layer.o_proj.w);
+            v.push(&layer.o_proj.scales);
+            v.push(&layer.o_proj.biases);
+            v.push(&layer.post_attn_norm);
+            v.push(&layer.gate_proj.w);
+            v.push(&layer.gate_proj.scales);
+            v.push(&layer.gate_proj.biases);
+            v.push(&layer.up_proj.w);
+            v.push(&layer.up_proj.scales);
+            v.push(&layer.up_proj.biases);
+            v.push(&layer.down_proj.w);
+            v.push(&layer.down_proj.scales);
+            v.push(&layer.down_proj.biases);
+        }
+        v.push(&self.gpu.final_norm);
+        if let Some(lm) = self.gpu.lm_head.as_ref() {
+            v.push(&lm.w);
+            v.push(&lm.scales);
+            v.push(&lm.biases);
+        }
+        if let Some(y) = self.gpu.yarn_freqs.as_ref() {
+            v.push(y);
+        }
+        for slot in &self.cache {
+            if let Some(c) = slot {
+                if let Some(k) = c.keys() {
+                    v.push(k);
+                }
+                if let Some(val) = c.values() {
+                    v.push(val);
+                }
+            }
+        }
+        v
+    }
+
+    fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array> {
+        let mut v: Vec<&mut Array> = Vec::with_capacity(self.updatable_states_len());
+        v.push(&mut self.gpu.embed.w);
+        v.push(&mut self.gpu.embed.scales);
+        v.push(&mut self.gpu.embed.biases);
+        for layer in &mut self.gpu.layers {
+            v.push(&mut layer.input_norm);
+            v.push(&mut layer.q_proj.w);
+            v.push(&mut layer.q_proj.scales);
+            v.push(&mut layer.q_proj.biases);
+            v.push(&mut layer.k_proj.w);
+            v.push(&mut layer.k_proj.scales);
+            v.push(&mut layer.k_proj.biases);
+            v.push(&mut layer.v_proj.w);
+            v.push(&mut layer.v_proj.scales);
+            v.push(&mut layer.v_proj.biases);
+            v.push(&mut layer.q_norm);
+            v.push(&mut layer.k_norm);
+            v.push(&mut layer.o_proj.w);
+            v.push(&mut layer.o_proj.scales);
+            v.push(&mut layer.o_proj.biases);
+            v.push(&mut layer.post_attn_norm);
+            v.push(&mut layer.gate_proj.w);
+            v.push(&mut layer.gate_proj.scales);
+            v.push(&mut layer.gate_proj.biases);
+            v.push(&mut layer.up_proj.w);
+            v.push(&mut layer.up_proj.scales);
+            v.push(&mut layer.up_proj.biases);
+            v.push(&mut layer.down_proj.w);
+            v.push(&mut layer.down_proj.scales);
+            v.push(&mut layer.down_proj.biases);
+        }
+        v.push(&mut self.gpu.final_norm);
+        if let Some(lm) = self.gpu.lm_head.as_mut() {
+            v.push(&mut lm.w);
+            v.push(&mut lm.scales);
+            v.push(&mut lm.biases);
+        }
+        if let Some(y) = self.gpu.yarn_freqs.as_mut() {
+            v.push(y);
+        }
+        for slot in &mut self.cache {
+            if let Some(c) = slot {
+                let (k_opt, v_opt) = c.key_value_arrays_mut();
+                if let Some(k) = k_opt {
+                    v.push(k);
+                }
+                if let Some(val) = v_opt {
+                    v.push(val);
+                }
+            }
+        }
+        v
+    }
+}
+
+/// Free-fn decode step compatible with `compile_with_state`.
+///
+/// `state.cache` **must** be populated by a prefill call before this runs:
+/// compile-wrap is applied only in decode, and shape consistency across
+/// steps (for the MLX per-shape trace cache) requires
+/// [`SteppingKeyValueCache::reserve_max_tokens`] ahead of the first
+/// `update_dense`.
+pub fn decode_step_free(
+    state: &mut BonsaiQ1DecodeState,
+    inputs: &Array,
+) -> Result<Array, Exception> {
+    let h = forward_trunk_free(&state.gpu, &mut state.cache, inputs)?;
+    let t = *h
+        .shape()
+        .get(1)
+        .ok_or_else(|| Exception::custom("trunk hidden missing T dim"))?;
+    let last = if t > 1 { h.index((.., -1.., ..)) } else { h };
+    state.gpu.project_logits(&last)
 }
 
 /// Per-section wall-time accumulator for the Bonsai-Q1 forward pass.
@@ -1354,6 +1546,44 @@ mod tests {
         eprintln!("forward_all_logits OK: shape=[1,8,{vocab}], row[-1] matches forward()");
     }
 
+    /// B1 step 6 sanity: hand-rolled `Updatable::updatable_states_len` must
+    /// equal the actual iter count, and both must match the architecture
+    /// math. Positional zip in `compile_with_state` depends on this
+    /// invariant — any drift would corrupt state replacement silently.
+    ///
+    /// Expected for Bonsai-1.7B (tied embed, YARN factor=4, empty cache):
+    ///   3 embed + 28*25 per-layer + 1 final_norm + 1 yarn_freqs = **705**.
+    /// (Recap claimed no YARN on 1.7B; actual `config.json` has
+    /// `rope_scaling.rope_type = "yarn"`.)
+    #[test]
+    fn test_bonsai_q1_updatable_count_matches_iter() {
+        use mlx_rs::utils::Updatable;
+
+        let Some(dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+        let gpu = load_bonsai_q1(&dir).expect("load");
+        assert!(gpu.lm_head.is_none(), "1.7B expected tied (lm_head=None)");
+        assert!(
+            gpu.yarn_freqs.is_some(),
+            "1.7B config has YARN factor=4.0; expected yarn_freqs=Some"
+        );
+
+        let state = BonsaiQ1DecodeState {
+            gpu,
+            cache: Vec::new(),
+        };
+        let len = state.updatable_states_len();
+        let count = state.updatable_states().into_iter().count();
+        assert_eq!(
+            len, count,
+            "updatable_states_len ({len}) != actual iter count ({count})"
+        );
+        assert_eq!(len, 705, "1.7B expected 705 arrays, got {len}");
+        eprintln!("updatable_count OK: {len} arrays (1.7B tied + yarn, empty cache)");
+    }
+
     // ---------------------------------------------------------------------
     // Bench (ignored by default — run with `--ignored --nocapture`).
     // ---------------------------------------------------------------------
@@ -1502,12 +1732,101 @@ mod tests {
             "| decode steps | total ms | ms/tok | tok/s |\n|---:|---:|---:|---:|\n"
         ));
         md.push_str(&format!(
-            "| {steady} (after {warm_steps} warmup) | {:.1} | {ms_per_tok:.2} | {tps:.1} |\n",
+            "| {steady} (after {warm_steps} warmup, uncompiled) | {:.1} | {ms_per_tok:.2} | {tps:.1} |\n",
             dt * 1000.0
         ));
         eprintln!(
-            "[{name}] decode {steady} steps: {:.1}ms ({tps:.1} tok/s, {ms_per_tok:.2}ms/tok)",
+            "[{name}] decode {steady} steps uncompiled: {:.1}ms ({tps:.1} tok/s, {ms_per_tok:.2}ms/tok)",
             dt * 1000.0
+        );
+        let uncompiled_ms_per_tok = ms_per_tok;
+
+        // --- Sustained decode (compile_with_state wrap) ---
+        // B1 step 6: measure the dispatch-overhead win from fusing the trunk
+        // into a single compiled Metal graph. Uses a fresh prefill so the
+        // pre-allocated KV slab is independent of the uncompiled run above.
+        md.push_str("\n### Sustained decode (compile_with_state wrap)\n\n");
+        let AnyModel::BonsaiQ1(gpu) = model else {
+            unreachable!("bench_one wraps a BonsaiQ1 gpu above")
+        };
+
+        let mut cache_c: Vec<Option<SteppingKeyValueCache>> = (0..gpu.layers.len())
+            .map(|_| {
+                let mut c = SteppingKeyValueCache::new();
+                c.reserve_max_tokens(16 + decode_n + 8);
+                Some(c)
+            })
+            .collect();
+
+        let prompt = synth_ids(16);
+        let x = mlx_rs::Array::from_slice(&prompt, &[1, 16]);
+        let y0 = gpu
+            .forward(&x, &mut cache_c)
+            .expect("compiled decode prefill");
+        y0.eval().expect("eval prefill");
+        let s0: &[f32] = y0.as_slice::<f32>();
+        let (mut tok, mut best) = (0i32, f32::NEG_INFINITY);
+        for (i, v) in s0.iter().enumerate() {
+            if *v > best {
+                best = *v;
+                tok = i as i32;
+            }
+        }
+
+        let mut state = BonsaiQ1DecodeState {
+            gpu,
+            cache: cache_c,
+        };
+        let mut compiled_step =
+            mlx_rs::transforms::compile::compile_with_state(decode_step_free, false);
+
+        let warm_steps = 4.min(decode_n / 4);
+        for _ in 0..warm_steps {
+            let d = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+            let y = compiled_step(&mut state, &d).expect("compiled decode");
+            y.eval().expect("eval");
+            let s: &[f32] = y.as_slice::<f32>();
+            let (mut nb_i, mut nb_v) = (0i32, f32::NEG_INFINITY);
+            for (i, v) in s.iter().enumerate() {
+                if *v > nb_v {
+                    nb_v = *v;
+                    nb_i = i as i32;
+                }
+            }
+            tok = nb_i;
+        }
+
+        let steady = decode_n - warm_steps;
+        let t0 = Instant::now();
+        for _ in 0..steady {
+            let d = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+            let y = compiled_step(&mut state, &d).expect("compiled decode");
+            y.eval().expect("eval");
+            let s: &[f32] = y.as_slice::<f32>();
+            let (mut nb_i, mut nb_v) = (0i32, f32::NEG_INFINITY);
+            for (i, v) in s.iter().enumerate() {
+                if *v > nb_v {
+                    nb_v = *v;
+                    nb_i = i as i32;
+                }
+            }
+            tok = nb_i;
+        }
+        let dt_c = t0.elapsed().as_secs_f64();
+        let tps_c = f64::from(steady) / dt_c;
+        let ms_per_tok_c = dt_c * 1000.0 / f64::from(steady);
+        let speedup = uncompiled_ms_per_tok / ms_per_tok_c;
+
+        md.push_str(
+            "| decode steps | total ms | ms/tok | tok/s | speedup |\n|---:|---:|---:|---:|---:|\n",
+        );
+        md.push_str(&format!(
+            "| {steady} (after {warm_steps} warmup, compiled) | {:.1} | {ms_per_tok_c:.2} | {tps_c:.1} | {speedup:.2}x |\n",
+            dt_c * 1000.0
+        ));
+        eprintln!(
+            "[{name}] decode {steady} steps compiled: {:.1}ms ({tps_c:.1} tok/s, {ms_per_tok_c:.2}ms/tok, {speedup:.2}x)",
+            dt_c * 1000.0
         );
 
         Some(md)

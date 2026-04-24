@@ -517,6 +517,28 @@ impl SteppingKeyValueCache {
         self.values.as_ref()
     }
 
+    /// Mutable access to internal key array. Used by `compile_with_state`
+    /// wrappers that must expose K/V arrays as part of an `Updatable` state.
+    pub fn keys_mut(&mut self) -> Option<&mut Array> {
+        self.keys.as_mut()
+    }
+
+    /// Mutable access to internal value array. See [`Self::keys_mut`].
+    pub fn values_mut(&mut self) -> Option<&mut Array> {
+        self.values.as_mut()
+    }
+
+    /// Simultaneous mutable access to the key and value arrays.
+    ///
+    /// Exists because `compile_with_state`'s `Updatable::updatable_states_mut`
+    /// must yield both in a single iterator without splitting borrows — a
+    /// naive `keys_mut()` then `values_mut()` on the same `&mut self` fails
+    /// the borrow checker. This method re-borrows both optional fields from
+    /// a single `&mut` split.
+    pub fn key_value_arrays_mut(&mut self) -> (Option<&mut Array>, Option<&mut Array>) {
+        (self.keys.as_mut(), self.values.as_mut())
+    }
+
     /// Create a pre-filled cache from existing K/V arrays.
     ///
     /// Sets `offset = keys.shape()[2]` so the next `update_dense` triggers a

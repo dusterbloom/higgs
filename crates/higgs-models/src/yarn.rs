@@ -108,7 +108,13 @@ pub(crate) fn apply_yarn_rope(
     traditional: bool,
 ) -> Result<Array, Exception> {
     let x_scaled = if (mscale - 1.0).abs() > f32::EPSILON {
-        x.multiply(mlx_rs::array!(mscale))?
+        // Match x's dtype to avoid silent upcast (fp16 → f32) that bleeds into
+        // the entire attention path (rope, sdpa, o_proj inputs). For Bonsai
+        // with rope_yarn_factor>1, mscale ≈ 1.14, so this branch fires every
+        // rope call; without the cast the whole decode runs in f32 and pays
+        // ~28 ms/step on 8B. See bisect_decode v6 vs v7.
+        let scalar = Array::from_f32(mscale).as_dtype(x.dtype())?;
+        x.multiply(&scalar)?
     } else {
         x.clone()
     };
