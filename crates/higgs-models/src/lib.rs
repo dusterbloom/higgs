@@ -15,6 +15,7 @@ pub mod turboquant;
 pub mod utils;
 
 pub mod bd3lm_qwen3;
+pub mod bonsai_q1;
 pub mod dflash;
 pub mod dflash_cpu;
 pub mod diffusion;
