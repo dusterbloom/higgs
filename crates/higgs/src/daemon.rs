@@ -114,6 +114,8 @@ port = 8000
 # path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # name = "llama"
 # batch = false
+# draft_model = "mlx-community/Llama-3.2-1B-Instruct-4bit"  # speculative decoding
+# num_draft = 8  # draft tokens per cycle (default: 8)
 # dflash = "z-lab/Qwen3.5-27B-DFlash"  # optional DFlash drafter for spec decode
 # ar_spec = "mlx-community/Qwen3.5-0.8B-8bit"  # optional AR-spec drafter (greedy only; mutually exclusive with dflash)
 

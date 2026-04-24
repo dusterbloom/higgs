@@ -112,6 +112,8 @@ port = 8000
 path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # name = "llama"     # optional friendly name (used as engine key and for auto_router lookup)
 # batch = false
+# draft_model = "mlx-community/Llama-3.2-1B-Instruct-4bit"  # speculative decoding
+# num_draft = 8      # draft tokens per speculative cycle (default: 8)
 
 # --- Remote providers ---
 [provider.anthropic]

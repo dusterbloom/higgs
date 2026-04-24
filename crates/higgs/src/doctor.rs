@@ -40,6 +40,7 @@ pub async fn run_doctor(config: &HiggsConfig) -> DoctorResult {
 
     check_config_valid(&mut result);
     check_models(config, &mut result);
+    check_draft_models(config, &mut result);
     check_duplicate_models(config, &mut result);
     check_providers(config, &mut result).await;
     check_route_consistency(config, &mut result);
@@ -206,6 +207,28 @@ fn check_bd3lm_config(model_dir: &std::path::Path, label: &str, result: &mut Doc
             &format!("model {label}: bd3lm_extras.safetensors present"),
             result,
         );
+    }
+}
+
+fn check_draft_models(config: &HiggsConfig, result: &mut DoctorResult) {
+    for model in &config.models {
+        let Some(ref draft_path) = model.draft_model else {
+            continue;
+        };
+        let label = model_label(model);
+        match model_resolver::resolve(draft_path) {
+            Ok(_) => pass(&format!("draft model for {label} resolvable"), result),
+            Err(err) => fail(
+                &format!("draft model \"{draft_path}\" for {label} not found: {err}"),
+                result,
+            ),
+        }
+        if model.batch {
+            warn(
+                &format!("{label} has draft_model but batch=true; speculative decoding is only supported with SimpleEngine"),
+                result,
+            );
+        }
     }
 }
 
@@ -707,6 +730,81 @@ mod tests {
         let mut result = empty_result();
         check_route_consistency(&config, &mut result);
         assert_eq!(result.passes, 1);
+        assert_eq!(result.failures, 0);
+    }
+
+    // -- Draft model validation --
+
+    #[test]
+    fn test_draft_model_not_found_fails() {
+        let config = HiggsConfig {
+            models: vec![ModelConfig {
+                path: "org/target-model".to_owned(),
+                name: None,
+                batch: false,
+                draft_model: Some("org/nonexistent-draft".to_owned()),
+                num_draft: 8,
+                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                kv_bits: 3,
+                kv_seed: 0,
+                dflash: None,
+                ar_spec: None,
+                bd3lm: None,
+            }],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_draft_models(&config, &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_draft_model_with_batch_warns() {
+        let config = HiggsConfig {
+            models: vec![ModelConfig {
+                path: "org/target-model".to_owned(),
+                name: None,
+                batch: true,
+                draft_model: Some("org/some-draft".to_owned()),
+                num_draft: 8,
+                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                kv_bits: 3,
+                kv_seed: 0,
+                dflash: None,
+                ar_spec: None,
+                bd3lm: None,
+            }],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_draft_models(&config, &mut result);
+        // Fails for unresolvable path + warns for batch incompatibility
+        assert!(result.failures >= 1);
+        assert_eq!(result.warnings, 1);
+    }
+
+    #[test]
+    fn test_no_draft_model_skips() {
+        let config = HiggsConfig {
+            models: vec![ModelConfig {
+                path: "org/model".to_owned(),
+                name: None,
+                batch: false,
+                draft_model: None,
+                num_draft: 8,
+                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+                kv_bits: 3,
+                kv_seed: 0,
+                dflash: None,
+                ar_spec: None,
+                bd3lm: None,
+            }],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_draft_models(&config, &mut result);
+        assert_eq!(result.passes, 0);
+        assert_eq!(result.warnings, 0);
         assert_eq!(result.failures, 0);
     }
 
