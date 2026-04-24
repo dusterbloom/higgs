@@ -1342,4 +1342,126 @@ mod tests {
             }
         }
     }
+
+    // ---------------------------------------------------------------------
+    // P6 verify-cost probe: does `forward_all_logits` scale linearly in K?
+    // Path A (ANE drafter + GPU target) pivots on this. If 8B verify at K=8
+    // scales super-linearly, the split-silicon cycle collapses even with
+    // good acceptance. Risk #4 from session-22 recap.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "bench; run with --ignored --nocapture"]
+    fn bench_bonsai_q1_verify_cost_8b() {
+        use crate::AnyModel;
+        use std::time::Instant;
+
+        let Some(dir) = bonsai_8b_dir() else {
+            eprintln!("Bonsai-8B not found; skipping");
+            return;
+        };
+        let gpu = load_bonsai_q1(&dir).expect("load");
+        let vocab = gpu.config.vocab as i32;
+        let layers_n = gpu.num_layers();
+        let mut model = AnyModel::BonsaiQ1(gpu);
+
+        // Prime the cache with a 64-token "mid-generation" prefix so every K
+        // measurement runs against an attn K-dim ~64+K, close to real spec-
+        // decode conditions (prefill + some accepted tokens already).
+        let prefix_len = 64i32;
+        let prefix_ids = synth_ids(prefix_len);
+
+        let ks: &[i32] = &[1, 4, 8, 12, 16];
+        let iters = 5;
+
+        let mut md = String::new();
+        md.push_str("# Bonsai-8B verify-cost probe\n\n");
+        md.push_str(&format!("- layers: {layers_n}, vocab: {vocab}\n"));
+        md.push_str(&format!(
+            "- prime prefix: {prefix_len} tokens (fresh KV per K measurement)\n"
+        ));
+        md.push_str(&format!(
+            "- timing: min of {iters} iters per K after per-shape warmup\n\n"
+        ));
+        md.push_str("| K | min ms | ms/tok | vs K=1 ratio | super-linear? |\n");
+        md.push_str("|---:|---:|---:|---:|:---|\n");
+
+        let mut baseline_ms = f64::NAN;
+
+        for &k in ks {
+            let ids = synth_ids(k);
+
+            // Warmup: prefill + one all-logits call to compile kernels for this K.
+            {
+                let mut c = model.make_cache();
+                let px = mlx_rs::Array::from_slice(&prefix_ids, &[1, prefix_len]);
+                let y = model.forward(&px, None, &mut c).expect("prefill warmup");
+                y.eval().expect("eval");
+                let x = mlx_rs::Array::from_slice(&ids, &[1, k]);
+                let yv = model
+                    .forward_all_logits(&x, None, &mut c)
+                    .expect("verify warmup");
+                yv.eval().expect("eval");
+            }
+
+            // Measure: min over `iters`. Fresh cache each time so timings aren't
+            // polluted by state carried over from the previous K.
+            let mut best_ms = f64::INFINITY;
+            for _ in 0..iters {
+                let mut c = model.make_cache();
+                let px = mlx_rs::Array::from_slice(&prefix_ids, &[1, prefix_len]);
+                let y = model.forward(&px, None, &mut c).expect("prefill");
+                y.eval().expect("eval");
+
+                let x = mlx_rs::Array::from_slice(&ids, &[1, k]);
+                let t0 = Instant::now();
+                let yv = model
+                    .forward_all_logits(&x, None, &mut c)
+                    .expect("verify");
+                yv.eval().expect("eval");
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if ms < best_ms {
+                    best_ms = ms;
+                }
+            }
+
+            if k == 1 {
+                baseline_ms = best_ms;
+            }
+            let ratio = best_ms / baseline_ms;
+            let per_tok = best_ms / f64::from(k);
+            let expected_ratio = f64::from(k);
+            let super_linear = ratio / expected_ratio > 1.25;
+            let flag = if super_linear { "YES (>1.25×)" } else { "no" };
+
+            md.push_str(&format!(
+                "| {k} | {best_ms:.2} | {per_tok:.2} | {ratio:.2}× (ideal {expected_ratio:.0}×) | {flag} |\n"
+            ));
+            eprintln!(
+                "[verify-cost 8B] K={k}: {best_ms:.2}ms ({per_tok:.2}ms/tok, {ratio:.2}× baseline)"
+            );
+        }
+
+        md.push_str("\n**Interpretation:** if any K flags super-linear, Path A's verify\n");
+        md.push_str("budget must be re-estimated before running the daemon experiment.\n");
+        md.push_str("Linear-ish scaling (≤1.25× over ideal) means K=8 verify ≈ 8× K=1 cost,\n");
+        md.push_str("which preserves the session-22 back-of-envelope.\n");
+
+        eprintln!("\n========== VERIFY-COST REPORT ==========\n{md}\n========== END ==========");
+
+        let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if let Some(out_dir) = crate_dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|p| p.join(".planning/measurements"))
+        {
+            if out_dir.exists() {
+                let out = out_dir.join("p6-verify-cost-8b.md");
+                match std::fs::write(&out, &md) {
+                    Ok(()) => eprintln!("wrote: {}", out.display()),
+                    Err(e) => eprintln!("write failed {}: {e}", out.display()),
+                }
+            }
+        }
+    }
 }
