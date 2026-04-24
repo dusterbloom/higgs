@@ -13,6 +13,7 @@ pub mod starcoder2;
 pub mod transformer;
 pub mod turboquant;
 pub mod utils;
+pub(crate) mod yarn;
 
 pub mod bd3lm_qwen3;
 pub mod bonsai_q1;
