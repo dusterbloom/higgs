@@ -120,6 +120,26 @@ pub enum AnyCache {
 }
 
 impl AnyCache {
+    /// Trim all layer caches by `count` entries (reduce offset).
+    /// Used after speculative decode verification to discard rejected draft KV.
+    /// Hybrid/SSM layers are left unchanged (recurrent state can't trivially roll back).
+    pub fn trim_by(&mut self, count: i32) {
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    layer.trim_by(count);
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        kv.trim_by(count);
+                    }
+                }
+            }
+        }
+    }
+
     /// Force-evaluate all lazy arrays so a subsequent `clone()` captures
     /// materialized values rather than the compute graph.  Required before
     /// snapshotting for speculative-decode rollback.

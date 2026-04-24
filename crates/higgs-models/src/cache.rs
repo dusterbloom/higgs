@@ -457,6 +457,12 @@ impl SteppingKeyValueCache {
         self.config
     }
 
+    /// Trim the cache by reducing the offset, discarding the last `count`
+    /// entries. Used by speculative decoding to remove rejected draft tokens.
+    pub fn trim_by(&mut self, count: i32) {
+        self.offset = (self.offset - count).max(0);
+    }
+
     /// References to internal arrays that must be eval'd between chunked-prefill steps.
     pub fn eval_targets(&self) -> Vec<&Array> {
         let mut targets = Vec::with_capacity(8);
