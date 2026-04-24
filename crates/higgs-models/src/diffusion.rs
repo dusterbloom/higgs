@@ -2679,9 +2679,7 @@ impl AneBonsaiEngine {
     pub fn drop_blas_layers(&mut self) {
         let mut freed_bytes: usize = 0;
         for layer in self.blas_engine.layers.iter_mut() {
-            freed_bytes += (layer.gate_proj.len()
-                + layer.up_proj.len()
-                + layer.down_proj.len())
+            freed_bytes += (layer.gate_proj.len() + layer.up_proj.len() + layer.down_proj.len())
                 * std::mem::size_of::<f32>();
             layer.gate_proj = Vec::new();
             layer.up_proj = Vec::new();
