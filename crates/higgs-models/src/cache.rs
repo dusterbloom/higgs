@@ -463,6 +463,28 @@ impl SteppingKeyValueCache {
         self.offset = (self.offset - count).max(0);
     }
 
+    /// Hint the total number of tokens the cache will hold over its lifetime.
+    ///
+    /// Sets the grow `step` so the very first `update_dense` call allocates
+    /// enough slots for the whole sequence. Subsequent decode steps stay
+    /// within the pre-allocated slab — no concat, no reallocation, no
+    /// change in array shape. This is what makes `compile_with_state`
+    /// wrapping of the decode step work: the compiled trace sees the same
+    /// keys/values shape on every call, so no recompile.
+    ///
+    /// If the actual sequence exceeds `max_tokens`, the grow path still
+    /// runs (doubling `step` once more) — so this is a hint, not a hard
+    /// cap. Callers should size it slightly above their known
+    /// `prefill + max_new_tokens` budget.
+    ///
+    /// Must be called before the first `update_dense` (otherwise the
+    /// initial slab is already allocated at the old step size).
+    pub fn reserve_max_tokens(&mut self, max_tokens: i32) {
+        if max_tokens > 0 {
+            self.step = max_tokens;
+        }
+    }
+
     /// References to internal arrays that must be eval'd between chunked-prefill steps.
     pub fn eval_targets(&self) -> Vec<&Array> {
         let mut targets = Vec::with_capacity(8);
@@ -1158,6 +1180,51 @@ mod tests {
         assert_eq!(cache.offset(), 4);
         // Internal buffer should be 256 slots
         assert_eq!(cache.keys.as_ref().unwrap().shape()[2], 256);
+    }
+
+    /// `reserve_max_tokens` sizes the initial slab so that a prefill +
+    /// long decode never triggers a grow. This is the B1-step-2 guarantee:
+    /// keys/values shape stays constant across every decode step →
+    /// compiled trace remains valid.
+    #[test]
+    fn test_stepping_cache_reserve_skips_grow() {
+        let mut cache = SteppingKeyValueCache::new();
+        cache.reserve_max_tokens(1024);
+
+        // Prefill 16.
+        let (keys, values) = make_kv_pair(16, 8);
+        cache.update_and_fetch(keys, values).unwrap();
+        let slab = cache.keys.as_ref().unwrap().shape()[2];
+        assert_eq!(slab, 1024, "first slab must match reserve hint");
+
+        // 900 single-token decode steps — well past the default 256 step.
+        for _ in 0..900 {
+            let (k, v) = make_kv_pair(1, 8);
+            cache.update_and_fetch(k, v).unwrap();
+            let s = cache.keys.as_ref().unwrap().shape()[2];
+            assert_eq!(s, 1024, "slab must never grow while under reserve");
+        }
+        assert_eq!(cache.offset(), 16 + 900);
+    }
+
+    /// reserve is a hint: if the sequence exceeds it, the cache still grows
+    /// correctly (no correctness regression vs default behaviour).
+    #[test]
+    fn test_stepping_cache_reserve_grows_if_exceeded() {
+        let mut cache = SteppingKeyValueCache::new();
+        cache.reserve_max_tokens(32);
+
+        let (keys, values) = make_kv_pair(16, 8);
+        cache.update_and_fetch(keys, values).unwrap();
+        assert_eq!(cache.keys.as_ref().unwrap().shape()[2], 32);
+
+        // 20 more tokens → offset=36 > 32, must grow.
+        for _ in 0..20 {
+            let (k, v) = make_kv_pair(1, 8);
+            cache.update_and_fetch(k, v).unwrap();
+        }
+        assert_eq!(cache.offset(), 36);
+        assert!(cache.keys.as_ref().unwrap().shape()[2] >= 36);
     }
 
     #[test]

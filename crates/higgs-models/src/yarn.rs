@@ -95,13 +95,16 @@ pub(crate) fn compute_yarn_freqs(
 /// When `mscale != 1.0`, inputs are pre-scaled before rotation (matches the
 /// DeepSeek reference). `traditional=false` matches the Qwen3 / LLaMA rope
 /// layout; `traditional=true` matches DeepSeek's packed complex layout.
+///
+/// `offset` is a scalar `Array` (not an `i32`) so the value is not baked into
+/// compiled traces — required for `compile_with_state` wrapping of decode.
 pub(crate) fn apply_yarn_rope(
     x: &Array,
     dim: i32,
     base: f32,
     yarn_freqs: Option<&Array>,
     mscale: f32,
-    offset: i32,
+    offset: &Array,
     traditional: bool,
 ) -> Result<Array, Exception> {
     let x_scaled = if (mscale - 1.0).abs() > f32::EPSILON {
@@ -111,7 +114,7 @@ pub(crate) fn apply_yarn_rope(
     };
     yarn_freqs.map_or_else(
         || {
-            fast::rope(
+            fast::rope_dynamic(
                 &x_scaled,
                 dim,
                 traditional,
@@ -122,7 +125,7 @@ pub(crate) fn apply_yarn_rope(
             )
         },
         |freqs| {
-            fast::rope(
+            fast::rope_dynamic(
                 &x_scaled,
                 dim,
                 traditional,
@@ -133,4 +136,62 @@ pub(crate) fn apply_yarn_rope(
             )
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::random;
+
+    /// Parity: dynamic-offset rope (via `apply_yarn_rope`) must match
+    /// static-offset `fast::rope` for every offset in 0..64, both with and
+    /// without precomputed YaRN freqs. Guards the B1 step 1 migration to
+    /// `fast::rope_dynamic` (prerequisite for `compile_with_state`-wrapped
+    /// decode — the static `offset: i32` was being baked into the compile
+    /// trace, forcing a recompile every step).
+    #[test]
+    fn rope_dynamic_matches_static_offset_0_to_64() {
+        random::seed(71).unwrap();
+        // [B=2, H=4, T=1, head_dim=16] — matches decode shape (T=1).
+        let head_dim: i32 = 16;
+        let base: f32 = 10_000.0;
+        let x = random::uniform::<_, f32>(0.0, 1.0, &[2, 4, 1, head_dim], None).unwrap();
+
+        // Case A: no yarn_freqs (base path).
+        for offset in 0_i32..64 {
+            let off_arr = Array::from_int(offset);
+            let got = apply_yarn_rope(&x, head_dim, base, None, 1.0, &off_arr, false).unwrap();
+            let want = fast::rope(&x, head_dim, false, base, 1.0, offset, None::<&Array>).unwrap();
+            let diff = (&got - &want)
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            assert!(
+                diff < 1e-5,
+                "offset={offset} no-freqs: max_diff={diff} >= 1e-5"
+            );
+        }
+
+        // Case B: with precomputed yarn_freqs (Bonsai path).
+        let freqs = compute_yarn_freqs(head_dim, base, 1.0, 2048, 32.0, 1.0);
+        for offset in 0_i32..64 {
+            let off_arr = Array::from_int(offset);
+            let got =
+                apply_yarn_rope(&x, head_dim, base, Some(&freqs), 1.0, &off_arr, false).unwrap();
+            let want =
+                fast::rope(&x, head_dim, false, None::<f32>, 1.0, offset, Some(&freqs)).unwrap();
+            let diff = (&got - &want)
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            assert!(
+                diff < 1e-5,
+                "offset={offset} with-freqs: max_diff={diff} >= 1e-5"
+            );
+        }
+    }
 }

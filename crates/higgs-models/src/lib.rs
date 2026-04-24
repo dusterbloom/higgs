@@ -142,6 +142,30 @@ impl AnyCache {
         }
     }
 
+    /// Hint the maximum token budget on every dense KV layer. Sizes the
+    /// initial slab to fit the whole sequence so the grow branch never fires
+    /// during decode, keeping keys/values shape constant across steps
+    /// (prerequisite for `compile_with_state`-wrapped decode).
+    ///
+    /// Must be called before the first forward, otherwise initial slabs
+    /// are already allocated at the default 256-token step.
+    pub fn reserve_max_tokens(&mut self, max_tokens: i32) {
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    layer.reserve_max_tokens(max_tokens);
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        kv.reserve_max_tokens(max_tokens);
+                    }
+                }
+            }
+        }
+    }
+
     /// Force-evaluate all lazy arrays so a subsequent `clone()` captures
     /// materialized values rather than the compute graph.  Required before
     /// snapshotting for speculative-decode rollback.

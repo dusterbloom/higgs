@@ -30,8 +30,7 @@ use crate::{
 /// the engine surface in `higgs-engine::model_loader` can route it through the
 /// same `EngineError::Model` path used by all other architectures.
 pub fn load_bonsai_q1<P: AsRef<Path>>(model_dir: P) -> Result<BonsaiQ1Gpu, ModelError> {
-    let engine =
-        BonsaiQ1Engine::load(model_dir).map_err(ModelError::ShapeMismatch)?;
+    let engine = BonsaiQ1Engine::load(model_dir).map_err(ModelError::ShapeMismatch)?;
     engine.to_gpu().map_err(ModelError::Mlx)
 }
 
@@ -513,13 +512,14 @@ impl BonsaiQ1Gpu {
     fn apply_rope(&self, x: &Array, offset: i32) -> Result<Array, Exception> {
         let head_dim = i32::try_from(self.config.head_dim)
             .map_err(|_| Exception::custom("head_dim overflows i32"))?;
+        let offset_array = Array::from_int(offset);
         apply_yarn_rope(
             x,
             head_dim,
             self.config.rope_theta as f32,
             self.yarn_freqs.as_ref(),
             self.yarn_mscale,
-            offset,
+            &offset_array,
             false, // Qwen3 layout
         )
     }
@@ -667,6 +667,237 @@ impl BonsaiQ1Gpu {
     ) -> Result<Array, Exception> {
         let h = self.forward_trunk(inputs, cache)?;
         self.project_logits(&h)
+    }
+
+    /// Profiled variant of `forward`: same result, but attributes per-section
+    /// wall time into `times`. Forces `.eval()` after every section (kills
+    /// lazy batching — that's the point: ratios matter, absolutes don't).
+    ///
+    /// Used by `bench_bonsai_q1_decode_breakdown` to answer the
+    /// dispatch-bound-vs-matmul-bound question for Bonsai-8B AR parity.
+    pub fn forward_profiled(
+        &self,
+        inputs: &Array,
+        cache: &mut Vec<Option<SteppingKeyValueCache>>,
+        times: &mut SectionTimes,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_trunk_profiled(inputs, cache, times)?;
+        let t0 = std::time::Instant::now();
+        let t = *h
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("trunk hidden missing T dim"))?;
+        let last = if t > 1 { h.index((.., -1.., ..)) } else { h };
+        let logits = self.project_logits(&last)?;
+        logits.eval()?;
+        times.add("lm_head", t0.elapsed().as_nanos());
+        Ok(logits)
+    }
+
+    /// Profiled mirror of `forward_trunk`. Inserts `eval + record` at each
+    /// semantic section boundary. Sections are grouped by operation type
+    /// (qkv projections together, mlp up+gate together, etc.) — per-layer
+    /// noise is collapsed into section totals across all layers.
+    #[allow(non_snake_case)]
+    fn forward_trunk_profiled(
+        &self,
+        inputs: &Array,
+        cache: &mut Vec<Option<SteppingKeyValueCache>>,
+        times: &mut SectionTimes,
+    ) -> Result<Array, Exception> {
+        use std::time::Instant;
+
+        let shape = inputs.shape();
+        let B = *shape
+            .first()
+            .ok_or_else(|| Exception::custom("inputs must have >= 2 dims"))?;
+        let T = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("inputs must have >= 2 dims"))?;
+
+        if cache.is_empty() {
+            *cache = (0..self.layers.len())
+                .map(|_| Some(SteppingKeyValueCache::new()))
+                .collect();
+        } else if cache.len() != self.layers.len() {
+            return Err(Exception::custom(format!(
+                "cache len {} != num_layers {}",
+                cache.len(),
+                self.layers.len()
+            )));
+        }
+
+        // Sync point: make sure prior work isn't folded into embed_rows time.
+        inputs.eval()?;
+
+        let t0 = Instant::now();
+        let mut h = self.embed_rows(inputs)?;
+        h.eval()?;
+        times.add("embed_rows", t0.elapsed().as_nanos());
+
+        let mask = create_attention_mask(&h, cache, None)?;
+
+        let heads = i32::try_from(self.config.heads)
+            .map_err(|_| Exception::custom("heads overflows i32"))?;
+        let kv_heads = i32::try_from(self.config.kv_heads)
+            .map_err(|_| Exception::custom("kv_heads overflows i32"))?;
+        let rms_eps = self.config.rms_norm_eps;
+
+        for (layer, layer_cache) in self.layers.iter().zip(cache.iter_mut()) {
+            let t0 = Instant::now();
+            let normed = fast::rms_norm(&h, &layer.input_norm, rms_eps)?;
+            normed.eval()?;
+            times.add("input_norm", t0.elapsed().as_nanos());
+
+            // qkv projections — 3× quantized_matmul on the same input.
+            let t0 = Instant::now();
+            let q = layer.q_proj.forward(&normed)?;
+            let k = layer.k_proj.forward(&normed)?;
+            let v = layer.v_proj.forward(&normed)?;
+            q.eval()?;
+            k.eval()?;
+            v.eval()?;
+            times.add("qkv_proj", t0.elapsed().as_nanos());
+
+            // Reshape to [B, L, n_heads, head_dim] then transpose to
+            // [B, n_heads, L, head_dim]. Metadata-only; lumped with qk_norm.
+            let q = q
+                .reshape(&[B, T, heads, -1])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let k = k
+                .reshape(&[B, T, kv_heads, -1])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let v = v
+                .reshape(&[B, T, kv_heads, -1])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+
+            let t0 = Instant::now();
+            let q = fast::rms_norm(&q, &layer.q_norm, rms_eps)?;
+            let k = fast::rms_norm(&k, &layer.k_norm, rms_eps)?;
+            q.eval()?;
+            k.eval()?;
+            times.add("qk_norm", t0.elapsed().as_nanos());
+
+            let offset = layer_cache.as_ref().map_or(0, KeyValueCache::offset);
+            let t0 = Instant::now();
+            let q = self.apply_rope(&q, offset)?;
+            let k = self.apply_rope(&k, offset)?;
+            q.eval()?;
+            k.eval()?;
+            times.add("rope", t0.elapsed().as_nanos());
+
+            let mask_arr = match &mask {
+                Some(crate::utils::AttentionMask::Array(a)) => Some(a),
+                _ => None,
+            };
+            let mask_arr_opt: Option<&Array> = mask_arr;
+
+            let t0 = Instant::now();
+            let attn_out = match layer_cache.as_mut() {
+                Some(c) => cached_scaled_dot_product_attention(
+                    q,
+                    c,
+                    k,
+                    v,
+                    self.attention_scale,
+                    mask_arr_opt,
+                )?,
+                None => fast::scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    self.attention_scale,
+                    mask_arr_opt.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
+                    None::<&Array>,
+                )?,
+            };
+            attn_out.eval()?;
+            times.add("sdpa_kv", t0.elapsed().as_nanos());
+
+            let attn_out = attn_out
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[B, T, -1])?;
+
+            let t0 = Instant::now();
+            let attn_out = layer.o_proj.forward(&attn_out)?;
+            attn_out.eval()?;
+            times.add("o_proj", t0.elapsed().as_nanos());
+
+            let t0 = Instant::now();
+            let h_post_attn = h.add(&attn_out)?;
+            h_post_attn.eval()?;
+            times.add("residual", t0.elapsed().as_nanos());
+
+            let t0 = Instant::now();
+            let normed_post = fast::rms_norm(&h_post_attn, &layer.post_attn_norm, rms_eps)?;
+            normed_post.eval()?;
+            times.add("post_attn_norm", t0.elapsed().as_nanos());
+
+            let t0 = Instant::now();
+            let gate = layer.gate_proj.forward(&normed_post)?;
+            let up = layer.up_proj.forward(&normed_post)?;
+            gate.eval()?;
+            up.eval()?;
+            times.add("mlp_up_gate", t0.elapsed().as_nanos());
+
+            let t0 = Instant::now();
+            let mlp_hidden = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
+            mlp_hidden.eval()?;
+            times.add("silu_mul", t0.elapsed().as_nanos());
+
+            let t0 = Instant::now();
+            let mlp_out = layer.down_proj.forward(&mlp_hidden)?;
+            mlp_out.eval()?;
+            times.add("mlp_down", t0.elapsed().as_nanos());
+
+            let t0 = Instant::now();
+            h = h_post_attn.add(&mlp_out)?;
+            h.eval()?;
+            times.add("residual", t0.elapsed().as_nanos());
+        }
+
+        let t0 = Instant::now();
+        let out = fast::rms_norm(&h, &self.final_norm, rms_eps)?;
+        out.eval()?;
+        times.add("final_norm", t0.elapsed().as_nanos());
+        Ok(out)
+    }
+}
+
+/// Per-section wall-time accumulator for the Bonsai-Q1 forward pass.
+///
+/// Exists only to attribute the 45 ms/tok Bonsai-8B AR decode cost to
+/// individual sections (embed / norms / qkv / rope / sdpa / o_proj / mlp / lm_head).
+/// Each section's compute is force-`.eval()`'d to prevent MLX lazy batching
+/// from pooling multiple sections into one materialization — ratios between
+/// sections are meaningful even though absolutes will be slower than the
+/// unprofiled path.
+#[derive(Debug, Default, Clone)]
+pub struct SectionTimes {
+    totals: std::collections::BTreeMap<&'static str, (u128, u64)>,
+}
+
+impl SectionTimes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, name: &'static str, ns: u128) {
+        let e = self.totals.entry(name).or_insert((0, 0));
+        e.0 += ns;
+        e.1 += 1;
+    }
+
+    /// Total across all sections (ns).
+    pub fn total_ns(&self) -> u128 {
+        self.totals.values().map(|(t, _)| *t).sum()
+    }
+
+    /// Section totals: `(name, total_ns, call_count)`, sorted by ns descending.
+    pub fn entries(&self) -> Vec<(&'static str, u128, u64)> {
+        let mut v: Vec<_> = self.totals.iter().map(|(k, (t, n))| (*k, *t, *n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
     }
 }
 
@@ -1120,9 +1351,7 @@ mod tests {
             last_slice, last_row,
             "forward vs forward_all_logits[-1] diverge"
         );
-        eprintln!(
-            "forward_all_logits OK: shape=[1,8,{vocab}], row[-1] matches forward()"
-        );
+        eprintln!("forward_all_logits OK: shape=[1,8,{vocab}], row[-1] matches forward()");
     }
 
     // ---------------------------------------------------------------------
@@ -1162,7 +1391,9 @@ mod tests {
         md.push_str(&format!(
             "- layers: {layers_n}, vocab: {vocab}, packed resident: {mb:.1} MB\n"
         ));
-        md.push_str(&format!("- load: {load_ms:.0} ms, to_gpu: {to_gpu_ms:.0} ms\n\n"));
+        md.push_str(&format!(
+            "- load: {load_ms:.0} ms, to_gpu: {to_gpu_ms:.0} ms\n\n"
+        ));
         eprintln!(
             "[{name}] load={load_ms:.0}ms to_gpu={to_gpu_ms:.0}ms resident={mb:.1}MB layers={layers_n}"
         );
@@ -1201,12 +1432,20 @@ mod tests {
             let dt = t0.elapsed().as_secs_f64();
             let tps = f64::from(L) / dt;
             md.push_str(&format!("| {L} | {:.1} | {tps:.1} |\n", dt * 1000.0));
-            eprintln!("[{name}] prefill L={L}: {:.1}ms ({tps:.1} tok/s)", dt * 1000.0);
+            eprintln!(
+                "[{name}] prefill L={L}: {:.1}ms ({tps:.1} tok/s)",
+                dt * 1000.0
+            );
         }
 
         // --- Sustained decode ---
         md.push_str("\n### Sustained decode after 16-token prefill (autoregressive argmax)\n\n");
         let mut c = model.make_cache();
+        // Pre-allocate KV cache for the full sequence. Without this, the
+        // default 256-token step forces a grow+concat every 256 decode
+        // steps, which breaks any compiled-decode trace (shape of
+        // keys/values changes). See crates/higgs-models/src/cache.rs.
+        c.reserve_max_tokens(16 + decode_n + 8); // slack for safety
         let prompt = synth_ids(16);
         let x = mlx_rs::Array::from_slice(&prompt, &[1, 16]);
         let y0 = model.forward(&x, None, &mut c).expect("decode prefill");
@@ -1259,7 +1498,9 @@ mod tests {
         let tps = f64::from(steady) / dt;
         let ms_per_tok = dt * 1000.0 / f64::from(steady);
 
-        md.push_str(&format!("| decode steps | total ms | ms/tok | tok/s |\n|---:|---:|---:|---:|\n"));
+        md.push_str(&format!(
+            "| decode steps | total ms | ms/tok | tok/s |\n|---:|---:|---:|---:|\n"
+        ));
         md.push_str(&format!(
             "| {steady} (after {warm_steps} warmup) | {:.1} | {ms_per_tok:.2} | {tps:.1} |\n",
             dt * 1000.0
@@ -1295,12 +1536,7 @@ mod tests {
                 &[1, 16, 128, 512, 2048][..],
                 256,
             ),
-            (
-                "Bonsai-8B",
-                bonsai_8b_dir(),
-                &[1, 16, 128, 512][..],
-                128,
-            ),
+            ("Bonsai-8B", bonsai_8b_dir(), &[1, 16, 128, 512][..], 128),
         ];
 
         let mut any_ran = false;
@@ -1321,7 +1557,9 @@ mod tests {
         assert!(any_ran, "no Bonsai checkpoints found; nothing to bench");
 
         // Print the full markdown report to stdout.
-        eprintln!("\n========== BEGIN REPORT ==========\n{report}\n========== END REPORT ==========");
+        eprintln!(
+            "\n========== BEGIN REPORT ==========\n{report}\n========== END REPORT =========="
+        );
 
         // Try to write to .planning/measurements/p5-bonsai-q1-anymodel.md. Path
         // is derived from the crate dir (two levels up from higgs-models).
@@ -1339,6 +1577,154 @@ mod tests {
                 }
             } else {
                 eprintln!("measurements dir not found: {}", dir.display());
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase-A decode breakdown: attribute Bonsai-8B's 45 ms/tok to sections.
+    // Gated by HIGGS_PROFILE_BONSAI=1 so it runs only when asked; bench
+    // itself is `--ignored` anyway.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "bench; run with HIGGS_PROFILE_BONSAI=1 --ignored --nocapture"]
+    fn bench_bonsai_q1_decode_breakdown() {
+        use std::time::Instant;
+
+        if std::env::var("HIGGS_PROFILE_BONSAI").ok().as_deref() != Some("1") {
+            eprintln!(
+                "HIGGS_PROFILE_BONSAI != 1; skipping (set to 1 to enable per-section profile)"
+            );
+            return;
+        }
+
+        let Some(dir) = bonsai_8b_dir() else {
+            eprintln!("Bonsai-8B not found; skipping");
+            return;
+        };
+        let gpu = load_bonsai_q1(&dir).expect("load");
+        let layers_n = gpu.num_layers();
+
+        // Prefill once (16 tokens), discard logits. Warmup with 4 decode
+        // steps on a FRESH profile accumulator, then measure 64 steps.
+        let prompt = synth_ids(16);
+        let x = mlx_rs::Array::from_slice(&prompt, &[1, 16]);
+        let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+        let y = gpu.forward(&x, &mut cache).expect("prefill");
+        y.eval().expect("eval prefill");
+
+        // Seed decode token from prefill argmax.
+        let s0: &[f32] = y.as_slice::<f32>();
+        let (mut tok, mut best) = (0i32, f32::NEG_INFINITY);
+        for (i, v) in s0.iter().enumerate() {
+            if *v > best {
+                best = *v;
+                tok = i as i32;
+            }
+        }
+
+        // Warmup (4 steps, no profiling): settle MLX per-shape compile cache.
+        for _ in 0..4 {
+            let d = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+            let y = gpu.forward(&d, &mut cache).expect("warm decode");
+            y.eval().expect("eval");
+            let s: &[f32] = y.as_slice::<f32>();
+            let mut nb_i = 0i32;
+            let mut nb_v = f32::NEG_INFINITY;
+            for (i, v) in s.iter().enumerate() {
+                if *v > nb_v {
+                    nb_v = *v;
+                    nb_i = i as i32;
+                }
+            }
+            tok = nb_i;
+        }
+
+        // Measured run: 64 decode steps with per-section attribution.
+        let steady: i32 = 64;
+        let mut times = SectionTimes::new();
+        let t0 = Instant::now();
+        for _ in 0..steady {
+            let d = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+            let y = gpu
+                .forward_profiled(&d, &mut cache, &mut times)
+                .expect("profiled decode");
+            // forward_profiled already evals; still touch logits to pick next tok.
+            let s: &[f32] = y.as_slice::<f32>();
+            let mut nb_i = 0i32;
+            let mut nb_v = f32::NEG_INFINITY;
+            for (i, v) in s.iter().enumerate() {
+                if *v > nb_v {
+                    nb_v = *v;
+                    nb_i = i as i32;
+                }
+            }
+            tok = nb_i;
+        }
+        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // Aggregate.
+        let entries = times.entries();
+        let total_ns = times.total_ns() as f64;
+        let steady_f = f64::from(steady);
+        let ms_per_step = wall_ms / steady_f;
+        let accounted_ms = total_ns / 1_000_000.0 / steady_f;
+        let accounted_pct = if ms_per_step > 0.0 {
+            100.0 * accounted_ms / ms_per_step
+        } else {
+            0.0
+        };
+
+        // Build report.
+        let mut md = String::new();
+        md.push_str("# Bonsai-8B decode breakdown (Phase A)\n\n");
+        md.push_str(&format!("- layers: {layers_n}\n"));
+        md.push_str(&format!("- prefill: 16 synthetic tokens\n"));
+        md.push_str(&format!("- warmup: 4 decode steps (discarded)\n"));
+        md.push_str(&format!(
+            "- measured: {steady} decode steps, profiled (eval per section)\n"
+        ));
+        md.push_str(&format!(
+            "- wall ms/step: **{ms_per_step:.2}** (accounted {accounted_ms:.2} ms, {accounted_pct:.1}%)\n\n"
+        ));
+        md.push_str("| Section | μs/step | % accounted | calls/step |\n");
+        md.push_str("|---|---:|---:|---:|\n");
+        let denom_ns = total_ns.max(1.0);
+        for (name, section_ns, calls) in &entries {
+            let us_per_step = (*section_ns as f64) / 1000.0 / steady_f;
+            let pct = 100.0 * (*section_ns as f64) / denom_ns;
+            let calls_per_step = (*calls as f64) / steady_f;
+            md.push_str(&format!(
+                "| {name} | {us_per_step:.1} | {pct:.1}% | {calls_per_step:.1} |\n"
+            ));
+        }
+        md.push_str(
+            "\n**Note:** eval-per-section kills lazy batching, so ms/step > unprofiled 45 ms.\n",
+        );
+        md.push_str("Ratios (% accounted) are the signal. Unprofiled 8B decode is 22.2 tok/s\n");
+        md.push_str("(~45 ms/tok) per REPORT.md.\n");
+
+        eprintln!("\n========== DECODE BREAKDOWN ==========\n{md}\n========== END ==========");
+
+        // Write to .planning/measurements/bonsai-parity/decode-breakdown.md.
+        let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if let Some(out_dir) = crate_dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|p| p.join(".planning/measurements/bonsai-parity"))
+        {
+            if out_dir.exists() {
+                let out = out_dir.join("decode-breakdown.md");
+                match std::fs::write(&out, &md) {
+                    Ok(()) => eprintln!("wrote: {}", out.display()),
+                    Err(e) => eprintln!("write failed {}: {e}", out.display()),
+                }
+            } else {
+                eprintln!(
+                    "measurements/bonsai-parity dir not found: {}",
+                    out_dir.display()
+                );
             }
         }
     }
@@ -1415,9 +1801,7 @@ mod tests {
 
                 let x = mlx_rs::Array::from_slice(&ids, &[1, k]);
                 let t0 = Instant::now();
-                let yv = model
-                    .forward_all_logits(&x, None, &mut c)
-                    .expect("verify");
+                let yv = model.forward_all_logits(&x, None, &mut c).expect("verify");
                 yv.eval().expect("eval");
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 if ms < best_ms {
