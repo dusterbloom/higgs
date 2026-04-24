@@ -504,4 +504,80 @@ mod tests {
         eprintln!("max_err vs reference dequant: {max_err}");
         assert!(max_err < 1e-6, "dequant mismatch: max_err={max_err}");
     }
+
+    /// P2 acceptance gate — verify MLX `quantized_matmul` with `bits=1` through
+    /// the PrismML-forked core + mlx-c v0.6.0-3 bindings matches a scalar
+    /// dequant-then-dot oracle on a real Bonsai-1.7B layer. A passing test
+    /// proves the 1-bit hot path is wired end-to-end: packed uint32 storage →
+    /// mlx-rs `Array` → PrismML `quantize(bits=1)` kernel → fp32 result.
+    #[test]
+    fn test_mlx_quantized_matmul_bits1_matches_oracle() {
+        let Some(dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+        let engine = BonsaiQ1Engine::load(&dir).unwrap();
+
+        // Pick k_proj of layer 0 — smallest per-layer linear in 1.7B:
+        // in=hidden=2048, out=kv_heads*head_dim=8*128=1024. Keeps the oracle
+        // loop cheap while exercising the full dispatch.
+        let k = &engine.layers[0].k_proj;
+        let in_f = k.in_features;
+        let out_f = k.out_features;
+        let packed_cols = in_f / 32;
+        let n_groups = in_f / GROUP_SIZE;
+
+        // Build MLX arrays directly from the packed tables (no dequant).
+        let w_mlx = mlx_rs::Array::from_slice(
+            &k.w_packed,
+            &[out_f as i32, packed_cols as i32],
+        );
+        let s_f32: Vec<f32> = k.scales.iter().map(|h| h.to_f32()).collect();
+        let b_f32: Vec<f32> = k.biases.iter().map(|h| h.to_f32()).collect();
+        let s_mlx = mlx_rs::Array::from_slice(&s_f32, &[out_f as i32, n_groups as i32]);
+        let b_mlx = mlx_rs::Array::from_slice(&b_f32, &[out_f as i32, n_groups as i32]);
+
+        // Deterministic activation: two sinusoids, small magnitude so fp16
+        // intermediate precision doesn't blow the tolerance.
+        let x_f32: Vec<f32> = (0..in_f)
+            .map(|i| 0.01 * ((i as f32 * 0.03).sin() + 0.5 * (i as f32 * 0.17).cos()))
+            .collect();
+        let x_mlx = mlx_rs::Array::from_slice(&x_f32, &[1, in_f as i32]);
+
+        // Hot path: PrismML bits=1 quantized matmul.
+        let y_mlx = mlx_rs::ops::quantized_matmul(
+            &x_mlx,
+            &w_mlx,
+            &s_mlx,
+            &b_mlx,
+            true,
+            GROUP_SIZE as i32,
+            1,
+        )
+        .expect("quantized_matmul(bits=1) failed — PrismML mlx core swap missing?");
+        y_mlx.eval().expect("eval failed");
+        let y_mlx_vec: &[f32] = y_mlx.as_slice::<f32>();
+        assert_eq!(y_mlx_vec.len(), out_f);
+
+        // Oracle: per-row scalar dequant-then-dot.
+        let mut y_ref = vec![0.0f32; out_f];
+        let mut w_row = vec![0.0f32; in_f];
+        for row in 0..out_f {
+            k.dequant_row_to_fp32(row, &mut w_row);
+            y_ref[row] = w_row.iter().zip(x_f32.iter()).map(|(a, b)| a * b).sum();
+        }
+
+        let max_err = y_ref
+            .iter()
+            .zip(y_mlx_vec.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "bits=1 quantized_matmul[1,{in_f}]x[{out_f},{in_f}] vs scalar oracle: max_err={max_err}"
+        );
+        assert!(
+            max_err < 1e-2,
+            "bits=1 MLX matmul disagrees with oracle dequant: max_err={max_err}"
+        );
+    }
 }
