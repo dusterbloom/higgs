@@ -487,8 +487,13 @@ impl TurboQuantContext {
 
         // Pack on GPU: [H*T, D] u32 → [H*T, code_words] u32
         let indices_flat = indices.reshape(&[n, self.head_dim])?;
-        let packed_flat =
-            pack_indices_gpu(&indices_flat, n, self.head_dim, self.config.bits, self.value_code_words)?;
+        let packed_flat = pack_indices_gpu(
+            &indices_flat,
+            n,
+            self.head_dim,
+            self.config.bits,
+            self.value_code_words,
+        )?;
         let packed = packed_flat.reshape(&[h, t, self.value_code_words])?;
 
         Ok((norms, packed))
@@ -544,10 +549,14 @@ impl TurboQuantContext {
         let indices_flat = mse_indices.reshape(&[n, self.head_dim])?;
         let signs_flat = signs.reshape(&[n, self.head_dim])?;
 
-        let packed_codes_flat =
-            pack_indices_gpu(&indices_flat, n, self.head_dim, key_bits, self.key_code_words)?;
-        let packed_signs_flat =
-            pack_signs_gpu(&signs_flat, n, self.head_dim, self.sign_bytes)?;
+        let packed_codes_flat = pack_indices_gpu(
+            &indices_flat,
+            n,
+            self.head_dim,
+            key_bits,
+            self.key_code_words,
+        )?;
+        let packed_signs_flat = pack_signs_gpu(&signs_flat, n, self.head_dim, self.sign_bytes)?;
 
         let packed_codes = packed_codes_flat.reshape(&[h, t, self.key_code_words])?;
         let packed_signs = packed_signs_flat.reshape(&[h, t, self.sign_bytes])?;
@@ -1357,27 +1366,35 @@ out_rot[head * L_val * D + l * D + int(dim)] = acc;
 
 fn create_scores_block_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let input_names: [&std::ffi::CStr; 10] = [
-        c"q_rot", c"q_qjl", c"k_codes", c"k_norms", c"k_qjl", c"k_gammas",
-        c"key_centroids", c"Capacity", c"T", c"L",
+        c"q_rot",
+        c"q_qjl",
+        c"k_codes",
+        c"k_norms",
+        c"k_qjl",
+        c"k_gammas",
+        c"key_centroids",
+        c"Capacity",
+        c"T",
+        c"L",
     ];
     let output_names: [&std::ffi::CStr; 1] = [c"scores"];
-    let input_ptrs: Vec<*const c_char> =
-        input_names.iter().map(|n| n.as_ptr()).collect();
-    let output_ptrs: Vec<*const c_char> =
-        output_names.iter().map(|n| n.as_ptr()).collect();
-    let source =
-        CString::new(TURBOQUANT_SCORES_BLOCK_KERNEL_SOURCE).unwrap_or_default();
+    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|n| n.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|n| n.as_ptr()).collect();
+    let source = CString::new(TURBOQUANT_SCORES_BLOCK_KERNEL_SOURCE).unwrap_or_default();
     #[allow(unsafe_code)]
     unsafe {
-        let in_vec = mlx_sys::mlx_vector_string_new_data(
-            input_ptrs.as_ptr().cast_mut(), input_ptrs.len(),
-        );
-        let out_vec = mlx_sys::mlx_vector_string_new_data(
-            output_ptrs.as_ptr().cast_mut(), output_ptrs.len(),
-        );
+        let in_vec =
+            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
         let kernel = mlx_sys::mlx_fast_metal_kernel_new(
             c"turboquant_scores_block".as_ptr(),
-            in_vec, out_vec, source.as_ptr(), c"".as_ptr(), true, false,
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
         );
         mlx_sys::mlx_vector_string_free(in_vec);
         mlx_sys::mlx_vector_string_free(out_vec);
@@ -1387,27 +1404,32 @@ fn create_scores_block_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 
 fn create_values_block_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let input_names: [&std::ffi::CStr; 7] = [
-        c"weights", c"v_codes", c"v_norms", c"value_centroids",
-        c"Capacity", c"T", c"L",
+        c"weights",
+        c"v_codes",
+        c"v_norms",
+        c"value_centroids",
+        c"Capacity",
+        c"T",
+        c"L",
     ];
     let output_names: [&std::ffi::CStr; 1] = [c"out_rot"];
-    let input_ptrs: Vec<*const c_char> =
-        input_names.iter().map(|n| n.as_ptr()).collect();
-    let output_ptrs: Vec<*const c_char> =
-        output_names.iter().map(|n| n.as_ptr()).collect();
-    let source =
-        CString::new(TURBOQUANT_VALUES_BLOCK_KERNEL_SOURCE).unwrap_or_default();
+    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|n| n.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|n| n.as_ptr()).collect();
+    let source = CString::new(TURBOQUANT_VALUES_BLOCK_KERNEL_SOURCE).unwrap_or_default();
     #[allow(unsafe_code)]
     unsafe {
-        let in_vec = mlx_sys::mlx_vector_string_new_data(
-            input_ptrs.as_ptr().cast_mut(), input_ptrs.len(),
-        );
-        let out_vec = mlx_sys::mlx_vector_string_new_data(
-            output_ptrs.as_ptr().cast_mut(), output_ptrs.len(),
-        );
+        let in_vec =
+            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
         let kernel = mlx_sys::mlx_fast_metal_kernel_new(
             c"turboquant_values_block".as_ptr(),
-            in_vec, out_vec, source.as_ptr(), c"".as_ptr(), true, false,
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
         );
         mlx_sys::mlx_vector_string_free(in_vec);
         mlx_sys::mlx_vector_string_free(out_vec);
@@ -1442,43 +1464,71 @@ pub(crate) fn decode_scores_block(
     ensure_ffi_error_handler();
 
     let stream = Stream::task_local_or_default();
-    let kernel =
-        SCORE_BLOCK_KERNEL.get_or_init(|| CachedMetalKernel(create_scores_block_kernel()));
+    let kernel = SCORE_BLOCK_KERNEL.get_or_init(|| CachedMetalKernel(create_scores_block_kernel()));
 
     let config = unsafe {
         let cfg = mlx_sys::mlx_fast_metal_kernel_config_new();
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"D".as_ptr(), head_dim);
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"H".as_ptr(), num_heads);
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"HKV".as_ptr(), num_kv_heads);
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"KBits".as_ptr(), i32::from(key_bits));
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"KWords".as_ptr(), key_code_words);
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"QBytes".as_ptr(), sign_bytes);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            cfg,
+            c"HKV".as_ptr(),
+            num_kv_heads,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            cfg,
+            c"KBits".as_ptr(),
+            i32::from(key_bits),
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            cfg,
+            c"KWords".as_ptr(),
+            key_code_words,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            cfg,
+            c"QBytes".as_ptr(),
+            sign_bytes,
+        );
         // grid: (T, HKV, L) — all queries dispatched in z-axis
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(cfg, seq_len, num_kv_heads, num_queries);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1);
         // output: [H, L, seq_len]
         let shape = [num_heads, num_queries, seq_len];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
-            cfg, shape.as_ptr(), shape.len(), mlx_sys::mlx_dtype__MLX_FLOAT32,
+            cfg,
+            shape.as_ptr(),
+            shape.len(),
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
         );
         cfg
     };
 
     let cap_scalar = unsafe { mlx_sys::mlx_array_new_int(capacity) };
     let seq_scalar = unsafe { mlx_sys::mlx_array_new_int(seq_len) };
-    let l_scalar   = unsafe { mlx_sys::mlx_array_new_int(num_queries) };
+    let l_scalar = unsafe { mlx_sys::mlx_array_new_int(num_queries) };
     let input_ptrs = [
-        q_rot.as_ptr(), q_qjl.as_ptr(),
-        key_codes.as_ptr(), key_norms.as_ptr(), key_qjl.as_ptr(), key_gammas.as_ptr(),
-        key_centroids.as_ptr(), cap_scalar, seq_scalar, l_scalar,
+        q_rot.as_ptr(),
+        q_qjl.as_ptr(),
+        key_codes.as_ptr(),
+        key_norms.as_ptr(),
+        key_qjl.as_ptr(),
+        key_gammas.as_ptr(),
+        key_centroids.as_ptr(),
+        cap_scalar,
+        seq_scalar,
+        l_scalar,
     ];
-    let inputs_vec = unsafe {
-        mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len())
-    };
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
     let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
     let status = unsafe {
         mlx_sys::mlx_fast_metal_kernel_apply(
-            &raw mut outputs_vec, kernel.0, inputs_vec, config, stream.as_ptr(),
+            &raw mut outputs_vec,
+            kernel.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
         )
     };
     let result = extract_single_output(status, outputs_vec, "turboquant_scores_block");
@@ -1515,42 +1565,63 @@ pub(crate) fn decode_weighted_values_block(
     ensure_ffi_error_handler();
 
     let stream = Stream::task_local_or_default();
-    let kernel =
-        VALUE_BLOCK_KERNEL.get_or_init(|| CachedMetalKernel(create_values_block_kernel()));
+    let kernel = VALUE_BLOCK_KERNEL.get_or_init(|| CachedMetalKernel(create_values_block_kernel()));
 
     let config = unsafe {
         let cfg = mlx_sys::mlx_fast_metal_kernel_config_new();
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"D".as_ptr(), head_dim);
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"H".as_ptr(), num_heads);
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"HKV".as_ptr(), num_kv_heads);
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"VBits".as_ptr(), i32::from(value_bits));
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c"VWords".as_ptr(), value_code_words);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            cfg,
+            c"HKV".as_ptr(),
+            num_kv_heads,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            cfg,
+            c"VBits".as_ptr(),
+            i32::from(value_bits),
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            cfg,
+            c"VWords".as_ptr(),
+            value_code_words,
+        );
         // grid: (D, H, L)
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(cfg, head_dim, num_heads, num_queries);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1);
         // output: [H, L, head_dim]
         let shape = [num_heads, num_queries, head_dim];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
-            cfg, shape.as_ptr(), shape.len(), mlx_sys::mlx_dtype__MLX_FLOAT32,
+            cfg,
+            shape.as_ptr(),
+            shape.len(),
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
         );
         cfg
     };
 
     let cap_scalar = unsafe { mlx_sys::mlx_array_new_int(capacity) };
     let seq_scalar = unsafe { mlx_sys::mlx_array_new_int(seq_len) };
-    let l_scalar   = unsafe { mlx_sys::mlx_array_new_int(num_queries) };
+    let l_scalar = unsafe { mlx_sys::mlx_array_new_int(num_queries) };
     let input_ptrs = [
         weights.as_ptr(),
-        value_codes.as_ptr(), value_norms.as_ptr(), value_centroids.as_ptr(),
-        cap_scalar, seq_scalar, l_scalar,
+        value_codes.as_ptr(),
+        value_norms.as_ptr(),
+        value_centroids.as_ptr(),
+        cap_scalar,
+        seq_scalar,
+        l_scalar,
     ];
-    let inputs_vec = unsafe {
-        mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len())
-    };
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
     let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
     let status = unsafe {
         mlx_sys::mlx_fast_metal_kernel_apply(
-            &raw mut outputs_vec, kernel.0, inputs_vec, config, stream.as_ptr(),
+            &raw mut outputs_vec,
+            kernel.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
         )
     };
     let result = extract_single_output(status, outputs_vec, "turboquant_values_block");
@@ -1602,8 +1673,7 @@ fn create_pack_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let output_names: [&std::ffi::CStr; 1] = [c"packed"];
     let input_ptrs: Vec<*const c_char> = input_names.iter().map(|name| name.as_ptr()).collect();
     let output_ptrs: Vec<*const c_char> = output_names.iter().map(|name| name.as_ptr()).collect();
-    let source =
-        CString::new(TURBOQUANT_PACK_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+    let source = CString::new(TURBOQUANT_PACK_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
 
     unsafe {
         let in_vec =
@@ -2142,9 +2212,7 @@ mod tests {
             let code_words = packed_words(dim as usize, bits).unwrap();
 
             // Generate deterministic indices
-            let indices_vec: Vec<u32> = (0..(n * dim) as u32)
-                .map(|i| i % (max_val + 1))
-                .collect();
+            let indices_vec: Vec<u32> = (0..(n * dim) as u32).map(|i| i % (max_val + 1)).collect();
 
             // CPU pack (into bytes, then reinterpret as u32 words)
             let mut cpu_packed = vec![0_u8; (n as usize) * (code_bytes as usize)];
@@ -2169,10 +2237,7 @@ mod tests {
             gpu_packed.eval().unwrap();
             let gpu_data = gpu_packed.as_slice::<u32>();
 
-            assert_eq!(
-                gpu_data, &cpu_words[..],
-                "GPU pack mismatch for {bits}-bit",
-            );
+            assert_eq!(gpu_data, &cpu_words[..], "GPU pack mismatch for {bits}-bit",);
         }
     }
 
@@ -2198,7 +2263,9 @@ mod tests {
 
         // GPU pack: create bool array from u8 (MLX bool == uint8)
         let signs_u8: Vec<u8> = signs_bool.iter().map(|&b| b as u8).collect();
-        let signs_arr = Array::from_slice(&signs_u8, &[n, dim]).as_dtype(Dtype::Bool).unwrap();
+        let signs_arr = Array::from_slice(&signs_u8, &[n, dim])
+            .as_dtype(Dtype::Bool)
+            .unwrap();
         let gpu_packed = pack_signs_gpu(&signs_arr, n, dim, sign_bytes).unwrap();
         gpu_packed.eval().unwrap();
         let gpu_data = gpu_packed.as_slice::<u8>();
@@ -2230,7 +2297,11 @@ mod tests {
             let gpu_norms_data = gpu_norms.as_slice::<f32>();
 
             // Compare norms
-            for (i, (gpu, cpu)) in gpu_norms_data.iter().zip(cpu_result.norms.iter()).enumerate() {
+            for (i, (gpu, cpu)) in gpu_norms_data
+                .iter()
+                .zip(cpu_result.norms.iter())
+                .enumerate()
+            {
                 assert!(
                     (gpu - cpu).abs() < 1e-5,
                     "{bits}b norm[{i}]: gpu={gpu} vs cpu={cpu}",
@@ -2238,7 +2309,8 @@ mod tests {
             }
 
             // Reinterpret CPU bytes as u32 words for comparison
-            let cpu_words: Vec<u32> = cpu_result.packed_codes
+            let cpu_words: Vec<u32> = cpu_result
+                .packed_codes
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
@@ -2275,7 +2347,12 @@ mod tests {
             gpu_signs.eval().unwrap();
 
             // Compare norms
-            for (i, (gpu, cpu)) in gpu_norms.as_slice::<f32>().iter().zip(cpu_result.norms.iter()).enumerate() {
+            for (i, (gpu, cpu)) in gpu_norms
+                .as_slice::<f32>()
+                .iter()
+                .zip(cpu_result.norms.iter())
+                .enumerate()
+            {
                 assert!(
                     (gpu - cpu).abs() < 1e-5,
                     "{bits}b key norm[{i}]: gpu={gpu} vs cpu={cpu}",
@@ -2283,7 +2360,12 @@ mod tests {
             }
 
             // Compare gammas
-            for (i, (gpu, cpu)) in gpu_gammas.as_slice::<f32>().iter().zip(cpu_result.gammas.iter()).enumerate() {
+            for (i, (gpu, cpu)) in gpu_gammas
+                .as_slice::<f32>()
+                .iter()
+                .zip(cpu_result.gammas.iter())
+                .enumerate()
+            {
                 assert!(
                     (gpu - cpu).abs() < 1e-4,
                     "{bits}b gamma[{i}]: gpu={gpu} vs cpu={cpu}",
@@ -2291,7 +2373,8 @@ mod tests {
             }
 
             // Reinterpret CPU bytes as u32 words for comparison
-            let cpu_code_words: Vec<u32> = cpu_result.packed_codes
+            let cpu_code_words: Vec<u32> = cpu_result
+                .packed_codes
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();

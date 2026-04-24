@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use mlx_rs::Array;
 use mlx_rs::module::ModuleParameters;
 use mlx_rs::transforms::eval;
-use mlx_rs::Array;
 
 use crate::ane_forward::{LayerAneWeightData, LayerCpuWeights, LoraActivation, LoraWeights};
 use crate::rwkv7::Rwkv7CausalLM;
@@ -62,7 +62,13 @@ fn get_f32_flat(params: &ParamMap<'_>, key: &str) -> Vec<f32> {
 /// PyTorch linear weight is [out_features, in_features]; ANE MIL matmul needs [in_features, out_features].
 fn get_f32_transposed(params: &ParamMap<'_>, key: &str, rows: usize, cols: usize) -> Vec<f32> {
     let data = get_f32(params, key);
-    assert_eq!(data.len(), rows * cols, "{key}: expected {rows}x{cols}={}, got {}", rows * cols, data.len());
+    assert_eq!(
+        data.len(),
+        rows * cols,
+        "{key}: expected {rows}x{cols}={}, got {}",
+        rows * cols,
+        data.len()
+    );
     let mut out = vec![0.0f32; rows * cols];
     for r in 0..rows {
         for c in 0..cols {
@@ -235,7 +241,9 @@ pub fn extract_ane_weights(
 
 /// Extract projection weights as fp16 in ORIGINAL PyTorch layout `[oc, ic]` for `gemm_f16`.
 /// This halves memory bandwidth vs f32 for BLAS projections.
-pub fn extract_fp16_projection_weights(model: &Rwkv7CausalLM) -> Vec<crate::ane_forward::LayerFp16Weights> {
+pub fn extract_fp16_projection_weights(
+    model: &Rwkv7CausalLM,
+) -> Vec<crate::ane_forward::LayerFp16Weights> {
     let params = model.parameters().flatten();
     let all_arrays: Vec<&Array> = params.values().copied().collect();
     eval(all_arrays).expect("Failed to eval");

@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use mlx_rs::{
-    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn, ops, Array,
+    Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn, ops,
 };
 use serde::Deserialize;
 
@@ -237,7 +237,10 @@ impl DFlashAttention {
         let noise_k = self.k_proj.forward(noise)?;
         let noise_v = self.v_proj.forward(noise)?;
         let noise_k = noise_k.reshape(&[B, q_len, self.num_key_value_heads, self.head_dim])?;
-        let noise_k = self.k_norm.forward(&noise_k)?.transpose_axes(&[0, 2, 1, 3])?;
+        let noise_k = self
+            .k_norm
+            .forward(&noise_k)?
+            .transpose_axes(&[0, 2, 1, 3])?;
         let noise_v = noise_v
             .reshape(&[B, q_len, self.num_key_value_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
@@ -481,10 +484,7 @@ impl GdnStateBackup {
 /// Rollback only KV cache layers by `rollback` positions. GDN layers are
 /// left untouched. Used with stateless GDN verify where GDN state was never
 /// corrupted by speculative tokens.
-pub fn rollback_kv_only(
-    kv_cache: &mut [Option<crate::qwen3_next::LayerCache>],
-    rollback: i32,
-) {
+pub fn rollback_kv_only(kv_cache: &mut [Option<crate::qwen3_next::LayerCache>], rollback: i32) {
     if rollback <= 0 {
         return;
     }
@@ -883,7 +883,10 @@ mod tests {
                     "  verify_flat: {:?}",
                     &verify_flat[..verify_flat.len().min(16)]
                 );
-                println!("  accepted:    {:?} + correction={}", accepted, correction_token);
+                println!(
+                    "  accepted:    {:?} + correction={}",
+                    accepted, correction_token
+                );
                 println!(
                     "  n_accepted:  {n_accepted} + 1 correction (of {} drafts)",
                     draft_u32.len()
@@ -951,6 +954,207 @@ mod tests {
             "Generated tokens: {:?}",
             &generated[..generated.len().min(50)]
         );
+    }
+
+    #[test]
+    #[ignore] // requires Qwen3.6-35B-A3B-4bit target + Qwen3.6-35B-A3B-DFlash drafter
+    fn test_dflash_qwen36_35b_a3b_smoke() {
+        use crate::diffusion::accept_prefix;
+        use crate::qwen3_next::load_qwen3_5_moe_model;
+        use std::time::Instant;
+
+        let target_path = "/Users/peppi/.cache/lm-studio/models/NexVeridian/Qwen3.6-35B-A3B-4bit";
+        let drafter_base = Path::new(
+            "/Users/peppi/AI-Models/shared/huggingface/hub/models--z-lab--Qwen3.6-35B-A3B-DFlash",
+        );
+        let snap_dir = std::fs::read_dir(drafter_base.join("snapshots"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .next()
+            .unwrap()
+            .path();
+
+        println!("Loading target (Qwen3.6-35B-A3B-4bit)...");
+        let t0 = Instant::now();
+        let mut target = load_qwen3_5_moe_model(target_path).unwrap();
+        println!("Target loaded in {:.1}s", t0.elapsed().as_secs_f64());
+
+        println!("Loading DFlash drafter (Qwen3.6-35B-A3B-DFlash)...");
+        let t0 = Instant::now();
+        let mut drafter = load_dflash_drafter(&snap_dir).unwrap();
+        println!("Drafter loaded in {:.1}s", t0.elapsed().as_secs_f64());
+        println!(
+            "  drafter: layers={}, hidden={}, taps={:?}",
+            drafter.layers.len(),
+            drafter.config.hidden_size,
+            drafter.config.target_layer_ids()
+        );
+
+        let tap_layers = drafter.config.target_layer_ids().to_vec();
+        let configured_block_size = drafter.config.block_size;
+        let block_size = std::env::var("HIGGS_DFLASH_BLOCK_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .filter(|&n| n >= 2 && n <= configured_block_size)
+            .unwrap_or(configured_block_size);
+        let mask_id = drafter.config.mask_token_id();
+
+        let prompt_tokens: Vec<i32> = vec![
+            248045, 846, 198, 7734, 264, 2716, 13901, 883, 279, 3712, 314, 17943, 13, 248046, 198,
+            248045, 74455, 198, 248068, 271, 248069, 271,
+        ];
+        let eos_token: i32 = 248046;
+        let prompt_len = prompt_tokens.len() as i32;
+        let input_ids = Array::from_slice(&prompt_tokens, &[1, prompt_len]);
+
+        println!("Prefilling...");
+        let t0 = Instant::now();
+        let mut kv_cache: Vec<Option<crate::qwen3_next::LayerCache>> = Vec::new();
+        let (prefill_logits, taps) = target
+            .forward_with_taps(&input_ids, None, &mut kv_cache, &tap_layers)
+            .unwrap();
+        let mut eval_targets: Vec<&Array> = vec![&prefill_logits];
+        for t in &taps {
+            eval_targets.push(t);
+        }
+        for lc in kv_cache.iter().flatten() {
+            match lc {
+                crate::qwen3_next::LayerCache::KV(kv) => eval_targets.extend(kv.eval_targets()),
+                crate::qwen3_next::LayerCache::Arrays(ac) => {
+                    if let Some(ref s) = ac.ssm_state {
+                        eval_targets.push(s);
+                    }
+                    if let Some(ref c) = ac.conv_state {
+                        eval_targets.push(c);
+                    }
+                }
+            }
+        }
+        mlx_rs::transforms::eval(eval_targets).unwrap();
+        let prefill_ms = t0.elapsed().as_millis();
+        println!("Prefill: {prefill_ms}ms, taps: {}", taps.len());
+
+        let prefill_am = mlx_rs::argmax_axis!(prefill_logits, -1).unwrap();
+        let am_flat: Vec<u32> = prefill_am
+            .reshape(&[-1])
+            .unwrap()
+            .as_slice::<u32>()
+            .to_vec();
+        let mut last_token: i32 = *am_flat.last().unwrap() as i32;
+
+        let max_rounds = 8;
+        let mut total_tokens = 0usize;
+        let mut total_accepted = 0usize;
+        let mut total_draft_ms = 0u128;
+        let mut total_verify_ms = 0u128;
+        let mut generated: Vec<i32> = vec![last_token];
+        let mut current_taps = taps;
+        let mut draft_cache = drafter.make_cache();
+        let mut start = prompt_len;
+
+        println!("\n--- DFlash generation (mask_id={mask_id}, block_size={block_size}) ---");
+        for round in 0..max_rounds {
+            let mut block_tokens = vec![mask_id; block_size as usize];
+            block_tokens[0] = last_token;
+            let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
+            let noise_embedding = target.embed_token_ids(&block_ids).unwrap();
+
+            let t0 = Instant::now();
+            let draft_hidden = drafter
+                .forward(&noise_embedding, &current_taps, &mut draft_cache)
+                .unwrap();
+            mlx_rs::transforms::eval([&draft_hidden]).unwrap();
+            let draft_ms = t0.elapsed().as_millis();
+            total_draft_ms += draft_ms;
+            crop_drafter_cache(&mut draft_cache, start);
+
+            let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
+            let draft_logits = target
+                .forward_all_logits_from_hidden(&draft_hidden_sliced)
+                .unwrap();
+            let draft_token_ids = mlx_rs::argmax_axis!(draft_logits, -1).unwrap();
+            mlx_rs::transforms::eval([&draft_token_ids]).unwrap();
+
+            let draft_u32: Vec<u32> = draft_token_ids
+                .reshape(&[-1])
+                .unwrap()
+                .as_slice::<u32>()
+                .to_vec();
+            let draft_flat: Vec<i32> = draft_u32.iter().map(|&x| x as i32).collect();
+
+            let mut verify_tokens = vec![last_token];
+            verify_tokens.extend_from_slice(&draft_flat);
+            let verify_len = verify_tokens.len() as i32;
+            let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
+
+            let gdn_backup = GdnStateBackup::save(&kv_cache).unwrap();
+            let t0 = Instant::now();
+            let (verify_logits, verify_taps) = target
+                .forward_with_taps(&verify_input, None, &mut kv_cache, &tap_layers)
+                .unwrap();
+            mlx_rs::transforms::eval([&verify_logits]).unwrap();
+            let verify_ms = t0.elapsed().as_millis();
+            total_verify_ms += verify_ms;
+
+            let verify_argmax_arr = mlx_rs::argmax_axis!(verify_logits, -1).unwrap();
+            let verify_flat: Vec<u32> = verify_argmax_arr
+                .reshape(&[-1])
+                .unwrap()
+                .as_slice::<u32>()
+                .to_vec();
+
+            let accepted = accept_prefix(&draft_u32, &verify_flat);
+            let n_accepted = accepted.len();
+            let correction_token = verify_flat[n_accepted] as i32;
+            let tokens_this_round = n_accepted + 1;
+
+            {
+                let keep = tokens_this_round as i32;
+                let rollback = verify_len - keep;
+                if rollback > 0 {
+                    GdnStateBackup::restore_and_rollback(&gdn_backup, &mut kv_cache, rollback);
+                }
+                current_taps = verify_taps
+                    .into_iter()
+                    .map(|tap| tap.index((.., ..keep, ..)))
+                    .collect();
+            }
+
+            total_accepted += tokens_this_round;
+            total_tokens += tokens_this_round;
+            for &tok in &accepted {
+                generated.push(tok as i32);
+            }
+            generated.push(correction_token);
+            last_token = correction_token;
+            start += tokens_this_round as i32;
+
+            println!(
+                "Round {round}: draft={draft_ms}ms verify={verify_ms}ms accepted={n_accepted}+1/{}",
+                block_size - 1
+            );
+
+            if generated.contains(&eos_token) {
+                println!("EOS detected, stopping.");
+                break;
+            }
+        }
+
+        let total_ms = total_draft_ms + total_verify_ms;
+        let tok_per_sec = if total_ms > 0 {
+            total_tokens as f64 / (total_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        println!("\n--- Qwen3.6-35B-A3B DFlash Results ---");
+        println!("Total tokens: {total_tokens}");
+        println!(
+            "Avg acceptance: {:.1}/round",
+            total_accepted as f64 / max_rounds as f64
+        );
+        println!("Draft: {total_draft_ms}ms, Verify: {total_verify_ms}ms");
+        println!("Throughput: {tok_per_sec:.1} tok/s (baseline 45 tok/s)");
+        println!("Generated: {:?}", &generated[..generated.len().min(40)]);
     }
 
     #[test]
@@ -1060,8 +1264,16 @@ mod tests {
         // --- Phase 3: Cosine similarity between taps ---
         println!("\n=== Phase 3: Tap cosine similarity (BF16 vs 4-bit) ===");
         for (i, (bf, q4)) in bf16_taps.iter().zip(q4_taps.iter()).enumerate() {
-            let bf_flat = bf.reshape(&[-1]).unwrap().as_dtype(mlx_rs::Dtype::Float32).unwrap();
-            let q4_flat = q4.reshape(&[-1]).unwrap().as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            let bf_flat = bf
+                .reshape(&[-1])
+                .unwrap()
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap();
+            let q4_flat = q4
+                .reshape(&[-1])
+                .unwrap()
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap();
             let dot = ops::sum(&bf_flat.multiply(&q4_flat).unwrap(), None).unwrap();
             let norm_bf = ops::sum(&bf_flat.multiply(&bf_flat).unwrap(), None)
                 .unwrap()
@@ -1076,9 +1288,7 @@ mod tests {
             let cos_val: f32 = cos.item();
             println!(
                 "  Tap {} (layer {}): cosine={:.6}",
-                i,
-                tap_layers[i],
-                cos_val
+                i, tap_layers[i], cos_val
             );
         }
 
@@ -1128,7 +1338,8 @@ mod tests {
             mlx_rs::transforms::eval([&verify_logits]).unwrap();
 
             let verify_am = mlx_rs::argmax_axis!(verify_logits, -1).unwrap();
-            let verify_flat: Vec<u32> = verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+            let verify_flat: Vec<u32> =
+                verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
 
             let accepted = accept_prefix(&draft_u32, &verify_flat);
             let n_accepted = accepted.len();
@@ -1173,13 +1384,19 @@ mod tests {
             .unwrap();
         {
             let mut ev: Vec<&Array> = vec![&q4_logits2];
-            for t in &q4_taps2 { ev.push(t); }
+            for t in &q4_taps2 {
+                ev.push(t);
+            }
             for lc in q4_cache2.iter().flatten() {
                 match lc {
                     crate::qwen3_next::LayerCache::KV(kv) => ev.extend(kv.eval_targets()),
                     crate::qwen3_next::LayerCache::Arrays(ac) => {
-                        if let Some(ref s) = ac.ssm_state { ev.push(s); }
-                        if let Some(ref c) = ac.conv_state { ev.push(c); }
+                        if let Some(ref s) = ac.ssm_state {
+                            ev.push(s);
+                        }
+                        if let Some(ref c) = ac.conv_state {
+                            ev.push(c);
+                        }
                     }
                 }
             }
@@ -1224,7 +1441,8 @@ mod tests {
             mlx_rs::transforms::eval([&verify_logits]).unwrap();
 
             let verify_am = mlx_rs::argmax_axis!(verify_logits, -1).unwrap();
-            let verify_flat: Vec<u32> = verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+            let verify_flat: Vec<u32> =
+                verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
 
             let accepted = accept_prefix(&draft_u32, &verify_flat);
             let n_accepted = accepted.len();
@@ -1275,8 +1493,7 @@ mod tests {
         use crate::qwen3_next::load_qwen3_5_model;
         use std::time::Instant;
 
-        let target_path =
-            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
+        let target_path = "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
         let drafter_base = Path::new(
             "/Users/peppi/AI-Models/shared/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash",
         );
@@ -1457,7 +1674,10 @@ mod tests {
                     &verify_flat[..verify_flat.len().min(16)]
                 );
                 println!("  accepted:    {:?}", accepted);
-                println!("  n_accepted:  {n_accepted} (of {} drafts)", draft_u32.len());
+                println!(
+                    "  n_accepted:  {n_accepted} (of {} drafts)",
+                    draft_u32.len()
+                );
             }
 
             if (n_accepted as i32) < block_size {
@@ -1780,8 +2000,7 @@ mod tests {
                 // Skip anchor at [0] — it's already in the restored cache.
                 kv_cache = kv_cache_clone;
                 let rerun_len = (n_accepted - 1) as i32;
-                let rerun_input =
-                    Array::from_slice(&verify_tokens[1..n_accepted], &[1, rerun_len]);
+                let rerun_input = Array::from_slice(&verify_tokens[1..n_accepted], &[1, rerun_len]);
                 let (_rerun_logits, rerun_taps) = target
                     .forward_with_taps(&rerun_input, None, &mut kv_cache, &tap_layers)
                     .unwrap();
@@ -1979,8 +2198,7 @@ mod tests {
                 // Skip anchor at [0] — it's already in the restored cache.
                 kv_cache = kv_cache_clone;
                 let rerun_len = (n_accepted - 1) as i32;
-                let rerun_input =
-                    Array::from_slice(&verify_tokens[1..n_accepted], &[1, rerun_len]);
+                let rerun_input = Array::from_slice(&verify_tokens[1..n_accepted], &[1, rerun_len]);
                 let (_rerun_logits, rerun_taps) = target
                     .forward_with_taps(&rerun_input, None, &mut kv_cache, &tap_layers)
                     .unwrap();
@@ -2121,13 +2339,18 @@ mod tests {
                     crate::qwen3_next::LayerCache::KV(kv) => kv.eval_targets(),
                     crate::qwen3_next::LayerCache::Arrays(ac) => {
                         let mut t = vec![];
-                        if let Some(ref s) = ac.ssm_state { t.push(s); }
-                        if let Some(ref c) = ac.conv_state { t.push(c); }
+                        if let Some(ref s) = ac.ssm_state {
+                            t.push(s);
+                        }
+                        if let Some(ref c) = ac.conv_state {
+                            t.push(c);
+                        }
                         t
                     }
                 }))
                 .collect::<Vec<_>>(),
-        ).unwrap();
+        )
+        .unwrap();
         println!("Prefill: {}ms", t0.elapsed().as_millis());
 
         let mut last = {
@@ -2149,10 +2372,14 @@ mod tests {
         let decode_ms = t0.elapsed().as_millis();
         println!(
             "AR decode: {} tokens in {}ms ({:.1} tok/s)",
-            n_tokens, decode_ms,
+            n_tokens,
+            decode_ms,
             n_tokens as f64 / (decode_ms as f64 / 1000.0)
         );
-        println!("First 30 tokens: {:?}", &generated[..generated.len().min(30)]);
+        println!(
+            "First 30 tokens: {:?}",
+            &generated[..generated.len().min(30)]
+        );
     }
 
     /// Sweep generation lengths to measure acceptance vs context length.
@@ -2168,7 +2395,11 @@ mod tests {
             "/Users/peppi/AI-Models/shared/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash",
         );
         let snap_dir = std::fs::read_dir(drafter_path.join("snapshots"))
-            .unwrap().filter_map(|e| e.ok()).next().unwrap().path();
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .next()
+            .unwrap()
+            .path();
 
         println!("Loading models...");
         let mut target = load_qwen3_5_model(target_path).unwrap();
@@ -2178,30 +2409,43 @@ mod tests {
         let mask_id = drafter.config.mask_token_id();
 
         let prompt_tokens: Vec<i32> = vec![
-            248045, 846, 198, 11964, 264, 2820, 6804, 323, 1077, 248046, 198,
-            248045, 74455, 198, 248068, 271, 248069, 271,
+            248045, 846, 198, 11964, 264, 2820, 6804, 323, 1077, 248046, 198, 248045, 74455, 198,
+            248068, 271, 248069, 271,
         ];
         let prompt_len = prompt_tokens.len() as i32;
         let input_ids = Array::from_slice(&prompt_tokens, &[1, prompt_len]);
 
         let mut kv_cache: Vec<Option<crate::qwen3_next::LayerCache>> = Vec::new();
         let (prefill_logits, taps) = target
-            .forward_with_taps(&input_ids, None, &mut kv_cache, &tap_layers).unwrap();
+            .forward_with_taps(&input_ids, None, &mut kv_cache, &tap_layers)
+            .unwrap();
         let mut eval_targets: Vec<&Array> = vec![&prefill_logits];
-        for t in &taps { eval_targets.push(t); }
+        for t in &taps {
+            eval_targets.push(t);
+        }
         for lc in kv_cache.iter().flatten() {
             match lc {
                 crate::qwen3_next::LayerCache::KV(kv) => eval_targets.extend(kv.eval_targets()),
                 crate::qwen3_next::LayerCache::Arrays(ac) => {
-                    if let Some(ref s) = ac.ssm_state { eval_targets.push(s); }
-                    if let Some(ref c) = ac.conv_state { eval_targets.push(c); }
+                    if let Some(ref s) = ac.ssm_state {
+                        eval_targets.push(s);
+                    }
+                    if let Some(ref c) = ac.conv_state {
+                        eval_targets.push(c);
+                    }
                 }
             }
         }
         mlx_rs::transforms::eval(eval_targets).unwrap();
 
         let am = mlx_rs::argmax_axis!(prefill_logits, -1).unwrap();
-        let first_token = *am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec().last().unwrap() as i32;
+        let first_token = *am
+            .reshape(&[-1])
+            .unwrap()
+            .as_slice::<u32>()
+            .to_vec()
+            .last()
+            .unwrap() as i32;
 
         let mut current_taps = taps;
         mlx_rs::transforms::eval(current_taps.iter().collect::<Vec<_>>()).unwrap();
@@ -2226,13 +2470,15 @@ mod tests {
 
             let t0 = Instant::now();
             let draft_hidden = drafter
-                .forward(&noise_embedding, &current_taps, &mut draft_cache).unwrap();
+                .forward(&noise_embedding, &current_taps, &mut draft_cache)
+                .unwrap();
             mlx_rs::transforms::eval([&draft_hidden]).unwrap();
             total_draft_ms += t0.elapsed().as_millis();
             crop_drafter_cache(&mut draft_cache, start);
 
             let draft_logits = target
-                .forward_all_logits_from_hidden(&draft_hidden.index((.., 1.., ..))).unwrap();
+                .forward_all_logits_from_hidden(&draft_hidden.index((.., 1.., ..)))
+                .unwrap();
             let draft_am = mlx_rs::argmax_axis!(draft_logits, -1).unwrap();
             mlx_rs::transforms::eval([&draft_am]).unwrap();
             let draft_u32: Vec<u32> = draft_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
@@ -2243,43 +2489,50 @@ mod tests {
             let verify_len = verify_tokens.len() as i32;
             let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
 
-            let snapshots: Vec<(Option<Array>, Option<Array>, i32)> = kv_cache.iter()
+            let snapshots: Vec<(Option<Array>, Option<Array>, i32)> = kv_cache
+                .iter()
                 .map(|lc| match lc {
                     Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
                         ac.eval_arrays().unwrap();
                         (ac.conv_state.clone(), ac.ssm_state.clone(), ac.offset)
                     }
                     _ => (None, None, 0),
-                }).collect();
+                })
+                .collect();
 
             let t0 = Instant::now();
             let (verify_logits, verify_taps, layer_tapes) = target
-                .forward_with_taps_tape(&verify_input, None, &mut kv_cache, &tap_layers).unwrap();
+                .forward_with_taps_tape(&verify_input, None, &mut kv_cache, &tap_layers)
+                .unwrap();
             mlx_rs::transforms::eval([&verify_logits]).unwrap();
             total_verify_ms += t0.elapsed().as_millis();
 
             let verify_am = mlx_rs::argmax_axis!(verify_logits, -1).unwrap();
-            let verify_flat: Vec<u32> = verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+            let verify_flat: Vec<u32> =
+                verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
             let accepted = accept_prefix(&draft_u32, &verify_flat);
             let n_accepted = accepted.len() as i32;
 
             if n_accepted < block_size {
                 let kv_rollback = verify_len - n_accepted;
-                target.replay_tape_rollback(
-                    &layer_tapes, &mut kv_cache,
-                    n_accepted, kv_rollback,
-                ).unwrap();
-                let replay_states: Vec<&Array> = kv_cache.iter()
+                target
+                    .replay_tape_rollback(&layer_tapes, &mut kv_cache, n_accepted, kv_rollback)
+                    .unwrap();
+                let replay_states: Vec<&Array> = kv_cache
+                    .iter()
                     .filter_map(|lc| match lc {
                         Some(crate::qwen3_next::LayerCache::Arrays(ac)) => ac.ssm_state.as_ref(),
                         _ => None,
-                    }).collect();
+                    })
+                    .collect();
                 if !replay_states.is_empty() {
                     mlx_rs::transforms::eval(replay_states).unwrap();
                 }
             }
-            current_taps = verify_taps.into_iter()
-                .map(|tap| tap.index((.., ..n_accepted, ..))).collect();
+            current_taps = verify_taps
+                .into_iter()
+                .map(|tap| tap.index((.., ..n_accepted, ..)))
+                .collect();
 
             acceptance_list.push(n_accepted);
             total_tokens += n_accepted as usize;
@@ -2292,11 +2545,15 @@ mod tests {
                 if total_tokens >= cp && (total_tokens - n_accepted as usize) < cp {
                     let elapsed = t_global.elapsed().as_secs_f64();
                     let recent_50: f64 = if acceptance_list.len() >= 50 {
-                        acceptance_list[acceptance_list.len()-50..].iter().sum::<i32>() as f64 / 50.0
+                        acceptance_list[acceptance_list.len() - 50..]
+                            .iter()
+                            .sum::<i32>() as f64
+                            / 50.0
                     } else {
                         acceptance_list.iter().sum::<i32>() as f64 / acceptance_list.len() as f64
                     };
-                    let overall_avg = acceptance_list.iter().sum::<i32>() as f64 / acceptance_list.len() as f64;
+                    let overall_avg =
+                        acceptance_list.iter().sum::<i32>() as f64 / acceptance_list.len() as f64;
                     let tps = total_tokens as f64 / elapsed;
                     println!(
                         "\n  >>> {cp} tokens: {round} rounds, avg_accept={overall_avg:.1}, last50_accept={recent_50:.1}, {tps:.1} tok/s, draft={total_draft_ms}ms verify={total_verify_ms}ms"
@@ -2305,7 +2562,9 @@ mod tests {
             }
 
             if round % 50 == 0 {
-                let avg = acceptance_list[acceptance_list.len().saturating_sub(50)..].iter().sum::<i32>() as f64
+                let avg = acceptance_list[acceptance_list.len().saturating_sub(50)..]
+                    .iter()
+                    .sum::<i32>() as f64
                     / acceptance_list[acceptance_list.len().saturating_sub(50)..].len() as f64;
                 println!("  round {round}: {total_tokens} tokens, last50_accept={avg:.1}");
             }
@@ -2333,7 +2592,11 @@ mod tests {
             "/Users/peppi/AI-Models/shared/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash",
         );
         let snap_dir = std::fs::read_dir(drafter_path.join("snapshots"))
-            .unwrap().filter_map(|e| e.ok()).next().unwrap().path();
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .next()
+            .unwrap()
+            .path();
 
         println!("Loading models...");
         let mut target = load_qwen3_5_model(target_path).unwrap();
@@ -2343,8 +2606,8 @@ mod tests {
         let mask_id = drafter.config.mask_token_id();
 
         let prompt_tokens: Vec<i32> = vec![
-            248045, 846, 198, 11964, 264, 2820, 6804, 323, 1077, 248046, 198,
-            248045, 74455, 198, 248068, 271, 248069, 271,
+            248045, 846, 198, 11964, 264, 2820, 6804, 323, 1077, 248046, 198, 248045, 74455, 198,
+            248068, 271, 248069, 271,
         ];
         let prompt_len = prompt_tokens.len() as i32;
         let input_ids = Array::from_slice(&prompt_tokens, &[1, prompt_len]);
@@ -2352,15 +2615,22 @@ mod tests {
         // Prefill
         let mut kv_cache: Vec<Option<crate::qwen3_next::LayerCache>> = Vec::new();
         let (prefill_logits, taps) = target
-            .forward_with_taps(&input_ids, None, &mut kv_cache, &tap_layers).unwrap();
+            .forward_with_taps(&input_ids, None, &mut kv_cache, &tap_layers)
+            .unwrap();
         let mut eval_targets: Vec<&Array> = vec![&prefill_logits];
-        for t in &taps { eval_targets.push(t); }
+        for t in &taps {
+            eval_targets.push(t);
+        }
         for lc in kv_cache.iter().flatten() {
             match lc {
                 crate::qwen3_next::LayerCache::KV(kv) => eval_targets.extend(kv.eval_targets()),
                 crate::qwen3_next::LayerCache::Arrays(ac) => {
-                    if let Some(ref s) = ac.ssm_state { eval_targets.push(s); }
-                    if let Some(ref c) = ac.conv_state { eval_targets.push(c); }
+                    if let Some(ref s) = ac.ssm_state {
+                        eval_targets.push(s);
+                    }
+                    if let Some(ref c) = ac.conv_state {
+                        eval_targets.push(c);
+                    }
                 }
             }
         }
@@ -2378,8 +2648,12 @@ mod tests {
             for lc in kv.iter() {
                 match lc {
                     Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
-                        if let Some(ref s) = ac.ssm_state { mlx_rs::transforms::eval([s]).unwrap(); }
-                        if let Some(ref c) = ac.conv_state { mlx_rs::transforms::eval([c]).unwrap(); }
+                        if let Some(ref s) = ac.ssm_state {
+                            mlx_rs::transforms::eval([s]).unwrap();
+                        }
+                        if let Some(ref c) = ac.conv_state {
+                            mlx_rs::transforms::eval([c]).unwrap();
+                        }
                     }
                     Some(crate::qwen3_next::LayerCache::KV(kvc)) => {
                         mlx_rs::transforms::eval(kvc.eval_targets()).unwrap();
@@ -2410,31 +2684,35 @@ mod tests {
                 let noise_embedding = target.embed_token_ids(&block_ids).unwrap();
 
                 let draft_hidden = drafter
-                    .forward(&noise_embedding, &current_taps, &mut draft_cache).unwrap();
+                    .forward(&noise_embedding, &current_taps, &mut draft_cache)
+                    .unwrap();
                 mlx_rs::transforms::eval([&draft_hidden]).unwrap();
                 crop_drafter_cache(&mut draft_cache, start);
 
                 let mut draft_logits = target
-                    .forward_all_logits_from_hidden(&draft_hidden.index((.., 1.., ..))).unwrap();
+                    .forward_all_logits_from_hidden(&draft_hidden.index((.., 1.., ..)))
+                    .unwrap();
                 let mut draft_am = mlx_rs::argmax_axis!(draft_logits, -1).unwrap();
                 mlx_rs::transforms::eval([&draft_am]).unwrap();
 
                 // Refinement passes 2..N: replace masks with draft tokens
                 for _pass in 1..n_passes {
-                    let draft_u32: Vec<u32> = draft_am.reshape(&[-1]).unwrap()
-                        .as_slice::<u32>().to_vec();
+                    let draft_u32: Vec<u32> =
+                        draft_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
                     let mut refined = vec![last_token];
                     refined.extend(draft_u32.iter().map(|&x| x as i32));
                     let refined_ids = Array::from_slice(&refined, &[1, block_size]);
                     let refined_emb = target.embed_token_ids(&refined_ids).unwrap();
 
                     let refined_hidden = drafter
-                        .forward(&refined_emb, &current_taps, &mut draft_cache).unwrap();
+                        .forward(&refined_emb, &current_taps, &mut draft_cache)
+                        .unwrap();
                     mlx_rs::transforms::eval([&refined_hidden]).unwrap();
                     crop_drafter_cache(&mut draft_cache, start);
 
                     draft_logits = target
-                        .forward_all_logits_from_hidden(&refined_hidden.index((.., 1.., ..))).unwrap();
+                        .forward_all_logits_from_hidden(&refined_hidden.index((.., 1.., ..)))
+                        .unwrap();
                     draft_am = mlx_rs::argmax_axis!(draft_logits, -1).unwrap();
                     mlx_rs::transforms::eval([&draft_am]).unwrap();
                 }
@@ -2442,8 +2720,8 @@ mod tests {
                 let draft_ms = t0.elapsed().as_millis();
                 total_draft_ms += draft_ms;
 
-                let draft_u32: Vec<u32> = draft_am.reshape(&[-1]).unwrap()
-                    .as_slice::<u32>().to_vec();
+                let draft_u32: Vec<u32> =
+                    draft_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
                 let draft_flat: Vec<i32> = draft_u32.iter().map(|&x| x as i32).collect();
 
                 // --- Verify ---
@@ -2452,53 +2730,64 @@ mod tests {
                 let verify_len = verify_tokens.len() as i32;
                 let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
 
-                let snapshots: Vec<(Option<Array>, Option<Array>, i32)> = kv.iter()
+                let snapshots: Vec<(Option<Array>, Option<Array>, i32)> = kv
+                    .iter()
                     .map(|lc| match lc {
                         Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
                             ac.eval_arrays().unwrap();
                             (ac.conv_state.clone(), ac.ssm_state.clone(), ac.offset)
                         }
                         _ => (None, None, 0),
-                    }).collect();
+                    })
+                    .collect();
 
                 let t0 = Instant::now();
                 let (verify_logits, verify_taps, layer_tapes) = target
-                    .forward_with_taps_tape(&verify_input, None, &mut kv, &tap_layers).unwrap();
+                    .forward_with_taps_tape(&verify_input, None, &mut kv, &tap_layers)
+                    .unwrap();
                 mlx_rs::transforms::eval([&verify_logits]).unwrap();
                 let verify_ms = t0.elapsed().as_millis();
                 total_verify_ms += verify_ms;
 
                 let verify_am = mlx_rs::argmax_axis!(verify_logits, -1).unwrap();
-                let verify_flat: Vec<u32> = verify_am.reshape(&[-1]).unwrap()
-                    .as_slice::<u32>().to_vec();
+                let verify_flat: Vec<u32> =
+                    verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
                 let accepted = accept_prefix(&draft_u32, &verify_flat);
                 let n_accepted = accepted.len() as i32;
 
                 if n_accepted < block_size {
                     let kv_rollback = verify_len - n_accepted;
-                    target.replay_tape_rollback(
-                        &layer_tapes, &mut kv,
-                        n_accepted, kv_rollback,
-                    ).unwrap();
-                    let replay_states: Vec<&Array> = kv.iter()
+                    target
+                        .replay_tape_rollback(&layer_tapes, &mut kv, n_accepted, kv_rollback)
+                        .unwrap();
+                    let replay_states: Vec<&Array> = kv
+                        .iter()
                         .filter_map(|lc| match lc {
-                            Some(crate::qwen3_next::LayerCache::Arrays(ac)) => ac.ssm_state.as_ref(),
+                            Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
+                                ac.ssm_state.as_ref()
+                            }
                             _ => None,
-                        }).collect();
+                        })
+                        .collect();
                     if !replay_states.is_empty() {
                         mlx_rs::transforms::eval(replay_states).unwrap();
                     }
                 }
-                current_taps = verify_taps.into_iter()
-                    .map(|tap| tap.index((.., ..n_accepted, ..))).collect();
+                current_taps = verify_taps
+                    .into_iter()
+                    .map(|tap| tap.index((.., ..n_accepted, ..)))
+                    .collect();
 
                 acceptance_list.push(n_accepted);
                 total_tokens += n_accepted as usize;
-                for &tok in &accepted { }
+                for &tok in &accepted {}
                 last_token = *accepted.last().unwrap() as i32;
                 start += n_accepted;
 
-                println!("  Round {round}: draft={draft_ms}ms verify={verify_ms}ms accepted={n_accepted}/{}", block_size - 1);
+                println!(
+                    "  Round {round}: draft={draft_ms}ms verify={verify_ms}ms accepted={n_accepted}/{}",
+                    block_size - 1
+                );
             }
 
             let avg_accept = acceptance_list.iter().sum::<i32>() as f64 / max_rounds as f64;
@@ -2870,7 +3159,8 @@ mod tests {
             let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
 
             // Snapshot GDN state for tape replay
-            let snapshots: Vec<(Option<Array>, Option<Array>, i32)> = kv_cache.iter()
+            let snapshots: Vec<(Option<Array>, Option<Array>, i32)> = kv_cache
+                .iter()
                 .map(|lc| match lc {
                     Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
                         ac.eval_arrays().unwrap();
@@ -2902,10 +3192,14 @@ mod tests {
             let t0 = Instant::now();
             if (n_accepted as i32) < block_size {
                 let kv_rollback = verify_len - n_accepted as i32;
-                target.replay_tape_rollback(
-                    &layer_tapes, &mut kv_cache,
-                    n_accepted as i32, kv_rollback,
-                ).unwrap();
+                target
+                    .replay_tape_rollback(
+                        &layer_tapes,
+                        &mut kv_cache,
+                        n_accepted as i32,
+                        kv_rollback,
+                    )
+                    .unwrap();
                 for lc in kv_cache.iter() {
                     if let Some(crate::qwen3_next::LayerCache::Arrays(ac)) = lc {
                         if let Some(ref s) = ac.ssm_state {
@@ -2916,7 +3210,8 @@ mod tests {
             }
             let replay_ms = t0.elapsed().as_millis();
             total_replay_ms += replay_ms;
-            current_taps = verify_taps.into_iter()
+            current_taps = verify_taps
+                .into_iter()
                 .map(|tap| tap.index((.., ..n_accepted as i32, ..)))
                 .collect();
 
@@ -2982,8 +3277,7 @@ mod tests {
         use crate::qwen3_next::load_qwen3_5_model;
         use std::time::Instant;
 
-        let target_path =
-            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
+        let target_path = "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
         if !std::path::Path::new(target_path).exists() {
             println!("Skipping: 4B model not found at {target_path}");
             return;
@@ -3278,8 +3572,7 @@ mod tests {
         use crate::qwen3_next::load_qwen3_5_model;
         use std::time::Instant;
 
-        let target_path =
-            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
+        let target_path = "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
         let drafter_base = Path::new(
             "/Users/peppi/AI-Models/shared/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash",
         );
@@ -3315,13 +3608,19 @@ mod tests {
             .unwrap();
         {
             let mut ev: Vec<&Array> = vec![&prefill_logits];
-            for t in &taps { ev.push(t); }
+            for t in &taps {
+                ev.push(t);
+            }
             for lc in kv_cache.iter().flatten() {
                 match lc {
                     crate::qwen3_next::LayerCache::KV(kv) => ev.extend(kv.eval_targets()),
                     crate::qwen3_next::LayerCache::Arrays(ac) => {
-                        if let Some(ref s) = ac.ssm_state { ev.push(s); }
-                        if let Some(ref c) = ac.conv_state { ev.push(c); }
+                        if let Some(ref s) = ac.ssm_state {
+                            ev.push(s);
+                        }
+                        if let Some(ref c) = ac.conv_state {
+                            ev.push(c);
+                        }
                     }
                 }
             }
@@ -3329,7 +3628,11 @@ mod tests {
         }
 
         let prefill_am = mlx_rs::argmax_axis!(prefill_logits, -1).unwrap();
-        let am_flat: Vec<u32> = prefill_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+        let am_flat: Vec<u32> = prefill_am
+            .reshape(&[-1])
+            .unwrap()
+            .as_slice::<u32>()
+            .to_vec();
         let mut last_token: i32 = *am_flat.last().unwrap() as i32;
 
         let max_rounds = 20;
@@ -3385,7 +3688,8 @@ mod tests {
 
             // e. Check acceptance
             let verify_am = mlx_rs::argmax_axis!(verify_logits, -1).unwrap();
-            let verify_flat: Vec<u32> = verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+            let verify_flat: Vec<u32> =
+                verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
             // accept_prefix returns matched drafts + correction token
             let accepted = accept_prefix(&draft_u32, &verify_flat);
             let n_accepted = accepted.len(); // includes correction
@@ -3443,7 +3747,9 @@ mod tests {
             "Avg tok/round: {:.1}",
             total_tokens as f64 / rounds_run as f64
         );
-        println!("Total draft: {total_draft_ms}ms, verify: {total_verify_ms}ms, replay: {total_replay_ms}ms");
+        println!(
+            "Total draft: {total_draft_ms}ms, verify: {total_verify_ms}ms, replay: {total_replay_ms}ms"
+        );
         println!("Throughput: {tok_per_sec:.1} tok/s (no backup/restore overhead)");
     }
 
@@ -3457,8 +3763,7 @@ mod tests {
         use crate::qwen3_next::load_qwen3_5_model;
         use std::time::Instant;
 
-        let target_path =
-            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
+        let target_path = "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
         let drafter_base = Path::new(
             "/Users/peppi/AI-Models/shared/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash",
         );
@@ -3494,13 +3799,19 @@ mod tests {
             .unwrap();
         {
             let mut ev: Vec<&Array> = vec![&prefill_logits];
-            for t in &taps { ev.push(t); }
+            for t in &taps {
+                ev.push(t);
+            }
             for lc in kv_cache.iter().flatten() {
                 match lc {
                     crate::qwen3_next::LayerCache::KV(kv) => ev.extend(kv.eval_targets()),
                     crate::qwen3_next::LayerCache::Arrays(ac) => {
-                        if let Some(ref s) = ac.ssm_state { ev.push(s); }
-                        if let Some(ref c) = ac.conv_state { ev.push(c); }
+                        if let Some(ref s) = ac.ssm_state {
+                            ev.push(s);
+                        }
+                        if let Some(ref c) = ac.conv_state {
+                            ev.push(c);
+                        }
                     }
                 }
             }
@@ -3508,7 +3819,11 @@ mod tests {
         }
 
         let prefill_am = mlx_rs::argmax_axis!(prefill_logits, -1).unwrap();
-        let am_flat: Vec<u32> = prefill_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+        let am_flat: Vec<u32> = prefill_am
+            .reshape(&[-1])
+            .unwrap()
+            .as_slice::<u32>()
+            .to_vec();
         let mut last_token: i32 = *am_flat.last().unwrap() as i32;
 
         let max_rounds = 20;
@@ -3554,7 +3869,8 @@ mod tests {
             let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
 
             // c. Snapshot GDN state BEFORE verify
-            let snapshots: Vec<(Option<Array>, Option<Array>, i32)> = kv_cache.iter()
+            let snapshots: Vec<(Option<Array>, Option<Array>, i32)> = kv_cache
+                .iter()
                 .map(|lc| match lc {
                     Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
                         ac.eval_arrays().unwrap();
@@ -3575,7 +3891,8 @@ mod tests {
 
             // e. Check acceptance — accept_prefix returns matched drafts + correction
             let verify_am = mlx_rs::argmax_axis!(verify_logits, -1).unwrap();
-            let verify_flat: Vec<u32> = verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+            let verify_flat: Vec<u32> =
+                verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
             let accepted = accept_prefix(&draft_u32, &verify_flat);
             let n_accepted = accepted.len(); // includes correction token
             let n_draft_accepted = n_accepted - 1;
@@ -3586,13 +3903,17 @@ mod tests {
             if keep < verify_len {
                 // Partial rejection — restore + replay accepted from tape
                 let kv_rollback = verify_len - keep;
-                target.replay_tape_rollback(
-                    &layer_tapes, &mut kv_cache,
-                    keep, // replay keep tokens (anchor + accepted drafts)
-                    kv_rollback,
-                ).unwrap();
+                target
+                    .replay_tape_rollback(
+                        &layer_tapes,
+                        &mut kv_cache,
+                        keep, // replay keep tokens (anchor + accepted drafts)
+                        kv_rollback,
+                    )
+                    .unwrap();
                 // Batch-eval all replayed GDN states in one call
-                let replay_states: Vec<&Array> = kv_cache.iter()
+                let replay_states: Vec<&Array> = kv_cache
+                    .iter()
                     .filter_map(|lc| match lc {
                         Some(crate::qwen3_next::LayerCache::Arrays(ac)) => ac.ssm_state.as_ref(),
                         _ => None,
@@ -3609,7 +3930,8 @@ mod tests {
             total_replay_ms += replay_ms;
 
             // g. Taps from verify, sliced to accepted tokens
-            current_taps = verify_taps.into_iter()
+            current_taps = verify_taps
+                .into_iter()
                 .map(|tap| tap.index((.., ..keep, ..)))
                 .collect();
 
@@ -3647,7 +3969,9 @@ mod tests {
             total_tokens as f64 / rounds_run as f64
         );
         println!("Full acceptance rounds: {n_full_accept}/{rounds_run}");
-        println!("Total draft: {total_draft_ms}ms, verify: {total_verify_ms}ms, replay: {total_replay_ms}ms");
+        println!(
+            "Total draft: {total_draft_ms}ms, verify: {total_verify_ms}ms, replay: {total_replay_ms}ms"
+        );
         println!("Throughput: {tok_per_sec:.1} tok/s");
     }
 
@@ -3661,8 +3985,7 @@ mod tests {
         use crate::qwen3_next::load_qwen3_5_model;
         use std::time::Instant;
 
-        let target_path =
-            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
+        let target_path = "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
         let drafter_base = Path::new(
             "/Users/peppi/AI-Models/shared/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash",
         );
@@ -3687,9 +4010,7 @@ mod tests {
         let input_ids = Array::from_slice(&prompt_tokens, &[1, prompt_len]);
 
         let mut kv_cache: Vec<Option<crate::qwen3_next::LayerCache>> = Vec::new();
-        let prefill_logits = target
-            .forward(&input_ids, None, &mut kv_cache)
-            .unwrap();
+        let prefill_logits = target.forward(&input_ids, None, &mut kv_cache).unwrap();
         mlx_rs::transforms::eval([&prefill_logits]).unwrap();
 
         let mut ar_tokens: Vec<u32> = Vec::new();
@@ -3703,7 +4024,9 @@ mod tests {
 
         let t0 = Instant::now();
         while ar_tokens.len() < max_tokens {
-            if next_token == eos_token { break; }
+            if next_token == eos_token {
+                break;
+            }
             let tok_arr = Array::from_slice(&[next_token], &[1, 1]);
             let logits = target.forward(&tok_arr, None, &mut kv_cache).unwrap();
             mlx_rs::transforms::eval([&logits]).unwrap();
@@ -3713,7 +4036,12 @@ mod tests {
             next_token = tok as i32;
         }
         let ar_ms = t0.elapsed().as_millis();
-        println!("AR: {} tokens in {}ms, first 20: {:?}", ar_tokens.len(), ar_ms, &ar_tokens[..ar_tokens.len().min(20)]);
+        println!(
+            "AR: {} tokens in {}ms, first 20: {:?}",
+            ar_tokens.len(),
+            ar_ms,
+            &ar_tokens[..ar_tokens.len().min(20)]
+        );
 
         // Reset model state
         drop(kv_cache);
@@ -3734,13 +4062,19 @@ mod tests {
             .unwrap();
         {
             let mut ev: Vec<&Array> = vec![&prefill_logits];
-            for t in &taps { ev.push(t); }
+            for t in &taps {
+                ev.push(t);
+            }
             for lc in kv_cache.iter().flatten() {
                 match lc {
                     crate::qwen3_next::LayerCache::KV(kv) => ev.extend(kv.eval_targets()),
                     crate::qwen3_next::LayerCache::Arrays(ac) => {
-                        if let Some(ref s) = ac.ssm_state { ev.push(s); }
-                        if let Some(ref c) = ac.conv_state { ev.push(c); }
+                        if let Some(ref s) = ac.ssm_state {
+                            ev.push(s);
+                        }
+                        if let Some(ref c) = ac.conv_state {
+                            ev.push(c);
+                        }
                     }
                 }
             }
@@ -3748,7 +4082,11 @@ mod tests {
         }
 
         let prefill_am = mlx_rs::argmax_axis!(prefill_logits, -1).unwrap();
-        let am_flat: Vec<u32> = prefill_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+        let am_flat: Vec<u32> = prefill_am
+            .reshape(&[-1])
+            .unwrap()
+            .as_slice::<u32>()
+            .to_vec();
         let mut last_token: i32 = *am_flat.last().unwrap() as i32;
 
         let mut dflash_tokens: Vec<u32> = vec![last_token as u32];
@@ -3759,7 +4097,9 @@ mod tests {
 
         let t0 = Instant::now();
         while dflash_tokens.len() < max_tokens {
-            if last_token == eos_token { break; }
+            if last_token == eos_token {
+                break;
+            }
 
             let mut block_tokens = vec![mask_id; block_size as usize];
             block_tokens[0] = last_token;
@@ -3786,7 +4126,8 @@ mod tests {
             let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
 
             // Snapshot before tape-recording verify
-            let snapshots: Vec<(Option<Array>, Option<Array>, i32)> = kv_cache.iter()
+            let snapshots: Vec<(Option<Array>, Option<Array>, i32)> = kv_cache
+                .iter()
                 .map(|lc| match lc {
                     Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
                         ac.eval_arrays().unwrap();
@@ -3802,17 +4143,17 @@ mod tests {
             mlx_rs::transforms::eval([&verify_logits]).unwrap();
 
             let verify_am = mlx_rs::argmax_axis!(verify_logits, -1).unwrap();
-            let verify_flat: Vec<u32> = verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+            let verify_flat: Vec<u32> =
+                verify_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
             let accepted = accept_prefix(&draft_u32, &verify_flat);
             let n_accepted = accepted.len(); // includes correction
             let keep = n_accepted as i32;
 
             if keep < verify_len {
                 let kv_rollback = verify_len - keep;
-                target.replay_tape_rollback(
-                    &layer_tapes, &mut kv_cache,
-                    keep, kv_rollback,
-                ).unwrap();
+                target
+                    .replay_tape_rollback(&layer_tapes, &mut kv_cache, keep, kv_rollback)
+                    .unwrap();
                 for lc in kv_cache.iter() {
                     if let Some(crate::qwen3_next::LayerCache::Arrays(ac)) = lc {
                         if let Some(ref s) = ac.ssm_state {
@@ -3822,7 +4163,8 @@ mod tests {
                 }
             }
 
-            current_taps = verify_taps.into_iter()
+            current_taps = verify_taps
+                .into_iter()
                 .map(|tap| tap.index((.., ..keep, ..)))
                 .collect();
 
@@ -3839,28 +4181,43 @@ mod tests {
                 let gdn_snap_diag = crate::dflash::GdnStateBackup::save(&kv_cache).unwrap();
                 let probe_logits = target.forward(&probe, None, &mut kv_cache).unwrap();
                 mlx_rs::transforms::eval([&probe_logits]).unwrap();
-                let probe_tok: u32 = mlx_rs::argmax_axis!(probe_logits, -1).unwrap()
-                    .reshape(&[-1]).unwrap().as_slice::<u32>()[0];
+                let probe_tok: u32 = mlx_rs::argmax_axis!(probe_logits, -1)
+                    .unwrap()
+                    .reshape(&[-1])
+                    .unwrap()
+                    .as_slice::<u32>()[0];
                 let pos = dflash_tokens.len();
                 let ar_at_pos = ar_tokens.get(pos).copied();
                 if ar_at_pos != Some(probe_tok) {
-                    println!("  !! Round {rounds} DIVERGES: pos={pos} probe={probe_tok} ar={ar_at_pos:?} last_tok={last_token} accepted={n_accepted}");
+                    println!(
+                        "  !! Round {rounds} DIVERGES: pos={pos} probe={probe_tok} ar={ar_at_pos:?} last_tok={last_token} accepted={n_accepted}"
+                    );
                 } else {
                     println!("  Round {rounds} OK: pos={pos} tok={probe_tok}");
                 }
                 // Restore: rollback KV by 1, restore GDN state
-                crate::dflash::GdnStateBackup::restore_and_rollback(&gdn_snap_diag, &mut kv_cache, 1);
+                crate::dflash::GdnStateBackup::restore_and_rollback(
+                    &gdn_snap_diag,
+                    &mut kv_cache,
+                    1,
+                );
                 for lc in kv_cache.iter() {
                     if let Some(crate::qwen3_next::LayerCache::Arrays(ac)) = lc {
-                        if let Some(ref s) = ac.ssm_state { mlx_rs::transforms::eval([s]).unwrap(); }
+                        if let Some(ref s) = ac.ssm_state {
+                            mlx_rs::transforms::eval([s]).unwrap();
+                        }
                     }
                 }
             }
         }
         let dflash_ms = t0.elapsed().as_millis();
-        println!("DFlash: {} tokens in {}ms ({} rounds), first 20: {:?}",
-            dflash_tokens.len(), dflash_ms, rounds,
-            &dflash_tokens[..dflash_tokens.len().min(20)]);
+        println!(
+            "DFlash: {} tokens in {}ms ({} rounds), first 20: {:?}",
+            dflash_tokens.len(),
+            dflash_ms,
+            rounds,
+            &dflash_tokens[..dflash_tokens.len().min(20)]
+        );
 
         // ── Phase 3: Compare ─────────────────────────────────────────
         let cmp_len = ar_tokens.len().min(dflash_tokens.len());
@@ -3874,12 +4231,25 @@ mod tests {
 
         if let Some(pos) = first_mismatch {
             println!("\n❌ MISMATCH at position {pos}:");
-            println!("  AR:     {:?}", &ar_tokens[pos.saturating_sub(2)..ar_tokens.len().min(pos+5)]);
-            println!("  DFlash: {:?}", &dflash_tokens[pos.saturating_sub(2)..dflash_tokens.len().min(pos+5)]);
-            panic!("DFlash output diverges from AR at token {pos}: AR={} DFlash={}", ar_tokens[pos], dflash_tokens[pos]);
+            println!(
+                "  AR:     {:?}",
+                &ar_tokens[pos.saturating_sub(2)..ar_tokens.len().min(pos + 5)]
+            );
+            println!(
+                "  DFlash: {:?}",
+                &dflash_tokens[pos.saturating_sub(2)..dflash_tokens.len().min(pos + 5)]
+            );
+            panic!(
+                "DFlash output diverges from AR at token {pos}: AR={} DFlash={}",
+                ar_tokens[pos], dflash_tokens[pos]
+            );
         } else if ar_tokens.len() != dflash_tokens.len() {
-            println!("\n⚠ Length mismatch: AR={} DFlash={} (first {} tokens match)",
-                ar_tokens.len(), dflash_tokens.len(), cmp_len);
+            println!(
+                "\n⚠ Length mismatch: AR={} DFlash={} (first {} tokens match)",
+                ar_tokens.len(),
+                dflash_tokens.len(),
+                cmp_len
+            );
         } else {
             println!("\n✅ LOSSLESS: {} tokens match exactly", cmp_len);
         }
@@ -3892,8 +4262,7 @@ mod tests {
     fn test_batch_vs_sequential_parity() {
         use crate::qwen3_next::load_qwen3_5_model;
 
-        let target_path =
-            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
+        let target_path = "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-4bit";
         let mut target = load_qwen3_5_model(target_path).unwrap();
 
         // Use first 10 AR-generated tokens as a verify-like block
@@ -3926,7 +4295,9 @@ mod tests {
         }
         // Get logit at final position from AR
         let final_tok_arr = Array::from_slice(&[next], &[1, 1]);
-        let final_logits_ar = target.forward(&final_tok_arr, None, &mut kv_cache_ar).unwrap();
+        let final_logits_ar = target
+            .forward(&final_tok_arr, None, &mut kv_cache_ar)
+            .unwrap();
         mlx_rs::transforms::eval([&final_logits_ar]).unwrap();
         let ar_final = mlx_rs::argmax_axis!(final_logits_ar, -1).unwrap();
         let ar_final_tok: u32 = ar_final.reshape(&[-1]).unwrap().as_slice::<u32>()[0];
@@ -3937,14 +4308,18 @@ mod tests {
         drop(kv_cache_ar);
         let mut target2 = load_qwen3_5_model(target_path).unwrap();
         let mut kv_cache_batch: Vec<Option<crate::qwen3_next::LayerCache>> = Vec::new();
-        let logits2 = target2.forward(&input_ids, None, &mut kv_cache_batch).unwrap();
+        let logits2 = target2
+            .forward(&input_ids, None, &mut kv_cache_batch)
+            .unwrap();
         mlx_rs::transforms::eval([&logits2]).unwrap();
 
         // Batch forward all 5 tokens at once
         let mut all_tokens = ar_tokens.clone();
         all_tokens.push(next);
         let batch_ids = Array::from_slice(&all_tokens, &[1, all_tokens.len() as i32]);
-        let batch_logits = target2.forward(&batch_ids, None, &mut kv_cache_batch).unwrap();
+        let batch_logits = target2
+            .forward(&batch_ids, None, &mut kv_cache_batch)
+            .unwrap();
         mlx_rs::transforms::eval([&batch_logits]).unwrap();
 
         // Compare last-position logit
@@ -3961,7 +4336,9 @@ mod tests {
             // Also check intermediate positions
             for (i, (ar_tok, batch_tok)) in ar_tokens.iter().zip(batch_flat.iter()).enumerate() {
                 if *ar_tok as u32 != *batch_tok {
-                    println!("Divergence at intermediate position {i}: AR={ar_tok} batch={batch_tok}");
+                    println!(
+                        "Divergence at intermediate position {i}: AR={ar_tok} batch={batch_tok}"
+                    );
                 }
             }
             panic!("❌ DIVERGENCE: batch={batch_final_tok} vs AR={ar_final_tok}");

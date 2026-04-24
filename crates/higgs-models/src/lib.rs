@@ -19,10 +19,10 @@ pub mod dflash;
 pub mod dflash_cpu;
 pub mod diffusion;
 pub mod diffusion_lora;
-pub mod speculative_threaded;
 pub mod diffusion_train;
 pub mod llada_moe;
 pub mod rwkv7;
+pub mod speculative_threaded;
 
 #[cfg(feature = "ane")]
 pub mod ane_bridge;
@@ -617,11 +617,7 @@ impl AnyModel {
         cache: &mut AnyCache,
         tap_layers: &[usize],
         layer_chunk_size: usize,
-    ) -> Result<(
-        Array,
-        Vec<Array>,
-        Vec<Option<qwen3_next::GdnLayerTape>>,
-    ), Exception> {
+    ) -> Result<(Array, Vec<Array>, Vec<Option<qwen3_next::GdnLayerTape>>), Exception> {
         match (self, cache) {
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
                 m.forward_with_taps_tape_chunked(inputs, mask, c, tap_layers, layer_chunk_size)
@@ -1279,7 +1275,9 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
 }
 
 /// Collect safetensors file paths from a model directory.
-pub(crate) fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
+pub(crate) fn collect_safetensors_files(
+    model_path: &Path,
+) -> Result<Vec<std::path::PathBuf>, ModelError> {
     let index_path = model_path.join("model.safetensors.index.json");
     if index_path.exists() {
         let json = std::fs::read_to_string(&index_path)?;

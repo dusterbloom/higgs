@@ -53,20 +53,20 @@ pub struct DFlashCpuConfig {
 #[derive(Clone)]
 pub struct DFlashCpuLayerWeights {
     // Attention projections [out, in] — bf16 raw bits
-    pub q_proj: Vec<u16>,         // [heads*head_dim, hidden]
-    pub k_proj: Vec<u16>,         // [kv_heads*head_dim, hidden]
-    pub v_proj: Vec<u16>,         // [kv_heads*head_dim, hidden]
-    pub o_proj: Vec<u16>,         // [hidden, heads*head_dim]
+    pub q_proj: Vec<u16>, // [heads*head_dim, hidden]
+    pub k_proj: Vec<u16>, // [kv_heads*head_dim, hidden]
+    pub v_proj: Vec<u16>, // [kv_heads*head_dim, hidden]
+    pub o_proj: Vec<u16>, // [hidden, heads*head_dim]
     // Per-head QK norms — f32 (tiny)
-    pub q_norm: Vec<f32>,         // [head_dim]
-    pub k_norm: Vec<f32>,         // [head_dim]
+    pub q_norm: Vec<f32>, // [head_dim]
+    pub k_norm: Vec<f32>, // [head_dim]
     // Layer norms — f32 (tiny)
     pub input_norm: Vec<f32>,     // [hidden]
     pub post_attn_norm: Vec<f32>, // [hidden]
     // SwiGLU MLP — bf16 raw bits
-    pub gate_proj: Vec<u16>,      // [inter, hidden]
-    pub up_proj: Vec<u16>,        // [inter, hidden]
-    pub down_proj: Vec<u16>,      // [hidden, inter]
+    pub gate_proj: Vec<u16>, // [inter, hidden]
+    pub up_proj: Vec<u16>,   // [inter, hidden]
+    pub down_proj: Vec<u16>, // [hidden, inter]
 }
 
 /// Convert bf16 raw bits to f32 in a pre-allocated buffer.
@@ -78,7 +78,15 @@ fn bf16_to_f32(src: &[u16], dst: &mut [f32]) {
 }
 
 /// SGEMM with bf16 weight matrix B: convert B to f32 in scratch, then call sgemm_nt.
-fn sgemm_nt_bf16(m: usize, n: usize, k: usize, a: &[f32], b: &[u16], c: &mut [f32], scratch: &mut Vec<f32>) {
+fn sgemm_nt_bf16(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[u16],
+    c: &mut [f32],
+    scratch: &mut Vec<f32>,
+) {
     let len = b.len();
     if scratch.len() < len {
         scratch.resize(len, 0.0);
@@ -175,7 +183,10 @@ type ParamMap<'a> = HashMap<Rc<str>, &'a Array>;
 /// Extract a parameter as bf16 raw bits (u16), converting from any dtype.
 fn get_bf16_mlx(params: &ParamMap<'_>, key: &str) -> Vec<u16> {
     let f32_vec = get_f32_mlx(params, key);
-    f32_vec.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect()
+    f32_vec
+        .iter()
+        .map(|&v| half::bf16::from_f32(v).to_bits())
+        .collect()
 }
 
 /// Extract a single parameter as f32 vec, converting dtype if needed.
@@ -301,7 +312,12 @@ fn tensor_to_bf16(safetensors: &safetensors::SafeTensors<'_>, name: &str) -> Vec
             let count = data.len() / 4;
             let mut out = Vec::with_capacity(count);
             for i in 0..count {
-                let v = f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]);
+                let v = f32::from_le_bytes([
+                    data[i * 4],
+                    data[i * 4 + 1],
+                    data[i * 4 + 2],
+                    data[i * 4 + 3],
+                ]);
                 out.push(half::bf16::from_f32(v).to_bits());
             }
             out
@@ -340,7 +356,12 @@ fn tensor_to_f32(safetensors: &safetensors::SafeTensors<'_>, name: &str) -> Vec<
             let count = data.len() / 4;
             let mut out = Vec::with_capacity(count);
             for i in 0..count {
-                out.push(f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]));
+                out.push(f32::from_le_bytes([
+                    data[i * 4],
+                    data[i * 4 + 1],
+                    data[i * 4 + 2],
+                    data[i * 4 + 3],
+                ]));
             }
             out
         }
@@ -530,7 +551,15 @@ impl DFlashCpuEngine {
         let mut target_hidden = vec![0.0f32; ctx_len * h];
         // Scratch buffer for bf16→f32 weight conversion (sized for largest weight)
         let mut w_scratch: Vec<f32> = Vec::new();
-        sgemm_nt_bf16(ctx_len, h, fc_in, &target_cat, &self.fc, &mut target_hidden, &mut w_scratch);
+        sgemm_nt_bf16(
+            ctx_len,
+            h,
+            fc_in,
+            &target_cat,
+            &self.fc,
+            &mut target_hidden,
+            &mut w_scratch,
+        );
 
         // hidden_norm: RMSNorm on target_hidden
         let mut target_normed = vec![0.0f32; ctx_len * h];
@@ -565,16 +594,62 @@ impl DFlashCpuEngine {
             rms_norm(&hidden, &layer.input_norm, &mut normed, block, h);
 
             // Q from noise only
-            sgemm_nt_bf16(block, q_dim, h, &normed, &layer.q_proj, &mut q_buf, &mut w_scratch);
+            sgemm_nt_bf16(
+                block,
+                q_dim,
+                h,
+                &normed,
+                &layer.q_proj,
+                &mut q_buf,
+                &mut w_scratch,
+            );
 
             // K/V from target context — convert k_proj/v_proj once, reuse for both ctx and noise
-            bf16_to_f32(&layer.k_proj, { if w_scratch.len() < layer.k_proj.len() { w_scratch.resize(layer.k_proj.len(), 0.0); } &mut w_scratch[..layer.k_proj.len()] });
-            sgemm_nt(ctx_len, kv_dim, h, &target_hidden, &w_scratch[..layer.k_proj.len()], &mut k_ctx_buf);
-            sgemm_nt(block, kv_dim, h, &normed, &w_scratch[..layer.k_proj.len()], &mut k_noise_buf);
+            bf16_to_f32(&layer.k_proj, {
+                if w_scratch.len() < layer.k_proj.len() {
+                    w_scratch.resize(layer.k_proj.len(), 0.0);
+                }
+                &mut w_scratch[..layer.k_proj.len()]
+            });
+            sgemm_nt(
+                ctx_len,
+                kv_dim,
+                h,
+                &target_hidden,
+                &w_scratch[..layer.k_proj.len()],
+                &mut k_ctx_buf,
+            );
+            sgemm_nt(
+                block,
+                kv_dim,
+                h,
+                &normed,
+                &w_scratch[..layer.k_proj.len()],
+                &mut k_noise_buf,
+            );
 
-            bf16_to_f32(&layer.v_proj, { if w_scratch.len() < layer.v_proj.len() { w_scratch.resize(layer.v_proj.len(), 0.0); } &mut w_scratch[..layer.v_proj.len()] });
-            sgemm_nt(ctx_len, kv_dim, h, &target_hidden, &w_scratch[..layer.v_proj.len()], &mut v_ctx_buf);
-            sgemm_nt(block, kv_dim, h, &normed, &w_scratch[..layer.v_proj.len()], &mut v_noise_buf);
+            bf16_to_f32(&layer.v_proj, {
+                if w_scratch.len() < layer.v_proj.len() {
+                    w_scratch.resize(layer.v_proj.len(), 0.0);
+                }
+                &mut w_scratch[..layer.v_proj.len()]
+            });
+            sgemm_nt(
+                ctx_len,
+                kv_dim,
+                h,
+                &target_hidden,
+                &w_scratch[..layer.v_proj.len()],
+                &mut v_ctx_buf,
+            );
+            sgemm_nt(
+                block,
+                kv_dim,
+                h,
+                &normed,
+                &w_scratch[..layer.v_proj.len()],
+                &mut v_noise_buf,
+            );
 
             // Per-head QK norm (RMSNorm over head_dim)
             for s in 0..block {
@@ -679,13 +754,19 @@ impl DFlashCpuEngine {
 
                     // scores = Q[block, hd] @ K^T[hd, total_kv_len] → [block, total_kv_len]
                     let mut scores = vec![0.0f32; block * total_kv_len];
-                    sgemm_nt_scaled(block, total_kv_len, hd, &q_head, &k_full, &mut scores, scale);
+                    sgemm_nt_scaled(
+                        block,
+                        total_kv_len,
+                        hd,
+                        &q_head,
+                        &k_full,
+                        &mut scores,
+                        scale,
+                    );
 
                     // Softmax — non-causal (no mask)
                     for row in 0..block {
-                        softmax_inplace(
-                            &mut scores[row * total_kv_len..(row + 1) * total_kv_len],
-                        );
+                        softmax_inplace(&mut scores[row * total_kv_len..(row + 1) * total_kv_len]);
                     }
 
                     // context = scores[block, total_kv_len] @ V[total_kv_len, hd] → [block, hd]
@@ -701,7 +782,15 @@ impl DFlashCpuEngine {
             }
 
             // O projection
-            sgemm_nt_bf16(block, h, q_dim, &attn_out, &layer.o_proj, &mut o_buf, &mut w_scratch);
+            sgemm_nt_bf16(
+                block,
+                h,
+                q_dim,
+                &attn_out,
+                &layer.o_proj,
+                &mut o_buf,
+                &mut w_scratch,
+            );
 
             // Residual add
             for i in 0..block * h {
@@ -712,14 +801,30 @@ impl DFlashCpuEngine {
             rms_norm(&hidden, &layer.post_attn_norm, &mut normed, block, h);
 
             // Gate + SiLU: gate = normed @ gate_proj^T, then gate *= sigmoid(gate)
-            sgemm_nt_bf16(block, cfg.inter, h, &normed, &layer.gate_proj, &mut gate_buf, &mut w_scratch);
+            sgemm_nt_bf16(
+                block,
+                cfg.inter,
+                h,
+                &normed,
+                &layer.gate_proj,
+                &mut gate_buf,
+                &mut w_scratch,
+            );
             for v in gate_buf.iter_mut() {
                 let sig = 1.0 / (1.0 + (-*v).exp());
                 *v *= sig;
             }
 
             // Up
-            sgemm_nt_bf16(block, cfg.inter, h, &normed, &layer.up_proj, &mut up_buf, &mut w_scratch);
+            sgemm_nt_bf16(
+                block,
+                cfg.inter,
+                h,
+                &normed,
+                &layer.up_proj,
+                &mut up_buf,
+                &mut w_scratch,
+            );
 
             // gate * up
             for (g, u) in gate_buf.iter_mut().zip(up_buf.iter()) {
@@ -727,7 +832,15 @@ impl DFlashCpuEngine {
             }
 
             // Down
-            sgemm_nt_bf16(block, h, cfg.inter, &gate_buf, &layer.down_proj, &mut o_buf, &mut w_scratch);
+            sgemm_nt_bf16(
+                block,
+                h,
+                cfg.inter,
+                &gate_buf,
+                &layer.down_proj,
+                &mut o_buf,
+                &mut w_scratch,
+            );
 
             // Residual add
             for i in 0..block * h {
@@ -855,14 +968,8 @@ mod tests {
         let mean_diff = sum_diff / mlx_flat.len() as f32;
 
         eprintln!("Parity check: max_diff={max_diff:.6}, mean_diff={mean_diff:.6}");
-        eprintln!(
-            "  MLX  first 8: {:?}",
-            &mlx_flat[..8]
-        );
-        eprintln!(
-            "  CPU  first 8: {:?}",
-            &cpu_out[..8]
-        );
+        eprintln!("  MLX  first 8: {:?}", &mlx_flat[..8]);
+        eprintln!("  CPU  first 8: {:?}", &cpu_out[..8]);
 
         // MLX runs in float16 by default, CPU in float32.
         // Allow generous tolerance for fp16 accumulation differences.
@@ -899,7 +1006,11 @@ mod tests {
             // Generate random f32 data
             let noise: Vec<f32> = (0..block * h).map(|i| (i as f32 * 0.001).sin()).collect();
             let tap_data: Vec<Vec<f32>> = (0..num_taps)
-                .map(|t| (0..ctx_len * h).map(|i| ((i + t * 1000) as f32 * 0.001).cos()).collect())
+                .map(|t| {
+                    (0..ctx_len * h)
+                        .map(|i| ((i + t * 1000) as f32 * 0.001).cos())
+                        .collect()
+                })
                 .collect();
             let tap_slices: Vec<&[f32]> = tap_data.iter().map(|t| t.as_slice()).collect();
 

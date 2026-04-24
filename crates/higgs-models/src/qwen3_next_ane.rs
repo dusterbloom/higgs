@@ -278,7 +278,10 @@ impl AneProjKernel {
                 self.kernel.eval().map_err(Exception::custom)?;
             }
             let out_slice = &mut out_all[bi * s * oc..(bi + 1) * s * oc];
-            if !self.kernel.read_output_strided_fp32(0, out_slice, s, oc, pad) {
+            if !self
+                .kernel
+                .read_output_strided_fp32(0, out_slice, s, oc, pad)
+            {
                 let mut out_bytes = vec![0u8; self.output_bytes];
                 self.kernel.read_output(0, &mut out_bytes);
                 let out_padded = ane_to_cpu(&out_bytes, pad, oc);
@@ -390,13 +393,15 @@ pub fn compile_fused_gdn_proj(
     if w_qkvz.len() != qkvz_oc * ic {
         return Err(format!(
             "qkvz weight size mismatch: got {}, expected {}",
-            w_qkvz.len(), qkvz_oc * ic
+            w_qkvz.len(),
+            qkvz_oc * ic
         ));
     }
     if w_ba.len() != ba_oc * ic {
         return Err(format!(
             "ba weight size mismatch: got {}, expected {}",
-            w_ba.len(), ba_oc * ic
+            w_ba.len(),
+            ba_oc * ic
         ));
     }
     ane_bridge::ane_init()?;
@@ -405,7 +410,9 @@ pub fn compile_fused_gdn_proj(
 
     let qkvz_blobs = build_tiled_blobs(w_qkvz, ic, qkvz_oc);
     let ba_blobs = build_tiled_blobs(w_ba, ic, ba_oc);
-    let all_blobs: Vec<&[u8]> = qkvz_blobs.iter().chain(ba_blobs.iter())
+    let all_blobs: Vec<&[u8]> = qkvz_blobs
+        .iter()
+        .chain(ba_blobs.iter())
         .map(|v| v.as_slice())
         .collect();
     let name_refs: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
@@ -443,20 +450,24 @@ pub fn compile_fused_gdn_proj_from_donor(
     if w_qkvz.len() != qkvz_oc * ic {
         return Err(format!(
             "fused donor patch qkvz size mismatch: got {}, expected {}",
-            w_qkvz.len(), qkvz_oc * ic
+            w_qkvz.len(),
+            qkvz_oc * ic
         ));
     }
     if w_ba.len() != ba_oc * ic {
         return Err(format!(
             "fused donor patch ba size mismatch: got {}, expected {}",
-            w_ba.len(), ba_oc * ic
+            w_ba.len(),
+            ba_oc * ic
         ));
     }
 
     let mil = ane_mil::gen_fused_gdn_qkvz_ba_proj(ic, qkvz_oc, ba_oc, seq_len);
     let qkvz_blobs = build_tiled_blobs(w_qkvz, ic, qkvz_oc);
     let ba_blobs = build_tiled_blobs(w_ba, ic, ba_oc);
-    let all_blobs: Vec<&[u8]> = qkvz_blobs.iter().chain(ba_blobs.iter())
+    let all_blobs: Vec<&[u8]> = qkvz_blobs
+        .iter()
+        .chain(ba_blobs.iter())
         .map(|v| v.as_slice())
         .collect();
     let name_refs: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
@@ -490,7 +501,8 @@ impl FusedGdnProjKernel {
         let shape = x.shape();
         if shape.len() != 3 {
             return Err(Exception::custom(format!(
-                "FusedGdnProjKernel::dispatch expects rank-3, got {:?}", shape
+                "FusedGdnProjKernel::dispatch expects rank-3, got {:?}",
+                shape
             )));
         }
         let b = shape[0] as usize;
@@ -498,16 +510,20 @@ impl FusedGdnProjKernel {
         let h = shape[2] as usize;
         if h != self.in_dim {
             return Err(Exception::custom(format!(
-                "fused_gdn in_dim mismatch: input {h}, kernel {}", self.in_dim
+                "fused_gdn in_dim mismatch: input {h}, kernel {}",
+                self.in_dim
             )));
         }
         if s > self.seq_len {
             return Err(Exception::custom(format!(
-                "fused_gdn seq too long: input {s}, kernel seq_len {}", self.seq_len
+                "fused_gdn seq too long: input {s}, kernel seq_len {}",
+                self.seq_len
             )));
         }
 
-        let prof = std::env::var("HIGGS_ANE_GDN_PROFILE").map(|v| v == "1").unwrap_or(false);
+        let prof = std::env::var("HIGGS_ANE_GDN_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let t_phase0 = prof.then(std::time::Instant::now);
 
         let x_f32 = if x.dtype() == Dtype::Float32 {
@@ -545,16 +561,19 @@ impl FusedGdnProjKernel {
                 debug_assert_eq!(ane_in.len(), self.input_bytes);
                 self.kernel.write_input(0, &ane_in);
             }
-            if let Some(t) = tw0 { tw += t.elapsed().as_nanos() as u64; }
+            if let Some(t) = tw0 {
+                tw += t.elapsed().as_nanos() as u64;
+            }
             let ta0 = prof.then(std::time::Instant::now);
             if self.kernel.eval_realtime().is_err() {
                 self.kernel.eval().map_err(Exception::custom)?;
             }
-            if let Some(t) = ta0 { ta += t.elapsed().as_nanos() as u64; }
+            if let Some(t) = ta0 {
+                ta += t.elapsed().as_nanos() as u64;
+            }
 
             let tr0 = prof.then(std::time::Instant::now);
-            let out_q = &mut out_qkvz
-                [bi * s * self.qkvz_oc..(bi + 1) * s * self.qkvz_oc];
+            let out_q = &mut out_qkvz[bi * s * self.qkvz_oc..(bi + 1) * s * self.qkvz_oc];
             let out_b = &mut out_ba[bi * s * self.ba_oc..(bi + 1) * s * self.ba_oc];
             if self.output_rowwise {
                 // MIL output is [1, 1, pad, total_oc] fp32 — row-major.
@@ -575,10 +594,9 @@ impl FusedGdnProjKernel {
                         let row_start = si * total_oc;
                         out_q[si * self.qkvz_oc..(si + 1) * self.qkvz_oc]
                             .copy_from_slice(&all_f32[row_start..row_start + self.qkvz_oc]);
-                        out_b[si * self.ba_oc..(si + 1) * self.ba_oc]
-                            .copy_from_slice(
-                                &all_f32[row_start + self.qkvz_oc..row_start + total_oc],
-                            );
+                        out_b[si * self.ba_oc..(si + 1) * self.ba_oc].copy_from_slice(
+                            &all_f32[row_start + self.qkvz_oc..row_start + total_oc],
+                        );
                     }
                 } else {
                     #[allow(unsafe_code)]
@@ -601,11 +619,16 @@ impl FusedGdnProjKernel {
                     }
                 }
             } else {
-                let ok_q = self.kernel.read_output_strided_fp32_range(
-                    0, out_q, s, 0, self.qkvz_oc, pad,
-                );
+                let ok_q =
+                    self.kernel
+                        .read_output_strided_fp32_range(0, out_q, s, 0, self.qkvz_oc, pad);
                 let ok_b = self.kernel.read_output_strided_fp32_range(
-                    0, out_b, s, self.qkvz_oc, self.ba_oc, pad,
+                    0,
+                    out_b,
+                    s,
+                    self.qkvz_oc,
+                    self.ba_oc,
+                    pad,
                 );
                 if !(ok_q && ok_b) {
                     fb_r += 1;
@@ -624,7 +647,9 @@ impl FusedGdnProjKernel {
                     }
                 }
             }
-            if prof { let _ = tr0.map(|t| tr += t.elapsed().as_nanos() as u64); }
+            if prof {
+                let _ = tr0.map(|t| tr += t.elapsed().as_nanos() as u64);
+            }
         }
         if prof {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -774,8 +799,7 @@ pub fn compile_proj_lut6(
     }
 
     let hash = lut6_weight_hash(w_f32);
-    let cache_slot = lut6_cache_root()
-        .join(format!("{hash}_{out_dim}x{in_dim}_s{seq_len}"));
+    let cache_slot = lut6_cache_root().join(format!("{hash}_{out_dim}x{in_dim}_s{seq_len}"));
     let cache_mlmodelc = cache_slot.join("model.mlmodelc");
 
     if !cache_mlmodelc.is_dir() {
@@ -801,11 +825,16 @@ pub fn compile_proj_lut6(
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/palettize_lm_head.py");
         let out = std::process::Command::new("python3")
             .arg(script)
-            .arg("--weights-bin").arg(&weights_bin)
-            .arg("--vocab").arg(out_dim.to_string())
-            .arg("--hidden").arg(in_dim.to_string())
-            .arg("--seq-len").arg(seq_len.to_string())
-            .arg("--out-dir").arg(&staging)
+            .arg("--weights-bin")
+            .arg(&weights_bin)
+            .arg("--vocab")
+            .arg(out_dim.to_string())
+            .arg("--hidden")
+            .arg(in_dim.to_string())
+            .arg("--seq-len")
+            .arg(seq_len.to_string())
+            .arg("--out-dir")
+            .arg(&staging)
             .output()
             .map_err(|e| format!("compile_proj_lut6: spawn python3: {e}"))?;
         if !out.status.success() {
@@ -881,8 +910,7 @@ pub fn compile_proj_int8_mlpkg(
     }
 
     let hash = lut6_weight_hash(w_f32);
-    let cache_slot = int8_mlpkg_cache_root()
-        .join(format!("{hash}_{out_dim}x{in_dim}_s{seq_len}"));
+    let cache_slot = int8_mlpkg_cache_root().join(format!("{hash}_{out_dim}x{in_dim}_s{seq_len}"));
     let cache_mlmodelc = cache_slot.join("model.mlmodelc");
 
     if !cache_mlmodelc.is_dir() {
@@ -914,11 +942,16 @@ pub fn compile_proj_int8_mlpkg(
         let py = std::env::var("HIGGS_CORETOOLS_PYTHON").unwrap_or_else(|_| "python3".to_string());
         let out = std::process::Command::new(&py)
             .arg(script)
-            .arg("--weights-bin").arg(&weights_bin)
-            .arg("--out-features").arg(out_dim.to_string())
-            .arg("--in-features").arg(in_dim.to_string())
-            .arg("--seq-len").arg(seq_len.to_string())
-            .arg("--out-dir").arg(&script_out)
+            .arg("--weights-bin")
+            .arg(&weights_bin)
+            .arg("--out-features")
+            .arg(out_dim.to_string())
+            .arg("--in-features")
+            .arg(in_dim.to_string())
+            .arg("--seq-len")
+            .arg(seq_len.to_string())
+            .arg("--out-dir")
+            .arg(&script_out)
             .output()
             .map_err(|e| format!("compile_proj_int8_mlpkg({tag}): spawn {py}: {e}"))?;
         if !out.status.success() {
@@ -1151,18 +1184,17 @@ mod tests {
         let sp1_ok = match &res1 {
             Ok(k) => {
                 // Write known input, eval, read output.
-                let input: Vec<f16> = (0..ch).map(|i| {
-                    f16::from_f32((i as f32 - 16.0) * 0.1)
-                }).collect();
-                let in_bytes: Vec<u8> = input.iter()
-                    .flat_map(|v| v.to_le_bytes())
+                let input: Vec<f16> = (0..ch)
+                    .map(|i| f16::from_f32((i as f32 - 16.0) * 0.1))
                     .collect();
+                let in_bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
                 k.write_input(0, &in_bytes);
                 match k.eval() {
                     Ok(()) => {
                         let mut out_buf = vec![0u8; sp1_bytes];
                         k.read_output(0, &mut out_buf);
-                        let output: Vec<f16> = out_buf.chunks_exact(2)
+                        let output: Vec<f16> = out_buf
+                            .chunks_exact(2)
                             .map(|c| f16::from_le_bytes([c[0], c[1]]))
                             .collect();
                         // Verify sigmoid: σ(0) = 0.5
@@ -1218,8 +1250,14 @@ mod tests {
         eprintln!("\n--- Probe 3: a*b+c [1,{ch3},1,1] (spatial=1, multi-input) ---");
         let res3 = AneKernel::compile(&mil_fma, None, &[io3_bytes * 3], &[io3_bytes]);
         let fma_ok = match &res3 {
-            Ok(_) => { eprintln!("PASS: fma compiles at spatial=1"); true }
-            Err(e) => { eprintln!("FAIL: fma compile: {e}"); false }
+            Ok(_) => {
+                eprintln!("PASS: fma compiles at spatial=1");
+                true
+            }
+            Err(e) => {
+                eprintln!("FAIL: fma compile: {e}");
+                false
+            }
         };
 
         // --- Probe 3b: abs + real_div at spatial=1 ---
@@ -1241,10 +1279,19 @@ mod tests {
         let res_ad = AneKernel::compile(&mil_abs_div, None, &[ab_bytes], &[ab_bytes]);
         let abs_div_ok = match &res_ad {
             Ok(k) => match k.eval() {
-                Ok(()) => { eprintln!("PASS: abs+div compiles + evals"); true }
-                Err(e) => { eprintln!("PASS compile, FAIL eval: {e}"); false }
+                Ok(()) => {
+                    eprintln!("PASS: abs+div compiles + evals");
+                    true
+                }
+                Err(e) => {
+                    eprintln!("PASS compile, FAIL eval: {e}");
+                    false
+                }
             },
-            Err(e) => { eprintln!("FAIL compile: {e}"); false }
+            Err(e) => {
+                eprintln!("FAIL compile: {e}");
+                false
+            }
         };
 
         // --- Probe 3c: exp at spatial=1 ---
@@ -1258,10 +1305,19 @@ mod tests {
         let res_exp = AneKernel::compile(&mil_exp, None, &[ab_bytes], &[ab_bytes]);
         let exp_ok = match &res_exp {
             Ok(k) => match k.eval() {
-                Ok(()) => { eprintln!("PASS: exp compiles + evals"); true }
-                Err(e) => { eprintln!("PASS compile, FAIL eval: {e}"); false }
+                Ok(()) => {
+                    eprintln!("PASS: exp compiles + evals");
+                    true
+                }
+                Err(e) => {
+                    eprintln!("PASS compile, FAIL eval: {e}");
+                    false
+                }
             },
-            Err(e) => { eprintln!("FAIL compile: {e}"); false }
+            Err(e) => {
+                eprintln!("FAIL compile: {e}");
+                false
+            }
         };
 
         // --- Probe 4: reduce_sum over channel axis (critical for recurrence readout) ---
@@ -1285,28 +1341,55 @@ mod tests {
         eprintln!("{mil_reduce}");
         let res4 = AneKernel::compile(&mil_reduce, None, &[red_in_bytes], &[red_out_bytes]);
         let reduce_ok = match &res4 {
-            Ok(k) => {
-                match k.eval() {
-                    Ok(()) => { eprintln!("PASS: reduce_sum compiles + evals"); true }
-                    Err(e) => { eprintln!("PASS compile, FAIL eval: {e}"); false }
+            Ok(k) => match k.eval() {
+                Ok(()) => {
+                    eprintln!("PASS: reduce_sum compiles + evals");
+                    true
                 }
+                Err(e) => {
+                    eprintln!("PASS compile, FAIL eval: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                eprintln!("FAIL: reduce_sum compile: {e}");
+                false
             }
-            Err(e) => { eprintln!("FAIL: reduce_sum compile: {e}"); false }
         };
 
         // --- Summary ---
         eprintln!("\n=== Gate 1 Probe Summary ===");
-        eprintln!("  sigmoid spatial=1:  {}", if sp1_ok { "PASS" } else { "FAIL" });
-        eprintln!("  sigmoid spatial=16: {}", if sp16_ok { "PASS" } else { "FAIL" });
-        eprintln!("  fma spatial=1:      {}", if fma_ok { "PASS" } else { "FAIL" });
-        eprintln!("  abs+div spatial=1:  {}", if abs_div_ok { "PASS" } else { "FAIL" });
-        eprintln!("  exp spatial=1:      {}", if exp_ok { "PASS" } else { "FAIL" });
-        eprintln!("  reduce_sum:         {}", if reduce_ok { "PASS" } else { "FAIL" });
+        eprintln!(
+            "  sigmoid spatial=1:  {}",
+            if sp1_ok { "PASS" } else { "FAIL" }
+        );
+        eprintln!(
+            "  sigmoid spatial=16: {}",
+            if sp16_ok { "PASS" } else { "FAIL" }
+        );
+        eprintln!(
+            "  fma spatial=1:      {}",
+            if fma_ok { "PASS" } else { "FAIL" }
+        );
+        eprintln!(
+            "  abs+div spatial=1:  {}",
+            if abs_div_ok { "PASS" } else { "FAIL" }
+        );
+        eprintln!(
+            "  exp spatial=1:      {}",
+            if exp_ok { "PASS" } else { "FAIL" }
+        );
+        eprintln!(
+            "  reduce_sum:         {}",
+            if reduce_ok { "PASS" } else { "FAIL" }
+        );
 
         if abs_div_ok && fma_ok && reduce_ok {
             eprintln!("\nGate 1 ALL-ANE VIABLE: abs+div works → polynomial sigmoid feasible.");
             if !exp_ok {
-                eprintln!("  exp fails at spatial=1 → gate computation needs split or softplus approx.");
+                eprintln!(
+                    "  exp fails at spatial=1 → gate computation needs split or softplus approx."
+                );
             }
             eprintln!("  State update [32,128,128] has natural spatial=128 — no padding needed.");
         } else if sp16_ok && !sp1_ok {
@@ -1317,7 +1400,10 @@ mod tests {
         }
 
         // Baseline must pass — if this fails the ANE is broken.
-        assert!(sp16_ok, "spatial=16 sigmoid must compile — ANE sanity check");
+        assert!(
+            sp16_ok,
+            "spatial=16 sigmoid must compile — ANE sanity check"
+        );
     }
 
     /// Gate 1 parity: GDN recurrence state update on ANE vs f32 reference.
@@ -1350,46 +1436,85 @@ mod tests {
 
         // Compile both kernels
         let k_state = AneKernel::compile(
-            &kerns.state_update_mil, None, &kerns.state_input_sizes, &kerns.state_output_sizes,
-        ).expect("state_update MIL compile failed");
+            &kerns.state_update_mil,
+            None,
+            &kerns.state_input_sizes,
+            &kerns.state_output_sizes,
+        )
+        .expect("state_update MIL compile failed");
         let k_readout = AneKernel::compile(
-            &kerns.readout_mil, None, &kerns.readout_input_sizes, &kerns.readout_output_sizes,
-        ).expect("readout MIL compile failed");
+            &kerns.readout_mil,
+            None,
+            &kerns.readout_input_sizes,
+            &kerns.readout_output_sizes,
+        )
+        .expect("readout MIL compile failed");
 
         // Logical per-head scalars
         let g_log: Vec<f32> = (0..hv).map(|i| 0.8 + (i as f32) * 0.02).collect();
         let beta_log: Vec<f32> = (0..hv).map(|i| 0.4 + (i as f32) * 0.05).collect();
-        let k_log: Vec<f32> = (0..dk*hv).map(|i| ((i as f32) * 0.07).cos() * 0.1).collect();
-        let v_log: Vec<f32> = (0..hv*dv).map(|i| ((i as f32) * 0.03).sin() * 0.1).collect();
-        let q_log: Vec<f32> = (0..dk*hv).map(|i| ((i as f32) * 0.05).cos() * 0.1).collect();
+        let k_log: Vec<f32> = (0..dk * hv)
+            .map(|i| ((i as f32) * 0.07).cos() * 0.1)
+            .collect();
+        let v_log: Vec<f32> = (0..hv * dv)
+            .map(|i| ((i as f32) * 0.03).sin() * 0.1)
+            .collect();
+        let q_log: Vec<f32> = (0..dk * hv)
+            .map(|i| ((i as f32) * 0.05).cos() * 0.1)
+            .collect();
 
         // Build flat IOSurface buffers — ALL [1, dk, 1, fw] (uniform channel dim).
         // ANE 0x1d when 3+ IOSurfaces mix C=1 and C=Dk.
         // g/beta/v are logically per-head but replicated across dk channels.
         let mut st_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            st_flat[c * fw + h * dv + d] = (((c * hv * dv + h * dv + d) as f32 * 0.01) - 0.5).sin() * 0.1;
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    st_flat[c * fw + h * dv + d] =
+                        (((c * hv * dv + h * dv + d) as f32 * 0.01) - 0.5).sin() * 0.1;
+                }
+            }
+        }
         let mut g_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            g_flat[c * fw + h * dv + d] = g_log[h];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    g_flat[c * fw + h * dv + d] = g_log[h];
+                }
+            }
+        }
         let mut beta_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            beta_flat[c * fw + h * dv + d] = beta_log[h];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    beta_flat[c * fw + h * dv + d] = beta_log[h];
+                }
+            }
+        }
         let mut k_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            k_flat[c * fw + h * dv + d] = k_log[c * hv + h];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    k_flat[c * fw + h * dv + d] = k_log[c * hv + h];
+                }
+            }
+        }
         let mut v_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            v_flat[c * fw + h * dv + d] = v_log[h * dv + d];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    v_flat[c * fw + h * dv + d] = v_log[h * dv + d];
+                }
+            }
+        }
         let mut q_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            q_flat[c * fw + h * dv + d] = q_log[c * hv + h];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    q_flat[c * fw + h * dv + d] = q_log[c * hv + h];
+                }
+            }
+        }
 
         fn to_f32_bytes(data: &[f32]) -> Vec<u8> {
             data.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -1414,7 +1539,8 @@ mod tests {
         // Read new_state [1, dk, 1, fw] fp32
         let mut ns_buf = vec![0u8; dk * fw * 4];
         k_state.read_output(0, &mut ns_buf);
-        let ns_f32: Vec<f32> = ns_buf.chunks_exact(4)
+        let ns_f32: Vec<f32> = ns_buf
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -1426,54 +1552,88 @@ mod tests {
         // Read y [1, 1, 1, fw] fp32
         let mut y_buf = vec![0u8; fw * 4];
         k_readout.read_output(0, &mut y_buf);
-        let y_f32: Vec<f32> = y_buf.chunks_exact(4)
+        let y_f32: Vec<f32> = y_buf
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
         // Extract logical dims (ignore padding)
         let mut ns_ane = vec![0.0f32; dk * hv * dv];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            ns_ane[c * hv * dv + h * dv + d] = ns_f32[c * fw + h * dv + d];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    ns_ane[c * hv * dv + h * dv + d] = ns_f32[c * fw + h * dv + d];
+                }
+            }
+        }
         let mut y_ane = vec![0.0f32; hv * dv];
-        for h in 0..hv { for d in 0..dv {
-            y_ane[h * dv + d] = y_f32[h * dv + d];
-        }}
+        for h in 0..hv {
+            for d in 0..dv {
+                y_ane[h * dv + d] = y_f32[h * dv + d];
+            }
+        }
 
         // --- f32 reference ---
         let li = |c: usize, h: usize, d: usize| c * hv * dv + h * dv + d;
 
         let mut decay = vec![0.0f32; dk * hv * dv];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            decay[li(c,h,d)] = st_flat[c * fw + h * dv + d] * g_log[h];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    decay[li(c, h, d)] = st_flat[c * fw + h * dv + d] * g_log[h];
+                }
+            }
+        }
         let mut kvm = vec![0.0f32; hv * dv];
-        for h in 0..hv { for d in 0..dv {
-            let mut s = 0.0f32;
-            for c in 0..dk { s += decay[li(c,h,d)] * k_log[c * hv + h]; }
-            kvm[h * dv + d] = s;
-        }}
+        for h in 0..hv {
+            for d in 0..dv {
+                let mut s = 0.0f32;
+                for c in 0..dk {
+                    s += decay[li(c, h, d)] * k_log[c * hv + h];
+                }
+                kvm[h * dv + d] = s;
+            }
+        }
         let mut delta = vec![0.0f32; hv * dv];
-        for h in 0..hv { for d in 0..dv {
-            delta[h*dv+d] = (v_log[h*dv+d] - kvm[h*dv+d]) * beta_log[h];
-        }}
+        for h in 0..hv {
+            for d in 0..dv {
+                delta[h * dv + d] = (v_log[h * dv + d] - kvm[h * dv + d]) * beta_log[h];
+            }
+        }
         let mut ns_ref = vec![0.0f32; dk * hv * dv];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            ns_ref[li(c,h,d)] = decay[li(c,h,d)] + k_log[c*hv+h] * delta[h*dv+d];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    ns_ref[li(c, h, d)] =
+                        decay[li(c, h, d)] + k_log[c * hv + h] * delta[h * dv + d];
+                }
+            }
+        }
         let mut y_ref = vec![0.0f32; hv * dv];
-        for h in 0..hv { for d in 0..dv {
-            let mut s = 0.0f32;
-            for c in 0..dk { s += ns_ref[li(c,h,d)] * q_log[c*hv+h]; }
-            y_ref[h*dv+d] = s;
-        }}
+        for h in 0..hv {
+            for d in 0..dv {
+                let mut s = 0.0f32;
+                for c in 0..dk {
+                    s += ns_ref[li(c, h, d)] * q_log[c * hv + h];
+                }
+                y_ref[h * dv + d] = s;
+            }
+        }
 
-        let max_diff_ns = ns_ane.iter().zip(ns_ref.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        let max_diff_y = y_ane.iter().zip(y_ref.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_diff_ns = ns_ane
+            .iter()
+            .zip(ns_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_diff_y = y_ane
+            .iter()
+            .zip(y_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
 
-        eprintln!("[recurrence parity] new_state max_diff={max_diff_ns:.6} y max_diff={max_diff_y:.6}");
+        eprintln!(
+            "[recurrence parity] new_state max_diff={max_diff_ns:.6} y max_diff={max_diff_y:.6}"
+        );
 
         assert!(
             max_diff_ns < 0.01,
@@ -1516,7 +1676,10 @@ mod tests {
         }
         let elapsed = t0.elapsed();
         let us_per = elapsed.as_micros() as f64 / iters as f64;
-        eprintln!("[recurrence bench] {iters} iters in {:.1}ms, {us_per:.1}us/step (hv={hv} dk={dk} dv={dv})", elapsed.as_secs_f64() * 1000.0);
+        eprintln!(
+            "[recurrence bench] {iters} iters in {:.1}ms, {us_per:.1}us/step (hv={hv} dk={dk} dv={dv})",
+            elapsed.as_secs_f64() * 1000.0
+        );
     }
 
     /// Bisect GDN recurrence InvalidMILProgram.
@@ -1550,7 +1713,10 @@ mod tests {
         let sz_a = 16 * 16 * 4 * 2; // fp16
         let res_a = AneKernel::compile(&mil_a, None, &[sz_a, sz_a], &[sz_a]);
         let pass_a = res_a.is_ok();
-        eprintln!("[bisect A] 2-input mul [1,16,16,4]: {}", if pass_a { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect A] 2-input mul [1,16,16,4]: {}",
+            if pass_a { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe B: mul + reduce_sum(axis=1) at [1,16,16,4] ---
         let mil_b = format!(
@@ -1567,7 +1733,10 @@ mod tests {
         let sz_b_out = 1 * 16 * 4 * 2;
         let res_b = AneKernel::compile(&mil_b, None, &[sz_a, sz_a], &[sz_b_out]);
         let pass_b = res_b.is_ok();
-        eprintln!("[bisect B] mul+reduce_sum [1,16,16,4]: {}", if pass_b { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect B] mul+reduce_sum [1,16,16,4]: {}",
+            if pass_b { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe C: const(-1) fill ---
         let mil_c = format!(
@@ -1581,7 +1750,10 @@ mod tests {
         let sz_c = 1 * 16 * 4 * 2;
         let res_c = AneKernel::compile(&mil_c, None, &[sz_c], &[sz_c]);
         let pass_c = res_c.is_ok();
-        eprintln!("[bisect C] const(-1) fill: {}", if pass_c { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect C] const(-1) fill: {}",
+            if pass_c { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe C2: scalar const(-1) + broadcast mul (fallback if C fails) ---
         if !pass_c {
@@ -1594,7 +1766,10 @@ mod tests {
                 \n    }} -> (y);\n}}\n"
             );
             let res_c2 = AneKernel::compile(&mil_c2, None, &[sz_c], &[sz_c]);
-            eprintln!("[bisect C2] scalar const(-1) + broadcast: {}", if res_c2.is_ok() { "PASS" } else { "FAIL" });
+            eprintln!(
+                "[bisect C2] scalar const(-1) + broadcast: {}",
+                if res_c2.is_ok() { "PASS" } else { "FAIL" }
+            );
         }
 
         // --- Probe D: 6 inputs, trivial ops ---
@@ -1617,19 +1792,35 @@ mod tests {
         let sz_dk_hv = 16 * 4 * 2;
         let sz_dv_hv = 16 * 4 * 2;
         let res_d = AneKernel::compile(
-            &mil_d, None,
+            &mil_d,
+            None,
             &[sz_a, sz_hv, sz_hv, sz_dk_hv, sz_dv_hv, sz_dk_hv],
             &[sz_a],
         );
         let pass_d = res_d.is_ok();
-        eprintln!("[bisect D] 6 inputs, trivial ops: {}", if pass_d { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect D] 6 inputs, trivial ops: {}",
+            if pass_d { "PASS" } else { "FAIL" }
+        );
 
         // Summary
         eprintln!("\n=== BISECT SUMMARY ===");
-        eprintln!("  A (2D spatial mul):     {}", if pass_a { "OK" } else { "BLOCKED" });
-        eprintln!("  B (reduce_sum):         {}", if pass_b { "OK" } else { "BLOCKED" });
-        eprintln!("  C (const(-1)):          {}", if pass_c { "OK" } else { "BLOCKED" });
-        eprintln!("  D (6 inputs):           {}", if pass_d { "OK" } else { "BLOCKED" });
+        eprintln!(
+            "  A (2D spatial mul):     {}",
+            if pass_a { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  B (reduce_sum):         {}",
+            if pass_b { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  C (const(-1)):          {}",
+            if pass_c { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  D (6 inputs):           {}",
+            if pass_d { "OK" } else { "BLOCKED" }
+        );
 
         // --- Probe E: sub op at [1,1,16,4] ---
         let mil_e = format!(
@@ -1642,7 +1833,10 @@ mod tests {
         );
         let res_e = AneKernel::compile(&mil_e, None, &[sz_c, sz_c], &[sz_c]);
         let pass_e = res_e.is_ok();
-        eprintln!("[bisect E] sub op [1,1,16,4]: {}", if pass_e { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect E] sub op [1,1,16,4]: {}",
+            if pass_e { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe F: const(0xBC00) = fp16 -1.0 via hex literal ---
         let mil_f = format!(
@@ -1655,7 +1849,10 @@ mod tests {
         );
         let res_f = AneKernel::compile(&mil_f, None, &[sz_c], &[sz_c]);
         let pass_f = res_f.is_ok();
-        eprintln!("[bisect F] const(0xBC00) hex fill: {}", if pass_f { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect F] const(0xBC00) hex fill: {}",
+            if pass_f { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe G: const(0) then sub(zero, x) for negation ---
         let mil_g = format!(
@@ -1670,7 +1867,10 @@ mod tests {
         );
         let res_g = AneKernel::compile(&mil_g, None, &[sz_c, sz_c], &[sz_c]);
         let pass_g = res_g.is_ok();
-        eprintln!("[bisect G] sub(0,x) negation: {}", if pass_g { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect G] sub(0,x) negation: {}",
+            if pass_g { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe H: direct sub(a, b) at full dims [1,16,16,4] ---
         let mil_h = format!(
@@ -1683,12 +1883,27 @@ mod tests {
         );
         let res_h = AneKernel::compile(&mil_h, None, &[sz_a, sz_c], &[sz_a]);
         let pass_h = res_h.is_ok();
-        eprintln!("[bisect H] sub(a,b) broadcast [1,16,16,4]-[1,1,16,4]: {}", if pass_h { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect H] sub(a,b) broadcast [1,16,16,4]-[1,1,16,4]: {}",
+            if pass_h { "PASS" } else { "FAIL" }
+        );
 
-        eprintln!("\n  E (sub op):             {}", if pass_e { "OK" } else { "BLOCKED" });
-        eprintln!("  F (hex const):          {}", if pass_f { "OK" } else { "BLOCKED" });
-        eprintln!("  G (sub(0,x)):           {}", if pass_g { "OK" } else { "BLOCKED" });
-        eprintln!("  H (sub broadcast):      {}", if pass_h { "OK" } else { "BLOCKED" });
+        eprintln!(
+            "\n  E (sub op):             {}",
+            if pass_e { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  F (hex const):          {}",
+            if pass_f { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  G (sub(0,x)):           {}",
+            if pass_g { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  H (sub broadcast):      {}",
+            if pass_h { "OK" } else { "BLOCKED" }
+        );
 
         // --- Probe I: concat on channel axis ---
         let mil_i = format!(
@@ -1704,7 +1919,10 @@ mod tests {
         let sz_i_out = 17 * 16 * 4 * 2;
         let res_i = AneKernel::compile(&mil_i, None, &[sz_a, sz_c], &[sz_i_out]);
         let pass_i = res_i.is_ok();
-        eprintln!("[bisect I] concat ch axis [1,16+1,16,4]: {}", if pass_i { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect I] concat ch axis [1,16+1,16,4]: {}",
+            if pass_i { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe J: reduce_sum with int32 const axes (matching actual program) ---
         let mil_j = format!(
@@ -1728,10 +1946,19 @@ mod tests {
         );
         let res_j = AneKernel::compile(&mil_j, None, &[sz_a, sz_a], &[sz_i_out]);
         let pass_j = res_j.is_ok();
-        eprintln!("[bisect J] full op chain (2 inputs): {}", if pass_j { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect J] full op chain (2 inputs): {}",
+            if pass_j { "PASS" } else { "FAIL" }
+        );
 
-        eprintln!("  I (concat):             {}", if pass_i { "OK" } else { "BLOCKED" });
-        eprintln!("  J (full chain 2-in):    {}", if pass_j { "OK" } else { "BLOCKED" });
+        eprintln!(
+            "  I (concat):             {}",
+            if pass_i { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  J (full chain 2-in):    {}",
+            if pass_j { "OK" } else { "BLOCKED" }
+        );
 
         // --- Probe J2: strip concat from J (just output ns) ---
         let mil_j2 = format!(
@@ -1750,7 +1977,10 @@ mod tests {
         );
         let res_j2 = AneKernel::compile(&mil_j2, None, &[sz_a, sz_a], &[sz_a]);
         let pass_j2 = res_j2.is_ok();
-        eprintln!("[bisect J2] chain no concat (7 ops): {}", if pass_j2 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect J2] chain no concat (7 ops): {}",
+            if pass_j2 { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe J3: just the sub(a,rs) where rs came from reduce_sum ---
         // (sub where one operand has broadcast dims from reduce)
@@ -1768,7 +1998,10 @@ mod tests {
         );
         let res_j3 = AneKernel::compile(&mil_j3, None, &[sz_a, sz_a], &[sz_a]);
         let pass_j3 = res_j3.is_ok();
-        eprintln!("[bisect J3] mul+reduce+sub(broadcast): {}", if pass_j3 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect J3] mul+reduce+sub(broadcast): {}",
+            if pass_j3 { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe J4: sub where input is [1,16,16,4] and b is [1,1,16,4] ---
         // This is sub(x=a, y=b) where a has C=16 but b has C=1. Broadcast on ch dim.
@@ -1783,7 +2016,10 @@ mod tests {
         );
         let res_j4 = AneKernel::compile(&mil_j4, None, &[sz_a, sz_c], &[sz_a]);
         let pass_j4 = res_j4.is_ok();
-        eprintln!("[bisect J4] sub(C=16, C=1) broadcast: {}", if pass_j4 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect J4] sub(C=16, C=1) broadcast: {}",
+            if pass_j4 { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe J5: J3 (fixed) + mul(b, d) — d is [1,16,16,4] from broadcast sub ---
         let mil_j5 = format!(
@@ -1801,7 +2037,10 @@ mod tests {
         );
         let res_j5 = AneKernel::compile(&mil_j5, None, &[sz_a, sz_a], &[sz_a]);
         let pass_j5 = res_j5.is_ok();
-        eprintln!("[bisect J5] +outer_product (fixed d type): {}", if pass_j5 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect J5] +outer_product (fixed d type): {}",
+            if pass_j5 { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe J6: J5 + add(p, ko) → ns ---
         let mil_j6 = format!(
@@ -1820,13 +2059,31 @@ mod tests {
         );
         let res_j6 = AneKernel::compile(&mil_j6, None, &[sz_a, sz_a], &[sz_a]);
         let pass_j6 = res_j6.is_ok();
-        eprintln!("[bisect J6] +add(p,ko)=ns: {}", if pass_j6 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect J6] +add(p,ko)=ns: {}",
+            if pass_j6 { "PASS" } else { "FAIL" }
+        );
 
-        eprintln!("  J2 (no concat):         {}", if pass_j2 { "OK" } else { "BLOCKED" });
-        eprintln!("  J3 (reduce+sub):        {}", if pass_j3 { "OK" } else { "BLOCKED" });
-        eprintln!("  J4 (sub C broadcast):   {}", if pass_j4 { "OK" } else { "BLOCKED" });
-        eprintln!("  J5 (+outer):            {}", if pass_j5 { "OK" } else { "BLOCKED" });
-        eprintln!("  J6 (+add):              {}", if pass_j6 { "OK" } else { "BLOCKED" });
+        eprintln!(
+            "  J2 (no concat):         {}",
+            if pass_j2 { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  J3 (reduce+sub):        {}",
+            if pass_j3 { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  J4 (sub C broadcast):   {}",
+            if pass_j4 { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  J5 (+outer):            {}",
+            if pass_j5 { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  J6 (+add):              {}",
+            if pass_j6 { "OK" } else { "BLOCKED" }
+        );
 
         // --- Probe K: mul with 2-axis broadcast [1,16,1,4] * [1,1,16,4] → [1,16,16,4] ---
         // This is the outer product pattern in the actual GDN program
@@ -1840,7 +2097,10 @@ mod tests {
         );
         let res_k = AneKernel::compile(&mil_k, None, &[sz_dk_hv, sz_dv_hv], &[sz_a]);
         let pass_k = res_k.is_ok();
-        eprintln!("[bisect K] 2-axis broadcast mul [16,1]*[1,16]→[16,16]: {}", if pass_k { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect K] 2-axis broadcast mul [16,1]*[1,16]→[16,16]: {}",
+            if pass_k { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe K2: mul with 1-axis broadcast [1,16,16,4] * [1,1,16,4] ---
         // This is the pattern used in J5 probes (but J5 had a type bug in d)
@@ -1854,10 +2114,19 @@ mod tests {
         );
         let res_k2 = AneKernel::compile(&mil_k2, None, &[sz_a, sz_dv_hv], &[sz_a]);
         let pass_k2 = res_k2.is_ok();
-        eprintln!("[bisect K2] 1-axis broadcast mul [16,16]*[1,16]→[16,16]: {}", if pass_k2 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect K2] 1-axis broadcast mul [16,16]*[1,16]→[16,16]: {}",
+            if pass_k2 { "PASS" } else { "FAIL" }
+        );
 
-        eprintln!("  K (2-axis broadcast):   {}", if pass_k { "OK" } else { "BLOCKED" });
-        eprintln!("  K2 (1-axis broadcast):  {}", if pass_k2 { "OK" } else { "BLOCKED" });
+        eprintln!(
+            "  K (2-axis broadcast):   {}",
+            if pass_k { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  K2 (1-axis broadcast):  {}",
+            if pass_k2 { "OK" } else { "BLOCKED" }
+        );
 
         // --- Probe L: J3 + one more mul (same shape, no broadcast) ---
         let mil_l = format!(
@@ -1875,7 +2144,10 @@ mod tests {
         );
         let res_l = AneKernel::compile(&mil_l, None, &[sz_a, sz_a], &[sz_a]);
         let pass_l = res_l.is_ok();
-        eprintln!("[bisect L] J3 + mul(d,d) no broadcast: {}", if pass_l { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect L] J3 + mul(d,d) no broadcast: {}",
+            if pass_l { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe L2: multiple muls, no reduce, no sub ---
         let mil_l2 = format!(
@@ -1895,7 +2167,10 @@ mod tests {
         );
         let res_l2 = AneKernel::compile(&mil_l2, None, &[sz_a, sz_a], &[sz_a]);
         let pass_l2 = res_l2.is_ok();
-        eprintln!("[bisect L2] 8 chained muls: {}", if pass_l2 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect L2] 8 chained muls: {}",
+            if pass_l2 { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe L3: sub(x,y) where y has broadcast from reduce (like actual program diff = sub(v, kvm)) ---
         // Both are [1,1,16,4] so no broadcast needed. Test sub in a chain.
@@ -1914,11 +2189,23 @@ mod tests {
         );
         let res_l3 = AneKernel::compile(&mil_l3, None, &[sz_a, sz_dv_hv], &[sz_a]);
         let pass_l3 = res_l3.is_ok();
-        eprintln!("[bisect L3] sub(same-shape) + mul chain: {}", if pass_l3 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect L3] sub(same-shape) + mul chain: {}",
+            if pass_l3 { "PASS" } else { "FAIL" }
+        );
 
-        eprintln!("  L  (J3+mul same):       {}", if pass_l { "OK" } else { "BLOCKED" });
-        eprintln!("  L2 (8 muls):            {}", if pass_l2 { "OK" } else { "BLOCKED" });
-        eprintln!("  L3 (sub same+mul):      {}", if pass_l3 { "OK" } else { "BLOCKED" });
+        eprintln!(
+            "  L  (J3+mul same):       {}",
+            if pass_l { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  L2 (8 muls):            {}",
+            if pass_l2 { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  L3 (sub same+mul):      {}",
+            if pass_l3 { "OK" } else { "BLOCKED" }
+        );
 
         // --- Probe N: exact copy of gen_gdn_recurrence_step output (6 inputs) ---
         let mil_n = format!(
@@ -1946,18 +2233,22 @@ mod tests {
             \n        tensor<fp16, [1,17,16,4]> out = concat(values=(ns,y),axis=cat_ax,interleave=bF)[name=string(\"out\")];\
             \n    }} -> (out);\n}}\n"
         );
-        let n_state = 16*16*4*2;
-        let n_hv = 4*2;
-        let n_dk_hv = 16*4*2;
-        let n_dv_hv = 16*4*2;
-        let n_out = 17*16*4*2;
+        let n_state = 16 * 16 * 4 * 2;
+        let n_hv = 4 * 2;
+        let n_dk_hv = 16 * 4 * 2;
+        let n_dv_hv = 16 * 4 * 2;
+        let n_out = 17 * 16 * 4 * 2;
         let res_n = AneKernel::compile(
-            &mil_n, None,
+            &mil_n,
+            None,
             &[n_state, n_hv, n_hv, n_dk_hv, n_dv_hv, n_dk_hv],
             &[n_out],
         );
         let pass_n = res_n.is_ok();
-        eprintln!("[bisect N] exact gen_gdn program: {}", if pass_n { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect N] exact gen_gdn program: {}",
+            if pass_n { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe N2: same as N but without concat (2 separate outputs) ---
         let mil_n2 = format!(
@@ -1983,12 +2274,16 @@ mod tests {
             \n    }} -> (ns, y);\n}}\n"
         );
         let res_n2 = AneKernel::compile(
-            &mil_n2, None,
+            &mil_n2,
+            None,
             &[n_state, n_hv, n_hv, n_dk_hv, n_dv_hv, n_dk_hv],
             &[n_state, n_dv_hv],
         );
         let pass_n2 = res_n2.is_ok();
-        eprintln!("[bisect N2] 6-in, no concat, 2 outputs: {}", if pass_n2 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect N2] 6-in, no concat, 2 outputs: {}",
+            if pass_n2 { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe N3: same as N but output only ns (drop y branch) ---
         let mil_n3 = format!(
@@ -2012,16 +2307,29 @@ mod tests {
             \n    }} -> (ns);\n}}\n"
         );
         let res_n3 = AneKernel::compile(
-            &mil_n3, None,
+            &mil_n3,
+            None,
             &[n_state, n_hv, n_hv, n_dk_hv, n_dv_hv, n_dk_hv],
             &[n_state],
         );
         let pass_n3 = res_n3.is_ok();
-        eprintln!("[bisect N3] 6-in, ns output only: {}", if pass_n3 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect N3] 6-in, ns output only: {}",
+            if pass_n3 { "PASS" } else { "FAIL" }
+        );
 
-        eprintln!("  N  (exact program):     {}", if pass_n { "OK" } else { "BLOCKED" });
-        eprintln!("  N2 (2 outputs):         {}", if pass_n2 { "OK" } else { "BLOCKED" });
-        eprintln!("  N3 (ns only):           {}", if pass_n3 { "OK" } else { "BLOCKED" });
+        eprintln!(
+            "  N  (exact program):     {}",
+            if pass_n { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  N2 (2 outputs):         {}",
+            if pass_n2 { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  N3 (ns only):           {}",
+            if pass_n3 { "OK" } else { "BLOCKED" }
+        );
 
         // --- Probe N4: N3 but strip unused inputs (only state, g, beta, k, v) ---
         let mil_n4 = format!(
@@ -2044,12 +2352,16 @@ mod tests {
             \n    }} -> (ns);\n}}\n"
         );
         let res_n4 = AneKernel::compile(
-            &mil_n4, None,
+            &mil_n4,
+            None,
             &[n_state, n_hv, n_hv, n_dk_hv, n_dv_hv],
             &[n_state],
         );
         let pass_n4 = res_n4.is_ok();
-        eprintln!("[bisect N4] 5-in, ns only (no q): {}", if pass_n4 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect N4] 5-in, ns only (no q): {}",
+            if pass_n4 { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe N5: just 3 inputs (state, g, k) — minimal to get decay+sk ---
         let mil_n5 = format!(
@@ -2062,13 +2374,12 @@ mod tests {
             \n        tensor<fp16, [1,16,16,4]> sk = mul(x=decay,y=k)[name=string(\"sk\")];\
             \n    }} -> (sk);\n}}\n"
         );
-        let res_n5 = AneKernel::compile(
-            &mil_n5, None,
-            &[n_state, n_hv, n_dk_hv],
-            &[n_state],
-        );
+        let res_n5 = AneKernel::compile(&mil_n5, None, &[n_state, n_hv, n_dk_hv], &[n_state]);
         let pass_n5 = res_n5.is_ok();
-        eprintln!("[bisect N5] 3-in, 2 muls: {}", if pass_n5 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect N5] 3-in, 2 muls: {}",
+            if pass_n5 { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe N6: 3 inputs + reduce_sum ---
         let mil_n6 = format!(
@@ -2084,17 +2395,25 @@ mod tests {
             \n        tensor<fp16, [1,1,16,4]> kvm = reduce_sum(x=sk,axes=c_ax,keep_dims=kd)[name=string(\"kvm\")];\
             \n    }} -> (kvm);\n}}\n"
         );
-        let res_n6 = AneKernel::compile(
-            &mil_n6, None,
-            &[n_state, n_hv, n_dk_hv],
-            &[n_dv_hv],
-        );
+        let res_n6 = AneKernel::compile(&mil_n6, None, &[n_state, n_hv, n_dk_hv], &[n_dv_hv]);
         let pass_n6 = res_n6.is_ok();
-        eprintln!("[bisect N6] 3-in, 2 muls + reduce: {}", if pass_n6 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect N6] 3-in, 2 muls + reduce: {}",
+            if pass_n6 { "PASS" } else { "FAIL" }
+        );
 
-        eprintln!("  N4 (5-in ns):           {}", if pass_n4 { "OK" } else { "BLOCKED" });
-        eprintln!("  N5 (3-in 2 muls):       {}", if pass_n5 { "OK" } else { "BLOCKED" });
-        eprintln!("  N6 (3-in +reduce):      {}", if pass_n6 { "OK" } else { "BLOCKED" });
+        eprintln!(
+            "  N4 (5-in ns):           {}",
+            if pass_n4 { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  N5 (3-in 2 muls):       {}",
+            if pass_n5 { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  N6 (3-in +reduce):      {}",
+            if pass_n6 { "OK" } else { "BLOCKED" }
+        );
 
         // --- Probe N7: state[1,16,16,4] * g[1,1,1,4] (just one mul, 2 inputs, mixed shapes) ---
         let mil_n7 = format!(
@@ -2107,7 +2426,10 @@ mod tests {
         );
         let res_n7 = AneKernel::compile(&mil_n7, None, &[n_state, n_hv], &[n_state]);
         let pass_n7 = res_n7.is_ok();
-        eprintln!("[bisect N7] state*g (2-in, tiny g): {}", if pass_n7 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect N7] state*g (2-in, tiny g): {}",
+            if pass_n7 { "PASS" } else { "FAIL" }
+        );
 
         // --- Compare: same structure as D probe but with 3 inputs ---
         eprintln!("[info] D used sz_a={sz_a}, sz_hv={sz_hv}, sz_dk_hv={sz_dk_hv}");
@@ -2124,10 +2446,19 @@ mod tests {
         );
         let res_n8 = AneKernel::compile(&mil_n8, None, &[sz_a, n_hv], &[sz_a]);
         let pass_n8 = res_n8.is_ok();
-        eprintln!("[bisect N8] mul(16x16x4, 1x1x4): {}", if pass_n8 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect N8] mul(16x16x4, 1x1x4): {}",
+            if pass_n8 { "PASS" } else { "FAIL" }
+        );
 
-        eprintln!("  N7 (state*g):           {}", if pass_n7 { "OK" } else { "BLOCKED" });
-        eprintln!("  N8 (mul 16x16x4*1x1x4):{}", if pass_n8 { "OK" } else { "BLOCKED" });
+        eprintln!(
+            "  N7 (state*g):           {}",
+            if pass_n7 { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  N8 (mul 16x16x4*1x1x4):{}",
+            if pass_n8 { "OK" } else { "BLOCKED" }
+        );
 
         // --- Probe P: exact same as N7 but rename 'state' → 'st' ---
         let mil_p = format!(
@@ -2140,7 +2471,10 @@ mod tests {
         );
         let res_p = AneKernel::compile(&mil_p, None, &[n_state, n_hv], &[n_state]);
         let pass_p = res_p.is_ok();
-        eprintln!("[bisect P] rename 'state'→'st': {}", if pass_p { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect P] rename 'state'→'st': {}",
+            if pass_p { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe M: J6 + mul(ns,b) + reduce_sum → 2nd reduce (the actual J2 chain) ---
         let mil_m = format!(
@@ -2161,7 +2495,10 @@ mod tests {
         );
         let res_m = AneKernel::compile(&mil_m, None, &[sz_a, sz_a], &[sz_b_out]);
         let pass_m = res_m.is_ok();
-        eprintln!("[bisect M] J6 + mul+reduce (2nd reduce): {}", if pass_m { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect M] J6 + mul+reduce (2nd reduce): {}",
+            if pass_m { "PASS" } else { "FAIL" }
+        );
 
         // --- Probe M2: just 2 reduce_sums ---
         let mil_m2 = format!(
@@ -2180,13 +2517,25 @@ mod tests {
         );
         let res_m2 = AneKernel::compile(&mil_m2, None, &[sz_a, sz_a], &[sz_b_out]);
         let pass_m2 = res_m2.is_ok();
-        eprintln!("[bisect M2] 2x reduce_sum (parallel): {}", if pass_m2 { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[bisect M2] 2x reduce_sum (parallel): {}",
+            if pass_m2 { "PASS" } else { "FAIL" }
+        );
 
-        eprintln!("  M  (2nd reduce):        {}", if pass_m { "OK" } else { "BLOCKED" });
-        eprintln!("  M2 (2x reduce):         {}", if pass_m2 { "OK" } else { "BLOCKED" });
+        eprintln!(
+            "  M  (2nd reduce):        {}",
+            if pass_m { "OK" } else { "BLOCKED" }
+        );
+        eprintln!(
+            "  M2 (2x reduce):         {}",
+            if pass_m2 { "OK" } else { "BLOCKED" }
+        );
 
         // At least probe A must pass for ANE to be viable at these dims
-        assert!(pass_a, "Probe A failed — 2D spatial is rejected, need [1,C,1,W] layout");
+        assert!(
+            pass_a,
+            "Probe A failed — 2D spatial is rejected, need [1,C,1,W] layout"
+        );
     }
 
     /// Eval probe: fp32 IOSurface + cast + broadcast mul + cast back.
@@ -2219,8 +2568,10 @@ mod tests {
         let sz16_64 = 16 * 64 * 4; // fp32
         let k_p1 = AneKernel::compile(&mil_p1, None, &[sz16_64, sz16_64], &[sz16_64]);
         let pass_compile_p1 = k_p1.is_ok();
-        let pass_eval_p1 = k_p1.map(|k| { k.eval().is_ok() }).unwrap_or(false);
-        eprintln!("[probe P1] same-shape mul fp32-IO: compile={pass_compile_p1} eval={pass_eval_p1}");
+        let pass_eval_p1 = k_p1.map(|k| k.eval().is_ok()).unwrap_or(false);
+        eprintln!(
+            "[probe P1] same-shape mul fp32-IO: compile={pass_compile_p1} eval={pass_eval_p1}"
+        );
 
         // P2: broadcast mul [1,16,1,64]*[1,1,1,64] — fp32 in/out
         let mil_p2 = format!(
@@ -2239,8 +2590,10 @@ mod tests {
         let sz1_64 = 64 * 4; // fp32
         let k_p2 = AneKernel::compile(&mil_p2, None, &[sz16_64, sz1_64], &[sz16_64]);
         let pass_compile_p2 = k_p2.is_ok();
-        let pass_eval_p2 = k_p2.map(|k| { k.eval().is_ok() }).unwrap_or(false);
-        eprintln!("[probe P2] broadcast mul fp32-IO: compile={pass_compile_p2} eval={pass_eval_p2}");
+        let pass_eval_p2 = k_p2.map(|k| k.eval().is_ok()).unwrap_or(false);
+        eprintln!(
+            "[probe P2] broadcast mul fp32-IO: compile={pass_compile_p2} eval={pass_eval_p2}"
+        );
 
         // P3: broadcast reduce_sum [1,16,1,64] → [1,1,1,64] — fp32 in/out
         let mil_p3 = format!(
@@ -2258,7 +2611,7 @@ mod tests {
         );
         let k_p3 = AneKernel::compile(&mil_p3, None, &[sz16_64], &[sz1_64]);
         let pass_compile_p3 = k_p3.is_ok();
-        let pass_eval_p3 = k_p3.map(|k| { k.eval().is_ok() }).unwrap_or(false);
+        let pass_eval_p3 = k_p3.map(|k| k.eval().is_ok()).unwrap_or(false);
         eprintln!("[probe P3] reduce_sum fp32-IO: compile={pass_compile_p3} eval={pass_eval_p3}");
 
         // P4: bisect state_update — first 3 ops only: decay=st*g, sk=decay*k, output=decay
@@ -2281,7 +2634,7 @@ mod tests {
         );
         let k_p4 = AneKernel::compile(&mil_p4, None, &[sz16_64, sz1_64, sz16_64], &[sz16_64]);
         let pass_compile_p4 = k_p4.is_ok();
-        let pass_eval_p4 = k_p4.map(|k| { k.eval().is_ok() }).unwrap_or(false);
+        let pass_eval_p4 = k_p4.map(|k| k.eval().is_ok()).unwrap_or(false);
         eprintln!("[probe P4] 3-input decay+sk: compile={pass_compile_p4} eval={pass_eval_p4}");
 
         // P5: add reduce_sum — decay, sk, kvm=reduce_sum(sk)
@@ -2306,8 +2659,10 @@ mod tests {
         );
         let k_p5 = AneKernel::compile(&mil_p5, None, &[sz16_64, sz1_64, sz16_64], &[sz1_64]);
         let pass_compile_p5 = k_p5.is_ok();
-        let pass_eval_p5 = k_p5.map(|k| { k.eval().is_ok() }).unwrap_or(false);
-        eprintln!("[probe P5] 3-input decay+sk+reduce: compile={pass_compile_p5} eval={pass_eval_p5}");
+        let pass_eval_p5 = k_p5.map(|k| k.eval().is_ok()).unwrap_or(false);
+        eprintln!(
+            "[probe P5] 3-input decay+sk+reduce: compile={pass_compile_p5} eval={pass_eval_p5}"
+        );
 
         // P6: add v input — decay, sk, kvm, diff=v-kvm, delta=diff*beta
         let mil_p6 = format!(
@@ -2337,11 +2692,17 @@ mod tests {
             \n        tensor<fp32, [1,16,1,64]> out = cast(dtype=to32,x=ns)[name=string(\"out\")];\
             \n    }} -> (out);\n}}\n"
         );
-        let k_p6 = AneKernel::compile(&mil_p6, None,
-            &[sz16_64, sz1_64, sz16_64, sz1_64, sz1_64], &[sz16_64]);
+        let k_p6 = AneKernel::compile(
+            &mil_p6,
+            None,
+            &[sz16_64, sz1_64, sz16_64, sz1_64, sz1_64],
+            &[sz16_64],
+        );
         let pass_compile_p6 = k_p6.is_ok();
-        let pass_eval_p6 = k_p6.map(|k| { k.eval().is_ok() }).unwrap_or(false);
-        eprintln!("[probe P6] 5-input full state_update: compile={pass_compile_p6} eval={pass_eval_p6}");
+        let pass_eval_p6 = k_p6.map(|k| k.eval().is_ok()).unwrap_or(false);
+        eprintln!(
+            "[probe P6] 5-input full state_update: compile={pass_compile_p6} eval={pass_eval_p6}"
+        );
 
         // P7: 3 same-shape fp32 inputs, 2 muls — is it 3 inputs or the broadcast?
         let mil_p7 = format!(
@@ -2362,8 +2723,10 @@ mod tests {
         );
         let k_p7 = AneKernel::compile(&mil_p7, None, &[sz16_64, sz16_64, sz16_64], &[sz16_64]);
         let pass_compile_p7 = k_p7.is_ok();
-        let pass_eval_p7 = k_p7.map(|k| { k.eval().is_ok() }).unwrap_or(false);
-        eprintln!("[probe P7] 3-input same-shape 2-mul: compile={pass_compile_p7} eval={pass_eval_p7}");
+        let pass_eval_p7 = k_p7.map(|k| k.eval().is_ok()).unwrap_or(false);
+        eprintln!(
+            "[probe P7] 3-input same-shape 2-mul: compile={pass_compile_p7} eval={pass_eval_p7}"
+        );
 
         // P8: 2 inputs, chained mul+mul (same as P4 but without the small input)
         // st*st then result*k — is it the chain or the mixed shapes?
@@ -2383,8 +2746,10 @@ mod tests {
         );
         let k_p8 = AneKernel::compile(&mil_p8, None, &[sz16_64, sz1_64], &[sz16_64]);
         let pass_compile_p8 = k_p8.is_ok();
-        let pass_eval_p8 = k_p8.map(|k| { k.eval().is_ok() }).unwrap_or(false);
-        eprintln!("[probe P8] 2-input broadcast+chain mul: compile={pass_compile_p8} eval={pass_eval_p8}");
+        let pass_eval_p8 = k_p8.map(|k| k.eval().is_ok()).unwrap_or(false);
+        eprintln!(
+            "[probe P8] 2-input broadcast+chain mul: compile={pass_compile_p8} eval={pass_eval_p8}"
+        );
 
         // P9a: reduce_sum then sub with internal broadcast
         // a=[1,16,1,64], b=[1,16,1,64]. r=reduce_sum(a,axis=1)=[1,1,1,64]. out=sub(b,r).
@@ -2410,18 +2775,35 @@ mod tests {
             // Fill a with 1.0 in all 16 channels, b with 10.0 everywhere
             // reduce_sum(a, axis=1) = 16.0 for each spatial element
             // sub(b, r) = 10.0 - 16.0 = -6.0 for each element of all 16 channels
-            let a_data: Vec<u8> = vec![1.0f32; 16 * 64].iter().flat_map(|v| v.to_le_bytes()).collect();
-            let b_data: Vec<u8> = vec![10.0f32; 16 * 64].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let a_data: Vec<u8> = vec![1.0f32; 16 * 64]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let b_data: Vec<u8> = vec![10.0f32; 16 * 64]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
             k.write_input(0, &a_data);
             k.write_input(1, &b_data);
             let eval_ok = k.eval().is_ok();
             if eval_ok {
                 let mut out = vec![0u8; 16 * 64 * 4];
                 k.read_output(0, &mut out);
-                let vals: Vec<f32> = out.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
-                eprintln!("[probe P9a] reduce+sub broadcast: eval=true, out[0..4]={:?} (expect -6.0)", &vals[..4]);
+                let vals: Vec<f32> = out
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                eprintln!(
+                    "[probe P9a] reduce+sub broadcast: eval=true, out[0..4]={:?} (expect -6.0)",
+                    &vals[..4]
+                );
                 // Check channel 0 vs channel 8
-                eprintln!("[probe P9a] ch0[0]={} ch8[0]={} ch15[0]={}", vals[0], vals[8*64], vals[15*64]);
+                eprintln!(
+                    "[probe P9a] ch0[0]={} ch8[0]={} ch15[0]={}",
+                    vals[0],
+                    vals[8 * 64],
+                    vals[15 * 64]
+                );
             } else {
                 eprintln!("[probe P9a] reduce+sub broadcast: compile=true eval=false");
             }
@@ -2448,8 +2830,10 @@ mod tests {
         );
         let k_p9 = AneKernel::compile(&mil_p9, None, &[sz16_64, sz16_64, sz16_64], &[sz16_64]);
         let pass_compile_p9 = k_p9.is_ok();
-        let pass_eval_p9 = k_p9.map(|k| { k.eval().is_ok() }).unwrap_or(false);
-        eprintln!("[probe P9] P4 with all [1,16,1,64]: compile={pass_compile_p9} eval={pass_eval_p9}");
+        let pass_eval_p9 = k_p9.map(|k| k.eval().is_ok()).unwrap_or(false);
+        eprintln!(
+            "[probe P9] P4 with all [1,16,1,64]: compile={pass_compile_p9} eval={pass_eval_p9}"
+        );
 
         assert!(pass_eval_p1, "P1 eval failed — basic fp32 IO broken");
     }
@@ -2515,8 +2899,7 @@ mod tests {
         let bytes = oc * ic * 2; // fp16
 
         eprintln!("\n[probe] compile_direct (full op set)...");
-        let direct_res =
-            AneKernel::compile_direct(&mil, &names, &blob_refs, &[bytes], &[bytes]);
+        let direct_res = AneKernel::compile_direct(&mil, &names, &blob_refs, &[bytes], &[bytes]);
         let direct_ok = direct_res.is_ok();
         match &direct_res {
             Ok(_) => eprintln!("PASS: compile_direct accepts constexpr_lut_to_dense"),
@@ -2524,9 +2907,8 @@ mod tests {
         }
 
         eprintln!("\n[probe] compile_multi_weights...");
-        let multi_res = AneKernel::compile_multi_weights(
-            &mil, &names, &blob_refs, &[bytes], &[bytes],
-        );
+        let multi_res =
+            AneKernel::compile_multi_weights(&mil, &names, &blob_refs, &[bytes], &[bytes]);
         let multi_ok = multi_res.is_ok();
         match &multi_res {
             Ok(_) => eprintln!("PASS: compile_multi_weights accepts constexpr_lut_to_dense"),
@@ -2555,17 +2937,13 @@ mod tests {
         let s: usize = 5;
         let pad: usize = 16;
 
-        let w_qkvz = random::uniform::<f32, f32>(
-            -0.05, 0.05, &[qkvz_oc as i32, ic as i32], None,
-        ).unwrap();
+        let w_qkvz =
+            random::uniform::<f32, f32>(-0.05, 0.05, &[qkvz_oc as i32, ic as i32], None).unwrap();
         w_qkvz.eval().unwrap();
-        let w_ba = random::uniform::<f32, f32>(
-            -0.05, 0.05, &[ba_oc as i32, ic as i32], None,
-        ).unwrap();
+        let w_ba =
+            random::uniform::<f32, f32>(-0.05, 0.05, &[ba_oc as i32, ic as i32], None).unwrap();
         w_ba.eval().unwrap();
-        let x = random::uniform::<f32, f32>(
-            -1.0, 1.0, &[1, s as i32, ic as i32], None,
-        ).unwrap();
+        let x = random::uniform::<f32, f32>(-1.0, 1.0, &[1, s as i32, ic as i32], None).unwrap();
         x.eval().unwrap();
 
         // Reference: two separate MLX matmuls.
@@ -2578,21 +2956,35 @@ mod tests {
         let kernel = compile_fused_gdn_proj(
             w_qkvz.as_slice::<f32>(),
             w_ba.as_slice::<f32>(),
-            ic, qkvz_oc, ba_oc, pad,
-        ).expect("compile_fused_gdn_proj failed");
+            ic,
+            qkvz_oc,
+            ba_oc,
+            pad,
+        )
+        .expect("compile_fused_gdn_proj failed");
 
         let (ane_qkvz, ane_ba) = kernel.dispatch(&x).expect("fused dispatch");
         ane_qkvz.eval().unwrap();
         ane_ba.eval().unwrap();
 
         let diff_qkvz: f32 = ref_qkvz
-            .subtract(&ane_qkvz).unwrap().abs().unwrap().max(None).unwrap().item();
+            .subtract(&ane_qkvz)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
         let diff_ba: f32 = ref_ba
-            .subtract(&ane_ba).unwrap().abs().unwrap().max(None).unwrap().item();
+            .subtract(&ane_ba)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
 
-        eprintln!(
-            "[fused parity] qkvz max_diff={diff_qkvz:.6} ba max_diff={diff_ba:.6}"
-        );
+        eprintln!("[fused parity] qkvz max_diff={diff_qkvz:.6} ba max_diff={diff_ba:.6}");
         assert!(
             diff_qkvz < 0.05,
             "fused qkvz parity: max_diff={diff_qkvz} (budget 0.05)"
@@ -2613,42 +3005,41 @@ mod tests {
         let s: usize = 5;
         let pad: usize = 16;
 
-        let w1_qkvz = random::uniform::<f32, f32>(
-            -0.05, 0.05, &[qkvz_oc as i32, ic as i32], None,
-        ).unwrap();
+        let w1_qkvz =
+            random::uniform::<f32, f32>(-0.05, 0.05, &[qkvz_oc as i32, ic as i32], None).unwrap();
         w1_qkvz.eval().unwrap();
-        let w1_ba = random::uniform::<f32, f32>(
-            -0.05, 0.05, &[ba_oc as i32, ic as i32], None,
-        ).unwrap();
+        let w1_ba =
+            random::uniform::<f32, f32>(-0.05, 0.05, &[ba_oc as i32, ic as i32], None).unwrap();
         w1_ba.eval().unwrap();
 
-        let w2_qkvz = random::uniform::<f32, f32>(
-            -0.05, 0.05, &[qkvz_oc as i32, ic as i32], None,
-        ).unwrap();
+        let w2_qkvz =
+            random::uniform::<f32, f32>(-0.05, 0.05, &[qkvz_oc as i32, ic as i32], None).unwrap();
         w2_qkvz.eval().unwrap();
-        let w2_ba = random::uniform::<f32, f32>(
-            -0.05, 0.05, &[ba_oc as i32, ic as i32], None,
-        ).unwrap();
+        let w2_ba =
+            random::uniform::<f32, f32>(-0.05, 0.05, &[ba_oc as i32, ic as i32], None).unwrap();
         w2_ba.eval().unwrap();
 
-        let x = random::uniform::<f32, f32>(
-            -1.0, 1.0, &[1, s as i32, ic as i32], None,
-        ).unwrap();
+        let x = random::uniform::<f32, f32>(-1.0, 1.0, &[1, s as i32, ic as i32], None).unwrap();
         x.eval().unwrap();
 
         // Compile donor with W1.
         let donor = compile_fused_gdn_proj(
             w1_qkvz.as_slice::<f32>(),
             w1_ba.as_slice::<f32>(),
-            ic, qkvz_oc, ba_oc, pad,
-        ).expect("donor compile");
+            ic,
+            qkvz_oc,
+            ba_oc,
+            pad,
+        )
+        .expect("donor compile");
 
         let compile_before = ane_bridge::compile_count();
         let patched = compile_fused_gdn_proj_from_donor(
             &donor,
             w2_qkvz.as_slice::<f32>(),
             w2_ba.as_slice::<f32>(),
-        ).expect("donor patch");
+        )
+        .expect("donor patch");
         let compile_after = ane_bridge::compile_count();
         assert_eq!(
             compile_before, compile_after,
@@ -2663,8 +3054,22 @@ mod tests {
         ref_q1.eval().unwrap();
         let ref_b1 = matmul(&x, &w1_ba.t()).unwrap();
         ref_b1.eval().unwrap();
-        let d_diff_q: f32 = ref_q1.subtract(&d_qkvz).unwrap().abs().unwrap().max(None).unwrap().item();
-        let d_diff_b: f32 = ref_b1.subtract(&d_ba).unwrap().abs().unwrap().max(None).unwrap().item();
+        let d_diff_q: f32 = ref_q1
+            .subtract(&d_qkvz)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        let d_diff_b: f32 = ref_b1
+            .subtract(&d_ba)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
         assert!(d_diff_q < 0.05, "donor qkvz parity: {d_diff_q}");
         assert!(d_diff_b < 0.05, "donor ba parity: {d_diff_b}");
 
@@ -2676,13 +3081,34 @@ mod tests {
         ref_q2.eval().unwrap();
         let ref_b2 = matmul(&x, &w2_ba.t()).unwrap();
         ref_b2.eval().unwrap();
-        let p_diff_q: f32 = ref_q2.subtract(&p_qkvz).unwrap().abs().unwrap().max(None).unwrap().item();
-        let p_diff_b: f32 = ref_b2.subtract(&p_ba).unwrap().abs().unwrap().max(None).unwrap().item();
+        let p_diff_q: f32 = ref_q2
+            .subtract(&p_qkvz)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        let p_diff_b: f32 = ref_b2
+            .subtract(&p_ba)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
         assert!(p_diff_q < 0.05, "patched qkvz parity: {p_diff_q}");
         assert!(p_diff_b < 0.05, "patched ba parity: {p_diff_b}");
 
         // Cross-check: patched output should differ from donor's matmul.
-        let cross_q: f32 = p_qkvz.subtract(&ref_q1).unwrap().abs().unwrap().max(None).unwrap().item();
+        let cross_q: f32 = p_qkvz
+            .subtract(&ref_q1)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
         assert!(
             cross_q > 0.05,
             "patched qkvz indistinguishable from donor (max_diff={cross_q})"
@@ -2700,26 +3126,20 @@ mod tests {
         let pad: usize = 16;
         let iters = 200;
 
-        let w_qkvz = random::uniform::<f32, f32>(
-            -0.02, 0.02, &[qkvz_oc as i32, ic as i32], None,
-        ).unwrap();
+        let w_qkvz =
+            random::uniform::<f32, f32>(-0.02, 0.02, &[qkvz_oc as i32, ic as i32], None).unwrap();
         w_qkvz.eval().unwrap();
-        let w_ba = random::uniform::<f32, f32>(
-            -0.02, 0.02, &[ba_oc as i32, ic as i32], None,
-        ).unwrap();
+        let w_ba =
+            random::uniform::<f32, f32>(-0.02, 0.02, &[ba_oc as i32, ic as i32], None).unwrap();
         w_ba.eval().unwrap();
-        let x = random::uniform::<f32, f32>(
-            -1.0, 1.0, &[1, s as i32, ic as i32], None,
-        ).unwrap();
+        let x = random::uniform::<f32, f32>(-1.0, 1.0, &[1, s as i32, ic as i32], None).unwrap();
         x.eval().unwrap();
 
         // --- Separate path: 2 dispatches ---
-        let sep_qkvz = compile_proj(
-            w_qkvz.as_slice::<f32>(), ic, qkvz_oc, pad, "qkvz",
-        ).expect("compile qkvz");
-        let sep_ba = compile_proj(
-            w_ba.as_slice::<f32>(), ic, ba_oc, pad, "ba",
-        ).expect("compile ba");
+        let sep_qkvz =
+            compile_proj(w_qkvz.as_slice::<f32>(), ic, qkvz_oc, pad, "qkvz").expect("compile qkvz");
+        let sep_ba =
+            compile_proj(w_ba.as_slice::<f32>(), ic, ba_oc, pad, "ba").expect("compile ba");
 
         // Warmup
         for _ in 0..10 {
@@ -2737,8 +3157,12 @@ mod tests {
         let fused = compile_fused_gdn_proj(
             w_qkvz.as_slice::<f32>(),
             w_ba.as_slice::<f32>(),
-            ic, qkvz_oc, ba_oc, pad,
-        ).expect("compile fused");
+            ic,
+            qkvz_oc,
+            ba_oc,
+            pad,
+        )
+        .expect("compile fused");
 
         // Warmup
         for _ in 0..10 {
@@ -2798,24 +3222,34 @@ mod tests {
         eprintln!("  flat_w={fw}, big_bytes={big}, small_bytes={small}");
 
         let k_state_r = AneKernel::compile(
-            &kerns.state_update_mil, None,
-            &kerns.state_input_sizes, &kerns.state_output_sizes,
+            &kerns.state_update_mil,
+            None,
+            &kerns.state_input_sizes,
+            &kerns.state_output_sizes,
         );
         if let Err(ref e) = k_state_r {
             eprintln!("  !! state_update compile FAILED at 9B dims: {e}");
-            eprintln!("  Dk={dk} × flat_w={fw} = {} fp16 elems/tensor, {} bytes IOSurface",
-                dk * fw, big);
+            eprintln!(
+                "  Dk={dk} × flat_w={fw} = {} fp16 elems/tensor, {} bytes IOSurface",
+                dk * fw,
+                big
+            );
             eprintln!("  Likely exceeds ANE op-count or SRAM limit at these dimensions.");
             eprintln!("\n  Sweeping to find max compilable Dk...");
             for test_dk in [64, 32, 16, 8_usize] {
                 let test_kerns = gen_gdn_recurrence_step(hv, test_dk, dv);
                 match AneKernel::compile(
-                    &test_kerns.state_update_mil, None,
-                    &test_kerns.state_input_sizes, &test_kerns.state_output_sizes,
+                    &test_kerns.state_update_mil,
+                    None,
+                    &test_kerns.state_input_sizes,
+                    &test_kerns.state_output_sizes,
                 ) {
                     Ok(_) => {
-                        eprintln!("  ✓ Dk={test_dk} compiles (flat_w={}, {}B/tensor)",
-                            test_kerns.flat_w, test_dk * test_kerns.flat_w * 4);
+                        eprintln!(
+                            "  ✓ Dk={test_dk} compiles (flat_w={}, {}B/tensor)",
+                            test_kerns.flat_w,
+                            test_dk * test_kerns.flat_w * 4
+                        );
                     }
                     Err(_) => {
                         eprintln!("  ✗ Dk={test_dk} also fails");
@@ -2826,52 +3260,60 @@ mod tests {
         }
 
         // Find the largest Dk that compiles for ANE benchmarking
-        let (k_state, k_readout, ane_dk, ane_fw, ane_big, ane_small) =
-            if let Ok(ks) = k_state_r {
-                let kr = AneKernel::compile(
-                    &kerns.readout_mil, None,
-                    &kerns.readout_input_sizes, &kerns.readout_output_sizes,
-                ).expect("readout compile");
-                (ks, kr, dk, fw, big, small)
-            } else {
-                // Try smaller dims — the bottleneck is flat_w = Hv*Dv
-                let candidates: &[(usize, usize, usize)] = &[
-                    (hv, dk, 64),    // reduce Dv
-                    (hv, dk, 32),
-                    (16, dk, 64),    // reduce Hv + Dv
-                    (16, 64, 64),    // reduce all
-                    (4, 16, 16),     // parity-test dims
-                ];
-                let mut found = None;
-                for &(th, td, tv) in candidates {
-                    let tk = gen_gdn_recurrence_step(th, td, tv);
-                    eprintln!("  trying Hv={th} Dk={td} Dv={tv} fw={}...", tk.flat_w);
-                    if let Ok(ks) = AneKernel::compile(
-                        &tk.state_update_mil, None,
-                        &tk.state_input_sizes, &tk.state_output_sizes,
+        let (k_state, k_readout, ane_dk, ane_fw, ane_big, ane_small) = if let Ok(ks) = k_state_r {
+            let kr = AneKernel::compile(
+                &kerns.readout_mil,
+                None,
+                &kerns.readout_input_sizes,
+                &kerns.readout_output_sizes,
+            )
+            .expect("readout compile");
+            (ks, kr, dk, fw, big, small)
+        } else {
+            // Try smaller dims — the bottleneck is flat_w = Hv*Dv
+            let candidates: &[(usize, usize, usize)] = &[
+                (hv, dk, 64), // reduce Dv
+                (hv, dk, 32),
+                (16, dk, 64), // reduce Hv + Dv
+                (16, 64, 64), // reduce all
+                (4, 16, 16),  // parity-test dims
+            ];
+            let mut found = None;
+            for &(th, td, tv) in candidates {
+                let tk = gen_gdn_recurrence_step(th, td, tv);
+                eprintln!("  trying Hv={th} Dk={td} Dv={tv} fw={}...", tk.flat_w);
+                if let Ok(ks) = AneKernel::compile(
+                    &tk.state_update_mil,
+                    None,
+                    &tk.state_input_sizes,
+                    &tk.state_output_sizes,
+                ) {
+                    if let Ok(kr) = AneKernel::compile(
+                        &tk.readout_mil,
+                        None,
+                        &tk.readout_input_sizes,
+                        &tk.readout_output_sizes,
                     ) {
-                        if let Ok(kr) = AneKernel::compile(
-                            &tk.readout_mil, None,
-                            &tk.readout_input_sizes, &tk.readout_output_sizes,
-                        ) {
-                            let fb = td * tk.flat_w * 4;
-                            let fs = tk.flat_w * 4;
-                            eprintln!("  -> compiles at Hv={th} Dk={td} Dv={tv} fw={}", tk.flat_w);
-                            found = Some((ks, kr, td, tk.flat_w, fb, fs));
-                            break;
-                        }
+                        let fb = td * tk.flat_w * 4;
+                        let fs = tk.flat_w * 4;
+                        eprintln!("  -> compiles at Hv={th} Dk={td} Dv={tv} fw={}", tk.flat_w);
+                        found = Some((ks, kr, td, tk.flat_w, fb, fs));
+                        break;
                     }
                 }
-                found.expect("No dims compile — ANE unavailable?")
-            };
+            }
+            found.expect("No dims compile — ANE unavailable?")
+        };
 
         // Random fp32 IOSurface buffers
         let rand_buf = |n: usize| -> Vec<u8> {
-            let arr = mlx_rs::random::uniform::<f32, f32>(
-                -0.1, 0.1, &[(n / 4) as i32], None,
-            ).unwrap();
+            let arr =
+                mlx_rs::random::uniform::<f32, f32>(-0.1, 0.1, &[(n / 4) as i32], None).unwrap();
             arr.eval().unwrap();
-            arr.as_slice::<f32>().iter().flat_map(|v| v.to_le_bytes()).collect()
+            arr.as_slice::<f32>()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
         };
         let st_b = rand_buf(ane_big);
         let g_b = rand_buf(ane_big);
@@ -2915,42 +3357,66 @@ mod tests {
         }
         let ane_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
-        if rt { AneKernel::end_realtime(); }
+        if rt {
+            AneKernel::end_realtime();
+        }
 
         // ── Metal side ──
-        eprintln!("=== Metal: gated_delta_kernel_ffi_stateless (Hk={hk}, Dk={dk}, Hv={hv}, Dv={dv}) ===");
+        eprintln!(
+            "=== Metal: gated_delta_kernel_ffi_stateless (Hk={hk}, Dk={dk}, Hv={hv}, Dv={dv}) ==="
+        );
         let q = mlx_rs::random::normal::<f32>(&[1, 1, hk as i32, dk as i32], None, None, None)
-            .unwrap().as_dtype(Dtype::Float16).unwrap();
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
         let k_arr = mlx_rs::random::normal::<f32>(&[1, 1, hk as i32, dk as i32], None, None, None)
-            .unwrap().as_dtype(Dtype::Float16).unwrap();
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
         let v_arr = mlx_rs::random::normal::<f32>(&[1, 1, hv as i32, dv as i32], None, None, None)
-            .unwrap().as_dtype(Dtype::Float16).unwrap();
-        let state = ops::zeros_dtype(&[1, hv as i32, dv as i32, dk as i32], Dtype::Float16).unwrap();
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        let state =
+            ops::zeros_dtype(&[1, hv as i32, dv as i32, dk as i32], Dtype::Float16).unwrap();
         let a_log = mlx_rs::random::normal::<f32>(&[hv as i32], None, None, None)
-            .unwrap().as_dtype(Dtype::Float16).unwrap();
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
         let dt_bias = mlx_rs::random::normal::<f32>(&[hv as i32], None, None, None)
-            .unwrap().as_dtype(Dtype::Float16).unwrap();
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
         let a_proj = mlx_rs::random::normal::<f32>(&[1, 1, hv as i32], None, None, None)
-            .unwrap().as_dtype(Dtype::Float16).unwrap();
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
         let b_proj = mlx_rs::random::normal::<f32>(&[1, 1, hv as i32], None, None, None)
-            .unwrap().as_dtype(Dtype::Float16).unwrap();
-        eval([&q, &k_arr, &v_arr, &state, &a_log, &dt_bias, &a_proj, &b_proj]).unwrap();
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        eval([
+            &q, &k_arr, &v_arr, &state, &a_log, &dt_bias, &a_proj, &b_proj,
+        ])
+        .unwrap();
 
         // Warmup
         for _ in 0..warmup {
             let (y, _s) = gated_delta_kernel_ffi_stateless(
-                &q, &k_arr, &v_arr, &a_log, &a_proj, &dt_bias, &b_proj,
-                &state, 1, 1, hk as i32, dk as i32, hv as i32, dv as i32,
-            ).unwrap();
+                &q, &k_arr, &v_arr, &a_log, &a_proj, &dt_bias, &b_proj, &state, 1, 1, hk as i32,
+                dk as i32, hv as i32, dv as i32,
+            )
+            .unwrap();
             y.eval().unwrap();
         }
 
         let t1 = Instant::now();
         for _ in 0..iters {
             let (y, _s) = gated_delta_kernel_ffi_stateless(
-                &q, &k_arr, &v_arr, &a_log, &a_proj, &dt_bias, &b_proj,
-                &state, 1, 1, hk as i32, dk as i32, hv as i32, dv as i32,
-            ).unwrap();
+                &q, &k_arr, &v_arr, &a_log, &a_proj, &dt_bias, &b_proj, &state, 1, 1, hk as i32,
+                dk as i32, hv as i32, dv as i32,
+            )
+            .unwrap();
             y.eval().unwrap();
         }
         let metal_us = t1.elapsed().as_micros() as f64 / iters as f64;
@@ -2962,18 +3428,33 @@ mod tests {
         eprintln!("║  GDN Recurrence: ANE vs Metal                           ║");
         eprintln!("╠══════════════════════════════════════════════════════════╣");
         eprintln!("║  Metal dims (9B):  Hk={hk:>3}  Dk={dk:>4}  Hv={hv:>3}  Dv={dv:>4}       ║");
-        eprintln!("║  ANE dims:         Dk={ane_dk:>4}  fw={ane_fw:>5}  {:<23}║",
-            if dims_match { "(full 9B)".to_string() } else { format!("(reduced — 9B Dk={dk} fails)") });
-        eprintln!("║  ANE IOSurface: state_update 5×{:.1}MB, readout 2×{:.1}MB    ║",
-            ane_big as f64 / 1e6, ane_big as f64 / 1e6);
+        eprintln!(
+            "║  ANE dims:         Dk={ane_dk:>4}  fw={ane_fw:>5}  {:<23}║",
+            if dims_match {
+                "(full 9B)".to_string()
+            } else {
+                format!("(reduced — 9B Dk={dk} fails)")
+            }
+        );
+        eprintln!(
+            "║  ANE IOSurface: state_update 5×{:.1}MB, readout 2×{:.1}MB    ║",
+            ane_big as f64 / 1e6,
+            ane_big as f64 / 1e6
+        );
         eprintln!("╠══════════════════════════════════════════════════════════╣");
         eprintln!("║  ANE  (2 kernels, pre-computed g/beta):  {ane_us:>8.1} µs      ║");
         eprintln!("║  Metal (fused, includes g/beta compute): {metal_us:>8.1} µs      ║");
         eprintln!("║  Ratio (Metal / ANE):                    {ratio:>8.2}x         ║");
         if ratio > 1.0 {
-            eprintln!("║  -> ANE is {:.0}% faster                                  ║", (ratio - 1.0) * 100.0);
+            eprintln!(
+                "║  -> ANE is {:.0}% faster                                  ║",
+                (ratio - 1.0) * 100.0
+            );
         } else {
-            eprintln!("║  -> Metal is {:.0}% faster                                ║", (1.0 / ratio - 1.0) * 100.0);
+            eprintln!(
+                "║  -> Metal is {:.0}% faster                                ║",
+                (1.0 / ratio - 1.0) * 100.0
+            );
         }
         eprintln!("╚══════════════════════════════════════════════════════════╝");
         if !dims_match {

@@ -177,6 +177,11 @@ fn load_model_inner(config: &ModelConfig) -> Result<AnyModel, EngineError> {
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::DeepSeekV2(model))
         }
+        "bd3lm_qwen3" => {
+            let model = higgs_models::bd3lm_qwen3::load_bd3lm_qwen3_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Bd3lmQwen3(model))
+        }
         other => Err(EngineError::Model(
             higgs_models::error::ModelError::UnsupportedModel(other.to_owned()),
         )),

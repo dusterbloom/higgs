@@ -83,14 +83,129 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                         pass(&format!("dflash drafter for {label} resolvable"), result);
                     } else {
                         fail(
-                            &format!("dflash drafter for {label}: no config.json in {}", p.display()),
+                            &format!(
+                                "dflash drafter for {label}: no config.json in {}",
+                                p.display()
+                            ),
                             result,
                         );
                     }
                 }
-                Err(err) => fail(&format!("dflash drafter for {label} not found: {err}"), result),
+                Err(err) => fail(
+                    &format!("dflash drafter for {label} not found: {err}"),
+                    result,
+                ),
             }
         }
+        if let Some(ref ar_spec_path) = model.ar_spec {
+            match model_resolver::resolve(ar_spec_path) {
+                Ok(p) => {
+                    if p.join("config.json").exists() {
+                        pass(&format!("ar_spec drafter for {label} resolvable"), result);
+                    } else {
+                        fail(
+                            &format!(
+                                "ar_spec drafter for {label}: no config.json in {}",
+                                p.display()
+                            ),
+                            result,
+                        );
+                    }
+                }
+                Err(err) => fail(
+                    &format!("ar_spec drafter for {label} not found: {err}"),
+                    result,
+                ),
+            }
+            if model.dflash.is_some() {
+                fail(
+                    &format!(
+                        "{label}: both dflash and ar_spec are set — they are mutually exclusive (ar_spec wins at runtime)"
+                    ),
+                    result,
+                );
+            }
+        }
+        if let Ok(ref model_dir) = model_resolver::resolve(&model.path) {
+            check_bd3lm_config(model_dir, &label, result);
+        }
+    }
+}
+
+fn check_bd3lm_config(model_dir: &std::path::Path, label: &str, result: &mut DoctorResult) {
+    let config_path = model_dir.join("config.json");
+    let Ok(f) = std::fs::File::open(&config_path) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_reader::<_, serde_json::Value>(f) else {
+        return;
+    };
+    if v.get("model_type").and_then(|t| t.as_str()) != Some("bd3lm_qwen3") {
+        return;
+    }
+    // Require bd3lm_config.json
+    let bd3lm_cfg_path = model_dir.join("bd3lm_config.json");
+    if !bd3lm_cfg_path.exists() {
+        fail(
+            &format!("model {label}: bd3lm_qwen3 requires bd3lm_config.json"),
+            result,
+        );
+        return;
+    }
+    let Ok(f2) = std::fs::File::open(&bd3lm_cfg_path) else {
+        fail(
+            &format!("model {label}: cannot open bd3lm_config.json"),
+            result,
+        );
+        return;
+    };
+    let Ok(cfg) = serde_json::from_reader::<_, serde_json::Value>(f2) else {
+        fail(
+            &format!("model {label}: bd3lm_config.json is not valid JSON"),
+            result,
+        );
+        return;
+    };
+    let block_size = cfg.get("block_size").and_then(|v| v.as_i64()).unwrap_or(64);
+    if ![16, 32, 64, 128].contains(&block_size) {
+        fail(
+            &format!("model {label}: bd3lm block_size={block_size} must be one of 16, 32, 64, 128"),
+            result,
+        );
+    } else {
+        pass(
+            &format!("model {label}: bd3lm block_size={block_size} is valid"),
+            result,
+        );
+    }
+    let num_steps = cfg
+        .get("num_denoising_steps")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(8);
+    if num_steps <= 0 || block_size % num_steps != 0 {
+        fail(
+            &format!(
+                "model {label}: bd3lm num_denoising_steps={num_steps} must be >0 and divide block_size={block_size}"
+            ),
+            result,
+        );
+    } else {
+        pass(
+            &format!("model {label}: bd3lm num_denoising_steps={num_steps} valid"),
+            result,
+        );
+    }
+    // Require bd3lm_extras.safetensors
+    if !model_dir.join("bd3lm_extras.safetensors").exists() {
+        fail(
+            &format!("model {label}: bd3lm_qwen3 requires bd3lm_extras.safetensors"),
+            result,
+        );
+    } else {
+        pass(
+            &format!("model {label}: bd3lm_extras.safetensors present"),
+            result,
+        );
     }
 }
 
@@ -410,7 +525,9 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
-                dflash: None,
+                    dflash: None,
+                    ar_spec: None,
+                    bd3lm: None,
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
@@ -419,7 +536,9 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
-                dflash: None,
+                    dflash: None,
+                    ar_spec: None,
+                    bd3lm: None,
                 },
             ],
             ..HiggsConfig::default()
@@ -441,7 +560,9 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
-                dflash: None,
+                    dflash: None,
+                    ar_spec: None,
+                    bd3lm: None,
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
@@ -450,7 +571,9 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
-                dflash: None,
+                    dflash: None,
+                    ar_spec: None,
+                    bd3lm: None,
                 },
             ],
             ..HiggsConfig::default()
@@ -703,6 +826,8 @@ mod tests {
                 kv_bits: 3,
                 kv_seed: 0,
                 dflash: None,
+                ar_spec: None,
+                bd3lm: None,
             }],
             ..HiggsConfig::default()
         };
@@ -729,6 +854,8 @@ mod tests {
                 kv_bits: 3,
                 kv_seed: 0,
                 dflash: None,
+                ar_spec: None,
+                bd3lm: None,
             }],
             ..HiggsConfig::default()
         };
@@ -757,6 +884,8 @@ mod tests {
                 kv_bits: 3,
                 kv_seed: 0,
                 dflash: None,
+                ar_spec: None,
+                bd3lm: None,
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),
@@ -816,6 +945,8 @@ mod tests {
                 kv_bits: 3,
                 kv_seed: 0,
                 dflash: Some(dflash_dir.path().to_str().unwrap().to_owned()),
+                ar_spec: None,
+                bd3lm: None,
             }],
             ..HiggsConfig::default()
         };
@@ -840,6 +971,8 @@ mod tests {
                 kv_bits: 3,
                 kv_seed: 0,
                 dflash: Some(dflash_dir.path().to_str().unwrap().to_owned()),
+                ar_spec: None,
+                bd3lm: None,
             }],
             ..HiggsConfig::default()
         };
@@ -862,6 +995,8 @@ mod tests {
                 kv_bits: 3,
                 kv_seed: 0,
                 dflash: Some("/nonexistent/dflash/drafter".to_owned()),
+                ar_spec: None,
+                bd3lm: None,
             }],
             ..HiggsConfig::default()
         };
@@ -884,6 +1019,8 @@ mod tests {
                 kv_bits: 3,
                 kv_seed: 0,
                 dflash: None,
+                ar_spec: None,
+                bd3lm: None,
             }],
             ..HiggsConfig::default()
         };
@@ -892,5 +1029,39 @@ mod tests {
         assert_eq!(result.passes, 1);
         assert_eq!(result.failures, 0);
         assert_eq!(result.warnings, 0);
+    }
+
+    #[test]
+    fn test_check_bd3lm_config_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "bd3lm_qwen3"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("bd3lm_config.json"),
+            r#"{"block_size": 64, "num_denoising_steps": 8, "denoise_hidden": 4096}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("bd3lm_extras.safetensors"), b"").unwrap();
+        let mut result = empty_result();
+        check_bd3lm_config(dir.path(), "test-model", &mut result);
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.passes, 3);
+    }
+
+    #[test]
+    fn test_check_bd3lm_config_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "bd3lm_qwen3"}"#,
+        )
+        .unwrap();
+        // no bd3lm_config.json, no extras
+        let mut result = empty_result();
+        check_bd3lm_config(dir.path(), "test-model", &mut result);
+        assert_eq!(result.failures, 1); // missing bd3lm_config.json
     }
 }

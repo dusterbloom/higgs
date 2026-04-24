@@ -28,8 +28,7 @@ use mlx_rs::{Array, Dtype};
 // --- FFI --------------------------------------------------------------------
 
 unsafe extern "C" {
-    fn ane_mlmodel_load(mlmodelc_path: *const c_char, error_out: *mut *mut c_char)
-        -> *mut c_void;
+    fn ane_mlmodel_load(mlmodelc_path: *const c_char, error_out: *mut *mut c_char) -> *mut c_void;
 
     fn ane_mlmodel_predict_fp16(
         handle: *mut c_void,
@@ -86,7 +85,9 @@ unsafe fn take_error(ptr: *mut c_char) -> String {
     // same heap on macOS).
     let cstr = unsafe { std::ffi::CStr::from_ptr(ptr) };
     let s = cstr.to_string_lossy().into_owned();
-    unsafe { free(ptr.cast()); }
+    unsafe {
+        free(ptr.cast());
+    }
     s
 }
 
@@ -121,7 +122,9 @@ impl Drop for AneLmHeadLut6Kernel {
         if !self.handle.is_null() {
             // SAFETY: handle came from `ane_mlmodel_load`; freed exactly once
             // here since we zero it out.
-            unsafe { ane_mlmodel_free(self.handle); }
+            unsafe {
+                ane_mlmodel_free(self.handle);
+            }
             self.handle = std::ptr::null_mut();
         }
     }
@@ -135,8 +138,8 @@ impl AneLmHeadLut6Kernel {
         hidden: usize,
         seq_len: usize,
     ) -> Result<Self, String> {
-        let path = CString::new(mlmodelc_path)
-            .map_err(|e| format!("mlmodelc_path contains NUL: {e}"))?;
+        let path =
+            CString::new(mlmodelc_path).map_err(|e| format!("mlmodelc_path contains NUL: {e}"))?;
         let mut err_ptr: *mut c_char = std::ptr::null_mut();
         // SAFETY: pointers are valid; bridge writes to `err_ptr` on failure.
         let handle = unsafe { ane_mlmodel_load(path.as_ptr(), &mut err_ptr) };
@@ -148,7 +151,12 @@ impl AneLmHeadLut6Kernel {
                 msg
             });
         }
-        Ok(Self { handle, vocab, hidden, seq_len })
+        Ok(Self {
+            handle,
+            vocab,
+            hidden,
+            seq_len,
+        })
     }
 
     /// Run `y = x @ W^T` through the compiled MLModel.
@@ -277,14 +285,13 @@ impl AneLmHeadLut6Kernel {
 /// the same core as the fp32 reference. A production-shape failure here
 /// means ANE is not engaged at all, regardless of correctness.
 pub fn verify_ane_dispatch(mlmodelc_path: &str) -> Result<(bool, String), String> {
-    let path = CString::new(mlmodelc_path)
-        .map_err(|e| format!("mlmodelc_path contains NUL: {e}"))?;
+    let path =
+        CString::new(mlmodelc_path).map_err(|e| format!("mlmodelc_path contains NUL: {e}"))?;
     let mut report_ptr: *mut c_char = std::ptr::null_mut();
     let mut err_ptr: *mut c_char = std::ptr::null_mut();
     // SAFETY: pointers valid; bridge fills report/error on success/failure.
-    let on_ane = unsafe {
-        ane_mlmodel_verify_ane_dispatch(path.as_ptr(), &mut report_ptr, &mut err_ptr)
-    };
+    let on_ane =
+        unsafe { ane_mlmodel_verify_ane_dispatch(path.as_ptr(), &mut report_ptr, &mut err_ptr) };
     // Always take both strings so neither leaks.
     let report = unsafe { take_error(report_ptr) };
     let err_msg = unsafe { take_error(err_ptr) };
@@ -327,7 +334,9 @@ impl Drop for AneMlPackageKernel {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             // SAFETY: handle from `ane_mlmodel_load`; freed once here.
-            unsafe { ane_mlmodel_free(self.handle); }
+            unsafe {
+                ane_mlmodel_free(self.handle);
+            }
             self.handle = std::ptr::null_mut();
         }
     }
@@ -351,12 +360,12 @@ impl AneMlPackageKernel {
                 "empty shape: input={input_shape:?} output={output_shape:?}"
             ));
         }
-        let path = CString::new(mlmodelc_path)
-            .map_err(|e| format!("mlmodelc_path contains NUL: {e}"))?;
-        let in_name = CString::new(input_name)
-            .map_err(|e| format!("input_name contains NUL: {e}"))?;
-        let out_name = CString::new(output_name)
-            .map_err(|e| format!("output_name contains NUL: {e}"))?;
+        let path =
+            CString::new(mlmodelc_path).map_err(|e| format!("mlmodelc_path contains NUL: {e}"))?;
+        let in_name =
+            CString::new(input_name).map_err(|e| format!("input_name contains NUL: {e}"))?;
+        let out_name =
+            CString::new(output_name).map_err(|e| format!("output_name contains NUL: {e}"))?;
         let mut err_ptr: *mut c_char = std::ptr::null_mut();
         // SAFETY: path is a valid C string; err_ptr receives malloc'd msg.
         let handle = unsafe { ane_mlmodel_load(path.as_ptr(), &mut err_ptr) };
@@ -462,14 +471,11 @@ impl AneMlPackageKernel {
 
         let names_cstr: Vec<CString> = outputs
             .iter()
-            .map(|(n, _)| {
-                CString::new(*n).map_err(|e| format!("output name contains NUL: {e}"))
-            })
+            .map(|(n, _)| CString::new(*n).map_err(|e| format!("output name contains NUL: {e}")))
             .collect::<Result<_, _>>()?;
         let name_ptrs: Vec<*const c_char> = names_cstr.iter().map(|c| c.as_ptr()).collect();
         let counts: Vec<usize> = outputs.iter().map(|(_, b)| b.len()).collect();
-        let buf_ptrs: Vec<*mut u16> =
-            outputs.iter_mut().map(|(_, b)| b.as_mut_ptr()).collect();
+        let buf_ptrs: Vec<*mut u16> = outputs.iter_mut().map(|(_, b)| b.as_mut_ptr()).collect();
 
         let mut err_ptr: *mut c_char = std::ptr::null_mut();
         // SAFETY: handle alive, x length validated, every output buffer
@@ -522,21 +528,21 @@ mod tests {
     #[test]
     #[ignore = "requires Python venv with coremltools; run explicitly"]
     fn lut6_synthetic_parity() {
-        use std::process::Command;
         use std::fs;
+        use std::process::Command;
 
         let in_dim: usize = 512;
         let out_dim: usize = 1024;
         let s: usize = 15;
         let pad: usize = 16;
 
-        let w = random::uniform::<f32, f32>(-0.05, 0.05,
-            &[out_dim as i32, in_dim as i32], None).expect("random w");
+        let w = random::uniform::<f32, f32>(-0.05, 0.05, &[out_dim as i32, in_dim as i32], None)
+            .expect("random w");
         w.eval().unwrap();
         let w_vec = w.as_slice::<f32>().to_vec();
 
-        let x = random::uniform::<f32, f32>(-1.0, 1.0,
-            &[1, s as i32, in_dim as i32], None).expect("random x");
+        let x = random::uniform::<f32, f32>(-1.0, 1.0, &[1, s as i32, in_dim as i32], None)
+            .expect("random x");
         x.eval().unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
@@ -546,28 +552,36 @@ mod tests {
 
         // Write f32 LE bytes.
         let mut bytes = Vec::with_capacity(w_vec.len() * 4);
-        for v in &w_vec { bytes.extend_from_slice(&v.to_le_bytes()); }
+        for v in &w_vec {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
         fs::write(&weights_bin, &bytes).unwrap();
 
-        let script = env!("CARGO_MANIFEST_DIR").to_string()
-            + "/scripts/palettize_lm_head.py";
+        let script = env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/palettize_lm_head.py";
         let out = Command::new("python3")
             .arg(&script)
-            .arg("--weights-bin").arg(&weights_bin)
-            .arg("--vocab").arg(out_dim.to_string())
-            .arg("--hidden").arg(in_dim.to_string())
-            .arg("--seq-len").arg(pad.to_string())
-            .arg("--out-dir").arg(&out_dir)
-            .output().expect("spawn python3");
-        assert!(out.status.success(),
-            "palettize failed: stderr={}", String::from_utf8_lossy(&out.stderr));
+            .arg("--weights-bin")
+            .arg(&weights_bin)
+            .arg("--vocab")
+            .arg(out_dim.to_string())
+            .arg("--hidden")
+            .arg(in_dim.to_string())
+            .arg("--seq-len")
+            .arg(pad.to_string())
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .output()
+            .expect("spawn python3");
+        assert!(
+            out.status.success(),
+            "palettize failed: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
 
-        let response: serde_json::Value =
-            serde_json::from_slice(&out.stdout).expect("json");
+        let response: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
         let mlmodelc = response["mlmodelc"].as_str().unwrap();
 
-        let kernel = AneLmHeadLut6Kernel::load(mlmodelc, out_dim, in_dim, pad)
-            .expect("load");
+        let kernel = AneLmHeadLut6Kernel::load(mlmodelc, out_dim, in_dim, pad).expect("load");
 
         let y_ref = matmul(&x, &w.t()).unwrap();
         y_ref.eval().unwrap();
@@ -580,11 +594,15 @@ mod tests {
         let mut max_diff = 0.0f32;
         for (a, b) in y_ane_vec.iter().zip(y_ref_vec.iter()) {
             let d = (a - b).abs();
-            if d > max_diff { max_diff = d; }
+            if d > max_diff {
+                max_diff = d;
+            }
         }
         // 6-bit palettization at group_size=16 is lossy — see module docstring.
-        assert!(max_diff < 0.5,
-            "LUT6 parity: max_diff={max_diff} (budget 0.5)");
+        assert!(
+            max_diff < 0.5,
+            "LUT6 parity: max_diff={max_diff} (budget 0.5)"
+        );
     }
 
     /// Second compile hits the filesystem cache via the caller
@@ -608,20 +626,15 @@ mod tests {
     #[test]
     #[ignore = "requires pre-built .mlmodelc; set HIGGS_INT8_O_PROJ_MLMODELC"]
     fn verify_o_proj_4b_prefers_ane() {
-        let path = std::env::var("HIGGS_INT8_O_PROJ_MLMODELC").expect(
-            "set HIGGS_INT8_O_PROJ_MLMODELC=<path to int8_o_proj_4b.mlmodelc>",
-        );
-        let (on_ane, report) =
-            verify_ane_dispatch(&path).expect("verify_ane_dispatch");
+        let path = std::env::var("HIGGS_INT8_O_PROJ_MLMODELC")
+            .expect("set HIGGS_INT8_O_PROJ_MLMODELC=<path to int8_o_proj_4b.mlmodelc>");
+        let (on_ane, report) = verify_ane_dispatch(&path).expect("verify_ane_dispatch");
         println!("{report}");
         assert!(
             on_ane,
             "conv op did NOT prefer ANE at 3072x3072 — AB7 regression?\n{report}"
         );
-        assert!(
-            report.contains("ANE"),
-            "report missing 'ANE' tag: {report}"
-        );
+        assert!(report.contains("ANE"), "report missing 'ANE' tag: {report}");
     }
 
     /// End-to-end int8 parity at DFlash-4B `o_proj` shape (3072×3072, seq=16).
@@ -656,14 +669,14 @@ mod tests {
         // Uniform over a tight range keeps scale small so int8 quant
         // resolution is usable; larger ranges would blow the 0.08 budget
         // by the scale = max(|w|)/127 definition.
-        let w = random::uniform::<f32, f32>(-0.05, 0.05,
-            &[out_dim as i32, in_dim as i32], None).expect("random W");
+        let w = random::uniform::<f32, f32>(-0.05, 0.05, &[out_dim as i32, in_dim as i32], None)
+            .expect("random W");
         w.eval().unwrap();
         let w_vec: Vec<f32> = w.as_slice::<f32>().to_vec();
 
         // x is [1, seq, in_dim] in MLX convention; conv1x1 wants [1, in, 1, seq].
-        let x = random::uniform::<f32, f32>(-1.0, 1.0,
-            &[1, seq as i32, in_dim as i32], None).expect("random x");
+        let x = random::uniform::<f32, f32>(-1.0, 1.0, &[1, seq as i32, in_dim as i32], None)
+            .expect("random x");
         x.eval().unwrap();
         let x_vec: Vec<f32> = x.as_slice::<f32>().to_vec();
 
@@ -674,47 +687,54 @@ mod tests {
         fs::create_dir_all(&out_dir).unwrap();
 
         let mut bytes = Vec::with_capacity(w_vec.len() * 4);
-        for v in &w_vec { bytes.extend_from_slice(&v.to_le_bytes()); }
+        for v in &w_vec {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
         fs::write(&weights_bin, &bytes).unwrap();
 
-        let script = env!("CARGO_MANIFEST_DIR").to_string()
-            + "/scripts/quantize_int8_proj.py";
+        let script = env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/quantize_int8_proj.py";
         let out = Command::new(&py)
             .arg(&script)
-            .arg("--weights-bin").arg(&weights_bin)
-            .arg("--out-features").arg(out_dim.to_string())
-            .arg("--in-features").arg(in_dim.to_string())
-            .arg("--seq-len").arg(seq.to_string())
-            .arg("--out-dir").arg(&out_dir)
-            .output().expect("spawn python");
-        assert!(out.status.success(),
+            .arg("--weights-bin")
+            .arg(&weights_bin)
+            .arg("--out-features")
+            .arg(out_dim.to_string())
+            .arg("--in-features")
+            .arg(in_dim.to_string())
+            .arg("--seq-len")
+            .arg(seq.to_string())
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .output()
+            .expect("spawn python");
+        assert!(
+            out.status.success(),
             "quantize_int8_proj failed\nstdout: {}\nstderr: {}",
             String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stderr)
+        );
 
-        let resp: serde_json::Value =
-            serde_json::from_slice(&out.stdout).expect("json response");
+        let resp: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json response");
         let mlmodelc = resp["mlmodelc"].as_str().unwrap();
         let in_name = resp["input_name"].as_str().unwrap();
         let out_name = resp["output_name"].as_str().unwrap();
         let scale = resp["scale"].as_f64().unwrap();
         let max_abs_w = resp["max_abs_w"].as_f64().unwrap();
-        eprintln!(
-            "built mlmodelc={mlmodelc}  scale={scale:.3e}  max|w|={max_abs_w:.3e}"
-        );
+        eprintln!("built mlmodelc={mlmodelc}  scale={scale:.3e}  max|w|={max_abs_w:.3e}");
 
         // --- Load the kernel and verify ANE dispatch ---
         let input_shape: Vec<i64> = vec![1, in_dim as i64, 1, seq as i64];
         let output_shape: Vec<i64> = vec![1, out_dim as i64, 1, seq as i64];
-        let kernel = AneMlPackageKernel::load(
-            mlmodelc, in_name, out_name, input_shape, output_shape,
-        ).expect("load mlpackage kernel");
+        let kernel =
+            AneMlPackageKernel::load(mlmodelc, in_name, out_name, input_shape, output_shape)
+                .expect("load mlpackage kernel");
 
-        let (on_ane, report) = kernel.verify_ane_dispatch()
-            .expect("verify_ane_dispatch");
+        let (on_ane, report) = kernel.verify_ane_dispatch().expect("verify_ane_dispatch");
         eprintln!("{report}");
-        assert!(on_ane,
-            "3072x3072 seq=16 should dispatch to ANE (AB7) — got:\n{report}");
+        assert!(
+            on_ane,
+            "3072x3072 seq=16 should dispatch to ANE (AB7) — got:\n{report}"
+        );
 
         // --- Pack x into conv1x1 layout [1, in, 1, seq] as fp16 ---
         let pin = in_dim * seq;
@@ -735,8 +755,7 @@ mod tests {
         let mut y_ane = vec![0.0f32; seq * out_dim];
         for co in 0..out_dim {
             for t in 0..seq {
-                y_ane[t * out_dim + co] =
-                    f16::from_bits(y_fp16[co * seq + t]).to_f32();
+                y_ane[t * out_dim + co] = f16::from_bits(y_fp16[co * seq + t]).to_f32();
             }
         }
 
@@ -750,17 +769,21 @@ mod tests {
         let mut max_abs_ref = 0.0f32;
         for (a, b) in y_ane.iter().zip(y_ref_vec.iter()) {
             let d = (a - b).abs();
-            if d > max_diff { max_diff = d; }
+            if d > max_diff {
+                max_diff = d;
+            }
             let ab = b.abs();
-            if ab > max_abs_ref { max_abs_ref = ab; }
+            if ab > max_abs_ref {
+                max_abs_ref = ab;
+            }
         }
-        eprintln!(
-            "int8 parity: max_diff={max_diff:.6}  max|ref|={max_abs_ref:.3}"
-        );
+        eprintln!("int8 parity: max_diff={max_diff:.6}  max|ref|={max_abs_ref:.3}");
         // Budget matches the plan's acceptance criterion 1.5:
         //   int8 adds ~quant_noise above fp16's ~0.034 baseline; ≤ 0.08 total.
-        assert!(max_diff <= 0.08,
-            "int8 parity max_diff={max_diff} > 0.08 (budget)");
+        assert!(
+            max_diff <= 0.08,
+            "int8 parity max_diff={max_diff} > 0.08 (budget)"
+        );
     }
 
     /// Plan Step 1.6 gate: time `predict_fp16` on the int8 path at
@@ -801,7 +824,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let weights_bin = tmp.path().join("w.bin");
         let mut bytes = Vec::with_capacity(seed_w.len() * 4);
-        for v in &seed_w { bytes.extend_from_slice(&v.to_le_bytes()); }
+        for v in &seed_w {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
         fs::write(&weights_bin, &bytes).unwrap();
 
         eprintln!("| seq | min_ms | med_ms | GB/s (int8 bw) | GB/s (vs fp16 baseline) |");
@@ -811,30 +836,36 @@ mod tests {
             let out_dir = tmp.path().join(format!("out_{seq}"));
             fs::create_dir_all(&out_dir).unwrap();
 
-            let script = env!("CARGO_MANIFEST_DIR").to_string()
-                + "/scripts/quantize_int8_proj.py";
+            let script = env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/quantize_int8_proj.py";
             let out = Command::new(&py)
                 .arg(&script)
-                .arg("--weights-bin").arg(&weights_bin)
-                .arg("--out-features").arg(out_dim.to_string())
-                .arg("--in-features").arg(in_dim.to_string())
-                .arg("--seq-len").arg(seq.to_string())
-                .arg("--out-dir").arg(&out_dir)
-                .output().expect("spawn python");
-            assert!(out.status.success(),
+                .arg("--weights-bin")
+                .arg(&weights_bin)
+                .arg("--out-features")
+                .arg(out_dim.to_string())
+                .arg("--in-features")
+                .arg(in_dim.to_string())
+                .arg("--seq-len")
+                .arg(seq.to_string())
+                .arg("--out-dir")
+                .arg(&out_dir)
+                .output()
+                .expect("spawn python");
+            assert!(
+                out.status.success(),
                 "quantize_int8_proj failed\nstderr: {}",
-                String::from_utf8_lossy(&out.stderr));
-            let resp: serde_json::Value =
-                serde_json::from_slice(&out.stdout).expect("json");
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let resp: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
             let mlmodelc = resp["mlmodelc"].as_str().unwrap();
             let in_name = resp["input_name"].as_str().unwrap();
             let out_name = resp["output_name"].as_str().unwrap();
 
             let input_shape: Vec<i64> = vec![1, in_dim as i64, 1, seq as i64];
             let output_shape: Vec<i64> = vec![1, out_dim as i64, 1, seq as i64];
-            let kernel = AneMlPackageKernel::load(
-                mlmodelc, in_name, out_name, input_shape, output_shape,
-            ).expect("load");
+            let kernel =
+                AneMlPackageKernel::load(mlmodelc, in_name, out_name, input_shape, output_shape)
+                    .expect("load");
 
             let (on_ane, _report) = kernel.verify_ane_dispatch().expect("verify");
             assert!(on_ane, "seq={seq} did not dispatch to ANE");
@@ -903,12 +934,16 @@ mod tests {
 
         // (label, out_features, in_features, iters, warmup)
         let shapes = [
-            ("tiny(cpu-fallback)",   64usize,   64usize, 1000usize, 50usize),
-            ("ane(3072x3072)",     3072usize, 3072usize,  200usize, 20usize),
+            ("tiny(cpu-fallback)", 64usize, 64usize, 1000usize, 50usize),
+            ("ane(3072x3072)", 3072usize, 3072usize, 200usize, 20usize),
         ];
 
-        eprintln!("| shape              | on_ane | min_us | p50_us | p99_us | compute_floor_us | overhead_us | 35× ms |");
-        eprintln!("|--------------------|--------|--------|--------|--------|------------------|-------------|--------|");
+        eprintln!(
+            "| shape              | on_ane | min_us | p50_us | p99_us | compute_floor_us | overhead_us | 35× ms |"
+        );
+        eprintln!(
+            "|--------------------|--------|--------|--------|--------|------------------|-------------|--------|"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let mut ane_overhead_us: Option<f64> = None;
@@ -918,35 +953,43 @@ mod tests {
                 .collect();
             let weights_bin = tmp.path().join(format!("{label}.bin"));
             let mut bytes = Vec::with_capacity(seed_w.len() * 4);
-            for v in &seed_w { bytes.extend_from_slice(&v.to_le_bytes()); }
+            for v in &seed_w {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
             fs::write(&weights_bin, &bytes).unwrap();
 
             let out_dir = tmp.path().join(format!("out_{label}"));
             fs::create_dir_all(&out_dir).unwrap();
-            let script = env!("CARGO_MANIFEST_DIR").to_string()
-                + "/scripts/quantize_int8_proj.py";
+            let script = env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/quantize_int8_proj.py";
             let out = Command::new(&py)
                 .arg(&script)
-                .arg("--weights-bin").arg(&weights_bin)
-                .arg("--out-features").arg(out_dim.to_string())
-                .arg("--in-features").arg(in_dim.to_string())
-                .arg("--seq-len").arg(seq.to_string())
-                .arg("--out-dir").arg(&out_dir)
-                .output().expect("spawn python");
-            assert!(out.status.success(),
+                .arg("--weights-bin")
+                .arg(&weights_bin)
+                .arg("--out-features")
+                .arg(out_dim.to_string())
+                .arg("--in-features")
+                .arg(in_dim.to_string())
+                .arg("--seq-len")
+                .arg(seq.to_string())
+                .arg("--out-dir")
+                .arg(&out_dir)
+                .output()
+                .expect("spawn python");
+            assert!(
+                out.status.success(),
                 "{label}: quantize_int8_proj failed\nstderr: {}",
-                String::from_utf8_lossy(&out.stderr));
-            let resp: serde_json::Value =
-                serde_json::from_slice(&out.stdout).expect("json");
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let resp: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
             let mlmodelc = resp["mlmodelc"].as_str().unwrap();
             let in_name = resp["input_name"].as_str().unwrap();
             let out_name = resp["output_name"].as_str().unwrap();
 
             let input_shape: Vec<i64> = vec![1, in_dim as i64, 1, seq as i64];
             let output_shape: Vec<i64> = vec![1, out_dim as i64, 1, seq as i64];
-            let kernel = AneMlPackageKernel::load(
-                mlmodelc, in_name, out_name, input_shape, output_shape,
-            ).expect("load");
+            let kernel =
+                AneMlPackageKernel::load(mlmodelc, in_name, out_name, input_shape, output_shape)
+                    .expect("load");
             let (on_ane, _rep) = kernel.verify_ane_dispatch().expect("verify");
 
             let x_fp16 = vec![f16::from_f32(0.1).to_bits(); in_dim * seq];
@@ -975,7 +1018,9 @@ mod tests {
             eprintln!(
                 "| {label:<18} | {on_ane:<6} | {min_us:>6.1} | {p50_us:>6.1} | {p99_us:>6.1} | {compute_floor_us:>16.2} | {overhead_us:>11.1} | {projected_35_ms:>6.2} |",
             );
-            if on_ane { ane_overhead_us = Some(overhead_us); }
+            if on_ane {
+                ane_overhead_us = Some(overhead_us);
+            }
         }
 
         eprintln!();
@@ -984,9 +1029,13 @@ mod tests {
         eprintln!("  100-200 µs → wash; need fusion to beat raw-MIL fp16");
         eprintln!("  ≥ 300 µs → fusion mandatory");
         if let Some(o) = ane_overhead_us {
-            let verdict = if o <= 50.0 { "FANOUT-VIABLE" }
-                else if o < 250.0 { "WASH/FUSION-NEEDED" }
-                else { "FUSION-MANDATORY" };
+            let verdict = if o <= 50.0 {
+                "FANOUT-VIABLE"
+            } else if o < 250.0 {
+                "WASH/FUSION-NEEDED"
+            } else {
+                "FUSION-MANDATORY"
+            };
             eprintln!("ANE-engaged overhead ≈ {o:.1} µs → {verdict}");
         } else {
             eprintln!("WARN: no shape reported on_ane=true; verdict deferred.");
@@ -1041,14 +1090,16 @@ mod tests {
                 .collect();
             let wb = tmp.path().join(format!("{label}.bin"));
             let mut bytes = Vec::with_capacity(seed.len() * 4);
-            for v in &seed { bytes.extend_from_slice(&v.to_le_bytes()); }
+            for v in &seed {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
             fs::write(&wb, &bytes).unwrap();
             wbins.push(wb);
         }
 
         // --- Individual path: 3 separate mlpackages ---
-        let single_script = env!("CARGO_MANIFEST_DIR").to_string()
-            + "/scripts/quantize_int8_proj.py";
+        let single_script =
+            env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/quantize_int8_proj.py";
         let mut singles: Vec<AneMlPackageKernel> = Vec::new();
         let mut single_outs: Vec<(usize, usize)> = Vec::new(); // (out, seq)
         for (i, (label, out_dim)) in projs.iter().enumerate() {
@@ -1056,14 +1107,23 @@ mod tests {
             fs::create_dir_all(&out_dir).unwrap();
             let o = Command::new(&py)
                 .arg(&single_script)
-                .arg("--weights-bin").arg(&wbins[i])
-                .arg("--out-features").arg(out_dim.to_string())
-                .arg("--in-features").arg(in_dim.to_string())
-                .arg("--seq-len").arg(seq.to_string())
-                .arg("--out-dir").arg(&out_dir)
-                .output().expect("spawn");
-            assert!(o.status.success(), "{label}: single build failed\nstderr: {}",
-                String::from_utf8_lossy(&o.stderr));
+                .arg("--weights-bin")
+                .arg(&wbins[i])
+                .arg("--out-features")
+                .arg(out_dim.to_string())
+                .arg("--in-features")
+                .arg(in_dim.to_string())
+                .arg("--seq-len")
+                .arg(seq.to_string())
+                .arg("--out-dir")
+                .arg(&out_dir)
+                .output()
+                .expect("spawn");
+            assert!(
+                o.status.success(),
+                "{label}: single build failed\nstderr: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
             let resp: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
             let mlc = resp["mlmodelc"].as_str().unwrap();
             let iname = resp["input_name"].as_str().unwrap();
@@ -1079,28 +1139,36 @@ mod tests {
         }
 
         // --- Fused path: 1 mlpackage, 3 named outputs ---
-        let fused_script = env!("CARGO_MANIFEST_DIR").to_string()
-            + "/scripts/quantize_int8_fused.py";
+        let fused_script =
+            env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/quantize_int8_fused.py";
         let fused_out_dir = tmp.path().join("fused");
         fs::create_dir_all(&fused_out_dir).unwrap();
         let mut fused_cmd = Command::new(&py);
-        fused_cmd.arg(&fused_script)
-            .arg("--in-features").arg(in_dim.to_string())
-            .arg("--seq-len").arg(seq.to_string())
-            .arg("--out-dir").arg(&fused_out_dir);
+        fused_cmd
+            .arg(&fused_script)
+            .arg("--in-features")
+            .arg(in_dim.to_string())
+            .arg("--seq-len")
+            .arg(seq.to_string())
+            .arg("--out-dir")
+            .arg(&fused_out_dir);
         for (i, (label, out_dim)) in projs.iter().enumerate() {
-            fused_cmd.arg("--proj").arg(format!(
-                "{label}:{out_dim}:{}", wbins[i].display()
-            ));
+            fused_cmd
+                .arg("--proj")
+                .arg(format!("{label}:{out_dim}:{}", wbins[i].display()));
         }
         let fo = fused_cmd.output().expect("spawn fused");
-        assert!(fo.status.success(), "fused build failed\nstderr: {}",
-            String::from_utf8_lossy(&fo.stderr));
+        assert!(
+            fo.status.success(),
+            "fused build failed\nstderr: {}",
+            String::from_utf8_lossy(&fo.stderr)
+        );
         let fresp: serde_json::Value = serde_json::from_slice(&fo.stdout).unwrap();
         let fmlc = fresp["mlmodelc"].as_str().unwrap();
         let finput = fresp["input_name"].as_str().unwrap().to_owned();
         // Output names from the script are "y_<label>" — keep that ABI.
-        let fused_output_names: Vec<String> = projs.iter()
+        let fused_output_names: Vec<String> = projs
+            .iter()
             .map(|(label, _)| format!("y_{label}"))
             .collect();
 
@@ -1110,17 +1178,19 @@ mod tests {
         let fused_input_shape: Vec<i64> = vec![1, in_dim as i64, 1, seq as i64];
         let fused_output_shape: Vec<i64> = vec![1, 3072, 1, seq as i64];
         let fused = AneMlPackageKernel::load(
-            fmlc, &finput, &fused_output_names[0],
-            fused_input_shape, fused_output_shape,
-        ).expect("load fused");
+            fmlc,
+            &finput,
+            &fused_output_names[0],
+            fused_input_shape,
+            fused_output_shape,
+        )
+        .expect("load fused");
         let (on_ane, report) = fused.verify_ane_dispatch().unwrap();
         assert!(on_ane, "fused QKV not on ANE\n{report}");
 
         // --- Warmup + time individual path ---
         let x_fp16 = vec![f16::from_f32(0.1).to_bits(); in_dim * seq];
-        let mut ys: Vec<Vec<u16>> = projs.iter()
-            .map(|(_, out)| vec![0u16; out * seq])
-            .collect();
+        let mut ys: Vec<Vec<u16>> = projs.iter().map(|(_, out)| vec![0u16; out * seq]).collect();
 
         for _ in 0..warmup {
             for (i, k) in singles.iter().enumerate() {
@@ -1138,13 +1208,13 @@ mod tests {
         indiv_samples_us.sort_unstable();
 
         // --- Warmup + time fused path ---
-        let mut fused_ys: Vec<Vec<u16>> = projs.iter()
-            .map(|(_, out)| vec![0u16; out * seq])
-            .collect();
+        let mut fused_ys: Vec<Vec<u16>> =
+            projs.iter().map(|(_, out)| vec![0u16; out * seq]).collect();
         for _ in 0..warmup {
             // Build the &mut slice of (name, buf) pairs fresh each call —
             // mutable borrows can't be reused.
-            let mut pairs: Vec<(&str, &mut [u16])> = fused_output_names.iter()
+            let mut pairs: Vec<(&str, &mut [u16])> = fused_output_names
+                .iter()
                 .map(|s| s.as_str())
                 .zip(fused_ys.iter_mut().map(|v| v.as_mut_slice()))
                 .collect();
@@ -1153,7 +1223,8 @@ mod tests {
         let mut fused_samples_us: Vec<u128> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            let mut pairs: Vec<(&str, &mut [u16])> = fused_output_names.iter()
+            let mut pairs: Vec<(&str, &mut [u16])> = fused_output_names
+                .iter()
                 .map(|s| s.as_str())
                 .zip(fused_ys.iter_mut().map(|v| v.as_mut_slice()))
                 .collect();
@@ -1171,15 +1242,16 @@ mod tests {
         let mut total_single_act_bytes = 0.0;
         for (_, out_dim) in projs {
             total_w_bytes += (in_dim * out_dim) as f64;
-            total_single_act_bytes +=
-                ((in_dim * seq) + (out_dim * seq)) as f64 * 2.0;
+            total_single_act_bytes += ((in_dim * seq) + (out_dim * seq)) as f64 * 2.0;
         }
         let fused_act_bytes = (in_dim * seq) as f64 * 2.0
-            + projs.iter().map(|(_, o)| (o * seq) as f64 * 2.0).sum::<f64>();
-        let indiv_floor_us = (total_w_bytes + total_single_act_bytes)
-            / (ane_peak_gbs * 1.0e9) * 1.0e6;
-        let fused_floor_us = (total_w_bytes + fused_act_bytes)
-            / (ane_peak_gbs * 1.0e9) * 1.0e6;
+            + projs
+                .iter()
+                .map(|(_, o)| (o * seq) as f64 * 2.0)
+                .sum::<f64>();
+        let indiv_floor_us =
+            (total_w_bytes + total_single_act_bytes) / (ane_peak_gbs * 1.0e9) * 1.0e6;
+        let fused_floor_us = (total_w_bytes + fused_act_bytes) / (ane_peak_gbs * 1.0e9) * 1.0e6;
 
         let indiv_min_us = indiv_samples_us[0] as f64;
         let indiv_p50_us = indiv_samples_us[iters / 2] as f64;
@@ -1194,11 +1266,11 @@ mod tests {
         let saved_us = (indiv_overhead_us - fused_overhead_us).max(0.0);
         let amortization = if indiv_overhead_us > 0.0 {
             saved_us / indiv_overhead_us * 100.0
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
-        eprintln!(
-            "DFlash-4B QKV fusion probe (seq={seq}, iters={iters}):"
-        );
+        eprintln!("DFlash-4B QKV fusion probe (seq={seq}, iters={iters}):");
         eprintln!(
             "  individual: min={indiv_min_us:.1}us p50={indiv_p50_us:.1}us  \
              floor≈{indiv_floor_us:.1}us  overhead≈{indiv_overhead_us:.1}us  \
@@ -1208,9 +1280,7 @@ mod tests {
             "  fused:      min={fused_min_us:.1}us p50={fused_p50_us:.1}us  \
              floor≈{fused_floor_us:.1}us  overhead≈{fused_overhead_us:.1}us"
         );
-        eprintln!(
-            "  saved overhead ≈ {saved_us:.1}us ({amortization:.0}% amortization)"
-        );
+        eprintln!("  saved overhead ≈ {saved_us:.1}us ({amortization:.0}% amortization)");
         let verdict = if amortization >= 60.0 {
             "FUSION AMORTIZES — ship layer-level fusion"
         } else if amortization >= 30.0 {
@@ -1233,8 +1303,7 @@ mod tests {
         use std::process::Command;
         use std::time::Instant;
 
-        let py = std::env::var("HIGGS_CORETOOLS_PYTHON")
-            .expect("set HIGGS_CORETOOLS_PYTHON");
+        let py = std::env::var("HIGGS_CORETOOLS_PYTHON").expect("set HIGGS_CORETOOLS_PYTHON");
         let hidden: usize = 3072;
         let kv_head: usize = 1024;
         let ffn: usize = 9728;
@@ -1249,7 +1318,9 @@ mod tests {
                 .collect();
             let p = tmp.path().join(format!("{label}.bin"));
             let mut b = Vec::with_capacity(seed.len() * 4);
-            for v in &seed { b.extend_from_slice(&v.to_le_bytes()); }
+            for v in &seed {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
             fs::write(&p, &b).unwrap();
             p
         };
@@ -1261,69 +1332,126 @@ mod tests {
         let u_bin = write_w("u", ffn, hidden);
         let d_bin = write_w("d", hidden, ffn);
 
-        let fused_script = env!("CARGO_MANIFEST_DIR").to_string()
-            + "/scripts/quantize_int8_fused.py";
-        let single_script = env!("CARGO_MANIFEST_DIR").to_string()
-            + "/scripts/quantize_int8_proj.py";
+        let fused_script =
+            env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/quantize_int8_fused.py";
+        let single_script =
+            env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/quantize_int8_proj.py";
 
         // Build QKV fused (in=hidden, seq=32).
-        let qkv_dir = tmp.path().join("qkv"); fs::create_dir_all(&qkv_dir).unwrap();
-        let o1 = Command::new(&py).arg(&fused_script)
-            .arg("--in-features").arg(hidden.to_string())
-            .arg("--seq-len").arg(seq.to_string())
-            .arg("--out-dir").arg(&qkv_dir)
-            .arg("--proj").arg(format!("q:{hidden}:{}", q_bin.display()))
-            .arg("--proj").arg(format!("k:{kv_head}:{}", k_bin.display()))
-            .arg("--proj").arg(format!("v:{kv_head}:{}", v_bin.display()))
-            .output().expect("qkv build");
-        assert!(o1.status.success(), "qkv: {}", String::from_utf8_lossy(&o1.stderr));
+        let qkv_dir = tmp.path().join("qkv");
+        fs::create_dir_all(&qkv_dir).unwrap();
+        let o1 = Command::new(&py)
+            .arg(&fused_script)
+            .arg("--in-features")
+            .arg(hidden.to_string())
+            .arg("--seq-len")
+            .arg(seq.to_string())
+            .arg("--out-dir")
+            .arg(&qkv_dir)
+            .arg("--proj")
+            .arg(format!("q:{hidden}:{}", q_bin.display()))
+            .arg("--proj")
+            .arg(format!("k:{kv_head}:{}", k_bin.display()))
+            .arg("--proj")
+            .arg(format!("v:{kv_head}:{}", v_bin.display()))
+            .output()
+            .expect("qkv build");
+        assert!(
+            o1.status.success(),
+            "qkv: {}",
+            String::from_utf8_lossy(&o1.stderr)
+        );
         let qkv_resp: serde_json::Value = serde_json::from_slice(&o1.stdout).unwrap();
         let qkv_mlc = qkv_resp["mlmodelc"].as_str().unwrap();
 
         // Build gate+up fused.
-        let gu_dir = tmp.path().join("gu"); fs::create_dir_all(&gu_dir).unwrap();
-        let o2 = Command::new(&py).arg(&fused_script)
-            .arg("--in-features").arg(hidden.to_string())
-            .arg("--seq-len").arg(seq.to_string())
-            .arg("--out-dir").arg(&gu_dir)
-            .arg("--proj").arg(format!("g:{ffn}:{}", g_bin.display()))
-            .arg("--proj").arg(format!("u:{ffn}:{}", u_bin.display()))
-            .output().expect("gu build");
-        assert!(o2.status.success(), "gu: {}", String::from_utf8_lossy(&o2.stderr));
+        let gu_dir = tmp.path().join("gu");
+        fs::create_dir_all(&gu_dir).unwrap();
+        let o2 = Command::new(&py)
+            .arg(&fused_script)
+            .arg("--in-features")
+            .arg(hidden.to_string())
+            .arg("--seq-len")
+            .arg(seq.to_string())
+            .arg("--out-dir")
+            .arg(&gu_dir)
+            .arg("--proj")
+            .arg(format!("g:{ffn}:{}", g_bin.display()))
+            .arg("--proj")
+            .arg(format!("u:{ffn}:{}", u_bin.display()))
+            .output()
+            .expect("gu build");
+        assert!(
+            o2.status.success(),
+            "gu: {}",
+            String::from_utf8_lossy(&o2.stderr)
+        );
         let gu_resp: serde_json::Value = serde_json::from_slice(&o2.stdout).unwrap();
         let gu_mlc = gu_resp["mlmodelc"].as_str().unwrap();
 
         // Build O single (in=hidden, out=hidden).
-        let build_single = |label: &str, wbin: &std::path::Path, out: usize, in_: usize| -> String {
-            let d = tmp.path().join(format!("single_{label}"));
-            fs::create_dir_all(&d).unwrap();
-            let o = Command::new(&py).arg(&single_script)
-                .arg("--weights-bin").arg(wbin)
-                .arg("--out-features").arg(out.to_string())
-                .arg("--in-features").arg(in_.to_string())
-                .arg("--seq-len").arg(seq.to_string())
-                .arg("--out-dir").arg(&d)
-                .output().expect("single build");
-            assert!(o.status.success(), "{label}: {}", String::from_utf8_lossy(&o.stderr));
-            let r: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-            r["mlmodelc"].as_str().unwrap().to_owned()
-        };
+        let build_single =
+            |label: &str, wbin: &std::path::Path, out: usize, in_: usize| -> String {
+                let d = tmp.path().join(format!("single_{label}"));
+                fs::create_dir_all(&d).unwrap();
+                let o = Command::new(&py)
+                    .arg(&single_script)
+                    .arg("--weights-bin")
+                    .arg(wbin)
+                    .arg("--out-features")
+                    .arg(out.to_string())
+                    .arg("--in-features")
+                    .arg(in_.to_string())
+                    .arg("--seq-len")
+                    .arg(seq.to_string())
+                    .arg("--out-dir")
+                    .arg(&d)
+                    .output()
+                    .expect("single build");
+                assert!(
+                    o.status.success(),
+                    "{label}: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                let r: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+                r["mlmodelc"].as_str().unwrap().to_owned()
+            };
         let o_mlc = build_single("o", &o_bin, hidden, hidden);
         let d_mlc = build_single("d", &d_bin, hidden, ffn);
 
         // Load all kernels.
-        let qkv = AneMlPackageKernel::load(qkv_mlc, "x", "y_q",
+        let qkv = AneMlPackageKernel::load(
+            qkv_mlc,
+            "x",
+            "y_q",
             vec![1, hidden as i64, 1, seq as i64],
-            vec![1, hidden as i64, 1, seq as i64]).unwrap();
-        let gu = AneMlPackageKernel::load(gu_mlc, "x", "y_g",
             vec![1, hidden as i64, 1, seq as i64],
-            vec![1, ffn as i64, 1, seq as i64]).unwrap();
-        let o = AneMlPackageKernel::load(&o_mlc, "x", "y",
+        )
+        .unwrap();
+        let gu = AneMlPackageKernel::load(
+            gu_mlc,
+            "x",
+            "y_g",
             vec![1, hidden as i64, 1, seq as i64],
-            vec![1, hidden as i64, 1, seq as i64]).unwrap();
-        let d = AneMlPackageKernel::load(&d_mlc, "x", "y",
             vec![1, ffn as i64, 1, seq as i64],
-            vec![1, hidden as i64, 1, seq as i64]).unwrap();
+        )
+        .unwrap();
+        let o = AneMlPackageKernel::load(
+            &o_mlc,
+            "x",
+            "y",
+            vec![1, hidden as i64, 1, seq as i64],
+            vec![1, hidden as i64, 1, seq as i64],
+        )
+        .unwrap();
+        let d = AneMlPackageKernel::load(
+            &d_mlc,
+            "x",
+            "y",
+            vec![1, ffn as i64, 1, seq as i64],
+            vec![1, hidden as i64, 1, seq as i64],
+        )
+        .unwrap();
 
         for k in [&qkv, &gu, &o, &d] {
             let (on_ane, _) = k.verify_ane_dispatch().unwrap();
@@ -1341,30 +1469,33 @@ mod tests {
         let mut y_d = vec![0u16; hidden * seq];
 
         // One "layer" = 4 dispatches (simulates weight-work, skips norm/attn/rope/residual).
-        let run_layer = |y_q: &mut [u16], y_k: &mut [u16], y_v: &mut [u16],
-                         y_o: &mut [u16], y_g: &mut [u16], y_u: &mut [u16],
+        let run_layer = |y_q: &mut [u16],
+                         y_k: &mut [u16],
+                         y_v: &mut [u16],
+                         y_o: &mut [u16],
+                         y_g: &mut [u16],
+                         y_u: &mut [u16],
                          y_d: &mut [u16]| {
-            let mut qkv_pairs: Vec<(&str, &mut [u16])> = vec![
-                ("y_q", y_q), ("y_k", y_k), ("y_v", y_v)
-            ];
+            let mut qkv_pairs: Vec<(&str, &mut [u16])> =
+                vec![("y_q", y_q), ("y_k", y_k), ("y_v", y_v)];
             qkv.predict_fp16_multi(&x_hid, &mut qkv_pairs).unwrap();
             o.predict_fp16(&x_hid, y_o).unwrap();
-            let mut gu_pairs: Vec<(&str, &mut [u16])> = vec![
-                ("y_g", y_g), ("y_u", y_u)
-            ];
+            let mut gu_pairs: Vec<(&str, &mut [u16])> = vec![("y_g", y_g), ("y_u", y_u)];
             gu.predict_fp16_multi(&x_hid, &mut gu_pairs).unwrap();
             d.predict_fp16(&x_ffn, y_d).unwrap();
         };
 
         for _ in 0..warmup {
-            run_layer(&mut y_q, &mut y_k, &mut y_v, &mut y_o,
-                      &mut y_g, &mut y_u, &mut y_d);
+            run_layer(
+                &mut y_q, &mut y_k, &mut y_v, &mut y_o, &mut y_g, &mut y_u, &mut y_d,
+            );
         }
         let mut samples_us: Vec<u128> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            run_layer(&mut y_q, &mut y_k, &mut y_v, &mut y_o,
-                      &mut y_g, &mut y_u, &mut y_d);
+            run_layer(
+                &mut y_q, &mut y_k, &mut y_v, &mut y_o, &mut y_g, &mut y_u, &mut y_d,
+            );
             samples_us.push(t0.elapsed().as_micros());
         }
         samples_us.sort_unstable();
@@ -1379,9 +1510,7 @@ mod tests {
         let savings_ms = fp16_baseline_ms - proj_ms;
         let pct = savings_ms / fp16_baseline_ms * 100.0;
 
-        eprintln!(
-            "DFlash-4B full-layer int8 weight-work (seq=32, iters={iters}):"
-        );
+        eprintln!("DFlash-4B full-layer int8 weight-work (seq=32, iters={iters}):");
         eprintln!("  1 layer: min={min_us:.1}us p50={p50_us:.1}us p99={p99_us:.1}us");
         eprintln!("  5 layers projected: min={proj_ms:.2}ms p50={p50_proj_ms:.2}ms");
         eprintln!("  fp16 baseline step: {fp16_baseline_ms} ms");
@@ -1389,21 +1518,11 @@ mod tests {
             "  naive delta (ignores non-weight work in baseline): \
              {savings_ms:+.2}ms ({pct:+.1}%)"
         );
-        eprintln!(
-            "  note: baseline 18.5ms includes norm/attn-core/rope/residual/lm_head;"
-        );
-        eprintln!(
-            "        int8 savings apply only to weight kernels. The projected"
-        );
-        eprintln!(
-            "        5-layer figure above is just the int8 weight-work portion;"
-        );
-        eprintln!(
-            "        it must be smaller than the fp16 weight-work portion by"
-        );
-        eprintln!(
-            "        ≥15% of the total baseline (2.8 ms) to ship."
-        );
+        eprintln!("  note: baseline 18.5ms includes norm/attn-core/rope/residual/lm_head;");
+        eprintln!("        int8 savings apply only to weight kernels. The projected");
+        eprintln!("        5-layer figure above is just the int8 weight-work portion;");
+        eprintln!("        it must be smaller than the fp16 weight-work portion by");
+        eprintln!("        ≥15% of the total baseline (2.8 ms) to ship.");
     }
 
     /// DFlash-4B MLP chain: gate/up [9728, 3072] and down [3072, 9728] at
@@ -1417,22 +1536,27 @@ mod tests {
         use std::process::Command;
         use std::time::Instant;
 
-        let py = std::env::var("HIGGS_CORETOOLS_PYTHON")
-            .expect("set HIGGS_CORETOOLS_PYTHON");
+        let py = std::env::var("HIGGS_CORETOOLS_PYTHON").expect("set HIGGS_CORETOOLS_PYTHON");
         let seq: usize = std::env::var("HIGGS_BENCH_SEQ")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
         let iters: usize = 50;
         let warmup: usize = 10;
 
         // (label, out_features, in_features)
         let shapes = [
             ("gate", 9728usize, 3072usize),
-            ("up",   9728usize, 3072usize),
+            ("up", 9728usize, 3072usize),
             ("down", 3072usize, 9728usize),
         ];
 
-        eprintln!("| kernel | out×in        | min_ms | med_ms | int8 GB/s | fp16-eq GB/s | on_ane |");
-        eprintln!("|--------|---------------|--------|--------|-----------|--------------|--------|");
+        eprintln!(
+            "| kernel | out×in        | min_ms | med_ms | int8 GB/s | fp16-eq GB/s | on_ane |"
+        );
+        eprintln!(
+            "|--------|---------------|--------|--------|-----------|--------------|--------|"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         for (label, out_dim, in_dim) in shapes {
@@ -1441,35 +1565,43 @@ mod tests {
                 .collect();
             let wbin = tmp.path().join(format!("{label}.bin"));
             let mut bytes = Vec::with_capacity(seed.len() * 4);
-            for v in &seed { bytes.extend_from_slice(&v.to_le_bytes()); }
+            for v in &seed {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
             fs::write(&wbin, &bytes).unwrap();
 
             let out_dir = tmp.path().join(format!("out_{label}"));
             fs::create_dir_all(&out_dir).unwrap();
-            let script = env!("CARGO_MANIFEST_DIR").to_string()
-                + "/scripts/quantize_int8_proj.py";
+            let script = env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/quantize_int8_proj.py";
             let out = Command::new(&py)
                 .arg(&script)
-                .arg("--weights-bin").arg(&wbin)
-                .arg("--out-features").arg(out_dim.to_string())
-                .arg("--in-features").arg(in_dim.to_string())
-                .arg("--seq-len").arg(seq.to_string())
-                .arg("--out-dir").arg(&out_dir)
-                .output().expect("spawn python");
-            assert!(out.status.success(),
+                .arg("--weights-bin")
+                .arg(&wbin)
+                .arg("--out-features")
+                .arg(out_dim.to_string())
+                .arg("--in-features")
+                .arg(in_dim.to_string())
+                .arg("--seq-len")
+                .arg(seq.to_string())
+                .arg("--out-dir")
+                .arg(&out_dir)
+                .output()
+                .expect("spawn python");
+            assert!(
+                out.status.success(),
                 "{label}: quantize failed\nstderr: {}",
-                String::from_utf8_lossy(&out.stderr));
-            let resp: serde_json::Value =
-                serde_json::from_slice(&out.stdout).expect("json");
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let resp: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
             let mlmodelc = resp["mlmodelc"].as_str().unwrap();
             let in_name = resp["input_name"].as_str().unwrap();
             let out_name = resp["output_name"].as_str().unwrap();
 
             let input_shape: Vec<i64> = vec![1, in_dim as i64, 1, seq as i64];
             let output_shape: Vec<i64> = vec![1, out_dim as i64, 1, seq as i64];
-            let kernel = AneMlPackageKernel::load(
-                mlmodelc, in_name, out_name, input_shape, output_shape,
-            ).expect("load");
+            let kernel =
+                AneMlPackageKernel::load(mlmodelc, in_name, out_name, input_shape, output_shape)
+                    .expect("load");
             let (on_ane, _rep) = kernel.verify_ane_dispatch().expect("verify");
 
             let x_fp16 = vec![f16::from_f32(0.1).to_bits(); in_dim * seq];
@@ -1513,8 +1645,7 @@ mod tests {
         use std::process::Command;
         use std::time::Instant;
 
-        let py = std::env::var("HIGGS_CORETOOLS_PYTHON")
-            .expect("set HIGGS_CORETOOLS_PYTHON");
+        let py = std::env::var("HIGGS_CORETOOLS_PYTHON").expect("set HIGGS_CORETOOLS_PYTHON");
         // Carnice-9B (qwen3_5) MLP gate_proj shape.
         let in_dim: usize = 4096;
         let out_dim: usize = 12288;
@@ -1523,13 +1654,13 @@ mod tests {
         let warmup: usize = 5;
 
         // --- Synthetic weight + activation ---
-        let w = random::uniform::<f32, f32>(-0.05, 0.05,
-            &[out_dim as i32, in_dim as i32], None).expect("random W");
+        let w = random::uniform::<f32, f32>(-0.05, 0.05, &[out_dim as i32, in_dim as i32], None)
+            .expect("random W");
         w.eval().unwrap();
         let w_vec: Vec<f32> = w.as_slice::<f32>().to_vec();
 
-        let x = random::uniform::<f32, f32>(-1.0, 1.0,
-            &[1, seq as i32, in_dim as i32], None).expect("random x");
+        let x = random::uniform::<f32, f32>(-1.0, 1.0, &[1, seq as i32, in_dim as i32], None)
+            .expect("random x");
         x.eval().unwrap();
         let x_vec: Vec<f32> = x.as_slice::<f32>().to_vec();
 
@@ -1539,24 +1670,32 @@ mod tests {
         let out_dir = tmp.path().join("out");
         fs::create_dir_all(&out_dir).unwrap();
         let mut bytes = Vec::with_capacity(w_vec.len() * 4);
-        for v in &w_vec { bytes.extend_from_slice(&v.to_le_bytes()); }
+        for v in &w_vec {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
         fs::write(&weights_bin, &bytes).unwrap();
 
-        let script = env!("CARGO_MANIFEST_DIR").to_string()
-            + "/scripts/quantize_int8_proj.py";
+        let script = env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/quantize_int8_proj.py";
         let out = Command::new(&py)
             .arg(&script)
-            .arg("--weights-bin").arg(&weights_bin)
-            .arg("--out-features").arg(out_dim.to_string())
-            .arg("--in-features").arg(in_dim.to_string())
-            .arg("--seq-len").arg(seq.to_string())
-            .arg("--out-dir").arg(&out_dir)
-            .output().expect("spawn python");
-        assert!(out.status.success(),
+            .arg("--weights-bin")
+            .arg(&weights_bin)
+            .arg("--out-features")
+            .arg(out_dim.to_string())
+            .arg("--in-features")
+            .arg(in_dim.to_string())
+            .arg("--seq-len")
+            .arg(seq.to_string())
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .output()
+            .expect("spawn python");
+        assert!(
+            out.status.success(),
             "quantize failed\nstderr: {}",
-            String::from_utf8_lossy(&out.stderr));
-        let resp: serde_json::Value =
-            serde_json::from_slice(&out.stdout).expect("json");
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let resp: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
         let mlmodelc = resp["mlmodelc"].as_str().unwrap();
         let in_name = resp["input_name"].as_str().unwrap();
         let out_name = resp["output_name"].as_str().unwrap();
@@ -1564,9 +1703,9 @@ mod tests {
         // --- Load + verify ANE ---
         let input_shape: Vec<i64> = vec![1, in_dim as i64, 1, seq as i64];
         let output_shape: Vec<i64> = vec![1, out_dim as i64, 1, seq as i64];
-        let kernel = AneMlPackageKernel::load(
-            mlmodelc, in_name, out_name, input_shape, output_shape,
-        ).expect("load");
+        let kernel =
+            AneMlPackageKernel::load(mlmodelc, in_name, out_name, input_shape, output_shape)
+                .expect("load");
         let (on_ane, report) = kernel.verify_ane_dispatch().expect("verify");
         eprintln!("{report}");
         assert!(on_ane, "shape should dispatch to ANE — got:\n{report}");
@@ -1617,17 +1756,17 @@ mod tests {
 
         // --- Bench MLX q4 matmul (production baseline; group_size=64 bits=4) ---
         let (qw, qs, qb) = mlx_rs::ops::quantize(&w, 64, 4).expect("quantize q4");
-        qw.eval().unwrap(); qs.eval().unwrap(); qb.eval().unwrap();
+        qw.eval().unwrap();
+        qs.eval().unwrap();
+        qb.eval().unwrap();
         for _ in 0..warmup {
-            let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4)
-                .expect("qmm");
+            let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4).expect("qmm");
             y.eval().unwrap();
         }
         let mut q4_samples: Vec<u128> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4)
-                .expect("qmm");
+            let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4).expect("qmm");
             y.eval().unwrap();
             q4_samples.push(t0.elapsed().as_micros());
         }
@@ -1639,8 +1778,7 @@ mod tests {
         let mut y_ane = vec![0.0f32; seq * out_dim];
         for co in 0..out_dim {
             for t in 0..seq {
-                y_ane[t * out_dim + co] =
-                    f16::from_bits(y_fp16[co * seq + t]).to_f32();
+                y_ane[t * out_dim + co] = f16::from_bits(y_fp16[co * seq + t]).to_f32();
             }
         }
         let y_ref = matmul(&x, &wt).expect("matmul");
@@ -1650,9 +1788,13 @@ mod tests {
         let mut max_abs_ref = 0.0f32;
         for (a, b) in y_ane.iter().zip(y_ref_vec.iter()) {
             let d = (a - b).abs();
-            if d > max_diff { max_diff = d; }
+            if d > max_diff {
+                max_diff = d;
+            }
             let ab = b.abs();
-            if ab > max_abs_ref { max_abs_ref = ab; }
+            if ab > max_abs_ref {
+                max_abs_ref = ab;
+            }
         }
 
         let w_bytes = (in_dim * out_dim) as f64;
@@ -1662,7 +1804,9 @@ mod tests {
 
         eprintln!("");
         eprintln!("=== Qwen3-9B gate_proj prefill probe ({out_dim}×{in_dim} seq={seq}) ===");
-        eprintln!("ANE int8: min={ane_min_ms:.3} ms  med={ane_med_ms:.3} ms  ({ane_int8_gbs:.1} GB/s int8)");
+        eprintln!(
+            "ANE int8: min={ane_min_ms:.3} ms  med={ane_med_ms:.3} ms  ({ane_int8_gbs:.1} GB/s int8)"
+        );
         eprintln!("MLX f32 : min={mlx_min_ms:.3} ms  med={mlx_med_ms:.3} ms");
         eprintln!("MLX q4  : min={q4_min_ms:.3} ms  med={q4_med_ms:.3} ms  (production baseline)");
         eprintln!("speedup vs f32: {speedup_f32:.2}x");
@@ -1671,8 +1815,10 @@ mod tests {
         eprintln!("");
 
         // Informational — never panic. The verdict is the printed numbers.
-        assert!(max_diff <= 0.5,
-            "parity sanity: max_diff={max_diff} exceeds 0.5 (something is wrong)");
+        assert!(
+            max_diff <= 0.5,
+            "parity sanity: max_diff={max_diff} exceeds 0.5 (something is wrong)"
+        );
     }
 
     /// Layer-0 MLP projection sweep — runs the int8-vs-q4 probe for BOTH
@@ -1692,34 +1838,37 @@ mod tests {
         use std::process::Command;
         use std::time::Instant;
 
-        let py = std::env::var("HIGGS_CORETOOLS_PYTHON")
-            .expect("set HIGGS_CORETOOLS_PYTHON");
+        let py = std::env::var("HIGGS_CORETOOLS_PYTHON").expect("set HIGGS_CORETOOLS_PYTHON");
         let seq: usize = std::env::var("HIGGS_ANE_INT8_PROBE_SEQ")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128);
         let iters: usize = 30;
         let warmup: usize = 5;
 
         // Qwen3-9B MLP projection shapes. hidden=4096, intermediate=12288.
-        let cases: &[(usize, usize, &str)] = &[
-            (4096, 12288, "gate/up"),
-            (12288, 4096, "down"),
-        ];
+        let cases: &[(usize, usize, &str)] = &[(4096, 12288, "gate/up"), (12288, 4096, "down")];
 
         eprintln!("");
         eprintln!("=== Qwen3-9B MLP projections probe (seq={seq}) ===");
-        eprintln!("| proj    | shape         | ANE int8 | MLX f32  | MLX q4   | vs q4  | on_ane | max_diff |");
-        eprintln!("|---------|---------------|----------|----------|----------|--------|--------|----------|");
+        eprintln!(
+            "| proj    | shape         | ANE int8 | MLX f32  | MLX q4   | vs q4  | on_ane | max_diff |"
+        );
+        eprintln!(
+            "|---------|---------------|----------|----------|----------|--------|--------|----------|"
+        );
 
         let mut all_pass = true;
         for &(in_dim, out_dim, label) in cases {
             // --- Synthetic weight + activation ---
-            let w = random::uniform::<f32, f32>(-0.05, 0.05,
-                &[out_dim as i32, in_dim as i32], None).expect("random W");
+            let w =
+                random::uniform::<f32, f32>(-0.05, 0.05, &[out_dim as i32, in_dim as i32], None)
+                    .expect("random W");
             w.eval().unwrap();
             let w_vec: Vec<f32> = w.as_slice::<f32>().to_vec();
 
-            let x = random::uniform::<f32, f32>(-1.0, 1.0,
-                &[1, seq as i32, in_dim as i32], None).expect("random x");
+            let x = random::uniform::<f32, f32>(-1.0, 1.0, &[1, seq as i32, in_dim as i32], None)
+                .expect("random x");
             x.eval().unwrap();
             let x_vec: Vec<f32> = x.as_slice::<f32>().to_vec();
 
@@ -1729,24 +1878,32 @@ mod tests {
             let out_dir = tmp.path().join("out");
             fs::create_dir_all(&out_dir).unwrap();
             let mut bytes = Vec::with_capacity(w_vec.len() * 4);
-            for v in &w_vec { bytes.extend_from_slice(&v.to_le_bytes()); }
+            for v in &w_vec {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
             fs::write(&weights_bin, &bytes).unwrap();
 
-            let script = env!("CARGO_MANIFEST_DIR").to_string()
-                + "/scripts/quantize_int8_proj.py";
+            let script = env!("CARGO_MANIFEST_DIR").to_string() + "/scripts/quantize_int8_proj.py";
             let out = Command::new(&py)
                 .arg(&script)
-                .arg("--weights-bin").arg(&weights_bin)
-                .arg("--out-features").arg(out_dim.to_string())
-                .arg("--in-features").arg(in_dim.to_string())
-                .arg("--seq-len").arg(seq.to_string())
-                .arg("--out-dir").arg(&out_dir)
-                .output().expect("spawn python");
-            assert!(out.status.success(),
+                .arg("--weights-bin")
+                .arg(&weights_bin)
+                .arg("--out-features")
+                .arg(out_dim.to_string())
+                .arg("--in-features")
+                .arg(in_dim.to_string())
+                .arg("--seq-len")
+                .arg(seq.to_string())
+                .arg("--out-dir")
+                .arg(&out_dir)
+                .output()
+                .expect("spawn python");
+            assert!(
+                out.status.success(),
                 "quantize failed ({label})\nstderr: {}",
-                String::from_utf8_lossy(&out.stderr));
-            let resp: serde_json::Value =
-                serde_json::from_slice(&out.stdout).expect("json");
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let resp: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
             let mlmodelc = resp["mlmodelc"].as_str().unwrap();
             let in_name = resp["input_name"].as_str().unwrap();
             let out_name = resp["output_name"].as_str().unwrap();
@@ -1754,9 +1911,9 @@ mod tests {
             // --- Load + verify ANE ---
             let input_shape: Vec<i64> = vec![1, in_dim as i64, 1, seq as i64];
             let output_shape: Vec<i64> = vec![1, out_dim as i64, 1, seq as i64];
-            let kernel = AneMlPackageKernel::load(
-                mlmodelc, in_name, out_name, input_shape, output_shape,
-            ).expect("load");
+            let kernel =
+                AneMlPackageKernel::load(mlmodelc, in_name, out_name, input_shape, output_shape)
+                    .expect("load");
             let (on_ane, _report) = kernel.verify_ane_dispatch().expect("verify");
 
             // --- Pack input into conv1x1 layout fp16 ---
@@ -1803,17 +1960,17 @@ mod tests {
 
             // --- Bench MLX q4 (production baseline; group_size=64 bits=4) ---
             let (qw, qs, qb) = mlx_rs::ops::quantize(&w, 64, 4).expect("quantize q4");
-            qw.eval().unwrap(); qs.eval().unwrap(); qb.eval().unwrap();
+            qw.eval().unwrap();
+            qs.eval().unwrap();
+            qb.eval().unwrap();
             for _ in 0..warmup {
-                let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4)
-                    .expect("qmm");
+                let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4).expect("qmm");
                 y.eval().unwrap();
             }
             let mut q4_samples: Vec<u128> = Vec::with_capacity(iters);
             for _ in 0..iters {
                 let t0 = Instant::now();
-                let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4)
-                    .expect("qmm");
+                let y = mlx_rs::ops::quantized_matmul(&x, &qw, &qs, &qb, true, 64, 4).expect("qmm");
                 y.eval().unwrap();
                 q4_samples.push(t0.elapsed().as_micros());
             }
@@ -1824,8 +1981,7 @@ mod tests {
             let mut y_ane = vec![0.0f32; seq * out_dim];
             for co in 0..out_dim {
                 for t in 0..seq {
-                    y_ane[t * out_dim + co] =
-                        f16::from_bits(y_fp16[co * seq + t]).to_f32();
+                    y_ane[t * out_dim + co] = f16::from_bits(y_fp16[co * seq + t]).to_f32();
                 }
             }
             let y_ref = matmul(&x, &wt).expect("matmul");
@@ -1834,7 +1990,9 @@ mod tests {
             let mut max_diff = 0.0f32;
             for (a, b) in y_ane.iter().zip(y_ref_vec.iter()) {
                 let d = (a - b).abs();
-                if d > max_diff { max_diff = d; }
+                if d > max_diff {
+                    max_diff = d;
+                }
             }
 
             let speedup_q4 = q4_min_ms / ane_min_ms;
@@ -1846,13 +2004,17 @@ mod tests {
             if speedup_q4 < 1.5 || !on_ane {
                 all_pass = false;
             }
-            assert!(max_diff <= 0.5,
-                "parity sanity ({label}): max_diff={max_diff} exceeds 0.5");
+            assert!(
+                max_diff <= 0.5,
+                "parity sanity ({label}): max_diff={max_diff} exceeds 0.5"
+            );
         }
         eprintln!("");
         eprintln!("DECISION GATE: all shapes must clear >1.5x vs q4 and dispatch on ANE.");
         if !all_pass {
-            eprintln!("WARN: at least one projection did not clear the gate — probe informational, not a hard fail.");
+            eprintln!(
+                "WARN: at least one projection did not clear the gate — probe informational, not a hard fail."
+            );
         }
     }
 }

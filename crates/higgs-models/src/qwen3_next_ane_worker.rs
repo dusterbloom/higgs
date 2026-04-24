@@ -56,8 +56,8 @@ use mlx_rs::{Array, Dtype};
 use crate::ane_bridge::AneKernel;
 use crate::ane_mil::gen_gdn_recurrence_step;
 use crate::qwen3_next_ane::{
-    AneProjKernel, FusedGdnProjKernel, compile_proj, compile_proj_from_donor,
-    compile_fused_gdn_proj, compile_fused_gdn_proj_from_donor,
+    AneProjKernel, FusedGdnProjKernel, compile_fused_gdn_proj, compile_fused_gdn_proj_from_donor,
+    compile_proj, compile_proj_from_donor,
 };
 
 /// Which of the three GDN dense projections to dispatch on the worker.
@@ -348,7 +348,8 @@ impl GdnAneWorkerHandle {
         let shape = input_array.shape();
         if shape.len() != 3 {
             return Err(Exception::custom(format!(
-                "dispatch_fused: expected rank-3, got {:?}", shape
+                "dispatch_fused: expected rank-3, got {:?}",
+                shape
             )));
         }
         let b = shape[0] as usize;
@@ -361,7 +362,8 @@ impl GdnAneWorkerHandle {
         }
         if s > self.seq_len || b == 0 || s == 0 {
             return Err(Exception::custom(format!(
-                "dispatch_fused: bad dims B={b} S={s} seq_len={}", self.seq_len
+                "dispatch_fused: bad dims B={b} S={s} seq_len={}",
+                self.seq_len
             )));
         }
 
@@ -379,7 +381,9 @@ impl GdnAneWorkerHandle {
             .send(GdnAneMsg::DispatchFusedQkvzBa {
                 linear_layer_idx,
                 input: input_vec,
-                b, s, in_dim,
+                b,
+                s,
+                in_dim,
                 reply: reply_tx,
             })
             .map_err(|e| Exception::custom(format!("GDN ANE worker terminated: {e}")))?;
@@ -418,19 +422,29 @@ impl GdnAneWorkerHandle {
             .ok_or("dispatch_recurrence: recurrence was not compiled")?;
         let big = dims.big_bytes;
         for (name, buf) in [
-            ("st", &st), ("g", &g), ("k", &k),
-            ("v", &v), ("beta", &beta), ("q", &q),
+            ("st", &st),
+            ("g", &g),
+            ("k", &k),
+            ("v", &v),
+            ("beta", &beta),
+            ("q", &q),
         ] {
             if buf.len() != big {
                 return Err(format!(
-                    "dispatch_recurrence: {name} len {} != expected {big}", buf.len()
+                    "dispatch_recurrence: {name} len {} != expected {big}",
+                    buf.len()
                 ));
             }
         }
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
             .send(GdnAneMsg::DispatchRecurrence {
-                st, g, k, v, beta, q,
+                st,
+                g,
+                k,
+                v,
+                beta,
+                q,
                 reply: reply_tx,
             })
             .map_err(|e| format!("GDN ANE worker terminated: {e}"))?;
@@ -489,8 +503,7 @@ pub fn spawn_gdn_ane_worker(
     let pad = seq_len as usize;
 
     let (tx, rx) = mpsc::channel::<GdnAneMsg>();
-    let (init_tx, init_rx) =
-        mpsc::channel::<Result<Option<RecurrenceDimsInfo>, String>>();
+    let (init_tx, init_rx) = mpsc::channel::<Result<Option<RecurrenceDimsInfo>, String>>();
 
     std::thread::Builder::new()
         .name("qwen-gdn-ane-worker".to_owned())
@@ -515,30 +528,29 @@ pub fn spawn_gdn_ane_worker(
             // Compile recurrence kernels (state_update + readout) if requested.
             // One shared pair for all layers — no baked weights, all dynamic.
             let (recurrence_pair, recurrence_info) = if let Some(dims) = recurrence {
-                let kerns = gen_gdn_recurrence_step(
-                    dims.num_v_heads, dims.head_k_dim, dims.head_v_dim,
-                );
+                let kerns =
+                    gen_gdn_recurrence_step(dims.num_v_heads, dims.head_k_dim, dims.head_v_dim);
                 let k_state = match AneKernel::compile(
-                    &kerns.state_update_mil, None,
-                    &kerns.state_input_sizes, &kerns.state_output_sizes,
+                    &kerns.state_update_mil,
+                    None,
+                    &kerns.state_input_sizes,
+                    &kerns.state_output_sizes,
                 ) {
                     Ok(k) => k,
                     Err(e) => {
-                        let _ = init_tx.send(Err(format!(
-                            "recurrence state_update compile: {e}"
-                        )));
+                        let _ = init_tx.send(Err(format!("recurrence state_update compile: {e}")));
                         return;
                     }
                 };
                 let k_readout = match AneKernel::compile(
-                    &kerns.readout_mil, None,
-                    &kerns.readout_input_sizes, &kerns.readout_output_sizes,
+                    &kerns.readout_mil,
+                    None,
+                    &kerns.readout_input_sizes,
+                    &kerns.readout_output_sizes,
                 ) {
                     Ok(k) => k,
                     Err(e) => {
-                        let _ = init_tx.send(Err(format!(
-                            "recurrence readout compile: {e}"
-                        )));
+                        let _ = init_tx.send(Err(format!("recurrence readout compile: {e}")));
                         return;
                     }
                 };
@@ -649,7 +661,12 @@ pub fn spawn_gdn_ane_worker(
                         let _ = reply.send(send_result);
                     }
                     GdnAneMsg::DispatchFusedQkvzBa {
-                        linear_layer_idx, input, b, s, in_dim, reply,
+                        linear_layer_idx,
+                        input,
+                        b,
+                        s,
+                        in_dim,
+                        reply,
                     } => {
                         round += 1;
                         if linear_layer_idx >= kernels.len() {
@@ -660,7 +677,8 @@ pub fn spawn_gdn_ane_worker(
                         }
                         let (ref kfused, _) = kernels[linear_layer_idx];
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let arr = Array::from_slice(&input, &[b as i32, s as i32, in_dim as i32]);
+                            let arr =
+                                Array::from_slice(&input, &[b as i32, s as i32, in_dim as i32]);
                             let (q, ba) = kfused.dispatch(&arr)?;
                             q.eval()?;
                             ba.eval()?;
@@ -671,9 +689,9 @@ pub fn spawn_gdn_ane_worker(
                         }));
                         let send_result = match result {
                             Ok(Ok(v)) => Ok(v),
-                            Ok(Err(e)) => Err(format!(
-                                "round {round} layer {linear_layer_idx} fused: {e}"
-                            )),
+                            Ok(Err(e)) => {
+                                Err(format!("round {round} layer {linear_layer_idx} fused: {e}"))
+                            }
                             Err(payload) => {
                                 let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
                                     (*s).to_owned()
@@ -690,28 +708,33 @@ pub fn spawn_gdn_ane_worker(
                         let _ = reply.send(send_result);
                     }
                     GdnAneMsg::DispatchRecurrence {
-                        st, g, k, v, beta, q, reply,
+                        st,
+                        g,
+                        k,
+                        v,
+                        beta,
+                        q,
+                        reply,
                     } => {
                         round += 1;
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let (k_state, k_readout, _) = recurrence_pair
-                                .as_ref()
-                                .ok_or("recurrence not compiled")?;
+                            let (k_state, k_readout, _) =
+                                recurrence_pair.as_ref().ok_or("recurrence not compiled")?;
                             // Kernel A: state_update — write 5 inputs, eval, read output
                             k_state.write_input(0, &st);
                             k_state.write_input(1, &g);
                             k_state.write_input(2, &k);
                             k_state.write_input(3, &v);
                             k_state.write_input(4, &beta);
-                            k_state.eval()
+                            k_state
+                                .eval()
                                 .map_err(|e| format!("state_update eval: {e}"))?;
                             k_state.read_output(0, &mut ns_buf);
 
                             // Kernel B: readout — write 2 inputs, eval, read output
                             k_readout.write_input(0, &ns_buf);
                             k_readout.write_input(1, &q);
-                            k_readout.eval()
-                                .map_err(|e| format!("readout eval: {e}"))?;
+                            k_readout.eval().map_err(|e| format!("readout eval: {e}"))?;
                             k_readout.read_output(0, &mut y_buf);
 
                             Ok::<RecurrenceResult, String>(RecurrenceResult {
@@ -721,9 +744,7 @@ pub fn spawn_gdn_ane_worker(
                         }));
                         let send_result = match result {
                             Ok(Ok(r)) => Ok(r),
-                            Ok(Err(e)) => Err(format!(
-                                "round {round} recurrence: {e}"
-                            )),
+                            Ok(Err(e)) => Err(format!("round {round} recurrence: {e}")),
                             Err(payload) => {
                                 let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
                                     (*s).to_owned()
@@ -736,9 +757,7 @@ pub fn spawn_gdn_ane_worker(
                                     round, msg = %msg,
                                     "GDN ANE recurrence dispatch panicked",
                                 );
-                                Err(format!(
-                                    "round {round} recurrence panic: {msg}"
-                                ))
+                                Err(format!("round {round} recurrence panic: {msg}"))
                             }
                         };
                         let _ = reply.send(send_result);
@@ -788,8 +807,14 @@ fn compile_all_layers(
     // Layer 0: full compile (becomes the donor for layers 1..n-1).
     let w0 = &layer_weights[0];
     let fused0 = compile_fused_gdn_proj(
-        &w0.qkvz_w_f32, &w0.ba_w_f32, w0.qkvz_in, w0.qkvz_out, w0.ba_out, pad,
-    ).map_err(|e| format!("layer 0 fused compile: {e}"))?;
+        &w0.qkvz_w_f32,
+        &w0.ba_w_f32,
+        w0.qkvz_in,
+        w0.qkvz_out,
+        w0.ba_out,
+        pad,
+    )
+    .map_err(|e| format!("layer 0 fused compile: {e}"))?;
     let out0 = compile_proj(&w0.out_w_f32, w0.out_in, w0.out_out, pad, "out_proj")
         .map_err(|e| format!("layer 0 out_proj compile: {e}"))?;
 
@@ -1019,16 +1044,14 @@ mod tests {
         let in_dim = 128_usize;
         let out_dim = 256_usize;
         let pad = 16_i32;
-        let weights = synthetic_layer_weights(
-            2, in_dim, out_dim, in_dim, out_dim, in_dim, out_dim,
-        );
+        let weights = synthetic_layer_weights(2, in_dim, out_dim, in_dim, out_dim, in_dim, out_dim);
         let rec_dims = RecurrenceDims {
             num_v_heads: hv,
             head_k_dim: dk,
             head_v_dim: dv,
         };
-        let handle = spawn_gdn_ane_worker(weights, pad, Some(rec_dims))
-            .expect("spawn with recurrence");
+        let handle =
+            spawn_gdn_ane_worker(weights, pad, Some(rec_dims)).expect("spawn with recurrence");
 
         // Verify recurrence_dims metadata
         let info = handle.recurrence_dims().expect("recurrence_dims is None");
@@ -1045,9 +1068,15 @@ mod tests {
         // Matches the pattern from the working gdn_recurrence_ane_parity_synthetic test.
         let g_log: Vec<f32> = (0..hv).map(|i| 0.8 + (i as f32) * 0.02).collect();
         let beta_log: Vec<f32> = (0..hv).map(|i| 0.4 + (i as f32) * 0.05).collect();
-        let k_log: Vec<f32> = (0..dk*hv).map(|i| ((i as f32) * 0.07).cos() * 0.1).collect();
-        let v_log: Vec<f32> = (0..hv*dv).map(|i| ((i as f32) * 0.03).sin() * 0.1).collect();
-        let q_log: Vec<f32> = (0..dk*hv).map(|i| ((i as f32) * 0.05).cos() * 0.1).collect();
+        let k_log: Vec<f32> = (0..dk * hv)
+            .map(|i| ((i as f32) * 0.07).cos() * 0.1)
+            .collect();
+        let v_log: Vec<f32> = (0..hv * dv)
+            .map(|i| ((i as f32) * 0.03).sin() * 0.1)
+            .collect();
+        let q_log: Vec<f32> = (0..dk * hv)
+            .map(|i| ((i as f32) * 0.05).cos() * 0.1)
+            .collect();
 
         fn to_bytes(data: &[f32]) -> Vec<u8> {
             data.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -1055,30 +1084,54 @@ mod tests {
 
         // All buffers [1, dk, 1, fw] — expand per-head values across channels.
         let mut st_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            st_flat[c * fw + h * dv + d] =
-                (((c * hv * dv + h * dv + d) as f32 * 0.01) - 0.5).sin() * 0.1;
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    st_flat[c * fw + h * dv + d] =
+                        (((c * hv * dv + h * dv + d) as f32 * 0.01) - 0.5).sin() * 0.1;
+                }
+            }
+        }
         let mut g_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            g_flat[c * fw + h * dv + d] = g_log[h];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    g_flat[c * fw + h * dv + d] = g_log[h];
+                }
+            }
+        }
         let mut k_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            k_flat[c * fw + h * dv + d] = k_log[c * hv + h];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    k_flat[c * fw + h * dv + d] = k_log[c * hv + h];
+                }
+            }
+        }
         let mut v_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            v_flat[c * fw + h * dv + d] = v_log[h * dv + d];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    v_flat[c * fw + h * dv + d] = v_log[h * dv + d];
+                }
+            }
+        }
         let mut beta_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            beta_flat[c * fw + h * dv + d] = beta_log[h];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    beta_flat[c * fw + h * dv + d] = beta_log[h];
+                }
+            }
+        }
         let mut q_flat = vec![0.0f32; dk * fw];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            q_flat[c * fw + h * dv + d] = q_log[c * hv + h];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    q_flat[c * fw + h * dv + d] = q_log[c * hv + h];
+                }
+            }
+        }
 
         let result = handle
             .dispatch_recurrence(
@@ -1095,10 +1148,14 @@ mod tests {
         assert_eq!(result.y.len(), small, "y size mismatch");
 
         // Decode ANE outputs
-        let ns_f32: Vec<f32> = result.new_state.chunks_exact(4)
+        let ns_f32: Vec<f32> = result
+            .new_state
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let y_f32: Vec<f32> = result.y.chunks_exact(4)
+        let y_f32: Vec<f32> = result
+            .y
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -1107,43 +1164,74 @@ mod tests {
 
         // Extract ANE output into logical dims
         let mut ns_ane = vec![0.0f32; dk * hv * dv];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            ns_ane[li(c,h,d)] = ns_f32[c * fw + h * dv + d];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    ns_ane[li(c, h, d)] = ns_f32[c * fw + h * dv + d];
+                }
+            }
+        }
         let mut y_ane = vec![0.0f32; hv * dv];
-        for h in 0..hv { for d in 0..dv {
-            y_ane[h * dv + d] = y_f32[h * dv + d];
-        }}
+        for h in 0..hv {
+            for d in 0..dv {
+                y_ane[h * dv + d] = y_f32[h * dv + d];
+            }
+        }
 
         let mut decay = vec![0.0f32; dk * hv * dv];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            decay[li(c,h,d)] = st_flat[c * fw + h * dv + d] * g_log[h];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    decay[li(c, h, d)] = st_flat[c * fw + h * dv + d] * g_log[h];
+                }
+            }
+        }
         let mut kvm = vec![0.0f32; hv * dv];
-        for h in 0..hv { for d in 0..dv {
-            let mut s = 0.0f32;
-            for c in 0..dk { s += decay[li(c,h,d)] * k_log[c * hv + h]; }
-            kvm[h * dv + d] = s;
-        }}
+        for h in 0..hv {
+            for d in 0..dv {
+                let mut s = 0.0f32;
+                for c in 0..dk {
+                    s += decay[li(c, h, d)] * k_log[c * hv + h];
+                }
+                kvm[h * dv + d] = s;
+            }
+        }
         let mut delta = vec![0.0f32; hv * dv];
-        for h in 0..hv { for d in 0..dv {
-            delta[h*dv+d] = (v_log[h*dv+d] - kvm[h*dv+d]) * beta_log[h];
-        }}
+        for h in 0..hv {
+            for d in 0..dv {
+                delta[h * dv + d] = (v_log[h * dv + d] - kvm[h * dv + d]) * beta_log[h];
+            }
+        }
         let mut ns_ref = vec![0.0f32; dk * hv * dv];
-        for c in 0..dk { for h in 0..hv { for d in 0..dv {
-            ns_ref[li(c,h,d)] = decay[li(c,h,d)] + k_log[c*hv+h] * delta[h*dv+d];
-        }}}
+        for c in 0..dk {
+            for h in 0..hv {
+                for d in 0..dv {
+                    ns_ref[li(c, h, d)] =
+                        decay[li(c, h, d)] + k_log[c * hv + h] * delta[h * dv + d];
+                }
+            }
+        }
         let mut y_ref = vec![0.0f32; hv * dv];
-        for h in 0..hv { for d in 0..dv {
-            let mut s = 0.0f32;
-            for c in 0..dk { s += ns_ref[li(c,h,d)] * q_log[c*hv+h]; }
-            y_ref[h*dv+d] = s;
-        }}
+        for h in 0..hv {
+            for d in 0..dv {
+                let mut s = 0.0f32;
+                for c in 0..dk {
+                    s += ns_ref[li(c, h, d)] * q_log[c * hv + h];
+                }
+                y_ref[h * dv + d] = s;
+            }
+        }
 
-        let max_diff_ns = ns_ane.iter().zip(ns_ref.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        let max_diff_y = y_ane.iter().zip(y_ref.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_diff_ns = ns_ane
+            .iter()
+            .zip(ns_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_diff_y = y_ane
+            .iter()
+            .zip(y_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
 
         eprintln!(
             "[worker recurrence parity] new_state max_diff={max_diff_ns:.6} \

@@ -121,6 +121,18 @@ struct DFlashState {
     mask_token_id: i32,
 }
 
+/// Optional AR-speculative state: dense Qwen3.5 drafter + adaptive K window.
+///
+/// When present (via `HIGGS_AR_SPEC_DRAFT_PATH`), `generate_inner` routes
+/// unconstrained, non-multimodal requests through `speculative_generate_next`
+/// instead of plain AR decode. Mutually exclusive with DFlash — if both are
+/// configured, the doctor warns and AR-spec wins (this dispatch runs first).
+struct ArSpecState {
+    drafter: std::sync::Mutex<higgs_models::diffusion::QwenNextCausalDrafter>,
+    k_low: usize,
+    k_high: usize,
+}
+
 /// Simple single-request inference engine with prefix KV caching.
 ///
 /// Serializes requests with a mutex (same pattern as vllm-mlx's `SimpleEngine`).
@@ -140,6 +152,8 @@ pub struct SimpleEngine {
     kv_cache_config: KvCacheConfig,
     /// Optional DFlash speculative decoding drafter.
     dflash: Option<DFlashState>,
+    /// Optional AR-speculative drafter (Qwen3.5 dense, GPU).
+    ar_spec: Option<ArSpecState>,
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
@@ -424,11 +438,57 @@ impl SimpleEngine {
             None
         };
 
-        // Cap MLX memory for large-dense + DFlash to prevent Metal silent
-        // SIGKILL on verify-tape allocations at long contexts (crash fix per
-        // .planning/next-session-27b-dflash-crash.md). Override with
+        // Load AR-speculative drafter if HIGGS_AR_SPEC_DRAFT_PATH is set.
+        // Loads a Qwen3.5 dense drafter through the qwen3_next loader and
+        // wires it into a stateful-per-round adapter. See
+        // `higgs_models::diffusion::QwenNextCausalDrafter`.
+        let ar_spec = if let Some(p) = std::env::var("HIGGS_AR_SPEC_DRAFT_PATH").ok() {
+            tracing::info!(drafter = %p, "Loading AR-spec drafter (qwen3_5)");
+            let max_seq = std::env::var("HIGGS_AR_SPEC_MAX_SEQ")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2048);
+            let t0 = std::time::Instant::now();
+            let drafter =
+                higgs_models::diffusion::QwenNextCausalDrafter::from_dir(Path::new(&p), max_seq)
+                    .map_err(EngineError::Model)?;
+            let k_low = std::env::var("HIGGS_AR_SPEC_K_LOW")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(4);
+            let k_high = std::env::var("HIGGS_AR_SPEC_K_HIGH")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(8);
+            tracing::info!(
+                elapsed_ms = t0.elapsed().as_millis(),
+                vocab = drafter.vocab,
+                max_seq,
+                k_low,
+                k_high,
+                "AR-spec drafter loaded"
+            );
+            Some(ArSpecState {
+                drafter: std::sync::Mutex::new(drafter),
+                k_low,
+                k_high,
+            })
+        } else {
+            None
+        };
+
+        if ar_spec.is_some() && dflash.is_some() {
+            tracing::warn!(
+                "Both HIGGS_AR_SPEC_DRAFT_PATH and HIGGS_DFLASH_PATH are configured — \
+                 AR-spec wins; DFlash will not be used"
+            );
+        }
+
+        // Cap MLX memory for large-dense + DFlash/AR-spec to prevent Metal
+        // silent SIGKILL on verify-tape allocations at long contexts (crash
+        // fix per .planning/next-session-27b-dflash-crash.md). Override with
         // HIGGS_MLX_CAP_FRACTION=0 (disable) or e.g. 0.80 (tighter).
-        if dflash.is_some() && model.num_layers() > 32 {
+        if (dflash.is_some() || ar_spec.is_some()) && model.num_layers() > 32 {
             let cap_frac = std::env::var("HIGGS_MLX_CAP_FRACTION")
                 .ok()
                 .and_then(|s| s.parse::<f64>().ok())
@@ -453,6 +513,7 @@ impl SimpleEngine {
             think_close_token,
             kv_cache_config,
             dflash,
+            ar_spec,
         })
     }
 
@@ -860,6 +921,19 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
+        // AR-speculative decoding (Qwen3.5 dense drafter on GPU): runs ahead
+        // of DFlash when both are configured. Greedy-only for V1 — falls
+        // through to AR/DFlash when constraints, multimodal, stop sequences,
+        // or logprobs are requested.
+        if self.ar_spec.is_some()
+            && constraint.is_none()
+            && pixel_values.is_none()
+            && stop_sequences.is_empty()
+            && !logprobs
+        {
+            return self.generate_ar_spec_inner(prompt_tokens, max_tokens);
+        }
+
         // DFlash speculative decoding: use draft-verify loop when available,
         // no constraints active, and no multimodal input.
         if self.dflash.is_some() && constraint.is_none() && pixel_values.is_none() {
@@ -1139,6 +1213,89 @@ impl SimpleEngine {
             }
             next_logprob_data = following_logprob_data;
         }
+    }
+
+    /// AR-speculative decode (greedy, V1).
+    ///
+    /// Routes through `higgs_models::diffusion::speculative_generate_next`,
+    /// which pairs a Qwen3.5 dense drafter (loaded via the qwen3_next loader,
+    /// stateful KV cache within each round) with the target verifier. EOS
+    /// early-stop is enforced inside this method by truncating the returned
+    /// vector at the first EOS hit. No sampling — temperature/top_p/top_k are
+    /// ignored. No logprobs. No stop sequences.
+    fn generate_ar_spec_inner(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+    ) -> Result<GenerationOutput, EngineError> {
+        let ar = self
+            .ar_spec
+            .as_ref()
+            .expect("AR-spec state must be Some when generate_ar_spec_inner is called");
+        let prompt_len = Self::prompt_len(prompt_tokens)?;
+        if max_tokens == 0 {
+            return Ok(GenerationOutput {
+                text: String::new(),
+                finish_reason: "length".to_owned(),
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+                token_logprobs: None,
+            });
+        }
+
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+        let mut drafter = ar
+            .drafter
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("AR-spec drafter lock poisoned: {e}")))?;
+
+        let t0 = std::time::Instant::now();
+        let raw = higgs_models::diffusion::speculative_generate_next(
+            &mut drafter,
+            &mut model,
+            prompt_tokens,
+            max_tokens as usize,
+            ar.k_low,
+            ar.k_high,
+            &self.eos_token_ids,
+        );
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // EOS truncation: the algorithm runs to max_tokens; chop at the first
+        // EOS hit (inclusive — we keep the EOS token so the decoded text
+        // matches what an AR-decode call would emit before stopping).
+        let (tokens, finish_reason) =
+            if let Some(idx) = raw.iter().position(|t| self.eos_token_ids.contains(t)) {
+                (raw[..=idx].to_vec(), "stop")
+            } else {
+                (raw, "length")
+            };
+
+        let completion_tokens = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+        let tps = if elapsed_ms > 0.0 {
+            f64::from(completion_tokens) / elapsed_ms * 1000.0
+        } else {
+            0.0
+        };
+        tracing::info!(
+            completion_tokens,
+            elapsed_ms = elapsed_ms as u64,
+            tok_per_s = tps,
+            finish_reason,
+            "AR-spec generate done"
+        );
+
+        let text = self.decode_tokens(&tokens)?;
+        Ok(GenerationOutput {
+            text,
+            finish_reason: finish_reason.to_owned(),
+            prompt_tokens: prompt_len,
+            completion_tokens,
+            token_logprobs: None,
+        })
     }
 
     /// DFlash speculative decode: draft 16 tokens per round, verify, accept prefix.

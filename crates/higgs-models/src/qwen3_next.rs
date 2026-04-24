@@ -375,9 +375,7 @@ pub(crate) fn swiglu(gate: &Array, x: &Array) -> Result<Array, Exception> {
 pub(crate) fn sigmoid_mul(gate: &Array, x: &Array) -> Result<Array, Exception> {
     if target_compile_enabled() {
         let mut compiled = mlx_rs::transforms::compile::compile(
-            |(g, u): (&Array, &Array)| -> Result<Array, Exception> {
-                nn::sigmoid(g)?.multiply(u)
-            },
+            |(g, u): (&Array, &Array)| -> Result<Array, Exception> { nn::sigmoid(g)?.multiply(u) },
             None,
         );
         compiled((gate, x))
@@ -511,13 +509,19 @@ fn sigmoid(x: &mlx_rs::Array) -> Result<mlx_rs::Array, Exception> {
 ///   y:            [B, S, Hv, Dv]
 ///   final_state:  [B, Hv, Dk, Dv]  (HF layout; caller must transpose to [Dv, Dk] for Metal kernel)
 fn chunk_gated_delta_rule(
-    q: &Array, k: &Array, v: &Array,
-    g: &Array, beta: &Array,
-    num_k_heads: i32, head_k_dim: i32, num_v_heads: i32, head_v_dim: i32,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    num_k_heads: i32,
+    head_k_dim: i32,
+    num_v_heads: i32,
+    head_v_dim: i32,
     initial_state: Option<&Array>,
 ) -> Result<(Array, Array), Exception> {
-    use mlx_rs::ops::*;
     use mlx_rs::ops::indexing::NewAxis;
+    use mlx_rs::ops::*;
 
     let orig_dtype = q.dtype();
     let shape = q.shape();
@@ -526,15 +530,20 @@ fn chunk_gated_delta_rule(
     let cs = 64i32;
     let num_chunks = (s + cs - 1) / cs;
 
-    let q = q.as_dtype(mlx_rs::Dtype::Float32)?
+    let q = q
+        .as_dtype(mlx_rs::Dtype::Float32)?
         .transpose_axes(&[0, 2, 1, 3])?;
-    let k = k.as_dtype(mlx_rs::Dtype::Float32)?
+    let k = k
+        .as_dtype(mlx_rs::Dtype::Float32)?
         .transpose_axes(&[0, 2, 1, 3])?;
-    let v = v.as_dtype(mlx_rs::Dtype::Float32)?
+    let v = v
+        .as_dtype(mlx_rs::Dtype::Float32)?
         .transpose_axes(&[0, 2, 1, 3])?;
-    let beta = beta.as_dtype(mlx_rs::Dtype::Float32)?
+    let beta = beta
+        .as_dtype(mlx_rs::Dtype::Float32)?
         .transpose_axes(&[0, 2, 1])?;
-    let g = g.as_dtype(mlx_rs::Dtype::Float32)?
+    let g = g
+        .as_dtype(mlx_rs::Dtype::Float32)?
         .transpose_axes(&[0, 2, 1])?;
 
     let scale = 1.0f32 / (head_k_dim as f32).sqrt();
@@ -591,11 +600,11 @@ fn chunk_gated_delta_rule(
     let mut attn_acc_parts: Vec<Array> = Vec::with_capacity(cs as usize);
     attn_acc_parts.push(attn.index((.., .., .., 0..1, ..)));
     for i in 1..cs {
-        let attn_ik = attn.index((.., .., .., i..i+1, ..i));
+        let attn_ik = attn.index((.., .., .., i..i + 1, ..i));
         let acc_k = concatenate_axis(&attn_acc_parts.iter().collect::<Vec<_>>(), 3)?;
         let acc_k_trunc = acc_k.index((.., .., .., .., ..i));
         let contrib = matmul(&attn_ik, &acc_k_trunc)?;
-        let attn_row_i = attn.index((.., .., .., i..i+1, ..));
+        let attn_row_i = attn.index((.., .., .., i..i + 1, ..));
         let row_updated = attn_row_i.index((.., .., .., .., ..i)).add(&contrib)?;
         let row_rest = attn_row_i.index((.., .., .., .., i..));
         let new_row = concatenate_axis(&[&row_updated, &row_rest], -1)?;
@@ -667,7 +676,10 @@ fn chunk_gated_delta_rule(
         .index((.., .., ..s, ..));
     let core_attn_out = core_attn_out.transpose_axes(&[0, 2, 1, 3])?;
 
-    Ok((core_attn_out.as_dtype(orig_dtype)?, last_state.as_dtype(orig_dtype)?))
+    Ok((
+        core_attn_out.as_dtype(orig_dtype)?,
+        last_state.as_dtype(orig_dtype)?,
+    ))
 }
 
 /// Grid: `(32, Dv, B * Hv)`, Threadgroup: `(32, 4, 1)`.
@@ -1143,7 +1155,15 @@ for (int i = 0; i < n_per_t; ++i) {
 #[allow(unsafe_code)]
 fn create_gated_delta_tape_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let input_names: [&std::ffi::CStr; 9] = [
-        c"q", c"k", c"v", c"a_log", c"a", c"dt_bias", c"b", c"state_in", c"T",
+        c"q",
+        c"k",
+        c"v",
+        c"a_log",
+        c"a",
+        c"dt_bias",
+        c"b",
+        c"state_in",
+        c"T",
     ];
     let output_names: [&std::ffi::CStr; 3] = [c"y", c"state_out", c"innovation_tape"];
 
@@ -1187,34 +1207,53 @@ fn configure_gated_delta_tape_kernel(
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
 
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
-            config, c"InT".as_ptr(), in_dtype,
+            config,
+            c"InT".as_ptr(),
+            in_dtype,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"Dk".as_ptr(), head_k_dim,
+            config,
+            c"Dk".as_ptr(),
+            head_k_dim,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"Dv".as_ptr(), head_v_dim,
+            config,
+            c"Dv".as_ptr(),
+            head_v_dim,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"Hk".as_ptr(), num_k_heads,
+            config,
+            c"Hk".as_ptr(),
+            num_k_heads,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"Hv".as_ptr(), num_v_heads,
+            config,
+            c"Hv".as_ptr(),
+            num_v_heads,
         );
 
         let y_shape = [batch, seq_len, num_v_heads, head_v_dim];
         let state_shape = [batch, num_v_heads, head_v_dim, head_k_dim];
         let tape_shape = [batch, seq_len, num_v_heads, head_v_dim];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
-            config, y_shape.as_ptr(), y_shape.len(), in_dtype,
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            in_dtype,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
-            config, state_shape.as_ptr(), state_shape.len(), in_dtype,
+            config,
+            state_shape.as_ptr(),
+            state_shape.len(),
+            in_dtype,
         );
         // Tape stores deltas in float32 for precision (matches dflash-mlx)
         let f32_dtype: mlx_sys::mlx_dtype = 10; // MLX_FLOAT32
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
-            config, tape_shape.as_ptr(), tape_shape.len(), f32_dtype,
+            config,
+            tape_shape.as_ptr(),
+            tape_shape.len(),
+            f32_dtype,
         );
 
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 32, head_v_dim, batch * num_v_heads);
@@ -1227,12 +1266,20 @@ fn configure_gated_delta_tape_kernel(
 /// Tape-recording GDN kernel: returns `(y, state_out, innovation_tape)`.
 #[allow(unsafe_code, clippy::too_many_arguments)]
 pub(crate) fn gated_delta_kernel_ffi_with_tape(
-    q: &Array, k: &Array, v: &Array,
-    a_log: &Array, a: &Array, dt_bias: &Array, b: &Array,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    a_log: &Array,
+    a: &Array,
+    dt_bias: &Array,
+    b: &Array,
     state_in: &Array,
-    batch: i32, seq_len: i32,
-    num_k_heads: i32, head_k_dim: i32,
-    num_v_heads: i32, head_v_dim: i32,
+    batch: i32,
+    seq_len: i32,
+    num_k_heads: i32,
+    head_k_dim: i32,
+    num_v_heads: i32,
+    head_v_dim: i32,
 ) -> Result<(Array, Array, Array), Exception> {
     ensure_ffi_error_handler();
 
@@ -1242,14 +1289,26 @@ pub(crate) fn gated_delta_kernel_ffi_with_tape(
     let cached =
         GATED_DELTA_TAPE_KERNEL.get_or_init(|| CachedMetalKernel(create_gated_delta_tape_kernel()));
     let config = configure_gated_delta_tape_kernel(
-        in_dtype, batch, seq_len, num_k_heads, head_k_dim, num_v_heads, head_v_dim,
+        in_dtype,
+        batch,
+        seq_len,
+        num_k_heads,
+        head_k_dim,
+        num_v_heads,
+        head_v_dim,
     );
 
     let t_scalar = unsafe { mlx_sys::mlx_array_new_int(seq_len) };
     let input_ptrs = [
-        q.as_ptr(), k.as_ptr(), v.as_ptr(),
-        a_log.as_ptr(), a.as_ptr(), dt_bias.as_ptr(), b.as_ptr(),
-        state_in.as_ptr(), t_scalar,
+        q.as_ptr(),
+        k.as_ptr(),
+        v.as_ptr(),
+        a_log.as_ptr(),
+        a.as_ptr(),
+        dt_bias.as_ptr(),
+        b.as_ptr(),
+        state_in.as_ptr(),
+        t_scalar,
     ];
     let inputs_vec =
         unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
@@ -1257,14 +1316,23 @@ pub(crate) fn gated_delta_kernel_ffi_with_tape(
     let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
     let status = unsafe {
         mlx_sys::mlx_fast_metal_kernel_apply(
-            &raw mut outputs_vec, cached.0, inputs_vec, config, stream.as_ptr(),
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
         )
     };
 
     let result = if status != 0 {
         let mlx_msg = FFI_LAST_ERROR
-            .lock().ok().and_then(|mut guard| guard.take()).unwrap_or_default();
-        Err(Exception::custom(format!("gated_delta_tape_kernel failed: {mlx_msg}")))
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+            .unwrap_or_default();
+        Err(Exception::custom(format!(
+            "gated_delta_tape_kernel failed: {mlx_msg}"
+        )))
     } else {
         let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
         let mut state_ptr = unsafe { mlx_sys::mlx_array_new() };
@@ -1352,9 +1420,8 @@ for (int i = 0; i < n_per_t; ++i) {
 
 #[allow(unsafe_code)]
 fn create_tape_replay_kernel() -> mlx_sys::mlx_fast_metal_kernel {
-    let input_names: [&std::ffi::CStr; 7] = [
-        c"tape", c"k", c"a", c"a_log", c"dt_bias", c"state_in", c"T",
-    ];
+    let input_names: [&std::ffi::CStr; 7] =
+        [c"tape", c"k", c"a", c"a_log", c"dt_bias", c"state_in", c"T"];
     let output_names: [&std::ffi::CStr; 1] = [c"state_out"];
 
     let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
@@ -1386,42 +1453,60 @@ fn create_tape_replay_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 /// Returns the new SSM state after replaying `seq_len` steps.
 #[allow(unsafe_code, clippy::too_many_arguments)]
 pub(crate) fn tape_replay_kernel_ffi(
-    tape: &Array, k: &Array, a: &Array,
-    a_log: &Array, dt_bias: &Array,
+    tape: &Array,
+    k: &Array,
+    a: &Array,
+    a_log: &Array,
+    dt_bias: &Array,
     state_in: &Array,
-    batch: i32, seq_len: i32,
-    num_k_heads: i32, head_k_dim: i32,
-    num_v_heads: i32, head_v_dim: i32,
+    batch: i32,
+    seq_len: i32,
+    num_k_heads: i32,
+    head_k_dim: i32,
+    num_v_heads: i32,
+    head_v_dim: i32,
 ) -> Result<Array, Exception> {
     ensure_ffi_error_handler();
 
     let stream = Stream::task_local_or_default();
     let in_dtype = unsafe { mlx_sys::mlx_array_dtype(state_in.as_ptr()) };
 
-    let cached =
-        TAPE_REPLAY_KERNEL.get_or_init(|| CachedMetalKernel(create_tape_replay_kernel()));
+    let cached = TAPE_REPLAY_KERNEL.get_or_init(|| CachedMetalKernel(create_tape_replay_kernel()));
 
     let config = unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
-            config, c"InT".as_ptr(), in_dtype,
+            config,
+            c"InT".as_ptr(),
+            in_dtype,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"Dk".as_ptr(), head_k_dim,
+            config,
+            c"Dk".as_ptr(),
+            head_k_dim,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"Dv".as_ptr(), head_v_dim,
+            config,
+            c"Dv".as_ptr(),
+            head_v_dim,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"Hk".as_ptr(), num_k_heads,
+            config,
+            c"Hk".as_ptr(),
+            num_k_heads,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"Hv".as_ptr(), num_v_heads,
+            config,
+            c"Hv".as_ptr(),
+            num_v_heads,
         );
 
         let state_shape = [batch, num_v_heads, head_v_dim, head_k_dim];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
-            config, state_shape.as_ptr(), state_shape.len(), in_dtype,
+            config,
+            state_shape.as_ptr(),
+            state_shape.len(),
+            in_dtype,
         );
 
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 32, head_v_dim, batch * num_v_heads);
@@ -1432,9 +1517,13 @@ pub(crate) fn tape_replay_kernel_ffi(
 
     let t_scalar = unsafe { mlx_sys::mlx_array_new_int(seq_len) };
     let input_ptrs = [
-        tape.as_ptr(), k.as_ptr(), a.as_ptr(),
-        a_log.as_ptr(), dt_bias.as_ptr(),
-        state_in.as_ptr(), t_scalar,
+        tape.as_ptr(),
+        k.as_ptr(),
+        a.as_ptr(),
+        a_log.as_ptr(),
+        dt_bias.as_ptr(),
+        state_in.as_ptr(),
+        t_scalar,
     ];
     let inputs_vec =
         unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
@@ -1442,17 +1531,28 @@ pub(crate) fn tape_replay_kernel_ffi(
     let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
     let status = unsafe {
         mlx_sys::mlx_fast_metal_kernel_apply(
-            &raw mut outputs_vec, cached.0, inputs_vec, config, stream.as_ptr(),
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
         )
     };
 
     let result = if status != 0 {
         let mlx_msg = FFI_LAST_ERROR
-            .lock().ok().and_then(|mut guard| guard.take()).unwrap_or_default();
-        Err(Exception::custom(format!("tape_replay_kernel failed: {mlx_msg}")))
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+            .unwrap_or_default();
+        Err(Exception::custom(format!(
+            "tape_replay_kernel failed: {mlx_msg}"
+        )))
     } else {
         let mut state_ptr = unsafe { mlx_sys::mlx_array_new() };
-        unsafe { mlx_sys::mlx_vector_array_get(&raw mut state_ptr, outputs_vec, 0); }
+        unsafe {
+            mlx_sys::mlx_vector_array_get(&raw mut state_ptr, outputs_vec, 0);
+        }
         Ok(unsafe { Array::from_ptr(state_ptr) })
     };
 
@@ -1597,13 +1697,13 @@ impl Qwen3NextAttention {
                 // Reshape → [1, L, total_seq] for broadcast with scores [H, L, total_seq]
                 let total_seq = *mask_arr.shape().last().unwrap_or(&1);
                 let mask_3d = mask_arr.reshape(&[1, L, total_seq])?;
-                let neg_inf =
-                    Array::from_f32(f32::NEG_INFINITY).as_dtype(scaled.dtype())?;
+                let neg_inf = Array::from_f32(f32::NEG_INFINITY).as_dtype(scaled.dtype())?;
                 scaled = ops::r#where(&mask_3d, &scaled, &neg_inf)?;
             }
 
             let weights = ops::softmax_axis(&scaled, -1, true)?;
-            tq_view.decode_values(&weights, self.num_attention_heads)?
+            tq_view
+                .decode_values(&weights, self.num_attention_heads)?
                 .transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[B, L, -1])?
         } else {
@@ -1713,11 +1813,14 @@ pub(crate) fn forward_ane_int8_mlp(
     let x_f16 = x_f16_arr.as_slice::<f16>();
 
     let mut x_fp16 = vec![0u16; h * bucket];
-    x_fp16.par_chunks_mut(bucket).enumerate().for_each(|(ci, row)| {
-        for t in 0..s {
-            row[t] = x_f16[t * h + ci].to_bits();
-        }
-    });
+    x_fp16
+        .par_chunks_mut(bucket)
+        .enumerate()
+        .for_each(|(ci, row)| {
+            for t in 0..s {
+                row[t] = x_f16[t * h + ci].to_bits();
+            }
+        });
 
     // --- gate / up projections ---
     let mut gate_fp16 = vec![0u16; inter * bucket];
@@ -1737,20 +1840,12 @@ pub(crate) fn forward_ane_int8_mlp(
     //
     // SAFETY: `half::f16` is `#[repr(transparent)]` over `u16`, so a
     // `&[u16]` of fp16 bits is layout-identical to a `&[f16]`.
-    let gate_as_f16: &[f16] = unsafe {
-        std::slice::from_raw_parts(gate_fp16.as_ptr().cast::<f16>(), gate_fp16.len())
-    };
-    let up_as_f16: &[f16] = unsafe {
-        std::slice::from_raw_parts(up_fp16.as_ptr().cast::<f16>(), up_fp16.len())
-    };
-    let gate_arr = Array::from_slice(
-        gate_as_f16,
-        &[1, inter as i32, 1, bucket as i32],
-    );
-    let up_arr = Array::from_slice(
-        up_as_f16,
-        &[1, inter as i32, 1, bucket as i32],
-    );
+    let gate_as_f16: &[f16] =
+        unsafe { std::slice::from_raw_parts(gate_fp16.as_ptr().cast::<f16>(), gate_fp16.len()) };
+    let up_as_f16: &[f16] =
+        unsafe { std::slice::from_raw_parts(up_fp16.as_ptr().cast::<f16>(), up_fp16.len()) };
+    let gate_arr = Array::from_slice(gate_as_f16, &[1, inter as i32, 1, bucket as i32]);
+    let up_arr = Array::from_slice(up_as_f16, &[1, inter as i32, 1, bucket as i32]);
     drop(gate_fp16);
     drop(up_fp16);
     let activated = swiglu(&gate_arr, &up_arr)?;
@@ -1760,9 +1855,8 @@ pub(crate) fn forward_ane_int8_mlp(
     // SAFETY: activated is Dtype::Float16 with len inter*bucket;
     // `as_slice::<f16>` is contiguous and f16↔u16 are repr-identical.
     let act_f16 = activated.as_slice::<f16>();
-    let act_u16: &[u16] = unsafe {
-        std::slice::from_raw_parts(act_f16.as_ptr().cast::<u16>(), act_f16.len())
-    };
+    let act_u16: &[u16] =
+        unsafe { std::slice::from_raw_parts(act_f16.as_ptr().cast::<u16>(), act_f16.len()) };
     let mut down_fp16 = vec![0u16; h * bucket];
     down.predict_fp16(act_u16, &mut down_fp16)
         .map_err(|e| Exception::custom(format!("forward_ane_int8_mlp: down: {e}")))?;
@@ -1770,14 +1864,11 @@ pub(crate) fn forward_ane_int8_mlp(
     // --- Unpack [H, bucket] → [S, H] fp16, return as Dtype::Float16. ---
     // Caller adds residual against bf16 hidden; MLX upcasts automatically.
     let mut out_f16: Vec<f16> = vec![f16::ZERO; s * h];
-    out_f16
-        .par_chunks_mut(h)
-        .enumerate()
-        .for_each(|(t, row)| {
-            for co in 0..h {
-                row[co] = f16::from_bits(down_fp16[co * bucket + t]);
-            }
-        });
+    out_f16.par_chunks_mut(h).enumerate().for_each(|(t, row)| {
+        for co in 0..h {
+            row[co] = f16::from_bits(down_fp16[co * bucket + t]);
+        }
+    });
     Ok(Array::from_slice(&out_f16, &[1, s as i32, h as i32]))
 }
 
@@ -1981,12 +2072,9 @@ impl SwitchMlpWeights {
                 .shape()
                 .get(1)
                 .ok_or_else(|| Exception::custom("gate_proj weight missing dim 1"))?;
-            let fw =
-                ops::concatenate_axis(&[&*self.gate_proj.weight, &*self.up_proj.weight], 1)?;
-            let fs =
-                ops::concatenate_axis(&[&*self.gate_proj.scales, &*self.up_proj.scales], 1)?;
-            let fb =
-                ops::concatenate_axis(&[&*self.gate_proj.biases, &*self.up_proj.biases], 1)?;
+            let fw = ops::concatenate_axis(&[&*self.gate_proj.weight, &*self.up_proj.weight], 1)?;
+            let fs = ops::concatenate_axis(&[&*self.gate_proj.scales, &*self.up_proj.scales], 1)?;
+            let fb = ops::concatenate_axis(&[&*self.gate_proj.biases, &*self.up_proj.biases], 1)?;
             fw.eval()?;
             fs.eval()?;
             fb.eval()?;
@@ -2495,9 +2583,10 @@ impl GatedDeltaNet {
                         .sum_axes(&[1], true)?,
                 );
             }
-            nn::silu(
-                &ops::concatenate_axis(&windows.iter().collect::<Vec<_>>(), 1)?,
-            )?
+            nn::silu(&ops::concatenate_axis(
+                &windows.iter().collect::<Vec<_>>(),
+                1,
+            )?)?
         } else {
             // S=1 decode + large S prefill: native Conv1d is a single fused dispatch
             nn::silu(&self.conv1d.forward(&conv_input)?)?
@@ -2537,14 +2626,24 @@ impl GatedDeltaNet {
                 ops::zeros_dtype(
                     &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
                     inputs.dtype(),
-                ).unwrap()
+                )
+                .unwrap()
             });
             gated_delta_kernel_ffi(
-                &norm_q, &norm_k, &conv_v,
-                &self.A_log, &a, &self.dt_bias, &b,
-                &state, B, S,
-                self.num_k_heads, self.head_k_dim,
-                self.num_v_heads, self.head_v_dim,
+                &norm_q,
+                &norm_k,
+                &conv_v,
+                &self.A_log,
+                &a,
+                &self.dt_bias,
+                &b,
+                &state,
+                B,
+                S,
+                self.num_k_heads,
+                self.head_k_dim,
+                self.num_v_heads,
+                self.head_v_dim,
             )?
         } else {
             // Recurrent mode: use previous ssm_state
@@ -2556,11 +2655,20 @@ impl GatedDeltaNet {
                 )?,
             };
             gated_delta_kernel_ffi(
-                &norm_q, &norm_k, &conv_v,
-                &self.A_log, &a, &self.dt_bias, &b,
-                &state, B, S,
-                self.num_k_heads, self.head_k_dim,
-                self.num_v_heads, self.head_v_dim,
+                &norm_q,
+                &norm_k,
+                &conv_v,
+                &self.A_log,
+                &a,
+                &self.dt_bias,
+                &b,
+                &state,
+                B,
+                S,
+                self.num_k_heads,
+                self.head_k_dim,
+                self.num_v_heads,
+                self.head_v_dim,
             )?
         };
         cache.ssm_state = Some(new_state);
@@ -2689,9 +2797,10 @@ impl GatedDeltaNet {
                         .sum_axes(&[1], true)?,
                 );
             }
-            nn::silu(
-                &ops::concatenate_axis(&windows.iter().collect::<Vec<_>>(), 1)?,
-            )?
+            nn::silu(&ops::concatenate_axis(
+                &windows.iter().collect::<Vec<_>>(),
+                1,
+            )?)?
         } else {
             nn::silu(&self.conv1d.forward(&conv_input)?)?
         };
@@ -2735,11 +2844,20 @@ impl GatedDeltaNet {
             )?,
         };
         let (y, _unchanged_state) = gated_delta_kernel_ffi_stateless(
-            &norm_q, &norm_k, &conv_v,
-            &self.A_log, &a, &self.dt_bias, &b,
-            &state, B, S,
-            self.num_k_heads, self.head_k_dim,
-            self.num_v_heads, self.head_v_dim,
+            &norm_q,
+            &norm_k,
+            &conv_v,
+            &self.A_log,
+            &a,
+            &self.dt_bias,
+            &b,
+            &state,
+            B,
+            S,
+            self.num_k_heads,
+            self.head_k_dim,
+            self.num_v_heads,
+            self.head_v_dim,
         )?;
         // DO NOT update cache.ssm_state or cache.offset
 
@@ -2761,34 +2879,50 @@ impl GatedDeltaNet {
         cache: &mut ArraysCache,
     ) -> Result<(Array, GdnLayerTape), Exception> {
         let shape = inputs.shape();
-        let B = *shape.first().ok_or_else(|| Exception::custom("need >= 2 dims"))?;
-        let S = *shape.get(1).ok_or_else(|| Exception::custom("need >= 2 dims"))?;
+        let B = *shape
+            .first()
+            .ok_or_else(|| Exception::custom("need >= 2 dims"))?;
+        let S = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("need >= 2 dims"))?;
 
         let (q, k, v, z, b, a) = if self.use_separate_projections {
-            let qkv_proj = self.in_proj_qkv.as_ref()
+            let qkv_proj = self
+                .in_proj_qkv
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_qkv missing"))?;
-            let z_proj = self.in_proj_z.as_ref()
+            let z_proj = self
+                .in_proj_z
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_z missing"))?;
-            let b_proj = self.in_proj_b.as_ref()
+            let b_proj = self
+                .in_proj_b
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_b missing"))?;
-            let a_proj = self.in_proj_a.as_ref()
+            let a_proj = self
+                .in_proj_a
+                .as_ref()
                 .ok_or_else(|| Exception::custom("in_proj_a missing"))?;
 
             let qkv = qkv_proj.forward(inputs)?;
-            let z = z_proj.forward(inputs)?
+            let z = z_proj
+                .forward(inputs)?
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
             let b = b_proj.forward(inputs)?;
             let a = a_proj.forward(inputs)?;
 
             let split_indices = &[self.key_dim, self.key_dim * 2];
             let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
-            let q = qkv_parts.first()
+            let q = qkv_parts
+                .first()
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
                 .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
-            let k = qkv_parts.get(1)
+            let k = qkv_parts
+                .get(1)
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
                 .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
-            let v = qkv_parts.get(2)
+            let v = qkv_parts
+                .get(2)
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
             (q, k, v, z, b, a)
@@ -2871,13 +3005,16 @@ impl GatedDeltaNet {
         let conv_state = match cache.conv_state.take() {
             Some(state) => state,
             None => ops::zeros_dtype(
-                &[B, self.conv_kernel_size - 1, self.conv_dim], inputs.dtype(),
+                &[B, self.conv_kernel_size - 1, self.conv_dim],
+                inputs.dtype(),
             )?,
         };
         let conv_input = ops::concatenate_axis(&[&conv_state, &mixed_qkv], 1)?;
 
         let n_keep = self.conv_kernel_size - 1;
-        let conv_input_len = *conv_input.shape().get(1)
+        let conv_input_len = *conv_input
+            .shape()
+            .get(1)
             .ok_or_else(|| Exception::custom("conv_input missing seq dim"))?;
         let keep_start = conv_input_len - n_keep;
         let cs = conv_input.index((.., keep_start.., ..));
@@ -2895,7 +3032,8 @@ impl GatedDeltaNet {
                         self.conv1d.weight.squeeze_axes(&[1])?.transpose()?
                     } else {
                         return Err(Exception::custom(format!(
-                            "Unexpected conv1d weight shape: {:?}", shape
+                            "Unexpected conv1d weight shape: {:?}",
+                            shape
                         )));
                     };
                     let w = w.as_dtype(inputs.dtype())?;
@@ -2908,24 +3046,32 @@ impl GatedDeltaNet {
             let mut windows = Vec::with_capacity(S as usize);
             for i in 0..S {
                 windows.push(
-                    conv_input.index((.., i..i + ks, ..))
-                        .multiply(&wt)?.sum_axes(&[1], true)?,
+                    conv_input
+                        .index((.., i..i + ks, ..))
+                        .multiply(&wt)?
+                        .sum_axes(&[1], true)?,
                 );
             }
-            nn::silu(&ops::concatenate_axis(&windows.iter().collect::<Vec<_>>(), 1)?)?
+            nn::silu(&ops::concatenate_axis(
+                &windows.iter().collect::<Vec<_>>(),
+                1,
+            )?)?
         } else {
             nn::silu(&self.conv1d.forward(&conv_input)?)?
         };
 
         let split_indices = &[self.key_dim, self.key_dim * 2];
         let conv_parts = conv_out.split_axis(split_indices, Some(-1))?;
-        let conv_q = conv_parts.first()
+        let conv_q = conv_parts
+            .first()
             .ok_or_else(|| Exception::custom("conv split failed"))?
             .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
-        let conv_k = conv_parts.get(1)
+        let conv_k = conv_parts
+            .get(1)
             .ok_or_else(|| Exception::custom("conv split failed"))?
             .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
-        let conv_v = conv_parts.get(2)
+        let conv_v = conv_parts
+            .get(2)
             .ok_or_else(|| Exception::custom("conv split failed"))?
             .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
 
@@ -2946,14 +3092,24 @@ impl GatedDeltaNet {
             ops::zeros_dtype(
                 &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
                 inputs.dtype(),
-            ).unwrap()
+            )
+            .unwrap()
         });
         let (y, new_state, delta_tape) = gated_delta_kernel_ffi_with_tape(
-            &norm_q, &norm_k, &conv_v,
-            &self.A_log, &a, &self.dt_bias, &b,
-            &state, B, S,
-            self.num_k_heads, self.head_k_dim,
-            self.num_v_heads, self.head_v_dim,
+            &norm_q,
+            &norm_k,
+            &conv_v,
+            &self.A_log,
+            &a,
+            &self.dt_bias,
+            &b,
+            &state,
+            B,
+            S,
+            self.num_k_heads,
+            self.head_k_dim,
+            self.num_v_heads,
+            self.head_v_dim,
         )?;
         cache.ssm_state = Some(new_state);
         cache.offset += S;
@@ -3017,18 +3173,22 @@ impl GatedDeltaNet {
 
         let state = cache.ssm_state.take().unwrap_or_else(|| {
             let dt = tape.delta_tape.dtype();
-            ops::zeros_dtype(
-                &[1, self.num_v_heads, self.head_v_dim, self.head_k_dim], dt,
-            ).unwrap()
+            ops::zeros_dtype(&[1, self.num_v_heads, self.head_v_dim, self.head_k_dim], dt).unwrap()
         });
 
         let new_state = tape_replay_kernel_ffi(
-            &tape_slice, &k_slice, &a_slice,
-            &self.A_log, &self.dt_bias,
+            &tape_slice,
+            &k_slice,
+            &a_slice,
+            &self.A_log,
+            &self.dt_bias,
             &state,
-            1, n_accepted,
-            self.num_k_heads, self.head_k_dim,
-            self.num_v_heads, self.head_v_dim,
+            1,
+            n_accepted,
+            self.num_k_heads,
+            self.head_k_dim,
+            self.num_v_heads,
+            self.head_v_dim,
         )?;
         cache.ssm_state = Some(new_state);
         cache.offset += n_accepted;
@@ -3041,12 +3201,12 @@ impl GatedDeltaNet {
             // Prepend existing conv_state (or zeros), take last n_keep entries
             let prefix = match &cache.conv_state {
                 Some(cs) => cs.clone(),
-                None => ops::zeros_dtype(
-                    &[1, n_keep, self.conv_dim], tape.qkv_input.dtype(),
-                )?,
+                None => ops::zeros_dtype(&[1, n_keep, self.conv_dim], tape.qkv_input.dtype())?,
             };
             let full = ops::concatenate_axis(&[&prefix, &qkv_slice], 1)?;
-            let total_len = *full.shape().get(1)
+            let total_len = *full
+                .shape()
+                .get(1)
                 .ok_or_else(|| Exception::custom("conv rebuild: missing seq dim"))?;
             let start = total_len - n_keep;
             let cs = full.index((.., start.., ..));
@@ -3203,9 +3363,7 @@ impl GatedDeltaNet {
             ));
         }
         if donors.is_empty() {
-            return Err(Exception::custom(
-                "enable_ane_gdn_from_donor: donors empty",
-            ));
+            return Err(Exception::custom("enable_ane_gdn_from_donor: donors empty"));
         }
         if donors.len() > 1 {
             return Err(Exception::custom(format!(
@@ -3220,26 +3378,33 @@ impl GatedDeltaNet {
             Vec::with_capacity(donors.len());
         for (bi, donor) in donors.iter().enumerate() {
             let seq = donor.seq_len;
-            let donor_qkvz = donor.qkvz.as_ref().ok_or_else(|| Exception::custom(
-                "enable_ane_gdn_from_donor: donor missing separate qkvz kernel \
-                 (was compiled with fused layout — not supported for multi-bucket patching)"
-            ))?;
-            let donor_ba = donor.ba.as_ref().ok_or_else(|| Exception::custom(
-                "enable_ane_gdn_from_donor: donor missing separate ba kernel"
-            ))?;
+            let donor_qkvz = donor.qkvz.as_ref().ok_or_else(|| {
+                Exception::custom(
+                    "enable_ane_gdn_from_donor: donor missing separate qkvz kernel \
+                 (was compiled with fused layout — not supported for multi-bucket patching)",
+                )
+            })?;
+            let donor_ba = donor.ba.as_ref().ok_or_else(|| {
+                Exception::custom("enable_ane_gdn_from_donor: donor missing separate ba kernel")
+            })?;
             let load_before = crate::ane_bridge::load_count();
-            let qkvz = compile_proj_from_qlinear_donor(&self.in_proj_qkvz, donor_qkvz)
-                .map_err(|e| Exception::custom(format!(
-                    "patch qkvz bucket{bi}(seq={seq}) load_before={load_before}: {e}"
-                )))?;
-            let ba = compile_proj_from_qlinear_donor(&self.in_proj_ba, donor_ba)
-                .map_err(|e| Exception::custom(format!(
+            let qkvz =
+                compile_proj_from_qlinear_donor(&self.in_proj_qkvz, donor_qkvz).map_err(|e| {
+                    Exception::custom(format!(
+                        "patch qkvz bucket{bi}(seq={seq}) load_before={load_before}: {e}"
+                    ))
+                })?;
+            let ba = compile_proj_from_qlinear_donor(&self.in_proj_ba, donor_ba).map_err(|e| {
+                Exception::custom(format!(
                     "patch ba   bucket{bi}(seq={seq}) load_before={load_before}: {e}"
-                )))?;
+                ))
+            })?;
             let out_proj = compile_proj_from_qlinear_donor(&self.out_proj, &donor.out_proj)
-                .map_err(|e| Exception::custom(format!(
-                    "patch out  bucket{bi}(seq={seq}) load_before={load_before}: {e}"
-                )))?;
+                .map_err(|e| {
+                    Exception::custom(format!(
+                        "patch out  bucket{bi}(seq={seq}) load_before={load_before}: {e}"
+                    ))
+                })?;
             buckets.push(Arc::new(crate::qwen3_next_ane::GdnAneLayerKernels {
                 seq_len: qkvz.seq_len,
                 qkvz: Some(Arc::new(qkvz)),
@@ -3328,7 +3493,11 @@ fn dequantize_gdn_qlinear(
     }
     let out_dim = wshape[0] as usize;
     let w_f32 = crate::qwen3_next_ane::dequantize_qlinear_to_f32(
-        &ql.weight, &ql.scales, &ql.biases, ql.group_size, ql.bits,
+        &ql.weight,
+        &ql.scales,
+        &ql.biases,
+        ql.group_size,
+        ql.bits,
     )?;
     if out_dim == 0 || w_f32.is_empty() {
         return Err(Exception::custom(format!(
@@ -3339,7 +3508,8 @@ fn dequantize_gdn_qlinear(
     if in_dim * out_dim != w_f32.len() {
         return Err(Exception::custom(format!(
             "dequantize_gdn_qlinear({name}, layer {layer_idx}): weight len {} not divisible by oc {}",
-            w_f32.len(), out_dim
+            w_f32.len(),
+            out_dim
         )));
     }
     Ok((w_f32, in_dim, out_dim))
@@ -3961,9 +4131,7 @@ impl Qwen3NextCausalLM {
             .iter()
             .position(|l| l.is_linear)
             .ok_or_else(|| {
-                Exception::custom(
-                    "enable_ane_gdn_all_layers: model has no linear-attention layers",
-                )
+                Exception::custom("enable_ane_gdn_all_layers: model has no linear-attention layers")
             })?;
 
         // Compile layer `first_linear_idx` fully (one kernel set per bucket).
@@ -3979,14 +4147,13 @@ impl Qwen3NextCausalLM {
         let layer0_compile_ms = t0.elapsed().as_millis() as u64;
 
         // Snapshot the donor bucket list (Arc clone per bucket — cheap).
-        let donors: Vec<std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>> = self
-            .model
-            .layers[first_linear_idx]
-            .linear_attn
-            .as_ref()
-            .and_then(|g| g.ane_kernels.as_ref())
-            .map(|v| v.clone())
-            .ok_or_else(|| Exception::custom("donor kernels missing after enable_ane_gdn"))?;
+        let donors: Vec<std::sync::Arc<crate::qwen3_next_ane::GdnAneLayerKernels>> =
+            self.model.layers[first_linear_idx]
+                .linear_attn
+                .as_ref()
+                .and_then(|g| g.ane_kernels.as_ref())
+                .map(|v| v.clone())
+                .ok_or_else(|| Exception::custom("donor kernels missing after enable_ane_gdn"))?;
 
         // Patch the rest (per-bucket patch inside `enable_ane_gdn_from_donor`).
         let t_patch = Instant::now();
@@ -3998,9 +4165,8 @@ impl Qwen3NextCausalLM {
             let gdn = layer.linear_attn.as_mut().ok_or_else(|| {
                 Exception::custom(format!("layer {idx}: is_linear but linear_attn=None"))
             })?;
-            gdn.enable_ane_gdn_from_donor(&donors).map_err(|e| {
-                Exception::custom(format!("layer{idx} patch: {e}"))
-            })?;
+            gdn.enable_ane_gdn_from_donor(&donors)
+                .map_err(|e| Exception::custom(format!("layer{idx} patch: {e}")))?;
             if n_patched < 3 || n_patched % 4 == 0 {
                 eprintln!(
                     "patched layer{idx}: load_count={}",
@@ -4086,8 +4252,7 @@ impl Qwen3NextCausalLM {
         // handle by index after the worker spawns.
         let t_dequant = Instant::now();
         let mut linear_indices: Vec<usize> = Vec::new();
-        let mut layer_weights: Vec<crate::qwen3_next_ane_worker::GdnLayerWeights> =
-            Vec::new();
+        let mut layer_weights: Vec<crate::qwen3_next_ane_worker::GdnLayerWeights> = Vec::new();
         for (idx, layer) in self.model.layers.iter().enumerate() {
             if !layer.is_linear {
                 continue;
@@ -4106,10 +4271,8 @@ impl Qwen3NextCausalLM {
             }
             let (qkvz_w, qkvz_in, qkvz_out) =
                 dequantize_gdn_qlinear(&gdn.in_proj_qkvz, "qkvz", idx)?;
-            let (ba_w, ba_in, ba_out) =
-                dequantize_gdn_qlinear(&gdn.in_proj_ba, "ba", idx)?;
-            let (out_w, out_in, out_out) =
-                dequantize_gdn_qlinear(&gdn.out_proj, "out_proj", idx)?;
+            let (ba_w, ba_in, ba_out) = dequantize_gdn_qlinear(&gdn.in_proj_ba, "ba", idx)?;
+            let (out_w, out_in, out_out) = dequantize_gdn_qlinear(&gdn.out_proj, "out_proj", idx)?;
             linear_indices.push(idx);
             layer_weights.push(crate::qwen3_next_ane_worker::GdnLayerWeights {
                 qkvz_w_f32: qkvz_w,
@@ -4133,14 +4296,13 @@ impl Qwen3NextCausalLM {
         // Step 2: spawn the worker (compiles layer 0, patches 1..N-1).
         let t_spawn = Instant::now();
         let n_layers = layer_weights.len();
-        let handle = crate::qwen3_next_ane_worker::spawn_gdn_ane_worker(
-            layer_weights, seq_len, None,
-        )
-        .map_err(|e| {
-            Exception::custom(format!(
-                "enable_ane_gdn_all_layers_via_worker: spawn_gdn_ane_worker: {e}"
-            ))
-        })?;
+        let handle =
+            crate::qwen3_next_ane_worker::spawn_gdn_ane_worker(layer_weights, seq_len, None)
+                .map_err(|e| {
+                    Exception::custom(format!(
+                        "enable_ane_gdn_all_layers_via_worker: spawn_gdn_ane_worker: {e}"
+                    ))
+                })?;
         let spawn_ms = t_spawn.elapsed().as_millis() as u64;
 
         // Step 3: attach the handle to every linear layer.
@@ -4185,8 +4347,7 @@ impl Qwen3NextCausalLM {
         // Sanity: compile_count must rise by exactly 3 (one per projection
         // donor — patches use loadWithQoS only). This is the Wave 2 invariant
         // applied to the worker spawn path.
-        let compile_delta =
-            report.compile_count_after - report.compile_count_before;
+        let compile_delta = report.compile_count_after - report.compile_count_before;
         if compile_delta != 3 {
             eprintln!(
                 "WARN: enable_ane_gdn_all_layers_via_worker: expected compile_count delta=3 \
@@ -4213,15 +4374,13 @@ impl Qwen3NextCausalLM {
     pub fn prepare_ane_gdn_weights(
         &self,
         seq_len: i32,
-    ) -> Result<(Vec<crate::qwen3_next_ane_worker::GdnLayerWeights>, i32), Exception>
-    {
+    ) -> Result<(Vec<crate::qwen3_next_ane_worker::GdnLayerWeights>, i32), Exception> {
         if seq_len <= 0 {
             return Err(Exception::custom(format!(
                 "prepare_ane_gdn_weights: non-positive seq_len {seq_len}"
             )));
         }
-        let mut layer_weights: Vec<crate::qwen3_next_ane_worker::GdnLayerWeights> =
-            Vec::new();
+        let mut layer_weights: Vec<crate::qwen3_next_ane_worker::GdnLayerWeights> = Vec::new();
         for (idx, layer) in self.model.layers.iter().enumerate() {
             if !layer.is_linear {
                 continue;
@@ -4239,10 +4398,8 @@ impl Qwen3NextCausalLM {
             }
             let (qkvz_w, qkvz_in, qkvz_out) =
                 dequantize_gdn_qlinear(&gdn.in_proj_qkvz, "qkvz", idx)?;
-            let (ba_w, ba_in, ba_out) =
-                dequantize_gdn_qlinear(&gdn.in_proj_ba, "ba", idx)?;
-            let (out_w, out_in, out_out) =
-                dequantize_gdn_qlinear(&gdn.out_proj, "out_proj", idx)?;
+            let (ba_w, ba_in, ba_out) = dequantize_gdn_qlinear(&gdn.in_proj_ba, "ba", idx)?;
+            let (out_w, out_in, out_out) = dequantize_gdn_qlinear(&gdn.out_proj, "out_proj", idx)?;
             layer_weights.push(crate::qwen3_next_ane_worker::GdnLayerWeights {
                 qkvz_w_f32: qkvz_w,
                 qkvz_in,
@@ -4322,11 +4479,20 @@ impl Qwen3NextCausalLM {
         let pad = seq_len as usize;
         let w0 = &weights[0];
         let fused0 = crate::qwen3_next_ane::compile_fused_gdn_proj(
-            &w0.qkvz_w_f32, &w0.ba_w_f32, w0.qkvz_in, w0.qkvz_out, w0.ba_out, pad,
+            &w0.qkvz_w_f32,
+            &w0.ba_w_f32,
+            w0.qkvz_in,
+            w0.qkvz_out,
+            w0.ba_out,
+            pad,
         )
         .map_err(|e| Exception::custom(format!("finalize: layer 0 fused compile: {e}")))?;
         let out0 = crate::qwen3_next_ane::compile_proj(
-            &w0.out_w_f32, w0.out_in, w0.out_out, pad, "out_proj",
+            &w0.out_w_f32,
+            w0.out_in,
+            w0.out_out,
+            pad,
+            "out_proj",
         )
         .map_err(|e| Exception::custom(format!("finalize: layer 0 out_proj compile: {e}")))?;
 
@@ -4350,18 +4516,15 @@ impl Qwen3NextCausalLM {
                 )));
             }
             let fused_i = crate::qwen3_next_ane::compile_fused_gdn_proj_from_donor(
-                &fused0, &w.qkvz_w_f32, &w.ba_w_f32,
+                &fused0,
+                &w.qkvz_w_f32,
+                &w.ba_w_f32,
             )
-            .map_err(|e| {
-                Exception::custom(format!("finalize: layer {idx} fused patch: {e}"))
-            })?;
-            let out_i =
-                crate::qwen3_next_ane::compile_proj_from_donor(&out0, &w.out_w_f32)
-                    .map_err(|e| {
-                        Exception::custom(format!(
-                            "finalize: layer {idx} out_proj patch: {e}"
-                        ))
-                    })?;
+            .map_err(|e| Exception::custom(format!("finalize: layer {idx} fused patch: {e}")))?;
+            let out_i = crate::qwen3_next_ane::compile_proj_from_donor(&out0, &w.out_w_f32)
+                .map_err(|e| {
+                    Exception::custom(format!("finalize: layer {idx} out_proj patch: {e}"))
+                })?;
             tail.push((fused_i, out_i));
         }
         let mut compiled: Vec<(
@@ -4404,7 +4567,12 @@ impl Qwen3NextCausalLM {
         // worker thread setup at qwen3_next_ane_worker.rs:350. The
         // inference thread lives for the daemon's lifetime — never call
         // end_realtime.
-        let rt_enabled = crate::ane_bridge::AneKernel::begin_realtime();
+        let rt_enabled = if std::env::var("HIGGS_ANE_REALTIME").as_deref() == Ok("0") {
+            tracing::warn!("HIGGS_ANE_REALTIME=0 — skipping begin_realtime for GDN path");
+            false
+        } else {
+            crate::ane_bridge::AneKernel::begin_realtime()
+        };
 
         let load_after = crate::ane_bridge::load_count();
         let compile_after = crate::ane_bridge::compile_count();
@@ -4441,19 +4609,14 @@ impl Qwen3NextCausalLM {
     /// Send-safe (returns plain `Vec<f32>`). Ships across the inference-thread
     /// move; finalize on that thread via [`Self::finalize_ane_lm_head_inline`].
     #[cfg(feature = "ane")]
-    pub fn prepare_lm_head_weights(
-        &self,
-    ) -> Result<Option<(Vec<f32>, usize, usize)>, Exception> {
+    pub fn prepare_lm_head_weights(&self) -> Result<Option<(Vec<f32>, usize, usize)>, Exception> {
         let hidden = self.args.hidden_size as usize;
         let vocab = self.args.vocab_size as usize;
 
         if let Some(head) = self.dense_lm_head.as_ref() {
             let w = &head.weight.value;
             let shape = w.shape();
-            if shape.len() != 2
-                || shape[0] as usize != vocab
-                || shape[1] as usize != hidden
-            {
+            if shape.len() != 2 || shape[0] as usize != vocab || shape[1] as usize != hidden {
                 return Err(Exception::custom(format!(
                     "prepare_lm_head_weights: dense_lm_head shape {:?} != [{vocab}, {hidden}]",
                     shape
@@ -4546,12 +4709,11 @@ impl Qwen3NextCausalLM {
         let t_compile = Instant::now();
 
         let pad = seq_len as usize;
-        let kernel = crate::qwen3_next_ane::compile_proj_lut6(
-            &w_f32, hidden, vocab, pad, "lm_head",
-        )
-        .map_err(|e| {
-            Exception::custom(format!("finalize_ane_lm_head_inline: compile: {e}"))
-        })?;
+        let kernel =
+            crate::qwen3_next_ane::compile_proj_lut6(&w_f32, hidden, vocab, pad, "lm_head")
+                .map_err(|e| {
+                    Exception::custom(format!("finalize_ane_lm_head_inline: compile: {e}"))
+                })?;
         let compile_ms = t_compile.elapsed().as_millis() as u64;
 
         // Drop the dequantized weights ASAP — they're now baked into the ANE
@@ -4724,25 +4886,38 @@ impl Qwen3NextCausalLM {
 
         let t = Instant::now();
         let gate_k = crate::qwen3_next_ane::compile_proj_int8_mlpkg(
-            &gate_f32, hidden, inter, pad, "mlp0.gate",
+            &gate_f32,
+            hidden,
+            inter,
+            pad,
+            "mlp0.gate",
         )
-        .map_err(|e| Exception::custom(format!("finalize_ane_mlp_layer0_int8_inline: gate: {e}")))?;
+        .map_err(|e| {
+            Exception::custom(format!("finalize_ane_mlp_layer0_int8_inline: gate: {e}"))
+        })?;
         let gate_ms = t.elapsed().as_millis() as u64;
         drop(gate_f32);
 
         let t = Instant::now();
-        let up_k = crate::qwen3_next_ane::compile_proj_int8_mlpkg(
-            &up_f32, hidden, inter, pad, "mlp0.up",
-        )
-        .map_err(|e| Exception::custom(format!("finalize_ane_mlp_layer0_int8_inline: up: {e}")))?;
+        let up_k =
+            crate::qwen3_next_ane::compile_proj_int8_mlpkg(&up_f32, hidden, inter, pad, "mlp0.up")
+                .map_err(|e| {
+                    Exception::custom(format!("finalize_ane_mlp_layer0_int8_inline: up: {e}"))
+                })?;
         let up_ms = t.elapsed().as_millis() as u64;
         drop(up_f32);
 
         let t = Instant::now();
         let down_k = crate::qwen3_next_ane::compile_proj_int8_mlpkg(
-            &down_f32, inter, hidden, pad, "mlp0.down",
+            &down_f32,
+            inter,
+            hidden,
+            pad,
+            "mlp0.down",
         )
-        .map_err(|e| Exception::custom(format!("finalize_ane_mlp_layer0_int8_inline: down: {e}")))?;
+        .map_err(|e| {
+            Exception::custom(format!("finalize_ane_mlp_layer0_int8_inline: down: {e}"))
+        })?;
         let down_ms = t.elapsed().as_millis() as u64;
         drop(down_f32);
 
@@ -4840,8 +5015,12 @@ impl Qwen3NextCausalLM {
                 .map(|v| v == "1")
                 .unwrap_or(false);
 
-        for (layer_idx, (layer, layer_cache)) in
-            self.model.layers.iter_mut().zip(kv_cache.iter_mut()).enumerate()
+        for (layer_idx, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(kv_cache.iter_mut())
+            .enumerate()
         {
             let cache = layer_cache
                 .as_mut()
@@ -4890,16 +5069,14 @@ impl Qwen3NextCausalLM {
                     mlx_rs::transforms::eval([&h])?;
                 }
                 let ns = t0.elapsed().as_nanos() as u64;
-                let kind = if layer.is_linear { "attn_linear" } else { "attn_full" };
+                let kind = if layer.is_linear {
+                    "attn_linear"
+                } else {
+                    "attn_full"
+                };
                 let hidden = h.shape().last().copied().unwrap_or(0) as usize;
                 crate::decode_trace::record_layer(
-                    tok,
-                    layer_idx,
-                    kind,
-                    mlp_path,
-                    T as usize,
-                    hidden,
-                    ns,
+                    tok, layer_idx, kind, mlp_path, T as usize, hidden, ns,
                 );
             }
         }
@@ -5183,16 +5360,19 @@ impl Qwen3NextCausalLM {
         if kv_cache.len() != self.model.layers.len() {
             return Err(Exception::custom(format!(
                 "cache length ({}) must match num layers ({})",
-                kv_cache.len(), self.model.layers.len()
+                kv_cache.len(),
+                self.model.layers.len()
             )));
         }
 
         let shape = h.shape();
-        let T = *shape.get(1)
+        let T = *shape
+            .get(1)
             .ok_or_else(|| Exception::custom("Hidden state must have >= 2 dims"))?;
 
         let fa_mask: Option<AttentionMask> = if T > 1 {
-            let kv_offset = kv_cache.iter()
+            let kv_offset = kv_cache
+                .iter()
                 .filter_map(|lc| match lc.as_ref()? {
                     LayerCache::KV(kv) => Some(kv.offset()),
                     _ => None,
@@ -5201,7 +5381,10 @@ impl Qwen3NextCausalLM {
                 .unwrap_or(0);
 
             if kv_offset > 0 {
-                Some(AttentionMask::Array(create_causal_mask(T, Some(kv_offset))?))
+                Some(AttentionMask::Array(create_causal_mask(
+                    T,
+                    Some(kv_offset),
+                )?))
             } else {
                 Some(AttentionMask::Causal)
             }
@@ -5210,14 +5393,16 @@ impl Qwen3NextCausalLM {
         };
 
         let mut taps = Vec::with_capacity(tap_layers.len());
-        let mut layer_tapes: Vec<Option<GdnLayerTape>> = Vec::with_capacity(self.model.layers.len());
+        let mut layer_tapes: Vec<Option<GdnLayerTape>> =
+            Vec::with_capacity(self.model.layers.len());
 
         // Optional per-layer GDN/FA timing. Gated by env to avoid the eval()
         // stalls (which serialize the GPU pipeline) in normal runs. Numbers
         // produced under timing are upper bounds: they include synchronization
         // cost that real execution overlaps. Useful for the GDN-vs-FA ratio.
         let layer_timing = std::env::var("HIGGS_DFLASH_LAYER_TIMING")
-            .map(|v| v == "1").unwrap_or(false);
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let mut gdn_total_ms = 0.0_f64;
         let mut fa_total_ms = 0.0_f64;
         let mut gdn_count = 0usize;
@@ -5229,10 +5414,15 @@ impl Qwen3NextCausalLM {
             None
         };
 
-        for (layer_idx, (layer, layer_cache)) in self.model.layers.iter_mut()
-            .zip(kv_cache.iter_mut()).enumerate()
+        for (layer_idx, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(kv_cache.iter_mut())
+            .enumerate()
         {
-            let cache = layer_cache.as_mut()
+            let cache = layer_cache
+                .as_mut()
                 .ok_or_else(|| Exception::custom("Layer cache is None"))?;
             let is_linear = layer.is_linear;
             let mask_ref = if is_linear { None } else { fa_mask.as_ref() };
@@ -5240,7 +5430,9 @@ impl Qwen3NextCausalLM {
             let normed = layer.input_layernorm.forward(&h)?;
 
             let (r, tape) = if is_linear {
-                let attn = layer.linear_attn.as_mut()
+                let attn = layer
+                    .linear_attn
+                    .as_mut()
                     .ok_or_else(|| Exception::custom("linear_attn missing"))?;
                 let LayerCache::Arrays(ssm_cache) = cache else {
                     return Err(Exception::custom("Expected ArraysCache"));
@@ -5248,7 +5440,9 @@ impl Qwen3NextCausalLM {
                 let (out, tape) = attn.forward_with_tape(&normed, mask_ref, ssm_cache)?;
                 (out, Some(tape))
             } else {
-                let attn = layer.self_attn.as_mut()
+                let attn = layer
+                    .self_attn
+                    .as_mut()
                     .ok_or_else(|| Exception::custom("self_attn missing"))?;
                 let LayerCache::KV(layer_kv) = cache else {
                     return Err(Exception::custom("Expected KVCache"));
@@ -5293,8 +5487,14 @@ impl Qwen3NextCausalLM {
             tracing::info!(
                 "dflash_layer_timing seq={} gdn_layers={} gdn_total_ms={:.1} gdn_avg={:.2}ms \
                  fa_layers={} fa_total_ms={:.1} fa_avg={:.2}ms tail_ms={:.1}",
-                T, gdn_count, gdn_total_ms, gdn_total_ms / gdn_count.max(1) as f64,
-                fa_count, fa_total_ms, fa_total_ms / fa_count.max(1) as f64, tail_ms,
+                T,
+                gdn_count,
+                gdn_total_ms,
+                gdn_total_ms / gdn_count.max(1) as f64,
+                fa_count,
+                fa_total_ms,
+                fa_total_ms / fa_count.max(1) as f64,
+                tail_ms,
             );
         }
 
@@ -5321,11 +5521,7 @@ impl Qwen3NextCausalLM {
         kv_cache: &mut Vec<Option<LayerCache>>,
         tap_layers: &[usize],
         layer_chunk_size: usize,
-    ) -> Result<(
-        Array,
-        Vec<Array>,
-        Vec<Option<GdnLayerTape>>,
-    ), Exception> {
+    ) -> Result<(Array, Vec<Array>, Vec<Option<GdnLayerTape>>), Exception> {
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
         if kv_cache.is_empty() {
@@ -5335,16 +5531,19 @@ impl Qwen3NextCausalLM {
         if kv_cache.len() != self.model.layers.len() {
             return Err(Exception::custom(format!(
                 "cache length ({}) must match num layers ({})",
-                kv_cache.len(), self.model.layers.len()
+                kv_cache.len(),
+                self.model.layers.len()
             )));
         }
 
         let shape = h.shape();
-        let T = *shape.get(1)
+        let T = *shape
+            .get(1)
             .ok_or_else(|| Exception::custom("Hidden state must have >= 2 dims"))?;
 
         let fa_mask: Option<AttentionMask> = if T > 1 {
-            let kv_offset = kv_cache.iter()
+            let kv_offset = kv_cache
+                .iter()
                 .filter_map(|lc| match lc.as_ref()? {
                     LayerCache::KV(kv) => Some(kv.offset()),
                     _ => None,
@@ -5353,7 +5552,10 @@ impl Qwen3NextCausalLM {
                 .unwrap_or(0);
 
             if kv_offset > 0 {
-                Some(AttentionMask::Array(create_causal_mask(T, Some(kv_offset))?))
+                Some(AttentionMask::Array(create_causal_mask(
+                    T,
+                    Some(kv_offset),
+                )?))
             } else {
                 Some(AttentionMask::Causal)
             }
@@ -5367,7 +5569,8 @@ impl Qwen3NextCausalLM {
 
         // See `forward_with_taps_tape` for caveats on per-layer timing.
         let layer_timing = std::env::var("HIGGS_DFLASH_LAYER_TIMING")
-            .map(|v| v == "1").unwrap_or(false);
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let mut gdn_total_ms = 0.0_f64;
         let mut fa_total_ms = 0.0_f64;
         let mut gdn_count = 0usize;
@@ -5379,10 +5582,15 @@ impl Qwen3NextCausalLM {
             None
         };
 
-        for (layer_idx, (layer, layer_cache)) in self.model.layers.iter_mut()
-            .zip(kv_cache.iter_mut()).enumerate()
+        for (layer_idx, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(kv_cache.iter_mut())
+            .enumerate()
         {
-            let cache = layer_cache.as_mut()
+            let cache = layer_cache
+                .as_mut()
                 .ok_or_else(|| Exception::custom("Layer cache is None"))?;
 
             let is_linear = layer.is_linear;
@@ -5391,7 +5599,9 @@ impl Qwen3NextCausalLM {
             let normed = layer.input_layernorm.forward(&h)?;
 
             let (r, tape) = if is_linear {
-                let attn = layer.linear_attn.as_mut()
+                let attn = layer
+                    .linear_attn
+                    .as_mut()
                     .ok_or_else(|| Exception::custom("linear_attn missing"))?;
                 let LayerCache::Arrays(ssm_cache) = cache else {
                     return Err(Exception::custom("Expected ArraysCache"));
@@ -5399,7 +5609,9 @@ impl Qwen3NextCausalLM {
                 let (out, tape) = attn.forward_with_tape(&normed, mask_ref, ssm_cache)?;
                 (out, Some(tape))
             } else {
-                let attn = layer.self_attn.as_mut()
+                let attn = layer
+                    .self_attn
+                    .as_mut()
                     .ok_or_else(|| Exception::custom("self_attn missing"))?;
                 let LayerCache::KV(layer_kv) = cache else {
                     return Err(Exception::custom("Expected KVCache"));
@@ -5436,7 +5648,11 @@ impl Qwen3NextCausalLM {
             // Metal buffers (layernorm, projections, MLP intermediates).
             if (layer_idx + 1) % layer_chunk_size == 0 && layer_idx + 1 < num_layers {
                 let mut targets: Vec<&Array> = vec![&h];
-                for lt in layer_tapes.iter().skip(layer_idx + 1 - layer_chunk_size).flatten() {
+                for lt in layer_tapes
+                    .iter()
+                    .skip(layer_idx + 1 - layer_chunk_size)
+                    .flatten()
+                {
                     targets.push(&lt.delta_tape);
                     targets.push(&lt.norm_k);
                     targets.push(&lt.a_proj);
@@ -5460,8 +5676,14 @@ impl Qwen3NextCausalLM {
             tracing::info!(
                 "dflash_layer_timing_chunked seq={} gdn_layers={} gdn_total_ms={:.1} gdn_avg={:.2}ms \
                  fa_layers={} fa_total_ms={:.1} fa_avg={:.2}ms tail_ms={:.1}",
-                T, gdn_count, gdn_total_ms, gdn_total_ms / gdn_count.max(1) as f64,
-                fa_count, fa_total_ms, fa_total_ms / fa_count.max(1) as f64, tail_ms,
+                T,
+                gdn_count,
+                gdn_total_ms,
+                gdn_total_ms / gdn_count.max(1) as f64,
+                fa_count,
+                fa_total_ms,
+                fa_total_ms / fa_count.max(1) as f64,
+                tail_ms,
             );
         }
 
@@ -5504,14 +5726,23 @@ impl Qwen3NextCausalLM {
                         ac.ssm_state = tape.ssm_state_init.clone();
                         ac.offset = tape.offset_init;
 
-                        let gdn_layer = self.model.layers[i].linear_attn.as_ref()
+                        let gdn_layer = self.model.layers[i]
+                            .linear_attn
+                            .as_ref()
                             .ok_or_else(|| Exception::custom("linear_attn missing for replay"))?;
 
                         let state = tape.ssm_state_init.clone().unwrap_or_else(|| {
                             let dt = tape.delta_tape.dtype();
                             ops::zeros_dtype(
-                                &[1, gdn_layer.num_v_heads, gdn_layer.head_v_dim, gdn_layer.head_k_dim], dt,
-                            ).unwrap()
+                                &[
+                                    1,
+                                    gdn_layer.num_v_heads,
+                                    gdn_layer.head_v_dim,
+                                    gdn_layer.head_k_dim,
+                                ],
+                                dt,
+                            )
+                            .unwrap()
                         });
 
                         gdn_entries.push(GdnReplayEntry {
@@ -5523,7 +5754,9 @@ impl Qwen3NextCausalLM {
                     }
                 }
                 Some(LayerCache::KV(kv)) => {
-                    if kv_rollback > 0 { kv.rollback(kv_rollback); }
+                    if kv_rollback > 0 {
+                        kv.rollback(kv_rollback);
+                    }
                 }
                 _ => {}
             }
@@ -5534,18 +5767,24 @@ impl Qwen3NextCausalLM {
         }
 
         // Batch all GDN layers: concat tape/k/a/state/A_log/dt_bias along batch dim
-        let tape_slices: Vec<Array> = gdn_entries.iter()
+        let tape_slices: Vec<Array> = gdn_entries
+            .iter()
             .map(|e| e.tape.delta_tape.index((.., ..n_accepted, ..)))
             .collect();
-        let k_slices: Vec<Array> = gdn_entries.iter()
+        let k_slices: Vec<Array> = gdn_entries
+            .iter()
             .map(|e| e.tape.norm_k.index((.., ..n_accepted, ..)))
             .collect();
-        let a_slices: Vec<Array> = gdn_entries.iter()
+        let a_slices: Vec<Array> = gdn_entries
+            .iter()
             .map(|e| e.tape.a_proj.index((.., ..n_accepted, ..)))
             .collect();
         let states: Vec<&Array> = gdn_entries.iter().map(|e| &e.snap_state).collect();
         let a_logs: Vec<&Array> = gdn_entries.iter().map(|e| e.layer.A_log.as_ref()).collect();
-        let dt_biases: Vec<&Array> = gdn_entries.iter().map(|e| e.layer.dt_bias.as_ref()).collect();
+        let dt_biases: Vec<&Array> = gdn_entries
+            .iter()
+            .map(|e| e.layer.dt_bias.as_ref())
+            .collect();
 
         let tape_refs: Vec<&Array> = tape_slices.iter().collect();
         let k_refs: Vec<&Array> = k_slices.iter().collect();
@@ -5564,12 +5803,18 @@ impl Qwen3NextCausalLM {
 
         // Single kernel dispatch for all GDN layers
         let batched_new_state = tape_replay_kernel_ffi(
-            &batched_tape, &batched_k, &batched_a,
-            &batched_a_log, &batched_dt_bias,
+            &batched_tape,
+            &batched_k,
+            &batched_a,
+            &batched_a_log,
+            &batched_dt_bias,
             &batched_state,
-            num_layers, n_accepted,
-            e0.layer.num_k_heads, e0.layer.head_k_dim,
-            e0.layer.num_v_heads, e0.layer.head_v_dim,
+            num_layers,
+            n_accepted,
+            e0.layer.num_k_heads,
+            e0.layer.head_k_dim,
+            e0.layer.num_v_heads,
+            e0.layer.head_v_dim,
         )?;
 
         // Split results back to individual layers and rebuild conv_state
@@ -5593,11 +5838,14 @@ impl Qwen3NextCausalLM {
                 let prefix = match &ac.conv_state {
                     Some(cs) => cs.clone(),
                     None => ops::zeros_dtype(
-                        &[1, n_keep, entry.layer.conv_dim], entry.tape.qkv_input.dtype(),
+                        &[1, n_keep, entry.layer.conv_dim],
+                        entry.tape.qkv_input.dtype(),
                     )?,
                 };
                 let full = ops::concatenate_axis(&[&prefix, &qkv_slice], 1)?;
-                let total_len = *full.shape().get(1)
+                let total_len = *full
+                    .shape()
+                    .get(1)
                     .ok_or_else(|| Exception::custom("conv rebuild: missing seq dim"))?;
                 let cs_start = total_len - n_keep;
                 let cs = full.index((.., cs_start.., ..));
@@ -5622,10 +5870,7 @@ impl Qwen3NextCausalLM {
     /// Used by DFlash: the drafter produces hidden states in the target model's
     /// hidden space, and we project them through the target's lm_head to get logits.
     /// Input: `[B, T, hidden_size]`. Returns: `[B, T, vocab_size]`.
-    pub fn forward_all_logits_from_hidden(
-        &self,
-        hidden: &Array,
-    ) -> Result<Array, Exception> {
+    pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
         self.project_logits(hidden)
     }
 
@@ -14312,7 +14557,8 @@ mod tests {
         let flat = qwen35_dense_text_config();
         // Add the top-level tie_word_embeddings the VLM wrapper normally supplies
         // so both code paths end up with identical args.
-        let flat_with_tie = flat.trim_end_matches('}').to_string() + r#", "tie_word_embeddings": false}"#;
+        let flat_with_tie =
+            flat.trim_end_matches('}').to_string() + r#", "tie_word_embeddings": false}"#;
         std::fs::write(dir.path().join("config.json"), &flat_with_tie).unwrap();
         let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
         assert_eq!(args.num_hidden_layers, 4);
@@ -14789,7 +15035,9 @@ mod tests {
         }
 
         let max_seq: i32 = std::env::var("BENCH_MAX_SEQ")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
         let all_lens: &[i32] = &[128, 512, 1024, 2048, 5120];
         let seq_lengths: Vec<i32> = all_lens.iter().copied().filter(|&t| t <= max_seq).collect();
         let seq_lengths: &[i32] = &seq_lengths;
@@ -15011,17 +15259,19 @@ mod tests {
             let mut tgts: Vec<&Array> = vec![&prefill_out];
             for lc in &cache {
                 if let Some(LayerCache::Arrays(ac)) = lc {
-                    if let Some(ref s) = ac.ssm_state { tgts.push(s); }
-                    if let Some(ref c) = ac.conv_state { tgts.push(c); }
+                    if let Some(ref s) = ac.ssm_state {
+                        tgts.push(s);
+                    }
+                    if let Some(ref c) = ac.conv_state {
+                        tgts.push(c);
+                    }
                 }
             }
             eval(tgts).unwrap();
         }
 
         // 2 warmup decode steps
-        let tok = ops::indexing::argmax_axis(
-            &prefill_out.index((.., -1, ..)), -1, false,
-        ).unwrap();
+        let tok = ops::indexing::argmax_axis(&prefill_out.index((.., -1, ..)), -1, false).unwrap();
         eval([&tok]).unwrap();
         let mut current = tok;
         for _ in 0..2 {
@@ -15060,9 +15310,9 @@ mod tests {
 
             let fa_mask: Option<AttentionMask> = if block_k > 1 {
                 if kv_offset > block_k {
-                    Some(AttentionMask::Array(create_causal_mask(
-                        block_k, Some(kv_offset),
-                    ).unwrap()))
+                    Some(AttentionMask::Array(
+                        create_causal_mask(block_k, Some(kv_offset)).unwrap(),
+                    ))
                 } else {
                     Some(AttentionMask::Causal)
                 }
@@ -15085,7 +15335,11 @@ mod tests {
 
             for (layer, layer_cache) in model.model.layers.iter_mut().zip(cache.iter_mut()) {
                 let lc = layer_cache.as_mut().unwrap();
-                let mask_ref = if layer.is_linear { None } else { fa_mask.as_ref() };
+                let mask_ref = if layer.is_linear {
+                    None
+                } else {
+                    fa_mask.as_ref()
+                };
 
                 let t0 = Instant::now();
                 let normed = layer.input_layernorm.forward(&h).unwrap();
@@ -15095,18 +15349,26 @@ mod tests {
                 let t0 = Instant::now();
                 let r = if layer.is_linear {
                     let gdn = layer.linear_attn.as_mut().unwrap();
-                    let LayerCache::Arrays(sc) = lc else { panic!("Expected ArraysCache"); };
+                    let LayerCache::Arrays(sc) = lc else {
+                        panic!("Expected ArraysCache");
+                    };
                     let out = gdn.forward(&normed, mask_ref, sc).unwrap();
                     let mut tgts: Vec<&Array> = vec![&out];
-                    if let Some(ref s) = sc.ssm_state { tgts.push(s); }
-                    if let Some(ref c) = sc.conv_state { tgts.push(c); }
+                    if let Some(ref s) = sc.ssm_state {
+                        tgts.push(s);
+                    }
+                    if let Some(ref c) = sc.conv_state {
+                        tgts.push(c);
+                    }
                     eval(tgts).unwrap();
                     n_gdn += 1;
                     ns_gdn += t0.elapsed().as_nanos();
                     out
                 } else {
                     let attn = layer.self_attn.as_mut().unwrap();
-                    let LayerCache::KV(kvc) = lc else { panic!("Expected KVCache"); };
+                    let LayerCache::KV(kvc) = lc else {
+                        panic!("Expected KVCache");
+                    };
                     let out = attn.forward(&normed, mask_ref, kvc).unwrap();
                     eval([&out].into_iter()).unwrap();
                     n_attn += 1;
@@ -15154,32 +15416,42 @@ mod tests {
             println!("  Wall (no barriers):   {:>8.1}ms", wall_ms);
             println!(
                 "  Sum  (eval barriers): {:>8.1}ms  (overhead: {:.1}ms)",
-                ms(barrier_total), ms(barrier_total) - wall_ms,
+                ms(barrier_total),
+                ms(barrier_total) - wall_ms,
             );
             println!();
             println!(
                 "  embed:            {:>8.1}ms  {:>5.1}%",
-                ms(ns_embed), pct(ns_embed),
+                ms(ns_embed),
+                pct(ns_embed),
             );
             println!(
                 "  GDN ({n_gdn:>2} layers): {:>8.1}ms  {:>5.1}%   [{:.2}ms/layer]",
-                ms(ns_gdn), pct(ns_gdn), ms(ns_gdn) / n_gdn.max(1) as f64,
+                ms(ns_gdn),
+                pct(ns_gdn),
+                ms(ns_gdn) / n_gdn.max(1) as f64,
             );
             println!(
                 "  Attn ({n_attn:>2} layers): {:>8.1}ms  {:>5.1}%   [{:.2}ms/layer]",
-                ms(ns_attn), pct(ns_attn), ms(ns_attn) / n_attn.max(1) as f64,
+                ms(ns_attn),
+                pct(ns_attn),
+                ms(ns_attn) / n_attn.max(1) as f64,
             );
             println!(
                 "  MLP/MoE:          {:>8.1}ms  {:>5.1}%   [{:.2}ms/layer]",
-                ms(ns_mlp), pct(ns_mlp), ms(ns_mlp) / n_total.max(1) as f64,
+                ms(ns_mlp),
+                pct(ns_mlp),
+                ms(ns_mlp) / n_total.max(1) as f64,
             );
             println!(
                 "  norms+residual:   {:>8.1}ms  {:>5.1}%",
-                ms(ns_norm), pct(ns_norm),
+                ms(ns_norm),
+                pct(ns_norm),
             );
             println!(
                 "  lm_head:          {:>8.1}ms  {:>5.1}%",
-                ms(ns_lm), pct(ns_lm),
+                ms(ns_lm),
+                pct(ns_lm),
             );
             println!(
                 "  ---- GDN share of wall: {:.1}%",
@@ -15234,20 +15506,14 @@ mod tests {
         eval(to_eval).unwrap();
 
         // --- Warmup: 2 decode steps ---
-        let tok = ops::indexing::argmax_axis(
-            &prefill_out.index((.., -1, ..)),
-            -1,
-            false,
-        )
-        .unwrap();
+        let tok = ops::indexing::argmax_axis(&prefill_out.index((.., -1, ..)), -1, false).unwrap();
         eval([&tok]).unwrap();
 
         let mut current = tok;
         for _ in 0..2 {
             let inp = current.index((.., ops::indexing::NewAxis));
             let out = model.forward(&inp, None, &mut cache).unwrap();
-            current =
-                ops::indexing::argmax_axis(&out.index((.., -1, ..)), -1, false).unwrap();
+            current = ops::indexing::argmax_axis(&out.index((.., -1, ..)), -1, false).unwrap();
             eval([&current]).unwrap();
         }
 
@@ -15268,8 +15534,7 @@ mod tests {
             s1_times.push(t0.elapsed());
             // Undo the cache advancement by continuing (cache already updated, but
             // we measure the same workload each time — offset grows by 1 per trial)
-            current =
-                ops::indexing::argmax_axis(&h.index((.., -1, ..)), -1, false).unwrap();
+            current = ops::indexing::argmax_axis(&h.index((.., -1, ..)), -1, false).unwrap();
             eval([&current]).unwrap();
         }
         let s1_median_ms = {
@@ -15297,8 +15562,7 @@ mod tests {
                 // Undo: cache offset grows by block_k each trial
             }
             let bk_median_ms = {
-                let mut ms: Vec<f64> =
-                    bk_times.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+                let mut ms: Vec<f64> = bk_times.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
                 ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 ms[ms.len() / 2]
             };
@@ -15343,9 +15607,9 @@ mod tests {
         let kernel_size = 4i32;
 
         // Depthwise Conv1d weight: [conv_dim, kernel_size, 1] (groups=conv_dim)
-        let weight = mlx_rs::random::uniform::<f32, f32>(
-            -1.0, 1.0, &[conv_dim, kernel_size, 1], None,
-        ).unwrap();
+        let weight =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[conv_dim, kernel_size, 1], None)
+                .unwrap();
         eval([&weight]).unwrap();
 
         // Transposed weight for fast path: [kernel_size, conv_dim]
@@ -15354,9 +15618,9 @@ mod tests {
 
         for s in [2, 4, 8, 16] {
             let total_len = kernel_size - 1 + s;
-            let conv_input = mlx_rs::random::uniform::<f32, f32>(
-                -1.0, 1.0, &[1, total_len, conv_dim], None,
-            ).unwrap();
+            let conv_input =
+                mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, total_len, conv_dim], None)
+                    .unwrap();
             eval([&conv_input]).unwrap();
 
             // Reference: native depthwise Conv1d kernel
@@ -15375,12 +15639,10 @@ mod tests {
                         .unwrap(),
                 );
             }
-            let fast_out =
-                ops::concatenate_axis(&windows.iter().collect::<Vec<_>>(), 1).unwrap();
+            let fast_out = ops::concatenate_axis(&windows.iter().collect::<Vec<_>>(), 1).unwrap();
             eval([&fast_out]).unwrap();
 
-            assert_eq!(ref_out.shape(), fast_out.shape(),
-                "shape mismatch at S={s}");
+            assert_eq!(ref_out.shape(), fast_out.shape(), "shape mismatch at S={s}");
 
             let diff = ref_out.subtract(&fast_out).unwrap().abs().unwrap();
             let max_diff: f32 = diff.max(None).unwrap().item();
@@ -15420,8 +15682,12 @@ mod tests {
             let mut tgts: Vec<&Array> = vec![&prefill_out];
             for lc in &cache_a {
                 if let Some(LayerCache::Arrays(ac)) = lc {
-                    if let Some(ref s) = ac.ssm_state { tgts.push(s); }
-                    if let Some(ref c) = ac.conv_state { tgts.push(c); }
+                    if let Some(ref s) = ac.ssm_state {
+                        tgts.push(s);
+                    }
+                    if let Some(ref c) = ac.conv_state {
+                        tgts.push(c);
+                    }
                 }
             }
             eval(tgts).unwrap();
@@ -15440,9 +15706,7 @@ mod tests {
             seq_logits.push(logits); // [1, 1, vocab]
         }
         // Stack → [1, block_k, vocab]
-        let seq_all = ops::concatenate_axis(
-            &seq_logits.iter().collect::<Vec<_>>(), 1,
-        ).unwrap();
+        let seq_all = ops::concatenate_axis(&seq_logits.iter().collect::<Vec<_>>(), 1).unwrap();
         eval([&seq_all]).unwrap();
 
         // --- Path B: L=block_k block forward ---
@@ -15534,7 +15798,10 @@ mod tests {
 
         println!("\n==== Dense 27B-4bit, ctx={prompt_len} ====");
         println!("  Prefill TTFT: {prefill_ms:.1} ms");
-        println!("  S=1 decode median: {med:.2} ms  ({:.1} tok/s)", 1000.0 / med);
+        println!(
+            "  S=1 decode median: {med:.2} ms  ({:.1} tok/s)",
+            1000.0 / med
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -15564,7 +15831,10 @@ mod tests {
         let prompt_lengths: &[i32] = &[256, 2048];
         let n_decode = 20usize;
 
-        println!("\n{:>8}  {:>10}  {:>10}  {:>8}", "ctx", "dense_ms", "tq_ms", "tq/dense");
+        println!(
+            "\n{:>8}  {:>10}  {:>10}  {:>8}",
+            "ctx", "dense_ms", "tq_ms", "tq/dense"
+        );
         println!("{}", "-".repeat(44));
 
         for &prompt_len in prompt_lengths {
@@ -15603,8 +15873,13 @@ mod tests {
             tq_samples.sort_by(f64::total_cmp);
             let tq_med = tq_samples[n_decode / 2];
 
-            println!("{:>8}  {:>10.2}  {:>10.2}  {:>8.3}x",
-                prompt_len, dense_med, tq_med, tq_med / dense_med);
+            println!(
+                "{:>8}  {:>10.2}  {:>10.2}  {:>8.3}x",
+                prompt_len,
+                dense_med,
+                tq_med,
+                tq_med / dense_med
+            );
         }
     }
 
@@ -15642,8 +15917,7 @@ mod tests {
         let vocab = model.args.vocab_size;
         eprintln!(
             "Loaded: {} layers, hidden={hidden}, intermediate={intermediate}, fa_interval={}, vocab={vocab}",
-            model.args.num_hidden_layers,
-            model.args.full_attention_interval,
+            model.args.num_hidden_layers, model.args.full_attention_interval,
         );
 
         // ── 1. Verify weight dtypes are BF16 (not quantized) ──
@@ -15673,21 +15947,35 @@ mod tests {
         // ── 2. QEmbedding BF16 path (line 296: self.weight.index(indices)) ──
         let embed = &model.model.embed_tokens;
         eprintln!("\n=== QEmbedding BF16 ===");
-        eprintln!("  weight dtype: {:?}, shape: {:?}", embed.weight.dtype(), embed.weight.shape());
+        eprintln!(
+            "  weight dtype: {:?}, shape: {:?}",
+            embed.weight.dtype(),
+            embed.weight.shape()
+        );
         assert_eq!(embed.weight.dtype(), Dtype::Bfloat16);
 
         let indices = Array::from_slice(&[1u32, 100, 5000, 42], &[1, 4]);
         let emb_out = embed.forward(&indices).unwrap();
         eval([&emb_out]).unwrap();
-        eprintln!("  output shape: {:?}, dtype: {:?}", emb_out.shape(), emb_out.dtype());
+        eprintln!(
+            "  output shape: {:?}, dtype: {:?}",
+            emb_out.shape(),
+            emb_out.dtype()
+        );
         assert_eq!(emb_out.shape(), &[1, 4, hidden]);
 
         let emb_abs = emb_out.abs().unwrap();
         let emb_max: f32 = emb_abs.max(None).unwrap().item();
         let emb_mean: f32 = emb_abs.mean(None).unwrap().item();
         eprintln!("  |embed| max={emb_max:.4}, mean={emb_mean:.6}");
-        assert!(emb_max.is_finite() && emb_max > 0.001, "Dead embedding: max={emb_max}");
-        assert!(emb_mean.is_finite() && emb_mean > 0.0001, "Dead embedding: mean={emb_mean}");
+        assert!(
+            emb_max.is_finite() && emb_max > 0.001,
+            "Dead embedding: max={emb_max}"
+        );
+        assert!(
+            emb_mean.is_finite() && emb_mean > 0.0001,
+            "Dead embedding: mean={emb_mean}"
+        );
 
         // ── 3. QLinear BF16 path (line 254: matmul(x, self.weight.value.t())) ──
         eprintln!("\n=== QLinear BF16 ===");
@@ -15701,13 +15989,7 @@ mod tests {
         assert_eq!(gate.weight.dtype(), Dtype::Bfloat16);
 
         // Feed a realistic-magnitude input through a single QLinear
-        let x_linear = mlx_rs::random::normal::<f32>(
-            &[1, 1, hidden],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let x_linear = mlx_rs::random::normal::<f32>(&[1, 1, hidden], None, None, None).unwrap();
         let x_bf16 = x_linear.as_dtype(Dtype::Bfloat16).unwrap();
         let lin_out = gate.forward(&x_bf16).unwrap();
         eval([&lin_out]).unwrap();
@@ -15722,7 +16004,10 @@ mod tests {
         let lin_max: f32 = lin_abs.max(None).unwrap().item();
         let lin_mean: f32 = lin_abs.mean(None).unwrap().item();
         eprintln!("  |gate_proj(x)| max={lin_max:.4}, mean={lin_mean:.6}");
-        assert!(lin_max.is_finite() && lin_max > 0.001, "Dead QLinear: max={lin_max}");
+        assert!(
+            lin_max.is_finite() && lin_max > 0.001,
+            "Dead QLinear: max={lin_max}"
+        );
 
         // Also check down_proj (intermediate → hidden)
         let down = l0.mlp.down_proj.as_ref().unwrap();
@@ -15731,20 +16016,18 @@ mod tests {
             down.weight.dtype(),
             down.weight.shape()
         );
-        let x_inter = mlx_rs::random::normal::<f32>(
-            &[1, 1, intermediate],
-            None,
-            None,
-            None,
-        )
-        .unwrap()
-        .as_dtype(Dtype::Bfloat16)
-        .unwrap();
+        let x_inter = mlx_rs::random::normal::<f32>(&[1, 1, intermediate], None, None, None)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
         let down_out = down.forward(&x_inter).unwrap();
         eval([&down_out]).unwrap();
         let down_max: f32 = down_out.abs().unwrap().max(None).unwrap().item();
         eprintln!("  |down_proj(x)| max={down_max:.4}");
-        assert!(down_max.is_finite() && down_max > 0.001, "Dead down_proj: max={down_max}");
+        assert!(
+            down_max.is_finite() && down_max > 0.001,
+            "Dead down_proj: max={down_max}"
+        );
 
         // ── 4. FfnBlock dense BF16 path (line 1826-1829: separate gate/up/down) ──
         eprintln!("\n=== FfnBlock dense BF16 (SwiGLU) ===");
@@ -15759,15 +16042,10 @@ mod tests {
             gp_dtype != Dtype::Uint32 || up_dtype != Dtype::Uint32
         );
 
-        let x_ffn = mlx_rs::random::normal::<f32>(
-            &[1, 4, hidden],
-            None,
-            None,
-            None,
-        )
-        .unwrap()
-        .as_dtype(Dtype::Bfloat16)
-        .unwrap();
+        let x_ffn = mlx_rs::random::normal::<f32>(&[1, 4, hidden], None, None, None)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
         let ffn_out = ffn.forward(&x_ffn).unwrap();
         eval([&ffn_out]).unwrap();
         eprintln!(
@@ -15781,60 +16059,66 @@ mod tests {
         let ffn_max: f32 = ffn_abs.max(None).unwrap().item();
         let ffn_mean: f32 = ffn_abs.mean(None).unwrap().item();
         eprintln!("  |FfnBlock(x)| max={ffn_max:.4}, mean={ffn_mean:.6}");
-        assert!(ffn_max.is_finite() && ffn_max > 0.001, "Dead FfnBlock: max={ffn_max}");
+        assert!(
+            ffn_max.is_finite() && ffn_max > 0.001,
+            "Dead FfnBlock: max={ffn_max}"
+        );
         assert!(ffn_mean.is_finite(), "NaN in FfnBlock output");
 
         // ── 5. lm_head BF16 path ──
         eprintln!("\n=== lm_head BF16 ===");
         if let Some(ref mut head) = model.dense_lm_head {
             eprintln!("  dense_lm_head present (nn::Linear)");
-            let h_in = mlx_rs::random::normal::<f32>(
-                &[1, 1, hidden],
-                None,
-                None,
-                None,
-            )
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
+            let h_in = mlx_rs::random::normal::<f32>(&[1, 1, hidden], None, None, None)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
             let lm_out = head.forward(&h_in).unwrap();
             eval([&lm_out]).unwrap();
             let lm_max: f32 = lm_out.abs().unwrap().max(None).unwrap().item();
-            eprintln!("  output shape: {:?}, |lm_head| max={lm_max:.4}", lm_out.shape());
-            assert!(lm_max.is_finite() && lm_max > 0.001, "Dead lm_head: max={lm_max}");
+            eprintln!(
+                "  output shape: {:?}, |lm_head| max={lm_max:.4}",
+                lm_out.shape()
+            );
+            assert!(
+                lm_max.is_finite() && lm_max > 0.001,
+                "Dead lm_head: max={lm_max}"
+            );
         } else if let Some(ref head) = model.lm_head {
             eprintln!("  QLinear lm_head, weight dtype: {:?}", head.weight.dtype());
-            let h_in = mlx_rs::random::normal::<f32>(
-                &[1, 1, hidden],
-                None,
-                None,
-                None,
-            )
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
+            let h_in = mlx_rs::random::normal::<f32>(&[1, 1, hidden], None, None, None)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
             let lm_out = head.forward(&h_in).unwrap();
             eval([&lm_out]).unwrap();
             let lm_max: f32 = lm_out.abs().unwrap().max(None).unwrap().item();
-            eprintln!("  output shape: {:?}, |lm_head| max={lm_max:.4}", lm_out.shape());
-            assert!(lm_max.is_finite() && lm_max > 0.001, "Dead lm_head: max={lm_max}");
+            eprintln!(
+                "  output shape: {:?}, |lm_head| max={lm_max:.4}",
+                lm_out.shape()
+            );
+            assert!(
+                lm_max.is_finite() && lm_max > 0.001,
+                "Dead lm_head: max={lm_max}"
+            );
         } else {
             // Tied embeddings — as_linear path
             eprintln!("  Tied embeddings (as_linear path)");
-            let h_in = mlx_rs::random::normal::<f32>(
-                &[1, 1, hidden],
-                None,
-                None,
-                None,
-            )
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
+            let h_in = mlx_rs::random::normal::<f32>(&[1, 1, hidden], None, None, None)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
             let lm_out = model.model.embed_tokens.as_linear(&h_in).unwrap();
             eval([&lm_out]).unwrap();
             let lm_max: f32 = lm_out.abs().unwrap().max(None).unwrap().item();
-            eprintln!("  output shape: {:?}, |as_linear| max={lm_max:.4}", lm_out.shape());
-            assert!(lm_max.is_finite() && lm_max > 0.001, "Dead as_linear: max={lm_max}");
+            eprintln!(
+                "  output shape: {:?}, |as_linear| max={lm_max:.4}",
+                lm_out.shape()
+            );
+            assert!(
+                lm_max.is_finite() && lm_max > 0.001,
+                "Dead as_linear: max={lm_max}"
+            );
         }
 
         eprintln!("\n✓ All BF16 forward paths produce finite, non-zero outputs.");
@@ -15876,7 +16160,10 @@ mod tests {
                 ms.push(t.elapsed().as_secs_f64() * 1000.0);
             }
             ms.sort_by(f64::total_cmp);
-            eprintln!("  QLinear gate:  {:.3} ms (median)  [{hidden}→{intermediate}]", ms[n_iter / 2]);
+            eprintln!(
+                "  QLinear gate:  {:.3} ms (median)  [{hidden}→{intermediate}]",
+                ms[n_iter / 2]
+            );
         }
 
         // QLinear (down_proj: intermediate→hidden)
@@ -15896,7 +16183,10 @@ mod tests {
                 ms.push(t.elapsed().as_secs_f64() * 1000.0);
             }
             ms.sort_by(f64::total_cmp);
-            eprintln!("  QLinear down:  {:.3} ms (median)  [{intermediate}→{hidden}]", ms[n_iter / 2]);
+            eprintln!(
+                "  QLinear down:  {:.3} ms (median)  [{intermediate}→{hidden}]",
+                ms[n_iter / 2]
+            );
         }
 
         // FfnBlock (full SwiGLU: gate+up+silu+down)
@@ -15911,7 +16201,10 @@ mod tests {
                 ms.push(t.elapsed().as_secs_f64() * 1000.0);
             }
             ms.sort_by(f64::total_cmp);
-            eprintln!("  FfnBlock:     {:.3} ms (median)  [SwiGLU {hidden}→{intermediate}→{hidden}]", ms[n_iter / 2]);
+            eprintln!(
+                "  FfnBlock:     {:.3} ms (median)  [SwiGLU {hidden}→{intermediate}→{hidden}]",
+                ms[n_iter / 2]
+            );
         }
 
         // lm_head
@@ -15926,7 +16219,10 @@ mod tests {
                     ms.push(t.elapsed().as_secs_f64() * 1000.0);
                 }
                 ms.sort_by(f64::total_cmp);
-                eprintln!("  lm_head:      {:.3} ms (median)  [{hidden}→{vocab}]", ms[n_iter / 2]);
+                eprintln!(
+                    "  lm_head:      {:.3} ms (median)  [{hidden}→{vocab}]",
+                    ms[n_iter / 2]
+                );
             }
         }
 
@@ -15941,7 +16237,10 @@ mod tests {
         })) {
             Ok(out) => {
                 let out_max: f32 = out.abs().unwrap().max(None).unwrap().item();
-                eprintln!("  output shape: {:?}, |logits| max={out_max:.4}", out.shape());
+                eprintln!(
+                    "  output shape: {:?}, |logits| max={out_max:.4}",
+                    out.shape()
+                );
 
                 // S=1 decode timing
                 let mut ms = Vec::with_capacity(n_iter);
@@ -15972,9 +16271,12 @@ mod tests {
         let dk = 128i32;
         let dv = 128i32;
 
-        let q: Array = mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[b, s, nk, dk], None).unwrap();
-        let k: Array = mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[b, s, nk, dk], None).unwrap();
-        let v: Array = mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[b, s, nv, dv], None).unwrap();
+        let q: Array =
+            mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[b, s, nk, dk], None).unwrap();
+        let k: Array =
+            mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[b, s, nk, dk], None).unwrap();
+        let v: Array =
+            mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[b, s, nv, dv], None).unwrap();
         let g: Array = mlx_rs::random::uniform::<f32, f32>(-5.0, -0.5, &[b, s, nv], None).unwrap();
         let beta: Array = mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[b, s, nv], None).unwrap();
 
@@ -15989,17 +16291,18 @@ mod tests {
         let k_refs: Vec<&Array> = k_parts.iter().collect();
         let k_rep = concatenate_axis(&k_refs, 2).unwrap();
 
-        let (chunk_y, chunk_state) = chunk_gated_delta_rule(
-            &q_rep, &k_rep, &v, &g, &beta,
-            nv, dk, nv, dv,
-            None,
-        ).unwrap();
+        let (chunk_y, chunk_state) =
+            chunk_gated_delta_rule(&q_rep, &k_rep, &v, &g, &beta, nv, dk, nv, dv, None).unwrap();
         chunk_y.eval().unwrap();
         chunk_state.eval().unwrap();
         let cy_max: f32 = chunk_y.abs().unwrap().max(None).unwrap().item();
         let cs_max: f32 = chunk_state.abs().unwrap().max(None).unwrap().item();
         eprintln!("chunk_y: max={:.4}, shape={:?}", cy_max, chunk_y.shape());
-        eprintln!("chunk_state: max={:.4}, shape={:?}", cs_max, chunk_state.shape());
+        eprintln!(
+            "chunk_state: max={:.4}, shape={:?}",
+            cs_max,
+            chunk_state.shape()
+        );
 
         assert!(!cy_max.is_nan(), "chunk y has NaN");
         assert!(!cs_max.is_nan(), "chunk state has NaN");
@@ -16007,12 +16310,33 @@ mod tests {
         // Sequential (HF recurrent_gated_delta_rule) — state [B, H, Dk, Dv]
         let mut seq_state: Array = Array::zeros::<f32>(&[b, nv, dk, dv]).unwrap();
         let scale = 1.0f32 / (dk as f32).sqrt();
-        let q_f = q_rep.as_dtype(mlx_rs::Dtype::Float32).unwrap()
-            .transpose_axes(&[0, 2, 1, 3]).unwrap().multiply(&Array::from_f32(scale)).unwrap();
-        let k_f = k_rep.as_dtype(mlx_rs::Dtype::Float32).unwrap().transpose_axes(&[0, 2, 1, 3]).unwrap();
-        let v_f = v.as_dtype(mlx_rs::Dtype::Float32).unwrap().transpose_axes(&[0, 2, 1, 3]).unwrap();
-        let g_f = g.as_dtype(mlx_rs::Dtype::Float32).unwrap().transpose_axes(&[0, 2, 1]).unwrap();
-        let b_f = beta.as_dtype(mlx_rs::Dtype::Float32).unwrap().transpose_axes(&[0, 2, 1]).unwrap();
+        let q_f = q_rep
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap()
+            .transpose_axes(&[0, 2, 1, 3])
+            .unwrap()
+            .multiply(&Array::from_f32(scale))
+            .unwrap();
+        let k_f = k_rep
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap()
+            .transpose_axes(&[0, 2, 1, 3])
+            .unwrap();
+        let v_f = v
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap()
+            .transpose_axes(&[0, 2, 1, 3])
+            .unwrap();
+        let g_f = g
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap()
+            .transpose_axes(&[0, 2, 1])
+            .unwrap();
+        let b_f = beta
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap()
+            .transpose_axes(&[0, 2, 1])
+            .unwrap();
         q_f.eval().unwrap();
         k_f.eval().unwrap();
         v_f.eval().unwrap();
@@ -16022,11 +16346,19 @@ mod tests {
 
         let mut seq_y_parts: Vec<Array> = Vec::new();
         for t in 0..s {
-            let q_t = q_f.index((.., .., t..t+1, ..));
-            let k_t = k_f.index((.., .., t..t+1, ..));
-            let v_t = v_f.index((.., .., t..t+1, ..));
-            let g_t = g_f.index((.., .., t..t+1)).exp().unwrap().expand_dims(-1).unwrap();
-            let bt = sigmoid(&b_f.index((.., .., t..t+1))).unwrap().expand_dims(-1).unwrap();
+            let q_t = q_f.index((.., .., t..t + 1, ..));
+            let k_t = k_f.index((.., .., t..t + 1, ..));
+            let v_t = v_f.index((.., .., t..t + 1, ..));
+            let g_t = g_f
+                .index((.., .., t..t + 1))
+                .exp()
+                .unwrap()
+                .expand_dims(-1)
+                .unwrap();
+            let bt = sigmoid(&b_f.index((.., .., t..t + 1)))
+                .unwrap()
+                .expand_dims(-1)
+                .unwrap();
 
             // HF: state [B, H, Dk, Dv], k_t [B, H, 1, Dk], q_t [B, H, 1, Dk], v_t [B, H, 1, Dv]
             // state * g_t → [B, H, Dk, Dv] * [B, H, 1, 1] → [B, H, Dk, Dv]
@@ -16036,25 +16368,37 @@ mod tests {
             // kv_mem = (state * k_t.unsqueeze(-1)).sum(-2)
             // k_t.unsqueeze(-1) → [B, H, 1, Dk, 1], state needs to be [B, H, 1, Dk, Dv] for broadcast
             // So: expand state to 5D, multiply, sum over Dk axis (axis -2)
-            let sg_5d = sg.expand_dims(2).unwrap();  // [B, H, 1, Dk, Dv]
-            let k_t_5d = k_t.expand_dims(-1).unwrap();  // [B, H, 1, Dk, 1]
-            let kv = sg_5d.multiply(&k_t_5d).unwrap().sum_axes(&[-2], None).unwrap();  // [B, H, 1, Dv]
+            let sg_5d = sg.expand_dims(2).unwrap(); // [B, H, 1, Dk, Dv]
+            let k_t_5d = k_t.expand_dims(-1).unwrap(); // [B, H, 1, Dk, 1]
+            let kv = sg_5d
+                .multiply(&k_t_5d)
+                .unwrap()
+                .sum_axes(&[-2], None)
+                .unwrap(); // [B, H, 1, Dv]
 
-            let delta = v_t.subtract(&kv).unwrap().multiply(&broadcast_to(&bt, v_t.shape()).unwrap()).unwrap();
+            let delta = v_t
+                .subtract(&kv)
+                .unwrap()
+                .multiply(&broadcast_to(&bt, v_t.shape()).unwrap())
+                .unwrap();
 
             // state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
             // delta.unsqueeze(-2) → [B, H, 1, 1, Dv], k_t.unsqueeze(-1) → [B, H, 1, Dk, 1]
             // product → [B, H, 1, Dk, Dv], squeeze axis 2 → [B, H, Dk, Dv]
-            let d_5d = delta.expand_dims(-2).unwrap();  // [B, H, 1, 1, Dv]
-            let k_t_5d = k_t.expand_dims(-1).unwrap();  // [B, H, 1, Dk, 1]
-            let update = k_t_5d.multiply(&d_5d).unwrap();  // [B, H, 1, Dk, Dv]
-            let update_4d = update.squeeze_axes(&[2]).unwrap();  // [B, H, Dk, Dv]
+            let d_5d = delta.expand_dims(-2).unwrap(); // [B, H, 1, 1, Dv]
+            let k_t_5d = k_t.expand_dims(-1).unwrap(); // [B, H, 1, Dk, 1]
+            let update = k_t_5d.multiply(&d_5d).unwrap(); // [B, H, 1, Dk, Dv]
+            let update_4d = update.squeeze_axes(&[2]).unwrap(); // [B, H, Dk, Dv]
             seq_state = sg.add(&update_4d).unwrap();
 
             // out = (state * q_t.unsqueeze(-1)).sum(-2)
-            let s_5d = seq_state.expand_dims(2).unwrap();  // [B, H, 1, Dk, Dv]
-            let q_t_5d = q_t.expand_dims(-1).unwrap();  // [B, H, 1, Dk, 1]
-            let out = s_5d.multiply(&q_t_5d).unwrap().sum_axes(&[-2], None).unwrap();
+            let s_5d = seq_state.expand_dims(2).unwrap(); // [B, H, 1, Dk, Dv]
+            let q_t_5d = q_t.expand_dims(-1).unwrap(); // [B, H, 1, Dk, 1]
+            let out = s_5d
+                .multiply(&q_t_5d)
+                .unwrap()
+                .sum_axes(&[-2], None)
+                .unwrap();
             // out is [B, H, 1, Dv] (4D)
             seq_state.eval().unwrap();
             out.eval().unwrap();
@@ -16071,7 +16415,14 @@ mod tests {
         eprintln!("seq_y: max={:.4}, shape={:?}", sy_max, seq_y.shape());
         assert!(!sy_max.is_nan(), "seq y has NaN");
 
-        let max_diff: f32 = chunk_y.subtract(&seq_y).unwrap().abs().unwrap().max(None).unwrap().item();
+        let max_diff: f32 = chunk_y
+            .subtract(&seq_y)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
         eprintln!("max |chunk - seq| = {:.6}", max_diff);
     }
 
@@ -16221,12 +16572,7 @@ mod tests {
         let mut model = load_qwen3_5_model(&model_path).unwrap();
         let hidden = model.args.hidden_size;
         let n_layers = model.model.layers.len();
-        let n_linear = model
-            .model
-            .layers
-            .iter()
-            .filter(|l| l.is_linear)
-            .count();
+        let n_linear = model.model.layers.iter().filter(|l| l.is_linear).count();
         eprintln!("Loaded: {n_layers} layers ({n_linear} linear), hidden={hidden}");
 
         // Per-linear-layer Metal baseline: feed the same input into every GDN
@@ -16260,7 +16606,10 @@ mod tests {
             .enable_ane_gdn_all_layers(&[s])
             .expect("enable_ane_gdn_all_layers failed");
         eprintln!("ANE setup: {report:?}");
-        assert_eq!(report.n_compiled_layers, 1, "expected exactly one donor compile");
+        assert_eq!(
+            report.n_compiled_layers, 1,
+            "expected exactly one donor compile"
+        );
         assert_eq!(report.n_buckets, 1, "expected single-bucket setup");
         assert_eq!(
             report.n_patched_layers,
@@ -16309,9 +16658,7 @@ mod tests {
             diff.eval().unwrap();
             let max_diff: f32 = diff.max(None).unwrap().item();
             if i < 3 || i >= metal_outs.len().saturating_sub(2) {
-                eprintln!(
-                    "  layer{idx:>2}: |out|_max={ref_max:.3} max_diff={max_diff:.5}"
-                );
+                eprintln!("  layer{idx:>2}: |out|_max={ref_max:.3} max_diff={max_diff:.5}");
             }
             if max_diff > max_diff_global {
                 max_diff_global = max_diff;
@@ -16400,7 +16747,10 @@ mod tests {
             .enable_ane_gdn_all_layers_via_worker(s)
             .expect("enable_ane_gdn_all_layers_via_worker failed");
         eprintln!("Worker setup: {report:?}");
-        assert_eq!(report.n_compiled_layers, 1, "expected exactly one donor compile");
+        assert_eq!(
+            report.n_compiled_layers, 1,
+            "expected exactly one donor compile"
+        );
         assert_eq!(report.n_buckets, 1, "Wave 4 is single-bucket");
         assert_eq!(
             report.n_patched_layers,
@@ -16447,9 +16797,7 @@ mod tests {
             diff.eval().unwrap();
             let max_diff: f32 = diff.max(None).unwrap().item();
             if i < 3 || i >= metal_outs.len().saturating_sub(2) {
-                eprintln!(
-                    "  layer{idx:>2}: |out|_max={ref_max:.3} max_diff={max_diff:.5}"
-                );
+                eprintln!("  layer{idx:>2}: |out|_max={ref_max:.3} max_diff={max_diff:.5}");
             }
             if max_diff > max_diff_global {
                 max_diff_global = max_diff;
@@ -16651,8 +16999,7 @@ mod tests {
         let iters: usize = 50;
         let warmup: usize = 5;
 
-        let x_f32 =
-            mlx_rs::random::normal::<f32>(&[1, seq, hidden], None, None, None).unwrap();
+        let x_f32 = mlx_rs::random::normal::<f32>(&[1, seq, hidden], None, None, None).unwrap();
         let x = x_f32.as_dtype(Dtype::Bfloat16).unwrap();
         x.eval().unwrap();
 
@@ -16689,5 +17036,56 @@ mod tests {
             "forward_ane_int8_mlp_bench seq={seq} bucket={seq} hidden={hidden} inter={inter}: \
              min={min_ms:.3}ms  median={med_ms:.3}ms  mean={mean_ms:.3}ms  (n={iters})"
         );
+    }
+
+    /// Smoke-load the 0.8B Qwen3.5 drafter candidate through `load_qwen3_5_model`
+    /// and run a single incremental forward. Confirms the VLM-wrapped 24-layer
+    /// dense variant loads and forwards before we build the drafter adapter on top.
+    ///
+    /// Required model on disk at `~/.cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit/`.
+    #[test]
+    #[ignore]
+    fn smoke_load_qwen3_5_08b() {
+        use mlx_rs::Array;
+        use mlx_rs::transforms::eval;
+        use std::time::Instant;
+
+        let home = std::env::var("HOME").unwrap();
+        let path = format!("{home}/.cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit");
+
+        let t0 = Instant::now();
+        let mut model = load_qwen3_5_model(&path).expect("load_qwen3_5_model on 0.8B");
+        eprintln!(
+            "0.8B loaded in {:.2}s: vocab={}, hidden={}, layers={}",
+            t0.elapsed().as_secs_f64(),
+            model.args.vocab_size,
+            model.args.hidden_size,
+            model.args.num_hidden_layers
+        );
+        assert_eq!(model.args.vocab_size, 248320);
+        assert_eq!(model.args.hidden_size, 1024);
+        assert_eq!(model.args.num_hidden_layers, 24);
+
+        // One incremental forward on a trivial token sequence.
+        let toks: [i32; 4] = [248045, 1234, 5678, 248046];
+        let arr = Array::from_slice(&toks, &[1, toks.len() as i32]);
+        let mut cache = model.make_cache();
+
+        let t1 = Instant::now();
+        let logits = model.forward(&arr, None, &mut cache).expect("forward");
+        eval([&logits]).unwrap();
+        eprintln!(
+            "forward in {:.1}ms: shape={:?}",
+            t1.elapsed().as_secs_f64() * 1000.0,
+            logits.shape()
+        );
+        assert_eq!(logits.shape(), &[1, 1, 248320]);
+
+        // Argmax sanity — any valid token id.
+        let argmax = mlx_rs::ops::indexing::argmax_axis(&logits, -1, false).unwrap();
+        eval([&argmax]).unwrap();
+        let top: i32 = argmax.index((0, 0)).item::<i32>();
+        assert!(top >= 0 && top < 248320, "argmax out of range: {top}");
+        eprintln!("argmax top token: {top}");
     }
 }

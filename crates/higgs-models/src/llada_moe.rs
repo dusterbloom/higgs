@@ -12,47 +12,108 @@ use std::path::Path;
 // BLAS FFI — Accelerate framework
 unsafe extern "C" {
     unsafe fn cblas_sgemm(
-        order: i32, transa: i32, transb: i32,
-        m: i32, n: i32, k: i32,
-        alpha: f32, a: *const f32, lda: i32,
-        b: *const f32, ldb: i32,
-        beta: f32, c: *mut f32, ldc: i32,
+        order: i32,
+        transa: i32,
+        transb: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
     );
 }
 
 /// y[M,N] = A[M,K] @ B[K,N]. Row-major.
 fn sgemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
     unsafe {
-        cblas_sgemm(101, 111, 111, m as i32, n as i32, k as i32,
-            1.0, a.as_ptr(), k as i32, b.as_ptr(), n as i32,
-            0.0, y.as_mut_ptr(), n as i32);
+        cblas_sgemm(
+            101,
+            111,
+            111,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            n as i32,
+            0.0,
+            y.as_mut_ptr(),
+            n as i32,
+        );
     }
 }
 
 /// y[M,N] = A[M,K] @ B^T[K,N] where B stored as [N,K].
 fn sgemm_nt(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
     unsafe {
-        cblas_sgemm(101, 111, 112, m as i32, n as i32, k as i32,
-            1.0, a.as_ptr(), k as i32, b.as_ptr(), k as i32,
-            0.0, y.as_mut_ptr(), n as i32);
+        cblas_sgemm(
+            101,
+            111,
+            112,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            k as i32,
+            0.0,
+            y.as_mut_ptr(),
+            n as i32,
+        );
     }
 }
 
 /// y[M,N] += A[M,K] @ B^T[K,N] where B stored as [N,K]. Accumulates.
 fn sgemm_nt_acc(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
     unsafe {
-        cblas_sgemm(101, 111, 112, m as i32, n as i32, k as i32,
-            1.0, a.as_ptr(), k as i32, b.as_ptr(), k as i32,
-            1.0, y.as_mut_ptr(), n as i32);
+        cblas_sgemm(
+            101,
+            111,
+            112,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            k as i32,
+            1.0,
+            y.as_mut_ptr(),
+            n as i32,
+        );
     }
 }
 
 /// y[M,N] = alpha * A[M,K] @ B^T[K,N].
 fn sgemm_nt_scaled(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32], alpha: f32) {
     unsafe {
-        cblas_sgemm(101, 111, 112, m as i32, n as i32, k as i32,
-            alpha, a.as_ptr(), k as i32, b.as_ptr(), k as i32,
-            0.0, y.as_mut_ptr(), n as i32);
+        cblas_sgemm(
+            101,
+            111,
+            112,
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            k as i32,
+            0.0,
+            y.as_mut_ptr(),
+            n as i32,
+        );
     }
 }
 
@@ -67,9 +128,9 @@ pub struct LladaMoeConfig {
     pub heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
-    pub expert_inter: usize,  // 1024
-    pub num_experts: usize,   // 64
-    pub top_k: usize,         // 8
+    pub expert_inter: usize, // 1024
+    pub num_experts: usize,  // 64
+    pub top_k: usize,        // 8
     pub vocab: usize,
     pub mask_token_id: u32,
     pub rope_theta: f64,
@@ -82,7 +143,7 @@ pub struct LladaMoeConfig {
 // ---------------------------------------------------------------------------
 
 pub struct Bf16Weight {
-    pub data: Vec<u8>,    // raw bf16 bytes [rows * cols * 2]
+    pub data: Vec<u8>, // raw bf16 bytes [rows * cols * 2]
     pub rows: usize,
     pub cols: usize,
 }
@@ -90,7 +151,13 @@ pub struct Bf16Weight {
 impl Bf16Weight {
     /// Store raw bf16 bytes with shape metadata.
     fn new(data: Vec<u8>, rows: usize, cols: usize) -> Self {
-        assert_eq!(data.len(), rows * cols * 2, "bf16 size mismatch: got {} expected {}", data.len(), rows * cols * 2);
+        assert_eq!(
+            data.len(),
+            rows * cols * 2,
+            "bf16 size mismatch: got {} expected {}",
+            data.len(),
+            rows * cols * 2
+        );
         Self { data, rows, cols }
     }
 
@@ -126,7 +193,7 @@ pub struct LladaMoeLayerWeights {
     pub input_norm: Vec<f32>,     // [hidden]
     pub post_attn_norm: Vec<f32>, // [hidden]
     // MoE
-    pub router: Bf16Weight,       // [num_experts, hidden]
+    pub router: Bf16Weight, // [num_experts, hidden]
     pub experts: Vec<ExpertWeights>,
 }
 
@@ -136,9 +203,9 @@ pub struct LladaMoeLayerWeights {
 
 pub struct LladaMoeEngine {
     pub layers: Vec<LladaMoeLayerWeights>,
-    pub embed: Vec<f32>,       // [vocab, hidden] — f32 for embedding lookup
-    pub lm_head: Bf16Weight,   // [vocab, hidden]
-    pub final_norm: Vec<f32>,  // [hidden]
+    pub embed: Vec<f32>,      // [vocab, hidden] — f32 for embedding lookup
+    pub lm_head: Bf16Weight,  // [vocab, hidden]
+    pub final_norm: Vec<f32>, // [hidden]
     pub config: LladaMoeConfig,
     rope_cos: Vec<f32>,
     rope_sin: Vec<f32>,
@@ -152,8 +219,8 @@ impl LladaMoeEngine {
         // Load config
         let config_str = std::fs::read_to_string(dir.join("config.json"))
             .map_err(|e| format!("config.json: {e}"))?;
-        let cfg: serde_json::Value = serde_json::from_str(&config_str)
-            .map_err(|e| format!("parse config: {e}"))?;
+        let cfg: serde_json::Value =
+            serde_json::from_str(&config_str).map_err(|e| format!("parse config: {e}"))?;
 
         let hidden = cfg["hidden_size"].as_u64().unwrap() as usize;
         let heads = cfg["num_attention_heads"].as_u64().unwrap() as usize;
@@ -183,7 +250,8 @@ impl LladaMoeEngine {
         let mut f32_map: HashMap<String, Vec<f32>> = HashMap::new();
 
         for (shard_idx, path) in shard_paths.iter().enumerate() {
-            let data = std::fs::read(path).map_err(|e| format!("read shard {}: {e}", path.display()))?;
+            let data =
+                std::fs::read(path).map_err(|e| format!("read shard {}: {e}", path.display()))?;
             let st = safetensors::SafeTensors::deserialize(&data)
                 .map_err(|e| format!("deserialize shard {}: {e}", path.display()))?;
             let names: Vec<String> = st.names().iter().map(|s| s.to_string()).collect();
@@ -194,7 +262,8 @@ impl LladaMoeEngine {
                 let raw = t.data();
 
                 // Small tensors (norms, embeddings) → f32. Large tensors → keep bf16 raw.
-                if name.ends_with("_norm.weight") || name.ends_with("layernorm.weight")
+                if name.ends_with("_norm.weight")
+                    || name.ends_with("layernorm.weight")
                     || name == "model.norm.weight"
                 {
                     f32_map.insert(name, bf16_to_f32(raw));
@@ -206,9 +275,13 @@ impl LladaMoeEngine {
                     bf16_map.insert(name, raw.to_vec());
                 }
             }
-            eprintln!("  shard {}/{}: {} tensors from {}",
-                shard_idx + 1, shard_paths.len(), n_tensors,
-                path.file_name().unwrap().to_string_lossy());
+            eprintln!(
+                "  shard {}/{}: {} tensors from {}",
+                shard_idx + 1,
+                shard_paths.len(),
+                n_tensors,
+                path.file_name().unwrap().to_string_lossy()
+            );
             // `data` dropped here — reclaim shard memory before loading next
         }
 
@@ -216,12 +289,19 @@ impl LladaMoeEngine {
         let ei = config.expert_inter;
         let ne = config.num_experts;
 
-        let take_bf16 = |map: &mut HashMap<String, Vec<u8>>, name: &str, rows: usize, cols: usize| -> Bf16Weight {
-            let data = map.remove(name).unwrap_or_else(|| panic!("Missing bf16: {name}"));
+        let take_bf16 = |map: &mut HashMap<String, Vec<u8>>,
+                         name: &str,
+                         rows: usize,
+                         cols: usize|
+         -> Bf16Weight {
+            let data = map
+                .remove(name)
+                .unwrap_or_else(|| panic!("Missing bf16: {name}"));
             Bf16Weight::new(data, rows, cols)
         };
         let take_f32 = |map: &mut HashMap<String, Vec<f32>>, name: &str| -> Vec<f32> {
-            map.remove(name).unwrap_or_else(|| panic!("Missing f32: {name}"))
+            map.remove(name)
+                .unwrap_or_else(|| panic!("Missing f32: {name}"))
         };
 
         let embed = take_f32(&mut f32_map, "model.embed_tokens.weight");
@@ -235,21 +315,59 @@ impl LladaMoeEngine {
             let mut experts = Vec::with_capacity(ne);
             for e in 0..ne {
                 experts.push(ExpertWeights {
-                    gate_proj: take_bf16(&mut bf16_map, &format!("{p}.mlp.experts.{e}.gate_proj.weight"), ei, hidden),
-                    up_proj: take_bf16(&mut bf16_map, &format!("{p}.mlp.experts.{e}.up_proj.weight"), ei, hidden),
-                    down_proj: take_bf16(&mut bf16_map, &format!("{p}.mlp.experts.{e}.down_proj.weight"), hidden, ei),
+                    gate_proj: take_bf16(
+                        &mut bf16_map,
+                        &format!("{p}.mlp.experts.{e}.gate_proj.weight"),
+                        ei,
+                        hidden,
+                    ),
+                    up_proj: take_bf16(
+                        &mut bf16_map,
+                        &format!("{p}.mlp.experts.{e}.up_proj.weight"),
+                        ei,
+                        hidden,
+                    ),
+                    down_proj: take_bf16(
+                        &mut bf16_map,
+                        &format!("{p}.mlp.experts.{e}.down_proj.weight"),
+                        hidden,
+                        ei,
+                    ),
                 });
             }
 
             layers.push(LladaMoeLayerWeights {
-                q_proj: take_bf16(&mut bf16_map, &format!("{p}.self_attn.q_proj.weight"), hidden, hidden),
-                k_proj: take_bf16(&mut bf16_map, &format!("{p}.self_attn.k_proj.weight"), hidden, hidden),
-                v_proj: take_bf16(&mut bf16_map, &format!("{p}.self_attn.v_proj.weight"), hidden, hidden),
-                o_proj: take_bf16(&mut bf16_map, &format!("{p}.self_attn.o_proj.weight"), hidden, hidden),
+                q_proj: take_bf16(
+                    &mut bf16_map,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    hidden,
+                    hidden,
+                ),
+                k_proj: take_bf16(
+                    &mut bf16_map,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    hidden,
+                    hidden,
+                ),
+                v_proj: take_bf16(
+                    &mut bf16_map,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    hidden,
+                    hidden,
+                ),
+                o_proj: take_bf16(
+                    &mut bf16_map,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    hidden,
+                    hidden,
+                ),
                 q_norm: take_f32(&mut f32_map, &format!("{p}.self_attn.q_norm.weight")),
                 k_norm: take_f32(&mut f32_map, &format!("{p}.self_attn.k_norm.weight")),
                 input_norm: take_f32(&mut f32_map, &format!("{p}.input_layernorm.weight")),
-                post_attn_norm: take_f32(&mut f32_map, &format!("{p}.post_attention_layernorm.weight")),
+                post_attn_norm: take_f32(
+                    &mut f32_map,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                ),
                 router: take_bf16(&mut bf16_map, &format!("{p}.mlp.gate.weight"), ne, hidden),
                 experts,
             });
@@ -269,35 +387,83 @@ impl LladaMoeEngine {
             }
         }
 
-        let param_b = (embed.len() + lm_head.rows * lm_head.cols + final_norm.len()
-            + layers.iter().map(|l| {
-                l.q_proj.rows * l.q_proj.cols + l.k_proj.rows * l.k_proj.cols
-                + l.v_proj.rows * l.v_proj.cols + l.o_proj.rows * l.o_proj.cols
-                + l.q_norm.len() + l.k_norm.len() + l.input_norm.len() + l.post_attn_norm.len()
-                + l.router.rows * l.router.cols
-                + l.experts.iter().map(|e| {
-                    e.gate_proj.rows * e.gate_proj.cols
-                    + e.up_proj.rows * e.up_proj.cols
-                    + e.down_proj.rows * e.down_proj.cols
-                }).sum::<usize>()
-            }).sum::<usize>()) as f64 / 1e9;
+        let param_b = (embed.len()
+            + lm_head.rows * lm_head.cols
+            + final_norm.len()
+            + layers
+                .iter()
+                .map(|l| {
+                    l.q_proj.rows * l.q_proj.cols
+                        + l.k_proj.rows * l.k_proj.cols
+                        + l.v_proj.rows * l.v_proj.cols
+                        + l.o_proj.rows * l.o_proj.cols
+                        + l.q_norm.len()
+                        + l.k_norm.len()
+                        + l.input_norm.len()
+                        + l.post_attn_norm.len()
+                        + l.router.rows * l.router.cols
+                        + l.experts
+                            .iter()
+                            .map(|e| {
+                                e.gate_proj.rows * e.gate_proj.cols
+                                    + e.up_proj.rows * e.up_proj.cols
+                                    + e.down_proj.rows * e.down_proj.cols
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>()) as f64
+            / 1e9;
 
-        let mem_mb = (embed.len() * 4 + lm_head.data.len() + final_norm.len() * 4
-            + layers.iter().map(|l| {
-                l.q_proj.data.len() + l.k_proj.data.len() + l.v_proj.data.len() + l.o_proj.data.len()
-                + (l.q_norm.len() + l.k_norm.len() + l.input_norm.len() + l.post_attn_norm.len()) * 4
-                + l.router.data.len()
-                + l.experts.iter().map(|e| e.gate_proj.data.len() + e.up_proj.data.len() + e.down_proj.data.len()).sum::<usize>()
-            }).sum::<usize>()) as f64 / 1e6;
+        let mem_mb = (embed.len() * 4
+            + lm_head.data.len()
+            + final_norm.len() * 4
+            + layers
+                .iter()
+                .map(|l| {
+                    l.q_proj.data.len()
+                        + l.k_proj.data.len()
+                        + l.v_proj.data.len()
+                        + l.o_proj.data.len()
+                        + (l.q_norm.len()
+                            + l.k_norm.len()
+                            + l.input_norm.len()
+                            + l.post_attn_norm.len())
+                            * 4
+                        + l.router.data.len()
+                        + l.experts
+                            .iter()
+                            .map(|e| {
+                                e.gate_proj.data.len()
+                                    + e.up_proj.data.len()
+                                    + e.down_proj.data.len()
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>()) as f64
+            / 1e6;
 
         eprintln!(
             "LladaMoeEngine loaded (bf16): {}L, hidden={}, heads={}, {}experts(top-{}), vocab={}, \
              {:.1}B params, {:.0}MB resident",
-            config.layers, config.hidden, config.heads, config.num_experts, config.top_k,
-            config.vocab, param_b, mem_mb
+            config.layers,
+            config.hidden,
+            config.heads,
+            config.num_experts,
+            config.top_k,
+            config.vocab,
+            param_b,
+            mem_mb
         );
 
-        Ok(Self { layers, embed, lm_head, final_norm, config, rope_cos, rope_sin })
+        Ok(Self {
+            layers,
+            embed,
+            lm_head,
+            final_norm,
+            config,
+            rope_cos,
+            rope_sin,
+        })
     }
 
     /// Full forward pass: token_ids [seq] → logits [seq, vocab].
@@ -311,7 +477,7 @@ impl LladaMoeEngine {
         let n_kv = cfg.kv_heads;
         let gqa_ratio = n_heads / n_kv;
         let q_dim = n_heads * hd; // = h for MHA
-        let kv_dim = n_kv * hd;   // = h for MHA
+        let kv_dim = n_kv * hd; // = h for MHA
 
         // 1. Embedding lookup
         let mut hidden = vec![0.0f32; seq * h];
@@ -340,7 +506,14 @@ impl LladaMoeEngine {
 
         for layer in &self.layers {
             // === Attention ===
-            rms_norm(&hidden, &layer.input_norm, &mut normed, seq, h, cfg.rms_norm_eps);
+            rms_norm(
+                &hidden,
+                &layer.input_norm,
+                &mut normed,
+                seq,
+                h,
+                cfg.rms_norm_eps,
+            );
 
             layer.q_proj.decode_into(&mut dq);
             sgemm_nt(seq, q_dim, h, &normed, &dq, &mut q_buf);
@@ -365,11 +538,23 @@ impl LladaMoeEngine {
             for s in 0..seq {
                 for head in 0..n_heads {
                     let off = s * q_dim + head * hd;
-                    apply_rope(&mut q_buf[off..off + hd], s, half_hd, &self.rope_cos, &self.rope_sin);
+                    apply_rope(
+                        &mut q_buf[off..off + hd],
+                        s,
+                        half_hd,
+                        &self.rope_cos,
+                        &self.rope_sin,
+                    );
                 }
                 for head in 0..n_kv {
                     let off = s * kv_dim + head * hd;
-                    apply_rope(&mut k_buf[off..off + hd], s, half_hd, &self.rope_cos, &self.rope_sin);
+                    apply_rope(
+                        &mut k_buf[off..off + hd],
+                        s,
+                        half_hd,
+                        &self.rope_cos,
+                        &self.rope_sin,
+                    );
                 }
             }
 
@@ -407,10 +592,19 @@ impl LladaMoeEngine {
             // O projection + residual
             layer.o_proj.decode_into(&mut dq);
             sgemm_nt(seq, h, q_dim, &attn_out, &dq, &mut o_buf);
-            for i in 0..seq * h { hidden[i] += o_buf[i]; }
+            for i in 0..seq * h {
+                hidden[i] += o_buf[i];
+            }
 
             // === MoE FFN ===
-            rms_norm(&hidden, &layer.post_attn_norm, &mut normed, seq, h, cfg.rms_norm_eps);
+            rms_norm(
+                &hidden,
+                &layer.post_attn_norm,
+                &mut normed,
+                seq,
+                h,
+                cfg.rms_norm_eps,
+            );
 
             // Router: normed[seq, h] @ gate^T[h, num_experts] → [seq, num_experts]
             layer.router.decode_into(&mut dq);
@@ -458,7 +652,9 @@ impl LladaMoeEngine {
             }
 
             for (expert_idx, positions) in expert_positions.iter().enumerate() {
-                if positions.is_empty() { continue; }
+                if positions.is_empty() {
+                    continue;
+                }
 
                 let n_tok = positions.len();
                 let ei = cfg.expert_inter;
@@ -497,11 +693,20 @@ impl LladaMoeEngine {
             }
 
             // Residual
-            for i in 0..seq * h { hidden[i] += moe_out[i]; }
+            for i in 0..seq * h {
+                hidden[i] += moe_out[i];
+            }
         }
 
         // 3. Final RMSNorm
-        rms_norm(&hidden, &self.final_norm, &mut normed, seq, h, cfg.rms_norm_eps);
+        rms_norm(
+            &hidden,
+            &self.final_norm,
+            &mut normed,
+            seq,
+            h,
+            cfg.rms_norm_eps,
+        );
 
         // 4. LM head (separate weight, NOT tied)
         let mut logits = vec![0.0f32; seq * cfg.vocab];
@@ -525,7 +730,9 @@ impl LladaMoeEngine {
 
             let mut mask_positions: Vec<(usize, f32, u32)> = Vec::new();
             for pos in 0..seq {
-                if canvas[pos] != mask_id { continue; }
+                if canvas[pos] != mask_id {
+                    continue;
+                }
                 let row = &logits[pos * vocab..(pos + 1) * vocab];
                 let max_logit = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum_exp = 0.0f32;
@@ -533,19 +740,25 @@ impl LladaMoeEngine {
                 let mut best_val = f32::NEG_INFINITY;
                 for (i, &v) in row.iter().enumerate() {
                     sum_exp += (v - max_logit).exp();
-                    if v > best_val { best_val = v; best_idx = i as u32; }
+                    if v > best_val {
+                        best_val = v;
+                        best_idx = i as u32;
+                    }
                 }
                 let confidence = (best_val - max_logit).exp() / sum_exp;
                 mask_positions.push((pos, confidence, best_idx));
             }
 
-            if mask_positions.is_empty() { break; }
+            if mask_positions.is_empty() {
+                break;
+            }
 
             let n_masks = mask_positions.len();
             let n_keep = n_masks * (steps - step - 1) / steps;
             let n_unmask = (n_masks - n_keep).max(1);
 
-            mask_positions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            mask_positions
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for &(pos, _, pred) in mask_positions.iter().take(n_unmask) {
                 canvas[pos] = pred;
             }
@@ -582,7 +795,10 @@ fn find_safetensor_shards(dir: &Path) -> Result<Vec<std::path::PathBuf>, String>
         return Err("No safetensors files found".to_string());
     }
 
-    eprintln!("Loading {} safetensors shards (int8 quantization)...", shard_paths.len());
+    eprintln!(
+        "Loading {} safetensors shards (int8 quantization)...",
+        shard_paths.len()
+    );
     Ok(shard_paths)
 }
 
@@ -642,7 +858,9 @@ fn softmax_inplace(row: &mut [f32]) {
         sum += *v;
     }
     let inv = 1.0 / sum;
-    for v in row.iter_mut() { *v *= inv; }
+    for v in row.iter_mut() {
+        *v *= inv;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -664,8 +882,8 @@ impl AneLladaMoeEngine {
     /// Compile ANE attention kernel, pre-build weight blobs for all layers.
     pub fn new(engine: LladaMoeEngine, seq_len: usize) -> Result<Self, String> {
         use crate::ane_bridge::{self, AneKernel, build_weight_blob, build_weight_blob_transposed};
-        use crate::diffusion_ane;
         use crate::ane_mil::ANE_MIN_SPATIAL;
+        use crate::diffusion_ane;
 
         ane_bridge::ane_init()?;
 
@@ -677,7 +895,10 @@ impl AneLladaMoeEngine {
         let kv_heads = cfg.kv_heads;
         let seq = seq_len.max(ANE_MIN_SPATIAL);
 
-        eprintln!("Compiling ANE attention kernel (dim={h}, seq={seq}) + {} layer weight sets...", cfg.layers);
+        eprintln!(
+            "Compiling ANE attention kernel (dim={h}, seq={seq}) + {} layer weight sets...",
+            cfg.layers
+        );
         let t0 = std::time::Instant::now();
 
         // Precompute RoPE
@@ -695,7 +916,16 @@ impl AneLladaMoeEngine {
         let rope_sin_blob = build_weight_blob(&rope_sin, seq, half_hd);
 
         // Generate attention MIL (reuse diffusion attention — same arch: QK-norm, RoPE, bidir SDPA)
-        let mil = diffusion_ane::gen_diffusion_attention(h, heads, kv_heads, hd, seq, cfg.rms_norm_eps, true, false);
+        let mil = diffusion_ane::gen_diffusion_attention(
+            h,
+            heads,
+            kv_heads,
+            hd,
+            seq,
+            cfg.rms_norm_eps,
+            true,
+            false,
+        );
         let names: Vec<&str> = mil.weight_names.iter().map(|s| s.as_str()).collect();
 
         // Pre-build attention weight blobs for all layers.
@@ -715,15 +945,15 @@ impl AneLladaMoeEngine {
             let wo = build_weight_blob_transposed(&dq, h, heads * hd);
 
             let blobs = vec![
-                build_weight_blob(&lw.input_norm, 1, h),   // rms_att
-                wq,                                         // wq
-                wk,                                         // wk
-                wv,                                         // wv
-                wo,                                         // wo
-                rope_cos_blob.clone(),                      // rope_cos
-                rope_sin_blob.clone(),                      // rope_sin
-                build_weight_blob(&lw.q_norm, 1, hd),      // q_norm
-                build_weight_blob(&lw.k_norm, 1, hd),      // k_norm
+                build_weight_blob(&lw.input_norm, 1, h), // rms_att
+                wq,                                      // wq
+                wk,                                      // wk
+                wv,                                      // wv
+                wo,                                      // wo
+                rope_cos_blob.clone(),                   // rope_cos
+                rope_sin_blob.clone(),                   // rope_sin
+                build_weight_blob(&lw.q_norm, 1, hd),    // q_norm
+                build_weight_blob(&lw.k_norm, 1, hd),    // k_norm
             ];
             attn_blobs.push(blobs);
         }
@@ -731,9 +961,13 @@ impl AneLladaMoeEngine {
         // Compile ONE kernel using layer-0 weights
         let l0_refs: Vec<&[u8]> = attn_blobs[0].iter().map(|b| b.as_slice()).collect();
         let attn_kernel = AneKernel::compile_multi_weights(
-            &mil.mil_text, &names, &l0_refs,
-            &[mil.input_bytes], &[mil.output_bytes],
-        ).map_err(|e| format!("L0 attn compile: {e}"))?;
+            &mil.mil_text,
+            &names,
+            &l0_refs,
+            &[mil.input_bytes],
+            &[mil.output_bytes],
+        )
+        .map_err(|e| format!("L0 attn compile: {e}"))?;
 
         let compile_ms = t0.elapsed().as_millis();
         let blob_mb: f64 = attn_blobs[0].iter().map(|b| b.len() as f64).sum::<f64>() / 1e6;
@@ -742,7 +976,12 @@ impl AneLladaMoeEngine {
             compile_ms, blob_mb, cfg.layers,
         );
 
-        Ok(Self { blas_engine: engine, attn_kernel, attn_blobs, seq_len: seq })
+        Ok(Self {
+            blas_engine: engine,
+            attn_kernel,
+            attn_blobs,
+            seq_len: seq,
+        })
     }
 
     /// Hybrid forward: ANE attention + BLAS MoE FFN.
@@ -772,7 +1011,8 @@ impl AneLladaMoeEngine {
 
         // Unpack ANE channel-first fp32 [dim, ps] → row-major [seq, dim]
         let unpack = |bytes: &[u8], dim: usize| -> Vec<f32> {
-            let all: Vec<f32> = bytes.chunks_exact(4)
+            let all: Vec<f32> = bytes
+                .chunks_exact(4)
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect();
             let mut out = vec![0.0f32; seq * dim];
@@ -799,7 +1039,10 @@ impl AneLladaMoeEngine {
         // 2. Layer loop: ANE attention → BLAS MoE
         for (layer_idx, layer) in self.blas_engine.layers.iter().enumerate() {
             // === ANE Attention dispatch ===
-            let blob_refs: Vec<&[u8]> = self.attn_blobs[layer_idx].iter().map(|b| b.as_slice()).collect();
+            let blob_refs: Vec<&[u8]> = self.attn_blobs[layer_idx]
+                .iter()
+                .map(|b| b.as_slice())
+                .collect();
             self.attn_kernel.reload_weights(&blob_refs).unwrap();
 
             let attn_in = pack(&hidden, h);
@@ -809,7 +1052,14 @@ impl AneLladaMoeEngine {
             hidden = unpack(&attn_out_bytes, h);
 
             // === BLAS MoE FFN ===
-            rms_norm(&hidden, &layer.post_attn_norm, &mut normed, seq, h, cfg.rms_norm_eps);
+            rms_norm(
+                &hidden,
+                &layer.post_attn_norm,
+                &mut normed,
+                seq,
+                h,
+                cfg.rms_norm_eps,
+            );
 
             // Router
             layer.router.decode_into(&mut dq);
@@ -856,7 +1106,9 @@ impl AneLladaMoeEngine {
 
             let mut n_active = 0u32;
             for (expert_idx, positions) in expert_positions.iter().enumerate() {
-                if positions.is_empty() { continue; }
+                if positions.is_empty() {
+                    continue;
+                }
                 n_active += 1;
 
                 let n_tok = positions.len();
@@ -893,14 +1145,26 @@ impl AneLladaMoeEngine {
             }
 
             // Residual
-            for i in 0..seq * h { hidden[i] += moe_out[i]; }
+            for i in 0..seq * h {
+                hidden[i] += moe_out[i];
+            }
         }
 
         let fwd_ms = t_fwd.elapsed().as_millis();
-        eprintln!("  hybrid fwd: {} ANE attn + BLAS MoE in {}ms (seq={seq})", cfg.layers, fwd_ms);
+        eprintln!(
+            "  hybrid fwd: {} ANE attn + BLAS MoE in {}ms (seq={seq})",
+            cfg.layers, fwd_ms
+        );
 
         // 3. Final RMSNorm
-        rms_norm(&hidden, &self.blas_engine.final_norm, &mut normed, seq, h, cfg.rms_norm_eps);
+        rms_norm(
+            &hidden,
+            &self.blas_engine.final_norm,
+            &mut normed,
+            seq,
+            h,
+            cfg.rms_norm_eps,
+        );
 
         // 4. LM head (BLAS — too large for ANE)
         let mut logits = vec![0.0f32; seq * cfg.vocab];
@@ -923,7 +1187,9 @@ impl AneLladaMoeEngine {
 
             let mut mask_positions: Vec<(usize, f32, u32)> = Vec::new();
             for pos in 0..seq {
-                if canvas[pos] != mask_id { continue; }
+                if canvas[pos] != mask_id {
+                    continue;
+                }
                 let row = &logits[pos * vocab..(pos + 1) * vocab];
                 let max_logit = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum_exp = 0.0f32;
@@ -931,19 +1197,25 @@ impl AneLladaMoeEngine {
                 let mut best_val = f32::NEG_INFINITY;
                 for (i, &v) in row.iter().enumerate() {
                     sum_exp += (v - max_logit).exp();
-                    if v > best_val { best_val = v; best_idx = i as u32; }
+                    if v > best_val {
+                        best_val = v;
+                        best_idx = i as u32;
+                    }
                 }
                 let confidence = (best_val - max_logit).exp() / sum_exp;
                 mask_positions.push((pos, confidence, best_idx));
             }
 
-            if mask_positions.is_empty() { break; }
+            if mask_positions.is_empty() {
+                break;
+            }
 
             let n_masks = mask_positions.len();
             let n_keep = n_masks * (steps - step - 1) / steps;
             let n_unmask = (n_masks - n_keep).max(1);
 
-            mask_positions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            mask_positions
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for &(pos, _, pred) in mask_positions.iter().take(n_unmask) {
                 canvas[pos] = pred;
             }
@@ -978,8 +1250,12 @@ mod tests {
             }
         }
         // Fallback: check root dir (older HF layout)
-        if std::path::Path::new(&hub).join("model-00001-of-00003.safetensors").exists()
-            || std::path::Path::new(&hub).join("model.safetensors").exists()
+        if std::path::Path::new(&hub)
+            .join("model-00001-of-00003.safetensors")
+            .exists()
+            || std::path::Path::new(&hub)
+                .join("model.safetensors")
+                .exists()
         {
             return Some(hub);
         }
@@ -1001,7 +1277,9 @@ mod tests {
 
         // Forward with mask tokens
         let mask_id = engine.config.mask_token_id;
-        let input: Vec<u32> = (0..32).map(|i| if i < 5 { 1000 + i } else { mask_id }).collect();
+        let input: Vec<u32> = (0..32)
+            .map(|i| if i < 5 { 1000 + i } else { mask_id })
+            .collect();
 
         let t0 = std::time::Instant::now();
         let logits = engine.forward(&input);
@@ -1031,17 +1309,26 @@ mod tests {
         let elapsed = t0.elapsed();
         let n_gen = 27;
         let tps = n_gen as f64 / elapsed.as_secs_f64();
-        eprintln!("Generated {n_gen} tokens in {}ms ({tps:.1} tok/s, 16 steps)", elapsed.as_millis());
+        eprintln!(
+            "Generated {n_gen} tokens in {}ms ({tps:.1} tok/s, 16 steps)",
+            elapsed.as_millis()
+        );
         eprintln!("Result IDs (gen part): {:?}", &result[5..15]);
 
-        let masks = result.iter().filter(|&&t| t == engine.config.mask_token_id).count();
+        let masks = result
+            .iter()
+            .filter(|&&t| t == engine.config.mask_token_id)
+            .count();
         eprintln!("Remaining masks: {masks}");
         assert!(masks < 5, "Too many masks remaining: {masks}");
 
         // Model should produce at least some non-eos tokens (e.g. "Paris.<|role_end|>")
         let non_eos = result[5..].iter().filter(|&&t| t != 156892).count();
         eprintln!("Non-eos tokens: {non_eos}/27");
-        assert!(non_eos >= 1, "Model generated all eos — possible correctness issue");
+        assert!(
+            non_eos >= 1,
+            "Model generated all eos — possible correctness issue"
+        );
     }
 
     #[test]
@@ -1055,7 +1342,9 @@ mod tests {
         let mask_id = engine.config.mask_token_id;
 
         for seq in [32, 64, 128] {
-            let input: Vec<u32> = (0..seq).map(|i| if i < 5 { 1000 } else { mask_id }).collect();
+            let input: Vec<u32> = (0..seq)
+                .map(|i| if i < 5 { 1000 } else { mask_id })
+                .collect();
             let _ = engine.forward(&input); // warmup
 
             let n = 3;
@@ -1067,7 +1356,9 @@ mod tests {
             let steps = 64;
             let gen_tok = seq - 5;
             let tps = gen_tok as f64 / (ms * steps as f64 / 1000.0);
-            eprintln!("seq={seq:>4}: {ms:>6.1}ms/fwd × {steps} steps → {tps:>5.1} tok/s ({gen_tok} tokens)");
+            eprintln!(
+                "seq={seq:>4}: {ms:>6.1}ms/fwd × {steps} steps → {tps:>5.1} tok/s ({gen_tok} tokens)"
+            );
         }
     }
 
@@ -1086,18 +1377,26 @@ mod tests {
 
         // seq=128 — ANE sweet spot (4.4x over BLAS for attention alone)
         let seq = 128;
-        let input: Vec<u32> = (0..seq).map(|i| if i < 5 { prompt[i] } else { mask_id }).collect();
+        let input: Vec<u32> = (0..seq)
+            .map(|i| if i < 5 { prompt[i] } else { mask_id })
+            .collect();
 
         // BLAS forward for reference
         let blas_logits = engine.forward(&input);
-        eprintln!("BLAS forward done (seq={seq}): {} logits", blas_logits.len());
+        eprintln!(
+            "BLAS forward done (seq={seq}): {} logits",
+            blas_logits.len()
+        );
 
         // Build ANE hybrid engine at seq=128
         let ane = super::AneLladaMoeEngine::new(engine, seq).unwrap();
 
         // ANE hybrid forward
         let ane_logits = ane.forward(&input);
-        eprintln!("ANE hybrid forward done (seq={seq}): {} logits", ane_logits.len());
+        eprintln!(
+            "ANE hybrid forward done (seq={seq}): {} logits",
+            ane_logits.len()
+        );
 
         // Compare logits — ANE uses fp16 for attention, so some error expected
         let mut max_err = 0.0f32;
@@ -1119,11 +1418,15 @@ mod tests {
 
         let n_runs = 3;
         let blas_t0 = std::time::Instant::now();
-        for _ in 0..n_runs { let _ = ane.blas_engine.forward(&input); }
+        for _ in 0..n_runs {
+            let _ = ane.blas_engine.forward(&input);
+        }
         let blas_ms = blas_t0.elapsed().as_millis() as f64 / n_runs as f64;
 
         let ane_t0 = std::time::Instant::now();
-        for _ in 0..n_runs { let _ = ane.forward(&input); }
+        for _ in 0..n_runs {
+            let _ = ane.forward(&input);
+        }
         let ane_ms = ane_t0.elapsed().as_millis() as f64 / n_runs as f64;
 
         let speedup = blas_ms / ane_ms;
@@ -1131,7 +1434,9 @@ mod tests {
         let gen_tok = seq - 5;
         let blas_tps = gen_tok as f64 / (blas_ms * steps as f64 / 1000.0);
         let ane_tps = gen_tok as f64 / (ane_ms * steps as f64 / 1000.0);
-        eprintln!("seq={seq}: BLAS {blas_ms:.0}ms ({blas_tps:.1} tok/s) | ANE hybrid {ane_ms:.0}ms ({ane_tps:.1} tok/s) | speedup {speedup:.2}x");
+        eprintln!(
+            "seq={seq}: BLAS {blas_ms:.0}ms ({blas_tps:.1} tok/s) | ANE hybrid {ane_ms:.0}ms ({ane_tps:.1} tok/s) | speedup {speedup:.2}x"
+        );
     }
 
     /// ANE hybrid at seq=1024: attention should dominate, ANE wins big.
@@ -1148,13 +1453,19 @@ mod tests {
         let prompt: Vec<u32> = vec![678, 7706, 300, 11406, 341];
 
         let seq = 1024;
-        let input: Vec<u32> = (0..seq).map(|i| if i < 5 { prompt[i] } else { mask_id }).collect();
+        let input: Vec<u32> = (0..seq)
+            .map(|i| if i < 5 { prompt[i] } else { mask_id })
+            .collect();
 
         // BLAS baseline
         let blas_t0 = std::time::Instant::now();
         let blas_logits = engine.forward(&input);
         let blas_ms = blas_t0.elapsed().as_millis();
-        eprintln!("BLAS forward (seq={seq}): {}ms, {} logits", blas_ms, blas_logits.len());
+        eprintln!(
+            "BLAS forward (seq={seq}): {}ms, {} logits",
+            blas_ms,
+            blas_logits.len()
+        );
 
         // ANE hybrid
         let ane = super::AneLladaMoeEngine::new(engine, seq).unwrap();
@@ -1178,6 +1489,8 @@ mod tests {
         let gen_tok = seq - 5;
         let blas_tps = gen_tok as f64 / (blas_ms as f64 * steps as f64 / 1000.0);
         let ane_tps = gen_tok as f64 / (ane_ms as f64 * steps as f64 / 1000.0);
-        eprintln!("seq={seq}: BLAS {blas_ms}ms ({blas_tps:.2} tok/s) | ANE hybrid {ane_ms}ms ({ane_tps:.2} tok/s) | speedup {speedup:.2}x");
+        eprintln!(
+            "seq={seq}: BLAS {blas_ms}ms ({blas_tps:.2} tok/s) | ANE hybrid {ane_ms}ms ({ane_tps:.2} tok/s) | speedup {speedup:.2}x"
+        );
     }
 }

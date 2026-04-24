@@ -14,7 +14,7 @@
 
 #![cfg(feature = "ane")]
 
-use crate::ane_mil::{ane_align_seq, FusedMil, ANE_MIN_SPATIAL, MIL_HEADER};
+use crate::ane_mil::{ANE_MIN_SPATIAL, FusedMil, MIL_HEADER, ane_align_seq};
 use std::fmt::Write;
 
 /// STUB: gen_decode_layer was removed from this branch but call sites remain.
@@ -185,7 +185,6 @@ pub fn gen_fused_diffusion_layer(
         "        tensor<fp16, [1,1,{seq},{kv_dim}]> vm = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wv)[name=string(\"vm\")];"
     );
 
-
     // Determine reshape input names (with or without bias)
     let qt_to_reshape = if has_qkv_bias { "qt_b" } else { "qt" };
     let kt_to_reshape = if has_qkv_bias { "kt_b" } else { "kt" };
@@ -339,7 +338,6 @@ pub fn gen_fused_diffusion_layer(
     } else {
         ("q", "k_kv")
     };
-
 
     // === RoPE ===
     let _ = writeln!(
@@ -1001,7 +999,6 @@ pub fn gen_diffusion_attention(
         "        tensor<fp16, [1,1,{seq},{kv_dim}]> vm = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wv)[name=string(\"vm\")];"
     );
 
-
     // Determine reshape input names (with or without bias)
     let qt_to_reshape = if has_qkv_bias { "qt_b" } else { "qt" };
     let kt_to_reshape = if has_qkv_bias { "kt_b" } else { "kt" };
@@ -1155,7 +1152,6 @@ pub fn gen_diffusion_attention(
     } else {
         ("q", "k_kv")
     };
-
 
     // === RoPE ===
     let _ = writeln!(
@@ -2121,7 +2117,7 @@ mod tests {
     #[test]
     #[ignore = "int8 confirmed dead on ANE — kept as evidence"]
     fn test_int8_conv1x1_nanobot_pattern() {
-        use crate::ane_bridge::{self, build_weight_blob_int8, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob_int8};
         use crate::ane_mil::MIL_HEADER;
 
         ane_bridge::ane_init().expect("ANE init");
@@ -2229,7 +2225,7 @@ mod tests {
     #[test]
     #[ignore = "probe — run explicitly to decide if int8 can ship in raw-MIL bridge"]
     fn probe_int8_conv1x1_compile_direct() {
-        use crate::ane_bridge::{self, build_weight_blob_int8, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob_int8};
         use crate::ane_mil::MIL_HEADER;
 
         ane_bridge::ane_init().expect("ANE init");
@@ -2304,13 +2300,13 @@ mod tests {
         );
         let multi_ok = multi_res.is_ok();
         match &multi_res {
-            Ok(_) => eprintln!("UNEXPECTED PASS: compile_multi_weights now accepts int8 (AB5 reversed)"),
+            Ok(_) => {
+                eprintln!("UNEXPECTED PASS: compile_multi_weights now accepts int8 (AB5 reversed)")
+            }
             Err(e) => eprintln!("EXPECTED FAIL compile_multi_weights: {e}"),
         }
 
-        eprintln!(
-            "\n[probe summary] compile_direct={direct_ok} compile_multi_weights={multi_ok}"
-        );
+        eprintln!("\n[probe summary] compile_direct={direct_ok} compile_multi_weights={multi_ok}");
 
         if !direct_ok {
             panic!(
@@ -2324,7 +2320,7 @@ mod tests {
     /// Also benchmarks 28 fused dispatches vs 56 multi-dispatches at seq=128.
     #[test]
     fn test_multi_dispatch_vs_fused() {
-        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob, build_weight_blob_transposed};
         use crate::diffusion::DiffusionEngine;
 
         let Some(dir) = model_dir() else {
@@ -2411,8 +2407,16 @@ mod tests {
         eprintln!("Fused kernel compiled (13 BLOBFILEs)");
 
         // === 2. Compile attention kernel (9 blobs) ===
-        let attn_mil =
-            gen_diffusion_attention(cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim, seq, 1e-6, true, false);
+        let attn_mil = gen_diffusion_attention(
+            cfg.hidden,
+            cfg.heads,
+            cfg.kv_heads,
+            cfg.head_dim,
+            seq,
+            1e-6,
+            true,
+            false,
+        );
         let attn_blobs: Vec<&[u8]> = vec![
             &rms_att_blob,
             &wq_blob,
@@ -2551,7 +2555,7 @@ mod tests {
     /// THE BIG TEST: compile + eval a fully-fused layer on ANE, benchmark 28 dispatches.
     #[test]
     fn test_fused_layer_compile_and_benchmark() {
-        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob, build_weight_blob_transposed};
         use crate::diffusion::DiffusionEngine;
 
         let Some(dir) = model_dir() else {
@@ -2670,7 +2674,7 @@ mod tests {
     /// LLaDA-MoE: dim=2048, heads=16, kv_heads=16, hd=128 → QKVO = 32MB exactly.
     #[test]
     fn test_dim2048_attention_compile() {
-        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob, build_weight_blob_transposed};
 
         ane_bridge::ane_init().expect("ANE init");
 

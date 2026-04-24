@@ -571,6 +571,8 @@ mod tests {
                 kv_bits: 3,
                 kv_seed: 0,
                 dflash: None,
+                ar_spec: None,
+                bd3lm: None,
             }],
             ..HiggsConfig::default()
         }

@@ -1428,7 +1428,7 @@ impl AneDiffusionEngine {
     /// No reload_weights at runtime — each kernel is self-contained.
     pub fn new(engine: DiffusionEngine, seq_len: usize) -> Result<Self, String> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
-        use crate::ane_mil::{ane_align_seq, ANE_MIN_SPATIAL};
+        use crate::ane_mil::{ANE_MIN_SPATIAL, ane_align_seq};
         use crate::diffusion_ane;
 
         ane_bridge::ane_init()?;
@@ -1696,7 +1696,7 @@ impl AneDiffusionEngine {
     /// the causal mask BLOBFILE.
     pub fn new_causal(engine: DiffusionEngine, seq_len: usize) -> Result<Self, String> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
-        use crate::ane_mil::{ane_align_seq, build_causal_mask_blob, ANE_MIN_SPATIAL};
+        use crate::ane_mil::{ANE_MIN_SPATIAL, ane_align_seq, build_causal_mask_blob};
         use crate::diffusion_ane;
 
         ane_bridge::ane_init()?;
@@ -2680,8 +2680,8 @@ impl AneBonsaiEngine {
     ) -> Result<Self, String> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
         use crate::ane_mil::{
-            ane_align_seq, build_causal_mask_blob, compute_blobfile_tile_plan, gen_blobfile_matmul,
-            gen_fused_silu_gate_up_proj, ANE_MIN_SPATIAL,
+            ANE_MIN_SPATIAL, ane_align_seq, build_causal_mask_blob, compute_blobfile_tile_plan,
+            gen_blobfile_matmul, gen_fused_silu_gate_up_proj,
         };
         use crate::diffusion_ane;
 
@@ -3378,7 +3378,7 @@ impl AneArDecodeEngine {
     /// input buffer that holds x, K/V cache, rope, and mask in a single IOSurface.
     pub fn new(engine: DiffusionEngine, max_seq: usize) -> Result<Self, String> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
-        use crate::ane_mil::{ane_align_seq, ANE_MIN_SPATIAL};
+        use crate::ane_mil::{ANE_MIN_SPATIAL, ane_align_seq};
         use crate::diffusion_ane;
 
         ane_bridge::ane_init()?;
@@ -4125,10 +4125,7 @@ impl QwenNextCausalDrafter {
     ///   and attach on a dedicated worker thread via
     ///   `enable_ane_gdn_all_layers_via_worker`. ~3.2ms GPU sync per
     ///   dispatch — kept as a safety valve for debugging the inline path.
-    pub fn from_dir(
-        model_dir: &Path,
-        max_seq: usize,
-    ) -> Result<Self, crate::error::ModelError> {
+    pub fn from_dir(model_dir: &Path, max_seq: usize) -> Result<Self, crate::error::ModelError> {
         #[allow(unused_mut)]
         let mut model = crate::qwen3_next::load_qwen3_5_model(model_dir)?;
         #[cfg(feature = "ane")]
@@ -4679,7 +4676,7 @@ mod tests {
     #[cfg(feature = "ane")]
     fn bonsai_l0_attention_context_ane(engine: &DiffusionEngine, token_ids: &[u32]) -> Vec<f32> {
         use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed};
-        use crate::ane_mil::{ane_align_seq, ANE_MIN_SPATIAL};
+        use crate::ane_mil::{ANE_MIN_SPATIAL, ane_align_seq};
 
         ane_bridge::ane_init().unwrap();
 
@@ -5500,7 +5497,7 @@ mod tests {
     #[test]
     #[cfg(feature = "ane")]
     fn test_diffusion_blas_vs_ane() {
-        use crate::ane_bridge::{self, build_weight_blob, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob};
         use crate::ane_mil;
 
         ane_bridge::ane_init().expect("ANE init failed");
@@ -7073,7 +7070,9 @@ mod tests {
             let ffn_dispatches_per_layer = 2 * n_w13;
             eprintln!(
                 "  dispatches/layer: 1 attn + {ffn_dispatches_per_layer} FFN ({} gated + {} down-partial) = {}",
-                n_w13, n_w13, 1 + ffn_dispatches_per_layer,
+                n_w13,
+                n_w13,
+                1 + ffn_dispatches_per_layer,
             );
 
             let cfg = &ane_engine.blas_engine.config;
@@ -8217,7 +8216,7 @@ mod tests {
                 &[5, 3, 9], // drafter says 5, 3, 9
                 &[1.0, 1.0, 1.0],
                 &[1.0, 1.0, 0.0], // target matches at 0,1 but not at 2
-                &[0, 0, 7], // residual[2] = target's argmax at position 2
+                &[0, 0, 7],       // residual[2] = target's argmax at position 2
                 42,
                 &[0.0, 0.0, 0.5],
             ),
@@ -8438,9 +8437,8 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2048);
-        let mut drafter =
-            super::QwenNextCausalDrafter::from_dir(&drafter_dir, drafter_max_seq)
-                .expect("build drafter");
+        let mut drafter = super::QwenNextCausalDrafter::from_dir(&drafter_dir, drafter_max_seq)
+            .expect("build drafter");
         // Dispatch loader by config.json model_type so MoE variants
         // (qwen3_5_moe, e.g. Qwen3.6-35B-A3B-4bit) load via the MoE path.
         let model_type: String = {
@@ -8519,7 +8517,10 @@ mod tests {
             );
             eprintln!("  Output: {decoded:?}");
 
-            assert!(!tokens.is_empty(), "{label}: should produce at least 1 token");
+            assert!(
+                !tokens.is_empty(),
+                "{label}: should produce at least 1 token"
+            );
             assert!(tokens.len() <= 60, "{label}: should not exceed max_tokens");
         }
     }
@@ -8533,7 +8534,7 @@ mod tests {
     #[test]
     #[cfg(feature = "ane")]
     fn test_ane_decode_kernel_compiles() {
-        use crate::ane_bridge::{self, build_weight_blob, build_weight_blob_transposed, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob, build_weight_blob_transposed};
         use crate::diffusion_ane;
 
         ane_bridge::ane_init().expect("ANE init");
@@ -8875,8 +8876,11 @@ mod tests {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("[chat-parity] ANE compile failed: {e}");
-                eprintln!("[chat-parity] SKIP — model architecture incompatible with ANE (hpg={}, head_dim={})",
-                    cfg.heads / cfg.kv_heads, cfg.head_dim);
+                eprintln!(
+                    "[chat-parity] SKIP — model architecture incompatible with ANE (hpg={}, head_dim={})",
+                    cfg.heads / cfg.kv_heads,
+                    cfg.head_dim
+                );
                 return;
             }
         };
@@ -8885,9 +8889,13 @@ mod tests {
         })) {
             Ok(logits) => logits,
             Err(_) => {
-                eprintln!("[chat-parity] ANE eval failed at runtime — hpg={} likely exceeds ANE hardware constraints",
-                    cfg.heads / cfg.kv_heads);
-                eprintln!("[chat-parity] SKIP — CPU path works, ANE requires compatible GQA ratio (hpg<=4)");
+                eprintln!(
+                    "[chat-parity] ANE eval failed at runtime — hpg={} likely exceeds ANE hardware constraints",
+                    cfg.heads / cfg.kv_heads
+                );
+                eprintln!(
+                    "[chat-parity] SKIP — CPU path works, ANE requires compatible GQA ratio (hpg<=4)"
+                );
                 return;
             }
         };
@@ -9027,7 +9035,7 @@ mod tests {
     #[ignore = "ANE hardware probe — run manually"]
     #[cfg(feature = "ane")]
     fn t_ane_dim_probe() {
-        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
 
         struct DimSpec {
             label: &'static str,
@@ -9141,7 +9149,9 @@ mod tests {
                                 logits.len()
                             );
                         } else {
-                            eprintln!("  seq={seq:>4} EVAL BAD — finite={finite} nonzero={nonzero} max_abs={max_abs:.4}");
+                            eprintln!(
+                                "  seq={seq:>4} EVAL BAD — finite={finite} nonzero={nonzero} max_abs={max_abs:.4}"
+                            );
                         }
                     }
                 }

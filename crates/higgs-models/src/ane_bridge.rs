@@ -9,7 +9,7 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr;
 
 // ---------------------------------------------------------------------------
@@ -291,7 +291,13 @@ pub fn matvec_f16(a_f16: &[u16], m: usize, k: usize, x_f32: &[f32], y_f32: &mut 
     debug_assert_eq!(x_f32.len(), k);
     debug_assert!(y_f32.len() >= m);
     unsafe {
-        ane_bridge_matvec_f16(a_f16.as_ptr(), m as c_int, k as c_int, x_f32.as_ptr(), y_f32.as_mut_ptr());
+        ane_bridge_matvec_f16(
+            a_f16.as_ptr(),
+            m as c_int,
+            k as c_int,
+            x_f32.as_ptr(),
+            y_f32.as_mut_ptr(),
+        );
     }
 }
 

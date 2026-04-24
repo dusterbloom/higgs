@@ -629,8 +629,16 @@ pub fn gen_blobfile_matmul(ic: usize, oc: usize, seq_len: usize, name: &str) -> 
     let mut weight_names = Vec::new();
     let mut cax3_emitted = false;
     emit_blobfile_matmul_tiled(
-        &mut m, "xt", name, "yf", "w", ic, oc, seq,
-        &mut weight_names, &mut cax3_emitted,
+        &mut m,
+        "xt",
+        name,
+        "yf",
+        "w",
+        ic,
+        oc,
+        seq,
+        &mut weight_names,
+        &mut cax3_emitted,
     );
     // Cast back to fp32
     let _ = writeln!(
@@ -836,16 +844,40 @@ pub fn gen_fused_qkv_proj(ic: usize, q_dim: usize, kv_dim: usize, seq_len: usize
     let mut weight_names = Vec::new();
     let mut cax3_emitted = false;
     emit_blobfile_matmul_tiled(
-        &mut m, "xt", "wq", "qm", "q", ic, q_dim, seq,
-        &mut weight_names, &mut cax3_emitted,
+        &mut m,
+        "xt",
+        "wq",
+        "qm",
+        "q",
+        ic,
+        q_dim,
+        seq,
+        &mut weight_names,
+        &mut cax3_emitted,
     );
     emit_blobfile_matmul_tiled(
-        &mut m, "xt", "wk", "km", "k", ic, kv_dim, seq,
-        &mut weight_names, &mut cax3_emitted,
+        &mut m,
+        "xt",
+        "wk",
+        "km",
+        "k",
+        ic,
+        kv_dim,
+        seq,
+        &mut weight_names,
+        &mut cax3_emitted,
     );
     emit_blobfile_matmul_tiled(
-        &mut m, "xt", "wv", "vm", "v", ic, kv_dim, seq,
-        &mut weight_names, &mut cax3_emitted,
+        &mut m,
+        "xt",
+        "wv",
+        "vm",
+        "v",
+        ic,
+        kv_dim,
+        seq,
+        &mut weight_names,
+        &mut cax3_emitted,
     );
     // Helper outputs qm/km/vm already in channel-first [1,q_dim/kv_dim,1,seq].
     // Concat Q|K|V directly on channel axis.
@@ -1031,12 +1063,28 @@ pub fn gen_fused_silu_gate_up_proj(ic: usize, inter: usize, seq_len: usize) -> F
     let mut weight_names = Vec::new();
     let mut cax3_emitted = false;
     emit_blobfile_matmul_tiled(
-        &mut m, "xt", "wg", "gm", "g", ic, inter, seq,
-        &mut weight_names, &mut cax3_emitted,
+        &mut m,
+        "xt",
+        "wg",
+        "gm",
+        "g",
+        ic,
+        inter,
+        seq,
+        &mut weight_names,
+        &mut cax3_emitted,
     );
     emit_blobfile_matmul_tiled(
-        &mut m, "xt", "wu", "um", "u", ic, inter, seq,
-        &mut weight_names, &mut cax3_emitted,
+        &mut m,
+        "xt",
+        "wu",
+        "um",
+        "u",
+        ic,
+        inter,
+        seq,
+        &mut weight_names,
+        &mut cax3_emitted,
     );
     // Helper emits gm/um already in channel-first [1,inter,1,seq]; feed directly into sigmoid+mul.
     let _ = writeln!(
@@ -1347,12 +1395,28 @@ pub fn gen_fused_gdn_qkvz_ba_proj(
     let mut weight_names = Vec::new();
     let mut cax3_emitted = false;
     emit_blobfile_matmul_tiled(
-        &mut m, "xt", "wqkvz", "qkvzm", "qkvz", ic, qkvz_oc, seq,
-        &mut weight_names, &mut cax3_emitted,
+        &mut m,
+        "xt",
+        "wqkvz",
+        "qkvzm",
+        "qkvz",
+        ic,
+        qkvz_oc,
+        seq,
+        &mut weight_names,
+        &mut cax3_emitted,
     );
     emit_blobfile_matmul_tiled(
-        &mut m, "xt", "wba", "bam", "ba", ic, ba_oc, seq,
-        &mut weight_names, &mut cax3_emitted,
+        &mut m,
+        "xt",
+        "wba",
+        "bam",
+        "ba",
+        ic,
+        ba_oc,
+        seq,
+        &mut weight_names,
+        &mut cax3_emitted,
     );
     // Concat qkvz|ba on channel axis
     let _ = writeln!(
@@ -1489,7 +1553,7 @@ pub fn gen_gdn_recurrence_step(
     // ANE 0x1d at eval when 3+ IOSurfaces mix C=1 and C=Dk.
     // Caller must expand g/beta/v to [1, Dk, 1, flat_w] before writing.
     let big = dk * flat_w * 4; // [1, Dk, 1, flat_w] fp32
-    let small = flat_w * 4;    // [1, 1,  1, flat_w] fp32 (readout output only)
+    let small = flat_w * 4; // [1, 1,  1, flat_w] fp32 (readout output only)
 
     // ── Kernel A: state_update ──
     // (st, g, beta, k, v) → new_state — all inputs [1, Dk, 1, flat_w]
@@ -1500,33 +1564,84 @@ pub fn gen_gdn_recurrence_step(
     let mut a = String::with_capacity(2048);
     a.push_str(MIL_HEADER);
     let _ = writeln!(a, "    func main<ios18>(");
-    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a0,");  // st
-    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a1,");  // g
-    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a2,");  // k
-    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a3,");  // v
-    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a4");   // beta
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a0,"); // st
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a1,"); // g
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a2,"); // k
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a3,"); // v
+    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> a4"); // beta
     let _ = writeln!(a, "    ) {{");
-    let _ = writeln!(a, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
-    let _ = writeln!(a, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> st = cast(dtype=to16,x=a0)[name=string(\"c0\")];");
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> g = cast(dtype=to16,x=a1)[name=string(\"c1\")];");
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> k = cast(dtype=to16,x=a2)[name=string(\"c2\")];");
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> v = cast(dtype=to16,x=a3)[name=string(\"c3\")];");
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> beta = cast(dtype=to16,x=a4)[name=string(\"c4\")];");
-    let _ = writeln!(a, "        tensor<int32, [1]> c_ax = const()[name=string(\"cax\"), val=tensor<int32, [1]>([1])];");
-    let _ = writeln!(a, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
+    let _ = writeln!(
+        a,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> st = cast(dtype=to16,x=a0)[name=string(\"c0\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> g = cast(dtype=to16,x=a1)[name=string(\"c1\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> k = cast(dtype=to16,x=a2)[name=string(\"c2\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> v = cast(dtype=to16,x=a3)[name=string(\"c3\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> beta = cast(dtype=to16,x=a4)[name=string(\"c4\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<int32, [1]> c_ax = const()[name=string(\"cax\"), val=tensor<int32, [1]>([1])];"
+    );
+    let _ = writeln!(
+        a,
+        "        bool kd = const()[name=string(\"kd\"), val=bool(true)];"
+    );
     // Compute: 7 ops — no broadcast needed, all same shape [1,Dk,1,flat_w]
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> decay = mul(x=st,y=g)[name=string(\"dc\")];");
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> sk = mul(x=decay,y=k)[name=string(\"sk\")];");
-    let _ = writeln!(a, "        tensor<fp16, [1,1,1,{flat_w}]> kvm = reduce_sum(x=sk,axes=c_ax,keep_dims=kd)[name=string(\"kvm\")];");
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> decay = mul(x=st,y=g)[name=string(\"dc\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> sk = mul(x=decay,y=k)[name=string(\"sk\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,1,1,{flat_w}]> kvm = reduce_sum(x=sk,axes=c_ax,keep_dims=kd)[name=string(\"kvm\")];"
+    );
     // After reduce_sum, kvm is [1,1,1,flat_w]. sub(v,kvm) needs same shape.
     // v is [1,Dk,1,flat_w] (caller-expanded). kvm broadcasts on channel axis.
     // Internal broadcast (not IOSurface) should be fine per P3 probe.
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> diff = sub(x=v,y=kvm)[name=string(\"diff\")];");
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> delta = mul(x=diff,y=beta)[name=string(\"dl\")];");
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> kdo = mul(x=k,y=delta)[name=string(\"kdo\")];");
-    let _ = writeln!(a, "        tensor<fp16, [1,{dk},1,{flat_w}]> ns = add(x=decay,y=kdo)[name=string(\"ns\")];");
-    let _ = writeln!(a, "        tensor<fp32, [1,{dk},1,{flat_w}]> out = cast(dtype=to32,x=ns)[name=string(\"out\")];");
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> diff = sub(x=v,y=kvm)[name=string(\"diff\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> delta = mul(x=diff,y=beta)[name=string(\"dl\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> kdo = mul(x=k,y=delta)[name=string(\"kdo\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> ns = add(x=decay,y=kdo)[name=string(\"ns\")];"
+    );
+    let _ = writeln!(
+        a,
+        "        tensor<fp32, [1,{dk},1,{flat_w}]> out = cast(dtype=to32,x=ns)[name=string(\"out\")];"
+    );
     let _ = writeln!(a, "    }} -> (out);");
     a.push_str("}\n");
 
@@ -1539,15 +1654,42 @@ pub fn gen_gdn_recurrence_step(
     let _ = writeln!(b, "        tensor<fp32, [1,{dk},1,{flat_w}]> ns_f,");
     let _ = writeln!(b, "        tensor<fp32, [1,{dk},1,{flat_w}]> q_f");
     let _ = writeln!(b, "    ) {{");
-    let _ = writeln!(b, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
-    let _ = writeln!(b, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
-    let _ = writeln!(b, "        tensor<fp16, [1,{dk},1,{flat_w}]> ns = cast(dtype=to16,x=ns_f)[name=string(\"c0\")];");
-    let _ = writeln!(b, "        tensor<fp16, [1,{dk},1,{flat_w}]> q = cast(dtype=to16,x=q_f)[name=string(\"c1\")];");
-    let _ = writeln!(b, "        tensor<int32, [1]> c_ax = const()[name=string(\"cax\"), val=tensor<int32, [1]>([1])];");
-    let _ = writeln!(b, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
-    let _ = writeln!(b, "        tensor<fp16, [1,{dk},1,{flat_w}]> sq = mul(x=ns,y=q)[name=string(\"sq\")];");
-    let _ = writeln!(b, "        tensor<fp16, [1,1,1,{flat_w}]> yr = reduce_sum(x=sq,axes=c_ax,keep_dims=kd)[name=string(\"yr\")];");
-    let _ = writeln!(b, "        tensor<fp32, [1,1,1,{flat_w}]> out = cast(dtype=to32,x=yr)[name=string(\"out\")];");
+    let _ = writeln!(
+        b,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
+    let _ = writeln!(
+        b,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        b,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> ns = cast(dtype=to16,x=ns_f)[name=string(\"c0\")];"
+    );
+    let _ = writeln!(
+        b,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> q = cast(dtype=to16,x=q_f)[name=string(\"c1\")];"
+    );
+    let _ = writeln!(
+        b,
+        "        tensor<int32, [1]> c_ax = const()[name=string(\"cax\"), val=tensor<int32, [1]>([1])];"
+    );
+    let _ = writeln!(
+        b,
+        "        bool kd = const()[name=string(\"kd\"), val=bool(true)];"
+    );
+    let _ = writeln!(
+        b,
+        "        tensor<fp16, [1,{dk},1,{flat_w}]> sq = mul(x=ns,y=q)[name=string(\"sq\")];"
+    );
+    let _ = writeln!(
+        b,
+        "        tensor<fp16, [1,1,1,{flat_w}]> yr = reduce_sum(x=sq,axes=c_ax,keep_dims=kd)[name=string(\"yr\")];"
+    );
+    let _ = writeln!(
+        b,
+        "        tensor<fp32, [1,1,1,{flat_w}]> out = cast(dtype=to32,x=yr)[name=string(\"out\")];"
+    );
     let _ = writeln!(b, "    }} -> (out);");
     b.push_str("}\n");
 
@@ -1556,8 +1698,8 @@ pub fn gen_gdn_recurrence_step(
         readout_mil: b,
         state_input_sizes: vec![big, big, big, big, big], // [st, g, k, v, beta] all [1,Dk,1,flat_w] fp32
         state_output_sizes: vec![big],
-        readout_input_sizes: vec![big, big],               // ns + q
-        readout_output_sizes: vec![small],                  // y is [1,1,1,flat_w] fp32
+        readout_input_sizes: vec![big, big], // ns + q
+        readout_output_sizes: vec![small],   // y is [1,1,1,flat_w] fp32
         num_v_heads: hv,
         head_k_dim: dk,
         head_v_dim: dv,
@@ -1748,7 +1890,7 @@ mod tests {
     /// RED→GREEN: Single BLOBFILE matmul — weight baked into compiled kernel.
     #[test]
     fn test_blobfile_matmul_identity() {
-        use crate::ane_bridge::{self, build_weight_blob, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob};
 
         ane_bridge::ane_init().expect("ANE init failed");
         ane_bridge::set_quiet(false);
@@ -1813,7 +1955,7 @@ mod tests {
     /// RED→GREEN: Fused r+k+v BLOBFILE projection — 3 matmuls in one ANE dispatch.
     #[test]
     fn test_fused_rkv_blobfile() {
-        use crate::ane_bridge::{self, build_weight_blob, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob};
 
         ane_bridge::ane_init().expect("ANE init failed");
         ane_bridge::set_quiet(false);
@@ -1886,7 +2028,7 @@ mod tests {
     /// This simulates the 4-dispatch-per-layer approach (112 total, under 119 limit).
     #[test]
     fn test_fused_diffusion_layer_benchmark() {
-        use crate::ane_bridge::{self, build_weight_blob, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob};
 
         ane_bridge::ane_init().expect("ANE init failed");
 
@@ -2046,7 +2188,7 @@ mod tests {
     /// This is the path to 280 tok/s.
     #[test]
     fn test_mega_fused_layer_benchmark() {
-        use crate::ane_bridge::{self, build_weight_blob, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob};
 
         ane_bridge::ane_init().expect("ANE init failed");
         ane_bridge::set_quiet(false);
@@ -2145,7 +2287,7 @@ mod tests {
     /// Realistic decode simulation: includes write_input + eval + read_output.
     #[test]
     fn test_blas_vs_ane_blobfile_latency() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::ane_bridge::{self, build_weight_blob, AneKernel};
+        use crate::ane_bridge::{self, AneKernel, build_weight_blob};
 
         // cblas_sgemm FFI — Accelerate framework (already linked)
         unsafe extern "C" {
@@ -2283,7 +2425,7 @@ mod tests {
 
                 // --- GPU (MLX Metal) ---
                 // W is [oc, ic] f32, act is [seq, ic] f32, out = act @ W^T = [seq, oc]
-                use mlx_rs::{ops, transforms::eval as mlx_eval, Array as MlxArray};
+                use mlx_rs::{Array as MlxArray, ops, transforms::eval as mlx_eval};
                 let w_mlx = MlxArray::from_slice(&w_f32, &[oc as i32, ic as i32]);
                 let act_mlx = MlxArray::from_slice(&act, &[seq as i32, ic as i32]);
                 // Warmup

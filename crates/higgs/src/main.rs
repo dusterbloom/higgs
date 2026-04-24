@@ -250,15 +250,29 @@ fn load_engines(
 
         tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
         let kv_cache_config = model_cfg.kv_cache_config();
-        let dflash_path = model_cfg.dflash.as_ref().and_then(|p| {
+        let dflash_path =
+            model_cfg
+                .dflash
+                .as_ref()
+                .and_then(|p| match model_resolver::resolve(p) {
+                    Ok(resolved) => Some(resolved),
+                    Err(e) => {
+                        tracing::warn!(dflash = %p, "DFlash drafter not found, skipping: {e}");
+                        None
+                    }
+                });
+        // AR-spec drafter is wired through an env var (the engine reads
+        // HIGGS_AR_SPEC_DRAFT_PATH at SimpleEngine load time). Surface the
+        // resolved path here so the higgs.toml entry stays self-contained
+        // without spreading another path through the engine API.
+        if let Some(ref p) = model_cfg.ar_spec {
             match model_resolver::resolve(p) {
-                Ok(resolved) => Some(resolved),
+                Ok(resolved) => set_ar_spec_env(&resolved),
                 Err(e) => {
-                    tracing::warn!(dflash = %p, "DFlash drafter not found, skipping: {e}");
-                    None
+                    tracing::warn!(ar_spec = %p, "AR-spec drafter not found, skipping: {e}");
                 }
             }
-        });
+        }
         let engine = if model_cfg.batch {
             Engine::load_batch(&resolved, kv_cache_config)?
         } else {
@@ -320,6 +334,16 @@ fn init_tracing(verbose: bool) {
 
 /// Crash diagnostic: install panic hook, SIGABRT/SEGV/BUS handlers, and atexit.
 /// Writes to `/tmp/higgs_crash_<pid>.log`. Enabled via `HIGGS_CRASH_DIAG=1`.
+/// Set `HIGGS_AR_SPEC_DRAFT_PATH` so `SimpleEngine::load` can pick it up.
+/// Called from the single-threaded init phase before any worker threads
+/// are spawned, so the unsafe `set_var` cannot race with concurrent readers.
+#[allow(unsafe_code)]
+fn set_ar_spec_env(path: &std::path::Path) {
+    unsafe {
+        std::env::set_var("HIGGS_AR_SPEC_DRAFT_PATH", path);
+    }
+}
+
 #[allow(unsafe_code, clippy::print_stderr)]
 fn install_crash_diagnostics() {
     use std::io::Write;

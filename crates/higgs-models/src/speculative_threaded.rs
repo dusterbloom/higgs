@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use mlx_rs::ops::indexing::{self as ix, IndexOp};
 
-use crate::diffusion::{accept_prefix, AdaptiveKController, QwenNextCausalDrafter};
+use crate::diffusion::{AdaptiveKController, QwenNextCausalDrafter, accept_prefix};
 use crate::qwen3_next::LayerCache;
 
 enum DraftReq {
@@ -54,7 +54,9 @@ fn produce_drafts(
         if context_len + drafts.len() >= max_seq {
             break;
         }
-        let next = drafter.step(last, cache).map_err(|e| format!("step: {e}"))?;
+        let next = drafter
+            .step(last, cache)
+            .map_err(|e| format!("step: {e}"))?;
         drafts.push(next);
         last = next;
     }
@@ -185,7 +187,11 @@ fn drafter_thread_loop(
 ///
 /// Signature matches the serial version so callers dispatch based on env var
 /// without restructuring.
-#[allow(clippy::as_conversions, clippy::cast_precision_loss, clippy::too_many_lines)]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines
+)]
 pub fn speculative_generate_next_threaded(
     drafter: &mut QwenNextCausalDrafter,
     verifier: &mut crate::AnyModel,

@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
@@ -16,7 +17,6 @@ use mlx_rs::{
     nn,
     ops::{self, indexing::IndexOp},
     transforms::eval,
-    Array,
 };
 use serde::Deserialize;
 
@@ -468,10 +468,7 @@ impl Rwkv7Attention {
         let g = self.g_lora.forward(&xg)?;
 
         // Decay: w = -0.6065306597126334 * sigmoid(w_lora_out) (log-space).
-        let w_log = ops::multiply(
-            &Array::from_f32(-0.606_530_66),
-            &ops::sigmoid(&w_raw)?,
-        )?;
+        let w_log = ops::multiply(&Array::from_f32(-0.606_530_66), &ops::sigmoid(&w_raw)?)?;
 
         // Attention bonus: a = sigmoid(a_lora_out), range (0, 1).
         let a = ops::sigmoid(&a_raw)?;
@@ -978,7 +975,13 @@ impl Rwkv7CausalLM {
         let inter = self.args.intermediate_size as usize;
         let vocab = self.args.vocab_size as usize;
 
-        tracing::info!(dim, num_heads, head_dim, inter, "Initializing RWKV-7 ANE executor");
+        tracing::info!(
+            dim,
+            num_heads,
+            head_dim,
+            inter,
+            "Initializing RWKV-7 ANE executor"
+        );
 
         let config = MilConfig {
             dim,
@@ -1027,9 +1030,8 @@ mod tests {
     fn model_dir() -> Option<PathBuf> {
         // Check for model in standard HF cache location.
         let home = std::env::var("HOME").ok()?;
-        let hf_cache = PathBuf::from(home).join(
-            ".cache/huggingface/hub/models--fla-hub--rwkv7-1.5B-world",
-        );
+        let hf_cache =
+            PathBuf::from(home).join(".cache/huggingface/hub/models--fla-hub--rwkv7-1.5B-world");
         if !hf_cache.exists() {
             return None;
         }
@@ -1150,7 +1152,10 @@ mod tests {
 
         // The model should produce something other than token 0 repeatedly
         let unique: std::collections::HashSet<_> = generated.iter().collect();
-        assert!(unique.len() > 1, "Model only produced one unique token — weights likely not loaded");
+        assert!(
+            unique.len() > 1,
+            "Model only produced one unique token — weights likely not loaded"
+        );
     }
 
     /// E2E ANE test: compile kernels, run decode on the Neural Engine.
@@ -1202,7 +1207,11 @@ mod tests {
             .unwrap();
         }
         let prefill_ms = t0.elapsed().as_millis();
-        eprintln!("ANE prefill: {}ms ({} tokens)", prefill_ms, prompt_ids.len());
+        eprintln!(
+            "ANE prefill: {}ms ({} tokens)",
+            prefill_ms,
+            prompt_ids.len()
+        );
 
         // Greedy decode
         let first_token = last_logits
@@ -1290,9 +1299,12 @@ mod tests {
         let cpu_logits = model.forward(&input, &mut cpu_cache).unwrap();
         eval([&cpu_logits]).unwrap();
         let cpu_logits = cpu_logits.as_slice::<f32>();
-        let cpu_top = cpu_logits.iter().enumerate()
+        let cpu_top = cpu_logits
+            .iter()
+            .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, v)| (i, *v)).unwrap();
+            .map(|(i, v)| (i, *v))
+            .unwrap();
 
         // --- ANE path ---
         let mut ane_state = crate::ane_forward::AneModelState {
@@ -1302,22 +1314,36 @@ mod tests {
             v_first: vec![0.0; dim],
         };
         let ane_logits = crate::ane_forward::forward_ane_full(
-            &ane_ctx.executor, token_id, &mut ane_state,
-            &ane_ctx.embedding, &ane_ctx.lm_head_fp16,
-            &ane_ctx.final_norm_w, &ane_ctx.final_norm_b,
-            ane_ctx.vocab_size, ane_ctx.dim,
-        ).unwrap();
-        let ane_top = ane_logits.iter().enumerate()
+            &ane_ctx.executor,
+            token_id,
+            &mut ane_state,
+            &ane_ctx.embedding,
+            &ane_ctx.lm_head_fp16,
+            &ane_ctx.final_norm_w,
+            &ane_ctx.final_norm_b,
+            ane_ctx.vocab_size,
+            ane_ctx.dim,
+        )
+        .unwrap();
+        let ane_top = ane_logits
+            .iter()
+            .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, v)| (i, *v)).unwrap();
+            .map(|(i, v)| (i, *v))
+            .unwrap();
 
         // Compare
-        let max_err = cpu_logits.iter().zip(ane_logits.iter())
+        let max_err = cpu_logits
+            .iter()
+            .zip(ane_logits.iter())
             .map(|(c, a)| (c - a).abs())
             .fold(0.0f32, f32::max);
-        let mean_err = cpu_logits.iter().zip(ane_logits.iter())
+        let mean_err = cpu_logits
+            .iter()
+            .zip(ane_logits.iter())
             .map(|(c, a)| (c - a).abs())
-            .sum::<f32>() / cpu_logits.len() as f32;
+            .sum::<f32>()
+            / cpu_logits.len() as f32;
 
         eprintln!("CPU top: token {} logit {:.3}", cpu_top.0, cpu_top.1);
         eprintln!("ANE top: token {} logit {:.3}", ane_top.0, ane_top.1);
@@ -1325,12 +1351,32 @@ mod tests {
         eprintln!("Top-1 match: {}", cpu_top.0 == ane_top.0);
 
         // Also compare top-5
-        let mut cpu_sorted: Vec<(usize, f32)> = cpu_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-        let mut ane_sorted: Vec<(usize, f32)> = ane_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        let mut cpu_sorted: Vec<(usize, f32)> = cpu_logits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i, v))
+            .collect();
+        let mut ane_sorted: Vec<(usize, f32)> = ane_logits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i, v))
+            .collect();
         cpu_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         ane_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        eprintln!("CPU top-5: {:?}", &cpu_sorted[..5].iter().map(|(i, v)| (*i, format!("{v:.2}"))).collect::<Vec<_>>());
-        eprintln!("ANE top-5: {:?}", &ane_sorted[..5].iter().map(|(i, v)| (*i, format!("{v:.2}"))).collect::<Vec<_>>());
+        eprintln!(
+            "CPU top-5: {:?}",
+            &cpu_sorted[..5]
+                .iter()
+                .map(|(i, v)| (*i, format!("{v:.2}")))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "ANE top-5: {:?}",
+            &ane_sorted[..5]
+                .iter()
+                .map(|(i, v)| (*i, format!("{v:.2}")))
+                .collect::<Vec<_>>()
+        );
 
         // r_proj comparison removed (shared kernel architecture)
     }

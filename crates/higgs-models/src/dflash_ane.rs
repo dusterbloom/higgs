@@ -43,8 +43,7 @@ use crate::diffusion::{
 pub(crate) fn cpu_to_ane(data: &[f32], seq: usize, ch: usize) -> Vec<u8> {
     debug_assert_eq!(data.len(), seq * ch);
     let mut out = vec![0u8; seq * ch * 4];
-    let out_f32 =
-        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut f32, seq * ch) };
+    let out_f32 = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut f32, seq * ch) };
     transpose_rc_to_cr(data, out_f32, seq, ch);
     out
 }
@@ -54,8 +53,7 @@ pub(crate) fn cpu_to_ane(data: &[f32], seq: usize, ch: usize) -> Vec<u8> {
 /// Uses NEON 4x4 block transpose for the aligned interior and scalar for edges.
 pub(crate) fn ane_to_cpu(bytes: &[u8], seq: usize, ch: usize) -> Vec<f32> {
     debug_assert_eq!(bytes.len(), seq * ch * 4);
-    let src =
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, seq * ch) };
+    let src = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, seq * ch) };
     let mut out = vec![0.0f32; seq * ch];
     // ANE [ch, seq] → CPU [seq, ch] is the inverse: rows=ch, cols=seq → rows=seq, cols=ch.
     transpose_rc_to_cr(src, &mut out, ch, seq);
@@ -64,10 +62,15 @@ pub(crate) fn ane_to_cpu(bytes: &[u8], seq: usize, ch: usize) -> Vec<f32> {
 
 /// Read a split from ANE concatenated output [total_ch, seq] and transpose to CPU [seq, sub_ch].
 /// Reads channels `ch_start..ch_start+sub_ch` from the output.
-fn ane_split_to_cpu(bytes: &[u8], seq: usize, total_ch: usize, ch_start: usize, sub_ch: usize) -> Vec<f32> {
+fn ane_split_to_cpu(
+    bytes: &[u8],
+    seq: usize,
+    total_ch: usize,
+    ch_start: usize,
+    sub_ch: usize,
+) -> Vec<f32> {
     debug_assert_eq!(bytes.len(), total_ch * seq * 4);
-    let src =
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, total_ch * seq) };
+    let src = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, total_ch * seq) };
     let mut out = vec![0.0f32; seq * sub_ch];
     // This is a strided sub-transpose: read from [total_ch, seq] starting at row ch_start,
     // sub_ch rows, and transpose to [seq, sub_ch].
@@ -81,20 +84,20 @@ fn ane_split_to_cpu(bytes: &[u8], seq: usize, total_ch: usize, ch_start: usize, 
             let r_abs = ch_start + r;
             for c in (0..cols_4).step_by(4) {
                 unsafe {
-                    let r0 = vld1q_f32(src.as_ptr().add(( r_abs     ) * seq + c));
-                    let r1 = vld1q_f32(src.as_ptr().add(( r_abs + 1 ) * seq + c));
-                    let r2 = vld1q_f32(src.as_ptr().add(( r_abs + 2 ) * seq + c));
-                    let r3 = vld1q_f32(src.as_ptr().add(( r_abs + 3 ) * seq + c));
+                    let r0 = vld1q_f32(src.as_ptr().add((r_abs) * seq + c));
+                    let r1 = vld1q_f32(src.as_ptr().add((r_abs + 1) * seq + c));
+                    let r2 = vld1q_f32(src.as_ptr().add((r_abs + 2) * seq + c));
+                    let r3 = vld1q_f32(src.as_ptr().add((r_abs + 3) * seq + c));
                     let t01 = vtrnq_f32(r0, r1);
                     let t23 = vtrnq_f32(r2, r3);
                     let o0 = vcombine_f32(vget_low_f32(t01.0), vget_low_f32(t23.0));
                     let o1 = vcombine_f32(vget_low_f32(t01.1), vget_low_f32(t23.1));
                     let o2 = vcombine_f32(vget_high_f32(t01.0), vget_high_f32(t23.0));
                     let o3 = vcombine_f32(vget_high_f32(t01.1), vget_high_f32(t23.1));
-                    vst1q_f32(out.as_mut_ptr().add(( c     ) * sub_ch + r), o0);
-                    vst1q_f32(out.as_mut_ptr().add(( c + 1 ) * sub_ch + r), o1);
-                    vst1q_f32(out.as_mut_ptr().add(( c + 2 ) * sub_ch + r), o2);
-                    vst1q_f32(out.as_mut_ptr().add(( c + 3 ) * sub_ch + r), o3);
+                    vst1q_f32(out.as_mut_ptr().add((c) * sub_ch + r), o0);
+                    vst1q_f32(out.as_mut_ptr().add((c + 1) * sub_ch + r), o1);
+                    vst1q_f32(out.as_mut_ptr().add((c + 2) * sub_ch + r), o2);
+                    vst1q_f32(out.as_mut_ptr().add((c + 3) * sub_ch + r), o3);
                 }
             }
         }
@@ -264,10 +267,10 @@ fn transpose_rc_to_cr(src: &[f32], dst: &mut [f32], rows: usize, cols: usize) {
             for c in (0..cols_4).step_by(4) {
                 unsafe {
                     // Load 4 rows of 4 elements from src [rows, cols] layout.
-                    let r0 = vld1q_f32(src.as_ptr().add(( r     ) * cols + c));
-                    let r1 = vld1q_f32(src.as_ptr().add(( r + 1 ) * cols + c));
-                    let r2 = vld1q_f32(src.as_ptr().add(( r + 2 ) * cols + c));
-                    let r3 = vld1q_f32(src.as_ptr().add(( r + 3 ) * cols + c));
+                    let r0 = vld1q_f32(src.as_ptr().add((r) * cols + c));
+                    let r1 = vld1q_f32(src.as_ptr().add((r + 1) * cols + c));
+                    let r2 = vld1q_f32(src.as_ptr().add((r + 2) * cols + c));
+                    let r3 = vld1q_f32(src.as_ptr().add((r + 3) * cols + c));
                     // 4x4 in-register transpose via trn + zip.
                     let t01 = vtrnq_f32(r0, r1);
                     let t23 = vtrnq_f32(r2, r3);
@@ -276,10 +279,10 @@ fn transpose_rc_to_cr(src: &[f32], dst: &mut [f32], rows: usize, cols: usize) {
                     let o2 = vcombine_f32(vget_high_f32(t01.0), vget_high_f32(t23.0));
                     let o3 = vcombine_f32(vget_high_f32(t01.1), vget_high_f32(t23.1));
                     // Store to dst [cols, rows] layout.
-                    vst1q_f32(dst.as_mut_ptr().add(( c     ) * rows + r), o0);
-                    vst1q_f32(dst.as_mut_ptr().add(( c + 1 ) * rows + r), o1);
-                    vst1q_f32(dst.as_mut_ptr().add(( c + 2 ) * rows + r), o2);
-                    vst1q_f32(dst.as_mut_ptr().add(( c + 3 ) * rows + r), o3);
+                    vst1q_f32(dst.as_mut_ptr().add((c) * rows + r), o0);
+                    vst1q_f32(dst.as_mut_ptr().add((c + 1) * rows + r), o1);
+                    vst1q_f32(dst.as_mut_ptr().add((c + 2) * rows + r), o2);
+                    vst1q_f32(dst.as_mut_ptr().add((c + 3) * rows + r), o3);
                 }
             }
         }
@@ -362,7 +365,9 @@ const UP_PROJ_ANE_UNSCALE: f32 = 1.0 / UP_PROJ_ANE_SCALE;
 
 /// Convert bf16 raw bits to f32 (top 16 bits of f32 layout).
 fn bf16_u16_to_f32_vec(src: &[u16]) -> Vec<f32> {
-    src.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect()
+    src.iter()
+        .map(|&b| half::bf16::from_bits(b).to_f32())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -407,11 +412,31 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
     let up_mil = ane_mil::gen_blobfile_matmul(h, inter, block, "u");
     let down_mil = ane_mil::gen_blobfile_matmul(inter, h, block, "d");
     if std::env::var_os("HIGGS_ANE_DUMP_MIL").is_some() {
-        eprintln!("=== QKV MIL ({} weights) ===\n{}", qkv_mil.weight_names.len(), qkv_mil.mil_text);
-        eprintln!("=== O MIL ({} weights) ===\n{}", o_mil.weight_names.len(), o_mil.mil_text);
-        eprintln!("=== GATE MIL ({} weights) ===\n{}", gate_mil.weight_names.len(), gate_mil.mil_text);
-        eprintln!("=== UP MIL ({} weights) ===\n{}", up_mil.weight_names.len(), up_mil.mil_text);
-        eprintln!("=== DOWN MIL ({} weights) ===\n{}", down_mil.weight_names.len(), down_mil.mil_text);
+        eprintln!(
+            "=== QKV MIL ({} weights) ===\n{}",
+            qkv_mil.weight_names.len(),
+            qkv_mil.mil_text
+        );
+        eprintln!(
+            "=== O MIL ({} weights) ===\n{}",
+            o_mil.weight_names.len(),
+            o_mil.mil_text
+        );
+        eprintln!(
+            "=== GATE MIL ({} weights) ===\n{}",
+            gate_mil.weight_names.len(),
+            gate_mil.mil_text
+        );
+        eprintln!(
+            "=== UP MIL ({} weights) ===\n{}",
+            up_mil.weight_names.len(),
+            up_mil.mil_text
+        );
+        eprintln!(
+            "=== DOWN MIL ({} weights) ===\n{}",
+            down_mil.weight_names.len(),
+            down_mil.mil_text
+        );
     }
 
     let n_layers = cfg.layers;
@@ -464,8 +489,12 @@ pub fn compile_dflash_ane(engine: DFlashCpuEngine) -> Result<DFlashAneExecutor, 
         // Flatten per-kernel: QKV takes q||k||v. Gate and up are now separate
         // kernels (each <= 16 tiles, under the ANE compiler cap); CPU fuses
         // silu(g) * u between them, so their blobs are NOT chained.
-        let qkv_blobs: Vec<&[u8]> = bq_tiles.iter().chain(bk_tiles.iter())
-            .chain(bv_tiles.iter()).map(|v| v.as_slice()).collect();
+        let qkv_blobs: Vec<&[u8]> = bq_tiles
+            .iter()
+            .chain(bk_tiles.iter())
+            .chain(bv_tiles.iter())
+            .map(|v| v.as_slice())
+            .collect();
         let o_blobs: Vec<&[u8]> = bo_tiles.iter().map(|v| v.as_slice()).collect();
         let gate_blobs: Vec<&[u8]> = bg_tiles.iter().map(|v| v.as_slice()).collect();
         let up_blobs: Vec<&[u8]> = bu_tiles.iter().map(|v| v.as_slice()).collect();
@@ -628,8 +657,22 @@ impl DFlashAneExecutor {
         let mut t_ane_o = 0u64;
         let mut t_ane_mlp = 0u64;
         let mut t_norm_residual = 0u64;
-        macro_rules! tick { () => { if trace { std::time::Instant::now() } else { std::time::Instant::now() } } }
-        macro_rules! tock { ($acc:ident, $t0:expr) => { if trace { $acc += $t0.elapsed().as_nanos() as u64; } } }
+        macro_rules! tick {
+            () => {
+                if trace {
+                    std::time::Instant::now()
+                } else {
+                    std::time::Instant::now()
+                }
+            };
+        }
+        macro_rules! tock {
+            ($acc:ident, $t0:expr) => {
+                if trace {
+                    $acc += $t0.elapsed().as_nanos() as u64;
+                }
+            };
+        }
 
         // Enter ANE realtime dispatch mode for lower per-dispatch latency.
         AneKernel::begin_realtime();
@@ -646,11 +689,24 @@ impl DFlashAneExecutor {
             }
         }
         let mut target_hidden = vec![0.0f32; ctx_len * h];
-        sgemm_nt(ctx_len, h, fc_in, &target_cat, &self.fc_f32, &mut target_hidden);
+        sgemm_nt(
+            ctx_len,
+            h,
+            fc_in,
+            &target_cat,
+            &self.fc_f32,
+            &mut target_hidden,
+        );
 
         // hidden_norm
         let mut target_normed = vec![0.0f32; ctx_len * h];
-        rms_norm(&target_hidden, &self.cpu_engine.hidden_norm, &mut target_normed, ctx_len, h);
+        rms_norm(
+            &target_hidden,
+            &self.cpu_engine.hidden_norm,
+            &mut target_normed,
+            ctx_len,
+            h,
+        );
         let target_hidden = target_normed;
         tock!(t_fc, t0);
 
@@ -692,8 +748,22 @@ impl DFlashAneExecutor {
             std::thread::scope(|s| {
                 // 3. CPU: K/V from target context (background thread)
                 let blas_job = s.spawn(|| {
-                    sgemm_nt(ctx_len, kv_dim, h, &target_hidden, k_proj_f32, &mut k_ctx_buf);
-                    sgemm_nt(ctx_len, kv_dim, h, &target_hidden, v_proj_f32, &mut v_ctx_buf);
+                    sgemm_nt(
+                        ctx_len,
+                        kv_dim,
+                        h,
+                        &target_hidden,
+                        k_proj_f32,
+                        &mut k_ctx_buf,
+                    );
+                    sgemm_nt(
+                        ctx_len,
+                        kv_dim,
+                        h,
+                        &target_hidden,
+                        v_proj_f32,
+                        &mut v_ctx_buf,
+                    );
                 });
                 // ANE QKV (main thread — blocks during eval)
                 lk.qkv.write_input(0, &normed_ane);
@@ -708,7 +778,8 @@ impl DFlashAneExecutor {
             let q_buf = ane_split_to_cpu(&qkv_out, block, total_qkv_ch, 0, q_dim);
             let mut q_buf = q_buf; // make mutable for in-place QK norm + RoPE
             let mut k_noise_buf = ane_split_to_cpu(&qkv_out, block, total_qkv_ch, q_dim, kv_dim);
-            let v_noise_buf = ane_split_to_cpu(&qkv_out, block, total_qkv_ch, q_dim + kv_dim, kv_dim);
+            let v_noise_buf =
+                ane_split_to_cpu(&qkv_out, block, total_qkv_ch, q_dim + kv_dim, kv_dim);
             tock!(t_transpose, t0);
 
             // 4. Per-head QK norm + 5. RoPE
@@ -736,16 +807,20 @@ impl DFlashAneExecutor {
                     let off = s * q_dim + head * hd;
                     apply_rope(
                         &mut q_buf[off..off + hd],
-                        pos, half_hd,
-                        &self.cpu_engine.rope_cos, &self.cpu_engine.rope_sin,
+                        pos,
+                        half_hd,
+                        &self.cpu_engine.rope_cos,
+                        &self.cpu_engine.rope_sin,
                     );
                 }
                 for head in 0..n_kv {
                     let off = s * kv_dim + head * hd;
                     apply_rope(
                         &mut k_noise_buf[off..off + hd],
-                        pos, half_hd,
-                        &self.cpu_engine.rope_cos, &self.cpu_engine.rope_sin,
+                        pos,
+                        half_hd,
+                        &self.cpu_engine.rope_cos,
+                        &self.cpu_engine.rope_sin,
                     );
                 }
             }
@@ -755,8 +830,10 @@ impl DFlashAneExecutor {
                     let off = s * kv_dim + head * hd;
                     apply_rope(
                         &mut k_ctx_buf[off..off + hd],
-                        pos, half_hd,
-                        &self.cpu_engine.rope_cos, &self.cpu_engine.rope_sin,
+                        pos,
+                        half_hd,
+                        &self.cpu_engine.rope_cos,
+                        &self.cpu_engine.rope_sin,
                     );
                 }
             }
@@ -802,12 +879,18 @@ impl DFlashAneExecutor {
                     }
 
                     let mut scores = vec![0.0f32; block * total_kv_len];
-                    sgemm_nt_scaled(block, total_kv_len, hd, &q_head, &k_full, &mut scores, scale);
+                    sgemm_nt_scaled(
+                        block,
+                        total_kv_len,
+                        hd,
+                        &q_head,
+                        &k_full,
+                        &mut scores,
+                        scale,
+                    );
 
                     for row in 0..block {
-                        softmax_inplace(
-                            &mut scores[row * total_kv_len..(row + 1) * total_kv_len],
-                        );
+                        softmax_inplace(&mut scores[row * total_kv_len..(row + 1) * total_kv_len]);
                     }
 
                     let mut ctx = vec![0.0f32; block * hd];
@@ -841,9 +924,14 @@ impl DFlashAneExecutor {
                     let sl = &o_cpu[b * h..(b + 1) * h];
                     let ni = sl.iter().filter(|v| v.is_infinite()).count();
                     let nn = sl.iter().filter(|v| v.is_nan()).count();
-                    let mx = sl.iter().fold(0.0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+                    let mx = sl.iter().fold(
+                        0.0f32,
+                        |m, v| if v.is_finite() { m.max(v.abs()) } else { m },
+                    );
                     if ni > 0 || nn > 0 {
-                        eprintln!("    [L{li}] o_cpu block {b}: inf={ni}, nan={nn}, max|finite|={mx}");
+                        eprintln!(
+                            "    [L{li}] o_cpu block {b}: inf={ni}, nan={nn}, max|finite|={mx}"
+                        );
                     }
                 }
             }
@@ -918,9 +1006,14 @@ impl DFlashAneExecutor {
                     let sl = &down_cpu[b * h..(b + 1) * h];
                     let ni = sl.iter().filter(|v| v.is_infinite()).count();
                     let nn = sl.iter().filter(|v| v.is_nan()).count();
-                    let mx = sl.iter().fold(0.0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+                    let mx = sl.iter().fold(
+                        0.0f32,
+                        |m, v| if v.is_finite() { m.max(v.abs()) } else { m },
+                    );
                     if ni > 0 || nn > 0 {
-                        eprintln!("    [L{li}] down_cpu block {b}: inf={ni}, nan={nn}, max|finite|={mx}");
+                        eprintln!(
+                            "    [L{li}] down_cpu block {b}: inf={ni}, nan={nn}, max|finite|={mx}"
+                        );
                     }
                 }
             }
@@ -955,10 +1048,20 @@ impl DFlashAneExecutor {
             eprintln!("    qk_norm+rope:  {:>8.0}us", us(t_qk_norm_rope));
             eprintln!("    sdpa:          {:>8.0}us", us(t_sdpa));
             eprintln!("    ane_o:         {:>8.0}us", us(t_ane_o));
-            eprintln!("    ane_mlp:       {:>8.0}us (silu+down chain)", us(t_ane_mlp));
+            eprintln!(
+                "    ane_mlp:       {:>8.0}us (silu+down chain)",
+                us(t_ane_mlp)
+            );
             eprintln!("    norm+residual: {:>8.0}us", us(t_norm_residual));
-            let total = t_fc + t_ane_qkv + t_transpose + t_target_kv + t_qk_norm_rope
-                + t_sdpa + t_ane_o + t_ane_mlp + t_norm_residual;
+            let total = t_fc
+                + t_ane_qkv
+                + t_transpose
+                + t_target_kv
+                + t_qk_norm_rope
+                + t_sdpa
+                + t_ane_o
+                + t_ane_mlp
+                + t_norm_residual;
             eprintln!("    TOTAL:         {:>8.0}us", us(total));
         }
 
@@ -1033,9 +1136,7 @@ impl DFlashAneWorkerHandle {
                 reply: reply_tx,
             })
             .expect("ANE worker thread terminated unexpectedly");
-        reply_rx
-            .recv()
-            .expect("ANE worker reply channel dropped")
+        reply_rx.recv().expect("ANE worker reply channel dropped")
     }
 
     pub fn config(&self) -> &DFlashCpuConfig {
@@ -1064,9 +1165,7 @@ impl DFlashAneWorkerHandle {
 ///
 /// Blocks until compilation completes — returns `Err` if the ANE compile
 /// failed so the caller can fall back to CPU BLAS.
-pub fn spawn_ane_worker(
-    cpu_engine: DFlashCpuEngine,
-) -> Result<DFlashAneWorkerHandle, String> {
+pub fn spawn_ane_worker(cpu_engine: DFlashCpuEngine) -> Result<DFlashAneWorkerHandle, String> {
     let config = cpu_engine.config.clone();
     let (tx, rx) = std::sync::mpsc::channel::<AneWorkerMsg>();
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -1198,7 +1297,9 @@ mod tests {
                 let cap = n.min(cpu_engine.layers.len());
                 cpu_engine.layers.truncate(cap);
                 cpu_engine.config.layers = cap;
-                eprintln!("DFlash ANE parity: truncated to {cap} layers via DFLASH_ANE_TEST_LAYERS");
+                eprintln!(
+                    "DFlash ANE parity: truncated to {cap} layers via DFLASH_ANE_TEST_LAYERS"
+                );
             }
         }
         let cfg = &cpu_engine.config;
@@ -1414,7 +1515,7 @@ mod tests {
 
     /// Run the full DFlash CPU-vs-ANE E2E benchmark for a given target + drafter pair.
     fn run_dflash_ane_e2e(target_path: &str, drafter_base: &str) {
-        use crate::dflash::{load_dflash_drafter, GdnStateBackup};
+        use crate::dflash::{GdnStateBackup, load_dflash_drafter};
         use crate::diffusion::accept_prefix;
         use crate::qwen3_next::load_qwen3_5_model;
         use mlx_rs::ops::indexing::IndexOp;
@@ -1441,12 +1542,15 @@ mod tests {
 
         let t0 = Instant::now();
         let ane_executor = compile_dflash_ane(cpu_engine.clone()).expect("ANE compile failed");
-        eprintln!("ANE executor compiled in {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "ANE executor compiled in {:.0}ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
 
         // Prompt tokens
         let prompt_tokens: Vec<i32> = vec![
-            248045, 846, 198, 7734, 264, 2716, 13901, 883, 279, 3712, 314, 17943, 13,
-            248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
+            248045, 846, 198, 7734, 264, 2716, 13901, 883, 279, 3712, 314, 17943, 13, 248046, 198,
+            248045, 74455, 198, 248068, 271, 248069, 271,
         ];
         let eos_token: i32 = 248046;
         let prompt_len = prompt_tokens.len() as i32;
@@ -1460,13 +1564,19 @@ mod tests {
             .forward_with_taps(&input_ids, None, &mut kv_cache, &tap_layers)
             .unwrap();
         let mut eval_targets: Vec<&mlx_rs::Array> = vec![&prefill_logits];
-        for t in &taps { eval_targets.push(t); }
+        for t in &taps {
+            eval_targets.push(t);
+        }
         for lc in kv_cache.iter().flatten() {
             match lc {
                 crate::qwen3_next::LayerCache::KV(kv) => eval_targets.extend(kv.eval_targets()),
                 crate::qwen3_next::LayerCache::Arrays(ac) => {
-                    if let Some(ref s) = ac.ssm_state { eval_targets.push(s); }
-                    if let Some(ref c) = ac.conv_state { eval_targets.push(c); }
+                    if let Some(ref s) = ac.ssm_state {
+                        eval_targets.push(s);
+                    }
+                    if let Some(ref c) = ac.conv_state {
+                        eval_targets.push(c);
+                    }
                 }
             }
         }
@@ -1474,14 +1584,23 @@ mod tests {
         eprintln!("Prefill: {}ms", t0.elapsed().as_millis());
 
         let prefill_am = mlx_rs::argmax_axis!(prefill_logits, -1).unwrap();
-        let am_flat: Vec<u32> = prefill_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+        let am_flat: Vec<u32> = prefill_am
+            .reshape(&[-1])
+            .unwrap()
+            .as_slice::<u32>()
+            .to_vec();
         let first_token = *am_flat.last().unwrap() as i32;
 
         // Run E2E for a given forward function
         let mut run_e2e = |engine_name: &str,
-                       forward_fn: &dyn Fn(&[f32], &[&[f32]], usize, &mut DFlashCpuCache) -> Vec<f32>,
-                       hidden_dim: usize| -> (usize, u128, u128)
-        {
+                           forward_fn: &dyn Fn(
+            &[f32],
+            &[&[f32]],
+            usize,
+            &mut DFlashCpuCache,
+        ) -> Vec<f32>,
+                           hidden_dim: usize|
+         -> (usize, u128, u128) {
             let mut kv = kv_cache.clone();
             let mut current_taps = taps.clone();
             let mut cpu_cache = cpu_engine.make_cache();
@@ -1502,50 +1621,67 @@ mod tests {
                 let t0 = Instant::now();
                 eval([&noise_embedding]).unwrap();
                 let noise_f32: Vec<f32> = noise_embedding
-                    .as_dtype(mlx_rs::Dtype::Float32).unwrap()
-                    .reshape(&[-1]).unwrap()
-                    .as_slice::<f32>().to_vec();
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .unwrap()
+                    .reshape(&[-1])
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .to_vec();
                 eval(current_taps.iter().collect::<Vec<_>>()).unwrap();
-                let taps_f32: Vec<Vec<f32>> = current_taps.iter().map(|t| {
-                    t.as_dtype(mlx_rs::Dtype::Float32).unwrap()
-                        .reshape(&[-1]).unwrap()
-                        .as_slice::<f32>().to_vec()
-                }).collect();
+                let taps_f32: Vec<Vec<f32>> = current_taps
+                    .iter()
+                    .map(|t| {
+                        t.as_dtype(mlx_rs::Dtype::Float32)
+                            .unwrap()
+                            .reshape(&[-1])
+                            .unwrap()
+                            .as_slice::<f32>()
+                            .to_vec()
+                    })
+                    .collect();
                 let tap_slices: Vec<&[f32]> = taps_f32.iter().map(|t| t.as_slice()).collect();
                 let ctx_len = current_taps[0].shape()[1] as usize;
                 let out_f32 = forward_fn(&noise_f32, &tap_slices, ctx_len, &mut cpu_cache);
                 // Context-only cache: no crop needed.
-                let draft_hidden = mlx_rs::Array::from_slice(
-                    &out_f32, &[1, block_size, hidden_dim as i32]);
+                let draft_hidden =
+                    mlx_rs::Array::from_slice(&out_f32, &[1, block_size, hidden_dim as i32]);
                 let draft_ms = t0.elapsed().as_millis();
                 total_draft_ms += draft_ms;
 
                 let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
-                let draft_logits = target.forward_all_logits_from_hidden(
-                    &draft_hidden_sliced).unwrap();
+                let draft_logits = target
+                    .forward_all_logits_from_hidden(&draft_hidden_sliced)
+                    .unwrap();
                 let draft_token_ids = mlx_rs::argmax_axis!(draft_logits, -1).unwrap();
                 eval([&draft_token_ids]).unwrap();
-                let draft_u32: Vec<u32> = draft_token_ids.reshape(&[-1]).unwrap()
-                    .as_slice::<u32>().to_vec();
+                let draft_u32: Vec<u32> = draft_token_ids
+                    .reshape(&[-1])
+                    .unwrap()
+                    .as_slice::<u32>()
+                    .to_vec();
                 let draft_flat: Vec<i32> = draft_u32.iter().map(|&x| x as i32).collect();
 
                 // Verify
                 let mut verify_tokens = vec![last_token];
                 verify_tokens.extend_from_slice(&draft_flat);
                 let verify_len = verify_tokens.len() as i32;
-                let verify_input = mlx_rs::Array::from_slice(
-                    &verify_tokens, &[1, verify_len]);
+                let verify_input = mlx_rs::Array::from_slice(&verify_tokens, &[1, verify_len]);
                 let gdn_backup = GdnStateBackup::save(&kv).unwrap();
 
                 let t0 = Instant::now();
                 let (verify_logits, verify_taps) = target
-                    .forward_with_taps(&verify_input, None, &mut kv, &tap_layers).unwrap();
+                    .forward_with_taps(&verify_input, None, &mut kv, &tap_layers)
+                    .unwrap();
                 eval([&verify_logits]).unwrap();
                 let verify_ms = t0.elapsed().as_millis();
                 total_verify_ms += verify_ms;
 
-                let verify_flat: Vec<u32> = mlx_rs::argmax_axis!(verify_logits, -1).unwrap()
-                    .reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+                let verify_flat: Vec<u32> = mlx_rs::argmax_axis!(verify_logits, -1)
+                    .unwrap()
+                    .reshape(&[-1])
+                    .unwrap()
+                    .as_slice::<u32>()
+                    .to_vec();
                 let accepted = accept_prefix(&draft_u32, &verify_flat);
                 let n_accepted = accepted.len();
                 let tokens_this_round = n_accepted + 1;
@@ -1555,8 +1691,10 @@ mod tests {
                 if rollback > 0 {
                     GdnStateBackup::restore_and_rollback(&gdn_backup, &mut kv, rollback);
                 }
-                current_taps = verify_taps.into_iter()
-                    .map(|tap| tap.index((.., ..keep, ..))).collect();
+                current_taps = verify_taps
+                    .into_iter()
+                    .map(|tap| tap.index((.., ..keep, ..)))
+                    .collect();
 
                 total_tokens += tokens_this_round;
                 last_token = verify_flat[n_accepted] as i32;
@@ -1566,7 +1704,9 @@ mod tests {
                     "  [{engine_name}] R{round}: draft={draft_ms}ms verify={verify_ms}ms accept={n_accepted}+1/{}",
                     block_size - 1
                 );
-                if last_token == eos_token { break; }
+                if last_token == eos_token {
+                    break;
+                }
             }
             (total_tokens, total_draft_ms, total_verify_ms)
         };
@@ -1588,9 +1728,14 @@ mod tests {
         let cpu_tps = cpu_tok as f64 / ((cpu_draft + cpu_verify) as f64 / 1000.0);
         let ane_tps = ane_tok as f64 / ((ane_draft + ane_verify) as f64 / 1000.0);
         eprintln!("\n=== RESULTS ===");
-        eprintln!("CPU BLAS: {cpu_tok} tok, draft={cpu_draft}ms, verify={cpu_verify}ms, {cpu_tps:.1} tok/s");
-        eprintln!("ANE+CPU:  {ane_tok} tok, draft={ane_draft}ms, verify={ane_verify}ms, {ane_tps:.1} tok/s");
-        eprintln!("Draft speedup: {:.2}x, Overall speedup: {:.2}x",
+        eprintln!(
+            "CPU BLAS: {cpu_tok} tok, draft={cpu_draft}ms, verify={cpu_verify}ms, {cpu_tps:.1} tok/s"
+        );
+        eprintln!(
+            "ANE+CPU:  {ane_tok} tok, draft={ane_draft}ms, verify={ane_verify}ms, {ane_tps:.1} tok/s"
+        );
+        eprintln!(
+            "Draft speedup: {:.2}x, Overall speedup: {:.2}x",
             cpu_draft as f64 / ane_draft.max(1) as f64,
             ane_tps / cpu_tps,
         );
@@ -1601,15 +1746,14 @@ mod tests {
     #[test]
     #[ignore]
     fn test_dflash_ane_acceptance_sweep() {
-        use crate::dflash::{load_dflash_drafter, GdnStateBackup};
+        use crate::dflash::{GdnStateBackup, load_dflash_drafter};
         use crate::diffusion::accept_prefix;
         use crate::qwen3_next::load_qwen3_5_model;
         use mlx_rs::ops::indexing::IndexOp;
         use mlx_rs::transforms::eval;
         use std::time::Instant;
 
-        let target_path =
-            "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-bf16";
+        let target_path = "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.5-4B-MLX-bf16";
         let drafter_dir = resolve_drafter_dir(std::path::Path::new(
             "/Users/peppi/AI-Models/shared/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash",
         ));
@@ -1626,22 +1770,60 @@ mod tests {
 
         let prompts: Vec<(&str, Vec<i32>)> = vec![
             // Original: "Write a short paragraph about the history of computers" + think tags
-            ("history+think", vec![
-                248045, 846, 198, 7734, 264, 2716, 13901, 883, 279, 3712, 314, 17943, 13,
-                248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
-            ]),
+            (
+                "history+think",
+                vec![
+                    248045, 846, 198, 7734, 264, 2716, 13901, 883, 279, 3712, 314, 17943, 13,
+                    248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
+                ],
+            ),
             // Counting — very predictable
-            ("counting", vec![248045, 846, 198, 2427, 494, 220, 16, 310, 220, 16, 15, 15, 248046, 198, 248045, 74455, 198]),
+            (
+                "counting",
+                vec![
+                    248045, 846, 198, 2427, 494, 220, 16, 310, 220, 16, 15, 15, 248046, 198,
+                    248045, 74455, 198,
+                ],
+            ),
             // Factual — "What is the capital of France?"
-            ("factual", vec![248045, 846, 198, 3710, 369, 279, 6511, 314, 9338, 30, 248046, 198, 248045, 74455, 198]),
+            (
+                "factual",
+                vec![
+                    248045, 846, 198, 3710, 369, 279, 6511, 314, 9338, 30, 248046, 198, 248045,
+                    74455, 198,
+                ],
+            ),
             // Code — "Write a Python fibonacci function"
-            ("code", vec![248045, 846, 198, 7734, 264, 12654, 73111, 709, 248046, 198, 248045, 74455, 198]),
+            (
+                "code",
+                vec![
+                    248045, 846, 198, 7734, 264, 12654, 73111, 709, 248046, 198, 248045, 74455, 198,
+                ],
+            ),
             // Repeat — "Repeat the word hello 50 times"
-            ("repeat", vec![248045, 846, 198, 37436, 279, 3299, 23066, 220, 20, 15, 2942, 248046, 198, 248045, 74455, 198]),
+            (
+                "repeat",
+                vec![
+                    248045, 846, 198, 37436, 279, 3299, 23066, 220, 20, 15, 2942, 248046, 198,
+                    248045, 74455, 198,
+                ],
+            ),
             // Reasoning — harder
-            ("reasoning", vec![248045, 846, 198, 814, 20139, 29144, 1157, 512, 954, 310, 264, 220, 20, 1007, 2235, 1608, 3487, 22672, 536, 248046, 198, 248045, 74455, 198]),
+            (
+                "reasoning",
+                vec![
+                    248045, 846, 198, 814, 20139, 29144, 1157, 512, 954, 310, 264, 220, 20, 1007,
+                    2235, 1608, 3487, 22672, 536, 248046, 198, 248045, 74455, 198,
+                ],
+            ),
             // List — "List the days of the week"
-            ("list", vec![248045, 846, 198, 826, 279, 2756, 314, 279, 1936, 248046, 198, 248045, 74455, 198]),
+            (
+                "list",
+                vec![
+                    248045, 846, 198, 826, 279, 2756, 314, 279, 1936, 248046, 198, 248045, 74455,
+                    198,
+                ],
+            ),
         ];
 
         eprintln!("\n{}", "=".repeat(80));
@@ -1661,20 +1843,30 @@ mod tests {
                 .forward_with_taps(&input_ids, None, &mut kv_cache, &tap_layers)
                 .unwrap();
             let mut eval_targets: Vec<&mlx_rs::Array> = vec![&prefill_logits];
-            for t in &taps { eval_targets.push(t); }
+            for t in &taps {
+                eval_targets.push(t);
+            }
             for lc in kv_cache.iter().flatten() {
                 match lc {
                     crate::qwen3_next::LayerCache::KV(kv) => eval_targets.extend(kv.eval_targets()),
                     crate::qwen3_next::LayerCache::Arrays(ac) => {
-                        if let Some(ref s) = ac.ssm_state { eval_targets.push(s); }
-                        if let Some(ref c) = ac.conv_state { eval_targets.push(c); }
+                        if let Some(ref s) = ac.ssm_state {
+                            eval_targets.push(s);
+                        }
+                        if let Some(ref c) = ac.conv_state {
+                            eval_targets.push(c);
+                        }
                     }
                 }
             }
             eval(eval_targets).unwrap();
 
             let prefill_am = mlx_rs::argmax_axis!(prefill_logits, -1).unwrap();
-            let am_flat: Vec<u32> = prefill_am.reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+            let am_flat: Vec<u32> = prefill_am
+                .reshape(&[-1])
+                .unwrap()
+                .as_slice::<u32>()
+                .to_vec();
             let first_token = *am_flat.last().unwrap() as i32;
 
             // Decode loop — ANE only, 15 rounds
@@ -1700,51 +1892,68 @@ mod tests {
                 let t0 = Instant::now();
                 eval([&noise_embedding]).unwrap();
                 let noise_f32: Vec<f32> = noise_embedding
-                    .as_dtype(mlx_rs::Dtype::Float32).unwrap()
-                    .reshape(&[-1]).unwrap()
-                    .as_slice::<f32>().to_vec();
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .unwrap()
+                    .reshape(&[-1])
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .to_vec();
                 eval(current_taps.iter().collect::<Vec<_>>()).unwrap();
-                let taps_f32: Vec<Vec<f32>> = current_taps.iter().map(|t| {
-                    t.as_dtype(mlx_rs::Dtype::Float32).unwrap()
-                        .reshape(&[-1]).unwrap()
-                        .as_slice::<f32>().to_vec()
-                }).collect();
+                let taps_f32: Vec<Vec<f32>> = current_taps
+                    .iter()
+                    .map(|t| {
+                        t.as_dtype(mlx_rs::Dtype::Float32)
+                            .unwrap()
+                            .reshape(&[-1])
+                            .unwrap()
+                            .as_slice::<f32>()
+                            .to_vec()
+                    })
+                    .collect();
                 let tap_slices: Vec<&[f32]> = taps_f32.iter().map(|t| t.as_slice()).collect();
                 let ctx_len = current_taps[0].shape()[1] as usize;
-                let out_f32 = ane_executor.forward(&noise_f32, &tap_slices, ctx_len, &mut cpu_cache);
+                let out_f32 =
+                    ane_executor.forward(&noise_f32, &tap_slices, ctx_len, &mut cpu_cache);
                 // Context-only cache: no crop needed.
                 let h = ane_executor.cpu_engine.config.hidden;
-                let draft_hidden = mlx_rs::Array::from_slice(
-                    &out_f32, &[1, block_size, h as i32]);
+                let draft_hidden = mlx_rs::Array::from_slice(&out_f32, &[1, block_size, h as i32]);
                 let draft_ms = t0.elapsed().as_millis();
                 total_draft_ms += draft_ms;
 
                 let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
-                let draft_logits = target.forward_all_logits_from_hidden(
-                    &draft_hidden_sliced).unwrap();
+                let draft_logits = target
+                    .forward_all_logits_from_hidden(&draft_hidden_sliced)
+                    .unwrap();
                 let draft_token_ids = mlx_rs::argmax_axis!(draft_logits, -1).unwrap();
                 eval([&draft_token_ids]).unwrap();
-                let draft_u32: Vec<u32> = draft_token_ids.reshape(&[-1]).unwrap()
-                    .as_slice::<u32>().to_vec();
+                let draft_u32: Vec<u32> = draft_token_ids
+                    .reshape(&[-1])
+                    .unwrap()
+                    .as_slice::<u32>()
+                    .to_vec();
                 let draft_flat: Vec<i32> = draft_u32.iter().map(|&x| x as i32).collect();
 
                 // Verify
                 let mut verify_tokens = vec![last_token];
                 verify_tokens.extend_from_slice(&draft_flat);
                 let verify_len = verify_tokens.len() as i32;
-                let verify_input = mlx_rs::Array::from_slice(
-                    &verify_tokens, &[1, verify_len]);
+                let verify_input = mlx_rs::Array::from_slice(&verify_tokens, &[1, verify_len]);
                 let gdn_backup = GdnStateBackup::save(&kv_cache).unwrap();
 
                 let t0 = Instant::now();
                 let (verify_logits, verify_taps) = target
-                    .forward_with_taps(&verify_input, None, &mut kv_cache, &tap_layers).unwrap();
+                    .forward_with_taps(&verify_input, None, &mut kv_cache, &tap_layers)
+                    .unwrap();
                 eval([&verify_logits]).unwrap();
                 let verify_ms = t0.elapsed().as_millis();
                 total_verify_ms += verify_ms;
 
-                let verify_flat: Vec<u32> = mlx_rs::argmax_axis!(verify_logits, -1).unwrap()
-                    .reshape(&[-1]).unwrap().as_slice::<u32>().to_vec();
+                let verify_flat: Vec<u32> = mlx_rs::argmax_axis!(verify_logits, -1)
+                    .unwrap()
+                    .reshape(&[-1])
+                    .unwrap()
+                    .as_slice::<u32>()
+                    .to_vec();
                 let accepted = accept_prefix(&draft_u32, &verify_flat);
                 let n_accepted = accepted.len();
                 let tokens_this_round = n_accepted + 1;
@@ -1754,8 +1963,10 @@ mod tests {
                 if rollback > 0 {
                     GdnStateBackup::restore_and_rollback(&gdn_backup, &mut kv_cache, rollback);
                 }
-                current_taps = verify_taps.into_iter()
-                    .map(|tap| tap.index((.., ..keep, ..))).collect();
+                current_taps = verify_taps
+                    .into_iter()
+                    .map(|tap| tap.index((.., ..keep, ..)))
+                    .collect();
 
                 total_accepted += n_accepted;
                 total_tokens += tokens_this_round;
@@ -1766,38 +1977,64 @@ mod tests {
                 // Show per-position match for first few rounds
                 if round < 5 {
                     let mut match_str = String::new();
-                    for i in 0..(block_size as usize - 1).min(draft_u32.len()).min(verify_flat.len()) {
+                    for i in 0..(block_size as usize - 1)
+                        .min(draft_u32.len())
+                        .min(verify_flat.len())
+                    {
                         if draft_u32[i] == verify_flat[i] {
                             match_str.push('=');
                         } else {
                             match_str.push('X');
                         }
                     }
-                    eprintln!("  R{round:02}: accept={n_accepted:2}/{} [{match_str}] draft={draft_ms}ms verify={verify_ms}ms",
-                        block_size - 1);
+                    eprintln!(
+                        "  R{round:02}: accept={n_accepted:2}/{} [{match_str}] draft={draft_ms}ms verify={verify_ms}ms",
+                        block_size - 1
+                    );
                 }
 
-                if last_token == eos_token { break; }
+                if last_token == eos_token {
+                    break;
+                }
             }
 
-            let accept_rate = total_accepted as f64 / (total_rounds as f64 * (block_size - 1) as f64) * 100.0;
+            let accept_rate =
+                total_accepted as f64 / (total_rounds as f64 * (block_size - 1) as f64) * 100.0;
             let tok_per_round = total_tokens as f64 / total_rounds as f64;
             let total_ms = total_draft_ms + total_verify_ms;
             let tps = total_tokens as f64 / (total_ms as f64 / 1000.0);
 
-            eprintln!("  => {total_tokens} tok / {total_rounds} rounds, accept={accept_rate:.1}%, tok/round={tok_per_round:.1}, {tps:.1} tok/s (draft={total_draft_ms}ms verify={total_verify_ms}ms)\n");
+            eprintln!(
+                "  => {total_tokens} tok / {total_rounds} rounds, accept={accept_rate:.1}%, tok/round={tok_per_round:.1}, {tps:.1} tok/s (draft={total_draft_ms}ms verify={total_verify_ms}ms)\n"
+            );
 
-            summary.push((name, total_tokens, total_rounds, total_accepted, accept_rate, tps));
+            summary.push((
+                name,
+                total_tokens,
+                total_rounds,
+                total_accepted,
+                accept_rate,
+                tps,
+            ));
         }
 
         eprintln!("\n{}", "=".repeat(80));
         eprintln!("  SUMMARY");
         eprintln!("{}", "=".repeat(80));
-        eprintln!("{:<16} {:>5} {:>6} {:>8} {:>8} {:>8}", "Prompt", "Tok", "Rounds", "Accept%", "Tok/Rnd", "Tok/s");
-        eprintln!("{:-<16} {:->5} {:->6} {:->8} {:->8} {:->8}", "", "", "", "", "", "");
+        eprintln!(
+            "{:<16} {:>5} {:>6} {:>8} {:>8} {:>8}",
+            "Prompt", "Tok", "Rounds", "Accept%", "Tok/Rnd", "Tok/s"
+        );
+        eprintln!(
+            "{:-<16} {:->5} {:->6} {:->8} {:->8} {:->8}",
+            "", "", "", "", "", ""
+        );
         for (name, tok, rounds, _acc, rate, tps) in &summary {
             let tpr = *tok as f64 / *rounds as f64;
-            eprintln!("{:<16} {:>5} {:>6} {:>7.1}% {:>8.1} {:>7.1}", name, tok, rounds, rate, tpr, tps);
+            eprintln!(
+                "{:<16} {:>5} {:>6} {:>7.1}% {:>8.1} {:>7.1}",
+                name, tok, rounds, rate, tpr, tps
+            );
         }
         eprintln!();
     }

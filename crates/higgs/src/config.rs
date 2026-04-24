@@ -226,6 +226,27 @@ pub struct ModelConfig {
     /// Override per-request with `HIGGS_DFLASH_PATH` env var.
     #[serde(default)]
     pub dflash: Option<String>,
+    /// Path to an AR-speculative drafter model (a small dense Qwen3.5 variant).
+    /// Routes greedy completions through `speculative_generate_next`. Mutually
+    /// exclusive with DFlash — if both are set, AR-spec wins. Tune the K window
+    /// with `HIGGS_AR_SPEC_K_LOW` / `HIGGS_AR_SPEC_K_HIGH` (defaults 4 / 8).
+    /// Override per-request with `HIGGS_AR_SPEC_DRAFT_PATH` env var.
+    #[serde(default)]
+    pub ar_spec: Option<String>,
+    /// BD3LM block-diffusion configuration (only used when model_type = "bd3lm_qwen3").
+    #[serde(default)]
+    pub bd3lm: Option<Bd3lmSection>,
+}
+
+/// BD3LM runtime configuration overrides.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Bd3lmSection {
+    /// Number of denoising iterations per block. Must divide block_size.
+    #[serde(default)]
+    pub num_denoising_steps: Option<i32>,
+    /// Top-K positions to unmask per denoising step. Default = block_size / num_denoising_steps.
+    #[serde(default)]
+    pub top_k_unmask_per_step: Option<i32>,
 }
 
 const fn default_kv_bits() -> u8 {
@@ -434,6 +455,8 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
             kv_seed: args.kv_seed.unwrap_or_default(),
             dflash: None,
+            ar_spec: None,
+            bd3lm: None,
         })
         .collect();
 
@@ -514,6 +537,8 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
                     dflash: None,
+                    ar_spec: None,
+                    bd3lm: None,
                 })
                 .collect();
             figment = figment.merge(Serialized::default("models", &extra));
@@ -635,6 +660,8 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_bits: default_kv_bits(),
         kv_seed: 0,
         dflash: None,
+        ar_spec: None,
+        bd3lm: None,
     });
     config.auto_router.model = name;
 }
@@ -769,7 +796,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: true,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -793,7 +820,7 @@ mod tests {
             rate_limit: Some(60),
             timeout: Some(60.0),
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -817,7 +844,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-                    kv_cache: Some("turboquant".to_owned()),
+            kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(4),
             kv_seed: Some(99),
         };
@@ -839,7 +866,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -857,7 +884,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -875,7 +902,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -893,7 +920,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: true,
-                    kv_cache: Some("turboquant".to_owned()),
+            kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(3),
             kv_seed: Some(0),
         };
@@ -1199,7 +1226,7 @@ mod tests {
             rate_limit: None,
             timeout: Some(-1.0),
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };
@@ -1232,7 +1259,7 @@ mod tests {
             rate_limit: None,
             timeout: None,
             batch: false,
-                    kv_cache: None,
+            kv_cache: None,
             kv_bits: None,
             kv_seed: None,
         };

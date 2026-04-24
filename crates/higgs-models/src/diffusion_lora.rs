@@ -12,8 +12,8 @@
 #![allow(clippy::too_many_arguments, unsafe_code)]
 
 use crate::diffusion::{
-    apply_rope, rms_norm, rms_norm_slice, sgemm, sgemm_acc, sgemm_at, sgemm_at_acc,
-    sgemm_nt, sgemm_nt_scaled, softmax_inplace, DiffusionConfig, DiffusionEngine,
+    DiffusionConfig, DiffusionEngine, apply_rope, rms_norm, rms_norm_slice, sgemm, sgemm_acc,
+    sgemm_at, sgemm_at_acc, sgemm_nt, sgemm_nt_scaled, softmax_inplace,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,7 +74,13 @@ impl LoraAdapter {
             .map(|i| ((i as f32 * 0.618033988 + 0.31415926).fract() * 2.0 - 1.0) * bound)
             .collect();
         let b = vec![0.0f32; d_out * rank];
-        LoraAdapter { a, b, rank, d_in, d_out }
+        LoraAdapter {
+            a,
+            b,
+            rank,
+            d_in,
+            d_out,
+        }
     }
 
     /// LoRA forward (row-major): x[seq, d_in] → δy[seq, d_out], h[seq, rank].
@@ -147,7 +153,10 @@ impl DiffusionLoraModel {
             })
             .collect();
 
-        DiffusionLoraModel { layers, config: cfg }
+        DiffusionLoraModel {
+            layers,
+            config: cfg,
+        }
     }
 
     pub fn scale(&self) -> f32 {
@@ -156,12 +165,15 @@ impl DiffusionLoraModel {
 
     /// Total trainable parameters across all layers.
     pub fn num_params(&self) -> usize {
-        self.layers.iter().map(|l| {
-            l.q.as_ref().map_or(0, |a| a.num_params())
-                + l.v.as_ref().map_or(0, |a| a.num_params())
-                + l.o.as_ref().map_or(0, |a| a.num_params())
-                + l.down.as_ref().map_or(0, |a| a.num_params())
-        }).sum()
+        self.layers
+            .iter()
+            .map(|l| {
+                l.q.as_ref().map_or(0, |a| a.num_params())
+                    + l.v.as_ref().map_or(0, |a| a.num_params())
+                    + l.o.as_ref().map_or(0, |a| a.num_params())
+                    + l.down.as_ref().map_or(0, |a| a.num_params())
+            })
+            .sum()
     }
 }
 
@@ -185,7 +197,7 @@ pub struct LayerActivations {
     pub up_out: Vec<f32>,          // [seq, inter] up proj output
     pub gate_times_up: Vec<f32>,   // [seq, inter] SiLU(gate) * up = input to down_proj
     // LoRA intermediates (saved for weight gradient computation)
-    pub lora_h_q: Option<Vec<f32>>,    // [seq, rank]
+    pub lora_h_q: Option<Vec<f32>>, // [seq, rank]
     pub lora_h_v: Option<Vec<f32>>,
     pub lora_h_o: Option<Vec<f32>>,
     pub lora_h_down: Option<Vec<f32>>,
@@ -195,7 +207,7 @@ pub struct LayerActivations {
 pub struct DiffusionActivations {
     pub token_ids: Vec<u32>,
     pub layer_acts: Vec<LayerActivations>,
-    pub hidden_out: Vec<f32>,   // [seq, h] final layer output (before final norm)
+    pub hidden_out: Vec<f32>, // [seq, h] final layer output (before final norm)
     pub final_normed: Vec<f32>, // [seq, h] after final RMSNorm
 }
 
@@ -288,7 +300,9 @@ pub fn forward_train(
         // LoRA on Q
         let lora_h_q = if let Some(lora_q) = &lora_layer.q {
             let (dy, hh) = lora_q.forward(&normed, seq);
-            for i in 0..seq * q_dim { q_buf[i] += scale * dy[i]; }
+            for i in 0..seq * q_dim {
+                q_buf[i] += scale * dy[i];
+            }
             Some(hh)
         } else {
             None
@@ -297,7 +311,9 @@ pub fn forward_train(
         // LoRA on V
         let lora_h_v = if let Some(lora_v) = &lora_layer.v {
             let (dy, hh) = lora_v.forward(&normed, seq);
-            for i in 0..seq * kv_dim { v_buf[i] += scale * dy[i]; }
+            for i in 0..seq * kv_dim {
+                v_buf[i] += scale * dy[i];
+            }
             Some(hh)
         } else {
             None
@@ -325,11 +341,23 @@ pub fn forward_train(
         for s in 0..seq {
             for head in 0..n_heads {
                 let off = s * q_dim + head * hd;
-                apply_rope(&mut q_buf[off..off + hd], s, half_hd, &engine.rope_cos, &engine.rope_sin);
+                apply_rope(
+                    &mut q_buf[off..off + hd],
+                    s,
+                    half_hd,
+                    &engine.rope_cos,
+                    &engine.rope_sin,
+                );
             }
             for head in 0..n_kv {
                 let off = s * kv_dim + head * hd;
-                apply_rope(&mut k_buf[off..off + hd], s, half_hd, &engine.rope_cos, &engine.rope_sin);
+                apply_rope(
+                    &mut k_buf[off..off + hd],
+                    s,
+                    half_hd,
+                    &engine.rope_cos,
+                    &engine.rope_sin,
+                );
             }
         }
 
@@ -386,14 +414,18 @@ pub fn forward_train(
         // LoRA on O
         let lora_h_o = if let Some(lora_o) = &lora_layer.o {
             let (dy, hh) = lora_o.forward(&attn_out, seq);
-            for i in 0..seq * h { o_buf[i] += scale * dy[i]; }
+            for i in 0..seq * h {
+                o_buf[i] += scale * dy[i];
+            }
             Some(hh)
         } else {
             None
         };
 
         // Residual add
-        for i in 0..seq * h { hidden[i] += o_buf[i]; }
+        for i in 0..seq * h {
+            hidden[i] += o_buf[i];
+        }
 
         // --- MLP ---
         rms_norm(&hidden, &layer.post_attn_norm, &mut normed, seq, h);
@@ -403,13 +435,17 @@ pub fn forward_train(
         let gate_pre_silu = gate_buf.clone();
 
         // SiLU(gate)
-        for v in gate_buf.iter_mut() { *v *= 1.0 / (1.0 + (-*v).exp()); }
+        for v in gate_buf.iter_mut() {
+            *v *= 1.0 / (1.0 + (-*v).exp());
+        }
 
         sgemm_nt(seq, cfg.inter, h, &normed, &layer.up_proj, &mut up_buf);
         let up_out = up_buf.clone();
 
         // gate * up
-        for (g, u) in gate_buf.iter_mut().zip(up_buf.iter()) { *g *= u; }
+        for (g, u) in gate_buf.iter_mut().zip(up_buf.iter()) {
+            *g *= u;
+        }
         let gate_times_up = gate_buf.clone();
 
         // down = gate_buf @ down_proj^T → [seq, h]
@@ -418,14 +454,18 @@ pub fn forward_train(
         // LoRA on down_proj
         let lora_h_down = if let Some(lora_down) = &lora_layer.down {
             let (dy, hh) = lora_down.forward(&gate_buf, seq);
-            for i in 0..seq * h { o_buf[i] += scale * dy[i]; }
+            for i in 0..seq * h {
+                o_buf[i] += scale * dy[i];
+            }
             Some(hh)
         } else {
             None
         };
 
         // Residual add
-        for i in 0..seq * h { hidden[i] += o_buf[i]; }
+        for i in 0..seq * h {
+            hidden[i] += o_buf[i];
+        }
 
         layer_acts.push(LayerActivations {
             hidden_in,
@@ -592,7 +632,9 @@ fn lora_bwd(
     // dh = scale * dy @ B: [seq, d_out] @ [d_out, rank] → [seq, rank]
     let mut dh = vec![0.0f32; seq * rank];
     sgemm(seq, rank, d_out, dy, &adapter.b, &mut dh);
-    for v in dh.iter_mut() { *v *= scale; }
+    for v in dh.iter_mut() {
+        *v *= scale;
+    }
 
     // dx_lora = dh @ A: [seq, rank] @ [rank, d_in] → [seq, d_in] (accumulated into dx)
     sgemm_acc(seq, d_in, rank, &dh, &adapter.a, dx);
@@ -600,7 +642,9 @@ fn lora_bwd(
     // dB = scale * dy^T @ h: [d_out, seq] @ [seq, rank] → [d_out, rank]
     let mut db = vec![0.0f32; d_out * rank];
     sgemm_at(d_out, rank, seq, dy, h, &mut db);
-    for v in db.iter_mut() { *v *= scale; }
+    for v in db.iter_mut() {
+        *v *= scale;
+    }
 
     // dA = dh^T @ x: [rank, seq] @ [seq, d_in] → [rank, d_in]
     let mut da = vec![0.0f32; rank * d_in];
@@ -645,8 +689,13 @@ pub fn backward(
     let mut d_pre_norm = vec![0.0f32; seq * h];
     let mut _d_final_norm_w = vec![0.0f32; h]; // not training norm weights
     rmsnorm_bwd(
-        &mut d_pre_norm, &mut _d_final_norm_w, &d_hidden,
-        &acts.hidden_out, &engine.final_norm, seq, h,
+        &mut d_pre_norm,
+        &mut _d_final_norm_w,
+        &d_hidden,
+        &acts.hidden_out,
+        &engine.final_norm,
+        seq,
+        h,
     );
     d_hidden = d_pre_norm;
 
@@ -671,11 +720,27 @@ pub fn backward(
 
         // d_gate_times_up = d_hidden @ down_proj: [seq, h] @ [h, inter] → [seq, inter]
         let mut d_gate_times_up = vec![0.0f32; seq * cfg.inter];
-        sgemm(seq, cfg.inter, h, &d_hidden, &layer.down_proj, &mut d_gate_times_up);
+        sgemm(
+            seq,
+            cfg.inter,
+            h,
+            &d_hidden,
+            &layer.down_proj,
+            &mut d_gate_times_up,
+        );
 
         // LoRA on down_proj
-        let down_grads = if let (Some(adapter), Some(lora_h)) = (&lora_layer.down, &la.lora_h_down) {
-            Some(lora_bwd(&mut d_gate_times_up, &d_hidden, &la.gate_times_up, lora_h, adapter, scale, seq))
+        let down_grads = if let (Some(adapter), Some(lora_h)) = (&lora_layer.down, &la.lora_h_down)
+        {
+            Some(lora_bwd(
+                &mut d_gate_times_up,
+                &d_hidden,
+                &la.gate_times_up,
+                lora_h,
+                adapter,
+                scale,
+                seq,
+            ))
         } else {
             None
         };
@@ -684,13 +749,24 @@ pub fn backward(
         let mut d_gate_pre_silu = vec![0.0f32; seq * cfg.inter];
         let mut d_up = vec![0.0f32; seq * cfg.inter];
         silu_gate_bwd(
-            &mut d_gate_pre_silu, &mut d_up, &d_gate_times_up,
-            &la.gate_pre_silu, &la.up_out, seq * cfg.inter,
+            &mut d_gate_pre_silu,
+            &mut d_up,
+            &d_gate_times_up,
+            &la.gate_pre_silu,
+            &la.up_out,
+            seq * cfg.inter,
         );
 
         // d_normed_ffn from gate: d_gate_pre_silu @ gate_proj: [seq, inter] @ [inter, h] → [seq, h]
         let mut d_normed_ffn = vec![0.0f32; seq * h];
-        sgemm(seq, h, cfg.inter, &d_gate_pre_silu, &layer.gate_proj, &mut d_normed_ffn);
+        sgemm(
+            seq,
+            h,
+            cfg.inter,
+            &d_gate_pre_silu,
+            &layer.gate_proj,
+            &mut d_normed_ffn,
+        );
         // d_normed_ffn from up: d_up @ up_proj (accumulated)
         sgemm_acc(seq, h, cfg.inter, &d_up, &layer.up_proj, &mut d_normed_ffn);
 
@@ -739,21 +815,42 @@ pub fn backward(
 
         // Recompute attn residual: o_proj(attn_out) + scale*lora_o(attn_out)
         let mut attn_residual = vec![0.0f32; seq * h];
-        sgemm_nt(seq, h, q_dim, &la.attn_out, &layer.o_proj, &mut attn_residual);
+        sgemm_nt(
+            seq,
+            h,
+            q_dim,
+            &la.attn_out,
+            &layer.o_proj,
+            &mut attn_residual,
+        );
         if let (Some(adapter), Some(hh)) = (&lora_layer.o, &la.lora_h_o) {
             let mut dy = vec![0.0f32; seq * h];
             sgemm_nt(seq, h, adapter.rank, hh, &adapter.b, &mut dy);
-            for i in 0..seq * h { attn_residual[i] += scale * dy[i]; }
+            for i in 0..seq * h {
+                attn_residual[i] += scale * dy[i];
+            }
         }
-        let hidden_mid: Vec<f32> = la.hidden_in.iter().zip(attn_residual.iter()).map(|(a, b)| a + b).collect();
+        let hidden_mid: Vec<f32> = la
+            .hidden_in
+            .iter()
+            .zip(attn_residual.iter())
+            .map(|(a, b)| a + b)
+            .collect();
 
         rmsnorm_bwd(
-            &mut d_hidden_mid, &mut _d_post_norm_w, &d_normed_ffn,
-            &hidden_mid, &layer.post_attn_norm, seq, h,
+            &mut d_hidden_mid,
+            &mut _d_post_norm_w,
+            &d_normed_ffn,
+            &hidden_mid,
+            &layer.post_attn_norm,
+            seq,
+            h,
         );
 
         // Add residual: d_hidden_mid += d_hidden (the skip connection from FFN output)
-        for i in 0..seq * h { d_hidden_mid[i] += d_hidden[i]; }
+        for i in 0..seq * h {
+            d_hidden_mid[i] += d_hidden[i];
+        }
 
         // ==================== Attention backward ====================
         // O projection backward: d_attn_out = d_hidden_mid @ o_proj: [seq, h] @ [h, q_dim] → [seq, q_dim]
@@ -773,7 +870,15 @@ pub fn backward(
 
         // LoRA on O: backward adds to d_attn_out
         let o_grads = if let (Some(adapter), Some(lora_h)) = (&lora_layer.o, &la.lora_h_o) {
-            Some(lora_bwd(&mut d_attn_out, &d_hidden_mid, &la.attn_out, lora_h, adapter, scale, seq))
+            Some(lora_bwd(
+                &mut d_attn_out,
+                &d_hidden_mid,
+                &la.attn_out,
+                lora_h,
+                adapter,
+                scale,
+                seq,
+            ))
         } else {
             None
         };
@@ -833,17 +938,23 @@ pub fn backward(
                 // dQ = dS @ K * scale: [seq, seq] @ [seq, hd] → [seq, hd]
                 let mut dq_head = vec![0.0f32; seq * hd];
                 sgemm(seq, hd, seq, &ds, &k_head, &mut dq_head);
-                for v in dq_head.iter_mut() { *v *= attn_scale; }
+                for v in dq_head.iter_mut() {
+                    *v *= attn_scale;
+                }
 
                 // dK += dS^T @ Q * scale
                 let mut dk_contrib = vec![0.0f32; seq * hd];
                 sgemm_at(seq, hd, seq, &ds, &q_head, &mut dk_contrib);
-                for (a, b) in dk_head.iter_mut().zip(dk_contrib.iter()) { *a += b * attn_scale; }
+                for (a, b) in dk_head.iter_mut().zip(dk_contrib.iter()) {
+                    *a += b * attn_scale;
+                }
 
                 // Scatter dQ back into dq_buf
                 for s in 0..seq {
                     let ao = s * q_dim + q_h * hd;
-                    for d in 0..hd { dq_buf[ao + d] += dq_head[s * hd + d]; }
+                    for d in 0..hd {
+                        dq_buf[ao + d] += dq_head[s * hd + d];
+                    }
                 }
             }
 
@@ -866,7 +977,10 @@ pub fn backward(
                 rope_bwd(
                     &mut dq_pre_rope[off..off + hd],
                     &dq_buf[off..off + hd],
-                    s, half_hd, &engine.rope_cos, &engine.rope_sin,
+                    s,
+                    half_hd,
+                    &engine.rope_cos,
+                    &engine.rope_sin,
                 );
             }
             for head in 0..n_kv {
@@ -874,7 +988,10 @@ pub fn backward(
                 rope_bwd(
                     &mut dk_pre_rope[off..off + hd],
                     &dk_buf[off..off + hd],
-                    s, half_hd, &engine.rope_cos, &engine.rope_sin,
+                    s,
+                    half_hd,
+                    &engine.rope_cos,
+                    &engine.rope_sin,
                 );
             }
         }
@@ -920,14 +1037,30 @@ pub fn backward(
 
         // LoRA on Q
         let q_grads = if let (Some(adapter), Some(lora_h)) = (&lora_layer.q, &la.lora_h_q) {
-            Some(lora_bwd(&mut d_normed_attn, &dq_proj, &la.normed_attn, lora_h, adapter, scale, seq))
+            Some(lora_bwd(
+                &mut d_normed_attn,
+                &dq_proj,
+                &la.normed_attn,
+                lora_h,
+                adapter,
+                scale,
+                seq,
+            ))
         } else {
             None
         };
 
         // LoRA on V
         let v_grads = if let (Some(adapter), Some(lora_h)) = (&lora_layer.v, &la.lora_h_v) {
-            Some(lora_bwd(&mut d_normed_attn, &dv_buf, &la.normed_attn, lora_h, adapter, scale, seq))
+            Some(lora_bwd(
+                &mut d_normed_attn,
+                &dv_buf,
+                &la.normed_attn,
+                lora_h,
+                adapter,
+                scale,
+                seq,
+            ))
         } else {
             None
         };
@@ -936,12 +1069,19 @@ pub fn backward(
         let mut d_hidden_in = vec![0.0f32; seq * h];
         let mut _d_input_norm_w = vec![0.0f32; h];
         rmsnorm_bwd(
-            &mut d_hidden_in, &mut _d_input_norm_w, &d_normed_attn,
-            &la.hidden_in, &layer.input_norm, seq, h,
+            &mut d_hidden_in,
+            &mut _d_input_norm_w,
+            &d_normed_attn,
+            &la.hidden_in,
+            &layer.input_norm,
+            seq,
+            h,
         );
 
         // Add residual: d_hidden_in += d_hidden_mid
-        for i in 0..seq * h { d_hidden_in[i] += d_hidden_mid[i]; }
+        for i in 0..seq * h {
+            d_hidden_in[i] += d_hidden_mid[i];
+        }
 
         // This becomes d_hidden for the previous layer
         d_hidden = d_hidden_in;
@@ -957,7 +1097,9 @@ pub fn backward(
     // Reverse the grads to match layer order (we built them in reverse)
     layer_grads.reverse();
 
-    DiffusionLoraGrads { layers: layer_grads }
+    DiffusionLoraGrads {
+        layers: layer_grads,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -995,18 +1137,26 @@ mod tests {
         let base_logits = engine.forward(&tokens);
         let (lora_logits, _acts) = forward_train(&engine, &lora, &tokens);
 
-        let max_err = base_logits.iter().zip(lora_logits.iter())
+        let max_err = base_logits
+            .iter()
+            .zip(lora_logits.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
         eprintln!("Base vs LoRA (B=0) max error: {max_err:.6e}");
-        assert!(max_err < 1e-4, "LoRA with B=0 should match base. Error: {max_err}");
+        assert!(
+            max_err < 1e-4,
+            "LoRA with B=0 should match base. Error: {max_err}"
+        );
     }
 
     #[test]
     fn test_lora_params_count() {
         let cfg = small_config();
-        let lora_cfg = LoraConfig { rank: 8, ..LoraConfig::default() };
+        let lora_cfg = LoraConfig {
+            rank: 8,
+            ..LoraConfig::default()
+        };
         let lora = DiffusionLoraModel::new(lora_cfg, &cfg);
 
         let n_params = lora.num_params();
@@ -1024,7 +1174,10 @@ mod tests {
     fn test_finite_difference_gradient_check() {
         let cfg = small_config();
         let engine = DiffusionEngine::from_random(cfg.clone());
-        let lora_cfg = LoraConfig { rank: 4, ..LoraConfig::default() };
+        let lora_cfg = LoraConfig {
+            rank: 4,
+            ..LoraConfig::default()
+        };
         let mut lora = DiffusionLoraModel::new(lora_cfg, &cfg);
 
         // Give B matrices larger non-zero values so gradients are well above noise floor
@@ -1106,14 +1259,28 @@ mod tests {
         for (name, li, ti, mat, idx, analytical) in &checks {
             // Get/set the parameter
             let get_param = |l: &DiffusionLoraModel| -> f32 {
-                let adapter = match ti { 0 => &l.layers[*li].q, 1 => &l.layers[*li].v, 2 => &l.layers[*li].o, _ => &l.layers[*li].down };
+                let adapter = match ti {
+                    0 => &l.layers[*li].q,
+                    1 => &l.layers[*li].v,
+                    2 => &l.layers[*li].o,
+                    _ => &l.layers[*li].down,
+                };
                 let a = adapter.as_ref().unwrap();
                 if *mat == 0 { a.a[*idx] } else { a.b[*idx] }
             };
             let set_param = |l: &mut DiffusionLoraModel, val: f32| {
-                let adapter = match ti { 0 => &mut l.layers[*li].q, 1 => &mut l.layers[*li].v, 2 => &mut l.layers[*li].o, _ => &mut l.layers[*li].down };
+                let adapter = match ti {
+                    0 => &mut l.layers[*li].q,
+                    1 => &mut l.layers[*li].v,
+                    2 => &mut l.layers[*li].o,
+                    _ => &mut l.layers[*li].down,
+                };
                 let a = adapter.as_mut().unwrap();
-                if *mat == 0 { a.a[*idx] = val; } else { a.b[*idx] = val; }
+                if *mat == 0 {
+                    a.a[*idx] = val;
+                } else {
+                    a.b[*idx] = val;
+                }
             };
 
             let original = get_param(&lora);
@@ -1141,12 +1308,15 @@ mod tests {
         }
 
         let total = n_pass + n_fail + n_skip;
-        eprintln!("Gradient check: {n_pass} pass, {n_fail} fail, {n_skip} skip (tiny), {total} total");
+        eprintln!(
+            "Gradient check: {n_pass} pass, {n_fail} fail, {n_skip} skip (tiny), {total} total"
+        );
         let fail_rate = n_fail as f32 / (n_pass + n_fail).max(1) as f32;
         assert!(
             fail_rate < 0.15,
             "Too many gradient check failures: {n_fail}/{} ({:.0}%)",
-            n_pass + n_fail, fail_rate * 100.0
+            n_pass + n_fail,
+            fail_rate * 100.0
         );
     }
 }

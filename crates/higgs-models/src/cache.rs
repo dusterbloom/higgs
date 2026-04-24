@@ -68,7 +68,10 @@ impl TurboQuantKvView {
         let key_qjl_signs = self.key_qjl_signs.as_slice::<u8>();
         let key_gammas = self.key_gammas.as_slice::<f32>();
         let value_codes_u32 = self.value_codes.as_slice::<u32>();
-        let value_codes_u8: Vec<u8> = value_codes_u32.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let value_codes_u8: Vec<u8> = value_codes_u32
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         let value_norms = self.value_norms.as_slice::<f32>();
 
         // Each row occupies key_code_words * 4 bytes in the reinterpreted buffer
@@ -164,11 +167,13 @@ impl TurboQuantKvView {
         } else {
             // Block-K path: single Metal dispatch over all L queries.
             // queries [1, H, L, D] → [H, L, D] for matmul broadcast.
-            let q_block = queries
-                .as_dtype(Dtype::Float32)?
-                .reshape(&[num_heads, l, self.context.head_dim])?;
-            let q_rot  = self.context.rotate_queries(&q_block)?;   // [H, L, D]
-            let q_qjl  = self.context.project_queries_qjl(&q_block)?; // [H, L, D]
+            let q_block = queries.as_dtype(Dtype::Float32)?.reshape(&[
+                num_heads,
+                l,
+                self.context.head_dim,
+            ])?;
+            let q_rot = self.context.rotate_queries(&q_block)?; // [H, L, D]
+            let q_qjl = self.context.project_queries_qjl(&q_block)?; // [H, L, D]
             // Returns [H, L, seq_len] — one Metal dispatch for all L queries.
             crate::turboquant::decode_scores_block(
                 &q_rot,
@@ -241,9 +246,12 @@ impl TurboQuantKvView {
                 self.context.value_code_words,
             )?;
             // Apply rotation: [H, L, D] @ [D, D] → [H, L, D], reshape → [1, H, L, D]
-            out_rot
-                .matmul(&self.context.rotation_array()?)?
-                .reshape(&[1, num_heads, l, self.context.head_dim])
+            out_rot.matmul(&self.context.rotation_array()?)?.reshape(&[
+                1,
+                num_heads,
+                l,
+                self.context.head_dim,
+            ])
         }
     }
 }
@@ -674,27 +682,45 @@ impl TurboQuantStorage {
         let err = || Exception::custom("TurboQuant storage not allocated");
         self.value_norms = Some(slice_update_axis(
             self.value_norms.as_ref().ok_or_else(err)?,
-            &v_norms, 1, prev, new_tokens,
+            &v_norms,
+            1,
+            prev,
+            new_tokens,
         )?);
         self.value_codes = Some(slice_update_axis(
             self.value_codes.as_ref().ok_or_else(err)?,
-            &v_codes, 1, prev, new_tokens,
+            &v_codes,
+            1,
+            prev,
+            new_tokens,
         )?);
         self.key_norms = Some(slice_update_axis(
             self.key_norms.as_ref().ok_or_else(err)?,
-            &k_norms, 1, prev, new_tokens,
+            &k_norms,
+            1,
+            prev,
+            new_tokens,
         )?);
         self.key_gammas = Some(slice_update_axis(
             self.key_gammas.as_ref().ok_or_else(err)?,
-            &k_gammas, 1, prev, new_tokens,
+            &k_gammas,
+            1,
+            prev,
+            new_tokens,
         )?);
         self.key_codes = Some(slice_update_axis(
             self.key_codes.as_ref().ok_or_else(err)?,
-            &k_codes, 1, prev, new_tokens,
+            &k_codes,
+            1,
+            prev,
+            new_tokens,
         )?);
         self.key_qjl_signs = Some(slice_update_axis(
             self.key_qjl_signs.as_ref().ok_or_else(err)?,
-            &k_signs, 1, prev, new_tokens,
+            &k_signs,
+            1,
+            prev,
+            new_tokens,
         )?);
 
         self.view(prev + new_tokens)
@@ -771,9 +797,7 @@ impl KeyValueCache for SteppingKeyValueCache {
                 // If dense KV was accumulated during prefill, bulk-quantize it
                 // into TurboQuant storage before appending the new token.
                 if turbo.capacity == 0 && self.offset > 0 {
-                    if let (Some(dense_k), Some(dense_v)) =
-                        (&self.keys, &self.values)
-                    {
+                    if let (Some(dense_k), Some(dense_v)) = (&self.keys, &self.values) {
                         let k = slice_axis2(dense_k, 0, self.offset)?;
                         let v = slice_axis2(dense_v, 0, self.offset)?;
                         turbo.append(k, v, 0, self.step)?;
@@ -781,9 +805,7 @@ impl KeyValueCache for SteppingKeyValueCache {
                         self.values = None;
                     }
                 }
-                KvCacheView::TurboQuant(
-                    turbo.append(keys, values, self.offset, self.step)?,
-                )
+                KvCacheView::TurboQuant(turbo.append(keys, values, self.offset, self.step)?)
             }
         } else {
             self.update_dense(keys, values)?
@@ -1180,6 +1202,92 @@ mod tests {
         assert!((k_data[8] - 2.0).abs() < 1e-6);
     }
 
+    /// BD3LM relies on `SteppingKeyValueCache::rollback(n)` to rewind the
+    /// offset without touching the dense buffer, so a re-forward at the
+    /// rolled-back position overwrites exactly those slots while leaving the
+    /// earlier prefix bytes untouched. If this invariant breaks, every
+    /// denoising step after the first would corrupt the committed prefix.
+    #[test]
+    fn test_stepping_cache_rollback_preserves_prefix_and_overwrites_block() {
+        let mut cache = SteppingKeyValueCache::new();
+
+        // Prefill: 4 prefix tokens filled with 1.0.
+        let ones_k = Array::ones::<f32>(&[1, 1, 4, 4]).unwrap();
+        let ones_v = Array::ones::<f32>(&[1, 1, 4, 4]).unwrap();
+        cache.update_and_fetch(ones_k, ones_v).unwrap();
+        assert_eq!(cache.offset(), 4);
+
+        // Denoising step 0: write a 2-token block filled with 2.0.
+        let two = Array::from_f32(2.0);
+        let twos_k = Array::full::<f32>(&[1, 1, 2, 4], &two).unwrap();
+        let twos_v = Array::full::<f32>(&[1, 1, 2, 4], &two).unwrap();
+        cache.update_and_fetch(twos_k, twos_v).unwrap();
+        assert_eq!(cache.offset(), 6);
+
+        // Rollback block: logical position returns to 4, buffer still holds 2.0 at slots [4..6].
+        cache.rollback(2);
+        assert_eq!(cache.offset(), 4);
+
+        // Denoising step 1: same block, updated tokens filled with 3.0.
+        let three = Array::from_f32(3.0);
+        let threes_k = Array::full::<f32>(&[1, 1, 2, 4], &three).unwrap();
+        let threes_v = Array::full::<f32>(&[1, 1, 2, 4], &three).unwrap();
+        let (rk, rv) = cache.update_and_fetch(threes_k, threes_v).unwrap();
+        assert_eq!(cache.offset(), 6);
+        assert_eq!(rk.shape(), &[1, 1, 6, 4]);
+
+        rk.eval().unwrap();
+        rv.eval().unwrap();
+        let k_data: Vec<f32> = rk.as_slice::<f32>().to_vec();
+        let v_data: Vec<f32> = rv.as_slice::<f32>().to_vec();
+
+        // Prefix [0..4] must be bitwise-unchanged (still 1.0).
+        for t in 0..4 {
+            for d in 0..4 {
+                let idx = t * 4 + d;
+                assert_eq!(
+                    k_data[idx], 1.0,
+                    "prefix K corrupted at t={t}, d={d}: {}",
+                    k_data[idx]
+                );
+                assert_eq!(
+                    v_data[idx], 1.0,
+                    "prefix V corrupted at t={t}, d={d}: {}",
+                    v_data[idx]
+                );
+            }
+        }
+        // Block [4..6] must now hold 3.0 (step 1 overwrote step 0's 2.0).
+        for t in 4..6 {
+            for d in 0..4 {
+                let idx = t * 4 + d;
+                assert_eq!(
+                    k_data[idx], 3.0,
+                    "block K not overwritten at t={t}, d={d}: {}",
+                    k_data[idx]
+                );
+                assert_eq!(
+                    v_data[idx], 3.0,
+                    "block V not overwritten at t={t}, d={d}: {}",
+                    v_data[idx]
+                );
+            }
+        }
+    }
+
+    /// Rollback must clamp to zero when asked to rewind past the start of the
+    /// cache (defensive guard around signed offset arithmetic).
+    #[test]
+    fn test_stepping_cache_rollback_clamps_to_zero() {
+        let mut cache = SteppingKeyValueCache::new();
+        let (keys, values) = make_kv_pair(3, 8);
+        cache.update_and_fetch(keys, values).unwrap();
+        assert_eq!(cache.offset(), 3);
+
+        cache.rollback(10);
+        assert_eq!(cache.offset(), 0);
+    }
+
     #[test]
     fn test_turboquant_cache_round_trips_dense_fetch() {
         let config = KvCacheConfig {
@@ -1256,7 +1364,10 @@ mod tests {
         // Multi-token prefill: returns Dense (quantization deferred)
         let (keys, values) = make_kv_pair(2, 8);
         let view = cache.update_and_view(keys, values).unwrap();
-        assert!(view.turboquant().is_none(), "prefill should return Dense view");
+        assert!(
+            view.turboquant().is_none(),
+            "prefill should return Dense view"
+        );
         assert_eq!(cache.offset(), 2);
 
         // First decode token: triggers bulk quantize, returns TurboQuant

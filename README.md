@@ -348,6 +348,21 @@ Run `higgs doctor` to validate the combination before serving.
 |---|---|---|
 | `HIGGS_DFLASH_BLOCK_SIZE` | `4` | Runtime decode block size for speculative drafting. Drafters are trained at 16, but acceptance plateaus at ~3 tokens — smaller blocks amortize verify cost better. Set to `3` for a slight edge at short contexts, `2` lower bound. |
 
+## AR-spec env flags
+
+Greedy AR-speculative decoding pairs a small dense Qwen3.5 drafter with the
+target model via `speculative_generate_next`. Configure in `higgs.toml` with
+`ar_spec = "<model-path>"` on a `[[models]]` entry, or set the env vars
+directly. Mutually exclusive with `dflash`; greedy only (no temperature,
+top_p, top_k, logprobs, stop sequences).
+
+| Env var | Default | Effect |
+|---|---|---|
+| `HIGGS_AR_SPEC_DRAFT_PATH` | unset | Path/HF id of the dense Qwen3.5 drafter (e.g. `mlx-community/Qwen3.5-0.8B-8bit`). Set by `higgs.toml`'s `ar_spec` field at startup. |
+| `HIGGS_AR_SPEC_K_LOW` | `4` | Lower bound of the adaptive K window (draft tokens per round). |
+| `HIGGS_AR_SPEC_K_HIGH` | `8` | Upper bound of the adaptive K window. |
+| `HIGGS_AR_SPEC_MAX_SEQ` | `2048` | Maximum sequence length the drafter will hold in its KV cache within a round. |
+
 ## Development
 
 ```bash

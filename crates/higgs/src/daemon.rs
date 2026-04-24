@@ -115,6 +115,13 @@ port = 8000
 # name = "llama"
 # batch = false
 # dflash = "z-lab/Qwen3.5-27B-DFlash"  # optional DFlash drafter for spec decode
+# ar_spec = "mlx-community/Qwen3.5-0.8B-8bit"  # optional AR-spec drafter (greedy only; mutually exclusive with dflash)
+
+# [[models]]
+# name = "bonsai-bd3lm"
+# path = "./bonsai-bd3lm-merged-bf16"
+# [models.bd3lm]
+# num_denoising_steps = 8
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.

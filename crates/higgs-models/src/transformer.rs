@@ -642,6 +642,19 @@ impl Model {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
+        let out = self.forward_hidden_from_embeddings(embeddings, mask, kv_cache)?;
+        self.apply_lm_head(&out)
+    }
+
+    /// Forward pass from pre-computed embeddings returning normed hidden states
+    /// (skips the LM head). Used by BD3LM which applies a denoise head instead.
+    /// Returns `[B, T, hidden_size]`.
+    pub fn forward_hidden_from_embeddings<C: KeyValueCache>(
+        &mut self,
+        embeddings: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
         let computed_mask = match mask {
             Some(m) => Some(m.clone()),
             None => match create_attention_mask(embeddings, kv_cache, Some(true))? {
@@ -672,8 +685,7 @@ impl Model {
             })?;
         }
 
-        let out = self.model.norm.forward(&h)?;
-        self.apply_lm_head(&out)
+        self.model.norm.forward(&h)
     }
 
     /// Batched decode: one forward pass for N requests each with 1 token.

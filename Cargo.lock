@@ -1924,7 +1924,6 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -1936,7 +1935,6 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -1947,7 +1945,6 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
 dependencies = [
  "dyn-clone",
  "half",
@@ -1970,7 +1967,6 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=af21d79#af21d799dd826bd64703ba85623fbd45cc1452bb"
 dependencies = [
  "bindgen",
  "cc",

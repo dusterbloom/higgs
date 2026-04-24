@@ -67,7 +67,7 @@ pub enum LoraActivation {
 
 /// LoRA weights: down `[rank, input_dim]`, up_weight `[output_dim, rank]`, up_bias `[output_dim]`.
 pub struct LoraWeights {
-    pub down: Vec<f32>,    // [rank, input_dim]
+    pub down: Vec<f32>,      // [rank, input_dim]
     pub up_weight: Vec<f32>, // [output_dim, rank]
     pub up_bias: Vec<f32>,   // [output_dim]
     pub rank: usize,
@@ -80,19 +80,32 @@ pub struct LoraWeights {
 unsafe extern "C" {
     // cblas_sgemv(order, trans, m, n, alpha, a, lda, x, incx, beta, y, incy)
     fn cblas_sgemv(
-        order: i32, trans: i32, m: i32, n: i32,
-        alpha: f32, a: *const f32, lda: i32,
-        x: *const f32, incx: i32,
-        beta: f32, y: *mut f32, incy: i32,
+        order: i32,
+        trans: i32,
+        m: i32,
+        n: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        x: *const f32,
+        incx: i32,
+        beta: f32,
+        y: *mut f32,
+        incy: i32,
     );
     // cblas_sger(order, m, n, alpha, x, incx, y, incy, a, lda)
     // Rank-1 update: A += alpha * x * y^T
     fn cblas_sger(
-        order: i32, m: i32, n: i32,
+        order: i32,
+        m: i32,
+        n: i32,
         alpha: f32,
-        x: *const f32, incx: i32,
-        y: *const f32, incy: i32,
-        a: *mut f32, lda: i32,
+        x: *const f32,
+        incx: i32,
+        y: *const f32,
+        incy: i32,
+        a: *mut f32,
+        lda: i32,
     );
 }
 
@@ -103,10 +116,16 @@ fn gemv_f32(a: &[f32], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
         cblas_sgemv(
             101, // CblasRowMajor
             111, // CblasNoTrans
-            m as i32, n as i32,
-            1.0, a.as_ptr(), n as i32,
-            x.as_ptr(), 1,
-            0.0, y.as_mut_ptr(), 1,
+            m as i32,
+            n as i32,
+            1.0,
+            a.as_ptr(),
+            n as i32,
+            x.as_ptr(),
+            1,
+            0.0,
+            y.as_mut_ptr(),
+            1,
         );
     }
 }
@@ -118,10 +137,16 @@ pub fn gemv_trans_f32(a: &[f32], m: usize, n: usize, x: &[f32], y: &mut [f32]) {
         cblas_sgemv(
             101, // CblasRowMajor
             112, // CblasTrans
-            m as i32, n as i32,
-            1.0, a.as_ptr(), n as i32,
-            x.as_ptr(), 1,
-            0.0, y.as_mut_ptr(), 1,
+            m as i32,
+            n as i32,
+            1.0,
+            a.as_ptr(),
+            n as i32,
+            x.as_ptr(),
+            1,
+            0.0,
+            y.as_mut_ptr(),
+            1,
         );
     }
 }
@@ -211,7 +236,13 @@ pub fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], eps: f32) -> Vec<f32>
 }
 
 /// Group normalization: split `x` into `num_groups` and normalize each.
-fn group_norm_cpu(x: &[f32], weight: &[f32], bias: &[f32], num_groups: usize, eps: f32) -> Vec<f32> {
+fn group_norm_cpu(
+    x: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    num_groups: usize,
+    eps: f32,
+) -> Vec<f32> {
     let c = x.len();
     let group_size = c / num_groups;
     let mut out = vec![0.0f32; c];
@@ -222,7 +253,8 @@ fn group_norm_cpu(x: &[f32], weight: &[f32], bias: &[f32], num_groups: usize, ep
         let group = &x[start..end];
 
         let mean: f32 = group.iter().sum::<f32>() / group_size as f32;
-        let var: f32 = group.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / group_size as f32;
+        let var: f32 =
+            group.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / group_size as f32;
         let inv_std = 1.0 / (var + eps).sqrt();
 
         for i in 0..group_size {
@@ -271,7 +303,11 @@ fn f32_to_f16(v: f32) -> u16 {
 // ANE IOSurface I/O helpers (used when ANE kernels are active).
 // Kept for future ANE integration.
 #[allow(dead_code)]
-fn _write_activation_f32(kernel: &crate::ane_bridge::AneKernel, activation: &[f32], padded_seq: usize) {
+fn _write_activation_f32(
+    kernel: &crate::ane_bridge::AneKernel,
+    activation: &[f32],
+    padded_seq: usize,
+) {
     if padded_seq <= 1 {
         kernel.write_input(0, &f32_to_bytes(activation));
     } else {
@@ -285,12 +321,20 @@ fn _write_activation_f32(kernel: &crate::ane_bridge::AneKernel, activation: &[f3
 }
 
 #[allow(dead_code)]
-fn _read_output_f32(kernel: &crate::ane_bridge::AneKernel, oc: usize, padded_seq: usize) -> Vec<f32> {
+fn _read_output_f32(
+    kernel: &crate::ane_bridge::AneKernel,
+    oc: usize,
+    padded_seq: usize,
+) -> Vec<f32> {
     let total = oc * padded_seq;
     let mut buf = vec![0u8; total * 4];
     kernel.read_output(0, &mut buf);
     let all = bytes_to_f32(&buf);
-    if padded_seq <= 1 { all } else { (0..oc).map(|c| all[c * padded_seq]).collect() }
+    if padded_seq <= 1 {
+        all
+    } else {
+        (0..oc).map(|c| all[c * padded_seq]).collect()
+    }
 }
 
 /// Read f32 values from little-endian byte buffer.
@@ -447,7 +491,12 @@ pub fn forward_ane_decode(
         // --- Attention path ---
 
         // 1. Layer norm
-        let normed = layer_norm(&hidden, &cpu_w.attn_norm_weight, &cpu_w.attn_norm_bias, 1e-5);
+        let normed = layer_norm(
+            &hidden,
+            &cpu_w.attn_norm_weight,
+            &cpu_w.attn_norm_bias,
+            1e-5,
+        );
 
         // 2. Token shift: delta = prev - curr, mix = curr + delta * param
         let shifted = &state.attn_shift_state;
@@ -494,7 +543,11 @@ pub fn forward_ane_decode(
         }
 
         // kk: l2_norm(k * k_k) — normalized key for attention bonus
-        let kk: Vec<f32> = k.iter().zip(cpu_w.k_k.iter()).map(|(&ki, &kki)| ki * kki).collect();
+        let kk: Vec<f32> = k
+            .iter()
+            .zip(cpu_w.k_k.iter())
+            .map(|(&ki, &kki)| ki * kki)
+            .collect();
         let kk = l2_norm_cpu(&kk);
 
         // k update: k = k * (1 + (a - 1) * k_a)
@@ -531,22 +584,32 @@ pub fn forward_ane_decode(
             //    S[d,d] += k[d] * v[d]^T
             unsafe {
                 cblas_sger(
-                    101, d as i32, d as i32,
+                    101,
+                    d as i32,
+                    d as i32,
                     1.0,
-                    k[ho..].as_ptr(), 1,
-                    v[ho..].as_ptr(), 1,
-                    state.wkv_state[s_off..].as_mut_ptr(), d as i32,
+                    k[ho..].as_ptr(),
+                    1,
+                    v[ho..].as_ptr(),
+                    1,
+                    state.wkv_state[s_off..].as_mut_ptr(),
+                    d as i32,
                 );
             }
 
             // 3. S -= outer(kk, kk_a): rank-1 update with alpha=-1
             unsafe {
                 cblas_sger(
-                    101, d as i32, d as i32,
+                    101,
+                    d as i32,
+                    d as i32,
                     -1.0,
-                    kk[ho..].as_ptr(), 1,
-                    kk_a[ho..].as_ptr(), 1,
-                    state.wkv_state[s_off..].as_mut_ptr(), d as i32,
+                    kk[ho..].as_ptr(),
+                    1,
+                    kk_a[ho..].as_ptr(),
+                    1,
+                    state.wkv_state[s_off..].as_mut_ptr(),
+                    d as i32,
                 );
             }
 
@@ -554,13 +617,18 @@ pub fn forward_ane_decode(
             //    out[j] = sum_i r[i] * S[i,j] = (S^T @ r)[j]
             unsafe {
                 cblas_sgemv(
-                    101, 112, // RowMajor, Trans
-                    d as i32, d as i32,
+                    101,
+                    112, // RowMajor, Trans
+                    d as i32,
+                    d as i32,
                     1.0,
-                    state.wkv_state[s_off..].as_ptr(), d as i32,
-                    r[ho..].as_ptr(), 1,
+                    state.wkv_state[s_off..].as_ptr(),
+                    d as i32,
+                    r[ho..].as_ptr(),
+                    1,
                     0.0,
-                    attn_out[ho..].as_mut_ptr(), 1,
+                    attn_out[ho..].as_mut_ptr(),
+                    1,
                 );
             }
         }
@@ -568,7 +636,13 @@ pub fn forward_ane_decode(
         t_wkv_us += t0_wkv.elapsed().as_micros() as u64;
 
         // 6. Group norm + gate output correction + gate
-        let y = group_norm_cpu(&attn_out, &cpu_w.g_norm_weight, &cpu_w.g_norm_bias, num_heads, gn_eps);
+        let y = group_norm_cpu(
+            &attn_out,
+            &cpu_w.g_norm_weight,
+            &cpu_w.g_norm_bias,
+            num_heads,
+            gn_eps,
+        );
 
         // correction = (r * k * r_k).sum_per_head * v — reuse `o` buffer as y_out
         for h in 0..num_heads {
@@ -607,7 +681,10 @@ pub fn forward_ane_decode(
         // FFN via sgemv
         let t0 = std::time::Instant::now();
         gemv_trans_f32(&ane_w.ffn_key, dim, inter, &ffn_xk, &mut fk);
-        for val in fk.iter_mut() { *val = val.max(0.0); *val *= *val; } // sqReLU
+        for val in fk.iter_mut() {
+            *val = val.max(0.0);
+            *val *= *val;
+        } // sqReLU
         gemv_trans_f32(&ane_w.ffn_value, inter, dim, &fk, &mut fv);
         t_ane_us += t0.elapsed().as_micros() as u64;
 
@@ -619,7 +696,9 @@ pub fn forward_ane_decode(
 
     eprintln!(
         "  timing: proj={}ms lora={}ms wkv={}ms other={}ms total={}ms",
-        t_ane_us / 1000, t_lora_us / 1000, t_wkv_us / 1000,
+        t_ane_us / 1000,
+        t_lora_us / 1000,
+        t_wkv_us / 1000,
         (t_cpu_us.saturating_sub(t_lora_us).saturating_sub(t_wkv_us)) / 1000,
         (t_ane_us + t_cpu_us + t_io_us) / 1000,
     );
@@ -661,6 +740,15 @@ pub fn forward_ane_full(
     // gemm_f16(A_fp16, M, K, B_f32, N, C_out, alpha, beta)
     // A = lm_head [vocab × dim], B = normed [dim × 1], C = logits [vocab × 1]
     let mut logits = vec![0.0f32; vocab_size];
-    ane_bridge::gemm_f16(lm_head_fp16, vocab_size, dim, &normed, 1, &mut logits, 1.0, 0.0);
+    ane_bridge::gemm_f16(
+        lm_head_fp16,
+        vocab_size,
+        dim,
+        &normed,
+        1,
+        &mut logits,
+        1.0,
+        0.0,
+    );
     Ok(logits)
 }

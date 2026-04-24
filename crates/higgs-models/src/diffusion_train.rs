@@ -13,8 +13,7 @@
 
 use crate::diffusion::DiffusionEngine;
 use crate::diffusion_lora::{
-    backward, forward_train, DiffusionLoraGrads, DiffusionLoraModel, LoraAdapter,
-    LoraAdapterGrads,
+    DiffusionLoraGrads, DiffusionLoraModel, LoraAdapter, LoraAdapterGrads, backward, forward_train,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,7 +37,7 @@ impl Default for TrainingConfig {
     fn default() -> Self {
         TrainingConfig {
             total_steps: 1000,
-            max_lr: 5e-4,     // 10x standard (JIT LoRA proven)
+            max_lr: 5e-4, // 10x standard (JIT LoRA proven)
             adam_beta1: 0.9,
             adam_beta2: 0.999,
             adam_eps: 1e-8,
@@ -62,7 +61,10 @@ pub struct AdamState {
 
 impl AdamState {
     pub fn zeros(n: usize) -> Self {
-        AdamState { m: vec![0.0; n], v: vec![0.0; n] }
+        AdamState {
+            m: vec![0.0; n],
+            v: vec![0.0; n],
+        }
     }
 }
 
@@ -84,20 +86,24 @@ pub struct DiffusionLoraAdamState {
 
 impl DiffusionLoraAdamState {
     pub fn zeros(lora: &DiffusionLoraModel) -> Self {
-        let layers = lora.layers.iter().map(|l| {
-            let mk = |opt: &Option<LoraAdapter>| -> Option<LoraAdapterAdamState> {
-                opt.as_ref().map(|a| LoraAdapterAdamState {
-                    a: AdamState::zeros(a.rank * a.d_in),
-                    b: AdamState::zeros(a.d_out * a.rank),
-                })
-            };
-            LoraLayerAdamState {
-                q: mk(&l.q),
-                v: mk(&l.v),
-                o: mk(&l.o),
-                down: mk(&l.down),
-            }
-        }).collect();
+        let layers = lora
+            .layers
+            .iter()
+            .map(|l| {
+                let mk = |opt: &Option<LoraAdapter>| -> Option<LoraAdapterAdamState> {
+                    opt.as_ref().map(|a| LoraAdapterAdamState {
+                        a: AdamState::zeros(a.rank * a.d_in),
+                        b: AdamState::zeros(a.d_out * a.rank),
+                    })
+                };
+                LoraLayerAdamState {
+                    q: mk(&l.q),
+                    v: mk(&l.v),
+                    o: mk(&l.o),
+                    down: mk(&l.down),
+                }
+            })
+            .collect();
         DiffusionLoraAdamState { layers }
     }
 }
@@ -121,7 +127,9 @@ fn adam_update(
     let bc2 = 1.0 / (1.0 - b2.powi(t as i32));
 
     for i in 0..w.len() {
-        if wd > 0.0 { w[i] *= 1.0 - lr * wd; }
+        if wd > 0.0 {
+            w[i] *= 1.0 - lr * wd;
+        }
         state.m[i] = b1 * state.m[i] + (1.0 - b1) * g[i];
         state.v[i] = b2 * state.v[i] + (1.0 - b2) * g[i] * g[i];
         let m_hat = state.m[i] * bc1;
@@ -138,8 +146,28 @@ fn apply_adam_to_adapter(
     lr: f32,
     cfg: &TrainingConfig,
 ) {
-    adam_update(&mut adapter.a, &grads.da, &mut adam.a, t, lr, cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps, cfg.weight_decay);
-    adam_update(&mut adapter.b, &grads.db, &mut adam.b, t, lr, cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps, cfg.weight_decay);
+    adam_update(
+        &mut adapter.a,
+        &grads.da,
+        &mut adam.a,
+        t,
+        lr,
+        cfg.adam_beta1,
+        cfg.adam_beta2,
+        cfg.adam_eps,
+        cfg.weight_decay,
+    );
+    adam_update(
+        &mut adapter.b,
+        &grads.db,
+        &mut adam.b,
+        t,
+        lr,
+        cfg.adam_beta1,
+        cfg.adam_beta2,
+        cfg.adam_eps,
+        cfg.weight_decay,
+    );
 }
 
 /// Apply Adam to all LoRA parameters.
@@ -180,7 +208,9 @@ pub fn cosine_lr(step: usize, warmup: usize, total: usize, max_lr: f32, min_lr_f
     } else {
         let min_lr = max_lr * min_lr_frac;
         let decay_steps = total.saturating_sub(warmup);
-        if decay_steps == 0 { return max_lr; }
+        if decay_steps == 0 {
+            return max_lr;
+        }
         let progress = ((step - warmup) as f32 / decay_steps as f32).min(1.0);
         min_lr + 0.5 * (max_lr - min_lr) * (1.0 + (std::f32::consts::PI * progress).cos())
     }
@@ -192,26 +222,52 @@ pub fn cosine_lr(step: usize, warmup: usize, total: usize, max_lr: f32, min_lr_f
 
 fn for_each_grad(grads: &DiffusionLoraGrads, mut f: impl FnMut(&[f32])) {
     for lg in &grads.layers {
-        if let Some(ref g) = lg.q { f(&g.da); f(&g.db); }
-        if let Some(ref g) = lg.v { f(&g.da); f(&g.db); }
-        if let Some(ref g) = lg.o { f(&g.da); f(&g.db); }
-        if let Some(ref g) = lg.down { f(&g.da); f(&g.db); }
+        if let Some(ref g) = lg.q {
+            f(&g.da);
+            f(&g.db);
+        }
+        if let Some(ref g) = lg.v {
+            f(&g.da);
+            f(&g.db);
+        }
+        if let Some(ref g) = lg.o {
+            f(&g.da);
+            f(&g.db);
+        }
+        if let Some(ref g) = lg.down {
+            f(&g.da);
+            f(&g.db);
+        }
     }
 }
 
 fn for_each_grad_mut(grads: &mut DiffusionLoraGrads, mut f: impl FnMut(&mut [f32])) {
     for lg in &mut grads.layers {
-        if let Some(ref mut g) = lg.q { f(&mut g.da); f(&mut g.db); }
-        if let Some(ref mut g) = lg.v { f(&mut g.da); f(&mut g.db); }
-        if let Some(ref mut g) = lg.o { f(&mut g.da); f(&mut g.db); }
-        if let Some(ref mut g) = lg.down { f(&mut g.da); f(&mut g.db); }
+        if let Some(ref mut g) = lg.q {
+            f(&mut g.da);
+            f(&mut g.db);
+        }
+        if let Some(ref mut g) = lg.v {
+            f(&mut g.da);
+            f(&mut g.db);
+        }
+        if let Some(ref mut g) = lg.o {
+            f(&mut g.da);
+            f(&mut g.db);
+        }
+        if let Some(ref mut g) = lg.down {
+            f(&mut g.da);
+            f(&mut g.db);
+        }
     }
 }
 
 pub fn global_grad_norm(grads: &DiffusionLoraGrads) -> f32 {
     let mut sum_sq = 0.0f64;
     for_each_grad(grads, |g| {
-        for &v in g { sum_sq += (v as f64) * (v as f64); }
+        for &v in g {
+            sum_sq += (v as f64) * (v as f64);
+        }
     });
     (sum_sq as f32).sqrt()
 }
@@ -221,7 +277,9 @@ pub fn clip_gradients(grads: &mut DiffusionLoraGrads, clip: f32) {
     if norm > clip {
         let scale = clip / norm;
         for_each_grad_mut(grads, |g| {
-            for v in g.iter_mut() { *v *= scale; }
+            for v in g.iter_mut() {
+                *v *= scale;
+            }
         });
     }
 }
@@ -325,11 +383,19 @@ pub fn training_step(
 
     // Sample mask ratio from uniform [0, 1] (MDLM schedule)
     let mut state = rng_seed.wrapping_add(step as u64 * 31337);
-    state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
     let mask_ratio = (state as f32) / (u64::MAX as f32);
 
     // Mask input
-    let (masked_tokens, mask_positions) = random_mask(tokens, prompt_len, mask_id, mask_ratio, rng_seed.wrapping_add(step as u64));
+    let (masked_tokens, mask_positions) = random_mask(
+        tokens,
+        prompt_len,
+        mask_id,
+        mask_ratio,
+        rng_seed.wrapping_add(step as u64),
+    );
 
     if mask_positions.is_empty() {
         return 0.0;
@@ -348,7 +414,13 @@ pub fn training_step(
     clip_gradients(&mut grads, cfg.grad_clip);
 
     // LR schedule
-    let lr = cosine_lr(step, cfg.warmup_steps, cfg.total_steps, cfg.max_lr, cfg.min_lr_frac);
+    let lr = cosine_lr(
+        step,
+        cfg.warmup_steps,
+        cfg.total_steps,
+        cfg.max_lr,
+        cfg.min_lr_frac,
+    );
 
     // Adam update (step is 1-indexed for bias correction)
     adam_update_all(lora, &grads, adam, step + 1, lr, cfg);
@@ -370,15 +442,23 @@ pub fn train(
     let t0 = std::time::Instant::now();
 
     for step in 0..cfg.total_steps {
-        let loss = training_step(
-            engine, lora, &mut adam, tokens, prompt_len, step, cfg, 42,
-        );
+        let loss = training_step(engine, lora, &mut adam, tokens, prompt_len, step, cfg, 42);
         losses.push(loss);
 
         if step % cfg.log_interval == 0 || step == cfg.total_steps - 1 {
-            let lr = cosine_lr(step, cfg.warmup_steps, cfg.total_steps, cfg.max_lr, cfg.min_lr_frac);
+            let lr = cosine_lr(
+                step,
+                cfg.warmup_steps,
+                cfg.total_steps,
+                cfg.max_lr,
+                cfg.min_lr_frac,
+            );
             let elapsed = t0.elapsed().as_secs_f64();
-            let ms_per_step = if step > 0 { elapsed / step as f64 * 1000.0 } else { 0.0 };
+            let ms_per_step = if step > 0 {
+                elapsed / step as f64 * 1000.0
+            } else {
+                0.0
+            };
             eprintln!(
                 "step {step:>5}/{}: loss={loss:.4}, lr={lr:.2e}, {ms_per_step:.0}ms/step",
                 cfg.total_steps
@@ -420,7 +500,10 @@ mod tests {
         assert!(lr < 1e-6, "LR at step 0 should be ~0 during warmup");
 
         let lr = cosine_lr(10, 10, 100, 1e-3, 0.1);
-        assert!((lr - 1e-3).abs() < 1e-6, "LR should be max_lr at end of warmup");
+        assert!(
+            (lr - 1e-3).abs() < 1e-6,
+            "LR should be max_lr at end of warmup"
+        );
 
         let lr = cosine_lr(100, 10, 100, 1e-3, 0.1);
         assert!((lr - 1e-4).abs() < 1e-6, "LR should be min_lr at end");
@@ -449,7 +532,10 @@ mod tests {
                 // Gradient row should sum to ~0 (softmax - one_hot sums to 0)
                 assert!(row_sum.abs() < 1e-5, "Gradient at mask pos should sum to 0");
             } else {
-                assert!(row_sum.abs() < 1e-10, "Gradient at non-mask pos should be 0");
+                assert!(
+                    row_sum.abs() < 1e-10,
+                    "Gradient at non-mask pos should be 0"
+                );
             }
         }
     }
@@ -478,9 +564,8 @@ mod tests {
     #[ignore]
     fn test_real_model_training() {
         let home = std::env::var("HOME").expect("HOME not set");
-        let model_dir = std::path::PathBuf::from(home).join(
-            ".cache/huggingface/hub/models--dllm-hub--Qwen3-0.6B-diffusion-mdlm-v0.1"
-        );
+        let model_dir = std::path::PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--dllm-hub--Qwen3-0.6B-diffusion-mdlm-v0.1");
         if !model_dir.exists() {
             eprintln!("Model not found at {model_dir:?}, skipping");
             return;
@@ -494,11 +579,20 @@ mod tests {
         let lora_cfg = LoraConfig::default();
         let mut lora = DiffusionLoraModel::new(lora_cfg, &engine.config);
 
-        let n_params: usize = lora.layers.iter().map(|l| {
-            let c = |a: &Option<LoraAdapter>| a.as_ref().map_or(0, |a| a.rank * a.d_in + a.d_out * a.rank);
-            c(&l.q) + c(&l.v) + c(&l.o) + c(&l.down)
-        }).sum();
-        eprintln!("LoRA parameters: {n_params} ({:.2}M)", n_params as f64 / 1e6);
+        let n_params: usize = lora
+            .layers
+            .iter()
+            .map(|l| {
+                let c = |a: &Option<LoraAdapter>| {
+                    a.as_ref().map_or(0, |a| a.rank * a.d_in + a.d_out * a.rank)
+                };
+                c(&l.q) + c(&l.v) + c(&l.o) + c(&l.down)
+            })
+            .sum();
+        eprintln!(
+            "LoRA parameters: {n_params} ({:.2}M)",
+            n_params as f64 / 1e6
+        );
 
         // Training data: a short sentence with mask token at the end
         // "The capital of France is [MASK] [MASK] [MASK]"
@@ -506,7 +600,7 @@ mod tests {
         let mask_id = engine.config.mask_token_id;
         let tokens: Vec<u32> = vec![
             791, 6864, 315, 9822, 374, // "The capital of France is"
-            12366, 13,                  // "Paris."  (target)
+            12366, 13, // "Paris."  (target)
         ];
         let prompt_len = 5; // Everything before "Paris." is prompt
 
@@ -518,7 +612,10 @@ mod tests {
             ..TrainingConfig::default()
         };
 
-        eprintln!("\nRunning 5 training steps on {} tokens (prompt_len={prompt_len})...", tokens.len());
+        eprintln!(
+            "\nRunning 5 training steps on {} tokens (prompt_len={prompt_len})...",
+            tokens.len()
+        );
         let losses = train(&engine, &mut lora, &tokens, prompt_len, &train_cfg);
 
         eprintln!("\nLosses: {:?}", losses);
@@ -530,7 +627,10 @@ mod tests {
     fn test_training_reduces_loss() {
         let cfg = small_config();
         let engine = DiffusionEngine::from_random(cfg.clone());
-        let lora_cfg = LoraConfig { rank: 4, ..LoraConfig::default() };
+        let lora_cfg = LoraConfig {
+            rank: 4,
+            ..LoraConfig::default()
+        };
         let mut lora = DiffusionLoraModel::new(lora_cfg, &cfg);
 
         let tokens: Vec<u32> = vec![1, 2, 3, 10, 20, 30, 40, 50];
@@ -546,11 +646,14 @@ mod tests {
         let losses = train(&engine, &mut lora, &tokens, prompt_len, &train_cfg);
 
         let first_5: f32 = losses[..5].iter().sum::<f32>() / 5.0;
-        let last_5: f32 = losses[losses.len()-5..].iter().sum::<f32>() / 5.0;
+        let last_5: f32 = losses[losses.len() - 5..].iter().sum::<f32>() / 5.0;
 
         eprintln!("First 5 avg loss: {first_5:.4}, last 5 avg loss: {last_5:.4}");
         // Loss should decrease (or at least not increase drastically)
         // With random model this might not always decrease, but it should not explode
-        assert!(last_5 < first_5 * 2.0, "Loss should not explode: {first_5} → {last_5}");
+        assert!(
+            last_5 < first_5 * 2.0,
+            "Loss should not explode: {first_5} → {last_5}"
+        );
     }
 }
