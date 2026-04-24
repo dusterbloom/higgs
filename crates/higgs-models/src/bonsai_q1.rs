@@ -1124,4 +1124,222 @@ mod tests {
             "forward_all_logits OK: shape=[1,8,{vocab}], row[-1] matches forward()"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Bench (ignored by default — run with `--ignored --nocapture`).
+    // ---------------------------------------------------------------------
+
+    fn synth_ids(n: i32) -> Vec<i32> {
+        // Deterministic low-index stream; avoids special tokens near 0 and
+        // keeps indices well below vocab for any Qwen3-shape target.
+        (0..n).map(|i| 100 + (i * 131) % 50_000).collect()
+    }
+
+    fn bench_one(
+        name: &str,
+        dir: &std::path::Path,
+        prefill_lens: &[i32],
+        decode_n: i32,
+    ) -> Option<String> {
+        use crate::AnyModel;
+        use std::time::Instant;
+
+        let mut md = String::new();
+        md.push_str(&format!("\n## {name}\n\n"));
+
+        // --- Load + to_gpu ---
+        let t0 = Instant::now();
+        let engine = BonsaiQ1Engine::load(dir).ok()?;
+        let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let mb = engine.resident_bytes() as f64 / (1024.0 * 1024.0);
+        let layers_n = engine.num_layers();
+        let vocab = engine.config.vocab as i32;
+
+        let t0 = Instant::now();
+        let gpu = engine.to_gpu().expect("to_gpu");
+        let to_gpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        md.push_str(&format!(
+            "- layers: {layers_n}, vocab: {vocab}, packed resident: {mb:.1} MB\n"
+        ));
+        md.push_str(&format!("- load: {load_ms:.0} ms, to_gpu: {to_gpu_ms:.0} ms\n\n"));
+        eprintln!(
+            "[{name}] load={load_ms:.0}ms to_gpu={to_gpu_ms:.0}ms resident={mb:.1}MB layers={layers_n}"
+        );
+
+        let mut model = AnyModel::BonsaiQ1(gpu);
+
+        // --- Kernel warmup (1 forward discarded) ---
+        {
+            let mut c = model.make_cache();
+            let warm_ids = synth_ids(8);
+            let x = mlx_rs::Array::from_slice(&warm_ids, &[1, 8]);
+            let y = model.forward(&x, None, &mut c).expect("warmup forward");
+            y.eval().expect("warmup eval");
+        }
+
+        // --- Prefill matrix ---
+        // Two passes per shape: the first warms the MLX per-shape kernel
+        // cache (one-shot compile), the second is the measured run.
+        md.push_str("### Prefill (per-shape kernel warmed, fresh KV cache)\n\n");
+        md.push_str("| L (tokens) | ms | tok/s |\n|---:|---:|---:|\n");
+        for &L in prefill_lens {
+            let ids = synth_ids(L);
+            // Warm (compile kernel for this T).
+            {
+                let x = mlx_rs::Array::from_slice(&ids, &[1, L]);
+                let mut c = model.make_cache();
+                let y = model.forward(&x, None, &mut c).expect("prefill warmup");
+                y.eval().expect("eval warmup");
+            }
+            // Measure.
+            let x = mlx_rs::Array::from_slice(&ids, &[1, L]);
+            let mut c = model.make_cache();
+            let t0 = Instant::now();
+            let y = model.forward(&x, None, &mut c).expect("prefill");
+            y.eval().expect("eval");
+            let dt = t0.elapsed().as_secs_f64();
+            let tps = f64::from(L) / dt;
+            md.push_str(&format!("| {L} | {:.1} | {tps:.1} |\n", dt * 1000.0));
+            eprintln!("[{name}] prefill L={L}: {:.1}ms ({tps:.1} tok/s)", dt * 1000.0);
+        }
+
+        // --- Sustained decode ---
+        md.push_str("\n### Sustained decode after 16-token prefill (autoregressive argmax)\n\n");
+        let mut c = model.make_cache();
+        let prompt = synth_ids(16);
+        let x = mlx_rs::Array::from_slice(&prompt, &[1, 16]);
+        let y0 = model.forward(&x, None, &mut c).expect("decode prefill");
+        y0.eval().expect("eval");
+
+        // Argmax from prefill logits to seed decode.
+        let s0: &[f32] = y0.as_slice::<f32>();
+        let (mut tok, mut best) = (0i32, f32::NEG_INFINITY);
+        for (i, v) in s0.iter().enumerate() {
+            if *v > best {
+                best = *v;
+                tok = i as i32;
+            }
+        }
+
+        // Warm 4 steps (settle), then time decode_n-4 steps.
+        let warm_steps = 4.min(decode_n / 4);
+        for _ in 0..warm_steps {
+            let d = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+            let y = model.forward(&d, None, &mut c).expect("decode");
+            y.eval().expect("eval");
+            let s: &[f32] = y.as_slice::<f32>();
+            let (mut nb_i, mut nb_v) = (0i32, f32::NEG_INFINITY);
+            for (i, v) in s.iter().enumerate() {
+                if *v > nb_v {
+                    nb_v = *v;
+                    nb_i = i as i32;
+                }
+            }
+            tok = nb_i;
+        }
+
+        let steady = decode_n - warm_steps;
+        let t0 = Instant::now();
+        for _ in 0..steady {
+            let d = mlx_rs::Array::from_slice(&[tok], &[1, 1]);
+            let y = model.forward(&d, None, &mut c).expect("decode");
+            y.eval().expect("eval");
+            let s: &[f32] = y.as_slice::<f32>();
+            let (mut nb_i, mut nb_v) = (0i32, f32::NEG_INFINITY);
+            for (i, v) in s.iter().enumerate() {
+                if *v > nb_v {
+                    nb_v = *v;
+                    nb_i = i as i32;
+                }
+            }
+            tok = nb_i;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let tps = f64::from(steady) / dt;
+        let ms_per_tok = dt * 1000.0 / f64::from(steady);
+
+        md.push_str(&format!("| decode steps | total ms | ms/tok | tok/s |\n|---:|---:|---:|---:|\n"));
+        md.push_str(&format!(
+            "| {steady} (after {warm_steps} warmup) | {:.1} | {ms_per_tok:.2} | {tps:.1} |\n",
+            dt * 1000.0
+        ));
+        eprintln!(
+            "[{name}] decode {steady} steps: {:.1}ms ({tps:.1} tok/s, {ms_per_tok:.2}ms/tok)",
+            dt * 1000.0
+        );
+
+        Some(md)
+    }
+
+    #[test]
+    #[ignore = "bench; run with --ignored --nocapture"]
+    fn bench_bonsai_q1_anymodel_full_matrix() {
+        use std::time::SystemTime;
+
+        let mut report = String::new();
+        report.push_str("# Bonsai-Q1 through AnyModel — full-matrix bench\n\n");
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        report.push_str(&format!("Run unix: {ts}\n"));
+        report.push_str("Path: AnyModel::BonsaiQ1 → BonsaiQ1Gpu::forward (P5 integration)\n");
+        report.push_str("Workload: synthetic deterministic token IDs, argmax decode.\n");
+
+        // 1.7B: full matrix. 8B: drop 2048 prefill (peak memory cap).
+        let sections = [
+            (
+                "Bonsai-1.7B",
+                bonsai_1_7b_dir(),
+                &[1, 16, 128, 512, 2048][..],
+                256,
+            ),
+            (
+                "Bonsai-8B",
+                bonsai_8b_dir(),
+                &[1, 16, 128, 512][..],
+                128,
+            ),
+        ];
+
+        let mut any_ran = false;
+        for (name, maybe_dir, prefill, decode_n) in sections {
+            match maybe_dir {
+                Some(dir) => {
+                    if let Some(section) = bench_one(name, &dir, prefill, decode_n) {
+                        report.push_str(&section);
+                        any_ran = true;
+                    }
+                }
+                None => {
+                    eprintln!("[{name}] not found, skipping");
+                    report.push_str(&format!("\n## {name}\n\n- not found locally; skipped.\n"));
+                }
+            }
+        }
+        assert!(any_ran, "no Bonsai checkpoints found; nothing to bench");
+
+        // Print the full markdown report to stdout.
+        eprintln!("\n========== BEGIN REPORT ==========\n{report}\n========== END REPORT ==========");
+
+        // Try to write to .planning/measurements/p5-bonsai-q1-anymodel.md. Path
+        // is derived from the crate dir (two levels up from higgs-models).
+        let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let out_dir = crate_dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|p| p.join(".planning/measurements"));
+        if let Some(dir) = out_dir {
+            if dir.exists() {
+                let out = dir.join("p5-bonsai-q1-anymodel.md");
+                match std::fs::write(&out, &report) {
+                    Ok(()) => eprintln!("wrote report: {}", out.display()),
+                    Err(e) => eprintln!("failed to write report {}: {e}", out.display()),
+                }
+            } else {
+                eprintln!("measurements dir not found: {}", dir.display());
+            }
+        }
+    }
 }
