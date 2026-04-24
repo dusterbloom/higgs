@@ -19,9 +19,21 @@ use safetensors::SafeTensors;
 
 use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
+    error::ModelError,
     utils::{cached_scaled_dot_product_attention, create_attention_mask},
     yarn::{apply_yarn_rope, compute_yarn_freqs, yarn_get_mscale},
 };
+
+/// Load and materialize a Bonsai-Q1 model from `model_dir` onto the GPU.
+///
+/// Adapts [`BonsaiQ1Engine::load`]'s `Result<_, String>` into [`ModelError`] so
+/// the engine surface in `higgs-engine::model_loader` can route it through the
+/// same `EngineError::Model` path used by all other architectures.
+pub fn load_bonsai_q1<P: AsRef<Path>>(model_dir: P) -> Result<BonsaiQ1Gpu, ModelError> {
+    let engine =
+        BonsaiQ1Engine::load(model_dir).map_err(ModelError::ShapeMismatch)?;
+    engine.to_gpu().map_err(ModelError::Mlx)
+}
 
 pub const GROUP_SIZE: usize = 128;
 const BITS: i32 = 1;
@@ -989,5 +1001,45 @@ mod tests {
         let s0b: &[f32] = logits0b.as_slice::<f32>();
         assert_eq!(s0, s0b, "repeat prefill is non-deterministic");
         eprintln!("P4 forward OK: prefill+decode finite, determinism confirmed");
+    }
+
+    /// P5 acceptance gate — round-trip Bonsai-1.7B through `AnyModel`:
+    /// `load_bonsai_q1` + `AnyModel::BonsaiQ1` variant + `make_cache()` +
+    /// `AnyModel::forward()`. Asserts logits shape matches the direct
+    /// `BonsaiQ1Gpu::forward` path, proving the dispatch table is wired.
+    #[test]
+    fn test_bonsai_q1_through_anymodel() {
+        use crate::AnyModel;
+
+        let Some(dir) = bonsai_1_7b_dir() else {
+            eprintln!("Bonsai-1.7B not found, skipping");
+            return;
+        };
+        let gpu = load_bonsai_q1(&dir).expect("load_bonsai_q1 failed");
+        let vocab = gpu.config.vocab as i32;
+        let layers_n = gpu.num_layers();
+
+        let mut model = AnyModel::BonsaiQ1(gpu);
+        assert_eq!(model.num_layers(), layers_n);
+
+        let mut cache = model.make_cache();
+
+        let ids: Vec<i32> = vec![1, 2, 3, 4, 5];
+        let prompt = mlx_rs::Array::from_slice(&ids, &[1, 5]);
+        let logits = model
+            .forward(&prompt, None, &mut cache)
+            .expect("AnyModel::forward on BonsaiQ1 failed");
+        logits.eval().expect("eval");
+        assert_eq!(
+            logits.shape().to_vec(),
+            &[1, 1, vocab],
+            "BonsaiQ1 through AnyModel: logits shape mismatch"
+        );
+        let s: &[f32] = logits.as_slice::<f32>();
+        assert!(
+            s.iter().all(|v| v.is_finite()),
+            "AnyModel BonsaiQ1 logits contain NaN/Inf"
+        );
+        eprintln!("P5 AnyModel::BonsaiQ1 forward OK: shape=[1,1,{vocab}]");
     }
 }

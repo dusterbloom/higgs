@@ -216,6 +216,8 @@ pub enum AnyModel {
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
     /// BD3LM block-diffusion LM on top of Qwen3.
     Bd3lmQwen3(bd3lm_qwen3::Bd3lmQwen3CausalLM),
+    /// Bonsai-Q1: packed 1.25-bpw Qwen3-shaped target (1.7B / 8B).
+    BonsaiQ1(bonsai_q1::BonsaiQ1Gpu),
 }
 
 fn checked_head_dim(hidden_size: i32, num_attention_heads: i32) -> Result<i32, Exception> {
@@ -288,6 +290,9 @@ impl AnyModel {
             (Self::Bd3lmQwen3(_), AnyCache::KV(_)) => {
                 Err(Exception::custom("Bd3lmQwen3: use generate_bd3lm_inner"))
             }
+            // BonsaiQ1 builds its causal mask internally; any externally-provided
+            // mask is ignored (causal-only semantics).
+            (Self::BonsaiQ1(m), AnyCache::KV(c)) => m.forward(inputs, c),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -311,6 +316,9 @@ impl AnyModel {
             (Self::Bd3lmQwen3(_), AnyCache::KV(_)) => {
                 Err(Exception::custom("Bd3lmQwen3: use generate_bd3lm_inner"))
             }
+            (Self::BonsaiQ1(_), AnyCache::KV(_)) => Err(Exception::custom(
+                "BonsaiQ1: forward_hidden not supported (tap not implemented)",
+            )),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -340,6 +348,12 @@ impl AnyModel {
         // also handles SSM/conv state eval.
         if let (Self::Qwen3Next(m), AnyCache::Hybrid(c)) = (&mut *self, &mut *cache) {
             return m.forward_chunked(inputs, None, c, chunk_size);
+        }
+
+        // BonsaiQ1 has no forward_hidden tap; run whole-prompt forward. Bonsai
+        // 1.7B/8B at typical contexts fit fine without inter-chunk eval.
+        if matches!(self, Self::BonsaiQ1(_)) {
+            return self.forward(inputs, None, cache);
         }
 
         // Generic path for all KV-only models.
@@ -394,7 +408,8 @@ impl AnyModel {
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
-            | Self::Bd3lmQwen3(_) => Err(Exception::custom(
+            | Self::Bd3lmQwen3(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer models",
             )),
         }
@@ -424,6 +439,7 @@ impl AnyModel {
             Self::LlavaQwen2(m) => m.hidden_size(),
             Self::DeepSeekV2(m) => m.args.hidden_size,
             Self::Bd3lmQwen3(m) => m.hidden_size(),
+            Self::BonsaiQ1(m) => m.config.hidden as i32,
         }
     }
 
@@ -536,6 +552,16 @@ impl AnyModel {
                     Ok(AnyCache::Hybrid(m.make_cache()))
                 }
             }
+            Self::BonsaiQ1(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not supported for BonsaiQ1 models",
+                    ));
+                }
+                let n_layers = i32::try_from(m.num_layers())
+                    .map_err(|_| Exception::custom("BonsaiQ1 num_layers overflows i32"))?;
+                Ok(make_kv_cache(n_layers))
+            }
         }
     }
 
@@ -555,7 +581,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::DeepSeekV2(_)
-            | Self::Bd3lmQwen3(_) => None,
+            | Self::Bd3lmQwen3(_)
+            | Self::BonsaiQ1(_) => None,
         }
     }
 
@@ -625,6 +652,7 @@ impl AnyModel {
         match self {
             Self::Qwen3Next(m) => m.num_layers(),
             Self::Bd3lmQwen3(m) => m.num_hidden_layers() as usize,
+            Self::BonsaiQ1(m) => m.num_layers(),
             _ => 0,
         }
     }

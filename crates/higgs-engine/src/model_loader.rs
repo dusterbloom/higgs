@@ -129,6 +129,15 @@ pub fn load_model<P: AsRef<Path>>(
 fn load_model_inner(config: &ModelConfig) -> Result<AnyModel, EngineError> {
     match config.model_type.as_str() {
         "qwen2" | "qwen3" | "llama" | "mistral" => {
+            // Packed 1.25-bpw Bonsai-Q1 checkpoints declare model_type="qwen3"
+            // but the weights are quantized to bits=1 — route them to the
+            // dedicated packed engine instead of the fp16/Q4-assuming
+            // transformer loader.
+            if is_bonsai_q1(&config.model_dir)? {
+                let gpu = higgs_models::bonsai_q1::load_bonsai_q1(&config.model_dir)
+                    .map_err(EngineError::Model)?;
+                return Ok(AnyModel::BonsaiQ1(gpu));
+            }
             let model = transformer::load_model(&config.model_dir).map_err(EngineError::Model)?;
             Ok(AnyModel::Transformer(model))
         }
@@ -186,6 +195,28 @@ fn load_model_inner(config: &ModelConfig) -> Result<AnyModel, EngineError> {
             higgs_models::error::ModelError::UnsupportedModel(other.to_owned()),
         )),
     }
+}
+
+/// Peek into `config.json` to detect packed 1-bit Bonsai-Q1 checkpoints.
+///
+/// Returns `true` when `quantization.bits == 1`. Returns `false` for any other
+/// quantization config (or when the block is missing). A missing / malformed
+/// `config.json` propagates as an IO / JSON error — we never mask it.
+fn is_bonsai_q1(dir: &Path) -> Result<bool, EngineError> {
+    let cfg_path = dir.join("config.json");
+    let txt = std::fs::read_to_string(&cfg_path).map_err(|e| {
+        EngineError::Model(higgs_models::error::ModelError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", cfg_path.display()),
+        )))
+    })?;
+    let cfg: serde_json::Value = serde_json::from_str(&txt)
+        .map_err(|e| EngineError::Model(higgs_models::error::ModelError::Json(e)))?;
+    Ok(cfg
+        .get("quantization")
+        .and_then(|q| q.get("bits"))
+        .and_then(serde_json::Value::as_u64)
+        == Some(1))
 }
 
 /// Wave 4: opt-in GDN-on-ANE offload via env-var.
