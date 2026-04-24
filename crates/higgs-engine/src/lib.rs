@@ -11,4 +11,7 @@ pub mod simple;
 pub mod speculative;
 pub mod tool_parser;
 
+#[cfg(feature = "ane")]
+pub mod ane_bonsai_draft;
+
 pub use tokenizers;
