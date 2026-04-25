@@ -216,7 +216,10 @@ fn apply_deepseek_rope(
     offset: i32,
 ) -> Result<Array, Exception> {
     let x_scaled = if (yarn_mscale - 1.0).abs() > f32::EPSILON {
-        x.multiply(mlx_rs::array!(yarn_mscale))?
+        // Match x's dtype to avoid silent fp16→f32 upcast bleeding through
+        // the entire attention path. Same bug as yarn.rs:111.
+        let scalar = Array::from_f32(yarn_mscale).as_dtype(x.dtype())?;
+        x.multiply(&scalar)?
     } else {
         x.clone()
     };
@@ -622,7 +625,8 @@ impl DeepSeekV2MlpBlock {
 
         // Scale scores
         let scaled_scores = if (self.scaling_factor - 1.0).abs() > f32::EPSILON {
-            top_scores.multiply(mlx_rs::array!(self.scaling_factor))?
+            let scalar = Array::from_f32(self.scaling_factor).as_dtype(top_scores.dtype())?;
+            top_scores.multiply(&scalar)?
         } else {
             top_scores
         };

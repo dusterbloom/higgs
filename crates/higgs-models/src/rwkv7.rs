@@ -254,7 +254,8 @@ fn apply_shift(x: &Array, shifted: &Array, mix: &Array) -> Result<Array, Excepti
 fn l2_norm(x: &Array, axis: i32) -> Result<Array, Exception> {
     let sq = ops::multiply(x, x)?;
     let sum = sq.sum_axis(axis, true)?;
-    let norm = ops::sqrt(&ops::add(&sum, &Array::from_f32(1e-12))?)?;
+    let eps = Array::from_f32(1e-12).as_dtype(sum.dtype())?;
+    let norm = ops::sqrt(&ops::add(&sum, &eps)?)?;
     ops::divide(x, &norm)
 }
 
@@ -286,7 +287,8 @@ fn group_norm(
     let mean = reshaped.mean_axis(-1, true)?;
     let centered = ops::subtract(&reshaped, &mean)?;
     let var = ops::multiply(&centered, &centered)?.mean_axis(-1, true)?;
-    let inv_std = ops::rsqrt(&ops::add(&var, &Array::from_f32(eps))?)?;
+    let eps_arr = Array::from_f32(eps).as_dtype(var.dtype())?;
+    let inv_std = ops::rsqrt(&ops::add(&var, &eps_arr)?)?;
     let normed = ops::multiply(&centered, &inv_std)?;
 
     // Flatten back to [B, T, C].
@@ -468,7 +470,9 @@ impl Rwkv7Attention {
         let g = self.g_lora.forward(&xg)?;
 
         // Decay: w = -0.6065306597126334 * sigmoid(w_lora_out) (log-space).
-        let w_log = ops::multiply(&Array::from_f32(-0.606_530_66), &ops::sigmoid(&w_raw)?)?;
+        let w_sig = ops::sigmoid(&w_raw)?;
+        let w_coef = Array::from_f32(-0.606_530_66).as_dtype(w_sig.dtype())?;
+        let w_log = ops::multiply(&w_coef, &w_sig)?;
 
         // Attention bonus: a = sigmoid(a_lora_out), range (0, 1).
         let a = ops::sigmoid(&a_raw)?;
@@ -498,7 +502,8 @@ impl Rwkv7Attention {
 
         // k update: k = k * (1 + (a - 1) * k_a)
         // Python: k.addcmul(k * (a - 1), k_a) = k + k * (a - 1) * k_a = k * (1 + (a-1)*k_a)
-        let a_minus_1 = ops::subtract(&a, &Array::from_f32(1.0))?;
+        let one = Array::from_f32(1.0).as_dtype(a.dtype())?;
+        let a_minus_1 = ops::subtract(&a, &one)?;
         let k_correction = ops::multiply(&ops::multiply(&k, &a_minus_1)?, &self.k_a)?;
         let k = ops::add(&k, &k_correction)?;
 
@@ -630,7 +635,8 @@ impl Rwkv7FeedForward {
         // Activation.
         let h = match self.hidden_act.as_str() {
             "sqrelu" => {
-                let relu_h = ops::maximum(&h, &Array::from_f32(0.0))?;
+                let zero = Array::from_f32(0.0).as_dtype(h.dtype())?;
+                let relu_h = ops::maximum(&h, &zero)?;
                 ops::multiply(&relu_h, &relu_h)?
             }
             "silu" => nn::silu(&h)?,

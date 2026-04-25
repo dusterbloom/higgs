@@ -104,8 +104,9 @@ impl SigLipAttention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Scaled dot-product attention
-        let scores = ops::matmul(&queries, &keys.transpose_axes(&[0, 1, 3, 2])?)?
-            .multiply(mlx_rs::array!(self.scale))?;
+        let scores_raw = ops::matmul(&queries, &keys.transpose_axes(&[0, 1, 3, 2])?)?;
+        let scale_arr = Array::from_f32(self.scale).as_dtype(scores_raw.dtype())?;
+        let scores = scores_raw.multiply(&scale_arr)?;
         let weights = ops::softmax_axis(&scores, -1, None)?;
         let attn_output = ops::matmul(&weights, &values)?
             .transpose_axes(&[0, 2, 1, 3])?
