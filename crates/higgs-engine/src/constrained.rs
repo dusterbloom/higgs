@@ -67,19 +67,62 @@ impl ConstrainedGenerator {
         }
     }
 
+    /// Read-only walk of the FSM along `draft_ids` from the current state.
+    ///
+    /// Returns the entry state followed by the state after each legal transition.
+    /// Stops at the first illegal token, so the returned length is
+    /// `1 + min(draft_ids.len(), longest_legal_prefix)`.
+    pub fn peek_states_for_drafts(
+        &self,
+        draft_ids: &[u32],
+    ) -> Vec<outlines_core::primitives::StateId> {
+        let mut states = Vec::with_capacity(draft_ids.len() + 1);
+        let mut state = self.state;
+        states.push(state);
+        for &tid in draft_ids {
+            match self.index.next_state(&state, &tid) {
+                Some(next) => {
+                    state = next;
+                    states.push(state);
+                }
+                None => break,
+            }
+        }
+        states
+    }
+
     /// Whether the FSM is in a final (accepting) state.
     pub fn is_finished(&self) -> bool {
         self.index.is_final_state(&self.state)
     }
 
-    /// Apply the constraint mask to logits.
+    /// Apply the constraint mask to logits at the current FSM state.
     ///
     /// Sets disallowed token logits to negative infinity so they have zero
     /// probability after softmax.
     pub fn apply_mask(&self, logits: &Array) -> Result<Array, Exception> {
-        let Some(allowed) = self.allowed_token_ids() else {
-            // No allowed tokens -- this shouldn't happen in practice.
-            // Return logits unchanged and let EOS handling take over.
+        self.mask_for_state(logits, self.state)
+    }
+
+    /// Apply the constraint mask to logits at an arbitrary FSM state.
+    ///
+    /// Used by speculative decoding to mask K+1 verify-row logits using
+    /// per-position states without mutating `self`.
+    pub fn apply_mask_at_state(
+        &self,
+        logits: &Array,
+        state: outlines_core::primitives::StateId,
+    ) -> Result<Array, Exception> {
+        self.mask_for_state(logits, state)
+    }
+
+    fn mask_for_state(
+        &self,
+        logits: &Array,
+        state: outlines_core::primitives::StateId,
+    ) -> Result<Array, Exception> {
+        let Some(allowed) = self.index.allowed_tokens(&state) else {
+            // No allowed tokens -- shouldn't happen in practice; let EOS take over.
             return Ok(logits.clone());
         };
 
@@ -87,7 +130,6 @@ impl ConstrainedGenerator {
         // Models often pad their embedding table beyond the tokenizer vocabulary.
         let vocab_size = usize::try_from(*logits.shape().last().unwrap_or(&0)).unwrap_or(0);
 
-        // Build a mask: -inf for disallowed, 0 for allowed
         let mut mask_vec = vec![f32::NEG_INFINITY; vocab_size];
         for &tid in &allowed {
             if let Some(slot) = mask_vec.get_mut(usize::try_from(tid).unwrap_or(usize::MAX)) {
@@ -99,7 +141,6 @@ impl ConstrainedGenerator {
             i32::try_from(vocab_size).map_err(|_| Exception::custom("vocab_size overflow"))?;
         let mask_array = Array::from_slice(&mask_vec, &[vocab_i32]);
 
-        // Reshape for broadcasting: [1, vocab_size] broadcasts across batch dim.
         let reshaped = if logits.ndim() > 1 {
             mask_array.reshape(&[1, vocab_i32])?
         } else {
@@ -343,6 +384,110 @@ mod tests {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
         let vals: Vec<f32> = logits.as_slice().to_vec();
         assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+    }
+
+    fn build_ab_generator() -> ConstrainedGenerator {
+        let mut vocab = Vocabulary::new(0);
+        vocab.try_insert("a", 1).unwrap();
+        vocab.try_insert("b", 2).unwrap();
+        vocab.try_insert("c", 3).unwrap();
+        ConstrainedGenerator::from_regex("[ab]+", &vocab).unwrap()
+    }
+
+    #[test]
+    fn peek_states_for_drafts_empty_returns_entry_state() {
+        let cg = build_ab_generator();
+        let states = cg.peek_states_for_drafts(&[]);
+        assert_eq!(
+            states.len(),
+            1,
+            "empty drafts should yield only the entry state"
+        );
+    }
+
+    #[test]
+    fn peek_states_for_drafts_does_not_mutate() {
+        let cg = build_ab_generator();
+        let before = cg
+            .allowed_token_ids()
+            .expect("initial state has allowed tokens");
+        let _ = cg.peek_states_for_drafts(&[1, 2, 1]);
+        let after = cg.allowed_token_ids().expect("state preserved after peek");
+        let mut b_sorted = before.clone();
+        let mut a_sorted = after.clone();
+        b_sorted.sort_unstable();
+        a_sorted.sort_unstable();
+        assert_eq!(b_sorted, a_sorted, "peek must not mutate the FSM state");
+    }
+
+    #[test]
+    fn peek_states_for_drafts_three_legal_tokens_yields_four_states() {
+        let cg = build_ab_generator();
+        let states = cg.peek_states_for_drafts(&[1, 2, 1]);
+        assert_eq!(states.len(), 4, "K=3 legal drafts should yield K+1 states");
+    }
+
+    #[test]
+    fn apply_mask_at_state_reflects_state_specific_allowed_set() {
+        // regex "ab|ba": after 'a' only 'b' allowed; after 'b' only 'a' allowed.
+        let mut vocab = Vocabulary::new(0);
+        vocab.try_insert("a", 1).unwrap();
+        vocab.try_insert("b", 2).unwrap();
+        let cg = ConstrainedGenerator::from_regex("ab|ba", &vocab).unwrap();
+
+        let states_a = cg.peek_states_for_drafts(&[1]);
+        let states_b = cg.peek_states_for_drafts(&[2]);
+        assert_eq!(states_a.len(), 2, "drafts=[a] walks one step");
+        assert_eq!(states_b.len(), 2, "drafts=[b] walks one step");
+
+        let vocab_i32 = 3_i32; // EOS=0, a=1, b=2
+        let logits = Array::zeros::<f32>(&[vocab_i32]).unwrap();
+
+        let masked_after_a = cg.apply_mask_at_state(&logits, states_a[1]).unwrap();
+        let masked_after_b = cg.apply_mask_at_state(&logits, states_b[1]).unwrap();
+        mlx_rs::transforms::eval([&masked_after_a, &masked_after_b]).unwrap();
+
+        let after_a = masked_after_a.as_slice::<f32>();
+        let after_b = masked_after_b.as_slice::<f32>();
+
+        assert!((after_a[2] - 0.0).abs() < 1e-5, "'b' allowed after 'a'");
+        assert!(after_a[1].is_infinite(), "'a' disallowed after 'a'");
+        assert!((after_b[1] - 0.0).abs() < 1e-5, "'a' allowed after 'b'");
+        assert!(after_b[2].is_infinite(), "'b' disallowed after 'b'");
+    }
+
+    #[test]
+    fn apply_mask_at_state_with_entry_state_matches_apply_mask() {
+        let cg = build_ab_generator();
+        let entry = cg.peek_states_for_drafts(&[])[0];
+        let logits = Array::zeros::<f32>(&[4_i32]).unwrap();
+
+        let via_apply = cg.apply_mask(&logits).unwrap();
+        let via_at_state = cg.apply_mask_at_state(&logits, entry).unwrap();
+        mlx_rs::transforms::eval([&via_apply, &via_at_state]).unwrap();
+
+        let v1 = via_apply.as_slice::<f32>();
+        let v2 = via_at_state.as_slice::<f32>();
+
+        for i in 0..4 {
+            if v1[i].is_infinite() {
+                assert!(v2[i].is_infinite(), "mismatch at index {i}");
+            } else {
+                assert!((v1[i] - v2[i]).abs() < 1e-5, "mismatch at index {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn peek_states_for_drafts_illegal_first_halts_at_entry() {
+        let cg = build_ab_generator();
+        // Token 3 ("c") is not in [ab]+ so the first transition is illegal.
+        let states = cg.peek_states_for_drafts(&[3, 1, 2]);
+        assert_eq!(
+            states.len(),
+            1,
+            "illegal first draft should halt the walk at the entry state"
+        );
     }
 
     #[test]

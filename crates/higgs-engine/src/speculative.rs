@@ -210,7 +210,11 @@ mod tests {
             Ok(())
         }
 
-        fn draft(&mut self, _last_token_id: u32, num_draft: usize) -> Result<Vec<u32>, EngineError> {
+        fn draft(
+            &mut self,
+            _last_token_id: u32,
+            num_draft: usize,
+        ) -> Result<Vec<u32>, EngineError> {
             let mut tokens = Vec::with_capacity(num_draft);
             for i in 0..num_draft {
                 let idx = (self.cursor + i) % self.sequence.len();
@@ -350,5 +354,74 @@ mod tests {
         let mut draft = MockDraft::new(vec![1]);
         let tokens = speculative_loop(&mut draft, 0, 3, 0, &[], |_| unreachable!()).unwrap();
         assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn fsm_aware_verify_enforces_legality_and_cuts_at_illegal_draft() {
+        use crate::constrained::ConstrainedGenerator;
+        use mlx_rs::Array;
+        use outlines_core::vocabulary::Vocabulary;
+
+        let mut vocab = Vocabulary::new(0);
+        vocab.try_insert("1", 1).unwrap();
+        vocab.try_insert("2", 2).unwrap();
+        vocab.try_insert("3", 3).unwrap();
+        let cg = ConstrainedGenerator::from_regex("[12]+", &vocab).unwrap();
+
+        // MockDraft drafts [1, 2, 3]: token 3 is FSM-illegal under "[12]+".
+        let mut draft = MockDraft::new(vec![1, 2, 3]);
+        let vocab_i32 = 4_i32;
+
+        let accepted = speculative_step(&mut draft, 1, 3, |batch| {
+            let draft_ids = &batch[1..];
+            let states = cg.peek_states_for_drafts(draft_ids);
+            let mut target = Vec::with_capacity(batch.len());
+
+            for i in 0..batch.len() {
+                // "Raw" verifier prediction: pretend the unconstrained model wanted the draft itself.
+                let raw = if i < draft_ids.len() {
+                    draft_ids[i]
+                } else {
+                    1_u32
+                };
+
+                let token = if i < states.len() {
+                    let logits = Array::zeros::<f32>(&[vocab_i32]).unwrap();
+                    let masked = cg.apply_mask_at_state(&logits, states[i]).unwrap();
+                    mlx_rs::transforms::eval([&masked]).unwrap();
+                    let vals = masked.as_slice::<f32>();
+                    if vals.get(raw as usize).is_some_and(|v| v.is_finite()) {
+                        raw
+                    } else {
+                        // Substitute the lowest-index non-EOS FSM-legal token.
+                        vals.iter()
+                            .enumerate()
+                            .skip(1)
+                            .find_map(|(idx, &v)| {
+                                v.is_finite().then(|| u32::try_from(idx).unwrap())
+                            })
+                            .expect("at least one non-EOS legal token at any reachable state")
+                    }
+                } else {
+                    // No state for this row — accept_prefix has already cut.
+                    0
+                };
+                target.push(token);
+            }
+            Ok(target)
+        })
+        .unwrap();
+
+        for &tok in &accepted {
+            assert!(
+                tok == 1 || tok == 2,
+                "accepted token {tok} is not FSM-legal"
+            );
+        }
+        assert_eq!(
+            accepted.len(),
+            3,
+            "illegal draft at position 2 should cause accept_prefix to cut: got {accepted:?}"
+        );
     }
 }

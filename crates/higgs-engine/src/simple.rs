@@ -508,8 +508,7 @@ impl SimpleEngine {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|f| (0.0..=1.0).contains(f));
-        let auto_default =
-            (dflash.is_some() || ar_spec.is_some()) && model.num_layers() > 32;
+        let auto_default = (dflash.is_some() || ar_spec.is_some()) && model.num_layers() > 32;
         let cap_frac = env_cap.or(if auto_default { Some(0.88) } else { None });
         if let Some(c) = cap_frac
             && c > 0.0
@@ -643,7 +642,9 @@ impl SimpleEngine {
             tracing::info!(hash = %target_hash, "tokenizers match");
             return Ok(());
         }
-        if std::env::var("HIGGS_SPEC_ALLOW_TOKENIZER_MISMATCH").ok().as_deref()
+        if std::env::var("HIGGS_SPEC_ALLOW_TOKENIZER_MISMATCH")
+            .ok()
+            .as_deref()
             == Some("1")
         {
             tracing::warn!(
@@ -1140,9 +1141,10 @@ impl SimpleEngine {
             });
         }
 
-        // Speculative decode: if we have a draft model, no constraint, and no
-        // logprobs, use the fast speculative path instead of token-by-token decode.
-        if self.draft.is_some() && constraint.is_none() && !logprobs {
+        // Speculative decode: if we have a draft model and no logprobs, use the
+        // fast speculative path. FSM-aware verify masks each verify row so PLD
+        // compounds with constrained decoding.
+        if self.draft.is_some() && !logprobs {
             return self.speculative_generate(
                 prompt_tokens,
                 &mut prepared,
@@ -1151,6 +1153,7 @@ impl SimpleEngine {
                 params,
                 stop_sequences,
                 prompt_len,
+                &mut constraint,
             );
         }
 
@@ -1676,8 +1679,7 @@ impl SimpleEngine {
                 let last_arr = Array::from_slice(&[last_token], &[1, 1]);
                 let dt_i32 = dt.as_dtype(Dtype::Int32).map_err(EngineError::Mlx)?;
                 verify_len = block_size;
-                mlx_rs::ops::concatenate_axis(&[&last_arr, &dt_i32], 1)
-                    .map_err(EngineError::Mlx)?
+                mlx_rs::ops::concatenate_axis(&[&last_arr, &dt_i32], 1).map_err(EngineError::Mlx)?
             } else {
                 let mut verify_tokens = vec![last_token];
                 verify_tokens.extend_from_slice(&draft_i32);
@@ -2251,8 +2253,7 @@ impl SimpleEngine {
                 let last_arr = Array::from_slice(&[last_token], &[1, 1]);
                 let dt_i32 = dt.as_dtype(Dtype::Int32).map_err(EngineError::Mlx)?;
                 verify_len = block_size;
-                mlx_rs::ops::concatenate_axis(&[&last_arr, &dt_i32], 1)
-                    .map_err(EngineError::Mlx)?
+                mlx_rs::ops::concatenate_axis(&[&last_arr, &dt_i32], 1).map_err(EngineError::Mlx)?
             } else {
                 let mut verify_tokens = vec![last_token];
                 verify_tokens.extend_from_slice(&draft_i32);
@@ -2606,9 +2607,10 @@ impl SimpleEngine {
             return Ok(());
         }
 
-        // Speculative streaming: if draft model is available with no constraint
-        // and no logprobs, use speculative decode for higher throughput.
-        if self.draft.is_some() && constraint.is_none() && !logprobs {
+        // Speculative streaming: if draft model is available and no logprobs,
+        // use speculative decode for higher throughput. FSM-aware verify masks
+        // each verify row so PLD compounds with constrained decoding.
+        if self.draft.is_some() && !logprobs {
             return self.speculative_streaming(
                 prompt_tokens,
                 &mut prepared,
@@ -2619,6 +2621,7 @@ impl SimpleEngine {
                 stop_sequences,
                 sender,
                 prompt_len,
+                &mut constraint,
             );
         }
 
@@ -2790,6 +2793,7 @@ impl SimpleEngine {
         params: &SamplingParams,
         stop_sequences: &[String],
         prompt_len: u32,
+        constraint: &mut Option<crate::constrained::ConstrainedGenerator>,
     ) -> Result<GenerationOutput, EngineError> {
         let draft_mutex = self
             .draft
@@ -2821,30 +2825,44 @@ impl SimpleEngine {
             let cycle_start = Instant::now();
             let mut verify_ms: f64 = 0.0;
             let mut actual_k = 0usize;
-            let accepted =
-                speculative::speculative_step(draft, current, k, |batch: &[u32]| {
-                    actual_k = batch.len() - 1;
-                    let verify_start = Instant::now();
-                    let batch_len = i32::try_from(batch.len())
-                        .map_err(|_| EngineError::Generation("verify batch overflow".into()))?;
-                    let input = Array::from_slice(batch, &[1, batch_len]);
-                    let logits = model
-                        .forward_all_logits(&input, None, cache)
-                        .map_err(EngineError::Mlx)?;
-                    eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
+            let constraint_ref = constraint.as_ref();
+            let accepted = speculative::speculative_step(draft, current, k, |batch: &[u32]| {
+                actual_k = batch.len() - 1;
+                let verify_start = Instant::now();
+                let batch_len = i32::try_from(batch.len())
+                    .map_err(|_| EngineError::Generation("verify batch overflow".into()))?;
+                let input = Array::from_slice(batch, &[1, batch_len]);
+                let logits = model
+                    .forward_all_logits(&input, None, cache)
+                    .map_err(EngineError::Mlx)?;
+                eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
 
-                    let mut ids = Vec::with_capacity(batch.len());
-                    for i in 0..batch.len() {
-                        let pos_logits = logits.index((.., i as i32, ..));
-                        let penalized = apply_penalties(&pos_logits, &tokens, params)
-                            .map_err(EngineError::Mlx)?;
-                        let token = sample(&penalized, params).map_err(EngineError::Mlx)?;
-                        eval(std::slice::from_ref(&token)).map_err(EngineError::Mlx)?;
-                        ids.push(token.item());
-                    }
-                    verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
-                    Ok(ids)
-                })?;
+                // Walk the FSM along draft tokens to compute per-position states
+                // for the K+1 verify rows. Stops at the first illegal draft;
+                // accept_prefix cuts at the same position so missing rows are safe.
+                let states = constraint_ref.map(|cg| cg.peek_states_for_drafts(&batch[1..]));
+
+                let mut ids = Vec::with_capacity(batch.len());
+                for i in 0..batch.len() {
+                    let pos_logits = logits.index((.., i as i32, ..));
+                    let penalized =
+                        apply_penalties(&pos_logits, &tokens, params).map_err(EngineError::Mlx)?;
+                    let masked = match (
+                        constraint_ref,
+                        states.as_ref().and_then(|s| s.get(i).copied()),
+                    ) {
+                        (Some(cg), Some(state)) => cg
+                            .apply_mask_at_state(&penalized, state)
+                            .map_err(EngineError::Mlx)?,
+                        _ => penalized,
+                    };
+                    let token = sample(&masked, params).map_err(EngineError::Mlx)?;
+                    eval(std::slice::from_ref(&token)).map_err(EngineError::Mlx)?;
+                    ids.push(token.item());
+                }
+                verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
+                Ok(ids)
+            })?;
             let total_ms = cycle_start.elapsed().as_secs_f64() * 1000.0;
             let draft_ms = (total_ms - verify_ms).max(0.0);
             tracing::info!(
@@ -2867,6 +2885,10 @@ impl SimpleEngine {
                 }
                 tokens.push(token_id);
 
+                if let Some(ref mut cg) = *constraint {
+                    cg.advance(token_id);
+                }
+
                 if self.eos_token_ids.contains(&token_id) {
                     return Ok(GenerationOutput {
                         text: self.decode_tokens(&tokens)?,
@@ -2888,6 +2910,19 @@ impl SimpleEngine {
                             token_logprobs: None,
                         });
                     }
+                }
+
+                if constraint
+                    .as_ref()
+                    .is_some_and(crate::constrained::ConstrainedGenerator::is_finished)
+                {
+                    return Ok(GenerationOutput {
+                        text: self.decode_tokens(&tokens)?,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: Self::completion_len(&tokens)?,
+                        token_logprobs: None,
+                    });
                 }
             }
 
@@ -2924,6 +2959,7 @@ impl SimpleEngine {
         stop_sequences: &[String],
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         prompt_len: u32,
+        constraint: &mut Option<crate::constrained::ConstrainedGenerator>,
     ) -> Result<(), EngineError> {
         let draft_mutex = self
             .draft
@@ -2959,30 +2995,41 @@ impl SimpleEngine {
             let cycle_start = Instant::now();
             let mut verify_ms: f64 = 0.0;
             let mut actual_k = 0usize;
-            let accepted =
-                speculative::speculative_step(draft, current, k, |batch: &[u32]| {
-                    actual_k = batch.len() - 1;
-                    let verify_start = Instant::now();
-                    let batch_len = i32::try_from(batch.len())
-                        .map_err(|_| EngineError::Generation("verify batch overflow".into()))?;
-                    let input = Array::from_slice(batch, &[1, batch_len]);
-                    let logits = model
-                        .forward_all_logits(&input, None, cache)
-                        .map_err(EngineError::Mlx)?;
-                    eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
+            let constraint_ref = constraint.as_ref();
+            let accepted = speculative::speculative_step(draft, current, k, |batch: &[u32]| {
+                actual_k = batch.len() - 1;
+                let verify_start = Instant::now();
+                let batch_len = i32::try_from(batch.len())
+                    .map_err(|_| EngineError::Generation("verify batch overflow".into()))?;
+                let input = Array::from_slice(batch, &[1, batch_len]);
+                let logits = model
+                    .forward_all_logits(&input, None, cache)
+                    .map_err(EngineError::Mlx)?;
+                eval(std::slice::from_ref(&logits)).map_err(EngineError::Mlx)?;
 
-                    let mut ids = Vec::with_capacity(batch.len());
-                    for i in 0..batch.len() {
-                        let pos_logits = logits.index((.., i as i32, ..));
-                        let penalized = apply_penalties(&pos_logits, all_tokens, params)
-                            .map_err(EngineError::Mlx)?;
-                        let token = sample(&penalized, params).map_err(EngineError::Mlx)?;
-                        eval(std::slice::from_ref(&token)).map_err(EngineError::Mlx)?;
-                        ids.push(token.item());
-                    }
-                    verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
-                    Ok(ids)
-                })?;
+                let states = constraint_ref.map(|cg| cg.peek_states_for_drafts(&batch[1..]));
+
+                let mut ids = Vec::with_capacity(batch.len());
+                for i in 0..batch.len() {
+                    let pos_logits = logits.index((.., i as i32, ..));
+                    let penalized = apply_penalties(&pos_logits, all_tokens, params)
+                        .map_err(EngineError::Mlx)?;
+                    let masked = match (
+                        constraint_ref,
+                        states.as_ref().and_then(|s| s.get(i).copied()),
+                    ) {
+                        (Some(cg), Some(state)) => cg
+                            .apply_mask_at_state(&penalized, state)
+                            .map_err(EngineError::Mlx)?,
+                        _ => penalized,
+                    };
+                    let token = sample(&masked, params).map_err(EngineError::Mlx)?;
+                    eval(std::slice::from_ref(&token)).map_err(EngineError::Mlx)?;
+                    ids.push(token.item());
+                }
+                verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
+                Ok(ids)
+            })?;
             let total_ms = cycle_start.elapsed().as_secs_f64() * 1000.0;
             let draft_ms = (total_ms - verify_ms).max(0.0);
             tracing::info!(
@@ -3006,9 +3053,15 @@ impl SimpleEngine {
                     break;
                 }
                 all_tokens.push(token_id);
+                if let Some(ref mut cg) = *constraint {
+                    cg.advance(token_id);
+                }
                 let completion_len = Self::completion_len(all_tokens)?;
                 let is_eos = self.eos_token_ids.contains(&token_id);
                 let is_max = completion_len >= max_tokens;
+                let constraint_done = constraint
+                    .as_ref()
+                    .is_some_and(crate::constrained::ConstrainedGenerator::is_finished);
 
                 let full_text = self.decode_tokens(all_tokens)?;
                 let new_text = full_text
@@ -3032,13 +3085,13 @@ impl SimpleEngine {
                     (new_text, false)
                 };
 
-                let finished = is_eos || hit_stop || is_max;
+                let finished = is_eos || hit_stop || is_max || constraint_done;
 
                 if sender
                     .blocking_send(StreamingOutput {
                         new_text: final_text,
                         finished,
-                        finish_reason: if is_eos || hit_stop {
+                        finish_reason: if is_eos || hit_stop || constraint_done {
                             Some("stop".to_owned())
                         } else if is_max {
                             Some("length".to_owned())
@@ -3078,9 +3131,8 @@ impl SimpleEngine {
 fn tokenizer_hash(model_dir: &Path) -> Result<String, EngineError> {
     use std::hash::{Hash, Hasher};
     let path = model_dir.join("tokenizer.json");
-    let bytes = std::fs::read(&path).map_err(|e| {
-        EngineError::Generation(format!("read {}: {e}", path.display()))
-    })?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| EngineError::Generation(format!("read {}: {e}", path.display())))?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
     Ok(format!("{:016x}", h.finish()))
