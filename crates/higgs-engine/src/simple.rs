@@ -419,13 +419,15 @@ impl SimpleEngine {
             };
 
             #[cfg(feature = "ane")]
-            let backend = if ane_worker.is_some() {
+            let backend = if !pipeline_enabled {
+                "GPU"
+            } else if ane_worker.is_some() {
                 "ANE+CPU"
             } else {
                 "CPU BLAS"
             };
             #[cfg(not(feature = "ane"))]
-            let backend = "CPU BLAS";
+            let backend = if pipeline_enabled { "CPU BLAS" } else { "GPU" };
             tracing::info!(
                 tap_layers = ?tap_layers,
                 block_size,
@@ -1626,46 +1628,66 @@ impl SimpleEngine {
                 .map_err(EngineError::Mlx)?;
             let logits_ms = t_logits.elapsed().as_secs_f64() * 1000.0;
 
-            let (draft_u32, draft_i32, rs_state, argmax_build_ms, eval_block_ms, draft_transfer_ms) =
-                if params.temperature == 0.0 {
-                    let t_argmax = Instant::now();
-                    let draft_token_arr =
-                        mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
-                    let argmax_build_ms = t_argmax.elapsed().as_secs_f64() * 1000.0;
-                    let t_eval_done = Instant::now();
-                    eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
-                    let eval_block_ms = t_eval_done.elapsed().as_secs_f64() * 1000.0;
-                    let t_draft_transfer = Instant::now();
-                    let du32: Vec<u32> = draft_token_arr
-                        .reshape(&[-1])
-                        .map_err(EngineError::Mlx)?
-                        .as_slice::<u32>()
-                        .to_vec();
-                    let di32: Vec<i32> = du32.iter().map(|&x| x as i32).collect();
-                    let draft_transfer_ms = t_draft_transfer.elapsed().as_secs_f64() * 1000.0;
-                    (
-                        du32,
-                        di32,
-                        None,
-                        argmax_build_ms,
-                        eval_block_ms,
-                        draft_transfer_ms,
-                    )
-                } else {
-                    let t_rs = Instant::now();
-                    let (du32, di32, arr, q) = rs_draft_sample(&draft_logits, params)?;
-                    let rs_ms = t_rs.elapsed().as_secs_f64() * 1000.0;
-                    (du32, di32, Some((arr, q)), 0.0, 0.0, rs_ms)
-                };
-            let _ = eval_block_ms; // kept for trace format compatibility
+            // Greedy: keep tokens on-device through verify dispatch.
+            // RECAP-2026-04-25-session34 found a sync host pull here was
+            // charging ~39ms/round for a 64-byte transfer because it blocked
+            // verify GPU dispatch. Mirrors z-lab (model_mlx.py): async_eval
+            // the draft tokens, build verify_input via on-device concatenate,
+            // defer host pull until after eval([&verify_logits]) below.
+            let mut draft_u32: Vec<u32> = Vec::new();
+            let mut draft_i32: Vec<i32> = Vec::new();
+            let argmax_build_ms;
+            let mut draft_transfer_ms = 0.0;
+            let (draft_token_arr_greedy, rs_state) = if params.temperature == 0.0 {
+                let t_argmax = Instant::now();
+                let arr = mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
+                argmax_build_ms = t_argmax.elapsed().as_secs_f64() * 1000.0;
+                async_eval([&arr]).map_err(EngineError::Mlx)?;
+                (Some(arr), None)
+            } else {
+                let t_rs = Instant::now();
+                let (du32, di32, arr, q) = rs_draft_sample(&draft_logits, params)?;
+                draft_transfer_ms = t_rs.elapsed().as_secs_f64() * 1000.0;
+                draft_u32 = du32;
+                draft_i32 = di32;
+                argmax_build_ms = 0.0;
+                (None, Some((arr, q)))
+            };
             let lm_draft_ms = t_lm_draft.elapsed().as_secs_f64() * 1000.0;
 
             // f. Build verify input: [anchor, draft_0..draft_14]
+            //    Greedy: concat on-device, no host roundtrip.
+            //    RS: legacy host build (rs_draft_sample already materialized).
             let t_gap = Instant::now();
-            let mut verify_tokens = vec![last_token];
-            verify_tokens.extend_from_slice(&draft_i32);
-            let verify_len = verify_tokens.len() as i32;
-            let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
+            // verify_input layout: [anchor] ++ dt where dt has block_size-1
+            // positions (draft_hidden_sliced drops position 0). Total length =
+            // block_size. Off-by-one here propagates into kv_rollback below
+            // and corrupts rope offsets across rounds.
+            let verify_len: i32;
+            let verify_input = if let Some(ref dt) = draft_token_arr_greedy {
+                let last_arr = Array::from_slice(&[last_token], &[1, 1]);
+                let dt_i32 = dt.as_dtype(Dtype::Int32).map_err(EngineError::Mlx)?;
+                verify_len = block_size;
+                mlx_rs::ops::concatenate_axis(&[&last_arr, &dt_i32], 1)
+                    .map_err(EngineError::Mlx)?
+            } else {
+                let mut verify_tokens = vec![last_token];
+                verify_tokens.extend_from_slice(&draft_i32);
+                verify_len = verify_tokens.len() as i32;
+                Array::from_slice(&verify_tokens, &[1, verify_len])
+            };
+
+            // S36 shape probe (round 1 only): confirm verify_len matches actual
+            // verify_input length. Off-by-one would corrupt rope across rounds.
+            if round_idx == 0 {
+                tracing::info!(
+                    "dflash_verify_shape round=1 verify_input={:?} verify_len={} block_size={} draft_token_arr_greedy={}",
+                    verify_input.shape(),
+                    verify_len,
+                    block_size,
+                    draft_token_arr_greedy.is_some(),
+                );
+            }
 
             // Drop draft intermediates before verify to free Metal buffers
             drop(draft_hidden);
@@ -1757,6 +1779,19 @@ impl SimpleEngine {
             let t_verify_fwd = Instant::now();
             eval([&verify_logits]).map_err(EngineError::Mlx)?;
             let verify_fwd_ms = t_verify_fwd.elapsed().as_secs_f64() * 1000.0;
+
+            // Greedy host pull deferred from step e — verify forced full eval
+            // so draft tokens are already computed; this is now metadata-cheap.
+            if let Some(ref dt) = draft_token_arr_greedy {
+                let t_transfer = Instant::now();
+                draft_u32 = dt
+                    .reshape(&[-1])
+                    .map_err(EngineError::Mlx)?
+                    .as_slice::<u32>()
+                    .to_vec();
+                draft_i32 = draft_u32.iter().map(|&x| x as i32).collect();
+                draft_transfer_ms = t_transfer.elapsed().as_secs_f64() * 1000.0;
+            }
 
             // i. Accept: greedy argmax+accept_prefix when temp=0, else rejection sampling
             let (verify_argmax_ms, accept_ms, accepted) = match rs_state {
@@ -2178,30 +2213,56 @@ impl SimpleEngine {
             let draft_logits = model
                 .forward_all_logits_from_hidden(&draft_hidden_sliced)
                 .map_err(EngineError::Mlx)?;
-            let (draft_u32, draft_i32, rs_state) = if params.temperature == 0.0 {
-                let draft_token_arr =
-                    mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
-                eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
-                let du32: Vec<u32> = draft_token_arr
-                    .reshape(&[-1])
-                    .map_err(EngineError::Mlx)?
-                    .as_slice::<u32>()
-                    .to_vec();
-                let di32: Vec<i32> = du32.iter().map(|&x| x as i32).collect();
-                (du32, di32, None)
+            // Greedy: keep tokens on-device through verify dispatch (mirrors
+            // pipelined path; see RECAP-2026-04-25-session34 for the bug).
+            let mut draft_u32: Vec<u32> = Vec::new();
+            let mut draft_i32: Vec<i32> = Vec::new();
+            let (draft_token_arr_greedy, rs_state) = if params.temperature == 0.0 {
+                let arr = mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
+                async_eval([&arr]).map_err(EngineError::Mlx)?;
+                (Some(arr), None)
             } else {
                 let (du32, di32, arr, q) = rs_draft_sample(&draft_logits, params)?;
-                (du32, di32, Some((arr, q)))
+                draft_u32 = du32;
+                draft_i32 = di32;
+                (None, Some((arr, q)))
             };
 
             let lm_draft_ms = t_lm_draft.elapsed().as_secs_f64() * 1000.0;
 
             let t_verify = Instant::now();
             // Verify
-            let mut verify_tokens = vec![last_token];
-            verify_tokens.extend_from_slice(&draft_i32);
-            let verify_len = verify_tokens.len() as i32;
-            let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
+            //   Greedy: build verify_input on-device (no host roundtrip).
+            //   RS: legacy host build.
+            // verify_input is [anchor] ++ dt where dt has block_size-1 tokens
+            // (draft_hidden_sliced drops position 0 of the drafter output).
+            // Length is block_size; an off-by-one here propagates into
+            // kv_rollback below and corrupts rope offsets across rounds.
+            let verify_len: i32;
+            let verify_input = if let Some(ref dt) = draft_token_arr_greedy {
+                let last_arr = Array::from_slice(&[last_token], &[1, 1]);
+                let dt_i32 = dt.as_dtype(Dtype::Int32).map_err(EngineError::Mlx)?;
+                verify_len = block_size;
+                mlx_rs::ops::concatenate_axis(&[&last_arr, &dt_i32], 1)
+                    .map_err(EngineError::Mlx)?
+            } else {
+                let mut verify_tokens = vec![last_token];
+                verify_tokens.extend_from_slice(&draft_i32);
+                verify_len = verify_tokens.len() as i32;
+                Array::from_slice(&verify_tokens, &[1, verify_len])
+            };
+
+            // S36 shape probe (round 1 only): confirm verify_len matches actual
+            // verify_input length. Off-by-one would corrupt rope across rounds.
+            if round_idx == 0 {
+                tracing::info!(
+                    "dflash_stream_verify_shape round=1 verify_input={:?} verify_len={} block_size={} draft_token_arr_greedy={}",
+                    verify_input.shape(),
+                    verify_len,
+                    block_size,
+                    draft_token_arr_greedy.is_some(),
+                );
+            }
 
             // Drop draft intermediates before verify to free Metal buffers
             drop(draft_hidden);
@@ -2235,6 +2296,16 @@ impl SimpleEngine {
                         .map_err(EngineError::Mlx)?
                         .as_slice::<u32>()
                         .to_vec();
+                    // Greedy host pull deferred from lm_draft step — verify
+                    // forced full eval, so this is now metadata-cheap.
+                    if let Some(ref dt) = draft_token_arr_greedy {
+                        draft_u32 = dt
+                            .reshape(&[-1])
+                            .map_err(EngineError::Mlx)?
+                            .as_slice::<u32>()
+                            .to_vec();
+                        draft_i32 = draft_u32.iter().map(|&x| x as i32).collect();
+                    }
                     accept_prefix(&draft_u32, &verify_flat)
                 }
                 Some((draft_arr, q_probs)) => rs_verify_accept(
