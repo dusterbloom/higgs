@@ -1378,7 +1378,7 @@ pub struct Qwen3NextAttention {
 }
 
 impl Qwen3NextAttention {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs, attn_prefix: &str) -> Result<Self, Exception> {
         let head_dim = args.head_dim;
         let head_dim_f32 = f32::from(
             i16::try_from(head_dim).map_err(|_| Exception::custom("head_dim out of i16 range"))?,
@@ -1391,11 +1391,16 @@ impl Qwen3NextAttention {
         #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
         let partial_dim = (rope_dim_f32 * args.partial_rotary_factor).round() as i32;
 
+        let (q_ql, q_qb) = resolve_quant_for(args, &format!("{attn_prefix}.q_proj"));
+        let (k_ql, k_qb) = resolve_quant_for(args, &format!("{attn_prefix}.k_proj"));
+        let (v_ql, v_qb) = resolve_quant_for(args, &format!("{attn_prefix}.v_proj"));
+        let (o_ql, o_qb) = resolve_quant_for(args, &format!("{attn_prefix}.o_proj"));
+
         Ok(Self {
-            q_proj: QLinear::new(ql, qb)?,
-            k_proj: QLinear::new(ql, qb)?,
-            v_proj: QLinear::new(ql, qb)?,
-            o_proj: QLinear::new(ql, qb)?,
+            q_proj: QLinear::new(q_ql, q_qb)?,
+            k_proj: QLinear::new(k_ql, k_qb)?,
+            v_proj: QLinear::new(v_ql, v_qb)?,
+            o_proj: QLinear::new(o_ql, o_qb)?,
             q_norm: nn::RmsNormBuilder::new(head_dim)
                 .eps(args.rms_norm_eps)
                 .build()?,
@@ -1556,6 +1561,24 @@ pub struct Qwen3NextMLP {
 }
 
 pub(crate) fn new_mlp_projections(
+    args: &Qwen3NextModelArgs,
+    mlp_prefix: &str,
+) -> Result<(QLinear, QLinear, QLinear), Exception> {
+    let (g_ql, g_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.gate_proj"));
+    let (d_ql, d_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.down_proj"));
+    let (u_ql, u_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.up_proj"));
+    Ok((
+        QLinear::new(g_ql, g_qb)?,
+        QLinear::new(d_ql, d_qb)?,
+        QLinear::new(u_ql, u_qb)?,
+    ))
+}
+
+/// Build the three MLP projections with a single shared `(group_size, bits)`.
+///
+/// Used by callers that don't carry a `Qwen3NextModelArgs` and therefore can't
+/// participate in path-aware override resolution (e.g. `qwen3_moe`).
+pub(crate) fn new_mlp_projections_from_quant(
     ql: i32,
     qb: i32,
 ) -> Result<(QLinear, QLinear, QLinear), Exception> {
@@ -1567,8 +1590,8 @@ pub(crate) fn new_mlp_projections(
 }
 
 impl Qwen3NextMLP {
-    fn new(ql: i32, qb: i32) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections(ql, qb)?;
+    fn new(args: &Qwen3NextModelArgs, mlp_prefix: &str) -> Result<Self, Exception> {
+        let (gate_proj, down_proj, up_proj) = new_mlp_projections(args, mlp_prefix)?;
         Ok(Self {
             gate_proj,
             down_proj,
@@ -1661,21 +1684,22 @@ impl MtpFc {
 }
 
 impl MtpHead {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs) -> Result<Self, Exception> {
         let n = usize::try_from(args.mtp_num_hidden_layers)
             .map_err(|_| Exception::custom("mtp_num_hidden_layers must be non-negative"))?;
 
         let layers = (0..n)
-            .map(|_| {
+            .map(|i| {
+                let layer_prefix = format!("language_model.mtp.layers.{i}");
                 Ok(MtpTransformerLayer {
-                    self_attn: Qwen3NextAttention::new(args, ql, qb)?,
+                    self_attn: Qwen3NextAttention::new(args, &format!("{layer_prefix}.self_attn"))?,
                     input_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
                         .eps(args.rms_norm_eps)
                         .build()?,
                     post_attention_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
                         .eps(args.rms_norm_eps)
                         .build()?,
-                    mlp: Qwen3NextMLP::new(ql, qb)?,
+                    mlp: Qwen3NextMLP::new(args, &format!("{layer_prefix}.mlp"))?,
                 })
             })
             .collect::<Result<Vec<_>, Exception>>()?;
@@ -1711,8 +1735,19 @@ pub(crate) struct SwitchMlpWeights {
 }
 
 impl SwitchMlpWeights {
-    pub(crate) fn new(ql: i32, qb: i32) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections(ql, qb)?;
+    pub(crate) fn new(args: &Qwen3NextModelArgs, prefix: &str) -> Result<Self, Exception> {
+        let (gate_proj, down_proj, up_proj) = new_mlp_projections(args, prefix)?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    /// Build with a single shared `(group_size, bits)` — for callers without
+    /// a `Qwen3NextModelArgs`.
+    pub(crate) fn from_quant(ql: i32, qb: i32) -> Result<Self, Exception> {
+        let (gate_proj, down_proj, up_proj) = new_mlp_projections_from_quant(ql, qb)?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -1900,7 +1935,7 @@ struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs, mlp_prefix: &str) -> Result<Self, Exception> {
         if args.num_experts <= 0 {
             return Err(Exception::custom("num_experts must be > 0"));
         }
@@ -1912,16 +1947,17 @@ impl SparseMoeBlock {
                 "num_experts_per_tok must be <= num_experts",
             ));
         }
-        // Gate quantization: use per-layer override if present, else global
-        let (gate_ql, gate_qb) = args
-            .gate_quantization
-            .as_ref()
-            .map_or((ql, qb), |gq| (gq.group_size, gq.bits));
+        let gate_path = format!("{mlp_prefix}.gate");
+        let shared_expert_gate_path = format!("{mlp_prefix}.shared_expert_gate");
+        let (gate_ql, gate_qb) = resolve_gate_quant(args, &gate_path);
+        let (seg_ql, seg_qb) = resolve_gate_quant(args, &shared_expert_gate_path);
+        let switch_mlp_prefix = format!("{mlp_prefix}.switch_mlp");
+        let shared_expert_prefix = format!("{mlp_prefix}.shared_expert");
         Ok(Self {
             gate: QLinear::new(gate_ql, gate_qb)?,
-            switch_mlp: SwitchMlpWeights::new(ql, qb)?,
-            shared_expert: Qwen3NextMLP::new(ql, qb)?,
-            shared_expert_gate: QLinear::new(gate_ql, gate_qb)?,
+            switch_mlp: SwitchMlpWeights::new(args, &switch_mlp_prefix)?,
+            shared_expert: Qwen3NextMLP::new(args, &shared_expert_prefix)?,
+            shared_expert_gate: QLinear::new(seg_ql, seg_qb)?,
             top_k: args.num_experts_per_tok,
             norm_topk_prob: args.norm_topk_prob,
         })
@@ -2130,7 +2166,7 @@ struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs, gdn_prefix: &str) -> Result<Self, Exception> {
         let num_k_heads = args.linear_num_key_heads;
         let num_v_heads = args.linear_num_value_heads;
         let head_k_dim = args.linear_key_head_dim;
@@ -2141,26 +2177,30 @@ impl GatedDeltaNet {
         let conv_kernel_size = args.linear_conv_kernel_dim;
 
         let use_sep = args.use_separate_gdn_projections;
+        let resolve = |name: &str| {
+            let (g, b) = resolve_quant_for(args, &format!("{gdn_prefix}.{name}"));
+            QLinear::new(g, b)
+        };
         Ok(Self {
-            in_proj_qkvz: QLinear::new(ql, qb)?,
-            in_proj_ba: QLinear::new(ql, qb)?,
+            in_proj_qkvz: resolve("in_proj_qkvz")?,
+            in_proj_ba: resolve("in_proj_ba")?,
             in_proj_qkv: if use_sep {
-                Some(QLinear::new(ql, qb)?)
+                Some(resolve("in_proj_qkv")?)
             } else {
                 None
             },
             in_proj_z: if use_sep {
-                Some(QLinear::new(ql, qb)?)
+                Some(resolve("in_proj_z")?)
             } else {
                 None
             },
             in_proj_a: if use_sep {
-                Some(QLinear::new(ql, qb)?)
+                Some(resolve("in_proj_a")?)
             } else {
                 None
             },
             in_proj_b: if use_sep {
-                Some(QLinear::new(ql, qb)?)
+                Some(resolve("in_proj_b")?)
             } else {
                 None
             },
@@ -2172,7 +2212,7 @@ impl GatedDeltaNet {
             norm: nn::RmsNormBuilder::new(head_v_dim)
                 .eps(args.rms_norm_eps)
                 .build()?,
-            out_proj: QLinear::new(ql, qb)?,
+            out_proj: resolve("out_proj")?,
             A_log: Param::new(Array::zeros::<f32>(&[num_v_heads])?),
             dt_bias: Param::new(Array::zeros::<f32>(&[num_v_heads])?),
             num_k_heads,
@@ -2577,8 +2617,8 @@ struct FfnBlock {
 }
 
 impl FfnBlock {
-    fn new_moe(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
-        let moe = SparseMoeBlock::new(args, ql, qb)?;
+    fn new_moe(args: &Qwen3NextModelArgs, mlp_prefix: &str) -> Result<Self, Exception> {
+        let moe = SparseMoeBlock::new(args, mlp_prefix)?;
         Ok(Self {
             gate: Some(moe.gate),
             switch_mlp: Some(moe.switch_mlp),
@@ -2594,15 +2634,18 @@ impl FfnBlock {
         })
     }
 
-    fn new_dense(ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new_dense(args: &Qwen3NextModelArgs, mlp_prefix: &str) -> Result<Self, Exception> {
+        let (g_ql, g_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.gate_proj"));
+        let (u_ql, u_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.up_proj"));
+        let (d_ql, d_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.down_proj"));
         Ok(Self {
             gate: None,
             switch_mlp: None,
             shared_expert: None,
             shared_expert_gate: None,
-            gate_proj: Some(QLinear::new(ql, qb)?),
-            up_proj: Some(QLinear::new(ql, qb)?),
-            down_proj: Some(QLinear::new(ql, qb)?),
+            gate_proj: Some(QLinear::new(g_ql, g_qb)?),
+            up_proj: Some(QLinear::new(u_ql, u_qb)?),
+            down_proj: Some(QLinear::new(d_ql, d_qb)?),
             is_moe: false,
             top_k: 0,
             norm_topk_prob: false,
@@ -2791,24 +2834,32 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(args: &Qwen3NextModelArgs, layer_idx: i32, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs, layer_idx: i32) -> Result<Self, Exception> {
         let is_linear = (layer_idx + 1) % args.full_attention_interval != 0;
 
+        let layer_prefix = format!("language_model.model.layers.{layer_idx}");
         let linear_attn = if is_linear {
-            Some(GatedDeltaNet::new(args, ql, qb)?)
+            Some(GatedDeltaNet::new(
+                args,
+                &format!("{layer_prefix}.linear_attn"),
+            )?)
         } else {
             None
         };
         let self_attn = if is_linear {
             None
         } else {
-            Some(Qwen3NextAttention::new(args, ql, qb)?)
+            Some(Qwen3NextAttention::new(
+                args,
+                &format!("{layer_prefix}.self_attn"),
+            )?)
         };
 
+        let mlp_prefix = format!("{layer_prefix}.mlp");
         let ffn = if args.num_experts > 0 {
-            FfnBlock::new_moe(args, ql, qb)?
+            FfnBlock::new_moe(args, &mlp_prefix)?
         } else {
-            FfnBlock::new_dense(ql, qb)?
+            FfnBlock::new_dense(args, &mlp_prefix)?
         };
         Ok(Self {
             linear_attn,
@@ -2886,13 +2937,14 @@ struct Qwen3NextInner {
 }
 
 impl Qwen3NextInner {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs) -> Result<Self, Exception> {
         let layers = (0..args.num_hidden_layers)
-            .map(|i| DecoderLayer::new(args, i, ql, qb))
+            .map(|i| DecoderLayer::new(args, i))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let (embed_ql, embed_qb) = resolve_quant_for(args, "language_model.model.embed_tokens");
         Ok(Self {
-            embed_tokens: QEmbedding::new(ql, qb)?,
+            embed_tokens: QEmbedding::new(embed_ql, embed_qb)?,
             layers,
             norm: nn::RmsNormBuilder::new(args.hidden_size)
                 .eps(args.rms_norm_eps)
@@ -3018,17 +3070,15 @@ impl Qwen3NextCausalLM {
             return Err(Exception::custom("linear_conv_kernel_dim must be > 0"));
         }
 
-        let ql = args.quantization.as_ref().map_or(64, |q| q.group_size);
-        let qb = args.quantization.as_ref().map_or(4, |q| q.bits);
-
-        let model = Qwen3NextInner::new(&args, ql, qb)?;
+        let model = Qwen3NextInner::new(&args)?;
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(QLinear::new(ql, qb)?)
+            let (lm_ql, lm_qb) = resolve_quant_for(&args, "language_model.lm_head");
+            Some(QLinear::new(lm_ql, lm_qb)?)
         };
         let mtp = if args.mtp_num_hidden_layers > 0 {
-            Some(MtpHead::new(&args, ql, qb)?)
+            Some(MtpHead::new(&args)?)
         } else {
             None
         };
@@ -3532,6 +3582,24 @@ pub fn load_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextModelArg
 pub(crate) fn resolve_quant_for(args: &Qwen3NextModelArgs, path: &str) -> (i32, i32) {
     if let Some(o) = args.quant_overrides.get(path) {
         return (o.group_size, o.bits);
+    }
+    args.quantization
+        .as_ref()
+        .map_or((64, 4), |q| (q.group_size, q.bits))
+}
+
+/// Resolve `(group_size, bits)` for an MoE gate-style tensor.
+///
+/// Resolution order: `quant_overrides[path]` → `gate_quantization` → global
+/// `quantization` → `(64, 4)`. The middle `gate_quantization` step preserves
+/// backward compat with checkpoints that publish a single gate-quantization
+/// override but no per-tensor override map.
+fn resolve_gate_quant(args: &Qwen3NextModelArgs, path: &str) -> (i32, i32) {
+    if let Some(o) = args.quant_overrides.get(path) {
+        return (o.group_size, o.bits);
+    }
+    if let Some(gq) = args.gate_quantization.as_ref() {
+        return (gq.group_size, gq.bits);
     }
     args.quantization
         .as_ref()
@@ -4317,7 +4385,7 @@ mod tests {
         let mut args = minimal_qwen3_next_args();
         args.num_experts = 4;
         args.num_experts_per_tok = 4; // top_k == num_experts is fine
-        let result = SparseMoeBlock::new(&args, 64, 4);
+        let result = SparseMoeBlock::new(&args, "test.layer.mlp");
         assert!(result.is_ok());
     }
 
@@ -4327,7 +4395,7 @@ mod tests {
     ) {
         let mut args = minimal_qwen3_next_args();
         mutate(&mut args);
-        let result = SparseMoeBlock::new(&args, 64, 4);
+        let result = SparseMoeBlock::new(&args, "test.layer.mlp");
         assert!(result.is_err(), "Should reject invalid args");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -4668,6 +4736,118 @@ mod tests {
     }
 
     #[test]
+    fn test_decoder_layer_routes_overrides_to_qlinears() {
+        // A full-attention layer (idx 3 with full_attention_interval=4) for the
+        // dense Qwen3.5 path. We override mlp.down_proj to 3-bit and self_attn.q_proj
+        // to 5-bit; everything else must stay at the global default (64, 2).
+        let mut args = valid_causal_lm_args();
+        args.num_experts = 0; // dense FFN path
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 2,
+        });
+        args.quant_overrides.insert(
+            "language_model.model.layers.3.mlp.down_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 3,
+            },
+        );
+        args.quant_overrides.insert(
+            "language_model.model.layers.3.self_attn.q_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 5,
+            },
+        );
+
+        let layer = DecoderLayer::new(&args, 3).unwrap();
+        assert!(!layer.is_linear, "layer 3 should be full-attention");
+
+        let attn = layer.self_attn.as_ref().expect("self_attn present");
+        assert_eq!(attn.q_proj.bits, 5, "q_proj override applied");
+        assert_eq!(attn.k_proj.bits, 2, "k_proj falls back to global");
+        assert_eq!(attn.v_proj.bits, 2, "v_proj falls back to global");
+        assert_eq!(attn.o_proj.bits, 2, "o_proj falls back to global");
+
+        let down = layer
+            .mlp
+            .down_proj
+            .as_ref()
+            .expect("dense down_proj present");
+        let gate = layer
+            .mlp
+            .gate_proj
+            .as_ref()
+            .expect("dense gate_proj present");
+        let up = layer.mlp.up_proj.as_ref().expect("dense up_proj present");
+        assert_eq!(down.bits, 3, "down_proj override applied");
+        assert_eq!(gate.bits, 2, "gate_proj falls back to global");
+        assert_eq!(up.bits, 2, "up_proj falls back to global");
+    }
+
+    #[test]
+    fn test_decoder_layer_moe_routes_overrides_to_shared_expert_and_switch_mlp() {
+        // MoE layer at idx 3 (full attention). Overrides target the shared expert
+        // down_proj, switch_mlp gate_proj, and the router gate.
+        let mut args = valid_causal_lm_args();
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 4,
+        });
+        args.quant_overrides.insert(
+            "language_model.model.layers.3.mlp.shared_expert.down_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 3,
+            },
+        );
+        args.quant_overrides.insert(
+            "language_model.model.layers.3.mlp.switch_mlp.gate_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 5,
+            },
+        );
+        args.quant_overrides.insert(
+            "language_model.model.layers.3.mlp.gate".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 8,
+            },
+        );
+
+        let layer = DecoderLayer::new(&args, 3).unwrap();
+
+        let gate = layer.mlp.gate.as_ref().expect("MoE gate present");
+        assert_eq!(gate.bits, 8, "router gate override applied");
+
+        let switch = layer.mlp.switch_mlp.as_ref().expect("switch_mlp present");
+        assert_eq!(
+            switch.gate_proj.bits, 5,
+            "switch_mlp.gate_proj override applied"
+        );
+        assert_eq!(
+            switch.down_proj.bits, 4,
+            "switch_mlp.down_proj falls back to global"
+        );
+
+        let shared = layer
+            .mlp
+            .shared_expert
+            .as_ref()
+            .expect("shared_expert present");
+        assert_eq!(
+            shared.down_proj.bits, 3,
+            "shared_expert.down_proj override applied"
+        );
+        assert_eq!(
+            shared.gate_proj.bits, 4,
+            "shared_expert.gate_proj falls back to global"
+        );
+    }
+
+    #[test]
     fn test_placeholder_param_names_finds_shape_one_tensors() {
         let loaded = Array::from_slice(&[1.0f32, 2.0], &[2]);
         let placeholder = Array::from_slice(&[0.0f32], &[1]);
@@ -4739,7 +4919,7 @@ mod tests {
     #[test]
     fn test_sparse_moe_happy_path_construction() {
         let args = minimal_qwen3_next_args();
-        let result = SparseMoeBlock::new(&args, 64, 4);
+        let result = SparseMoeBlock::new(&args, "test.layer.mlp");
         assert!(result.is_ok());
         let block = result.unwrap();
         assert_eq!(block.top_k, args.num_experts_per_tok);
@@ -5021,7 +5201,8 @@ mod tests {
     #[test]
     fn test_forward_gather_global_sort_shape() {
         // RED: forward_gather_global_sort should produce [B, L, top_k, D]
-        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+        let args = minimal_qwen3_next_args();
+        let mut block = SwitchMlpWeights::new(&args, "test.layer.mlp.switch_mlp").unwrap();
 
         let gate_w = Array::ones::<f32>(&[4, 64, 64]).unwrap();
         let (gw, gs, gb) = quantize_weights(&gate_w, 64, 4);
@@ -5052,7 +5233,8 @@ mod tests {
     #[test]
     fn test_forward_gather_global_sort_equivalence() {
         // RED: global sort must produce the same values as forward_gather
-        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+        let args = minimal_qwen3_next_args();
+        let mut block = SwitchMlpWeights::new(&args, "test.layer.mlp.switch_mlp").unwrap();
 
         let gate_w = Array::ones::<f32>(&[4, 64, 64]).unwrap();
         let (gw, gs, gb) = quantize_weights(&gate_w, 64, 4);
@@ -5098,7 +5280,8 @@ mod tests {
         let b = 1;
         let l = 16;
 
-        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+        let args = minimal_qwen3_next_args();
+        let mut block = SwitchMlpWeights::new(&args, "test.layer.mlp.switch_mlp").unwrap();
 
         let gate_w =
             mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
@@ -5154,7 +5337,8 @@ mod tests {
     fn test_switch_mlp_forward_gather_shapes() {
         // Verify forward_gather produces the correct output shape with the
         // double expand_dims pattern matching Python's SwitchGLU.
-        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+        let args = minimal_qwen3_next_args();
+        let mut block = SwitchMlpWeights::new(&args, "test.layer.mlp.switch_mlp").unwrap();
 
         // 4 experts, intermediate=64, hidden=64
         let gate_w = Array::ones::<f32>(&[4, 64, 64]).unwrap();
@@ -5198,7 +5382,7 @@ mod tests {
             bits: 8,
         });
 
-        let mut block = SparseMoeBlock::new(&args, 64, 4).unwrap();
+        let mut block = SparseMoeBlock::new(&args, "test.layer.mlp").unwrap();
 
         // Set router gate weights: [num_experts, hidden_size]
         let gate_w = Array::ones::<f32>(&[4, 64]).unwrap();
@@ -5421,7 +5605,7 @@ mod tests {
         use mlx_rs::Dtype;
 
         let args = valid_causal_lm_args();
-        let mut gdn = GatedDeltaNet::new(&args, 64, 4).unwrap();
+        let mut gdn = GatedDeltaNet::new(&args, "test.layer.linear_attn").unwrap();
         let conv_w = mlx_rs::random::uniform::<f32, f32>(
             -0.5,
             0.5,
@@ -13820,7 +14004,8 @@ mod tests {
             layer.bits = 4;
         }
 
-        let mut block = FfnBlock::new_dense(64, 4).unwrap();
+        let args = minimal_qwen3_next_args();
+        let mut block = FfnBlock::new_dense(&args, "test.layer.mlp").unwrap();
         assign_qlinear(block.gate_proj.as_mut().unwrap(), 96, 64);
         assign_qlinear(block.up_proj.as_mut().unwrap(), 96, 64);
         assign_qlinear(block.down_proj.as_mut().unwrap(), 64, 96);
