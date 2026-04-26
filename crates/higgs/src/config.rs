@@ -509,9 +509,9 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             dflash: None,
             ar_spec: None,
             bd3lm: None,
-            pld: false,
-            pld_max_ngram: 3,
-            pld_min_ngram: 1,
+            pld: args.pld,
+            pld_max_ngram: args.pld_max_ngram,
+            pld_min_ngram: args.pld_min_ngram,
         })
         .collect();
 
@@ -933,6 +933,33 @@ mod tests {
         assert_eq!(model.kv_cache, KvCacheMode::Turboquant);
         assert_eq!(model.kv_bits, 4);
         assert_eq!(model.kv_seed, 99);
+    }
+
+    #[test]
+    fn test_simple_mode_pld_flags_propagate_to_model() {
+        let args = ServeArgs {
+            models: vec!["some/model".to_owned()],
+            host: None,
+            port: None,
+            max_tokens: None,
+            api_key: None,
+            rate_limit: None,
+            timeout: None,
+            batch: false,
+            draft_model: None,
+            num_draft: 8,
+            pld: true,
+            pld_max_ngram: 5,
+            pld_min_ngram: 2,
+            kv_cache: None,
+            kv_bits: None,
+            kv_seed: None,
+        };
+        let config = build_simple_config(&args).unwrap();
+        let model = config.models.first().unwrap();
+        assert!(model.pld);
+        assert_eq!(model.pld_max_ngram, 5);
+        assert_eq!(model.pld_min_ngram, 2);
     }
 
     #[test]

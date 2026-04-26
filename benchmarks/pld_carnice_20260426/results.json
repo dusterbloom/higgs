@@ -1,0 +1,68 @@
+{
+  "baseline": [
+    {
+      "prompt_tokens": 381,
+      "completion_tokens": 344,
+      "ttft_ms": 1958.6731670133304,
+      "decode_s": 15.852462832990568,
+      "wall_s": 17.81148737500189,
+      "decode_tps": 21.637016507377172,
+      "e2e_tps": 19.31337865038705,
+      "text": "<<<\nB-tree storage engines split a page when an insert would overflow it; the median key is promoted into the parent and two siblings are written. Merge happens lazily when a delete drops occupancy under a threshold. Write-ahead logging records the intent of each modification before the page itself is mutated, so a crash mid-write is recoverable: replay the log forward and any committed transaction is durable, any uncommitted one is rolled back. TCP congestion control walks a state machine: slow start doubles the window every RTT until a loss, congestion avoidance linearly probes for more bandwidth, fast retransmit cuts the window in half when triplicate ACKs arrive, and fast recovery resumes additive increase without re-entering slow start. CUBIC replaces the linear probe with a cubic function around the previous max. BBR abandons loss-as-signal entirely and models the bottleneck pipe directly via delivery rate and minimum RTT. Out-of-order CPUs use Tomasulo-style reservation stations to dispatch ready instructions and a reorder buffer to retire them in program order. Branch prediction speculates across control flow, mis-predictions flush the pipeline. TLS 1.3 completes a key exchange in one round trip: ClientHello carries an ECDHE share, ServerHello completes the exchange, the certificate is signed under the negotiated key. 0-RTT resumes a session with a pre-shared key, sending early data before the handshake completes. Raft elects a leader by majority vote, replicates a log entry to a majority before considering it committed, and applies entries in log order to the state machine. Membership changes use a joint-consensus phase to avoid split-brain across the old and new configurations.\n>>>\n"
+    },
+    {
+      "prompt_tokens": 381,
+      "completion_tokens": 25,
+      "ttft_ms": 269.0846670011524,
+      "decode_s": 1.075601666001603,
+      "wall_s": 1.3450763750006445,
+      "decode_tps": 22.313092995863983,
+      "e2e_tps": 18.586305182847347,
+      "text": null
+    },
+    {
+      "prompt_tokens": 381,
+      "completion_tokens": 342,
+      "ttft_ms": 316.1430839973036,
+      "decode_s": 15.728419207996922,
+      "wall_s": 16.044935250014532,
+      "decode_tps": 21.680500468007793,
+      "e2e_tps": 21.315137435639713,
+      "text": null
+    }
+  ],
+  "pld": [
+    {
+      "prompt_tokens": 381,
+      "completion_tokens": 344,
+      "ttft_ms": 2133.1672920205165,
+      "decode_s": 7.633991832990432,
+      "wall_s": 9.767308583017439,
+      "decode_tps": 44.93062181671709,
+      "e2e_tps": 35.219528192046454,
+      "text": "<<<\nB-tree storage engines split a page when an insert would overflow it; the median key is promoted into the parent and two siblings are written. Merge happens lazily when a delete drops occupancy under a threshold. Write-ahead logging records the intent of each modification before the page itself is mutated, so a crash mid-write is recoverable: replay the log forward and any committed transaction is durable, any uncommitted one is rolled back. TCP congestion control walks a state machine: slow start doubles the window every RTT until a loss, congestion avoidance linearly probes for more bandwidth, fast retransmit cuts the window in half when triplicate ACKs arrive, and fast recovery resumes additive increase without re-entering slow start. CUBIC replaces the linear probe with a cubic function around the previous max. BBR abandons loss-as-signal entirely and models the bottleneck pipe directly via delivery rate and minimum RTT. Out-of-order CPUs use Tomasulo-style reservation stations to dispatch ready instructions and a reorder buffer to retire them in program order. Branch prediction speculates across control flow, mis-predictions flush the pipeline. TLS 1.3 completes a key exchange in one round trip: ClientHello carries an ECDHE share, ServerHello completes the exchange, the certificate is signed under the negotiated key. 0-RTT resumes a session with a pre-shared key, sending early data before the handshake completes. Raft elects a leader by majority vote, replicates a log entry to a majority before considering it committed, and applies entries in log order to the state machine. Membership changes use a joint-consensus phase to avoid split-brain across the old and new configurations.\n>>>\n"
+    },
+    {
+      "prompt_tokens": 381,
+      "completion_tokens": 45,
+      "ttft_ms": 231.1975829943549,
+      "decode_s": 1.5700237919809297,
+      "wall_s": 1.8015847079805098,
+      "decode_tps": 28.025053011766364,
+      "e2e_tps": 24.978009527202772,
+      "text": null
+    },
+    {
+      "prompt_tokens": 381,
+      "completion_tokens": 384,
+      "ttft_ms": 439.3703330133576,
+      "decode_s": 9.605703584005823,
+      "wall_s": 10.045439042005455,
+      "decode_tps": 39.87214436199365,
+      "e2e_tps": 38.22630333968348,
+      "text": null
+    }
+  ],
+  "baseline_median": 21.680500468007793,
+  "pld_median": 39.87214436199365
+}
