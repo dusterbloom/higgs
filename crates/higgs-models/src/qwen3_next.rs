@@ -215,6 +215,14 @@ pub struct Qwen3NextModelArgs {
     #[serde(default)]
     pub use_separate_gdn_projections: bool,
 
+    /// Store attention output projections (`self_attn.o_proj`, `linear_attn.out_proj`,
+    /// `linear_attn.in_proj_a`, `linear_attn.in_proj_b`, `linear_attn.in_proj_ba`)
+    /// as BF16-dense rather than quantized. Set by the `qwen3_5` / `qwen3_5_moe`
+    /// loaders to match the Unsloth UD checkpoint layout. Left `false` for the
+    /// original `qwen3_next` `model_type` to preserve historical behavior.
+    #[serde(default)]
+    pub dense_attention_outputs: bool,
+
     /// Number of MTP (Multi-Token Prediction) hidden layers.
     /// 0 = no MTP head, 1 = one transformer layer for next-next-token prediction.
     #[serde(default)]
@@ -232,6 +240,17 @@ pub(crate) fn init_quantized_params() -> Result<QuantizedParams, Exception> {
         Param::new(Array::zeros::<f32>(&[1])?),
         Param::new(Array::zeros::<f32>(&[1])?),
         Param::new(Array::zeros::<f32>(&[1])?),
+    ))
+}
+
+/// Init params for a BF16-dense `QLinear` (`bits == 0`): only `.weight` is
+/// loaded from the checkpoint. Scales/biases get shape `[0]` so they bypass
+/// the shape-`[1]` placeholder check after weight loading completes.
+pub(crate) fn init_unquantized_params() -> Result<QuantizedParams, Exception> {
+    Ok((
+        Param::new(Array::zeros::<f32>(&[1])?),
+        Param::new(Array::zeros::<f32>(&[0])?),
+        Param::new(Array::zeros::<f32>(&[0])?),
     ))
 }
 
@@ -262,7 +281,11 @@ pub(crate) struct QLinear {
 
 impl QLinear {
     pub(crate) fn new(group_size: i32, bits: i32) -> Result<Self, Exception> {
-        let (weight, scales, biases) = init_quantized_params()?;
+        let (weight, scales, biases) = if bits == 0 {
+            init_unquantized_params()?
+        } else {
+            init_quantized_params()?
+        };
         Ok(Self {
             weight,
             scales,
@@ -273,6 +296,11 @@ impl QLinear {
     }
 
     pub(crate) fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        if self.bits == 0 {
+            // BF16-dense path: weight stored as [out, in], compute x @ weight.T.
+            let w = (*self.weight).as_dtype(x.dtype())?;
+            return x.matmul(&w.transpose()?);
+        }
         quantized_forward(
             x,
             &self.weight,
@@ -315,7 +343,11 @@ pub(crate) struct QEmbedding {
 
 impl QEmbedding {
     pub(crate) fn new(group_size: i32, bits: i32) -> Result<Self, Exception> {
-        let (weight, scales, biases) = init_quantized_params()?;
+        let (weight, scales, biases) = if bits == 0 {
+            init_unquantized_params()?
+        } else {
+            init_quantized_params()?
+        };
         Ok(Self {
             weight,
             scales,
@@ -338,6 +370,11 @@ impl QEmbedding {
     }
 
     pub(crate) fn as_linear(&self, x: &Array) -> Result<Array, Exception> {
+        if self.bits == 0 {
+            // BF16-dense path: weight stored as [vocab, hidden], compute x @ weight.T.
+            let w = (*self.weight).as_dtype(x.dtype())?;
+            return x.matmul(&w.transpose()?);
+        }
         if self.bits == 4 && matches!(x.shape(), [1, 1, _]) && self.weight.shape().len() == 2 {
             qgemv_4bit(x, &self.weight, &self.scales, &self.biases, self.group_size)
         } else {
@@ -1394,7 +1431,12 @@ impl Qwen3NextAttention {
         let (q_ql, q_qb) = resolve_quant_for(args, &format!("{attn_prefix}.q_proj"));
         let (k_ql, k_qb) = resolve_quant_for(args, &format!("{attn_prefix}.k_proj"));
         let (v_ql, v_qb) = resolve_quant_for(args, &format!("{attn_prefix}.v_proj"));
-        let (o_ql, o_qb) = resolve_quant_for(args, &format!("{attn_prefix}.o_proj"));
+        let (o_ql, o_qb_resolved) = resolve_quant_for(args, &format!("{attn_prefix}.o_proj"));
+        let o_qb = if args.dense_attention_outputs {
+            0
+        } else {
+            o_qb_resolved
+        };
 
         Ok(Self {
             q_proj: QLinear::new(q_ql, q_qb)?,
@@ -2181,9 +2223,20 @@ impl GatedDeltaNet {
             let (g, b) = resolve_quant_for(args, &format!("{gdn_prefix}.{name}"));
             QLinear::new(g, b)
         };
+        // Names whose checkpoint tensors are BF16-dense (no `.scales`/`.biases`)
+        // when `args.dense_attention_outputs` is true.
+        let resolve_maybe_dense = |name: &str| {
+            let (g, b_resolved) = resolve_quant_for(args, &format!("{gdn_prefix}.{name}"));
+            let b = if args.dense_attention_outputs {
+                0
+            } else {
+                b_resolved
+            };
+            QLinear::new(g, b)
+        };
         Ok(Self {
             in_proj_qkvz: resolve("in_proj_qkvz")?,
-            in_proj_ba: resolve("in_proj_ba")?,
+            in_proj_ba: resolve_maybe_dense("in_proj_ba")?,
             in_proj_qkv: if use_sep {
                 Some(resolve("in_proj_qkv")?)
             } else {
@@ -2195,12 +2248,12 @@ impl GatedDeltaNet {
                 None
             },
             in_proj_a: if use_sep {
-                Some(resolve("in_proj_a")?)
+                Some(resolve_maybe_dense("in_proj_a")?)
             } else {
                 None
             },
             in_proj_b: if use_sep {
-                Some(resolve("in_proj_b")?)
+                Some(resolve_maybe_dense("in_proj_b")?)
             } else {
                 None
             },
@@ -2212,7 +2265,7 @@ impl GatedDeltaNet {
             norm: nn::RmsNormBuilder::new(head_v_dim)
                 .eps(args.rms_norm_eps)
                 .build()?,
-            out_proj: resolve("out_proj")?,
+            out_proj: resolve_maybe_dense("out_proj")?,
             A_log: Param::new(Array::zeros::<f32>(&[num_v_heads])?),
             dt_bias: Param::new(Array::zeros::<f32>(&[num_v_heads])?),
             num_k_heads,
@@ -3869,6 +3922,13 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
         serde_json::Value::from(use_separate),
     );
 
+    // Unsloth UD qwen3_5 / qwen3_5_moe checkpoints store the four attention
+    // output projections as raw BF16 (no `.scales`/`.biases` siblings).
+    map.insert(
+        "dense_attention_outputs".to_owned(),
+        serde_json::Value::from(true),
+    );
+
     // Detect per-layer gate quantization override from top-level quantization config
     if let Some(gate_q) = gate_quantization_override(&config) {
         map.insert("gate_quantization".to_owned(), gate_q);
@@ -4845,6 +4905,69 @@ mod tests {
             shared.gate_proj.bits, 4,
             "shared_expert.gate_proj falls back to global"
         );
+    }
+
+    #[test]
+    fn test_o_proj_and_out_proj_are_bf16_in_qwen3_5() {
+        // `dense_attention_outputs` forces the four checkpoint-BF16-dense
+        // attention output projections to bits=0, while leaving every other
+        // QLinear at the resolved (overrides → global) bit width.
+        let mut args = valid_causal_lm_args();
+        args.dense_attention_outputs = true;
+        args.use_separate_gdn_projections = true;
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 4,
+        });
+
+        // Full-attention layer (idx 3): only o_proj drops to BF16-dense.
+        let attn_layer = DecoderLayer::new(&args, 3).unwrap();
+        let attn = attn_layer
+            .self_attn
+            .as_ref()
+            .expect("self_attn at full-attention layer");
+        assert_eq!(attn.q_proj.bits, 4, "q_proj keeps global quant");
+        assert_eq!(attn.k_proj.bits, 4, "k_proj keeps global quant");
+        assert_eq!(attn.v_proj.bits, 4, "v_proj keeps global quant");
+        assert_eq!(attn.o_proj.bits, 0, "o_proj forced to BF16-dense");
+
+        // Linear (GDN) layer (idx 0): out_proj, in_proj_ba, in_proj_a, in_proj_b
+        // drop to BF16-dense; in_proj_qkvz / in_proj_qkv / in_proj_z keep quant.
+        let gdn_layer = DecoderLayer::new(&args, 0).unwrap();
+        let gdn = gdn_layer
+            .linear_attn
+            .as_ref()
+            .expect("linear_attn at GDN layer");
+        assert_eq!(gdn.in_proj_qkvz.bits, 4, "in_proj_qkvz keeps global quant");
+        assert_eq!(gdn.in_proj_ba.bits, 0, "in_proj_ba forced to BF16-dense");
+        assert_eq!(gdn.out_proj.bits, 0, "out_proj forced to BF16-dense");
+        assert_eq!(
+            gdn.in_proj_qkv.as_ref().expect("separate in_proj_qkv").bits,
+            4,
+            "in_proj_qkv keeps global quant",
+        );
+        assert_eq!(
+            gdn.in_proj_z.as_ref().expect("separate in_proj_z").bits,
+            4,
+            "in_proj_z keeps global quant",
+        );
+        assert_eq!(
+            gdn.in_proj_a.as_ref().expect("separate in_proj_a").bits,
+            0,
+            "in_proj_a forced to BF16-dense",
+        );
+        assert_eq!(
+            gdn.in_proj_b.as_ref().expect("separate in_proj_b").bits,
+            0,
+            "in_proj_b forced to BF16-dense",
+        );
+
+        // Scales/biases for bits=0 use shape [0] so they bypass the
+        // placeholder-`[1]` missing-param check after weight loading.
+        assert_eq!(attn.o_proj.scales.shape(), [0]);
+        assert_eq!(attn.o_proj.biases.shape(), [0]);
+        assert_eq!(gdn.out_proj.scales.shape(), [0]);
+        assert_eq!(gdn.out_proj.biases.shape(), [0]);
     }
 
     #[test]
