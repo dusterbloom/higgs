@@ -3681,6 +3681,14 @@ fn gate_quantization_override(config: &serde_json::Value) -> Option<serde_json::
 /// Scalar siblings (`bits`, `group_size`, `mode`) are skipped, and `mode` is
 /// dropped from override entries since [`QuantizationConfig`] only carries
 /// `(group_size, bits)`.
+///
+/// Synthesizes a fused-key override at `<prefix>.linear_attn.in_proj_qkvz`
+/// whenever both `<prefix>.linear_attn.in_proj_qkv` and `<prefix>.linear_attn.in_proj_z`
+/// are present and agree on `(group_size, bits)`. Unsloth UD checkpoints publish
+/// GDN overrides under the on-disk SPLIT keys, but the model resolves the FUSED
+/// key when running with default (non-separate) GDN projections; without this
+/// synthesis the fused `QLinear` silently picks up the global default and the
+/// runtime quantized matmul fails on the on-disk packing shape.
 fn collect_quant_overrides(
     config: &serde_json::Value,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -3706,7 +3714,47 @@ fn collect_quant_overrides(
         clean.insert("bits".to_owned(), bits.clone());
         overrides.insert(key.clone(), serde_json::Value::Object(clean));
     }
+    synthesize_fused_gdn_overrides(&mut overrides);
     overrides
+}
+
+/// For each `<prefix>.linear_attn.in_proj_qkv` entry, insert a sibling
+/// `<prefix>.linear_attn.in_proj_qkvz` override copied from the matching
+/// `in_proj_qkv` / `in_proj_z` pair when they agree on `(group_size, bits)`.
+/// No-op if `in_proj_qkvz` is already present, if the matching `in_proj_z`
+/// sibling is missing, or if the two sides disagree.
+fn synthesize_fused_gdn_overrides(overrides: &mut serde_json::Map<String, serde_json::Value>) {
+    const QKV_SUFFIX: &str = ".linear_attn.in_proj_qkv";
+    const Z_SUFFIX: &str = ".linear_attn.in_proj_z";
+    const FUSED_SUFFIX: &str = ".linear_attn.in_proj_qkvz";
+
+    let synthesized: Vec<(String, serde_json::Value)> = overrides
+        .iter()
+        .filter_map(|(key, value)| {
+            let prefix = key.strip_suffix(QKV_SUFFIX)?;
+            let fused_key = format!("{prefix}{FUSED_SUFFIX}");
+            if overrides.contains_key(&fused_key) {
+                return None;
+            }
+            let z_key = format!("{prefix}{Z_SUFFIX}");
+            let z_entry = overrides.get(&z_key)?;
+            if z_entry != value {
+                tracing::warn!(
+                    qkv_key = %key,
+                    z_key = %z_key,
+                    qkv = %value,
+                    z = %z_entry,
+                    "GDN split overrides disagree; skipping fused-key synthesis"
+                );
+                return None;
+            }
+            Some((fused_key, value.clone()))
+        })
+        .collect();
+
+    for (key, value) in synthesized {
+        overrides.insert(key, value);
+    }
 }
 
 fn load_qwen3_next_args_from_value(
@@ -4747,6 +4795,84 @@ mod tests {
         // Scalar default keys (`bits`, `group_size`) must not pollute the override map.
         assert!(!args.quant_overrides.contains_key("bits"));
         assert!(!args.quant_overrides.contains_key("group_size"));
+    }
+
+    #[test]
+    fn test_collect_quant_overrides_synthesizes_fused_gdn_key() {
+        // Real Unsloth UD-Q2 checkpoints publish GDN per-tensor overrides under
+        // the on-disk SPLIT keys (`in_proj_qkv` / `in_proj_z`). The model in
+        // default (non-separate) GDN mode resolves the FUSED key
+        // (`in_proj_qkvz`) at QLinear construction time. The lift step must
+        // synthesize a fused-key entry from agreeing split entries, otherwise
+        // the global default applies and the quantized matmul shape check fails
+        // at runtime against the 4-bit-packed weight on disk.
+        let config = serde_json::json!({
+            "quantization": {
+                "group_size": 64,
+                "bits": 2,
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": {
+                    "group_size": 64, "bits": 4, "mode": "affine"
+                },
+                "language_model.model.layers.0.linear_attn.in_proj_z": {
+                    "group_size": 64, "bits": 4, "mode": "affine"
+                }
+            }
+        });
+
+        let overrides = collect_quant_overrides(&config);
+        let fused = overrides
+            .get("language_model.model.layers.0.linear_attn.in_proj_qkvz")
+            .and_then(|v| v.as_object())
+            .expect("fused-key override synthesized");
+        assert_eq!(fused.get("group_size"), Some(&serde_json::json!(64)));
+        assert_eq!(fused.get("bits"), Some(&serde_json::json!(4)));
+    }
+
+    #[test]
+    fn test_collect_quant_overrides_skips_synthesis_when_split_overrides_disagree() {
+        let config = serde_json::json!({
+            "quantization": {
+                "group_size": 64,
+                "bits": 2,
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": {
+                    "group_size": 64, "bits": 4, "mode": "affine"
+                },
+                "language_model.model.layers.0.linear_attn.in_proj_z": {
+                    "group_size": 64, "bits": 3, "mode": "affine"
+                }
+            }
+        });
+        let overrides = collect_quant_overrides(&config);
+        assert!(
+            !overrides.contains_key("language_model.model.layers.0.linear_attn.in_proj_qkvz"),
+            "must not synthesize when split overrides disagree on (group_size, bits)"
+        );
+    }
+
+    #[test]
+    fn test_collect_quant_overrides_does_not_overwrite_existing_fused_override() {
+        let config = serde_json::json!({
+            "quantization": {
+                "group_size": 64,
+                "bits": 2,
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": {
+                    "group_size": 64, "bits": 4, "mode": "affine"
+                },
+                "language_model.model.layers.0.linear_attn.in_proj_z": {
+                    "group_size": 64, "bits": 4, "mode": "affine"
+                },
+                "language_model.model.layers.0.linear_attn.in_proj_qkvz": {
+                    "group_size": 64, "bits": 5, "mode": "affine"
+                }
+            }
+        });
+        let overrides = collect_quant_overrides(&config);
+        let fused = overrides
+            .get("language_model.model.layers.0.linear_attn.in_proj_qkvz")
+            .and_then(|v| v.as_object())
+            .expect("explicit fused override preserved");
+        // Explicit user override wins over synthesized split-pair.
+        assert_eq!(fused.get("bits"), Some(&serde_json::json!(5)));
     }
 
     #[test]
