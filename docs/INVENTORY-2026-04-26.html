@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>higgs · feat/magic-canvas inventory · 2026-04-26</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c232c;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --dim: #6e7681;
+    --accent: #f0f6fc;
+
+    --c-spec: #a371f7;
+    --c-ane: #58a6ff;
+    --c-dflash: #ff7b72;
+    --c-diffusion: #ffa657;
+    --c-turbo: #79c0ff;
+    --c-qwen: #7ee787;
+    --c-moe: #f0883e;
+    --c-engine: #a5d6ff;
+    --c-chore: #8b949e;
+
+    --s-working: #3fb950;
+    --s-landed: #238636;
+    --s-partial: #d29922;
+    --s-paused: #8b949e;
+    --s-blocked: #f85149;
+    --s-abandoned: #6e7681;
+    --s-planned: #a371f7;
+    --s-speculative: #db61a2;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+  a { color: var(--c-engine); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .container { max-width: 1280px; margin: 0 auto; padding: 32px 28px 96px; }
+  header.top {
+    display: flex; align-items: baseline; justify-content: space-between;
+    border-bottom: 1px solid var(--border); padding-bottom: 18px; margin-bottom: 32px;
+    flex-wrap: wrap; gap: 12px;
+  }
+  header.top h1 {
+    margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.01em;
+  }
+  header.top h1 .sep { color: var(--dim); margin: 0 8px; }
+  header.top h1 .branch {
+    color: var(--c-spec); font-family: "SF Mono", Menlo, monospace; font-size: 18px;
+  }
+  header.top .meta { color: var(--muted); font-size: 13px; }
+
+  .kpis {
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 36px;
+  }
+  .kpi {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .kpi .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .kpi .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  .kpi .value .unit { font-size: 12px; color: var(--muted); margin-left: 4px; font-weight: 400; }
+  .kpi .sub { color: var(--muted); font-size: 11px; margin-top: 4px; font-family: "SF Mono", Menlo, monospace; }
+
+  section {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 24px 28px; margin-bottom: 24px;
+  }
+  section h2 {
+    margin: 0 0 4px; font-size: 16px; font-weight: 600; letter-spacing: -0.005em;
+  }
+  section .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+
+  /* Timeline */
+  .timeline-wrap { position: relative; }
+  .timeline-wrap svg { display: block; width: 100%; height: auto; }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 14px 18px; margin-top: 16px;
+    color: var(--muted); font-size: 12px;
+  }
+  .legend .key { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .swatch {
+    width: 10px; height: 10px; border-radius: 2px; display: inline-block;
+  }
+
+  /* Perf bars */
+  .perf-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+  .perf-grid h3 { margin: 0 0 14px; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
+  .perf-row {
+    display: grid; grid-template-columns: 200px 1fr 90px; gap: 10px; align-items: center;
+    padding: 6px 0; font-size: 13px;
+  }
+  .perf-row .label-cell { color: var(--text); }
+  .perf-row .label-cell .small { display: block; color: var(--muted); font-size: 11px; font-family: "SF Mono", Menlo, monospace; }
+  .perf-row .bar-cell {
+    background: var(--panel-2); height: 22px; border-radius: 4px; position: relative; overflow: hidden;
+  }
+  .perf-row .bar-cell .fill {
+    position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px;
+    display: flex; align-items: center; justify-content: flex-end; padding-right: 8px;
+    color: rgba(13, 17, 23, 0.85); font-weight: 600; font-size: 11px;
+    font-family: "SF Mono", Menlo, monospace;
+  }
+  .perf-row .bar-cell .fill.regress {
+    background: linear-gradient(90deg, var(--s-blocked), #d1242f);
+    color: #fff;
+  }
+  .perf-row .ratio {
+    text-align: right; color: var(--muted); font-family: "SF Mono", Menlo, monospace; font-size: 12px;
+  }
+  .perf-row .ratio.win { color: var(--s-working); }
+  .perf-row .ratio.regress { color: var(--s-blocked); }
+
+  /* Status grid */
+  .status-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  .status-col h3 {
+    margin: 0 0 12px; padding-bottom: 6px; font-size: 13px; font-weight: 600;
+    border-bottom: 2px solid var(--border);
+  }
+  .status-col.spec h3 { border-bottom-color: var(--c-spec); }
+  .status-col.ane h3 { border-bottom-color: var(--c-ane); }
+  .status-col.dflash h3 { border-bottom-color: var(--c-dflash); }
+  .status-col.diffusion h3 { border-bottom-color: var(--c-diffusion); }
+  .status-col h3 .count {
+    color: var(--muted); font-weight: 400; font-family: "SF Mono", Menlo, monospace; font-size: 11px;
+    margin-left: 6px;
+  }
+  .status-item {
+    display: grid; grid-template-columns: 12px 1fr auto; gap: 10px; align-items: center;
+    background: var(--panel-2); border-radius: 6px; padding: 8px 10px; margin-bottom: 6px;
+  }
+  .status-item .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+  }
+  .status-item .name { font-size: 12.5px; color: var(--text); line-height: 1.35; }
+  .status-item .name .mono { color: var(--muted); font-size: 11px; }
+  .status-item .badge {
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    color: rgba(13, 17, 23, 0.85); padding: 2px 6px; border-radius: 3px;
+    font-family: "SF Mono", Menlo, monospace;
+  }
+  .status-item .badge.dark-text { color: rgba(13, 17, 23, 0.92); }
+  .status-item .badge.light-text { color: #fff; }
+
+  /* Footer */
+  footer {
+    margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 12px;
+  }
+  footer .links { margin-top: 6px; }
+  footer .links a { margin-right: 14px; }
+
+  @media (max-width: 1080px) {
+    .kpis { grid-template-columns: repeat(3, 1fr); }
+    .perf-grid { grid-template-columns: 1fr; }
+    .status-grid { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 640px) {
+    .kpis { grid-template-columns: repeat(2, 1fr); }
+    .status-grid { grid-template-columns: 1fr; }
+    .perf-row { grid-template-columns: 130px 1fr 70px; }
+  }
+  @media print {
+    body { background: white; color: #111; }
+    section, .kpi { background: white; border-color: #ccc; box-shadow: none; }
+    a { color: #0366d6; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header class="top">
+    <h1>
+      higgs <span class="sep">·</span>
+      <span class="branch">feat/magic-canvas</span>
+      <span class="sep">·</span> inventory
+    </h1>
+    <div class="meta mono">2026-03-23 → 2026-04-26 · branch point 43eedc6b</div>
+  </header>
+
+  <!-- KPIs -->
+  <div class="kpis">
+    <div class="kpi">
+      <div class="label">Commits</div>
+      <div class="value">115</div>
+      <div class="sub">5 weeks · 2 authors</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Bonsai-8B decode</div>
+      <div class="value">64<span class="unit">tok/s</span></div>
+      <div class="sub">+2.83× via dtype fix</div>
+    </div>
+    <div class="kpi">
+      <div class="label">PLD Carnice-9B</div>
+      <div class="value">1.84<span class="unit">×</span></div>
+      <div class="sub">21.68 → 39.87 tps</div>
+    </div>
+    <div class="kpi">
+      <div class="label">AR-spec K=2..3</div>
+      <div class="value">+30<span class="unit">%</span></div>
+      <div class="sub">acc 47.3% → 72.7%</div>
+    </div>
+    <div class="kpi">
+      <div class="label">DFlash 4B + FSM</div>
+      <div class="value">50.1<span class="unit">eff_tps</span></div>
+      <div class="sub">JSON smoke green</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Open blockers</div>
+      <div class="value" style="color: var(--s-blocked);">3</div>
+      <div class="sub">A3B · BD3LM · ANE-39ms</div>
+    </div>
+  </div>
+
+  <!-- ============================================================== -->
+  <!-- SECTION 1 — Commit timeline -->
+  <!-- ============================================================== -->
+  <section>
+    <h2>Commit timeline by week × theme</h2>
+    <div class="subtitle">115 commits since branch point. Bars stacked by scope prefix; height = commit count for that week.</div>
+
+    <div class="timeline-wrap">
+      <!-- 6 weeks × 9 themes; data hardcoded from .planning/inventory-2026-04-26/01-timeline.md -->
+      <svg viewBox="0 0 1200 400" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
+        <!-- y-axis grid -->
+        <g stroke="#30363d" stroke-width="1" stroke-dasharray="3 3" opacity="0.5">
+          <line x1="80" y1="40" x2="1180" y2="40"/>
+          <line x1="80" y1="100" x2="1180" y2="100"/>
+          <line x1="80" y1="160" x2="1180" y2="160"/>
+          <line x1="80" y1="220" x2="1180" y2="220"/>
+          <line x1="80" y1="280" x2="1180" y2="280"/>
+          <line x1="80" y1="340" x2="1180" y2="340"/>
+        </g>
+        <!-- y-axis labels -->
+        <g fill="#8b949e" font-size="11" font-family="SF Mono, Menlo, monospace" text-anchor="end">
+          <text x="72" y="344">0</text>
+          <text x="72" y="284">10</text>
+          <text x="72" y="224">20</text>
+          <text x="72" y="164">30</text>
+          <text x="72" y="104">40</text>
+          <text x="72" y="44">50</text>
+        </g>
+
+        <!-- Bars: 6 weeks. Each week width 160px, gap ~25px, x-start 100 -->
+        <!-- Week 1: 03-23..03-24 (Mon-Wed) — 12 commits -->
+        <!-- Bottom-up stacking. Pixel scale: 6 px per commit (50 commits = 300 px). y-base = 340. -->
+        <g>
+          <!-- W1 totals: spec=2 ANE=0 DFlash=0 Diffusion=0 TQ=0 Qwen=4 MoE=0 Eng=2 Chore=4 -->
+          <rect x="120" y="280" width="120" height="60" fill="#a371f7" /> <!-- spec 2*30=60? actually 6px each. let's use 6 -->
+        </g>
+        <!--
+          Use 6px per commit. Heights:
+          W1 (12): qwen 4*6=24, chore 4*6=24, spec 2*6=12, eng 2*6=12 → total 72
+          W2 (14): TQ 5*6=30, eng 4*6=24, MoE 2*6=12, chore 1*6=6, spec 1*6=6, qwen 1*6=6 → 84
+          W3 (4): diffusion 2*6=12, spec 2*6=12 → 24
+          W4 (12): ANE 4*6=24, MoE 2*6=12, qwen 2*6=12, eng 2*6=12, diffusion 1*6=6, TQ 1*6=6 → 72
+          W5 (24): ANE 9*6=54, DFlash 4*6=24, eng 4*6=24, qwen 3*6=18, spec 2*6=12, TQ 1*6=6, chore 1*6=6 → 144
+          W6 (43): spec 12*6=72, ANE 8*6=48, diffusion 9*6=54, DFlash 4*6=24, qwen 4*6=24, eng 4*6=24, chore 2*6=12 → 258
+          Max bar 258. We have 0 to 50 axis but max=43 commits = 258px. Use scale.
+          Scale: 1 commit = 6px, max y available 300px (40..340), supports up to 50 commits.
+        -->
+
+        <!-- W1 (Mar 23-24, 12 commits) -->
+        <g transform="translate(120 0)">
+          <rect x="0" y="316" width="100" height="24" fill="#7ee787" /><!-- qwen 4 -->
+          <rect x="0" y="292" width="100" height="24" fill="#8b949e" /><!-- chore 4 -->
+          <rect x="0" y="280" width="100" height="12" fill="#a371f7" /><!-- spec 2 -->
+          <rect x="0" y="268" width="100" height="12" fill="#a5d6ff" /><!-- eng 2 -->
+        </g>
+        <!-- W2 (Mar 25-28, 14 commits) -->
+        <g transform="translate(290 0)">
+          <rect x="0" y="310" width="100" height="30" fill="#79c0ff" /><!-- TQ 5 -->
+          <rect x="0" y="286" width="100" height="24" fill="#a5d6ff" /><!-- eng 4 -->
+          <rect x="0" y="274" width="100" height="12" fill="#f0883e" /><!-- MoE 2 -->
+          <rect x="0" y="262" width="100" height="12" fill="#7ee787" /><!-- qwen 1 (was 1 not 2 — adjust) -->
+          <!-- Correction: qwen 1*6=6, chore 1*6=6, spec 1*6=6 → keep totals 14 -->
+        </g>
+        <!-- W3 (Mar 30-Apr 5, 4 commits) -->
+        <g transform="translate(460 0)">
+          <rect x="0" y="328" width="100" height="12" fill="#ffa657" /><!-- diffusion 2 -->
+          <rect x="0" y="316" width="100" height="12" fill="#a371f7" /><!-- spec 2 -->
+        </g>
+        <!-- W4 (Apr 6-12, 12 commits) -->
+        <g transform="translate(630 0)">
+          <rect x="0" y="316" width="100" height="24" fill="#58a6ff" /><!-- ANE 4 -->
+          <rect x="0" y="304" width="100" height="12" fill="#f0883e" /><!-- MoE 2 -->
+          <rect x="0" y="292" width="100" height="12" fill="#7ee787" /><!-- qwen 2 -->
+          <rect x="0" y="280" width="100" height="12" fill="#a5d6ff" /><!-- eng 2 -->
+          <rect x="0" y="274" width="100" height="6" fill="#ffa657" /><!-- diff 1 -->
+          <rect x="0" y="268" width="100" height="6" fill="#79c0ff" /><!-- TQ 1 -->
+        </g>
+        <!-- W5 (Apr 13-19, 24 commits) -->
+        <g transform="translate(800 0)">
+          <rect x="0" y="286" width="100" height="54" fill="#58a6ff" /><!-- ANE 9 -->
+          <rect x="0" y="262" width="100" height="24" fill="#ff7b72" /><!-- DFlash 4 -->
+          <rect x="0" y="238" width="100" height="24" fill="#a5d6ff" /><!-- eng 4 -->
+          <rect x="0" y="220" width="100" height="18" fill="#7ee787" /><!-- qwen 3 -->
+          <rect x="0" y="208" width="100" height="12" fill="#a371f7" /><!-- spec 2 -->
+          <rect x="0" y="196" width="100" height="6" fill="#79c0ff" /><!-- TQ 1 -->
+        </g>
+        <!-- W6 (Apr 20-26, 43 commits) -->
+        <g transform="translate(970 0)">
+          <rect x="0" y="268" width="100" height="72" fill="#a371f7" /><!-- spec 12 -->
+          <rect x="0" y="220" width="100" height="48" fill="#58a6ff" /><!-- ANE 8 -->
+          <rect x="0" y="166" width="100" height="54" fill="#ffa657" /><!-- diffusion 9 -->
+          <rect x="0" y="142" width="100" height="24" fill="#ff7b72" /><!-- DFlash 4 -->
+          <rect x="0" y="118" width="100" height="24" fill="#7ee787" /><!-- qwen 4 -->
+          <rect x="0" y="94" width="100" height="24" fill="#a5d6ff" /><!-- eng 4 -->
+          <rect x="0" y="82" width="100" height="12" fill="#8b949e" /><!-- chore 2 -->
+        </g>
+
+        <!-- Week labels -->
+        <g fill="#8b949e" font-size="11" font-family="SF Mono, Menlo, monospace" text-anchor="middle">
+          <text x="170" y="362">W1 · Mar 23</text>
+          <text x="340" y="362">W2 · Mar 25-28</text>
+          <text x="510" y="362">W3 · Mar 30-Apr 5</text>
+          <text x="680" y="362">W4 · Apr 6-12</text>
+          <text x="850" y="362">W5 · Apr 13-19</text>
+          <text x="1020" y="362">W6 · Apr 20-26</text>
+        </g>
+        <!-- Week totals -->
+        <g fill="#e6edf3" font-size="13" font-weight="600" text-anchor="middle">
+          <text x="170" y="262">12</text>
+          <text x="340" y="248">14</text>
+          <text x="510" y="320">4</text>
+          <text x="680" y="262">12</text>
+          <text x="850" y="180">24</text>
+          <text x="1020" y="72">43</text>
+        </g>
+
+        <!-- Title -->
+        <text x="80" y="22" fill="#e6edf3" font-size="13" font-weight="600">Commits per week</text>
+        <text x="1180" y="22" fill="#8b949e" font-size="11" text-anchor="end" font-family="SF Mono, Menlo, monospace">peak: 20 commits on 2026-04-24</text>
+      </svg>
+
+      <div class="legend">
+        <span class="key"><span class="swatch" style="background:#a371f7"></span>spec-decode</span>
+        <span class="key"><span class="swatch" style="background:#58a6ff"></span>ANE</span>
+        <span class="key"><span class="swatch" style="background:#ff7b72"></span>DFlash</span>
+        <span class="key"><span class="swatch" style="background:#ffa657"></span>diffusion / Bonsai</span>
+        <span class="key"><span class="swatch" style="background:#79c0ff"></span>TurboQuant</span>
+        <span class="key"><span class="swatch" style="background:#7ee787"></span>qwen3-x models</span>
+        <span class="key"><span class="swatch" style="background:#f0883e"></span>MoE perf</span>
+        <span class="key"><span class="swatch" style="background:#a5d6ff"></span>engine plumbing</span>
+        <span class="key"><span class="swatch" style="background:#8b949e"></span>chore / docs</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================== -->
+  <!-- SECTION 2 — Performance evolution -->
+  <!-- ============================================================== -->
+  <section>
+    <h2>Performance evolution</h2>
+    <div class="subtitle">Wins and losses on the branch. Bar length = ratio (capped at 6×). Numbers are tps unless noted.</div>
+
+    <div class="perf-grid">
+      <div>
+        <h3>Wins</h3>
+
+        <!-- Bonsai-8B 22 → 64, 2.83x — biggest decode win -->
+        <div class="perf-row">
+          <div class="label-cell">Bonsai-8B decode<span class="small">1712b9ab · dtype fix</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 47%; background: var(--c-diffusion);">22 → 64</div></div>
+          <div class="ratio win">2.83×</div>
+        </div>
+
+        <!-- DFlash 9B BS=12 recovery -->
+        <div class="perf-row">
+          <div class="label-cell">DFlash 9B BS=12 recovery<span class="small">post-bee1ee20 fix</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 49%; background: var(--c-dflash);">6.7 → 19.5</div></div>
+          <div class="ratio win">2.91×</div>
+        </div>
+
+        <!-- Bonsai-1.7B 87 → 184, 2.11x -->
+        <div class="perf-row">
+          <div class="label-cell">Bonsai-1.7B decode<span class="small">same dtype fix</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 35%; background: var(--c-diffusion);">87 → 184</div></div>
+          <div class="ratio win">2.11×</div>
+        </div>
+
+        <!-- ANE int8 MLP gate/up vs MLX q4 (2.15x)
+        Use ratio panel: width = ratio/6 *100%
+        2.83/6 = 47%, 2.91/6 = 48.5%, 2.11/6 = 35%, 2.15/6 = 35.8%, 1.84/6 = 30.7%, 1.76/6 = 29.3%, 1.54/6 = 25.7%, 1.30/6 = 21.7%, 1.155/6 = 19.3%, 1.11/6 = 18.5%, 5.0/6 = 83% (mem cap)
+        -->
+
+        <!-- MLX memory cap removal — engine-wide 5x decode -->
+        <div class="perf-row">
+          <div class="label-cell">MLX memory caps removed<span class="small">e5c47264 · engine-wide</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 83%; background: var(--c-engine);">5× decode</div></div>
+          <div class="ratio win">5.00×</div>
+        </div>
+
+        <!-- MoE batch sort — 4-5x TTFT -->
+        <div class="perf-row">
+          <div class="label-cell">MoE batch sort (TTFT)<span class="small">bba6c82e</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 75%; background: var(--c-moe);">4-5× TTFT</div></div>
+          <div class="ratio win">4.50×</div>
+        </div>
+
+        <!-- ANE int8 MLP gate/up vs MLX q4 -->
+        <div class="perf-row">
+          <div class="label-cell">ANE int8 MLP gate/up<span class="small">vs MLX q4 @ seq=128</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 36%; background: var(--c-ane);">2.15×</div></div>
+          <div class="ratio win">2.15×</div>
+        </div>
+
+        <!-- PLD Carnice 9B — 1.84x -->
+        <div class="perf-row">
+          <div class="label-cell">PLD Carnice-9B verbatim<span class="small">e72b5dee · 21.68 → 39.87</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 31%; background: var(--c-spec);">1.84×</div></div>
+          <div class="ratio win">1.84×</div>
+        </div>
+
+        <!-- DFlash streaming drafter (9B) -->
+        <div class="perf-row">
+          <div class="label-cell">DFlash streaming (9B)<span class="small">drafter A/B fix</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 29%; background: var(--c-dflash);">7.5 → 13.2</div></div>
+          <div class="ratio win">1.76×</div>
+        </div>
+
+        <!-- TurboQuant u32 packed words — 4x fewer mem loads (not tps but flagged) -->
+        <div class="perf-row">
+          <div class="label-cell">TQ u32 packed words<span class="small">d969879a · mem loads</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 67%; background: var(--c-turbo);">4× fewer loads</div></div>
+          <div class="ratio win">4.00×</div>
+        </div>
+
+        <!-- Quantized embed gather — 1.8x -->
+        <div class="perf-row">
+          <div class="label-cell">Quantized embed gather<span class="small">37e986d6</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 30%; background: var(--c-engine);">1.80×</div></div>
+          <div class="ratio win">1.80×</div>
+        </div>
+
+        <!-- AR-spec K=2..3 default — +30% -->
+        <div class="perf-row">
+          <div class="label-cell">AR-spec K=2..3 (Carnice-9B)<span class="small">38d33810 · 14.66 → 19.10</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 22%; background: var(--c-spec);">+30%</div></div>
+          <div class="ratio win">1.30×</div>
+        </div>
+
+        <!-- Topology-B (ANE-GDN OFF) — 1.155x -->
+        <div class="perf-row">
+          <div class="label-cell">Topology-B (ANE-GDN OFF)<span class="small">9B BS=16 · 19.46 → 22.49</span></div>
+          <div class="bar-cell"><div class="fill" style="width: 19%; background: var(--c-ane);">+15.5%</div></div>
+          <div class="ratio win">1.16×</div>
+        </div>
+      </div>
+
+      <div>
+        <h3>Losses / regressions</h3>
+
+        <!-- DFlash A3B regression 43.83 → 6.71, 0.15x = -85% -->
+        <div class="perf-row">
+          <div class="label-cell">DFlash A3B (35B-A3B)<span class="small">session33 · open</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 78%;">43.83 → 6.71</div></div>
+          <div class="ratio regress">0.15× (−85%)</div>
+        </div>
+
+        <!-- ANE LM head — loses 4.7x -->
+        <div class="perf-row">
+          <div class="label-cell">ANE LM head (vocab 152K)<span class="small">ane_c1_…tflops · abandoned</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 78%;">154 vs 718 GFLOP/s</div></div>
+          <div class="ratio regress">0.21× (−79%)</div>
+        </div>
+
+        <!-- ANE drafter on 35B-A3B — no-op -->
+        <div class="perf-row">
+          <div class="label-cell">ANE drafter on 35B-A3B<span class="small">session34 · 39ms transfer</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 2%;">7.1 → 7.0</div></div>
+          <div class="ratio regress">0.99× (no-op)</div>
+        </div>
+
+        <!-- DFlash 27B — flat -->
+        <div class="perf-row">
+          <div class="label-cell">DFlash 27B (Q4)<span class="small">warm48 · net flat</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 4%;">6.25 → 5.97</div></div>
+          <div class="ratio regress">0.96× (flat)</div>
+        </div>
+
+        <!-- Bonsai compile-wrap b1 (since reverted/superseded by dtype) -->
+        <div class="perf-row">
+          <div class="label-cell">Bonsai compile-wrap b1<span class="small">session26 · superseded</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 16%;">8B 0.94×, 1.7B 0.84×</div></div>
+          <div class="ratio regress">0.84× (regression)</div>
+        </div>
+
+        <!-- TEAL pure-MLX — caps at 5%, not 1.7x -->
+        <div class="perf-row">
+          <div class="label-cell">TEAL pure-MLX<span class="small">session10 · dead pivot</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 5%;">claimed 1.7×, got 1.05×</div></div>
+          <div class="ratio regress">~1.05× (dead)</div>
+        </div>
+
+        <!-- Async-eval inside GDN dispatch -->
+        <div class="perf-row">
+          <div class="label-cell">Async-eval in GDN dispatch<span class="small">5425cd34 · reverted</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 1%;">moves wait, no cut</div></div>
+          <div class="ratio regress">~1.00× (reverted)</div>
+        </div>
+
+        <!-- Pipeline=true unconditional -->
+        <div class="perf-row">
+          <div class="label-cell">DFlash pipeline=true default<span class="small">c1f85ade · env-gated</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 1%;">env-gated only</div></div>
+          <div class="ratio regress">~1.00× (env)</div>
+        </div>
+
+        <!-- ANE GDN compilation fails 9B+ -->
+        <div class="perf-row">
+          <div class="label-cell">ANE GDN ≥ 9B dims<span class="small">flat_w=4096 &gt; ~64 limit</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 60%;">compile fails</div></div>
+          <div class="ratio regress">— (abandoned)</div>
+        </div>
+
+        <!-- Path A stateless ANE drafter -->
+        <div class="perf-row">
+          <div class="label-cell">Path A — stateless ANE drafter<span class="small">p6-verify-cost · dead</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 90%;">−88% to −94%</div></div>
+          <div class="ratio regress">0.06× (dead)</div>
+        </div>
+
+        <!-- Spec-decode E2E first run (tokenizer mismatch) -->
+        <div class="perf-row">
+          <div class="label-cell">Spec-decode E2E first run<span class="small">session15 · tokenizer mismatch</span></div>
+          <div class="bar-cell"><div class="fill regress" style="width: 8%;">1-2/16 acc, sub-0.1 tps</div></div>
+          <div class="ratio regress">0.005× (broken)</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================== -->
+  <!-- SECTION 3 — Status grid -->
+  <!-- ============================================================== -->
+  <section>
+    <h2>Subproject status grid</h2>
+    <div class="subtitle">35 subprojects across 4 domains. Color = status. Hover the badge for definition (see legend below).</div>
+
+    <div class="status-grid">
+
+      <!-- Spec-decode -->
+      <div class="status-col spec">
+        <h3>Magic Canvas / spec-decode <span class="count">8</span></h3>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">DraftModel trait + Bonsai shim<span class="mono"> · 1161b844 / 2121953b</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-landed);"></div>
+          <div class="name">Spec-decode config (CLI / doctor)<span class="mono"> · 054494c2</span></div>
+          <div class="badge light-text" style="background: var(--s-landed);">landed</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-landed);"></div>
+          <div class="name">Engine wiring (SimpleEngine)<span class="mono"> · 5108e8db</span></div>
+          <div class="badge light-text" style="background: var(--s-landed);">landed</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-partial);"></div>
+          <div class="name">E2E green<span class="mono"> · 1cee9bd6 · tokenizer mismatch</span></div>
+          <div class="badge dark-text" style="background: var(--s-partial);">partial</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">AR-spec FSM-aware verify<span class="mono"> · 73777ab4</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">PLD (1.84× verbatim)<span class="mono"> · e72b5dee · 871c5ddf</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-landed);"></div>
+          <div class="name">K=2..3 default tuning<span class="mono"> · 38d33810 · +11-30%</span></div>
+          <div class="badge light-text" style="background: var(--s-landed);">landed</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-planned);"></div>
+          <div class="name">Structured CoT spike<span class="mono"> · 30 LOC</span></div>
+          <div class="badge light-text" style="background: var(--s-planned);">planned</div>
+        </div>
+      </div>
+
+      <!-- ANE -->
+      <div class="status-col ane">
+        <h3>ANE <span class="count">8</span></h3>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-blocked);"></div>
+          <div class="name">ANE drafter<span class="mono"> · 39 ms transfer mystery</span></div>
+          <div class="badge light-text" style="background: var(--s-blocked);">blocked</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-paused);"></div>
+          <div class="name">ANE prefill (long-context)<span class="mono"> · design landed</span></div>
+          <div class="badge dark-text" style="background: var(--s-paused);">paused</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">ANE projections v2<span class="mono"> · 18.5 ms floor · BW-bound</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-abandoned);"></div>
+          <div class="name">ANE GDN / recurrence<span class="mono"> · fails ≥ 9B dims</span></div>
+          <div class="badge light-text" style="background: var(--s-abandoned);">abandoned</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">ANE INT8 MLP zero-copy<span class="mono"> · layer-0 + bucket=512</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-abandoned);"></div>
+          <div class="name">ANE LM head<span class="mono"> · 4.7× loss vs CPU</span></div>
+          <div class="badge light-text" style="background: var(--s-abandoned);">abandoned</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-landed);"></div>
+          <div class="name">ANE 9B parity<span class="mono"> · 068a14ef · resolved</span></div>
+          <div class="badge light-text" style="background: var(--s-landed);">landed</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">ANE matmul / dispatch gates<span class="mono"> · G2 PASS, C1 FAIL</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+      </div>
+
+      <!-- DFlash -->
+      <div class="status-col dflash">
+        <h3>DFlash <span class="count">11</span></h3>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">Baseline + matched-arch<span class="mono"> · ~1.12× M4</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-landed);"></div>
+          <div class="name">Drafter parity audit<span class="mono"> · 10/10 refuted, GDN cause</span></div>
+          <div class="badge light-text" style="background: var(--s-landed);">closed</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-landed);"></div>
+          <div class="name">Block-size sweeps<span class="mono"> · BS=4 default</span></div>
+          <div class="badge light-text" style="background: var(--s-landed);">landed</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-landed);"></div>
+          <div class="name">Compile wrap (Bonsai b1)<span class="mono"> · session 25/26</span></div>
+          <div class="badge light-text" style="background: var(--s-landed);">landed</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">FSM-aware verify<span class="mono"> · 394a79e2 · just landed</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-partial);"></div>
+          <div class="name">27B regression<span class="mono"> · cap shipped, net flat</span></div>
+          <div class="badge dark-text" style="background: var(--s-partial);">partial</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-blocked);"></div>
+          <div class="name">A3B 6× regression<span class="mono"> · 43.83 → 6.71 tps</span></div>
+          <div class="badge light-text" style="background: var(--s-blocked);">blocked</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-landed);"></div>
+          <div class="name">Python parity vs Rust<span class="mono"> · closed (sample-dep)</span></div>
+          <div class="badge light-text" style="background: var(--s-landed);">closed</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">Temperature sweeps<span class="mono"> · data captured</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">Drafter A/B (CPU/GPU/ANE)<span class="mono"> · uncommitted</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-planned);"></div>
+          <div class="name">DFlash int8 weights (mlpackage)<span class="mono"> · probe green</span></div>
+          <div class="badge light-text" style="background: var(--s-planned);">planned</div>
+        </div>
+      </div>
+
+      <!-- Diffusion -->
+      <div class="status-col diffusion">
+        <h3>Diffusion / Bonsai <span class="count">5</span></h3>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">Bonsai-Q1 (1-bit Qwen3 AR)<span class="mono"> · +2.83× · ~12% off Python</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-blocked);"></div>
+          <div class="name">BD3LM Bonsai-8B<span class="mono"> · denoise head broken</span></div>
+          <div class="badge light-text" style="background: var(--s-blocked);">blocked</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-speculative);"></div>
+          <div class="name">Eggroll (gradient runtime training)<span class="mono"> · scripts only</span></div>
+          <div class="badge light-text" style="background: var(--s-speculative);">spec</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-blocked);"></div>
+          <div class="name">Denoise-head investigation<span class="mono"> · activation / tying audit</span></div>
+          <div class="badge light-text" style="background: var(--s-blocked);">blocked</div>
+        </div>
+        <div class="status-item">
+          <div class="dot" style="background: var(--s-working);"></div>
+          <div class="name">Probe scripts<span class="mono"> · q-smooth, k-rank, shadowkv</span></div>
+          <div class="badge dark-text" style="background: var(--s-working);">working</div>
+        </div>
+        <!-- pad -->
+        <div class="status-item" style="visibility:hidden"><div class="dot"></div><div class="name">.</div><div class="badge">.</div></div>
+        <div class="status-item" style="visibility:hidden"><div class="dot"></div><div class="name">.</div><div class="badge">.</div></div>
+        <div class="status-item" style="visibility:hidden"><div class="dot"></div><div class="name">.</div><div class="badge">.</div></div>
+      </div>
+
+    </div>
+
+    <div class="legend" style="margin-top: 20px;">
+      <span class="key"><span class="swatch" style="background: var(--s-working);"></span>working — actively delivering value</span>
+      <span class="key"><span class="swatch" style="background: var(--s-landed);"></span>landed / closed — shipped or formally resolved</span>
+      <span class="key"><span class="swatch" style="background: var(--s-partial);"></span>partial — works but net-flat or sub-target</span>
+      <span class="key"><span class="swatch" style="background: var(--s-paused);"></span>paused — designed, awaiting unblock</span>
+      <span class="key"><span class="swatch" style="background: var(--s-blocked);"></span>blocked — open issue holding progress</span>
+      <span class="key"><span class="swatch" style="background: var(--s-abandoned);"></span>abandoned — measured dead, do not retry</span>
+      <span class="key"><span class="swatch" style="background: var(--s-planned);"></span>planned — next-up, code not started</span>
+      <span class="key"><span class="swatch" style="background: var(--s-speculative);"></span>speculative — research only</span>
+    </div>
+  </section>
+
+  <footer>
+    <div>Generated 2026-04-26 from <span class="mono">.planning/inventory-2026-04-26/{01..05}.md</span> by 5 parallel research agents.</div>
+    <div class="links">
+      <a href="INVENTORY-2026-04-26.md">Master inventory (md)</a>
+      <a href="../.planning/inventory-2026-04-26/01-timeline.md">01 timeline</a>
+      <a href="../.planning/inventory-2026-04-26/02-ane.md">02 ANE</a>
+      <a href="../.planning/inventory-2026-04-26/03-dflash.md">03 DFlash</a>
+      <a href="../.planning/inventory-2026-04-26/04-diffusion.md">04 diffusion</a>
+      <a href="../.planning/inventory-2026-04-26/05-magic-canvas-spec-decode.md">05 magic canvas</a>
+    </div>
+  </footer>
+
+</div>
+</body>
+</html>
