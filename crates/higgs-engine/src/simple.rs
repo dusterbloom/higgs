@@ -1078,10 +1078,18 @@ impl SimpleEngine {
             return self.generate_ar_spec_inner(prompt_tokens, max_tokens);
         }
 
-        // DFlash speculative decoding: use draft-verify loop when available,
-        // no constraints active, and no multimodal input.
-        if self.dflash.is_some() && constraint.is_none() && pixel_values.is_none() {
-            return self.generate_dflash_inner(prompt_tokens, max_tokens, params, stop_sequences);
+        // DFlash speculative decoding: use draft-verify loop when available
+        // and no multimodal input. FSM-aware verify masks K+1 verify rows so
+        // PLD-style structured output compounds with DFlash; see
+        // `ConstrainedGenerator::build_mask_rows`.
+        if self.dflash.is_some() && pixel_values.is_none() {
+            return self.generate_dflash_inner(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                &mut constraint,
+            );
         }
 
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
@@ -1474,6 +1482,7 @@ impl SimpleEngine {
         max_tokens: u32,
         params: &SamplingParams,
         stop_sequences: &[String],
+        constraint: &mut Option<crate::constrained::ConstrainedGenerator>,
     ) -> Result<GenerationOutput, EngineError> {
         let dflash = self.dflash.as_ref().expect("DFlash state must be Some");
         let prompt_len = Self::prompt_len(prompt_tokens)?;
@@ -1503,15 +1512,25 @@ impl SimpleEngine {
         let first_token_id: u32 = first_token.item();
         let mut tokens: Vec<u32> = vec![first_token_id];
 
-        if self.eos_token_ids.contains(&first_token_id) || max_tokens <= 1 {
-            return Ok(GenerationOutput {
-                text: self.decode_tokens(&tokens)?,
-                finish_reason: if self.eos_token_ids.contains(&first_token_id) {
+        // Advance FSM by the prefill-sampled token so subsequent verify rows
+        // mask against the post-T1 state. (Mirrors generate_inner.)
+        if let Some(cg) = constraint.as_mut() {
+            cg.advance(first_token_id);
+        }
+        let constraint_finished = constraint
+            .as_ref()
+            .is_some_and(crate::constrained::ConstrainedGenerator::is_finished);
+
+        if self.eos_token_ids.contains(&first_token_id) || max_tokens <= 1 || constraint_finished {
+            let finish_reason =
+                if constraint_finished || self.eos_token_ids.contains(&first_token_id) {
                     "stop"
                 } else {
                     "length"
-                }
-                .to_owned(),
+                };
+            return Ok(GenerationOutput {
+                text: self.decode_tokens(&tokens)?,
+                finish_reason: finish_reason.to_owned(),
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: None,
@@ -1803,12 +1822,29 @@ impl SimpleEngine {
                 draft_transfer_ms = t_transfer.elapsed().as_secs_f64() * 1000.0;
             }
 
+            // FSM-aware mask: build [verify_len, vocab] mask from per-position
+            // FSM states walked along draft tokens, broadcast-add to verify
+            // logits before argmax/RS. Trailing rows beyond the FSM walk stay
+            // unmasked — accept_prefix cuts at the illegal draft anyway.
+            let masked_logits = if let Some(cg) = constraint.as_ref() {
+                let states = cg.peek_states_for_drafts(&draft_u32);
+                let vocab_size =
+                    usize::try_from(*verify_logits.shape().last().unwrap_or(&0)).unwrap_or(0);
+                let mask_2d = cg
+                    .build_mask_rows(&states, verify_len as usize, vocab_size)
+                    .map_err(EngineError::Mlx)?;
+                let mask_3d = mask_2d.expand_dims(0).map_err(EngineError::Mlx)?;
+                verify_logits.add(&mask_3d).map_err(EngineError::Mlx)?
+            } else {
+                verify_logits.clone()
+            };
+
             // i. Accept: greedy argmax+accept_prefix when temp=0, else rejection sampling
             let (verify_argmax_ms, accept_ms, accepted) = match rs_state {
                 None => {
                     let t_verify_argmax = Instant::now();
                     let verify_argmax =
-                        mlx_rs::argmax_axis!(verify_logits, -1).map_err(EngineError::Mlx)?;
+                        mlx_rs::argmax_axis!(masked_logits, -1).map_err(EngineError::Mlx)?;
                     eval([&verify_argmax]).map_err(EngineError::Mlx)?;
                     let v_ms = t_verify_argmax.elapsed().as_secs_f64() * 1000.0;
                     let t_accept = Instant::now();
@@ -1837,7 +1873,7 @@ impl SimpleEngine {
                         &draft_u32,
                         &draft_arr,
                         &q_probs,
-                        &verify_logits,
+                        &masked_logits,
                         params,
                         block_size,
                     )?;
@@ -1892,6 +1928,16 @@ impl SimpleEngine {
             }
             last_token = *accepted.last().expect("accept_prefix always returns >= 1") as i32;
             start += n_accepted;
+            // Advance the FSM by every accepted token; bail when the FSM
+            // reaches a final state so we don't emit unconstrained text past
+            // the schema boundary.
+            let mut constraint_finished_round = false;
+            if let Some(cg) = constraint.as_mut() {
+                for &tok in &accepted {
+                    cg.advance(tok);
+                }
+                constraint_finished_round = cg.is_finished();
+            }
             let end_ms = t_end.elapsed().as_secs_f64() * 1000.0;
             if kv_debug {
                 eprintln!(
@@ -2050,7 +2096,7 @@ impl SimpleEngine {
             // l. Check termination
             let completion_len = Self::completion_len(&tokens)?;
 
-            if tokens.iter().any(|t| self.eos_token_ids.contains(t)) {
+            if tokens.iter().any(|t| self.eos_token_ids.contains(t)) || constraint_finished_round {
                 let elapsed = t_start.elapsed();
                 tracing::info!(
                     tokens = tokens.len(),
@@ -2115,6 +2161,7 @@ impl SimpleEngine {
         params: &SamplingParams,
         stop_sequences: &[String],
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        constraint: &mut Option<crate::constrained::ConstrainedGenerator>,
     ) -> Result<(), EngineError> {
         let dflash = self.dflash.as_ref().expect("DFlash state must be Some");
         let prompt_len = Self::prompt_len(prompt_tokens)?;
@@ -2145,14 +2192,23 @@ impl SimpleEngine {
         let mut tokens: Vec<u32> = vec![first_token_id];
         let mut prev_decoded_len: usize = 0;
 
+        // Advance FSM by the prefill-sampled token before the first verify
+        // round so subsequent mask states are correct.
+        if let Some(cg) = constraint.as_mut() {
+            cg.advance(first_token_id);
+        }
+        let constraint_finished = constraint
+            .as_ref()
+            .is_some_and(crate::constrained::ConstrainedGenerator::is_finished);
+
         // Stream first token
         let full_text = self.decode_tokens(&tokens)?;
         let new_text = full_text[prev_decoded_len..].to_owned();
         prev_decoded_len = full_text.len();
 
         let is_eos = self.eos_token_ids.contains(&first_token_id);
-        let is_done = is_eos || max_tokens <= 1;
-        let finish_reason = if is_eos {
+        let is_done = is_eos || max_tokens <= 1 || constraint_finished;
+        let finish_reason = if is_eos || constraint_finished {
             Some("stop".to_owned())
         } else if max_tokens <= 1 {
             Some("length".to_owned())
@@ -2294,34 +2350,58 @@ impl SimpleEngine {
             let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
 
             let t_accept = Instant::now();
+            // Greedy host pull deferred from lm_draft step — verify forced
+            // full eval above (mlx_rs::argmax_axis! triggers it for greedy
+            // path; for RS, draft_u32 was already populated by rs_draft_sample).
+            // Pull BEFORE the FSM walk so peek_states_for_drafts has the
+            // draft IDs.
+            if let Some(ref dt) = draft_token_arr_greedy {
+                // Force the verify forward to materialize so the host pull
+                // below is metadata-cheap (mirrors non-streaming variant).
+                eval([&verify_logits]).map_err(EngineError::Mlx)?;
+                draft_u32 = dt
+                    .reshape(&[-1])
+                    .map_err(EngineError::Mlx)?
+                    .as_slice::<u32>()
+                    .to_vec();
+                draft_i32 = draft_u32.iter().map(|&x| x as i32).collect();
+            }
+
+            // FSM-aware mask: build [verify_len, vocab] mask from per-position
+            // FSM states walked along draft tokens, broadcast-add to verify
+            // logits before argmax/RS. Trailing rows beyond the FSM walk stay
+            // unmasked — accept_prefix cuts at the illegal draft anyway.
+            let masked_logits = if let Some(cg) = constraint.as_ref() {
+                let states = cg.peek_states_for_drafts(&draft_u32);
+                let vocab_size =
+                    usize::try_from(*verify_logits.shape().last().unwrap_or(&0)).unwrap_or(0);
+                let mask_2d = cg
+                    .build_mask_rows(&states, verify_len as usize, vocab_size)
+                    .map_err(EngineError::Mlx)?;
+                let mask_3d = mask_2d.expand_dims(0).map_err(EngineError::Mlx)?;
+                verify_logits.add(&mask_3d).map_err(EngineError::Mlx)?
+            } else {
+                verify_logits.clone()
+            };
+
             // Accept: greedy argmax+accept_prefix (temp=0) or rejection sampling (temp>0)
             let accepted = match rs_state {
                 None => {
                     let verify_argmax =
-                        mlx_rs::argmax_axis!(verify_logits, -1).map_err(EngineError::Mlx)?;
+                        mlx_rs::argmax_axis!(masked_logits, -1).map_err(EngineError::Mlx)?;
                     eval([&verify_argmax]).map_err(EngineError::Mlx)?;
                     let verify_flat: Vec<u32> = verify_argmax
                         .reshape(&[-1])
                         .map_err(EngineError::Mlx)?
                         .as_slice::<u32>()
                         .to_vec();
-                    // Greedy host pull deferred from lm_draft step — verify
-                    // forced full eval, so this is now metadata-cheap.
-                    if let Some(ref dt) = draft_token_arr_greedy {
-                        draft_u32 = dt
-                            .reshape(&[-1])
-                            .map_err(EngineError::Mlx)?
-                            .as_slice::<u32>()
-                            .to_vec();
-                        draft_i32 = draft_u32.iter().map(|&x| x as i32).collect();
-                    }
                     accept_prefix(&draft_u32, &verify_flat)
                 }
                 Some((draft_arr, q_probs)) => rs_verify_accept(
                     &draft_u32,
                     &draft_arr,
                     &q_probs,
-                    &verify_logits,
+                    &masked_logits,
                     params,
                     block_size,
                 )?,
@@ -2364,6 +2444,13 @@ impl SimpleEngine {
             }
             last_token = *accepted.last().expect("accept_prefix always returns >= 1") as i32;
             start += n_accepted;
+            let mut constraint_finished_round = false;
+            if let Some(cg) = constraint.as_mut() {
+                for &tok in &accepted {
+                    cg.advance(tok);
+                }
+                constraint_finished_round = cg.is_finished();
+            }
 
             round_idx += 1;
             total_accepted += n_accepted as u64;
@@ -2408,9 +2495,9 @@ impl SimpleEngine {
 
             let is_eos = tokens.iter().any(|t| self.eos_token_ids.contains(t));
             let is_max = completion_len >= max_tokens;
-            let step_finished = is_eos || is_max || hit_stop_seq;
+            let step_finished = is_eos || is_max || hit_stop_seq || constraint_finished_round;
 
-            let finish_reason = if is_eos || hit_stop_seq {
+            let finish_reason = if is_eos || hit_stop_seq || constraint_finished_round {
                 Some("stop".to_owned())
             } else if is_max {
                 Some("length".to_owned())
@@ -2535,13 +2622,16 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
         // DFlash speculative decoding: use draft-verify streaming when available.
-        if self.dflash.is_some() && constraint.is_none() && pixel_values.is_none() {
+        // FSM-aware verify masks K+1 verify rows so structured output compounds
+        // with DFlash; see `ConstrainedGenerator::build_mask_rows`.
+        if self.dflash.is_some() && pixel_values.is_none() {
             return self.generate_dflash_streaming_inner(
                 prompt_tokens,
                 max_tokens,
                 params,
                 stop_sequences,
                 sender,
+                &mut constraint,
             );
         }
 

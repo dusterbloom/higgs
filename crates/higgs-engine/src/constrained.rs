@@ -116,6 +116,44 @@ impl ConstrainedGenerator {
         self.mask_for_state(logits, state)
     }
 
+    /// Build a multi-row FSM mask covering `num_rows` verify positions.
+    ///
+    /// Row `i` masks to the allowed set at `states[i]`; rows beyond
+    /// `states.len()` (the FSM walk halted on an illegal draft) stay
+    /// unmasked (zeros). Used by DFlash speculative decode to mask K+1
+    /// verify rows in a single on-device add.
+    ///
+    /// Returns shape `[num_rows, vocab_size]`. Caller reshapes to broadcast
+    /// against `[1, num_rows, vocab_size]` verify logits.
+    pub fn build_mask_rows(
+        &self,
+        states: &[outlines_core::primitives::StateId],
+        num_rows: usize,
+        vocab_size: usize,
+    ) -> Result<Array, Exception> {
+        let mut mask_vec = vec![0.0_f32; num_rows * vocab_size];
+        for (i, &state) in states.iter().enumerate().take(num_rows) {
+            let Some(allowed) = self.index.allowed_tokens(&state) else {
+                continue;
+            };
+            let base = i * vocab_size;
+            for slot in &mut mask_vec[base..base + vocab_size] {
+                *slot = f32::NEG_INFINITY;
+            }
+            for &tid in &allowed {
+                let offset = usize::try_from(tid).unwrap_or(usize::MAX);
+                if offset < vocab_size {
+                    mask_vec[base + offset] = 0.0;
+                }
+            }
+        }
+        let num_rows_i32 =
+            i32::try_from(num_rows).map_err(|_| Exception::custom("num_rows overflow"))?;
+        let vocab_i32 =
+            i32::try_from(vocab_size).map_err(|_| Exception::custom("vocab_size overflow"))?;
+        Ok(Array::from_slice(&mask_vec, &[num_rows_i32, vocab_i32]))
+    }
+
     fn mask_for_state(
         &self,
         logits: &Array,
@@ -488,6 +526,71 @@ mod tests {
             1,
             "illegal first draft should halt the walk at the entry state"
         );
+    }
+
+    #[test]
+    fn build_mask_rows_full_walk_matches_per_row_apply_mask_at_state() {
+        // K+1 = 3 verify rows over a full legal walk; row i must match
+        // apply_mask_at_state(row_logits, states[i]) elementwise.
+        let mut vocab = Vocabulary::new(0);
+        vocab.try_insert("a", 1).unwrap();
+        vocab.try_insert("b", 2).unwrap();
+        let cg = ConstrainedGenerator::from_regex("ab|ba", &vocab).unwrap();
+
+        let states = cg.peek_states_for_drafts(&[1]); // [entry, after-a]
+        assert_eq!(states.len(), 2);
+
+        let vocab_size = 3_usize;
+        let mask_2d = cg.build_mask_rows(&states, 2, vocab_size).unwrap();
+        mlx_rs::transforms::eval([&mask_2d]).unwrap();
+        assert_eq!(mask_2d.shape(), &[2, 3]);
+
+        let bytes = mask_2d.as_slice::<f32>();
+        // Row 0: entry state allows a,b (1,2); EOS=0 disallowed.
+        assert!(bytes[0].is_infinite() && bytes[0].is_sign_negative());
+        assert!((bytes[1] - 0.0).abs() < 1e-5);
+        assert!((bytes[2] - 0.0).abs() < 1e-5);
+        // Row 1: after 'a', only 'b' allowed (regex "ab|ba": a→b is the only legal step).
+        assert!(bytes[3].is_infinite());
+        assert!(bytes[4].is_infinite());
+        assert!((bytes[5] - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn build_mask_rows_partial_walk_leaves_trailing_rows_unmasked() {
+        // FSM walk halted at 1 state but caller asked for 3 rows; rows 1 and 2
+        // must stay zeros (unmasked) so accept_prefix can cut at the illegal draft.
+        let cg = build_ab_generator();
+        let states = cg.peek_states_for_drafts(&[3]); // illegal first → 1 state
+        assert_eq!(states.len(), 1);
+
+        let vocab_size = 4_usize;
+        let mask_2d = cg.build_mask_rows(&states, 3, vocab_size).unwrap();
+        mlx_rs::transforms::eval([&mask_2d]).unwrap();
+        assert_eq!(mask_2d.shape(), &[3, 4]);
+
+        let bytes = mask_2d.as_slice::<f32>();
+        // Row 0: masked by entry state.
+        assert!(bytes[0].is_infinite(), "EOS disallowed at entry");
+        // Rows 1 and 2: unmasked (all zero).
+        for i in 4..12 {
+            assert!(
+                (bytes[i] - 0.0).abs() < 1e-5,
+                "trailing row index {i} should be unmasked",
+            );
+        }
+    }
+
+    #[test]
+    fn build_mask_rows_with_empty_states_returns_all_unmasked() {
+        // No states (e.g., constraint inactive) → every row stays at zero.
+        let cg = build_ab_generator();
+        let mask_2d = cg.build_mask_rows(&[], 2, 3).unwrap();
+        mlx_rs::transforms::eval([&mask_2d]).unwrap();
+        assert_eq!(mask_2d.shape(), &[2, 3]);
+        for v in mask_2d.as_slice::<f32>() {
+            assert!((v - 0.0).abs() < 1e-5);
+        }
     }
 
     #[test]
