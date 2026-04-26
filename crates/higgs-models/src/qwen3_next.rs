@@ -2588,7 +2588,18 @@ impl GatedDeltaNet {
                 1,
             )?)?
         } else {
-            // S=1 decode + large S prefill: native Conv1d is a single fused dispatch
+            // S=1 decode + large S prefill: native Conv1d is a single fused dispatch.
+            // Coerce conv1d.weight to input dtype on first call — the S>1 path above
+            // does this implicitly via conv_weight_t; the native path needs it
+            // explicit or MLX panics with "operation failed but no error was set"
+            // when the model's stored dtype (e.g. bf16 distil drafter) differs from
+            // the active activation dtype (e.g. f16 from a 4-bit verifier pair).
+            let in_dt = inputs.dtype();
+            if self.conv1d.weight.dtype() != in_dt {
+                let coerced = self.conv1d.weight.as_dtype(in_dt)?;
+                coerced.eval()?;
+                self.conv1d.weight.value = coerced;
+            }
             nn::silu(&self.conv1d.forward(&conv_input)?)?
         };
 
@@ -2802,7 +2813,23 @@ impl GatedDeltaNet {
                 1,
             )?)?
         } else {
-            nn::silu(&self.conv1d.forward(&conv_input)?)?
+            // Stateless path: clone-coerce rather than mutate self.conv1d.weight,
+            // matching the qk_norm_weight_* clone pattern below.
+            let in_dt = inputs.dtype();
+            if self.conv1d.weight.dtype() != in_dt {
+                let coerced = self.conv1d.weight.as_dtype(in_dt)?;
+                let out = ops::conv1d(
+                    &conv_input,
+                    &coerced,
+                    1,
+                    0,
+                    1,
+                    self.conv_dim,
+                )?;
+                nn::silu(&out)?
+            } else {
+                nn::silu(&self.conv1d.forward(&conv_input)?)?
+            }
         };
 
         let split_indices = &[self.key_dim, self.key_dim * 2];
@@ -3057,6 +3084,14 @@ impl GatedDeltaNet {
                 1,
             )?)?
         } else {
+            // Mirror the S>1 dtype coercion for the native Conv1d path —
+            // see GatedDeltaNet::forward for the rationale.
+            let in_dt = inputs.dtype();
+            if self.conv1d.weight.dtype() != in_dt {
+                let coerced = self.conv1d.weight.as_dtype(in_dt)?;
+                coerced.eval()?;
+                self.conv1d.weight.value = coerced;
+            }
             nn::silu(&self.conv1d.forward(&conv_input)?)?
         };
 
