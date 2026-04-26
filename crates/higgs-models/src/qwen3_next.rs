@@ -8,7 +8,7 @@
 //! All layers use Sparse `MoE` for the feed-forward block.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -115,7 +115,7 @@ const fn default_norm_topk_prob() -> bool {
 }
 
 /// Quantization parameters from config.json (top-level defaults).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct QuantizationConfig {
     pub group_size: i32,
     pub bits: i32,
@@ -198,6 +198,18 @@ pub struct Qwen3NextModelArgs {
     /// When absent, uses the global quantization config.
     #[serde(default)]
     pub gate_quantization: Option<QuantizationConfig>,
+
+    /// Per-tensor quantization overrides keyed by canonical module path
+    /// (e.g. `"language_model.model.layers.3.self_attn.q_proj"`,
+    /// `"language_model.lm_head"`).
+    ///
+    /// Lifted from `quantization.<key>` entries by the loader. Consumed
+    /// by [`resolve_quant_for`] to pick `(group_size, bits)` per `QLinear`,
+    /// falling back to `quantization` when no entry matches. Empty for
+    /// uniform-bit checkpoints; non-empty for Unsloth UD mix-bit and
+    /// similar mixed-precision configs.
+    #[serde(default)]
+    pub quant_overrides: BTreeMap<String, QuantizationConfig>,
 
     /// Use separate GDN projections (qwen3.5-style) instead of combined (qwen3_next-style).
     #[serde(default)]
@@ -3512,6 +3524,20 @@ pub fn load_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextModelArg
     load_qwen3_next_args_from_value(config)
 }
 
+/// Resolve `(group_size, bits)` for a canonical tensor path.
+///
+/// Looks up `path` in [`Qwen3NextModelArgs::quant_overrides`]; falls back to
+/// `quantization` (the global default) when no override applies. Returns
+/// `(64, 4)` if neither is set, matching the historical default.
+pub(crate) fn resolve_quant_for(args: &Qwen3NextModelArgs, path: &str) -> (i32, i32) {
+    if let Some(o) = args.quant_overrides.get(path) {
+        return (o.group_size, o.bits);
+    }
+    args.quantization
+        .as_ref()
+        .map_or((64, 4), |q| (q.group_size, q.bits))
+}
+
 fn gate_quantization_override(config: &serde_json::Value) -> Option<serde_json::Value> {
     let quant = config.get("quantization")?;
     for key in [
@@ -4462,6 +4488,131 @@ mod tests {
         let gate_q = args.gate_quantization.unwrap();
         assert_eq!(gate_q.group_size, 64);
         assert_eq!(gate_q.bits, 8);
+    }
+
+    #[test]
+    fn test_load_args_lifts_mix_bit_overrides_into_quant_overrides() {
+        // Unsloth UD-style: top-level `quantization` carries default `(group_size, bits)`
+        // plus per-tensor override entries keyed by canonical module path.
+        // Loader must lift those entries into `args.quant_overrides`.
+        let config = serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 1024,
+            "max_position_embeddings": 4096,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 4,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4,
+            "quantization": {
+                "group_size": 64,
+                "bits": 2,
+                "language_model.lm_head": { "group_size": 64, "bits": 5, "mode": "affine" },
+                "language_model.model.embed_tokens": { "group_size": 64, "bits": 4, "mode": "affine" },
+                "language_model.model.layers.0.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" },
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": { "group_size": 64, "bits": 4, "mode": "affine" },
+                "language_model.model.layers.3.self_attn.q_proj": { "group_size": 64, "bits": 4, "mode": "affine" }
+            }
+        });
+
+        let args = load_qwen3_next_args_from_value(config).unwrap();
+
+        // Default still parses.
+        let q = args.quantization.as_ref().unwrap();
+        assert_eq!((q.group_size, q.bits), (64, 2));
+
+        // Every override key landed.
+        assert_eq!(
+            args.quant_overrides
+                .get("language_model.lm_head")
+                .map(|o| (o.group_size, o.bits)),
+            Some((64, 5))
+        );
+        assert_eq!(
+            args.quant_overrides
+                .get("language_model.model.embed_tokens")
+                .map(|o| (o.group_size, o.bits)),
+            Some((64, 4))
+        );
+        assert_eq!(
+            args.quant_overrides
+                .get("language_model.model.layers.0.mlp.down_proj")
+                .map(|o| (o.group_size, o.bits)),
+            Some((64, 3))
+        );
+        assert_eq!(
+            args.quant_overrides
+                .get("language_model.model.layers.0.linear_attn.in_proj_qkv")
+                .map(|o| (o.group_size, o.bits)),
+            Some((64, 4))
+        );
+        assert_eq!(
+            args.quant_overrides
+                .get("language_model.model.layers.3.self_attn.q_proj")
+                .map(|o| (o.group_size, o.bits)),
+            Some((64, 4))
+        );
+
+        // Scalar default keys (`bits`, `group_size`) must not pollute the override map.
+        assert!(!args.quant_overrides.contains_key("bits"));
+        assert!(!args.quant_overrides.contains_key("group_size"));
+    }
+
+    #[test]
+    fn test_resolve_quant_for_falls_back_to_default_when_no_override() {
+        let mut args: Qwen3NextModelArgs = serde_json::from_value(serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 1024,
+            "max_position_embeddings": 4096,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 4,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4,
+            "quantization": { "group_size": 64, "bits": 2 }
+        }))
+        .unwrap();
+
+        // Default fallback: no overrides yet.
+        assert_eq!(
+            resolve_quant_for(&args, "language_model.model.layers.0.mlp.down_proj"),
+            (64, 2)
+        );
+
+        // Insert an override; resolver picks it up over the default.
+        args.quant_overrides.insert(
+            "language_model.model.layers.0.mlp.down_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 3,
+            },
+        );
+        assert_eq!(
+            resolve_quant_for(&args, "language_model.model.layers.0.mlp.down_proj"),
+            (64, 3)
+        );
+
+        // Unrelated key still falls back to the default.
+        assert_eq!(
+            resolve_quant_for(&args, "language_model.lm_head"),
+            (64, 2)
+        );
     }
 
     #[test]
