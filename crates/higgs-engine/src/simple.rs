@@ -1067,15 +1067,16 @@ impl SimpleEngine {
     ) -> Result<GenerationOutput, EngineError> {
         // AR-speculative decoding (Qwen3.5 dense drafter on GPU): runs ahead
         // of DFlash when both are configured. Greedy-only for V1 — falls
-        // through to AR/DFlash when constraints, multimodal, stop sequences,
-        // or logprobs are requested.
+        // through to AR/DFlash when multimodal, stop sequences, or logprobs
+        // are requested. Constrained decoding compounds via the `FsmHook`
+        // path threaded into `speculative_generate_next`, mirroring the
+        // PLD/DFlash FSM-aware verify pattern.
         if self.ar_spec.is_some()
-            && constraint.is_none()
             && pixel_values.is_none()
             && stop_sequences.is_empty()
             && !logprobs
         {
-            return self.generate_ar_spec_inner(prompt_tokens, max_tokens);
+            return self.generate_ar_spec_inner(prompt_tokens, max_tokens, &mut constraint);
         }
 
         // DFlash speculative decoding: use draft-verify loop when available
@@ -1391,10 +1392,16 @@ impl SimpleEngine {
     /// early-stop is enforced inside this method by truncating the returned
     /// vector at the first EOS hit. No sampling — temperature/top_p/top_k are
     /// ignored. No logprobs. No stop sequences.
+    ///
+    /// When `constraint` is `Some`, a [`ConstrainedFsmHook`] wraps the
+    /// generator and is forwarded into `speculative_generate_next`, where it
+    /// masks K+1 verify-row logits and advances the FSM by every accepted
+    /// token — same pattern as PLD and DFlash FSM-aware verify.
     fn generate_ar_spec_inner(
         &self,
         prompt_tokens: &[u32],
         max_tokens: u32,
+        constraint: &mut Option<crate::constrained::ConstrainedGenerator>,
     ) -> Result<GenerationOutput, EngineError> {
         let ar = self
             .ar_spec
@@ -1421,15 +1428,30 @@ impl SimpleEngine {
             .map_err(|e| EngineError::Generation(format!("AR-spec drafter lock poisoned: {e}")))?;
 
         let t0 = std::time::Instant::now();
-        let raw = higgs_models::diffusion::speculative_generate_next(
-            &mut drafter,
-            &mut model,
-            prompt_tokens,
-            max_tokens as usize,
-            ar.k_low,
-            ar.k_high,
-            &self.eos_token_ids,
-        );
+        let raw = if let Some(cg) = constraint.as_mut() {
+            let mut hook = crate::constrained::ConstrainedFsmHook(cg);
+            higgs_models::diffusion::speculative_generate_next(
+                &mut drafter,
+                &mut model,
+                prompt_tokens,
+                max_tokens as usize,
+                ar.k_low,
+                ar.k_high,
+                &self.eos_token_ids,
+                Some(&mut hook),
+            )
+        } else {
+            higgs_models::diffusion::speculative_generate_next(
+                &mut drafter,
+                &mut model,
+                prompt_tokens,
+                max_tokens as usize,
+                ar.k_low,
+                ar.k_high,
+                &self.eos_token_ids,
+                None,
+            )
+        };
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         // EOS truncation: the algorithm runs to max_tokens; chop at the first

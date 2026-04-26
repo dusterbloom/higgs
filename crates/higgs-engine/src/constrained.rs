@@ -303,6 +303,41 @@ impl TokenKind {
     }
 }
 
+/// `FsmHook` wrapper for `ConstrainedGenerator`.
+///
+/// Lets `higgs_models::diffusion::speculative_generate_next` apply FSM-aware
+/// verify masking + advance without `higgs-models` taking a dependency on
+/// `higgs-engine`. Reuses the same primitives (`peek_states_for_drafts`,
+/// `build_mask_rows`, `advance`, `is_finished`) that the PLD and DFlash
+/// FSM-aware verify paths already use.
+pub struct ConstrainedFsmHook<'a>(pub &'a mut ConstrainedGenerator);
+
+impl higgs_models::diffusion::FsmHook for ConstrainedFsmHook<'_> {
+    fn mask_verify_logits(&self, logits: &Array, drafts: &[u32]) -> Result<Array, Exception> {
+        let states = self.0.peek_states_for_drafts(drafts);
+        let vocab_size = usize::try_from(*logits.shape().last().unwrap_or(&0)).unwrap_or(0);
+        // K+1 verify rows: row 0 predicts the first new token, rows 1..K
+        // predict tokens after each draft, row K predicts the bonus.
+        let num_rows = drafts.len() + 1;
+        let mask_2d = self.0.build_mask_rows(&states, num_rows, vocab_size)?;
+        // `speculative_generate_next` assembles a 2D `[K+1, V]` verify tensor
+        // (concat of saved + new) — direct add against the 2D mask. PLD/DFlash
+        // pass 3D verify logits and `expand_dims(0)` the mask to match; AR-spec
+        // doesn't need that extra batch dim.
+        logits.add(&mask_2d)
+    }
+
+    fn advance_accepted(&mut self, accepted: &[u32]) {
+        for &t in accepted {
+            self.0.advance(t);
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+}
+
 /// Maps Unicode surrogate characters used by `ByteLevel` tokenizers back to their
 /// raw byte values (the same table as outlines-core's `CHAR_MAP`).
 static BYTE_CHAR_MAP: std::sync::LazyLock<std::collections::HashMap<char, u8>> =
@@ -609,5 +644,57 @@ mod tests {
         let vals = masked.as_slice::<f32>();
         assert!((vals[1] - 1.0).abs() < 1e-5);
         assert!(vals[0].is_infinite());
+    }
+
+    #[test]
+    fn constrained_fsm_hook_wraps_generator() {
+        // Round-trip the FsmHook impl: build an FSM over "ab|ba", wrap it
+        // with ConstrainedFsmHook, mask a [K+1, V] logits tensor along
+        // drafts=[a]. K=1 → 2 verify rows; row 0 is the entry state (a or b
+        // legal), row 1 is the state after consuming 'a' (only b legal).
+        use higgs_models::diffusion::FsmHook as _;
+
+        let mut vocab = Vocabulary::new(0);
+        vocab.try_insert("a", 1).unwrap();
+        vocab.try_insert("b", 2).unwrap();
+        let mut cg = ConstrainedGenerator::from_regex("ab|ba", &vocab).unwrap();
+        let hook = super::ConstrainedFsmHook(&mut cg);
+
+        let vocab_i32 = 3_i32; // EOS=0, a=1, b=2
+        let logits = Array::zeros::<f32>(&[2, vocab_i32]).unwrap();
+        let masked = hook.mask_verify_logits(&logits, &[1]).unwrap();
+        mlx_rs::transforms::eval([&masked]).unwrap();
+        assert_eq!(masked.shape(), &[2, vocab_i32]);
+
+        let bytes = masked.as_slice::<f32>();
+        // Row 0 (entry state): EOS disallowed; a, b both legal.
+        assert!(bytes[0].is_infinite() && bytes[0].is_sign_negative());
+        assert!((bytes[1] - 0.0).abs() < 1e-5);
+        assert!((bytes[2] - 0.0).abs() < 1e-5);
+        // Row 1 (after 'a' under "ab|ba"): only b legal.
+        assert!(bytes[3].is_infinite());
+        assert!(bytes[4].is_infinite());
+        assert!((bytes[5] - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn constrained_fsm_hook_advance_walks_states() {
+        // advance_accepted ↔ is_finished must mirror direct ConstrainedGenerator
+        // calls. Walk the regex "ab|ba" with [a, b]: after both tokens the FSM
+        // is in a final accepting state.
+        use higgs_models::diffusion::FsmHook as _;
+
+        let mut vocab = Vocabulary::new(0);
+        vocab.try_insert("a", 1).unwrap();
+        vocab.try_insert("b", 2).unwrap();
+        let mut cg = ConstrainedGenerator::from_regex("ab|ba", &vocab).unwrap();
+        let mut hook = super::ConstrainedFsmHook(&mut cg);
+
+        assert!(!hook.is_finished(), "entry state is not final");
+        hook.advance_accepted(&[1, 2]);
+        assert!(
+            hook.is_finished(),
+            "after 'a','b' the FSM is in a final state"
+        );
     }
 }

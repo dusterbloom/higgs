@@ -24,6 +24,7 @@ pub mod diffusion_lora;
 pub mod diffusion_train;
 pub mod llada_moe;
 pub mod rwkv7;
+pub mod speculation_policy;
 pub mod speculative_threaded;
 
 #[cfg(feature = "ane")]

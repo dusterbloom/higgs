@@ -4296,6 +4296,31 @@ impl QwenNextCausalDrafter {
     }
 }
 
+/// FSM-aware verify hook for [`speculative_generate_next`].
+///
+/// Lets a higher-level crate (e.g. `higgs-engine`) plug constrained-decoding
+/// state into the AR-spec verify loop without `higgs-models` taking a
+/// dependency on the constraint engine. Implemented by a wrapper around
+/// `ConstrainedGenerator` in `higgs-engine`; passed as `Some(&mut hook)`
+/// when JSON-mode / regex constraints are active, else `None`.
+pub trait FsmHook {
+    /// Mask K+1 verify-row logits per-position by walking the FSM along
+    /// `drafts`. Input shape `[K+1, V]`; returns same shape with `-inf` at
+    /// FSM-illegal vocab entries. Trailing rows beyond a halted FSM walk
+    /// stay unmasked — `accept_prefix` cuts at the illegal draft anyway.
+    fn mask_verify_logits(
+        &self,
+        logits: &mlx_rs::Array,
+        drafts: &[u32],
+    ) -> Result<mlx_rs::Array, mlx_rs::error::Exception>;
+
+    /// Advance the FSM by every accepted token in order.
+    fn advance_accepted(&mut self, accepted: &[u32]);
+
+    /// True when the FSM has reached a final accepting state.
+    fn is_finished(&self) -> bool;
+}
+
 /// Qwen3Next-drafter variant of [`speculative_generate`].
 ///
 /// Same accept-longest-prefix algorithm. Both the drafter and verifier keep
@@ -4304,6 +4329,10 @@ impl QwenNextCausalDrafter {
 /// slow-path restore + re-feed accepted prefix on partial accept. Eliminates
 /// the per-round drafter prefill (≈80–180ms on a 0.8B drafter at prompt
 /// length ~200).
+///
+/// `hook` plugs in FSM-aware verify masking when a constraint is active.
+/// `None` for unconstrained AR-spec — behavior is byte-identical to the
+/// pre-hook code path.
 #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
 pub fn speculative_generate_next(
     drafter: &mut QwenNextCausalDrafter,
@@ -4313,8 +4342,12 @@ pub fn speculative_generate_next(
     k_low: usize,
     k_high: usize,
     eos_token_ids: &[u32],
+    mut hook: Option<&mut dyn FsmHook>,
 ) -> Vec<u32> {
-    if std::env::var("HIGGS_SPEC_DECODE_PIPELINE").as_deref() == Ok("1") {
+    // Threaded path doesn't yet support FSM hooks; fall through to serial
+    // when a hook is active. Threaded path is opt-in via env var, so
+    // unconstrained callers retain the threaded fast path.
+    if hook.is_none() && std::env::var("HIGGS_SPEC_DECODE_PIPELINE").as_deref() == Ok("1") {
         return crate::speculative_threaded::speculative_generate_next_threaded(
             drafter,
             verifier,
@@ -4418,20 +4451,42 @@ pub fn speculative_generate_next(
             .expect("verifier forward_all_logits");
         mlx_rs::transforms::eval([&all_logits]).expect("eval all_logits");
 
-        let new_2d = all_logits.squeeze_axes(&[0]).expect("squeeze");
-        let new_preds = ix::argmax_axis(&new_2d, -1, false).expect("argmax new");
-        mlx_rs::transforms::eval([&new_preds]).expect("eval new argmax");
-
-        let first_pred = {
-            let p = ix::argmax_axis(&saved_verify_logits, -1, false).expect("argmax saved");
-            mlx_rs::transforms::eval([&p]).expect("eval saved argmax");
-            p.index((0, 0)).item::<i32>() as u32
-        };
-
+        // Verify argmax: split-argmax for the unconstrained path (byte-identical
+        // to the pre-hook code) and a parallel `[K+1, V]` mask+argmax branch
+        // when an FSM hook is active. Splitting keeps the unconstrained lazy
+        // graph unchanged — the FSM branch only runs under JSON-mode/regex.
+        let new_2d = all_logits.squeeze_axes(&[0]).expect("squeeze new logits");
         let mut verify_argmax: Vec<u32> = Vec::with_capacity(actual_k + 1);
-        verify_argmax.push(first_pred);
-        for i in 0..actual_k {
-            verify_argmax.push(new_preds.index(i as i32).item::<i32>() as u32);
+
+        if let Some(h) = hook.as_deref() {
+            // FSM-aware: combine saved + new into [K+1, V], mask, single argmax.
+            let saved_2d = saved_verify_logits
+                .squeeze_axes(&[0])
+                .expect("squeeze saved logits");
+            let combined = mlx_rs::ops::concatenate_axis(&[&saved_2d, &new_2d], 0)
+                .expect("concatenate verify rows");
+            let masked = h
+                .mask_verify_logits(&combined, &draft_tokens)
+                .expect("FSM mask verify logits");
+            let preds = ix::argmax_axis(&masked, -1, false).expect("argmax masked verify");
+            mlx_rs::transforms::eval([&preds]).expect("eval masked verify argmax");
+            for i in 0..=actual_k {
+                verify_argmax.push(preds.index(i as i32).item::<i32>() as u32);
+            }
+        } else {
+            // Original path: argmax saved and new separately. Byte-identical
+            // graph + eval pattern as before the FSM-hook plumbing landed.
+            let new_preds = ix::argmax_axis(&new_2d, -1, false).expect("argmax new");
+            mlx_rs::transforms::eval([&new_preds]).expect("eval new argmax");
+            let first_pred = {
+                let p = ix::argmax_axis(&saved_verify_logits, -1, false).expect("argmax saved");
+                mlx_rs::transforms::eval([&p]).expect("eval saved argmax");
+                p.index((0, 0)).item::<i32>() as u32
+            };
+            verify_argmax.push(first_pred);
+            for i in 0..actual_k {
+                verify_argmax.push(new_preds.index(i as i32).item::<i32>() as u32);
+            }
         }
         verify_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
@@ -4459,6 +4514,12 @@ pub fn speculative_generate_next(
         generated.extend_from_slice(&accepted_tokens);
         context.extend_from_slice(&accepted_tokens);
 
+        // Advance the FSM by every committed token in order. Mirrors how PLD
+        // and DFlash advance `ConstrainedGenerator` after their accept step.
+        if let Some(h) = hook.as_deref_mut() {
+            h.advance_accepted(&accepted_tokens);
+        }
+
         let round = total_drafted / k.max(1);
         let round_verify_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let round_draft_ms = t0.elapsed().as_secs_f64() * 1000.0 - round_verify_ms;
@@ -4469,7 +4530,11 @@ pub fn speculative_generate_next(
         );
 
         // Skip both verify-cache advance and drafter refresh when finished.
-        if eos_hit.is_some() || generated.len() >= max_tokens {
+        // FSM `is_finished()` joins EOS / max_tokens as a clean termination —
+        // returning early skips the cache advance, but caches are dropped on
+        // function return so coherence doesn't matter past this point.
+        let constraint_finished = hook.as_deref().is_some_and(|h| h.is_finished());
+        if eos_hit.is_some() || generated.len() >= max_tokens || constraint_finished {
             break;
         }
 
@@ -8400,8 +8465,16 @@ mod tests {
 
         eprintln!("Running speculative_generate_next (max_tokens=60, k=8..16)...");
         let t2 = std::time::Instant::now();
-        let tokens =
-            super::speculative_generate_next(&mut drafter, &mut verifier, &prompt, 60, 8, 16, &[]);
+        let tokens = super::speculative_generate_next(
+            &mut drafter,
+            &mut verifier,
+            &prompt,
+            60,
+            8,
+            16,
+            &[],
+            None,
+        );
         let gen_ms = t2.elapsed().as_secs_f64() * 1000.0;
         let tps = if gen_ms > 0.0 {
             tokens.len() as f64 / gen_ms * 1000.0
@@ -8531,6 +8604,7 @@ mod tests {
                 k_low,
                 k_high,
                 &[],
+                None,
             );
             let gen_ms = t2.elapsed().as_secs_f64() * 1000.0;
             let tps = if gen_ms > 0.0 {
