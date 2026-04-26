@@ -283,6 +283,14 @@ fn load_engines(
                 model_cfg.num_draft,
                 kv_cache_config,
             )?
+        } else if model_cfg.pld {
+            Engine::load_simple_with_pld(
+                &resolved,
+                model_cfg.num_draft,
+                model_cfg.pld_max_ngram,
+                model_cfg.pld_min_ngram,
+                kv_cache_config,
+            )?
         } else {
             Engine::load_simple_with_dflash(&resolved, kv_cache_config, dflash_path.as_deref())?
         };

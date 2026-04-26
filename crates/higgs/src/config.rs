@@ -124,6 +124,18 @@ pub struct ServeArgs {
     #[arg(long, default_value = "8")]
     pub num_draft: usize,
 
+    /// Enable Prompt Lookup Decoding (no draft model required).
+    #[arg(long)]
+    pub pld: bool,
+
+    /// PLD: maximum n-gram length to search (default: 3).
+    #[arg(long, default_value = "3")]
+    pub pld_max_ngram: usize,
+
+    /// PLD: minimum n-gram length to search (default: 1).
+    #[arg(long, default_value = "1")]
+    pub pld_min_ngram: usize,
+
     /// KV cache mode for simple mode models.
     #[arg(long, value_name = "MODE", value_parser = ["off", "turboquant"])]
     pub kv_cache: Option<String>,
@@ -250,6 +262,26 @@ pub struct ModelConfig {
     /// BD3LM block-diffusion configuration (only used when model_type = "bd3lm_qwen3").
     #[serde(default)]
     pub bd3lm: Option<Bd3lmSection>,
+    /// Enable Prompt Lookup Decoding (n-gram speculative decoding, no drafter
+    /// model required). Mutually exclusive with `draft_model`, `dflash`, and
+    /// `ar_spec`. Helps most on workloads where the output overlaps the prompt
+    /// (RAG, code edit, summarization, agentic tool use).
+    #[serde(default)]
+    pub pld: bool,
+    /// PLD: maximum n-gram length to search. Defaults to 3.
+    #[serde(default = "default_pld_max_ngram")]
+    pub pld_max_ngram: usize,
+    /// PLD: minimum n-gram length to search. Defaults to 1.
+    #[serde(default = "default_pld_min_ngram")]
+    pub pld_min_ngram: usize,
+}
+
+const fn default_pld_max_ngram() -> usize {
+    3
+}
+
+const fn default_pld_min_ngram() -> usize {
+    1
 }
 
 /// BD3LM runtime configuration overrides.
@@ -477,6 +509,9 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             dflash: None,
             ar_spec: None,
             bd3lm: None,
+            pld: false,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
         })
         .collect();
 
@@ -561,6 +596,9 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     dflash: None,
                     ar_spec: None,
                     bd3lm: None,
+                    pld: false,
+                    pld_max_ngram: 3,
+                    pld_min_ngram: 1,
                 })
                 .collect();
             figment = figment.merge(Serialized::default("models", &extra));
@@ -686,6 +724,9 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         dflash: None,
         ar_spec: None,
         bd3lm: None,
+        pld: false,
+        pld_max_ngram: 3,
+        pld_min_ngram: 1,
     });
     config.auto_router.model = name;
 }
@@ -822,6 +863,9 @@ mod tests {
             batch: true,
             draft_model: None,
             num_draft: 8,
+            pld: false,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -848,6 +892,9 @@ mod tests {
             batch: false,
             draft_model: None,
             num_draft: 8,
+            pld: false,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -874,6 +921,9 @@ mod tests {
             batch: false,
             draft_model: None,
             num_draft: 8,
+            pld: false,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
             kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(4),
             kv_seed: Some(99),
@@ -898,6 +948,9 @@ mod tests {
             batch: false,
             draft_model: None,
             num_draft: 8,
+            pld: false,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -918,6 +971,9 @@ mod tests {
             batch: false,
             draft_model: None,
             num_draft: 8,
+            pld: false,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -938,6 +994,9 @@ mod tests {
             batch: false,
             draft_model: None,
             num_draft: 8,
+            pld: false,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -958,6 +1017,9 @@ mod tests {
             batch: true,
             draft_model: None,
             num_draft: 8,
+            pld: false,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
             kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(3),
             kv_seed: Some(0),
@@ -1266,6 +1328,9 @@ mod tests {
             batch: false,
             draft_model: None,
             num_draft: 8,
+            pld: false,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1301,6 +1366,9 @@ mod tests {
             batch: false,
             draft_model: None,
             num_draft: 8,
+            pld: false,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,

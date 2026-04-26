@@ -41,6 +41,7 @@ pub async fn run_doctor(config: &HiggsConfig) -> DoctorResult {
     check_config_valid(&mut result);
     check_models(config, &mut result);
     check_draft_models(config, &mut result);
+    check_pld(config, &mut result);
     check_duplicate_models(config, &mut result);
     check_providers(config, &mut result).await;
     check_route_consistency(config, &mut result);
@@ -225,10 +226,81 @@ fn check_draft_models(config: &HiggsConfig, result: &mut DoctorResult) {
         }
         if model.batch {
             warn(
-                &format!("{label} has draft_model but batch=true; speculative decoding is only supported with SimpleEngine"),
+                &format!(
+                    "{label} has draft_model but batch=true; speculative decoding is only supported with SimpleEngine"
+                ),
                 result,
             );
         }
+    }
+}
+
+fn check_pld(config: &HiggsConfig, result: &mut DoctorResult) {
+    for model in &config.models {
+        if !model.pld {
+            continue;
+        }
+        let label = model_label(model);
+        let mut conflicts = Vec::new();
+        if model.draft_model.is_some() {
+            conflicts.push("draft_model");
+        }
+        if model.dflash.is_some() {
+            conflicts.push("dflash");
+        }
+        if model.ar_spec.is_some() {
+            conflicts.push("ar_spec");
+        }
+        if !conflicts.is_empty() {
+            fail(
+                &format!(
+                    "{label}: pld=true conflicts with {} — choose one speculative path",
+                    conflicts.join(", ")
+                ),
+                result,
+            );
+            continue;
+        }
+        if model.batch {
+            warn(
+                &format!("{label}: pld=true with batch=true; PLD only runs in SimpleEngine"),
+                result,
+            );
+        }
+        if model.pld_min_ngram < 1 {
+            fail(
+                &format!(
+                    "{label}: pld_min_ngram={} must be >= 1",
+                    model.pld_min_ngram
+                ),
+                result,
+            );
+            continue;
+        }
+        if model.pld_max_ngram < model.pld_min_ngram {
+            fail(
+                &format!(
+                    "{label}: pld_max_ngram={} must be >= pld_min_ngram={}",
+                    model.pld_max_ngram, model.pld_min_ngram
+                ),
+                result,
+            );
+            continue;
+        }
+        if model.num_draft == 0 {
+            fail(
+                &format!("{label}: pld=true requires num_draft >= 1 (got 0)"),
+                result,
+            );
+            continue;
+        }
+        pass(
+            &format!(
+                "PLD enabled for {label} (n-gram {}..={}, num_draft={})",
+                model.pld_min_ngram, model.pld_max_ngram, model.num_draft
+            ),
+            result,
+        );
     }
 }
 
@@ -553,6 +625,9 @@ mod tests {
                     dflash: None,
                     ar_spec: None,
                     bd3lm: None,
+                    pld: false,
+                    pld_max_ngram: 3,
+                    pld_min_ngram: 1,
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
@@ -566,6 +641,9 @@ mod tests {
                     dflash: None,
                     ar_spec: None,
                     bd3lm: None,
+                    pld: false,
+                    pld_max_ngram: 3,
+                    pld_min_ngram: 1,
                 },
             ],
             ..HiggsConfig::default()
@@ -592,6 +670,9 @@ mod tests {
                     dflash: None,
                     ar_spec: None,
                     bd3lm: None,
+                    pld: false,
+                    pld_max_ngram: 3,
+                    pld_min_ngram: 1,
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
@@ -605,6 +686,9 @@ mod tests {
                     dflash: None,
                     ar_spec: None,
                     bd3lm: None,
+                    pld: false,
+                    pld_max_ngram: 3,
+                    pld_min_ngram: 1,
                 },
             ],
             ..HiggsConfig::default()
@@ -750,6 +834,9 @@ mod tests {
                 dflash: None,
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             ..HiggsConfig::default()
         };
@@ -773,6 +860,9 @@ mod tests {
                 dflash: None,
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             ..HiggsConfig::default()
         };
@@ -798,6 +888,9 @@ mod tests {
                 dflash: None,
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             ..HiggsConfig::default()
         };
@@ -936,6 +1029,9 @@ mod tests {
                 dflash: None,
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             ..HiggsConfig::default()
         };
@@ -966,6 +1062,9 @@ mod tests {
                 dflash: None,
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             ..HiggsConfig::default()
         };
@@ -998,6 +1097,9 @@ mod tests {
                 dflash: None,
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),
@@ -1061,6 +1163,9 @@ mod tests {
                 dflash: Some(dflash_dir.path().to_str().unwrap().to_owned()),
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             ..HiggsConfig::default()
         };
@@ -1089,6 +1194,9 @@ mod tests {
                 dflash: Some(dflash_dir.path().to_str().unwrap().to_owned()),
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             ..HiggsConfig::default()
         };
@@ -1115,6 +1223,9 @@ mod tests {
                 dflash: Some("/nonexistent/dflash/drafter".to_owned()),
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             ..HiggsConfig::default()
         };
@@ -1141,6 +1252,9 @@ mod tests {
                 dflash: None,
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             ..HiggsConfig::default()
         };
@@ -1169,6 +1283,145 @@ mod tests {
         check_bd3lm_config(dir.path(), "test-model", &mut result);
         assert_eq!(result.failures, 0);
         assert_eq!(result.passes, 3);
+    }
+
+    fn pld_model(path: &str) -> ModelConfig {
+        ModelConfig {
+            path: path.to_owned(),
+            name: None,
+            batch: false,
+            draft_model: None,
+            num_draft: 8,
+            kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+            kv_bits: 3,
+            kv_seed: 0,
+            dflash: None,
+            ar_spec: None,
+            bd3lm: None,
+            pld: true,
+            pld_max_ngram: 3,
+            pld_min_ngram: 1,
+        }
+    }
+
+    #[test]
+    fn test_pld_disabled_skips() {
+        let mut model = pld_model("org/m");
+        model.pld = false;
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_pld(&config, &mut result);
+        assert_eq!(result.passes, 0);
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.warnings, 0);
+    }
+
+    #[test]
+    fn test_pld_enabled_passes() {
+        let config = HiggsConfig {
+            models: vec![pld_model("org/m")],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_pld(&config, &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_pld_conflicts_with_draft_model() {
+        let mut model = pld_model("org/m");
+        model.draft_model = Some("org/d".to_owned());
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_pld(&config, &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_pld_conflicts_with_dflash() {
+        let mut model = pld_model("org/m");
+        model.dflash = Some("org/d".to_owned());
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_pld(&config, &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_pld_conflicts_with_ar_spec() {
+        let mut model = pld_model("org/m");
+        model.ar_spec = Some("org/a".to_owned());
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_pld(&config, &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_pld_min_ngram_zero_fails() {
+        let mut model = pld_model("org/m");
+        model.pld_min_ngram = 0;
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_pld(&config, &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_pld_max_lt_min_fails() {
+        let mut model = pld_model("org/m");
+        model.pld_min_ngram = 4;
+        model.pld_max_ngram = 2;
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_pld(&config, &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_pld_zero_num_draft_fails() {
+        let mut model = pld_model("org/m");
+        model.num_draft = 0;
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_pld(&config, &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_pld_with_batch_warns() {
+        let mut model = pld_model("org/m");
+        model.batch = true;
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_pld(&config, &mut result);
+        assert_eq!(result.warnings, 1);
+        assert_eq!(result.passes, 1);
     }
 
     #[test]

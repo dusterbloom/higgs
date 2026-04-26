@@ -114,6 +114,9 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # batch = false
 # draft_model = "mlx-community/Llama-3.2-1B-Instruct-4bit"  # speculative decoding
 # num_draft = 8      # draft tokens per speculative cycle (default: 8)
+# pld = false        # Prompt Lookup Decoding — n-gram speculative decoding, no drafter required
+# pld_max_ngram = 3  # max n-gram length to search in prompt+output (default: 3)
+# pld_min_ngram = 1  # min n-gram length to search (default: 1)
 
 # --- Remote providers ---
 [provider.anthropic]
@@ -364,6 +367,38 @@ top_p, top_k, logprobs, stop sequences).
 | `HIGGS_AR_SPEC_K_LOW` | `4` | Lower bound of the adaptive K window (draft tokens per round). |
 | `HIGGS_AR_SPEC_K_HIGH` | `8` | Upper bound of the adaptive K window. |
 | `HIGGS_AR_SPEC_MAX_SEQ` | `2048` | Maximum sequence length the drafter will hold in its KV cache within a round. |
+
+## Prompt Lookup Decoding (PLD)
+
+PLD is drafter-free speculative decoding. At each step it scans the prompt+output
+for n-gram matches of the recent suffix and proposes the continuation as draft
+tokens. It shines on workloads where the output overlaps the input — RAG, code
+edit, summarization, agentic tool use — and is a no-op on novel generation.
+Mutually exclusive with `draft_model`, `dflash`, and `ar_spec`.
+
+Enable per-model in `higgs.toml`:
+
+```toml
+[[models]]
+path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+pld = true
+pld_max_ngram = 3   # default
+pld_min_ngram = 1   # default
+num_draft = 8       # tokens proposed per cycle (default: 8)
+```
+
+Or via simple-mode flags:
+
+```bash
+higgs serve --model some/model --pld --pld-max-ngram 3 --pld-min-ngram 1
+```
+
+| Field | CLI flag | Default | Notes |
+|---|---|---|---|
+| `pld` | `--pld` | `false` | Enables Prompt Lookup Decoding. |
+| `pld_max_ngram` | `--pld-max-ngram` | `3` | Longest suffix n-gram searched. |
+| `pld_min_ngram` | `--pld-min-ngram` | `1` | Shortest suffix n-gram searched (≥ 1). |
+| `num_draft` | `--num-draft` | `8` | Continuation length when a match is found. |
 
 ## Development
 

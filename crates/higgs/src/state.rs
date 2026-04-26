@@ -51,6 +51,17 @@ impl Engine {
             .map(|e| Self::Simple(Box::new(e)))
     }
 
+    pub fn load_simple_with_pld<P: AsRef<Path>>(
+        dir: P,
+        num_draft: usize,
+        max_ngram: usize,
+        min_ngram: usize,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        SimpleEngine::load_with_pld(dir, num_draft, max_ngram, min_ngram, kv_cache_config)
+            .map(|e| Self::Simple(Box::new(e)))
+    }
+
     pub fn load_batch<P: AsRef<Path>>(
         dir: P,
         kv_cache_config: KvCacheConfig,

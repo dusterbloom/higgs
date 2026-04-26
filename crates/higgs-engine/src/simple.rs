@@ -590,6 +590,38 @@ impl SimpleEngine {
         ))
     }
 
+    /// Load a model with Prompt Lookup Decoding enabled.
+    ///
+    /// PLD requires no draft model — it proposes draft tokens by n-gram
+    /// matching the trailing suffix of the running sequence against earlier
+    /// occurrences in the same sequence. See `crate::pld` for the impl.
+    pub fn load_with_pld<P: AsRef<Path>>(
+        dir: P,
+        num_draft: usize,
+        max_ngram: usize,
+        min_ngram: usize,
+        kv_cache_config: KvCacheConfig,
+    ) -> Result<Self, EngineError> {
+        let mut engine = Self::load(&dir, kv_cache_config)?;
+        tracing::info!(
+            num_draft,
+            max_ngram,
+            min_ngram,
+            "Enabling PLD speculative decoding"
+        );
+        engine.draft = Some(Mutex::new(Box::new(crate::pld::PldDraftModel::new(
+            max_ngram, min_ngram,
+        ))));
+        engine.num_draft = num_draft;
+        tracing::info!(
+            model_name = %engine.model_name,
+            speculative = "pld",
+            num_draft,
+            "Engine ready (PLD)"
+        );
+        Ok(engine)
+    }
+
     /// Verify target and draft tokenizers match by hashing their vocab+merges.
     /// Speculative decode is unsound if the two models don't share vocabulary
     /// (a draft token ID means different text to the target). Set

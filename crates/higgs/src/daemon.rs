@@ -118,6 +118,9 @@ port = 8000
 # num_draft = 8  # draft tokens per cycle (default: 8)
 # dflash = "z-lab/Qwen3.5-27B-DFlash"  # optional DFlash drafter for spec decode
 # ar_spec = "mlx-community/Qwen3.5-0.8B-8bit"  # optional AR-spec drafter (greedy only; mutually exclusive with dflash)
+# pld = true  # Prompt Lookup Decoding — n-gram spec decode, no drafter weights (mutually exclusive with draft_model/dflash/ar_spec)
+# pld_max_ngram = 3  # PLD: max n-gram window (default 3)
+# pld_min_ngram = 1  # PLD: min n-gram window (default 1)
 
 # [[models]]
 # name = "bonsai-bd3lm"

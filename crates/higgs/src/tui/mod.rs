@@ -575,6 +575,9 @@ mod tests {
                 dflash: None,
                 ar_spec: None,
                 bd3lm: None,
+                pld: false,
+                pld_max_ngram: 3,
+                pld_min_ngram: 1,
             }],
             ..HiggsConfig::default()
         }
