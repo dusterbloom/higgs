@@ -14216,6 +14216,350 @@ mod tests {
             "compiled GDN decode state mismatch by {state_max}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Step 5 Layer 1: synthetic mix-bit safetensors fixture end-to-end test
+    // -----------------------------------------------------------------------
+
+    mod mixbit_fixture_tests {
+        use super::*;
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        fn random_f32(shape: &[i32], scale: f32) -> Array {
+            let arr = mlx_rs::random::uniform::<f32, f32>(-scale, scale, shape, None).unwrap();
+            arr.eval().unwrap();
+            arr
+        }
+
+        fn ones_f32(shape: &[i32]) -> Array {
+            let arr = Array::ones::<f32>(shape).unwrap();
+            arr.eval().unwrap();
+            arr
+        }
+
+        fn zeros_f32(shape: &[i32]) -> Array {
+            let arr = Array::zeros::<f32>(shape).unwrap();
+            arr.eval().unwrap();
+            arr
+        }
+
+        fn insert_qlinear(
+            map: &mut HashMap<String, Array>,
+            base: &str,
+            out_features: i32,
+            in_features: i32,
+            group_size: i32,
+            bits: i32,
+        ) {
+            let w = random_f32(&[out_features, in_features], 0.05);
+            let (qw, s, b) = mlx_rs::ops::quantize(&w, group_size, bits).unwrap();
+            mlx_rs::transforms::eval([&qw, &s, &b]).unwrap();
+            map.insert(format!("{base}.weight"), qw);
+            map.insert(format!("{base}.scales"), s);
+            map.insert(format!("{base}.biases"), b);
+        }
+
+        fn insert_dense(map: &mut HashMap<String, Array>, base: &str, shape: &[i32]) {
+            map.insert(format!("{base}.weight"), random_f32(shape, 0.05));
+        }
+
+        fn config_json() -> serde_json::Value {
+            serde_json::json!({
+                "tie_word_embeddings": false,
+                "text_config": {
+                    "model_type": "qwen3_5",
+                    "hidden_size": 256,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 512,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 64,
+                    "rms_norm_eps": 1e-6,
+                    "vocab_size": 1024,
+                    "max_position_embeddings": 512,
+                    "full_attention_interval": 4,
+                    "linear_num_key_heads": 2,
+                    "linear_num_value_heads": 4,
+                    "linear_key_head_dim": 32,
+                    "linear_value_head_dim": 16,
+                    "linear_conv_kernel_dim": 4,
+                    "num_experts": 0,
+                    "num_experts_per_tok": 0
+                },
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 2,
+                    "language_model.lm_head": { "group_size": 64, "bits": 5, "mode": "affine" },
+                    "language_model.model.embed_tokens": { "group_size": 64, "bits": 4, "mode": "affine" },
+                    "language_model.model.layers.0.linear_attn.in_proj_qkvz": { "group_size": 64, "bits": 4, "mode": "affine" },
+                    "language_model.model.layers.1.linear_attn.in_proj_qkvz": { "group_size": 64, "bits": 4, "mode": "affine" },
+                    "language_model.model.layers.2.linear_attn.in_proj_qkvz": { "group_size": 64, "bits": 4, "mode": "affine" },
+                    "language_model.model.layers.0.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" },
+                    "language_model.model.layers.1.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" },
+                    "language_model.model.layers.2.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" },
+                    "language_model.model.layers.3.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" }
+                }
+            })
+        }
+
+        fn write_fixture(dir: &Path) {
+            std::fs::write(
+                dir.join("config.json"),
+                serde_json::to_string_pretty(&config_json()).unwrap(),
+            )
+            .unwrap();
+
+            let hidden = 256i32;
+            let vocab = 1024i32;
+            let inter = 512i32;
+            let n_heads = 4i32;
+            let n_kv = 2i32;
+            let head_dim = 64i32;
+            let nk = 2i32;
+            let nv = 4i32;
+            let dk = 32i32;
+            let dv = 16i32;
+            let key_dim = nk * dk; // 64
+            let value_dim = nv * dv; // 64
+            let conv_dim = key_dim * 2 + value_dim; // 192
+            let kernel = 4i32;
+            let qkv_rows = key_dim * 2 + value_dim; // 192
+
+            let prefix = "language_model.";
+            let mut map: HashMap<String, Array> = HashMap::new();
+
+            // Embedding (4-bit) and lm_head (5-bit)
+            insert_qlinear(
+                &mut map,
+                &format!("{prefix}model.embed_tokens"),
+                vocab,
+                hidden,
+                64,
+                4,
+            );
+            insert_qlinear(&mut map, &format!("{prefix}lm_head"), vocab, hidden, 64, 5);
+            map.insert(format!("{prefix}model.norm.weight"), ones_f32(&[hidden]));
+
+            for i in 0..4 {
+                let layer = format!("{prefix}model.layers.{i}");
+                map.insert(
+                    format!("{layer}.input_layernorm.weight"),
+                    ones_f32(&[hidden]),
+                );
+                map.insert(
+                    format!("{layer}.post_attention_layernorm.weight"),
+                    ones_f32(&[hidden]),
+                );
+                // MLP: gate/up at default (2-bit), down at 3-bit
+                insert_qlinear(
+                    &mut map,
+                    &format!("{layer}.mlp.gate_proj"),
+                    inter,
+                    hidden,
+                    64,
+                    2,
+                );
+                insert_qlinear(
+                    &mut map,
+                    &format!("{layer}.mlp.up_proj"),
+                    inter,
+                    hidden,
+                    64,
+                    2,
+                );
+                insert_qlinear(
+                    &mut map,
+                    &format!("{layer}.mlp.down_proj"),
+                    hidden,
+                    inter,
+                    64,
+                    3,
+                );
+
+                if (i + 1) % 4 == 0 {
+                    // Layer 3: full self-attention
+                    let q_out = 2 * n_heads * head_dim; // 512 (gated)
+                    let kv_out = n_kv * head_dim; // 128
+                    insert_qlinear(
+                        &mut map,
+                        &format!("{layer}.self_attn.q_proj"),
+                        q_out,
+                        hidden,
+                        64,
+                        2,
+                    );
+                    insert_qlinear(
+                        &mut map,
+                        &format!("{layer}.self_attn.k_proj"),
+                        kv_out,
+                        hidden,
+                        64,
+                        2,
+                    );
+                    insert_qlinear(
+                        &mut map,
+                        &format!("{layer}.self_attn.v_proj"),
+                        kv_out,
+                        hidden,
+                        64,
+                        2,
+                    );
+                    insert_dense(
+                        &mut map,
+                        &format!("{layer}.self_attn.o_proj"),
+                        &[hidden, n_heads * head_dim],
+                    );
+                    map.insert(
+                        format!("{layer}.self_attn.q_norm.weight"),
+                        ones_f32(&[head_dim]),
+                    );
+                    map.insert(
+                        format!("{layer}.self_attn.k_norm.weight"),
+                        ones_f32(&[head_dim]),
+                    );
+                } else {
+                    // Layers 0/1/2: GDN linear attention. Disk has split
+                    // in_proj_qkv / in_proj_z (quantized) and BF16-dense
+                    // in_proj_b / in_proj_a / out_proj. The fused loader
+                    // concatenates qkv+z into in_proj_qkvz and b+a into
+                    // in_proj_ba on the model side.
+                    insert_qlinear(
+                        &mut map,
+                        &format!("{layer}.linear_attn.in_proj_qkv"),
+                        qkv_rows,
+                        hidden,
+                        64,
+                        4,
+                    );
+                    insert_qlinear(
+                        &mut map,
+                        &format!("{layer}.linear_attn.in_proj_z"),
+                        value_dim,
+                        hidden,
+                        64,
+                        4,
+                    );
+                    insert_dense(
+                        &mut map,
+                        &format!("{layer}.linear_attn.in_proj_b"),
+                        &[nv, hidden],
+                    );
+                    insert_dense(
+                        &mut map,
+                        &format!("{layer}.linear_attn.in_proj_a"),
+                        &[nv, hidden],
+                    );
+                    insert_dense(
+                        &mut map,
+                        &format!("{layer}.linear_attn.out_proj"),
+                        &[hidden, value_dim],
+                    );
+                    map.insert(
+                        format!("{layer}.linear_attn.conv1d.weight"),
+                        random_f32(&[conv_dim, kernel, 1], 0.1),
+                    );
+                    map.insert(format!("{layer}.linear_attn.norm.weight"), ones_f32(&[dv]));
+                    map.insert(format!("{layer}.linear_attn.A_log"), zeros_f32(&[nv]));
+                    map.insert(format!("{layer}.linear_attn.dt_bias"), zeros_f32(&[nv]));
+                }
+            }
+
+            let path = dir.join("model.safetensors");
+            Array::save_safetensors(&map, None, &path).unwrap();
+
+            let weight_map: serde_json::Map<String, serde_json::Value> = map
+                .keys()
+                .map(|k| {
+                    (
+                        k.clone(),
+                        serde_json::Value::String("model.safetensors".to_owned()),
+                    )
+                })
+                .collect();
+            let index = serde_json::json!({"metadata": {}, "weight_map": weight_map});
+            std::fs::write(
+                dir.join("model.safetensors.index.json"),
+                serde_json::to_string(&index).unwrap(),
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn test_qwen3_5_mixbit_synthetic_fixture_loads_and_runs_forward() {
+            let dir = tempfile::tempdir().unwrap();
+            write_fixture(dir.path());
+
+            let mut model = load_qwen3_5_model(dir.path()).expect("model loads");
+
+            // Bit widths land where overrides + dense_attention_outputs say
+            assert_eq!(
+                model.lm_head.as_ref().expect("lm_head not tied").bits,
+                5,
+                "lm_head override (5-bit) applied"
+            );
+            assert_eq!(
+                model.model.embed_tokens.bits, 4,
+                "embed override (4-bit) applied"
+            );
+
+            let layer0 = &model.model.layers[0];
+            let gdn = layer0.linear_attn.as_ref().expect("layer 0 is GDN");
+            assert_eq!(
+                gdn.in_proj_qkvz.bits, 4,
+                "layer 0 in_proj_qkvz override (4-bit) applied"
+            );
+            assert_eq!(gdn.in_proj_ba.bits, 0, "layer 0 in_proj_ba is BF16-dense");
+            assert_eq!(gdn.out_proj.bits, 0, "layer 0 out_proj is BF16-dense");
+            let l0_down = layer0.mlp.down_proj.as_ref().expect("dense mlp.down_proj");
+            assert_eq!(
+                l0_down.bits, 3,
+                "layer 0 mlp.down_proj override (3-bit) applied"
+            );
+
+            let layer3 = &model.model.layers[3];
+            let attn = layer3
+                .self_attn
+                .as_ref()
+                .expect("layer 3 is full attention");
+            assert_eq!(attn.o_proj.bits, 0, "layer 3 o_proj is BF16-dense");
+            assert_eq!(attn.q_proj.bits, 2, "layer 3 q_proj at default 2-bit");
+
+            // No shape-[1] placeholders survive after loading
+            use mlx_rs::module::ModuleParameters;
+            let params = model.parameters().flatten();
+            let placeholders: Vec<String> = params
+                .iter()
+                .filter_map(|(k, v): (&std::rc::Rc<str>, &&Array)| {
+                    if v.shape() == [1] {
+                        Some((**k).to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(
+                placeholders.is_empty(),
+                "expected no [1] placeholders, got: {placeholders:?}"
+            );
+
+            // Forward pass produces finite logits of expected shape
+            let tokens = Array::from_slice(&[1u32, 2, 3, 4], &[1, 4]);
+            let mut cache: Vec<Option<LayerCache>> = Vec::new();
+            let logits = model
+                .forward(&tokens, None, &mut cache)
+                .expect("forward succeeds");
+            mlx_rs::transforms::eval([&logits]).unwrap();
+            // Qwen3NextCausalLM::forward returns the last-position logits only
+            assert_eq!(logits.shape(), [1, 1, 1024], "logits shape [B, 1, vocab]");
+
+            let finite = logits.is_finite().unwrap();
+            let all_finite = finite.all(None).unwrap();
+            mlx_rs::transforms::eval([&all_finite]).unwrap();
+            let ok: bool = all_finite.item();
+            assert!(ok, "logits should be finite");
+        }
+    }
 }
 
 // ===========================================================================
