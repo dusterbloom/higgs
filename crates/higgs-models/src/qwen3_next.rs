@@ -3551,10 +3551,48 @@ fn gate_quantization_override(config: &serde_json::Value) -> Option<serde_json::
     None
 }
 
+/// Collect per-tensor mix-bit overrides from a config.json blob.
+///
+/// Reads `config["quantization"]` (preferred) or `config["quantization_config"]`
+/// (sibling fallback used by some Unsloth UD checkpoints). Every nested entry
+/// that is a JSON object carrying both `group_size` and `bits` is treated as
+/// an override and copied — keyed by the canonical tensor path that holds it.
+/// Scalar siblings (`bits`, `group_size`, `mode`) are skipped, and `mode` is
+/// dropped from override entries since [`QuantizationConfig`] only carries
+/// `(group_size, bits)`.
+fn collect_quant_overrides(
+    config: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut overrides = serde_json::Map::new();
+    let Some(quant) = config
+        .get("quantization")
+        .or_else(|| config.get("quantization_config"))
+    else {
+        return overrides;
+    };
+    let Some(obj) = quant.as_object() else {
+        return overrides;
+    };
+    for (key, value) in obj {
+        let Some(entry) = value.as_object() else {
+            continue; // scalar default (`bits`, `group_size`, `mode`).
+        };
+        let (Some(group_size), Some(bits)) = (entry.get("group_size"), entry.get("bits")) else {
+            continue;
+        };
+        let mut clean = serde_json::Map::with_capacity(2);
+        clean.insert("group_size".to_owned(), group_size.clone());
+        clean.insert("bits".to_owned(), bits.clone());
+        overrides.insert(key.clone(), serde_json::Value::Object(clean));
+    }
+    overrides
+}
+
 fn load_qwen3_next_args_from_value(
     mut config: serde_json::Value,
 ) -> Result<Qwen3NextModelArgs, ModelError> {
     let gate_override = gate_quantization_override(&config);
+    let quant_overrides = collect_quant_overrides(&config);
     let map = config
         .as_object_mut()
         .ok_or_else(|| ModelError::UnsupportedModel("config.json root is not an object".into()))?;
@@ -3562,6 +3600,12 @@ fn load_qwen3_next_args_from_value(
         if let Some(gate_q) = gate_override {
             map.insert("gate_quantization".to_owned(), gate_q);
         }
+    }
+    if !quant_overrides.is_empty() && !map.contains_key("quant_overrides") {
+        map.insert(
+            "quant_overrides".to_owned(),
+            serde_json::Value::Object(quant_overrides),
+        );
     }
     Ok(serde_json::from_value(config)?)
 }
@@ -3760,6 +3804,17 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     // Detect per-layer gate quantization override from top-level quantization config
     if let Some(gate_q) = gate_quantization_override(&config) {
         map.insert("gate_quantization".to_owned(), gate_q);
+    }
+
+    // Mix-bit per-tensor overrides live on the OUTER `config["quantization"]`
+    // (not under `text_config`) for Qwen3.5 VLM-wrapped checkpoints such as
+    // Unsloth's UD-Q2_K_XL builds. Lift them so the inner args carry them.
+    let quant_overrides = collect_quant_overrides(&config);
+    if !quant_overrides.is_empty() {
+        map.insert(
+            "quant_overrides".to_owned(),
+            serde_json::Value::Object(quant_overrides),
+        );
     }
 
     Ok(serde_json::from_value(obj)?)
@@ -4609,10 +4664,7 @@ mod tests {
         );
 
         // Unrelated key still falls back to the default.
-        assert_eq!(
-            resolve_quant_for(&args, "language_model.lm_head"),
-            (64, 2)
-        );
+        assert_eq!(resolve_quant_for(&args, "language_model.lm_head"), (64, 2));
     }
 
     #[test]
