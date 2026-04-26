@@ -494,19 +494,27 @@ impl SimpleEngine {
             );
         }
 
-        // Cap MLX memory for large-dense + DFlash/AR-spec to prevent Metal
-        // silent SIGKILL on verify-tape allocations at long contexts (crash
-        // fix per .planning/next-session-27b-dflash-crash.md). Override with
-        // HIGGS_MLX_CAP_FRACTION=0 (disable) or e.g. 0.80 (tighter).
-        if (dflash.is_some() || ar_spec.is_some()) && model.num_layers() > 32 {
-            let cap_frac = std::env::var("HIGGS_MLX_CAP_FRACTION")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .filter(|f| (0.0..=1.0).contains(f))
-                .unwrap_or(0.88);
-            if cap_frac > 0.0 {
-                set_mlx_memory_cap(cap_frac);
-            }
+        // MLX memory cap. Two activation paths:
+        //   (a) env opt-in: HIGGS_MLX_CAP_FRACTION=<0..1> applies to any model
+        //       (use to survive first-fire MoE expert-preload jetsam on 35B-A3B
+        //       baseline; the env var was previously gated to DFlash/AR-spec
+        //       paths and silently inert on baseline AR — this lifts the gate).
+        //   (b) auto-default 0.88 on DFlash/AR-spec + large-dense, prevents
+        //       Metal silent SIGKILL on verify-tape allocations at long contexts
+        //       (.planning/next-session-27b-dflash-crash.md).
+        // Default off because an unconditional cap regressed 35B MoE decode 5×
+        // (commit e5c47264).
+        let env_cap = std::env::var("HIGGS_MLX_CAP_FRACTION")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|f| (0.0..=1.0).contains(f));
+        let auto_default =
+            (dflash.is_some() || ar_spec.is_some()) && model.num_layers() > 32;
+        let cap_frac = env_cap.or(if auto_default { Some(0.88) } else { None });
+        if let Some(c) = cap_frac
+            && c > 0.0
+        {
+            set_mlx_memory_cap(c);
         }
 
         Ok(Self {
