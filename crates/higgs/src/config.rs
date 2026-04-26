@@ -255,7 +255,7 @@ pub struct ModelConfig {
     /// Path to an AR-speculative drafter model (a small dense Qwen3.5 variant).
     /// Routes greedy completions through `speculative_generate_next`. Mutually
     /// exclusive with DFlash — if both are set, AR-spec wins. Tune the K window
-    /// with `HIGGS_AR_SPEC_K_LOW` / `HIGGS_AR_SPEC_K_HIGH` (defaults 4 / 8).
+    /// with `HIGGS_AR_SPEC_K_LOW` / `HIGGS_AR_SPEC_K_HIGH` (defaults 2 / 3).
     /// Override per-request with `HIGGS_AR_SPEC_DRAFT_PATH` env var.
     #[serde(default)]
     pub ar_spec: Option<String>,

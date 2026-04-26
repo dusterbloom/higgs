@@ -364,8 +364,8 @@ top_p, top_k, logprobs, stop sequences).
 | Env var | Default | Effect |
 |---|---|---|
 | `HIGGS_AR_SPEC_DRAFT_PATH` | unset | Path/HF id of the dense Qwen3.5 drafter (e.g. `mlx-community/Qwen3.5-0.8B-8bit`). Set by `higgs.toml`'s `ar_spec` field at startup. |
-| `HIGGS_AR_SPEC_K_LOW` | `4` | Lower bound of the adaptive K window (draft tokens per round). |
-| `HIGGS_AR_SPEC_K_HIGH` | `8` | Upper bound of the adaptive K window. |
+| `HIGGS_AR_SPEC_K_LOW` | `2` | Lower bound of the adaptive K window (draft tokens per round). |
+| `HIGGS_AR_SPEC_K_HIGH` | `3` | Upper bound of the adaptive K window. |
 | `HIGGS_AR_SPEC_MAX_SEQ` | `2048` | Maximum sequence length the drafter will hold in its KV cache within a round. |
 
 ## Prompt Lookup Decoding (PLD)

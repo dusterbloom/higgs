@@ -462,14 +462,18 @@ impl SimpleEngine {
             let drafter =
                 higgs_models::diffusion::QwenNextCausalDrafter::from_dir(Path::new(&p), max_seq)
                     .map_err(EngineError::Model)?;
+            // Default K=2..3: K=4..8 is over-eager for typical 0.8B→9B/4B
+            // drafter+verifier pairs (.planning/RECAP-2026-04-26-session7
+            // -arspec-validated-k23-win.md). On Carnice-9b+0.8B, K=2..3
+            // lifted acceptance 47% → 73% and tps 14.7 → 19.1 (+30%).
             let k_low = std::env::var("HIGGS_AR_SPEC_K_LOW")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(4);
+                .unwrap_or(2);
             let k_high = std::env::var("HIGGS_AR_SPEC_K_HIGH")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(8);
+                .unwrap_or(3);
             tracing::info!(
                 elapsed_ms = t0.elapsed().as_millis(),
                 vocab = drafter.vocab,
