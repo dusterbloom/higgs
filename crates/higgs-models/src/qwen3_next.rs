@@ -1696,7 +1696,7 @@ pub(crate) struct SwitchMlpWeights {
     up_proj: QLinear,
     #[param]
     down_proj: QLinear,
-    /// Lazily fused gate+up weights for MoE gather_qmm (3→2 calls per layer).
+    /// Lazily fused gate+up weights for `MoE` `gather_qmm` (3→2 calls per layer).
     fused_gate_up: Option<(Array, Array, Array, i32)>,
 }
 
@@ -1915,7 +1915,9 @@ impl SwitchMlpWeights {
         let order = ops::argsort_axis(&idx_flat, 0)?;
         let inv_order = ops::argsort_axis(&order, 0)?;
 
-        let top_k_arr = Array::from_slice(&[top_k as u32], &[1]);
+        let top_k_u32 =
+            u32::try_from(top_k).map_err(|_| Exception::custom("top_k must fit in u32"))?;
+        let top_k_arr = Array::from_slice(&[top_k_u32], &[1]);
         let token_idx = order.floor_divide(&top_k_arr)?;
 
         let x_flat = x.reshape(&[b * l, 1, d])?;
