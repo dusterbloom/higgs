@@ -1887,12 +1887,9 @@ impl SwitchMlpWeights {
                 .shape()
                 .get(1)
                 .ok_or_else(|| Exception::custom("gate_proj weight missing dim 1"))?;
-            let fw =
-                ops::concatenate_axis(&[&*self.gate_proj.weight, &*self.up_proj.weight], 1)?;
-            let fs =
-                ops::concatenate_axis(&[&*self.gate_proj.scales, &*self.up_proj.scales], 1)?;
-            let fb =
-                ops::concatenate_axis(&[&*self.gate_proj.biases, &*self.up_proj.biases], 1)?;
+            let fw = ops::concatenate_axis(&[&*self.gate_proj.weight, &*self.up_proj.weight], 1)?;
+            let fs = ops::concatenate_axis(&[&*self.gate_proj.scales, &*self.up_proj.scales], 1)?;
+            let fb = ops::concatenate_axis(&[&*self.gate_proj.biases, &*self.up_proj.biases], 1)?;
             fw.eval()?;
             fs.eval()?;
             fb.eval()?;
