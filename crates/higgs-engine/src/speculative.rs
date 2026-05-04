@@ -111,14 +111,22 @@ pub fn accept_prefix(draft_ids: &[u32], target_ids: &[u32]) -> Result<Vec<u32>, 
         )));
     }
 
+    // Walk both slices in lock-step: types enforce bounds, no indexing needed.
+    // The k+1th target token (the bonus when every draft matched) is appended
+    // after the loop using `.last()` on target_ids.
     let mut accepted = Vec::with_capacity(k + 1);
-    for i in 0..k {
-        accepted.push(target_ids[i]);
-        if target_ids[i] != draft_ids[i] {
+    for (&target_token, &draft_token) in target_ids.iter().zip(draft_ids.iter()) {
+        accepted.push(target_token);
+        if target_token != draft_token {
             return Ok(accepted);
         }
     }
-    accepted.push(target_ids[k]);
+    // All k draft tokens matched — append the verify model's k+1th sample.
+    // Safe because we validated `target_ids.len() == k + 1` above; the
+    // .last() returns Some unless the slice is empty (impossible for k+1≥1).
+    if let Some(&bonus_token) = target_ids.last() {
+        accepted.push(bonus_token);
+    }
     Ok(accepted)
 }
 
@@ -143,7 +151,12 @@ pub trait DraftModel: Send {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::unreachable
+)]
 mod tests {
     use super::*;
 
@@ -210,7 +223,11 @@ mod tests {
             Ok(())
         }
 
-        fn draft(&mut self, _last_token_id: u32, num_draft: usize) -> Result<Vec<u32>, EngineError> {
+        fn draft(
+            &mut self,
+            _last_token_id: u32,
+            num_draft: usize,
+        ) -> Result<Vec<u32>, EngineError> {
             let mut tokens = Vec::with_capacity(num_draft);
             for i in 0..num_draft {
                 let idx = (self.cursor + i) % self.sequence.len();
