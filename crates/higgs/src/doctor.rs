@@ -235,7 +235,9 @@ fn check_draft_models(config: &HiggsConfig, result: &mut DoctorResult) {
         }
         if model.batch {
             warn(
-                &format!("{label} has draft_model but batch=true; speculative decoding is only supported with SimpleEngine"),
+                &format!(
+                    "{label} has draft_model but batch=true; speculative decoding is only supported with SimpleEngine"
+                ),
                 result,
             );
         }
@@ -464,6 +466,26 @@ mod tests {
             passes: 0,
             warnings: 0,
             failures: 0,
+        }
+    }
+
+    /// Build a `ModelConfig` with sensible test defaults. Tests override only
+    /// the fields they care about via struct-update syntax.
+    fn test_model_config(path: &str) -> ModelConfig {
+        ModelConfig {
+            path: path.to_owned(),
+            name: None,
+            mlx_profile: None,
+            batch: false,
+            draft_model: None,
+            num_draft: 8,
+            kv_cache: higgs_models::turboquant::KvCacheMode::Off,
+            kv_bits: 3,
+            kv_seed: 0,
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_norm_correction: true,
+            kv_adaptive_dense_layers: 0,
         }
     }
 
@@ -708,17 +730,8 @@ mod tests {
     fn test_draft_model_not_found_fails() {
         let config = HiggsConfig {
             models: vec![ModelConfig {
-                path: "org/target-model".to_owned(),
-                name: None,
-                batch: false,
                 draft_model: Some("org/nonexistent-draft".to_owned()),
-                num_draft: 8,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                dflash: None,
-                ar_spec: None,
-                bd3lm: None,
+                ..test_model_config("org/target-model")
             }],
             ..HiggsConfig::default()
         };
@@ -731,17 +744,9 @@ mod tests {
     fn test_draft_model_with_batch_warns() {
         let config = HiggsConfig {
             models: vec![ModelConfig {
-                path: "org/target-model".to_owned(),
-                name: None,
                 batch: true,
                 draft_model: Some("org/some-draft".to_owned()),
-                num_draft: 8,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                dflash: None,
-                ar_spec: None,
-                bd3lm: None,
+                ..test_model_config("org/target-model")
             }],
             ..HiggsConfig::default()
         };
@@ -755,19 +760,7 @@ mod tests {
     #[test]
     fn test_no_draft_model_skips() {
         let config = HiggsConfig {
-            models: vec![ModelConfig {
-                path: "org/model".to_owned(),
-                name: None,
-                batch: false,
-                draft_model: None,
-                num_draft: 8,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                dflash: None,
-                ar_spec: None,
-                bd3lm: None,
-            }],
+            models: vec![test_model_config("org/model")],
             ..HiggsConfig::default()
         };
         let mut result = empty_result();
