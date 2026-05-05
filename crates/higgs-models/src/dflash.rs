@@ -473,12 +473,10 @@ impl GdnStateBackup {
                     ac.ssm_state.clone_from(ssm);
                     ac.offset = *offset;
                 }
-                Some(crate::qwen3_next::LayerCache::KV(kv)) => {
-                    if rollback > 0 {
-                        kv.trim_by(rollback.unsigned_abs().try_into().unwrap_or(usize::MAX));
-                    }
+                Some(crate::qwen3_next::LayerCache::KV(kv)) if rollback > 0 => {
+                    kv.trim_by(rollback.unsigned_abs().try_into().unwrap_or(usize::MAX));
                 }
-                _ => {}
+                Some(crate::qwen3_next::LayerCache::KV(_)) | None => {}
             }
         }
     }

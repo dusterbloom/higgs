@@ -5142,12 +5142,10 @@ impl Qwen3NextCausalLM {
                         });
                     }
                 }
-                Some(LayerCache::KV(kv)) => {
-                    if kv_rollback > 0 {
-                        kv.trim_by(kv_rollback.unsigned_abs().try_into().unwrap_or(usize::MAX));
-                    }
+                Some(LayerCache::KV(kv)) if kv_rollback > 0 => {
+                    kv.trim_by(kv_rollback.unsigned_abs().try_into().unwrap_or(usize::MAX));
                 }
-                None => {}
+                Some(LayerCache::KV(_)) | None => {}
             }
         }
 
