@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use higgs_models::{AnyModel, load_tokenizer as shared_load_tokenizer, registry, transformer};
+use higgs_models::{
+    AnyModel, dflash, load_tokenizer as shared_load_tokenizer, registry, transformer,
+};
 
 use crate::error::EngineError;
 
@@ -93,6 +95,17 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokenizer, EngineError> {
     shared_load_tokenizer(model_dir).map_err(|e| EngineError::Tokenization(e.to_string()))
+}
+
+/// Load a `DFlash` drafter from a model directory.
+///
+/// The drafter is a small (typically 0.5B) block-diffusion model that the
+/// `SimpleEngine` uses to propose draft tokens which the target verifies in a
+/// single forward.
+pub fn load_dflash_drafter<P: AsRef<Path>>(
+    model_dir: P,
+) -> Result<dflash::DFlashDrafter, EngineError> {
+    dflash::load_dflash_drafter(model_dir.as_ref()).map_err(EngineError::Model)
 }
 
 #[cfg(test)]
