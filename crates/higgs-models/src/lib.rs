@@ -88,6 +88,9 @@ pub type MtpCache = Vec<cache::SteppingKeyValueCache>;
 // AnyModel / AnyCache -- unified dispatch across model architectures
 // ---------------------------------------------------------------------------
 
+/// Output of [`AnyModel::forward_with_taps_tape`]: logits, tap hiddens, per-layer GDN tape.
+pub type TapsTapeOutput = (Array, Vec<Array>, Vec<Option<qwen3_next::GdnLayerTape>>);
+
 /// Cache type that works for all supported model architectures.
 #[derive(Debug, Clone)]
 pub enum AnyCache {
@@ -662,6 +665,102 @@ impl AnyModel {
             _ => Err(Exception::custom(
                 "Model does not support multimodal forward",
             )),
+        }
+    }
+
+    /// Forward pass returning logits + hidden states at specified tap layers.
+    ///
+    /// `DFlash` speculative decoding entry point. Currently only supported on
+    /// `Qwen3Next` + `Hybrid` cache.
+    pub fn forward_with_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Forward pass returning logits + tap hiddens + GDN innovation tape.
+    ///
+    /// Used by `DFlash` verify path to enable cheap rollback via tape replay
+    /// instead of full model rerun on partial accept.
+    pub fn forward_with_taps_tape(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<TapsTapeOutput, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps_tape(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps_tape requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Embed raw token IDs through the target model's embedding layer.
+    pub fn embed_token_ids(&self, token_ids: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.embed_token_ids(token_ids),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_) => Err(Exception::custom(
+                "embed_token_ids only implemented for Qwen3Next",
+            )),
+        }
+    }
+
+    /// Apply only the `lm_head` to pre-computed hidden states.
+    pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.forward_all_logits_from_hidden(hidden),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_) => Err(Exception::custom(
+                "forward_all_logits_from_hidden only implemented for Qwen3Next",
+            )),
+        }
+    }
+}
+
+impl AnyCache {
+    /// Borrow the inner hybrid cache slice (`Qwen3Next`'s mixed KV+SSM cache).
+    ///
+    /// Returns an error if this is a `KV`-only cache.
+    pub fn as_hybrid(&self) -> Result<&[Option<LayerCache>], Exception> {
+        match self {
+            Self::Hybrid(c) => Ok(c),
+            Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
+        }
+    }
+
+    /// Mutably borrow the inner hybrid cache vec.
+    ///
+    /// Returns an error if this is a `KV`-only cache.
+    pub fn as_hybrid_mut(&mut self) -> Result<&mut Vec<Option<LayerCache>>, Exception> {
+        match self {
+            Self::Hybrid(c) => Ok(c),
+            Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
         }
     }
 }

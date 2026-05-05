@@ -548,13 +548,86 @@ pub fn load_dflash_drafter(model_path: &Path) -> Result<DFlashDrafter, ModelErro
 }
 
 // ---------------------------------------------------------------------------
+// Speculative-decode acceptance helper
+// ---------------------------------------------------------------------------
+
+/// Greedy speculative-decode acceptance.
+///
+/// Compares each drafted token to the target's verified argmax. Accepts the
+/// longest matching prefix and appends one bonus token (the target's argmax at
+/// the position immediately after the rejected draft, or after the last accept
+/// if all tokens accepted).
+///
+/// Returns at least 1 token, at most `draft.len() + 1`.
+///
+/// # Panics in debug
+/// Panics if `verify_argmax.len() != draft.len() + 1`.
+pub fn accept_prefix(draft: &[u32], verify_argmax: &[u32]) -> Vec<u32> {
+    debug_assert_eq!(verify_argmax.len(), draft.len() + 1);
+
+    let accepted = draft
+        .iter()
+        .zip(verify_argmax.iter())
+        .take_while(|(d, v)| **d == **v)
+        .count();
+    let mut out: Vec<u32> = draft.get(..accepted).unwrap_or_default().to_vec();
+    if let Some(&bonus) = verify_argmax.get(accepted) {
+        out.push(bonus);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 //
-// The original DFlash test suite (~3.8K lines, 30+ end-to-end tests) lives on
-// `feat/magic-canvas` and exercises the full draft-verify loop through the
-// target model. It depends on tap APIs (`forward_with_taps`,
-// `forward_with_taps_tape`, `replay_tape_rollback`,
-// `forward_all_logits_from_hidden`) and `crate::diffusion::accept_prefix`,
-// none of which are on `origin/main` yet. Tests will be ported in a follow-up
-// PR alongside the qwen3_next tap-API surface.
+// The full DFlash test suite (~3.8K lines, 30+ end-to-end tests covering the
+// draft-verify loop against a real target model) lives on `feat/magic-canvas`
+// and will be ported in a follow-up PR alongside the engine glue
+// (`SimpleEngine::generate_dflash_inner`).
+//
+// What's tested here: only the pure helpers (`accept_prefix`) — the
+// rest depends on MLX-loaded model weights which aren't part of unit-test
+// surface.
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::accept_prefix;
+
+    #[test]
+    fn accept_prefix_full_match_returns_draft_plus_bonus() {
+        let draft = vec![1, 2, 3];
+        let verify = vec![1, 2, 3, 4];
+        assert_eq!(accept_prefix(&draft, &verify), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn accept_prefix_first_token_rejects_returns_correction() {
+        let draft = vec![1, 2, 3];
+        let verify = vec![9, 5, 5, 5];
+        assert_eq!(accept_prefix(&draft, &verify), vec![9]);
+    }
+
+    #[test]
+    fn accept_prefix_partial_match_returns_prefix_plus_correction() {
+        let draft = vec![1, 2, 3];
+        let verify = vec![1, 2, 9, 0];
+        assert_eq!(accept_prefix(&draft, &verify), vec![1, 2, 9]);
+    }
+
+    #[test]
+    fn accept_prefix_empty_draft_returns_single_verify_token() {
+        let draft: Vec<u32> = vec![];
+        let verify = vec![42];
+        assert_eq!(accept_prefix(&draft, &verify), vec![42]);
+    }
+
+    #[test]
+    #[should_panic(expected = "left == right")]
+    fn accept_prefix_mismatched_lengths_panic_in_debug() {
+        let draft = vec![1, 2, 3];
+        let verify = vec![1, 2]; // wrong length
+        let _ = accept_prefix(&draft, &verify);
+    }
+}
