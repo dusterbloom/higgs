@@ -1,6 +1,7 @@
 pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
+pub mod dflash;
 pub mod error;
 pub mod gemma2;
 pub mod llava_qwen2;
