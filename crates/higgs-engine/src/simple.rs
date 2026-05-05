@@ -10,7 +10,9 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use higgs_models::{
-    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
+    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties,
+    dflash::{DFlashDrafter, accept_prefix, crop_drafter_cache},
+    sample,
     turboquant::KvCacheConfig,
 };
 use mlx_rs::{
@@ -182,6 +184,22 @@ pub struct Session {
     pub max_tokens: usize,
 }
 
+/// `DFlash` block-diffusion speculative decoding state.
+///
+/// When present, `generate_inner` uses the `DFlash` draft-verify loop
+/// instead of autoregressive decode: draft `block_size` tokens per round
+/// via the small drafter, verify with the target model, accept prefix +
+/// correction.
+///
+/// CPU/ANE execution branches are deferred to PR-6c — only the MLX
+/// fallback drafter forward path is wired here.
+struct DFlashState {
+    drafter: Mutex<DFlashDrafter>,
+    tap_layers: Vec<usize>,
+    block_size: i32,
+    mask_token_id: i32,
+}
+
 /// Simple single-request inference engine with paged KV caching.
 ///
 /// Uses paged KV cache for efficient memory management during single-request
@@ -211,6 +229,8 @@ pub struct SimpleEngine {
     gen_prompt_suffix_len: usize,
     kv_cache_config: KvCacheConfig,
     tuning: MlxRuntimeTuning,
+    /// Optional `DFlash` block-diffusion speculative decoding state.
+    dflash: Option<DFlashState>,
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
@@ -229,6 +249,22 @@ impl SimpleEngine {
         kv_cache_config: KvCacheConfig,
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
+    ) -> Result<Self, EngineError> {
+        Self::load_with_dflash(dir, kv_cache_config, tuning, raise_wired_limit, None)
+    }
+
+    /// Load a model with an optional `DFlash` speculative decoding drafter.
+    ///
+    /// When `dflash_path` is `Some`, or when the `HIGGS_DFLASH_PATH` env var is
+    /// set, the drafter is loaded and `generate_inner` will dispatch to the
+    /// `DFlash` draft-verify loop for unconstrained text generation.
+    #[allow(clippy::too_many_lines)]
+    pub fn load_with_dflash<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+        tuning: MlxRuntimeTuning,
+        raise_wired_limit: bool,
+        dflash_path: Option<&Path>,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
@@ -373,6 +409,35 @@ impl SimpleEngine {
             None
         };
 
+        // Resolve DFlash drafter path: explicit arg wins over env var.
+        let dflash_resolved = dflash_path.map(Path::to_path_buf).or_else(|| {
+            std::env::var("HIGGS_DFLASH_PATH")
+                .ok()
+                .map(std::path::PathBuf::from)
+        });
+        let dflash = if let Some(ref dp) = dflash_resolved {
+            tracing::info!(drafter = %dp.display(), "Loading DFlash drafter");
+            let drafter = model_loader::load_dflash_drafter(dp)?;
+            let tap_layers = drafter.config.target_layer_ids().to_vec();
+            let block_size = drafter.config.block_size;
+            let mask_token_id = drafter.config.mask_token_id();
+            tracing::info!(
+                tap_layers = ?tap_layers,
+                block_size,
+                mask_token_id,
+                backend = "MLX",
+                "DFlash drafter loaded — speculative decoding enabled"
+            );
+            Some(DFlashState {
+                drafter: Mutex::new(drafter),
+                tap_layers,
+                block_size,
+                mask_token_id,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             model: Mutex::new(model),
             prefix_cache: Mutex::new(PagedPrefixCache::new(
@@ -391,6 +456,7 @@ impl SimpleEngine {
             gen_prompt_suffix_len,
             kv_cache_config,
             tuning,
+            dflash,
         })
     }
 
@@ -933,6 +999,12 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
+        // DFlash speculative decoding: use draft-verify loop when available,
+        // no constraints active, and no multimodal input.
+        if self.dflash.is_some() && constraint.is_none() && pixel_values.is_none() {
+            return self.generate_dflash_inner(prompt_tokens, max_tokens, params, stop_sequences);
+        }
+
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
@@ -1221,6 +1293,252 @@ impl SimpleEngine {
                 next_token = following;
             }
             next_logprob_data = following_logprob_data;
+        }
+    }
+
+    /// `DFlash` speculative decode: draft `block_size` tokens per round,
+    /// verify, accept prefix.
+    ///
+    /// Mirrors the proven Python `DFlash` reference loop adapted for the
+    /// engine's sampling, stop-sequence, and EOS handling. CPU/ANE drafter
+    /// branches are deferred to PR-6c — this is the MLX-only fallback path.
+    // Long verify loop with numerical casts; deeper drop tightening for the
+    // model+drafter mutex guards is intentional (held for the full loop).
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::significant_drop_tightening
+    )]
+    fn generate_dflash_inner(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+    ) -> Result<GenerationOutput, EngineError> {
+        let dflash = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| EngineError::Generation("DFlash state missing".to_owned()))?;
+        let prompt_len = Self::prompt_len(prompt_tokens)?;
+        let has_stop_sequences = !stop_sequences.is_empty();
+
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+        let mut drafter = dflash
+            .drafter
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Drafter lock poisoned: {e}")))?;
+
+        let mut cache = model
+            .make_cache_with_config(self.kv_cache_config)
+            .map_err(EngineError::Mlx)?;
+
+        // Prefill with taps.
+        let prompt_array = Array::from(prompt_tokens).index(NewAxis);
+        let (prefill_logits, taps) = model
+            .forward_with_taps(&prompt_array, None, &mut cache, &dflash.tap_layers)
+            .map_err(EngineError::Mlx)?;
+        eval([&prefill_logits]).map_err(EngineError::Mlx)?;
+
+        // Sample first token.
+        let last_logits = prefill_logits.index((.., -1, ..));
+        let first_token = sample(&last_logits, params).map_err(EngineError::Mlx)?;
+        eval([&first_token]).map_err(EngineError::Mlx)?;
+
+        let first_token_id: u32 = first_token.item();
+        let mut tokens: Vec<u32> = vec![first_token_id];
+
+        if self.eos_token_ids.contains(&first_token_id) || max_tokens <= 1 {
+            let finish_reason = if self.eos_token_ids.contains(&first_token_id) {
+                "stop"
+            } else {
+                "length"
+            };
+            return Ok(GenerationOutput {
+                text: self.decode_tokens(&tokens)?,
+                finish_reason: finish_reason.to_owned(),
+                prompt_tokens: prompt_len,
+                completion_tokens: 1,
+                token_logprobs: None,
+            });
+        }
+
+        let mut current_taps = taps;
+        let mut draft_cache = drafter.make_cache();
+        let mut last_token = i32::try_from(first_token_id)
+            .map_err(|_| EngineError::Generation("first_token_id overflow for i32".to_owned()))?;
+        let mut start = i32::try_from(prompt_len)
+            .map_err(|_| EngineError::Generation("prompt_len overflow for i32".to_owned()))?;
+        let block_size = dflash.block_size;
+        let mask_id = dflash.mask_token_id;
+        let t_start = std::time::Instant::now();
+
+        loop {
+            // a. Build block: [anchor, mask, mask, ...]
+            let block_size_us = usize::try_from(block_size)
+                .map_err(|_| EngineError::Generation("block_size overflow for usize".to_owned()))?;
+            let mut block_tokens = vec![mask_id; block_size_us];
+            if let Some(slot) = block_tokens.get_mut(0) {
+                *slot = last_token;
+            }
+            let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
+
+            // b. Embed through target's embedding layer.
+            let noise_embedding = model
+                .embed_token_ids(&block_ids)
+                .map_err(EngineError::Mlx)?;
+
+            // c. Drafter forward — MLX fallback path.
+            let draft_hidden = drafter
+                .forward(&noise_embedding, &current_taps, &mut draft_cache)
+                .map_err(EngineError::Mlx)?;
+            crop_drafter_cache(&mut draft_cache, start);
+
+            // e. Target lm_head on sliced hidden -> argmax draft tokens.
+            let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
+            let draft_logits = model
+                .forward_all_logits_from_hidden(&draft_hidden_sliced)
+                .map_err(EngineError::Mlx)?;
+            let draft_token_arr =
+                mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
+            eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
+            let draft_u32: Vec<u32> = draft_token_arr
+                .reshape(&[-1])
+                .map_err(EngineError::Mlx)?
+                .as_slice::<u32>()
+                .to_vec();
+            let draft_i32: Vec<i32> = draft_u32
+                .iter()
+                .map(|&x| {
+                    i32::try_from(x)
+                        .map_err(|_| EngineError::Generation("draft token overflow i32".to_owned()))
+                })
+                .collect::<Result<_, _>>()?;
+
+            // f. Build verify input: [anchor, draft_0..draft_{N-2}].
+            let mut verify_tokens = vec![last_token];
+            verify_tokens.extend_from_slice(&draft_i32);
+            let verify_len = i32::try_from(verify_tokens.len())
+                .map_err(|_| EngineError::Generation("verify_len overflow".to_owned()))?;
+            let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
+
+            // g+h. Tape-recording verify: forward with taps + GDN innovation tapes.
+            //    The tape captures per-position SSM innovations so we can replay
+            //    only the SSM recurrence kernel for accepted positions on partial
+            //    accept (~5ms vs ~30ms full rerun) AND, more importantly, the tape
+            //    kernel's recurrence is bit-exact with sequential AR steps —
+            //    fixing the S>1 vs S=1 numerical drift that the full-rerun
+            //    `forward_with_taps` path exhibits.
+            let (verify_logits, verify_taps, layer_tapes) = model
+                .forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
+                .map_err(EngineError::Mlx)?;
+            eval([&verify_logits]).map_err(EngineError::Mlx)?;
+
+            // i. Accept prefix.
+            let verify_argmax =
+                mlx_rs::argmax_axis!(verify_logits, -1).map_err(EngineError::Mlx)?;
+            eval([&verify_argmax]).map_err(EngineError::Mlx)?;
+            let verify_flat: Vec<u32> = verify_argmax
+                .reshape(&[-1])
+                .map_err(EngineError::Mlx)?
+                .as_slice::<u32>()
+                .to_vec();
+            let accepted = accept_prefix(&draft_u32, &verify_flat);
+            let n_accepted = i32::try_from(accepted.len())
+                .map_err(|_| EngineError::Generation("n_accepted overflow".to_owned()))?;
+
+            if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && tokens.len() <= 32 {
+                tracing::info!(
+                    iter_first_token = tokens.first().copied().unwrap_or(0),
+                    drafts = ?draft_u32,
+                    verify_argmax = ?verify_flat,
+                    n_accepted,
+                    accepted = ?accepted,
+                    "DFlash iter trace"
+                );
+            }
+
+            // j. Partial accept — GDN-only replay from tape. Tape-recording
+            //    verify advanced state for ALL positions; on partial rejection
+            //    we restore each GDN layer's snapshot from the tape, replay
+            //    the SSM kernel for the n_accepted positions only, and trim
+            //    KV layers by the rejected count. No full rerun.
+            if n_accepted < block_size {
+                let kv_rollback = verify_len - n_accepted;
+                model
+                    .replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
+                    .map_err(EngineError::Mlx)?;
+            }
+            // Slice verify taps to accepted positions (valid for both full and
+            // partial accept — earlier positions' hidden states are causally
+            // independent of later ones).
+            current_taps = verify_taps
+                .into_iter()
+                .map(|tap| tap.index((.., ..n_accepted, ..)))
+                .collect();
+
+            // k. Update state.
+            for &tok in &accepted {
+                tokens.push(tok);
+            }
+            last_token = i32::try_from(*accepted.last().ok_or_else(|| {
+                EngineError::Generation("accept_prefix returned empty vec".to_owned())
+            })?)
+            .map_err(|_| EngineError::Generation("accepted token overflow i32".to_owned()))?;
+            start += n_accepted;
+
+            // l. Check termination.
+            let completion_len = Self::completion_len(&tokens)?;
+
+            if tokens.iter().any(|t| self.eos_token_ids.contains(t)) {
+                let elapsed = t_start.elapsed();
+                let secs = elapsed.as_secs_f64();
+                let tok_count_u32 = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+                let tok_per_sec = if secs > 0.0 {
+                    f64::from(tok_count_u32) / secs
+                } else {
+                    0.0
+                };
+                tracing::info!(
+                    tokens = tokens.len(),
+                    tok_per_sec = format!("{tok_per_sec:.1}"),
+                    "DFlash generation complete"
+                );
+                return Ok(GenerationOutput {
+                    text: self.decode_tokens(&tokens)?,
+                    finish_reason: "stop".to_owned(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: completion_len,
+                    token_logprobs: None,
+                });
+            }
+
+            if has_stop_sequences {
+                let text = self.decode_tokens(&tokens)?;
+                if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
+                    return Ok(GenerationOutput {
+                        text: truncated,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: completion_len,
+                        token_logprobs: None,
+                    });
+                }
+            }
+
+            if completion_len >= max_tokens {
+                return Ok(GenerationOutput {
+                    text: self.decode_tokens(&tokens)?,
+                    finish_reason: "length".to_owned(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: completion_len,
+                    token_logprobs: None,
+                });
+            }
         }
     }
 

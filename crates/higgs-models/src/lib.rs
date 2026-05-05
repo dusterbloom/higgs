@@ -648,6 +648,29 @@ impl AnyModel {
         }
     }
 
+    /// Replay GDN innovation tape for accepted prefix on partial accept.
+    ///
+    /// Used by `DFlash` verify path: after partial acceptance, restore each
+    /// GDN layer's state from the tape's initial snapshot, replay only the
+    /// SSM recurrence kernel for `n_accepted` accepted positions, and roll
+    /// KV layers back by `kv_rollback`. Avoids the cost of a full rerun.
+    pub fn replay_tape_rollback(
+        &self,
+        layer_tapes: &[Option<qwen3_next::GdnLayerTape>],
+        cache: &mut AnyCache,
+        n_accepted: i32,
+        kv_rollback: i32,
+    ) -> Result<(), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.replay_tape_rollback(layer_tapes, c, n_accepted, kv_rollback)
+            }
+            _ => Err(Exception::custom(
+                "replay_tape_rollback requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
     /// Embed raw token IDs through the target model's embedding layer.
     pub fn embed_token_ids(&self, token_ids: &Array) -> Result<Array, Exception> {
         match self {
