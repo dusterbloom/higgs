@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties,
-    dflash::{DFlashDrafter, GdnStateBackup, accept_prefix, crop_drafter_cache},
+    dflash::{DFlashDrafter, accept_prefix, crop_drafter_cache},
     sample,
     turboquant::KvCacheConfig,
 };
@@ -1426,13 +1426,15 @@ impl SimpleEngine {
                 .map_err(|_| EngineError::Generation("verify_len overflow".to_owned()))?;
             let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
 
-            // g. Save GDN state for rollback.
-            let gdn_backup = GdnStateBackup::save(cache.as_hybrid().map_err(EngineError::Mlx)?)
-                .map_err(EngineError::Mlx)?;
-
-            // h. Verify: target forward_with_taps.
-            let (verify_logits, verify_taps) = model
-                .forward_with_taps(&verify_input, None, &mut cache, &dflash.tap_layers)
+            // g+h. Tape-recording verify: forward with taps + GDN innovation tapes.
+            //    The tape captures per-position SSM innovations so we can replay
+            //    only the SSM recurrence kernel for accepted positions on partial
+            //    accept (~5ms vs ~30ms full rerun) AND, more importantly, the tape
+            //    kernel's recurrence is bit-exact with sequential AR steps —
+            //    fixing the S>1 vs S=1 numerical drift that the full-rerun
+            //    `forward_with_taps` path exhibits.
+            let (verify_logits, verify_taps, layer_tapes) = model
+                .forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
                 .map_err(EngineError::Mlx)?;
             eval([&verify_logits]).map_err(EngineError::Mlx)?;
 
@@ -1449,33 +1451,35 @@ impl SimpleEngine {
             let n_accepted = i32::try_from(accepted.len())
                 .map_err(|_| EngineError::Generation("n_accepted overflow".to_owned()))?;
 
-            // j. Rollback on partial accept — restore GDN state and rerun
-            //    accepted tokens so recurrent (GDN) layers advance correctly.
-            //    Without replay, GDN state stays at pre-verify (missing the
-            //    accepted tokens' updates), causing cascading state corruption.
-            if n_accepted < block_size {
-                let n_acc_us = usize::try_from(n_accepted).map_err(|_| {
-                    EngineError::Generation("n_accepted underflow for usize".to_owned())
-                })?;
-                gdn_backup.restore_and_rollback(
-                    cache.as_hybrid_mut().map_err(EngineError::Mlx)?,
-                    verify_len,
+            if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && tokens.len() <= 32 {
+                tracing::info!(
+                    iter_first_token = tokens.first().copied().unwrap_or(0),
+                    drafts = ?draft_u32,
+                    verify_argmax = ?verify_flat,
+                    n_accepted,
+                    accepted = ?accepted,
+                    "DFlash iter trace"
                 );
-                let rerun_slice = verify_tokens.get(..n_acc_us).ok_or_else(|| {
-                    EngineError::Generation("verify_tokens slice out of range".to_owned())
-                })?;
-                let rerun_input = Array::from_slice(rerun_slice, &[1, n_accepted]);
-                let (rerun_logits, rerun_taps) = model
-                    .forward_with_taps(&rerun_input, None, &mut cache, &dflash.tap_layers)
-                    .map_err(EngineError::Mlx)?;
-                eval([&rerun_logits]).map_err(EngineError::Mlx)?;
-                current_taps = rerun_taps;
-            } else {
-                current_taps = verify_taps
-                    .into_iter()
-                    .map(|tap| tap.index((.., ..n_accepted, ..)))
-                    .collect();
             }
+
+            // j. Partial accept — GDN-only replay from tape. Tape-recording
+            //    verify advanced state for ALL positions; on partial rejection
+            //    we restore each GDN layer's snapshot from the tape, replay
+            //    the SSM kernel for the n_accepted positions only, and trim
+            //    KV layers by the rejected count. No full rerun.
+            if n_accepted < block_size {
+                let kv_rollback = verify_len - n_accepted;
+                model
+                    .replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
+                    .map_err(EngineError::Mlx)?;
+            }
+            // Slice verify taps to accepted positions (valid for both full and
+            // partial accept — earlier positions' hidden states are causally
+            // independent of later ones).
+            current_taps = verify_taps
+                .into_iter()
+                .map(|tap| tap.index((.., ..n_accepted, ..)))
+                .collect();
 
             // k. Update state.
             for &tok in &accepted {
