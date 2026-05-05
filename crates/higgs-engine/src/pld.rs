@@ -36,7 +36,7 @@ pub struct PldDraftModel {
 }
 
 impl PldDraftModel {
-    pub fn new(max_ngram: usize, min_ngram: usize) -> Self {
+    pub const fn new(max_ngram: usize, min_ngram: usize) -> Self {
         Self {
             committed: Vec::new(),
             pending: None,
@@ -147,10 +147,8 @@ impl DraftModel for PldDraftModel {
 }
 
 const _: () = {
-    fn _assert_send<T: DraftModel + Send>() {}
-    fn _assert() {
-        _assert_send::<PldDraftModel>();
-    }
+    const fn check_send<T: DraftModel + Send>() {}
+    check_send::<PldDraftModel>();
 };
 
 #[cfg(test)]
