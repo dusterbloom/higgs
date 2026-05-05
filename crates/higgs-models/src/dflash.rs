@@ -1,0 +1,560 @@
+//! `DFlash` block-diffusion drafter for speculative decoding.
+//!
+//! A 0.5B drafter that produces 16 draft tokens per round via a single
+//! non-causal forward pass. Conditions on hidden states tapped from 5
+//! target model layers during the previous verify step.
+//!
+//! Architecture: 8 decoder layers with dual-stream attention —
+//! Q from noise embedding, K/V from `concat(target_hidden, noise)`.
+//! No `embed_tokens` or `lm_head` — uses the target model's `lm_head`.
+//!
+//! Reference: `dflash.py` in `z-lab/Qwen3.5-35B-A3B-DFlash`.
+use std::path::Path;
+
+use mlx_rs::{
+    Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn, ops,
+};
+use serde::Deserialize;
+
+use crate::{error::ModelError, utils::apply_rope};
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+struct DFlashSubConfig {
+    target_layer_ids: Vec<usize>,
+    #[serde(default)]
+    mask_token_id: Option<i32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DFlashConfig {
+    pub hidden_size: i32,
+    pub num_hidden_layers: i32,
+    pub num_attention_heads: i32,
+    pub num_key_value_heads: i32,
+    #[serde(default = "default_head_dim")]
+    pub head_dim: i32,
+    pub intermediate_size: i32,
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f32,
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f32,
+    #[serde(default = "default_block_size")]
+    pub block_size: i32,
+    pub vocab_size: i32,
+    dflash_config: DFlashSubConfig,
+}
+
+impl DFlashConfig {
+    pub fn target_layer_ids(&self) -> &[usize] {
+        &self.dflash_config.target_layer_ids
+    }
+
+    pub const fn num_taps(&self) -> usize {
+        self.dflash_config.target_layer_ids.len()
+    }
+
+    pub fn mask_token_id(&self) -> i32 {
+        self.dflash_config.mask_token_id.unwrap_or(248_070)
+    }
+}
+
+const fn default_head_dim() -> i32 {
+    128
+}
+
+const fn default_rms_norm_eps() -> f32 {
+    1e-6
+}
+
+const fn default_rope_theta() -> f32 {
+    1e7
+}
+
+const fn default_block_size() -> i32 {
+    16
+}
+
+/// Runtime decode `block_size` used at inference.
+///
+/// Overridable via `HIGGS_DFLASH_BLOCK_SIZE`. Diverges from the drafter's
+/// trained `block_size` (16) because acceptance rate plateaus at ~3 tokens
+/// and smaller blocks amortize verify cost better.
+pub const DEFAULT_DECODE_BLOCK_SIZE: i32 = 4;
+
+// ---------------------------------------------------------------------------
+// SwiGLU MLP (non-quantized)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, ModuleParameters)]
+struct DFlashMLP {
+    #[param]
+    gate_proj: nn::Linear,
+    #[param]
+    up_proj: nn::Linear,
+    #[param]
+    down_proj: nn::Linear,
+}
+
+impl DFlashMLP {
+    fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
+        Ok(Self {
+            gate_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
+                .bias(false)
+                .build()?,
+            up_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
+                .bias(false)
+                .build()?,
+            down_proj: nn::LinearBuilder::new(intermediate_size, hidden_size)
+                .bias(false)
+                .build()?,
+        })
+    }
+
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        let gate = self.gate_proj.forward(x)?;
+        let up = self.up_proj.forward(x)?;
+        let activated = nn::sigmoid(&gate)?.multiply(&gate)?.multiply(&up)?;
+        self.down_proj.forward(&activated)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DFlash dual-stream attention
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, ModuleParameters)]
+struct DFlashAttention {
+    #[param]
+    q_proj: nn::Linear,
+    #[param]
+    k_proj: nn::Linear,
+    #[param]
+    v_proj: nn::Linear,
+    #[param]
+    o_proj: nn::Linear,
+    #[param]
+    q_norm: nn::RmsNorm,
+    #[param]
+    k_norm: nn::RmsNorm,
+    #[param]
+    rope: nn::Rope,
+    num_attention_heads: i32,
+    num_key_value_heads: i32,
+    head_dim: i32,
+    scale: f32,
+}
+
+impl DFlashAttention {
+    fn new(config: &DFlashConfig) -> Result<Self, Exception> {
+        let head_dim = config.head_dim;
+        let n_heads = config.num_attention_heads;
+        let n_kv_heads = config.num_key_value_heads;
+        let hidden = config.hidden_size;
+
+        Ok(Self {
+            q_proj: nn::LinearBuilder::new(hidden, n_heads * head_dim)
+                .bias(false)
+                .build()?,
+            k_proj: nn::LinearBuilder::new(hidden, n_kv_heads * head_dim)
+                .bias(false)
+                .build()?,
+            v_proj: nn::LinearBuilder::new(hidden, n_kv_heads * head_dim)
+                .bias(false)
+                .build()?,
+            o_proj: nn::LinearBuilder::new(n_heads * head_dim, hidden)
+                .bias(false)
+                .build()?,
+            q_norm: nn::RmsNormBuilder::new(head_dim)
+                .eps(config.rms_norm_eps)
+                .build()?,
+            k_norm: nn::RmsNormBuilder::new(head_dim)
+                .eps(config.rms_norm_eps)
+                .build()?,
+            rope: nn::RopeBuilder::new(head_dim)
+                .traditional(false)
+                .base(config.rope_theta)
+                .scale(1.0)
+                .build()
+                .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?,
+            num_attention_heads: n_heads,
+            num_key_value_heads: n_kv_heads,
+            head_dim,
+            scale: f32::from(
+                i16::try_from(head_dim)
+                    .map_err(|_| Exception::custom("head_dim out of i16 range"))?,
+            )
+            .sqrt()
+            .recip(),
+        })
+    }
+
+    /// Dual-stream attention: Q from noise, K/V from `concat(target, noise)`.
+    ///
+    /// `noise`: `[B, block_size, hidden]` — the 16 draft positions.
+    /// `target_hidden`: `[B, ctx_len, hidden]` — projected+normed tap states.
+    /// `cache`: optional (K, V) from prior rounds, shape `[B, n_kv, cached_len, head_dim]`.
+    ///   Post-RoPE K and raw V. Updated in-place with the new K/V appended.
+    /// `cache_offset`: absolute position offset for `RoPE` (= cached seq length).
+    #[allow(non_snake_case, clippy::shadow_reuse)]
+    fn forward(
+        &mut self,
+        noise: &Array,
+        target_hidden: &Array,
+        cache: &mut Option<(Array, Array)>,
+        cache_offset: i32,
+    ) -> Result<Array, Exception> {
+        let B = *noise
+            .shape()
+            .first()
+            .ok_or_else(|| Exception::custom("need 3D"))?;
+        let q_len = *noise
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("need 3D"))?;
+        let ctx_len = *target_hidden
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("need 3D"))?;
+        // Q from noise only
+        let q = self.q_proj.forward(noise)?;
+        let q = q.reshape(&[B, q_len, self.num_attention_heads, self.head_dim])?;
+        let q = self.q_norm.forward(&q)?.transpose_axes(&[0, 2, 1, 3])?;
+
+        // K/V from context (target_hidden) — SEPARATE from noise
+        let ctx_k = self.k_proj.forward(target_hidden)?;
+        let ctx_v = self.v_proj.forward(target_hidden)?;
+        let ctx_k = ctx_k.reshape(&[B, ctx_len, self.num_key_value_heads, self.head_dim])?;
+        let ctx_k = self.k_norm.forward(&ctx_k)?.transpose_axes(&[0, 2, 1, 3])?;
+        let ctx_v = ctx_v
+            .reshape(&[B, ctx_len, self.num_key_value_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        // K/V from noise — freshly computed every round, never cached
+        let noise_k = self.k_proj.forward(noise)?;
+        let noise_v = self.v_proj.forward(noise)?;
+        let noise_k = noise_k.reshape(&[B, q_len, self.num_key_value_heads, self.head_dim])?;
+        let noise_k = self
+            .k_norm
+            .forward(&noise_k)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let noise_v = noise_v
+            .reshape(&[B, q_len, self.num_key_value_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        // RoPE with absolute positions:
+        // Context K: [cache_offset .. cache_offset + ctx_len]
+        // Noise K + Q: [cache_offset + ctx_len .. cache_offset + ctx_len + q_len]
+        let q = apply_rope(&q, &self.rope, cache_offset + ctx_len)?;
+        let ctx_k = apply_rope(&ctx_k, &self.rope, cache_offset)?;
+        let noise_k = apply_rope(&noise_k, &self.rope, cache_offset + ctx_len)?;
+
+        // Cache stores ONLY context K/V (append to prior rounds)
+        let (ctx_k, ctx_v) = if let Some((k_cached, v_cached)) = cache.as_ref() {
+            (
+                ops::concatenate_axis(&[k_cached, &ctx_k], 2)?,
+                ops::concatenate_axis(&[v_cached, &ctx_v], 2)?,
+            )
+        } else {
+            (ctx_k, ctx_v)
+        };
+        *cache = Some((ctx_k.clone(), ctx_v.clone()));
+
+        // Attention over cached_context + fresh_noise
+        let k = ops::concatenate_axis(&[&ctx_k, &noise_k], 2)?;
+        let v = ops::concatenate_axis(&[&ctx_v, &noise_v], 2)?;
+
+        // Non-causal SDPA (no mask)
+        let output = mlx_rs::fast::scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            self.scale,
+            None::<mlx_rs::fast::ScaledDotProductAttentionMask>,
+            None::<&Array>,
+        )?;
+
+        // [B, n_heads, q_len, head_dim] -> [B, q_len, n_heads * head_dim]
+        let output = output.transpose_axes(&[0, 2, 1, 3])?;
+        let output = output.reshape(&[B, q_len, -1])?;
+        self.o_proj.forward(&output)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DFlash decoder layer
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, ModuleParameters)]
+struct DFlashDecoderLayer {
+    #[param]
+    self_attn: DFlashAttention,
+    #[param]
+    mlp: DFlashMLP,
+    #[param]
+    input_layernorm: nn::RmsNorm,
+    #[param]
+    post_attention_layernorm: nn::RmsNorm,
+}
+
+impl DFlashDecoderLayer {
+    fn new(config: &DFlashConfig) -> Result<Self, Exception> {
+        Ok(Self {
+            self_attn: DFlashAttention::new(config)?,
+            mlp: DFlashMLP::new(config.hidden_size, config.intermediate_size)?,
+            input_layernorm: nn::RmsNormBuilder::new(config.hidden_size)
+                .eps(config.rms_norm_eps)
+                .build()?,
+            post_attention_layernorm: nn::RmsNormBuilder::new(config.hidden_size)
+                .eps(config.rms_norm_eps)
+                .build()?,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        noise: &Array,
+        target_hidden: &Array,
+        cache: &mut Option<(Array, Array)>,
+        cache_offset: i32,
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(noise)?;
+        let attn_out = self
+            .self_attn
+            .forward(&normed, target_hidden, cache, cache_offset)?;
+        let h = noise.add(attn_out)?;
+        let normed_post = self.post_attention_layernorm.forward(&h)?;
+        let mlp_out = self.mlp.forward(&normed_post)?;
+        h.add(mlp_out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DFlash drafter (top-level)
+// ---------------------------------------------------------------------------
+
+/// `DFlash` block-diffusion drafter.
+///
+/// Produces `block_size` (16) draft tokens per round. Does NOT have its own
+/// `embed_tokens` or `lm_head` — uses the target model's `lm_head` on the output.
+#[derive(Debug, ModuleParameters)]
+pub struct DFlashDrafter {
+    #[param]
+    fc: nn::Linear,
+    #[param]
+    hidden_norm: nn::RmsNorm,
+    #[param]
+    layers: Vec<DFlashDecoderLayer>,
+    #[param]
+    norm: nn::RmsNorm,
+    pub config: DFlashConfig,
+}
+
+impl DFlashDrafter {
+    pub fn new(config: DFlashConfig) -> Result<Self, Exception> {
+        let fc_in = i32::try_from(config.num_taps())
+            .map_err(|e| Exception::custom(format!("num_taps too large for i32: {e}")))?
+            * config.hidden_size;
+        let layers = (0..config.num_hidden_layers)
+            .map(|_| DFlashDecoderLayer::new(&config))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            fc: nn::LinearBuilder::new(fc_in, config.hidden_size)
+                .bias(false)
+                .build()?,
+            hidden_norm: nn::RmsNormBuilder::new(config.hidden_size)
+                .eps(config.rms_norm_eps)
+                .build()?,
+            layers,
+            norm: nn::RmsNormBuilder::new(config.hidden_size)
+                .eps(config.rms_norm_eps)
+                .build()?,
+            config,
+        })
+    }
+
+    /// Create an empty per-layer KV cache for the drafter.
+    pub fn make_cache(&self) -> Vec<Option<(Array, Array)>> {
+        vec![None; self.layers.len()]
+    }
+
+    /// Run the drafter forward pass.
+    ///
+    /// - `noise`: `[B, block_size, hidden_size]` — embedded block tokens.
+    /// - `taps`: slice of hidden states from the target model at tap layers,
+    ///   each `[B, T, target_hidden_size]`. Concatenated along the last dim,
+    ///   projected via `fc`, then normalized.
+    /// - `cache`: per-layer KV cache. Grows each round; crop after verify.
+    ///
+    /// Returns `[B, block_size, hidden_size]` — pass to target's `lm_head` for logits.
+    #[allow(non_snake_case)]
+    pub fn forward(
+        &mut self,
+        noise: &Array,
+        taps: &[Array],
+        cache: &mut [Option<(Array, Array)>],
+    ) -> Result<Array, Exception> {
+        if taps.len() != self.config.num_taps() {
+            return Err(Exception::custom(format!(
+                "expected {} taps, got {}",
+                self.config.num_taps(),
+                taps.len()
+            )));
+        }
+
+        // Cache offset = current cached seq length (0 on first round)
+        let cache_offset = cache
+            .first()
+            .and_then(|c| c.as_ref())
+            .and_then(|(k, _)| k.shape().get(2).copied())
+            .unwrap_or(0);
+
+        // Concatenate tap hidden states: [B, T, num_taps * hidden_size]
+        let tap_refs: Vec<&Array> = taps.iter().collect();
+        let target_cat = ops::concatenate_axis(&tap_refs, -1)?;
+
+        // Project + norm: [B, T, hidden_size]
+        let target_projected = self.fc.forward(&target_cat)?;
+        let target_hidden = self.hidden_norm.forward(&target_projected)?;
+
+        let mut h = noise.clone();
+        for (layer, lc) in self.layers.iter_mut().zip(cache.iter_mut()) {
+            h = layer.forward(&h, &target_hidden, lc, cache_offset)?;
+        }
+
+        self.norm.forward(&h)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GDN state save/restore for hybrid models (Qwen3.5)
+// ---------------------------------------------------------------------------
+
+/// Saved state for all GDN/linear-attention layers in the target model.
+///
+/// Much smaller than cloning the full KV cache — only stores `conv_state`,
+/// `ssm_state`, and offset for each `ArraysCache` layer.
+pub struct GdnStateBackup {
+    states: Vec<(Option<Array>, Option<Array>, i32)>,
+}
+
+impl GdnStateBackup {
+    /// Save GDN (`ArraysCache`) state from all layers. Call BEFORE verify forward.
+    /// KV layers are not saved — they use cheap offset-based rollback instead.
+    pub fn save(kv_cache: &[Option<crate::qwen3_next::LayerCache>]) -> Result<Self, Exception> {
+        let mut states = Vec::with_capacity(kv_cache.len());
+        for lc in kv_cache {
+            match lc {
+                Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
+                    ac.eval_arrays()?;
+                    states.push((ac.conv_state.clone(), ac.ssm_state.clone(), ac.offset));
+                }
+                _ => states.push((None, None, 0)),
+            }
+        }
+        Ok(Self { states })
+    }
+
+    /// Restore GDN state and rollback KV offsets. On rejection, call this
+    /// BEFORE re-running the accepted tokens.
+    pub fn restore_and_rollback(
+        &self,
+        kv_cache: &mut [Option<crate::qwen3_next::LayerCache>],
+        rollback: i32,
+    ) {
+        for (lc, (conv, ssm, offset)) in kv_cache.iter_mut().zip(self.states.iter()) {
+            match lc {
+                Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
+                    ac.conv_state.clone_from(conv);
+                    ac.ssm_state.clone_from(ssm);
+                    ac.offset = *offset;
+                }
+                Some(crate::qwen3_next::LayerCache::KV(kv)) => {
+                    if rollback > 0 {
+                        kv.trim_by(rollback.unsigned_abs().try_into().unwrap_or(usize::MAX));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Rollback only KV cache layers by `rollback` positions. GDN layers are
+/// left untouched. Used with stateless GDN verify where GDN state was never
+/// corrupted by speculative tokens.
+pub fn rollback_kv_only(kv_cache: &mut [Option<crate::qwen3_next::LayerCache>], rollback: i32) {
+    if rollback <= 0 {
+        return;
+    }
+    for kv in kv_cache.iter_mut().filter_map(|lc| match lc {
+        Some(crate::qwen3_next::LayerCache::KV(kv)) => Some(kv),
+        _ => None,
+    }) {
+        kv.trim_by(rollback.unsigned_abs().try_into().unwrap_or(usize::MAX));
+    }
+}
+
+/// Crop the drafter KV cache to `keep_len` along the sequence dim.
+///
+/// Called after verify to discard rejected positions.
+/// Cache tensors have shape `[B, n_kv_heads, seq_len, head_dim]`.
+pub fn crop_drafter_cache(cache: &mut [Option<(Array, Array)>], keep_len: i32) {
+    use mlx_rs::ops::indexing::IndexOp;
+    for (k, v) in cache.iter_mut().filter_map(Option::as_mut) {
+        *k = k.index((.., .., ..keep_len, ..));
+        *v = v.index((.., .., ..keep_len, ..));
+    }
+}
+
+/// Trim `n` entries from the END of the drafter KV cache.
+///
+/// Reference: `trim_draft_cache(draft_cache, block_size)` in `dflash-mlx`.
+/// After each draft forward, the cache has `prev + ctx_len + block_size` entries.
+/// Trimming `block_size` removes the noise K/V while keeping the accumulated
+/// target context K/V that conditions future rounds.
+pub fn trim_drafter_cache(cache: &mut [Option<(Array, Array)>], n: i32) {
+    use mlx_rs::ops::indexing::IndexOp;
+    for (k, v) in cache.iter_mut().filter_map(Option::as_mut) {
+        let seq_len = k.shape().get(2).copied().unwrap_or(0);
+        let keep = (seq_len - n).max(0);
+        *k = k.index((.., .., ..keep, ..));
+        *v = v.index((.., .., ..keep, ..));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+
+/// Load a `DFlash` drafter from a directory containing `config.json` + `model.safetensors`.
+pub fn load_dflash_drafter(model_path: &Path) -> Result<DFlashDrafter, ModelError> {
+    let config_path = model_path.join("config.json");
+    let config_str = std::fs::read_to_string(&config_path)
+        .map_err(|e| ModelError::Io(std::io::Error::other(format!("reading config.json: {e}"))))?;
+    let config: DFlashConfig = serde_json::from_str(&config_str)
+        .map_err(|e| ModelError::Io(std::io::Error::other(format!("parsing config.json: {e}"))))?;
+
+    let mut drafter = DFlashDrafter::new(config)
+        .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+
+    crate::load_safetensors_weights(&mut drafter, model_path)?;
+
+    Ok(drafter)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// The original DFlash test suite (~3.8K lines, 30+ end-to-end tests) lives on
+// `feat/magic-canvas` and exercises the full draft-verify loop through the
+// target model. It depends on tap APIs (`forward_with_taps`,
+// `forward_with_taps_tape`, `replay_tape_rollback`,
+// `forward_all_logits_from_hidden`) and `crate::diffusion::accept_prefix`,
+// none of which are on `origin/main` yet. Tests will be ported in a follow-up
+// PR alongside the qwen3_next tap-API surface.
