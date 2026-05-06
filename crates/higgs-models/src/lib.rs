@@ -1,3 +1,4 @@
+pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
 pub mod error;
@@ -13,6 +14,7 @@ pub mod starcoder2;
 pub mod transformer;
 pub mod turboquant;
 pub mod utils;
+pub mod yarn;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -132,6 +134,8 @@ pub enum AnyModel {
     LlavaQwen2(llava_qwen2::LlavaQwen2Model),
     /// DeepSeek-V2 with Multi-head Latent Attention and sparse `MoE`.
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
+    /// Bonsai-Q1: packed 1.25-bpw Qwen3-shaped target (1.7B / 8B).
+    BonsaiQ1(bonsai_q1::BonsaiQ1Gpu),
 }
 
 fn checked_head_dim(hidden_size: i32, num_attention_heads: i32) -> Result<i32, Exception> {
@@ -213,6 +217,9 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
+            // BonsaiQ1 builds its causal mask internally; any externally-provided
+            // mask is ignored (causal-only semantics).
+            (Self::BonsaiQ1(m), AnyCache::KV(c)) => m.forward(inputs, c),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -233,6 +240,9 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_hidden(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
+            (Self::BonsaiQ1(_), AnyCache::KV(_)) => Err(Exception::custom(
+                "BonsaiQ1: forward_hidden not supported (tap not implemented)",
+            )),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -347,7 +357,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom(
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer models",
             )),
         }
@@ -373,7 +384,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => None,
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => None,
         }
     }
 
@@ -394,7 +406,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 
@@ -413,7 +426,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 
@@ -435,7 +449,7 @@ impl AnyModel {
     }
 
     /// The model's hidden dimension.
-    pub const fn hidden_size(&self) -> i32 {
+    pub fn hidden_size(&self) -> i32 {
         match self {
             Self::Transformer(m) => m.args.hidden_size,
             Self::Qwen3Moe(m) => m.args.hidden_size,
@@ -445,6 +459,7 @@ impl AnyModel {
             Self::Starcoder2(m) => m.args.hidden_size,
             Self::LlavaQwen2(m) => m.hidden_size(),
             Self::DeepSeekV2(m) => m.args.hidden_size,
+            Self::BonsaiQ1(m) => i32::try_from(m.config.hidden).unwrap_or(i32::MAX),
         }
     }
 
@@ -481,6 +496,10 @@ impl AnyModel {
                 m.args.num_key_value_heads,
                 m.args.qk_nope_head_dim + m.args.qk_rope_head_dim,
             )),
+            Self::BonsaiQ1(m) => Ok((
+                i32::try_from(m.config.kv_heads).map_err(|e| Exception::custom(e.to_string()))?,
+                i32::try_from(m.config.head_dim).map_err(|e| Exception::custom(e.to_string()))?,
+            )),
         }
     }
 
@@ -489,6 +508,7 @@ impl AnyModel {
         self.make_cache_with_config(KvCacheConfig::default())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn make_cache_with_config(
         &self,
         kv_cache_config: KvCacheConfig,
@@ -583,6 +603,16 @@ impl AnyModel {
                     Ok(AnyCache::Hybrid(m.make_cache()))
                 }
             }
+            Self::BonsaiQ1(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not supported for BonsaiQ1 (1-bit packed engine)",
+                    ));
+                }
+                let layers =
+                    i32::try_from(m.config.layers).map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(make_kv_cache(layers))
+            }
         }
     }
 
@@ -601,7 +631,8 @@ impl AnyModel {
             | Self::Gemma2(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
-            | Self::DeepSeekV2(_) => None,
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => None,
         }
     }
 

@@ -453,6 +453,14 @@ impl SteppingKeyValueCache {
         self.values.as_ref()
     }
 
+    /// Simultaneous mutable access to the key and value arrays.
+    ///
+    /// Re-borrows both optional fields from a single `&mut` split to satisfy
+    /// the borrow checker when both must yield from one iterator.
+    pub const fn key_value_arrays_mut(&mut self) -> (Option<&mut Array>, Option<&mut Array>) {
+        (self.keys.as_mut(), self.values.as_mut())
+    }
+
     /// Create a pre-filled cache from existing K/V arrays.
     ///
     /// Sets `offset = keys.shape()[2]` so the next `update_dense` triggers a
