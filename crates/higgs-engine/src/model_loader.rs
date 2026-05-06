@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use higgs_models::{AnyModel, load_tokenizer as shared_load_tokenizer, registry, transformer};
+use higgs_models::{
+    AnyModel, error::ModelError, load_tokenizer as shared_load_tokenizer, registry, transformer,
+};
 
 use crate::error::EngineError;
 
@@ -36,6 +38,17 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
 
     match config.model_type.as_str() {
         "qwen2" | "qwen3" | "llama" | "mistral" => {
+            // Packed 1.25-bpw Bonsai-Q1 checkpoints declare model_type="qwen3"
+            // but the weights are quantized to bits=1. Keep detection ahead of
+            // the fp16/Q4 transformer loader so users get an explicit error
+            // while the workspace remains on upstream oxideai/mlx-rs.
+            if is_bonsai_q1(&config.model_dir)? {
+                return Err(EngineError::Model(ModelError::UnsupportedModel(
+                    "Bonsai-Q1 requires MLX bits=1 affine quantization support; \
+                     the workspace stays on upstream oxideai/mlx-rs until that support lands"
+                        .to_owned(),
+                )));
+            }
             let model = transformer::load_model(&config.model_dir).map_err(EngineError::Model)?;
             Ok(AnyModel::Transformer(model))
         }
@@ -88,6 +101,39 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
             higgs_models::error::ModelError::UnsupportedModel(other.to_owned()),
         )),
     }
+}
+
+/// Peek into `config.json` to detect packed 1-bit Bonsai-Q1 checkpoints.
+///
+/// Returns `true` for Qwen3-shaped `quantization.bits == 1` checkpoints using
+/// the expected group size. Returns `false` for any other model type or
+/// quantization config. A missing / malformed `config.json` propagates as an
+/// IO / JSON error — we never mask it.
+fn is_bonsai_q1(dir: &Path) -> Result<bool, EngineError> {
+    let cfg_path = dir.join("config.json");
+    let txt = std::fs::read_to_string(&cfg_path).map_err(|e| {
+        EngineError::Model(higgs_models::error::ModelError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", cfg_path.display()),
+        )))
+    })?;
+    let cfg: serde_json::Value = serde_json::from_str(&txt)
+        .map_err(|e| EngineError::Model(higgs_models::error::ModelError::Json(e)))?;
+    let bonsai_group_size = u64::try_from(higgs_models::bonsai_q1::GROUP_SIZE)
+        .map_err(|e| EngineError::Model(ModelError::ShapeMismatch(e.to_string())))?;
+    Ok(
+        cfg.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen3")
+            && cfg
+                .get("quantization")
+                .and_then(|q| q.get("bits"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+            && cfg
+                .get("quantization")
+                .and_then(|q| q.get("group_size"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(bonsai_group_size),
+    )
 }
 
 /// Load a tokenizer from a model directory.
@@ -228,6 +274,58 @@ mod tests {
             err,
             EngineError::Model(ModelError::UnsupportedModel(_))
         ));
+    }
+
+    #[test]
+    fn is_bonsai_q1_requires_qwen3_model_type_and_group_size() {
+        let (qwen3_dir, _qwen3_result) = config_from_raw(
+            r#"{
+                "model_type": "qwen3",
+                "quantization": {"bits": 1, "group_size": 128}
+            }"#,
+        );
+        assert!(is_bonsai_q1(qwen3_dir.path()).unwrap());
+
+        let (llama_dir, _llama_result) = config_from_raw(
+            r#"{
+                "model_type": "llama",
+                "quantization": {"bits": 1, "group_size": 128}
+            }"#,
+        );
+        assert!(!is_bonsai_q1(llama_dir.path()).unwrap());
+
+        let (wrong_group_dir, _wrong_group_result) = config_from_raw(
+            r#"{
+                "model_type": "qwen3",
+                "quantization": {"bits": 1, "group_size": 64}
+            }"#,
+        );
+        assert!(!is_bonsai_q1(wrong_group_dir.path()).unwrap());
+
+        let (q4_dir, _q4_result) = config_from_raw(
+            r#"{
+                "model_type": "qwen3",
+                "quantization": {"bits": 4, "group_size": 128}
+            }"#,
+        );
+        assert!(
+            !is_bonsai_q1(q4_dir.path()).unwrap(),
+            "regular Q4 Qwen3 must not be misclassified as Bonsai-Q1"
+        );
+    }
+
+    #[test]
+    fn load_model_rejects_bonsai_q1_without_runtime_support() {
+        let (dir, _result) = config_from_raw(
+            r#"{
+                "model_type": "qwen3",
+                "quantization": {"bits": 1, "group_size": 128}
+            }"#,
+        );
+        match load_model(dir.path()) {
+            Err(err) => assert!(err.to_string().contains("Bonsai-Q1 requires MLX bits=1")),
+            Ok(_) => panic!("Expected unsupported Bonsai-Q1 runtime error"),
+        }
     }
 
     #[test]

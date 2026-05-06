@@ -1015,6 +1015,7 @@ static DECODE_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 static QGEMV_NSG_OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
 static DENSE_FFN_GEMV_MODE: OnceLock<DenseFfnGemvMode> = OnceLock::new();
 static DENSE_FFN_FUSE_GATE_UP: OnceLock<bool> = OnceLock::new();
+static MOE_FFN_FUSE_GATE_UP: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DenseFfnGemvMode {
@@ -1085,6 +1086,10 @@ fn dense_ffn_fuse_gate_up() -> bool {
             },
         )
     })
+}
+
+fn moe_ffn_fuse_gate_up() -> bool {
+    *MOE_FFN_FUSE_GATE_UP.get_or_init(|| truthy_env_var("HIGGS_MOE_FFN_GATE_UP"))
 }
 
 fn qgemv_config_cache_enabled() -> bool {
@@ -1696,6 +1701,8 @@ pub(crate) struct SwitchMlpWeights {
     up_proj: QLinear,
     #[param]
     down_proj: QLinear,
+    /// Lazily fused gate+up weights for `MoE` `gather_qmm` (3→2 calls per layer).
+    fused_gate_up: Option<(Array, Array, Array, i32)>,
 }
 
 impl SwitchMlpWeights {
@@ -1705,6 +1712,7 @@ impl SwitchMlpWeights {
             gate_proj,
             up_proj,
             down_proj,
+            fused_gate_up: None,
         })
     }
 
@@ -1846,6 +1854,106 @@ impl SwitchMlpWeights {
 
         let activated = swiglu(&gate_out, &up_out)?;
 
+        let down_out = gather_qmm(
+            &activated,
+            &self.down_proj.weight,
+            &self.down_proj.scales,
+            &self.down_proj.biases,
+            &idx_sorted,
+            true,
+            self.down_proj.group_size,
+            self.down_proj.bits,
+            true,
+        )?;
+
+        // down_out: [N, 1, D] -> squeeze M -> [N, D]
+        let out_flat = down_out.squeeze_axes(&[-2])?;
+
+        // --- Unsort: restore original token order ---
+        let out_unsorted = out_flat.take_axis(&inv_order, 0)?;
+
+        // Reshape back to [B, L, top_k, D]
+        out_unsorted.reshape(&[b, l, top_k, d])
+    }
+
+    /// Like `forward_gather_global_sort` but fuses gate+up into a single
+    /// `gather_qmm` call (3→2 per layer). Lazy-inits fused weights on first call.
+    /// Production routing gates this behind `HIGGS_MOE_FFN_GATE_UP` because the
+    /// fused cache duplicates the resident gate/up tensors.
+    pub(crate) fn forward_gather_fused(
+        &mut self,
+        x: &Array,
+        indices: &Array,
+    ) -> Result<Array, Exception> {
+        // Lazy-init: concatenate gate+up weights along axis 1 (intermediate dim).
+        // MoE weights are [num_experts, intermediate_packed, hidden].
+        if self.fused_gate_up.is_none() {
+            let intermediate = *self
+                .gate_proj
+                .weight
+                .shape()
+                .get(1)
+                .ok_or_else(|| Exception::custom("gate_proj weight missing dim 1"))?;
+            let fw = ops::concatenate_axis(&[&*self.gate_proj.weight, &*self.up_proj.weight], 1)?;
+            let fs = ops::concatenate_axis(&[&*self.gate_proj.scales, &*self.up_proj.scales], 1)?;
+            let fb = ops::concatenate_axis(&[&*self.gate_proj.biases, &*self.up_proj.biases], 1)?;
+            fw.eval()?;
+            fs.eval()?;
+            fb.eval()?;
+            self.fused_gate_up = Some((fw, fs, fb, intermediate));
+        }
+        let (fw, fs, fb, intermediate) = self
+            .fused_gate_up
+            .as_ref()
+            .ok_or_else(|| Exception::custom("fused_gate_up missing after init"))?;
+
+        // --- Global sort (same as forward_gather_global_sort) ---
+        let x_shape = x.shape();
+        let err = || Exception::custom("forward_gather_fused input must be [B, L, D]");
+        let b = *x_shape.first().ok_or_else(err)?;
+        let l = *x_shape.get(1).ok_or_else(err)?;
+        let d = *x_shape.get(2).ok_or_else(err)?;
+        let top_k = *indices
+            .shape()
+            .last()
+            .ok_or_else(|| Exception::custom("indices must have last dim"))?;
+
+        let idx_flat = indices.flatten(None, None)?;
+        let order = ops::argsort_axis(&idx_flat, 0)?;
+        let inv_order = ops::argsort_axis(&order, 0)?;
+
+        let top_k_u32 =
+            u32::try_from(top_k).map_err(|_| Exception::custom("top_k must fit in u32"))?;
+        let top_k_arr = Array::from_slice(&[top_k_u32], &[1]);
+        let token_idx = order.floor_divide(&top_k_arr)?;
+
+        let x_flat = x.reshape(&[b * l, 1, d])?;
+        let x_sorted = x_flat.take_axis(&token_idx, 0)?;
+        let idx_sorted = idx_flat.take_axis(&order, 0)?;
+
+        // --- Fused gate+up: ONE gather_qmm instead of TWO ---
+        let fused_out = gather_qmm(
+            &x_sorted,
+            fw,
+            fs,
+            fb,
+            &idx_sorted,
+            true,
+            self.gate_proj.group_size,
+            self.gate_proj.bits,
+            true,
+        )?;
+        // Split at intermediate boundary → gate_out, up_out
+        let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
+        let gate_out = parts
+            .first()
+            .ok_or_else(|| Exception::custom("fused split failed"))?;
+        let up_out = parts
+            .get(1)
+            .ok_or_else(|| Exception::custom("fused split failed"))?;
+        let activated = swiglu(gate_out, up_out)?;
+
+        // --- down_proj: unchanged ---
         let down_out = gather_qmm(
             &activated,
             &self.down_proj.weight,
@@ -2667,14 +2775,6 @@ impl FfnBlock {
                 .gate
                 .as_ref()
                 .ok_or_else(|| Exception::custom("MoE gate missing"))?;
-            let switch_ref = self
-                .switch_mlp
-                .as_ref()
-                .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
-            let se_ref = self
-                .shared_expert
-                .as_ref()
-                .ok_or_else(|| Exception::custom("MoE shared_expert missing"))?;
             let seg_ref = self
                 .shared_expert_gate
                 .as_ref()
@@ -2698,13 +2798,26 @@ impl FfnBlock {
                 raw_scores
             };
 
-            let y = switch_ref.forward_gather_global_sort(x, &inds)?;
+            let switch_ref = self
+                .switch_mlp
+                .as_mut()
+                .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
+            let y = if moe_ffn_fuse_gate_up() {
+                switch_ref.forward_gather_fused(x, &inds)?
+            } else {
+                switch_ref.forward_gather_global_sort(x, &inds)?
+            };
 
             let expert_sum = y
                 .multiply(&scores.expand_dims(-1)?)?
                 .sum_axes(&[-2], false)?;
 
+            let se_ref = self
+                .shared_expert
+                .as_ref()
+                .ok_or_else(|| Exception::custom("MoE shared_expert missing"))?;
             let shared_y = se_ref.forward(x)?;
+
             let shared_gate_val = nn::sigmoid(&seg_ref.forward(x)?)?;
             let shared_out = shared_y.multiply(&shared_gate_val)?;
 
@@ -3722,14 +3835,29 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
             .or_insert(serde_json::Value::from(0));
     }
 
-    // When HIGGS_SEPARATE_GDN_PROJ is set, construct the model with separate
-    // GDN projection fields so the direct weight loader can match them.
-    // Otherwise, construct with fused fields (weights are rearranged at load time).
-    let use_separate = std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
+    // When HIGGS_SEPARATE_GDN_PROJ is set, or when per-layer GDN BA quantization
+    // disagrees on bit-width / group_size between in_proj_a and in_proj_b (common
+    // in Unsloth dynamic quants), construct the model with separate GDN
+    // projection fields so the direct weight loader can match them. Otherwise,
+    // construct with fused fields (weights are rearranged at load time).
+    let mixed_ba_layers = qwen3_5_mixed_ba_quantization_layers(&config, text_config);
+    let config_requests_separate = map
+        .get("use_separate_gdn_projections")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let use_separate = config_requests_separate
+        || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok()
+        || !mixed_ba_layers.is_empty();
     map.insert(
         "use_separate_gdn_projections".to_owned(),
         serde_json::Value::from(use_separate),
     );
+    if !mixed_ba_layers.is_empty() {
+        tracing::info!(
+            layers = ?mixed_ba_layers,
+            "Detected mixed-bit GDN BA projections; using separate GDN projections"
+        );
+    }
 
     // Detect per-layer gate quantization override from top-level quantization config
     if let Some(gate_q) = gate_quantization_override(&config) {
@@ -3737,6 +3865,59 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     }
 
     Ok(serde_json::from_value(obj)?)
+}
+
+/// Parse a `{group_size, bits}` quantization spec from a JSON node.
+fn qwen3_5_quantization_config(value: &serde_json::Value) -> Option<QuantizationConfig> {
+    Some(QuantizationConfig {
+        group_size: i32::try_from(value.get("group_size")?.as_i64()?).ok()?,
+        bits: i32::try_from(value.get("bits")?.as_i64()?).ok()?,
+    })
+}
+
+/// Scan the per-layer `quantization` map and return layer indices where the GDN
+/// `in_proj_a` and `in_proj_b` projections disagree on bit-width or group size.
+/// Such layers cannot be fused into a single `in_proj_ba` matrix without
+/// dequantizing, so the loader must fall back to separate GDN projections.
+fn qwen3_5_mixed_ba_quantization_layers(
+    config: &serde_json::Value,
+    text_config: &serde_json::Value,
+) -> Vec<i32> {
+    let Some(quant) = config.get("quantization") else {
+        return Vec::new();
+    };
+    let Some(default_quant) = qwen3_5_quantization_config(quant) else {
+        return Vec::new();
+    };
+    let Some(num_hidden_layers) = text_config
+        .get("num_hidden_layers")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+    else {
+        return Vec::new();
+    };
+
+    (0..num_hidden_layers)
+        .filter(|layer_idx| {
+            let prefixes = [
+                format!("language_model.model.layers.{layer_idx}.linear_attn"),
+                format!("model.layers.{layer_idx}.linear_attn"),
+            ];
+            let projection_quantization = |projection: &str| {
+                prefixes
+                    .iter()
+                    .find_map(|prefix| {
+                        quant
+                            .get(format!("{prefix}.{projection}"))
+                            .and_then(qwen3_5_quantization_config)
+                    })
+                    .unwrap_or_else(|| default_quant.clone())
+            };
+            let a_quant = projection_quantization("in_proj_a");
+            let b_quant = projection_quantization("in_proj_b");
+            a_quant.bits != b_quant.bits || a_quant.group_size != b_quant.group_size
+        })
+        .collect()
 }
 
 /// Load a Qwen3.5 dense model (VLM wrapper around `Qwen3Next` architecture).
@@ -3766,15 +3947,7 @@ pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausa
         head_v_dim: args.linear_value_head_dim,
     };
     gdn_dims.validate()?;
-    let use_separate_gdn = std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
-    let mut model = Qwen3NextCausalLM::new(args)?;
-
-    if use_separate_gdn {
-        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
-        tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
-    } else {
-        load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
-    }
+    let model = load_qwen3_5_model_with_gdn_fallback(model_path, args, &gdn_dims)?;
 
     tracing::info!("Qwen3.5 dense model loaded successfully");
     Ok(model)
@@ -3810,23 +3983,71 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
         head_v_dim: args.linear_value_head_dim,
     };
     gdn_dims.validate()?;
-    let mut model = Qwen3NextCausalLM::new(args.clone())?;
-
     // Load weights with GDN projection rearrangement: flat (qkv,z,b,a)
     // → per-head-grouped (qkvz,ba) for fused 2-dispatch forward path.
-    // Respect use_separate_gdn_projections config flag or HIGGS_SEPARATE_GDN_PROJ env var.
-    let use_separate =
-        args.use_separate_gdn_projections || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
-    if use_separate {
-        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
-        tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
-    } else {
-        load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
-        tracing::info!("Using FUSED GDN projections (2 dispatches per layer)");
-    }
+    // Respects use_separate_gdn_projections (set by HIGGS_SEPARATE_GDN_PROJ env
+    // var or mixed-bit BA detection in load_qwen3_5_moe_text_config_args), and
+    // falls back to separate projections at runtime if fusion finds a
+    // shape-incompatible BA pair.
+    let model = load_qwen3_5_model_with_gdn_fallback(model_path, args, &gdn_dims)?;
 
     tracing::info!("Qwen3.5-MoE model loaded successfully");
     Ok(model)
+}
+
+/// Build a `Qwen3NextCausalLM` and load weights, choosing fused or separate GDN
+/// projections. When the config (or env var) requests separate projections, use
+/// the direct loader. Otherwise try the fused loader; if it reports a mixed-bit
+/// `in_proj_ba` shape mismatch, rebuild the model with separate projections and
+/// retry via the direct loader.
+fn load_qwen3_5_model_with_gdn_fallback(
+    model_path: &Path,
+    mut args: Qwen3NextModelArgs,
+    gdn_dims: &GdnDims,
+) -> Result<Qwen3NextCausalLM, ModelError> {
+    let force_separate =
+        args.use_separate_gdn_projections || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
+    if force_separate {
+        args.use_separate_gdn_projections = true;
+        let mut model = Qwen3NextCausalLM::new(args)?;
+        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
+        tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
+        return Ok(model);
+    }
+
+    let mut fused_model = Qwen3NextCausalLM::new(args.clone())?;
+    match load_qwen3_5_moe_weights_fused(&mut fused_model, model_path, gdn_dims) {
+        Ok(()) => {
+            tracing::info!("Using FUSED GDN projections (2 dispatches per layer)");
+            Ok(fused_model)
+        }
+        Err(err) if is_mixed_bit_gdn_ba_fusion_error(&err) => {
+            tracing::warn!(
+                error = %err,
+                "Detected mixed-bit GDN BA projection shapes; retrying with separate GDN projections"
+            );
+            args.use_separate_gdn_projections = true;
+            let mut separate_model = Qwen3NextCausalLM::new(args)?;
+            load_qwen3_5_moe_weights_direct(&mut separate_model, model_path)?;
+            tracing::info!(
+                "Using SEPARATE GDN projections (4 dispatches per layer, mixed-bit fallback)"
+            );
+            Ok(separate_model)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Returns true when the supplied error is the mixed-bit BA fusion error raised
+/// by [`load_qwen3_5_moe_weights_fused`] when `in_proj_a` and `in_proj_b` have
+/// incompatible packed inner shapes.
+fn is_mixed_bit_gdn_ba_fusion_error(err: &ModelError) -> bool {
+    matches!(
+        err,
+        ModelError::ShapeMismatch(message)
+            if message.contains("in_proj_ba")
+                && message.contains("requires separate GDN projections")
+    )
 }
 
 /// GDN dimension info extracted from model args before move.
@@ -3916,6 +4137,25 @@ fn concat_and_permute(a: &Array, b: &Array, perm: &[i32]) -> Result<Array, Excep
         &[i32::try_from(perm.len()).map_err(|_| Exception::custom("perm len overflow"))?],
     );
     cat.take_axis(&perm_arr, 0)
+}
+
+/// Return true when `a` and `b` can be concatenated along axis 0: the rank
+/// matches and every non-axis-0 dimension is identical. Quantized weights pack
+/// different bit-widths into different inner shapes, so this guards the BA
+/// fusion path from silently producing a malformed `in_proj_ba` matrix.
+fn can_concatenate_axis0_shapes(a_shape: &[i32], b_shape: &[i32]) -> bool {
+    a_shape.len() == b_shape.len()
+        && a_shape
+            .iter()
+            .zip(b_shape.iter())
+            .enumerate()
+            .all(|(axis, (lhs, rhs))| axis == 0 || lhs == rhs)
+}
+
+fn can_concatenate_axis0(a: &Array, b: &Array) -> bool {
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    can_concatenate_axis0_shapes(a_shape, b_shape)
 }
 
 /// Load Qwen3.5-MoE weights with GDN projection fusion.
@@ -4052,6 +4292,13 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
                 format!("Incomplete GDN projection pair for key: {combined_key}"),
             )));
         };
+        if combined_key.contains("in_proj_ba") && !can_concatenate_axis0(a, b) {
+            return Err(crate::error::ModelError::ShapeMismatch(format!(
+                "Mixed-bit BA fusion requires separate GDN projections for key {combined_key}: {:?} vs {:?}",
+                a.shape(),
+                b.shape()
+            )));
+        }
         let Some(param) = params.get_mut(combined_key.as_str()) else {
             return Err(crate::error::ModelError::Io(std::io::Error::other(
                 format!("Fused target key not found in model params: {combined_key}"),
@@ -4944,6 +5191,81 @@ mod tests {
         assert!(
             max_diff < 1e-4,
             "random weights: global sort differs by {max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_moe_gate_up_fusion_parity() {
+        // Fused gate+up (2 gather_qmm) must match unfused (3 gather_qmm).
+        // Uses random weights + distinct per-token inputs to stress sort/unsort.
+        let num_experts = 8;
+        let hidden = 128;
+        let intermediate = 64;
+        let top_k = 3;
+        let b = 1;
+        let l = 16;
+
+        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+
+        let gate_w = mlx_rs::random::uniform::<f32, f32>(
+            -1.0,
+            1.0,
+            &[num_experts, intermediate, hidden],
+            None,
+        )
+        .unwrap();
+        let (gw, gs, gb) = quantize_weights(&gate_w, 64, 4);
+        *block.gate_proj.weight = gw;
+        *block.gate_proj.scales = gs;
+        *block.gate_proj.biases = gb;
+
+        let up_w = mlx_rs::random::uniform::<f32, f32>(
+            -1.0,
+            1.0,
+            &[num_experts, intermediate, hidden],
+            None,
+        )
+        .unwrap();
+        let (uw, us, ub) = quantize_weights(&up_w, 64, 4);
+        *block.up_proj.weight = uw;
+        *block.up_proj.scales = us;
+        *block.up_proj.biases = ub;
+
+        let down_w = mlx_rs::random::uniform::<f32, f32>(
+            -1.0,
+            1.0,
+            &[num_experts, hidden, intermediate],
+            None,
+        )
+        .unwrap();
+        let (dw, ds, db) = quantize_weights(&down_w, 64, 4);
+        *block.down_proj.weight = dw;
+        *block.down_proj.scales = ds;
+        *block.down_proj.biases = db;
+
+        let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[b, l, hidden], None).unwrap();
+        let idx_data: Vec<u32> = (0..(b * l * top_k) as u32)
+            .map(|i| i % num_experts as u32)
+            .collect();
+        let indices = Array::from_slice(&idx_data, &[b, l, top_k]);
+        x.eval().unwrap();
+        indices.eval().unwrap();
+
+        // Reference: unfused 3-call path
+        let reference = block.forward_gather_global_sort(&x, &indices).unwrap();
+        // Fused: 2-call path
+        let fused = block.forward_gather_fused(&x, &indices).unwrap();
+        reference.eval().unwrap();
+        fused.eval().unwrap();
+
+        assert_eq!(reference.shape(), fused.shape());
+        assert_eq!(fused.shape(), &[b, l, top_k, hidden]);
+
+        let diff = reference.subtract(&fused).unwrap().abs().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        assert!(
+            max_diff < 1e-5,
+            "fused gate+up differs from unfused by {max_diff}"
         );
     }
 
@@ -6345,6 +6667,7 @@ mod tests {
                     gate_proj: make_switch_ql(d, d_inter),
                     up_proj: make_switch_ql(d, d_inter),
                     down_proj: make_switch_ql(d_inter, d),
+                    fused_gate_up: None,
                 },
                 shared_expert: Qwen3NextMLP {
                     gate_proj: make_ql(d, shared_inter * 2, gs, bits),
@@ -12823,6 +13146,132 @@ mod tests {
         args.mtp_num_hidden_layers = 1;
         maybe_disable_mtp_without_checkpoint_weights(&mut args, dir.path()).unwrap();
         assert_eq!(args.mtp_num_hidden_layers, 1);
+    }
+
+    #[test]
+    fn test_load_qwen35_mixed_ba_quantization_forces_separate_gdn() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = format!(
+            r#"{{
+                "text_config": {},
+                "tie_word_embeddings": false,
+                "quantization": {{
+                    "group_size": 64,
+                    "bits": 2,
+                    "mode": "affine",
+                    "language_model.model.layers.1.linear_attn.in_proj_a": {{
+                        "group_size": 64,
+                        "bits": 5,
+                        "mode": "affine"
+                    }}
+                }}
+            }}"#,
+            qwen35_dense_text_config()
+        );
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(
+            args.use_separate_gdn_projections,
+            "mixed-bit in_proj_a/in_proj_b must force separate GDN projections"
+        );
+    }
+
+    #[test]
+    fn test_load_qwen35_mixed_ba_quantization_supports_unprefixed_layer_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = format!(
+            r#"{{
+                "text_config": {},
+                "tie_word_embeddings": false,
+                "quantization": {{
+                    "group_size": 64,
+                    "bits": 2,
+                    "mode": "affine",
+                    "model.layers.1.linear_attn.in_proj_a": {{
+                        "group_size": 64,
+                        "bits": 5,
+                        "mode": "affine"
+                    }}
+                }}
+            }}"#,
+            qwen35_dense_text_config()
+        );
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(
+            args.use_separate_gdn_projections,
+            "unprefixed mixed-bit in_proj_a/in_proj_b must force separate GDN projections"
+        );
+    }
+
+    #[test]
+    fn test_load_qwen35_matching_ba_quantization_keeps_fused_gdn() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = format!(
+            r#"{{
+                "text_config": {},
+                "tie_word_embeddings": false,
+                "quantization": {{
+                    "group_size": 64,
+                    "bits": 2,
+                    "mode": "affine",
+                    "language_model.model.layers.1.linear_attn.in_proj_a": {{
+                        "group_size": 64,
+                        "bits": 5,
+                        "mode": "affine"
+                    }},
+                    "language_model.model.layers.1.linear_attn.in_proj_b": {{
+                        "group_size": 64,
+                        "bits": 5,
+                        "mode": "affine"
+                    }}
+                }}
+            }}"#,
+            qwen35_dense_text_config()
+        );
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(
+            !args.use_separate_gdn_projections,
+            "matching BA overrides should keep the fused GDN loader path"
+        );
+    }
+
+    #[test]
+    fn test_load_qwen35_explicit_separate_gdn_config_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut text_config = qwen35_dense_text_config().trim_end_matches('}').to_owned();
+        text_config.push_str(
+            r#",
+            "use_separate_gdn_projections": true
+        }"#,
+        );
+        write_qwen35_config(dir.path(), &text_config);
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(
+            args.use_separate_gdn_projections,
+            "explicit use_separate_gdn_projections=true must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn test_can_concatenate_axis0_detects_quantized_inner_shape_mismatch() {
+        assert!(
+            !can_concatenate_axis0_shapes(&[48, 320], &[48, 800]),
+            "different packed inner dims must block BA fusion"
+        );
+        assert!(
+            can_concatenate_axis0_shapes(&[48, 320], &[96, 320]),
+            "axis-0 size may differ because fusion concatenates rows"
+        );
     }
 
     /// GQA ratio: `num_v_heads` must be divisible by `num_k_heads`.
