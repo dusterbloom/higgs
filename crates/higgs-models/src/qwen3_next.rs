@@ -3728,8 +3728,13 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     // projection fields so the direct weight loader can match them. Otherwise,
     // construct with fused fields (weights are rearranged at load time).
     let mixed_ba_layers = qwen3_5_mixed_ba_quantization_layers(&config, text_config);
-    let use_separate =
-        std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok() || !mixed_ba_layers.is_empty();
+    let config_requests_separate = map
+        .get("use_separate_gdn_projections")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let use_separate = config_requests_separate
+        || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok()
+        || !mixed_ba_layers.is_empty();
     map.insert(
         "use_separate_gdn_projections".to_owned(),
         serde_json::Value::from(use_separate),
@@ -3781,15 +3786,22 @@ fn qwen3_5_mixed_ba_quantization_layers(
 
     (0..num_hidden_layers)
         .filter(|layer_idx| {
-            let prefix = format!("language_model.model.layers.{layer_idx}.linear_attn");
-            let a_quant = quant
-                .get(format!("{prefix}.in_proj_a"))
-                .and_then(qwen3_5_quantization_config)
-                .unwrap_or_else(|| default_quant.clone());
-            let b_quant = quant
-                .get(format!("{prefix}.in_proj_b"))
-                .and_then(qwen3_5_quantization_config)
-                .unwrap_or_else(|| default_quant.clone());
+            let prefixes = [
+                format!("language_model.model.layers.{layer_idx}.linear_attn"),
+                format!("model.layers.{layer_idx}.linear_attn"),
+            ];
+            let projection_quantization = |projection: &str| {
+                prefixes
+                    .iter()
+                    .find_map(|prefix| {
+                        quant
+                            .get(format!("{prefix}.{projection}"))
+                            .and_then(qwen3_5_quantization_config)
+                    })
+                    .unwrap_or_else(|| default_quant.clone())
+            };
+            let a_quant = projection_quantization("in_proj_a");
+            let b_quant = projection_quantization("in_proj_b");
             a_quant.bits != b_quant.bits || a_quant.group_size != b_quant.group_size
         })
         .collect()
@@ -4018,15 +4030,19 @@ fn concat_and_permute(a: &Array, b: &Array, perm: &[i32]) -> Result<Array, Excep
 /// matches and every non-axis-0 dimension is identical. Quantized weights pack
 /// different bit-widths into different inner shapes, so this guards the BA
 /// fusion path from silently producing a malformed `in_proj_ba` matrix.
-fn can_concatenate_axis0(a: &Array, b: &Array) -> bool {
-    let a_shape = a.shape();
-    let b_shape = b.shape();
+fn can_concatenate_axis0_shapes(a_shape: &[i32], b_shape: &[i32]) -> bool {
     a_shape.len() == b_shape.len()
         && a_shape
             .iter()
             .zip(b_shape.iter())
             .enumerate()
             .all(|(axis, (lhs, rhs))| axis == 0 || lhs == rhs)
+}
+
+fn can_concatenate_axis0(a: &Array, b: &Array) -> bool {
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    can_concatenate_axis0_shapes(a_shape, b_shape)
 }
 
 /// Load Qwen3.5-MoE weights with GDN projection fusion.
@@ -12974,6 +12990,36 @@ mod tests {
     }
 
     #[test]
+    fn test_load_qwen35_mixed_ba_quantization_supports_unprefixed_layer_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = format!(
+            r#"{{
+                "text_config": {},
+                "tie_word_embeddings": false,
+                "quantization": {{
+                    "group_size": 64,
+                    "bits": 2,
+                    "mode": "affine",
+                    "model.layers.1.linear_attn.in_proj_a": {{
+                        "group_size": 64,
+                        "bits": 5,
+                        "mode": "affine"
+                    }}
+                }}
+            }}"#,
+            qwen35_dense_text_config()
+        );
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(
+            args.use_separate_gdn_projections,
+            "unprefixed mixed-bit in_proj_a/in_proj_b must force separate GDN projections"
+        );
+    }
+
+    #[test]
     fn test_load_qwen35_matching_ba_quantization_keeps_fused_gdn() {
         let dir = tempfile::tempdir().unwrap();
         let config = format!(
@@ -13009,17 +13055,32 @@ mod tests {
     }
 
     #[test]
-    fn test_can_concatenate_axis0_detects_quantized_inner_shape_mismatch() {
-        let a = Array::zeros::<f32>(&[48, 320]).unwrap();
-        let b = Array::zeros::<f32>(&[48, 800]).unwrap();
-        let c = Array::zeros::<f32>(&[96, 320]).unwrap();
+    fn test_load_qwen35_explicit_separate_gdn_config_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut text_config = qwen35_dense_text_config().trim_end_matches('}').to_owned();
+        text_config.push_str(
+            r#",
+            "use_separate_gdn_projections": true
+        }"#,
+        );
+        write_qwen35_config(dir.path(), &text_config);
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
 
         assert!(
-            !can_concatenate_axis0(&a, &b),
+            args.use_separate_gdn_projections,
+            "explicit use_separate_gdn_projections=true must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn test_can_concatenate_axis0_detects_quantized_inner_shape_mismatch() {
+        assert!(
+            !can_concatenate_axis0_shapes(&[48, 320], &[48, 800]),
             "different packed inner dims must block BA fusion"
         );
         assert!(
-            can_concatenate_axis0(&a, &c),
+            can_concatenate_axis0_shapes(&[48, 320], &[96, 320]),
             "axis-0 size may differ because fusion concatenates rows"
         );
     }
