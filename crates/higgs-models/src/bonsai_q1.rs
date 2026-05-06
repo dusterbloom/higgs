@@ -483,12 +483,14 @@ impl BonsaiQ1Engine {
         let base = self.config.rope_theta as f32;
         let (yarn_freqs, yarn_mscale) = match self.config.rope_yarn_factor {
             Some(factor) if factor > 1.0 => {
-                let orig = i32::try_from(
-                    self.config
-                        .rope_original_max_seq
-                        .unwrap_or(self.config.hidden),
-                )
-                .map_err(|_| Exception::custom("orig_max_seq overflows i32"))?;
+                let orig_seq = self.config.rope_original_max_seq.ok_or_else(|| {
+                    Exception::custom(
+                        "rope_yarn_factor > 1.0 requires \
+                         rope_scaling.original_max_position_embeddings",
+                    )
+                })?;
+                let orig = i32::try_from(orig_seq)
+                    .map_err(|_| Exception::custom("orig_max_seq overflows i32"))?;
                 let factor_f = factor as f32;
                 let freqs = compute_yarn_freqs(head_dim_i, base, factor_f, orig, 32.0, 1.0);
                 (Some(freqs), yarn_get_mscale(factor_f, 1.0))

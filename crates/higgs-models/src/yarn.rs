@@ -11,9 +11,14 @@ use std::f32::consts::PI;
 
 use mlx_rs::{Array, error::Exception, fast};
 
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
 fn yarn_find_correction_dim(num_rotations: f32, dim: i32, base: f32, max_pos: i32) -> f32 {
-    let dim_f = f32::from(i16::try_from(dim).unwrap_or(i16::MAX));
-    let max_pos_f = f32::from(i16::try_from(max_pos).unwrap_or(i16::MAX));
+    let dim_f = dim as f32;
+    let max_pos_f = max_pos as f32;
     (dim_f * (max_pos_f / (num_rotations * 2.0 * PI)).ln()) / (2.0 * base.ln())
 }
 
@@ -44,6 +49,7 @@ pub(crate) fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
 
 #[allow(
     clippy::as_conversions,
+    clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::indexing_slicing
@@ -57,12 +63,12 @@ pub(crate) fn compute_yarn_freqs(
     beta_slow: f32,
 ) -> Array {
     let half_dim = dim / 2;
-    let dim_f = f32::from(i16::try_from(dim).unwrap_or(i16::MAX));
+    let dim_f = dim as f32;
 
     let mut freq_extra = Vec::with_capacity(half_dim as usize);
     let mut freq_inter = Vec::with_capacity(half_dim as usize);
     for i in 0..half_dim {
-        let exp = f32::from(i16::try_from(2 * i).unwrap_or(0)) / dim_f;
+        let exp = (2 * i) as f32 / dim_f;
         let theta = base.powf(exp);
         freq_extra.push(theta);
         freq_inter.push(scaling_factor * theta);
@@ -70,8 +76,8 @@ pub(crate) fn compute_yarn_freqs(
 
     let (low, high) = yarn_find_correction_range(beta_fast, beta_slow, dim, base, orig_max_pos);
 
-    let low_f = f32::from(i16::try_from(low).unwrap_or(0));
-    let high_f = f32::from(i16::try_from(high).unwrap_or(0));
+    let low_f = low as f32;
+    let high_f = high as f32;
     let range = if (high_f - low_f).abs() < 0.001 {
         high_f - low_f + 0.001
     } else {
@@ -80,7 +86,7 @@ pub(crate) fn compute_yarn_freqs(
 
     let mut freqs = Vec::with_capacity(half_dim as usize);
     for i in 0..half_dim as usize {
-        let idx_f = f32::from(i16::try_from(i).unwrap_or(0));
+        let idx_f = i as f32;
         let ramp = ((idx_f - low_f) / range).clamp(0.0, 1.0);
         let mask = 1.0 - ramp;
         let inter = freq_inter[i];
@@ -153,9 +159,9 @@ pub(crate) fn apply_yarn_rope(
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::as_conversions,
+    clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
     clippy::cast_lossless
 )]
 mod tests {

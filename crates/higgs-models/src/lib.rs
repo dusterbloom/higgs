@@ -18,6 +18,7 @@ pub mod yarn;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
@@ -28,6 +29,8 @@ use serde_json::Value;
 
 use crate::error::ModelError;
 use crate::turboquant::KvCacheConfig;
+
+static BONSAI_IGNORED_MASK_WARNED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // SamplingParams -- configurable sampling parameters
@@ -219,7 +222,14 @@ impl AnyModel {
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
             // BonsaiQ1 builds its causal mask internally; any externally-provided
             // mask is ignored (causal-only semantics).
-            (Self::BonsaiQ1(m), AnyCache::KV(c)) => m.forward(inputs, c),
+            (Self::BonsaiQ1(m), AnyCache::KV(c)) => {
+                if mask.is_some() && !BONSAI_IGNORED_MASK_WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "BonsaiQ1 ignores externally provided masks and builds its own causal mask"
+                    );
+                }
+                m.forward(inputs, c)
+            }
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -240,9 +250,7 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_hidden(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
-            (Self::BonsaiQ1(_), AnyCache::KV(_)) => Err(Exception::custom(
-                "BonsaiQ1: forward_hidden not supported (tap not implemented)",
-            )),
+            (Self::BonsaiQ1(m), AnyCache::KV(c)) => bonsai_q1::forward_trunk_free(m, c, inputs),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }

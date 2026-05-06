@@ -301,6 +301,17 @@ mod tests {
             }"#,
         );
         assert!(!is_bonsai_q1(wrong_group_dir.path()).unwrap());
+
+        let (q4_dir, _q4_result) = config_from_raw(
+            r#"{
+                "model_type": "qwen3",
+                "quantization": {"bits": 4, "group_size": 128}
+            }"#,
+        );
+        assert!(
+            !is_bonsai_q1(q4_dir.path()).unwrap(),
+            "regular Q4 Qwen3 must not be misclassified as Bonsai-Q1"
+        );
     }
 
     #[test]
