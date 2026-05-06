@@ -3722,14 +3722,29 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
             .or_insert(serde_json::Value::from(0));
     }
 
-    // When HIGGS_SEPARATE_GDN_PROJ is set, construct the model with separate
-    // GDN projection fields so the direct weight loader can match them.
-    // Otherwise, construct with fused fields (weights are rearranged at load time).
-    let use_separate = std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
+    // When HIGGS_SEPARATE_GDN_PROJ is set, or when per-layer GDN BA quantization
+    // disagrees on bit-width / group_size between in_proj_a and in_proj_b (common
+    // in Unsloth dynamic quants), construct the model with separate GDN
+    // projection fields so the direct weight loader can match them. Otherwise,
+    // construct with fused fields (weights are rearranged at load time).
+    let mixed_ba_layers = qwen3_5_mixed_ba_quantization_layers(&config, text_config);
+    let config_requests_separate = map
+        .get("use_separate_gdn_projections")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let use_separate = config_requests_separate
+        || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok()
+        || !mixed_ba_layers.is_empty();
     map.insert(
         "use_separate_gdn_projections".to_owned(),
         serde_json::Value::from(use_separate),
     );
+    if !mixed_ba_layers.is_empty() {
+        tracing::info!(
+            layers = ?mixed_ba_layers,
+            "Detected mixed-bit GDN BA projections; using separate GDN projections"
+        );
+    }
 
     // Detect per-layer gate quantization override from top-level quantization config
     if let Some(gate_q) = gate_quantization_override(&config) {
@@ -3737,6 +3752,59 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     }
 
     Ok(serde_json::from_value(obj)?)
+}
+
+/// Parse a `{group_size, bits}` quantization spec from a JSON node.
+fn qwen3_5_quantization_config(value: &serde_json::Value) -> Option<QuantizationConfig> {
+    Some(QuantizationConfig {
+        group_size: i32::try_from(value.get("group_size")?.as_i64()?).ok()?,
+        bits: i32::try_from(value.get("bits")?.as_i64()?).ok()?,
+    })
+}
+
+/// Scan the per-layer `quantization` map and return layer indices where the GDN
+/// `in_proj_a` and `in_proj_b` projections disagree on bit-width or group size.
+/// Such layers cannot be fused into a single `in_proj_ba` matrix without
+/// dequantizing, so the loader must fall back to separate GDN projections.
+fn qwen3_5_mixed_ba_quantization_layers(
+    config: &serde_json::Value,
+    text_config: &serde_json::Value,
+) -> Vec<i32> {
+    let Some(quant) = config.get("quantization") else {
+        return Vec::new();
+    };
+    let Some(default_quant) = qwen3_5_quantization_config(quant) else {
+        return Vec::new();
+    };
+    let Some(num_hidden_layers) = text_config
+        .get("num_hidden_layers")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+    else {
+        return Vec::new();
+    };
+
+    (0..num_hidden_layers)
+        .filter(|layer_idx| {
+            let prefixes = [
+                format!("language_model.model.layers.{layer_idx}.linear_attn"),
+                format!("model.layers.{layer_idx}.linear_attn"),
+            ];
+            let projection_quantization = |projection: &str| {
+                prefixes
+                    .iter()
+                    .find_map(|prefix| {
+                        quant
+                            .get(format!("{prefix}.{projection}"))
+                            .and_then(qwen3_5_quantization_config)
+                    })
+                    .unwrap_or_else(|| default_quant.clone())
+            };
+            let a_quant = projection_quantization("in_proj_a");
+            let b_quant = projection_quantization("in_proj_b");
+            a_quant.bits != b_quant.bits || a_quant.group_size != b_quant.group_size
+        })
+        .collect()
 }
 
 /// Load a Qwen3.5 dense model (VLM wrapper around `Qwen3Next` architecture).
@@ -3766,15 +3834,7 @@ pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausa
         head_v_dim: args.linear_value_head_dim,
     };
     gdn_dims.validate()?;
-    let use_separate_gdn = std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
-    let mut model = Qwen3NextCausalLM::new(args)?;
-
-    if use_separate_gdn {
-        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
-        tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
-    } else {
-        load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
-    }
+    let model = load_qwen3_5_model_with_gdn_fallback(model_path, args, &gdn_dims)?;
 
     tracing::info!("Qwen3.5 dense model loaded successfully");
     Ok(model)
@@ -3810,23 +3870,71 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
         head_v_dim: args.linear_value_head_dim,
     };
     gdn_dims.validate()?;
-    let mut model = Qwen3NextCausalLM::new(args.clone())?;
-
     // Load weights with GDN projection rearrangement: flat (qkv,z,b,a)
     // → per-head-grouped (qkvz,ba) for fused 2-dispatch forward path.
-    // Respect use_separate_gdn_projections config flag or HIGGS_SEPARATE_GDN_PROJ env var.
-    let use_separate =
-        args.use_separate_gdn_projections || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
-    if use_separate {
-        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
-        tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
-    } else {
-        load_qwen3_5_moe_weights_fused(&mut model, model_path, &gdn_dims)?;
-        tracing::info!("Using FUSED GDN projections (2 dispatches per layer)");
-    }
+    // Respects use_separate_gdn_projections (set by HIGGS_SEPARATE_GDN_PROJ env
+    // var or mixed-bit BA detection in load_qwen3_5_moe_text_config_args), and
+    // falls back to separate projections at runtime if fusion finds a
+    // shape-incompatible BA pair.
+    let model = load_qwen3_5_model_with_gdn_fallback(model_path, args, &gdn_dims)?;
 
     tracing::info!("Qwen3.5-MoE model loaded successfully");
     Ok(model)
+}
+
+/// Build a `Qwen3NextCausalLM` and load weights, choosing fused or separate GDN
+/// projections. When the config (or env var) requests separate projections, use
+/// the direct loader. Otherwise try the fused loader; if it reports a mixed-bit
+/// `in_proj_ba` shape mismatch, rebuild the model with separate projections and
+/// retry via the direct loader.
+fn load_qwen3_5_model_with_gdn_fallback(
+    model_path: &Path,
+    mut args: Qwen3NextModelArgs,
+    gdn_dims: &GdnDims,
+) -> Result<Qwen3NextCausalLM, ModelError> {
+    let force_separate =
+        args.use_separate_gdn_projections || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
+    if force_separate {
+        args.use_separate_gdn_projections = true;
+        let mut model = Qwen3NextCausalLM::new(args)?;
+        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
+        tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
+        return Ok(model);
+    }
+
+    let mut fused_model = Qwen3NextCausalLM::new(args.clone())?;
+    match load_qwen3_5_moe_weights_fused(&mut fused_model, model_path, gdn_dims) {
+        Ok(()) => {
+            tracing::info!("Using FUSED GDN projections (2 dispatches per layer)");
+            Ok(fused_model)
+        }
+        Err(err) if is_mixed_bit_gdn_ba_fusion_error(&err) => {
+            tracing::warn!(
+                error = %err,
+                "Detected mixed-bit GDN BA projection shapes; retrying with separate GDN projections"
+            );
+            args.use_separate_gdn_projections = true;
+            let mut separate_model = Qwen3NextCausalLM::new(args)?;
+            load_qwen3_5_moe_weights_direct(&mut separate_model, model_path)?;
+            tracing::info!(
+                "Using SEPARATE GDN projections (4 dispatches per layer, mixed-bit fallback)"
+            );
+            Ok(separate_model)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Returns true when the supplied error is the mixed-bit BA fusion error raised
+/// by [`load_qwen3_5_moe_weights_fused`] when `in_proj_a` and `in_proj_b` have
+/// incompatible packed inner shapes.
+fn is_mixed_bit_gdn_ba_fusion_error(err: &ModelError) -> bool {
+    matches!(
+        err,
+        ModelError::ShapeMismatch(message)
+            if message.contains("in_proj_ba")
+                && message.contains("requires separate GDN projections")
+    )
 }
 
 /// GDN dimension info extracted from model args before move.
@@ -3916,6 +4024,25 @@ fn concat_and_permute(a: &Array, b: &Array, perm: &[i32]) -> Result<Array, Excep
         &[i32::try_from(perm.len()).map_err(|_| Exception::custom("perm len overflow"))?],
     );
     cat.take_axis(&perm_arr, 0)
+}
+
+/// Return true when `a` and `b` can be concatenated along axis 0: the rank
+/// matches and every non-axis-0 dimension is identical. Quantized weights pack
+/// different bit-widths into different inner shapes, so this guards the BA
+/// fusion path from silently producing a malformed `in_proj_ba` matrix.
+fn can_concatenate_axis0_shapes(a_shape: &[i32], b_shape: &[i32]) -> bool {
+    a_shape.len() == b_shape.len()
+        && a_shape
+            .iter()
+            .zip(b_shape.iter())
+            .enumerate()
+            .all(|(axis, (lhs, rhs))| axis == 0 || lhs == rhs)
+}
+
+fn can_concatenate_axis0(a: &Array, b: &Array) -> bool {
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    can_concatenate_axis0_shapes(a_shape, b_shape)
 }
 
 /// Load Qwen3.5-MoE weights with GDN projection fusion.
@@ -4052,6 +4179,13 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
                 format!("Incomplete GDN projection pair for key: {combined_key}"),
             )));
         };
+        if combined_key.contains("in_proj_ba") && !can_concatenate_axis0(a, b) {
+            return Err(crate::error::ModelError::ShapeMismatch(format!(
+                "Mixed-bit BA fusion requires separate GDN projections for key {combined_key}: {:?} vs {:?}",
+                a.shape(),
+                b.shape()
+            )));
+        }
         let Some(param) = params.get_mut(combined_key.as_str()) else {
             return Err(crate::error::ModelError::Io(std::io::Error::other(
                 format!("Fused target key not found in model params: {combined_key}"),
@@ -12823,6 +12957,132 @@ mod tests {
         args.mtp_num_hidden_layers = 1;
         maybe_disable_mtp_without_checkpoint_weights(&mut args, dir.path()).unwrap();
         assert_eq!(args.mtp_num_hidden_layers, 1);
+    }
+
+    #[test]
+    fn test_load_qwen35_mixed_ba_quantization_forces_separate_gdn() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = format!(
+            r#"{{
+                "text_config": {},
+                "tie_word_embeddings": false,
+                "quantization": {{
+                    "group_size": 64,
+                    "bits": 2,
+                    "mode": "affine",
+                    "language_model.model.layers.1.linear_attn.in_proj_a": {{
+                        "group_size": 64,
+                        "bits": 5,
+                        "mode": "affine"
+                    }}
+                }}
+            }}"#,
+            qwen35_dense_text_config()
+        );
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(
+            args.use_separate_gdn_projections,
+            "mixed-bit in_proj_a/in_proj_b must force separate GDN projections"
+        );
+    }
+
+    #[test]
+    fn test_load_qwen35_mixed_ba_quantization_supports_unprefixed_layer_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = format!(
+            r#"{{
+                "text_config": {},
+                "tie_word_embeddings": false,
+                "quantization": {{
+                    "group_size": 64,
+                    "bits": 2,
+                    "mode": "affine",
+                    "model.layers.1.linear_attn.in_proj_a": {{
+                        "group_size": 64,
+                        "bits": 5,
+                        "mode": "affine"
+                    }}
+                }}
+            }}"#,
+            qwen35_dense_text_config()
+        );
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(
+            args.use_separate_gdn_projections,
+            "unprefixed mixed-bit in_proj_a/in_proj_b must force separate GDN projections"
+        );
+    }
+
+    #[test]
+    fn test_load_qwen35_matching_ba_quantization_keeps_fused_gdn() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = format!(
+            r#"{{
+                "text_config": {},
+                "tie_word_embeddings": false,
+                "quantization": {{
+                    "group_size": 64,
+                    "bits": 2,
+                    "mode": "affine",
+                    "language_model.model.layers.1.linear_attn.in_proj_a": {{
+                        "group_size": 64,
+                        "bits": 5,
+                        "mode": "affine"
+                    }},
+                    "language_model.model.layers.1.linear_attn.in_proj_b": {{
+                        "group_size": 64,
+                        "bits": 5,
+                        "mode": "affine"
+                    }}
+                }}
+            }}"#,
+            qwen35_dense_text_config()
+        );
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(
+            !args.use_separate_gdn_projections,
+            "matching BA overrides should keep the fused GDN loader path"
+        );
+    }
+
+    #[test]
+    fn test_load_qwen35_explicit_separate_gdn_config_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut text_config = qwen35_dense_text_config().trim_end_matches('}').to_owned();
+        text_config.push_str(
+            r#",
+            "use_separate_gdn_projections": true
+        }"#,
+        );
+        write_qwen35_config(dir.path(), &text_config);
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(
+            args.use_separate_gdn_projections,
+            "explicit use_separate_gdn_projections=true must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn test_can_concatenate_axis0_detects_quantized_inner_shape_mismatch() {
+        assert!(
+            !can_concatenate_axis0_shapes(&[48, 320], &[48, 800]),
+            "different packed inner dims must block BA fusion"
+        );
+        assert!(
+            can_concatenate_axis0_shapes(&[48, 320], &[96, 320]),
+            "axis-0 size may differ because fusion concatenates rows"
+        );
     }
 
     /// GQA ratio: `num_v_heads` must be divisible by `num_k_heads`.
