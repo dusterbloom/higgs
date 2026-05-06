@@ -1015,6 +1015,7 @@ static DECODE_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 static QGEMV_NSG_OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
 static DENSE_FFN_GEMV_MODE: OnceLock<DenseFfnGemvMode> = OnceLock::new();
 static DENSE_FFN_FUSE_GATE_UP: OnceLock<bool> = OnceLock::new();
+static MOE_FFN_FUSE_GATE_UP: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DenseFfnGemvMode {
@@ -1085,6 +1086,10 @@ fn dense_ffn_fuse_gate_up() -> bool {
             },
         )
     })
+}
+
+fn moe_ffn_fuse_gate_up() -> bool {
+    *MOE_FFN_FUSE_GATE_UP.get_or_init(|| truthy_env_var("HIGGS_MOE_FFN_GATE_UP"))
 }
 
 fn qgemv_config_cache_enabled() -> bool {
@@ -1873,6 +1878,8 @@ impl SwitchMlpWeights {
 
     /// Like `forward_gather_global_sort` but fuses gate+up into a single
     /// `gather_qmm` call (3→2 per layer). Lazy-inits fused weights on first call.
+    /// Production routing gates this behind `HIGGS_MOE_FFN_GATE_UP` because the
+    /// fused cache duplicates the resident gate/up tensors.
     pub(crate) fn forward_gather_fused(
         &mut self,
         x: &Array,
@@ -2795,7 +2802,11 @@ impl FfnBlock {
                 .switch_mlp
                 .as_mut()
                 .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
-            let y = switch_ref.forward_gather_fused(x, &inds)?;
+            let y = if moe_ffn_fuse_gate_up() {
+                switch_ref.forward_gather_fused(x, &inds)?
+            } else {
+                switch_ref.forward_gather_global_sort(x, &inds)?
+            };
 
             let expert_sum = y
                 .multiply(&scores.expand_dims(-1)?)?
@@ -5188,32 +5199,45 @@ mod tests {
         // Fused gate+up (2 gather_qmm) must match unfused (3 gather_qmm).
         // Uses random weights + distinct per-token inputs to stress sort/unsort.
         let num_experts = 8;
-        let hidden = 64;
+        let hidden = 128;
+        let intermediate = 64;
         let top_k = 3;
         let b = 1;
         let l = 16;
 
         let mut block = SwitchMlpWeights::new(64, 4).unwrap();
 
-        let gate_w =
-            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
-                .unwrap();
+        let gate_w = mlx_rs::random::uniform::<f32, f32>(
+            -1.0,
+            1.0,
+            &[num_experts, intermediate, hidden],
+            None,
+        )
+        .unwrap();
         let (gw, gs, gb) = quantize_weights(&gate_w, 64, 4);
         *block.gate_proj.weight = gw;
         *block.gate_proj.scales = gs;
         *block.gate_proj.biases = gb;
 
-        let up_w =
-            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
-                .unwrap();
+        let up_w = mlx_rs::random::uniform::<f32, f32>(
+            -1.0,
+            1.0,
+            &[num_experts, intermediate, hidden],
+            None,
+        )
+        .unwrap();
         let (uw, us, ub) = quantize_weights(&up_w, 64, 4);
         *block.up_proj.weight = uw;
         *block.up_proj.scales = us;
         *block.up_proj.biases = ub;
 
-        let down_w =
-            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
-                .unwrap();
+        let down_w = mlx_rs::random::uniform::<f32, f32>(
+            -1.0,
+            1.0,
+            &[num_experts, hidden, intermediate],
+            None,
+        )
+        .unwrap();
         let (dw, ds, db) = quantize_weights(&down_w, 64, 4);
         *block.down_proj.weight = dw;
         *block.down_proj.scales = ds;
