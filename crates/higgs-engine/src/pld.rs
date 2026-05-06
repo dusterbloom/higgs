@@ -23,6 +23,8 @@
 use crate::error::EngineError;
 use crate::speculative::DraftModel;
 
+/// PLD drafter: tracks committed tokens and pending draft state for n-gram
+/// suffix-match lookups against the running sequence.
 pub struct PldDraftModel {
     /// Search corpus: prompt tokens plus every token confirmed by `advance()`.
     /// The next cycle's `last_token_id` is appended onto a temporary view
@@ -36,6 +38,7 @@ pub struct PldDraftModel {
 }
 
 impl PldDraftModel {
+    /// Construct an empty PLD drafter with the given n-gram suffix bounds.
     pub const fn new(max_ngram: usize, min_ngram: usize) -> Self {
         Self {
             committed: Vec::new(),

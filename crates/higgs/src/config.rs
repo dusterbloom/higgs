@@ -936,7 +936,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         mlx_profile: None,
         batch: false,
         draft_model: None,
-        num_draft: 8,
+        num_draft: default_num_draft(),
         kv_cache: KvCacheMode::Off,
         kv_bits: default_kv_bits(),
         kv_key_bits: None,
