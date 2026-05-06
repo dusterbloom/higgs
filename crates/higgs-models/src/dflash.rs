@@ -29,22 +29,36 @@ struct DFlashSubConfig {
     mask_token_id: Option<i32>,
 }
 
+/// `DFlash` drafter configuration deserialized from the drafter's `config.json`.
+/// `vocab_size` must match the target model.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DFlashConfig {
+    /// Hidden dimension of the drafter's residual stream.
     pub hidden_size: i32,
+    /// Number of decoder layers in the drafter (typically 8).
     pub num_hidden_layers: i32,
+    /// Total attention heads per layer.
     pub num_attention_heads: i32,
+    /// KV heads per layer (≤ `num_attention_heads`; enables GQA).
     pub num_key_value_heads: i32,
+    /// Per-head dimension; defaults to 128 when absent.
     #[serde(default = "default_head_dim")]
     pub head_dim: i32,
+    /// `SwiGLU` MLP inner dimension.
     pub intermediate_size: i32,
+    /// `RMSNorm` epsilon; defaults to 1e-6.
     #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f32,
+    /// `RoPE` base frequency theta; defaults to 1e7.
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+    /// Trained block size for the drafter (typically 16). Runtime decode may use
+    /// a smaller value — see `DEFAULT_DECODE_BLOCK_SIZE`.
     #[serde(default = "default_block_size")]
     pub block_size: i32,
+    /// Vocabulary size; must equal the target model's vocab.
     pub vocab_size: i32,
+    /// Internal sub-config (target tap layers, mask token id).
     dflash_config: DFlashSubConfig,
 }
 
@@ -78,11 +92,9 @@ const fn default_block_size() -> i32 {
     16
 }
 
-/// Runtime decode `block_size` used at inference.
-///
-/// Overridable via `HIGGS_DFLASH_BLOCK_SIZE`. Diverges from the drafter's
-/// trained `block_size` (16) because acceptance rate plateaus at ~3 tokens
-/// and smaller blocks amortize verify cost better.
+/// Runtime decode `block_size` used at inference. Diverges from the drafter's
+/// trained `block_size` (16) because acceptance rate plateaus at ~3 tokens and
+/// smaller blocks amortize verify cost better.
 pub const DEFAULT_DECODE_BLOCK_SIZE: i32 = 4;
 
 // ---------------------------------------------------------------------------
@@ -437,9 +449,9 @@ impl DFlashDrafter {
 /// Saved state for all GDN/linear-attention layers in the target model.
 ///
 /// Much smaller than cloning the full KV cache — only stores `conv_state`,
-/// `ssm_state`, and offset for each `ArraysCache` layer.
+/// `ssm_state`, `conv_pos`, and `offset` for each `ArraysCache` layer.
 pub struct GdnStateBackup {
-    states: Vec<(Option<Array>, Option<Array>, i32)>,
+    states: Vec<(Option<Array>, Option<Array>, i32, i32)>,
 }
 
 impl GdnStateBackup {
@@ -451,9 +463,14 @@ impl GdnStateBackup {
             match lc {
                 Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
                     ac.eval_arrays()?;
-                    states.push((ac.conv_state.clone(), ac.ssm_state.clone(), ac.offset));
+                    states.push((
+                        ac.conv_state.clone(),
+                        ac.ssm_state.clone(),
+                        ac.conv_pos,
+                        ac.offset,
+                    ));
                 }
-                _ => states.push((None, None, 0)),
+                _ => states.push((None, None, 0, 0)),
             }
         }
         Ok(Self { states })
@@ -466,11 +483,12 @@ impl GdnStateBackup {
         kv_cache: &mut [Option<crate::qwen3_next::LayerCache>],
         rollback: i32,
     ) {
-        for (lc, (conv, ssm, offset)) in kv_cache.iter_mut().zip(self.states.iter()) {
+        for (lc, (conv, ssm, conv_pos, offset)) in kv_cache.iter_mut().zip(self.states.iter()) {
             match lc {
                 Some(crate::qwen3_next::LayerCache::Arrays(ac)) => {
                     ac.conv_state.clone_from(conv);
                     ac.ssm_state.clone_from(ssm);
+                    ac.conv_pos = *conv_pos;
                     ac.offset = *offset;
                 }
                 Some(crate::qwen3_next::LayerCache::KV(kv)) if rollback > 0 => {
@@ -532,13 +550,10 @@ pub fn trim_drafter_cache(cache: &mut [Option<(Array, Array)>], n: i32) {
 /// Load a `DFlash` drafter from a directory containing `config.json` + `model.safetensors`.
 pub fn load_dflash_drafter(model_path: &Path) -> Result<DFlashDrafter, ModelError> {
     let config_path = model_path.join("config.json");
-    let config_str = std::fs::read_to_string(&config_path)
-        .map_err(|e| ModelError::Io(std::io::Error::other(format!("reading config.json: {e}"))))?;
-    let config: DFlashConfig = serde_json::from_str(&config_str)
-        .map_err(|e| ModelError::Io(std::io::Error::other(format!("parsing config.json: {e}"))))?;
+    let config_str = std::fs::read_to_string(&config_path)?;
+    let config: DFlashConfig = serde_json::from_str(&config_str)?;
 
-    let mut drafter = DFlashDrafter::new(config)
-        .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    let mut drafter = DFlashDrafter::new(config)?;
 
     crate::load_safetensors_weights(&mut drafter, model_path)?;
 
