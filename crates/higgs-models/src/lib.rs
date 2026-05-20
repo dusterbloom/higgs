@@ -720,7 +720,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom(
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
                 "embed_token_ids only implemented for Qwen3Next",
             )),
         }
@@ -736,7 +737,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom(
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
                 "forward_all_logits_from_hidden only implemented for Qwen3Next",
             )),
         }
