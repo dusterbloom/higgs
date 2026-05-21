@@ -90,8 +90,173 @@ fn try_parse_tool_call(content: &str) -> Option<ParsedToolCall> {
     Some(ParsedToolCall { name, arguments })
 }
 
+/// One chunk of streaming output from [`StreamingToolCallTracker::process`]
+/// or [`StreamingToolCallTracker::flush`].
+///
+/// `visible` is the text that should be forwarded to the client as a normal
+/// content delta. `new_tool_calls` are any tool calls that became complete
+/// during this chunk — the route layer turns them into `ToolCallDelta` SSE
+/// events.
+#[derive(Debug, Default)]
+pub struct StreamingToolOutput {
+    pub visible: String,
+    pub new_tool_calls: Vec<ParsedToolCall>,
+}
+
+/// State machine that buffers streaming text chunks and extracts
+/// `<tool_call>{json}</tool_call>` blocks on the fly.
+///
+/// Designed to be cheap: when `active = false` (no tools in the request),
+/// `process` is a single allocation per chunk and `flush` is a no-op.
+///
+/// When active, it accumulates a tail buffer just large enough that the
+/// `<tool_call>` opener can't straddle a chunk boundary. As soon as a
+/// complete `<tool_call>…</tool_call>` block is in the buffer, the JSON
+/// between the tags is parsed and emitted as a [`ParsedToolCall`]. Text
+/// before/after tags streams out verbatim.
+///
+/// Invariants:
+/// - **Never silently drops tokens.** Unclosed tool-call tags at `flush`
+///   are re-emitted (with the `<tool_call>` opener prepended) as visible
+///   content rather than discarded.
+/// - **UTF-8 safe.** Tail-flushes walk back to the previous char boundary
+///   so a partial multi-byte sequence is never split.
+/// - **Pure passthrough when inactive.** Zero parsing cost on requests
+///   that did not pass `tools` to the chat route.
+pub struct StreamingToolCallTracker {
+    buffer: String,
+    inside_tool_call: bool,
+    completed_count: usize,
+    active: bool,
+}
+
+impl StreamingToolCallTracker {
+    pub const fn new(active: bool) -> Self {
+        Self {
+            buffer: String::new(),
+            inside_tool_call: false,
+            completed_count: 0,
+            active,
+        }
+    }
+
+    pub const fn completed_count(&self) -> usize {
+        self.completed_count
+    }
+
+    pub const fn has_tool_calls(&self) -> bool {
+        self.completed_count > 0
+    }
+
+    /// Feed a chunk of streamed text. Returns visible text + any tool calls
+    /// that became complete in this chunk.
+    pub fn process(&mut self, text: &str) -> StreamingToolOutput {
+        if !self.active {
+            return StreamingToolOutput {
+                visible: text.to_owned(),
+                new_tool_calls: Vec::new(),
+            };
+        }
+
+        self.buffer.push_str(text);
+        let mut out = StreamingToolOutput::default();
+
+        loop {
+            if self.inside_tool_call {
+                // Look for closing tag — once seen, parse the JSON body
+                // and continue scanning (another tool call may follow in
+                // the same chunk).
+                if let Some(end) = self.buffer.find(TOOL_CALL_CLOSE) {
+                    let raw_block = self.buffer.get(..end).unwrap_or_default();
+                    let call_content = raw_block.trim();
+                    if let Some(parsed) = try_parse_tool_call(call_content) {
+                        out.new_tool_calls.push(parsed);
+                        self.completed_count += 1;
+                    } else {
+                        // Invalid JSON inside the tag — preserve verbatim
+                        // so the client/operator can see what the model
+                        // emitted instead of silent loss.
+                        out.visible.push_str(TOOL_CALL_OPEN);
+                        out.visible.push_str(raw_block);
+                        out.visible.push_str(TOOL_CALL_CLOSE);
+                    }
+                    self.buffer = self
+                        .buffer
+                        .get(end + TOOL_CALL_CLOSE.len()..)
+                        .unwrap_or_default()
+                        .to_owned();
+                    self.inside_tool_call = false;
+                } else {
+                    // Still accumulating — wait for more.
+                    break;
+                }
+            } else if let Some(start) = self.buffer.find(TOOL_CALL_OPEN) {
+                // Everything before the open tag flushes out as visible.
+                out.visible
+                    .push_str(self.buffer.get(..start).unwrap_or_default());
+                self.buffer = self
+                    .buffer
+                    .get(start + TOOL_CALL_OPEN.len()..)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.inside_tool_call = true;
+            } else if self.buffer.len() > TOOL_CALL_OPEN.len() {
+                // No open tag yet, but the buffer is bigger than the open
+                // tag — safe to flush all-but-tail. Keep
+                // `TOOL_CALL_OPEN.len()` bytes at the tail so a partial
+                // `<tool_call>` straddling the next chunk is still
+                // detectable.
+                let target_len = self.buffer.len() - TOOL_CALL_OPEN.len();
+                // Walk back to the previous UTF-8 char boundary so a
+                // multi-byte sequence is never split.
+                let mut safe_len = target_len;
+                while safe_len > 0 && !self.buffer.is_char_boundary(safe_len) {
+                    safe_len -= 1;
+                }
+                out.visible
+                    .push_str(self.buffer.get(..safe_len).unwrap_or_default());
+                self.buffer = self
+                    .buffer
+                    .get(safe_len..)
+                    .unwrap_or_default()
+                    .to_owned();
+                break;
+            } else {
+                // Buffer smaller than the open tag — keep waiting.
+                break;
+            }
+        }
+
+        out
+    }
+
+    /// Drain everything still buffered. Call this when the model stream
+    /// ends. Any unclosed `<tool_call>` block is emitted as visible content
+    /// (with its opener prepended) so no tokens silently vanish.
+    pub fn flush(&mut self) -> StreamingToolOutput {
+        let leftover = std::mem::take(&mut self.buffer);
+        let was_inside = self.inside_tool_call;
+        self.inside_tool_call = false;
+
+        if was_inside {
+            let mut visible = String::with_capacity(TOOL_CALL_OPEN.len() + leftover.len());
+            visible.push_str(TOOL_CALL_OPEN);
+            visible.push_str(&leftover);
+            StreamingToolOutput {
+                visible,
+                new_tool_calls: Vec::new(),
+            }
+        } else {
+            StreamingToolOutput {
+                visible: leftover,
+                new_tool_calls: Vec::new(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -335,5 +500,171 @@ After last."#;
     fn test_whitespace_only_content_between_tags() {
         let input = "<tool_call>\n   \n  \t  \n</tool_call>";
         assert_parse(input, 0, Some("<tool_call>"));
+    }
+
+    // ============================================================
+    // StreamingToolCallTracker tests
+    //
+    // The tracker is a state machine fed text chunks. It buffers
+    // until it sees `<tool_call>…</tool_call>` boundaries, returning
+    // (visible_text, completed_tool_calls) on every chunk.
+    //
+    // Invariants tested:
+    // 1. inactive=false → pure passthrough, zero overhead
+    // 2. complete tag in one chunk → tool call emitted, no visible
+    // 3. tag split across chunks → tracker reassembles
+    // 4. text before/after tag → both visible, tool extracted
+    // 5. invalid JSON inside tag → preserved as visible
+    // 6. unclosed tag at flush → buffered prefix emitted as visible
+    // 7. multi-byte UTF-8 boundary at buffer-tail → no panic
+    // 8. has_tool_calls / completed_count track state correctly
+    // ============================================================
+
+    fn drain_visible_and_calls(
+        tracker: &mut StreamingToolCallTracker,
+        chunks: &[&str],
+    ) -> (String, Vec<ParsedToolCall>) {
+        let mut visible = String::new();
+        let mut calls = Vec::new();
+        for chunk in chunks {
+            let out = tracker.process(chunk);
+            visible.push_str(&out.visible);
+            calls.extend(out.new_tool_calls);
+        }
+        let final_out = tracker.flush();
+        visible.push_str(&final_out.visible);
+        calls.extend(final_out.new_tool_calls);
+        (visible, calls)
+    }
+
+    #[test]
+    fn streaming_inactive_is_passthrough() {
+        let mut t = StreamingToolCallTracker::new(false);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &["hello ", "<tool_call>", "{\"name\":\"x\"}", "</tool_call>", " world"],
+        );
+        assert_eq!(
+            vis,
+            "hello <tool_call>{\"name\":\"x\"}</tool_call> world",
+            "inactive tracker must pass every chunk through verbatim",
+        );
+        assert!(calls.is_empty());
+        assert!(!t.has_tool_calls());
+        assert_eq!(t.completed_count(), 0);
+    }
+
+    #[test]
+    fn streaming_single_call_one_chunk() {
+        let mut t = StreamingToolCallTracker::new(true);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &[r#"<tool_call>{"name":"get_weather","arguments":{"city":"London"}}</tool_call>"#],
+        );
+        assert!(vis.trim().is_empty(), "tool-only input should yield no visible text, got {vis:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert!(t.has_tool_calls());
+        assert_eq!(t.completed_count(), 1);
+    }
+
+    #[test]
+    fn streaming_tag_split_across_chunks() {
+        // Open tag arrives in pieces; close tag also chunk-split. Tracker must reassemble.
+        let mut t = StreamingToolCallTracker::new(true);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &[
+                "<tool",
+                "_call>",
+                r#"{"name":"search","#,
+                r#""arguments":{"q":"rust"}}"#,
+                "</tool",
+                "_call>",
+            ],
+        );
+        assert!(vis.trim().is_empty(), "split tags must not leak into visible, got {vis:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+    }
+
+    #[test]
+    fn streaming_text_before_and_after() {
+        let mut t = StreamingToolCallTracker::new(true);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &[
+                "Let me check. ",
+                r#"<tool_call>{"name":"lookup","arguments":{}}</tool_call>"#,
+                " Done.",
+            ],
+        );
+        assert!(vis.contains("Let me check."));
+        assert!(vis.contains("Done."));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+    }
+
+    #[test]
+    fn streaming_invalid_json_preserved_as_visible() {
+        let mut t = StreamingToolCallTracker::new(true);
+        let (vis, calls) =
+            drain_visible_and_calls(&mut t, &["<tool_call>not json</tool_call> after"]);
+        assert!(vis.contains("<tool_call>"));
+        assert!(vis.contains("not json"));
+        assert!(vis.contains("</tool_call>"));
+        assert!(vis.contains("after"));
+        assert!(calls.is_empty());
+        assert_eq!(t.completed_count(), 0);
+    }
+
+    #[test]
+    fn streaming_unclosed_tag_flushed_as_visible() {
+        let mut t = StreamingToolCallTracker::new(true);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &["<tool_call>{\"name\":\"partial\""],
+        );
+        // No closing tag ever arrives — at flush, the buffered prefix MUST be
+        // emitted as visible (otherwise tokens vanish silently).
+        assert!(vis.contains("<tool_call>"));
+        assert!(vis.contains("partial"));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn streaming_utf8_char_boundary_safety() {
+        // The tracker's tail-flush logic must respect UTF-8 char boundaries,
+        // otherwise it can panic when slicing inside a multi-byte sequence.
+        let mut t = StreamingToolCallTracker::new(true);
+        // Buffer ends just before the `é` byte sequence; next chunk completes it.
+        let (vis, calls) =
+            drain_visible_and_calls(&mut t, &["caf", "\u{00e9}", " and more text here"]);
+        assert!(vis.contains("caf\u{00e9}"));
+        assert!(vis.contains("more text"));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn streaming_multiple_calls_with_text_between() {
+        let mut t = StreamingToolCallTracker::new(true);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &[
+                "first ",
+                r#"<tool_call>{"name":"a","arguments":{}}</tool_call>"#,
+                " middle ",
+                r#"<tool_call>{"name":"b","arguments":{}}</tool_call>"#,
+                " last",
+            ],
+        );
+        assert!(vis.contains("first"));
+        assert!(vis.contains("middle"));
+        assert!(vis.contains("last"));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[1].name, "b");
+        assert_eq!(t.completed_count(), 2);
+        assert!(t.has_tool_calls());
     }
 }

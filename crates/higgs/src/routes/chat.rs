@@ -23,7 +23,7 @@ use crate::{
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
         ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent, StopSequence,
-        TokenLogprob, ToolCall, ToolCallFunction, TopLogprob,
+        TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
     },
 };
 use higgs_models::SamplingParams;
@@ -419,14 +419,11 @@ fn chat_completions_stream(
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
     let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
 
-    // Tool-calling responses are not supported in streaming mode.
-    // Accept requests that include tools (nanobot always sends them) but
-    // exclude them from prompt rendering so the model generates plain text.
     if stream_includes_tools {
-        tracing::warn!(
+        tracing::debug!(
             request_model = req.model,
             tool_count = req.tools.as_ref().map_or(0, Vec::len),
-            "Streaming API does not support tool-calls; tools will be ignored",
+            "Streaming with tool-calls enabled; will emit tool_calls deltas via StreamingToolCallTracker",
         );
     }
 
@@ -451,9 +448,14 @@ fn chat_completions_stream(
         req.reasoning.as_ref(),
     );
 
-    // Exclude tools from streaming prompt — tool_calls deltas are unsupported.
+    // Pass tools into prompt rendering so the chat template emits the
+    // tool spec the model recognises. The on-the-fly
+    // [`StreamingToolCallTracker`] below intercepts `<tool_call>…
+    // </tool_call>` blocks the model produces and turns them into
+    // structured `ToolCallDelta` SSE events.
+    let prompt_tools = req.tools.as_deref();
     let mut prompt_tokens = engine
-        .prepare_chat_prompt_with_thinking(&messages, None, thinking_enabled_stream)
+        .prepare_chat_prompt_with_thinking(&messages, prompt_tools, thinking_enabled_stream)
         .map_err(ServerError::Engine)?;
 
     // Preprocess images for VLM
@@ -548,6 +550,27 @@ fn chat_completions_stream(
         } else {
             higgs_engine::reasoning_parser::StreamingReasoningTracker::new()
         };
+        // Streaming tool-call extractor — passthrough when no tools were
+        // requested, otherwise watches for `<tool_call>…</tool_call>`
+        // blocks and emits structured `ToolCallDelta` events.
+        let mut tool_tracker =
+            higgs_engine::tool_parser::StreamingToolCallTracker::new(stream_includes_tools);
+
+        // Closure that turns a `ParsedToolCall` into the OpenAI streaming
+        // delta shape. Index is the running zero-based position of the
+        // call in this response.
+        let make_tool_delta = |index: u32, parsed: &higgs_engine::tool_parser::ParsedToolCall| {
+            ToolCallDelta {
+                index,
+                id: Some(format!("call_{index}_{}", uuid::Uuid::new_v4())),
+                r#type: Some("function".to_owned()),
+                function: Some(ToolCallFunctionDelta {
+                    name: Some(parsed.name.clone()),
+                    arguments: Some(parsed.arguments.to_string()),
+                }),
+            }
+        };
+
         let mut output_token_count: u32 = 0;
         let mut pending_finish_reason: Option<String> = None;
         let mut pending_finish_logprobs: Option<ChoiceLogprobs> = None;
@@ -560,7 +583,6 @@ fn chat_completions_stream(
                 .map(|lp| logprobs_to_response(std::slice::from_ref(lp), &tokenizer));
 
             let (visible, reasoning) = reasoning_tracker.process(&output.new_text);
-            let visible_is_empty = visible.is_empty();
 
             if !reasoning.is_empty() {
                 let d = ChatCompletionDelta {
@@ -572,10 +594,35 @@ fn chat_completions_stream(
                 emit_delta!(&d, None, None);
             }
 
-            if !visible.is_empty() {
+            // Run the visible-text portion through the tool-call tracker
+            // so `<tool_call>…</tool_call>` blocks become structured
+            // deltas rather than being spoken aloud as plain text.
+            let tool_out = tool_tracker.process(&visible);
+            let visible_is_empty = tool_out.visible.is_empty();
+
+            // Tool-call indices count up across the whole response. Each
+            // chunk that closes N tool calls covers indices
+            // `[base_index .. base_index+N)` where `base_index` is the
+            // total completed *before* this chunk.
+            let base_index = tool_tracker
+                .completed_count()
+                .saturating_sub(tool_out.new_tool_calls.len());
+            for (i, parsed) in tool_out.new_tool_calls.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let idx = u32::try_from(base_index + i).unwrap_or(u32::MAX);
                 let d = ChatCompletionDelta {
                     role: None,
-                    content: Some(visible),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
+                };
+                emit_delta!(&d, None, None);
+            }
+
+            if !tool_out.visible.is_empty() {
+                let d = ChatCompletionDelta {
+                    role: None,
+                    content: Some(tool_out.visible),
                     reasoning_content: None,
                     tool_calls: None,
                 };
@@ -588,7 +635,7 @@ fn chat_completions_stream(
             }
         }
 
-        // Flush any remaining buffered content from the reasoning tracker
+        // Flush any remaining buffered content.
         let (flush_vis, flush_reas) = reasoning_tracker.flush();
         if !flush_reas.is_empty() {
             let d = ChatCompletionDelta {
@@ -599,23 +646,59 @@ fn chat_completions_stream(
             };
             emit_delta!(&d, None, None);
         }
-        if !flush_vis.is_empty() {
+        // Drain the tool tracker (handles unclosed `<tool_call>` tags by
+        // re-emitting their buffered prefix as visible content — never
+        // silently drop tokens).
+        let flush_tool_out = tool_tracker.process(&flush_vis);
+        let flush_base_index = tool_tracker
+            .completed_count()
+            .saturating_sub(flush_tool_out.new_tool_calls.len());
+        for (i, parsed) in flush_tool_out.new_tool_calls.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = u32::try_from(flush_base_index + i).unwrap_or(u32::MAX);
             let d = ChatCompletionDelta {
                 role: None,
-                content: Some(flush_vis),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
+            };
+            emit_delta!(&d, None, None);
+        }
+        if !flush_tool_out.visible.is_empty() {
+            let d = ChatCompletionDelta {
+                role: None,
+                content: Some(flush_tool_out.visible),
                 reasoning_content: None,
                 tool_calls: None,
             };
             emit_delta!(&d, None, None);
         }
+        let final_tool_out = tool_tracker.flush();
+        if !final_tool_out.visible.is_empty() {
+            let d = ChatCompletionDelta {
+                role: None,
+                content: Some(final_tool_out.visible),
+                reasoning_content: None,
+                tool_calls: None,
+            };
+            emit_delta!(&d, None, None);
+        }
+
+        // Defer `finish_reason` until after the tracker has drained so we
+        // know whether to report `"tool_calls"` or `"stop"`.
         if let Some(finish_reason) = pending_finish_reason {
+            let effective_finish = if tool_tracker.has_tool_calls() {
+                "tool_calls".to_owned()
+            } else {
+                finish_reason
+            };
             let d = ChatCompletionDelta {
                 role: None,
                 content: None,
                 reasoning_content: None,
                 tool_calls: None,
             };
-            emit_delta!(&d, Some(finish_reason.as_str()), pending_finish_logprobs.as_ref());
+            emit_delta!(&d, Some(effective_finish.as_str()), pending_finish_logprobs.as_ref());
         }
 
         // Emit final chunk with usage only when explicitly requested.
@@ -654,6 +737,17 @@ fn convert_messages(
                 calls
                     .iter()
                     .filter_map(|tc| serde_json::to_value(tc).ok())
+                    .map(|mut tc_value| {
+                        // Make the tool call template-friendly: hoist
+                        // `function.{name,arguments}` to the top level
+                        // and parse string-encoded arguments to a JSON
+                        // value. Without this, Qwen's chat template
+                        // crashes on `tool_call.arguments|items`.
+                        higgs_engine::chat_template::normalize_tool_call_for_template(
+                            &mut tc_value,
+                        );
+                        tc_value
+                    })
                     .collect()
             });
             let content = m
