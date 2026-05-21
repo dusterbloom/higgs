@@ -215,11 +215,7 @@ impl StreamingToolCallTracker {
                 }
                 out.visible
                     .push_str(self.buffer.get(..safe_len).unwrap_or_default());
-                self.buffer = self
-                    .buffer
-                    .get(safe_len..)
-                    .unwrap_or_default()
-                    .to_owned();
+                self.buffer = self.buffer.get(safe_len..).unwrap_or_default().to_owned();
                 break;
             } else {
                 // Buffer smaller than the open tag — keep waiting.
@@ -542,11 +538,16 @@ After last."#;
         let mut t = StreamingToolCallTracker::new(false);
         let (vis, calls) = drain_visible_and_calls(
             &mut t,
-            &["hello ", "<tool_call>", "{\"name\":\"x\"}", "</tool_call>", " world"],
+            &[
+                "hello ",
+                "<tool_call>",
+                "{\"name\":\"x\"}",
+                "</tool_call>",
+                " world",
+            ],
         );
         assert_eq!(
-            vis,
-            "hello <tool_call>{\"name\":\"x\"}</tool_call> world",
+            vis, "hello <tool_call>{\"name\":\"x\"}</tool_call> world",
             "inactive tracker must pass every chunk through verbatim",
         );
         assert!(calls.is_empty());
@@ -561,7 +562,10 @@ After last."#;
             &mut t,
             &[r#"<tool_call>{"name":"get_weather","arguments":{"city":"London"}}</tool_call>"#],
         );
-        assert!(vis.trim().is_empty(), "tool-only input should yield no visible text, got {vis:?}");
+        assert!(
+            vis.trim().is_empty(),
+            "tool-only input should yield no visible text, got {vis:?}"
+        );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
         assert!(t.has_tool_calls());
@@ -583,7 +587,10 @@ After last."#;
                 "_call>",
             ],
         );
-        assert!(vis.trim().is_empty(), "split tags must not leak into visible, got {vis:?}");
+        assert!(
+            vis.trim().is_empty(),
+            "split tags must not leak into visible, got {vis:?}"
+        );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "search");
     }
@@ -621,10 +628,7 @@ After last."#;
     #[test]
     fn streaming_unclosed_tag_flushed_as_visible() {
         let mut t = StreamingToolCallTracker::new(true);
-        let (vis, calls) = drain_visible_and_calls(
-            &mut t,
-            &["<tool_call>{\"name\":\"partial\""],
-        );
+        let (vis, calls) = drain_visible_and_calls(&mut t, &["<tool_call>{\"name\":\"partial\""]);
         // No closing tag ever arrives — at flush, the buffered prefix MUST be
         // emitted as visible (otherwise tokens vanish silently).
         assert!(vis.contains("<tool_call>"));

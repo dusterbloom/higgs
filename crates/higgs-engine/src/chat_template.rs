@@ -214,14 +214,56 @@ pub fn normalize_tool_call_for_template(tc: &mut serde_json::Value) {
         }
     }
 
-    // String-encoded arguments → parsed JSON value (if it parses).
+    // Normalize the top-level `arguments` (used by Qwen-flat templates).
     if let Some(args) = obj.get_mut("arguments") {
-        if let Some(s) = args.as_str() {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                *args = parsed;
+        normalize_arguments_value(args);
+    }
+
+    // Normalize the nested `function.arguments` too. Qwen's
+    // `chat_template.jinja` lines 107-108 rebind `tool_call` to
+    // `tool_call.function` when present, so if we only normalised the
+    // top-level copy the template still walks into a string and crashes
+    // at `|items`. Templates that don't rebind are unaffected.
+    if let Some(function) = obj.get_mut("function") {
+        if let Some(func_obj) = function.as_object_mut() {
+            if let Some(nested_args) = func_obj.get_mut("arguments") {
+                normalize_arguments_value(nested_args);
             }
         }
     }
+}
+
+/// Coerce a `tool_call.arguments` (or `function.arguments`) value into
+/// the mapping shape that `chat_template.jinja:120` requires.
+///
+/// 1. If it's a JSON-string, try to parse it back to a `Value`.
+/// 2. If the result still isn't an object (null, bool, number, array,
+///    or unparseable string), coerce to an empty object so the
+///    template's `|items` doesn't raise. A warn is logged so the
+///    pathological shape is visible.
+fn normalize_arguments_value(args: &mut serde_json::Value) {
+    if let Some(s) = args.as_str() {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+            *args = parsed;
+        }
+    }
+    if args.is_object() {
+        return;
+    }
+    let shape = match args {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        // `is_object()` already returned for this case above.
+        serde_json::Value::Object(_) => "object",
+    };
+    tracing::warn!(
+        shape,
+        "tool_call arguments not a mapping after normalization; coercing to empty object so the chat template can render"
+    );
+    *args = serde_json::Value::Object(serde_json::Map::new());
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -237,7 +279,13 @@ fn tojson_filter(value: Value) -> Result<String, minijinja::Error> {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::shadow_unrelated,
+    clippy::shadow_reuse
+)]
 mod tests {
     use super::*;
 
@@ -682,7 +730,10 @@ TOOLS:{{ tools | length }}
         assert_eq!(tc.get("name").and_then(|v| v.as_str()), Some("get_weather"));
         // arguments is now an OBJECT, not a string.
         let args = tc.get("arguments").unwrap();
-        assert!(args.is_object(), "expected arguments to be an object, got {args:?}");
+        assert!(
+            args.is_object(),
+            "expected arguments to be an object, got {args:?}"
+        );
         assert_eq!(args.get("city").and_then(|v| v.as_str()), Some("Paris"));
         // id and type preserved.
         assert_eq!(tc.get("id").and_then(|v| v.as_str()), Some("call_0"));
@@ -691,30 +742,26 @@ TOOLS:{{ tools | length }}
 
     #[test]
     fn normalize_qwen_flat_shape_is_noop() {
-        let original = parsed(
-            r#"{ "name": "search", "arguments": { "q": "rust" } }"#,
-        );
+        let original = parsed(r#"{ "name": "search", "arguments": { "q": "rust" } }"#);
         let mut tc = original.clone();
         normalize_tool_call_for_template(&mut tc);
         assert_eq!(tc, original, "already-flat shape must be a no-op");
     }
 
     #[test]
-    fn normalize_unparseable_string_arguments_kept_as_string() {
+    fn normalize_unparseable_string_arguments_coerced_to_empty_object() {
+        // Unparseable string arguments are coerced to `{}` so the chat
+        // template's `|items` doesn't blow up. The model loses the
+        // pathological arguments, which is strictly better than the
+        // entire conversation 500-ing.
         let mut tc = parsed(
             r#"{
                 "function": { "name": "f", "arguments": "this is not json" }
             }"#,
         );
         normalize_tool_call_for_template(&mut tc);
-        // name flattened.
         assert_eq!(tc.get("name").and_then(|v| v.as_str()), Some("f"));
-        // arguments preserved as string (the template / model side can
-        // choose how to surface it).
-        assert_eq!(
-            tc.get("arguments").and_then(|v| v.as_str()),
-            Some("this is not json")
-        );
+        assert_eq!(tc.get("arguments"), Some(&parsed("{}")));
     }
 
     #[test]
@@ -730,5 +777,84 @@ TOOLS:{{ tools | length }}
         let mut a = parsed("[1, 2, 3]");
         normalize_tool_call_for_template(&mut a);
         assert_eq!(a, parsed("[1, 2, 3]"));
+    }
+
+    /// Qwen's `chat_template.jinja:107-108` rebinds `tool_call` to
+    /// `tool_call.function` when the latter is defined. If we only
+    /// normalised the hoisted top-level `arguments` and left
+    /// `function.arguments` as the original JSON-encoded string, the
+    /// rebinding would walk straight into a string and the template
+    /// would crash at `|items`. This test pins both paths.
+    #[test]
+    fn normalize_handles_qwen_rebind_to_function() {
+        let mut tc = parsed(
+            r#"{
+                "id": "call_0",
+                "type": "function",
+                "function": { "name": "f", "arguments": "{\"city\":\"London\"}" }
+            }"#,
+        );
+        normalize_tool_call_for_template(&mut tc);
+
+        // Top-level arguments — Qwen-flat templates see this.
+        let top_args = tc.get("arguments").unwrap();
+        assert!(
+            top_args.is_object(),
+            "top-level arguments must be a mapping"
+        );
+        assert_eq!(
+            top_args.get("city").and_then(|v| v.as_str()),
+            Some("London")
+        );
+
+        // Nested function.arguments — Qwen's standard template walks this
+        // after rebinding via `set tool_call = tool_call.function`.
+        let func_args = tc
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .expect("function.arguments must still be present");
+        assert!(
+            func_args.is_object(),
+            "nested function.arguments must ALSO be a mapping, got {func_args:?}"
+        );
+        assert_eq!(
+            func_args.get("city").and_then(|v| v.as_str()),
+            Some("London")
+        );
+    }
+
+    /// Arguments shaped as something other than an object after normalization
+    /// must be coerced to an empty object so the chat template's
+    /// `tool_call.arguments|items` can render. Without this, Qwen's
+    /// `chat_template.jinja:120` raises `cannot convert value into pairs`
+    /// when prior conversation turns carried weird tool-call shapes.
+    #[test]
+    fn arguments_coerced_to_empty_object_when_not_mapping() {
+        // Null arguments → empty object.
+        let mut tc = parsed(r#"{ "name": "f", "arguments": null }"#);
+        normalize_tool_call_for_template(&mut tc);
+        assert_eq!(tc.get("arguments"), Some(&parsed("{}")));
+
+        // Array arguments → empty object.
+        let mut tc = parsed(r#"{ "name": "f", "arguments": [1, 2, 3] }"#);
+        normalize_tool_call_for_template(&mut tc);
+        assert_eq!(tc.get("arguments"), Some(&parsed("{}")));
+
+        // Number arguments → empty object.
+        let mut tc = parsed(r#"{ "name": "f", "arguments": 42 }"#);
+        normalize_tool_call_for_template(&mut tc);
+        assert_eq!(tc.get("arguments"), Some(&parsed("{}")));
+
+        // Unparseable string arguments → empty object (the model can't
+        // express what it wanted; better than a 500).
+        let mut tc = parsed(r#"{ "name": "f", "arguments": "this is not json" }"#);
+        normalize_tool_call_for_template(&mut tc);
+        assert_eq!(tc.get("arguments"), Some(&parsed("{}")));
+
+        // Valid-JSON-string-that-parses-to-array → coerced via the
+        // second pass (parse succeeds, result is still not an object).
+        let mut tc = parsed(r#"{ "name": "f", "arguments": "[1,2,3]" }"#);
+        normalize_tool_call_for_template(&mut tc);
+        assert_eq!(tc.get("arguments"), Some(&parsed("{}")));
     }
 }
