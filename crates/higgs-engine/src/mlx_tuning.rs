@@ -414,7 +414,21 @@ fn heuristic_paged_kv_target_bytes(
     size_class: ModelSizeClass,
     is_moe: bool,
 ) -> usize {
-    let Some(max_recommended) = configured_max_working_set_bytes() else {
+    heuristic_paged_kv_target_bytes_with_max(
+        metadata,
+        size_class,
+        is_moe,
+        configured_max_working_set_bytes(),
+    )
+}
+
+fn heuristic_paged_kv_target_bytes_with_max(
+    metadata: &ModelMetadata,
+    size_class: ModelSizeClass,
+    is_moe: bool,
+    max_working_set_bytes: Option<usize>,
+) -> usize {
+    let Some(max_recommended) = max_working_set_bytes else {
         return DEFAULT_PAGED_KV_TARGET_BYTES;
     };
 
@@ -426,7 +440,7 @@ fn heuristic_paged_kv_target_bytes(
         });
 
     if available == 0 {
-        return DEFAULT_PAGED_KV_TARGET_BYTES;
+        return DEFAULT_PAGED_KV_TARGET_BYTES.min(max_recommended);
     }
 
     let divisor = if is_moe {
@@ -440,7 +454,7 @@ fn heuristic_paged_kv_target_bytes(
         }
     };
 
-    clamp_paged_kv_target_bytes(available / divisor)
+    clamp_paged_kv_target_bytes(available / divisor).min(max_recommended)
 }
 
 fn configured_max_working_set_bytes() -> Option<usize> {
@@ -543,9 +557,9 @@ fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
 mod tests {
     use super::{
         MlxRuntimeTuning, ModelMetadata, ModelSizeClass, RequestedMlxProfile, ResolvedMlxProfile,
-        default_mtp_draft_n_max, model_weight_bytes, parse_enabled_flag, parse_mtp_draft_n_max,
-        parse_positive_chunked_prefill_value, resolve_effective_mlx_profile,
-        resolve_profile_from_metadata, resolve_runtime_tuning,
+        default_mtp_draft_n_max, heuristic_paged_kv_target_bytes_with_max, model_weight_bytes,
+        parse_enabled_flag, parse_mtp_draft_n_max, parse_positive_chunked_prefill_value,
+        resolve_effective_mlx_profile, resolve_profile_from_metadata, resolve_runtime_tuning,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -725,6 +739,23 @@ mod tests {
         assert_eq!(parse_enabled_flag(Some("maybe")), None);
         assert_eq!(parse_enabled_flag(Some("3")), None);
         assert_eq!(parse_enabled_flag(None), None);
+    }
+
+    #[test]
+    fn test_paged_kv_target_respects_configured_working_set_cap() {
+        let metadata = ModelMetadata {
+            weight_bytes: Some(134_217_728),
+            ..ModelMetadata::default()
+        };
+
+        let target = heuristic_paged_kv_target_bytes_with_max(
+            &metadata,
+            ModelSizeClass::Small,
+            false,
+            Some(134_217_728),
+        );
+
+        assert_eq!(target, 134_217_728);
     }
 
     #[test]

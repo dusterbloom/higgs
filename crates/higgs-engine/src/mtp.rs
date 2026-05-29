@@ -35,15 +35,21 @@ pub struct MtpStats {
 }
 
 impl MtpStats {
-    pub fn record_cycle(&mut self, drafted_count: usize, emitted_count: usize) {
+    pub fn record_cycle(
+        &mut self,
+        drafted_count: usize,
+        emitted_count: usize,
+        accepted_drafts_count: usize,
+    ) {
         let drafted = u32::try_from(drafted_count).unwrap_or(u32::MAX);
         let emitted = u32::try_from(emitted_count).unwrap_or(u32::MAX);
+        let accepted_drafts = u32::try_from(accepted_drafts_count)
+            .unwrap_or(u32::MAX)
+            .min(drafted);
         self.cycles = self.cycles.saturating_add(1);
         self.drafted = self.drafted.saturating_add(drafted);
         self.emitted = self.emitted.saturating_add(emitted);
-        self.accepted_drafts = self
-            .accepted_drafts
-            .saturating_add(emitted.saturating_sub(1).min(drafted));
+        self.accepted_drafts = self.accepted_drafts.saturating_add(accepted_drafts);
     }
 
     pub const fn cycles(&self) -> u32 {
@@ -68,6 +74,48 @@ impl MtpStats {
             0.0
         } else {
             f64::from(self.accepted_drafts) * 100.0 / f64::from(self.drafted)
+        }
+    }
+}
+
+/// Small adaptive controller for choosing the next MTP draft depth.
+#[derive(Debug, Clone)]
+pub struct AdaptiveDraftDepth {
+    current: usize,
+    min: usize,
+    max: usize,
+}
+
+impl AdaptiveDraftDepth {
+    #[must_use]
+    pub fn new(initial: usize, max_depth: usize) -> Self {
+        let capped_max = max_depth.max(1);
+        Self {
+            current: initial.clamp(1, capped_max),
+            min: 1,
+            max: capped_max,
+        }
+    }
+
+    #[must_use]
+    pub const fn current(&self) -> usize {
+        self.current
+    }
+
+    pub const fn observe(&mut self, accepted_drafts: usize, drafted: usize) {
+        if drafted == 0 {
+            self.current = self.min;
+            return;
+        }
+
+        if accepted_drafts == drafted && self.current < self.max {
+            self.current += 1;
+        } else if accepted_drafts.saturating_mul(4) <= drafted && self.current > self.min {
+            self.current -= 1;
+        } else if accepted_drafts.saturating_mul(4) >= drafted.saturating_mul(3)
+            && self.current < self.max
+        {
+            self.current += 1;
         }
     }
 }
@@ -114,6 +162,92 @@ pub struct PromptLookupCycleResult {
     pub drafted: usize,
     /// Number of prompt-lookup draft tokens accepted this cycle.
     pub accepted_drafts: usize,
+}
+
+/// Run one prompt-lookup draft inside an MTP decode loop.
+///
+/// This verifies copied prompt/history tokens with the backbone and mirrors the
+/// accepted verifier span into the MTP cache, so the next cycle can continue
+/// with either prompt lookup or the model's MTP head.
+pub fn mtp_prompt_lookup_cycle(
+    model: &mut AnyModel,
+    cache: &mut AnyCache,
+    mtp_cache: &mut MtpCache,
+    previous_hidden: &Array,
+    history_before_confirmed: &[u32],
+    confirmed_token_id: u32,
+    config: PromptLookupConfig,
+) -> Result<Option<MtpCycleResult>, EngineError> {
+    let mut lookup_context = Vec::with_capacity(history_before_confirmed.len().saturating_add(1));
+    lookup_context.extend_from_slice(history_before_confirmed);
+    lookup_context.push(confirmed_token_id);
+    let drafts = prompt_lookup_draft(
+        &lookup_context,
+        config.max_drafts,
+        config.max_ngram,
+        config.max_window,
+    );
+    if drafts.is_empty() {
+        return Ok(None);
+    }
+
+    let base_cache = cache.clone();
+    let base_mtp_cache = mtp_cache.clone();
+    let mut verify_tokens = Vec::with_capacity(drafts.len().saturating_add(1));
+    verify_tokens.push(confirmed_token_id);
+    verify_tokens.extend(drafts.iter().copied());
+
+    let (verify_hidden, verifier_targets) = backbone_verify_batch(model, cache, &verify_tokens)?;
+    let verify_hidden_for_mtp = verify_hidden.clone();
+    if verifier_targets.len() < verify_tokens.len() {
+        return Err(EngineError::Generation(format!(
+            "hybrid prompt-lookup verifier returned {} target ids for {} input tokens",
+            verifier_targets.len(),
+            verify_tokens.len()
+        )));
+    }
+
+    let accepted_drafts = accepted_draft_prefix_len(&drafts, &verifier_targets);
+    let tokens = emitted_tokens(confirmed_token_id, &drafts, accepted_drafts);
+
+    let (accepted_hidden_rows, next_token_id) = if accepted_drafts == drafts.len() {
+        let next = *verifier_targets.get(accepted_drafts).ok_or_else(|| {
+            EngineError::Generation(format!(
+                "hybrid prompt-lookup verifier missing target at accepted index {accepted_drafts}"
+            ))
+        })?;
+        (verify_hidden, next)
+    } else {
+        *cache = base_cache;
+        let (replay_hidden, replay_targets) = backbone_verify_batch(model, cache, &tokens)?;
+        let next = *replay_targets.get(accepted_drafts).ok_or_else(|| {
+            EngineError::Generation(format!(
+                "hybrid prompt-lookup replay returned {} target ids for accepted index {}",
+                replay_targets.len(),
+                accepted_drafts
+            ))
+        })?;
+        (replay_hidden, next)
+    };
+
+    let h_last = hidden_row(&accepted_hidden_rows, accepted_drafts)?;
+    mirror_verified_mtp_cache(
+        model,
+        mtp_cache,
+        base_mtp_cache,
+        previous_hidden,
+        &verify_hidden_for_mtp,
+        &verify_tokens,
+        tokens.len(),
+    )?;
+
+    Ok(Some(MtpCycleResult {
+        tokens,
+        hidden: h_last,
+        next_token_id,
+        drafted: drafts.len(),
+        accepted_drafts,
+    }))
 }
 
 fn greedy_token_id(logits: &Array) -> Result<u32, EngineError> {
@@ -580,11 +714,10 @@ pub fn mtp_cycle(
         )?;
     }
 
-    if accepted_drafts < drafts.len() && tokens.is_empty() {
-        return Err(EngineError::Generation(
-            "MTP accepted no committed tokens".to_owned(),
-        ));
-    }
+    debug_assert!(
+        !tokens.is_empty(),
+        "MTP must always emit the confirmed token"
+    );
 
     Ok(MtpCycleResult {
         tokens,
@@ -598,8 +731,8 @@ pub fn mtp_cycle(
 #[cfg(test)]
 mod tests {
     use super::{
-        MtpStats, accepted_draft_prefix_len, draft_matches_target, emitted_tokens,
-        prompt_lookup_draft,
+        AdaptiveDraftDepth, MtpStats, accepted_draft_prefix_len, draft_matches_target,
+        emitted_tokens, prompt_lookup_draft,
     };
 
     #[test]
@@ -613,16 +746,30 @@ mod tests {
     }
 
     #[test]
-    fn mtp_stats_tracks_drafted_and_bonus_acceptance_rate() {
+    fn mtp_stats_tracks_explicit_accepted_draft_count() {
         let mut stats = MtpStats::default();
-        stats.record_cycle(3, 4);
-        stats.record_cycle(2, 1);
+        stats.record_cycle(3, 2, 2);
+        stats.record_cycle(2, 1, 0);
 
         assert_eq!(stats.cycles(), 2);
         assert_eq!(stats.drafted(), 5);
-        assert_eq!(stats.emitted(), 5);
-        assert_eq!(stats.accepted_drafts(), 3);
-        assert!((stats.acceptance_rate_percent() - 60.0).abs() < f64::EPSILON);
+        assert_eq!(stats.emitted(), 3);
+        assert_eq!(stats.accepted_drafts(), 2);
+        assert!((stats.acceptance_rate_percent() - 40.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn adaptive_draft_depth_grows_on_full_acceptance_and_backs_off_on_rejection() {
+        let mut depth = AdaptiveDraftDepth::new(2, 4);
+
+        depth.observe(2, 2);
+        assert_eq!(depth.current(), 3);
+
+        depth.observe(3, 3);
+        assert_eq!(depth.current(), 4);
+
+        depth.observe(0, 4);
+        assert_eq!(depth.current(), 3);
     }
 
     #[test]

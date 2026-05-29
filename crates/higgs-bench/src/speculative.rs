@@ -74,8 +74,10 @@ fn looks_like_huggingface_repo_id(model_path: &str) -> bool {
 
 /// Parses a comma-separated trial list.
 ///
-/// Supported items are `baseline`, `mtp_default`, numeric MTP draft depths,
-/// `prompt_lookup`, and `prompt_lookup_unchecked`.
+/// Supported items are `baseline`, `mtp_default`, `mtp_adaptive`,
+/// `mtp_hybrid` (prompt lookup plus adaptive MTP), numeric MTP draft depths,
+/// `prompt_lookup`, and
+/// `prompt_lookup_unchecked`.
 pub fn parse_trial_specs(input: &str) -> Result<Vec<TrialSpec>> {
     let mut trials = Vec::new();
     for raw in input.split(',') {
@@ -97,6 +99,18 @@ fn parse_trial_spec(trial: &str) -> Result<TrialSpec> {
     match trial {
         "baseline" => Ok(trial_spec("baseline_mtp_off", [("HIGGS_MTP", "0")])),
         "mtp_default" | "default" => Ok(trial_spec("mtp_default", [("HIGGS_MTP", "1")])),
+        "mtp_adaptive" | "adaptive" => Ok(trial_spec(
+            "mtp_adaptive",
+            [("HIGGS_MTP", "1"), ("HIGGS_MTP_ADAPTIVE_DRAFT", "1")],
+        )),
+        "mtp_hybrid" | "hybrid" => Ok(trial_spec(
+            "mtp_hybrid",
+            [
+                ("HIGGS_MTP", "1"),
+                ("HIGGS_MTP_ADAPTIVE_DRAFT", "1"),
+                ("HIGGS_MTP_PROMPT_LOOKUP", "1"),
+            ],
+        )),
         "prompt_lookup" | "plookup" => Ok(trial_spec(
             "prompt_lookup",
             [("HIGGS_MTP", "0"), ("HIGGS_PROMPT_LOOKUP", "1")],
@@ -176,14 +190,17 @@ mod tests {
 
     #[test]
     fn parse_trial_specs_sets_expected_env_overrides() -> anyhow::Result<()> {
-        let trials =
-            parse_trial_specs("baseline,mtp_default,2,prompt_lookup,prompt_lookup_unchecked")?;
+        let trials = parse_trial_specs(
+            "baseline,mtp_default,mtp_adaptive,mtp_hybrid,2,prompt_lookup,prompt_lookup_unchecked",
+        )?;
 
         let baseline = trial_at(&trials, 0)?;
         let mtp_default = trial_at(&trials, 1)?;
-        let mtp_draft_2 = trial_at(&trials, 2)?;
-        let prompt_lookup = trial_at(&trials, 3)?;
-        let prompt_lookup_unchecked = trial_at(&trials, 4)?;
+        let mtp_adaptive = trial_at(&trials, 2)?;
+        let mtp_hybrid = trial_at(&trials, 3)?;
+        let mtp_draft_2 = trial_at(&trials, 4)?;
+        let prompt_lookup = trial_at(&trials, 5)?;
+        let prompt_lookup_unchecked = trial_at(&trials, 6)?;
 
         assert_eq!(baseline.label, "baseline_mtp_off");
         assert_eq!(baseline.env.get("HIGGS_MTP").map(String::as_str), Some("0"));
@@ -191,6 +208,39 @@ mod tests {
         assert_eq!(mtp_default.label, "mtp_default");
         assert_eq!(
             mtp_default.env.get("HIGGS_MTP").map(String::as_str),
+            Some("1")
+        );
+
+        assert_eq!(mtp_adaptive.label, "mtp_adaptive");
+        assert_eq!(
+            mtp_adaptive.env.get("HIGGS_MTP").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            mtp_adaptive
+                .env
+                .get("HIGGS_MTP_ADAPTIVE_DRAFT")
+                .map(String::as_str),
+            Some("1")
+        );
+
+        assert_eq!(mtp_hybrid.label, "mtp_hybrid");
+        assert_eq!(
+            mtp_hybrid.env.get("HIGGS_MTP").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            mtp_hybrid
+                .env
+                .get("HIGGS_MTP_ADAPTIVE_DRAFT")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            mtp_hybrid
+                .env
+                .get("HIGGS_MTP_PROMPT_LOOKUP")
+                .map(String::as_str),
             Some("1")
         );
 

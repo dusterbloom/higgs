@@ -32,6 +32,9 @@ mod built_info {
 /// Bench-crate version (from `CARGO_PKG_VERSION` at compile time).
 pub const BENCH_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Version of the JSON/Markdown benchmark output envelope.
+pub const BENCH_SCHEMA_VERSION: u32 = 1;
+
 /// Returns the short git commit hash captured at compile time.
 #[must_use]
 pub fn git_commit_short() -> String {
@@ -204,7 +207,9 @@ pub fn path_for_output(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{hostname_for_output, public_model_ref, redact_arg_for_output};
+    use super::{
+        BENCH_SCHEMA_VERSION, hostname_for_output, public_model_ref, redact_arg_for_output,
+    };
 
     #[test]
     fn benchmark_metadata_redacts_hostname_by_default() {
@@ -239,6 +244,26 @@ mod tests {
             public_model_ref("/Users/alice/models/private-qwen", "local-qwen"),
             "local-qwen"
         );
+    }
+
+    #[test]
+    fn bench_output_includes_schema_version() -> anyhow::Result<()> {
+        let output = super::BenchOutput {
+            schema_version: BENCH_SCHEMA_VERSION,
+            metadata: super::RunMetadata::capture("unit"),
+            params: serde_json::json!({}),
+            results: serde_json::json!({}),
+        };
+        let json = super::format_json(&output)?;
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+
+        assert_eq!(
+            value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        Ok(())
     }
 }
 
@@ -316,6 +341,8 @@ where
     P: Serialize,
     R: Serialize,
 {
+    /// JSON/Markdown envelope schema version.
+    pub schema_version: u32,
     /// Reproducibility metadata (host, model, git, argv, timing).
     pub metadata: RunMetadata,
     /// Bench-specific parameters (CLI flags, prompt, etc.).
@@ -368,6 +395,7 @@ where
         meta.git_commit_short,
         if meta.git_dirty { " (dirty)" } else { "" }
     )?;
+    writeln!(s, "| schema_version | {} |", output.schema_version)?;
     writeln!(s, "| started_at | {} |", meta.started_at.to_rfc3339())?;
     writeln!(s, "| duration_ms | {} |", meta.duration_ms)?;
     if let Some(model) = &meta.model {

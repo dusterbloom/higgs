@@ -66,21 +66,32 @@ experiments. `HIGGS_MTP_MIRROR_VERIFY=1` enables full verifier-window MTP cache
 mirroring; on the Qwen3.6 27B MTP 8-bit benchmark below it was slightly slower
 than the default accepted-prefix replay path, so it remains opt-in.
 
+`HIGGS_MTP_ADAPTIVE_DRAFT=1` enables a lightweight controller that grows the
+draft window after high verifier acceptance and backs off after rejections.
+`HIGGS_MTP_PROMPT_LOOKUP=1` enables a hybrid path that verifies repeated
+prompt/history spans inside the MTP loop and mirrors accepted verifier rows into
+the MTP cache, so it can fall back to normal MTP-head cycles on models without
+useful repeated spans.
+
 Measured on M4 Max 128GB, `temperature=0`, 96 completion tokens, prompt:
 `Write a concise technical explanation of speculative decoding for local LLM inference...`
 
 | Runtime | Mode | Request tok/s | Decode-only tok/s | Speedup vs runtime baseline |
 | --- | ---: | ---: | ---: | ---: |
-| Higgs | baseline MTP off | 14.32 | n/a | 1.00x |
-| Higgs | MTP draft depth 2 | 22.89 | 28.0 | 1.60x request / 1.96x vs request baseline |
-| llama.cpp `b1-d374e71` | baseline | n/a | 15.9 | 1.00x |
-| llama.cpp `b1-d374e71` | MTP draft depth 1 | n/a | 25.0 | 1.57x |
-| llama.cpp `b1-d374e71` | MTP draft depth 2 | n/a | 24.3 | 1.53x |
+| Higgs | baseline MTP off | 14.14 | n/a | 1.00x |
+| Higgs | MTP default | 22.75 | n/a | 1.61x request |
+| Higgs | MTP adaptive | 22.11 | n/a | 1.56x request |
+| Higgs | MTP hybrid prompt lookup + adaptive | 18.45 | n/a | 1.30x request |
+| Higgs | MTP draft depth 2 | 22.79 | n/a | 1.61x request |
+| llama.cpp `b9410-031ddb2e0` | baseline | 14.62 | 15.64 | 1.00x |
+| llama.cpp `b9410-031ddb2e0` | `draft-mtp`, depth 2 | 21.63 | 24.16 | 1.48x request / 1.55x decode |
 
-The Higgs request-level number includes HTTP and prompt processing; llama.cpp's
-CLI line reports generation only. The closest decode-only comparison from this
-run is Higgs MTP depth 2 at `28.0 tok/s` versus llama.cpp's best measured MTP
-setting at `25.0 tok/s`.
+The Higgs numbers are from `bench_speculative`, which starts a fresh server per
+mode and reports end-to-end request tok/s. The llama.cpp rows use the
+OpenAI-compatible server with Qwen thinking disabled via
+`chat_template_kwargs.enable_thinking=false`, prompt cache disabled, and
+`draft-mtp` depth 2. On this run, Higgs MTP draft depth 2 was `1.05x` faster
+than llama.cpp `draft-mtp` depth 2 at the request level.
 
 ## Iterations
 
@@ -201,12 +212,13 @@ not time-to-visible-answer for thinking-mode models.
 ### `bench_speculative`
 
 Starts a fresh Higgs server per speculative mode and compares baseline greedy
-decode with MTP draft depths and architecture-neutral prompt lookup.
+decode with MTP draft depths, adaptive MTP, hybrid prompt-lookup+MTP, and
+architecture-neutral prompt lookup.
 
 ```bash
 cargo run --release -p higgs-bench --bin bench_speculative -- \
   --model qwen3.6-27B-mtp-8bit \
-  --trials baseline,mtp_default,1,2,3,prompt_lookup,prompt_lookup_unchecked \
+  --trials baseline,mtp_default,mtp_adaptive,mtp_hybrid,1,2,3,prompt_lookup,prompt_lookup_unchecked \
   --max-tokens 96 --repeats 3 --format markdown
 ```
 
@@ -214,6 +226,10 @@ cargo run --release -p higgs-bench --bin bench_speculative -- \
 tokens/sec when a `baseline` trial appears before the speculative trial. Server
 logs are captured under `target/bench-results/bench_speculative/logs/`, and the
 JSON result stores only filtered speculative telemetry lines.
+
+The `mtp_hybrid` trial intentionally combines MTP heads, adaptive draft depth,
+and MTP-local prompt lookup. Use `prompt_lookup` for architecture-neutral prompt
+lookup without MTP heads.
 
 ### `bench_summarize`
 
@@ -233,7 +249,7 @@ cargo run --release -p higgs-bench --bin bench_summarize
 3. Look up the model with `higgs_bench::models::find_by_key(...)` and
    set `metadata.model`.
 4. Define `Params` and `Results` structs (must implement `Serialize`).
-5. Build `BenchOutput { metadata, params, results }` and call
+5. Build `BenchOutput { schema_version: higgs_bench::BENCH_SCHEMA_VERSION, metadata, params, results }` and call
    `higgs_bench::persist_result(&output)` plus
    `higgs_bench::format_json` / `format_markdown` based on
    `--format`.

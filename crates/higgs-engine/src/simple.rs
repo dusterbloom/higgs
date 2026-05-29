@@ -69,6 +69,18 @@ fn unchecked_prompt_lookup_enabled() -> bool {
     .unwrap_or(false)
 }
 
+fn mtp_adaptive_draft_enabled() -> bool {
+    parse_enabled_flag(std::env::var("HIGGS_MTP_ADAPTIVE_DRAFT").ok().as_deref()).unwrap_or(false)
+}
+
+fn mtp_prompt_lookup_enabled() -> bool {
+    parse_enabled_flag(std::env::var("HIGGS_MTP_PROMPT_LOOKUP").ok().as_deref()).unwrap_or(false)
+}
+
+fn adaptive_draft_depth_for_cap(configured_max: usize) -> crate::mtp::AdaptiveDraftDepth {
+    crate::mtp::AdaptiveDraftDepth::new(configured_max, configured_max)
+}
+
 fn mtp_prefill_priming_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_MTP_PRIME_PREFILL").ok().as_deref()).unwrap_or(true)
 }
@@ -1450,7 +1462,7 @@ impl SimpleEngine {
             } else {
                 crate::mtp::prompt_lookup_cycle(model, cache, tokens, confirmed_token_id, config)?
             };
-            stats.record_cycle(result.drafted, result.tokens.len());
+            stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
 
             for &tok in &result.tokens {
                 if let Some(close_id) = think_close_token {
@@ -1613,6 +1625,10 @@ impl SimpleEngine {
         let mut current_hidden = h;
         let mut confirmed_token_id: u32 = next_arr.item();
         let mut mtp_stats = crate::mtp::MtpStats::default();
+        let mut adaptive_depth = mtp_adaptive_draft_enabled()
+            .then(|| adaptive_draft_depth_for_cap(self.tuning.mtp_draft_n_max()));
+        let hybrid_prompt_lookup = mtp_prompt_lookup_enabled();
+        let hybrid_prompt_lookup_config = prompt_lookup_config();
         let t_start = std::time::Instant::now();
 
         // Thinking budget: force </think> after N tokens if model hasn't closed it.
@@ -1628,16 +1644,60 @@ impl SimpleEngine {
             think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
         loop {
-            let result = crate::mtp::mtp_cycle(
-                model,
-                cache,
-                &mut mtp_cache,
-                &current_hidden,
-                confirmed_token_id,
-                self.tuning.mtp_draft_n_max(),
-            )?;
+            let cycle_completion_len = Self::completion_len(tokens)?;
+            let remaining = usize::try_from(max_tokens.saturating_sub(cycle_completion_len))
+                .map_err(|_| EngineError::Generation("max_tokens overflow".to_owned()))?;
+            let draft_depth = adaptive_depth
+                .as_ref()
+                .map_or_else(
+                    || self.tuning.mtp_draft_n_max(),
+                    crate::mtp::AdaptiveDraftDepth::current,
+                )
+                .min(remaining.saturating_sub(1).max(1));
+            let prompt_config = crate::mtp::PromptLookupConfig {
+                max_drafts: hybrid_prompt_lookup_config
+                    .max_drafts
+                    .min(remaining.saturating_sub(1)),
+                ..hybrid_prompt_lookup_config
+            };
+            let result = if hybrid_prompt_lookup && prompt_config.max_drafts > 0 {
+                crate::mtp::mtp_prompt_lookup_cycle(
+                    model,
+                    cache,
+                    &mut mtp_cache,
+                    &current_hidden,
+                    tokens,
+                    confirmed_token_id,
+                    prompt_config,
+                )?
+                .map_or_else(
+                    || {
+                        crate::mtp::mtp_cycle(
+                            model,
+                            cache,
+                            &mut mtp_cache,
+                            &current_hidden,
+                            confirmed_token_id,
+                            draft_depth,
+                        )
+                    },
+                    Ok,
+                )?
+            } else {
+                crate::mtp::mtp_cycle(
+                    model,
+                    cache,
+                    &mut mtp_cache,
+                    &current_hidden,
+                    confirmed_token_id,
+                    draft_depth,
+                )?
+            };
 
-            mtp_stats.record_cycle(result.drafted, result.tokens.len());
+            mtp_stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
+            if let Some(depth) = &mut adaptive_depth {
+                depth.observe(result.accepted_drafts, result.drafted);
+            }
 
             for &tok in &result.tokens {
                 // Thinking budget enforcement
@@ -1804,6 +1864,10 @@ impl SimpleEngine {
         let mut current_hidden = h;
         let mut confirmed_token_id: u32 = next_arr.item();
         let mut mtp_stats = crate::mtp::MtpStats::default();
+        let mut adaptive_depth = mtp_adaptive_draft_enabled()
+            .then(|| adaptive_draft_depth_for_cap(self.tuning.mtp_draft_n_max()));
+        let hybrid_prompt_lookup = mtp_prompt_lookup_enabled();
+        let hybrid_prompt_lookup_config = prompt_lookup_config();
         let t_start = std::time::Instant::now();
 
         const THINKING_BUDGET: u32 = 256;
@@ -1817,16 +1881,60 @@ impl SimpleEngine {
             think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
         loop {
-            let result = crate::mtp::mtp_cycle(
-                model,
-                cache,
-                &mut mtp_cache,
-                &current_hidden,
-                confirmed_token_id,
-                self.tuning.mtp_draft_n_max(),
-            )?;
+            let cycle_completion_len = Self::completion_len(tokens)?;
+            let remaining = usize::try_from(max_tokens.saturating_sub(cycle_completion_len))
+                .map_err(|_| EngineError::Generation("max_tokens overflow".to_owned()))?;
+            let draft_depth = adaptive_depth
+                .as_ref()
+                .map_or_else(
+                    || self.tuning.mtp_draft_n_max(),
+                    crate::mtp::AdaptiveDraftDepth::current,
+                )
+                .min(remaining.saturating_sub(1).max(1));
+            let prompt_config = crate::mtp::PromptLookupConfig {
+                max_drafts: hybrid_prompt_lookup_config
+                    .max_drafts
+                    .min(remaining.saturating_sub(1)),
+                ..hybrid_prompt_lookup_config
+            };
+            let result = if hybrid_prompt_lookup && prompt_config.max_drafts > 0 {
+                crate::mtp::mtp_prompt_lookup_cycle(
+                    model,
+                    cache,
+                    &mut mtp_cache,
+                    &current_hidden,
+                    tokens,
+                    confirmed_token_id,
+                    prompt_config,
+                )?
+                .map_or_else(
+                    || {
+                        crate::mtp::mtp_cycle(
+                            model,
+                            cache,
+                            &mut mtp_cache,
+                            &current_hidden,
+                            confirmed_token_id,
+                            draft_depth,
+                        )
+                    },
+                    Ok,
+                )?
+            } else {
+                crate::mtp::mtp_cycle(
+                    model,
+                    cache,
+                    &mut mtp_cache,
+                    &current_hidden,
+                    confirmed_token_id,
+                    draft_depth,
+                )?
+            };
 
-            mtp_stats.record_cycle(result.drafted, result.tokens.len());
+            mtp_stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
+            if let Some(depth) = &mut adaptive_depth {
+                depth.observe(result.accepted_drafts, result.drafted);
+            }
 
             for &tok in &result.tokens {
                 // Thinking budget enforcement
@@ -2479,7 +2587,8 @@ fn detect_thinking_support(model_dir: &Path) -> bool {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        check_stop_sequences, derive_model_name, estimate_paged_kv_blocks, parse_enabled_flag,
+        adaptive_draft_depth_for_cap, check_stop_sequences, derive_model_name,
+        estimate_paged_kv_blocks, parse_enabled_flag,
     };
     use std::path::Path;
 
@@ -2514,6 +2623,15 @@ mod tests {
     fn test_derive_model_name_relative_path() {
         let name = derive_model_name(Path::new("./my-model"));
         assert_eq!(name, "my-model");
+    }
+
+    #[test]
+    fn adaptive_draft_depth_respects_configured_cap() {
+        let mut depth = adaptive_draft_depth_for_cap(1);
+
+        depth.observe(1, 1);
+
+        assert_eq!(depth.current(), 1);
     }
 
     /// Create a temp dir, write config.json with the given content, and return
