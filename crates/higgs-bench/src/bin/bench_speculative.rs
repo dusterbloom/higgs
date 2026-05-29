@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use higgs_bench::{
-    BenchOutput, ModelInfo, OutputFormat, RunMetadata, default_manifest_path, format_json,
-    format_markdown, models, path_for_output, persist_result, public_model_ref, results_dir,
-    server, speculative, stats,
+    BENCH_SCHEMA_VERSION, BenchOutput, ModelInfo, OutputFormat, RunMetadata, default_manifest_path,
+    format_json, format_markdown, models, path_for_output, persist_result, public_model_ref,
+    results_dir, server, speculative, stats,
 };
 use serde::Serialize;
 
@@ -69,8 +69,8 @@ struct Args {
     repeats: u32,
 
     /// Comma-separated trial modes: `baseline`, `mtp_default`,
-    /// `prompt_lookup`, `prompt_lookup_unchecked`, or numeric MTP draft
-    /// depths such as `1,2,3`.
+    /// `mtp_adaptive`, `mtp_hybrid`, `prompt_lookup`,
+    /// `prompt_lookup_unchecked`, or numeric MTP draft depths such as `1,2,3`.
     #[arg(long, default_value = "baseline,1,2,3")]
     trials: String,
 
@@ -234,6 +234,7 @@ async fn run(args: Args) -> Result<()> {
     };
 
     let output = BenchOutput {
+        schema_version: BENCH_SCHEMA_VERSION,
         metadata,
         params,
         results: Results { trials: summaries },
@@ -494,6 +495,8 @@ fn clear_speculative_env(cmd: &mut Command) {
 const SPECULATIVE_ENV_KEYS: &[&str] = &[
     "HIGGS_MTP",
     "HIGGS_MTP_DRAFT_N_MAX",
+    "HIGGS_MTP_ADAPTIVE_DRAFT",
+    "HIGGS_MTP_PROMPT_LOOKUP",
     "HIGGS_PROMPT_LOOKUP",
     "HIGGS_PROMPT_LOOKUP_UNCHECKED",
     "HIGGS_MTP_PRIME_PREFILL",

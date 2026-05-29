@@ -38,7 +38,9 @@ This document collects the full CLI, environment, and config-file reference for 
 - `HIGGS_CHUNKED_PREFILL_THRESHOLD` enables chunked prefill above a token threshold.
 - `HIGGS_CHUNKED_PREFILL_CHUNK_SIZE` controls chunk size during chunked prefill.
 - `HIGGS_MTP=0|1` overrides the tuning profile's speculative decode choice when conditions allow.
-- `HIGGS_MTP_DRAFT_N_MAX` controls the maximum MTP draft tokens per speculative cycle. The default is `3` when MTP is enabled, clamped to `1..=8`.
+- `HIGGS_MTP_DRAFT_N_MAX` controls the maximum MTP draft tokens per speculative cycle. The default is `2` for huge checkpoints and `1` otherwise, clamped to `1..=8`.
+- `HIGGS_MTP_ADAPTIVE_DRAFT=1` lets the decode loop increase or decrease the MTP draft window based on recent verifier acceptance.
+- `HIGGS_MTP_PROMPT_LOOKUP=1` enables a hybrid MTP loop that tries verified prompt-lookup drafts when the prompt/history has a repeated suffix, then keeps the MTP cache synchronized for later MTP-head cycles.
 - `HIGGS_CLEAR_CACHE_AFTER_PREFILL` overrides the selected MLX profile behavior for cache clearing.
 - `HIGGS_TURBOQUANT_MIN_TOKENS` overrides the TurboQuant activation threshold. The default is `2048`.
 - `HIGGS_EXPERIMENTAL_PAGED_KV=1` enables the experimental paged-KV path.

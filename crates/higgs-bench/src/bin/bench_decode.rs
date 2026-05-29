@@ -22,8 +22,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use futures::StreamExt;
 use higgs_bench::{
-    BenchOutput, ModelInfo, OutputFormat, RunMetadata, default_manifest_path, format_json,
-    format_markdown, models, path_for_output, persist_result, public_model_ref, server, stats,
+    BENCH_SCHEMA_VERSION, BenchOutput, ModelInfo, OutputFormat, RunMetadata, default_manifest_path,
+    format_json, format_markdown, models, path_for_output, persist_result, public_model_ref,
+    server, stats,
 };
 use serde::Serialize;
 
@@ -232,6 +233,7 @@ async fn run(args: Args) -> Result<()> {
     };
 
     let output = BenchOutput {
+        schema_version: BENCH_SCHEMA_VERSION,
         metadata,
         params,
         results,
