@@ -9,6 +9,7 @@ const DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE: i32 = 512;
 const DEFAULT_PAGED_KV_TARGET_BYTES: usize = 512 * 1024 * 1024;
 const MIN_PAGED_KV_TARGET_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PAGED_KV_TARGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const MAX_MTP_DRAFT_N_MAX: usize = 8;
 
 fn parse_positive_chunked_prefill_value(raw: Option<&str>, default: i32) -> i32 {
     raw.and_then(|s| s.parse::<i32>().ok())
@@ -16,11 +17,24 @@ fn parse_positive_chunked_prefill_value(raw: Option<&str>, default: i32) -> i32 
         .unwrap_or(default)
 }
 
+fn parse_mtp_draft_n_max(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map_or(default, |v| v.min(MAX_MTP_DRAFT_N_MAX))
+}
+
 fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("1" | "true" | "on" | "yes") => Some(true),
         Some("0" | "false" | "off" | "no") => Some(false),
         _ => None,
+    }
+}
+
+const fn default_mtp_draft_n_max(size_class: ModelSizeClass) -> usize {
+    match size_class {
+        ModelSizeClass::Huge => 2,
+        ModelSizeClass::Small | ModelSizeClass::Medium | ModelSizeClass::Large => 1,
     }
 }
 
@@ -193,6 +207,11 @@ pub struct MlxRuntimeTuning {
     chunked_prefill_chunk_size: i32,
     clear_cache_after_prefill: bool,
     enable_mtp: bool,
+    /// Maximum MTP draft tokens per speculative cycle.
+    ///
+    /// Controlled by `HIGGS_MTP_DRAFT_N_MAX`; defaults to 2 for huge
+    /// checkpoints and 1 otherwise, clamped to 1..=8.
+    mtp_draft_n_max: usize,
     paged_kv_target_bytes: usize,
 }
 
@@ -224,6 +243,10 @@ impl MlxRuntimeTuning {
         .unwrap_or(tuning.clear_cache_after_prefill);
         tuning.enable_mtp = parse_enabled_flag(std::env::var("HIGGS_MTP").ok().as_deref())
             .unwrap_or(tuning.enable_mtp);
+        tuning.mtp_draft_n_max = parse_mtp_draft_n_max(
+            std::env::var("HIGGS_MTP_DRAFT_N_MAX").ok().as_deref(),
+            tuning.mtp_draft_n_max,
+        );
 
         tuning
     }
@@ -239,6 +262,7 @@ impl MlxRuntimeTuning {
         let (balanced_threshold, balanced_chunk) =
             balanced_chunked_prefill(size_class, is_long_context, is_moe);
         let balanced_paged_kv = heuristic_paged_kv_target_bytes(metadata, size_class, is_moe);
+        let default_mtp_draft_n_max = default_mtp_draft_n_max(size_class);
 
         match resolved_profile {
             ResolvedMlxProfile::Baseline => Self {
@@ -248,6 +272,7 @@ impl MlxRuntimeTuning {
                 chunked_prefill_chunk_size: DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE,
                 clear_cache_after_prefill: false,
                 enable_mtp: false,
+                mtp_draft_n_max: 1,
                 paged_kv_target_bytes: DEFAULT_PAGED_KV_TARGET_BYTES,
             },
             ResolvedMlxProfile::Latency => Self {
@@ -257,6 +282,7 @@ impl MlxRuntimeTuning {
                 chunked_prefill_chunk_size: balanced_chunk.max(768),
                 clear_cache_after_prefill: false,
                 enable_mtp: true,
+                mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
                     balanced_paged_kv.saturating_mul(9) / 8,
                 ),
@@ -268,6 +294,7 @@ impl MlxRuntimeTuning {
                 chunked_prefill_chunk_size: balanced_chunk,
                 clear_cache_after_prefill: false,
                 enable_mtp: true,
+                mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: balanced_paged_kv,
             },
             ResolvedMlxProfile::Throughput => Self {
@@ -277,6 +304,7 @@ impl MlxRuntimeTuning {
                 chunked_prefill_chunk_size: balanced_chunk.max(1024),
                 clear_cache_after_prefill: false,
                 enable_mtp: true,
+                mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
                     balanced_paged_kv.saturating_mul(5) / 4,
                 ),
@@ -309,6 +337,13 @@ impl MlxRuntimeTuning {
 
     pub const fn enable_mtp(&self) -> bool {
         self.enable_mtp
+    }
+
+    /// Maximum MTP draft tokens per speculative cycle.
+    ///
+    /// Configurable via `HIGGS_MTP_DRAFT_N_MAX`.
+    pub const fn mtp_draft_n_max(&self) -> usize {
+        self.mtp_draft_n_max
     }
 
     pub const fn paged_kv_target_bytes(&self) -> usize {
@@ -379,7 +414,7 @@ fn heuristic_paged_kv_target_bytes(
     size_class: ModelSizeClass,
     is_moe: bool,
 ) -> usize {
-    let Some(max_recommended) = mlx_max_recommended_working_set_size() else {
+    let Some(max_recommended) = configured_max_working_set_bytes() else {
         return DEFAULT_PAGED_KV_TARGET_BYTES;
     };
 
@@ -406,6 +441,13 @@ fn heuristic_paged_kv_target_bytes(
     };
 
     clamp_paged_kv_target_bytes(available / divisor)
+}
+
+fn configured_max_working_set_bytes() -> Option<usize> {
+    std::env::var("HIGGS_MLX_MAX_WORKING_SET_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn clamp_paged_kv_target_bytes(bytes: usize) -> usize {
@@ -467,15 +509,21 @@ fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
                 stack.push(path);
                 continue;
             }
-            if file_type.is_file()
+            if (file_type.is_file() || file_type.is_symlink())
                 && path
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
             {
-                match dir_entry.metadata() {
-                    Ok(meta) => {
+                let metadata = if file_type.is_symlink() {
+                    std::fs::metadata(&path)
+                } else {
+                    dir_entry.metadata()
+                };
+                match metadata {
+                    Ok(meta) if meta.is_file() => {
                         total = total.saturating_add(meta.len());
                     }
+                    Ok(_) => {}
                     Err(err) => {
                         tracing::warn!(
                             path = %path.display(),
@@ -491,33 +539,12 @@ fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
     Some(total).filter(|sum| *sum > 0)
 }
 
-#[allow(unsafe_code)]
-fn mlx_max_recommended_working_set_size() -> Option<usize> {
-    unsafe {
-        let mut info = mlx_sys::mlx_device_info_new();
-        let mut dev = mlx_sys::mlx_device_new();
-        mlx_sys::mlx_get_default_device(&raw mut dev);
-        let mut max_rec = None;
-        if mlx_sys::mlx_device_info_get(&raw mut info, dev) == 0 {
-            let mut value: usize = 0;
-            let key = c"max_recommended_working_set_size";
-            if mlx_sys::mlx_device_info_get_size(&raw mut value, info, key.as_ptr()) == 0
-                && value > 0
-            {
-                max_rec = Some(value);
-            }
-        }
-        mlx_sys::mlx_device_info_free(info);
-        mlx_sys::mlx_device_free(dev);
-        max_rec
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        MlxRuntimeTuning, ModelMetadata, RequestedMlxProfile, ResolvedMlxProfile,
-        parse_enabled_flag, parse_positive_chunked_prefill_value, resolve_effective_mlx_profile,
+        MlxRuntimeTuning, ModelMetadata, ModelSizeClass, RequestedMlxProfile, ResolvedMlxProfile,
+        default_mtp_draft_n_max, model_weight_bytes, parse_enabled_flag, parse_mtp_draft_n_max,
+        parse_positive_chunked_prefill_value, resolve_effective_mlx_profile,
         resolve_profile_from_metadata, resolve_runtime_tuning,
     };
     use std::fs;
@@ -659,6 +686,36 @@ mod tests {
         assert_eq!(parse_positive_chunked_prefill_value(Some("-8"), 32), 32);
         assert_eq!(parse_positive_chunked_prefill_value(Some("bad"), 32), 32);
         assert_eq!(parse_positive_chunked_prefill_value(None, 32), 32);
+    }
+
+    #[test]
+    fn test_parse_mtp_draft_n_max_clamps_invalid_and_large_values() {
+        assert_eq!(parse_mtp_draft_n_max(Some("1"), 3), 1);
+        assert_eq!(parse_mtp_draft_n_max(Some("3"), 1), 3);
+        assert_eq!(parse_mtp_draft_n_max(Some("0"), 3), 3);
+        assert_eq!(parse_mtp_draft_n_max(Some("bad"), 3), 3);
+        assert_eq!(parse_mtp_draft_n_max(Some("99"), 3), 8);
+        assert_eq!(parse_mtp_draft_n_max(None, 3), 3);
+    }
+
+    #[test]
+    fn test_default_mtp_draft_depth_uses_two_only_for_huge_models() {
+        assert_eq!(default_mtp_draft_n_max(ModelSizeClass::Small), 1);
+        assert_eq!(default_mtp_draft_n_max(ModelSizeClass::Medium), 1);
+        assert_eq!(default_mtp_draft_n_max(ModelSizeClass::Large), 1);
+        assert_eq!(default_mtp_draft_n_max(ModelSizeClass::Huge), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_model_weight_bytes_follows_hf_snapshot_symlinks() -> std::io::Result<()> {
+        let temp = TempDir::new().map_err(std::io::Error::other)?;
+        let blob = temp.path().join("blob");
+        fs::write(&blob, [0u8; 13])?;
+        std::os::unix::fs::symlink(&blob, temp.path().join("model.safetensors"))?;
+
+        assert_eq!(model_weight_bytes(temp.path()), Some(13));
+        Ok(())
     }
 
     #[test]

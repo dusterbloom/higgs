@@ -281,6 +281,35 @@ impl AnyModel {
         }
     }
 
+    /// Forward pass producing logits for every input position.
+    ///
+    /// Speculative verifiers use this for a candidate window where each
+    /// position's logits predict the following token.
+    pub fn forward_all_logits(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Transformer(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Qwen3Moe(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Gemma2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Phi3(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_all_logits(inputs, mask, c),
+            (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                let (_, logits) = m.forward_with_hidden(inputs, mask, c)?;
+                Ok(logits)
+            }
+            (Self::BonsaiQ1(_), AnyCache::KV(_)) => Err(Exception::custom(
+                "forward_all_logits not supported for BonsaiQ1",
+            )),
+            _ => Err(Exception::custom("Model/cache type mismatch")),
+        }
+    }
+
     /// Chunked prefill: process the prompt in `chunk_size`-token segments.
     ///
     /// Produces identical logits to `forward()` but evaluates the compute graph
@@ -419,6 +448,26 @@ impl AnyModel {
         }
     }
 
+    /// Run the MTP head and return both speculative hidden state and logits.
+    pub fn mtp_draft_with_hidden(
+        &mut self,
+        hidden: &Array,
+        next_token_id: u32,
+        mtp_cache: &mut MtpCache,
+    ) -> Result<(Array, Array), Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.mtp_draft_with_hidden(hidden, next_token_id, mtp_cache),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
+        }
+    }
+
     /// Advance the MTP head/cache for an accepted token without projecting logits.
     pub fn mtp_advance(
         &mut self,
@@ -428,6 +477,26 @@ impl AnyModel {
     ) -> Result<(), Exception> {
         match self {
             Self::Qwen3Next(m) => m.mtp_advance(hidden, next_token_id, mtp_cache),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
+        }
+    }
+
+    /// Advance the MTP head/cache for accepted tokens without projecting logits.
+    pub fn mtp_advance_many(
+        &mut self,
+        hidden: &Array,
+        next_token_ids: &[u32],
+        mtp_cache: &mut MtpCache,
+    ) -> Result<(), Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.mtp_advance_many(hidden, next_token_ids, mtp_cache),
             Self::Transformer(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
@@ -1066,6 +1135,8 @@ pub struct WeightMapIndex {
     pub weight_map: HashMap<String, String>,
 }
 
+const AUXILIARY_SAFETENSORS_FILES: &[&str] = &["mtp.safetensors", "model-mtp.safetensors"];
+
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokenizer, ModelError> {
     let file = model_dir.as_ref().join("tokenizer.json");
@@ -1203,6 +1274,33 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
 
 /// Collect safetensors file paths from a model directory.
 fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
+    fn existing_auxiliary_files(model_path: &Path) -> Vec<std::path::PathBuf> {
+        AUXILIARY_SAFETENSORS_FILES
+            .iter()
+            .map(|file_name| model_path.join(file_name))
+            .filter(|file_path| file_path.exists())
+            .collect()
+    }
+
+    fn append_existing_auxiliary_files(
+        model_path: &Path,
+        files: &mut Vec<std::path::PathBuf>,
+    ) -> Result<(), ModelError> {
+        let auxiliary_files = existing_auxiliary_files(model_path);
+        if auxiliary_files.len() > 1 {
+            return Err(ModelError::UnsupportedModel(
+                "ambiguous MTP sidecars: both mtp.safetensors and model-mtp.safetensors are present; remove one".to_owned(),
+            ));
+        }
+
+        if let Some(file_path) = auxiliary_files.into_iter().next() {
+            if !files.iter().any(|path| path == &file_path) {
+                files.push(file_path);
+            }
+        }
+        Ok(())
+    }
+
     let index_path = model_path.join("model.safetensors.index.json");
     if index_path.exists() {
         let json = std::fs::read_to_string(&index_path)?;
@@ -1213,11 +1311,16 @@ fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf
             .map(|f| model_path.join(f))
             .collect();
         files.sort();
+        append_existing_auxiliary_files(model_path, &mut files)?;
+        files.sort();
         Ok(files)
     } else {
         let single_path = model_path.join("model.safetensors");
         if single_path.exists() {
-            Ok(vec![single_path])
+            let mut files = vec![single_path];
+            append_existing_auxiliary_files(model_path, &mut files)?;
+            files.sort();
+            Ok(files)
         } else {
             Err(ModelError::MissingWeight(
                 "No safetensors files found".to_owned(),
@@ -1428,6 +1531,49 @@ mod tests {
         let result = collect_safetensors_files(dir.path()).unwrap();
         // Two unique shard files
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn collect_safetensors_index_json_includes_auxiliary_mtp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_json = r#"{
+            "metadata": {"total_size": 12345},
+            "weight_map": {
+                "model.embed_tokens.weight": "model-00001-of-00001.safetensors"
+            }
+        }"#;
+        std::fs::write(dir.path().join("model.safetensors.index.json"), index_json).unwrap();
+        std::fs::write(dir.path().join("model-mtp.safetensors"), b"dummy").unwrap();
+
+        let result = collect_safetensors_files(dir.path()).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(
+            result
+                .iter()
+                .any(|path| path.file_name().unwrap() == "model-00001-of-00001.safetensors")
+        );
+        assert!(
+            result
+                .iter()
+                .any(|path| path.file_name().unwrap() == "model-mtp.safetensors")
+        );
+    }
+
+    #[test]
+    fn collect_safetensors_rejects_ambiguous_mtp_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), b"dummy").unwrap();
+        std::fs::write(dir.path().join("mtp.safetensors"), b"dummy").unwrap();
+        std::fs::write(dir.path().join("model-mtp.safetensors"), b"dummy").unwrap();
+
+        let err = collect_safetensors_files(dir.path()).unwrap_err();
+
+        assert!(
+            matches!(err, ModelError::UnsupportedModel(_)),
+            "expected ambiguous sidecar error, got: {err:?}"
+        );
+        assert!(err.to_string().contains("ambiguous MTP sidecars"));
     }
 
     #[test]
