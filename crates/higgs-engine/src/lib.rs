@@ -1,3 +1,5 @@
+//! Engine crate for Higgs local inference, including MLX-backed MTP decoding.
+
 pub mod batch_engine;
 pub mod cache;
 pub mod chat_template;
