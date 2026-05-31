@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.0](https://github.com/panbanda/higgs/compare/higgs-engine-v1.2.0...higgs-engine-v1.3.0) (2026-05-31)
+
+
+### Features
+
+* **mtp:** release speculative decoding optimizations ([0e5e458](https://github.com/panbanda/higgs/commit/0e5e458ce2b59ab5f1a6aaaa1fe91af6f298fe39))
+* **mtp:** release speculative decoding optimizations ([1d15599](https://github.com/panbanda/higgs/commit/1d15599ea86fccb022d786a56b2904131078b150))
+
 ## [1.2.0](https://github.com/panbanda/higgs/compare/higgs-engine-v1.1.1...higgs-engine-v1.2.0) (2026-05-06)
 
 
