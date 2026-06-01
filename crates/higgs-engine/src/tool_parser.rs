@@ -28,6 +28,16 @@ pub struct ToolParseResult {
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 
+/// Hard cap on bytes buffered while inside an unclosed `<tool_call>`.
+///
+/// Without a cap, a model that emits `<tool_call>` and never closes the tag
+/// would grow `buffer` until OOM — flagged CRITICAL on the closed upstream
+/// PR #63. On overflow the tracker abandons the parse, emits `<tool_call>`
+/// plus the buffered bytes as visible content (preserving the "never
+/// silently drop tokens" invariant), and resets so subsequent well-formed
+/// tool calls in the same stream still parse.
+const MAX_INSIDE_TOOL_CALL_BYTES: usize = 1024 * 1024;
+
 /// Parse model output text for Qwen-format tool calls.
 ///
 /// Returns the non-tool-call text and any extracted tool calls.
@@ -186,6 +196,15 @@ impl StreamingToolCallTracker {
                         .unwrap_or_default()
                         .to_owned();
                     self.inside_tool_call = false;
+                } else if self.buffer.len() > MAX_INSIDE_TOOL_CALL_BYTES {
+                    // Overflow guard: `<tool_call>` opened but the close
+                    // tag never arrived within the cap. Abandon the parse
+                    // and emit verbatim so tokens still aren't dropped.
+                    let leftover = std::mem::take(&mut self.buffer);
+                    out.visible.push_str(TOOL_CALL_OPEN);
+                    out.visible.push_str(&leftover);
+                    self.inside_tool_call = false;
+                    break;
                 } else {
                     // Still accumulating — wait for more.
                     break;
@@ -647,6 +666,38 @@ After last."#;
         assert!(vis.contains("caf\u{00e9}"));
         assert!(vis.contains("more text"));
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn streaming_unbounded_buffer_capped_and_recovers() {
+        // CRITICAL guard (closed upstream PR #63 finding): a model that
+        // opens `<tool_call>` and never closes must not grow `buffer` past
+        // `MAX_INSIDE_TOOL_CALL_BYTES`. On overflow we drop the parse,
+        // flush the buffered bytes as visible, and reset so a later valid
+        // tool call in the same stream still parses.
+        let mut t = StreamingToolCallTracker::new(true);
+        let huge = "x".repeat(MAX_INSIDE_TOOL_CALL_BYTES + 1);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &[
+                "<tool_call>",
+                huge.as_str(),
+                // Same stream, after the overflow — a well-formed call
+                // arrives. The reset state must let it through.
+                r#"<tool_call>{"name":"after","arguments":{}}</tool_call>"#,
+            ],
+        );
+        assert!(
+            vis.contains("<tool_call>"),
+            "overflow must surface opener as visible, not silently swallow",
+        );
+        assert!(
+            vis.contains(huge.as_str()),
+            "overflow must surface buffered bytes as visible",
+        );
+        assert_eq!(calls.len(), 1, "post-overflow valid call still parses");
+        assert_eq!(calls[0].name, "after");
+        assert_eq!(t.completed_count(), 1);
     }
 
     #[test]
