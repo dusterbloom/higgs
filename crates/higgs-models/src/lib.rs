@@ -1,8 +1,11 @@
+pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
 pub mod error;
 pub mod gemma2;
 pub mod llava_qwen2;
+/// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
+mod metal_kernel;
 pub mod phi3;
 pub mod qwen3_moe;
 pub mod qwen3_next;
@@ -13,9 +16,11 @@ pub mod starcoder2;
 pub mod transformer;
 pub mod turboquant;
 pub mod utils;
+pub mod yarn;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
@@ -26,6 +31,8 @@ use serde_json::Value;
 
 use crate::error::ModelError;
 use crate::turboquant::KvCacheConfig;
+
+static BONSAI_IGNORED_MASK_WARNED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // SamplingParams -- configurable sampling parameters
@@ -91,6 +98,29 @@ pub enum AnyCache {
     Hybrid(Vec<Option<LayerCache>>),
 }
 
+impl AnyCache {
+    /// Trim every layer cache by `count` tokens, discarding the most recent
+    /// entries. Used after speculative-decode verify to roll back rejected
+    /// draft tokens. Hybrid SSM (recurrent) layers are intentionally left
+    /// untouched — their state cannot be trimmed by offset alone.
+    pub fn trim_by(&mut self, count: usize) {
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    layer.trim_by(count);
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        kv.trim_by(count);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Unified model wrapper dispatching to the correct architecture.
 pub enum AnyModel {
     /// Standard transformer architectures: Llama, Mistral, Qwen2/2.5, Qwen3.
@@ -109,6 +139,8 @@ pub enum AnyModel {
     LlavaQwen2(llava_qwen2::LlavaQwen2Model),
     /// DeepSeek-V2 with Multi-head Latent Attention and sparse `MoE`.
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
+    /// Bonsai-Q1: packed 1.25-bpw Qwen3-shaped target (1.7B / 8B).
+    BonsaiQ1(bonsai_q1::BonsaiQ1Gpu),
 }
 
 fn checked_head_dim(hidden_size: i32, num_attention_heads: i32) -> Result<i32, Exception> {
@@ -190,6 +222,16 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
+            // BonsaiQ1 builds its causal mask internally; any externally-provided
+            // mask is ignored (causal-only semantics).
+            (Self::BonsaiQ1(m), AnyCache::KV(c)) => {
+                if mask.is_some() && !BONSAI_IGNORED_MASK_WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "BonsaiQ1 ignores externally provided masks and builds its own causal mask"
+                    );
+                }
+                m.forward(inputs, c)
+            }
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -210,6 +252,7 @@ impl AnyModel {
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_hidden(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
+            (Self::BonsaiQ1(m), AnyCache::KV(c)) => bonsai_q1::forward_trunk_free(m, c, inputs),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
@@ -237,6 +280,35 @@ impl AnyModel {
                     Ok(logits)
                 }
             }
+        }
+    }
+
+    /// Forward pass producing logits for every input position.
+    ///
+    /// Speculative verifiers use this for a candidate window where each
+    /// position's logits predict the following token.
+    pub fn forward_all_logits(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Transformer(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Qwen3Moe(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Gemma2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Phi3(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_all_logits(inputs, mask, c),
+            (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                let (_, logits) = m.forward_with_hidden(inputs, mask, c)?;
+                Ok(logits)
+            }
+            (Self::BonsaiQ1(_), AnyCache::KV(_)) => Err(Exception::custom(
+                "forward_all_logits not supported for BonsaiQ1",
+            )),
+            _ => Err(Exception::custom("Model/cache type mismatch")),
         }
     }
 
@@ -324,7 +396,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom(
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer models",
             )),
         }
@@ -350,7 +423,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => None,
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => None,
         }
     }
 
@@ -371,7 +445,28 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
+        }
+    }
+
+    /// Run the MTP head and return both speculative hidden state and logits.
+    pub fn mtp_draft_with_hidden(
+        &mut self,
+        hidden: &Array,
+        next_token_id: u32,
+        mtp_cache: &mut MtpCache,
+    ) -> Result<(Array, Array), Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.mtp_draft_with_hidden(hidden, next_token_id, mtp_cache),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 
@@ -390,7 +485,28 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
-            | Self::DeepSeekV2(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
+        }
+    }
+
+    /// Advance the MTP head/cache for accepted tokens without projecting logits.
+    pub fn mtp_advance_many(
+        &mut self,
+        hidden: &Array,
+        next_token_ids: &[u32],
+        mtp_cache: &mut MtpCache,
+    ) -> Result<(), Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.mtp_advance_many(hidden, next_token_ids, mtp_cache),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 
@@ -412,7 +528,7 @@ impl AnyModel {
     }
 
     /// The model's hidden dimension.
-    pub const fn hidden_size(&self) -> i32 {
+    pub fn hidden_size(&self) -> i32 {
         match self {
             Self::Transformer(m) => m.args.hidden_size,
             Self::Qwen3Moe(m) => m.args.hidden_size,
@@ -422,6 +538,7 @@ impl AnyModel {
             Self::Starcoder2(m) => m.args.hidden_size,
             Self::LlavaQwen2(m) => m.hidden_size(),
             Self::DeepSeekV2(m) => m.args.hidden_size,
+            Self::BonsaiQ1(m) => i32::try_from(m.config.hidden).unwrap_or(i32::MAX),
         }
     }
 
@@ -458,6 +575,10 @@ impl AnyModel {
                 m.args.num_key_value_heads,
                 m.args.qk_nope_head_dim + m.args.qk_rope_head_dim,
             )),
+            Self::BonsaiQ1(m) => Ok((
+                i32::try_from(m.config.kv_heads).map_err(|e| Exception::custom(e.to_string()))?,
+                i32::try_from(m.config.head_dim).map_err(|e| Exception::custom(e.to_string()))?,
+            )),
         }
     }
 
@@ -466,6 +587,7 @@ impl AnyModel {
         self.make_cache_with_config(KvCacheConfig::default())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn make_cache_with_config(
         &self,
         kv_cache_config: KvCacheConfig,
@@ -560,6 +682,16 @@ impl AnyModel {
                     Ok(AnyCache::Hybrid(m.make_cache()))
                 }
             }
+            Self::BonsaiQ1(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not supported for BonsaiQ1 (1-bit packed engine)",
+                    ));
+                }
+                let layers =
+                    i32::try_from(m.config.layers).map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(make_kv_cache(layers))
+            }
         }
     }
 
@@ -578,7 +710,8 @@ impl AnyModel {
             | Self::Gemma2(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
-            | Self::DeepSeekV2(_) => None,
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => None,
         }
     }
 
@@ -1004,6 +1137,8 @@ pub struct WeightMapIndex {
     pub weight_map: HashMap<String, String>,
 }
 
+const AUXILIARY_SAFETENSORS_FILES: &[&str] = &["mtp.safetensors", "model-mtp.safetensors"];
+
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokenizer, ModelError> {
     let file = model_dir.as_ref().join("tokenizer.json");
@@ -1141,6 +1276,33 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
 
 /// Collect safetensors file paths from a model directory.
 fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
+    fn existing_auxiliary_files(model_path: &Path) -> Vec<std::path::PathBuf> {
+        AUXILIARY_SAFETENSORS_FILES
+            .iter()
+            .map(|file_name| model_path.join(file_name))
+            .filter(|file_path| file_path.exists())
+            .collect()
+    }
+
+    fn append_existing_auxiliary_files(
+        model_path: &Path,
+        files: &mut Vec<std::path::PathBuf>,
+    ) -> Result<(), ModelError> {
+        let auxiliary_files = existing_auxiliary_files(model_path);
+        if auxiliary_files.len() > 1 {
+            return Err(ModelError::UnsupportedModel(
+                "ambiguous MTP sidecars: both mtp.safetensors and model-mtp.safetensors are present; remove one".to_owned(),
+            ));
+        }
+
+        if let Some(file_path) = auxiliary_files.into_iter().next() {
+            if !files.iter().any(|path| path == &file_path) {
+                files.push(file_path);
+            }
+        }
+        Ok(())
+    }
+
     let index_path = model_path.join("model.safetensors.index.json");
     if index_path.exists() {
         let json = std::fs::read_to_string(&index_path)?;
@@ -1151,11 +1313,16 @@ fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf
             .map(|f| model_path.join(f))
             .collect();
         files.sort();
+        append_existing_auxiliary_files(model_path, &mut files)?;
+        files.sort();
         Ok(files)
     } else {
         let single_path = model_path.join("model.safetensors");
         if single_path.exists() {
-            Ok(vec![single_path])
+            let mut files = vec![single_path];
+            append_existing_auxiliary_files(model_path, &mut files)?;
+            files.sort();
+            Ok(files)
         } else {
             Err(ModelError::MissingWeight(
                 "No safetensors files found".to_owned(),
@@ -1189,6 +1356,7 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::cache::KeyValueCache;
 
     fn params(temp: f32, top_p: f32) -> SamplingParams {
         SamplingParams {
@@ -1365,6 +1533,49 @@ mod tests {
         let result = collect_safetensors_files(dir.path()).unwrap();
         // Two unique shard files
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn collect_safetensors_index_json_includes_auxiliary_mtp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_json = r#"{
+            "metadata": {"total_size": 12345},
+            "weight_map": {
+                "model.embed_tokens.weight": "model-00001-of-00001.safetensors"
+            }
+        }"#;
+        std::fs::write(dir.path().join("model.safetensors.index.json"), index_json).unwrap();
+        std::fs::write(dir.path().join("model-mtp.safetensors"), b"dummy").unwrap();
+
+        let result = collect_safetensors_files(dir.path()).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(
+            result
+                .iter()
+                .any(|path| path.file_name().unwrap() == "model-00001-of-00001.safetensors")
+        );
+        assert!(
+            result
+                .iter()
+                .any(|path| path.file_name().unwrap() == "model-mtp.safetensors")
+        );
+    }
+
+    #[test]
+    fn collect_safetensors_rejects_ambiguous_mtp_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), b"dummy").unwrap();
+        std::fs::write(dir.path().join("mtp.safetensors"), b"dummy").unwrap();
+        std::fs::write(dir.path().join("model-mtp.safetensors"), b"dummy").unwrap();
+
+        let err = collect_safetensors_files(dir.path()).unwrap_err();
+
+        assert!(
+            matches!(err, ModelError::UnsupportedModel(_)),
+            "expected ambiguous sidecar error, got: {err:?}"
+        );
+        assert!(err.to_string().contains("ambiguous MTP sidecars"));
     }
 
     #[test]
@@ -1694,5 +1905,59 @@ mod tests {
         assert!((vals[0] - 2.5).abs() < 1e-5);
         assert!((vals[1] - 2.0).abs() < 1e-5);
         assert!((vals[2] - 4.5).abs() < 1e-5);
+    }
+
+    // --- AnyCache::trim_by tests ---
+
+    #[test]
+    fn any_cache_trim_by_kv_dispatches_to_each_layer() {
+        // Two KV layers, both at offset 0; trim_by saturates to 0.
+        // Verifies the dispatcher iterates None and Some(_) layers without panic.
+        let mut cache = AnyCache::KV(vec![
+            Some(cache::SteppingKeyValueCache::new()),
+            None,
+            Some(cache::SteppingKeyValueCache::new()),
+        ]);
+        cache.trim_by(5);
+        if let AnyCache::KV(layers) = &cache {
+            assert_eq!(layers.len(), 3);
+            for layer in layers.iter().flatten() {
+                assert_eq!(layer.offset(), 0);
+            }
+        } else {
+            panic!("expected KV variant");
+        }
+    }
+
+    #[test]
+    fn any_cache_trim_by_hybrid_skips_arrays_layers() {
+        // Hybrid mixes LayerCache::KV (trimmable) and LayerCache::Arrays (recurrent,
+        // intentionally untouched). Verifies the dispatcher reaches into KV layers
+        // and leaves Arrays alone.
+        let mut arrays = qwen3_next::ArraysCache::new();
+        arrays.offset = 7;
+        let mut cache = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(cache::SteppingKeyValueCache::new())),
+            Some(LayerCache::Arrays(arrays)),
+            None,
+        ]);
+        cache.trim_by(3);
+        if let AnyCache::Hybrid(layers) = &cache {
+            assert_eq!(layers.len(), 3);
+            // KV layer trimmed (saturated at 0 since starting offset was 0)
+            if let Some(LayerCache::KV(kv)) = layers.first().and_then(|l| l.as_ref()) {
+                assert_eq!(kv.offset(), 0);
+            } else {
+                panic!("expected first layer to be KV variant");
+            }
+            // Arrays layer offset unchanged (recurrent state, can't trim by offset)
+            if let Some(LayerCache::Arrays(a)) = layers.get(1).and_then(|l| l.as_ref()) {
+                assert_eq!(a.offset, 7, "Arrays layer offset must NOT be trimmed");
+            } else {
+                panic!("expected second layer to be Arrays variant");
+            }
+        } else {
+            panic!("expected Hybrid variant");
+        }
     }
 }
