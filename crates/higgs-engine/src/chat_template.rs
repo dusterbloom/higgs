@@ -172,7 +172,6 @@ impl ChatTemplateRenderer {
     }
 }
 
-/// Custom tojson filter for minijinja (used by HF chat templates).
 /// Normalise a tool-call JSON object so Qwen-Hermes-style chat templates
 /// can render it without crashing on `tool_call.arguments|items`.
 ///
@@ -183,13 +182,14 @@ impl ChatTemplateRenderer {
 ///    `chat_template.jinja` references `tool_call.name` and
 ///    `tool_call.arguments` directly. After this call, both shapes are
 ///    accessible.
-/// 2. **Parse string-encoded arguments to a JSON value.** `OpenAI` says
-///    `function.arguments` is a JSON-encoded string. Qwen's template
-///    iterates it via `|items` (mapping pairs), which makes minijinja
-///    raise `cannot convert value into pairs` when it sees a string.
-///    Any string that successfully parses as JSON becomes a `Value`;
-///    strings that fail to parse are left untouched so the template can
-///    decide how to handle them.
+/// 2. **Coerce `arguments` to a mapping.** `OpenAI` sends
+///    `function.arguments` as a JSON-encoded string, but Qwen's template
+///    iterates it via `|items`. A string that parses to a JSON object is
+///    replaced by that object; anything that does not resolve to an object
+///    (unparseable strings, or JSON that isn't an object) is coerced to an
+///    empty object `{}` by [`normalize_arguments_value`] so the template
+///    can't raise `cannot convert value into pairs`. The original string
+///    does NOT survive when it isn't object-shaped.
 ///
 /// Other fields (`id`, `type`, …) are preserved unchanged. Callers that
 /// already supply the flat shape pay only the cost of a `serde_json::Value`

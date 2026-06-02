@@ -248,7 +248,9 @@ fn coerce_param_value(raw: &str, declared: Option<ParamType>) -> serde_json::Val
     };
     match declared {
         Some(ParamType::Str) => as_string(),
-        Some(ParamType::Integer | ParamType::Number) => parsed_if(Value::is_number),
+        // `integer` must reject fractional values — `is_number` accepts floats.
+        Some(ParamType::Integer) => parsed_if(|v| v.is_i64() || v.is_u64()),
+        Some(ParamType::Number) => parsed_if(Value::is_number),
         Some(ParamType::Boolean) => match raw.trim() {
             "true" => Value::Bool(true),
             "false" => Value::Bool(false),
@@ -495,7 +497,10 @@ fn parse_minicpm_tool_calls(text: &str, schema: Option<&ToolSchema>) -> ToolPars
 /// events.
 #[derive(Debug, Default)]
 pub struct StreamingToolOutput {
+    /// Text to forward to the client as a normal content delta.
     pub visible: String,
+    /// Tool calls that became complete during this chunk; the route layer
+    /// emits each as a `tool_calls` SSE delta.
     pub new_tool_calls: Vec<ParsedToolCall>,
 }
 
@@ -1239,6 +1244,40 @@ After last."#;
         assert_eq!(
             result.tool_calls.first().unwrap().arguments,
             serde_json::json!({ "count": 42, "enabled": true, "opts": { "a": 1 }, "label": "123" })
+        );
+    }
+
+    /// An `integer`-typed parameter must reject fractional input (kept as a
+    /// string) but accept whole numbers — `is_number` alone would wrongly
+    /// accept `3.14`.
+    #[test]
+    fn xml_integer_rejects_fractional() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": { "type": "object", "properties": { "n": { "type": "integer" } } }
+            }
+        })];
+        let schema = ToolSchema::from_tools(Some(tools.as_slice()));
+        let frac = "<tool_call>\n<function=f>\n<parameter=n>\n3.14\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(
+            parse_tool_calls(frac, schema.as_ref())
+                .tool_calls
+                .first()
+                .unwrap()
+                .arguments,
+            serde_json::json!({ "n": "3.14" })
+        );
+        let whole =
+            "<tool_call>\n<function=f>\n<parameter=n>\n42\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(
+            parse_tool_calls(whole, schema.as_ref())
+                .tool_calls
+                .first()
+                .unwrap()
+                .arguments,
+            serde_json::json!({ "n": 42 })
         );
     }
 
