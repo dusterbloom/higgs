@@ -409,17 +409,21 @@ fn extract_param_value(vr: &str) -> (&str, &str) {
 /// Returns `None` when no `name="…"` attribute is present so the caller can
 /// preserve the text verbatim.
 fn parse_minicpm_function(block: &str, schema: Option<&ToolSchema>) -> Option<ParsedToolCall> {
-    let name_attr = block.find(NAME_ATTR)?;
-    let after_attr = block.get(name_attr + NAME_ATTR.len()..)?;
+    // Read `name="…"` only from the opening `<function …>` tag (before its
+    // closing `>`). Scanning the whole block would let a malformed payload
+    // like `<function><param name="x">…` be parsed as a tool call named `x`
+    // instead of being preserved verbatim.
+    let tag_close = block.find('>')?;
+    let open_tag = block.get(..tag_close)?;
+    let name_attr = open_tag.find(NAME_ATTR)?;
+    let after_attr = open_tag.get(name_attr + NAME_ATTR.len()..)?;
     let name_end = after_attr.find('"')?;
     let name = after_attr.get(..name_end)?.to_owned();
     if name.is_empty() {
         return None;
     }
     // Params start after the `>` that closes the `<function …>` open tag.
-    let after_name = after_attr.get(name_end + 1..)?;
-    let tag_close = after_name.find('>')?;
-    let mut rest = after_name.get(tag_close + 1..).unwrap_or_default();
+    let mut rest = block.get(tag_close + 1..).unwrap_or_default();
 
     let mut map = serde_json::Map::new();
     while let Some(p_open) = rest.find(MINICPM_PARAM_OPEN) {
@@ -1433,6 +1437,17 @@ After last."#;
             result.tool_calls.first().unwrap().arguments,
             serde_json::json!({})
         );
+    }
+
+    /// A `<function>` opener with no `name="…"` attribute must NOT borrow the
+    /// `name` from a nested `<param>` — the block is preserved verbatim rather
+    /// than routed into the tool-execution path as a call named "city".
+    #[test]
+    fn minicpm_function_without_name_is_not_parsed() {
+        let input = "<function ><param name=\"city\">Paris</param></function>";
+        let result = parse_tool_calls(input, None);
+        assert!(result.tool_calls.is_empty());
+        assert!(result.text.contains("<param name=\"city\">"));
     }
 
     /// Streaming: the tracker reassembles a `MiniCPM` call split inside the

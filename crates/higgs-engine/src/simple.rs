@@ -2307,7 +2307,7 @@ mod tests {
         assert!(detect_thinking_support(dir.path()));
     }
 
-    /// A plain Llama (no reasoning model_type, no `enable_thinking` in the
+    /// A plain Llama (no reasoning `model_type`, no `enable_thinking` in the
     /// template) must NOT be treated as a thinking model.
     #[test]
     fn no_thinking_for_plain_llama() {

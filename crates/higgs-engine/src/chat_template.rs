@@ -345,9 +345,9 @@ mod tests {
         assert_eq!(result, r#""hello""#);
     }
 
-    /// HF templates (e.g. MiniCPM5 at `chat:6`) call `tojson(ensure_ascii=…)`.
+    /// HF templates (e.g. `MiniCPM5` at `chat:6`) call `tojson(ensure_ascii=…)`.
     /// The filter must accept the kwarg instead of failing with "too many
-    /// arguments"; the value is ignored since serde_json emits UTF-8.
+    /// arguments"; the value is ignored since `serde_json` emits UTF-8.
     #[test]
     fn test_tojson_filter_accepts_ensure_ascii_kwarg() {
         let env = tojson_env(r"{{ value | tojson(ensure_ascii=false) }}");
