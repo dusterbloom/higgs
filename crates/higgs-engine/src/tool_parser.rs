@@ -64,6 +64,14 @@ const MAX_INSIDE_TOOL_CALL_BYTES: usize = 1024 * 1024;
 ///
 /// Returns the non-tool-call text and any extracted tool calls.
 pub fn parse_tool_calls(text: &str, schema: Option<&ToolSchema>) -> ToolParseResult {
+    // MiniCPM5 emits bare `<function name=…>…</function>` with no `<tool_call>`
+    // wrapper. When there's no wrapper but a function opener is present, take
+    // that path; otherwise fall through to the `<tool_call>` scanner (which
+    // covers both the JSON and Qwen `<function=` XML inner forms).
+    if !text.contains(TOOL_CALL_OPEN) && text.contains(MINICPM_FUNCTION_OPEN) {
+        return parse_minicpm_tool_calls(text, schema);
+    }
+
     let mut result_text = String::new();
     let mut tool_calls = Vec::new();
     let mut remaining = text;
@@ -126,6 +134,16 @@ const FUNCTION_OPEN: &str = "<function=";
 const FUNCTION_CLOSE: &str = "</function>";
 const PARAM_OPEN: &str = "<parameter=";
 const PARAM_CLOSE: &str = "</parameter>";
+
+// MiniCPM5-style tool calls: `<function name="NAME"><param name="KEY">VALUE</param></function>`
+// with no `<tool_call>` wrapper and optional `<![CDATA[…]]>`-wrapped values.
+// `FUNCTION_CLOSE` (`</function>`) is shared with the Qwen XML form above.
+const MINICPM_FUNCTION_OPEN: &str = "<function ";
+const MINICPM_PARAM_OPEN: &str = "<param name=\"";
+const MINICPM_PARAM_CLOSE: &str = "</param>";
+const NAME_ATTR: &str = "name=\"";
+const CDATA_OPEN: &str = "<![CDATA[";
+const CDATA_CLOSE: &str = "]]>";
 
 /// Declared JSON-schema type for a single tool parameter, used to coerce the
 /// raw string values that the Qwen XML tool-call format emits.
@@ -330,6 +348,144 @@ fn parse_tool_call_block(content: &str, schema: Option<&ToolSchema>) -> Option<P
     }
 }
 
+/// Byte offset of the `</function>` that closes a `MiniCPM` function block in
+/// `s`, skipping any `<![CDATA[ … ]]>` spans whose content may itself contain
+/// a literal `</function>`.
+///
+/// Returns `None` when the block is not yet terminated: either no closer has
+/// arrived, or scanning is parked inside an unclosed CDATA span (the caller
+/// should wait for more input).
+fn minicpm_function_end(s: &str) -> Option<usize> {
+    let mut i = 0;
+    loop {
+        let rest = s.get(i..)?;
+        let next_close = rest.find(FUNCTION_CLOSE);
+        // A CDATA span that opens before the next close tag must be skipped
+        // whole, otherwise a `</function>` inside it would close early.
+        if let Some(d) = rest.find(CDATA_OPEN) {
+            if next_close.is_none_or(|c| d < c) {
+                let after_open = d + CDATA_OPEN.len();
+                let close = rest.get(after_open..)?.find(CDATA_CLOSE)?;
+                i += after_open + close + CDATA_CLOSE.len();
+                continue;
+            }
+        }
+        return next_close.map(|c| i + c);
+    }
+}
+
+/// Extract one `MiniCPM` `<param>` value from `vr` — the text immediately after
+/// the param tag's `>`. Returns `(value, rest_after_</param>)`. A
+/// `<![CDATA[…]]>` wrapper yields its verbatim content; otherwise the value is
+/// the text up to `</param>`. Both returned slices borrow `vr`.
+fn extract_param_value(vr: &str) -> (&str, &str) {
+    if let Some(stripped) = vr.strip_prefix(CDATA_OPEN) {
+        if let Some(close) = stripped.find(CDATA_CLOSE) {
+            let value = stripped.get(..close).unwrap_or_default();
+            let tail = stripped
+                .get(close + CDATA_CLOSE.len()..)
+                .unwrap_or_default();
+            let after = tail
+                .find(MINICPM_PARAM_CLOSE)
+                .and_then(|i| tail.get(i + MINICPM_PARAM_CLOSE.len()..))
+                .unwrap_or_default();
+            return (value, after);
+        }
+        return (stripped, "");
+    }
+    vr.find(MINICPM_PARAM_CLOSE).map_or((vr, ""), |i| {
+        (
+            vr.get(..i).unwrap_or_default(),
+            vr.get(i + MINICPM_PARAM_CLOSE.len()..).unwrap_or_default(),
+        )
+    })
+}
+
+/// Parse a single `MiniCPM` function block (`<function name="…">…` up to, but
+/// not including, the closing `</function>`).
+///
+/// Returns `None` when no `name="…"` attribute is present so the caller can
+/// preserve the text verbatim.
+fn parse_minicpm_function(block: &str, schema: Option<&ToolSchema>) -> Option<ParsedToolCall> {
+    let name_attr = block.find(NAME_ATTR)?;
+    let after_attr = block.get(name_attr + NAME_ATTR.len()..)?;
+    let name_end = after_attr.find('"')?;
+    let name = after_attr.get(..name_end)?.to_owned();
+    if name.is_empty() {
+        return None;
+    }
+    // Params start after the `>` that closes the `<function …>` open tag.
+    let after_name = after_attr.get(name_end + 1..)?;
+    let tag_close = after_name.find('>')?;
+    let mut rest = after_name.get(tag_close + 1..).unwrap_or_default();
+
+    let mut map = serde_json::Map::new();
+    while let Some(p_open) = rest.find(MINICPM_PARAM_OPEN) {
+        let after_p = rest
+            .get(p_open + MINICPM_PARAM_OPEN.len()..)
+            .unwrap_or_default();
+        let Some(key_end) = after_p.find('"') else {
+            break;
+        };
+        let key = after_p.get(..key_end).unwrap_or_default().to_owned();
+        let after_key = after_p.get(key_end + 1..).unwrap_or_default();
+        let Some(gt) = after_key.find('>') else {
+            break;
+        };
+        let value_region = after_key.get(gt + 1..).unwrap_or_default();
+        let (raw_value, after) = extract_param_value(value_region);
+        if !key.is_empty() {
+            let declared = schema.and_then(|s| s.param_type(&name, &key));
+            map.insert(key, coerce_param_value(raw_value, declared));
+        }
+        rest = after;
+    }
+
+    Some(ParsedToolCall {
+        name,
+        arguments: serde_json::Value::Object(map),
+    })
+}
+
+/// Scan text for one or more bare `MiniCPM` `<function …>…</function>` blocks
+/// (no `<tool_call>` wrapper). Text outside the blocks is preserved as visible
+/// content; unparseable or unterminated blocks are preserved verbatim.
+fn parse_minicpm_tool_calls(text: &str, schema: Option<&ToolSchema>) -> ToolParseResult {
+    let mut result_text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut remaining = text;
+
+    loop {
+        let Some(start) = remaining.find(MINICPM_FUNCTION_OPEN) else {
+            result_text.push_str(remaining);
+            break;
+        };
+        result_text.push_str(remaining.get(..start).unwrap_or_default());
+        let block_region = remaining.get(start..).unwrap_or_default();
+
+        let Some(end) = minicpm_function_end(block_region) else {
+            result_text.push_str(block_region);
+            break;
+        };
+
+        let block = block_region.get(..end).unwrap_or_default();
+        if let Some(parsed) = parse_minicpm_function(block, schema) {
+            tool_calls.push(parsed);
+        } else {
+            result_text.push_str(block);
+            result_text.push_str(FUNCTION_CLOSE);
+        }
+        remaining = block_region
+            .get(end + FUNCTION_CLOSE.len()..)
+            .unwrap_or_default();
+    }
+
+    ToolParseResult {
+        text: result_text.trim().to_owned(),
+        tool_calls,
+    }
+}
+
 /// One chunk of streaming output from [`StreamingToolCallTracker::process`]
 /// or [`StreamingToolCallTracker::flush`].
 ///
@@ -343,29 +499,47 @@ pub struct StreamingToolOutput {
     pub new_tool_calls: Vec<ParsedToolCall>,
 }
 
-/// State machine that buffers streaming text chunks and extracts
-/// `<tool_call>{json}</tool_call>` blocks on the fly.
+/// Longest opener token. In the scanning state the tracker keeps this many
+/// bytes at the buffer tail so a `<tool_call>` or `<function ` opener split
+/// across a chunk boundary is still detected next chunk.
+const MAX_OPENER_LEN: usize = if TOOL_CALL_OPEN.len() > MINICPM_FUNCTION_OPEN.len() {
+    TOOL_CALL_OPEN.len()
+} else {
+    MINICPM_FUNCTION_OPEN.len()
+};
+
+/// Which kind of tool-call block the tracker is currently inside.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Inside {
+    /// Scanning for the next opener.
+    None,
+    /// Inside a `<tool_call>…</tool_call>` block (JSON or Qwen `<function=` XML).
+    ToolCall,
+    /// Inside a bare `MiniCPM` `<function …>…</function>` block.
+    Function,
+}
+
+/// State machine that buffers streaming text chunks and extracts tool-call
+/// blocks on the fly — `<tool_call>…</tool_call>` (JSON or Qwen `<function=`
+/// XML) and bare `MiniCPM` `<function …>…</function>`.
 ///
 /// Designed to be cheap: when `active = false` (no tools in the request),
 /// `process` is a single allocation per chunk and `flush` is a no-op.
 ///
-/// When active, it accumulates a tail buffer just large enough that the
-/// `<tool_call>` opener can't straddle a chunk boundary. As soon as a
-/// complete `<tool_call>…</tool_call>` block is in the buffer, the JSON
-/// between the tags is parsed and emitted as a [`ParsedToolCall`]. Text
-/// before/after tags streams out verbatim.
+/// When active, it retains a small tail so an opener can't straddle a chunk
+/// boundary; once a complete block is buffered it is parsed and emitted as a
+/// [`ParsedToolCall`]. Text before/after blocks streams out verbatim.
 ///
 /// Invariants:
-/// - **Never silently drops tokens.** Unclosed tool-call tags at `flush`
-///   are re-emitted (with the `<tool_call>` opener prepended) as visible
-///   content rather than discarded.
+/// - **Never silently drops tokens.** Unclosed tags at `flush` are re-emitted
+///   as visible content rather than discarded.
 /// - **UTF-8 safe.** Tail-flushes walk back to the previous char boundary
 ///   so a partial multi-byte sequence is never split.
 /// - **Pure passthrough when inactive.** Zero parsing cost on requests
 ///   that did not pass `tools` to the chat route.
 pub struct StreamingToolCallTracker {
     buffer: String,
-    inside_tool_call: bool,
+    inside: Inside,
     completed_count: usize,
     active: bool,
     schema: Option<ToolSchema>,
@@ -377,7 +551,7 @@ impl StreamingToolCallTracker {
     pub const fn new(active: bool, schema: Option<ToolSchema>) -> Self {
         Self {
             buffer: String::new(),
-            inside_tool_call: false,
+            inside: Inside::None,
             completed_count: 0,
             active,
             schema,
@@ -390,6 +564,52 @@ impl StreamingToolCallTracker {
 
     pub const fn has_tool_calls(&self) -> bool {
         self.completed_count > 0
+    }
+
+    /// In the scanning state, advance to the next opener — entering
+    /// `ToolCall`/`Function` — or flush all-but-tail and signal "wait".
+    /// Returns `true` to keep looping, `false` to break (need more input).
+    fn scan_for_opener(&mut self, out: &mut StreamingToolOutput) -> bool {
+        let tc = self.buffer.find(TOOL_CALL_OPEN);
+        let fc = self.buffer.find(MINICPM_FUNCTION_OPEN);
+        // Enter whichever opener appears first; `(pos, is_tool_call)`.
+        let pick = match (tc, fc) {
+            (Some(t), Some(f)) => Some(if f < t { (f, false) } else { (t, true) }),
+            (Some(t), None) => Some((t, true)),
+            (None, Some(f)) => Some((f, false)),
+            (None, None) => None,
+        };
+        let Some((pos, is_tool_call)) = pick else {
+            // No opener yet — flush all but a tail large enough to hold a
+            // split opener, walking back to a UTF-8 char boundary.
+            if self.buffer.len() > MAX_OPENER_LEN {
+                let target_len = self.buffer.len() - MAX_OPENER_LEN;
+                let mut safe_len = target_len;
+                while safe_len > 0 && !self.buffer.is_char_boundary(safe_len) {
+                    safe_len -= 1;
+                }
+                out.visible
+                    .push_str(self.buffer.get(..safe_len).unwrap_or_default());
+                self.buffer = self.buffer.get(safe_len..).unwrap_or_default().to_owned();
+            }
+            return false;
+        };
+        out.visible
+            .push_str(self.buffer.get(..pos).unwrap_or_default());
+        if is_tool_call {
+            // Strip the `<tool_call>` opener; the inner body is parsed at the closer.
+            self.buffer = self
+                .buffer
+                .get(pos + TOOL_CALL_OPEN.len()..)
+                .unwrap_or_default()
+                .to_owned();
+            self.inside = Inside::ToolCall;
+        } else {
+            // Keep the `<function …` opener for the block parser.
+            self.buffer = self.buffer.get(pos..).unwrap_or_default().to_owned();
+            self.inside = Inside::Function;
+        }
+        true
     }
 
     /// Feed a chunk of streamed text. Returns visible text + any tool calls
@@ -406,74 +626,76 @@ impl StreamingToolCallTracker {
         let mut out = StreamingToolOutput::default();
 
         loop {
-            if self.inside_tool_call {
-                // Look for closing tag — once seen, parse the JSON body
-                // and continue scanning (another tool call may follow in
-                // the same chunk).
-                if let Some(end) = self.buffer.find(TOOL_CALL_CLOSE) {
-                    let raw_block = self.buffer.get(..end).unwrap_or_default();
-                    let call_content = raw_block.trim();
-                    if let Some(parsed) = parse_tool_call_block(call_content, self.schema.as_ref())
-                    {
-                        out.new_tool_calls.push(parsed);
-                        self.completed_count += 1;
-                    } else {
-                        // Invalid JSON inside the tag — preserve verbatim
-                        // so the client/operator can see what the model
-                        // emitted instead of silent loss.
+            match self.inside {
+                Inside::ToolCall => {
+                    // Seek `</tool_call>`; once seen, parse the inner block
+                    // (JSON or Qwen `<function=` XML) and keep scanning.
+                    if let Some(end) = self.buffer.find(TOOL_CALL_CLOSE) {
+                        let raw_block = self.buffer.get(..end).unwrap_or_default();
+                        let call_content = raw_block.trim();
+                        if let Some(parsed) =
+                            parse_tool_call_block(call_content, self.schema.as_ref())
+                        {
+                            out.new_tool_calls.push(parsed);
+                            self.completed_count += 1;
+                        } else {
+                            // Unparseable inner — preserve verbatim so the
+                            // client/operator sees what the model emitted.
+                            out.visible.push_str(TOOL_CALL_OPEN);
+                            out.visible.push_str(raw_block);
+                            out.visible.push_str(TOOL_CALL_CLOSE);
+                        }
+                        self.buffer = self
+                            .buffer
+                            .get(end + TOOL_CALL_CLOSE.len()..)
+                            .unwrap_or_default()
+                            .to_owned();
+                        self.inside = Inside::None;
+                    } else if self.buffer.len() > MAX_INSIDE_TOOL_CALL_BYTES {
+                        // Overflow guard: opener seen, closer never arrived.
+                        let leftover = std::mem::take(&mut self.buffer);
                         out.visible.push_str(TOOL_CALL_OPEN);
-                        out.visible.push_str(raw_block);
-                        out.visible.push_str(TOOL_CALL_CLOSE);
+                        out.visible.push_str(&leftover);
+                        self.inside = Inside::None;
+                        break;
+                    } else {
+                        break;
                     }
-                    self.buffer = self
-                        .buffer
-                        .get(end + TOOL_CALL_CLOSE.len()..)
-                        .unwrap_or_default()
-                        .to_owned();
-                    self.inside_tool_call = false;
-                } else if self.buffer.len() > MAX_INSIDE_TOOL_CALL_BYTES {
-                    // Overflow guard: `<tool_call>` opened but the close
-                    // tag never arrived within the cap. Abandon the parse
-                    // and emit verbatim so tokens still aren't dropped.
-                    let leftover = std::mem::take(&mut self.buffer);
-                    out.visible.push_str(TOOL_CALL_OPEN);
-                    out.visible.push_str(&leftover);
-                    self.inside_tool_call = false;
-                    break;
-                } else {
-                    // Still accumulating — wait for more.
-                    break;
                 }
-            } else if let Some(start) = self.buffer.find(TOOL_CALL_OPEN) {
-                // Everything before the open tag flushes out as visible.
-                out.visible
-                    .push_str(self.buffer.get(..start).unwrap_or_default());
-                self.buffer = self
-                    .buffer
-                    .get(start + TOOL_CALL_OPEN.len()..)
-                    .unwrap_or_default()
-                    .to_owned();
-                self.inside_tool_call = true;
-            } else if self.buffer.len() > TOOL_CALL_OPEN.len() {
-                // No open tag yet, but the buffer is bigger than the open
-                // tag — safe to flush all-but-tail. Keep
-                // `TOOL_CALL_OPEN.len()` bytes at the tail so a partial
-                // `<tool_call>` straddling the next chunk is still
-                // detectable.
-                let target_len = self.buffer.len() - TOOL_CALL_OPEN.len();
-                // Walk back to the previous UTF-8 char boundary so a
-                // multi-byte sequence is never split.
-                let mut safe_len = target_len;
-                while safe_len > 0 && !self.buffer.is_char_boundary(safe_len) {
-                    safe_len -= 1;
+                Inside::Function => {
+                    // The `<function …` opener is kept in the buffer so the
+                    // block parser can read the `name="…"` attribute. Seek a
+                    // CDATA-aware `</function>`.
+                    if let Some(end) = minicpm_function_end(&self.buffer) {
+                        let block = self.buffer.get(..end).unwrap_or_default();
+                        if let Some(parsed) = parse_minicpm_function(block, self.schema.as_ref()) {
+                            out.new_tool_calls.push(parsed);
+                            self.completed_count += 1;
+                        } else {
+                            out.visible.push_str(block);
+                            out.visible.push_str(FUNCTION_CLOSE);
+                        }
+                        self.buffer = self
+                            .buffer
+                            .get(end + FUNCTION_CLOSE.len()..)
+                            .unwrap_or_default()
+                            .to_owned();
+                        self.inside = Inside::None;
+                    } else if self.buffer.len() > MAX_INSIDE_TOOL_CALL_BYTES {
+                        // Overflow guard: `<function …` opened, never closed.
+                        let leftover = std::mem::take(&mut self.buffer);
+                        out.visible.push_str(&leftover);
+                        self.inside = Inside::None;
+                        break;
+                    } else {
+                        break;
+                    }
                 }
-                out.visible
-                    .push_str(self.buffer.get(..safe_len).unwrap_or_default());
-                self.buffer = self.buffer.get(safe_len..).unwrap_or_default().to_owned();
-                break;
-            } else {
-                // Buffer smaller than the open tag — keep waiting.
-                break;
+                Inside::None => {
+                    if !self.scan_for_opener(&mut out) {
+                        break;
+                    }
+                }
             }
         }
 
@@ -485,22 +707,25 @@ impl StreamingToolCallTracker {
     /// (with its opener prepended) so no tokens silently vanish.
     pub fn flush(&mut self) -> StreamingToolOutput {
         let leftover = std::mem::take(&mut self.buffer);
-        let was_inside = self.inside_tool_call;
-        self.inside_tool_call = false;
+        let inside = self.inside;
+        self.inside = Inside::None;
 
-        if was_inside {
-            let mut visible = String::with_capacity(TOOL_CALL_OPEN.len() + leftover.len());
-            visible.push_str(TOOL_CALL_OPEN);
-            visible.push_str(&leftover);
-            StreamingToolOutput {
-                visible,
-                new_tool_calls: Vec::new(),
+        let visible = match inside {
+            // The `<tool_call>` opener was stripped on entry, so re-prepend it.
+            Inside::ToolCall => {
+                let mut v = String::with_capacity(TOOL_CALL_OPEN.len() + leftover.len());
+                v.push_str(TOOL_CALL_OPEN);
+                v.push_str(&leftover);
+                v
             }
-        } else {
-            StreamingToolOutput {
-                visible: leftover,
-                new_tool_calls: Vec::new(),
-            }
+            // `Function` keeps its `<function …` opener in the buffer, and
+            // `None` is plain text — both emit the leftover verbatim.
+            Inside::Function | Inside::None => leftover,
+        };
+
+        StreamingToolOutput {
+            visible,
+            new_tool_calls: Vec::new(),
         }
     }
 }
@@ -1072,6 +1297,126 @@ After last."#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
         assert_eq!(calls[0].arguments, serde_json::json!({ "city": "London" }));
+        assert_eq!(t.completed_count(), 1);
+    }
+
+    // ============================================================
+    // MiniCPM5 tool-call format: <function name="…"><param name="…">…
+    // (no <tool_call> wrapper, attribute-named, optional CDATA values)
+    // ============================================================
+
+    /// Canonical `MiniCPM` shape: bare `<function name=…>` with one param.
+    #[test]
+    fn minicpm_single_call_one_param() {
+        let input = r#"<function name="get_weather"><param name="city">London</param></function>"#;
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        let tc = result.tool_calls.first().unwrap();
+        assert_eq!(tc.name, "get_weather");
+        assert_eq!(tc.arguments, serde_json::json!({ "city": "London" }));
+        assert!(result.text.is_empty());
+    }
+
+    /// Multiple consecutive blocks, with text before/between them preserved.
+    #[test]
+    fn minicpm_multiple_calls_with_text() {
+        let input = concat!(
+            "Sure.",
+            r#"<function name="a"><param name="x">1</param></function>"#,
+            " then ",
+            r#"<function name="b"><param name="y">two</param></function>"#,
+        );
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "a");
+        // No schema → best-effort: "1" parses to a number.
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({ "x": 1 })
+        );
+        assert_eq!(result.tool_calls[1].name, "b");
+        assert_eq!(
+            result.tool_calls[1].arguments,
+            serde_json::json!({ "y": "two" })
+        );
+        assert!(result.text.contains("Sure."));
+        assert!(result.text.contains("then"));
+    }
+
+    /// A CDATA value containing both a newline and a literal `</function>`
+    /// must be captured verbatim and must NOT close the block early.
+    #[test]
+    fn minicpm_cdata_value_with_literal_close_tag() {
+        let input = "<function name=\"write\"><param name=\"code\"><![CDATA[fn main() {\n  // </function> not a real close\n}]]></param></function>";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        let tc = result.tool_calls.first().unwrap();
+        assert_eq!(tc.name, "write");
+        let code = tc.arguments.get("code").unwrap().as_str().unwrap();
+        assert!(code.contains("fn main()"));
+        assert!(code.contains("</function> not a real close"));
+        assert!(code.contains('\n'));
+        assert!(result.text.is_empty());
+    }
+
+    /// Declared schema coerces `MiniCPM` param values; a `string`-typed `"123"`
+    /// stays a string (schema beats the best-effort number guess).
+    #[test]
+    fn minicpm_schema_driven_coercion() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "cfg",
+                "parameters": { "type": "object", "properties": {
+                    "count": { "type": "integer" },
+                    "on": { "type": "boolean" },
+                    "label": { "type": "string" }
+                }}
+            }
+        })];
+        let schema = ToolSchema::from_tools(Some(tools.as_slice()));
+        let input = r#"<function name="cfg"><param name="count">7</param><param name="on">true</param><param name="label">123</param></function>"#;
+        let result = parse_tool_calls(input, schema.as_ref());
+        assert_eq!(
+            result.tool_calls.first().unwrap().arguments,
+            serde_json::json!({ "count": 7, "on": true, "label": "123" })
+        );
+    }
+
+    /// A function with no params yields empty arguments, not a failure.
+    #[test]
+    fn minicpm_no_param_function() {
+        let input = r#"<function name="ping"></function>"#;
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls.first().unwrap().name, "ping");
+        assert_eq!(
+            result.tool_calls.first().unwrap().arguments,
+            serde_json::json!({})
+        );
+    }
+
+    /// Streaming: the tracker reassembles a `MiniCPM` call split inside the
+    /// `<function` opener AND inside a CDATA value, with no leak to visible.
+    #[test]
+    fn streaming_minicpm_split_across_chunks() {
+        let mut t = StreamingToolCallTracker::new(true, None);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &[
+                "<func",
+                "tion name=\"run\"><param name=\"cmd\">",
+                "<![CDATA[echo ",
+                "hi]]></param></function>",
+            ],
+        );
+        assert!(
+            vis.trim().is_empty(),
+            "split MiniCPM must not leak to visible, got {vis:?}"
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run");
+        assert_eq!(calls[0].arguments, serde_json::json!({ "cmd": "echo hi" }));
         assert_eq!(t.completed_count(), 1);
     }
 }
