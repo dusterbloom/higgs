@@ -39,15 +39,14 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
     match config.model_type.as_str() {
         "qwen2" | "qwen3" | "llama" | "mistral" => {
             // Packed 1.25-bpw Bonsai-Q1 checkpoints declare model_type="qwen3"
-            // but the weights are quantized to bits=1. Keep detection ahead of
-            // the fp16/Q4 transformer loader so users get an explicit error
-            // while the workspace remains on upstream oxideai/mlx-rs.
+            // but the weights are quantized to bits=1. Route them to the
+            // dedicated packed engine, whose bits=1 matvec/dequant run through
+            // runtime JIT Metal kernels (higgs-models::metal_kernel) — so it
+            // runs on stock oxideai/mlx-rs with no forked bits=1 MLX kernel.
             if is_bonsai_q1(&config.model_dir)? {
-                return Err(EngineError::Model(ModelError::UnsupportedModel(
-                    "Bonsai-Q1 requires MLX bits=1 affine quantization support; \
-                     the workspace stays on upstream oxideai/mlx-rs until that support lands"
-                        .to_owned(),
-                )));
+                let gpu = higgs_models::bonsai_q1::load_bonsai_q1(&config.model_dir)
+                    .map_err(EngineError::Model)?;
+                return Ok(AnyModel::BonsaiQ1(gpu));
             }
             let model = transformer::load_model(&config.model_dir).map_err(EngineError::Model)?;
             Ok(AnyModel::Transformer(model))
@@ -315,7 +314,12 @@ mod tests {
     }
 
     #[test]
-    fn load_model_rejects_bonsai_q1_without_runtime_support() {
+    fn load_model_routes_bonsai_q1_to_packed_engine() {
+        // A bits=1 / group=128 qwen3 config now routes to the packed Bonsai-Q1
+        // engine (its bits=1 kernels live in higgs-models::metal_kernel) instead
+        // of being rejected up front. With no weights in the dir the load still
+        // fails inside the engine — but it must no longer be gated out, and the
+        // old "requires MLX bits=1" guard error must be gone.
         let (dir, _result) = config_from_raw(
             r#"{
                 "model_type": "qwen3",
@@ -323,8 +327,14 @@ mod tests {
             }"#,
         );
         match load_model(dir.path()) {
-            Err(err) => assert!(err.to_string().contains("Bonsai-Q1 requires MLX bits=1")),
-            Ok(_) => panic!("Expected unsupported Bonsai-Q1 runtime error"),
+            Ok(_) => panic!("expected load failure: config-only dir has no weights"),
+            Err(EngineError::Model(ModelError::UnsupportedModel(_))) => {
+                panic!("Bonsai-Q1 must route to the packed engine, not be rejected as unsupported")
+            }
+            Err(err) => assert!(
+                !err.to_string().contains("requires MLX bits=1"),
+                "stale bits=1 guard error should be gone, got: {err}"
+            ),
         }
     }
 
