@@ -245,6 +245,10 @@ pub struct SimpleEngine {
     template: Option<ChatTemplateRenderer>,
     model_name: String,
     eos_token_ids: Vec<u32>,
+    /// Control tokens stripped from decoded output (EOS + `<|…|>` chat
+    /// delimiters + classic sentinels), while content-bearing special tokens
+    /// (tool-call markup, `<think>`) are preserved. See [`Self::decode_tokens`].
+    decode_skip_ids: std::collections::HashSet<u32>,
     /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
     enable_thinking: bool,
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
@@ -292,6 +296,25 @@ impl SimpleEngine {
         }
 
         let eos_token_ids = extract_eos_tokens(model_dir);
+
+        // Control tokens that must never surface in decoded text. `decode_tokens`
+        // keeps content-bearing special tokens (so tool-call markup like
+        // MiniCPM's `<function>`/`<param>` reaches the parser) but strips these:
+        // the EOS set, the `<|…|>` chat-control delimiters, and classic
+        // sentinels. Content tokens like `<think>`, `<tool_call>`, `<function>`
+        // do not match and are preserved.
+        let decode_skip_ids: std::collections::HashSet<u32> = {
+            let mut ids: std::collections::HashSet<u32> = eos_token_ids.iter().copied().collect();
+            for (id, added) in tokenizer.get_added_tokens_decoder() {
+                let content = added.content.as_str();
+                let is_control = (content.starts_with("<|") && content.ends_with("|>"))
+                    || matches!(content, "<s>" | "</s>" | "<pad>" | "<unk>" | "<mask>");
+                if is_control {
+                    ids.insert(id);
+                }
+            }
+            ids
+        };
 
         // Auto-detect thinking mode: Qwen3.5 models support <think> tags.
         // Override with HIGGS_ENABLE_THINKING=0/1, off/true, yes/no etc.
@@ -432,6 +455,7 @@ impl SimpleEngine {
             template,
             model_name,
             eos_token_ids,
+            decode_skip_ids,
             enable_thinking,
             think_close_token,
             gen_prompt_suffix_len,
@@ -759,10 +783,30 @@ impl SimpleEngine {
     }
 
     /// Decode the token buffer and return the text, mapping tokenizer errors.
+    ///
+    /// Decodes WITHOUT skipping special tokens so content-bearing markup
+    /// survives — notably models (e.g. `MiniCPM5`) that encode their tool-call
+    /// structure (`<function>`, `<param>`, …) as special tokens, which the
+    /// tool parser needs to see. Control tokens (EOS) are filtered out first so
+    /// they never leak into visible text. Plain text contains no special
+    /// tokens and decodes identically either way, so normal responses are
+    /// unaffected.
     fn decode_tokens(&self, tokens: &[u32]) -> Result<String, EngineError> {
-        self.tokenizer
-            .decode(tokens, true)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))
+        let decode = |ids: &[u32]| {
+            self.tokenizer
+                .decode(ids, false)
+                .map_err(|e| EngineError::Tokenization(e.to_string()))
+        };
+        // Fast path: no control token present, decode the slice as-is.
+        if !tokens.iter().any(|id| self.decode_skip_ids.contains(id)) {
+            return decode(tokens);
+        }
+        let filtered: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .filter(|id| !self.decode_skip_ids.contains(id))
+            .collect();
+        decode(&filtered)
     }
 
     /// The model's hidden dimension (embedding output size).
