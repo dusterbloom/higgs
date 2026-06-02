@@ -348,7 +348,8 @@ async fn chat_completions_non_streaming(
     };
 
     let (content, tool_calls, finish_reason) = if has_tools {
-        let parsed = higgs_engine::tool_parser::parse_tool_calls(&raw_text);
+        let schema = higgs_engine::tool_parser::ToolSchema::from_tools(tools);
+        let parsed = higgs_engine::tool_parser::parse_tool_calls(&raw_text, schema.as_ref());
         if parsed.tool_calls.is_empty() {
             (
                 Some(MessageContent::Text(raw_text)),
@@ -418,6 +419,10 @@ fn chat_completions_stream(
     routing_method: crate::router::RoutingMethod,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
     let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    // Built here (before the `async_stream::stream!` block, which captures by
+    // move) so the tracker can coerce XML-format tool-call values to their
+    // declared JSON types.
+    let tool_schema = higgs_engine::tool_parser::ToolSchema::from_tools(req.tools.as_deref());
 
     if stream_includes_tools {
         tracing::debug!(
@@ -556,8 +561,10 @@ fn chat_completions_stream(
         // Streaming tool-call extractor — passthrough when no tools were
         // requested, otherwise watches for `<tool_call>…</tool_call>`
         // blocks and emits structured `ToolCallDelta` events.
-        let mut tool_tracker =
-            higgs_engine::tool_parser::StreamingToolCallTracker::new(stream_includes_tools);
+        let mut tool_tracker = higgs_engine::tool_parser::StreamingToolCallTracker::new(
+            stream_includes_tools,
+            tool_schema,
+        );
 
         // Closure that turns a `ParsedToolCall` into the OpenAI streaming
         // delta shape. Index is the running zero-based position of the
