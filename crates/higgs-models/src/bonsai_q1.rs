@@ -434,15 +434,33 @@ impl BonsaiQ1GpuLinear {
             ops::matmul(x, &wd.transpose_axes(&[1, 0])?)
         }
     }
+
+    /// Fuse several linears along the output (row) axis into one, so a single
+    /// matvec dispatch replaces N. All parts must share `in_features` and group
+    /// layout (they do — q/k/v and gate/up all project from the same hidden).
+    fn concat_rows(parts: &[&Self]) -> Result<Self, Exception> {
+        let ws: Vec<&Array> = parts.iter().map(|p| &p.w).collect();
+        let ss: Vec<&Array> = parts.iter().map(|p| &p.scales).collect();
+        let bs: Vec<&Array> = parts.iter().map(|p| &p.biases).collect();
+        // Axis 0 (row concat). NOTE: `ops::concatenate` (no axis) flattens to 1-D
+        // like numpy's axis=None — must use the explicit axis variant.
+        Ok(Self {
+            w: ops::concatenate_axis(&ws, 0)?,
+            scales: ops::concatenate_axis(&ss, 0)?,
+            biases: ops::concatenate_axis(&bs, 0)?,
+            out_features: parts.iter().map(|p| p.out_features).sum(),
+            in_features: parts[0].in_features,
+        })
+    }
 }
 
 pub struct BonsaiQ1GpuLayer {
-    pub q_proj: BonsaiQ1GpuLinear,
-    pub k_proj: BonsaiQ1GpuLinear,
-    pub v_proj: BonsaiQ1GpuLinear,
+    /// Fused q+k+v projection (rows concatenated): one matvec instead of three.
+    /// Output split is `[heads*head_dim | kv_heads*head_dim | kv_heads*head_dim]`.
+    pub qkv_proj: BonsaiQ1GpuLinear,
     pub o_proj: BonsaiQ1GpuLinear,
-    pub gate_proj: BonsaiQ1GpuLinear,
-    pub up_proj: BonsaiQ1GpuLinear,
+    /// Fused gate+up projection (rows concatenated): output split `[inter | inter]`.
+    pub gate_up_proj: BonsaiQ1GpuLinear,
     pub down_proj: BonsaiQ1GpuLinear,
     pub q_norm: Array,
     pub k_norm: Array,
@@ -476,13 +494,15 @@ impl BonsaiQ1Engine {
     pub fn to_gpu(self) -> Result<BonsaiQ1Gpu, Exception> {
         let mut gpu_layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
+            let q = BonsaiQ1GpuLinear::from_packed(&layer.q_proj)?;
+            let k = BonsaiQ1GpuLinear::from_packed(&layer.k_proj)?;
+            let v = BonsaiQ1GpuLinear::from_packed(&layer.v_proj)?;
+            let gate = BonsaiQ1GpuLinear::from_packed(&layer.gate_proj)?;
+            let up = BonsaiQ1GpuLinear::from_packed(&layer.up_proj)?;
             gpu_layers.push(BonsaiQ1GpuLayer {
-                q_proj: BonsaiQ1GpuLinear::from_packed(&layer.q_proj)?,
-                k_proj: BonsaiQ1GpuLinear::from_packed(&layer.k_proj)?,
-                v_proj: BonsaiQ1GpuLinear::from_packed(&layer.v_proj)?,
+                qkv_proj: BonsaiQ1GpuLinear::concat_rows(&[&q, &k, &v])?,
                 o_proj: BonsaiQ1GpuLinear::from_packed(&layer.o_proj)?,
-                gate_proj: BonsaiQ1GpuLinear::from_packed(&layer.gate_proj)?,
-                up_proj: BonsaiQ1GpuLinear::from_packed(&layer.up_proj)?,
+                gate_up_proj: BonsaiQ1GpuLinear::concat_rows(&[&gate, &up])?,
                 down_proj: BonsaiQ1GpuLinear::from_packed(&layer.down_proj)?,
                 q_norm: f16_vec_to_array(&layer.q_norm)?,
                 k_norm: f16_vec_to_array(&layer.k_norm)?,
@@ -699,6 +719,10 @@ impl BonsaiQ1Gpu {
             .map_err(|_| Exception::custom("heads overflows i32"))?;
         let kv_heads = i32::try_from(self.config.kv_heads)
             .map_err(|_| Exception::custom("kv_heads overflows i32"))?;
+        let head_dim_i = i32::try_from(self.config.head_dim)
+            .map_err(|_| Exception::custom("head_dim overflows i32"))?;
+        let inter_i = i32::try_from(self.config.inter)
+            .map_err(|_| Exception::custom("inter overflows i32"))?;
         let rms_eps = self.config.rms_norm_eps;
 
         for (layer, layer_cache) in self.layers.iter().zip(cache.iter_mut()) {
@@ -707,26 +731,26 @@ impl BonsaiQ1Gpu {
             normed.eval()?;
             times.add("input_norm", t0.elapsed().as_nanos());
 
-            // qkv projections — 3× quantized_matmul on the same input.
+            // Fused qkv projection — one matvec instead of three.
             let t0 = Instant::now();
-            let q = layer.q_proj.forward(&normed)?;
-            let k = layer.k_proj.forward(&normed)?;
-            let v = layer.v_proj.forward(&normed)?;
-            q.eval()?;
-            k.eval()?;
-            v.eval()?;
+            let qkv = layer.qkv_proj.forward(&normed)?.reshape(&[
+                B,
+                T,
+                heads + 2 * kv_heads,
+                head_dim_i,
+            ])?;
+            qkv.eval()?;
             times.add("qkv_proj", t0.elapsed().as_nanos());
 
-            // Reshape to [B, L, n_heads, head_dim] then transpose to
-            // [B, n_heads, L, head_dim]. Metadata-only; lumped with qk_norm.
-            let q = q
-                .reshape(&[B, T, heads, -1])?
+            // Split heads along axis 2 then transpose to [B, n_heads, L, head_dim].
+            let q = qkv
+                .index((.., .., ..heads, ..))
                 .transpose_axes(&[0, 2, 1, 3])?;
-            let k = k
-                .reshape(&[B, T, kv_heads, -1])?
+            let k = qkv
+                .index((.., .., heads..heads + kv_heads, ..))
                 .transpose_axes(&[0, 2, 1, 3])?;
-            let v = v
-                .reshape(&[B, T, kv_heads, -1])?
+            let v = qkv
+                .index((.., .., heads + kv_heads..heads + 2 * kv_heads, ..))
                 .transpose_axes(&[0, 2, 1, 3])?;
 
             let t0 = Instant::now();
@@ -792,11 +816,11 @@ impl BonsaiQ1Gpu {
             times.add("post_attn_norm", t0.elapsed().as_nanos());
 
             let t0 = Instant::now();
-            let gate = layer.gate_proj.forward(&normed_post)?;
-            let up = layer.up_proj.forward(&normed_post)?;
-            gate.eval()?;
-            up.eval()?;
+            let gate_up = layer.gate_up_proj.forward(&normed_post)?;
+            gate_up.eval()?;
             times.add("mlp_up_gate", t0.elapsed().as_nanos());
+            let gate = gate_up.index((.., .., ..inter_i));
+            let up = gate_up.index((.., .., inter_i..2 * inter_i));
 
             let t0 = Instant::now();
             let mlp_hidden = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
@@ -864,23 +888,30 @@ pub fn forward_trunk_free(
         i32::try_from(gpu.config.heads).map_err(|_| Exception::custom("heads overflows i32"))?;
     let kv_heads = i32::try_from(gpu.config.kv_heads)
         .map_err(|_| Exception::custom("kv_heads overflows i32"))?;
+    let head_dim_i = i32::try_from(gpu.config.head_dim)
+        .map_err(|_| Exception::custom("head_dim overflows i32"))?;
+    let inter_i =
+        i32::try_from(gpu.config.inter).map_err(|_| Exception::custom("inter overflows i32"))?;
     let rms_eps = gpu.config.rms_norm_eps;
 
     for (layer, layer_cache) in gpu.layers.iter().zip(cache.iter_mut()) {
         let normed = fast::rms_norm(&h, &layer.input_norm, rms_eps)?;
 
-        let q = layer.q_proj.forward(&normed)?;
-        let k = layer.k_proj.forward(&normed)?;
-        let v = layer.v_proj.forward(&normed)?;
-
-        let q = q
-            .reshape(&[B, T, heads, -1])?
+        // One fused matvec for q/k/v, then split heads along axis 2 (views — no
+        // copy on the decode T=1 path) and transpose to [B, n_heads, T, head_dim].
+        let qkv =
+            layer
+                .qkv_proj
+                .forward(&normed)?
+                .reshape(&[B, T, heads + 2 * kv_heads, head_dim_i])?;
+        let q = qkv
+            .index((.., .., ..heads, ..))
             .transpose_axes(&[0, 2, 1, 3])?;
-        let k = k
-            .reshape(&[B, T, kv_heads, -1])?
+        let k = qkv
+            .index((.., .., heads..heads + kv_heads, ..))
             .transpose_axes(&[0, 2, 1, 3])?;
-        let v = v
-            .reshape(&[B, T, kv_heads, -1])?
+        let v = qkv
+            .index((.., .., heads + kv_heads..heads + 2 * kv_heads, ..))
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let q = fast::rms_norm(&q, &layer.q_norm, rms_eps)?;
@@ -917,8 +948,10 @@ pub fn forward_trunk_free(
         let h_post_attn = h.add(&attn_out)?;
 
         let normed_post = fast::rms_norm(&h_post_attn, &layer.post_attn_norm, rms_eps)?;
-        let gate = layer.gate_proj.forward(&normed_post)?;
-        let up = layer.up_proj.forward(&normed_post)?;
+        // One fused matvec for gate+up, then split along the last axis.
+        let gate_up = layer.gate_up_proj.forward(&normed_post)?;
+        let gate = gate_up.index((.., .., ..inter_i));
+        let up = gate_up.index((.., .., inter_i..2 * inter_i));
         let mlp_hidden = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
         let mlp_out = layer.down_proj.forward(&mlp_hidden)?;
 
@@ -944,11 +977,11 @@ pub struct BonsaiQ1DecodeState {
     pub cache: Vec<Option<SteppingKeyValueCache>>,
 }
 
-/// Number of updatable `Array`s per decoder layer:
-/// - `input_norm` + 3×(w,s,b) qkv + `q_norm` + `k_norm` + 3×(w,s,b) o_proj
-///   ... wait: 1 + 3×3 + 2 + 3 + 1 + 3×3 = 1+9+2+3+1+9 = **25**.
-/// Corresponds to the array push order in [`BonsaiQ1DecodeState::updatable_states`].
-const PER_LAYER_UPDATABLE: usize = 25;
+/// Number of updatable `Array`s per decoder layer, matching the push order in
+/// [`BonsaiQ1DecodeState::updatable_states`]: `input_norm` + (w,s,b) qkv_proj +
+/// `q_norm` + `k_norm` + (w,s,b) o_proj + `post_attn_norm` + (w,s,b) gate_up_proj
+/// + (w,s,b) down_proj = 1 + 3 + 2 + 3 + 1 + 3 + 3 = **16**.
+const PER_LAYER_UPDATABLE: usize = 16;
 
 impl mlx_rs::utils::Updatable for BonsaiQ1DecodeState {
     fn updatable_states_len(&self) -> usize {
@@ -981,27 +1014,18 @@ impl mlx_rs::utils::Updatable for BonsaiQ1DecodeState {
         v.push(&self.gpu.embed.biases);
         for layer in &self.gpu.layers {
             v.push(&layer.input_norm);
-            v.push(&layer.q_proj.w);
-            v.push(&layer.q_proj.scales);
-            v.push(&layer.q_proj.biases);
-            v.push(&layer.k_proj.w);
-            v.push(&layer.k_proj.scales);
-            v.push(&layer.k_proj.biases);
-            v.push(&layer.v_proj.w);
-            v.push(&layer.v_proj.scales);
-            v.push(&layer.v_proj.biases);
+            v.push(&layer.qkv_proj.w);
+            v.push(&layer.qkv_proj.scales);
+            v.push(&layer.qkv_proj.biases);
             v.push(&layer.q_norm);
             v.push(&layer.k_norm);
             v.push(&layer.o_proj.w);
             v.push(&layer.o_proj.scales);
             v.push(&layer.o_proj.biases);
             v.push(&layer.post_attn_norm);
-            v.push(&layer.gate_proj.w);
-            v.push(&layer.gate_proj.scales);
-            v.push(&layer.gate_proj.biases);
-            v.push(&layer.up_proj.w);
-            v.push(&layer.up_proj.scales);
-            v.push(&layer.up_proj.biases);
+            v.push(&layer.gate_up_proj.w);
+            v.push(&layer.gate_up_proj.scales);
+            v.push(&layer.gate_up_proj.biases);
             v.push(&layer.down_proj.w);
             v.push(&layer.down_proj.scales);
             v.push(&layer.down_proj.biases);
@@ -1035,27 +1059,18 @@ impl mlx_rs::utils::Updatable for BonsaiQ1DecodeState {
         v.push(&mut self.gpu.embed.biases);
         for layer in &mut self.gpu.layers {
             v.push(&mut layer.input_norm);
-            v.push(&mut layer.q_proj.w);
-            v.push(&mut layer.q_proj.scales);
-            v.push(&mut layer.q_proj.biases);
-            v.push(&mut layer.k_proj.w);
-            v.push(&mut layer.k_proj.scales);
-            v.push(&mut layer.k_proj.biases);
-            v.push(&mut layer.v_proj.w);
-            v.push(&mut layer.v_proj.scales);
-            v.push(&mut layer.v_proj.biases);
+            v.push(&mut layer.qkv_proj.w);
+            v.push(&mut layer.qkv_proj.scales);
+            v.push(&mut layer.qkv_proj.biases);
             v.push(&mut layer.q_norm);
             v.push(&mut layer.k_norm);
             v.push(&mut layer.o_proj.w);
             v.push(&mut layer.o_proj.scales);
             v.push(&mut layer.o_proj.biases);
             v.push(&mut layer.post_attn_norm);
-            v.push(&mut layer.gate_proj.w);
-            v.push(&mut layer.gate_proj.scales);
-            v.push(&mut layer.gate_proj.biases);
-            v.push(&mut layer.up_proj.w);
-            v.push(&mut layer.up_proj.scales);
-            v.push(&mut layer.up_proj.biases);
+            v.push(&mut layer.gate_up_proj.w);
+            v.push(&mut layer.gate_up_proj.scales);
+            v.push(&mut layer.gate_up_proj.biases);
             v.push(&mut layer.down_proj.w);
             v.push(&mut layer.down_proj.scales);
             v.push(&mut layer.down_proj.biases);
@@ -1329,5 +1344,59 @@ mod tests {
                 "qmv mismatch at row {r}: got {gv} want {acc}"
             );
         }
+    }
+
+    /// Diagnostic: per-section decode timing on a real model. Forced per-section
+    /// evals inflate absolute numbers (lazy batching is killed) — the *ratios*
+    /// localize where decode time goes (projections vs attention vs lm_head).
+    #[test]
+    #[ignore = "profiling: set HIGGS_BONSAI_PROFILE_DIR to a Bonsai-Q1 model dir"]
+    #[allow(clippy::print_stderr, clippy::expect_used, clippy::cast_lossless)]
+    fn profile_decode_sections() {
+        let Ok(dir) = std::env::var("HIGGS_BONSAI_PROFILE_DIR") else {
+            eprintln!("skip: set HIGGS_BONSAI_PROFILE_DIR");
+            return;
+        };
+        let gpu = load_bonsai_q1(&dir).expect("load Bonsai-Q1");
+        let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+
+        // Prefill a short prompt to populate the KV cache.
+        let prompt: Vec<i32> = (1..=16).collect();
+        let pin = Array::from_slice(&prompt, &[1, 16]);
+        let mut warm = SectionTimes::new();
+        gpu.forward_profiled(&pin, &mut cache, &mut warm)
+            .expect("prefill");
+
+        // Decode steps; skip the first few (JIT warmup), accumulate the rest.
+        let measured = 30;
+        let mut times = SectionTimes::new();
+        let mut tok = 100i32;
+        for step in 0..(measured + 5) {
+            let din = Array::from_slice(&[tok], &[1, 1]);
+            if step < 5 {
+                let mut w = SectionTimes::new();
+                gpu.forward_profiled(&din, &mut cache, &mut w)
+                    .expect("decode warm");
+            } else {
+                gpu.forward_profiled(&din, &mut cache, &mut times)
+                    .expect("decode");
+            }
+            tok = (tok * 7 + 13) % 60000 + 1;
+        }
+
+        let total = times.total_ns() as f64;
+        eprintln!("=== decode section breakdown ({measured} steps) ===");
+        for (name, ns, _cnt) in times.entries() {
+            eprintln!(
+                "{name:>16}: {:>7.3} ms  {:>5.1}%",
+                ns as f64 / 1e6,
+                100.0 * ns as f64 / total
+            );
+        }
+        eprintln!(
+            "TOTAL {:.2} ms / {measured} steps = {:.3} ms/step (absolutes inflated by forced evals; use ratios)",
+            total / 1e6,
+            total / 1e6 / measured as f64
+        );
     }
 }
