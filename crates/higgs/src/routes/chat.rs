@@ -267,7 +267,9 @@ async fn chat_completions_non_streaming(
     };
 
     let messages = convert_messages(&effective_messages);
-    let tools = req.tools.as_deref();
+    // Treat an empty `tools: []` as absent (mirrors the streaming path) so it
+    // doesn't define `tools` in the template context or trigger tool parsing.
+    let tools = req.tools.as_deref().filter(|t| !t.is_empty());
     let thinking_enabled = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
@@ -316,7 +318,7 @@ async fn chat_completions_non_streaming(
     .map_err(ServerError::Engine)?;
 
     let request_id = generate_request_id();
-    let has_tools = req.tools.is_some();
+    let has_tools = tools.is_some();
 
     let logprobs_response = output
         .token_logprobs
