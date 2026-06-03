@@ -245,6 +245,10 @@ pub struct SimpleEngine {
     template: Option<ChatTemplateRenderer>,
     model_name: String,
     eos_token_ids: Vec<u32>,
+    /// Control tokens stripped from decoded output (EOS + `<|…|>` chat
+    /// delimiters + classic sentinels), while content-bearing special tokens
+    /// (tool-call markup, `<think>`) are preserved. See [`Self::decode_tokens`].
+    decode_skip_ids: std::collections::HashSet<u32>,
     /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
     enable_thinking: bool,
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
@@ -293,6 +297,25 @@ impl SimpleEngine {
 
         let eos_token_ids = extract_eos_tokens(model_dir);
 
+        // Control tokens that must never surface in decoded text. `decode_tokens`
+        // keeps content-bearing special tokens (so tool-call markup like
+        // MiniCPM's `<function>`/`<param>` reaches the parser) but strips these:
+        // the EOS set, the `<|…|>` chat-control delimiters, and classic
+        // sentinels. Content tokens like `<think>`, `<tool_call>`, `<function>`
+        // do not match and are preserved.
+        let decode_skip_ids: std::collections::HashSet<u32> = {
+            let mut ids: std::collections::HashSet<u32> = eos_token_ids.iter().copied().collect();
+            for (id, added) in tokenizer.get_added_tokens_decoder() {
+                let content = added.content.as_str();
+                let is_control = (content.starts_with("<|") && content.ends_with("|>"))
+                    || matches!(content, "<s>" | "</s>" | "<pad>" | "<unk>" | "<mask>");
+                if is_control {
+                    ids.insert(id);
+                }
+            }
+            ids
+        };
+
         // Auto-detect thinking mode: Qwen3.5 models support <think> tags.
         // Override with HIGGS_ENABLE_THINKING=0/1, off/true, yes/no etc.
         let mut enable_thinking = std::env::var("HIGGS_ENABLE_THINKING")
@@ -323,10 +346,7 @@ impl SimpleEngine {
             enable_thinking = false;
         }
         if enable_thinking {
-            tracing::info!(
-                think_close_token,
-                "Thinking mode enabled (Qwen3.5 model detected)"
-            );
+            tracing::info!(think_close_token, "Thinking mode enabled");
         }
 
         set_wired_limit_to_max(raise_wired_limit);
@@ -434,6 +454,7 @@ impl SimpleEngine {
             template,
             model_name,
             eos_token_ids,
+            decode_skip_ids,
             enable_thinking,
             think_close_token,
             gen_prompt_suffix_len,
@@ -761,10 +782,30 @@ impl SimpleEngine {
     }
 
     /// Decode the token buffer and return the text, mapping tokenizer errors.
+    ///
+    /// Decodes WITHOUT skipping special tokens so content-bearing markup
+    /// survives — notably models (e.g. `MiniCPM5`) that encode their tool-call
+    /// structure (`<function>`, `<param>`, …) as special tokens, which the
+    /// tool parser needs to see. Control tokens (EOS) are filtered out first so
+    /// they never leak into visible text. Plain text contains no special
+    /// tokens and decodes identically either way, so normal responses are
+    /// unaffected.
     fn decode_tokens(&self, tokens: &[u32]) -> Result<String, EngineError> {
-        self.tokenizer
-            .decode(tokens, true)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))
+        let decode = |ids: &[u32]| {
+            self.tokenizer
+                .decode(ids, false)
+                .map_err(|e| EngineError::Tokenization(e.to_string()))
+        };
+        // Fast path: no control token present, decode the slice as-is.
+        if !tokens.iter().any(|id| self.decode_skip_ids.contains(id)) {
+            return decode(tokens);
+        }
+        let filtered: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .filter(|id| !self.decode_skip_ids.contains(id))
+            .collect();
+        decode(&filtered)
     }
 
     /// The model's hidden dimension (embedding output size).
@@ -2559,18 +2600,31 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
 }
 
 /// Detect whether a model supports thinking mode based on `model_type`.
+/// Whether the model *supports* a thinking toggle (capability, not default).
+///
+/// The per-request default — e.g. Qwen3.6 reasons off unless asked — is decided
+/// separately by `model_defaults_to_non_thinking` in the router; this only
+/// answers "can it think at all".
+///
+/// Signals, in order:
+/// 1. the chat template exposes an `enable_thinking` switch — the model
+///    author's own marker, which covers Qwen3.5/3.6, `MiniCPM5`, and future
+///    reasoning models without hardcoding model types; or
+/// 2. a known reasoning `model_type`.
+///
+/// The caller additionally requires a single-token `</think>`, so a stray
+/// mention can't enable thinking for a model that wasn't trained for it.
 fn detect_thinking_support(model_dir: &Path) -> bool {
-    let config_path = model_dir.join("config.json");
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(_) => return false,
+    if chat_template_mentions_enable_thinking(model_dir) {
+        return true;
+    }
+    let Ok(config_str) = std::fs::read_to_string(model_dir.join("config.json")) else {
+        return false;
     };
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(_) => return false,
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) else {
+        return false;
     };
-    // Qwen3.5 models (qwen3_5, qwen3_5_moe) support <think> tags.
-    // Check both top-level and nested text_config for VLM wrappers.
+    // Check both top-level and nested text_config (VLM wrappers).
     let model_type = config
         .get("model_type")
         .and_then(|v| v.as_str())
@@ -2583,18 +2637,85 @@ fn detect_thinking_support(model_dir: &Path) -> bool {
     matches!(model_type, Some("qwen3_5" | "qwen3_5_moe"))
 }
 
+/// Whether the model's chat template references the `enable_thinking` toggle,
+/// read from `chat_template.jinja` or `tokenizer_config.json`'s `chat_template`
+/// (a string, or a `{name, template}` array).
+fn chat_template_mentions_enable_thinking(model_dir: &Path) -> bool {
+    const MARKER: &str = "enable_thinking";
+    if let Ok(jinja) = std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
+        return jinja.contains(MARKER);
+    }
+    let Ok(cfg_str) = std::fs::read_to_string(model_dir.join("tokenizer_config.json")) else {
+        return false;
+    };
+    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) else {
+        return false;
+    };
+    let template = cfg.get("chat_template");
+    if let Some(s) = template.and_then(|v| v.as_str()) {
+        return s.contains(MARKER);
+    }
+    if let Some(arr) = template.and_then(|v| v.as_array()) {
+        return arr.iter().any(|entry| {
+            entry
+                .get("template")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains(MARKER))
+        });
+    }
+    false
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
         adaptive_draft_depth_for_cap, check_stop_sequences, derive_model_name,
-        estimate_paged_kv_blocks, parse_enabled_flag,
+        detect_thinking_support, estimate_paged_kv_blocks, parse_enabled_flag,
     };
     use std::path::Path;
 
     /// Write a config.json file into the given directory with the provided JSON content.
     fn write_config(dir: &std::path::Path, json: &str) {
         std::fs::write(dir.join("config.json"), json).unwrap();
+    }
+
+    // --- detect_thinking_support tests ---
+
+    /// MiniCPM5-style: a non-reasoning `model_type` (llama) but a chat template
+    /// that exposes the `enable_thinking` switch ⇒ thinking-capable.
+    #[test]
+    fn detect_thinking_from_template_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type": "llama"}"#);
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{%- if enable_thinking %}<think>\n{%- endif %}",
+        )
+        .unwrap();
+        assert!(detect_thinking_support(dir.path()));
+    }
+
+    /// Qwen3.5 reasoning `model_type` is detected even without a template file.
+    #[test]
+    fn detect_thinking_from_model_type() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type": "qwen3_5_moe"}"#);
+        assert!(detect_thinking_support(dir.path()));
+    }
+
+    /// A plain Llama (no reasoning `model_type`, no `enable_thinking` in the
+    /// template) must NOT be treated as a thinking model.
+    #[test]
+    fn no_thinking_for_plain_llama() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type": "llama"}"#);
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{%- for m in messages %}{{ m.content }}{%- endfor %}",
+        )
+        .unwrap();
+        assert!(!detect_thinking_support(dir.path()));
     }
 
     // --- derive_model_name tests ---
