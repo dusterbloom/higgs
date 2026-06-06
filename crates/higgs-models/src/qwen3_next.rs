@@ -4653,7 +4653,17 @@ fn qwen3_5_mixed_ba_quantization_layers(
             };
             let a_quant = projection_quantization("in_proj_a");
             let b_quant = projection_quantization("in_proj_b");
-            a_quant.bits != b_quant.bits || a_quant.group_size != b_quant.group_size
+            // The qkvz fusion pair has the same constraint: `in_proj_qkv` and
+            // `in_proj_z` are concatenated into `in_proj_qkvz`, which is only
+            // possible when their packed (quantized) shapes agree. Mixed-
+            // precision quants (e.g. OptiQ) assign different bit-widths per
+            // projection on sensitive layers, so check both fusion pairs.
+            let qkv_quant = projection_quantization("in_proj_qkv");
+            let z_quant = projection_quantization("in_proj_z");
+            a_quant.bits != b_quant.bits
+                || a_quant.group_size != b_quant.group_size
+                || qkv_quant.bits != z_quant.bits
+                || qkv_quant.group_size != z_quant.group_size
         })
         .collect()
 }
@@ -5031,9 +5041,19 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
         }
     }
     let param_count = params.len();
+    // This loader is only used with separate GDN projections (see
+    // `load_qwen3_5_model_with_gdn_fallback`). In that mode the fused
+    // `in_proj_qkvz` / `in_proj_ba` QLinears are still constructed — as unused
+    // placeholders, since the forward path dispatches on
+    // `use_separate_projections` — so they must be exempt from the
+    // completeness check. Flagging them would reject every mixed-bit
+    // checkpoint that *requires* separate projections (e.g. OptiQ quants).
     ensure_all_model_params_loaded(
         params
             .iter()
+            .filter(|(name, _)| {
+                !(name.contains(".in_proj_qkvz.") || name.contains(".in_proj_ba."))
+            })
             .map(|(name, value)| (std::rc::Rc::<str>::clone(name), &**value)),
     )?;
     tracing::info!(param_count, matched, "Total model parameters loaded");
@@ -14272,6 +14292,39 @@ mod tests {
         assert!(
             args.use_separate_gdn_projections,
             "unprefixed mixed-bit in_proj_a/in_proj_b must force separate GDN projections"
+        );
+    }
+
+    #[test]
+    fn test_load_qwen35_mixed_qkvz_quantization_forces_separate_gdn() {
+        // Mixed-precision quants (e.g. OptiQ) can also put `in_proj_qkv` and
+        // `in_proj_z` at different bit-widths — that breaks the qkvz fusion
+        // concat exactly like a mixed BA pair does.
+        let dir = tempfile::tempdir().unwrap();
+        let config = format!(
+            r#"{{
+                "text_config": {},
+                "tie_word_embeddings": false,
+                "quantization": {{
+                    "group_size": 64,
+                    "bits": 4,
+                    "mode": "affine",
+                    "language_model.model.layers.2.linear_attn.in_proj_z": {{
+                        "group_size": 64,
+                        "bits": 8,
+                        "mode": "affine"
+                    }}
+                }}
+            }}"#,
+            qwen35_dense_text_config()
+        );
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+
+        assert!(
+            args.use_separate_gdn_projections,
+            "mixed-bit in_proj_qkv/in_proj_z must force separate GDN projections"
         );
     }
 
