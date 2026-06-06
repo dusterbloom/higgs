@@ -1137,7 +1137,7 @@ pub struct WeightMapIndex {
     pub weight_map: HashMap<String, String>,
 }
 
-const AUXILIARY_SAFETENSORS_FILES: &[&str] = &["mtp.safetensors", "model-mtp.safetensors"];
+pub(crate) const AUXILIARY_SAFETENSORS_FILES: &[&str] = &["mtp.safetensors", "model-mtp.safetensors"];
 
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokenizer, ModelError> {
