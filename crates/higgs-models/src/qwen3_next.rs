@@ -215,6 +215,15 @@ pub struct Qwen3NextModelArgs {
     /// loader after inspecting checkpoint keys; it is not expected in configs.
     #[serde(default)]
     pub use_dense_mtp: bool,
+
+    /// Use an MoE-structured MTP head (Qwen3.6-A3B style).
+    ///
+    /// These sidecars ship the MTP layer as a full MoE decoder layer
+    /// (`mlp.gate`, `mlp.switch_mlp.*`, `mlp.shared_expert*`) with a quantized
+    /// `fc`. Set by the loader after inspecting checkpoint keys; not expected
+    /// in configs.
+    #[serde(default)]
+    pub use_moe_mtp: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1951,6 +1960,86 @@ impl DenseMtpHead {
     }
 }
 
+/// Single MoE MTP transformer layer (Qwen3.6-A3B style).
+///
+/// Qwen3.6-A3B sidecars ship the MTP layer as a full MoE decoder layer:
+/// full attention (with q/k norms) + `SparseMoeBlock`
+/// (router gate + stacked experts + shared expert + shared-expert gate).
+#[derive(Debug, Clone, ModuleParameters)]
+struct MoeMtpTransformerLayer {
+    #[param]
+    self_attn: Qwen3NextAttention,
+    #[param]
+    input_layernorm: nn::RmsNorm,
+    #[param]
+    post_attention_layernorm: nn::RmsNorm,
+    #[param]
+    mlp: SparseMoeBlock,
+}
+
+/// MTP head with an MoE transformer layer (Qwen3.6-A3B style sidecars).
+///
+/// Unlike [`MtpHead`], the fusion projection `fc` is a quantized [`QLinear`]
+/// (these sidecars ship `fc.{weight,scales,biases}` triples), and the MLP is
+/// a [`SparseMoeBlock`]. All projections use the checkpoint's uniform
+/// quantization — the main model's `gate_quantization` override must NOT be
+/// applied here (the sidecar's router gate is quantized at the default width).
+#[derive(Debug, Clone, ModuleParameters)]
+pub struct MoeMtpHead {
+    #[param]
+    pre_fc_norm_hidden: nn::RmsNorm,
+    #[param]
+    pre_fc_norm_embedding: nn::RmsNorm,
+    #[param]
+    fc: QLinear,
+    #[param]
+    layers: Vec<MoeMtpTransformerLayer>,
+    #[param]
+    norm: nn::RmsNorm,
+}
+
+impl MoeMtpHead {
+    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+        let n = usize::try_from(args.mtp_num_hidden_layers)
+            .map_err(|_| Exception::custom("mtp_num_hidden_layers must be non-negative"))?;
+
+        // The sidecar's MoE block is uniformly quantized at the default width;
+        // strip the main model's per-layer gate override so the router gate's
+        // QLinear dequantizes with the right parameters.
+        let mut mtp_args = args.clone();
+        mtp_args.gate_quantization = None;
+
+        let layers = (0..n)
+            .map(|_| {
+                Ok(MoeMtpTransformerLayer {
+                    self_attn: Qwen3NextAttention::new(args, ql, qb)?,
+                    input_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
+                        .eps(args.rms_norm_eps)
+                        .build()?,
+                    post_attention_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
+                        .eps(args.rms_norm_eps)
+                        .build()?,
+                    mlp: SparseMoeBlock::new(&mtp_args, ql, qb)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Exception>>()?;
+
+        Ok(Self {
+            pre_fc_norm_hidden: nn::RmsNormBuilder::new(args.hidden_size)
+                .eps(args.rms_norm_eps)
+                .build()?,
+            pre_fc_norm_embedding: nn::RmsNormBuilder::new(args.hidden_size)
+                .eps(args.rms_norm_eps)
+                .build()?,
+            fc: QLinear::new(ql, qb)?,
+            layers,
+            norm: nn::RmsNormBuilder::new(args.hidden_size)
+                .eps(args.rms_norm_eps)
+                .build()?,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SwitchMLP weights (stacked expert weights for MoE)
 // ---------------------------------------------------------------------------
@@ -3315,6 +3404,8 @@ pub struct Qwen3NextCausalLM {
     mtp: Option<MtpHead>,
     #[param]
     dense_mtp: Option<DenseMtpHead>,
+    #[param]
+    moe_mtp: Option<MoeMtpHead>,
 }
 
 // Manual RoPE implementation for arbitrary positions
@@ -3428,11 +3519,14 @@ impl Qwen3NextCausalLM {
         } else {
             Some(QLinear::new(ql, qb)?)
         };
-        let mtp = (args.mtp_num_hidden_layers > 0 && !args.use_dense_mtp)
+        let mtp = (args.mtp_num_hidden_layers > 0 && !args.use_dense_mtp && !args.use_moe_mtp)
             .then(|| MtpHead::new(&args, ql, qb))
             .transpose()?;
         let dense_mtp = (args.mtp_num_hidden_layers > 0 && args.use_dense_mtp)
             .then(|| DenseMtpHead::new(&args))
+            .transpose()?;
+        let moe_mtp = (args.mtp_num_hidden_layers > 0 && args.use_moe_mtp)
+            .then(|| MoeMtpHead::new(&args, ql, qb))
             .transpose()?;
 
         Ok(Self {
@@ -3441,6 +3535,7 @@ impl Qwen3NextCausalLM {
             lm_head,
             mtp,
             dense_mtp,
+            moe_mtp,
         })
     }
 
@@ -3790,7 +3885,7 @@ impl Qwen3NextCausalLM {
 
     /// Whether this model has an MTP head loaded.
     pub const fn has_mtp(&self) -> bool {
-        self.mtp.is_some() || self.dense_mtp.is_some()
+        self.mtp.is_some() || self.dense_mtp.is_some() || self.moe_mtp.is_some()
     }
 
     /// Create a fresh KV cache for the MTP head (one entry per MTP layer).
@@ -3800,7 +3895,8 @@ impl Qwen3NextCausalLM {
             .mtp
             .as_ref()
             .map(|mtp| mtp.layers.len())
-            .or_else(|| self.dense_mtp.as_ref().map(|mtp| mtp.layers.len()))?;
+            .or_else(|| self.dense_mtp.as_ref().map(|mtp| mtp.layers.len()))
+            .or_else(|| self.moe_mtp.as_ref().map(|mtp| mtp.layers.len()))?;
         Some(
             (0..layer_count)
                 .map(|_| SteppingKeyValueCache::new())
@@ -3869,6 +3965,25 @@ impl Qwen3NextCausalLM {
 
         // Scope the mutable borrow: run MTP forward, defer lm_head projection.
         if let Some(mtp) = self.mtp.as_mut() {
+            let h_norm = mtp.pre_fc_norm_hidden.forward(hidden)?;
+            let e_norm = mtp.pre_fc_norm_embedding.forward(&next_embed)?;
+            let concat = ops::concatenate_axis(&[&e_norm, &h_norm], -1)?;
+            let mut x = mtp.fc.forward(&concat)?;
+
+            for (layer, kv) in mtp.layers.iter_mut().zip(mtp_cache.iter_mut()) {
+                let normed = layer.input_layernorm.forward(&x)?;
+                let attn_out = layer.self_attn.forward(&normed, None, kv)?;
+                let h2 = x.add(attn_out)?;
+                let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+                let mlp_out = layer.mlp.forward(&normed_post)?;
+                x = h2.add(mlp_out)?;
+            }
+
+            return mtp.norm.forward(&x);
+        }
+
+        // MoE MTP head (Qwen3.6-A3B style): same loop, MoE MLP.
+        if let Some(mtp) = self.moe_mtp.as_mut() {
             let h_norm = mtp.pre_fc_norm_hidden.forward(hidden)?;
             let e_norm = mtp.pre_fc_norm_embedding.forward(&next_embed)?;
             let concat = ops::concatenate_axis(&[&e_norm, &h_norm], -1)?;
@@ -3978,6 +4093,7 @@ impl Qwen3NextCausalLM {
             .as_ref()
             .map(|mtp| mtp.layers.len())
             .or_else(|| self.dense_mtp.as_ref().map(|mtp| mtp.layers.len()))
+            .or_else(|| self.moe_mtp.as_ref().map(|mtp| mtp.layers.len()))
             .ok_or_else(|| Exception::custom("MTP head not loaded"))?;
         Self::validate_mtp_advance_many_inputs(hidden, mtp_cache, expected_layers, seq_len)?;
 
@@ -3986,6 +4102,26 @@ impl Qwen3NextCausalLM {
         let mask_ref = mask.as_ref();
 
         if let Some(mtp) = self.mtp.as_mut() {
+            let h_norm = mtp.pre_fc_norm_hidden.forward(hidden)?;
+            let e_norm = mtp.pre_fc_norm_embedding.forward(&next_embed)?;
+            let concat = ops::concatenate_axis(&[&e_norm, &h_norm], -1)?;
+            let mut x = mtp.fc.forward(&concat)?;
+
+            for (layer, kv) in mtp.layers.iter_mut().zip(mtp_cache.iter_mut()) {
+                let normed = layer.input_layernorm.forward(&x)?;
+                let attn_out = layer.self_attn.forward(&normed, mask_ref, kv)?;
+                let h2 = x.add(attn_out)?;
+                let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+                let mlp_out = layer.mlp.forward(&normed_post)?;
+                x = h2.add(mlp_out)?;
+            }
+
+            let _ = mtp.norm.forward(&x)?;
+            return Ok(());
+        }
+
+        // MoE MTP head (Qwen3.6-A3B style): same loop, MoE MLP.
+        if let Some(mtp) = self.moe_mtp.as_mut() {
             let h_norm = mtp.pre_fc_norm_hidden.forward(hidden)?;
             let e_norm = mtp.pre_fc_norm_embedding.forward(&next_embed)?;
             let concat = ops::concatenate_axis(&[&e_norm, &h_norm], -1)?;
@@ -4193,6 +4329,9 @@ enum MtpWeightLayout {
     None,
     Quantized,
     Dense,
+    /// MTP layer is MoE-structured (`mlp.gate` / `shared_expert` / experts),
+    /// e.g. Qwen3.6-A3B sidecars — loaded via [`MoeMtpHead`].
+    MoeQuantized,
 }
 
 fn is_mtp_key(key: &str) -> bool {
@@ -4203,6 +4342,7 @@ fn mtp_weight_layout_from_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> M
     let mut has_mtp = false;
     let mut has_unprefixed_mtp = false;
     let mut has_quantized_aux = false;
+    let mut has_moe_mlp = false;
 
     for key in keys {
         if !is_mtp_key(key) {
@@ -4211,9 +4351,15 @@ fn mtp_weight_layout_from_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> M
         has_mtp = true;
         has_unprefixed_mtp |= key.starts_with("mtp.");
         has_quantized_aux |= key.ends_with(".scales") || key.ends_with(".biases");
+        has_moe_mlp |= key.contains(".mlp.gate.")
+            || key.contains(".mlp.shared_expert")
+            || key.contains(".mlp.switch_mlp")
+            || key.contains(".mlp.experts");
     }
 
-    if has_quantized_aux {
+    if has_mtp && has_moe_mlp {
+        MtpWeightLayout::MoeQuantized
+    } else if has_quantized_aux {
         MtpWeightLayout::Quantized
     } else if has_unprefixed_mtp {
         MtpWeightLayout::Dense
@@ -4229,7 +4375,16 @@ fn checkpoint_mtp_weight_layout(model_path: &Path) -> Result<MtpWeightLayout, Mo
         let bytes = std::fs::read(file_path)?;
         let metadata = safetensors::SafeTensors::deserialize(&bytes)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(mtp_weight_layout_from_keys(metadata.names()))
+        // Auxiliary sidecars may ship truly unprefixed keys (`fc.weight`,
+        // `layers.0....`) — normalize so they classify as MTP keys.
+        let normalized: Vec<String> = metadata
+            .names()
+            .into_iter()
+            .map(|name| normalize_sidecar_mtp_key(file_path, name.to_owned()))
+            .collect();
+        Ok(mtp_weight_layout_from_keys(
+            normalized.iter().map(String::as_str),
+        ))
     }
 
     let index_path = model_path.join("model.safetensors.index.json");
@@ -4300,6 +4455,15 @@ fn maybe_disable_mtp_without_checkpoint_weights(
         }
         MtpWeightLayout::Dense => {
             args.use_dense_mtp = true;
+            return Ok(());
+        }
+        MtpWeightLayout::MoeQuantized => {
+            tracing::info!(
+                "Checkpoint ships an MoE-structured MTP head (Qwen3.6-A3B style); \
+                 loading via MoeMtpHead"
+            );
+            args.use_dense_mtp = false;
+            args.use_moe_mtp = true;
             return Ok(());
         }
         MtpWeightLayout::None => {}
@@ -4746,12 +4910,41 @@ fn dense_mtp_param_key(stripped: &str) -> Option<String> {
         .map(|rest| format!("dense_mtp.{rest}"))
 }
 
+fn moe_mtp_param_key(stripped: &str) -> Option<String> {
+    stripped
+        .strip_prefix("mtp.")
+        .map(|rest| format!("moe_mtp.{rest}"))
+}
+
+/// Normalize a tensor key loaded from an auxiliary MTP sidecar file.
+///
+/// Some sidecars (e.g. mlx-community MTP drafters) ship truly unprefixed keys
+/// (`fc.weight`, `layers.0....`); prefix them with `mtp.` so they map onto the
+/// model's MTP head params the same way prefixed sidecars do. Keys from
+/// non-auxiliary files are returned unchanged.
+fn normalize_sidecar_mtp_key(file_path: &Path, key: String) -> String {
+    let is_aux = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| crate::AUXILIARY_SAFETENSORS_FILES.contains(&n));
+    if is_aux && !key.starts_with("mtp.") {
+        format!("mtp.{key}")
+    } else {
+        key
+    }
+}
+
 fn qwen35_target_param_key(
     params: &HashMap<std::rc::Rc<str>, &mut Array>,
     stripped: &str,
 ) -> Option<(String, bool)> {
     if params.contains_key(stripped) {
         Some((stripped.to_owned(), false))
+    } else if let Some(moe_key) =
+        moe_mtp_param_key(stripped).filter(|key| params.contains_key(key.as_str()))
+    {
+        // MoE MTP head: plain remap, no dense rmsnorm adjustment.
+        Some((moe_key, false))
     } else {
         dense_mtp_param_key(stripped)
             .filter(|dense_key| params.contains_key(dense_key.as_str()))
@@ -4804,6 +4997,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
 
         for (key, value) in loaded {
+            let key = normalize_sidecar_mtp_key(file_path, key);
             let Some(stripped) = qwen35_checkpoint_param_key(&key) else {
                 unmatched.push(key);
                 continue;
@@ -4882,6 +5076,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
 
         for (key, value) in loaded {
+            let key = normalize_sidecar_mtp_key(file_path, key);
             let Some(stripped) = qwen35_checkpoint_param_key(&key) else {
                 continue;
             };
@@ -13881,6 +14076,57 @@ mod tests {
         assert_eq!(
             checkpoint_mtp_weight_layout(dir.path()).unwrap(),
             MtpWeightLayout::Quantized
+        );
+    }
+
+    #[test]
+    fn test_mtp_layout_detects_moe_structured_head() {
+        // Qwen3.6-A3B style: the MTP layer is a full MoE layer.
+        let layout = mtp_weight_layout_from_keys([
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.mlp.gate.weight",
+            "mtp.layers.0.mlp.shared_expert.up_proj.scales",
+            "mtp.layers.0.mlp.switch_mlp.down_proj.weight",
+            "mtp.fc.weight",
+        ]);
+        assert_eq!(layout, MtpWeightLayout::MoeQuantized);
+    }
+
+    #[test]
+    fn test_moe_mtp_param_key_remaps_mtp_prefix() {
+        assert_eq!(
+            moe_mtp_param_key("mtp.layers.0.mlp.gate.weight").as_deref(),
+            Some("moe_mtp.layers.0.mlp.gate.weight")
+        );
+        assert_eq!(
+            moe_mtp_param_key("mtp.fc.scales").as_deref(),
+            Some("moe_mtp.fc.scales")
+        );
+        assert!(moe_mtp_param_key("model.layers.0.mlp.gate.weight").is_none());
+    }
+
+    #[test]
+    fn test_normalize_sidecar_mtp_key_prefixes_aux_files_only() {
+        let aux = Path::new("/models/x/mtp.safetensors");
+        let main = Path::new("/models/x/model-00001-of-00004.safetensors");
+        // Unprefixed keys from the sidecar get the mtp. prefix.
+        assert_eq!(
+            normalize_sidecar_mtp_key(aux, "fc.weight".to_owned()),
+            "mtp.fc.weight"
+        );
+        assert_eq!(
+            normalize_sidecar_mtp_key(aux, "layers.0.mlp.gate.weight".to_owned()),
+            "mtp.layers.0.mlp.gate.weight"
+        );
+        // Already-prefixed sidecar keys are unchanged.
+        assert_eq!(
+            normalize_sidecar_mtp_key(aux, "mtp.fc.weight".to_owned()),
+            "mtp.fc.weight"
+        );
+        // Keys from main shards are never touched.
+        assert_eq!(
+            normalize_sidecar_mtp_key(main, "fc.weight".to_owned()),
+            "fc.weight"
         );
     }
 
