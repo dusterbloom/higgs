@@ -2,6 +2,7 @@ pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
 pub mod error;
+pub mod gdn_chunkwise;
 pub mod gemma2;
 pub mod llava_qwen2;
 /// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).

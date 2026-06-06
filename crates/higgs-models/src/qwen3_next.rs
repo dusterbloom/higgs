@@ -1066,6 +1066,7 @@ if (valid) {
 static QGEMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static QGEMV_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 static GATED_DELTA_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
+static GDN_CHUNKWISE_ENABLED: OnceLock<bool> = OnceLock::new();
 static DECODE_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 static QGEMV_NSG_OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
 static DENSE_FFN_GEMV_MODE: OnceLock<DenseFfnGemvMode> = OnceLock::new();
@@ -1161,6 +1162,24 @@ fn gated_delta_config_cache_enabled() -> bool {
                     Some("1" | "true" | "on" | "yes")
                 )
             })
+    })
+}
+
+/// Chunkwise-parallel GDN prefill (`crate::gdn_chunkwise`) for S > 1.
+///
+/// OFF by default: the math is exact (see the gdn_chunkwise tests) but the
+/// un-compiled graph-op implementation measured 1.6× slower per GDN layer
+/// than the serial kernel (58.6ms vs 37.2ms per 1024-token chunk), and
+/// profiling shows GDN is only ~37% of prefill time anyway. Opt in with
+/// `HIGGS_GDN_CHUNKWISE=1` for experiments.
+fn gdn_chunkwise_enabled() -> bool {
+    *GDN_CHUNKWISE_ENABLED.get_or_init(|| {
+        std::env::var("HIGGS_GDN_CHUNKWISE").ok().is_some_and(|raw| {
+            matches!(
+                Some(raw.trim().to_ascii_lowercase()).as_deref(),
+                Some("1" | "true" | "on" | "yes")
+            )
+        })
     })
 }
 
@@ -2943,23 +2962,51 @@ impl GatedDeltaNet {
             )?,
         };
 
-        // Fused kernel: computes g, beta, AND runs the full recurrence in one dispatch.
-        let (y, new_state) = gated_delta_kernel_ffi(
-            &norm_q,
-            &norm_k,
-            &conv_v,
-            &self.A_log,
-            &a,
-            &self.dt_bias,
-            &b,
-            &state,
-            B,
-            S,
-            self.num_k_heads,
-            self.head_k_dim,
-            self.num_v_heads,
-            self.head_v_dim,
-        )?;
+        let (y, new_state) = if S > 1 && gdn_chunkwise_enabled() {
+            // Chunkwise-parallel prefill: precompute gates and GQA-repeat q/k
+            // (same preprocessing as the compiled decode path above), then run
+            // the matmul-form recurrence — serial depth drops T → ceil(T/C)
+            // instead of the kernel's per-token scan.
+            let repeat_factor = self.num_v_heads / self.num_k_heads;
+            let (q_cw, k_cw) = if repeat_factor > 1 {
+                (
+                    ops::repeat_axis::<f32>(norm_q.clone(), repeat_factor, -2)?,
+                    ops::repeat_axis::<f32>(norm_k.clone(), repeat_factor, -2)?,
+                )
+            } else {
+                (norm_q.clone(), norm_k.clone())
+            };
+            let g = compute_g_direct(self.A_log.as_ref(), &a, self.dt_bias.as_ref())?;
+            let beta = nn::sigmoid(&b)?;
+            crate::gdn_chunkwise::gated_delta_chunkwise(
+                &q_cw,
+                &k_cw,
+                &conv_v,
+                &g,
+                &beta,
+                &state,
+                crate::gdn_chunkwise::chunk_len(),
+            )?
+        } else {
+            // Fused kernel: computes g, beta, AND runs the full recurrence in
+            // one dispatch. The per-token scan is the right shape for decode.
+            gated_delta_kernel_ffi(
+                &norm_q,
+                &norm_k,
+                &conv_v,
+                &self.A_log,
+                &a,
+                &self.dt_bias,
+                &b,
+                &state,
+                B,
+                S,
+                self.num_k_heads,
+                self.head_k_dim,
+                self.num_v_heads,
+                self.head_v_dim,
+            )?
+        };
         cache.ssm_state = Some(new_state);
         cache.offset += S;
 
@@ -3665,8 +3712,10 @@ impl Qwen3NextCausalLM {
         };
 
         // HIGGS_PROFILE=1: instrument per-layer timing with eval barriers.
-        // Samples layers 0-3 (3 GDN + 1 FA), extrapolates to all 64 layers.
-        let profiling = std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1") && T == 1;
+        // Samples layers 0-3 (3 GDN + 1 FA) and reports per-layer averages.
+        // Active for both decode (T==1) and prefill chunks (T>1) — the
+        // prefill numbers are what sizes chunkwise-GDN work (Amdahl's f).
+        let profiling = std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1");
         let mut prof_gdn_attn_ns: u128 = 0;
         let mut prof_gdn_mlp_ns: u128 = 0;
         let mut prof_fa_attn_ns: u128 = 0;
@@ -3764,6 +3813,7 @@ impl Qwen3NextCausalLM {
                 let est_total =
                     (gdn_attn_avg + gdn_mlp_avg).mul_add(48.0, (fa_attn_avg + fa_mlp_avg) * 16.0);
                 tracing::info!(
+                    seq_len = T,
                     gdn_attn_ms = format!("{:.2}", gdn_attn_avg / 1e6),
                     gdn_mlp_ms = format!("{:.2}", gdn_mlp_avg / 1e6),
                     fa_attn_ms = format!("{:.2}", fa_attn_avg / 1e6),
@@ -6564,6 +6614,50 @@ mod tests {
         assert_eq!(state2.shape(), &[1, 4, 32, 32]);
     }
 
+    /// Run the sequential reference over a full sequence, GQA-repeating q/k
+    /// per step. `q,k: [B,T,Hk,Dk]`, `v: [B,T,Hv,Dv]`, `g,beta: [B,T,Hv]`.
+    /// Returns `(y [B,T,Hv,Dv], final_state)`. Shared oracle for both the
+    /// serial-kernel and chunkwise comparison harnesses.
+    fn run_gated_delta_ref_sequence(
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        g: &Array,
+        beta: &Array,
+        state: &Array,
+        seq_len: i32,
+        repeat_factor: i32,
+    ) -> (Array, Array) {
+        let mut ref_state = state.clone();
+        let mut ref_ys = Vec::new();
+        for t in 0..seq_len {
+            let qt = q.index((.., t, .., ..));
+            let kt = k.index((.., t, .., ..));
+            let vt = v.index((.., t, .., ..));
+            let gt = g.index((.., t, ..));
+            let bt = beta.index((.., t, ..));
+
+            let qt_rep = if repeat_factor > 1 {
+                ops::repeat_axis::<f32>(qt, repeat_factor, -2).unwrap()
+            } else {
+                qt
+            };
+            let kt_rep = if repeat_factor > 1 {
+                ops::repeat_axis::<f32>(kt, repeat_factor, -2).unwrap()
+            } else {
+                kt
+            };
+
+            let (y_t, new_state) =
+                gated_delta_step_ref(&qt_rep, &kt_rep, &vt, &gt, &bt, &ref_state);
+            ref_state = new_state;
+            ref_ys.push(y_t);
+        }
+        let ref_y_refs: Vec<&Array> = ref_ys.iter().collect();
+        let ref_y = ops::stack_axis(&ref_y_refs, 1).unwrap();
+        (ref_y, ref_state)
+    }
+
     /// Reference ops implementation of a single gated delta step (for comparison tests).
     fn gated_delta_step_ref(
         q: &Array,
@@ -6720,35 +6814,8 @@ mod tests {
         let g = compute_g_fn((&a_log, &a_val, &dt_bias)).unwrap();
         let beta = nn::sigmoid(&b).unwrap();
 
-        // Reference: loop over timesteps with repeat_axis for GQA
-        let repeat_factor = hv / hk;
-        let mut ref_state = state.clone();
-        let mut ref_ys = Vec::new();
-        for t in 0..seq_len {
-            let qt = q.index((.., t, .., ..));
-            let kt = k.index((.., t, .., ..));
-            let vt = v.index((.., t, .., ..));
-            let gt = g.index((.., t, ..));
-            let bt = beta.index((.., t, ..));
-
-            let qt_rep = if repeat_factor > 1 {
-                ops::repeat_axis::<f32>(qt, repeat_factor, -2).unwrap()
-            } else {
-                qt
-            };
-            let kt_rep = if repeat_factor > 1 {
-                ops::repeat_axis::<f32>(kt, repeat_factor, -2).unwrap()
-            } else {
-                kt
-            };
-
-            let (y_t, new_state) =
-                gated_delta_step_ref(&qt_rep, &kt_rep, &vt, &gt, &bt, &ref_state);
-            ref_state = new_state;
-            ref_ys.push(y_t);
-        }
-        let ref_y_refs: Vec<&Array> = ref_ys.iter().collect();
-        let ref_y = ops::stack_axis(&ref_y_refs, 1).unwrap();
+        let (ref_y, ref_state) =
+            run_gated_delta_ref_sequence(&q, &k, &v, &g, &beta, &state, seq_len, hv / hk);
         ref_y.eval().unwrap();
         ref_state.eval().unwrap();
 
@@ -6769,6 +6836,243 @@ mod tests {
         let s_diff = ref_state.subtract(&kern_state).unwrap().abs().unwrap();
         let s_max: f32 = s_diff.max(None).unwrap().item();
         assert!(s_max < tol, "[{label}] kernel state differs by {s_max}");
+    }
+
+    /// L2-normalise along the last axis — the test-side stand-in for the
+    /// model's per-head qk-norm. The chunkwise UT solve's conditioning relies
+    /// on `|k_iᵀk_j| ≤ 1`, which the model guarantees; raw uniform vectors at
+    /// Dk=128 would put the solve in a regime the model never produces.
+    fn l2_normalize_last(x: &Array) -> Array {
+        let norm = x
+            .multiply(x)
+            .unwrap()
+            .sum_axes(&[-1], true)
+            .unwrap()
+            .sqrt()
+            .unwrap()
+            .add(&Array::from_f32(1e-6))
+            .unwrap();
+        x.divide(&norm).unwrap()
+    }
+
+    /// Compare the chunkwise-parallel path against the sequential reference.
+    /// Mirrors `assert_kernel_matches_ops`, but pre-repeats q/k to Hv heads
+    /// and qk-normalises them (exactly what the dispatch site feeds chunkwise).
+    fn assert_chunkwise_matches_ops(
+        batch: i32,
+        seq_len: i32,
+        hk: i32,
+        hv: i32,
+        dk: i32,
+        dv: i32,
+        chunk: i32,
+        tol: f32,
+        label: &str,
+    ) {
+        let q = l2_normalize_last(
+            &mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, seq_len, hk, dk], None)
+                .unwrap(),
+        );
+        let k = l2_normalize_last(
+            &mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, seq_len, hk, dk], None)
+                .unwrap(),
+        );
+        let v = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, seq_len, hv, dv], None)
+            .unwrap();
+        let a_log = mlx_rs::random::uniform::<f32, f32>(-1.0, 0.0, &[hv], None).unwrap();
+        let a_val =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, seq_len, hv], None).unwrap();
+        let dt_bias = mlx_rs::random::uniform::<f32, f32>(-0.5, 0.5, &[hv], None).unwrap();
+        let b =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, seq_len, hv], None).unwrap();
+        let state =
+            mlx_rs::random::uniform::<f32, f32>(-0.1, 0.1, &[batch, hv, dv, dk], None).unwrap();
+
+        let g = compute_g_direct(&a_log, &a_val, &dt_bias).unwrap();
+        let beta = nn::sigmoid(&b).unwrap();
+
+        let (ref_y, ref_state) =
+            run_gated_delta_ref_sequence(&q, &k, &v, &g, &beta, &state, seq_len, hv / hk);
+        ref_y.eval().unwrap();
+        ref_state.eval().unwrap();
+
+        // Chunkwise path takes q/k already repeated to Hv heads.
+        let repeat_factor = hv / hk;
+        let (q_rep, k_rep) = if repeat_factor > 1 {
+            (
+                ops::repeat_axis::<f32>(q, repeat_factor, -2).unwrap(),
+                ops::repeat_axis::<f32>(k, repeat_factor, -2).unwrap(),
+            )
+        } else {
+            (q, k)
+        };
+        let (cw_y, cw_state) = crate::gdn_chunkwise::gated_delta_chunkwise(
+            &q_rep, &k_rep, &v, &g, &beta, &state, chunk,
+        )
+        .unwrap();
+        cw_y.eval().unwrap();
+        cw_state.eval().unwrap();
+
+        let y_diff = ref_y.subtract(&cw_y).unwrap().abs().unwrap();
+        let y_max: f32 = y_diff.max(None).unwrap().item();
+        assert!(y_max < tol, "[{label}] chunkwise y differs by {y_max}");
+
+        let s_diff = ref_state.subtract(&cw_state).unwrap().abs().unwrap();
+        let s_max: f32 = s_diff.max(None).unwrap().item();
+        assert!(s_max < tol, "[{label}] chunkwise state differs by {s_max}");
+    }
+
+    #[test]
+    fn test_gdn_chunkwise_matches_ops_tail_only() {
+        // T < C: the whole sequence is one remainder chunk.
+        assert_chunkwise_matches_ops(1, 3, 2, 4, 32, 32, 64, 1e-4, "T=3 tail-only");
+    }
+
+    #[test]
+    fn test_gdn_chunkwise_matches_ops_exact_chunk() {
+        // T == C: exactly one full chunk, no tail.
+        assert_chunkwise_matches_ops(1, 64, 2, 4, 32, 32, 64, 1e-4, "T=64 exact");
+    }
+
+    #[test]
+    fn test_gdn_chunkwise_matches_ops_multi_chunk_tail() {
+        // T = 3·C + 4: state chains across chunks plus a short tail (GQA).
+        assert_chunkwise_matches_ops(1, 100, 2, 4, 32, 32, 32, 1e-4, "T=100 C=32");
+    }
+
+    #[test]
+    fn test_gdn_chunkwise_matches_ops_model_dims() {
+        // Real Qwen3.6 GDN dims across 4 chunks. Accumulation order differs
+        // from the sequential reference, so allow a slightly wider f32 band.
+        assert_chunkwise_matches_ops(1, 256, 16, 32, 128, 128, 64, 5e-4, "model dims T=256");
+    }
+
+    #[test]
+    fn test_gdn_chunkwise_state_passthrough() {
+        // One call over T=128 must equal two chained calls of 64+64 — the
+        // contract the outer chunked-prefill loop relies on.
+        let (batch, hv, dk, dv, t) = (1, 4, 32, 32, 128);
+        let q =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, t, hv, dk], None).unwrap();
+        let k =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, t, hv, dk], None).unwrap();
+        let v =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, t, hv, dv], None).unwrap();
+        let g = mlx_rs::random::uniform::<f32, f32>(0.05, 0.99, &[batch, t, hv], None).unwrap();
+        let beta = mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[batch, t, hv], None).unwrap();
+        let state =
+            mlx_rs::random::uniform::<f32, f32>(-0.1, 0.1, &[batch, hv, dv, dk], None).unwrap();
+
+        let (y_full, s_full) =
+            crate::gdn_chunkwise::gated_delta_chunkwise(&q, &k, &v, &g, &beta, &state, 64)
+                .unwrap();
+
+        let half = |x: &Array, lo: i32, hi: i32| x.index((.., lo..hi, .., ..));
+        let half_g = |x: &Array, lo: i32, hi: i32| x.index((.., lo..hi, ..));
+        let (y_a, s_a) = crate::gdn_chunkwise::gated_delta_chunkwise(
+            &half(&q, 0, 64),
+            &half(&k, 0, 64),
+            &half(&v, 0, 64),
+            &half_g(&g, 0, 64),
+            &half_g(&beta, 0, 64),
+            &state,
+            64,
+        )
+        .unwrap();
+        let (y_b, s_b) = crate::gdn_chunkwise::gated_delta_chunkwise(
+            &half(&q, 64, 128),
+            &half(&k, 64, 128),
+            &half(&v, 64, 128),
+            &half_g(&g, 64, 128),
+            &half_g(&beta, 64, 128),
+            &s_a,
+            64,
+        )
+        .unwrap();
+
+        let y_joined = ops::concatenate_axis(&[&y_a, &y_b], 1).unwrap();
+        let y_max: f32 = y_full
+            .subtract(&y_joined)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        let s_max: f32 = s_full
+            .subtract(&s_b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        assert!(y_max < 1e-5, "split-call y differs by {y_max}");
+        assert!(s_max < 1e-5, "split-call state differs by {s_max}");
+    }
+
+    #[test]
+    fn test_gdn_chunkwise_matches_ops_bfloat16() {
+        // bf16 inputs (model dtype); chunk math runs in f32 internally.
+        // Tolerance precedent: conv ring-buffer test uses 2e-3 for bf16.
+        use mlx_rs::Dtype;
+        let (batch, t, hk, hv, dk, dv) = (1, 40, 2, 4, 32, 32);
+        let bf = |a: Array| a.as_dtype(Dtype::Bfloat16).unwrap();
+        let q = bf(l2_normalize_last(
+            &mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, t, hk, dk], None).unwrap(),
+        ));
+        let k = bf(l2_normalize_last(
+            &mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, t, hk, dk], None).unwrap(),
+        ));
+        let v = bf(
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[batch, t, hv, dv], None).unwrap(),
+        );
+        let g = bf(mlx_rs::random::uniform::<f32, f32>(0.05, 0.99, &[batch, t, hv], None).unwrap());
+        let beta =
+            bf(mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[batch, t, hv], None).unwrap());
+        let state =
+            mlx_rs::random::uniform::<f32, f32>(-0.1, 0.1, &[batch, hv, dv, dk], None).unwrap();
+
+        let repeat = hv / hk;
+        let q_rep = ops::repeat_axis::<f32>(q.clone(), repeat, -2).unwrap();
+        let k_rep = ops::repeat_axis::<f32>(k.clone(), repeat, -2).unwrap();
+
+        let g32 = g.as_dtype(Dtype::Float32).unwrap();
+        let beta32 = beta.as_dtype(Dtype::Float32).unwrap();
+        let (ref_y, ref_state) = run_gated_delta_ref_sequence(
+            &q.as_dtype(Dtype::Float32).unwrap(),
+            &k.as_dtype(Dtype::Float32).unwrap(),
+            &v.as_dtype(Dtype::Float32).unwrap(),
+            &g32,
+            &beta32,
+            &state,
+            t,
+            repeat,
+        );
+
+        let (cw_y, cw_state) =
+            crate::gdn_chunkwise::gated_delta_chunkwise(&q_rep, &k_rep, &v, &g, &beta, &state, 16)
+                .unwrap();
+        assert_eq!(cw_y.dtype(), Dtype::Bfloat16, "y keeps input dtype");
+
+        let y_max: f32 = ref_y
+            .subtract(&cw_y.as_dtype(Dtype::Float32).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        let s_max: f32 = ref_state
+            .subtract(&cw_state)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        assert!(y_max < 2e-3, "bf16 chunkwise y differs by {y_max}");
+        assert!(s_max < 2e-3, "bf16 chunkwise state differs by {s_max}");
     }
 
     /// Benchmark: chain 48 layers of 3x gather_qmm + SwiGLU, single eval.
