@@ -3897,6 +3897,7 @@ impl Qwen3NextCausalLM {
             }
             mlx_rs::transforms::eval(targets)?;
             offset += chunk_size;
+            crate::progress::report_prefill_progress(offset, T);
         }
 
         // Last chunk: use forward_last_token which efficiently projects only

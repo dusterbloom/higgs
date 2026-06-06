@@ -96,6 +96,26 @@ impl ChatChunkWriter {
         self.buf.push('}');
         Ok(&self.buf)
     }
+
+    /// Build a prefill-progress chunk with `choices: []` and a
+    /// `prompt_progress` block (llama.cpp-compatible shape). Emitted only
+    /// when the request set `return_progress: true`.
+    pub(crate) fn write_prompt_progress(
+        &mut self,
+        total: u32,
+        cache: u32,
+        processed: u32,
+        time_ms: u64,
+    ) -> &str {
+        use std::fmt::Write as _;
+        self.buf.clear();
+        self.buf.push_str(&self.head);
+        let _ = write!(
+            self.buf,
+            r#","choices":[],"prompt_progress":{{"total":{total},"cache":{cache},"processed":{processed},"time_ms":{time_ms}}}}}"#
+        );
+        &self.buf
+    }
 }
 
 /// Pre-serialized prefix + reusable buffer for `/v1/completions` SSE chunks.

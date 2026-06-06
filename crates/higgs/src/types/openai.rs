@@ -44,6 +44,11 @@ pub struct ChatCompletionRequest {
     /// a non-empty value such as `"low"` to explicitly enable reasoning.
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
+    /// When true, streaming responses include `prompt_progress` chunks during
+    /// chunked prefill (llama.cpp-compatible shape: `{total, cache,
+    /// processed, time_ms}`). Ignored for non-streaming requests.
+    #[serde(default)]
+    pub return_progress: Option<bool>,
 }
 
 /// Optional request-level controls for streaming responses.
