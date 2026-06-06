@@ -192,6 +192,9 @@ Measured on DeepSeek-V2-Lite-4bit with global batch sorting before `gather_qmm`.
 **API endpoints**
 
 - OpenAI: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`
+  - Streaming requests may set `"return_progress": true` to receive
+    llama.cpp-compatible `prompt_progress` chunks (`{total, cache, processed,
+    time_ms}`) during chunked prefill.
 - Anthropic: `/v1/messages`, `/v1/messages/count_tokens`
 - Metrics: `/metrics`
 - Health: `/health`

@@ -5,6 +5,7 @@ pub mod error;
 pub mod gemma2;
 pub mod llava_qwen2;
 pub mod phi3;
+pub mod progress;
 pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod registry;
@@ -358,6 +359,7 @@ impl AnyModel {
             }
             eval(targets)?;
             offset += chunk_size;
+            progress::report_prefill_progress(offset, T);
         }
 
         // Last chunk: forward + LM head projection on last position only.

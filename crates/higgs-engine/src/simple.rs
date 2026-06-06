@@ -2012,6 +2012,7 @@ impl SimpleEngine {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: completion_len,
                                         token_logprob: None,
+                                        prefill_progress: None,
                                     })
                                     .is_err()
                                 {
@@ -2083,6 +2084,7 @@ impl SimpleEngine {
                         prompt_tokens: prompt_len,
                         completion_tokens: completion_len,
                         token_logprob: None,
+                        prefill_progress: None,
                     })
                     .is_err()
                 {
@@ -2159,6 +2161,7 @@ impl SimpleEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
                 token_logprob: None,
+                prefill_progress: None,
             });
             return Ok(());
         }
@@ -2210,6 +2213,36 @@ impl SimpleEngine {
             && !logprobs
             && params.temperature == 0.0;
 
+        // Stream prefill progress: the chunked-prefill loops report
+        // suffix-relative completions through a thread-local sink; map them
+        // to absolute prompt position by adding the prefix-cache hit. Events
+        // ride the normal streaming channel as progress-only outputs.
+        // try_send: never stall prefill on a slow consumer — dropped
+        // progress events are harmless.
+        let cached = prompt_len.saturating_sub(prepared.actual_prompt_tokens.len() as u32);
+        let make_progress_output = move |suffix_done: u32| StreamingOutput {
+            new_text: String::new(),
+            finished: false,
+            finish_reason: None,
+            prompt_tokens: prompt_len,
+            completion_tokens: 0,
+            token_logprob: None,
+            prefill_progress: Some(crate::engine::PrefillProgress {
+                processed: (cached + suffix_done).min(prompt_len),
+                cached,
+                total: prompt_len,
+            }),
+        };
+        // Initial event: tells the client the total (and cache hit) before
+        // the first ~1024-token chunk completes.
+        let _ = sender.try_send(make_progress_output(0));
+        let progress_sender = sender.clone();
+        let sink_guard = higgs_models::progress::install_prefill_progress_sink(Box::new(
+            move |done, _total| {
+                let _ = progress_sender.try_send(make_progress_output(done.max(0) as u32));
+            },
+        ));
+
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
             prompt_tokens,
             &mut prepared,
@@ -2218,6 +2251,8 @@ impl SimpleEngine {
             constraint.as_ref(),
             capture_mtp_prefill,
         )?;
+        // Prefill done — decode must not report progress.
+        drop(sink_guard);
 
         let mut all_tokens: Vec<u32> = Vec::new();
         let first_token_id: u32 = current_token.item();
@@ -2259,6 +2294,7 @@ impl SimpleEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprob: first_logprob,
+                prefill_progress: None,
             })
             .is_err()
         {
@@ -2433,6 +2469,7 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprob,
+                    prefill_progress: None,
                 })
                 .is_err()
             {

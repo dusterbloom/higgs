@@ -480,6 +480,7 @@ fn chat_completions_stream(
         .stream_options
         .as_ref()
         .is_some_and(|opts| opts.include_usage.unwrap_or(false));
+    let return_progress = req.return_progress.unwrap_or(false);
     let created = current_unix_timestamp();
     let model = req.model;
     let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(0);
@@ -553,6 +554,17 @@ fn chat_completions_stream(
         let mut pending_finish_logprobs: Option<ChoiceLogprobs> = None;
 
         while let Some(output) = rx.recv().await {
+            // Prefill-progress events carry no tokens: forward as
+            // `prompt_progress` chunks when the client opted in, and keep
+            // them away from the delta/tool trackers either way.
+            if let Some(p) = output.prefill_progress {
+                if return_progress {
+                    let time_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let json = writer.write_prompt_progress(p.total, p.cached, p.processed, time_ms);
+                    yield Ok(Event::default().data(json));
+                }
+                continue;
+            }
             output_token_count = output.completion_tokens;
             let chunk_logprobs = output
                 .token_logprob
