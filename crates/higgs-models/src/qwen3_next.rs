@@ -7075,6 +7075,153 @@ mod tests {
         assert!(s_max < 2e-3, "bf16 chunkwise state differs by {s_max}");
     }
 
+    /// MoE prefill micro-bench at REAL Qwen3.6-35B shapes: where do the
+    /// measured ~32.5 ms/layer/1024-tok go, and how far is the production
+    /// gather path from a dense matmul doing the same FLOPs?
+    ///
+    /// Phases are timed with eval barriers (inflates totals slightly but
+    /// attributes cost); `full` is the whole block under a single eval (the
+    /// honest production number); `dense anchor` runs the routed FLOPs as
+    /// plain quantized_matmul over [L·top_k, D] — the coalesced upper bound.
+    /// Run: cargo test -p higgs-models --release --lib -- bench_moe_prefill \
+    ///        --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore = "benchmark, requires GPU"]
+    fn bench_moe_prefill_shapes() {
+        use mlx_rs::module::Param;
+        use mlx_rs::Dtype;
+        use std::time::Instant;
+
+        // Real model dims (config.json of Qwen3.6-35B-A3B-4bit).
+        let (b, l, d) = (1, 1024, 2048);
+        let (n_experts, top_k, inter) = (256, 8, 512);
+        let (gs, bits) = (64, 4);
+
+        let quant = |shape: &[i32]| -> (Array, Array, Array) {
+            let raw = mlx_rs::random::normal::<f32>(shape, None, None, None)
+                .unwrap()
+                .as_dtype(Dtype::Float16)
+                .unwrap();
+            ops::quantize(&raw, gs, bits).unwrap()
+        };
+        let qlinear = |shape: &[i32]| -> QLinear {
+            let (w, s, bias) = quant(shape);
+            QLinear {
+                weight: Param::new(w),
+                scales: Param::new(s),
+                biases: Param::new(bias),
+                group_size: gs,
+                bits,
+            }
+        };
+
+        let router = qlinear(&[n_experts, d]);
+        let mut switch = SwitchMlpWeights {
+            gate_proj: qlinear(&[n_experts, inter, d]),
+            up_proj: qlinear(&[n_experts, inter, d]),
+            down_proj: qlinear(&[n_experts, d, inter]),
+            fused_gate_up: None,
+        };
+        let shared = Qwen3NextMLP {
+            gate_proj: qlinear(&[inter, d]),
+            down_proj: qlinear(&[d, inter]),
+            up_proj: qlinear(&[inter, d]),
+        };
+        let shared_gate = qlinear(&[1, d]);
+
+        let x = mlx_rs::random::normal::<f32>(&[b, l, d], None, None, None)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        mlx_rs::transforms::eval([&x]).unwrap();
+
+        let time_med = |label: &str, f: &mut dyn FnMut() -> Array| {
+            for _ in 0..2 {
+                let out = f();
+                mlx_rs::transforms::eval([&out]).unwrap();
+            }
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let t0 = Instant::now();
+                let out = f();
+                mlx_rs::transforms::eval([&out]).unwrap();
+                times.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            times.sort_by(|a, c| a.partial_cmp(c).unwrap());
+            let med = times[times.len() / 2];
+            println!("{label:<28} {med:8.2} ms");
+            med
+        };
+
+        // --- Phase pieces (mirroring FfnBlock::forward MoE branch) ---
+        let gates_logits = router.forward(&x).unwrap();
+        let inds = {
+            let gates = ops::softmax_axis(&gates_logits, -1, true).unwrap();
+            let all_inds = ops::argpartition_axis(&gates, -top_k, -1).unwrap();
+            ops::sort_axis(all_inds.index((.., .., (n_experts - top_k)..)), -1).unwrap()
+        };
+        mlx_rs::transforms::eval([&inds]).unwrap();
+
+        time_med("router+topk", &mut || {
+            let gates = ops::softmax_axis(&router.forward(&x).unwrap(), -1, true).unwrap();
+            let all_inds = ops::argpartition_axis(&gates, -top_k, -1).unwrap();
+            let inds =
+                ops::sort_axis(all_inds.index((.., .., (n_experts - top_k)..)), -1).unwrap();
+            gates.take_along_axis(&inds, -1).unwrap()
+        });
+        time_med("experts global_sort", &mut || {
+            switch.forward_gather_global_sort(&x, &inds).unwrap()
+        });
+        time_med("experts fused_gate_up", &mut || {
+            switch.forward_gather_fused(&x, &inds).unwrap()
+        });
+        time_med("shared expert", &mut || {
+            let sy = shared.forward(&x).unwrap();
+            let sg = nn::sigmoid(&shared_gate.forward(&x).unwrap()).unwrap();
+            sy.multiply(&sg).unwrap()
+        });
+
+        // --- Full production block, single eval ---
+        let full = time_med("FULL block (single eval)", &mut || {
+            let gates = ops::softmax_axis(&router.forward(&x).unwrap(), -1, true).unwrap();
+            let all_inds = ops::argpartition_axis(&gates, -top_k, -1).unwrap();
+            let inds =
+                ops::sort_axis(all_inds.index((.., .., (n_experts - top_k)..)), -1).unwrap();
+            let scores = gates.take_along_axis(&inds, -1).unwrap();
+            let y = switch.forward_gather_global_sort(&x, &inds).unwrap();
+            let expert_sum = y
+                .multiply(&scores.expand_dims(-1).unwrap())
+                .unwrap()
+                .sum_axes(&[-2], false)
+                .unwrap();
+            let sy = shared.forward(&x).unwrap();
+            let sg = nn::sigmoid(&shared_gate.forward(&x).unwrap()).unwrap();
+            expert_sum.add(&sy.multiply(&sg).unwrap()).unwrap()
+        });
+
+        // --- Dense anchor: same routed FLOPs as plain quantized matmuls ---
+        // L·top_k token-expert pairs through one expert's weights.
+        let x_pairs = mlx_rs::random::normal::<f32>(&[b, l * top_k, d], None, None, None)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        mlx_rs::transforms::eval([&x_pairs]).unwrap();
+        let dense_gate = qlinear(&[inter, d]);
+        let dense_up = qlinear(&[inter, d]);
+        let dense_down = qlinear(&[d, inter]);
+        let dense = time_med("dense anchor (same FLOPs)", &mut || {
+            let g = dense_gate.forward(&x_pairs).unwrap();
+            let u = dense_up.forward(&x_pairs).unwrap();
+            let h = nn::silu(&g).unwrap().multiply(&u).unwrap();
+            dense_down.forward(&h).unwrap()
+        });
+
+        println!(
+            "gather/dense ratio: {:.2}x  (in-situ profile: ~32.5 ms incl. norms/residual)",
+            full / dense
+        );
+    }
+
     /// Benchmark: chain 48 layers of 3x gather_qmm + SwiGLU, single eval.
     /// Compare with Python's 0.378ms (48 layers, single eval).
     #[test]
