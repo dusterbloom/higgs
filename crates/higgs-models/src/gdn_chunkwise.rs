@@ -29,8 +29,11 @@
 //! All chunk math runs in f32 (the cache state is already f32 for the same
 //! stability reason); inputs are cast in, outputs cast back.
 
+use std::cell::RefCell;
+
 use mlx_rs::error::Exception;
 use mlx_rs::ops::{self, indexing::IndexOp};
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
 /// Inner chunk length. Measured on Qwen3.6-35B (5.3k-token prefill, warm):
@@ -273,6 +276,99 @@ fn process_chunk(
     Ok((y, new_state))
 }
 
+/// `HIGGS_GDN_COMPILE=0` disables `mlx::compile` of the chunk step.
+///
+/// MEASURED (Qwen3.6-35B, 1024-tok prefill): compile does NOT move the
+/// needle — GDN stays ~44 ms/layer compiled vs uncompiled, both slower than
+/// the serial kernel's ~38 ms. compile fuses the elementwise *glue*, but the
+/// chunk form's cost is its ~21 matmul launches/chunk (the C×C solve + the
+/// intra-chunk GEMMs), which compile leaves as separate GEMM dispatches.
+/// Beating the serial kernel needs those matmuls fused *in-kernel*
+/// (simdgroup_matrix), not graph compilation. Left default-on so the
+/// experimental chunkwise path (also default-off) gets the marginal warmup
+/// smoothing for anyone benchmarking it.
+fn gdn_compile_enabled() -> bool {
+    std::env::var("HIGGS_GDN_COMPILE").ok().is_none_or(|raw| {
+        matches!(
+            Some(raw.trim().to_ascii_lowercase()).as_deref(),
+            Some("1" | "true" | "on" | "yes")
+        )
+    })
+}
+
+/// Compile-friendly wrapper: every participating `Array` is an explicit input
+/// (mlx::compile gives undefined behaviour for arrays captured by the
+/// closure), and the two outputs ride a `Vec` (the compile binding has no
+/// tuple-output form). Input order: q, k, v, log_g, beta, state, then the
+/// five `ChunkMasks` fields.
+fn process_chunk_graph(inputs: &[Array]) -> Result<Vec<Array>, Exception> {
+    let [q, k, v, log_g, beta, state, strict, incl, strict_off, incl_off, eye] = inputs else {
+        return Err(Exception::custom(
+            "process_chunk_graph expects 11 input arrays",
+        ));
+    };
+    let masks = ChunkMasks {
+        strict: strict.clone(),
+        incl: incl.clone(),
+        strict_off: strict_off.clone(),
+        incl_off: incl_off.clone(),
+        eye: eye.clone(),
+    };
+    let (y, new_state) = process_chunk(q, k, v, log_g, beta, state, &masks)?;
+    Ok(vec![y, new_state])
+}
+
+type CompiledChunkFn = dyn for<'a> FnMut(&'a [Array]) -> Result<Vec<Array>, Exception>;
+
+thread_local! {
+    /// One compiled `process_chunk_graph`, reused across all chunks and
+    /// layers on this worker thread. mlx::compile keys its internal trace
+    /// cache by input shape, so the C=128 full-chunk graph and the C=tail
+    /// graph each trace once and then replay (shapeless=false via the `None`
+    /// arg). Engines run generation on a dedicated blocking thread, so a
+    /// thread-local is the right lifetime.
+    static COMPILED_CHUNK_FN: RefCell<Option<Box<CompiledChunkFn>>> = const { RefCell::new(None) };
+}
+
+/// Run one chunk through the compiled graph, returning `(y, new_state)`.
+fn process_chunk_compiled(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    log_g: &Array,
+    beta: &Array,
+    state: &Array,
+    masks: &ChunkMasks,
+) -> Result<(Array, Array), Exception> {
+    COMPILED_CHUNK_FN.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let compiled =
+            guard.get_or_insert_with(|| Box::new(compile(process_chunk_graph, None)));
+        let inputs = [
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            log_g.clone(),
+            beta.clone(),
+            state.clone(),
+            masks.strict.clone(),
+            masks.incl.clone(),
+            masks.strict_off.clone(),
+            masks.incl_off.clone(),
+            masks.eye.clone(),
+        ];
+        let mut out = compiled(&inputs)?;
+        // Pushed as vec![y, new_state] → pop new_state first.
+        let new_state = out
+            .pop()
+            .ok_or_else(|| Exception::custom("compiled chunk returned no new_state"))?;
+        let y = out
+            .pop()
+            .ok_or_else(|| Exception::custom("compiled chunk returned no y"))?;
+        Ok((y, new_state))
+    })
+}
+
 /// Chunkwise-parallel gated delta rule over a full prefill segment.
 ///
 /// Inputs (token-major, any float dtype): `q,k: [B,T,Hv,Dk]` (already
@@ -321,6 +417,7 @@ pub(crate) fn gated_delta_chunkwise(
     // Masks depend only on the chunk length; at most two distinct lengths
     // occur per call (the full chunk and one tail), so cache by size.
     let mut mask_cache: Option<(i32, ChunkMasks)> = None;
+    let use_compiled = gdn_compile_enabled();
 
     let mut t0 = 0i32;
     while t0 < t {
@@ -339,7 +436,11 @@ pub(crate) fn gated_delta_chunkwise(
         let gc = log_g.index((.., .., t0..t0 + c_eff));
         let bc = beta.index((.., .., t0..t0 + c_eff));
 
-        let (y, new_state) = process_chunk(&qc, &kc, &vc, &gc, &bc, &state, masks)?;
+        let (y, new_state) = if use_compiled {
+            process_chunk_compiled(&qc, &kc, &vc, &gc, &bc, &state, masks)?
+        } else {
+            process_chunk(&qc, &kc, &vc, &gc, &bc, &state, masks)?
+        };
         outputs.push(y);
         state = new_state;
         t0 += c_eff;
