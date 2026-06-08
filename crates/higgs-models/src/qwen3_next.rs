@@ -85,6 +85,9 @@ impl Drop for CachedMetalKernel {
 /// Cached `GatedDeltaNet` Metal kernel -- created once, reused for all layers.
 static GATED_DELTA_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
+/// Cached unit-lower triangular-solve kernel (chunkwise GDN inverse fusion).
+static SOLVE_UNIT_LOWER_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
 use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
@@ -969,6 +972,173 @@ fn gated_delta_kernel_ffi(
         mlx_sys::mlx_vector_array_free(inputs_vec);
         mlx_sys::mlx_vector_array_free(outputs_vec);
         mlx_sys::mlx_array_free(t_scalar);
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Unit-lower triangular-solve kernel (chunkwise GDN inverse fusion)
+// ---------------------------------------------------------------------------
+
+/// Solve `(I + A)·U = b` for `U`, where `A` is strictly lower triangular
+/// `[BH, C, C]` and `b` is `[BH, C, Dv]` (all f32). The chunkwise GDN path
+/// otherwise spends ~14 batched matmul *launches* materialising `(I+A)⁻¹`
+/// then one more for `U = T·b`; this kernel does the whole solve in ONE
+/// dispatch by per-column forward substitution. Launch count, not FLOPs, is
+/// the chunkwise bottleneck (measured), so collapsing 15 launches → 1 is the
+/// lever.
+///
+/// One threadgroup per (batch·head) slab; `Dv` threads, each owning one
+/// output column and running the C-step recurrence
+/// `U[i] = b[i] − Σ_{j<i} A[i,j]·U[j]` over its column in registers. `A` is
+/// staged once into threadgroup memory (shared across all Dv columns).
+/// `MAXC` bounds the threadgroup tile and the per-thread register array, so
+/// the kernel requires `C ≤ MAXC` (= 64; a 64×64 f32 tile is 16 KB, well
+/// under the 32 KB Apple threadgroup cap).
+const SOLVE_UNIT_LOWER_KERNEL_SOURCE: &str = r"
+threadgroup float A_tile[MAXC * MAXC];
+
+uint bh = threadgroup_position_in_grid.z;
+uint col = thread_position_in_threadgroup.x;
+uint cc = (uint)C;
+uint dv = (uint)Dv;
+
+// Stage A[bh] (cc*cc f32) into threadgroup memory, shared across columns.
+const device float* a_bh = a + (ulong)bh * cc * cc;
+for (uint idx = col; idx < cc * cc; idx += dv) {
+    A_tile[idx] = a_bh[idx];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+if (col >= dv) { return; }
+
+const device float* b_bh = b + (ulong)bh * cc * dv;
+device float* u_bh = u + (ulong)bh * cc * dv;
+
+float u_col[MAXC];
+for (uint i = 0; i < cc; ++i) {
+    float acc = b_bh[i * dv + col];
+    for (uint j = 0; j < i; ++j) {
+        acc -= A_tile[i * cc + j] * u_col[j];
+    }
+    u_col[i] = acc;
+    u_bh[i * dv + col] = acc;
+}
+";
+
+/// Maximum chunk length the solve kernel supports (threadgroup-tile bound).
+const SOLVE_MAX_C: i32 = 64;
+
+#[allow(unsafe_code)]
+fn create_solve_unit_lower_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let input_names: [&CStr; 3] = [c"a", c"b", c"C"];
+    let output_names: [&CStr; 1] = [c"u"];
+    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
+    let source =
+        CString::new(SOLVE_UNIT_LOWER_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+    unsafe {
+        let in_vec =
+            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"solve_unit_lower".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,  // ensure_row_contiguous
+            false, // atomic_outputs
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+/// Solve `(I+A)U = b` via the custom forward-substitution kernel.
+/// `a`: `[B,Hv,C,C]` strictly-lower f32, `b`: `[B,Hv,C,Dv]` f32.
+/// Returns `U`: `[B,Hv,C,Dv]` f32.
+#[allow(unsafe_code)]
+pub(crate) fn solve_unit_lower(a: &Array, b: &Array) -> Result<Array, Exception> {
+    let ash = a.shape();
+    let bsh = b.shape();
+    let (big, hv, c) = (
+        *ash.first().unwrap_or(&1),
+        *ash.get(1).unwrap_or(&1),
+        *ash.get(2).unwrap_or(&1),
+    );
+    let dv = *bsh.get(3).unwrap_or(&1);
+    if c > SOLVE_MAX_C {
+        return Err(Exception::custom(format!(
+            "solve_unit_lower: C={c} exceeds SOLVE_MAX_C={SOLVE_MAX_C}"
+        )));
+    }
+    let bh = big * hv;
+    let a3 = a.reshape(&[bh, c, c])?;
+    let b3 = b.reshape(&[bh, c, dv])?;
+
+    ensure_ffi_error_handler();
+    let stream = Stream::task_local_or_default();
+    let cached =
+        SOLVE_UNIT_LOWER_KERNEL.get_or_init(|| CachedMetalKernel(create_solve_unit_lower_kernel()));
+
+    let config = unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"Dv".as_ptr(), dv);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"MAXC".as_ptr(),
+            SOLVE_MAX_C,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, dv, 1, bh);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, dv, 1, 1);
+        let u_shape = [bh, c, dv];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            u_shape.as_ptr(),
+            u_shape.len(),
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
+        config
+    };
+
+    let c_scalar = unsafe { mlx_sys::mlx_array_new_int(c) };
+    let input_ptrs = [a3.as_ptr(), b3.as_ptr(), c_scalar];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        let mlx_msg = FFI_LAST_ERROR
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
+        Err(Exception::custom(format!(
+            "solve_unit_lower kernel failed: {mlx_msg}"
+        )))
+    } else {
+        let mut u_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut u_ptr, outputs_vec, 0) };
+        let u3 = unsafe { Array::from_ptr(u_ptr) };
+        u3.reshape(&[big, hv, c, dv])
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(c_scalar);
     }
 
     result

@@ -230,6 +230,7 @@ fn process_chunk(
     beta: &Array,
     state: &Array,
     masks: &ChunkMasks,
+    use_solve_kernel: bool,
 ) -> Result<(Array, Array), Exception> {
     // Cumulative log-decay within the chunk: L_i = Σ_{j≤i} log g_j.
     let l = log_g.cumsum(-1, None, None)?; // [B,Hv,C]
@@ -252,12 +253,17 @@ fn process_chunk(
     let kkt = ops::matmul(k, &k_t)?; // [B,Hv,C,C]
     let a = kkt.multiply(&d_strict)?.multiply(&beta_col)?;
 
-    // U = (I + A)⁻¹ (β ⊙ (V − γ ⊙ K S₀ᵀ))
-    let m = masks.eye.add(&a)?;
-    let t_mat = invert_unit_lower(&m, *a.shape().last().unwrap_or(&1))?;
+    // U = (I + A)⁻¹ (β ⊙ (V − γ ⊙ K S₀ᵀ)). The solve dominates the chunk's
+    // launch count (~15 of ~21 matmul launches); the kernel collapses it to 1.
     let k_s0 = ops::matmul(k, &state_t)?; // [B,Hv,C,Dv]
     let v_eff = v.subtract(&gamma.multiply(&k_s0)?)?.multiply(&beta_col)?;
-    let u = ops::matmul(&t_mat, &v_eff)?; // [B,Hv,C,Dv]
+    let u = if use_solve_kernel {
+        crate::qwen3_next::solve_unit_lower(&a, &v_eff)? // one dispatch
+    } else {
+        let m = masks.eye.add(&a)?;
+        let t_mat = invert_unit_lower(&m, *a.shape().last().unwrap_or(&1))?;
+        ops::matmul(&t_mat, &v_eff)? // [B,Hv,C,Dv]
+    };
 
     // Y = γ ⊙ (Q S₀ᵀ) + ((Q Kᵀ) ⊙ D_incl) U
     let q_s0 = ops::matmul(q, &state_t)?; // [B,Hv,C,Dv]
@@ -314,8 +320,33 @@ fn process_chunk_graph(inputs: &[Array]) -> Result<Vec<Array>, Exception> {
         incl_off: incl_off.clone(),
         eye: eye.clone(),
     };
-    let (y, new_state) = process_chunk(q, k, v, log_g, beta, state, &masks)?;
+    // Compiled path never uses the custom kernel — mlx::compile traces the
+    // graph and a custom Metal kernel is not a traceable graph op.
+    let (y, new_state) = process_chunk(q, k, v, log_g, beta, state, &masks, false)?;
     Ok(vec![y, new_state])
+}
+
+/// `HIGGS_GDN_SOLVE_KERNEL=1` routes the chunk's triangular solve through the
+/// custom forward-substitution Metal kernel (one dispatch) instead of the
+/// ~15 batched matmul launches of the graph-ops inverter.
+///
+/// MEASURED (Qwen3.6-35B, 1024-tok prefill, per GDN layer):
+///   serial kernel            37.0 ms
+///   chunkwise C=64 inverter  42.2 ms
+///   chunkwise C=64 + solve   43.0 ms   ← collapsing 15 launches → 1 = no-op
+/// The solve is correct (residual < 1e-4) but irrelevant to the total: the
+/// chunkwise cost is materialising the C×C / C×Dv intermediates to device
+/// each chunk, which the serial scan never does (state stays resident). So
+/// launch count was not the bottleneck; memory traffic is, and no
+/// solve-method change moves it. Kept off by default — the kernel + FFI are
+/// reusable scaffolding, and this is the record that it was tried.
+fn gdn_solve_kernel_enabled() -> bool {
+    std::env::var("HIGGS_GDN_SOLVE_KERNEL").ok().is_some_and(|raw| {
+        matches!(
+            Some(raw.trim().to_ascii_lowercase()).as_deref(),
+            Some("1" | "true" | "on" | "yes")
+        )
+    })
 }
 
 type CompiledChunkFn = dyn for<'a> FnMut(&'a [Array]) -> Result<Vec<Array>, Exception>;
@@ -412,12 +443,17 @@ pub(crate) fn gated_delta_chunkwise(
         .as_dtype(mlx_rs::Dtype::Float32)?
         .transpose_axes(&[0, 2, 1])?;
 
+    // The solve kernel handles C ≤ 64 and is not compile-traceable, so it
+    // clamps the chunk and forces the direct (uncompiled) path.
+    let use_solve = gdn_solve_kernel_enabled();
+    let chunk = if use_solve { chunk.min(64) } else { chunk };
+    let use_compiled = !use_solve && gdn_compile_enabled();
+
     let mut state = state.as_dtype(mlx_rs::Dtype::Float32)?;
     let mut outputs: Vec<Array> = Vec::new();
     // Masks depend only on the chunk length; at most two distinct lengths
     // occur per call (the full chunk and one tail), so cache by size.
     let mut mask_cache: Option<(i32, ChunkMasks)> = None;
-    let use_compiled = gdn_compile_enabled();
 
     let mut t0 = 0i32;
     while t0 < t {
@@ -439,7 +475,7 @@ pub(crate) fn gated_delta_chunkwise(
         let (y, new_state) = if use_compiled {
             process_chunk_compiled(&qc, &kc, &vc, &gc, &bc, &state, masks)?
         } else {
-            process_chunk(&qc, &kc, &vc, &gc, &bc, &state, masks)?
+            process_chunk(&qc, &kc, &vc, &gc, &bc, &state, masks, use_solve)?
         };
         outputs.push(y);
         state = new_state;
@@ -494,5 +530,102 @@ mod tests {
             let max: f32 = residual.max(None).unwrap().item();
             assert!(max < 1e-3, "c={c}: inverse residual too large: {max}");
         }
+    }
+
+    /// The forward-substitution Metal kernel must solve `(I+A)·U = b`. Verify
+    /// the residual `(I+A)·U − b ≈ 0` directly (independent of the graph-ops
+    /// inverter), at a full chunk (c=64) and a tail (c=24). A is built like
+    /// the real delta-rule solve (qk-normed keys, β∈(0,1)).
+    #[test]
+    fn test_solve_unit_lower_kernel_residual() {
+        for c in [64, 24] {
+            let (bb, hv, dk, dv) = (1, 2, 32, 48);
+            let masks = chunk_masks(c).unwrap();
+            let k =
+                mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[bb, hv, c, dk], None).unwrap();
+            let norm = k
+                .multiply(&k)
+                .unwrap()
+                .sum_axes(&[-1], true)
+                .unwrap()
+                .sqrt()
+                .unwrap()
+                .add(&Array::from_f32(1e-6))
+                .unwrap();
+            let k = k.divide(&norm).unwrap();
+            let beta =
+                mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[bb, hv, c, 1], None).unwrap();
+            let kkt = ops::matmul(&k, &k.transpose_axes(&[0, 1, 3, 2]).unwrap()).unwrap();
+            let a = kkt.multiply(&beta).unwrap().multiply(&masks.strict).unwrap();
+            let b =
+                mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[bb, hv, c, dv], None).unwrap();
+
+            let u = crate::qwen3_next::solve_unit_lower(&a, &b).unwrap();
+            let m = masks.eye.add(&a).unwrap();
+            let residual = ops::matmul(&m, &u)
+                .unwrap()
+                .subtract(&b)
+                .unwrap()
+                .abs()
+                .unwrap();
+            let max: f32 = residual.max(None).unwrap().item();
+            assert!(max < 1e-4, "c={c}: solve-kernel residual too large: {max}");
+        }
+    }
+
+    /// End-to-end: a full `process_chunk` with the solve KERNEL must match the
+    /// same chunk via the graph-ops inverter. Guards the integration (input
+    /// reshapes, the `a`-vs-`m` argument convention) beyond the bare residual.
+    #[test]
+    fn test_process_chunk_solve_kernel_matches_graph() {
+        let (bb, hv, c, dk, dv) = (1, 2, 64, 32, 32);
+        let norm_last = |x: &Array| {
+            let n = x
+                .multiply(x)
+                .unwrap()
+                .sum_axes(&[-1], true)
+                .unwrap()
+                .sqrt()
+                .unwrap()
+                .add(&Array::from_f32(1e-6))
+                .unwrap();
+            x.divide(&n).unwrap()
+        };
+        let q =
+            norm_last(&mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[bb, hv, c, dk], None).unwrap());
+        let k =
+            norm_last(&mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[bb, hv, c, dk], None).unwrap());
+        let v = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[bb, hv, c, dv], None).unwrap();
+        // log_g ∈ (−small, 0]: realistic decay (g near 1).
+        let log_g =
+            mlx_rs::random::uniform::<f32, f32>(-0.1, 0.0, &[bb, hv, c], None).unwrap();
+        let beta = mlx_rs::random::uniform::<f32, f32>(0.0, 1.0, &[bb, hv, c], None).unwrap();
+        let state =
+            mlx_rs::random::uniform::<f32, f32>(-0.1, 0.1, &[bb, hv, dv, dk], None).unwrap();
+        let masks = chunk_masks(c).unwrap();
+
+        let (y_ref, s_ref) =
+            process_chunk(&q, &k, &v, &log_g, &beta, &state, &masks, false).unwrap();
+        let (y_ker, s_ker) =
+            process_chunk(&q, &k, &v, &log_g, &beta, &state, &masks, true).unwrap();
+
+        let y_max: f32 = y_ref
+            .subtract(&y_ker)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        let s_max: f32 = s_ref
+            .subtract(&s_ker)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        assert!(y_max < 1e-4, "kernel vs graph y differs by {y_max}");
+        assert!(s_max < 1e-4, "kernel vs graph state differs by {s_max}");
     }
 }
