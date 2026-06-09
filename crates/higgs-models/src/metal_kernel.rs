@@ -238,13 +238,11 @@ fn configure_qmv_kernel(
     }
 }
 
-/// Fused 1-bit quantized matvec: `y = x @ dequant(weight).T` for a single token.
-///
-/// `x` must hold exactly `in_features` elements (M = 1). `weight` is the packed
-/// `[out_features, in_features/32]` uint32 matrix; `scales`/`biases` are
-/// `[out_features, in_features/group_size]`. Output dtype matches `x`.
+/// Original per-row 1-bit matvec: one simdgroup computes one output row, with
+/// `x` staged in threadgroup memory. Kept as the A/B baseline (selected unless
+/// `HIGGS_BONSAI_QMV_KERNEL=fast`). See [`bonsai_q1_qmv`] for the dispatcher.
 #[allow(unsafe_code)]
-pub fn bonsai_q1_qmv(
+fn bonsai_q1_qmv_legacy(
     x: &Array,
     weight: &Array,
     scales: &Array,
@@ -326,6 +324,324 @@ pub fn bonsai_q1_qmv(
 }
 
 static QMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static FAST_QMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+/// Simdgroups per threadgroup for the `qmv_fast`-class kernel. Each simdgroup
+/// computes `RESULTS_PER_SIMDGROUP` (= 4) output rows. Tunable via
+/// `HIGGS_BONSAI_FAST_NSG` (Phase-2 sweep); MLX's reference uses 2.
+fn fast_qmv_nsg() -> i32 {
+    static OVERRIDE: OnceLock<i32> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("HIGGS_BONSAI_FAST_NSG")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .filter(|n| matches!(n, 1 | 2 | 4 | 8))
+            .unwrap_or(2)
+    })
+}
+
+/// Whether to route the decode matvec through the `qmv_fast`-class kernel.
+/// It is the **default** (measured 2.3× faster on Bonsai-8B decode and bit-exact
+/// vs the CPU reference); opt back to the original per-row kernel with
+/// `HIGGS_BONSAI_QMV_KERNEL=legacy`.
+fn use_fast_qmv() -> bool {
+    static FAST: OnceLock<bool> = OnceLock::new();
+    *FAST.get_or_init(|| {
+        !std::env::var("HIGGS_BONSAI_QMV_KERNEL").is_ok_and(|v| v.eq_ignore_ascii_case("legacy"))
+    })
+}
+
+/// Fused 1-bit quantized matvec: `y = x @ dequant(weight).T` for a single token.
+///
+/// `x` must hold exactly `in_features` elements (M = 1). `weight` is the packed
+/// `[out_features, in_features/32]` uint32 matrix; `scales`/`biases` are
+/// `[out_features, in_features/group_size]`. Output dtype matches `x`.
+///
+/// Dispatches to the `qmv_fast`-class kernel ([`bonsai_q1_qmv_fast`]) when
+/// `HIGGS_BONSAI_QMV_KERNEL=fast`, else the original per-row kernel.
+pub fn bonsai_q1_qmv(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    if use_fast_qmv() {
+        bonsai_q1_qmv_fast(x, weight, scales, biases, group_size)
+    } else {
+        bonsai_q1_qmv_legacy(x, weight, scales, biases, group_size)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `qmv_fast`-class 1-bit matvec (decode hot path).
+//
+// Ports MLX/PrismML `qmv_fast` tiling onto our uint32 packing: each simdgroup
+// computes RESULTS_PER_SIMDGROUP (4) output rows; each of its 32 lanes holds
+// VPT (64) input values in registers (no threadgroup memory, no barriers) and
+// reuses them across all 4 rows. block_size = 64 * 32 = 2048. The bits=1 affine
+// math is identical to the legacy kernel — `scale * sum(bit*x) + bias * sum(x)`
+// — only the data movement differs. Group scales/biases are per-lane (a lane's
+// 64 values lie in one 128-wide group); per-row partials are simd_sum-reduced.
+// ---------------------------------------------------------------------------
+
+const FAST_QMV_KERNEL_SOURCE: &str = r"
+constexpr int VPT = 64;          // values_per_thread
+constexpr int RPS = 4;           // results_per_simdgroup
+constexpr int WPT = VPT / 32;    // packed uint32 words per thread (2)
+constexpr int BLK = VPT * 32;    // block_size = 2048
+
+uint tgx = threadgroup_position_in_grid.x;
+uint sg  = simdgroup_index_in_threadgroup;
+uint lid = thread_index_in_simdgroup;
+uint nsg = simdgroups_per_threadgroup;
+
+int out_row = int(tgx) * (int(nsg) * RPS) + int(sg) * RPS;
+
+float xt[VPT];
+float result[RPS];
+for (int r = 0; r < RPS; ++r) { result[r] = 0.0f; }
+
+int aligned_end = (K / BLK) * BLK;
+
+// Main loop: full 2048-element blocks (covers every real Bonsai layer, since
+// all K are multiples of 2048).
+for (int k = 0; k < aligned_end; k += BLK) {
+    int xbase = k + int(lid) * VPT;
+    float sum = 0.0f;
+    for (int i = 0; i < VPT; ++i) { float v = float(x[xbase + i]); xt[i] = v; sum += v; }
+
+    int wcol = (k / 32) + int(lid) * WPT;
+    int g = xbase / GroupSize;   // all VPT values fall in one group
+
+    for (int r = 0; r < RPS; ++r) {
+        int row = out_row + r;
+        if (row >= n_param) { continue; }
+        float accum = 0.0f;
+        for (int wp = 0; wp < WPT; ++wp) {
+            uint packed = w[row * KPacked + wcol + wp];
+            int xo = wp * 32;
+            for (int bk = 0; bk < 4; ++bk) {
+                uint wb = (packed >> (uint(bk) * 8u)) & 0xFFu;
+                int b = xo + bk * 8;
+                accum += select(0.0f, xt[b + 0], (wb & 0x01u) != 0u);
+                accum += select(0.0f, xt[b + 1], (wb & 0x02u) != 0u);
+                accum += select(0.0f, xt[b + 2], (wb & 0x04u) != 0u);
+                accum += select(0.0f, xt[b + 3], (wb & 0x08u) != 0u);
+                accum += select(0.0f, xt[b + 4], (wb & 0x10u) != 0u);
+                accum += select(0.0f, xt[b + 5], (wb & 0x20u) != 0u);
+                accum += select(0.0f, xt[b + 6], (wb & 0x40u) != 0u);
+                accum += select(0.0f, xt[b + 7], (wb & 0x80u) != 0u);
+            }
+        }
+        float s_val = float(sc[row * NumGroups + g]);
+        float b_val = float(bi[row * NumGroups + g]);
+        result[r] += s_val * accum + b_val * sum;
+    }
+}
+
+// Tail: only exercised by tests with K < 2048 or K % 2048 != 0.
+if (aligned_end < K) {
+    int xbase = aligned_end + int(lid) * VPT;
+    bool in_bounds = xbase < K;
+    float sum = 0.0f;
+    for (int i = 0; i < VPT; ++i) {
+        float v = (in_bounds && (xbase + i) < K) ? float(x[xbase + i]) : 0.0f;
+        xt[i] = v;
+        sum += v;
+    }
+    int wcol = (aligned_end / 32) + int(lid) * WPT;
+    int g = in_bounds ? (xbase / GroupSize) : 0;
+    for (int r = 0; r < RPS; ++r) {
+        int row = out_row + r;
+        if (row >= n_param || !in_bounds) { continue; }
+        float accum = 0.0f;
+        for (int wp = 0; wp < WPT; ++wp) {
+            int widx = wcol + wp;
+            if (widx >= KPacked) { continue; }
+            uint packed = w[row * KPacked + widx];
+            int xo = wp * 32;
+            for (int bk = 0; bk < 4; ++bk) {
+                uint wb = (packed >> (uint(bk) * 8u)) & 0xFFu;
+                int b = xo + bk * 8;
+                accum += select(0.0f, xt[b + 0], (wb & 0x01u) != 0u);
+                accum += select(0.0f, xt[b + 1], (wb & 0x02u) != 0u);
+                accum += select(0.0f, xt[b + 2], (wb & 0x04u) != 0u);
+                accum += select(0.0f, xt[b + 3], (wb & 0x08u) != 0u);
+                accum += select(0.0f, xt[b + 4], (wb & 0x10u) != 0u);
+                accum += select(0.0f, xt[b + 5], (wb & 0x20u) != 0u);
+                accum += select(0.0f, xt[b + 6], (wb & 0x40u) != 0u);
+                accum += select(0.0f, xt[b + 7], (wb & 0x80u) != 0u);
+            }
+        }
+        float s_val = float(sc[row * NumGroups + g]);
+        float b_val = float(bi[row * NumGroups + g]);
+        result[r] += s_val * accum + b_val * sum;
+    }
+}
+
+for (int r = 0; r < RPS; ++r) {
+    int row = out_row + r;
+    float v = simd_sum(result[r]);
+    if (lid == 0u && row < n_param) {
+        y[row] = OutT(v);
+    }
+}
+";
+
+#[allow(unsafe_code)]
+fn create_fast_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"bi", c"x", c"n_param"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(FAST_QMV_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q1_qmv_fast".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            false, // ensure_row_contiguous
+            false, // atomic_outputs
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_fast_qmv_kernel(
+    out_dtype: mlx_sys::mlx_dtype,
+    n_rows: i32,
+    k_dim: i32,
+    group_size: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OutT".as_ptr(),
+            out_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"GroupSize".as_ptr(),
+            group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"KPacked".as_ptr(),
+            k_dim / 32,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NumGroups".as_ptr(),
+            k_dim / group_size,
+        );
+
+        // Each simdgroup computes 4 rows; nsg simdgroups per threadgroup.
+        let nsg = fast_qmv_nsg();
+        let rows_per_tg = nsg * 4;
+        let n_tgs = (n_rows + rows_per_tg - 1) / rows_per_tg;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tgs * 32, nsg, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, nsg, 1);
+
+        let y_shape = [1, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            out_dtype,
+        );
+        config
+    }
+}
+
+/// `qmv_fast`-class variant of [`bonsai_q1_qmv_legacy`]. Same inputs/outputs and
+/// bit-exact result; faster tiling. See [`bonsai_q1_qmv`] for dispatch.
+#[allow(unsafe_code)]
+pub fn bonsai_q1_qmv_fast(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    let n_rows = weight_shape
+        .first()
+        .copied()
+        .ok_or_else(|| Exception::custom("bonsai_q1_qmv_fast: weight has no rows"))?;
+    let k_packed = weight_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| Exception::custom("bonsai_q1_qmv_fast: weight has no columns"))?;
+    let k_dim = k_packed * 32;
+
+    let x_flat = x.reshape(&[k_dim])?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.flatten(None, None)?;
+    let b_flat = biases.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    let cached = FAST_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_qmv_kernel()));
+    let config = configure_fast_qmv_kernel(out_dtype, n_rows, k_dim, group_size);
+
+    let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
+    let input_ptrs = [
+        w_flat.as_ptr(),
+        s_flat.as_ptr(),
+        b_flat.as_ptr(),
+        x_flat.as_ptr(),
+        n_scalar,
+    ];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q1_qmv_fast failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        let trim_to = x_shape.len().saturating_sub(1);
+        let mut out_shape = x_shape
+            .get(..trim_to)
+            .ok_or_else(|| Exception::custom("bonsai_q1_qmv_fast: x_shape too small"))?
+            .to_vec();
+        out_shape.push(n_rows);
+        y.reshape(&out_shape)
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(n_scalar);
+    }
+    result
+}
 
 // ---------------------------------------------------------------------------
 // 1-bit dequantize to dense (embedding gather + prefill matmul path).

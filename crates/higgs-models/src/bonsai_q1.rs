@@ -1330,4 +1330,53 @@ mod tests {
             );
         }
     }
+
+    /// Oracle for the `qmv_fast`-class kernel (`bonsai_q1_qmv_fast`). Covers the
+    /// tail path (K = 256 < block) and the main-block path (K = 4096) with an
+    /// N % 4 != 0 row remainder (the lm_head case). Bit-exact vs CPU reference.
+    #[test]
+    fn qmv_fast_kernel_matches_cpu_reference() {
+        for &(out_f, in_f, seed) in &[
+            (96usize, 256usize, 0x1234_5678_u64),
+            (130usize, 4096usize, 0x0BAD_F00D_u64),
+        ] {
+            let p = make_packed(out_f, in_f, seed);
+            let gpu = BonsaiQ1GpuLinear::from_packed(&p).unwrap();
+
+            let mut st = 0xABCD_EF01_u64;
+            let x_f32: Vec<f32> = (0..in_f)
+                .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
+                .collect();
+            let x = Array::from_slice(&x_f32, &[1, in_f as i32])
+                .as_dtype(Dtype::Float16)
+                .unwrap();
+            let x_ref: Vec<f32> = x_f32.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+
+            let y = crate::metal_kernel::bonsai_q1_qmv_fast(
+                &x,
+                &gpu.w,
+                &gpu.scales,
+                &gpu.biases,
+                GROUP_SIZE_I32,
+            )
+            .unwrap();
+            y.eval().unwrap();
+            let got = y.as_slice::<f16>();
+            assert_eq!(got.len(), out_f);
+
+            let wd = dense_reference(&p);
+            for r in 0..out_f {
+                let mut acc = 0.0f32;
+                for c in 0..in_f {
+                    acc += x_ref[c] * wd[r * in_f + c];
+                }
+                let gv = got[r].to_f32();
+                let tol = 1e-2 * acc.abs().max(1.0);
+                assert!(
+                    (gv - acc).abs() <= tol,
+                    "qmv_fast mismatch ({out_f}x{in_f}) row {r}: got {gv} want {acc}"
+                );
+            }
+        }
+    }
 }
