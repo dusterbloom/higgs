@@ -1113,4 +1113,51 @@ After last."#;
         assert_eq!(calls[0].arguments, serde_json::json!({ "city": "London" }));
         assert_eq!(t.completed_count(), 1);
     }
+
+    /// Thinking-model + tool-call interaction. Qwen3.6 reasons first: in
+    /// thinking mode the chat template opens `<think>`, so generation starts
+    /// inside the think block and the tool call is emitted AFTER `</think>`.
+    /// The chat route prepends `<think>`, splits reasoning via
+    /// [`crate::reasoning_parser::parse_reasoning`], then runs
+    /// [`parse_tool_calls`] on the remainder. A parser that scanned the whole
+    /// output (or only the reasoning) would drop the call. This guards that
+    /// composition — the most common thinking+tools failure mode.
+    #[test]
+    fn xml_tool_call_after_think_block_is_extracted() {
+        // What the model generates after the template's opening `<think>`:
+        let generated = "The user wants the weather. I'll call the tool.</think>\n\
+            <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        // chat.rs composition: prepend `<think>` so the reasoning parser can
+        // find the matching `</think>` and split reasoning from visible text.
+        let reasoning = crate::reasoning_parser::parse_reasoning(&format!("<think>{generated}"));
+        assert!(
+            reasoning.reasoning.is_some(),
+            "the `<think>` block must be split off as reasoning"
+        );
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } }
+                }
+            }
+        })];
+        let schema = ToolSchema::from_tools(Some(tools.as_slice()));
+        let result = parse_tool_calls(&reasoning.text, schema.as_ref());
+
+        assert_eq!(
+            result.tool_calls.len(),
+            1,
+            "a tool call emitted after </think> must still be extracted, got {:?}",
+            result.tool_calls
+        );
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({ "city": "Paris" })
+        );
+    }
 }
