@@ -1346,6 +1346,55 @@ mod tests {
         }
     }
 
+    /// Oracle for the `qmv_fast`-class kernel (`bonsai_q1_qmv_fast`). Covers the
+    /// tail path (K = 256 < block) and the main-block path (K = 4096) with an
+    /// N % 4 != 0 row remainder (the lm_head case). Bit-exact vs CPU reference.
+    #[test]
+    fn qmv_fast_kernel_matches_cpu_reference() {
+        for &(out_f, in_f, seed) in &[
+            (96usize, 256usize, 0x1234_5678_u64),
+            (130usize, 4096usize, 0x0BAD_F00D_u64),
+        ] {
+            let p = make_packed(out_f, in_f, seed);
+            let gpu = BonsaiQ1GpuLinear::from_packed(&p).unwrap();
+
+            let mut st = 0xABCD_EF01_u64;
+            let x_f32: Vec<f32> = (0..in_f)
+                .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
+                .collect();
+            let x = Array::from_slice(&x_f32, &[1, in_f as i32])
+                .as_dtype(Dtype::Float16)
+                .unwrap();
+            let x_ref: Vec<f32> = x_f32.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+
+            let y = crate::metal_kernel::bonsai_q1_qmv_fast(
+                &x,
+                &gpu.w,
+                &gpu.scales,
+                &gpu.biases,
+                GROUP_SIZE_I32,
+            )
+            .unwrap();
+            y.eval().unwrap();
+            let got = y.as_slice::<f16>();
+            assert_eq!(got.len(), out_f);
+
+            let wd = dense_reference(&p);
+            for r in 0..out_f {
+                let mut acc = 0.0f32;
+                for c in 0..in_f {
+                    acc += x_ref[c] * wd[r * in_f + c];
+                }
+                let gv = got[r].to_f32();
+                let tol = 1e-2 * acc.abs().max(1.0);
+                assert!(
+                    (gv - acc).abs() <= tol,
+                    "qmv_fast mismatch ({out_f}x{in_f}) row {r}: got {gv} want {acc}"
+                );
+            }
+        }
+    }
+
     /// Diagnostic: per-section decode timing on a real model. Forced per-section
     /// evals inflate absolute numbers (lazy batching is killed) — the *ratios*
     /// localize where decode time goes (projections vs attention vs lm_head).
@@ -1397,6 +1446,75 @@ mod tests {
             "TOTAL {:.2} ms / {measured} steps = {:.3} ms/step (absolutes inflated by forced evals; use ratios)",
             total / 1e6,
             total / 1e6 / measured as f64
+        );
+    }
+
+    /// Sustained-decode throughput bench. Real-generation-equivalent: evals the
+    /// last-position logits every step (as token sampling would), so MLX
+    /// pipelines within a step but the inter-step data dependency is honored —
+    /// unlike `profile_decode_sections`, the absolute ms/step here is the true
+    /// decode cost. Reports ms/step and tok/s.
+    ///
+    /// `HIGGS_BONSAI_PROFILE_DIR` selects the model dir.
+    /// `HIGGS_BONSAI_DECODE_STEPS` overrides measured step count (default 128).
+    /// `HIGGS_BONSAI_QMV_KERNEL` ({default,fast}) selects the matvec kernel
+    /// variant and is echoed in the report for A/B runs.
+    #[test]
+    #[ignore = "bench: set HIGGS_BONSAI_PROFILE_DIR to a Bonsai-Q1 model dir"]
+    #[allow(
+        clippy::print_stderr,
+        clippy::expect_used,
+        clippy::cast_lossless,
+        clippy::cast_precision_loss
+    )]
+    fn bench_bonsai_q1_decode() {
+        let Ok(dir) = std::env::var("HIGGS_BONSAI_PROFILE_DIR") else {
+            eprintln!("skip: set HIGGS_BONSAI_PROFILE_DIR");
+            return;
+        };
+        let steps: usize = std::env::var("HIGGS_BONSAI_DECODE_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128);
+        let kernel = std::env::var("HIGGS_BONSAI_QMV_KERNEL").unwrap_or_else(|_| "default".into());
+
+        let gpu = load_bonsai_q1(&dir).expect("load Bonsai-Q1");
+        let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+
+        // Prefill a short prompt to populate the KV cache.
+        let prompt: Vec<i32> = (1..=16).collect();
+        let pin = Array::from_slice(&prompt, &[1, 16]);
+        gpu.forward(&pin, &mut cache)
+            .expect("prefill")
+            .eval()
+            .expect("prefill eval");
+
+        // Warmup decode steps (JIT/kernel-cache warm), discarded.
+        let mut tok = 100i32;
+        for _ in 0..4 {
+            let din = Array::from_slice(&[tok], &[1, 1]);
+            gpu.forward(&din, &mut cache)
+                .expect("warmup decode")
+                .eval()
+                .expect("warmup eval");
+            tok = (tok * 7 + 13) % 60000 + 1;
+        }
+
+        // Measured sustained decode.
+        let t0 = std::time::Instant::now();
+        for _ in 0..steps {
+            let din = Array::from_slice(&[tok], &[1, 1]);
+            gpu.forward(&din, &mut cache)
+                .expect("decode")
+                .eval()
+                .expect("decode eval");
+            tok = (tok * 7 + 13) % 60000 + 1;
+        }
+        let elapsed = t0.elapsed();
+        let ms_step = elapsed.as_secs_f64() * 1e3 / steps as f64;
+        let tps = 1e3 / ms_step;
+        eprintln!(
+            "BONSAI-Q1 DECODE [kernel={kernel}] dir={dir}\n  {steps} steps: {ms_step:.3} ms/step = {tps:.1} tok/s"
         );
     }
 }
