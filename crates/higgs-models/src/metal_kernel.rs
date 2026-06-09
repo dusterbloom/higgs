@@ -239,10 +239,10 @@ fn configure_qmv_kernel(
 }
 
 /// Original per-row 1-bit matvec: one simdgroup computes one output row, with
-/// `x` staged in threadgroup memory. Kept as the A/B baseline (selected unless
-/// `HIGGS_BONSAI_QMV_KERNEL=fast`). See [`bonsai_q1_qmv`] for the dispatcher.
+/// `x` staged in threadgroup memory. Kept as the A/B baseline (selected when
+/// `HIGGS_BONSAI_QMV_KERNEL=legacy`). See [`bonsai_q1_qmv`] for the dispatcher.
 #[allow(unsafe_code)]
-fn bonsai_q1_qmv_legacy(
+pub fn bonsai_q1_qmv_legacy(
     x: &Array,
     weight: &Array,
     scales: &Array,
@@ -357,8 +357,8 @@ fn use_fast_qmv() -> bool {
 /// `[out_features, in_features/32]` uint32 matrix; `scales`/`biases` are
 /// `[out_features, in_features/group_size]`. Output dtype matches `x`.
 ///
-/// Dispatches to the `qmv_fast`-class kernel ([`bonsai_q1_qmv_fast`]) when
-/// `HIGGS_BONSAI_QMV_KERNEL=fast`, else the original per-row kernel.
+/// Dispatches to the `qmv_fast`-class kernel ([`bonsai_q1_qmv_fast`]) by
+/// default; set `HIGGS_BONSAI_QMV_KERNEL=legacy` to force the per-row kernel.
 pub fn bonsai_q1_qmv(
     x: &Array,
     weight: &Array,

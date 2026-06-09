@@ -410,12 +410,19 @@ impl BonsaiQ1GpuLinear {
     /// over the M rows). Both run on stock `oxideai/mlx-rs` via
     /// [`crate::metal_kernel`] — no `bits=1` MLX kernel required.
     pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        let total: i32 = x.shape().iter().product();
-        let m = if self.in_features > 0 {
-            total / self.in_features
-        } else {
-            0
-        };
+        // `m` is derived from the element count, so a shape whose trailing dim
+        // isn't `in_features` would be silently treated as a decode row of the
+        // wrong size. Reject it loudly instead.
+        let shape = x.shape();
+        let last_dim = shape.last().copied().unwrap_or(0);
+        if self.in_features <= 0 || last_dim != self.in_features {
+            return Err(Exception::custom(format!(
+                "BonsaiQ1GpuLinear::forward: expected last dim {}, got shape {shape:?}",
+                self.in_features
+            )));
+        }
+        let total: i32 = shape.iter().product();
+        let m = total / self.in_features;
         if m == 1 {
             crate::metal_kernel::bonsai_q1_qmv(
                 x,
@@ -1228,7 +1235,7 @@ fn bytes_to_f16_vec(b: &[u8]) -> Vec<f16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metal_kernel::{bonsai_q1_dequant, bonsai_q1_qmv};
+    use crate::metal_kernel::{bonsai_q1_dequant, bonsai_q1_qmv_legacy};
 
     /// Deterministic PRNG (SplitMix-ish LCG). Tests prove the kernels match the
     /// CPU reference over pseudo-random data, not against hand-picked constants.
@@ -1311,7 +1318,7 @@ mod tests {
             .unwrap();
         let x_ref: Vec<f32> = x_f32.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
 
-        let y = bonsai_q1_qmv(&x, &gpu.w, &gpu.scales, &gpu.biases, GROUP_SIZE_I32).unwrap();
+        let y = bonsai_q1_qmv_legacy(&x, &gpu.w, &gpu.scales, &gpu.biases, GROUP_SIZE_I32).unwrap();
         y.eval().unwrap();
         let got = y.as_slice::<f16>();
         assert_eq!(got.len(), out_f);
