@@ -428,6 +428,26 @@ impl SteppingKeyValueCache {
         self.offset = self.offset.saturating_sub(trim).max(0);
     }
 
+    /// An **independent** deep copy: every MLX buffer is materialized into a
+    /// fresh buffer (`Array::deep_clone`), so the result shares no storage with
+    /// `self`. The derived `Clone` only bumps MLX refcounts (shared buffers),
+    /// which is unsafe as a speculative-decode rollback checkpoint: the live
+    /// cache's in-place `slice_update` lets MLX donate (reuse/free) a buffer the
+    /// checkpoint still references, double-freeing it (the MTP `malloc: pointer
+    /// being freed was not allocated` abort). Use this for any checkpoint that
+    /// will outlive an in-place update of the live cache.
+    #[must_use]
+    pub fn deep_clone(&self) -> Self {
+        Self {
+            keys: self.keys.as_ref().map(eval_deep_clone),
+            values: self.values.as_ref().map(eval_deep_clone),
+            turbo: self.turbo.as_ref().map(TurboQuantStorage::deep_clone),
+            config: self.config,
+            offset: self.offset,
+            step: self.step,
+        }
+    }
+
     /// References to internal arrays that must be eval'd between chunked-prefill steps.
     pub fn eval_targets(&self) -> Vec<&Array> {
         let mut targets = Vec::with_capacity(8);
@@ -783,6 +803,22 @@ impl TurboQuantStorage {
         }
     }
 
+    /// Independent deep copy (see [`SteppingKeyValueCache::deep_clone`]). The
+    /// shared read-only `context` is refcounted (safe to share); every packed
+    /// array is materialized into its own buffer so an in-place update of the
+    /// live cache cannot donate/free a buffer this snapshot holds.
+    fn deep_clone(&self) -> Self {
+        Self {
+            context: Arc::clone(&self.context),
+            key_codes: self.key_codes.as_ref().map(eval_deep_clone),
+            key_norms: self.key_norms.as_ref().map(eval_deep_clone),
+            key_gammas: self.key_gammas.as_ref().map(eval_deep_clone),
+            value_codes: self.value_codes.as_ref().map(eval_deep_clone),
+            value_norms: self.value_norms.as_ref().map(eval_deep_clone),
+            capacity: self.capacity,
+        }
+    }
+
     fn ensure_capacity(&mut self, required: i32, step: i32) -> Result<(), Exception> {
         if required <= self.capacity {
             return Ok(());
@@ -1018,6 +1054,25 @@ pub fn slice_axis2(arr: &Array, start: i32, end: i32) -> Result<Array, Exception
 /// Used for TQ arrays with shape `[H, capacity, ...]`.
 pub fn slice_axis1(arr: &Array, start: i32, end: i32) -> Result<Array, Exception> {
     slice_axis(arr, 1, start, end)
+}
+
+/// Evaluate, then independently deep-copy an MLX array.
+///
+/// `Array::deep_clone` copies bytes straight from the buffer pointer
+/// (`mlx_array_data_*`), which is only valid once the array is evaluated. The
+/// cache stores *lazy* `slice_update` results (see `update_dense`), so cloning a
+/// checkpoint without forcing evaluation first reads an unmaterialized pointer
+/// and segfaults. Eval makes the snapshot both valid and buffer-independent of
+/// the live cache (no shared buffer for a later in-place update to donate/free).
+//
+// `expect`: a failed `eval` on a live cache array leaves nothing safe to copy —
+// a loud panic here is strictly better than the segfault a lazy `deep_clone`
+// would cause, and the infallible signature keeps every checkpoint call site
+// (`AnyCache::deep_clone`, `deep_clone_mtp_cache`, the MTP cycle) clone-and-go.
+#[allow(clippy::expect_used)]
+fn eval_deep_clone(a: &Array) -> Array {
+    a.eval().expect("eval before deep_clone checkpoint");
+    a.deep_clone()
 }
 
 /// Write `update` into `target` at `[..., start:start+n, ...]` on axis 2.
@@ -1335,6 +1390,73 @@ mod tests {
         assert!((k_data[0] - 1.0).abs() < 1e-6);
         assert!((k_data[4] - 1.0).abs() < 1e-6);
         assert!((k_data[8] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deep_clone_preserves_contents_and_offset() {
+        // deep_clone must be a faithful, independent copy.
+        let mut cache = SteppingKeyValueCache::new();
+        let ones_k = Array::ones::<f32>(&[1, 2, 2, 8]).unwrap();
+        let ones_v = Array::ones::<f32>(&[1, 2, 2, 8]).unwrap();
+        cache.update_and_fetch(ones_k, ones_v).unwrap();
+
+        let copy = cache.deep_clone();
+        assert_eq!(copy.offset(), cache.offset());
+
+        let orig_k: Vec<f32> = {
+            let k = cache.keys.as_ref().unwrap();
+            k.eval().unwrap();
+            k.as_slice().to_vec()
+        };
+        let copy_k: Vec<f32> = {
+            let k = copy.keys.as_ref().unwrap();
+            k.eval().unwrap();
+            k.as_slice().to_vec()
+        };
+        assert_eq!(orig_k, copy_k, "deep_clone must copy contents faithfully");
+    }
+
+    #[test]
+    fn deep_clone_checkpoint_survives_live_in_place_update() {
+        // The speculative-decode invariant: a checkpoint captured before the
+        // live cache is advanced must NOT change when the live cache does an
+        // in-place `slice_update`. A shallow `clone()` shares the KV buffer, so
+        // MLX can donate/free it under the checkpoint (the double-free abort);
+        // `deep_clone()` is independent.
+        let mut cache = SteppingKeyValueCache::new();
+        let ones_k = Array::ones::<f32>(&[1, 2, 2, 8]).unwrap();
+        let ones_v = Array::ones::<f32>(&[1, 2, 2, 8]).unwrap();
+        cache.update_and_fetch(ones_k, ones_v).unwrap();
+
+        let checkpoint = cache.deep_clone();
+        let before: Vec<f32> = {
+            let k = checkpoint.keys.as_ref().unwrap();
+            k.eval().unwrap();
+            k.as_slice().to_vec()
+        };
+
+        // Advance the LIVE cache in place with a token of value 2.0; force eval
+        // so any buffer donation would fire.
+        let two = Array::from_f32(2.0);
+        let twos_k = Array::full::<f32>(&[1, 2, 1, 8], &two).unwrap();
+        let twos_v = Array::full::<f32>(&[1, 2, 1, 8], &two).unwrap();
+        let (rk, _) = cache.update_and_fetch(twos_k, twos_v).unwrap();
+        rk.eval().unwrap();
+
+        assert_eq!(
+            checkpoint.offset(),
+            2,
+            "checkpoint offset must be unchanged"
+        );
+        let after: Vec<f32> = {
+            let k = checkpoint.keys.as_ref().unwrap();
+            k.eval().unwrap();
+            k.as_slice().to_vec()
+        };
+        assert_eq!(
+            before, after,
+            "deep_clone checkpoint must survive the live cache's in-place update"
+        );
     }
 
     #[test]
