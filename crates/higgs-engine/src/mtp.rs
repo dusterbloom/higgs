@@ -6,7 +6,7 @@
 //!
 //! Expected speedup: ~1.5x on dense models at ~80% acceptance rate.
 
-use higgs_models::{AnyCache, AnyModel, MtpCache};
+use higgs_models::{AnyCache, AnyModel, MtpCache, deep_clone_mtp_cache};
 use mlx_rs::{
     Array, argmax_axis,
     ops::{self, concatenate_axis, indexing::IndexOp},
@@ -17,6 +17,35 @@ use crate::error::EngineError;
 
 const fn draft_matches_target(draft_token_id: u32, target_id: u32) -> bool {
     draft_token_id == target_id
+}
+
+/// Capture a backbone-cache rollback point before a speculative verify.
+///
+/// KV caches are rolled back by *trimming the offset* (see [`rollback_backbone`]),
+/// so we deliberately return `None` and never clone them. Cloning a KV cache and
+/// later restoring it (`*cache = base`) makes the checkpoint share the live
+/// cache's underlying MLX buffers; the in-place `slice_update` writes during
+/// verify then let MLX donate a buffer that the checkpoint still references,
+/// corrupting it and double-freeing on drop (the `malloc: pointer being freed
+/// was not allocated` abort). Hybrid SSM/recurrent state cannot be offset-
+/// trimmed, so those still need a full clone-restore.
+fn capture_backbone_checkpoint(cache: &AnyCache) -> Option<AnyCache> {
+    match cache {
+        AnyCache::KV(_) => None,
+        AnyCache::Hybrid(_) => Some(cache.deep_clone()),
+    }
+}
+
+/// Roll the backbone cache back after a rejected speculative verify.
+///
+/// `verify_len` is the number of tokens the verify batch advanced the cache by.
+/// KV caches rewind by `trim_by(verify_len)` (no clone, no buffer aliasing);
+/// hybrid caches restore the clone captured by [`capture_backbone_checkpoint`].
+fn rollback_backbone(cache: &mut AnyCache, checkpoint: Option<AnyCache>, verify_len: usize) {
+    match checkpoint {
+        Some(base) => *cache = base,
+        None => cache.trim_by(verify_len),
+    }
 }
 
 /// Aggregate MTP decode counters.
@@ -191,8 +220,8 @@ pub fn mtp_prompt_lookup_cycle(
         return Ok(None);
     }
 
-    let base_cache = cache.clone();
-    let base_mtp_cache = mtp_cache.clone();
+    let base_cache = capture_backbone_checkpoint(cache);
+    let base_mtp_cache = deep_clone_mtp_cache(mtp_cache);
     let mut verify_tokens = Vec::with_capacity(drafts.len().saturating_add(1));
     verify_tokens.push(confirmed_token_id);
     verify_tokens.extend(drafts.iter().copied());
@@ -218,7 +247,7 @@ pub fn mtp_prompt_lookup_cycle(
         })?;
         (verify_hidden, next)
     } else {
-        *cache = base_cache;
+        rollback_backbone(cache, base_cache, verify_tokens.len());
         let (replay_hidden, replay_targets) = backbone_verify_batch(model, cache, &tokens)?;
         let next = *replay_targets.get(accepted_drafts).ok_or_else(|| {
             EngineError::Generation(format!(
@@ -351,7 +380,7 @@ pub fn prompt_lookup_cycle(
         config.max_window,
     );
 
-    let base_cache = cache.clone();
+    let base_cache = capture_backbone_checkpoint(cache);
     let mut verify_tokens = Vec::with_capacity(drafts.len().saturating_add(1));
     verify_tokens.push(confirmed_token_id);
     verify_tokens.extend(drafts.iter().copied());
@@ -378,7 +407,7 @@ pub fn prompt_lookup_cycle(
             ))
         })?
     } else {
-        *cache = base_cache;
+        rollback_backbone(cache, base_cache, verify_tokens.len());
         let replay_logits = model
             .forward_all_logits(&token_input(&tokens)?, None, cache)
             .map_err(EngineError::Mlx)?;
@@ -617,9 +646,9 @@ pub fn mtp_cycle(
     draft_n_max: usize,
 ) -> Result<MtpCycleResult, EngineError> {
     let draft_limit = draft_n_max.max(1);
-    let base_cache = cache.clone();
-    let base_mtp_cache = mtp_cache.clone();
-    let mut speculative_mtp_cache = mtp_cache.clone();
+    let base_cache = capture_backbone_checkpoint(cache);
+    let base_mtp_cache = deep_clone_mtp_cache(mtp_cache);
+    let mut speculative_mtp_cache = deep_clone_mtp_cache(mtp_cache);
     let mut confirmed_mtp_cache: Option<MtpCache> = None;
     let mut speculative_hidden = hidden.clone();
     let mut speculative_token = confirmed_token_id;
@@ -638,7 +667,7 @@ pub fn mtp_cycle(
         speculative_hidden = next_hidden;
         speculative_token = draft_token_id;
         if draft_idx == 0 {
-            confirmed_mtp_cache = Some(speculative_mtp_cache.clone());
+            confirmed_mtp_cache = Some(deep_clone_mtp_cache(&speculative_mtp_cache));
         }
     }
 
@@ -678,7 +707,7 @@ pub fn mtp_cycle(
         })?;
         (verify_hidden, next)
     } else {
-        *cache = base_cache;
+        rollback_backbone(cache, base_cache, verify_tokens.len());
         let (replay_hidden, replay_targets) = backbone_verify_batch(model, cache, &tokens)?;
         let next = *replay_targets.get(accepted_drafts).ok_or_else(|| {
             EngineError::Generation(format!(
