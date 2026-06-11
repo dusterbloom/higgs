@@ -352,6 +352,23 @@ mod tests {
     }
 
     #[test]
+    fn chat_prompt_progress_chunk_is_valid_json_with_expected_shape() {
+        let id = "chatcmpl-p";
+        let model = "m";
+        let mut w = ChatChunkWriter::new(id, 11, model);
+        let got = w.write_prompt_progress(100, 30, 64, 250).to_owned();
+
+        // The buffer is concatenated by hand, so the failure mode is malformed
+        // JSON — assert it parses, then pin the exact llama.cpp-compatible wire
+        // shape (`choices: []` + a `prompt_progress` block).
+        serde_json::from_str::<serde_json::Value>(&got).unwrap();
+        let expected = format!(
+            r#"{{"id":"{id}","object":"chat.completion.chunk","created":11,"model":"{model}","choices":[],"prompt_progress":{{"total":100,"cache":30,"processed":64,"time_ms":250}}}}"#
+        );
+        assert_eq!(got, expected);
+    }
+
+    #[test]
     fn completion_chunk_matches_serde() {
         let id = "cmpl-1";
         let model = "m";

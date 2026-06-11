@@ -3806,7 +3806,12 @@ impl Qwen3NextCausalLM {
         // Last chunk: use forward_last_token which efficiently projects only
         // the last position through the LM head.
         let last_chunk = inputs.index((.., offset..));
-        self.forward_last_token(&last_chunk, None, kv_cache)
+        let logits = self.forward_last_token(&last_chunk, None, kv_cache)?;
+        // The loop only reports up to the final chunk boundary; emit the
+        // terminal 100% mark once the last chunk is processed so clients don't
+        // stall just short of `total`.
+        crate::progress::report_prefill_progress(T, T);
+        Ok(logits)
     }
 
     // -----------------------------------------------------------------------

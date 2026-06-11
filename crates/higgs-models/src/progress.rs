@@ -28,9 +28,18 @@ impl Drop for PrefillSinkGuard {
 
 /// Install a prefill-progress sink for the current thread.
 ///
-/// The sink receives `(processed, total)` in suffix-relative tokens after
-/// each completed prefill chunk. Hold the returned guard for the duration of
-/// the prefill; dropping it uninstalls the sink.
+/// The sink receives `(processed, total)` after each completed prefill chunk.
+/// `processed` is the cumulative number of tokens forwarded so far in *this*
+/// prefill — i.e. relative to the suffix that survived prefix-cache reuse, not
+/// a per-chunk delta and not an absolute prompt offset. Callers that want an
+/// absolute prompt position add the cached-prefix length themselves. Hold the
+/// returned guard for the duration of the prefill; dropping it uninstalls the
+/// sink.
+///
+/// The sink must not re-enter the progress machinery: calling
+/// [`report_prefill_progress`] or installing another sink from inside the sink
+/// callback panics, because the thread-local is `borrow_mut`-held while the
+/// sink runs.
 pub fn install_prefill_progress_sink(sink: Sink) -> PrefillSinkGuard {
     PREFILL_SINK.with(|s| *s.borrow_mut() = Some(sink));
     PrefillSinkGuard
@@ -39,6 +48,9 @@ pub fn install_prefill_progress_sink(sink: Sink) -> PrefillSinkGuard {
 /// Report chunked-prefill progress: `processed` of `total` tokens done.
 /// No-op when no sink is installed (the common path: one `thread_local`
 /// lookup + `Option` check per ~1024-token chunk).
+///
+/// The sink is invoked while the thread-local is `borrow_mut`-held, so the
+/// sink must not call back into this function or reinstall the sink.
 pub(crate) fn report_prefill_progress(processed: i32, total: i32) {
     PREFILL_SINK.with(|s| {
         if let Some(f) = s.borrow_mut().as_mut() {
