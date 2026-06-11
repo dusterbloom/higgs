@@ -27,6 +27,7 @@ use crate::{
     error::EngineError,
     model_loader,
     prompt_cache::PrefixCache,
+    simple::{IncrementalDetok, find_stop_in_tail},
 };
 
 /// Default maximum number of cached prefixes.
@@ -63,7 +64,7 @@ struct ActiveRequest {
     constraint: Option<crate::constrained::ConstrainedGenerator>,
     response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
     prompt_len: u32,
-    prev_decoded_len: usize,
+    detok: IncrementalDetok,
 }
 
 // ---------------------------------------------------------------------------
@@ -746,7 +747,7 @@ fn prefill_request(
         }
 
         // Send first token
-        let prev_decoded_len = first_text.len();
+        let detok = IncrementalDetok::new(first_text.clone(), 1);
         if req
             .response_tx
             .blocking_send(StreamingOutput {
@@ -773,7 +774,7 @@ fn prefill_request(
             constraint: req.constraint,
             response_tx: req.response_tx,
             prompt_len,
-            prev_decoded_len,
+            detok,
         }))
     })
 }
@@ -852,23 +853,21 @@ fn materialize_decode_step(
 
     let completion_len: u32 = ar.generated_tokens.len().try_into().unwrap_or(u32::MAX);
 
-    // Decode full text for diff and stop sequence checking
-    let full_text = tokenizer
-        .decode(&ar.generated_tokens, true)
+    // Decode only the trailing token window for diff and stop checking
+    let new_text = ar
+        .detok
+        .append(tokenizer, &ar.generated_tokens)
         .unwrap_or_default();
-    let new_text = full_text
-        .get(ar.prev_decoded_len..)
-        .unwrap_or_default()
-        .to_owned();
-    let old_decoded_len = ar.prev_decoded_len;
-    ar.prev_decoded_len = full_text.len();
+    let emitted_before = ar.detok.text.len() - new_text.len();
 
-    let (final_new_text, hit_stop) = if ar.stop_sequences.is_empty() {
+    let (mut final_new_text, hit_stop) = if ar.stop_sequences.is_empty() {
         (new_text, false)
-    } else if check_stop_sequences_simple(&full_text, &ar.stop_sequences) {
-        let truncated = truncate_at_stop(&full_text, &ar.stop_sequences);
-        let emit = truncated
-            .get(old_decoded_len..)
+    } else if let Some(pos) = find_stop_in_tail(&ar.detok.text, new_text.len(), &ar.stop_sequences)
+    {
+        let emit = ar
+            .detok
+            .text
+            .get(emitted_before..pos)
             .unwrap_or_default()
             .to_owned();
         (emit, true)
@@ -884,6 +883,13 @@ fn materialize_decode_step(
         .is_some_and(crate::constrained::ConstrainedGenerator::is_finished);
 
     let finished = is_eos || at_max || hit_stop || constraint_done;
+    if finished && !hit_stop {
+        final_new_text.push_str(
+            &ar.detok
+                .flush(tokenizer, &ar.generated_tokens)
+                .unwrap_or_default(),
+        );
+    }
     let finish_reason = if is_eos || hit_stop || constraint_done {
         Some("stop".to_owned())
     } else if at_max {
@@ -910,20 +916,6 @@ fn materialize_decode_step(
 /// Check if any stop sequence appears in the text.
 fn check_stop_sequences_simple(text: &str, stop_sequences: &[String]) -> bool {
     stop_sequences.iter().any(|seq| text.contains(seq.as_str()))
-}
-
-/// Truncate text at the earliest stop sequence.
-fn truncate_at_stop(text: &str, stop_sequences: &[String]) -> String {
-    let mut earliest: Option<usize> = None;
-    for seq in stop_sequences {
-        if let Some(pos) = text.find(seq.as_str()) {
-            earliest = Some(earliest.map_or(pos, |prev| prev.min(pos)));
-        }
-    }
-    earliest.map_or_else(
-        || text.to_owned(),
-        |pos| text.get(..pos).unwrap_or_default().to_owned(),
-    )
 }
 
 #[cfg(test)]
@@ -965,39 +957,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // truncate_at_stop
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn truncate_no_stop_returns_full_text() {
-        let stops = vec!["</s>".to_owned()];
-        assert_eq!(truncate_at_stop("hello world", &stops), "hello world");
-    }
-
-    #[test]
-    fn truncate_at_stop_removes_suffix() {
-        let stops = vec!["</s>".to_owned()];
-        assert_eq!(truncate_at_stop("hello</s>", &stops), "hello");
-    }
-
-    #[test]
-    fn truncate_at_earliest_of_multiple_stops() {
-        let stops = vec!["BBB".to_owned(), "AAA".to_owned()];
-        assert_eq!(truncate_at_stop("xAAAyBBBz", &stops), "x");
-    }
-
-    #[test]
-    fn truncate_empty_stops() {
-        assert_eq!(truncate_at_stop("hello", &[]), "hello");
-    }
-
-    #[test]
-    fn truncate_stop_at_start() {
-        let stops = vec!["STOP".to_owned()];
-        assert_eq!(truncate_at_stop("STOPrest", &stops), "");
-    }
-
-    // -----------------------------------------------------------------------
     // materialize_decode_step
     // -----------------------------------------------------------------------
 
@@ -1017,7 +976,7 @@ mod tests {
             constraint: None,
             response_tx: tx,
             prompt_len: 5,
-            prev_decoded_len: 0,
+            detok: IncrementalDetok::new(String::new(), 0),
         };
         (ar, rx)
     }
