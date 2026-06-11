@@ -70,7 +70,7 @@ async fn metrics_endpoint_returns_snapshot_json() {
         error_body: None,
     });
 
-    let app = build_router(build_test_state(Some(metrics)), 300.0, None, 0, 1024);
+    let app = build_router(build_test_state(Some(metrics)), 300.0, None, 0, 1024, None);
     let response = app
         .oneshot(
             Request::builder()
@@ -93,7 +93,7 @@ async fn metrics_endpoint_returns_snapshot_json() {
 
 #[tokio::test]
 async fn request_body_limit_is_enforced() {
-    let app = build_router(build_test_state(None), 300.0, None, 0, 64);
+    let app = build_router(build_test_state(None), 300.0, None, 0, 64, None);
     let body = serde_json::json!({
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "x".repeat(512)}]

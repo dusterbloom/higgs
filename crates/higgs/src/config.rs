@@ -273,6 +273,9 @@ pub struct ServerSection {
     pub timeout: f64,
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
+    /// CORS allow-list of origins. Unset = no CORS headers are sent;
+    /// `["*"]` allows any origin (permissive).
+    pub cors_origins: Option<Vec<String>>,
 }
 
 impl Default for ServerSection {
@@ -285,12 +288,13 @@ impl Default for ServerSection {
             rate_limit: 0,
             timeout: default_timeout(),
             max_body_size: default_max_body_size(),
+            cors_origins: None,
         }
     }
 }
 
 fn default_host() -> String {
-    "0.0.0.0".to_owned()
+    "127.0.0.1".to_owned()
 }
 
 const fn default_port() -> u16 {
@@ -957,6 +961,24 @@ pub fn default_config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// Write a file with owner-only permissions (0o600 on Unix). Used for config
+/// files (which may contain provider API keys) and other daemon-private
+/// files. The mode is applied at creation; existing files keep their
+/// permissions (doctor warns about loose ones).
+pub fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
 /// Validates that a profile name is safe for use in file paths.
 pub fn validate_profile_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
@@ -1057,7 +1079,7 @@ mod tests {
         assert!(config.models.is_empty());
         assert!(config.providers.is_empty());
         assert!(config.routes.is_empty());
-        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 8000);
         assert_eq!(config.server.max_tokens, 32768);
         assert!((config.server.timeout - 300.0).abs() < f64::EPSILON);
@@ -1069,6 +1091,19 @@ mod tests {
             RequestedMlxProfile::Auto
         );
         assert_eq!(config.default.provider, "higgs");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_write_private_file_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("higgs-cfg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        write_private_file(&path, "[server]\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

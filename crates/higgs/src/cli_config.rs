@@ -71,7 +71,7 @@ pub fn config_set(config_path: &Path, key: &str, value: &str) {
             std::process::exit(1);
         });
     }
-    fs::write(config_path, &rendered).unwrap_or_else(|e| {
+    config::write_private_file(config_path, &rendered).unwrap_or_else(|e| {
         eprintln!("failed to write {}: {e}", config_path.display());
         std::process::exit(1);
     });

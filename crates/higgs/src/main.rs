@@ -70,22 +70,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Doctor(ref args) => {
             init_tracing(cli.verbose);
-            let config = if let Some(ref path) = cli.config {
-                config::load_config_file(path, Some(args))?
+            let (config, config_path) = if let Some(ref path) = cli.config {
+                (
+                    config::load_config_file(path, Some(args))?,
+                    Some(path.clone()),
+                )
             } else if cli.profile.is_some() {
                 let path = resolve_config_path(&cli)?;
-                config::load_config_file(&path, Some(args))?
+                let config = config::load_config_file(&path, Some(args))?;
+                (config, Some(path))
             } else {
                 let default = config::default_config_path();
                 if default.exists() {
-                    config::load_config_file(&default, Some(args))?
+                    let config = config::load_config_file(&default, Some(args))?;
+                    (config, Some(default))
                 } else if !args.models.is_empty() {
-                    config::build_simple_config(args)?
+                    (config::build_simple_config(args)?, None)
                 } else {
                     return Err("no config to validate; use --config or 'higgs init'".into());
                 }
             };
-            let result = higgs::doctor::run_doctor(&config).await;
+            let result = higgs::doctor::run_doctor(&config, config_path.as_deref()).await;
             if result.failures > 0 {
                 std::process::exit(1);
             }
@@ -196,6 +201,7 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     let api_key = higgs_config.server.api_key.clone();
     let rate_limit = higgs_config.server.rate_limit;
     let max_body_size = higgs_config.server.max_body_size;
+    let cors_origins = higgs_config.server.cors_origins.clone();
     let bind_addr = format!("{}:{}", higgs_config.server.host, higgs_config.server.port);
 
     // Create metrics (config mode only)
@@ -223,6 +229,7 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         api_key,
         rate_limit,
         max_body_size,
+        cors_origins,
     );
 
     // Start server
