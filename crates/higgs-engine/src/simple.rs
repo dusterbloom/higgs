@@ -2237,11 +2237,10 @@ impl SimpleEngine {
         // the first ~1024-token chunk completes.
         let _ = sender.try_send(make_progress_output(0));
         let progress_sender = sender.clone();
-        let sink_guard = higgs_models::progress::install_prefill_progress_sink(Box::new(
-            move |done, _total| {
+        let sink_guard =
+            higgs_models::progress::install_prefill_progress_sink(Box::new(move |done, _total| {
                 let _ = progress_sender.try_send(make_progress_output(done.max(0) as u32));
-            },
-        ));
+            }));
 
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
             prompt_tokens,
