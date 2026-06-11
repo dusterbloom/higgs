@@ -2214,19 +2214,31 @@ impl SimpleEngine {
         }
         all_tokens.push(first_token_id);
 
-        let first_decoded = self.decode_tokens(&all_tokens)?;
-        let (first_text, first_hit_stop) = if stop_sequences.is_empty() {
-            (first_decoded.clone(), false)
+        let mut detok = IncrementalDetok::new(String::new(), 0);
+        let new_text = detok.append(&self.tokenizer, &all_tokens)?;
+        let emitted_before = detok.text.len() - new_text.len();
+        let (mut first_text, first_hit_stop) = if stop_sequences.is_empty() {
+            (new_text, false)
         } else {
-            check_stop_sequences(&first_decoded, stop_sequences).map_or_else(
-                || (first_decoded.clone(), false),
-                |truncated| (truncated, true),
+            find_stop_in_tail(&detok.text, new_text.len(), stop_sequences).map_or(
+                (new_text, false),
+                |pos| {
+                    let emit = detok
+                        .text
+                        .get(emitted_before..pos)
+                        .unwrap_or_default()
+                        .to_owned();
+                    (emit, true)
+                },
             )
         };
-        let mut detok = IncrementalDetok::new(first_decoded, all_tokens.len());
 
         let first_is_eos = self.eos_token_ids.contains(&first_token_id);
         let finished = first_is_eos || first_hit_stop || 1 >= max_tokens;
+
+        if finished && !first_hit_stop {
+            first_text.push_str(&detok.flush(&self.tokenizer, &all_tokens)?);
+        }
 
         let first_logprob = first_logprob_data
             .as_ref()
@@ -3041,7 +3053,7 @@ mod tests {
             },
             "model": {
                 "type": "WordLevel",
-                "vocab": {"Hello": 0, "Ġworld": 1, "!": 2},
+                "vocab": {"Hello": 0, "Ġworld": 1, "!": 2, "ðŁĺ": 3, "Ģ": 4},
                 "unk_token": "Hello"
             }
         }"#;
@@ -3075,5 +3087,59 @@ mod tests {
         tokens.push(1);
         detok.append(&tokenizer, &tokens).unwrap();
         assert_eq!(detok.flush(&tokenizer, &tokens).unwrap(), "");
+    }
+
+    /// Tokens 3 and 4 are the byte-level pieces of 😀 (U+1F600).
+    /// Appending only token 3 must hold back the incomplete UTF-8 sequence
+    /// (return ""), and appending both tokens must emit the full emoji.
+    #[test]
+    fn incremental_detok_first_token_partial_utf8_held_back() {
+        let tokenizer = word_tokenizer();
+        let mut detok = IncrementalDetok::new(String::new(), 0);
+
+        // First partial piece: held back, no replacement char emitted
+        let held = detok.append(&tokenizer, &[3]).unwrap();
+        assert_eq!(held, "", "partial UTF-8 token must be held back");
+
+        // Completing the sequence emits the full emoji
+        let emitted = detok.append(&tokenizer, &[3, 4]).unwrap();
+        assert_eq!(emitted, "😀", "completing UTF-8 should emit the emoji");
+
+        let full = tokenizer.decode(&[3u32, 4], true).unwrap();
+        assert_eq!(detok.text, full, "detok.text must equal full decode");
+    }
+
+    /// flush() must emit any bytes held back by append(), and a second flush
+    /// on the same (now-fully-drained) detok must return "".
+    #[test]
+    fn incremental_detok_flush_emits_pending() {
+        let tokenizer = word_tokenizer();
+        let mut detok = IncrementalDetok::new(String::new(), 0);
+
+        // Partial piece held back
+        let held = detok.append(&tokenizer, &[3]).unwrap();
+        assert_eq!(held, "", "partial UTF-8 must be held back before flush");
+
+        // flush must emit something (a replacement char is acceptable here)
+        let flushed = detok.flush(&tokenizer, &[3]).unwrap();
+        assert!(!flushed.is_empty(), "flush must emit held-back text");
+
+        // A second flush on an already-drained detok returns ""
+        let flushed2 = detok.flush(&tokenizer, &[3]).unwrap();
+        assert_eq!(flushed2, "", "second flush must return empty string");
+    }
+
+    /// find_stop_in_tail must identify a stop whose prefix was already emitted,
+    /// returning the byte position that lets the caller emit the prefix ("hi")
+    /// before the stop ("STOP") in the same new-text window.
+    #[test]
+    fn find_stop_in_tail_first_token_prefix_and_stop() {
+        let stops = vec!["STOP".to_owned()];
+        // "hiSTOP": all 6 bytes are new, stop starts at byte 2
+        assert_eq!(
+            find_stop_in_tail("hiSTOP", 6, &stops),
+            Some(2),
+            "stop at pos 2 so 'hi' can be emitted as prefix"
+        );
     }
 }

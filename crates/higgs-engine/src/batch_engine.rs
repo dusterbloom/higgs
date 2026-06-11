@@ -723,20 +723,40 @@ fn prefill_request(
             .as_ref()
             .map(|lp| lp.materialize(first_token_id));
 
-        // Decode the first token for text diff tracking
-        let first_text = tokenizer
-            .decode(&[first_token_id], true)
+        // Decode the first token incrementally (routes through IncrementalDetok
+        // so partial UTF-8 is held back and prefix-before-stop is correctly emitted).
+        let mut detok = IncrementalDetok::new(String::new(), 0);
+        let first_chunk = detok
+            .append(tokenizer, &[first_token_id])
             .unwrap_or_default();
+        let emitted_before = detok.text.len() - first_chunk.len();
 
         // Check if we're done after the first token
         let is_eos = eos_token_ids.contains(&first_token_id);
-        let hit_stop = check_stop_sequences_simple(&first_text, &req.stop_sequences);
+        let hit_stop = !req.stop_sequences.is_empty()
+            && find_stop_in_tail(&detok.text, first_chunk.len(), &req.stop_sequences).is_some();
         let at_max = req.max_tokens <= 1;
 
         if is_eos || hit_stop || at_max {
             let finish_reason = if is_eos || hit_stop { "stop" } else { "length" };
+            let mut send_text = if hit_stop {
+                // Emit any prefix text before the stop sequence
+                find_stop_in_tail(&detok.text, first_chunk.len(), &req.stop_sequences)
+                    .and_then(|pos| detok.text.get(emitted_before..pos))
+                    .unwrap_or_default()
+                    .to_owned()
+            } else {
+                first_chunk
+            };
+            if !hit_stop {
+                send_text.push_str(
+                    &detok
+                        .flush(tokenizer, &[first_token_id])
+                        .unwrap_or_default(),
+                );
+            }
             let _ = req.response_tx.blocking_send(StreamingOutput {
-                new_text: if hit_stop { String::new() } else { first_text },
+                new_text: send_text,
                 finished: true,
                 finish_reason: Some(finish_reason.to_owned()),
                 prompt_tokens: prompt_len,
@@ -747,11 +767,10 @@ fn prefill_request(
         }
 
         // Send first token
-        let detok = IncrementalDetok::new(first_text.clone(), 1);
         if req
             .response_tx
             .blocking_send(StreamingOutput {
-                new_text: first_text,
+                new_text: first_chunk,
                 finished: false,
                 finish_reason: None,
                 prompt_tokens: prompt_len,
@@ -913,48 +932,10 @@ fn materialize_decode_step(
     finished || disconnected
 }
 
-/// Check if any stop sequence appears in the text.
-fn check_stop_sequences_simple(text: &str, stop_sequences: &[String]) -> bool {
-    stop_sequences.iter().any(|seq| text.contains(seq.as_str()))
-}
-
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // check_stop_sequences_simple
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn stop_sequences_empty_never_matches() {
-        assert!(!check_stop_sequences_simple("hello world", &[]));
-    }
-
-    #[test]
-    fn stop_sequences_match_at_end() {
-        let stops = vec!["</s>".to_owned()];
-        assert!(check_stop_sequences_simple("some text</s>", &stops));
-    }
-
-    #[test]
-    fn stop_sequences_match_in_middle() {
-        let stops = vec!["STOP".to_owned()];
-        assert!(check_stop_sequences_simple("before STOP after", &stops));
-    }
-
-    #[test]
-    fn stop_sequences_no_match() {
-        let stops = vec!["</s>".to_owned(), "<|end|>".to_owned()];
-        assert!(!check_stop_sequences_simple("normal text", &stops));
-    }
-
-    #[test]
-    fn stop_sequences_multiple_one_matches() {
-        let stops = vec!["</s>".to_owned(), "\n\n".to_owned()];
-        assert!(check_stop_sequences_simple("text\n\nmore", &stops));
-    }
 
     // -----------------------------------------------------------------------
     // materialize_decode_step

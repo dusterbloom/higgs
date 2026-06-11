@@ -541,7 +541,7 @@ pub fn detach(config_path: &Path, verbose: bool, profile: Option<&str>) {
         let _ = child.wait();
     });
 
-    if let Err(e) = fs::write(pid_path(profile), child_pid.to_string()) {
+    if let Err(e) = config::write_private_file(&pid_path(profile), &child_pid.to_string()) {
         eprintln!("failed to write pid file: {e}");
         std::process::exit(1);
     }
