@@ -181,7 +181,8 @@ fn build_router_is_public_and_callable() {
     // This test verifies that build_router was successfully extracted to lib.rs.
     // We cannot actually call it without a real AppState, but we can verify
     // the function signature exists and is accessible.
-    let _: fn(Arc<AppState>, f64, Option<String>, u32, usize) -> axum::Router = build_router;
+    let _: fn(Arc<AppState>, f64, Option<String>, u32, usize, Option<Vec<String>>) -> axum::Router =
+        build_router;
 }
 
 // ---------------------------------------------------------------------------

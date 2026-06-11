@@ -116,19 +116,21 @@ pub fn build_router(
 ///
 /// `None` (unset) sends no CORS headers; `["*"]` is fully permissive;
 /// anything else is an explicit origin allow-list.
-fn build_cors_layer(origins: Option<&[String]>) -> Option<CorsLayer> {
-    let origins = origins?;
+fn build_cors_layer(origins_opt: Option<&[String]>) -> Option<CorsLayer> {
+    let origins = origins_opt?;
     if origins.iter().any(|o| o == "*") {
         return Some(CorsLayer::permissive());
     }
     let parsed: Vec<HeaderValue> = origins
         .iter()
-        .filter_map(|origin| match origin.parse::<HeaderValue>() {
-            Ok(value) => Some(value),
-            Err(_) => {
-                tracing::warn!(origin = %origin, "ignoring invalid CORS origin");
-                None
-            }
+        .filter_map(|origin| {
+            origin.parse::<HeaderValue>().map_or_else(
+                |_| {
+                    tracing::warn!(origin = %origin, "ignoring invalid CORS origin");
+                    None
+                },
+                Some,
+            )
         })
         .collect();
     if parsed.is_empty() {

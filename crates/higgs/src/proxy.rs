@@ -195,11 +195,11 @@ pub async fn send_to_provider(
 
     let status = upstream.status().as_u16();
     if status >= 400 {
-        let error_body = upstream
+        let error_body_raw = upstream
             .text()
             .await
             .unwrap_or_else(|_| String::from("(failed to read error body)"));
-        let error_body = truncate_error_body(&error_body, MAX_UPSTREAM_ERROR_BYTES);
+        let error_body = truncate_error_body(&error_body_raw, MAX_UPSTREAM_ERROR_BYTES);
         return Err(ServerError::ProxyError(format!(
             "upstream returned HTTP {status}: {error_body}"
         )));

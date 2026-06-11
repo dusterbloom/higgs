@@ -224,7 +224,7 @@ fn check_config_file_permissions(
     let mode = metadata.permissions().mode() & 0o777;
     let has_secrets =
         config.server.api_key.is_some() || config.providers.values().any(|p| p.api_key.is_some());
-    if (mode & 0o077) == 0 {
+    if mode.trailing_zeros() >= 6 {
         pass(
             &format!("config file permissions are owner-only ({mode:03o})"),
             result,
