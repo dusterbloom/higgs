@@ -961,10 +961,11 @@ pub fn default_config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-/// Write a file with owner-only permissions (0o600 on Unix). Used for config
-/// files (which may contain provider API keys) and other daemon-private
-/// files. The mode is applied at creation; existing files keep their
-/// permissions (doctor warns about loose ones).
+/// Write a file with owner-only permissions (0o600 on Unix).
+///
+/// Used for config files (which may contain provider API keys) and other
+/// daemon-private files. The mode is applied at creation; existing files
+/// keep their permissions (doctor warns about loose ones).
 pub fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 

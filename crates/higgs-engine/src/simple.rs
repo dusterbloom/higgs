@@ -2549,9 +2549,10 @@ impl IncrementalDetok {
     }
 }
 
-/// Find the earliest stop-sequence occurrence that could involve the newly
-/// appended text, scanning only the tail of `text` rather than the whole
-/// buffer. Returns the absolute byte position where the match starts.
+/// Find the earliest stop-sequence occurrence that could involve the newly appended text.
+///
+/// Scans only the tail of `text` rather than the whole buffer.
+/// Returns the absolute byte position where the match starts.
 pub(crate) fn find_stop_in_tail(
     text: &str,
     new_len: usize,
