@@ -2215,17 +2215,17 @@ impl SimpleEngine {
         all_tokens.push(first_token_id);
 
         let mut detok = IncrementalDetok::new(String::new(), 0);
-        let new_text = detok.append(&self.tokenizer, &all_tokens)?;
-        let emitted_before = detok.text.len() - new_text.len();
+        let first_new_text = detok.append(&self.tokenizer, &all_tokens)?;
+        let first_emitted_before = detok.text.len() - first_new_text.len();
         let (mut first_text, first_hit_stop) = if stop_sequences.is_empty() {
-            (new_text, false)
+            (first_new_text, false)
         } else {
-            find_stop_in_tail(&detok.text, new_text.len(), stop_sequences).map_or(
-                (new_text, false),
+            find_stop_in_tail(&detok.text, first_new_text.len(), stop_sequences).map_or(
+                (first_new_text, false),
                 |pos| {
                     let emit = detok
                         .text
-                        .get(emitted_before..pos)
+                        .get(first_emitted_before..pos)
                         .unwrap_or_default()
                         .to_owned();
                     (emit, true)
