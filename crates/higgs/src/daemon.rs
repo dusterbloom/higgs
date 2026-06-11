@@ -47,7 +47,7 @@ pub fn remove_pid_file(profile: Option<&str>) {
 
 pub fn write_pid_file(profile: Option<&str>) {
     let pid = std::process::id();
-    if let Err(e) = fs::write(pid_path(profile), pid.to_string()) {
+    if let Err(e) = config::write_private_file(&pid_path(profile), &pid.to_string()) {
         tracing::warn!("failed to write pid file: {e}");
     }
 }
@@ -128,12 +128,16 @@ pub fn cmd_init(profile: Option<&str>) {
 
     let default_config = format!(
         r#"[server]
-host = "0.0.0.0"
+# Bind to loopback by default. To expose on the network, set host = "0.0.0.0"
+# and set an api_key.
+host = "127.0.0.1"
 port = 8000
 # max_tokens = 32768
 # timeout = 300.0
 # api_key = "sk-..."
 # rate_limit = 0
+# CORS origin allow-list for browser clients. Unset = no CORS headers.
+# cors_origins = ["*"]
 
 # --- Local serving defaults ---
 # MLX profile applies to simple-engine local models. "auto" picks balanced for
@@ -216,7 +220,7 @@ provider = "higgs"
 "#
     );
 
-    if let Err(e) = fs::write(&path, default_config) {
+    if let Err(e) = config::write_private_file(&path, &default_config) {
         eprintln!("failed to write {}: {e}", path.display());
         std::process::exit(1);
     }
@@ -537,7 +541,7 @@ pub fn detach(config_path: &Path, verbose: bool, profile: Option<&str>) {
         let _ = child.wait();
     });
 
-    if let Err(e) = fs::write(pid_path(profile), child_pid.to_string()) {
+    if let Err(e) = config::write_private_file(&pid_path(profile), &child_pid.to_string()) {
         eprintln!("failed to write pid file: {e}");
         std::process::exit(1);
     }

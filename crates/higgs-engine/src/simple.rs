@@ -1833,7 +1833,7 @@ impl SimpleEngine {
         tokens: &mut Vec<u32>,
         stop_sequences: &[String],
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
-        mut prev_decoded_len: usize,
+        mut detok: IncrementalDetok,
         enable_thinking: bool,
     ) -> Result<(), EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
@@ -1956,36 +1956,25 @@ impl SimpleEngine {
                                 let completion_len = Self::completion_len(tokens)?;
                                 let is_max = completion_len >= max_tokens;
 
-                                let full_text = self.decode_tokens(tokens)?;
-                                let (final_new_text, hit_stop_seq) = if has_stop_sequences {
-                                    check_stop_sequences(&full_text, stop_sequences).map_or_else(
-                                        || {
-                                            (
-                                                full_text
-                                                    .get(prev_decoded_len..)
-                                                    .unwrap_or_default()
-                                                    .to_owned(),
-                                                false,
-                                            )
-                                        },
-                                        |truncated| {
-                                            let emit = truncated
-                                                .get(prev_decoded_len..)
+                                let new_text = detok.append(&self.tokenizer, tokens)?;
+                                let emitted_before = detok.text.len() - new_text.len();
+                                let (mut final_new_text, hit_stop_seq) = if has_stop_sequences {
+                                    find_stop_in_tail(&detok.text, new_text.len(), stop_sequences)
+                                        .map_or((new_text, false), |pos| {
+                                            let emit = detok
+                                                .text
+                                                .get(emitted_before..pos)
                                                 .unwrap_or_default()
                                                 .to_owned();
                                             (emit, true)
-                                        },
-                                    )
+                                        })
                                 } else {
-                                    (
-                                        full_text
-                                            .get(prev_decoded_len..)
-                                            .unwrap_or_default()
-                                            .to_owned(),
-                                        false,
-                                    )
+                                    (new_text, false)
                                 };
                                 let step_finished = is_eos || is_max || hit_stop_seq;
+                                if step_finished && !hit_stop_seq {
+                                    final_new_text.push_str(&detok.flush(&self.tokenizer, tokens)?);
+                                }
                                 let finish_reason = if is_eos || hit_stop_seq {
                                     Some("stop".to_owned())
                                 } else if is_max {
@@ -1993,7 +1982,6 @@ impl SimpleEngine {
                                 } else {
                                     None
                                 };
-                                prev_decoded_len = full_text.len();
 
                                 if step_finished {
                                     let elapsed = t_start.elapsed();
@@ -2034,20 +2022,16 @@ impl SimpleEngine {
                 let completion_len = Self::completion_len(tokens)?;
                 let is_max = completion_len >= max_tokens;
 
-                let full_text = self.decode_tokens(tokens)?;
-                let new_text = full_text
-                    .get(prev_decoded_len..)
-                    .unwrap_or_default()
-                    .to_owned();
-                let old_decoded_len = prev_decoded_len;
-                prev_decoded_len = full_text.len();
+                let new_text = detok.append(&self.tokenizer, tokens)?;
+                let emitted_before = detok.text.len() - new_text.len();
 
-                let (final_new_text, hit_stop_seq) = if has_stop_sequences {
-                    check_stop_sequences(&full_text, stop_sequences).map_or(
+                let (mut final_new_text, hit_stop_seq) = if has_stop_sequences {
+                    find_stop_in_tail(&detok.text, new_text.len(), stop_sequences).map_or(
                         (new_text, false),
-                        |truncated| {
-                            let emit = truncated
-                                .get(old_decoded_len..)
+                        |pos| {
+                            let emit = detok
+                                .text
+                                .get(emitted_before..pos)
                                 .unwrap_or_default()
                                 .to_owned();
                             (emit, true)
@@ -2058,6 +2042,9 @@ impl SimpleEngine {
                 };
 
                 let step_finished = is_eos || is_max || hit_stop_seq;
+                if step_finished && !hit_stop_seq {
+                    final_new_text.push_str(&detok.flush(&self.tokenizer, tokens)?);
+                }
                 let finish_reason = if is_eos || hit_stop_seq {
                     Some("stop".to_owned())
                 } else if is_max {
@@ -2227,19 +2214,31 @@ impl SimpleEngine {
         }
         all_tokens.push(first_token_id);
 
-        let first_decoded = self.decode_tokens(&all_tokens)?;
-        let (first_text, first_hit_stop) = if stop_sequences.is_empty() {
-            (first_decoded.clone(), false)
+        let mut detok = IncrementalDetok::new(String::new(), 0);
+        let first_new_text = detok.append(&self.tokenizer, &all_tokens)?;
+        let first_emitted_before = detok.text.len() - first_new_text.len();
+        let (mut first_text, first_hit_stop) = if stop_sequences.is_empty() {
+            (first_new_text, false)
         } else {
-            check_stop_sequences(&first_decoded, stop_sequences).map_or_else(
-                || (first_decoded.clone(), false),
-                |truncated| (truncated, true),
+            find_stop_in_tail(&detok.text, first_new_text.len(), stop_sequences).map_or(
+                (first_new_text, false),
+                |pos| {
+                    let emit = detok
+                        .text
+                        .get(first_emitted_before..pos)
+                        .unwrap_or_default()
+                        .to_owned();
+                    (emit, true)
+                },
             )
         };
-        let mut prev_decoded_len = first_decoded.len();
 
         let first_is_eos = self.eos_token_ids.contains(&first_token_id);
         let finished = first_is_eos || first_hit_stop || 1 >= max_tokens;
+
+        if finished && !first_hit_stop {
+            first_text.push_str(&detok.flush(&self.tokenizer, &all_tokens)?);
+        }
 
         let first_logprob = first_logprob_data
             .as_ref()
@@ -2289,7 +2288,7 @@ impl SimpleEngine {
                 &mut all_tokens,
                 stop_sequences,
                 sender,
-                prev_decoded_len,
+                detok,
                 enable_thinking,
             );
         }
@@ -2387,22 +2386,18 @@ impl SimpleEngine {
 
             let completion_len = Self::completion_len(&all_tokens)?;
 
-            let full_text = self.decode_tokens(&all_tokens)?;
-            let new_text = full_text
-                .get(prev_decoded_len..)
-                .unwrap_or_default()
-                .to_owned();
-            let old_decoded_len = prev_decoded_len;
-            prev_decoded_len = full_text.len();
+            let new_text = detok.append(&self.tokenizer, &all_tokens)?;
+            let emitted_before = detok.text.len() - new_text.len();
 
-            let (final_new_text, hit_stop_seq) = if stop_sequences.is_empty() {
+            let (mut final_new_text, hit_stop_seq) = if stop_sequences.is_empty() {
                 (new_text, false)
             } else {
-                check_stop_sequences(&full_text, stop_sequences).map_or(
+                find_stop_in_tail(&detok.text, new_text.len(), stop_sequences).map_or(
                     (new_text, false),
-                    |truncated| {
-                        let emit = truncated
-                            .get(old_decoded_len..)
+                    |pos| {
+                        let emit = detok
+                            .text
+                            .get(emitted_before..pos)
                             .unwrap_or_default()
                             .to_owned();
                         (emit, true)
@@ -2416,6 +2411,10 @@ impl SimpleEngine {
                 .as_ref()
                 .is_some_and(crate::constrained::ConstrainedGenerator::is_finished);
             let step_finished = is_eos || is_max || hit_stop_seq || constraint_done;
+
+            if step_finished && !hit_stop_seq {
+                final_new_text.push_str(&detok.flush(&self.tokenizer, &all_tokens)?);
+            }
 
             let finish_reason = if is_eos || hit_stop_seq || constraint_done {
                 Some("stop".to_owned())
@@ -2458,6 +2457,135 @@ impl SimpleEngine {
 
         Ok(())
     }
+}
+
+/// Cap on the trailing token window re-decoded per streaming step.
+/// Generous for any multi-token UTF-8 sequence; prevents a stream of
+/// undecodable tokens from growing the window without bound.
+const MAX_DETOK_WINDOW: usize = 64;
+
+/// Incremental streaming detokenizer.
+///
+/// Re-decoding the full completion on every generated token is O(n^2) in
+/// completion length. Instead, decode only `tokens[prefix_offset..]` and emit
+/// the difference against `tokens[prefix_offset..read_offset]`; both windows
+/// start at the same token, so tokenizer boundary effects cancel out. Text
+/// ending in an incomplete UTF-8 sequence (trailing replacement char) is held
+/// back until a later token completes it.
+pub(crate) struct IncrementalDetok {
+    /// Start of the decode window; advanced whenever text is emitted.
+    prefix_offset: usize,
+    /// Number of leading tokens already represented in `text`.
+    read_offset: usize,
+    /// All text decoded so far (streamed to the client incrementally).
+    pub(crate) text: String,
+}
+
+impl IncrementalDetok {
+    /// Start from text already decoded for the first `token_count` tokens.
+    pub(crate) const fn new(text: String, token_count: usize) -> Self {
+        Self {
+            prefix_offset: 0,
+            read_offset: token_count,
+            text,
+        }
+    }
+
+    fn decode(tokenizer: &Tokenizer, tokens: &[u32]) -> Result<String, EngineError> {
+        tokenizer
+            .decode(tokens, true)
+            .map_err(|e| EngineError::Tokenization(e.to_string()))
+    }
+
+    /// Decode the trailing window of `tokens`, appending newly stable text to
+    /// `self.text` and returning it.
+    pub(crate) fn append(
+        &mut self,
+        tokenizer: &Tokenizer,
+        tokens: &[u32],
+    ) -> Result<String, EngineError> {
+        let prefix_tokens = tokens
+            .get(self.prefix_offset..self.read_offset)
+            .unwrap_or_default();
+        let window_tokens = tokens.get(self.prefix_offset..).unwrap_or_default();
+        let prefix_text = Self::decode(tokenizer, prefix_tokens)?;
+        let window_text = Self::decode(tokenizer, window_tokens)?;
+
+        let over_window = window_tokens.len() > MAX_DETOK_WINDOW;
+        if window_text.len() > prefix_text.len()
+            && (!window_text.ends_with('\u{FFFD}') || over_window)
+        {
+            let new_text = window_text
+                .get(prefix_text.len()..)
+                .unwrap_or_default()
+                .to_owned();
+            self.prefix_offset = self.read_offset;
+            self.read_offset = tokens.len();
+            self.text.push_str(&new_text);
+            return Ok(new_text);
+        }
+        if over_window && window_text.len() == prefix_text.len() {
+            // The pending tokens decode to nothing (e.g. skipped special
+            // tokens); drop them so the window stays bounded.
+            self.prefix_offset = tokens.len();
+            self.read_offset = tokens.len();
+        }
+        Ok(String::new())
+    }
+
+    /// Emit any text still held back by `append` (a trailing incomplete UTF-8
+    /// sequence). Called when generation finishes so the total streamed text
+    /// matches a full decode of the token buffer.
+    pub(crate) fn flush(
+        &mut self,
+        tokenizer: &Tokenizer,
+        tokens: &[u32],
+    ) -> Result<String, EngineError> {
+        if self.read_offset >= tokens.len() {
+            return Ok(String::new());
+        }
+        let prefix_tokens = tokens
+            .get(self.prefix_offset..self.read_offset)
+            .unwrap_or_default();
+        let window_tokens = tokens.get(self.prefix_offset..).unwrap_or_default();
+        let prefix_text = Self::decode(tokenizer, prefix_tokens)?;
+        let window_text = Self::decode(tokenizer, window_tokens)?;
+        let new_text = window_text
+            .get(prefix_text.len()..)
+            .unwrap_or_default()
+            .to_owned();
+        self.prefix_offset = self.read_offset;
+        self.read_offset = tokens.len();
+        self.text.push_str(&new_text);
+        Ok(new_text)
+    }
+}
+
+/// Find the earliest stop-sequence occurrence that could involve the newly appended text.
+///
+/// Scans only the tail of `text` rather than the whole buffer.
+/// Returns the absolute byte position where the match starts.
+pub(crate) fn find_stop_in_tail(
+    text: &str,
+    new_len: usize,
+    stop_sequences: &[String],
+) -> Option<usize> {
+    let max_stop = stop_sequences.iter().map(String::len).max().unwrap_or(0);
+    if max_stop == 0 {
+        return None;
+    }
+    let mut start = text.len().saturating_sub(new_len + max_stop - 1);
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let tail = text.get(start..)?;
+    let mut earliest: Option<usize> = None;
+    for seq in stop_sequences {
+        if let Some(pos) = tail.find(seq.as_str()) {
+            earliest = Some(earliest.map_or(pos, |prev| prev.min(pos)));
+        }
+    }
+    earliest.map(|pos| start + pos)
 }
 
 /// Check if any stop sequence appears in the generated text.
@@ -2587,8 +2715,8 @@ fn detect_thinking_support(model_dir: &Path) -> bool {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        adaptive_draft_depth_for_cap, check_stop_sequences, derive_model_name,
-        estimate_paged_kv_blocks, parse_enabled_flag,
+        IncrementalDetok, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
+        derive_model_name, estimate_paged_kv_blocks, find_stop_in_tail, parse_enabled_flag,
     };
     use std::path::Path;
 
@@ -2856,5 +2984,162 @@ mod tests {
         assert_eq!(parse_enabled_flag(Some("off")), Some(false));
         assert_eq!(parse_enabled_flag(Some("no")), Some(false));
         assert_eq!(parse_enabled_flag(Some("unexpected")), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_stop_in_tail
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_stop_in_tail_empty_stops_returns_none() {
+        assert_eq!(find_stop_in_tail("hello world", 5, &[]), None);
+    }
+
+    #[test]
+    fn find_stop_in_tail_finds_stop_in_new_text() {
+        let stops = vec!["</s>".to_owned()];
+        // "hello</s>" with the last 4 bytes new
+        assert_eq!(find_stop_in_tail("hello</s>", 4, &stops), Some(5));
+    }
+
+    #[test]
+    fn find_stop_in_tail_finds_stop_spanning_boundary() {
+        let stops = vec!["STOP".to_owned()];
+        // "abcSTOP" where only "OP" is new; "ST" was emitted previously
+        assert_eq!(find_stop_in_tail("abcSTOP", 2, &stops), Some(3));
+    }
+
+    #[test]
+    fn find_stop_in_tail_ignores_stop_fully_in_old_text() {
+        let stops = vec!["XY".to_owned()];
+        // "XYabcdefgh" with 2 new bytes: the scan window covers the last
+        // 2 + (2 - 1) = 3 bytes only, so the old "XY" is not rescanned.
+        assert_eq!(find_stop_in_tail("XYabcdefgh", 2, &stops), None);
+    }
+
+    #[test]
+    fn find_stop_in_tail_earliest_of_multiple() {
+        let stops = vec!["BBB".to_owned(), "AAA".to_owned()];
+        assert_eq!(find_stop_in_tail("xAAAyBBBz", 9, &stops), Some(1));
+    }
+
+    #[test]
+    fn find_stop_in_tail_handles_multibyte_boundary() {
+        let stops = vec!["端".to_owned()];
+        // The tail start can land mid-codepoint; it must back up to a
+        // char boundary instead of panicking. "日本語端" = 4 chars, 12 bytes.
+        assert_eq!(find_stop_in_tail("日本語端", 3, &stops), Some(9));
+    }
+
+    // -----------------------------------------------------------------------
+    // IncrementalDetok
+    // -----------------------------------------------------------------------
+
+    /// Minimal word-level tokenizer with a byte-level decoder for detok tests.
+    fn word_tokenizer() -> Tokenizer {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": {
+                "type": "ByteLevel",
+                "add_prefix_space": true,
+                "trim_offsets": true,
+                "use_regex": true
+            },
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"Hello": 0, "Ġworld": 1, "!": 2, "ðŁĺ": 3, "Ģ": 4},
+                "unk_token": "Hello"
+            }
+        }"#;
+        Tokenizer::from_bytes(json.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn incremental_detok_emits_per_token_diffs() {
+        let tokenizer = word_tokenizer();
+        let mut tokens: Vec<u32> = vec![0];
+        let first = tokenizer.decode(&tokens, true).unwrap();
+        let mut detok = IncrementalDetok::new(first.clone(), tokens.len());
+
+        tokens.push(1);
+        let second = detok.append(&tokenizer, &tokens).unwrap();
+        tokens.push(2);
+        let third = detok.append(&tokenizer, &tokens).unwrap();
+
+        let full = tokenizer.decode(&tokens, true).unwrap();
+        assert_eq!(format!("{first}{second}{third}"), full);
+        assert_eq!(detok.text, full);
+    }
+
+    #[test]
+    fn incremental_detok_flush_without_pending_is_empty() {
+        let tokenizer = word_tokenizer();
+        let mut tokens: Vec<u32> = vec![0];
+        let first = tokenizer.decode(&tokens, true).unwrap();
+        let mut detok = IncrementalDetok::new(first, tokens.len());
+
+        tokens.push(1);
+        detok.append(&tokenizer, &tokens).unwrap();
+        assert_eq!(detok.flush(&tokenizer, &tokens).unwrap(), "");
+    }
+
+    // Tokens 3 and 4 are the byte-level pieces of 😀 (U+1F600).
+    // Appending only token 3 must hold back the incomplete UTF-8 sequence
+    // (return ""), and appending both tokens must emit the full emoji.
+    #[test]
+    fn incremental_detok_first_token_partial_utf8_held_back() {
+        let tokenizer = word_tokenizer();
+        let mut detok = IncrementalDetok::new(String::new(), 0);
+
+        // First partial piece: held back, no replacement char emitted
+        let held = detok.append(&tokenizer, &[3]).unwrap();
+        assert_eq!(held, "", "partial UTF-8 token must be held back");
+
+        // Completing the sequence emits the full emoji
+        let emitted = detok.append(&tokenizer, &[3, 4]).unwrap();
+        assert_eq!(emitted, "😀", "completing UTF-8 should emit the emoji");
+
+        let full = tokenizer.decode(&[3u32, 4], true).unwrap();
+        assert_eq!(detok.text, full, "detok.text must equal full decode");
+    }
+
+    // flush() must emit any bytes held back by append(), and a second flush
+    // on the same (now-fully-drained) detok must return "".
+    #[test]
+    fn incremental_detok_flush_emits_pending() {
+        let tokenizer = word_tokenizer();
+        let mut detok = IncrementalDetok::new(String::new(), 0);
+
+        // Partial piece held back
+        let held = detok.append(&tokenizer, &[3]).unwrap();
+        assert_eq!(held, "", "partial UTF-8 must be held back before flush");
+
+        // flush must emit something (a replacement char is acceptable here)
+        let flushed = detok.flush(&tokenizer, &[3]).unwrap();
+        assert!(!flushed.is_empty(), "flush must emit held-back text");
+
+        // A second flush on an already-drained detok returns ""
+        let flushed2 = detok.flush(&tokenizer, &[3]).unwrap();
+        assert_eq!(flushed2, "", "second flush must return empty string");
+    }
+
+    // find_stop_in_tail must identify a stop whose prefix was already emitted,
+    // returning the byte position that lets the caller emit the prefix ("hi")
+    // before the stop ("STOP") in the same new-text window.
+    #[test]
+    fn find_stop_in_tail_first_token_prefix_and_stop() {
+        let stops = vec!["STOP".to_owned()];
+        // "hiSTOP": all 6 bytes are new, stop starts at byte 2
+        assert_eq!(
+            find_stop_in_tail("hiSTOP", 6, &stops),
+            Some(2),
+            "stop at pos 2 so 'hi' can be emitted as prefix"
+        );
     }
 }

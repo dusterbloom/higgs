@@ -27,6 +27,8 @@ Higgs is a single static Rust binary that serves local models, proxies to provid
 - Exact local model names now beat regex routes.
 - `/metrics` is a real endpoint, and `server.max_body_size` is enforced on API requests.
 - `higgs shellenv` and `higgs exec` now fail fast on bad config or an unreachable server.
+- The server now binds `127.0.0.1` by default (was `0.0.0.0`). Set `server.host = "0.0.0.0"` (and an `api_key`) to expose it on the network.
+- CORS headers are no longer sent unless `server.cors_origins` is set (`["*"]` restores the old permissive behavior).
 
 ## Quick Links
 

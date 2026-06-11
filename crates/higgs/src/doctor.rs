@@ -31,7 +31,10 @@ fn fail(msg: &str, result: &mut DoctorResult) {
 }
 
 #[allow(clippy::print_stderr)]
-pub async fn run_doctor(config: &HiggsConfig) -> DoctorResult {
+pub async fn run_doctor(
+    config: &HiggsConfig,
+    config_path: Option<&std::path::Path>,
+) -> DoctorResult {
     let mut result = DoctorResult {
         passes: 0,
         warnings: 0,
@@ -41,6 +44,7 @@ pub async fn run_doctor(config: &HiggsConfig) -> DoctorResult {
     eprintln!("\x1b[1mhiggs doctor\x1b[0m\n");
 
     check_config_valid(&mut result);
+    check_config_file_permissions(config, config_path, &mut result);
     check_server_section(config, &mut result);
     check_models(config, &mut result);
     check_duplicate_models(config, &mut result);
@@ -134,6 +138,23 @@ fn check_server_section(config: &crate::config::HiggsConfig, result: &mut Doctor
         );
     }
 
+    let non_loopback = matches!(
+        server.host.parse::<std::net::IpAddr>(),
+        Ok(ip) if !ip.is_loopback()
+    );
+    if non_loopback && server.api_key.is_none() {
+        warn(
+            &format!(
+                "server.host=\"{}\" is reachable from the network but server.api_key is unset; \
+                 anyone on the network can use this server",
+                server.host
+            ),
+            result,
+        );
+    }
+
+    check_cors_origins(server, non_loopback, result);
+
     if server.rate_limit == 0 {
         pass("server.rate_limit=0 (disabled)", result);
     } else {
@@ -142,6 +163,96 @@ fn check_server_section(config: &crate::config::HiggsConfig, result: &mut Doctor
             result,
         );
     }
+}
+
+fn check_cors_origins(
+    server: &crate::config::ServerSection,
+    non_loopback: bool,
+    result: &mut DoctorResult,
+) {
+    match &server.cors_origins {
+        None => pass("server.cors_origins unset; no CORS headers sent", result),
+        Some(origins) if origins.iter().any(|o| o == "*") => {
+            if non_loopback {
+                warn(
+                    "server.cors_origins allows any origin (\"*\") on a network-reachable host; \
+                     consider an explicit origin list",
+                    result,
+                );
+            } else {
+                pass("server.cors_origins=[\"*\"] (permissive)", result);
+            }
+        }
+        Some(origins) => {
+            let mut all_valid = true;
+            for origin in origins {
+                let parses = origin.parse::<http::HeaderValue>().is_ok();
+                if !parses || !(origin.starts_with("http://") || origin.starts_with("https://")) {
+                    fail(
+                        &format!(
+                            "server.cors_origins entry \"{origin}\" is not a valid origin \
+                             (expected e.g. \"https://example.com\")"
+                        ),
+                        result,
+                    );
+                    all_valid = false;
+                }
+            }
+            if all_valid {
+                pass(
+                    &format!("server.cors_origins lists {} origin(s)", origins.len()),
+                    result,
+                );
+            }
+        }
+    }
+}
+
+/// Warn when the config file holding API keys is readable by other users.
+#[cfg(unix)]
+fn check_config_file_permissions(
+    config: &HiggsConfig,
+    config_path: Option<&std::path::Path>,
+    result: &mut DoctorResult,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some(path) = config_path else { return };
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    let has_secrets =
+        config.server.api_key.is_some() || config.providers.values().any(|p| p.api_key.is_some());
+    if mode.trailing_zeros() >= 6 {
+        pass(
+            &format!("config file permissions are owner-only ({mode:03o})"),
+            result,
+        );
+    } else if has_secrets {
+        warn(
+            &format!(
+                "config file {} is group/world-accessible (mode {mode:03o}) and contains API \
+                 keys; run: chmod 600 {}",
+                path.display(),
+                path.display()
+            ),
+            result,
+        );
+    } else {
+        pass(
+            &format!("config file permissions {mode:03o} (no API keys present)"),
+            result,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn check_config_file_permissions(
+    _config: &HiggsConfig,
+    _config_path: Option<&std::path::Path>,
+    _result: &mut DoctorResult,
+) {
 }
 
 fn model_label(model: &crate::config::ModelConfig) -> String {
@@ -894,6 +1005,71 @@ mod tests {
         check_server_section(&config, &mut result);
         assert_eq!(result.failures, 0);
         assert_eq!(result.warnings, 0);
+    }
+
+    #[test]
+    fn test_non_loopback_host_without_api_key_warns() {
+        let config = server_with(|s| s.host = "0.0.0.0".to_owned());
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.warnings >= 1);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_non_loopback_host_with_api_key_no_warning() {
+        let config = server_with(|s| {
+            s.host = "0.0.0.0".to_owned();
+            s.api_key = Some("sk-test".to_owned());
+        });
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_cors_wildcard_on_loopback_passes() {
+        let config = server_with(|s| s.cors_origins = Some(vec!["*".to_owned()]));
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_cors_wildcard_on_network_host_warns() {
+        let config = server_with(|s| {
+            s.host = "0.0.0.0".to_owned();
+            s.api_key = Some("sk-test".to_owned());
+            s.cors_origins = Some(vec!["*".to_owned()]);
+        });
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.warnings >= 1);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_cors_valid_origin_list_passes() {
+        let config = server_with(|s| {
+            s.cors_origins = Some(vec![
+                "https://example.com".to_owned(),
+                "http://localhost:3000".to_owned(),
+            ]);
+        });
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_cors_invalid_origin_fails() {
+        let config = server_with(|s| s.cors_origins = Some(vec!["not a url".to_owned()]));
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
     }
 
     // -- Auto router --

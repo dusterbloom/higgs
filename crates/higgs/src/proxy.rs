@@ -8,6 +8,24 @@ use futures::TryStreamExt;
 
 use crate::error::ServerError;
 
+/// Maximum number of upstream error-body bytes embedded in errors/metrics.
+/// Upstream error bodies can echo request headers (including credentials),
+/// so they are truncated rather than stored verbatim.
+const MAX_UPSTREAM_ERROR_BYTES: usize = 2048;
+
+/// Truncate `text` to at most `max_bytes`, respecting UTF-8 char boundaries.
+fn truncate_error_body(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = text.get(..end).unwrap_or_default();
+    format!("{truncated}... (truncated, {} bytes total)", text.len())
+}
+
 fn is_hop_by_hop(name: &http::header::HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -177,10 +195,11 @@ pub async fn send_to_provider(
 
     let status = upstream.status().as_u16();
     if status >= 400 {
-        let error_body = upstream
+        let error_body_raw = upstream
             .text()
             .await
             .unwrap_or_else(|_| String::from("(failed to read error body)"));
+        let error_body = truncate_error_body(&error_body_raw, MAX_UPSTREAM_ERROR_BYTES);
         return Err(ServerError::ProxyError(format!(
             "upstream returned HTTP {status}: {error_body}"
         )));
@@ -261,6 +280,28 @@ pub fn extract_usage(body: &[u8]) -> (u64, u64) {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_error_body_unchanged() {
+        assert_eq!(truncate_error_body("bad request", 2048), "bad request");
+    }
+
+    #[test]
+    fn long_error_body_truncated_with_marker() {
+        let body = "x".repeat(5000);
+        let truncated = truncate_error_body(&body, 2048);
+        assert!(truncated.starts_with(&"x".repeat(2048)));
+        assert!(truncated.contains("truncated, 5000 bytes total"));
+    }
+
+    #[test]
+    fn truncation_respects_utf8_boundaries() {
+        // 3-byte chars; a 4-byte cut would land mid-codepoint
+        let body = "錯".repeat(10);
+        let truncated = truncate_error_body(&body, 4);
+        assert!(truncated.starts_with('錯'));
+        assert!(truncated.contains("truncated"));
+    }
 
     #[test]
     fn hop_by_hop_headers_filtered() {

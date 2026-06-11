@@ -30,14 +30,16 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     extract::{ConnectInfo, Request},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
     routing::{get, post},
 };
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use tower_http::{
-    cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer,
+    cors::{Any, CorsLayer},
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
     validate_request::ValidateRequestHeaderLayer,
 };
 
@@ -59,6 +61,7 @@ pub fn build_router(
     api_key: Option<String>,
     rate_limit: u32,
     max_body_size: usize,
+    cors_origins: Option<Vec<String>>,
 ) -> Router {
     let timeout_duration = Duration::from_secs_f64(timeout_secs);
 
@@ -93,16 +96,52 @@ pub fn build_router(
 
     api_routes = api_routes.layer(DefaultBodyLimit::max(max_body_size));
 
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(routes::health::health))
         .merge(api_routes)
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             timeout_duration,
-        ))
-        .layer(CorsLayer::permissive())
-        .with_state(state)
+        ));
+
+    if let Some(cors) = build_cors_layer(cors_origins.as_deref()) {
+        router = router.layer(cors);
+    }
+
+    router.with_state(state)
+}
+
+/// Build a CORS layer from the configured origin allow-list.
+///
+/// `None` (unset) sends no CORS headers; `["*"]` is fully permissive;
+/// anything else is an explicit origin allow-list.
+fn build_cors_layer(origins_opt: Option<&[String]>) -> Option<CorsLayer> {
+    let origins = origins_opt?;
+    if origins.iter().any(|o| o == "*") {
+        return Some(CorsLayer::permissive());
+    }
+    let parsed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|origin| {
+            origin.parse::<HeaderValue>().map_or_else(
+                |_| {
+                    tracing::warn!(origin = %origin, "ignoring invalid CORS origin");
+                    None
+                },
+                Some,
+            )
+        })
+        .collect();
+    if parsed.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(parsed)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
 }
 
 async fn rate_limit_middleware(
@@ -118,5 +157,40 @@ async fn rate_limit_middleware(
     match limiter.check_key(&key) {
         Ok(()) => Ok(next.run(req).await),
         Err(_) => Err(StatusCode::TOO_MANY_REQUESTS),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod cors_tests {
+    use super::build_cors_layer;
+
+    #[test]
+    fn unset_origins_disable_cors() {
+        assert!(build_cors_layer(None).is_none());
+    }
+
+    #[test]
+    fn wildcard_enables_permissive_cors() {
+        let origins = vec!["*".to_owned()];
+        assert!(build_cors_layer(Some(&origins)).is_some());
+    }
+
+    #[test]
+    fn explicit_origins_enable_cors() {
+        let origins = vec!["https://example.com".to_owned()];
+        assert!(build_cors_layer(Some(&origins)).is_some());
+    }
+
+    #[test]
+    fn only_invalid_origins_disable_cors() {
+        let origins = vec!["\u{7f}invalid".to_owned()];
+        assert!(build_cors_layer(Some(&origins)).is_none());
+    }
+
+    #[test]
+    fn empty_list_disables_cors() {
+        let origins: Vec<String> = vec![];
+        assert!(build_cors_layer(Some(&origins)).is_none());
     }
 }

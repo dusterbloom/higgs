@@ -176,12 +176,15 @@ async fn streaming_chat_returns_sse_content_type() {
 // build_router smoke test (verifies the function is callable and public)
 // ---------------------------------------------------------------------------
 
+type BuildRouterFn =
+    fn(Arc<AppState>, f64, Option<String>, u32, usize, Option<Vec<String>>) -> axum::Router;
+
 #[test]
 fn build_router_is_public_and_callable() {
     // This test verifies that build_router was successfully extracted to lib.rs.
     // We cannot actually call it without a real AppState, but we can verify
     // the function signature exists and is accessible.
-    let _: fn(Arc<AppState>, f64, Option<String>, u32, usize) -> axum::Router = build_router;
+    let _: BuildRouterFn = build_router;
 }
 
 // ---------------------------------------------------------------------------

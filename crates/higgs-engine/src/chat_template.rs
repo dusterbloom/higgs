@@ -12,6 +12,11 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
+/// Upper bound on template-engine instructions per render. Generous enough
+/// for complex HF chat templates over long conversations, but stops a
+/// malicious template from looping forever.
+const TEMPLATE_FUEL: u64 = 5_000_000;
+
 /// Renders chat messages using a Jinja2 template (`HuggingFace` format).
 pub struct ChatTemplateRenderer {
     env: Environment<'static>,
@@ -24,6 +29,10 @@ impl ChatTemplateRenderer {
     /// Create a renderer from a Jinja2 template string.
     pub fn new<S: Into<String>>(template_source: S) -> Result<Self, EngineError> {
         let mut env = Environment::new();
+        // Templates come from model directories (tokenizer_config.json /
+        // chat_template.jinja), which are third-party content; bound execution
+        // so a hostile template cannot loop forever.
+        env.set_fuel(Some(TEMPLATE_FUEL));
         env.add_filter("tojson", tojson_filter);
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);

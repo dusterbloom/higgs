@@ -14,7 +14,7 @@ This document collects the full CLI, environment, and config-file reference for 
 | CLI Flag | Env Variable | Default | Description |
 |---|---|---|---|
 | `--model` | `HIGGS_MODELS` | *(required)* | Model path or HF ID (repeatable) |
-| `--host` | `HIGGS_HOST` | `0.0.0.0` | Bind address |
+| `--host` | `HIGGS_HOST` | `127.0.0.1` | Bind address (set `0.0.0.0` to expose on the network; pair with `--api-key`) |
 | `--port` | `HIGGS_PORT` | `8000` | Bind port |
 | `--max-tokens` | `HIGGS_MAX_TOKENS` | `32768` | Max generation tokens |
 | `--api-key` | `HIGGS_API_KEY` | *(none)* | Bearer token for auth |
@@ -52,13 +52,18 @@ Run `higgs init` to create `~/.config/higgs/config.toml`:
 
 ```toml
 [server]
-host = "0.0.0.0"
+# Bind to loopback by default. To expose on the network, set host = "0.0.0.0"
+# and set an api_key.
+host = "127.0.0.1"
 port = 8000
 # max_tokens = 32768
 # timeout = 300.0
 # max_body_size = 10485760
 # api_key = "sk-..."
 # rate_limit = 0
+# CORS origin allow-list for browser clients. Unset = no CORS headers;
+# ["*"] allows any origin.
+# cors_origins = ["https://app.example.com"]
 
 # --- Local defaults ---
 [local]
