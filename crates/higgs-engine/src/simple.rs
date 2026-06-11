@@ -3089,9 +3089,9 @@ mod tests {
         assert_eq!(detok.flush(&tokenizer, &tokens).unwrap(), "");
     }
 
-    /// Tokens 3 and 4 are the byte-level pieces of 😀 (U+1F600).
-    /// Appending only token 3 must hold back the incomplete UTF-8 sequence
-    /// (return ""), and appending both tokens must emit the full emoji.
+    // Tokens 3 and 4 are the byte-level pieces of 😀 (U+1F600).
+    // Appending only token 3 must hold back the incomplete UTF-8 sequence
+    // (return ""), and appending both tokens must emit the full emoji.
     #[test]
     fn incremental_detok_first_token_partial_utf8_held_back() {
         let tokenizer = word_tokenizer();
@@ -3109,8 +3109,8 @@ mod tests {
         assert_eq!(detok.text, full, "detok.text must equal full decode");
     }
 
-    /// flush() must emit any bytes held back by append(), and a second flush
-    /// on the same (now-fully-drained) detok must return "".
+    // flush() must emit any bytes held back by append(), and a second flush
+    // on the same (now-fully-drained) detok must return "".
     #[test]
     fn incremental_detok_flush_emits_pending() {
         let tokenizer = word_tokenizer();
@@ -3129,9 +3129,9 @@ mod tests {
         assert_eq!(flushed2, "", "second flush must return empty string");
     }
 
-    /// find_stop_in_tail must identify a stop whose prefix was already emitted,
-    /// returning the byte position that lets the caller emit the prefix ("hi")
-    /// before the stop ("STOP") in the same new-text window.
+    // find_stop_in_tail must identify a stop whose prefix was already emitted,
+    // returning the byte position that lets the caller emit the prefix ("hi")
+    // before the stop ("STOP") in the same new-text window.
     #[test]
     fn find_stop_in_tail_first_token_prefix_and_stop() {
         let stops = vec!["STOP".to_owned()];
