@@ -2219,7 +2219,8 @@ impl SimpleEngine {
         // ride the normal streaming channel as progress-only outputs.
         // try_send: never stall prefill on a slow consumer — dropped
         // progress events are harmless.
-        let cached = prompt_len.saturating_sub(prepared.actual_prompt_tokens.len() as u32);
+        let actual_tokens = u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
+        let cached = prompt_len.saturating_sub(actual_tokens);
         let make_progress_output = move |suffix_done: u32| StreamingOutput {
             new_text: String::new(),
             finished: false,
@@ -2239,7 +2240,9 @@ impl SimpleEngine {
         let progress_sender = sender.clone();
         let sink_guard =
             higgs_models::progress::install_prefill_progress_sink(Box::new(move |done, _total| {
-                let _ = progress_sender.try_send(make_progress_output(done.max(0) as u32));
+                let _ = progress_sender.try_send(make_progress_output(
+                    u32::try_from(done.max(0)).unwrap_or(0),
+                ));
             }));
 
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
