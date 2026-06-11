@@ -218,7 +218,7 @@ pub struct Qwen3NextModelArgs {
 
     /// Use an MoE-structured MTP head (Qwen3.6-A3B style).
     ///
-    /// These sidecars ship the MTP layer as a full MoE decoder layer
+    /// These sidecars ship the MTP layer as a full `MoE` decoder layer
     /// (`mlp.gate`, `mlp.switch_mlp.*`, `mlp.shared_expert*`) with a quantized
     /// `fc`. Set by the loader after inspecting checkpoint keys; not expected
     /// in configs.
@@ -1960,9 +1960,9 @@ impl DenseMtpHead {
     }
 }
 
-/// Single MoE MTP transformer layer (Qwen3.6-A3B style).
+/// Single `MoE` MTP transformer layer (Qwen3.6-A3B style).
 ///
-/// Qwen3.6-A3B sidecars ship the MTP layer as a full MoE decoder layer:
+/// Qwen3.6-A3B sidecars ship the MTP layer as a full `MoE` decoder layer:
 /// full attention (with q/k norms) + `SparseMoeBlock`
 /// (router gate + stacked experts + shared expert + shared-expert gate).
 #[derive(Debug, Clone, ModuleParameters)]
@@ -1977,7 +1977,7 @@ struct MoeMtpTransformerLayer {
     mlp: SparseMoeBlock,
 }
 
-/// MTP head with an MoE transformer layer (Qwen3.6-A3B style sidecars).
+/// MTP head with an `MoE` transformer layer (Qwen3.6-A3B style sidecars).
 ///
 /// Unlike [`MtpHead`], the fusion projection `fc` is a quantized [`QLinear`]
 /// (these sidecars ship `fc.{weight,scales,biases}` triples), and the MLP is
@@ -4498,9 +4498,12 @@ pub fn load_qwen3_next_model<P: AsRef<Path>>(
 
     let mut model = Qwen3NextCausalLM::new(args)?;
 
-    // Load weights directly from safetensors (no key remapping needed
-    // since our param names match the safetensors keys exactly)
-    crate::load_safetensors_weights(&mut model, model_path)?;
+    // Backbone keys match model params directly, but the MTP sidecar may need
+    // remapping: `maybe_disable_mtp_without_checkpoint_weights` can select the
+    // dense or MoE head (params `dense_mtp.*` / `moe_mtp.*`) while the checkpoint
+    // still ships the head under the `mtp.*` namespace. The plain loader can't
+    // bridge that, so it would silently leave the draft head uninitialized.
+    load_qwen3_next_weights(&mut model, model_path)?;
 
     tracing::info!("Qwen3Next model loaded successfully");
     Ok(model)
@@ -4937,7 +4940,11 @@ fn normalize_sidecar_mtp_key(file_path: &Path, key: String) -> String {
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| crate::AUXILIARY_SAFETENSORS_FILES.contains(&n));
-    if is_aux && !key.starts_with("mtp.") {
+    // Only prefix truly un-namespaced sidecar keys (`fc.weight`,
+    // `layers.0....`). Already-namespaced keys (`mtp.*`, `language_model.mtp.*`)
+    // are left intact so `qwen35_checkpoint_param_key` can still strip/remap
+    // them — prefixing those would produce unmatchable `mtp.language_model.mtp.*`.
+    if is_aux && !is_mtp_key(&key) {
         format!("mtp.{key}")
     } else {
         key
@@ -4989,10 +4996,51 @@ fn qwen35_loaded_value(
     }
 }
 
+/// Load `Qwen3Next` weights, remapping the `mtp.*` sidecar onto whichever MTP
+/// head is active (`mtp` / `dense_mtp` / `moe_mtp`).
+///
+/// Backbone keys match params directly (via `qwen35_target_param_key`'s
+/// direct-match branch), so this is behaviour-compatible with the plain loader
+/// for the common `Quantized` layout. The only added behaviour is the
+/// `mtp.*` → `dense_mtp.*` / `moe_mtp.*` remap, which the plain loader lacks —
+/// without it a dense/MoE draft head selected by
+/// `maybe_disable_mtp_without_checkpoint_weights` is silently left uninitialized.
+#[allow(clippy::shadow_reuse)]
+fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
+    model: &mut M,
+    model_path: &Path,
+) -> Result<(), crate::error::ModelError> {
+    let safetensors_files = crate::collect_safetensors_files(model_path)?;
+    let mut params = model.parameters_mut().flatten();
+
+    for file_path in &safetensors_files {
+        let loaded = Array::load_safetensors(file_path)
+            .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+
+        for (key, value) in loaded {
+            let key = normalize_sidecar_mtp_key(file_path, key);
+            if let Some((target_key, dense_mtp_target)) = qwen35_target_param_key(&params, &key) {
+                if let Some(param) = params.get_mut(target_key.as_str()) {
+                    **param = qwen35_loaded_value(&key, value, dense_mtp_target)?;
+                    continue;
+                }
+            }
+            tracing::warn!(key = %key, "Weight key not found in model parameters");
+        }
+    }
+
+    model
+        .eval()
+        .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+
+    Ok(())
+}
+
 /// Load Qwen3.5-MoE weights with GDN projection fusion.
 ///
 /// Direct weight loader: strip `language_model.` prefix, no rearrangement.
 /// Used when `use_separate_gdn_projections = true`.
+#[allow(clippy::shadow_reuse)]
 fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
@@ -5051,9 +5099,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     ensure_all_model_params_loaded(
         params
             .iter()
-            .filter(|(name, _)| {
-                !(name.contains(".in_proj_qkvz.") || name.contains(".in_proj_ba."))
-            })
+            .filter(|(name, _)| !(name.contains(".in_proj_qkvz.") || name.contains(".in_proj_ba.")))
             .map(|(name, value)| (std::rc::Rc::<str>::clone(name), &**value)),
     )?;
     tracing::info!(param_count, matched, "Total model parameters loaded");
@@ -5067,7 +5113,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
 
 /// Rearranges flat (qkv,z,b,a) projections to per-head-grouped (qkvz,ba)
 /// so the model uses the fused 2-dispatch forward path instead of 4 separate.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::shadow_reuse)]
 fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
@@ -14142,6 +14188,12 @@ mod tests {
         assert_eq!(
             normalize_sidecar_mtp_key(aux, "mtp.fc.weight".to_owned()),
             "mtp.fc.weight"
+        );
+        // Already-namespaced sidecar keys (e.g. `language_model.mtp.*`) must NOT
+        // be over-prefixed into unmatchable `mtp.language_model.mtp.*`.
+        assert_eq!(
+            normalize_sidecar_mtp_key(aux, "language_model.mtp.layers.0.fc.weight".to_owned()),
+            "language_model.mtp.layers.0.fc.weight"
         );
         // Keys from main shards are never touched.
         assert_eq!(

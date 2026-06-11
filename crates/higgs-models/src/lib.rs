@@ -140,7 +140,7 @@ impl AnyCache {
                     .map(|l| {
                         l.as_ref().map(|lc| match lc {
                             LayerCache::KV(kv) => LayerCache::KV(kv.deep_clone()),
-                            recurrent => recurrent.clone(),
+                            recurrent @ LayerCache::Arrays(_) => recurrent.clone(),
                         })
                     })
                     .collect(),
@@ -162,6 +162,11 @@ pub fn deep_clone_mtp_cache(c: &MtpCache) -> MtpCache {
 }
 
 /// Unified model wrapper dispatching to the correct architecture.
+// One `AnyModel` exists per loaded model (held by the engine for the process
+// lifetime), never stored in bulk, so the size spread between variants costs a
+// few hundred bytes once. Boxing a dispatch variant would add an indirection on
+// the forward path for no practical benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum AnyModel {
     /// Standard transformer architectures: Llama, Mistral, Qwen2/2.5, Qwen3.
     Transformer(Model),
@@ -1227,7 +1232,8 @@ pub struct WeightMapIndex {
     pub weight_map: HashMap<String, String>,
 }
 
-pub(crate) const AUXILIARY_SAFETENSORS_FILES: &[&str] = &["mtp.safetensors", "model-mtp.safetensors"];
+pub(crate) const AUXILIARY_SAFETENSORS_FILES: &[&str] =
+    &["mtp.safetensors", "model-mtp.safetensors"];
 
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokenizer, ModelError> {
