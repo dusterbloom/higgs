@@ -514,6 +514,7 @@ fn chat_completions_stream(
             top_logprobs,
             &tx,
             thinking_enabled_stream,
+            return_progress,
             constraint,
             pixel_values,
         );

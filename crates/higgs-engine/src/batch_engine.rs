@@ -306,6 +306,7 @@ impl BatchEngine {
             top_logprobs,
             sender,
             false,
+            false,
             constraint,
             pixel_values,
         )
@@ -322,6 +323,9 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         _enable_thinking: bool,
+        // Batch engine does not emit prefill progress; accepts the flag to
+        // share the streaming interface with SimpleEngine.
+        _return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<mlx_rs::Array>,
     ) -> Result<(), EngineError> {

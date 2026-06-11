@@ -348,6 +348,8 @@ fn create_message_stream(
             None,
             &tx,
             thinking_enabled,
+            // Anthropic streaming does not surface prefill progress.
+            false,
             None,
             None,
         );
