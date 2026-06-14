@@ -4,6 +4,7 @@ pub mod deepseek_v2;
 pub mod error;
 pub mod gemma2;
 pub mod llava_qwen2;
+pub mod nemotron_diffusion;
 pub mod phi3;
 pub mod qwen3_moe;
 pub mod qwen3_next;
@@ -139,6 +140,8 @@ pub enum AnyModel {
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
     /// Bonsai-Q1: packed 1.25-bpw Qwen3-shaped target (1.7B / 8B).
     BonsaiQ1(bonsai_q1::BonsaiQ1Gpu),
+    /// Nemotron-Labs-Diffusion: decoder-only masked-diffusion LM (diffusion mode).
+    NemotronDiffusion(nemotron_diffusion::NemotronDiffusionLM),
 }
 
 fn checked_head_dim(hidden_size: i32, num_attention_heads: i32) -> Result<i32, Exception> {
@@ -395,7 +398,8 @@ impl AnyModel {
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => Err(Exception::custom(
+            | Self::BonsaiQ1(_)
+            | Self::NemotronDiffusion(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer models",
             )),
         }
@@ -422,7 +426,8 @@ impl AnyModel {
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => None,
+            | Self::BonsaiQ1(_)
+            | Self::NemotronDiffusion(_) => None,
         }
     }
 
@@ -444,7 +449,10 @@ impl AnyModel {
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::BonsaiQ1(_)
+            | Self::NemotronDiffusion(_) => {
+                Err(Exception::custom("MTP not supported for this model"))
+            }
         }
     }
 
@@ -464,7 +472,10 @@ impl AnyModel {
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::BonsaiQ1(_)
+            | Self::NemotronDiffusion(_) => {
+                Err(Exception::custom("MTP not supported for this model"))
+            }
         }
     }
 
@@ -484,7 +495,10 @@ impl AnyModel {
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::BonsaiQ1(_)
+            | Self::NemotronDiffusion(_) => {
+                Err(Exception::custom("MTP not supported for this model"))
+            }
         }
     }
 
@@ -504,7 +518,10 @@ impl AnyModel {
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::BonsaiQ1(_)
+            | Self::NemotronDiffusion(_) => {
+                Err(Exception::custom("MTP not supported for this model"))
+            }
         }
     }
 
@@ -537,6 +554,7 @@ impl AnyModel {
             Self::LlavaQwen2(m) => m.hidden_size(),
             Self::DeepSeekV2(m) => m.args.hidden_size,
             Self::BonsaiQ1(m) => i32::try_from(m.config.hidden).unwrap_or(i32::MAX),
+            Self::NemotronDiffusion(m) => m.hidden_size(),
         }
     }
 
@@ -577,6 +595,7 @@ impl AnyModel {
                 i32::try_from(m.config.kv_heads).map_err(|e| Exception::custom(e.to_string()))?,
                 i32::try_from(m.config.head_dim).map_err(|e| Exception::custom(e.to_string()))?,
             )),
+            Self::NemotronDiffusion(m) => m.kv_cache_geometry(),
         }
     }
 
@@ -690,6 +709,14 @@ impl AnyModel {
                     i32::try_from(m.config.layers).map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(make_kv_cache(layers))
             }
+            Self::NemotronDiffusion(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not supported for Nemotron diffusion models",
+                    ));
+                }
+                Ok(make_kv_cache(m.args.num_hidden_layers))
+            }
         }
     }
 
@@ -709,7 +736,8 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::DeepSeekV2(_)
-            | Self::BonsaiQ1(_) => None,
+            | Self::BonsaiQ1(_)
+            | Self::NemotronDiffusion(_) => None,
         }
     }
 
@@ -729,6 +757,41 @@ impl AnyModel {
             }
             _ => Err(Exception::custom(
                 "Model does not support multimodal forward",
+            )),
+        }
+    }
+
+    /// Whether this model uses diffusion-mode (parallel) decoding rather than
+    /// autoregressive decoding.
+    pub const fn is_diffusion(&self) -> bool {
+        matches!(self, Self::NemotronDiffusion(_))
+    }
+
+    /// Diffusion decode: generate `num_tokens` tokens by block-wise masked
+    /// denoising, using the model's configured `diffusion_steps` / `block_size`.
+    /// Only supported by diffusion models.
+    pub fn diffusion_generate(
+        &mut self,
+        prompt_ids: &[u32],
+        num_tokens: usize,
+        on_block: nemotron_diffusion::BlockCallback<'_>,
+    ) -> Result<Vec<u32>, Exception> {
+        match self {
+            Self::NemotronDiffusion(m) => {
+                let steps = usize::try_from(m.args.diffusion_steps).unwrap_or(32).max(1);
+                let block_size = usize::try_from(m.args.block_size).unwrap_or(32).max(1);
+                m.diffusion_generate(prompt_ids, num_tokens, steps, block_size, on_block)
+            }
+            Self::Transformer(_)
+            | Self::Qwen3Next(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
+                "diffusion_generate is only supported for diffusion models",
             )),
         }
     }

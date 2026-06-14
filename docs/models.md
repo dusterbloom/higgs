@@ -19,6 +19,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Starcoder2 | `starcoder2` | Starcoder2 3B, 7B, and 15B |
 | DeepSeek-V2 | `deepseek_v2` | DeepSeek-V2-Lite |
 | LLaVA-Qwen2 | `llava-qwen2` | nanoLLaVA-1.5 |
+| Nemotron-Labs-Diffusion | `nemotron_labs_diffusion` | Nemotron-Labs-Diffusion 3B/8B/14B (diffusion-mode decode) |
 
 ## Continuous Batching Support
 
@@ -49,6 +50,16 @@ Other supported architectures still serve normally in simple mode, but Higgs now
 - `Qwen3.6` support currently uses the `qwen3_5_moe` loader path.
 - The cached-model smoke matrix covered `mlx-community/Qwen3.6-35B-A3B-4bit` plus `mlx-community/Llama-3.2-1B-Instruct-4bit`, `mlx-community/Qwen2.5-3B-Instruct-4bit`, `mlx-community/Qwen3-1.7B-4bit`, and `mlx-community/Qwen3-Coder-Next-4bit`.
 - OpenAI-style chat requests use non-thinking mode by default for `Qwen3.6` unless the request explicitly opts into reasoning.
+
+## Nemotron-Labs-Diffusion Notes
+
+- `nemotron_labs_diffusion` runs in **diffusion mode**: the model denoises blocks
+  of masked tokens in parallel (bidirectional attention, YaRN RoPE) rather than
+  decoding one token at a time. `block_size` and `diffusion_steps` are read from
+  `config.json`.
+- Decoding is greedy in this release; per-token logprobs are not surfaced, and
+  streaming emits the full generation as a single chunk. The model's
+  autoregressive and self-speculation modes are planned follow-ups.
 
 ## Model Input Requirements
 

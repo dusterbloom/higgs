@@ -97,6 +97,12 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::DeepSeekV2(model))
         }
+        "nemotron_labs_diffusion" => {
+            let model =
+                higgs_models::nemotron_diffusion::load_nemotron_diffusion_model(&config.model_dir)
+                    .map_err(EngineError::Model)?;
+            Ok(AnyModel::NemotronDiffusion(model))
+        }
         other => Err(EngineError::Model(
             higgs_models::error::ModelError::UnsupportedModel(other.to_owned()),
         )),

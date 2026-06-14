@@ -767,6 +767,59 @@ impl SimpleEngine {
             .map_err(|e| EngineError::Tokenization(e.to_string()))
     }
 
+    /// Whether the loaded model uses diffusion-mode (parallel) decoding.
+    fn model_is_diffusion(&self) -> Result<bool, EngineError> {
+        let model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+        Ok(model.is_diffusion())
+    }
+
+    /// Diffusion-mode generation: produce the full output via block-wise masked
+    /// denoising, then trim at EOS / stop sequences. Returns
+    /// `(text, finish_reason, prompt_tokens, completion_tokens)`.
+    ///
+    /// Diffusion decode is parallel (not token-by-token), so this first version
+    /// is greedy and does not surface per-token logprobs.
+    fn diffusion_run(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        stop_sequences: &[String],
+    ) -> Result<(String, String, u32, u32), EngineError> {
+        let prompt_len = Self::prompt_len(prompt_tokens)?;
+        let num_tokens = usize::try_from(max_tokens).unwrap_or(0);
+
+        let generated = {
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+            model
+                .diffusion_generate(prompt_tokens, num_tokens, None)
+                .map_err(EngineError::Mlx)?
+        };
+
+        // Trim at the first EOS token.
+        let mut hit_eos = false;
+        let mut ids: Vec<u32> = Vec::with_capacity(generated.len());
+        for tok in generated {
+            if self.eos_token_ids.contains(&tok) {
+                hit_eos = true;
+                break;
+            }
+            ids.push(tok);
+        }
+        let completion_tokens = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+
+        let decoded = self.decode_tokens(&ids)?;
+        let (text, stopped) = check_stop_sequences(&decoded, stop_sequences)
+            .map_or((decoded, false), |trimmed| (trimmed, true));
+        let finish_reason = if hit_eos || stopped { "stop" } else { "length" }.to_owned();
+        Ok((text, finish_reason, prompt_len, completion_tokens))
+    }
+
     /// The model's hidden dimension (embedding output size).
     pub fn hidden_size(&self) -> i32 {
         let model = self
@@ -1000,6 +1053,20 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
+        // Diffusion models decode in parallel (not token-by-token); take a
+        // dedicated path that bypasses the autoregressive prefill/decode loop.
+        if self.model_is_diffusion()? {
+            let (text, finish_reason, prompt_count, completion_tokens) =
+                self.diffusion_run(prompt_tokens, max_tokens, stop_sequences)?;
+            return Ok(GenerationOutput {
+                text,
+                finish_reason,
+                prompt_tokens: prompt_count,
+                completion_tokens,
+                token_logprobs: None,
+            });
+        }
+
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
@@ -2184,6 +2251,33 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
+        // Diffusion models decode in parallel. PR1 emits the full generated
+        // text as one content chunk followed by a terminal chunk (per-block
+        // incremental streaming is a follow-up).
+        if self.model_is_diffusion()? {
+            let (text, finish_reason, prompt_count, completion_tokens) =
+                self.diffusion_run(prompt_tokens, max_tokens, stop_sequences)?;
+            if !text.is_empty() {
+                let _ = sender.blocking_send(StreamingOutput {
+                    new_text: text,
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: prompt_count,
+                    completion_tokens,
+                    token_logprob: None,
+                });
+            }
+            let _ = sender.blocking_send(StreamingOutput {
+                new_text: String::new(),
+                finished: true,
+                finish_reason: Some(finish_reason),
+                prompt_tokens: prompt_count,
+                completion_tokens,
+                token_logprob: None,
+            });
+            return Ok(());
+        }
+
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;

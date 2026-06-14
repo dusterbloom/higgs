@@ -41,6 +41,7 @@ pub fn is_supported(model_type: &str) -> bool {
             | "starcoder2"
             | "llava-qwen2"
             | "deepseek_v2"
+            | "nemotron_labs_diffusion"
     )
 }
 
@@ -220,6 +221,20 @@ mod tests {
     fn test_detect_model_type_deepseek_v2() {
         let dir = write_model_type_config("deepseek_v2");
         assert_eq!(detect_model_type(dir.path()).unwrap(), "deepseek_v2");
+    }
+
+    #[test]
+    fn test_is_supported_nemotron_diffusion() {
+        assert!(is_supported("nemotron_labs_diffusion"));
+    }
+
+    #[test]
+    fn test_detect_model_type_nemotron_diffusion() {
+        let dir = write_model_type_config("nemotron_labs_diffusion");
+        assert_eq!(
+            detect_model_type(dir.path()).unwrap(),
+            "nemotron_labs_diffusion"
+        );
     }
 
     #[test]
