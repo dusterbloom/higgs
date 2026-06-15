@@ -16,6 +16,29 @@ use crate::config::HiggsConfig;
 use crate::metrics::MetricsStore;
 use crate::router::Router;
 
+/// Process-wide GPU inference gate.
+///
+/// MLX's Metal backend keeps shared, non-stream-local state — notably the
+/// output-array table mutated in `metal::CommandEncoder::set_output_array`. Two
+/// co-resident models evaluating concurrently (each on its own `spawn_blocking`
+/// thread, each under a fresh `with_new_default_stream(Stream::new())`) race on
+/// that table and corrupt it → `EXC_BAD_ACCESS`/SIGSEGV inside
+/// `set_output_array`. The per-engine `Mutex<AnyModel>` only serializes a single
+/// model, not across the co-resident set (e.g. an SLM trio).
+///
+/// On a single-GPU host there is no real parallelism to lose, so all GPU eval is
+/// serialized through this one gate. Held only for the duration of a
+/// generate/embed call. NOTE: this also serializes concurrent requests to a
+/// single `Batch` engine; if per-model batch interleaving is reintroduced, this
+/// gate should be narrowed to cross-model boundaries.
+static GPU_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the global GPU gate, recovering from poisoning so a panic mid-eval
+/// cannot permanently wedge all inference.
+fn gpu_gate() -> std::sync::MutexGuard<'static, ()> {
+    GPU_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Unified engine interface wrapping either the simple (serialized) or batch
 /// (interleaved) engine. Route handlers interact with this enum exclusively.
 pub enum Engine {
@@ -189,6 +212,7 @@ impl Engine {
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
+        let _gpu = gpu_gate();
         match self {
             Self::Simple(e) => e.generate_with_thinking(
                 prompt_tokens,
@@ -258,6 +282,7 @@ impl Engine {
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
+        let _gpu = gpu_gate();
         match self {
             Self::Simple(e) => e.generate_streaming_with_thinking(
                 prompt_tokens,
@@ -289,6 +314,7 @@ impl Engine {
     }
 
     pub fn embed(&self, token_ids: &[u32]) -> Result<Vec<f32>, EngineError> {
+        let _gpu = gpu_gate();
         match self {
             Self::Simple(e) => e.embed(token_ids),
             Self::Batch(e) => e.embed(token_ids),
