@@ -75,8 +75,16 @@ pub fn parse_tool_calls(text: &str) -> ToolParseResult {
     }
 }
 
-/// Try to parse a single tool call JSON block.
+/// Try to parse a single tool call block. Accepts two formats that Qwen-family
+/// templates emit between `<tool_call>` tags:
+///   1. JSON: `{"name": "f", "arguments": {"k": "v"}}`
+///   2. XML/Hermes: `<function=f><parameter=k>v</parameter></function>`
 fn try_parse_tool_call(content: &str) -> Option<ParsedToolCall> {
+    try_parse_json_tool_call(content).or_else(|| try_parse_xml_tool_call(content))
+}
+
+/// Parse the JSON object form: `{"name": ..., "arguments": ...}`.
+fn try_parse_json_tool_call(content: &str) -> Option<ParsedToolCall> {
     let value: serde_json::Value = serde_json::from_str(content).ok()?;
     let obj = value.as_object()?;
 
@@ -88,6 +96,43 @@ fn try_parse_tool_call(content: &str) -> Option<ParsedToolCall> {
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
 
     Some(ParsedToolCall { name, arguments })
+}
+
+/// Parse the XML/Hermes form: `<function=NAME><parameter=KEY>VALUE</parameter>…</function>`.
+/// Each parameter value is parsed as JSON when possible (numbers, bools, objects)
+/// and otherwise kept as a string (URLs, bare words).
+fn try_parse_xml_tool_call(content: &str) -> Option<ParsedToolCall> {
+    let rest = content.trim().strip_prefix("<function=")?;
+    let name_end = rest.find('>')?;
+    let name = rest.get(..name_end)?.trim().to_owned();
+    if name.is_empty() {
+        return None;
+    }
+
+    let body = rest.get(name_end + 1..)?;
+    let body = body.split("</function>").next().unwrap_or(body);
+
+    let mut args = serde_json::Map::new();
+    let mut cursor = body;
+    while let Some(p) = cursor.find("<parameter=") {
+        let after = &cursor[p + "<parameter=".len()..];
+        let Some(key_end) = after.find('>') else { break };
+        let key = after[..key_end].trim().to_owned();
+        let val_region = &after[key_end + 1..];
+        let Some(val_end) = val_region.find("</parameter>") else { break };
+        let val = val_region[..val_end].trim();
+        if !key.is_empty() {
+            let jval = serde_json::from_str::<serde_json::Value>(val)
+                .unwrap_or_else(|_| serde_json::Value::String(val.to_owned()));
+            args.insert(key, jval);
+        }
+        cursor = &val_region[val_end + "</parameter>".len()..];
+    }
+
+    Some(ParsedToolCall {
+        name,
+        arguments: serde_json::Value::Object(args),
+    })
 }
 
 #[cfg(test)]
@@ -335,5 +380,29 @@ After last."#;
     fn test_whitespace_only_content_between_tags() {
         let input = "<tool_call>\n   \n  \t  \n</tool_call>";
         assert_parse(input, 0, Some("<tool_call>"));
+    }
+
+    #[test]
+    fn test_xml_hermes_function_format() {
+        // Qwen3.5-0.8B emits this XML form between <tool_call> tags.
+        let input = "<tool_call>\n<function=web_fetch>\n<parameter=url>\nhttps://news.ycombinator.com\n</parameter>\n</function>\n</tool_call>";
+        let result = assert_parse(input, 1, None);
+        let call = result.tool_calls.first().unwrap();
+        assert_eq!(call.name, "web_fetch");
+        assert_eq!(
+            call.arguments.get("url").unwrap().as_str().unwrap(),
+            "https://news.ycombinator.com"
+        );
+    }
+
+    #[test]
+    fn test_xml_function_multiple_params_typed() {
+        let input = "<tool_call>\n<function=search><parameter=query>rust</parameter><parameter=limit>5</parameter></function>\n</tool_call>";
+        let result = assert_parse(input, 1, None);
+        let call = result.tool_calls.first().unwrap();
+        assert_eq!(call.name, "search");
+        assert_eq!(call.arguments.get("query").unwrap().as_str().unwrap(), "rust");
+        // numeric value parsed as JSON number, not string
+        assert_eq!(call.arguments.get("limit").unwrap().as_i64().unwrap(), 5);
     }
 }
