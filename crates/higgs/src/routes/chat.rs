@@ -23,7 +23,7 @@ use crate::{
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
         ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent, StopSequence,
-        TokenLogprob, ToolCall, ToolCallFunction, TopLogprob,
+        TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
     },
 };
 use higgs_models::SamplingParams;
@@ -417,18 +417,10 @@ fn chat_completions_stream(
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
+    // Tool-enabled streaming: render the tool defs into the prompt and buffer
+    // the visible output, parsing tool_calls once generation completes (the
+    // tool-call markup must be parsed, not streamed as content).
     let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
-
-    // Tool-calling responses are not supported in streaming mode.
-    // Accept requests that include tools (nanobot always sends them) but
-    // exclude them from prompt rendering so the model generates plain text.
-    if stream_includes_tools {
-        tracing::warn!(
-            request_model = req.model,
-            tool_count = req.tools.as_ref().map_or(0, Vec::len),
-            "Streaming API does not support tool-calls; tools will be ignored",
-        );
-    }
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
     let sampling = build_sampling_params(&req);
@@ -451,9 +443,13 @@ fn chat_completions_stream(
         req.reasoning.as_ref(),
     );
 
-    // Exclude tools from streaming prompt — tool_calls deltas are unsupported.
+    let tools_for_prompt = if stream_includes_tools {
+        req.tools.as_deref()
+    } else {
+        None
+    };
     let mut prompt_tokens = engine
-        .prepare_chat_prompt_with_thinking(&messages, None, thinking_enabled_stream)
+        .prepare_chat_prompt_with_thinking(&messages, tools_for_prompt, thinking_enabled_stream)
         .map_err(ServerError::Engine)?;
 
     // Preprocess images for VLM
@@ -551,6 +547,9 @@ fn chat_completions_stream(
         let mut output_token_count: u32 = 0;
         let mut pending_finish_reason: Option<String> = None;
         let mut pending_finish_logprobs: Option<ChoiceLogprobs> = None;
+        // When tools are present, visible output is buffered here and parsed for
+        // tool calls after generation rather than streamed as content.
+        let mut tool_buf = String::new();
 
         while let Some(output) = rx.recv().await {
             output_token_count = output.completion_tokens;
@@ -573,13 +572,17 @@ fn chat_completions_stream(
             }
 
             if !visible.is_empty() {
-                let d = ChatCompletionDelta {
-                    role: None,
-                    content: Some(visible),
-                    reasoning_content: None,
-                    tool_calls: None,
-                };
-                emit_delta!(&d, None, chunk_logprobs.as_ref());
+                if stream_includes_tools {
+                    tool_buf.push_str(&visible);
+                } else {
+                    let d = ChatCompletionDelta {
+                        role: None,
+                        content: Some(visible),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    };
+                    emit_delta!(&d, None, chunk_logprobs.as_ref());
+                }
             }
 
             if let Some(finish_reason) = output.finish_reason {
@@ -600,14 +603,68 @@ fn chat_completions_stream(
             emit_delta!(&d, None, None);
         }
         if !flush_vis.is_empty() {
-            let d = ChatCompletionDelta {
-                role: None,
-                content: Some(flush_vis),
-                reasoning_content: None,
-                tool_calls: None,
-            };
-            emit_delta!(&d, None, None);
+            if stream_includes_tools {
+                tool_buf.push_str(&flush_vis);
+            } else {
+                let d = ChatCompletionDelta {
+                    role: None,
+                    content: Some(flush_vis),
+                    reasoning_content: None,
+                    tool_calls: None,
+                };
+                emit_delta!(&d, None, None);
+            }
         }
+
+        // Tool-enabled streaming: parse buffered output for tool calls and emit
+        // them as a final delta (mirrors chat_completions_non_streaming).
+        if stream_includes_tools {
+            let parsed = higgs_engine::tool_parser::parse_tool_calls(&tool_buf);
+            if parsed.tool_calls.is_empty() {
+                if !tool_buf.is_empty() {
+                    let d = ChatCompletionDelta {
+                        role: None,
+                        content: Some(std::mem::take(&mut tool_buf)),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    };
+                    emit_delta!(&d, None, None);
+                }
+            } else {
+                if !parsed.text.is_empty() {
+                    let d = ChatCompletionDelta {
+                        role: None,
+                        content: Some(parsed.text.clone()),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    };
+                    emit_delta!(&d, None, None);
+                }
+                let calls: Vec<ToolCallDelta> = parsed
+                    .tool_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tc)| ToolCallDelta {
+                        index: u32::try_from(i).unwrap_or(0),
+                        id: Some(format!("call_{i}_{}", uuid::Uuid::new_v4())),
+                        r#type: Some("function".to_owned()),
+                        function: Some(ToolCallFunctionDelta {
+                            name: Some(tc.name.clone()),
+                            arguments: Some(tc.arguments.to_string()),
+                        }),
+                    })
+                    .collect();
+                let d = ChatCompletionDelta {
+                    role: None,
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(calls),
+                };
+                emit_delta!(&d, None, None);
+                pending_finish_reason = Some("tool_calls".to_owned());
+            }
+        }
+
         if let Some(finish_reason) = pending_finish_reason {
             let d = ChatCompletionDelta {
                 role: None,
