@@ -701,6 +701,25 @@ fn chat_completions_stream(
     Ok(stream)
 }
 
+/// Coerce a tool_call's `function.arguments` from a JSON-encoded string (the
+/// OpenAI wire format) into a parsed JSON object, so chat templates that iterate
+/// it (e.g. Qwen's `tool_call.arguments | items`) render instead of erroring with
+/// "cannot convert value into pairs". Non-string or unparseable arguments are
+/// left untouched.
+fn coerce_tool_call_arguments(mut tc: serde_json::Value) -> serde_json::Value {
+    let Some(func) = tc.pointer_mut("/function").and_then(|f| f.as_object_mut()) else {
+        return tc;
+    };
+    let parsed = func
+        .get("arguments")
+        .and_then(|a| a.as_str())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    if let Some(parsed) = parsed {
+        func.insert("arguments".to_owned(), parsed);
+    }
+    tc
+}
+
 fn convert_messages(
     messages: &[ChatCompletionMessage],
 ) -> Vec<higgs_engine::chat_template::ChatMessage> {
@@ -711,6 +730,7 @@ fn convert_messages(
                 calls
                     .iter()
                     .filter_map(|tc| serde_json::to_value(tc).ok())
+                    .map(coerce_tool_call_arguments)
                     .collect()
             });
             let content = m
