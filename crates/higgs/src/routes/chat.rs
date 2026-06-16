@@ -268,11 +268,17 @@ async fn chat_completions_non_streaming(
 
     let messages = convert_messages(&effective_messages);
     let tools = req.tools.as_deref();
-    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
-        req.reasoning.as_ref(),
-    );
+    // A forced tool call ("tool_choice":"required") constrains decoding from
+    // token 0, which leaves no room for a `<think>` prefix — so force thinking
+    // off for that request.
+    let force_tool = tools.is_some_and(|t| !t.is_empty())
+        && tool_choice_is_required(req.tool_choice.as_ref());
+    let thinking_enabled = !force_tool
+        && crate::reasoning::effective_thinking_enabled(
+            engine.enable_thinking(),
+            &[engine.model_name(), req.model.as_str()],
+            req.reasoning.as_ref(),
+        );
 
     let mut prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&messages, tools, thinking_enabled)
@@ -295,7 +301,11 @@ async fn chat_completions_non_streaming(
         None
     };
 
-    let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
+    let constraint = if force_tool {
+        Some(build_tool_constraint(tools.unwrap_or(&[]), &engine)?)
+    } else {
+        build_constraint(req.response_format.as_ref(), &engine)?
+    };
 
     let tokenizer = engine.tokenizer().clone();
     let output = tokio::task::spawn_blocking(move || {
@@ -437,11 +447,16 @@ fn chat_completions_stream(
     };
 
     let messages = convert_messages(&effective_messages);
-    let thinking_enabled_stream = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
-        req.reasoning.as_ref(),
-    );
+    // See non-streaming path: a forced tool call constrains from token 0, so
+    // thinking must be off for that request.
+    let force_tool =
+        stream_includes_tools && tool_choice_is_required(req.tool_choice.as_ref());
+    let thinking_enabled_stream = !force_tool
+        && crate::reasoning::effective_thinking_enabled(
+            engine.enable_thinking(),
+            &[engine.model_name(), req.model.as_str()],
+            req.reasoning.as_ref(),
+        );
 
     let tools_for_prompt = if stream_includes_tools {
         req.tools.as_deref()
@@ -469,7 +484,11 @@ fn chat_completions_stream(
         None
     };
 
-    let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
+    let constraint = if force_tool {
+        Some(build_tool_constraint(req.tools.as_deref().unwrap_or(&[]), &engine)?)
+    } else {
+        build_constraint(req.response_format.as_ref(), &engine)?
+    };
 
     let request_id = generate_request_id();
     let include_usage = req
@@ -811,6 +830,34 @@ fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
     }
+}
+
+/// Whether `tool_choice` forces a tool call: `"required"` or a named-function
+/// object. `"auto"` / `"none"` / a plain string / absent do not force.
+fn tool_choice_is_required(tool_choice: Option<&serde_json::Value>) -> bool {
+    match tool_choice {
+        Some(serde_json::Value::String(s)) => s == "required",
+        Some(serde_json::Value::Object(_)) => true,
+        _ => false,
+    }
+}
+
+/// Build a from-token-0 constraint that forces a well-formed `<tool_call>…
+/// </tool_call>` selecting one of `tools` with schema-valid arguments. The
+/// resulting text round-trips through [`higgs_engine::tool_parser`].
+fn build_tool_constraint(
+    tools: &[serde_json::Value],
+    engine: &std::sync::Arc<crate::state::Engine>,
+) -> Result<higgs_engine::constrained::ConstrainedGenerator, ServerError> {
+    let regex = higgs_engine::tool_grammar::tool_call_regex(tools);
+    let eos_id = engine.eos_token_ids().first().copied().unwrap_or(0);
+    higgs_engine::tool_grammar::cached_tool_constraint(
+        engine.model_name(),
+        engine.tokenizer(),
+        eos_id,
+        &regex,
+    )
+    .map_err(ServerError::Engine)
 }
 
 /// Build a constrained generator from the request's `response_format`.

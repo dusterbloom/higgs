@@ -5,6 +5,8 @@
 //! are valid at the current state, and `apply_mask` zeros out disallowed
 //! logits before sampling.
 
+use std::sync::Arc;
+
 use mlx_rs::{Array, error::Exception};
 use outlines_core::index::Index;
 use outlines_core::json_schema;
@@ -13,14 +15,24 @@ use outlines_core::vocabulary::Vocabulary;
 use crate::error::EngineError;
 
 /// Wraps an `outlines-core` Index for constrained decoding.
+///
+/// The `Index` (the expensive-to-build FSM) is held behind an `Arc` so it can be
+/// shared from a cache across many requests; only the lightweight `state` cursor
+/// is per-generator.
 pub struct ConstrainedGenerator {
-    index: Index,
+    index: Arc<Index>,
     state: outlines_core::primitives::StateId,
 }
 
 impl ConstrainedGenerator {
     /// Build from a pre-computed `Index`.
     fn new(index: Index) -> Self {
+        Self::from_shared(Arc::new(index))
+    }
+
+    /// Build a fresh generator over a shared, pre-built `Index` (cache hit path).
+    /// Each call resets the FSM cursor to the initial state.
+    pub fn from_shared(index: Arc<Index>) -> Self {
         let state = index.initial_state();
         Self { index, state }
     }

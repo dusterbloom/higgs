@@ -32,6 +32,12 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopSequence>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    /// OpenAI-style tool choice. `"required"` (or a named-function object) forces
+    /// the model to emit exactly one tool call; Higgs then constrains decoding to
+    /// a grammar built from `tools` so the call is always well-formed. `"auto"` /
+    /// `"none"` / absent leave generation unconstrained.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
