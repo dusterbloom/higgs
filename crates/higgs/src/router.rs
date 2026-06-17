@@ -95,6 +95,10 @@ pub struct Router {
     /// Map key bound to the auto-router model, if enabled. Unloading it is
     /// refused because `auto_router_engine` keeps a separate `Arc` alive.
     auto_router_model_name: Option<String>,
+    /// Name of the currently active model -- the one served for `model:
+    /// "active"`, and the target replaced by a `switch`. Set by `switch`/load;
+    /// defaults to the sole startup model when exactly one is configured.
+    active_model: std::sync::Mutex<Option<String>>,
     auto_router_force: bool,
     auto_router_timeout_ms: u64,
     default_target: RouteTarget,
@@ -170,6 +174,12 @@ impl Router {
 
         let default_target = build_route_target(&config.default.provider, None, config)?;
 
+        // When exactly one model is loaded, treat it as active so `model:
+        // "active"` works before any explicit switch.
+        let initial_active = (engines.len() == 1)
+            .then(|| engines.keys().next().cloned())
+            .flatten();
+
         Ok(Self {
             local_engines: RwLock::new(engines),
             compiled_routes,
@@ -177,6 +187,7 @@ impl Router {
             auto_candidates,
             auto_router_engine,
             auto_router_model_name,
+            active_model: std::sync::Mutex::new(initial_active),
             auto_router_force: config.auto_router.force,
             auto_router_timeout_ms: config.auto_router.timeout_ms,
             default_target,
@@ -192,6 +203,15 @@ impl Router {
         model: &str,
         messages: Option<&[serde_json::Value]>,
     ) -> Result<ResolvedRoute, String> {
+        // "active" is a stable alias for whichever model is current, so clients
+        // can keep hitting one name across switches. Re-resolve with the concrete
+        // name; falls through unchanged when no model is active.
+        if model == "active" {
+            if let Some(active) = self.active_model() {
+                return Box::pin(self.resolve(&active, messages)).await;
+            }
+        }
+
         if self.auto_router_force || model == "auto" {
             if let Some(resolved) = self.try_auto_route(messages).await {
                 return Ok(resolved);
@@ -254,6 +274,28 @@ impl Router {
     /// caller is responsible for dropping it once no request still holds a clone.
     pub fn remove_engine(&self, name: &str) -> Option<Arc<Engine>> {
         self.engines_write().remove(name)
+    }
+
+    /// Remove every loaded engine, returning them for the caller to drain and
+    /// drop. Used by `switch` to free the resident set before loading anew.
+    pub fn drain_all_engines(&self) -> Vec<Arc<Engine>> {
+        self.engines_write().drain().map(|(_, e)| e).collect()
+    }
+
+    /// Name of the currently active model, if any.
+    pub fn active_model(&self) -> Option<String> {
+        self.active_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Set (or clear) the currently active model.
+    pub fn set_active_model(&self, name: Option<String>) {
+        *self
+            .active_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = name;
     }
 
     /// Map key bound to the auto-router model, if the auto-router is enabled.
@@ -908,6 +950,49 @@ mod tests {
         assert!(removed.is_some());
         assert!(!router.contains_engine("x"));
         assert!(router.remove_engine("x").is_none());
+    }
+
+    #[test]
+    fn single_loaded_model_is_active_by_default() {
+        let config = config_from_toml("[[models]]\npath = \"some/model\"\n");
+        let mut engines = HashMap::new();
+        engines.insert(
+            "solo".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("solo")),
+        );
+        let router = Router::from_config(&config, engines).unwrap();
+        assert_eq!(router.active_model().as_deref(), Some("solo"));
+
+        // Two models -> ambiguous, so no default active.
+        let mut two = HashMap::new();
+        two.insert(
+            "a".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("a")),
+        );
+        two.insert(
+            "b".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("b")),
+        );
+        let router = Router::from_config(&config, two).unwrap();
+        assert!(router.active_model().is_none());
+    }
+
+    #[tokio::test]
+    async fn active_alias_routes_to_active_model() {
+        let config = config_from_toml("[[models]]\npath = \"some/model\"\n");
+        let mut engines = HashMap::new();
+        engines.insert(
+            "real".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("real")),
+        );
+        let router = Router::from_config(&config, engines).unwrap();
+        router.set_active_model(Some("real".to_owned()));
+
+        let route = router.resolve("active", None).await.unwrap();
+        match route {
+            ResolvedRoute::Higgs { model_name, .. } => assert_eq!(model_name, "real"),
+            ResolvedRoute::Remote { .. } => panic!("expected the active local model"),
+        }
     }
 
     #[tokio::test]

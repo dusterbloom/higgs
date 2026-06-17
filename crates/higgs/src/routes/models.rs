@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,7 @@ use axum::{
 use bytes::Bytes;
 
 use crate::{
-    config::ModelConfig,
+    config::{LocalConfig, ModelConfig},
     error::ServerError,
     model_resolver,
     state::{Engine, SharedState, build_engine},
@@ -50,19 +51,7 @@ pub async fn load_model(
         ));
     }
 
-    let model_cfg: ModelConfig = serde_json::from_slice(&body)
-        .map_err(|e| ServerError::BadRequest(format!("invalid model config: {e}")))?;
-
-    // Validate the KV-cache config up front, mirroring `doctor::check_models`.
-    model_cfg
-        .kv_cache_config()
-        .validate()
-        .map_err(|e| ServerError::BadRequest(format!("invalid KV cache config: {e}")))?;
-    if model_cfg.batch && model_cfg.kv_cache_config().is_turboquant() {
-        return Err(ServerError::BadRequest(
-            "unsupported combination: TurboQuant KV cache with batch=true".to_owned(),
-        ));
-    }
+    let model_cfg: ModelConfig = parse_model_cfg(&body)?;
 
     // Cheap collision pre-check when the caller named the model, so we don't pay
     // for a full load just to reject it. `insert_engine` re-checks under the
@@ -75,21 +64,9 @@ pub async fn load_model(
         }
     }
 
-    // Resolve the path without prompting -- the server has no interactive stdin.
-    let resolved = model_resolver::resolve(&model_cfg.path).map_err(|e| {
-        ServerError::BadRequest(format!(
-            "model '{}' not found locally: {e}; pre-download it (e.g. `huggingface-cli download {}`)",
-            model_cfg.path, model_cfg.path
-        ))
-    })?;
-
-    // The weight load is blocking and GPU-bound; keep it off the async runtime.
+    let resolved = resolve_model_path(&model_cfg.path)?;
     let local = state.config.local.clone();
-    let cfg = model_cfg.clone();
-    let (name, engine) = tokio::task::spawn_blocking(move || build_engine(&resolved, &cfg, &local))
-        .await
-        .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?
-        .map_err(ServerError::BadRequest)?;
+    let (name, engine) = build_engine_off_thread(resolved, model_cfg, local).await?;
 
     state
         .router
@@ -97,6 +74,59 @@ pub async fn load_model(
         .map_err(|n| ServerError::Conflict(format!("model '{n}' is already loaded")))?;
 
     tracing::info!(model_name = %name, "Model loaded at runtime");
+    Ok(Json(model_object(name)))
+}
+
+/// `POST /v1/models/switch` -- make a model the sole resident one, atomically.
+///
+/// Free-then-load: unloads every currently-loaded model first, then loads the
+/// target, so two models are never co-resident (safe for large models on a
+/// single GPU). The target becomes the active model (`model: "active"`). If the
+/// load fails the slot is left empty and a `500` is returned. Refused (`409`)
+/// while the auto-router is enabled, since that is a multi-model feature.
+pub async fn switch_model(
+    State(state): State<SharedState>,
+    body: Bytes,
+) -> Result<Json<ModelObject>, ServerError> {
+    if !state.config.local.allow_runtime_model_load {
+        return Err(ServerError::Forbidden(
+            "runtime model switching is disabled; set local.allow_runtime_model_load = true to enable it"
+                .to_owned(),
+        ));
+    }
+    if state.router.auto_router_model_name().is_some() {
+        return Err(ServerError::Conflict(
+            "model switching is unavailable while the auto-router is enabled".to_owned(),
+        ));
+    }
+
+    let model_cfg: ModelConfig = parse_model_cfg(&body)?;
+    // Resolve before unloading anything, so a bad request never leaves the
+    // server empty-handed.
+    let resolved = resolve_model_path(&model_cfg.path)?;
+
+    // Free the resident set first (free-then-load). Active is cleared up front:
+    // until the new model loads, there is no active model.
+    state.router.set_active_model(None);
+    for engine in state.router.drain_all_engines() {
+        drain_and_drop(engine, DRAIN_TIMEOUT).await;
+    }
+
+    let local = state.config.local.clone();
+    let (name, engine) = build_engine_off_thread(resolved, model_cfg, local)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "switch failed; no model is loaded");
+            ServerError::InternalError("switch failed; no model is loaded".to_owned())
+        })?;
+
+    state
+        .router
+        .insert_engine(name.clone(), Arc::new(engine))
+        .map_err(|n| ServerError::Conflict(format!("model '{n}' is already loaded")))?;
+    state.router.set_active_model(Some(name.clone()));
+
+    tracing::info!(model_name = %name, "Switched active model");
     Ok(Json(model_object(name)))
 }
 
@@ -120,6 +150,11 @@ pub async fn unload_model(
         .remove_engine(&name)
         .ok_or_else(|| ServerError::ModelNotFound(name.clone()))?;
 
+    // Drop the active pointer if it referenced this model.
+    if state.router.active_model().as_deref() == Some(name.as_str()) {
+        state.router.set_active_model(None);
+    }
+
     // The map entry is gone, so no new request can take a reference and the
     // strong count only decreases. Free GPU memory once the last in-flight
     // request releases its clone; detach past the timeout so a long generation
@@ -131,6 +166,44 @@ pub async fn unload_model(
         tracing::info!(model_name = %name, "Model unload deferred; request still in flight");
         Ok(StatusCode::ACCEPTED)
     }
+}
+
+/// Parse and validate a runtime model config from a request body. Mirrors the
+/// KV-cache checks in `doctor::check_models`.
+fn parse_model_cfg(body: &Bytes) -> Result<ModelConfig, ServerError> {
+    let model_cfg: ModelConfig = serde_json::from_slice(body)
+        .map_err(|e| ServerError::BadRequest(format!("invalid model config: {e}")))?;
+    model_cfg
+        .kv_cache_config()
+        .validate()
+        .map_err(|e| ServerError::BadRequest(format!("invalid KV cache config: {e}")))?;
+    if model_cfg.batch && model_cfg.kv_cache_config().is_turboquant() {
+        return Err(ServerError::BadRequest(
+            "unsupported combination: TurboQuant KV cache with batch=true".to_owned(),
+        ));
+    }
+    Ok(model_cfg)
+}
+
+/// Resolve a model path without prompting -- the server has no interactive stdin.
+fn resolve_model_path(path: &str) -> Result<PathBuf, ServerError> {
+    model_resolver::resolve(path).map_err(|e| {
+        ServerError::BadRequest(format!(
+            "model '{path}' not found locally: {e}; pre-download it (e.g. `huggingface-cli download {path}`)"
+        ))
+    })
+}
+
+/// Run the blocking, GPU-bound weight load off the async runtime.
+async fn build_engine_off_thread(
+    resolved: PathBuf,
+    model_cfg: ModelConfig,
+    local: LocalConfig,
+) -> Result<(String, Engine), ServerError> {
+    tokio::task::spawn_blocking(move || build_engine(&resolved, &model_cfg, &local))
+        .await
+        .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?
+        .map_err(ServerError::BadRequest)
 }
 
 /// Wait until `engine` is solely owned here, then drop it (freeing GPU memory).
@@ -349,5 +422,57 @@ mod tests {
         let drained = drain_and_drop(engine, Duration::from_millis(80)).await;
         assert!(!drained, "should time out while a reference is held");
         drop(clone); // let the detached task finish
+    }
+
+    #[tokio::test]
+    async fn switch_disabled_returns_forbidden() {
+        let state = build_state(
+            "[local]\nallow_runtime_model_load = false\n",
+            HashMap::new(),
+        );
+        let err = switch_model(State(state), Bytes::from_static(b"{\"path\":\"x\"}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServerError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn switch_refused_with_auto_router() {
+        let toml = r#"
+            [local]
+            allow_runtime_model_load = true
+
+            [[models]]
+            path = "/models/Arch-Router-1.5B-4bit"
+            name = "router"
+
+            [auto_router]
+            enabled = true
+            model = "router"
+        "#;
+        let state = build_state(toml, stub_engines(&["router"]));
+        let err = switch_model(State(state), Bytes::from_static(b"{\"path\":\"x\"}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServerError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn switch_bad_path_keeps_existing_model_loaded() {
+        // A switch that can't resolve its target must reject *before* unloading,
+        // so the currently-loaded model survives a bad request.
+        let state = build_state(
+            "[local]\nallow_runtime_model_load = true\n",
+            stub_engines(&["current"]),
+        );
+        let body = Bytes::from_static(b"{\"path\":\"definitely/not/a/real/model\"}");
+        let err = switch_model(State(Arc::clone(&state)), body)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServerError::BadRequest(_)));
+        assert!(
+            state.router.contains_engine("current"),
+            "existing model must not be unloaded on a failed switch"
+        );
     }
 }

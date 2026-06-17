@@ -128,6 +128,25 @@ async fn unload_unknown_model_returns_404() {
 }
 
 #[tokio::test]
+async fn switch_model_disabled_returns_403() {
+    // Default test config has no [local] section, so runtime switching is off.
+    let app = build_router(build_test_state(None), 300.0, None, 0, 1024, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/switch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"path":"some/model"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn request_body_limit_is_enforced() {
     let app = build_router(build_test_state(None), 300.0, None, 0, 64, None);
     let body = serde_json::json!({

@@ -126,7 +126,7 @@ curl http://localhost:8000/v1/chat/completions \
 - Release artifacts bundle `mlx.metallib`.
 - Source builds also require `mlx.metallib` next to the executable. Higgs now restores it automatically from Cargo build output when possible, then fails loudly if it still cannot be found.
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
-- `[local].allow_runtime_model_load` defaults to `false`. Enable it to load/unload models at runtime via `POST`/`DELETE /v1/models`; protect it with `server.api_key`.
+- `[local].allow_runtime_model_load` defaults to `false`. Enable it to switch/load/unload models at runtime via `POST /v1/models/switch`, `POST`/`DELETE /v1/models`; protect it with `server.api_key`.
 - `batch=true` is only supported for transformer families with true batched decode support.
 
 ## Performance
@@ -196,32 +196,44 @@ Measured on DeepSeek-V2-Lite-4bit with global batch sorting before `gather_qmm`.
 
 - OpenAI: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`
 - Anthropic: `/v1/messages`, `/v1/messages/count_tokens`
-- Runtime model management (opt-in): `POST /v1/models`, `DELETE /v1/models/{name}`
+- Runtime model management (opt-in): `POST /v1/models`, `POST /v1/models/switch`, `DELETE /v1/models/{name}`
 - Metrics: `/metrics`
 - Health: `/health`
 
 ### Runtime model management
 
-By default the set of loaded models is fixed at startup. To add or remove models
-while the server runs, set `allow_runtime_model_load = true` under `[local]`
-(protect it with `server.api_key` -- the load endpoint can read local model
-directories and trigger downloads). Changes are in-memory only and do not persist
-to the config file.
+By default the set of loaded models is fixed at startup. To change models while
+the server runs, set `allow_runtime_model_load = true` under `[local]` (protect it
+with `server.api_key` -- these endpoints can read local model directories and
+trigger downloads). Changes are in-memory only and do not persist to the config
+file.
 
 ```bash
-# Load a model (body mirrors a [[models]] entry; path required)
-curl http://localhost:8000/v1/models \
+# Switch the active model: free whatever is loaded, then load this one (never two
+# resident at once). Then route to it with model "active".
+curl http://localhost:8000/v1/models/switch \
   -H "Authorization: Bearer $HIGGS_API_KEY" \
   -d '{"path": "mlx-community/Llama-3.2-1B-Instruct-4bit", "name": "llama"}'
 
-# Unload it and free its GPU memory (204 once freed, 202 if a request is still in flight)
-curl -X DELETE http://localhost:8000/v1/models/llama \
+# Add another model alongside the current one(s)
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer $HIGGS_API_KEY" \
+  -d '{"path": "mlx-community/Qwen3-1.7B-4bit", "name": "qwen"}'
+
+# Unload one and free its GPU memory (204 once freed, 202 if a request is still in flight)
+curl -X DELETE http://localhost:8000/v1/models/qwen \
   -H "Authorization: Bearer $HIGGS_API_KEY"
 ```
 
-An in-flight request keeps the model resident until it completes; `DELETE` removes
-it from routing immediately and frees memory once the last request drains. A model
-bound to the auto-router cannot be unloaded.
+- **`POST /v1/models/switch`** makes the target the *sole* resident model
+  (free-then-load), so two models are never co-resident -- the memory-safe choice
+  for large models on one GPU. The target becomes the active model; route to it as
+  `"model": "active"`. If the load fails the slot is left empty (`500`). Switching
+  is unavailable while the auto-router is enabled.
+- **`POST /v1/models`** adds a model alongside the current set (co-resident).
+- **`DELETE /v1/models/{name}`** removes it from routing immediately and frees
+  memory once the last in-flight request drains. A model bound to the auto-router
+  cannot be unloaded.
 
 **Core commands**
 
