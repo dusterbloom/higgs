@@ -201,6 +201,14 @@ pub struct ServeArgs {
     #[arg(long)]
     pub batch: bool,
 
+    /// Path to a draft model for speculative decoding (MLX or ANE).
+    #[arg(long)]
+    pub draft_model: Option<String>,
+
+    /// Number of draft tokens per speculative cycle (default: 8).
+    #[arg(long, default_value = "8")]
+    pub num_draft: usize,
+
     /// KV cache mode for simple mode models.
     #[arg(long, value_name = "MODE", value_parser = ["off", "turboquant"])]
     pub kv_cache: Option<String>,
@@ -393,6 +401,12 @@ pub struct ModelConfig {
     /// Enable the separate batch engine for this model.
     #[serde(default)]
     pub batch: bool,
+    /// Path to a draft model for speculative decoding.
+    #[serde(default)]
+    pub draft_model: Option<String>,
+    /// Number of draft tokens per speculative cycle.
+    #[serde(default = "default_num_draft")]
+    pub num_draft: usize,
     /// KV-cache storage mode.
     #[serde(default)]
     pub kv_cache: KvCacheMode,
@@ -418,6 +432,10 @@ pub struct ModelConfig {
 
 const fn default_norm_correction() -> bool {
     true
+}
+
+const fn default_num_draft() -> usize {
+    8
 }
 
 const fn default_kv_bits() -> u8 {
@@ -659,6 +677,8 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             name: None,
             mlx_profile: None,
             batch: args.batch,
+            draft_model: args.draft_model.clone(),
+            num_draft: args.num_draft,
             kv_cache,
             kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
             kv_key_bits: args.kv_key_bits,
@@ -746,6 +766,8 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     name: None,
                     mlx_profile: None,
                     batch: serve_args.batch,
+                    draft_model: serve_args.draft_model.clone(),
+                    num_draft: serve_args.num_draft,
                     kv_cache,
                     kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
                     kv_key_bits: serve_args.kv_key_bits,
@@ -917,6 +939,8 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         name: Some(name.clone()),
         mlx_profile: None,
         batch: false,
+        draft_model: None,
+        num_draft: default_num_draft(),
         kv_cache: KvCacheMode::Off,
         kv_bits: default_kv_bits(),
         kv_key_bits: None,
@@ -1119,6 +1143,8 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: true,
+            draft_model: None,
+            num_draft: 8,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1148,6 +1174,8 @@ mod tests {
             timeout: Some(60.0),
             mlx_profile: None,
             batch: false,
+            draft_model: None,
+            num_draft: 8,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1177,6 +1205,8 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: false,
+            draft_model: None,
+            num_draft: 8,
             kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(4),
             kv_seed: Some(99),
@@ -1204,6 +1234,8 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: false,
+            draft_model: None,
+            num_draft: 8,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1227,6 +1259,8 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: false,
+            draft_model: None,
+            num_draft: 8,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1250,6 +1284,8 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: false,
+            draft_model: None,
+            num_draft: 8,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1273,6 +1309,8 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: true,
+            draft_model: None,
+            num_draft: 8,
             kv_cache: Some("turboquant".to_owned()),
             kv_bits: Some(3),
             kv_seed: Some(0),
@@ -1584,6 +1622,8 @@ mod tests {
             timeout: Some(-1.0),
             mlx_profile: None,
             batch: false,
+            draft_model: None,
+            num_draft: 8,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
@@ -1622,6 +1662,8 @@ mod tests {
             timeout: None,
             mlx_profile: None,
             batch: false,
+            draft_model: None,
+            num_draft: 8,
             kv_cache: None,
             kv_bits: None,
             kv_seed: None,
