@@ -21,13 +21,20 @@
 use std::path::Path;
 
 use mlx_rs::{
-    Array, Dtype, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
-    ops, ops::indexing::IndexOp,
+    Array, Dtype,
+    builder::Builder,
+    error::Exception,
+    macros::{ModuleParameters, Quantizable},
+    module::Module,
+    nn, ops,
+    ops::indexing::IndexOp,
+    quantization::MaybeQuantized,
 };
 use serde::Deserialize;
 
 use crate::{
     error::ModelError,
+    transformer::QuantizationConfig,
     utils::scaled_dot_product_attention,
     yarn::{apply_yarn_rope, compute_yarn_freqs, yarn_get_mscale},
 };
@@ -116,6 +123,9 @@ pub struct NemotronDiffusionArgs {
     pub tie_word_embeddings: bool,
     #[serde(default)]
     pub rope_parameters: RopeParameters,
+    /// Present for pre-quantized MLX checkpoints (e.g. 4-bit `group_size=64`).
+    #[serde(default)]
+    pub quantization: Option<QuantizationConfig>,
 
     // Diffusion-specific.
     #[serde(default = "default_mask_token_id")]
@@ -157,21 +167,25 @@ struct RopeState {
 }
 
 /// Multi-head GQA attention with YaRN rope, bidirectional (no KV cache).
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 struct NemotronAttention {
     n_heads: i32,
     n_kv_heads: i32,
     head_dim: i32,
     scale: f32,
 
+    #[quantizable]
     #[param]
-    q_proj: nn::Linear,
+    q_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    k_proj: nn::Linear,
+    k_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    v_proj: nn::Linear,
+    v_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    o_proj: nn::Linear,
+    o_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl NemotronAttention {
@@ -190,18 +204,26 @@ impl NemotronAttention {
             n_kv_heads,
             head_dim,
             scale,
-            q_proj: nn::LinearBuilder::new(dim, n_heads * head_dim)
-                .bias(false)
-                .build()?,
-            k_proj: nn::LinearBuilder::new(dim, n_kv_heads * head_dim)
-                .bias(false)
-                .build()?,
-            v_proj: nn::LinearBuilder::new(dim, n_kv_heads * head_dim)
-                .bias(false)
-                .build()?,
-            o_proj: nn::LinearBuilder::new(n_heads * head_dim, dim)
-                .bias(false)
-                .build()?,
+            q_proj: MaybeQuantized::Original(
+                nn::LinearBuilder::new(dim, n_heads * head_dim)
+                    .bias(false)
+                    .build()?,
+            ),
+            k_proj: MaybeQuantized::Original(
+                nn::LinearBuilder::new(dim, n_kv_heads * head_dim)
+                    .bias(false)
+                    .build()?,
+            ),
+            v_proj: MaybeQuantized::Original(
+                nn::LinearBuilder::new(dim, n_kv_heads * head_dim)
+                    .bias(false)
+                    .build()?,
+            ),
+            o_proj: MaybeQuantized::Original(
+                nn::LinearBuilder::new(n_heads * head_dim, dim)
+                    .bias(false)
+                    .build()?,
+            ),
         })
     }
 
@@ -263,28 +285,37 @@ impl NemotronAttention {
 }
 
 /// SiLU-gated MLP.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 struct NemotronMlp {
+    #[quantizable]
     #[param]
-    gate_proj: nn::Linear,
+    gate_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    up_proj: nn::Linear,
+    up_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    down_proj: nn::Linear,
+    down_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl NemotronMlp {
     fn new(dim: i32, hidden_dim: i32) -> Result<Self, Exception> {
         Ok(Self {
-            gate_proj: nn::LinearBuilder::new(dim, hidden_dim)
-                .bias(false)
-                .build()?,
-            up_proj: nn::LinearBuilder::new(dim, hidden_dim)
-                .bias(false)
-                .build()?,
-            down_proj: nn::LinearBuilder::new(hidden_dim, dim)
-                .bias(false)
-                .build()?,
+            gate_proj: MaybeQuantized::Original(
+                nn::LinearBuilder::new(dim, hidden_dim)
+                    .bias(false)
+                    .build()?,
+            ),
+            up_proj: MaybeQuantized::Original(
+                nn::LinearBuilder::new(dim, hidden_dim)
+                    .bias(false)
+                    .build()?,
+            ),
+            down_proj: MaybeQuantized::Original(
+                nn::LinearBuilder::new(hidden_dim, dim)
+                    .bias(false)
+                    .build()?,
+            ),
         })
     }
 
@@ -295,10 +326,12 @@ impl NemotronMlp {
 }
 
 /// One decoder layer: pre-norm attention + pre-norm MLP, residual.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 struct NemotronLayer {
+    #[quantizable]
     #[param]
     self_attn: NemotronAttention,
+    #[quantizable]
     #[param]
     mlp: NemotronMlp,
     #[param]
@@ -330,10 +363,12 @@ impl NemotronLayer {
 }
 
 /// Embedding + layers + final norm (no LM head).
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 struct NemotronModel {
+    #[quantizable]
     #[param]
-    embed_tokens: nn::Embedding,
+    embed_tokens: MaybeQuantized<nn::Embedding>,
+    #[quantizable]
     #[param]
     layers: Vec<NemotronLayer>,
     #[param]
@@ -348,7 +383,10 @@ impl NemotronModel {
             ));
         }
         Ok(Self {
-            embed_tokens: nn::Embedding::new(args.vocab_size, args.hidden_size)?,
+            embed_tokens: MaybeQuantized::Original(nn::Embedding::new(
+                args.vocab_size,
+                args.hidden_size,
+            )?),
             layers: (0..args.num_hidden_layers)
                 .map(|_| NemotronLayer::new(args))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -368,13 +406,19 @@ impl NemotronModel {
 }
 
 /// Nemotron-Labs-Diffusion causal LM (diffusion-mode inference).
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct NemotronDiffusionLM {
     pub args: NemotronDiffusionArgs,
+    /// Transformer body. Named `encoder` to match the checkpoint's weight keys
+    /// (`encoder.layers.*`, `encoder.embed_tokens.*`, `encoder.norm.*`).
+    #[quantizable]
     #[param]
-    model: NemotronModel,
+    encoder: NemotronModel,
+    /// Diffusion output projection (`diffusion_head.*` in the checkpoint) — a
+    /// separate quantized head, not a tied/`lm_head` layer.
+    #[quantizable]
     #[param]
-    lm_head: Option<nn::Linear>,
+    diffusion_head: MaybeQuantized<nn::Linear>,
     rope: RopeState,
 }
 
@@ -407,21 +451,19 @@ impl NemotronDiffusionLM {
             mscale,
         };
 
-        let model = NemotronModel::new(&args)?;
-        let lm_head = if args.tie_word_embeddings {
-            None
-        } else {
-            Some(
-                nn::LinearBuilder::new(args.hidden_size, args.vocab_size)
-                    .bias(false)
-                    .build()?,
-            )
-        };
+        let encoder = NemotronModel::new(&args)?;
+        // The checkpoint ships a dedicated (quantized) diffusion output head;
+        // there is no tied/`lm_head` path for this model.
+        let diffusion_head = MaybeQuantized::Original(
+            nn::LinearBuilder::new(args.hidden_size, args.vocab_size)
+                .bias(false)
+                .build()?,
+        );
 
         Ok(Self {
             args,
-            model,
-            lm_head,
+            encoder,
+            diffusion_head,
             rope,
         })
     }
@@ -438,11 +480,8 @@ impl NemotronDiffusionLM {
     /// Forward the whole canvas, returning logits for every position
     /// `[1, L, vocab]`. Bidirectional (no causal mask).
     fn forward_canvas(&mut self, canvas: &Array) -> Result<Array, Exception> {
-        let hidden = self.model.forward(canvas, &self.rope)?;
-        match self.lm_head.as_mut() {
-            Some(head) => head.forward(&hidden),
-            None => self.model.embed_tokens.as_linear(&hidden),
-        }
+        let hidden = self.encoder.forward(canvas, &self.rope)?;
+        self.diffusion_head.forward(&hidden)
     }
 
     /// Diffusion decode: generate `num_tokens` tokens by block-wise masked
@@ -604,8 +643,24 @@ pub fn load_nemotron_diffusion_model<P: AsRef<Path>>(
         "Loading Nemotron-Labs-Diffusion model (diffusion mode)"
     );
 
-    let mut model = NemotronDiffusionLM::new(args).map_err(ModelError::Mlx)?;
-    crate::load_safetensors_weights(&mut model, model_path)?;
+    let quantization = args.quantization.clone();
+    let raw_model = NemotronDiffusionLM::new(args).map_err(ModelError::Mlx)?;
+    // Pre-quantized MLX checkpoints store packed 4-bit weights; convert the
+    // module structure to quantized form (and remap the flat `.scales`/`.biases`
+    // keys) before loading, exactly as the autoregressive transformer path does.
+    let mut model = if let Some(ref qc) = quantization {
+        tracing::info!(
+            group_size = qc.group_size,
+            bits = qc.bits,
+            "Applying quantization structure"
+        );
+        mlx_rs::nn::quantize(raw_model, qc.group_size, qc.bits).map_err(|e| {
+            ModelError::ShapeMismatch(format!("Failed to quantize model structure: {e}"))
+        })?
+    } else {
+        raw_model
+    };
+    crate::load_quantized_safetensors_weights(&mut model, model_path, quantization.is_some())?;
 
     tracing::info!("Nemotron-Labs-Diffusion model loaded successfully");
     Ok(model)
@@ -635,6 +690,7 @@ mod tests {
             head_dim: Some(64),
             tie_word_embeddings: false,
             rope_parameters: RopeParameters::default(),
+            quantization: None,
             mask_token_id: 300,
             block_size: 8,
             diffusion_steps: 4,
@@ -695,8 +751,8 @@ mod tests {
     #[test]
     fn diffusion_generate_resolves_all_masks() {
         // Tiny random model: exercises the full MLX graph (embed → layers →
-        // yarn rope → bidirectional sdpa → lm_head) + the denoising loop, with
-        // no weights on disk. Asserts the loop terminates with no mask tokens.
+        // yarn rope → bidirectional sdpa → diffusion_head) + the denoising loop,
+        // with no weights on disk. Asserts the loop terminates with no masks.
         let args = small_args();
         let mask_id = args.mask_token_id;
         let mut model = NemotronDiffusionLM::new(args).unwrap();
@@ -749,5 +805,12 @@ mod tests {
             "no mask tokens should remain"
         );
         assert!(!text.trim().is_empty(), "decoded text must be non-empty");
+        // Coherence gate: greedy decode of this prompt must name the capital.
+        // If the weights are mis-loaded (e.g. the output head isn't mapped) the
+        // model emits noise and this fails -- which is exactly what we want.
+        assert!(
+            text.to_lowercase().contains("paris"),
+            "expected a coherent answer naming Paris, got: {text:?}"
+        );
     }
 }
