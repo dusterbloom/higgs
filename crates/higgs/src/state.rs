@@ -5,14 +5,14 @@ use higgs_engine::batch_engine::BatchEngine;
 use higgs_engine::chat_template::ChatMessage;
 use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
-use higgs_engine::mlx_tuning::MlxRuntimeTuning;
+use higgs_engine::mlx_tuning::{MlxRuntimeTuning, resolve_runtime_tuning};
 use higgs_engine::simple::SimpleEngine;
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
 use higgs_models::turboquant::KvCacheConfig;
 use mlx_rs::Array;
 
-use crate::config::HiggsConfig;
+use crate::config::{HiggsConfig, LocalConfig, ModelConfig, resolved_model_supports_batch};
 use crate::metrics::MetricsStore;
 use crate::router::Router;
 
@@ -36,7 +36,9 @@ static GPU_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Acquire the global GPU gate, recovering from poisoning so a panic mid-eval
 /// cannot permanently wedge all inference.
 fn gpu_gate() -> std::sync::MutexGuard<'static, ()> {
-    GPU_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    GPU_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Unified engine interface wrapping either the simple (serialized) or batch
@@ -322,6 +324,39 @@ impl Engine {
             Self::Stub(_) => Ok(Vec::new()),
         }
     }
+}
+
+/// Build an engine from an already-resolved model directory and its config.
+///
+/// Shared by startup loading (`load_engines` in the binary) and the runtime
+/// load endpoint (`POST /v1/models`). Path resolution and any download prompt
+/// are the caller's responsibility, so this never blocks on stdin. Returns the
+/// model's exposed name alongside the constructed engine.
+pub fn build_engine(
+    resolved: &Path,
+    model_cfg: &ModelConfig,
+    local: &LocalConfig,
+) -> Result<(String, Engine), String> {
+    if model_cfg.batch && !resolved_model_supports_batch(resolved)? {
+        return Err(format!(
+            "batch=true is only supported for transformer models (llama, mistral, qwen2, qwen3); '{}' is not supported",
+            model_cfg.path
+        ));
+    }
+    let kv_cache_config = model_cfg.kv_cache_config();
+    let engine = if model_cfg.batch {
+        Engine::load_batch(resolved, kv_cache_config, local.raise_wired_limit)
+            .map_err(|e| e.to_string())?
+    } else {
+        let tuning = resolve_runtime_tuning(resolved, model_cfg.requested_mlx_profile(local));
+        Engine::load_simple(resolved, kv_cache_config, tuning, local.raise_wired_limit)
+            .map_err(|e| e.to_string())?
+    };
+    let name = model_cfg
+        .name
+        .clone()
+        .unwrap_or_else(|| engine.model_name().to_owned());
+    Ok((name, engine))
 }
 
 /// Shared application state available to all route handlers.
