@@ -600,14 +600,12 @@ impl NemotronDiffusionLM {
     }
 
     /// Forward the current block against the frozen prefix cache (bidirectional,
-    /// no mask). Returns per-position argmax token + softmax confidence. `lora`
-    /// enables the linear-spec drafter adapter (draft phase); plain diffusion
-    /// passes `false`.
+    /// no mask). Returns per-position argmax token + softmax confidence. Used by
+    /// plain diffusion decode; the linear-spec draft is in `draft_and_verify`.
     fn predict_block(
         &mut self,
         block: &[u32],
         cache: &DiffusionKvCache,
-        lora: bool,
     ) -> Result<(Vec<u32>, Vec<f32>), Exception> {
         let blk = i32::try_from(block.len()).map_err(|_| Exception::custom("block too long"))?;
         let input = Array::from_slice(block, &[1, blk]);
@@ -617,7 +615,7 @@ impl NemotronDiffusionLM {
             Some(&cache.per_layer),
             cache.len,
             None,
-            lora,
+            false,
         )?;
         let logits = self.diffusion_head.forward(&hidden)?.reshape(&[blk, -1])?;
         let probs = ops::softmax_axis(&logits, -1, true)?;
@@ -652,30 +650,77 @@ impl NemotronDiffusionLM {
         self.last_token(&hidden, b)
     }
 
-    /// Verify a drafted block causally against the prefix cache (LoRA off).
-    /// Returns per-position AR argmax tokens and the block's freshly-computed
-    /// K/V so the caller can commit only the accepted prefix. Does not mutate
-    /// `cache`.
-    fn verify_block(
+    /// One linear-spec round: draft the seeded block (bidirectional, LoRA on,
+    /// argmax only — no softmax), then verify it causally (LoRA off), evaluating
+    /// the drafted block and the AR argmax in a single GPU→host barrier so the
+    /// per-block sync cost is one eval (plus the later cache-extend materialize).
+    /// The block stays on-device between draft and verify (no host round-trip).
+    /// Returns `(drafted_tokens, ar_tokens, verify_block_kv)`.
+    fn draft_and_verify(
         &mut self,
-        block: &[u32],
+        seed: u32,
+        block_len: usize,
         cache: &DiffusionKvCache,
-    ) -> Result<(Vec<u32>, LayerKv), Exception> {
-        let b = i32::try_from(block.len()).map_err(|_| Exception::custom("block too long"))?;
-        let input = Array::from_slice(block, &[1, b]);
-        let mask = create_causal_mask(b, Some(cache.len))?;
-        let (hidden, block_kv) = self.encoder.forward(
-            &input,
+    ) -> Result<(Vec<u32>, Vec<u32>, LayerKv), Exception> {
+        let l = i32::try_from(block_len).map_err(|_| Exception::custom("block too long"))?;
+        let mask_id = self.args.mask_token_id;
+
+        // Seeded block [seed, mask, ...] on device.
+        let mut seeded: Vec<u32> = std::iter::repeat_n(mask_id, block_len).collect();
+        if let Some(s) = seeded.first_mut() {
+            *s = seed;
+        }
+        let block0 = Array::from_slice(&seeded, &[1, l]);
+
+        // Draft: bidirectional, LoRA on, argmax only (no softmax/confidence).
+        let (dhidden, _) = self.encoder.forward(
+            &block0,
             &self.rope,
             Some(&cache.per_layer),
             cache.len,
-            Some(&mask),
+            None,
+            true,
+        )?;
+        let draft_logits = self.diffusion_head.forward(&dhidden)?.reshape(&[l, -1])?;
+        let draft_arg = ops::indexing::argmax_axis(&draft_logits, -1, false)?
+            .as_dtype(Dtype::Uint32)?
+            .reshape(&[1, l])?;
+        // Keep position 0 = verified seed; positions 1.. take the draft. (The
+        // draft's prediction at 0 is unused.)
+        let block_dev = if l > 1 {
+            ops::concatenate_axis(
+                &[
+                    &Array::from_slice(&[seed], &[1, 1]),
+                    &draft_arg.index((.., 1..l)),
+                ],
+                -1,
+            )?
+        } else {
+            Array::from_slice(&[seed], &[1, 1])
+        };
+
+        // Verify: causal, LoRA off.
+        let vmask = create_causal_mask(l, Some(cache.len))?;
+        let (vhidden, block_kv) = self.encoder.forward(
+            &block_dev,
+            &self.rope,
+            Some(&cache.per_layer),
+            cache.len,
+            Some(&vmask),
             false,
         )?;
-        let logits = self.diffusion_head.forward(&hidden)?.reshape(&[b, -1])?;
-        let ar = ops::indexing::argmax_axis(&logits, -1, false)?.as_dtype(Dtype::Uint32)?;
-        mlx_rs::transforms::eval([&ar])?;
-        Ok((ar.as_slice::<u32>().to_vec(), block_kv))
+        let verify_logits = self.diffusion_head.forward(&vhidden)?.reshape(&[l, -1])?;
+        let ar = ops::indexing::argmax_axis(&verify_logits, -1, false)?.as_dtype(Dtype::Uint32)?;
+
+        // Single barrier: drafted block + AR argmax together (verify depends on
+        // the draft, so one eval computes both forwards).
+        let block_flat = block_dev.reshape(&[l])?;
+        mlx_rs::transforms::eval([&block_flat, &ar])?;
+        Ok((
+            block_flat.as_slice::<u32>().to_vec(),
+            ar.as_slice::<u32>().to_vec(),
+            block_kv,
+        ))
     }
 
     /// Diffusion decode (the reference's block-diffusion `generate`): causal
@@ -714,7 +759,7 @@ impl NemotronDiffusionLM {
                 if masked.is_empty() {
                     break;
                 }
-                let (preds, conf) = self.predict_block(&block, &cache, false)?;
+                let (preds, conf) = self.predict_block(&block, &cache)?;
                 let n_unmask = unmask_count(masked.len(), step, steps);
                 let mut ranked: Vec<(usize, f32)> = masked
                     .iter()
@@ -733,7 +778,7 @@ impl NemotronDiffusionLM {
                 .filter(|&p| block.get(p).copied() == Some(mask_id))
                 .collect();
             if !still.is_empty() {
-                let (preds, _) = self.predict_block(&block, &cache, false)?;
+                let (preds, _) = self.predict_block(&block, &cache)?;
                 for pos in still {
                     if let (Some(slot), Some(&tok)) = (block.get_mut(pos), preds.get(pos)) {
                         *slot = tok;
@@ -772,7 +817,6 @@ impl NemotronDiffusionLM {
         block_length: usize,
         eos_token_id: Option<u32>,
     ) -> Result<(Vec<u32>, LinSpecStats), Exception> {
-        let mask_id = self.args.mask_token_id;
         let block_len = block_length.max(1);
 
         let (mut cache, mut seed) = self.prefill(prompt_ids)?;
@@ -788,32 +832,17 @@ impl NemotronDiffusionLM {
         }
 
         while generated.len() < max_new_tokens {
-            // Draft: block[0] = verified seed, rest masked; one bidirectional
-            // LoRA-on forward fills all masked positions (greedy).
-            let mut block: Vec<u32> = std::iter::repeat_n(mask_id, block_len).collect();
-            if let Some(slot) = block.first_mut() {
-                *slot = seed;
-            }
-            let (preds, _conf) = self.predict_block(&block, &cache, true)?;
-            stats.nfe += 1;
-            for (pos, slot) in block.iter_mut().enumerate() {
-                if *slot == mask_id {
-                    if let Some(&t) = preds.get(pos) {
-                        *slot = t;
-                    }
-                }
-            }
-
-            // Verify: one causal LoRA-off forward gives the AR argmax per pos.
-            let (ar_tokens, block_kv) = self.verify_block(&block, &cache)?;
-            stats.nfe += 1;
+            // Draft (bidirectional, LoRA on) + verify (causal, LoRA off) in one
+            // device round with a single host barrier.
+            let (drafted, ar_tokens, block_kv) = self.draft_and_verify(seed, block_len, &cache)?;
+            stats.nfe += 2;
             stats.blocks += 1;
 
             // Accept the longest run where AR agrees with the draft (shifted by
             // one), then the AR bonus token at the tail.
             let mut accepted = 0usize;
             for i in 0..block_len.saturating_sub(1) {
-                if ar_tokens.get(i).copied() == block.get(i + 1).copied() {
+                if ar_tokens.get(i).copied() == drafted.get(i + 1).copied() {
                     accepted += 1;
                 } else {
                     break;
