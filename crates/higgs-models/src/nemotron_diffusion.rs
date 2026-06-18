@@ -1330,4 +1330,53 @@ mod tests {
             "expected a coherent answer naming Paris, got: {last_text:?}"
         );
     }
+
+    /// Drift-free head-to-head: one model load, one warm-up, one thermal window.
+    /// Runs dlm at several step counts and linear_spec at a couple block sizes
+    /// back-to-back so the tok/s are directly comparable (cross-process runs
+    /// drift ~15-20% with thermal). Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "requires real Nemotron-Labs-Diffusion weights; set HIGGS_NEMOTRON_DIFFUSION_DIR"]
+    fn dlm_vs_linear_spec_headtohead() {
+        let Some(dir) = std::env::var_os("HIGGS_NEMOTRON_DIFFUSION_DIR") else {
+            eprintln!("skipping: set HIGGS_NEMOTRON_DIFFUSION_DIR to a model directory");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let mut model = load_nemotron_diffusion_model(&dir).unwrap();
+        let eos = model.args.eos_token_id;
+        let tokenizer = crate::load_tokenizer(&dir).unwrap();
+        let enc = tokenizer
+            .encode("Explain in detail how photosynthesis works:", true)
+            .unwrap();
+        let prompt = enc.get_ids();
+
+        // One warm-up for the whole comparison.
+        let _ = model.diffusion_generate(prompt, 16, 8, 32, None).unwrap();
+        let _ = model.linear_spec_generate(prompt, 16, 8, eos).unwrap();
+
+        eprintln!("== head-to-head (one process, 128 tok, block 32) ==");
+        for steps in [8usize, 12, 16, 32] {
+            let t = std::time::Instant::now();
+            let out = model
+                .diffusion_generate(prompt, 128, steps, 32, None)
+                .unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            let tps = f64::from(u32::try_from(out.len()).unwrap()) / secs;
+            eprintln!("  dlm steps={steps:>2}: {tps:>5.1} tok/s  (diffusion quality)");
+        }
+        for block in [4usize, 8] {
+            let t = std::time::Instant::now();
+            let (out, stats) = model.linear_spec_generate(prompt, 128, block, eos).unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            let toks = f64::from(u32::try_from(out.len()).unwrap());
+            let tps = toks / secs;
+            let mean_accept = f64::from(u32::try_from(stats.accepted_total).unwrap())
+                / f64::from(u32::try_from(stats.blocks.max(1)).unwrap());
+            eprintln!(
+                "  linear_spec block={block}: {tps:>5.1} tok/s  (AR-exact, mean_accept {mean_accept:.2})"
+            );
+            assert!(!out.is_empty());
+        }
+    }
 }
