@@ -1242,7 +1242,12 @@ mod tests {
         // Warm up Metal kernels (not timed).
         let _ = model.diffusion_generate(prompt, 16, 8, 32, None).unwrap();
 
-        for (num_tokens, steps, block) in [(128usize, 32usize, 32usize), (128, 8, 32)] {
+        for (num_tokens, steps, block) in [
+            (128usize, 32usize, 32usize),
+            (128, 16, 32),
+            (128, 12, 32),
+            (128, 8, 32),
+        ] {
             let t = std::time::Instant::now();
             let out = model
                 .diffusion_generate(prompt, num_tokens, steps, block, None)
