@@ -179,6 +179,28 @@ struct DiffusionKvCache {
     len: i32,
 }
 
+/// Per-layer `(roped_keys, values)` returned by one encoder forward.
+type LayerKv = Vec<(Array, Array)>;
+
+/// LoRA adapter on `o_proj` for the linear-spec drafter. Stored transposed so
+/// apply is two plain matmuls: `out += scale * (x @ a_t) @ b_t`. Loaded from the
+/// bundled `linear_spec_lora/` adapter; `None` for plain diffusion decode.
+#[derive(Debug, Clone)]
+struct OProjLora {
+    a_t: Array, // [in_features, r]
+    b_t: Array, // [r, out_features]
+    scale: f32, // lora_alpha / r
+}
+
+/// Stats from [`NemotronDiffusionLM::linear_spec_generate`] for throughput
+/// analysis: total forward evals, blocks drafted, tokens accepted.
+#[derive(Debug, Clone, Copy)]
+pub struct LinSpecStats {
+    pub nfe: usize,
+    pub blocks: usize,
+    pub accepted_total: usize,
+}
+
 /// Multi-head GQA attention with YaRN rope, bidirectional (no KV cache).
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 struct NemotronAttention {
@@ -199,6 +221,10 @@ struct NemotronAttention {
     #[quantizable]
     #[param]
     o_proj: MaybeQuantized<nn::Linear>,
+    /// Optional linear-spec drafter LoRA on `o_proj`; added to the `o_proj`
+    /// output only when the caller requests `lora` (the draft phase). Not a
+    /// model parameter — loaded separately and untouched by quantization.
+    o_lora: Option<OProjLora>,
 }
 
 impl NemotronAttention {
@@ -237,12 +263,15 @@ impl NemotronAttention {
                     .bias(false)
                     .build()?,
             ),
+            o_lora: None,
         })
     }
 
     /// Attention over `x`, optionally prepending a frozen prefix K/V cache and
     /// applying `mask`. Queries/keys are roped at absolute position `offset`.
-    /// Returns `(output, roped_keys, values)` so the caller can cache the K/V.
+    /// When `lora` is set and an `o_lora` adapter is attached, its low-rank term
+    /// is added to the `o_proj` output (linear-spec draft phase). Returns
+    /// `(output, roped_keys, values)` so the caller can cache the K/V.
     #[allow(non_snake_case)]
     fn forward(
         &mut self,
@@ -251,6 +280,7 @@ impl NemotronAttention {
         cache: Option<&(Array, Array)>,
         offset: i32,
         mask: Option<&Array>,
+        lora: bool,
     ) -> Result<(Array, Array, Array), Exception> {
         let shape = x.shape();
         let B = *shape
@@ -310,7 +340,17 @@ impl NemotronAttention {
             scaled_dot_product_attention(queries_roped, attn_keys, attn_values, self.scale, mask)?
                 .transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[B, L, -1])?;
-        Ok((self.o_proj.forward(&output)?, keys_roped, values))
+        let mut o = self.o_proj.forward(&output)?;
+        if lora {
+            if let Some(adapter) = self.o_lora.as_ref() {
+                let a_t = adapter.a_t.as_dtype(output.dtype())?;
+                let b_t = adapter.b_t.as_dtype(output.dtype())?;
+                let scale = Array::from_f32(adapter.scale).as_dtype(output.dtype())?;
+                let delta = output.matmul(&a_t)?.matmul(&b_t)?.multiply(&scale)?;
+                o = o.add(&delta)?;
+            }
+        }
+        Ok((o, keys_roped, values))
     }
 }
 
@@ -391,9 +431,12 @@ impl NemotronLayer {
         cache: Option<&(Array, Array)>,
         offset: i32,
         mask: Option<&Array>,
+        lora: bool,
     ) -> Result<(Array, (Array, Array)), Exception> {
         let normed = self.input_layernorm.forward(x)?;
-        let (attn_out, k, v) = self.self_attn.forward(&normed, rope, cache, offset, mask)?;
+        let (attn_out, k, v) = self
+            .self_attn
+            .forward(&normed, rope, cache, offset, mask, lora)?;
         let h = x.add(attn_out)?;
         let normed_post = self.post_attention_layernorm.forward(&h)?;
         Ok((h.add(self.mlp.forward(&normed_post)?)?, (k, v)))
@@ -444,12 +487,13 @@ impl NemotronModel {
         caches: Option<&[(Array, Array)]>,
         offset: i32,
         mask: Option<&Array>,
+        lora: bool,
     ) -> Result<(Array, Vec<(Array, Array)>), Exception> {
         let mut h = self.embed_tokens.forward(inputs)?;
         let mut new_kv = Vec::with_capacity(self.layers.len());
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let layer_cache = caches.and_then(|c| c.get(i));
-            let (hh, kv) = layer.forward(&h, rope, layer_cache, offset, mask)?;
+            let (hh, kv) = layer.forward(&h, rope, layer_cache, offset, mask, lora)?;
             h = hh;
             new_kv.push(kv);
         }
@@ -535,9 +579,9 @@ impl NemotronDiffusionLM {
             i32::try_from(prompt_ids.len()).map_err(|_| Exception::custom("prompt too long"))?;
         let input = Array::from_slice(prompt_ids, &[1, p]);
         let mask = create_causal_mask(p, None)?;
-        let (hidden, per_layer) = self
-            .encoder
-            .forward(&input, &self.rope, None, 0, Some(&mask))?;
+        let (hidden, per_layer) =
+            self.encoder
+                .forward(&input, &self.rope, None, 0, Some(&mask), false)?;
         materialize(&per_layer)?;
         let seed = self.last_token(&hidden, p)?;
         Ok((DiffusionKvCache { per_layer, len: p }, seed))
@@ -556,17 +600,25 @@ impl NemotronDiffusionLM {
     }
 
     /// Forward the current block against the frozen prefix cache (bidirectional,
-    /// no mask). Returns per-position argmax token + softmax confidence.
+    /// no mask). Returns per-position argmax token + softmax confidence. `lora`
+    /// enables the linear-spec drafter adapter (draft phase); plain diffusion
+    /// passes `false`.
     fn predict_block(
         &mut self,
         block: &[u32],
         cache: &DiffusionKvCache,
+        lora: bool,
     ) -> Result<(Vec<u32>, Vec<f32>), Exception> {
         let blk = i32::try_from(block.len()).map_err(|_| Exception::custom("block too long"))?;
         let input = Array::from_slice(block, &[1, blk]);
-        let (hidden, _) =
-            self.encoder
-                .forward(&input, &self.rope, Some(&cache.per_layer), cache.len, None)?;
+        let (hidden, _) = self.encoder.forward(
+            &input,
+            &self.rope,
+            Some(&cache.per_layer),
+            cache.len,
+            None,
+            lora,
+        )?;
         let logits = self.diffusion_head.forward(&hidden)?.reshape(&[blk, -1])?;
         let probs = ops::softmax_axis(&logits, -1, true)?;
         let conf = probs.max_axis(-1, false)?.as_dtype(Dtype::Float32)?;
@@ -594,18 +646,36 @@ impl NemotronDiffusionLM {
             Some(&cache.per_layer),
             cache.len,
             Some(&mask),
+            false,
         )?;
-        let mut extended = Vec::with_capacity(cache.per_layer.len());
-        for ((pk, pv), (bk, bv)) in cache.per_layer.iter().zip(&block_kv) {
-            extended.push((
-                ops::concatenate_axis(&[pk, bk], -2)?,
-                ops::concatenate_axis(&[pv, bv], -2)?,
-            ));
-        }
-        cache.per_layer = extended;
-        cache.len += b;
-        materialize(&cache.per_layer)?;
+        extend_cache_by(cache, &block_kv, b)?;
         self.last_token(&hidden, b)
+    }
+
+    /// Verify a drafted block causally against the prefix cache (LoRA off).
+    /// Returns per-position AR argmax tokens and the block's freshly-computed
+    /// K/V so the caller can commit only the accepted prefix. Does not mutate
+    /// `cache`.
+    fn verify_block(
+        &mut self,
+        block: &[u32],
+        cache: &DiffusionKvCache,
+    ) -> Result<(Vec<u32>, LayerKv), Exception> {
+        let b = i32::try_from(block.len()).map_err(|_| Exception::custom("block too long"))?;
+        let input = Array::from_slice(block, &[1, b]);
+        let mask = create_causal_mask(b, Some(cache.len))?;
+        let (hidden, block_kv) = self.encoder.forward(
+            &input,
+            &self.rope,
+            Some(&cache.per_layer),
+            cache.len,
+            Some(&mask),
+            false,
+        )?;
+        let logits = self.diffusion_head.forward(&hidden)?.reshape(&[b, -1])?;
+        let ar = ops::indexing::argmax_axis(&logits, -1, false)?.as_dtype(Dtype::Uint32)?;
+        mlx_rs::transforms::eval([&ar])?;
+        Ok((ar.as_slice::<u32>().to_vec(), block_kv))
     }
 
     /// Diffusion decode (the reference's block-diffusion `generate`): causal
@@ -644,7 +714,7 @@ impl NemotronDiffusionLM {
                 if masked.is_empty() {
                     break;
                 }
-                let (preds, conf) = self.predict_block(&block, &cache)?;
+                let (preds, conf) = self.predict_block(&block, &cache, false)?;
                 let n_unmask = unmask_count(masked.len(), step, steps);
                 let mut ranked: Vec<(usize, f32)> = masked
                     .iter()
@@ -663,7 +733,7 @@ impl NemotronDiffusionLM {
                 .filter(|&p| block.get(p).copied() == Some(mask_id))
                 .collect();
             if !still.is_empty() {
-                let (preds, _) = self.predict_block(&block, &cache)?;
+                let (preds, _) = self.predict_block(&block, &cache, false)?;
                 for pos in still {
                     if let (Some(slot), Some(&tok)) = (block.get_mut(pos), preds.get(pos)) {
                         *slot = tok;
@@ -685,6 +755,101 @@ impl NemotronDiffusionLM {
 
         Ok(generated)
     }
+
+    /// Linear self-speculation (the reference `linear_spec_generate`): causal
+    /// prefill, then per block draft the whole block in one bidirectional
+    /// LoRA-on forward, verify it in one causal LoRA-off forward, accept the
+    /// longest prefix where the AR argmax agrees with the draft plus the AR
+    /// bonus token, and advance the KV cache by the accepted count.
+    ///
+    /// Greedy: output is AR-exact regardless of draft quality, so the LoRA only
+    /// raises the acceptance length (the speedup). Returns `(tokens, stats)`;
+    /// `tokens` excludes the prompt.
+    pub fn linear_spec_generate(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        block_length: usize,
+        eos_token_id: Option<u32>,
+    ) -> Result<(Vec<u32>, LinSpecStats), Exception> {
+        let mask_id = self.args.mask_token_id;
+        let block_len = block_length.max(1);
+
+        let (mut cache, mut seed) = self.prefill(prompt_ids)?;
+        let mut stats = LinSpecStats {
+            nfe: 1, // prefill
+            blocks: 0,
+            accepted_total: 0,
+        };
+        let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+        generated.push(seed); // prefill seed is the first generated token
+        if eos_token_id == Some(seed) {
+            return Ok((generated, stats));
+        }
+
+        while generated.len() < max_new_tokens {
+            // Draft: block[0] = verified seed, rest masked; one bidirectional
+            // LoRA-on forward fills all masked positions (greedy).
+            let mut block: Vec<u32> = std::iter::repeat_n(mask_id, block_len).collect();
+            if let Some(slot) = block.first_mut() {
+                *slot = seed;
+            }
+            let (preds, _conf) = self.predict_block(&block, &cache, true)?;
+            stats.nfe += 1;
+            for (pos, slot) in block.iter_mut().enumerate() {
+                if *slot == mask_id {
+                    if let Some(&t) = preds.get(pos) {
+                        *slot = t;
+                    }
+                }
+            }
+
+            // Verify: one causal LoRA-off forward gives the AR argmax per pos.
+            let (ar_tokens, block_kv) = self.verify_block(&block, &cache)?;
+            stats.nfe += 1;
+            stats.blocks += 1;
+
+            // Accept the longest run where AR agrees with the draft (shifted by
+            // one), then the AR bonus token at the tail.
+            let mut accepted = 0usize;
+            for i in 0..block_len.saturating_sub(1) {
+                if ar_tokens.get(i).copied() == block.get(i + 1).copied() {
+                    accepted += 1;
+                } else {
+                    break;
+                }
+            }
+            accepted = (accepted + 1).min(block_len).min(ar_tokens.len());
+            stats.accepted_total += accepted;
+
+            // Committed tokens are the AR argmax of the first `accepted` positions.
+            let accepted_toks = ar_tokens.get(..accepted).unwrap_or(&[]);
+
+            // EOS truncation within the accepted run.
+            if let Some(eos) = eos_token_id {
+                if let Some(p) = accepted_toks.iter().position(|&t| t == eos) {
+                    let head = accepted_toks.get(..=p).unwrap_or(accepted_toks);
+                    generated.extend_from_slice(head);
+                    let acc =
+                        i32::try_from(p + 1).map_err(|_| Exception::custom("accepted overflow"))?;
+                    extend_cache_by(&mut cache, &block_kv, acc)?;
+                    return Ok((generated, stats));
+                }
+            }
+
+            generated.extend_from_slice(accepted_toks);
+            let acc =
+                i32::try_from(accepted).map_err(|_| Exception::custom("accepted overflow"))?;
+            extend_cache_by(&mut cache, &block_kv, acc)?;
+            seed = accepted
+                .checked_sub(1)
+                .and_then(|i| ar_tokens.get(i).copied())
+                .ok_or_else(|| Exception::custom("empty accept"))?;
+        }
+
+        generated.truncate(max_new_tokens);
+        Ok((generated, stats))
+    }
 }
 
 /// Force the cached K/V arrays to be evaluated once, so the prefix isn't
@@ -693,6 +858,29 @@ fn materialize(per_layer: &[(Array, Array)]) -> Result<(), Exception> {
     for (k, v) in per_layer {
         mlx_rs::transforms::eval([k, v])?;
     }
+    Ok(())
+}
+
+/// Append the first `accepted` positions of a verified block's per-layer K/V to
+/// `cache` (partial commit for linear-spec acceptance). `accepted == block_len`
+/// is the full-block case used by `commit_block`.
+fn extend_cache_by(
+    cache: &mut DiffusionKvCache,
+    block_kv: &[(Array, Array)],
+    accepted: i32,
+) -> Result<(), Exception> {
+    let mut extended = Vec::with_capacity(cache.per_layer.len());
+    for ((pk, pv), (bk, bv)) in cache.per_layer.iter().zip(block_kv) {
+        let bk_acc = bk.index((.., .., 0..accepted, ..));
+        let bv_acc = bv.index((.., .., 0..accepted, ..));
+        extended.push((
+            ops::concatenate_axis(&[pk, &bk_acc], -2)?,
+            ops::concatenate_axis(&[pv, &bv_acc], -2)?,
+        ));
+    }
+    cache.per_layer = extended;
+    cache.len += accepted;
+    materialize(&cache.per_layer)?;
     Ok(())
 }
 
@@ -718,6 +906,82 @@ pub fn load_nemotron_diffusion_model_args<P: AsRef<Path>>(
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
     Ok(serde_json::from_reader(file)?)
+}
+
+/// Extract `<i>` from an adapter key containing `layers.<i>.`.
+fn layer_index_from_key(key: &str) -> Option<usize> {
+    let after = key.split("layers.").nth(1)?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Load the bundled linear-spec drafter LoRA (`linear_spec_lora/`) if present.
+/// Returns one [`OProjLora`] per layer, indexed by the `layers.<i>.` in the
+/// adapter keys (matched by suffix, so the exact PEFT prefix is irrelevant), or
+/// `None` when the adapter directory is absent or incomplete.
+fn load_linear_spec_lora(
+    model_dir: &Path,
+    num_layers: usize,
+) -> Result<Option<Vec<OProjLora>>, ModelError> {
+    let dir = model_dir.join("linear_spec_lora");
+    let weights = dir.join("adapter_model.safetensors");
+    if !weights.exists() {
+        return Ok(None);
+    }
+
+    // scale = lora_alpha / r from adapter_config.json (integers; fallback 1.0).
+    let scale = std::fs::read_to_string(dir.join("adapter_config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map_or(1.0_f32, |cfg| {
+            let alpha_opt = cfg
+                .get("lora_alpha")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u16::try_from(v).ok());
+            let rank_opt = cfg
+                .get("r")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u16::try_from(v).ok());
+            match (alpha_opt, rank_opt) {
+                (Some(alpha), Some(rank)) if rank > 0 => f32::from(alpha) / f32::from(rank),
+                _ => 1.0,
+            }
+        });
+
+    let loaded = Array::load_safetensors(&weights)
+        .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+
+    let mut a: std::collections::HashMap<usize, Array> = std::collections::HashMap::new();
+    let mut b: std::collections::HashMap<usize, Array> = std::collections::HashMap::new();
+    for (key, value) in loaded {
+        let key_str: &str = &key;
+        let Some(idx) = layer_index_from_key(key_str) else {
+            continue;
+        };
+        if key_str.ends_with("lora_A.weight") {
+            a.insert(idx, value);
+        } else if key_str.ends_with("lora_B.weight") {
+            b.insert(idx, value);
+        }
+    }
+
+    let mut out = Vec::with_capacity(num_layers);
+    for i in 0..num_layers {
+        let (Some(av), Some(bv)) = (a.get(&i), b.get(&i)) else {
+            tracing::warn!(
+                layer = i,
+                "linear_spec_lora missing o_proj A/B; ignoring adapter"
+            );
+            return Ok(None);
+        };
+        // PEFT stores A=[r,in], B=[out,r]; store transposed so apply is two matmuls.
+        out.push(OProjLora {
+            a_t: av.transpose().map_err(ModelError::Mlx)?,
+            b_t: bv.transpose().map_err(ModelError::Mlx)?,
+            scale,
+        });
+    }
+    Ok(Some(out))
 }
 
 /// Load a Nemotron-Labs-Diffusion model from a directory.
@@ -758,6 +1022,15 @@ pub fn load_nemotron_diffusion_model<P: AsRef<Path>>(
         raw_model
     };
     crate::load_quantized_safetensors_weights(&mut model, model_path, quantization.is_some())?;
+
+    // Attach the linear-spec drafter LoRA (o_proj) when the adapter ships with
+    // the checkpoint; absent for plain diffusion-only checkpoints.
+    if let Some(loras) = load_linear_spec_lora(model_path, model.encoder.layers.len())? {
+        for (layer, lora) in model.encoder.layers.iter_mut().zip(loras) {
+            layer.self_attn.o_lora = Some(lora);
+        }
+        tracing::info!("Attached linear_spec drafter LoRA (o_proj)");
+    }
 
     tracing::info!("Nemotron-Labs-Diffusion model loaded successfully");
     Ok(model)
@@ -952,5 +1225,75 @@ mod tests {
                 "dlm baseline: {toks} tok in {secs:.3}s = {tps:.1} tok/s (req={num_tokens}, steps={steps}, block={block})"
             );
         }
+    }
+
+    /// Greedy `linear_spec_generate` is AR-exact: the block size only changes how
+    /// many tokens are verified per forward, never the resulting sequence. With
+    /// `block=1` the loop degrades to pure autoregressive decode, so a larger
+    /// block must produce the identical tokens. Catches off-by-one errors in the
+    /// accept / cache-crop / reseed logic (runs without a LoRA adapter).
+    #[test]
+    fn linear_spec_is_ar_exact_across_block_sizes() {
+        let mut model = NemotronDiffusionLM::new(small_args()).unwrap();
+        let prompt = [1u32, 2, 3, 4, 5];
+
+        let (ar, ar_stats) = model.linear_spec_generate(&prompt, 16, 1, None).unwrap();
+        let (blk, blk_stats) = model.linear_spec_generate(&prompt, 16, 8, None).unwrap();
+
+        assert_eq!(ar.len(), 16, "block=1 should fill max_new_tokens");
+        assert_eq!(blk.len(), 16);
+        assert_eq!(
+            ar, blk,
+            "block size must not change greedy output (AR-exact)"
+        );
+        // block=1 verifies one token per forward; block=8 must use no more NFE.
+        assert!(blk_stats.nfe <= ar_stats.nfe);
+        assert!(blk_stats.blocks >= 1 && blk_stats.accepted_total >= 1);
+    }
+
+    /// End-to-end linear-spec decode on real weights + LoRA drafter: coherent
+    /// ("Paris"), and prints throughput / NFE / TPF / mean acceptance to compare
+    /// against the dlm baseline. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "requires real Nemotron-Labs-Diffusion weights; set HIGGS_NEMOTRON_DIFFUSION_DIR"]
+    fn linear_spec_real_model_paris_and_throughput() {
+        let Some(dir) = std::env::var_os("HIGGS_NEMOTRON_DIFFUSION_DIR") else {
+            eprintln!("skipping: set HIGGS_NEMOTRON_DIFFUSION_DIR to a model directory");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let mut model = load_nemotron_diffusion_model(&dir).unwrap();
+        let eos = model.args.eos_token_id;
+        let tokenizer = crate::load_tokenizer(&dir).unwrap();
+        let enc = tokenizer.encode("The capital of France is", true).unwrap();
+        let prompt = enc.get_ids();
+
+        let _ = model.linear_spec_generate(prompt, 8, 16, eos).unwrap(); // warm up
+
+        // Sweep block_length: too wide wastes drafted positions the AR verify
+        // rejects; the sweet spot sits near the acceptance length.
+        let mut last_text = String::new();
+        for block in [4usize, 8, 16, 32] {
+            let t = std::time::Instant::now();
+            let (out, stats) = model.linear_spec_generate(prompt, 128, block, eos).unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            last_text = tokenizer.decode(&out, true).unwrap();
+            let toks = f64::from(u32::try_from(out.len()).unwrap());
+            let tps = toks / secs;
+            let tpf = toks / f64::from(u32::try_from(stats.nfe).unwrap());
+            let mean_accept = f64::from(u32::try_from(stats.accepted_total).unwrap())
+                / f64::from(u32::try_from(stats.blocks.max(1)).unwrap());
+            eprintln!(
+                "linear_spec block={block}: {} tok in {secs:.3}s = {tps:.1} tok/s | nfe={} TPF={tpf:.2} mean_accept={mean_accept:.2}",
+                out.len(),
+                stats.nfe
+            );
+        }
+        eprintln!("linear_spec output (block=32): {last_text:?}");
+
+        assert!(
+            last_text.to_lowercase().contains("paris"),
+            "expected a coherent answer naming Paris, got: {last_text:?}"
+        );
     }
 }
