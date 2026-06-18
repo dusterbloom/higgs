@@ -1350,31 +1350,43 @@ mod tests {
             .encode("Explain in detail how photosynthesis works:", true)
             .unwrap();
         let prompt = enc.get_ids();
+        // Generation length is configurable so we can sweep without recompiling.
+        let gen_tokens = std::env::var("HIGGS_NEMOTRON_GEN_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(128);
 
         // One warm-up for the whole comparison.
         let _ = model.diffusion_generate(prompt, 16, 8, 32, None).unwrap();
         let _ = model.linear_spec_generate(prompt, 16, 8, eos).unwrap();
 
-        eprintln!("== head-to-head (one process, 128 tok, block 32) ==");
+        eprintln!("== head-to-head (one process, {gen_tokens} tok, block 32) ==");
         for steps in [8usize, 12, 16, 32] {
             let t = std::time::Instant::now();
             let out = model
-                .diffusion_generate(prompt, 128, steps, 32, None)
+                .diffusion_generate(prompt, gen_tokens, steps, 32, None)
                 .unwrap();
             let secs = t.elapsed().as_secs_f64();
             let tps = f64::from(u32::try_from(out.len()).unwrap()) / secs;
-            eprintln!("  dlm steps={steps:>2}: {tps:>5.1} tok/s  (diffusion quality)");
+            eprintln!(
+                "  dlm steps={steps:>2}: {tps:>5.1} tok/s  ({} tok, diffusion quality)",
+                out.len()
+            );
         }
         for block in [4usize, 8] {
             let t = std::time::Instant::now();
-            let (out, stats) = model.linear_spec_generate(prompt, 128, block, eos).unwrap();
+            let (out, stats) = model
+                .linear_spec_generate(prompt, gen_tokens, block, eos)
+                .unwrap();
             let secs = t.elapsed().as_secs_f64();
             let toks = f64::from(u32::try_from(out.len()).unwrap());
             let tps = toks / secs;
             let mean_accept = f64::from(u32::try_from(stats.accepted_total).unwrap())
                 / f64::from(u32::try_from(stats.blocks.max(1)).unwrap());
             eprintln!(
-                "  linear_spec block={block}: {tps:>5.1} tok/s  (AR-exact, mean_accept {mean_accept:.2})"
+                "  linear_spec block={block}: {tps:>5.1} tok/s  ({} tok, AR-exact, mean_accept {mean_accept:.2})",
+                out.len()
             );
             assert!(!out.is_empty());
         }
