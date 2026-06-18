@@ -35,7 +35,7 @@ use serde::Deserialize;
 use crate::{
     error::ModelError,
     transformer::QuantizationConfig,
-    utils::scaled_dot_product_attention,
+    utils::{create_causal_mask, scaled_dot_product_attention},
     yarn::{apply_yarn_rope, compute_yarn_freqs, yarn_get_mscale},
 };
 
@@ -126,6 +126,10 @@ pub struct NemotronDiffusionArgs {
     /// Present for pre-quantized MLX checkpoints (e.g. 4-bit `group_size=64`).
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
+    /// End-of-sequence token; lets diffusion stop early instead of generating
+    /// the full requested length past EOS.
+    #[serde(default)]
+    pub eos_token_id: Option<u32>,
 
     // Diffusion-specific.
     #[serde(default = "default_mask_token_id")]
@@ -164,6 +168,15 @@ struct RopeState {
     freqs: Array,
     base: f32,
     mscale: f32,
+}
+
+/// Frozen per-layer prefix K/V for diffusion decoding. Each entry is
+/// `(roped_keys, values)` shaped `[1, n_kv_heads, len, head_dim]`. Built by a
+/// causal prefill of the prompt and extended (causally) after each block, so
+/// the denoising steps only forward the current block.
+struct DiffusionKvCache {
+    per_layer: Vec<(Array, Array)>,
+    len: i32,
 }
 
 /// Multi-head GQA attention with YaRN rope, bidirectional (no KV cache).
@@ -227,8 +240,18 @@ impl NemotronAttention {
         })
     }
 
+    /// Attention over `x`, optionally prepending a frozen prefix K/V cache and
+    /// applying `mask`. Queries/keys are roped at absolute position `offset`.
+    /// Returns `(output, roped_keys, values)` so the caller can cache the K/V.
     #[allow(non_snake_case)]
-    fn forward(&mut self, x: &Array, rope: &RopeState) -> Result<Array, Exception> {
+    fn forward(
+        &mut self,
+        x: &Array,
+        rope: &RopeState,
+        cache: Option<&(Array, Array)>,
+        offset: i32,
+        mask: Option<&Array>,
+    ) -> Result<(Array, Array, Array), Exception> {
         let shape = x.shape();
         let B = *shape
             .first()
@@ -253,16 +276,14 @@ impl NemotronAttention {
             .reshape(&[B, L, self.n_kv_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // YaRN rope over absolute positions 0..L (diffusion re-forwards the
-        // whole canvas each step, so the offset is always zero).
-        let offset = Array::from_int(0);
+        let offset_arr = Array::from_int(offset);
         let queries_roped = apply_yarn_rope(
             &queries,
             self.head_dim,
             rope.base,
             Some(&rope.freqs),
             rope.mscale,
-            &offset,
+            &offset_arr,
             false,
         )?;
         let keys_roped = apply_yarn_rope(
@@ -271,16 +292,25 @@ impl NemotronAttention {
             rope.base,
             Some(&rope.freqs),
             rope.mscale,
-            &offset,
+            &offset_arr,
             false,
         )?;
 
-        // Bidirectional attention: no mask.
+        // Prepend the frozen prefix K/V when decoding a block; the new (block)
+        // K/V are still returned so a committed block can extend the cache.
+        let (attn_keys, attn_values) = match cache {
+            Some((ck, cv)) => (
+                ops::concatenate_axis(&[ck, &keys_roped], -2)?,
+                ops::concatenate_axis(&[cv, &values], -2)?,
+            ),
+            None => (keys_roped.clone(), values.clone()),
+        };
+
         let output =
-            scaled_dot_product_attention(queries_roped, keys_roped, values, self.scale, None)?
+            scaled_dot_product_attention(queries_roped, attn_keys, attn_values, self.scale, mask)?
                 .transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[B, L, -1])?;
-        self.o_proj.forward(&output)
+        Ok((self.o_proj.forward(&output)?, keys_roped, values))
     }
 }
 
@@ -354,11 +384,19 @@ impl NemotronLayer {
         })
     }
 
-    fn forward(&mut self, x: &Array, rope: &RopeState) -> Result<Array, Exception> {
+    fn forward(
+        &mut self,
+        x: &Array,
+        rope: &RopeState,
+        cache: Option<&(Array, Array)>,
+        offset: i32,
+        mask: Option<&Array>,
+    ) -> Result<(Array, (Array, Array)), Exception> {
         let normed = self.input_layernorm.forward(x)?;
-        let h = x.add(self.self_attn.forward(&normed, rope)?)?;
+        let (attn_out, k, v) = self.self_attn.forward(&normed, rope, cache, offset, mask)?;
+        let h = x.add(attn_out)?;
         let normed_post = self.post_attention_layernorm.forward(&h)?;
-        h.add(self.mlp.forward(&normed_post)?)
+        Ok((h.add(self.mlp.forward(&normed_post)?)?, (k, v)))
     }
 }
 
@@ -396,12 +434,26 @@ impl NemotronModel {
         })
     }
 
-    fn forward(&mut self, inputs: &Array, rope: &RopeState) -> Result<Array, Exception> {
+    /// Forward `inputs`, threading an optional per-layer prefix cache, position
+    /// `offset` and `mask`. Returns the final hidden states and each layer's
+    /// freshly-computed `(roped_keys, values)`.
+    fn forward(
+        &mut self,
+        inputs: &Array,
+        rope: &RopeState,
+        caches: Option<&[(Array, Array)]>,
+        offset: i32,
+        mask: Option<&Array>,
+    ) -> Result<(Array, Vec<(Array, Array)>), Exception> {
         let mut h = self.embed_tokens.forward(inputs)?;
-        for layer in &mut self.layers {
-            h = layer.forward(&h, rope)?;
+        let mut new_kv = Vec::with_capacity(self.layers.len());
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let layer_cache = caches.and_then(|c| c.get(i));
+            let (hh, kv) = layer.forward(&h, rope, layer_cache, offset, mask)?;
+            h = hh;
+            new_kv.push(kv);
         }
-        self.norm.forward(&h)
+        Ok((self.norm.forward(&h)?, new_kv))
     }
 }
 
@@ -477,17 +529,89 @@ impl NemotronDiffusionLM {
         Ok((self.args.num_key_value_heads, self.args.checked_head_dim()?))
     }
 
-    /// Forward the whole canvas, returning logits for every position
-    /// `[1, L, vocab]`. Bidirectional (no causal mask).
-    fn forward_canvas(&mut self, canvas: &Array) -> Result<Array, Exception> {
-        let hidden = self.encoder.forward(canvas, &self.rope)?;
-        self.diffusion_head.forward(&hidden)
+    /// Causal prefill of the prompt → per-layer KV cache + block-0 seed token.
+    fn prefill(&mut self, prompt_ids: &[u32]) -> Result<(DiffusionKvCache, u32), Exception> {
+        let p =
+            i32::try_from(prompt_ids.len()).map_err(|_| Exception::custom("prompt too long"))?;
+        let input = Array::from_slice(prompt_ids, &[1, p]);
+        let mask = create_causal_mask(p, None)?;
+        let (hidden, per_layer) = self
+            .encoder
+            .forward(&input, &self.rope, None, 0, Some(&mask))?;
+        materialize(&per_layer)?;
+        let seed = self.last_token(&hidden, p)?;
+        Ok((DiffusionKvCache { per_layer, len: p }, seed))
     }
 
-    /// Diffusion decode: generate `num_tokens` tokens by block-wise masked
-    /// denoising. Greedy (argmax) selection; `steps` denoising iterations per
-    /// block of `block_size`. `on_block` is invoked with each finalized block's
-    /// token ids (for streaming).
+    /// Argmax token of the last position's logits in `hidden` (`[1, len, H]`).
+    fn last_token(&mut self, hidden: &Array, len: i32) -> Result<u32, Exception> {
+        let last = hidden.index((0, len - 1, ..)).reshape(&[1, -1])?;
+        let logit = self.diffusion_head.forward(&last)?;
+        let tok = ops::indexing::argmax_axis(&logit, -1, false)?.as_dtype(Dtype::Uint32)?;
+        mlx_rs::transforms::eval([&tok])?;
+        tok.as_slice::<u32>()
+            .first()
+            .copied()
+            .ok_or_else(|| Exception::custom("empty argmax"))
+    }
+
+    /// Forward the current block against the frozen prefix cache (bidirectional,
+    /// no mask). Returns per-position argmax token + softmax confidence.
+    fn predict_block(
+        &mut self,
+        block: &[u32],
+        cache: &DiffusionKvCache,
+    ) -> Result<(Vec<u32>, Vec<f32>), Exception> {
+        let blk = i32::try_from(block.len()).map_err(|_| Exception::custom("block too long"))?;
+        let input = Array::from_slice(block, &[1, blk]);
+        let (hidden, _) =
+            self.encoder
+                .forward(&input, &self.rope, Some(&cache.per_layer), cache.len, None)?;
+        let logits = self.diffusion_head.forward(&hidden)?.reshape(&[blk, -1])?;
+        let probs = ops::softmax_axis(&logits, -1, true)?;
+        let conf = probs.max_axis(-1, false)?.as_dtype(Dtype::Float32)?;
+        let preds = ops::indexing::argmax_axis(&logits, -1, false)?.as_dtype(Dtype::Uint32)?;
+        mlx_rs::transforms::eval([&conf, &preds])?;
+        Ok((
+            preds.as_slice::<u32>().to_vec(),
+            conf.as_slice::<f32>().to_vec(),
+        ))
+    }
+
+    /// Commit a finalized block causally: append its K/V to `cache` and return
+    /// the next block's seed token.
+    fn commit_block(
+        &mut self,
+        cache: &mut DiffusionKvCache,
+        block: &[u32],
+    ) -> Result<u32, Exception> {
+        let b = i32::try_from(block.len()).map_err(|_| Exception::custom("block too long"))?;
+        let input = Array::from_slice(block, &[1, b]);
+        let mask = create_causal_mask(b, Some(cache.len))?;
+        let (hidden, block_kv) = self.encoder.forward(
+            &input,
+            &self.rope,
+            Some(&cache.per_layer),
+            cache.len,
+            Some(&mask),
+        )?;
+        let mut extended = Vec::with_capacity(cache.per_layer.len());
+        for ((pk, pv), (bk, bv)) in cache.per_layer.iter().zip(&block_kv) {
+            extended.push((
+                ops::concatenate_axis(&[pk, bk], -2)?,
+                ops::concatenate_axis(&[pv, bv], -2)?,
+            ));
+        }
+        cache.per_layer = extended;
+        cache.len += b;
+        materialize(&cache.per_layer)?;
+        self.last_token(&hidden, b)
+    }
+
+    /// Diffusion decode (the reference's block-diffusion `generate`): causal
+    /// prefill, then per block seed position 0, denoise the rest against the
+    /// frozen prefix cache (bidirectional), and commit the block causally.
+    /// Greedy; `on_block` receives each finalized block (for streaming).
     #[allow(clippy::shadow_reuse)]
     pub fn diffusion_generate(
         &mut self,
@@ -498,105 +622,78 @@ impl NemotronDiffusionLM {
         mut on_block: BlockCallback<'_>,
     ) -> Result<Vec<u32>, Exception> {
         let mask_id = self.args.mask_token_id;
+        let eos_id = self.args.eos_token_id;
         let steps = steps.max(1);
         let block_size = block_size.max(1);
 
-        let mut canvas: Vec<u32> = prompt_ids.to_vec();
+        let (mut cache, mut seed) = self.prefill(prompt_ids)?;
         let mut generated: Vec<u32> = Vec::with_capacity(num_tokens);
 
         while generated.len() < num_tokens {
             let blk = block_size.min(num_tokens - generated.len());
-            let block_start = canvas.len();
-            canvas.extend(std::iter::repeat_n(mask_id, blk));
+            // Position 0 is the causal seed; the rest start masked.
+            let mut block: Vec<u32> = std::iter::repeat_n(mask_id, blk).collect();
+            if let Some(slot) = block.first_mut() {
+                *slot = seed;
+            }
 
             for step in 0..steps {
-                // Positions in the current block still masked.
-                let masked: Vec<usize> = (block_start..block_start + blk)
-                    .filter(|&p| canvas.get(p).copied() == Some(mask_id))
+                let masked: Vec<usize> = (0..blk)
+                    .filter(|&p| block.get(p).copied() == Some(mask_id))
                     .collect();
                 if masked.is_empty() {
                     break;
                 }
-
-                let (preds, confidences) = self.predict_block(&canvas, block_start, blk)?;
-
-                // Rank masked positions by confidence (descending) and unmask
-                // the scheduled count this step.
+                let (preds, conf) = self.predict_block(&block, &cache)?;
                 let n_unmask = unmask_count(masked.len(), step, steps);
-                let mut ranked: Vec<(usize, f32)> = Vec::with_capacity(masked.len());
-                for &pos in &masked {
-                    let local = pos - block_start;
-                    let conf = confidences.get(local).copied().unwrap_or(0.0);
-                    ranked.push((pos, conf));
-                }
+                let mut ranked: Vec<(usize, f32)> = masked
+                    .iter()
+                    .map(|&p| (p, conf.get(p).copied().unwrap_or(0.0)))
+                    .collect();
                 ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-
                 for &(pos, _) in ranked.iter().take(n_unmask) {
-                    let local = pos - block_start;
-                    if let (Some(slot), Some(&tok)) = (canvas.get_mut(pos), preds.get(local)) {
+                    if let (Some(slot), Some(&tok)) = (block.get_mut(pos), preds.get(pos)) {
                         *slot = tok;
                     }
                 }
             }
 
-            // Any positions left masked after the schedule (shouldn't happen on
-            // the final step) are filled with their last prediction.
-            let still_masked: Vec<usize> = (block_start..block_start + blk)
-                .filter(|&p| canvas.get(p).copied() == Some(mask_id))
+            // Fill any leftover masks with their last prediction.
+            let still: Vec<usize> = (0..blk)
+                .filter(|&p| block.get(p).copied() == Some(mask_id))
                 .collect();
-            if !still_masked.is_empty() {
-                let (preds, _) = self.predict_block(&canvas, block_start, blk)?;
-                for pos in still_masked {
-                    let local = pos - block_start;
-                    if let (Some(slot), Some(&tok)) = (canvas.get_mut(pos), preds.get(local)) {
+            if !still.is_empty() {
+                let (preds, _) = self.predict_block(&block, &cache)?;
+                for pos in still {
+                    if let (Some(slot), Some(&tok)) = (block.get_mut(pos), preds.get(pos)) {
                         *slot = tok;
                     }
                 }
             }
 
-            let block_ids: Vec<u32> = canvas
-                .get(block_start..block_start + blk)
-                .map(<[u32]>::to_vec)
-                .unwrap_or_default();
             if let Some(cb) = on_block.as_deref_mut() {
-                cb(&block_ids);
+                cb(&block);
             }
-            generated.extend_from_slice(&block_ids);
+            generated.extend_from_slice(&block);
+
+            // Stop once EOS appears; otherwise commit the block and reseed.
+            if eos_id.is_some_and(|e| block.contains(&e)) || generated.len() >= num_tokens {
+                break;
+            }
+            seed = self.commit_block(&mut cache, &block)?;
         }
 
         Ok(generated)
     }
+}
 
-    /// Run one forward over the canvas and return, for each position in the
-    /// current block, the argmax token id and its softmax confidence.
-    #[allow(non_snake_case)]
-    fn predict_block(
-        &mut self,
-        canvas: &[u32],
-        block_start: usize,
-        blk: usize,
-    ) -> Result<(Vec<u32>, Vec<f32>), Exception> {
-        let L = i32::try_from(canvas.len()).map_err(|_| Exception::custom("canvas too long"))?;
-        let input = Array::from_slice(canvas, &[1, L]);
-        let logits = self.forward_canvas(&input)?;
-
-        let start = i32::try_from(block_start).map_err(|_| Exception::custom("block_start"))?;
-        let len = i32::try_from(blk).map_err(|_| Exception::custom("blk"))?;
-        // [1, blk, vocab] -> [blk, vocab]
-        let block_logits = logits
-            .index((0, start..start + len, ..))
-            .reshape(&[len, -1])?;
-
-        let probs = ops::softmax_axis(&block_logits, -1, true)?;
-        let conf = probs.max_axis(-1, false)?.as_dtype(Dtype::Float32)?;
-        let preds_arr =
-            ops::indexing::argmax_axis(&block_logits, -1, false)?.as_dtype(Dtype::Uint32)?;
-        mlx_rs::transforms::eval([&conf, &preds_arr])?;
-
-        let conf_host: Vec<f32> = conf.as_slice::<f32>().to_vec();
-        let preds: Vec<u32> = preds_arr.as_slice::<u32>().to_vec();
-        Ok((preds, conf_host))
+/// Force the cached K/V arrays to be evaluated once, so the prefix isn't
+/// recomputed on every denoising step.
+fn materialize(per_layer: &[(Array, Array)]) -> Result<(), Exception> {
+    for (k, v) in per_layer {
+        mlx_rs::transforms::eval([k, v])?;
     }
+    Ok(())
 }
 
 /// Number of masked positions to un-mask at `step` of `steps`, given `n_masks`
@@ -691,6 +788,7 @@ mod tests {
             tie_word_embeddings: false,
             rope_parameters: RopeParameters::default(),
             quantization: None,
+            eos_token_id: None,
             mask_token_id: 300,
             block_size: 8,
             diffusion_steps: 4,
@@ -799,7 +897,12 @@ mod tests {
         let text = tokenizer.decode(&out, true).unwrap();
         eprintln!("Nemotron diffusion output: {text:?}");
 
-        assert_eq!(out.len(), 24);
+        // EOS may stop generation before the full 24 requested tokens.
+        assert!(
+            out.len() <= 24 && !out.is_empty(),
+            "got {} tokens",
+            out.len()
+        );
         assert!(
             out.iter().all(|&t| t != mask_id),
             "no mask tokens should remain"
