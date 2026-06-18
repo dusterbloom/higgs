@@ -109,17 +109,21 @@ fn try_parse_xml_tool_call(content: &str) -> Option<ParsedToolCall> {
         return None;
     }
 
-    let body = rest.get(name_end + 1..)?;
-    let body = body.split("</function>").next().unwrap_or(body);
+    let raw_body = rest.get(name_end + 1..)?;
+    let body = raw_body.split("</function>").next().unwrap_or(raw_body);
 
     let mut args = serde_json::Map::new();
     let mut cursor = body;
     while let Some(p) = cursor.find("<parameter=") {
         let after = &cursor[p + "<parameter=".len()..];
-        let Some(key_end) = after.find('>') else { break };
+        let Some(key_end) = after.find('>') else {
+            break;
+        };
         let key = after[..key_end].trim().to_owned();
         let val_region = &after[key_end + 1..];
-        let Some(val_end) = val_region.find("</parameter>") else { break };
+        let Some(val_end) = val_region.find("</parameter>") else {
+            break;
+        };
         let val = val_region[..val_end].trim();
         if !key.is_empty() {
             let jval = serde_json::from_str::<serde_json::Value>(val)
@@ -401,7 +405,10 @@ After last."#;
         let result = assert_parse(input, 1, None);
         let call = result.tool_calls.first().unwrap();
         assert_eq!(call.name, "search");
-        assert_eq!(call.arguments.get("query").unwrap().as_str().unwrap(), "rust");
+        assert_eq!(
+            call.arguments.get("query").unwrap().as_str().unwrap(),
+            "rust"
+        );
         // numeric value parsed as JSON number, not string
         assert_eq!(call.arguments.get("limit").unwrap().as_i64().unwrap(), 5);
     }

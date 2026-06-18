@@ -276,8 +276,14 @@ mod tests {
     #[test]
     fn compiles_union_of_tools() {
         let r = tool_call_regex(&[
-            tool("read_file", json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})),
-            tool("write_file", json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]})),
+            tool(
+                "read_file",
+                json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
+            ),
+            tool(
+                "write_file",
+                json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}),
+            ),
         ]);
         assert!(r.contains('|'), "union should contain alternation: {r}");
         assert!(r.contains("read_file") && r.contains("write_file"));

@@ -271,8 +271,8 @@ async fn chat_completions_non_streaming(
     // A forced tool call ("tool_choice":"required") constrains decoding from
     // token 0, which leaves no room for a `<think>` prefix — so force thinking
     // off for that request.
-    let force_tool = tools.is_some_and(|t| !t.is_empty())
-        && tool_choice_is_required(req.tool_choice.as_ref());
+    let force_tool =
+        tools.is_some_and(|t| !t.is_empty()) && tool_choice_is_required(req.tool_choice.as_ref());
     let thinking_enabled = !force_tool
         && crate::reasoning::effective_thinking_enabled(
             engine.enable_thinking(),
@@ -449,8 +449,7 @@ fn chat_completions_stream(
     let messages = convert_messages(&effective_messages);
     // See non-streaming path: a forced tool call constrains from token 0, so
     // thinking must be off for that request.
-    let force_tool =
-        stream_includes_tools && tool_choice_is_required(req.tool_choice.as_ref());
+    let force_tool = stream_includes_tools && tool_choice_is_required(req.tool_choice.as_ref());
     let thinking_enabled_stream = !force_tool
         && crate::reasoning::effective_thinking_enabled(
             engine.enable_thinking(),
@@ -485,7 +484,10 @@ fn chat_completions_stream(
     };
 
     let constraint = if force_tool {
-        Some(build_tool_constraint(req.tools.as_deref().unwrap_or(&[]), &engine)?)
+        Some(build_tool_constraint(
+            req.tools.as_deref().unwrap_or(&[]),
+            &engine,
+        )?)
     } else {
         build_constraint(req.response_format.as_ref(), &engine)?
     };
@@ -720,8 +722,8 @@ fn chat_completions_stream(
     Ok(stream)
 }
 
-/// Coerce a tool_call's `function.arguments` from a JSON-encoded string (the
-/// OpenAI wire format) into a parsed JSON object, so chat templates that iterate
+/// Coerce a `tool_call`'s `function.arguments` from a JSON-encoded string (the
+/// `OpenAI` wire format) into a parsed JSON object, so chat templates that iterate
 /// it (e.g. Qwen's `tool_call.arguments | items`) render instead of erroring with
 /// "cannot convert value into pairs". Non-string or unparseable arguments are
 /// left untouched.
@@ -733,8 +735,8 @@ fn coerce_tool_call_arguments(mut tc: serde_json::Value) -> serde_json::Value {
         .get("arguments")
         .and_then(|a| a.as_str())
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-    if let Some(parsed) = parsed {
-        func.insert("arguments".to_owned(), parsed);
+    if let Some(value) = parsed {
+        func.insert("arguments".to_owned(), value);
     }
     tc
 }
