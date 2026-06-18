@@ -916,4 +916,41 @@ mod tests {
             "expected a coherent answer naming Paris, got: {text:?}"
         );
     }
+
+    /// Decode-only throughput baseline for diffusion (dlm) mode on real weights.
+    /// Loads once, warms up Metal, then times `diffusion_generate` at two step
+    /// counts to show the steps<->parallelism tradeoff (fewer steps = more
+    /// tokens per forward = faster, lower quality). Run with `--ignored
+    /// --nocapture`. This is the "before" baseline for the linear_spec drafter.
+    #[test]
+    #[ignore = "requires real Nemotron-Labs-Diffusion weights; set HIGGS_NEMOTRON_DIFFUSION_DIR"]
+    fn dlm_throughput_baseline() {
+        let Some(dir) = std::env::var_os("HIGGS_NEMOTRON_DIFFUSION_DIR") else {
+            eprintln!("skipping: set HIGGS_NEMOTRON_DIFFUSION_DIR to a model directory");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let mut model = load_nemotron_diffusion_model(&dir).unwrap();
+        let tokenizer = crate::load_tokenizer(&dir).unwrap();
+        let enc = tokenizer
+            .encode("Explain in detail how photosynthesis works:", true)
+            .unwrap();
+        let prompt = enc.get_ids();
+
+        // Warm up Metal kernels (not timed).
+        let _ = model.diffusion_generate(prompt, 16, 8, 32, None).unwrap();
+
+        for (num_tokens, steps, block) in [(128usize, 32usize, 32usize), (128, 8, 32)] {
+            let t = std::time::Instant::now();
+            let out = model
+                .diffusion_generate(prompt, num_tokens, steps, block, None)
+                .unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            let toks = out.len();
+            let tps = f64::from(u32::try_from(toks).unwrap()) / secs;
+            eprintln!(
+                "dlm baseline: {toks} tok in {secs:.3}s = {tps:.1} tok/s (req={num_tokens}, steps={steps}, block={block})"
+            );
+        }
+    }
 }
