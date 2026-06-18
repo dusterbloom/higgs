@@ -32,8 +32,6 @@ use crate::{
     scheduler::RoundRobinScheduler,
 };
 
-/// Default maximum number of cached prefixes.
-const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 const DEFAULT_PAGED_KV_BLOCK_SIZE: usize = 64;
 
 /// Acquire a `Mutex` lock, recovering from poison by reusing the inner data.
@@ -424,7 +422,7 @@ impl SimpleEngine {
         Ok(Self {
             model: Mutex::new(model),
             prefix_cache: Mutex::new(PagedPrefixCache::new(
-                DEFAULT_PREFIX_CACHE_SIZE,
+                tuning.prefix_cache_entries(),
                 DEFAULT_BLOCK_SIZE,
             )),
             paged_cache: paged_cache.map(Mutex::new),

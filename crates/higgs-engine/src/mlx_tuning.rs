@@ -213,6 +213,15 @@ pub struct MlxRuntimeTuning {
     /// checkpoints and 1 otherwise, clamped to 1..=8.
     mtp_draft_n_max: usize,
     paged_kv_target_bytes: usize,
+    /// Max number of distinct prompt prefixes kept in the prefix KV cache.
+    ///
+    /// Each entry is one conversation's paged KV (common prefixes dedupe via
+    /// MLX refcount). Bigger = fewer cold re-prefills when bouncing between
+    /// conversations, at the cost of RAM. Controlled by
+    /// `HIGGS_PREFIX_CACHE_ENTRIES`.
+    // ponytail: entry-count cap, not bytes. If long-context entries pressure
+    // RAM, switch to a byte budget like `paged_kv_target_bytes`.
+    prefix_cache_entries: usize,
 }
 
 impl MlxRuntimeTuning {
@@ -247,6 +256,11 @@ impl MlxRuntimeTuning {
             std::env::var("HIGGS_MTP_DRAFT_N_MAX").ok().as_deref(),
             tuning.mtp_draft_n_max,
         );
+        tuning.prefix_cache_entries = std::env::var("HIGGS_PREFIX_CACHE_ENTRIES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(tuning.prefix_cache_entries);
 
         tuning
     }
@@ -274,6 +288,7 @@ impl MlxRuntimeTuning {
                 enable_mtp: false,
                 mtp_draft_n_max: 1,
                 paged_kv_target_bytes: DEFAULT_PAGED_KV_TARGET_BYTES,
+                prefix_cache_entries: 8,
             },
             ResolvedMlxProfile::Latency => Self {
                 requested_profile,
@@ -286,6 +301,7 @@ impl MlxRuntimeTuning {
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
                     balanced_paged_kv.saturating_mul(9) / 8,
                 ),
+                prefix_cache_entries: 16,
             },
             ResolvedMlxProfile::Balanced => Self {
                 requested_profile,
@@ -296,6 +312,7 @@ impl MlxRuntimeTuning {
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: balanced_paged_kv,
+                prefix_cache_entries: 16,
             },
             ResolvedMlxProfile::Throughput => Self {
                 requested_profile,
@@ -308,6 +325,7 @@ impl MlxRuntimeTuning {
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
                     balanced_paged_kv.saturating_mul(5) / 4,
                 ),
+                prefix_cache_entries: 32,
             },
         }
     }
@@ -348,6 +366,13 @@ impl MlxRuntimeTuning {
 
     pub const fn paged_kv_target_bytes(&self) -> usize {
         self.paged_kv_target_bytes
+    }
+
+    /// Max number of distinct prompt prefixes kept in the prefix KV cache.
+    ///
+    /// Configurable via `HIGGS_PREFIX_CACHE_ENTRIES`.
+    pub const fn prefix_cache_entries(&self) -> usize {
+        self.prefix_cache_entries
     }
 }
 
