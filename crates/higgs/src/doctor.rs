@@ -45,6 +45,7 @@ pub async fn run_doctor(
 
     check_config_valid(&mut result);
     check_config_file_permissions(config, config_path, &mut result);
+    check_misplaced_local_keys(config_path, &mut result);
     check_server_section(config, &mut result);
     check_models(config, &mut result);
     check_duplicate_models(config, &mut result);
@@ -349,6 +350,45 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     }
 }
 
+/// Catch `[local]` keys mistakenly written under `[server]`.
+///
+/// `local.allow_runtime_model_load = true` placed below a `[server]` header is
+/// parsed by TOML as `server.local.*` -- an unknown key serde silently drops, so
+/// the setting never takes effect. This is only visible in the raw file; the
+/// parsed [`HiggsConfig`] no longer carries the stray key.
+fn check_misplaced_local_keys(config_path: Option<&std::path::Path>, result: &mut DoctorResult) {
+    let Some(path) = config_path else { return };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        return;
+    };
+    let Some(server) = doc.get("server").and_then(|item| item.as_table()) else {
+        return;
+    };
+
+    let stray: Vec<&str> = [
+        "local",
+        "allow_runtime_model_load",
+        "raise_wired_limit",
+        "mlx_profile",
+    ]
+    .into_iter()
+    .filter(|key| server.contains_key(key))
+    .collect();
+    if stray.is_empty() {
+        pass("no misplaced [local] keys under [server]", result);
+    } else {
+        warn(
+            &format!(
+                "{stray:?} found under [server]: TOML reads these as server.* and silently ignores them, so the setting never applies. Move them to a top-level [local] table."
+            ),
+            result,
+        );
+    }
+}
+
 fn check_runtime_model_load(config: &HiggsConfig, result: &mut DoctorResult) {
     if config.local.allow_runtime_model_load {
         warn(
@@ -612,6 +652,37 @@ mod tests {
         assert_eq!(result.passes, 0);
         assert_eq!(result.warnings, 0);
         assert_eq!(result.failures, 1);
+    }
+
+    // -- Misplaced [local] keys under [server] --
+
+    fn write_config(toml: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_local_key_under_server_warns() {
+        // The exact footgun: dotted `local.*` written below [server] parses as
+        // server.local.* and is silently dropped.
+        let dir =
+            write_config("[server]\nhost = \"0.0.0.0\"\nlocal.allow_runtime_model_load = true\n");
+        let mut result = empty_result();
+        check_misplaced_local_keys(Some(&dir.path().join("config.toml")), &mut result);
+        assert_eq!(result.warnings, 1);
+        assert_eq!(result.passes, 0);
+    }
+
+    #[test]
+    fn test_correct_local_table_passes() {
+        let dir = write_config(
+            "[server]\nhost = \"0.0.0.0\"\n\n[local]\nallow_runtime_model_load = true\n",
+        );
+        let mut result = empty_result();
+        check_misplaced_local_keys(Some(&dir.path().join("config.toml")), &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.warnings, 0);
     }
 
     // -- Duplicate model detection --
