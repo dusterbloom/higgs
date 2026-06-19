@@ -50,6 +50,9 @@ pub struct ChatCompletionRequest {
     /// a non-empty value such as `"low"` to explicitly enable reasoning.
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional Higgs extension naming a disk prefix-cache checkpoint to load/store.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
 }
 
 /// Optional request-level controls for streaming responses.
@@ -320,6 +323,9 @@ pub struct CompletionRequest {
     pub logprobs: Option<bool>,
     #[serde(default)]
     pub top_logprobs: Option<u32>,
+    /// Optional Higgs extension naming a disk prefix-cache checkpoint to load/store.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
 }
 
 /// POST /v1/completions response (non-streaming).

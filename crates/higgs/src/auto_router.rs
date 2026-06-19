@@ -135,8 +135,17 @@ pub fn classify_local(
         presence_penalty: None,
     };
 
-    let output = match engine.generate(&prompt_tokens, 64, &sampling, &[], false, None, None, None)
-    {
+    let output = match engine.generate(
+        &prompt_tokens,
+        64,
+        &sampling,
+        &[],
+        false,
+        None,
+        None,
+        None,
+        None,
+    ) {
         Ok(o) => o,
         Err(e) => {
             warn!(error = %e, "auto-router generation failed");

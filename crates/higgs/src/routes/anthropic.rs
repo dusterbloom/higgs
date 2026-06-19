@@ -255,6 +255,7 @@ async fn create_message_non_streaming(
             thinking_enabled,
             None,
             None,
+            None,
         )
     })
     .await
@@ -348,6 +349,7 @@ fn create_message_stream(
             None,
             &tx,
             thinking_enabled,
+            None,
             None,
             None,
         );

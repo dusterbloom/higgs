@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use higgs_engine::batch_engine::BatchEngine;
+use higgs_engine::cache::DiskPrefixCacheConfig;
 use higgs_engine::chat_template::ChatMessage;
 use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
@@ -59,6 +60,23 @@ impl Engine {
     ) -> Result<Self, EngineError> {
         SimpleEngine::load(dir, kv_cache_config, tuning, raise_wired_limit)
             .map(|e| Self::Simple(Box::new(e)))
+    }
+
+    pub fn load_simple_with_disk_cache<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+        tuning: MlxRuntimeTuning,
+        raise_wired_limit: bool,
+        disk_cache_config: Option<DiskPrefixCacheConfig>,
+    ) -> Result<Self, EngineError> {
+        SimpleEngine::load_with_disk_cache(
+            dir,
+            kv_cache_config,
+            tuning,
+            raise_wired_limit,
+            disk_cache_config,
+        )
+        .map(|e| Self::Simple(Box::new(e)))
     }
 
     pub fn load_batch<P: AsRef<Path>>(
@@ -187,6 +205,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -198,6 +217,7 @@ impl Engine {
             self.enable_thinking(),
             constraint,
             pixel_values,
+            checkpoint_id,
         )
     }
 
@@ -213,6 +233,7 @@ impl Engine {
         enable_thinking: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
         let _gpu = gpu_gate();
         match self {
@@ -226,6 +247,7 @@ impl Engine {
                 enable_thinking,
                 constraint,
                 pixel_values,
+                checkpoint_id,
             ),
             Self::Batch(e) => e.generate_with_thinking(
                 prompt_tokens,
@@ -255,6 +277,7 @@ impl Engine {
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -267,6 +290,7 @@ impl Engine {
             self.enable_thinking(),
             constraint,
             pixel_values,
+            checkpoint_id,
         )
     }
 
@@ -283,6 +307,7 @@ impl Engine {
         enable_thinking: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
         let _gpu = gpu_gate();
         match self {
@@ -297,6 +322,7 @@ impl Engine {
                 enable_thinking,
                 constraint,
                 pixel_values,
+                checkpoint_id,
             ),
             Self::Batch(e) => e.generate_streaming_with_thinking(
                 prompt_tokens,
@@ -349,8 +375,14 @@ pub fn build_engine(
             .map_err(|e| e.to_string())?
     } else {
         let tuning = resolve_runtime_tuning(resolved, model_cfg.requested_mlx_profile(local));
-        Engine::load_simple(resolved, kv_cache_config, tuning, local.raise_wired_limit)
-            .map_err(|e| e.to_string())?
+        Engine::load_simple_with_disk_cache(
+            resolved,
+            kv_cache_config,
+            tuning,
+            local.raise_wired_limit,
+            model_cfg.disk_prefix_cache_config(resolved),
+        )
+        .map_err(|e| e.to_string())?
     };
     let name = model_cfg
         .name

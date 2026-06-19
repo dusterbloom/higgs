@@ -6,7 +6,11 @@ use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
-use higgs_engine::{mlx_tuning::RequestedMlxProfile, model_loader};
+use higgs_engine::{
+    cache::{DEFAULT_MAX_DISK_BLOCKS, DEFAULT_MIN_TOKENS_TO_PERSIST, DiskPrefixCacheConfig},
+    mlx_tuning::RequestedMlxProfile,
+    model_loader,
+};
 use higgs_models::turboquant::{KvCacheConfig, KvCacheMode};
 use serde::{Deserialize, Serialize};
 
@@ -422,6 +426,18 @@ pub struct ModelConfig {
     /// Seed used by `TurboQuant` setup.
     #[serde(default)]
     pub kv_seed: u64,
+    /// Persist simple-engine prefix KV snapshots to disk.
+    #[serde(default)]
+    pub disk_cache_enabled: bool,
+    /// Optional path for the disk prefix cache file.
+    #[serde(default)]
+    pub disk_cache_path: Option<PathBuf>,
+    /// Maximum number of blocks allowed in one persisted prefix snapshot.
+    #[serde(default = "default_max_disk_blocks")]
+    pub max_disk_blocks: usize,
+    /// Minimum prefix length, in tokens, before persisting to disk.
+    #[serde(default = "default_min_tokens_to_persist")]
+    pub min_tokens_to_persist: usize,
 }
 
 const fn default_norm_correction() -> bool {
@@ -430,6 +446,14 @@ const fn default_norm_correction() -> bool {
 
 const fn default_kv_bits() -> u8 {
     3
+}
+
+const fn default_max_disk_blocks() -> usize {
+    DEFAULT_MAX_DISK_BLOCKS
+}
+
+const fn default_min_tokens_to_persist() -> usize {
+    DEFAULT_MIN_TOKENS_TO_PERSIST
 }
 
 impl ModelConfig {
@@ -450,6 +474,21 @@ impl ModelConfig {
             Some(profile) => profile.to_requested(),
             None => local.requested_mlx_profile,
         }
+    }
+
+    pub fn disk_prefix_cache_config(&self, model_dir: &Path) -> Option<DiskPrefixCacheConfig> {
+        if !self.disk_cache_enabled {
+            return None;
+        }
+        let disk_path = self
+            .disk_cache_path
+            .clone()
+            .unwrap_or_else(|| model_dir.join(".higgs-prefix-cache.bin"));
+        Some(DiskPrefixCacheConfig {
+            disk_path,
+            max_disk_blocks: self.max_disk_blocks,
+            min_tokens_to_persist: self.min_tokens_to_persist,
+        })
     }
 }
 
@@ -674,6 +713,10 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_norm_correction: !args.kv_no_norm_correction,
             kv_adaptive_dense_layers: args.kv_adaptive_dense_layers.unwrap_or(0),
             kv_seed: args.kv_seed.unwrap_or_default(),
+            disk_cache_enabled: false,
+            disk_cache_path: None,
+            max_disk_blocks: default_max_disk_blocks(),
+            min_tokens_to_persist: default_min_tokens_to_persist(),
         })
         .collect();
 
@@ -761,6 +804,10 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_norm_correction: !serve_args.kv_no_norm_correction,
                     kv_adaptive_dense_layers: serve_args.kv_adaptive_dense_layers.unwrap_or(0),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
+                    disk_cache_enabled: false,
+                    disk_cache_path: None,
+                    max_disk_blocks: default_max_disk_blocks(),
+                    min_tokens_to_persist: default_min_tokens_to_persist(),
                 })
                 .collect();
             let mut existing = figment
@@ -810,6 +857,28 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
         if model.batch && model.kv_cache_config().is_turboquant() {
             return Err(format!(
                 "TurboQuant is not supported with batch=true for model {}",
+                model.path
+            ));
+        }
+        if model.batch && model.disk_cache_enabled {
+            return Err(format!(
+                "disk prefix cache is only supported with batch=false for model {}",
+                model.path
+            ));
+        }
+        if model.disk_cache_enabled && model.max_disk_blocks == 0 {
+            return Err(format!(
+                "max_disk_blocks must be greater than zero for model {}",
+                model.path
+            ));
+        }
+        if model
+            .disk_cache_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(format!(
+                "disk_cache_path must not be empty for model {}",
                 model.path
             ));
         }
@@ -932,6 +1001,10 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_norm_correction: true,
         kv_adaptive_dense_layers: 0,
         kv_seed: 0,
+        disk_cache_enabled: false,
+        disk_cache_path: None,
+        max_disk_blocks: default_max_disk_blocks(),
+        min_tokens_to_persist: default_min_tokens_to_persist(),
     });
     config.auto_router.model = name;
 }

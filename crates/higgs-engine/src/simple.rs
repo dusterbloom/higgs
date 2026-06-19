@@ -22,13 +22,13 @@ use mlx_rs::{
 use tokenizers::Tokenizer;
 
 use crate::{
-    cache::PagedKvCache,
+    cache::{DiskPrefixCache, DiskPrefixCacheConfig, PagedKvCache},
     chat_template::{ChatMessage, ChatTemplateRenderer},
     engine::{GenerationOutput, StreamingOutput},
     error::EngineError,
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
-    paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPrefixCache},
+    paged_prefix_cache::DEFAULT_BLOCK_SIZE,
     scheduler::RoundRobinScheduler,
 };
 
@@ -234,7 +234,7 @@ pub struct Session {
 /// yet and return explicit errors instead of placeholder output.
 pub struct SimpleEngine {
     model: Mutex<AnyModel>,
-    prefix_cache: Mutex<PagedPrefixCache>,
+    prefix_cache: Mutex<DiskPrefixCache>,
     /// Paged KV cache for session-based generation
     paged_cache: Option<Mutex<PagedKvCache>>,
     /// Session scheduler for continuous batching
@@ -275,6 +275,17 @@ impl SimpleEngine {
         kv_cache_config: KvCacheConfig,
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
+    ) -> Result<Self, EngineError> {
+        Self::load_with_disk_cache(dir, kv_cache_config, tuning, raise_wired_limit, None)
+    }
+
+    /// Load a model and tokenizer from a directory with optional disk prefix cache.
+    pub fn load_with_disk_cache<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+        tuning: MlxRuntimeTuning,
+        raise_wired_limit: bool,
+        disk_cache_config: Option<DiskPrefixCacheConfig>,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
@@ -421,12 +432,29 @@ impl SimpleEngine {
             None
         };
 
-        Ok(Self {
-            model: Mutex::new(model),
-            prefix_cache: Mutex::new(PagedPrefixCache::new(
+        let prefix_cache = disk_cache_config.map_or_else(
+            || DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE),
+            |config| match DiskPrefixCache::new(
                 DEFAULT_PREFIX_CACHE_SIZE,
                 DEFAULT_BLOCK_SIZE,
-            )),
+                config,
+                num_kv_heads,
+                head_dim,
+            ) {
+                Ok(cache) => cache,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Failed to initialize disk prefix cache; falling back to memory-only cache"
+                    );
+                    DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE)
+                }
+            },
+        );
+
+        Ok(Self {
+            model: Mutex::new(model),
+            prefix_cache: Mutex::new(prefix_cache),
             paged_cache: paged_cache.map(Mutex::new),
             scheduler: Mutex::new(RoundRobinScheduler::new()),
             sessions: Mutex::new(std::collections::HashMap::new()),
@@ -538,6 +566,7 @@ impl SimpleEngine {
         &self,
         prompt_tokens: &[u32],
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<PreparedGeneration<'_>, EngineError> {
         let prompt_len = Self::prompt_len(prompt_tokens)?;
         let has_images = pixel_values.is_some();
@@ -551,7 +580,7 @@ impl SimpleEngine {
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            pc.find_longest_prefix(prompt_tokens)
+            pc.find_longest_prefix(prompt_tokens, checkpoint_id)
         };
 
         let model = self
@@ -605,6 +634,7 @@ impl SimpleEngine {
     /// Run the prefill forward pass and sample the first token. Stores the
     /// post-prefill KV state back into the prefix cache (skipped for multimodal).
     /// Optionally computes logprobs for the first token.
+    #[allow(clippy::too_many_arguments)]
     fn run_prefill(
         &self,
         prompt_tokens: &[u32],
@@ -613,6 +643,7 @@ impl SimpleEngine {
         logprob_top_n: Option<u32>,
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
         capture_hidden: bool,
+        checkpoint_id: Option<&str>,
     ) -> Result<(Array, Option<LogprobArrays>, Option<Array>), EngineError> {
         let mut prefill_hidden = None;
         let logits = if let Some(ref pixel_values) = prepared.pixel_values {
@@ -699,7 +730,7 @@ impl SimpleEngine {
                         .saturating_sub(self.gen_prompt_suffix_len),
                 )
                 .unwrap_or(prompt_tokens);
-            pc.store(cache_key, &prepared.cache);
+            pc.store(cache_key, &prepared.cache, checkpoint_id);
         }
         maybe_clear_mlx_cache(
             self.tuning.clear_cache_after_prefill(),
@@ -979,6 +1010,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -990,6 +1022,7 @@ impl SimpleEngine {
             self.enable_thinking,
             constraint,
             pixel_values,
+            checkpoint_id,
         )
     }
 
@@ -1005,6 +1038,7 @@ impl SimpleEngine {
         enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
@@ -1032,6 +1066,7 @@ impl SimpleEngine {
                 enable_thinking,
                 constraint,
                 pixel_values,
+                checkpoint_id,
             )
         })
     }
@@ -1052,6 +1087,7 @@ impl SimpleEngine {
         enable_thinking: bool,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
         // Diffusion models decode in parallel (not token-by-token); take a
         // dedicated path that bypasses the autoregressive prefill/decode loop.
@@ -1069,7 +1105,7 @@ impl SimpleEngine {
 
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
-        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
+        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values, checkpoint_id)?;
         let prompt_len = prepared.prompt_len;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
@@ -1087,6 +1123,7 @@ impl SimpleEngine {
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
+            checkpoint_id,
         )?;
 
         // Capture T1 (already eval'd inside run_prefill).
@@ -2172,6 +2209,7 @@ impl SimpleEngine {
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -2184,6 +2222,7 @@ impl SimpleEngine {
             self.enable_thinking,
             constraint,
             pixel_values,
+            checkpoint_id,
         )
     }
 
@@ -2200,6 +2239,7 @@ impl SimpleEngine {
         enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
@@ -2229,6 +2269,7 @@ impl SimpleEngine {
                 enable_thinking,
                 constraint,
                 pixel_values,
+                checkpoint_id,
             )
         })
     }
@@ -2250,6 +2291,7 @@ impl SimpleEngine {
         enable_thinking: bool,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
         // Diffusion models decode in parallel. PR1 emits the full generated
         // text as one content chunk followed by a terminal chunk (per-block
@@ -2280,7 +2322,7 @@ impl SimpleEngine {
 
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
-        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
+        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values, checkpoint_id)?;
         let prompt_len = prepared.prompt_len;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
@@ -2298,6 +2340,7 @@ impl SimpleEngine {
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
+            checkpoint_id,
         )?;
 
         let mut all_tokens: Vec<u32> = Vec::new();
