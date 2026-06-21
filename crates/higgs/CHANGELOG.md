@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.4.0](https://github.com/panbanda/higgs/compare/higgs-v1.3.0...higgs-v1.4.0) (2026-06-21)
+
+
+### Features
+
+* harden default security posture ([1b41a5c](https://github.com/panbanda/higgs/commit/1b41a5c93696a7492ef4bf7e941982341edf50ab))
+
+
+### Bug Fixes
+
+* address CI lint and test failures ([0d8e259](https://github.com/panbanda/higgs/commit/0d8e2594809589fe405a3b8091e669164b2e8e52))
+* route first streamed token through incremental detokenizer ([722218d](https://github.com/panbanda/higgs/commit/722218df3cfb10c8671721cf45888ec45e31187c))
+* split long first doc paragraphs for clippy ([c195312](https://github.com/panbanda/higgs/commit/c1953125d8399f899236d7917f26b94051fccb4b))
+* type alias for build_router signature assertion ([d084592](https://github.com/panbanda/higgs/commit/d0845926a64c0179646855b628ef0da737e31b2f))
+
 ## [1.3.0](https://github.com/panbanda/higgs/compare/higgs-v1.2.0...higgs-v1.3.0) (2026-05-31)
 
 

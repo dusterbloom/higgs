@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.4.0](https://github.com/panbanda/higgs/compare/higgs-engine-v1.3.0...higgs-engine-v1.4.0) (2026-06-21)
+
+
+### Features
+
+* harden default security posture ([1b41a5c](https://github.com/panbanda/higgs/commit/1b41a5c93696a7492ef4bf7e941982341edf50ab))
+* **models:** add Gemma 3 and Gemma 4 inference support ([4f301fc](https://github.com/panbanda/higgs/commit/4f301fcc0d45e2922df4203149f05a24a9f46ae6))
+
+
+### Bug Fixes
+
+* doc_markdown lints in detok test comments ([deefbe3](https://github.com/panbanda/higgs/commit/deefbe39345669e101b9f1fc5caa90de0aaaa973))
+* rename first-token detok bindings to avoid shadowing ([8d16696](https://github.com/panbanda/higgs/commit/8d16696c2d59750d3d742f203ab7316a4785b2be))
+* route first streamed token through incremental detokenizer ([722218d](https://github.com/panbanda/higgs/commit/722218df3cfb10c8671721cf45888ec45e31187c))
+* split long first doc paragraphs for clippy ([c195312](https://github.com/panbanda/higgs/commit/c1953125d8399f899236d7917f26b94051fccb4b))
+
+
+### Performance Improvements
+
+* incremental detokenization for streaming generation ([a949e50](https://github.com/panbanda/higgs/commit/a949e50fb3a5c2d650c2d7de367eb4afea444138))
+
 ## [1.3.0](https://github.com/panbanda/higgs/compare/higgs-engine-v1.2.0...higgs-engine-v1.3.0) (2026-05-31)
 
 
