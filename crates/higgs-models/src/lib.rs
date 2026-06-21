@@ -120,9 +120,54 @@ impl AnyCache {
             }
         }
     }
+
+    /// An **independent** deep copy for use as a speculative-decode checkpoint.
+    /// KV layers are deep-cloned (their in-place `slice_update` buffers must not
+    /// be shared — see [`cache::SteppingKeyValueCache::deep_clone`]); GDN/SSM
+    /// (`Arrays`) layers update by full reassignment, never in place, so a cheap
+    /// shallow `clone()` of those is safe.
+    #[must_use]
+    pub fn deep_clone(&self) -> Self {
+        match self {
+            Self::KV(layers) => Self::KV(
+                layers
+                    .iter()
+                    .map(|l| l.as_ref().map(cache::SteppingKeyValueCache::deep_clone))
+                    .collect(),
+            ),
+            Self::Hybrid(layers) => Self::Hybrid(
+                layers
+                    .iter()
+                    .map(|l| {
+                        l.as_ref().map(|lc| match lc {
+                            LayerCache::KV(kv) => LayerCache::KV(kv.deep_clone()),
+                            recurrent @ LayerCache::Arrays(_) => recurrent.clone(),
+                        })
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Independent deep copy of an MTP head cache (`Vec<SteppingKeyValueCache>`).
+///
+/// For use as a speculative-decode checkpoint. See
+/// [`cache::SteppingKeyValueCache::deep_clone`] for why a shallow clone is
+/// unsafe (buffer donation double-free).
+#[must_use]
+pub fn deep_clone_mtp_cache(c: &MtpCache) -> MtpCache {
+    c.iter()
+        .map(cache::SteppingKeyValueCache::deep_clone)
+        .collect()
 }
 
 /// Unified model wrapper dispatching to the correct architecture.
+// One `AnyModel` exists per loaded model (held by the engine for the process
+// lifetime), never stored in bulk, so the size spread between variants costs a
+// few hundred bytes once. Boxing a dispatch variant would add an indirection on
+// the forward path for no practical benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum AnyModel {
     /// Standard transformer architectures: Llama, Mistral, Qwen2/2.5, Qwen3.
     Transformer(Model),
@@ -1194,7 +1239,8 @@ pub struct WeightMapIndex {
     pub weight_map: HashMap<String, String>,
 }
 
-const AUXILIARY_SAFETENSORS_FILES: &[&str] = &["mtp.safetensors", "model-mtp.safetensors"];
+pub(crate) const AUXILIARY_SAFETENSORS_FILES: &[&str] =
+    &["mtp.safetensors", "model-mtp.safetensors"];
 
 /// Load a tokenizer from a model directory.
 pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokenizer, ModelError> {
