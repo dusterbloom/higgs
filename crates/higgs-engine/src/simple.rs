@@ -1998,6 +1998,7 @@ impl SimpleEngine {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: completion_len,
                                         token_logprob: None,
+                                        prefill_progress: None,
                                     })
                                     .is_err()
                                 {
@@ -2068,6 +2069,7 @@ impl SimpleEngine {
                         prompt_tokens: prompt_len,
                         completion_tokens: completion_len,
                         token_logprob: None,
+                        prefill_progress: None,
                     })
                     .is_err()
                 {
@@ -2113,6 +2115,9 @@ impl SimpleEngine {
             top_logprobs,
             sender,
             self.enable_thinking,
+            // Non-thinking convenience entry (used by /v1/completions) never
+            // streams prefill progress.
+            false,
             constraint,
             pixel_values,
         )
@@ -2129,6 +2134,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         enable_thinking: bool,
+        return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
@@ -2144,6 +2150,7 @@ impl SimpleEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
                 token_logprob: None,
+                prefill_progress: None,
             });
             return Ok(());
         }
@@ -2158,6 +2165,7 @@ impl SimpleEngine {
                 top_logprobs,
                 sender,
                 enable_thinking,
+                return_progress,
                 constraint,
                 pixel_values,
             )
@@ -2179,6 +2187,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         enable_thinking: bool,
+        return_progress: bool,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
@@ -2195,6 +2204,44 @@ impl SimpleEngine {
             && !logprobs
             && params.temperature == 0.0;
 
+        // Stream prefill progress only when the caller opted in (OpenAI
+        // `return_progress: true`). Direct higgs-engine callers and BatchEngine
+        // keep the progress-free streaming contract: no sink, no extra events.
+        //
+        // The chunked-prefill loops report suffix-relative completions through a
+        // thread-local sink; map them to absolute prompt position by adding the
+        // prefix-cache hit. Events ride the normal streaming channel as
+        // progress-only outputs. try_send: never stall prefill on a slow
+        // consumer — dropped progress events are harmless. The returned guard is
+        // held for the prefill's duration and uninstalls the sink on drop.
+        let prefill_sink = return_progress.then(|| {
+            let actual_tokens =
+                u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
+            let cached = prompt_len.saturating_sub(actual_tokens);
+            let make_progress_output = move |suffix_done: u32| StreamingOutput {
+                new_text: String::new(),
+                finished: false,
+                finish_reason: None,
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+                token_logprob: None,
+                prefill_progress: Some(crate::engine::PrefillProgress {
+                    processed: (cached + suffix_done).min(prompt_len),
+                    cached,
+                    total: prompt_len,
+                }),
+            };
+            // Initial event: tells the client the total (and cache hit) before
+            // the first ~1024-token chunk completes.
+            let _ = sender.try_send(make_progress_output(0));
+            let progress_sender = sender.clone();
+            higgs_models::progress::install_prefill_progress_sink(Box::new(move |done, _total| {
+                let _ = progress_sender.try_send(make_progress_output(
+                    u32::try_from(done.max(0)).unwrap_or(0),
+                ));
+            }))
+        });
+
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
             prompt_tokens,
             &mut prepared,
@@ -2203,6 +2250,9 @@ impl SimpleEngine {
             constraint.as_ref(),
             capture_mtp_prefill,
         )?;
+        // Prefill done — decode must not report progress. Dropping the Option
+        // uninstalls the sink when present; a no-op when progress was off.
+        drop(prefill_sink);
 
         let mut all_tokens: Vec<u32> = Vec::new();
         let first_token_id: u32 = current_token.item();
@@ -2256,6 +2306,7 @@ impl SimpleEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprob: first_logprob,
+                prefill_progress: None,
             })
             .is_err()
         {
@@ -2430,6 +2481,7 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprob,
+                    prefill_progress: None,
                 })
                 .is_err()
             {

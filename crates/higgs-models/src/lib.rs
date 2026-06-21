@@ -7,6 +7,7 @@ pub mod gemma3;
 pub mod gemma4;
 pub mod llava_qwen2;
 pub mod phi3;
+pub mod progress;
 pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod registry;
@@ -370,11 +371,17 @@ impl AnyModel {
             }
             eval(targets)?;
             offset += chunk_size;
+            progress::report_prefill_progress(offset, T);
         }
 
         // Last chunk: forward + LM head projection on last position only.
         let last_chunk = inputs.index((.., offset..));
-        self.forward_last_token(&last_chunk, None, cache)
+        let logits = self.forward_last_token(&last_chunk, None, cache)?;
+        // The loop only reports up to the final chunk boundary; emit the
+        // terminal 100% mark once the last chunk is processed so clients don't
+        // stall just short of `total`.
+        progress::report_prefill_progress(T, T);
+        Ok(logits)
     }
 
     /// Batched decode forward pass for N requests each with 1 token.

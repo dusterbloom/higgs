@@ -307,6 +307,7 @@ impl BatchEngine {
             top_logprobs,
             sender,
             false,
+            false,
             constraint,
             pixel_values,
         )
@@ -323,6 +324,9 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         _enable_thinking: bool,
+        // Batch engine does not emit prefill progress; accepts the flag to
+        // share the streaming interface with SimpleEngine.
+        _return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<mlx_rs::Array>,
     ) -> Result<(), EngineError> {
@@ -348,6 +352,7 @@ impl BatchEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
                 token_logprob: None,
+                prefill_progress: None,
             });
             return Ok(());
         }
@@ -464,6 +469,7 @@ fn worker_loop(
                         prompt_tokens: ar.prompt_len,
                         completion_tokens: 0,
                         token_logprob: None,
+                        prefill_progress: None,
                     });
                     finished_indices.push(i);
                 }
@@ -517,6 +523,7 @@ fn run_pipelined_decode_round(
                             prompt_tokens: ar.prompt_len,
                             completion_tokens: 0,
                             token_logprob: None,
+                            prefill_progress: None,
                         });
                         finished_indices.push(i);
                         graphs.push(None);
@@ -532,6 +539,7 @@ fn run_pipelined_decode_round(
                     prompt_tokens: ar.prompt_len,
                     completion_tokens: 0,
                     token_logprob: None,
+                    prefill_progress: None,
                 });
                 finished_indices.push(i);
                 graphs.push(None);
@@ -762,6 +770,7 @@ fn prefill_request(
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprob: first_token_logprob,
+                prefill_progress: None,
             });
             return Ok(None);
         }
@@ -776,6 +785,7 @@ fn prefill_request(
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprob: first_token_logprob,
+                prefill_progress: None,
             })
             .is_err()
         {
@@ -926,6 +936,7 @@ fn materialize_decode_step(
             prompt_tokens: ar.prompt_len,
             completion_tokens: completion_len,
             token_logprob,
+            prefill_progress: None,
         })
         .is_err();
 

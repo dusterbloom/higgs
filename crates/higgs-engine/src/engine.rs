@@ -10,6 +10,18 @@ pub struct GenerationOutput {
     pub token_logprobs: Option<Vec<TokenLogprobInfo>>,
 }
 
+/// Prefill progress for one streaming request, in absolute prompt tokens.
+///
+/// `processed` counts cached + prefilled tokens, so `processed / total` is
+/// directly displayable; `cached` exposes the prefix-cache hit separately.
+/// Matches the semantics of llama.cpp's `prompt_progress` SSE field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillProgress {
+    pub processed: u32,
+    pub cached: u32,
+    pub total: u32,
+}
+
 /// Output from a streaming generation step.
 #[derive(Debug, Clone)]
 pub struct StreamingOutput {
@@ -19,6 +31,10 @@ pub struct StreamingOutput {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub token_logprob: Option<TokenLogprobInfo>,
+    /// Set on progress-only events emitted during chunked prefill
+    /// (`new_text` is empty, `completion_tokens` is 0). `None` on token
+    /// outputs.
+    pub prefill_progress: Option<PrefillProgress>,
 }
 
 #[cfg(test)]
@@ -64,6 +80,7 @@ mod tests {
             prompt_tokens: 20,
             completion_tokens: 15,
             token_logprob: None,
+            prefill_progress: None,
         };
         assert!(output.finished);
         assert_eq!(output.finish_reason.as_deref(), Some("stop"));
@@ -79,6 +96,7 @@ mod tests {
             prompt_tokens: 20,
             completion_tokens: 3,
             token_logprob: None,
+            prefill_progress: None,
         };
         assert!(!output.finished);
         assert!(output.finish_reason.is_none());
@@ -93,6 +111,7 @@ mod tests {
             prompt_tokens: 0,
             completion_tokens: 0,
             token_logprob: None,
+            prefill_progress: None,
         };
         assert!(output.new_text.is_empty());
         assert_eq!(output.prompt_tokens, 0);
@@ -122,6 +141,7 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 2,
             token_logprob: None,
+            prefill_progress: None,
         };
         let cloned = output.clone();
         assert_eq!(cloned.new_text, output.new_text);
@@ -152,6 +172,7 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 10,
             token_logprob: None,
+            prefill_progress: None,
         };
         let debug_str = format!("{output:?}");
         assert!(debug_str.contains("StreamingOutput"));

@@ -239,6 +239,8 @@ impl Engine {
             top_logprobs,
             sender,
             self.enable_thinking(),
+            // /v1/completions convenience entry never streams prefill progress.
+            false,
             constraint,
             pixel_values,
         )
@@ -255,6 +257,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         enable_thinking: bool,
+        return_progress: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
@@ -268,6 +271,7 @@ impl Engine {
                 top_logprobs,
                 sender,
                 enable_thinking,
+                return_progress,
                 constraint,
                 pixel_values,
             ),
@@ -280,6 +284,7 @@ impl Engine {
                 top_logprobs,
                 sender,
                 enable_thinking,
+                return_progress,
                 constraint,
                 pixel_values,
             ),
