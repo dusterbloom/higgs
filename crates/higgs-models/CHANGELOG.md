@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.3.0...higgs-models-v1.4.0) (2026-06-21)
+
+
+### Features
+
+* **models:** add Gemma 3 and Gemma 4 inference support ([4f301fc](https://github.com/panbanda/higgs/commit/4f301fcc0d45e2922df4203149f05a24a9f46ae6))
+
 ## [1.3.0](https://github.com/panbanda/higgs/compare/higgs-models-v1.2.0...higgs-models-v1.3.0) (2026-05-31)
 
 
