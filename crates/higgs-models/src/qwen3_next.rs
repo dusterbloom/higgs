@@ -5277,31 +5277,6 @@ impl Qwen3NextCausalLM {
         };
         Ok((h_raw, logits))
     }
-}
-
-const PREFILL_LAYER_EVAL_INTERVAL: usize = 8;
-const PREFILL_LAYER_EVAL_MIN_SEQ_LEN: i32 = 17;
-
-const fn should_eval_between_prefill_layers(seq_len: i32, layer_idx: usize) -> bool {
-    seq_len >= PREFILL_LAYER_EVAL_MIN_SEQ_LEN
-        && (layer_idx + 1).is_multiple_of(PREFILL_LAYER_EVAL_INTERVAL)
-}
-
-#[cfg(test)]
-mod prefill_eval_tests {
-    use super::should_eval_between_prefill_layers;
-
-    #[test]
-    fn skips_layer_eval_barriers_for_short_speculative_windows() {
-        assert!(!should_eval_between_prefill_layers(3, 7));
-        assert!(!should_eval_between_prefill_layers(8, 7));
-    }
-
-    #[test]
-    fn keeps_layer_eval_barriers_for_long_prefill_chunks() {
-        assert!(should_eval_between_prefill_layers(128, 7));
-        assert!(!should_eval_between_prefill_layers(128, 6));
-    }
 
     pub fn forward_with_taps(
         &mut self,
@@ -5884,6 +5859,31 @@ mod prefill_eval_tests {
             || self.model.embed_tokens.as_linear(hidden),
             |head| head.forward(hidden),
         )
+    }
+}
+
+const PREFILL_LAYER_EVAL_INTERVAL: usize = 8;
+const PREFILL_LAYER_EVAL_MIN_SEQ_LEN: i32 = 17;
+
+const fn should_eval_between_prefill_layers(seq_len: i32, layer_idx: usize) -> bool {
+    seq_len >= PREFILL_LAYER_EVAL_MIN_SEQ_LEN
+        && (layer_idx + 1).is_multiple_of(PREFILL_LAYER_EVAL_INTERVAL)
+}
+
+#[cfg(test)]
+mod prefill_eval_tests {
+    use super::should_eval_between_prefill_layers;
+
+    #[test]
+    fn skips_layer_eval_barriers_for_short_speculative_windows() {
+        assert!(!should_eval_between_prefill_layers(3, 7));
+        assert!(!should_eval_between_prefill_layers(8, 7));
+    }
+
+    #[test]
+    fn keeps_layer_eval_barriers_for_long_prefill_chunks() {
+        assert!(should_eval_between_prefill_layers(128, 7));
+        assert!(!should_eval_between_prefill_layers(128, 6));
     }
 }
 
