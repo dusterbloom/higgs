@@ -1525,143 +1525,213 @@ impl SimpleEngine {
         let mut total_accepted: u64 = 0;
         let mut rounds: u64 = 0;
 
+        // Realized-speedup gate (auto-calibrated, no per-model knob). Measure
+        // T_ar (wall per AR token) live; each spec round compute the realized
+        // speedup ratio = n_accepted * T_ar / step_wall. If the EMA of that
+        // ratio falls below 1.0, spec is actually slower than plain AR for this
+        // text (MoE's fast AR raises the bar; a fixed entropy threshold can't
+        // see that), so floor to AR and re-probe periodically. Flooring also
+        // keeps the S>1 verify off high-entropy near-ties (where it both slows
+        // down and flips argmax), so AR regions stay byte-exact. Start in AR for
+        // one step to calibrate T_ar, then enter spec. Disable: HIGGS_DFLASH_GATE=0.
+        let gate = std::env::var("HIGGS_DFLASH_GATE").map_or(true, |v| v != "0");
+        let mut t_ar_ema: Option<f64> = None;
+        let mut ratio_ema = 2.0_f64;
+        let mut in_ar = true;
+        let mut ar_run: u32 = 0;
+        // Re-probe spec sparsely: in a sustained high-entropy region each probe
+        // is a wasted slow spec round, so amortize it over many AR steps.
+        const AR_PROBE_EVERY: u32 = 32;
+
         loop {
-            // a. Build block: [anchor, mask, mask, ...]
-            let block_size_us = usize::try_from(block_size)
-                .map_err(|_| EngineError::Generation("block_size overflow for usize".to_owned()))?;
-            let mut block_tokens = vec![mask_id; block_size_us];
-            if let Some(slot) = block_tokens.get_mut(0) {
-                *slot = last_token;
-            }
-            let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
-
-            // b. Embed through target's embedding layer.
-            let noise_embedding = model
-                .embed_token_ids(&block_ids)
-                .map_err(EngineError::Mlx)?;
-
-            // c. Drafter forward.
-            let draft_hidden = drafter
-                .forward(&noise_embedding, &current_taps, &mut draft_cache)
-                .map_err(EngineError::Mlx)?;
-            crop_drafter_cache(&mut draft_cache, start);
-
-            // d. Target lm_head on sliced hidden -> argmax draft tokens.
-            let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
-            let draft_logits = model
-                .forward_all_logits_from_hidden(&draft_hidden_sliced)
-                .map_err(EngineError::Mlx)?;
-            let draft_token_arr =
-                mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
-            eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
-            let draft_u32: Vec<u32> = draft_token_arr
-                .reshape(&[-1])
-                .map_err(EngineError::Mlx)?
-                .as_slice::<u32>()
-                .to_vec();
-            let draft_i32: Vec<i32> = draft_u32
-                .iter()
-                .map(|&x| {
-                    i32::try_from(x)
-                        .map_err(|_| EngineError::Generation("draft token overflow i32".to_owned()))
-                })
-                .collect::<Result<_, _>>()?;
-
-            // e. Build verify input: [anchor, draft_0..draft_{N-2}].
-            let mut verify_tokens = vec![last_token];
-            verify_tokens.extend_from_slice(&draft_i32);
-            let verify_len = i32::try_from(verify_tokens.len())
-                .map_err(|_| EngineError::Generation("verify_len overflow".to_owned()))?;
-            let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
-
-            // f. Tape-recording verify: forward with taps + GDN innovation tapes.
-            //    The tape kernel's recurrence is bit-exact with sequential AR
-            //    steps, fixing the S>1 vs S=1 numerical drift that a full-rerun
-            //    verify exhibits, and lets partial accept replay only the SSM
-            //    recurrence for accepted positions instead of a full rerun.
-            let (verify_logits, verify_taps, layer_tapes) = model
-                .forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
-                .map_err(EngineError::Mlx)?;
-
-            // g. Accept prefix. One host barrier per round: eval'ing the argmax
-            //    pulls verify_logits + the whole verify forward through the
-            //    graph, so a separate eval([&verify_logits]) is redundant.
-            let verify_argmax =
-                mlx_rs::argmax_axis!(verify_logits, -1).map_err(EngineError::Mlx)?;
-            eval([&verify_argmax]).map_err(EngineError::Mlx)?;
-            let verify_flat: Vec<u32> = verify_argmax
-                .reshape(&[-1])
-                .map_err(EngineError::Mlx)?
-                .as_slice::<u32>()
-                .to_vec();
-            let accepted = accept_prefix(&draft_u32, &verify_flat);
-            let n_accepted = i32::try_from(accepted.len())
-                .map_err(|_| EngineError::Generation("n_accepted overflow".to_owned()))?;
-            rounds += 1;
-            total_accepted += accepted.len() as u64;
-
-            if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && tokens.len() <= 32 {
-                tracing::info!(
-                    drafts = ?draft_u32,
-                    verify_argmax = ?verify_flat,
-                    n_accepted,
-                    accepted = ?accepted,
-                    "DFlash iter trace"
-                );
-            }
-
-            // h. Partial accept — GDN-only replay from tape. The verify
-            //    advanced state for ALL positions; on partial rejection we
-            //    restore each GDN layer's snapshot, replay the SSM kernel for
-            //    the n_accepted positions, and trim KV layers by the rejected
-            //    count. Issued lazily (no eval) so it folds into the next
-            //    verify's host barrier.
-            if n_accepted < block_size {
-                let kv_rollback = verify_len - n_accepted;
-                model
-                    .replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
+            let round_t0 = std::time::Instant::now();
+            if gate && in_ar {
+                // AR floor: plain S=1 decode (byte-exact). Measures T_ar live and
+                // produces the taps the drafter needs if we re-enter spec.
+                let single = Array::from_slice(&[last_token], &[1, 1]);
+                let (ar_logits, ar_taps) = model
+                    .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
                     .map_err(EngineError::Mlx)?;
-            }
-            // Slice verify taps to accepted positions (valid for both full and
-            // partial accept — earlier positions' hidden states are causally
-            // independent of later ones).
-            current_taps = verify_taps
-                .into_iter()
-                .map(|tap| tap.index((.., ..n_accepted, ..)))
-                .collect();
+                let ar_next =
+                    sample(&ar_logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
+                eval([&ar_next]).map_err(EngineError::Mlx)?;
+                let dt = round_t0.elapsed().as_secs_f64();
+                let was_none = t_ar_ema.is_none();
+                t_ar_ema = Some(t_ar_ema.map_or(dt, |e| 0.7f64.mul_add(e, 0.3 * dt)));
+                current_taps = ar_taps;
+                let ar_id: u32 = ar_next.item();
+                tokens.push(ar_id);
+                last_token = i32::try_from(ar_id)
+                    .map_err(|_| EngineError::Generation("ar token overflow".to_owned()))?;
+                start += 1;
+                ar_run += 1;
+                // Leave AR after the initial T_ar calibration, or after a probe
+                // cooldown to re-test whether spec has become worthwhile again.
+                if was_none || ar_run >= AR_PROBE_EVERY {
+                    in_ar = false;
+                    ar_run = 0;
+                }
+            } else {
+                // a. Build block: [anchor, mask, mask, ...]
+                let block_size_us = usize::try_from(block_size).map_err(|_| {
+                    EngineError::Generation("block_size overflow for usize".to_owned())
+                })?;
+                let mut block_tokens = vec![mask_id; block_size_us];
+                if let Some(slot) = block_tokens.get_mut(0) {
+                    *slot = last_token;
+                }
+                let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
 
-            // i. Update state.
-            for &tok in &accepted {
-                tokens.push(tok);
-            }
-            last_token = i32::try_from(*accepted.last().ok_or_else(|| {
-                EngineError::Generation("accept_prefix returned empty vec".to_owned())
-            })?)
-            .map_err(|_| EngineError::Generation("accepted token overflow i32".to_owned()))?;
-            start += n_accepted;
+                // b. Embed through target's embedding layer.
+                let noise_embedding = model
+                    .embed_token_ids(&block_ids)
+                    .map_err(EngineError::Mlx)?;
 
-            // Adapt the next round's block size by block UTILIZATION
-            // (n_accepted / block_size) — the entropy proxy. On low-entropy text
-            // acceptance scales with the block (util stays high → grow toward
-            // block_max for the biggest win); on high-entropy text acceptance
-            // plateaus (util drops → shrink so the verify isn't wasted, and the
-            // S>1 verify stays off near-ties). Gating on util, not raw accept,
-            // keeps big blocks where they pay off. (all block_size uses above.)
-            if adaptive {
-                let util = f64::from(n_accepted) / f64::from(block_size);
-                ema_util = 0.5f64.mul_add(ema_util, 0.5 * util);
-                block_size = if ema_util >= 0.75 {
-                    (block_size * 2).min(block_max) // sustained high → grow
-                } else if ema_util <= 0.5 {
-                    (block_size / 2).max(block_min) // sustained low → shrink
-                } else {
-                    block_size
-                };
-            }
+                // c. Drafter forward.
+                let draft_hidden = drafter
+                    .forward(&noise_embedding, &current_taps, &mut draft_cache)
+                    .map_err(EngineError::Mlx)?;
+                crop_drafter_cache(&mut draft_cache, start);
+
+                // d. Target lm_head on sliced hidden -> argmax draft tokens.
+                let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
+                let draft_logits = model
+                    .forward_all_logits_from_hidden(&draft_hidden_sliced)
+                    .map_err(EngineError::Mlx)?;
+                let draft_token_arr =
+                    mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
+                eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
+                let draft_u32: Vec<u32> = draft_token_arr
+                    .reshape(&[-1])
+                    .map_err(EngineError::Mlx)?
+                    .as_slice::<u32>()
+                    .to_vec();
+                let draft_i32: Vec<i32> = draft_u32
+                    .iter()
+                    .map(|&x| {
+                        i32::try_from(x).map_err(|_| {
+                            EngineError::Generation("draft token overflow i32".to_owned())
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+
+                // e. Build verify input: [anchor, draft_0..draft_{N-2}].
+                let mut verify_tokens = vec![last_token];
+                verify_tokens.extend_from_slice(&draft_i32);
+                let verify_len = i32::try_from(verify_tokens.len())
+                    .map_err(|_| EngineError::Generation("verify_len overflow".to_owned()))?;
+                let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
+
+                // f. Tape-recording verify: forward with taps + GDN innovation tapes.
+                //    The tape kernel's recurrence is bit-exact with sequential AR
+                //    steps, fixing the S>1 vs S=1 numerical drift that a full-rerun
+                //    verify exhibits, and lets partial accept replay only the SSM
+                //    recurrence for accepted positions instead of a full rerun.
+                let (verify_logits, verify_taps, layer_tapes) = model
+                    .forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
+                    .map_err(EngineError::Mlx)?;
+
+                // g. Accept prefix. One host barrier per round: eval'ing the argmax
+                //    pulls verify_logits + the whole verify forward through the
+                //    graph, so a separate eval([&verify_logits]) is redundant.
+                let verify_argmax =
+                    mlx_rs::argmax_axis!(verify_logits, -1).map_err(EngineError::Mlx)?;
+                eval([&verify_argmax]).map_err(EngineError::Mlx)?;
+                let verify_flat: Vec<u32> = verify_argmax
+                    .reshape(&[-1])
+                    .map_err(EngineError::Mlx)?
+                    .as_slice::<u32>()
+                    .to_vec();
+                let accepted = accept_prefix(&draft_u32, &verify_flat);
+                let n_accepted = i32::try_from(accepted.len())
+                    .map_err(|_| EngineError::Generation("n_accepted overflow".to_owned()))?;
+                rounds += 1;
+                total_accepted += accepted.len() as u64;
+
+                if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && tokens.len() <= 32 {
+                    tracing::info!(
+                        drafts = ?draft_u32,
+                        verify_argmax = ?verify_flat,
+                        n_accepted,
+                        accepted = ?accepted,
+                        "DFlash iter trace"
+                    );
+                }
+
+                // h. Partial accept — GDN-only replay from tape. The verify
+                //    advanced state for ALL positions; on partial rejection we
+                //    restore each GDN layer's snapshot, replay the SSM kernel for
+                //    the n_accepted positions, and trim KV layers by the rejected
+                //    count. Issued lazily (no eval) so it folds into the next
+                //    verify's host barrier.
+                if n_accepted < block_size {
+                    let kv_rollback = verify_len - n_accepted;
+                    model
+                        .replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
+                        .map_err(EngineError::Mlx)?;
+                }
+                // Slice verify taps to accepted positions (valid for both full and
+                // partial accept — earlier positions' hidden states are causally
+                // independent of later ones).
+                current_taps = verify_taps
+                    .into_iter()
+                    .map(|tap| tap.index((.., ..n_accepted, ..)))
+                    .collect();
+
+                // i. Update state.
+                for &tok in &accepted {
+                    tokens.push(tok);
+                }
+                last_token = i32::try_from(*accepted.last().ok_or_else(|| {
+                    EngineError::Generation("accept_prefix returned empty vec".to_owned())
+                })?)
+                .map_err(|_| EngineError::Generation("accepted token overflow i32".to_owned()))?;
+                start += n_accepted;
+
+                // Adapt the next round's block size by block UTILIZATION
+                // (n_accepted / block_size) — the entropy proxy. On low-entropy text
+                // acceptance scales with the block (util stays high → grow toward
+                // block_max for the biggest win); on high-entropy text acceptance
+                // plateaus (util drops → shrink so the verify isn't wasted, and the
+                // S>1 verify stays off near-ties). Gating on util, not raw accept,
+                // keeps big blocks where they pay off. (all block_size uses above.)
+                if adaptive {
+                    let util = f64::from(n_accepted) / f64::from(block_size);
+                    ema_util = 0.5f64.mul_add(ema_util, 0.5 * util);
+                    block_size = if ema_util >= 0.75 {
+                        (block_size * 2).min(block_max) // sustained high → grow
+                    } else if ema_util <= 0.5 {
+                        (block_size / 2).max(block_min) // sustained low → shrink
+                    } else {
+                        block_size
+                    };
+                }
+
+                // Realized-speedup gate: floor to AR next round if spec has become
+                // slower than plain AR (or to calibrate T_ar if we have no sample).
+                if gate {
+                    let step_wall = round_t0.elapsed().as_secs_f64().max(1e-9);
+                    if let Some(t_ar) = t_ar_ema {
+                        let ratio = f64::from(n_accepted) * t_ar / step_wall;
+                        ratio_ema = 0.6f64.mul_add(ratio_ema, 0.4 * ratio);
+                        if ratio_ema < 1.0 {
+                            in_ar = true;
+                            ar_run = 0;
+                        }
+                    } else {
+                        in_ar = true;
+                        ar_run = 0;
+                    }
+                }
+            } // end spec-round branch
 
             // j. Check termination.
             let completion_len = Self::completion_len(&tokens)?;
-            let accept_len = total_accepted as f64 / rounds as f64;
+            let accept_len = if rounds > 0 {
+                total_accepted as f64 / rounds as f64
+            } else {
+                0.0
+            };
 
             if tokens.iter().any(|t| self.eos_token_ids.contains(t)) {
                 let secs = t_start.elapsed().as_secs_f64();
@@ -3350,8 +3420,10 @@ mod tests {
         // GSM8K/HumanEval/MT-Bench, not raw factual completions). Keep
         // max_tokens under the 256-token thinking budget so the AR (MTP) path
         // never force-closes </think> while DFlash wouldn't.
-        let user_prompt =
-            "Write a Python function that returns the n-th Fibonacci number iteratively.";
+        let user_prompt = std::env::var("HIGGS_TEST_PROMPT").unwrap_or_else(|_| {
+            "Write a Python function that returns the n-th Fibonacci number iteratively.".to_owned()
+        });
+        let user_prompt = user_prompt.as_str();
         // Toggle with HIGGS_TEST_THINKING=0 to measure the thinking-disabled
         // workload (default: enabled, matching the reference benchmark).
         let enable_thinking = std::env::var("HIGGS_TEST_THINKING")
