@@ -248,7 +248,9 @@ pub struct SimpleEngine {
     /// Control tokens stripped from decoded output (EOS + `<|…|>` chat
     /// delimiters + classic sentinels), while content-bearing special tokens
     /// (tool-call markup, `<think>`) are preserved. See [`Self::decode_tokens`].
-    decode_skip_ids: std::collections::HashSet<u32>,
+    /// Wrapped in `Arc` so each request's streaming [`IncrementalDetok`] shares
+    /// the same set and strips identically to `decode_tokens`.
+    decode_skip_ids: std::sync::Arc<std::collections::HashSet<u32>>,
     /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
     enable_thinking: bool,
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
@@ -297,24 +299,12 @@ impl SimpleEngine {
 
         let eos_token_ids = extract_eos_tokens(model_dir);
 
-        // Control tokens that must never surface in decoded text. `decode_tokens`
-        // keeps content-bearing special tokens (so tool-call markup like
-        // MiniCPM's `<function>`/`<param>` reaches the parser) but strips these:
-        // the EOS set, the `<|…|>` chat-control delimiters, and classic
-        // sentinels. Content tokens like `<think>`, `<tool_call>`, `<function>`
-        // do not match and are preserved.
-        let decode_skip_ids: std::collections::HashSet<u32> = {
-            let mut ids: std::collections::HashSet<u32> = eos_token_ids.iter().copied().collect();
-            for (id, added) in tokenizer.get_added_tokens_decoder() {
-                let content = added.content.as_str();
-                let is_control = (content.starts_with("<|") && content.ends_with("|>"))
-                    || matches!(content, "<s>" | "</s>" | "<pad>" | "<unk>" | "<mask>");
-                if is_control {
-                    ids.insert(id);
-                }
-            }
-            ids
-        };
+        // Control tokens that must never surface in decoded text (EOS + the
+        // `<|…|>` chat-control delimiters + classic sentinels). Shared via `Arc`
+        // with each request's streaming `IncrementalDetok` so streaming strips
+        // identically to `decode_tokens`.
+        let decode_skip_ids =
+            std::sync::Arc::new(content_preserving_skip_ids(&tokenizer, &eos_token_ids));
 
         // Auto-detect thinking mode: Qwen3.5 models support <think> tags.
         // Override with HIGGS_ENABLE_THINKING=0/1, off/true, yes/no etc.
@@ -2303,7 +2293,11 @@ impl SimpleEngine {
         }
         all_tokens.push(first_token_id);
 
-        let mut detok = IncrementalDetok::new(String::new(), 0);
+        let mut detok = IncrementalDetok::new(
+            String::new(),
+            0,
+            std::sync::Arc::clone(&self.decode_skip_ids),
+        );
         let first_new_text = detok.append(&self.tokenizer, &all_tokens)?;
         let first_emitted_before = detok.text.len() - first_new_text.len();
         let (mut first_text, first_hit_stop) = if stop_sequences.is_empty() {
@@ -2563,6 +2557,31 @@ const MAX_DETOK_WINDOW: usize = 64;
 /// start at the same token, so tokenizer boundary effects cancel out. Text
 /// ending in an incomplete UTF-8 sequence (trailing replacement char) is held
 /// back until a later token completes it.
+/// Token IDs that must never surface in decoded output text.
+///
+/// Seeded with the model's EOS ids, plus every added *control* special token:
+/// the `<|…|>` chat-control delimiters and the classic `<s>`/`</s>`/`<pad>`/
+/// `<unk>`/`<mask>` sentinels. Content-bearing special tokens (`<think>`,
+/// `<tool_call>`, `MiniCPM`'s `<function>`/`<param>`) deliberately do NOT match,
+/// so they survive decoding and reach the tool-call / reasoning parsers. Shared
+/// by the non-streaming decode path ([`SimpleEngine::decode_tokens`]) and the
+/// streaming detokenizer ([`IncrementalDetok`]) so the two strip identically.
+pub(crate) fn content_preserving_skip_ids(
+    tokenizer: &Tokenizer,
+    eos_token_ids: &[u32],
+) -> std::collections::HashSet<u32> {
+    let mut ids: std::collections::HashSet<u32> = eos_token_ids.iter().copied().collect();
+    for (id, added) in tokenizer.get_added_tokens_decoder() {
+        let content = added.content.as_str();
+        let is_control = (content.starts_with("<|") && content.ends_with("|>"))
+            || matches!(content, "<s>" | "</s>" | "<pad>" | "<unk>" | "<mask>");
+        if is_control {
+            ids.insert(id);
+        }
+    }
+    ids
+}
+
 pub(crate) struct IncrementalDetok {
     /// Start of the decode window; advanced whenever text is emitted.
     prefix_offset: usize,
@@ -2570,22 +2589,45 @@ pub(crate) struct IncrementalDetok {
     read_offset: usize,
     /// All text decoded so far (streamed to the client incrementally).
     pub(crate) text: String,
+    /// Control-token IDs filtered out before decoding so content-bearing
+    /// special tokens (tool-call markup) survive streaming. See
+    /// [`content_preserving_skip_ids`].
+    skip_ids: std::sync::Arc<std::collections::HashSet<u32>>,
 }
 
 impl IncrementalDetok {
     /// Start from text already decoded for the first `token_count` tokens.
-    pub(crate) const fn new(text: String, token_count: usize) -> Self {
+    pub(crate) const fn new(
+        text: String,
+        token_count: usize,
+        skip_ids: std::sync::Arc<std::collections::HashSet<u32>>,
+    ) -> Self {
         Self {
             prefix_offset: 0,
             read_offset: token_count,
             text,
+            skip_ids,
         }
     }
 
-    fn decode(tokenizer: &Tokenizer, tokens: &[u32]) -> Result<String, EngineError> {
-        tokenizer
-            .decode(tokens, true)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))
+    /// Decode `tokens`, dropping only the control tokens in `skip_ids` while
+    /// preserving content-bearing special tokens. Mirrors
+    /// [`SimpleEngine::decode_tokens`] so streamed and non-streamed text match.
+    fn decode(&self, tokenizer: &Tokenizer, tokens: &[u32]) -> Result<String, EngineError> {
+        let run = |ids: &[u32]| {
+            tokenizer
+                .decode(ids, false)
+                .map_err(|e| EngineError::Tokenization(e.to_string()))
+        };
+        if !tokens.iter().any(|id| self.skip_ids.contains(id)) {
+            return run(tokens);
+        }
+        let filtered: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .filter(|id| !self.skip_ids.contains(id))
+            .collect();
+        run(&filtered)
     }
 
     /// Decode the trailing window of `tokens`, appending newly stable text to
@@ -2599,8 +2641,8 @@ impl IncrementalDetok {
             .get(self.prefix_offset..self.read_offset)
             .unwrap_or_default();
         let window_tokens = tokens.get(self.prefix_offset..).unwrap_or_default();
-        let prefix_text = Self::decode(tokenizer, prefix_tokens)?;
-        let window_text = Self::decode(tokenizer, window_tokens)?;
+        let prefix_text = self.decode(tokenizer, prefix_tokens)?;
+        let window_text = self.decode(tokenizer, window_tokens)?;
 
         let over_window = window_tokens.len() > MAX_DETOK_WINDOW;
         if window_text.len() > prefix_text.len()
@@ -2639,8 +2681,8 @@ impl IncrementalDetok {
             .get(self.prefix_offset..self.read_offset)
             .unwrap_or_default();
         let window_tokens = tokens.get(self.prefix_offset..).unwrap_or_default();
-        let prefix_text = Self::decode(tokenizer, prefix_tokens)?;
-        let window_text = Self::decode(tokenizer, window_tokens)?;
+        let prefix_text = self.decode(tokenizer, prefix_tokens)?;
+        let window_text = self.decode(tokenizer, window_tokens)?;
         let new_text = window_text
             .get(prefix_text.len()..)
             .unwrap_or_default()
@@ -3327,12 +3369,51 @@ mod tests {
         Tokenizer::from_bytes(json.as_bytes()).unwrap()
     }
 
+    /// Empty skip-id set for detok tests that exercise plain (non-special)
+    /// tokens, where `skip_special_tokens` makes no difference.
+    fn no_skip() -> std::sync::Arc<std::collections::HashSet<u32>> {
+        std::sync::Arc::new(std::collections::HashSet::new())
+    }
+
+    /// `content_preserving_skip_ids` strips control tokens (chat delimiters,
+    /// sentinels, the explicit EOS list) but keeps content-bearing special
+    /// tokens so tool-call markup reaches the parser.
+    #[test]
+    fn skip_ids_strip_control_but_keep_content_special_tokens() {
+        let mut tok = Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        let _ = tok.add_special_tokens([
+            tokenizers::AddedToken::from("<|im_end|>", true),
+            tokenizers::AddedToken::from("</s>", true),
+            tokenizers::AddedToken::from("<function>", true),
+            tokenizers::AddedToken::from("<tool_call>", true),
+        ]);
+        let im_end = tok.token_to_id("<|im_end|>").unwrap();
+        let skip = super::content_preserving_skip_ids(&tok, &[im_end, 7]);
+
+        // Stripped: <|…|> delimiter, the </s> sentinel, and the explicit eos id.
+        assert!(skip.contains(&im_end), "<|…|> delimiter is a control token");
+        assert!(
+            skip.contains(&tok.token_to_id("</s>").unwrap()),
+            "</s> sentinel stripped"
+        );
+        assert!(skip.contains(&7), "explicit eos id retained");
+        // Preserved: content-bearing tool-call markup the parser depends on.
+        assert!(
+            !skip.contains(&tok.token_to_id("<function>").unwrap()),
+            "<function> preserved for the tool-call parser"
+        );
+        assert!(
+            !skip.contains(&tok.token_to_id("<tool_call>").unwrap()),
+            "<tool_call> preserved"
+        );
+    }
+
     #[test]
     fn incremental_detok_emits_per_token_diffs() {
         let tokenizer = word_tokenizer();
         let mut tokens: Vec<u32> = vec![0];
         let first = tokenizer.decode(&tokens, true).unwrap();
-        let mut detok = IncrementalDetok::new(first.clone(), tokens.len());
+        let mut detok = IncrementalDetok::new(first.clone(), tokens.len(), no_skip());
 
         tokens.push(1);
         let second = detok.append(&tokenizer, &tokens).unwrap();
@@ -3349,7 +3430,7 @@ mod tests {
         let tokenizer = word_tokenizer();
         let mut tokens: Vec<u32> = vec![0];
         let first = tokenizer.decode(&tokens, true).unwrap();
-        let mut detok = IncrementalDetok::new(first, tokens.len());
+        let mut detok = IncrementalDetok::new(first, tokens.len(), no_skip());
 
         tokens.push(1);
         detok.append(&tokenizer, &tokens).unwrap();
@@ -3362,7 +3443,7 @@ mod tests {
     #[test]
     fn incremental_detok_first_token_partial_utf8_held_back() {
         let tokenizer = word_tokenizer();
-        let mut detok = IncrementalDetok::new(String::new(), 0);
+        let mut detok = IncrementalDetok::new(String::new(), 0, no_skip());
 
         // First partial piece: held back, no replacement char emitted
         let held = detok.append(&tokenizer, &[3]).unwrap();
@@ -3381,7 +3462,7 @@ mod tests {
     #[test]
     fn incremental_detok_flush_emits_pending() {
         let tokenizer = word_tokenizer();
-        let mut detok = IncrementalDetok::new(String::new(), 0);
+        let mut detok = IncrementalDetok::new(String::new(), 0, no_skip());
 
         // Partial piece held back
         let held = detok.append(&tokenizer, &[3]).unwrap();

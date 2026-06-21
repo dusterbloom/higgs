@@ -733,7 +733,13 @@ fn prefill_request(
 
         // Decode the first token incrementally (routes through IncrementalDetok
         // so partial UTF-8 is held back and prefix-before-stop is correctly emitted).
-        let mut detok = IncrementalDetok::new(String::new(), 0);
+        // Preserve content-bearing special tokens (e.g. MiniCPM tool-call markup)
+        // while stripping control tokens, matching SimpleEngine's decode path.
+        let skip_ids = std::sync::Arc::new(crate::simple::content_preserving_skip_ids(
+            tokenizer,
+            eos_token_ids,
+        ));
+        let mut detok = IncrementalDetok::new(String::new(), 0, skip_ids);
         let first_chunk = detok
             .append(tokenizer, &[first_token_id])
             .unwrap_or_default();
@@ -968,7 +974,11 @@ mod tests {
             constraint: None,
             response_tx: tx,
             prompt_len: 5,
-            detok: IncrementalDetok::new(String::new(), 0),
+            detok: IncrementalDetok::new(
+                String::new(),
+                0,
+                std::sync::Arc::new(std::collections::HashSet::new()),
+            ),
         };
         (ar, rx)
     }
