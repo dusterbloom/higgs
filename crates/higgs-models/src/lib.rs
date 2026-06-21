@@ -6,6 +6,8 @@ pub mod gemma2;
 pub mod gemma3;
 pub mod gemma4;
 pub mod llava_qwen2;
+/// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
+mod metal_kernel;
 pub mod phi3;
 pub mod progress;
 pub mod qwen3_moe;
