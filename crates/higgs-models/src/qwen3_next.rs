@@ -1049,8 +1049,10 @@ auto tape_ = innovation_tape + b_idx * T * Hv * Dv + hv_idx * Dv;
 auto dk_idx = thread_position_in_threadgroup.x;
 auto dv_idx = thread_position_in_grid.y;
 
-auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+// state_in/state_out are float32 buffers (must match the f32 precision of the
+// AR-decode kernel so verify argmax is bit-exact); reinterpret from InT*.
+auto i_state = reinterpret_cast<const device float*>(state_in) + (n * Dv + dv_idx) * Dk;
+auto o_state = reinterpret_cast<device float*>(state_out) + (n * Dv + dv_idx) * Dk;
 
 float state[n_per_t];
 for (int i = 0; i < n_per_t; ++i) {
@@ -1094,10 +1096,8 @@ for (int t = 0; t < T; ++t) {
       tape_[dv_idx] = delta;
     }
   }
-  // Match mlx-lm precision: cast state to InT between timesteps
-  for (int i = 0; i < n_per_t; ++i) {
-    state[i] = static_cast<float>(static_cast<InT>(state[i]));
-  }
+  // Keep state in float32 across timesteps (no InT downcast) so the recurrence
+  // is bit-exact with the AR-decode kernel.
   q_ += Hk * Dk;
   k_ += Hk * Dk;
   v_ += Hv * Dv;
@@ -1108,7 +1108,7 @@ for (int t = 0; t < T; ++t) {
 }
 for (int i = 0; i < n_per_t; ++i) {
   auto s_idx = n_per_t * dk_idx + i;
-  o_state[s_idx] = static_cast<InT>(state[i]);
+  o_state[s_idx] = state[i];
 }
 ";
 
@@ -1201,11 +1201,12 @@ fn configure_gated_delta_tape_kernel(
             y_shape.len(),
             in_dtype,
         );
+        // State is float32 (matches the AR-decode kernel) for bit-exact verify.
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
             state_shape.as_ptr(),
             state_shape.len(),
-            in_dtype,
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
         );
         // Tape stores deltas in float32 for precision (matches dflash-mlx)
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
@@ -1356,13 +1357,14 @@ for (int t = 0; t < T; ++t) {
   float g_val = exp(-exp(a_log_val) * sp);
 
   auto delta = tape_[dv_idx];
+  // Replay the forward kernel's EXACT op sequence (decay as a separate
+  // statement, then the k*delta update) so the replayed state is bit-exact
+  // with a fresh forward. Fusing into `state*g + k*delta` rounds differently
+  // (FMA) and the ~1e-8 drift accumulates across rollbacks → argmax flips.
   for (int i = 0; i < n_per_t; ++i) {
     auto s_idx = n_per_t * dk_idx + i;
-    state[i] = state[i] * g_val + k_[s_idx] * delta;
-  }
-  // Match mlx-lm precision: cast state to InT between timesteps
-  for (int i = 0; i < n_per_t; ++i) {
-    state[i] = static_cast<float>(static_cast<InT>(state[i]));
+    state[i] = state[i] * g_val;
+    state[i] = state[i] + k_[s_idx] * delta;
   }
   tape_ += Hv * Dv;
   k_ += Hk * Dk;
@@ -1370,7 +1372,7 @@ for (int t = 0; t < T; ++t) {
 }
 for (int i = 0; i < n_per_t; ++i) {
   auto s_idx = n_per_t * dk_idx + i;
-  o_state[s_idx] = static_cast<InT>(state[i]);
+  o_state[s_idx] = state[i];
 }
 ";
 
@@ -3575,69 +3577,6 @@ impl GatedDeltaNet {
         Ok((q, k, v, z, b, a))
     }
 
-    fn replay_from_tape(
-        &self,
-        tape: &GdnLayerTape,
-        n_accepted: i32,
-        cache: &mut ArraysCache,
-    ) -> Result<(), Exception> {
-        if n_accepted <= 0 {
-            return Ok(());
-        }
-
-        // Slice tape data to accepted steps only
-        let tape_slice = tape.delta_tape.index((.., ..n_accepted, ..));
-        let k_slice = tape.norm_k.index((.., ..n_accepted, ..));
-        let a_slice = tape.a_proj.index((.., ..n_accepted, ..));
-
-        let state = if let Some(s) = cache.ssm_state.take() {
-            s
-        } else {
-            let dt = tape.delta_tape.dtype();
-            ops::zeros_dtype(&[1, self.num_v_heads, self.head_v_dim, self.head_k_dim], dt)?
-        };
-
-        let new_state = tape_replay_kernel_ffi(
-            &tape_slice,
-            &k_slice,
-            &a_slice,
-            &self.A_log,
-            &self.dt_bias,
-            &state,
-            1,
-            n_accepted,
-            self.num_k_heads,
-            self.head_k_dim,
-            self.num_v_heads,
-            self.head_v_dim,
-        )?;
-        cache.ssm_state = Some(new_state);
-        cache.offset += n_accepted;
-
-        // Rebuild conv_state from recorded qkv input
-        let ks = self.conv_kernel_size;
-        let n_keep = ks - 1;
-        if n_keep > 0 {
-            let qkv_slice = tape.qkv_input.index((.., ..n_accepted, ..));
-            // Prepend existing conv_state (or zeros), take last n_keep entries
-            let prefix = match &cache.conv_state {
-                Some(cs) => cs.clone(),
-                None => ops::zeros_dtype(&[1, n_keep, self.conv_dim], tape.qkv_input.dtype())?,
-            };
-            let full = ops::concatenate_axis(&[&prefix, &qkv_slice], 1)?;
-            let total_len = *full
-                .shape()
-                .get(1)
-                .ok_or_else(|| Exception::custom("conv rebuild: missing seq dim"))?;
-            let start = total_len - n_keep;
-            let cs = full.index((.., start.., ..));
-            let cs_shape = cs.shape().to_vec();
-            cache.conv_state = Some(cs.flatten(None, None)?.reshape(&cs_shape)?);
-        }
-
-        Ok(())
-    }
-
     /// Side-effect-free forward used by `DFlash` verify. Identical numerics to
     /// `forward`, but reads `cache.conv_state` / `cache.ssm_state` without
     /// mutating them so a rejected speculation can be retried cleanly.
@@ -4025,12 +3964,13 @@ impl GatedDeltaNet {
         // Save norm_k for replay
         let norm_k_for_replay = norm_k.clone();
 
-        // Tape-recording kernel — state IS updated, tape IS recorded
+        // Tape-recording kernel — state IS updated, tape IS recorded.
+        // State is float32 to match the AR-decode kernel (bit-exact verify).
         let state = match cache.ssm_state.take() {
             Some(s) => s,
             None => ops::zeros_dtype(
                 &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
-                inputs.dtype(),
+                Dtype::Float32,
             )?,
         };
         let (y, new_state, delta_tape) = gated_delta_kernel_ffi_with_tape(
@@ -5278,6 +5218,7 @@ impl Qwen3NextCausalLM {
         Ok((h_raw, logits))
     }
 
+    #[allow(non_snake_case)]
     pub fn forward_with_taps(
         &mut self,
         inputs: &Array,
@@ -8189,6 +8130,61 @@ mod tests {
             max_diff < 1e-3,
             "tape replay differs from forward by {max_diff}"
         );
+    }
+
+    /// DFlash verify must be bit-exact with AR decode. The verify path uses the
+    /// tape kernel (S>1 block); AR decode uses the plain kernel. With **bf16**
+    /// inputs (the production dtype) both must keep the SSM state in f32 and
+    /// produce identical `y`/`state` — otherwise the verify argmax flips on
+    /// close calls and DFlash diverges from greedy AR. Regression for the bug
+    /// where the tape kernel downcast state to bf16 between timesteps.
+    #[test]
+    #[allow(clippy::print_stderr, clippy::many_single_char_names)]
+    fn test_gdn_tape_forward_matches_plain_forward_bf16() {
+        let (b_, t, nk, dk, nv, dv) = (1, 12, 2, 32, 4, 32);
+        let rnd_bf16 = |s: &[i32]| {
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, s, None)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+        };
+        // Production dtypes: q/k/v/a/beta bf16, a_log/dt_bias/state f32.
+        let q = rnd_bf16(&[b_, t, nk, dk]);
+        let k = rnd_bf16(&[b_, t, nk, dk]);
+        let v = rnd_bf16(&[b_, t, nv, dv]);
+        let a = rnd_bf16(&[b_, t, nv]);
+        let beta = rnd_bf16(&[b_, t, nv]);
+        let a_log = Array::zeros::<f32>(&[nv]).unwrap();
+        let dt_bias = Array::zeros::<f32>(&[nv]).unwrap();
+        let s0 = Array::zeros::<f32>(&[b_, nv, dv, dk]).unwrap();
+
+        let (y_plain, st_plain) = gated_delta_kernel_ffi(
+            &q, &k, &v, &a_log, &a, &dt_bias, &beta, &s0, b_, t, nk, dk, nv, dv,
+        )
+        .unwrap();
+        let (y_tape, st_tape, _tape) = gated_delta_kernel_ffi_with_tape(
+            &q, &k, &v, &a_log, &a, &dt_bias, &beta, &s0, b_, t, nk, dk, nv, dv,
+        )
+        .unwrap();
+
+        let dmax = |x: &Array, y: &Array| -> f32 {
+            x.as_dtype(Dtype::Float32)
+                .unwrap()
+                .subtract(&y.as_dtype(Dtype::Float32).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item()
+        };
+        let y_diff = dmax(&y_plain, &y_tape);
+        let st_diff = dmax(&st_plain, &st_tape);
+        eprintln!("tape-vs-plain bf16: y_max_diff={y_diff:.2e} state_max_diff={st_diff:.2e}");
+        // y is stored bf16 in both kernels → identical. State is f32 in both →
+        // identical. Anything above bf16 epsilon means a precision divergence.
+        assert!(y_diff < 1e-2, "tape y differs from plain by {y_diff}");
+        assert!(st_diff < 1e-4, "tape state differs from plain by {st_diff}");
     }
 
     /// P2a gate (cost): rollback must be cheap vs recompute, or partial accepts
