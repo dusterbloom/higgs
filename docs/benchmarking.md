@@ -256,6 +256,39 @@ cargo run --release -p higgs-bench --bin bench_summarize
 6. Document the new binary in this file with a one-line description and
    a sample command.
 
+## Bonsai-Q1 1-bit decode (`bonsai_q1::tests::bench_bonsai_q1_decode`)
+
+Decode-throughput A/B for the bits=1 packed engine. It lives as an `#[ignore]`d
+test (it needs a real Bonsai-Q1 1-bit model on disk), not a `higgs-bench` binary,
+because it exercises the model's `forward` directly.
+
+```bash
+# fast (default) vs legacy matvec kernel — the per-row → qmv_fast speedup:
+HIGGS_BONSAI_PROFILE_DIR=<bonsai-1bit dir> HIGGS_BONSAI_QMV_KERNEL=fast \
+  cargo test --release -p higgs-models --lib -- --ignored --nocapture bench_bonsai_q1_decode
+# then again with HIGGS_BONSAI_QMV_KERNEL=legacy
+#
+# sync floor (default) vs async-pipelined ceiling (mirrors the serving path):
+HIGGS_BONSAI_BENCH_ASYNC=1 HIGGS_BONSAI_PROFILE_DIR=<dir> cargo test --release ... bench_bonsai_q1_decode
+```
+
+Knobs: `HIGGS_BONSAI_QMV_KERNEL` (`fast`|`legacy`), `HIGGS_BONSAI_BENCH_ASYNC=1`
+(async pipelining), `HIGGS_BONSAI_DECODE_STEPS` (default 128).
+
+Representative M-series numbers (fast kernel; absolutes vary ±a few % by
+thermal/session, so read the ratios and the floor/ceiling band):
+
+| model | sync floor | async ceiling | HTTP serving (decode) | fast/legacy |
+|-------|-----------:|--------------:|----------------------:|:-----------:|
+| Bonsai-1.7B | ~185 tok/s | ~270 tok/s | ~244 tok/s | ~1.8× |
+| Bonsai-8B   | ~60 tok/s  | ~75 tok/s  | ~69 tok/s  | ~2.1× |
+
+The **sync** loop blocks per step (`eval`) and is a conservative floor; the
+**async** loop (`async_eval`) is the GPU-bound ceiling and tracks the serving
+path's pipelining. HTTP serving (`higgs serve --model <dir>`, 256-vs-32-token
+wall-clock differencing) lands between the two. Quality vs the upstream PrismML
+reference is covered by `bonsai_q1::tests::matches_prismml_reference_logits_and_greedy`.
+
 ## Caveats
 
 - Benchmark numbers depend on hardware class, prompt mix, quantization, and model family.
