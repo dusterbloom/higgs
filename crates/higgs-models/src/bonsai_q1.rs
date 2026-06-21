@@ -441,15 +441,33 @@ impl BonsaiQ1GpuLinear {
             ops::matmul(x, &wd.transpose_axes(&[1, 0])?)
         }
     }
+
+    /// Fuse several linears along the output (row) axis into one, so a single
+    /// matvec dispatch replaces N. All parts must share `in_features` and group
+    /// layout (they do — q/k/v and gate/up all project from the same hidden).
+    fn concat_rows(parts: &[&Self]) -> Result<Self, Exception> {
+        let ws: Vec<&Array> = parts.iter().map(|p| &p.w).collect();
+        let ss: Vec<&Array> = parts.iter().map(|p| &p.scales).collect();
+        let bs: Vec<&Array> = parts.iter().map(|p| &p.biases).collect();
+        // Axis 0 (row concat). NOTE: `ops::concatenate` (no axis) flattens to 1-D
+        // like numpy's axis=None — must use the explicit axis variant.
+        Ok(Self {
+            w: ops::concatenate_axis(&ws, 0)?,
+            scales: ops::concatenate_axis(&ss, 0)?,
+            biases: ops::concatenate_axis(&bs, 0)?,
+            out_features: parts.iter().map(|p| p.out_features).sum(),
+            in_features: parts[0].in_features,
+        })
+    }
 }
 
 pub struct BonsaiQ1GpuLayer {
-    pub q_proj: BonsaiQ1GpuLinear,
-    pub k_proj: BonsaiQ1GpuLinear,
-    pub v_proj: BonsaiQ1GpuLinear,
+    /// Fused q+k+v projection (rows concatenated): one matvec instead of three.
+    /// Output split is `[heads*head_dim | kv_heads*head_dim | kv_heads*head_dim]`.
+    pub qkv_proj: BonsaiQ1GpuLinear,
     pub o_proj: BonsaiQ1GpuLinear,
-    pub gate_proj: BonsaiQ1GpuLinear,
-    pub up_proj: BonsaiQ1GpuLinear,
+    /// Fused gate+up projection (rows concatenated): output split `[inter | inter]`.
+    pub gate_up_proj: BonsaiQ1GpuLinear,
     pub down_proj: BonsaiQ1GpuLinear,
     pub q_norm: Array,
     pub k_norm: Array,
@@ -483,13 +501,15 @@ impl BonsaiQ1Engine {
     pub fn to_gpu(self) -> Result<BonsaiQ1Gpu, Exception> {
         let mut gpu_layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
+            let q = BonsaiQ1GpuLinear::from_packed(&layer.q_proj)?;
+            let k = BonsaiQ1GpuLinear::from_packed(&layer.k_proj)?;
+            let v = BonsaiQ1GpuLinear::from_packed(&layer.v_proj)?;
+            let gate = BonsaiQ1GpuLinear::from_packed(&layer.gate_proj)?;
+            let up = BonsaiQ1GpuLinear::from_packed(&layer.up_proj)?;
             gpu_layers.push(BonsaiQ1GpuLayer {
-                q_proj: BonsaiQ1GpuLinear::from_packed(&layer.q_proj)?,
-                k_proj: BonsaiQ1GpuLinear::from_packed(&layer.k_proj)?,
-                v_proj: BonsaiQ1GpuLinear::from_packed(&layer.v_proj)?,
+                qkv_proj: BonsaiQ1GpuLinear::concat_rows(&[&q, &k, &v])?,
                 o_proj: BonsaiQ1GpuLinear::from_packed(&layer.o_proj)?,
-                gate_proj: BonsaiQ1GpuLinear::from_packed(&layer.gate_proj)?,
-                up_proj: BonsaiQ1GpuLinear::from_packed(&layer.up_proj)?,
+                gate_up_proj: BonsaiQ1GpuLinear::concat_rows(&[&gate, &up])?,
                 down_proj: BonsaiQ1GpuLinear::from_packed(&layer.down_proj)?,
                 q_norm: f16_vec_to_array(&layer.q_norm)?,
                 k_norm: f16_vec_to_array(&layer.k_norm)?,
@@ -700,12 +720,19 @@ impl BonsaiQ1Gpu {
         h.eval()?;
         times.add("embed_rows", t0.elapsed().as_nanos());
 
-        let mask = create_attention_mask(&h, cache, None)?;
+        // use_array=true: the SDPA wrapper only honors an `Array` mask, so the
+        // `Causal` enum would be dropped to None and run prefill non-causally.
+        // Decode (T=1) returns None regardless and takes the decode path.
+        let mask = create_attention_mask(&h, cache, Some(true))?;
 
         let heads = i32::try_from(self.config.heads)
             .map_err(|_| Exception::custom("heads overflows i32"))?;
         let kv_heads = i32::try_from(self.config.kv_heads)
             .map_err(|_| Exception::custom("kv_heads overflows i32"))?;
+        let head_dim_i = i32::try_from(self.config.head_dim)
+            .map_err(|_| Exception::custom("head_dim overflows i32"))?;
+        let inter_i = i32::try_from(self.config.inter)
+            .map_err(|_| Exception::custom("inter overflows i32"))?;
         let rms_eps = self.config.rms_norm_eps;
 
         for (layer, layer_cache) in self.layers.iter().zip(cache.iter_mut()) {
@@ -714,26 +741,26 @@ impl BonsaiQ1Gpu {
             normed.eval()?;
             times.add("input_norm", t0.elapsed().as_nanos());
 
-            // qkv projections — 3× quantized_matmul on the same input.
+            // Fused qkv projection — one matvec instead of three.
             let t0 = Instant::now();
-            let q = layer.q_proj.forward(&normed)?;
-            let k = layer.k_proj.forward(&normed)?;
-            let v = layer.v_proj.forward(&normed)?;
-            q.eval()?;
-            k.eval()?;
-            v.eval()?;
+            let qkv = layer.qkv_proj.forward(&normed)?.reshape(&[
+                B,
+                T,
+                heads + 2 * kv_heads,
+                head_dim_i,
+            ])?;
+            qkv.eval()?;
             times.add("qkv_proj", t0.elapsed().as_nanos());
 
-            // Reshape to [B, L, n_heads, head_dim] then transpose to
-            // [B, n_heads, L, head_dim]. Metadata-only; lumped with qk_norm.
-            let q = q
-                .reshape(&[B, T, heads, -1])?
+            // Split heads along axis 2 then transpose to [B, n_heads, L, head_dim].
+            let q = qkv
+                .index((.., .., ..heads, ..))
                 .transpose_axes(&[0, 2, 1, 3])?;
-            let k = k
-                .reshape(&[B, T, kv_heads, -1])?
+            let k = qkv
+                .index((.., .., heads..heads + kv_heads, ..))
                 .transpose_axes(&[0, 2, 1, 3])?;
-            let v = v
-                .reshape(&[B, T, kv_heads, -1])?
+            let v = qkv
+                .index((.., .., heads + kv_heads..heads + 2 * kv_heads, ..))
                 .transpose_axes(&[0, 2, 1, 3])?;
 
             let t0 = Instant::now();
@@ -799,11 +826,11 @@ impl BonsaiQ1Gpu {
             times.add("post_attn_norm", t0.elapsed().as_nanos());
 
             let t0 = Instant::now();
-            let gate = layer.gate_proj.forward(&normed_post)?;
-            let up = layer.up_proj.forward(&normed_post)?;
-            gate.eval()?;
-            up.eval()?;
+            let gate_up = layer.gate_up_proj.forward(&normed_post)?;
+            gate_up.eval()?;
             times.add("mlp_up_gate", t0.elapsed().as_nanos());
+            let gate = gate_up.index((.., .., ..inter_i));
+            let up = gate_up.index((.., .., inter_i..2 * inter_i));
 
             let t0 = Instant::now();
             let mlp_hidden = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
@@ -865,29 +892,37 @@ pub fn forward_trunk_free(
 
     let mut h = gpu.embed_rows(inputs)?; // [B, L, hidden]
 
-    let mask = create_attention_mask(&h, cache, None)?;
+    // use_array=true: the SDPA wrapper only honors an `Array` mask, so the
+    // `Causal` enum would be dropped to None and run prefill non-causally.
+    // Decode (T=1) returns None regardless and takes the decode path.
+    let mask = create_attention_mask(&h, cache, Some(true))?;
 
     let heads =
         i32::try_from(gpu.config.heads).map_err(|_| Exception::custom("heads overflows i32"))?;
     let kv_heads = i32::try_from(gpu.config.kv_heads)
         .map_err(|_| Exception::custom("kv_heads overflows i32"))?;
+    let head_dim_i = i32::try_from(gpu.config.head_dim)
+        .map_err(|_| Exception::custom("head_dim overflows i32"))?;
+    let inter_i =
+        i32::try_from(gpu.config.inter).map_err(|_| Exception::custom("inter overflows i32"))?;
     let rms_eps = gpu.config.rms_norm_eps;
 
     for (layer, layer_cache) in gpu.layers.iter().zip(cache.iter_mut()) {
         let normed = fast::rms_norm(&h, &layer.input_norm, rms_eps)?;
 
-        let q = layer.q_proj.forward(&normed)?;
-        let k = layer.k_proj.forward(&normed)?;
-        let v = layer.v_proj.forward(&normed)?;
-
-        let q = q
-            .reshape(&[B, T, heads, -1])?
+        let qkv =
+            layer
+                .qkv_proj
+                .forward(&normed)?
+                .reshape(&[B, T, heads + 2 * kv_heads, head_dim_i])?;
+        let q = qkv
+            .index((.., .., ..heads, ..))
             .transpose_axes(&[0, 2, 1, 3])?;
-        let k = k
-            .reshape(&[B, T, kv_heads, -1])?
+        let k = qkv
+            .index((.., .., heads..heads + kv_heads, ..))
             .transpose_axes(&[0, 2, 1, 3])?;
-        let v = v
-            .reshape(&[B, T, kv_heads, -1])?
+        let v = qkv
+            .index((.., .., heads + kv_heads..heads + 2 * kv_heads, ..))
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let q = fast::rms_norm(&q, &layer.q_norm, rms_eps)?;
@@ -924,8 +959,9 @@ pub fn forward_trunk_free(
         let h_post_attn = h.add(&attn_out)?;
 
         let normed_post = fast::rms_norm(&h_post_attn, &layer.post_attn_norm, rms_eps)?;
-        let gate = layer.gate_proj.forward(&normed_post)?;
-        let up = layer.up_proj.forward(&normed_post)?;
+        let gate_up = layer.gate_up_proj.forward(&normed_post)?;
+        let gate = gate_up.index((.., .., ..inter_i));
+        let up = gate_up.index((.., .., inter_i..2 * inter_i));
         let mlp_hidden = mlx_rs::nn::silu(&gate)?.multiply(&up)?;
         let mlp_out = layer.down_proj.forward(&mlp_hidden)?;
 
@@ -951,11 +987,11 @@ pub struct BonsaiQ1DecodeState {
     pub cache: Vec<Option<SteppingKeyValueCache>>,
 }
 
-/// Number of updatable `Array`s per decoder layer:
-/// - `input_norm` + 3×(w,s,b) qkv + `q_norm` + `k_norm` + 3×(w,s,b) o_proj
-///   ... wait: 1 + 3×3 + 2 + 3 + 1 + 3×3 = 1+9+2+3+1+9 = **25**.
-/// Corresponds to the array push order in [`BonsaiQ1DecodeState::updatable_states`].
-const PER_LAYER_UPDATABLE: usize = 25;
+/// Number of updatable `Array`s per decoder layer, matching the push order in
+/// [`BonsaiQ1DecodeState::updatable_states`]: `input_norm` + (w,s,b) qkv_proj +
+/// `q_norm` + `k_norm` + (w,s,b) o_proj + `post_attn_norm` + (w,s,b) gate_up_proj
+/// + (w,s,b) down_proj = 1 + 3 + 2 + 3 + 1 + 3 + 3 = **16**.
+const PER_LAYER_UPDATABLE: usize = 16;
 
 impl mlx_rs::utils::Updatable for BonsaiQ1DecodeState {
     fn updatable_states_len(&self) -> usize {
@@ -988,27 +1024,18 @@ impl mlx_rs::utils::Updatable for BonsaiQ1DecodeState {
         v.push(&self.gpu.embed.biases);
         for layer in &self.gpu.layers {
             v.push(&layer.input_norm);
-            v.push(&layer.q_proj.w);
-            v.push(&layer.q_proj.scales);
-            v.push(&layer.q_proj.biases);
-            v.push(&layer.k_proj.w);
-            v.push(&layer.k_proj.scales);
-            v.push(&layer.k_proj.biases);
-            v.push(&layer.v_proj.w);
-            v.push(&layer.v_proj.scales);
-            v.push(&layer.v_proj.biases);
+            v.push(&layer.qkv_proj.w);
+            v.push(&layer.qkv_proj.scales);
+            v.push(&layer.qkv_proj.biases);
             v.push(&layer.q_norm);
             v.push(&layer.k_norm);
             v.push(&layer.o_proj.w);
             v.push(&layer.o_proj.scales);
             v.push(&layer.o_proj.biases);
             v.push(&layer.post_attn_norm);
-            v.push(&layer.gate_proj.w);
-            v.push(&layer.gate_proj.scales);
-            v.push(&layer.gate_proj.biases);
-            v.push(&layer.up_proj.w);
-            v.push(&layer.up_proj.scales);
-            v.push(&layer.up_proj.biases);
+            v.push(&layer.gate_up_proj.w);
+            v.push(&layer.gate_up_proj.scales);
+            v.push(&layer.gate_up_proj.biases);
             v.push(&layer.down_proj.w);
             v.push(&layer.down_proj.scales);
             v.push(&layer.down_proj.biases);
@@ -1042,27 +1069,18 @@ impl mlx_rs::utils::Updatable for BonsaiQ1DecodeState {
         v.push(&mut self.gpu.embed.biases);
         for layer in &mut self.gpu.layers {
             v.push(&mut layer.input_norm);
-            v.push(&mut layer.q_proj.w);
-            v.push(&mut layer.q_proj.scales);
-            v.push(&mut layer.q_proj.biases);
-            v.push(&mut layer.k_proj.w);
-            v.push(&mut layer.k_proj.scales);
-            v.push(&mut layer.k_proj.biases);
-            v.push(&mut layer.v_proj.w);
-            v.push(&mut layer.v_proj.scales);
-            v.push(&mut layer.v_proj.biases);
+            v.push(&mut layer.qkv_proj.w);
+            v.push(&mut layer.qkv_proj.scales);
+            v.push(&mut layer.qkv_proj.biases);
             v.push(&mut layer.q_norm);
             v.push(&mut layer.k_norm);
             v.push(&mut layer.o_proj.w);
             v.push(&mut layer.o_proj.scales);
             v.push(&mut layer.o_proj.biases);
             v.push(&mut layer.post_attn_norm);
-            v.push(&mut layer.gate_proj.w);
-            v.push(&mut layer.gate_proj.scales);
-            v.push(&mut layer.gate_proj.biases);
-            v.push(&mut layer.up_proj.w);
-            v.push(&mut layer.up_proj.scales);
-            v.push(&mut layer.up_proj.biases);
+            v.push(&mut layer.gate_up_proj.w);
+            v.push(&mut layer.gate_up_proj.scales);
+            v.push(&mut layer.gate_up_proj.biases);
             v.push(&mut layer.down_proj.w);
             v.push(&mut layer.down_proj.scales);
             v.push(&mut layer.down_proj.biases);
@@ -1324,18 +1342,33 @@ mod tests {
         assert_eq!(got.len(), out_f);
 
         let wd = dense_reference(&p);
+        let (mut signed_err, mut abs_acc) = (0.0f64, 0.0f64);
         for r in 0..out_f {
             let mut acc = 0.0f32;
             for c in 0..in_f {
                 acc += x_ref[c] * wd[r * in_f + c];
             }
             let gv = got[r].to_f32();
-            let tol = 1e-2 * acc.abs().max(1.0);
+            // Per-element error is dominated by the f16-output rounding (~5e-4
+            // relative) plus fp32 reorder; 3e-3 keeps ~5× margin and is 3× tighter
+            // than the original 1e-2.
+            let tol = 3e-3 * acc.abs().max(1.0);
             assert!(
                 (gv - acc).abs() <= tol,
                 "qmv mismatch at row {r}: got {gv} want {acc}"
             );
+            signed_err += f64::from(gv - acc);
+            abs_acc += f64::from(acc.abs());
         }
+        // A loose per-element tol can hide a *systematic* bias that a long matvec
+        // sum accumulates. f16 round-to-even is unbiased, so the mean signed error
+        // must sit far below the per-element bound.
+        let mean_bias = signed_err.abs() / out_f as f64;
+        let bound = 1e-3 * (abs_acc / out_f as f64).max(1.0);
+        assert!(
+            mean_bias <= bound,
+            "qmv systematic bias {mean_bias} > {bound}"
+        );
     }
 
     /// Oracle for the `qmv_fast`-class kernel (`bonsai_q1_qmv_fast`). Covers the
@@ -1372,18 +1405,307 @@ mod tests {
             assert_eq!(got.len(), out_f);
 
             let wd = dense_reference(&p);
+            let (mut signed_err, mut abs_acc) = (0.0f64, 0.0f64);
             for r in 0..out_f {
                 let mut acc = 0.0f32;
                 for c in 0..in_f {
                     acc += x_ref[c] * wd[r * in_f + c];
                 }
                 let gv = got[r].to_f32();
-                let tol = 1e-2 * acc.abs().max(1.0);
+                let tol = 3e-3 * acc.abs().max(1.0);
                 assert!(
                     (gv - acc).abs() <= tol,
                     "qmv_fast mismatch ({out_f}x{in_f}) row {r}: got {gv} want {acc}"
                 );
+                signed_err += f64::from(gv - acc);
+                abs_acc += f64::from(acc.abs());
+            }
+            // Mean signed error must be ~0 — guards against a systematic bias the
+            // per-element tol could mask over a long K (here K up to 4096).
+            let mean_bias = signed_err.abs() / out_f as f64;
+            let bound = 1e-3 * (abs_acc / out_f as f64).max(1.0);
+            assert!(
+                mean_bias <= bound,
+                "qmv_fast systematic bias ({out_f}x{in_f}) {mean_bias} > {bound}"
+            );
+        }
+    }
+
+    /// The `qmv_fast` kernel assumes each lane's VPT inputs lie in one group and
+    /// that K tiles into whole groups. A future Bonsai variant with a different
+    /// layout must error at dispatch, not silently read the wrong group's scale.
+    #[test]
+    fn qmv_fast_rejects_invalid_group_layout() {
+        let p = make_packed(96, 256, 0xFEED_FACE);
+        let gpu = BonsaiQ1GpuLinear::from_packed(&p).unwrap();
+        let x = Array::from_slice(&vec![0.0f32; 256], &[1, 256])
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        let qmv_fast = crate::metal_kernel::bonsai_q1_qmv_fast;
+        // group_size not a multiple of VPT (64) → one lane spans two groups.
+        assert!(qmv_fast(&x, &gpu.w, &gpu.scales, &gpu.biases, 96).is_err());
+        // group_size a multiple of VPT but K (256) not a whole number of groups.
+        assert!(qmv_fast(&x, &gpu.w, &gpu.scales, &gpu.biases, 192).is_err());
+    }
+
+    /// The decode fusion rests on one identity: concatenating linears along the
+    /// output (row) axis and running a single matvec equals running each linear
+    /// separately and concatenating the outputs. This proves `concat_rows` (used
+    /// to fuse q+k+v and gate+up) is loss-free, so the fused decode path is
+    /// numerically the per-projection path — just two kernel dispatches per layer
+    /// instead of five.
+    #[test]
+    fn fused_concat_rows_matches_separate_projections() {
+        let in_f = 4096usize; // real hidden size; main-block kernel path
+        // q / k / v row counts (k,v smaller, as in GQA); distinct seeds so a
+        // mis-stacked block surfaces. 96+32+32 = 160 (N % 4 != 0 row remainder).
+        let parts: Vec<BonsaiQ1GpuLinear> = [(96usize, 0x11u64), (32, 0x22), (32, 0x33)]
+            .iter()
+            .map(|&(out_f, seed)| {
+                BonsaiQ1GpuLinear::from_packed(&make_packed(out_f, in_f, seed)).unwrap()
+            })
+            .collect();
+        let refs: Vec<&BonsaiQ1GpuLinear> = parts.iter().collect();
+        let fused = BonsaiQ1GpuLinear::concat_rows(&refs).unwrap();
+
+        // Decode-shape input [1, in_f] (M = 1 → matvec path).
+        let mut st = 0x5EED_1234_u64;
+        let x_f32: Vec<f32> = (0..in_f)
+            .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
+            .collect();
+        let x = Array::from_slice(&x_f32, &[1, in_f as i32])
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+
+        let sep: Vec<Array> = parts.iter().map(|p| p.forward(&x).unwrap()).collect();
+        let sep_refs: Vec<&Array> = sep.iter().collect();
+        let want = ops::concatenate_axis(&sep_refs, 1).unwrap();
+        want.eval().unwrap();
+        let got = fused.forward(&x).unwrap();
+        got.eval().unwrap();
+
+        let want_s = want.as_slice::<f16>();
+        let got_s = got.as_slice::<f16>();
+        assert_eq!(want_s.len(), got_s.len());
+        for (i, (g, w)) in got_s.iter().zip(want_s.iter()).enumerate() {
+            assert!(
+                (g.to_f32() - w.to_f32()).abs() <= 1e-3,
+                "fused vs separate mismatch at {i}: got {} want {}",
+                g.to_f32(),
+                w.to_f32()
+            );
+        }
+    }
+
+    /// 1-bit output quality vs the upstream reference. The oracle tests prove the
+    /// GPU kernels match a CPU dequant of the *same* lossy weights; this proves the
+    /// full forward is numerically faithful to the PrismML mlx fork (the reference
+    /// that runs bits=1), so the 1-bit quant is actually usable — not just
+    /// self-consistent. Asserts, on fixed prompts: same argmax, ≥6/8 top-k overlap,
+    /// small de-biased logit divergence, and an identical greedy continuation
+    /// driven through the real decode-matvec path (KV-cache stepping).
+    ///
+    /// Golden is `src/testdata/bonsai_q1_golden.json` (regenerate with
+    /// `scripts/gen_bonsai_q1_golden.py` under the fork venv). Point
+    /// `HIGGS_BONSAI_GOLDEN_DIR` at the matching Bonsai-1.7B-mlx-1bit dir.
+    #[test]
+    #[ignore = "quality: set HIGGS_BONSAI_GOLDEN_DIR to the Bonsai-1.7B-mlx-1bit dir matching the golden"]
+    #[allow(
+        clippy::print_stderr,
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
+    fn matches_prismml_reference_logits_and_greedy() {
+        let Ok(dir) = std::env::var("HIGGS_BONSAI_GOLDEN_DIR") else {
+            eprintln!("skip: set HIGGS_BONSAI_GOLDEN_DIR");
+            return;
+        };
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/bonsai_q1_golden.json")).unwrap();
+        let gpu = load_bonsai_q1(&dir).expect("load Bonsai-Q1");
+
+        let argmax = |v: &[f32]| -> usize {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                    if x > bv { (i, x) } else { (bi, bv) }
+                })
+                .0
+        };
+        let logits_of = |out: &Array| -> Vec<f32> {
+            let flat = out.reshape(&[-1]).unwrap();
+            flat.eval().unwrap();
+            flat.as_slice::<f32>().to_vec()
+        };
+
+        for case in golden["cases"].as_array().unwrap() {
+            let prompt = case["prompt"].as_str().unwrap();
+            let ids: Vec<i32> = case["input_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as i32)
+                .collect();
+            let ref_topk: Vec<(usize, f64)> = case["topk"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| (p[0].as_u64().unwrap() as usize, p[1].as_f64().unwrap()))
+                .collect();
+            let ref_greedy: Vec<i32> = case["greedy"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as i32)
+                .collect();
+
+            // Batched causal prefill → last-position logits (also regression-covers
+            // the causal-mask fix; a non-causal prefill copies the last token).
+            let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+            let pin = Array::from_slice(&ids, &[1, ids.len() as i32]);
+            let logits = logits_of(&gpu.forward(&pin, &mut cache).expect("prefill"));
+
+            // 1) Same greedy argmax as the reference (the next-token prediction).
+            let h_argmax = argmax(&logits);
+            assert_eq!(
+                h_argmax, ref_topk[0].0,
+                "[{prompt}] argmax {h_argmax} != reference {}",
+                ref_topk[0].0
+            );
+
+            // 2) ≥6/8 of the reference's top-k tokens are in higgs' top-k.
+            let mut order: Vec<usize> = (0..logits.len()).collect();
+            order.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            let h_topk: std::collections::HashSet<usize> =
+                order.iter().take(ref_topk.len()).copied().collect();
+            let overlap = ref_topk
+                .iter()
+                .filter(|(id, _)| h_topk.contains(id))
+                .count();
+            assert!(
+                overlap >= 6,
+                "[{prompt}] top-{} overlap {overlap} < 6",
+                ref_topk.len()
+            );
+
+            // 3) De-biased logit divergence (subtract each side's top-1 so a global
+            //    offset/scale doesn't count) on the reference's top-k tokens.
+            let (h_max, r_max) = (f64::from(logits[h_argmax]), ref_topk[0].1);
+            let max_dev = ref_topk
+                .iter()
+                .map(|(id, r)| ((f64::from(logits[*id]) - h_max) - (r - r_max)).abs())
+                .fold(0.0f64, f64::max);
+            assert!(
+                max_dev <= 1.5,
+                "[{prompt}] logit divergence {max_dev:.3} > 1.5"
+            );
+
+            // 4) Identical greedy continuation through the DECODE matvec path.
+            let mut tok = h_argmax as i32;
+            assert_eq!(
+                tok, ref_greedy[0],
+                "[{prompt}] greedy[0] {tok} != {}",
+                ref_greedy[0]
+            );
+            for (k, want) in ref_greedy.iter().enumerate().skip(1) {
+                let din = Array::from_slice(&[tok], &[1, 1]);
+                let l = logits_of(&gpu.forward(&din, &mut cache).expect("decode"));
+                tok = argmax(&l) as i32;
+                assert_eq!(tok, *want, "[{prompt}] greedy step {k}: {tok} != {want}");
             }
         }
+        eprintln!("1-bit quality OK: argmax/top-k/divergence/greedy match PrismML reference");
+    }
+
+    /// Sustained-decode throughput bench for the Bonsai-Q1 path. Evals the
+    /// last-position logits every step (as token sampling would), so MLX
+    /// pipelines within a step but the inter-step data dependency is honored —
+    /// the reported ms/step is the true decode cost. Reports ms/step and tok/s.
+    ///
+    /// Reproduces the PR's decode numbers. Run the fast vs legacy matvec kernels
+    /// back-to-back for the A/B (the perf claim):
+    /// ```text
+    /// HIGGS_BONSAI_PROFILE_DIR=<bonsai-1bit dir> HIGGS_BONSAI_QMV_KERNEL=fast \
+    ///   cargo test -p higgs-models --lib -- --ignored --nocapture bench_bonsai_q1_decode
+    /// # then again with HIGGS_BONSAI_QMV_KERNEL=legacy
+    /// ```
+    /// `HIGGS_BONSAI_DECODE_STEPS` overrides the measured step count (default 128).
+    /// `HIGGS_BONSAI_QMV_KERNEL` ({fast,legacy}) selects the matvec kernel and is
+    /// echoed in the report for A/B runs. See `docs/benchmarking.md`.
+    #[test]
+    #[ignore = "bench: set HIGGS_BONSAI_PROFILE_DIR to a Bonsai-Q1 1-bit model dir"]
+    #[allow(
+        clippy::print_stderr,
+        clippy::expect_used,
+        clippy::cast_lossless,
+        clippy::cast_precision_loss
+    )]
+    fn bench_bonsai_q1_decode() {
+        let Ok(dir) = std::env::var("HIGGS_BONSAI_PROFILE_DIR") else {
+            eprintln!("skip: set HIGGS_BONSAI_PROFILE_DIR");
+            return;
+        };
+        let steps: usize = std::env::var("HIGGS_BONSAI_DECODE_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128);
+        let kernel = std::env::var("HIGGS_BONSAI_QMV_KERNEL").unwrap_or_else(|_| "fast".into());
+
+        let gpu = load_bonsai_q1(&dir).expect("load Bonsai-Q1");
+        let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+
+        // Prefill a short prompt to populate the KV cache.
+        let prompt: Vec<i32> = (1..=16).collect();
+        let pin = Array::from_slice(&prompt, &[1, 16]);
+        gpu.forward(&pin, &mut cache)
+            .expect("prefill")
+            .eval()
+            .expect("prefill eval");
+
+        // Warmup decode steps (JIT/kernel-cache warm), discarded.
+        let mut tok = 100i32;
+        for _ in 0..4 {
+            let din = Array::from_slice(&[tok], &[1, 1]);
+            gpu.forward(&din, &mut cache)
+                .expect("warmup decode")
+                .eval()
+                .expect("warmup eval");
+            tok = (tok * 7 + 13) % 60000 + 1;
+        }
+
+        // `sync` (default) blocks per step with `eval` — the conservative floor,
+        // a lower bound on serving throughput. `HIGGS_BONSAI_BENCH_ASYNC=1` uses
+        // `async_eval` per step so the next step's graph builds under the current
+        // step's GPU compute — the same pipelining the serving path uses; reports
+        // the GPU-bound ceiling.
+        let async_mode = std::env::var("HIGGS_BONSAI_BENCH_ASYNC").is_ok();
+
+        // Measured sustained decode.
+        let t0 = std::time::Instant::now();
+        let mut last: Option<Array> = None;
+        for _ in 0..steps {
+            let din = Array::from_slice(&[tok], &[1, 1]);
+            let logits = gpu.forward(&din, &mut cache).expect("decode");
+            if async_mode {
+                mlx_rs::transforms::async_eval([&logits]).expect("async_eval");
+            } else {
+                logits.eval().expect("decode eval");
+            }
+            last = Some(logits);
+            tok = (tok * 7 + 13) % 60000 + 1;
+        }
+        if let Some(l) = last {
+            l.eval().expect("flush eval"); // drain the pipeline before stopping the clock
+        }
+        let elapsed = t0.elapsed();
+        let ms_step = elapsed.as_secs_f64() * 1e3 / steps as f64;
+        let tps = 1e3 / ms_step;
+        let mode = if async_mode { "async" } else { "sync" };
+        eprintln!(
+            "BONSAI-Q1 DECODE [kernel={kernel} mode={mode}] dir={dir}\n  {steps} steps: {ms_step:.3} ms/step = {tps:.1} tok/s"
+        );
     }
 }

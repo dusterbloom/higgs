@@ -385,8 +385,14 @@ pub fn bonsai_q1_qmv(
 // 64 values lie in one 128-wide group); per-row partials are simd_sum-reduced.
 // ---------------------------------------------------------------------------
 
+/// Mirrors `constexpr int VPT` in [`FAST_QMV_KERNEL_SOURCE`]. Each lane reads
+/// this many contiguous inputs; the dispatch guard in [`bonsai_q1_qmv_fast`]
+/// uses it to reject layouts the kernel's one-group-per-lane assumption can't
+/// handle. Keep in sync with the Metal source below.
+const FAST_QMV_VPT: i32 = 64;
+
 const FAST_QMV_KERNEL_SOURCE: &str = r"
-constexpr int VPT = 64;          // values_per_thread
+constexpr int VPT = 64;          // values_per_thread (must match FAST_QMV_VPT)
 constexpr int RPS = 4;           // results_per_simdgroup
 constexpr int WPT = VPT / 32;    // packed uint32 words per thread (2)
 constexpr int BLK = VPT * 32;    // block_size = 2048
@@ -582,6 +588,23 @@ pub fn bonsai_q1_qmv_fast(
         .copied()
         .ok_or_else(|| Exception::custom("bonsai_q1_qmv_fast: weight has no columns"))?;
     let k_dim = k_packed * 32;
+
+    // Kernel invariants (see FAST_QMV_KERNEL_SOURCE): each lane reads VPT
+    // contiguous inputs that must lie in one group, so the group must tile the
+    // VPT block — GroupSize % VPT == 0 (which also implies VPT <= GroupSize) —
+    // and K must be a whole number of groups for the scale/bias indexing. Guard
+    // here so a future Bonsai variant with a different layout errors loudly
+    // instead of silently reading the wrong group's scale.
+    if group_size % FAST_QMV_VPT != 0 {
+        return Err(Exception::custom(format!(
+            "bonsai_q1_qmv_fast: group_size {group_size} must be a multiple of VPT {FAST_QMV_VPT}"
+        )));
+    }
+    if k_dim % group_size != 0 {
+        return Err(Exception::custom(format!(
+            "bonsai_q1_qmv_fast: K {k_dim} not divisible by group_size {group_size}"
+        )));
+    }
 
     let x_flat = x.reshape(&[k_dim])?;
     let w_flat = weight.reshape(&[-1])?;
