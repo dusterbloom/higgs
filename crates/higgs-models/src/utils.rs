@@ -1,5 +1,5 @@
 use mlx_rs::{
-    Array, arange,
+    Array, arange, array,
     error::Exception,
     fast::ScaledDotProductAttentionMask,
     nn, ops,
@@ -146,6 +146,40 @@ where
     } else {
         Ok(None)
     }
+}
+
+/// Create a windowed (sliding window) causal boolean mask.
+///
+/// Returns a `[N, offset+N]` boolean array where `mask[i, j]` is true iff
+/// key position `j` is both:
+/// - causally visible: `j <= query_i` (where `query_i = offset + i`), AND
+/// - within the window: `j > query_i - window`
+///
+/// For the single-token decode case (N=1), this collapses to a `[1, kv_len]`
+/// row that keeps only the last `window` keys.
+#[allow(non_snake_case)]
+pub(crate) fn create_windowed_causal_mask(
+    N: i32,
+    offset: i32,
+    window: i32,
+) -> Result<Array, Exception> {
+    let kv_len = offset + N;
+
+    let key_positions = arange!(stop = kv_len)?;
+    // query_i = offset + i for i in 0..N
+    let query_positions = arange!(start = offset, stop = kv_len)?;
+
+    // Broadcast shapes: query [N, 1] vs key [1, kv_len]
+    let query_expanded = query_positions.reshape(&[N, 1])?;
+    let key_expanded = key_positions.reshape(&[1, kv_len])?;
+
+    // Causal: key_j <= query_i
+    let causal = key_expanded.le(&query_expanded)?;
+    // Window lower bound: key_j > query_i - window
+    let lower_bound = query_expanded.subtract(array!(window))?;
+    let in_window = key_expanded.gt(&lower_bound)?;
+
+    causal.multiply(in_window)
 }
 
 /// Create a boolean attention mask for batched decode.
@@ -766,6 +800,63 @@ mod tests {
         let flat: Vec<bool> = mask.reshape(&[2, 4]).unwrap().as_slice().to_vec();
         // Both requests: all 4 positions valid
         assert!(flat.iter().all(|&v| v));
+    }
+
+    // -----------------------------------------------------------------------
+    // create_windowed_causal_mask
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_windowed_causal_mask_shape() {
+        // N=4, offset=6, window=3: output should be [4, 10]
+        let mask = create_windowed_causal_mask(4, 6, 3).unwrap();
+        assert_eq!(mask.shape(), &[4, 10]);
+    }
+
+    #[test]
+    fn test_windowed_causal_mask_values_no_offset() {
+        // N=4, offset=0, window=2
+        // query_i = i, key_j = j
+        // mask[i,j] = (j <= i) AND (j > i - 2)
+        // i=0: j in (−2, 0] ∩ {0,1,2,3} -> {0}:         T F F F
+        // i=1: j in (−1, 1] ∩ {0,1,2,3} -> {0,1}:       T T F F
+        // i=2: j in (0, 2]  ∩ {0,1,2,3} -> {1,2}:       F T T F
+        // i=3: j in (1, 3]  ∩ {0,1,2,3} -> {2,3}:       F F T T
+        let mask = create_windowed_causal_mask(4, 0, 2).unwrap();
+        mlx_rs::transforms::eval([&mask]).unwrap();
+        let flat: Vec<bool> = mask.as_slice().to_vec();
+        let expected = [
+            true, false, false, false, true, true, false, false, false, true, true, false, false,
+            false, true, true,
+        ];
+        assert_eq!(flat, expected);
+    }
+
+    #[test]
+    fn test_windowed_causal_mask_single_token_decode() {
+        // N=1, offset=10, window=4
+        // query_i = 10, kv_len = 11
+        // mask[0, j] = (j <= 10) AND (j > 6)
+        // j=0..6: false; j=7..10: true
+        let mask = create_windowed_causal_mask(1, 10, 4).unwrap();
+        assert_eq!(mask.shape(), &[1, 11]);
+        mlx_rs::transforms::eval([&mask]).unwrap();
+        let flat: Vec<bool> = mask.as_slice().to_vec();
+        let expected = [
+            false, false, false, false, false, false, false, true, true, true, true,
+        ];
+        assert_eq!(flat, expected);
+    }
+
+    #[test]
+    fn test_windowed_causal_mask_window_larger_than_context() {
+        // When window >= context length, behaves identically to a plain causal mask
+        let windowed = create_windowed_causal_mask(3, 0, 100).unwrap();
+        let causal = create_causal_mask(3, Some(0)).unwrap();
+        mlx_rs::transforms::eval([&windowed, &causal]).unwrap();
+        let w: Vec<bool> = windowed.as_slice().to_vec();
+        let c: Vec<bool> = causal.as_slice().to_vec();
+        assert_eq!(w, c);
     }
 
     #[test]

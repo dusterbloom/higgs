@@ -77,6 +77,16 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Gemma2(model))
         }
+        "gemma3" | "gemma3_text" => {
+            let model = higgs_models::gemma3::load_gemma3_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Gemma3(model))
+        }
+        "gemma4" | "gemma4_text" | "gemma4_unified" => {
+            let model = higgs_models::gemma4::load_gemma4_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Gemma4(model))
+        }
         "phi3" => {
             let model = higgs_models::phi3::load_phi3_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
@@ -211,6 +221,30 @@ mod tests {
     fn model_config_from_dir_gemma2() {
         let (_dir, result) = config_for_model("gemma2");
         assert_eq!(result.unwrap().model_type, "gemma2");
+    }
+
+    #[test]
+    fn model_config_from_dir_gemma3() {
+        let (_dir, result) = config_for_model("gemma3");
+        assert_eq!(result.unwrap().model_type, "gemma3");
+    }
+
+    #[test]
+    fn model_config_from_dir_gemma3_text() {
+        let (_dir, result) = config_for_model("gemma3_text");
+        assert_eq!(result.unwrap().model_type, "gemma3_text");
+    }
+
+    #[test]
+    fn model_config_from_dir_gemma4() {
+        let (_dir, result) = config_for_model("gemma4");
+        assert_eq!(result.unwrap().model_type, "gemma4");
+    }
+
+    #[test]
+    fn model_config_from_dir_gemma4_text() {
+        let (_dir, result) = config_for_model("gemma4_text");
+        assert_eq!(result.unwrap().model_type, "gemma4_text");
     }
 
     #[test]

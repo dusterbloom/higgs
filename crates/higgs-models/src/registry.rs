@@ -37,6 +37,11 @@ pub fn is_supported(model_type: &str) -> bool {
             | "qwen3_5"
             | "qwen3_5_moe"
             | "gemma2"
+            | "gemma3"
+            | "gemma3_text"
+            | "gemma4"
+            | "gemma4_text"
+            | "gemma4_unified"
             | "phi3"
             | "starcoder2"
             | "llava-qwen2"
@@ -187,6 +192,55 @@ mod tests {
     fn test_detect_model_type_gemma2() {
         let dir = write_model_type_config("gemma2");
         assert_eq!(detect_model_type(dir.path()).unwrap(), "gemma2");
+    }
+
+    #[test]
+    fn test_is_supported_gemma3() {
+        assert!(is_supported("gemma3"));
+    }
+
+    #[test]
+    fn test_is_supported_gemma3_text() {
+        assert!(is_supported("gemma3_text"));
+    }
+
+    #[test]
+    fn test_detect_model_type_gemma3() {
+        let dir = write_model_type_config("gemma3");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "gemma3");
+    }
+
+    #[test]
+    fn test_detect_model_type_gemma3_text() {
+        let dir = write_model_type_config("gemma3_text");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "gemma3_text");
+    }
+
+    #[test]
+    fn test_is_supported_gemma4() {
+        assert!(is_supported("gemma4"));
+    }
+
+    #[test]
+    fn test_is_supported_gemma4_text() {
+        assert!(is_supported("gemma4_text"));
+    }
+
+    #[test]
+    fn test_is_supported_gemma4_unified() {
+        assert!(is_supported("gemma4_unified"));
+    }
+
+    #[test]
+    fn test_detect_model_type_gemma4() {
+        let dir = write_model_type_config("gemma4");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "gemma4");
+    }
+
+    #[test]
+    fn test_detect_model_type_gemma4_text() {
+        let dir = write_model_type_config("gemma4_text");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "gemma4_text");
     }
 
     #[test]

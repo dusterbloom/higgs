@@ -15,10 +15,24 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints |
 | Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B |
 | Gemma 2 | `gemma2` | Gemma 2 2B, 9B, and 27B |
+| Gemma 3 | `gemma3`, `gemma3_text` | Gemma 3 1B, 4B, 12B, and 27B |
+| Gemma 4 | `gemma4`, `gemma4_text`, `gemma4_unified` | Gemma 4 E2B, E4B (edge); 12B, 31B; 26B-A4B (MoE) |
 | Phi-3 | `phi3` | Phi-3 Mini, Small, and Medium |
 | Starcoder2 | `starcoder2` | Starcoder2 3B, 7B, and 15B |
 | DeepSeek-V2 | `deepseek_v2` | DeepSeek-V2-Lite |
 | LLaVA-Qwen2 | `llava-qwen2` | nanoLLaVA-1.5 |
+
+### Gemma 3 / Gemma 4 notes
+
+- These are text-language-model implementations. Multimodal checkpoints
+  (`gemma3`, `gemma4`) load fine — their vision/audio tower weights are skipped
+  and only the text model runs. The text weights may be nested under
+  `language_model.` in such checkpoints; Higgs strips that prefix automatically.
+- Gemma 4 E2B/E4B (per-layer-input embeddings + cross-layer KV sharing) and dense
+  text variants are supported. The MoE variant (`gemma4` with
+  `enable_moe_block`, e.g. 26B-A4B) is supported only with **unquantized** expert
+  weights; a checkpoint with quantized experts is rejected at load with a clear
+  error rather than producing incorrect output.
 
 ## Continuous Batching Support
 
