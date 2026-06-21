@@ -284,6 +284,24 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             );
             continue;
         }
+        if let Some(ref drafter) = model.draft_model {
+            if !std::path::Path::new(drafter).exists() {
+                fail(
+                    &format!("model {label} draft_model path does not exist: {drafter}"),
+                    result,
+                );
+                continue;
+            }
+            if model.batch {
+                fail(
+                    &format!(
+                        "model {label} sets draft_model but DFlash is simple-engine only (batch=true)"
+                    ),
+                    result,
+                );
+                continue;
+            }
+        }
         match model_resolver::resolve(&model.path) {
             Ok(resolved) => {
                 if model.batch {
@@ -598,6 +616,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    draft_model: None,
                     kv_key_bits: None,
                     kv_value_bits: None,
                     kv_norm_correction: true,
@@ -611,6 +630,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    draft_model: None,
                     kv_key_bits: None,
                     kv_value_bits: None,
                     kv_norm_correction: true,
@@ -637,6 +657,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    draft_model: None,
                     kv_key_bits: None,
                     kv_value_bits: None,
                     kv_norm_correction: true,
@@ -650,6 +671,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    draft_model: None,
                     kv_key_bits: None,
                     kv_value_bits: None,
                     kv_norm_correction: true,
@@ -1125,6 +1147,7 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                draft_model: None,
                 kv_key_bits: None,
                 kv_value_bits: None,
                 kv_norm_correction: true,
@@ -1155,6 +1178,7 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                draft_model: None,
                 kv_key_bits: None,
                 kv_value_bits: None,
                 kv_norm_correction: true,
@@ -1187,6 +1211,7 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                draft_model: None,
                 kv_key_bits: None,
                 kv_value_bits: None,
                 kv_norm_correction: true,

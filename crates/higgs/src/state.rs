@@ -31,8 +31,9 @@ impl Engine {
         kv_cache_config: KvCacheConfig,
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
+        draft_model: Option<&Path>,
     ) -> Result<Self, EngineError> {
-        SimpleEngine::load(dir, kv_cache_config, tuning, raise_wired_limit)
+        SimpleEngine::load_with_dflash(dir, kv_cache_config, tuning, raise_wired_limit, draft_model)
             .map(|e| Self::Simple(Box::new(e)))
     }
 

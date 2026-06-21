@@ -653,6 +653,7 @@ mod tests {
                 kv_value_bits: None,
                 kv_norm_correction: true,
                 kv_adaptive_dense_layers: 0,
+                draft_model: None,
             }],
             ..HiggsConfig::default()
         }
