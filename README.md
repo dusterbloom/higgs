@@ -10,7 +10,7 @@ Run open-weight MLX models locally on Apple Silicon, route requests across local
 Higgs is a single static Rust binary that serves local models, proxies to providers like OpenAI, Anthropic, and Ollama, and translates between OpenAI and Anthropic-style APIs so your existing tools and apps do not need a new integration.
 
 **Why care**
-- Run open-weight models locally on your Mac, including supported Qwen, Llama, Mistral, Gemma, Phi, DeepSeek, and vision-capable MLX families.
+- Run open-weight models locally on your Mac, including supported Qwen, Llama, Mistral, Gemma (2, 3, 4), Phi, DeepSeek, and vision-capable MLX families.
 - Send requests to local models or remote providers through one endpoint.
 - Plug tools into Higgs with `higgs shellenv` or `higgs exec` instead of reconfiguring each client separately.
 

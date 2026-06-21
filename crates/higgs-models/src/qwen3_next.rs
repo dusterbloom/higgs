@@ -2501,26 +2501,10 @@ impl GatedDeltaNet {
         let use_sep = args.use_separate_gdn_projections;
         let in_proj_qkvz = QLinear::new(ql, qb)?;
         let in_proj_ba = QLinear::new(ql, qb)?;
-        let in_proj_qkv = if use_sep {
-            Some(QLinear::new(ql, qb)?)
-        } else {
-            None
-        };
-        let in_proj_z = if use_sep {
-            Some(QLinear::new(ql, qb)?)
-        } else {
-            None
-        };
-        let in_proj_a = if use_sep {
-            Some(QLinear::new(ql, qb)?)
-        } else {
-            None
-        };
-        let in_proj_b = if use_sep {
-            Some(QLinear::new(ql, qb)?)
-        } else {
-            None
-        };
+        let in_proj_qkv = use_sep.then(|| QLinear::new(ql, qb)).transpose()?;
+        let in_proj_z = use_sep.then(|| QLinear::new(ql, qb)).transpose()?;
+        let in_proj_a = use_sep.then(|| QLinear::new(ql, qb)).transpose()?;
+        let in_proj_b = use_sep.then(|| QLinear::new(ql, qb)).transpose()?;
         let conv1d = nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
             .bias(false)
             .groups(conv_dim)
@@ -3213,16 +3197,12 @@ impl DecoderLayer {
     fn new(args: &Qwen3NextModelArgs, layer_idx: i32, ql: i32, qb: i32) -> Result<Self, Exception> {
         let is_linear = (layer_idx + 1) % args.full_attention_interval != 0;
 
-        let linear_attn = if is_linear {
-            Some(GatedDeltaNet::new(args, ql, qb)?)
-        } else {
-            None
-        };
-        let self_attn = if is_linear {
-            None
-        } else {
-            Some(Qwen3NextAttention::new(args, ql, qb)?)
-        };
+        let linear_attn = is_linear
+            .then(|| GatedDeltaNet::new(args, ql, qb))
+            .transpose()?;
+        let self_attn = (!is_linear)
+            .then(|| Qwen3NextAttention::new(args, ql, qb))
+            .transpose()?;
 
         let ffn = if args.num_experts > 0 {
             FfnBlock::new_moe(args, ql, qb)?
@@ -3448,16 +3428,12 @@ impl Qwen3NextCausalLM {
         } else {
             Some(QLinear::new(ql, qb)?)
         };
-        let mtp = if args.mtp_num_hidden_layers > 0 && !args.use_dense_mtp {
-            Some(MtpHead::new(&args, ql, qb)?)
-        } else {
-            None
-        };
-        let dense_mtp = if args.mtp_num_hidden_layers > 0 && args.use_dense_mtp {
-            Some(DenseMtpHead::new(&args)?)
-        } else {
-            None
-        };
+        let mtp = (args.mtp_num_hidden_layers > 0 && !args.use_dense_mtp)
+            .then(|| MtpHead::new(&args, ql, qb))
+            .transpose()?;
+        let dense_mtp = (args.mtp_num_hidden_layers > 0 && args.use_dense_mtp)
+            .then(|| DenseMtpHead::new(&args))
+            .transpose()?;
 
         Ok(Self {
             args,

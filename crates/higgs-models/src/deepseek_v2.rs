@@ -565,11 +565,11 @@ impl DeepSeekV2MlpBlock {
             .ok_or_else(|| Exception::custom("n_routed_experts required for MoE layer"))?;
         let top_k = args.num_experts_per_tok.unwrap_or(6);
 
-        let shared = if args.n_shared_experts.is_some() {
-            Some(SharedExperts::new(ql, qb)?)
-        } else {
-            None
-        };
+        let shared = args
+            .n_shared_experts
+            .is_some()
+            .then(|| SharedExperts::new(ql, qb))
+            .transpose()?;
 
         Ok(Self {
             gate: Some(

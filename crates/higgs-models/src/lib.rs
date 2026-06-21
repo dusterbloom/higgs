@@ -3,6 +3,8 @@ pub mod cache;
 pub mod deepseek_v2;
 pub mod error;
 pub mod gemma2;
+pub mod gemma3;
+pub mod gemma4;
 pub mod llava_qwen2;
 pub mod phi3;
 pub mod qwen3_moe;
@@ -129,6 +131,10 @@ pub enum AnyModel {
     Qwen3Moe(qwen3_moe::Qwen3MoeCausalLM),
     /// Gemma 2 architecture with soft-capping and alternating sliding window.
     Gemma2(gemma2::Gemma2CausalLM),
+    /// Gemma 3 (text) architecture with QK-norm, dual `RoPE`, and sliding window masking.
+    Gemma3(gemma3::Gemma3CausalLM),
+    /// Gemma 4 (text) architecture with cross-layer KV sharing, partial rotary, optional `MoE`.
+    Gemma4(gemma4::Gemma4CausalLM),
     /// Phi-3 architecture with combined QKV and gate-up projections.
     Phi3(phi3::Phi3CausalLM),
     /// Starcoder2 architecture with `LayerNorm` and sliding window.
@@ -215,6 +221,8 @@ impl AnyModel {
             (Self::Transformer(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Qwen3Moe(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Gemma2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
+            (Self::Gemma3(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
+            (Self::Gemma4(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text(inputs, mask, c),
@@ -245,6 +253,8 @@ impl AnyModel {
             (Self::Transformer(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Moe(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Gemma2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
+            (Self::Gemma3(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
+            (Self::Gemma4(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_hidden(inputs, mask, c),
@@ -295,6 +305,8 @@ impl AnyModel {
             (Self::Transformer(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Qwen3Moe(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Gemma2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Gemma3(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Gemma4(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_all_logits(inputs, mask, c),
@@ -391,6 +403,8 @@ impl AnyModel {
             Self::Qwen3Moe(_)
             | Self::Qwen3Next(_)
             | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
@@ -418,6 +432,8 @@ impl AnyModel {
             Self::Transformer(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
@@ -440,6 +456,8 @@ impl AnyModel {
             Self::Transformer(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
@@ -460,6 +478,8 @@ impl AnyModel {
             Self::Transformer(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
@@ -480,6 +500,8 @@ impl AnyModel {
             Self::Transformer(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
@@ -500,6 +522,8 @@ impl AnyModel {
             Self::Transformer(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
@@ -532,6 +556,8 @@ impl AnyModel {
             Self::Qwen3Moe(m) => m.args.hidden_size,
             Self::Qwen3Next(m) => m.args.hidden_size,
             Self::Gemma2(m) => m.args.hidden_size,
+            Self::Gemma3(m) => m.args.hidden_size,
+            Self::Gemma4(m) => m.args.hidden_size,
             Self::Phi3(m) => m.args.hidden_size,
             Self::Starcoder2(m) => m.args.hidden_size,
             Self::LlavaQwen2(m) => m.hidden_size(),
@@ -556,6 +582,10 @@ impl AnyModel {
             )),
             Self::Qwen3Next(m) => Ok((m.args.num_key_value_heads, m.args.head_dim)),
             Self::Gemma2(m) => Ok((m.args.num_key_value_heads, m.args.head_dim)),
+            Self::Gemma3(m) => Ok((m.args.num_key_value_heads, m.args.head_dim)),
+            // Gemma 4 has heterogeneous head_dim (global vs sliding layers).
+            // We return the sliding/local geometry as the representative value.
+            Self::Gemma4(m) => Ok((m.args.num_key_value_heads, m.args.head_dim)),
             Self::Phi3(m) => Ok((
                 m.args.num_key_value_heads,
                 checked_head_dim(m.args.hidden_size, m.args.num_attention_heads)?,
@@ -633,6 +663,18 @@ impl AnyModel {
                     Ok(make_kv_cache(m.args.num_hidden_layers))
                 }
             }
+            Self::Gemma3(m) => {
+                if kv_cache_config.is_turboquant() {
+                    make_turboquant_kv_cache(
+                        m.args.num_hidden_layers,
+                        m.args.num_key_value_heads,
+                        m.args.head_dim,
+                        kv_cache_config,
+                    )
+                } else {
+                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                }
+            }
             Self::Phi3(m) => {
                 if kv_cache_config.is_turboquant() {
                     make_turboquant_kv_cache(
@@ -656,6 +698,14 @@ impl AnyModel {
                 } else {
                     Ok(make_kv_cache(m.args.num_hidden_layers))
                 }
+            }
+            Self::Gemma4(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not supported for Gemma4 models",
+                    ));
+                }
+                Ok(make_kv_cache(m.args.num_hidden_layers))
             }
             Self::LlavaQwen2(m) => {
                 if kv_cache_config.is_turboquant() {
@@ -706,6 +756,8 @@ impl AnyModel {
             | Self::Qwen3Next(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::DeepSeekV2(_)
@@ -1272,8 +1324,91 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
     Ok(())
 }
 
+/// Load weights, stripping `optional_prefix` from any key that carries it.
+///
+/// Unlike [`load_quantized_safetensors_weights_with_prefix`] (which skips keys
+/// lacking the prefix), keys without the prefix are matched as-is. This handles
+/// multimodal wrapper checkpoints that nest the text model under
+/// `language_model.` (e.g. Gemma 4 `model_type = "gemma4"`) as well as text-only
+/// checkpoints whose keys start directly at `model.`. Keys that match neither the
+/// language model nor its quantized remap (e.g. `vision_tower.*`, `audio_tower.*`)
+/// are counted as unmatched and skipped.
+pub fn load_quantized_safetensors_weights_optional_prefix<M: ModuleParametersExt>(
+    model: &mut M,
+    model_path: &Path,
+    quantized: bool,
+    optional_prefix: &str,
+) -> Result<(), ModelError> {
+    const MAX_UNMATCHED_WARNS: usize = 5;
+    let safetensors_files = collect_safetensors_files(model_path)?;
+
+    let mut params = model.parameters_mut().flatten();
+    let mut total_matched = 0usize;
+    let mut total_unmatched = 0usize;
+    let mut total_unmatched_warns = 0usize;
+
+    for file_path in &safetensors_files {
+        let loaded = Array::load_safetensors(file_path)
+            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+
+        for (key, value) in loaded {
+            let stripped = key.strip_prefix(optional_prefix).unwrap_or(&key);
+            if let Some(param) = params.get_mut(stripped) {
+                **param = value;
+                total_matched += 1;
+            } else if quantized
+                && let Some(remapped) = remap_quantized_key(stripped)
+                && let Some(param) = params.get_mut(&*remapped)
+            {
+                **param = value;
+                total_matched += 1;
+            } else {
+                total_unmatched += 1;
+                total_unmatched_warns += 1;
+                if total_unmatched_warns <= MAX_UNMATCHED_WARNS {
+                    tracing::debug!(stripped, "weight key unmatched");
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        matched = total_matched,
+        unmatched = total_unmatched,
+        "Weight loading stats (optional prefix)"
+    );
+
+    model
+        .eval()
+        .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+
+    Ok(())
+}
+
+/// Whether the checkpoint contains a weight whose key ends with `suffix`.
+///
+/// Checks `model.safetensors.index.json`'s weight map when present (cheap),
+/// otherwise scans the safetensors file headers. Used to detect optional weights
+/// such as a separate `lm_head` that determines tied vs untied embeddings.
+pub(crate) fn checkpoint_has_key_suffix(model_path: &Path, suffix: &str) -> bool {
+    let index_path = model_path.join("model.safetensors.index.json");
+    if let Ok(json) = std::fs::read_to_string(&index_path)
+        && let Ok(index) = serde_json::from_str::<WeightMapIndex>(&json)
+    {
+        return index.weight_map.keys().any(|k| k.ends_with(suffix));
+    }
+    collect_safetensors_files(model_path).is_ok_and(|files| {
+        files.iter().any(|f| {
+            Array::load_safetensors(f)
+                .is_ok_and(|loaded| loaded.keys().any(|k| k.ends_with(suffix)))
+        })
+    })
+}
+
 /// Collect safetensors file paths from a model directory.
-fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
+pub(crate) fn collect_safetensors_files(
+    model_path: &Path,
+) -> Result<Vec<std::path::PathBuf>, ModelError> {
     fn existing_auxiliary_files(model_path: &Path) -> Vec<std::path::PathBuf> {
         AUXILIARY_SAFETENSORS_FILES
             .iter()
@@ -1302,6 +1437,7 @@ fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf
     }
 
     let index_path = model_path.join("model.safetensors.index.json");
+    let single_path = model_path.join("model.safetensors");
     if index_path.exists() {
         let json = std::fs::read_to_string(&index_path)?;
         let index: WeightMapIndex = serde_json::from_str(&json)?;
@@ -1310,22 +1446,25 @@ fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf
             .into_iter()
             .map(|f| model_path.join(f))
             .collect();
+        // mlx-community sometimes ships a single consolidated `model.safetensors`
+        // but leaves a stale sharded index referencing files that don't exist.
+        // Fall back to the single file when any indexed shard is missing.
+        if !files.iter().all(|f| f.exists()) && single_path.exists() {
+            files = vec![single_path];
+        }
         files.sort();
         append_existing_auxiliary_files(model_path, &mut files)?;
         files.sort();
         Ok(files)
+    } else if single_path.exists() {
+        let mut files = vec![single_path];
+        append_existing_auxiliary_files(model_path, &mut files)?;
+        files.sort();
+        Ok(files)
     } else {
-        let single_path = model_path.join("model.safetensors");
-        if single_path.exists() {
-            let mut files = vec![single_path];
-            append_existing_auxiliary_files(model_path, &mut files)?;
-            files.sort();
-            Ok(files)
-        } else {
-            Err(ModelError::MissingWeight(
-                "No safetensors files found".to_owned(),
-            ))
-        }
+        Err(ModelError::MissingWeight(
+            "No safetensors files found".to_owned(),
+        ))
     }
 }
 
@@ -1514,6 +1653,21 @@ mod tests {
                 .to_string_lossy()
                 .contains("model.safetensors")
         );
+    }
+
+    #[test]
+    fn collect_safetensors_falls_back_to_single_when_index_shards_missing() {
+        // mlx-community quirk: a consolidated `model.safetensors` plus a stale
+        // sharded index referencing files that don't exist. Must use the single file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), b"dummy").unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        let result = collect_safetensors_files(dir.path()).unwrap();
+        assert_eq!(result, vec![dir.path().join("model.safetensors")]);
     }
 
     #[test]

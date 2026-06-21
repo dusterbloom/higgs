@@ -401,25 +401,23 @@ impl SimpleEngine {
             .map_err(|_| EngineError::Generation("paged cache num_kv_heads overflow".to_owned()))?;
         let head_dim = usize::try_from(raw_head_dim)
             .map_err(|_| EngineError::Generation("paged cache head_dim overflow".to_owned()))?;
-        let paged_cache = if experimental_paged_kv {
-            let num_blocks = estimate_paged_kv_blocks(
-                tuning.paged_kv_target_bytes(),
-                num_kv_heads,
-                head_dim,
-                DEFAULT_PAGED_KV_BLOCK_SIZE,
-            );
-            Some(
+        let paged_cache = experimental_paged_kv
+            .then(|| {
+                let num_blocks = estimate_paged_kv_blocks(
+                    tuning.paged_kv_target_bytes(),
+                    num_kv_heads,
+                    head_dim,
+                    DEFAULT_PAGED_KV_BLOCK_SIZE,
+                );
                 PagedKvCache::new(
                     num_blocks,
                     DEFAULT_PAGED_KV_BLOCK_SIZE,
                     num_kv_heads,
                     head_dim,
                 )
-                .map_err(|e| EngineError::Generation(format!("paged cache init: {e}")))?,
-            )
-        } else {
-            None
-        };
+                .map_err(|e| EngineError::Generation(format!("paged cache init: {e}")))
+            })
+            .transpose()?;
 
         Ok(Self {
             model: Mutex::new(model),
@@ -2664,7 +2662,48 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
                 .and_then(|tc| tc.get("eos_token_id"))
         });
 
-    match eos_value {
+    let mut ids = eos_ids_from_value(eos_value);
+
+    // Union eos_token_id from generation_config.json — HF applies it at inference
+    // and it often lists turn-end tokens the base config.json omits.
+    if let Ok(gen_str) = std::fs::read_to_string(model_dir.join("generation_config.json"))
+        && let Ok(gen_cfg) = serde_json::from_str::<serde_json::Value>(&gen_str)
+    {
+        for id in eos_ids_from_value(gen_cfg.get("eos_token_id")) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+
+    // Gemma chat models end assistant turns with <end_of_turn>, which their
+    // config.json typically leaves out of eos_token_id. Without it generation runs
+    // past the answer into filler. Add it for the Gemma family.
+    let model_type = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("model_type"))
+                .and_then(|v| v.as_str())
+        });
+    if model_type.is_some_and(|t| t.starts_with("gemma"))
+        && let Some(id) = special_token_id(model_dir, "<end_of_turn>")
+        && !ids.contains(&id)
+    {
+        ids.push(id);
+    }
+
+    if ids.is_empty() {
+        tracing::warn!("No eos_token_id found in config.json, generation will rely on max_tokens");
+    }
+    ids
+}
+
+/// Parse an `eos_token_id` JSON value (a single number or an array of numbers).
+fn eos_ids_from_value(value: Option<&serde_json::Value>) -> Vec<u32> {
+    match value {
         Some(serde_json::Value::Number(n)) => n
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
@@ -2673,17 +2712,21 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
             .iter()
             .filter_map(|v| v.as_u64().and_then(|val| u32::try_from(val).ok()))
             .collect(),
-        Some(other) => {
-            tracing::warn!(value = ?other, "Unexpected eos_token_id type in config.json");
-            vec![]
-        }
-        None => {
-            tracing::warn!(
-                "No eos_token_id found in config.json, generation will rely on max_tokens"
-            );
-            vec![]
-        }
+        _ => vec![],
     }
+}
+
+/// Resolve the id of an added special token by its `content` string, reading
+/// `tokenizer_config.json`'s `added_tokens_decoder` map.
+fn special_token_id(model_dir: &Path, content: &str) -> Option<u32> {
+    let text = std::fs::read_to_string(model_dir.join("tokenizer_config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let decoder = config.get("added_tokens_decoder")?.as_object()?;
+    decoder.iter().find_map(|(id, info)| {
+        (info.get("content").and_then(serde_json::Value::as_str) == Some(content))
+            .then(|| id.parse::<u32>().ok())
+            .flatten()
+    })
 }
 
 /// Detect whether a model supports thinking mode based on `model_type`.
@@ -2716,13 +2759,64 @@ fn detect_thinking_support(model_dir: &Path) -> bool {
 mod tests {
     use super::{
         IncrementalDetok, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
-        derive_model_name, estimate_paged_kv_blocks, find_stop_in_tail, parse_enabled_flag,
+        derive_model_name, estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail,
+        parse_enabled_flag,
     };
     use std::path::Path;
 
     /// Write a config.json file into the given directory with the provided JSON content.
     fn write_config(dir: &std::path::Path, json: &str) {
         std::fs::write(dir.join("config.json"), json).unwrap();
+    }
+
+    /// Gemma chat models stop on `<end_of_turn>`, which their `config.json` often
+    /// omits from `eos_token_id`. It must be resolved from the tokenizer and added.
+    #[test]
+    fn extract_eos_tokens_adds_gemma_end_of_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"model_type":"gemma3_text","eos_token_id":1}"#,
+        );
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"106":{"content":"<end_of_turn>"}}}"#,
+        )
+        .unwrap();
+        let ids = extract_eos_tokens(dir.path());
+        assert!(ids.contains(&1), "base eos retained: {ids:?}");
+        assert!(ids.contains(&106), "gemma <end_of_turn> added: {ids:?}");
+    }
+
+    /// `generation_config.json`'s `eos_token_id` (used by HF at inference) is unioned in.
+    #[test]
+    fn extract_eos_tokens_unions_generation_config() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type":"llama","eos_token_id":2}"#);
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"eos_token_id":[2,7]}"#,
+        )
+        .unwrap();
+        let ids = extract_eos_tokens(dir.path());
+        assert!(
+            ids.contains(&2) && ids.contains(&7),
+            "union with generation_config: {ids:?}"
+        );
+    }
+
+    /// Non-Gemma models must not pull in `<end_of_turn>`.
+    #[test]
+    fn extract_eos_tokens_non_gemma_ignores_end_of_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type":"llama","eos_token_id":2}"#);
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"106":{"content":"<end_of_turn>"}}}"#,
+        )
+        .unwrap();
+        let ids = extract_eos_tokens(dir.path());
+        assert_eq!(ids, vec![2], "non-gemma must not add end_of_turn: {ids:?}");
     }
 
     // --- derive_model_name tests ---

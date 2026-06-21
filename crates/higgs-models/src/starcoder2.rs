@@ -480,11 +480,9 @@ where
                 if let Some(window) = self.sliding_window {
                     // Combined causal + sliding window mask for prefill,
                     // or window-only mask for decode when KV exceeds window.
-                    if T > 1 || kv_len > window {
-                        Some(create_sliding_causal_mask(T, kv_len, window)?)
-                    } else {
-                        None
-                    }
+                    (T > 1 || kv_len > window)
+                        .then(|| create_sliding_causal_mask(T, kv_len, window))
+                        .transpose()?
                 } else if T > 1 {
                     Some(create_causal_mask(T, Some(offset))?)
                 } else {
