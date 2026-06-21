@@ -364,7 +364,12 @@ impl AnyModel {
 
         // Last chunk: forward + LM head projection on last position only.
         let last_chunk = inputs.index((.., offset..));
-        self.forward_last_token(&last_chunk, None, cache)
+        let logits = self.forward_last_token(&last_chunk, None, cache)?;
+        // The loop only reports up to the final chunk boundary; emit the
+        // terminal 100% mark once the last chunk is processed so clients don't
+        // stall just short of `total`.
+        progress::report_prefill_progress(T, T);
+        Ok(logits)
     }
 
     /// Batched decode forward pass for N requests each with 1 token.
