@@ -90,6 +90,14 @@ pub struct ModelArgs {
     pub sliding_window: Option<i32>,
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
+    /// Explicit attention head dimension (`head_dim` in config.json). Most
+    /// Llama-family configs omit it, in which case `head_dim()` falls back to
+    /// `hidden_size / num_attention_heads`. Some models set it to a value that
+    /// differs from that ratio — e.g. `MiniCPM5` uses 128 while 1536/16 = 96 —
+    /// and the attention projections, `RoPE`, and scale must use the explicit
+    /// value or the model produces garbage.
+    #[serde(default, rename = "head_dim")]
+    pub head_dim_override: Option<i32>,
 
     // Quantization (present in pre-quantized MLX models)
     #[serde(default)]
@@ -106,10 +114,14 @@ impl ModelArgs {
             .unwrap_or(matches!(self.model_type.as_str(), "qwen2"))
     }
 
-    /// Head dimension, computed from `hidden_size / num_attention_heads`.
+    /// Head dimension. Uses the explicit `head_dim` from config when present,
+    /// otherwise `hidden_size / num_attention_heads`.
     ///
-    /// Panics in debug builds if not evenly divisible.
+    /// Panics in debug builds if the fallback is not evenly divisible.
     pub fn head_dim(&self) -> i32 {
+        if let Some(head_dim) = self.head_dim_override {
+            return head_dim;
+        }
         debug_assert!(
             self.num_attention_heads != 0 && self.hidden_size % self.num_attention_heads == 0,
             "hidden_size ({}) must be divisible by num_attention_heads ({})",
@@ -119,8 +131,18 @@ impl ModelArgs {
         self.hidden_size / self.num_attention_heads
     }
 
-    /// Validated head dimension that returns an error if not evenly divisible.
+    /// Validated head dimension. Honours an explicit `head_dim` from config;
+    /// otherwise returns an error if `hidden_size` is not evenly divisible by
+    /// `num_attention_heads`.
     pub fn checked_head_dim(&self) -> Result<i32, ModelError> {
+        if let Some(head_dim) = self.head_dim_override {
+            if head_dim <= 0 {
+                return Err(ModelError::ShapeMismatch(
+                    "explicit head_dim must be positive".to_owned(),
+                ));
+            }
+            return Ok(head_dim);
+        }
         if self.num_attention_heads == 0 {
             return Err(ModelError::ShapeMismatch(
                 "num_attention_heads must be positive".to_owned(),
@@ -1015,6 +1037,7 @@ mod tests {
             use_sliding_window: false,
             sliding_window: None,
             rope_scaling: None,
+            head_dim_override: None,
             quantization: None,
         }
     }
@@ -1218,6 +1241,37 @@ mod tests {
         assert!(args.sliding_window.is_none());
         assert!(args.rope_scaling.is_none());
         assert!(args.quantization.is_none());
+    }
+
+    #[test]
+    fn test_explicit_head_dim_honored() {
+        // MiniCPM5-1B: head_dim=128 even though hidden/heads = 1536/16 = 96.
+        // Must use the explicit value or attention/RoPE are wrong.
+        let json = r#"{
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 1536,
+            "num_hidden_layers": 24,
+            "intermediate_size": 4608,
+            "num_attention_heads": 16,
+            "rms_norm_eps": 1e-06,
+            "vocab_size": 130560,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 131072,
+            "head_dim": 128
+        }"#;
+        let args = assert_model_config(json, "llama", 1536, 128, false);
+        assert_eq!(args.head_dim_override, Some(128));
+        assert_eq!(args.checked_head_dim().unwrap(), 128);
+    }
+
+    #[test]
+    fn test_head_dim_falls_back_when_config_omits_it() {
+        // Standard Llama config has no `head_dim` → fall back to 4096/32 = 128.
+        let args = make_model_args("llama", 4096, 32, 32, 32000, 32);
+        assert_eq!(args.head_dim_override, None);
+        assert_eq!(args.head_dim(), 128);
+        assert_eq!(args.checked_head_dim().unwrap(), 128);
     }
 
     #[test]

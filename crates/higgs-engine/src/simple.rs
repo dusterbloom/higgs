@@ -245,6 +245,12 @@ pub struct SimpleEngine {
     template: Option<ChatTemplateRenderer>,
     model_name: String,
     eos_token_ids: Vec<u32>,
+    /// Control tokens stripped from decoded output (EOS + `<|…|>` chat
+    /// delimiters + classic sentinels), while content-bearing special tokens
+    /// (tool-call markup, `<think>`) are preserved. See [`Self::decode_tokens`].
+    /// Wrapped in `Arc` so each request's streaming [`IncrementalDetok`] shares
+    /// the same set and strips identically to `decode_tokens`.
+    decode_skip_ids: std::sync::Arc<std::collections::HashSet<u32>>,
     /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
     enable_thinking: bool,
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
@@ -293,6 +299,13 @@ impl SimpleEngine {
 
         let eos_token_ids = extract_eos_tokens(model_dir);
 
+        // Control tokens that must never surface in decoded text (EOS + the
+        // `<|…|>` chat-control delimiters + classic sentinels). Shared via `Arc`
+        // with each request's streaming `IncrementalDetok` so streaming strips
+        // identically to `decode_tokens`.
+        let decode_skip_ids =
+            std::sync::Arc::new(content_preserving_skip_ids(&tokenizer, &eos_token_ids));
+
         // Auto-detect thinking mode: Qwen3.5 models support <think> tags.
         // Override with HIGGS_ENABLE_THINKING=0/1, off/true, yes/no etc.
         let mut enable_thinking = std::env::var("HIGGS_ENABLE_THINKING")
@@ -323,10 +336,7 @@ impl SimpleEngine {
             enable_thinking = false;
         }
         if enable_thinking {
-            tracing::info!(
-                think_close_token,
-                "Thinking mode enabled (Qwen3.5 model detected)"
-            );
+            tracing::info!(think_close_token, "Thinking mode enabled");
         }
 
         set_wired_limit_to_max(raise_wired_limit);
@@ -432,6 +442,7 @@ impl SimpleEngine {
             template,
             model_name,
             eos_token_ids,
+            decode_skip_ids,
             enable_thinking,
             think_close_token,
             gen_prompt_suffix_len,
@@ -759,10 +770,30 @@ impl SimpleEngine {
     }
 
     /// Decode the token buffer and return the text, mapping tokenizer errors.
+    ///
+    /// Decodes WITHOUT skipping special tokens so content-bearing markup
+    /// survives — notably models (e.g. `MiniCPM5`) that encode their tool-call
+    /// structure (`<function>`, `<param>`, …) as special tokens, which the
+    /// tool parser needs to see. Control tokens (EOS) are filtered out first so
+    /// they never leak into visible text. Plain text contains no special
+    /// tokens and decodes identically either way, so normal responses are
+    /// unaffected.
     fn decode_tokens(&self, tokens: &[u32]) -> Result<String, EngineError> {
-        self.tokenizer
-            .decode(tokens, true)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))
+        let decode = |ids: &[u32]| {
+            self.tokenizer
+                .decode(ids, false)
+                .map_err(|e| EngineError::Tokenization(e.to_string()))
+        };
+        // Fast path: no control token present, decode the slice as-is.
+        if !tokens.iter().any(|id| self.decode_skip_ids.contains(id)) {
+            return decode(tokens);
+        }
+        let filtered: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .filter(|id| !self.decode_skip_ids.contains(id))
+            .collect();
+        decode(&filtered)
     }
 
     /// The model's hidden dimension (embedding output size).
@@ -2262,7 +2293,11 @@ impl SimpleEngine {
         }
         all_tokens.push(first_token_id);
 
-        let mut detok = IncrementalDetok::new(String::new(), 0);
+        let mut detok = IncrementalDetok::new(
+            String::new(),
+            0,
+            std::sync::Arc::clone(&self.decode_skip_ids),
+        );
         let first_new_text = detok.append(&self.tokenizer, &all_tokens)?;
         let first_emitted_before = detok.text.len() - first_new_text.len();
         let (mut first_text, first_hit_stop) = if stop_sequences.is_empty() {
@@ -2522,6 +2557,31 @@ const MAX_DETOK_WINDOW: usize = 64;
 /// start at the same token, so tokenizer boundary effects cancel out. Text
 /// ending in an incomplete UTF-8 sequence (trailing replacement char) is held
 /// back until a later token completes it.
+/// Token IDs that must never surface in decoded output text.
+///
+/// Seeded with the model's EOS ids, plus every added *control* special token:
+/// the `<|…|>` chat-control delimiters and the classic `<s>`/`</s>`/`<pad>`/
+/// `<unk>`/`<mask>` sentinels. Content-bearing special tokens (`<think>`,
+/// `<tool_call>`, `MiniCPM`'s `<function>`/`<param>`) deliberately do NOT match,
+/// so they survive decoding and reach the tool-call / reasoning parsers. Shared
+/// by the non-streaming decode path ([`SimpleEngine::decode_tokens`]) and the
+/// streaming detokenizer ([`IncrementalDetok`]) so the two strip identically.
+pub(crate) fn content_preserving_skip_ids(
+    tokenizer: &Tokenizer,
+    eos_token_ids: &[u32],
+) -> std::collections::HashSet<u32> {
+    let mut ids: std::collections::HashSet<u32> = eos_token_ids.iter().copied().collect();
+    for (id, added) in tokenizer.get_added_tokens_decoder() {
+        let content = added.content.as_str();
+        let is_control = (content.starts_with("<|") && content.ends_with("|>"))
+            || matches!(content, "<s>" | "</s>" | "<pad>" | "<unk>" | "<mask>");
+        if is_control {
+            ids.insert(id);
+        }
+    }
+    ids
+}
+
 pub(crate) struct IncrementalDetok {
     /// Start of the decode window; advanced whenever text is emitted.
     prefix_offset: usize,
@@ -2529,22 +2589,45 @@ pub(crate) struct IncrementalDetok {
     read_offset: usize,
     /// All text decoded so far (streamed to the client incrementally).
     pub(crate) text: String,
+    /// Control-token IDs filtered out before decoding so content-bearing
+    /// special tokens (tool-call markup) survive streaming. See
+    /// [`content_preserving_skip_ids`].
+    skip_ids: std::sync::Arc<std::collections::HashSet<u32>>,
 }
 
 impl IncrementalDetok {
     /// Start from text already decoded for the first `token_count` tokens.
-    pub(crate) const fn new(text: String, token_count: usize) -> Self {
+    pub(crate) const fn new(
+        text: String,
+        token_count: usize,
+        skip_ids: std::sync::Arc<std::collections::HashSet<u32>>,
+    ) -> Self {
         Self {
             prefix_offset: 0,
             read_offset: token_count,
             text,
+            skip_ids,
         }
     }
 
-    fn decode(tokenizer: &Tokenizer, tokens: &[u32]) -> Result<String, EngineError> {
-        tokenizer
-            .decode(tokens, true)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))
+    /// Decode `tokens`, dropping only the control tokens in `skip_ids` while
+    /// preserving content-bearing special tokens. Mirrors
+    /// [`SimpleEngine::decode_tokens`] so streamed and non-streamed text match.
+    fn decode(&self, tokenizer: &Tokenizer, tokens: &[u32]) -> Result<String, EngineError> {
+        let run = |ids: &[u32]| {
+            tokenizer
+                .decode(ids, false)
+                .map_err(|e| EngineError::Tokenization(e.to_string()))
+        };
+        if !tokens.iter().any(|id| self.skip_ids.contains(id)) {
+            return run(tokens);
+        }
+        let filtered: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .filter(|id| !self.skip_ids.contains(id))
+            .collect();
+        run(&filtered)
     }
 
     /// Decode the trailing window of `tokens`, appending newly stable text to
@@ -2558,8 +2641,8 @@ impl IncrementalDetok {
             .get(self.prefix_offset..self.read_offset)
             .unwrap_or_default();
         let window_tokens = tokens.get(self.prefix_offset..).unwrap_or_default();
-        let prefix_text = Self::decode(tokenizer, prefix_tokens)?;
-        let window_text = Self::decode(tokenizer, window_tokens)?;
+        let prefix_text = self.decode(tokenizer, prefix_tokens)?;
+        let window_text = self.decode(tokenizer, window_tokens)?;
 
         let over_window = window_tokens.len() > MAX_DETOK_WINDOW;
         if window_text.len() > prefix_text.len()
@@ -2598,8 +2681,8 @@ impl IncrementalDetok {
             .get(self.prefix_offset..self.read_offset)
             .unwrap_or_default();
         let window_tokens = tokens.get(self.prefix_offset..).unwrap_or_default();
-        let prefix_text = Self::decode(tokenizer, prefix_tokens)?;
-        let window_text = Self::decode(tokenizer, window_tokens)?;
+        let prefix_text = self.decode(tokenizer, prefix_tokens)?;
+        let window_text = self.decode(tokenizer, window_tokens)?;
         let new_text = window_text
             .get(prefix_text.len()..)
             .unwrap_or_default()
@@ -2782,18 +2865,31 @@ fn special_token_id(model_dir: &Path, content: &str) -> Option<u32> {
 }
 
 /// Detect whether a model supports thinking mode based on `model_type`.
+/// Whether the model *supports* a thinking toggle (capability, not default).
+///
+/// The per-request default — e.g. Qwen3.6 reasons off unless asked — is decided
+/// separately by `model_defaults_to_non_thinking` in the router; this only
+/// answers "can it think at all".
+///
+/// Signals, in order:
+/// 1. the chat template exposes an `enable_thinking` switch — the model
+///    author's own marker, which covers Qwen3.5/3.6, `MiniCPM5`, and future
+///    reasoning models without hardcoding model types; or
+/// 2. a known reasoning `model_type`.
+///
+/// The caller additionally requires a single-token `</think>`, so a stray
+/// mention can't enable thinking for a model that wasn't trained for it.
 fn detect_thinking_support(model_dir: &Path) -> bool {
-    let config_path = model_dir.join("config.json");
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(_) => return false,
+    if chat_template_mentions_enable_thinking(model_dir) {
+        return true;
+    }
+    let Ok(config_str) = std::fs::read_to_string(model_dir.join("config.json")) else {
+        return false;
     };
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(_) => return false,
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) else {
+        return false;
     };
-    // Qwen3.5 models (qwen3_5, qwen3_5_moe) support <think> tags.
-    // Check both top-level and nested text_config for VLM wrappers.
+    // Check both top-level and nested text_config (VLM wrappers).
     let model_type = config
         .get("model_type")
         .and_then(|v| v.as_str())
@@ -2806,13 +2902,42 @@ fn detect_thinking_support(model_dir: &Path) -> bool {
     matches!(model_type, Some("qwen3_5" | "qwen3_5_moe"))
 }
 
+/// Whether the model's chat template references the `enable_thinking` toggle,
+/// read from `chat_template.jinja` or `tokenizer_config.json`'s `chat_template`
+/// (a string, or a `{name, template}` array).
+fn chat_template_mentions_enable_thinking(model_dir: &Path) -> bool {
+    const MARKER: &str = "enable_thinking";
+    if let Ok(jinja) = std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
+        return jinja.contains(MARKER);
+    }
+    let Ok(cfg_str) = std::fs::read_to_string(model_dir.join("tokenizer_config.json")) else {
+        return false;
+    };
+    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) else {
+        return false;
+    };
+    let template = cfg.get("chat_template");
+    if let Some(s) = template.and_then(|v| v.as_str()) {
+        return s.contains(MARKER);
+    }
+    if let Some(arr) = template.and_then(|v| v.as_array()) {
+        return arr.iter().any(|entry| {
+            entry
+                .get("template")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains(MARKER))
+        });
+    }
+    false
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
         IncrementalDetok, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
-        derive_model_name, estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail,
-        parse_enabled_flag,
+        derive_model_name, detect_thinking_support, estimate_paged_kv_blocks, extract_eos_tokens,
+        find_stop_in_tail, parse_enabled_flag,
     };
     use std::path::Path;
 
@@ -2869,6 +2994,44 @@ mod tests {
         .unwrap();
         let ids = extract_eos_tokens(dir.path());
         assert_eq!(ids, vec![2], "non-gemma must not add end_of_turn: {ids:?}");
+    }
+
+    // --- detect_thinking_support tests ---
+
+    /// MiniCPM5-style: a non-reasoning `model_type` (llama) but a chat template
+    /// that exposes the `enable_thinking` switch ⇒ thinking-capable.
+    #[test]
+    fn detect_thinking_from_template_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type": "llama"}"#);
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{%- if enable_thinking %}<think>\n{%- endif %}",
+        )
+        .unwrap();
+        assert!(detect_thinking_support(dir.path()));
+    }
+
+    /// Qwen3.5 reasoning `model_type` is detected even without a template file.
+    #[test]
+    fn detect_thinking_from_model_type() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type": "qwen3_5_moe"}"#);
+        assert!(detect_thinking_support(dir.path()));
+    }
+
+    /// A plain Llama (no reasoning `model_type`, no `enable_thinking` in the
+    /// template) must NOT be treated as a thinking model.
+    #[test]
+    fn no_thinking_for_plain_llama() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type": "llama"}"#);
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{%- for m in messages %}{{ m.content }}{%- endfor %}",
+        )
+        .unwrap();
+        assert!(!detect_thinking_support(dir.path()));
     }
 
     // --- derive_model_name tests ---
@@ -3206,12 +3369,51 @@ mod tests {
         Tokenizer::from_bytes(json.as_bytes()).unwrap()
     }
 
+    /// Empty skip-id set for detok tests that exercise plain (non-special)
+    /// tokens, where `skip_special_tokens` makes no difference.
+    fn no_skip() -> std::sync::Arc<std::collections::HashSet<u32>> {
+        std::sync::Arc::new(std::collections::HashSet::new())
+    }
+
+    /// `content_preserving_skip_ids` strips control tokens (chat delimiters,
+    /// sentinels, the explicit EOS list) but keeps content-bearing special
+    /// tokens so tool-call markup reaches the parser.
+    #[test]
+    fn skip_ids_strip_control_but_keep_content_special_tokens() {
+        let mut tok = Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        let _ = tok.add_special_tokens([
+            tokenizers::AddedToken::from("<|im_end|>", true),
+            tokenizers::AddedToken::from("</s>", true),
+            tokenizers::AddedToken::from("<function>", true),
+            tokenizers::AddedToken::from("<tool_call>", true),
+        ]);
+        let im_end = tok.token_to_id("<|im_end|>").unwrap();
+        let skip = super::content_preserving_skip_ids(&tok, &[im_end, 7]);
+
+        // Stripped: <|…|> delimiter, the </s> sentinel, and the explicit eos id.
+        assert!(skip.contains(&im_end), "<|…|> delimiter is a control token");
+        assert!(
+            skip.contains(&tok.token_to_id("</s>").unwrap()),
+            "</s> sentinel stripped"
+        );
+        assert!(skip.contains(&7), "explicit eos id retained");
+        // Preserved: content-bearing tool-call markup the parser depends on.
+        assert!(
+            !skip.contains(&tok.token_to_id("<function>").unwrap()),
+            "<function> preserved for the tool-call parser"
+        );
+        assert!(
+            !skip.contains(&tok.token_to_id("<tool_call>").unwrap()),
+            "<tool_call> preserved"
+        );
+    }
+
     #[test]
     fn incremental_detok_emits_per_token_diffs() {
         let tokenizer = word_tokenizer();
         let mut tokens: Vec<u32> = vec![0];
         let first = tokenizer.decode(&tokens, true).unwrap();
-        let mut detok = IncrementalDetok::new(first.clone(), tokens.len());
+        let mut detok = IncrementalDetok::new(first.clone(), tokens.len(), no_skip());
 
         tokens.push(1);
         let second = detok.append(&tokenizer, &tokens).unwrap();
@@ -3228,7 +3430,7 @@ mod tests {
         let tokenizer = word_tokenizer();
         let mut tokens: Vec<u32> = vec![0];
         let first = tokenizer.decode(&tokens, true).unwrap();
-        let mut detok = IncrementalDetok::new(first, tokens.len());
+        let mut detok = IncrementalDetok::new(first, tokens.len(), no_skip());
 
         tokens.push(1);
         detok.append(&tokenizer, &tokens).unwrap();
@@ -3241,7 +3443,7 @@ mod tests {
     #[test]
     fn incremental_detok_first_token_partial_utf8_held_back() {
         let tokenizer = word_tokenizer();
-        let mut detok = IncrementalDetok::new(String::new(), 0);
+        let mut detok = IncrementalDetok::new(String::new(), 0, no_skip());
 
         // First partial piece: held back, no replacement char emitted
         let held = detok.append(&tokenizer, &[3]).unwrap();
@@ -3260,7 +3462,7 @@ mod tests {
     #[test]
     fn incremental_detok_flush_emits_pending() {
         let tokenizer = word_tokenizer();
-        let mut detok = IncrementalDetok::new(String::new(), 0);
+        let mut detok = IncrementalDetok::new(String::new(), 0, no_skip());
 
         // Partial piece held back
         let held = detok.append(&tokenizer, &[3]).unwrap();
