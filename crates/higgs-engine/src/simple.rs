@@ -1578,6 +1578,19 @@ impl SimpleEngine {
         const SPEC_WARMUP: u32 = 3;
         let mut spec_warmup_left: u32 = 0;
 
+        // Periodic t_ar re-calibration. t_ar is only measured during AR steps, so
+        // a long spec-winning streak never refreshes it — and t_ar drifts with
+        // thermal (measured 25ms cool vs 101ms throttled on the same model). A
+        // stale t_ar skews `ratio = n_acc*t_ar/step_wall` and the gate can miss a
+        // regime where spec started losing. So every RECAL_EVERY judged winning
+        // rounds, force ONE AR step to refresh t_ar at the current thermal state.
+        // ~1 AR token per ~240 generated (<0.5% overhead); unlike a probe it does
+        // not re-arm the warm-up grace or reset ratio_ema (1 AR step barely cools
+        // the drafter, and we want to keep the winning EMA).
+        const T_AR_RECAL_EVERY: u32 = 48;
+        let mut spec_since_recal: u32 = 0;
+        let mut recal = false;
+
         loop {
             let round_t0 = std::time::Instant::now();
             if gate && in_ar {
@@ -1592,7 +1605,14 @@ impl SimpleEngine {
                 // so logits + cache are byte-identical; the only thing dropped is a
                 // tap clone the next floored step would overwrite unused.
                 let calibrating = !calibrated;
-                let window = if calibrating { T_AR_CALIB } else { probe_every };
+                // recal: a single AR step to refresh a stale t_ar mid-streak.
+                let window = if recal {
+                    1
+                } else if calibrating {
+                    T_AR_CALIB
+                } else {
+                    probe_every
+                };
                 let leaving = ar_run + 1 >= window;
                 let need_taps = leaving;
                 let single = Array::from_slice(&[last_token], &[1, 1]);
@@ -1628,13 +1648,27 @@ impl SimpleEngine {
                     in_ar = false;
                     ar_run = 0;
                     calibrated = true;
-                    // Grant the fresh spec burst its cold-start grace and re-seed
-                    // the EMA to the optimistic prior. Re-seeding (not blending)
-                    // is load-bearing: otherwise a re-probe inherits the stale
-                    // sub-1.0 ratio_ema and re-floors in one warm round, undoing
-                    // the grace. Mirrors the t_ar_ema map_or seed.
-                    spec_warmup_left = SPEC_WARMUP;
-                    ratio_ema = 2.0;
+                    if recal {
+                        // Just refreshed t_ar mid-streak: resume spec with the
+                        // winning EMA intact and no warm-up (the drafter barely
+                        // cooled over one AR step). need_taps was true, so
+                        // current_taps is fresh for the next draft.
+                        recal = false;
+                        if std::env::var("HIGGS_DFLASH_TRACE").is_ok() {
+                            tracing::info!(
+                                t_ar_ms = format!("{:.1}", t_ar_ema.unwrap_or(0.0) * 1e3),
+                                "GATE t_ar recal"
+                            );
+                        }
+                    } else {
+                        // Grant the fresh spec burst its cold-start grace and
+                        // re-seed the EMA to the optimistic prior. Re-seeding (not
+                        // blending) is load-bearing: otherwise a re-probe inherits
+                        // the stale sub-1.0 ratio_ema and re-floors in one warm
+                        // round, undoing the grace. Mirrors the t_ar_ema map_or seed.
+                        spec_warmup_left = SPEC_WARMUP;
+                        ratio_ema = 2.0;
+                    }
                 }
             } else {
                 // a. Build block: [anchor, mask, mask, ...]
@@ -1815,6 +1849,15 @@ impl SimpleEngine {
                             // Winning: stay in spec, but reset the cadence so a
                             // later degradation is re-probed promptly, not lazily.
                             probe_every = AR_PROBE_BASE;
+                            // Refresh t_ar periodically so a long winning streak
+                            // can't run on a thermally-stale AR reference.
+                            spec_since_recal += 1;
+                            if spec_since_recal >= T_AR_RECAL_EVERY {
+                                in_ar = true;
+                                ar_run = 0;
+                                recal = true;
+                                spec_since_recal = 0;
+                            }
                         }
                     } else {
                         // No T_ar sample yet (initial calibration) — floor at base
@@ -3532,7 +3575,11 @@ mod tests {
         let enable_thinking = std::env::var("HIGGS_TEST_THINKING")
             .map(|v| v != "0")
             .unwrap_or(true);
-        let max_tokens = 200u32;
+        let max_tokens = std::env::var("HIGGS_TEST_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(200);
         let greedy = SamplingParams {
             temperature: 0.0,
             ..SamplingParams::default()
