@@ -1567,6 +1567,17 @@ impl SimpleEngine {
         const T_AR_CALIB: u32 = 3;
         let mut calibrated = false;
 
+        // Spec-side cold-start grace (symmetric to T_AR_CALIB). The first spec
+        // rounds after every (re-)entry are cold on two axes the warm t_ar is
+        // not: the verify/drafter/lm_head Metal kernels are kernel-cold
+        // (step_wall ~2x inflated until they JIT-warm) and the drafter KV cache
+        // is empty (accept length climbs from ~3 to its steady ~6 as it fills).
+        // Judging those rounds floored winning workloads (9B code: 1.53x->0.83x)
+        // and then death-spiralled (floored -> spec re-cools -> re-probe also
+        // looks bad). So don't update ratio_ema or floor until the burst warms.
+        const SPEC_WARMUP: u32 = 3;
+        let mut spec_warmup_left: u32 = 0;
+
         loop {
             let round_t0 = std::time::Instant::now();
             if gate && in_ar {
@@ -1617,6 +1628,13 @@ impl SimpleEngine {
                     in_ar = false;
                     ar_run = 0;
                     calibrated = true;
+                    // Grant the fresh spec burst its cold-start grace and re-seed
+                    // the EMA to the optimistic prior. Re-seeding (not blending)
+                    // is load-bearing: otherwise a re-probe inherits the stale
+                    // sub-1.0 ratio_ema and re-floors in one warm round, undoing
+                    // the grace. Mirrors the t_ar_ema map_or seed.
+                    spec_warmup_left = SPEC_WARMUP;
+                    ratio_ema = 2.0;
                 }
             } else {
                 // a. Build block: [anchor, mask, mask, ...]
@@ -1758,7 +1776,22 @@ impl SimpleEngine {
                 // slower than plain AR (or to calibrate T_ar if we have no sample).
                 if gate {
                     let step_wall = round_t0.elapsed().as_secs_f64().max(1e-9);
-                    if let Some(t_ar) = t_ar_ema {
+                    if spec_warmup_left > 0 {
+                        // Cold spec warm-up: stay in spec, don't judge or floor,
+                        // don't poison ratio_ema with the cold step_wall / low
+                        // cold-cache accept. The kernels warm and the drafter
+                        // cache fills over these rounds.
+                        spec_warmup_left -= 1;
+                        if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && rounds <= 8 {
+                            tracing::info!(
+                                round = rounds,
+                                n_accepted,
+                                step_wall_ms = format!("{:.1}", step_wall * 1e3),
+                                warmup_left = spec_warmup_left,
+                                "GATE warmup (discarded)"
+                            );
+                        }
+                    } else if let Some(t_ar) = t_ar_ema {
                         let ratio = f64::from(n_accepted) * t_ar / step_wall;
                         ratio_ema = 0.6f64.mul_add(ratio_ema, 0.4 * ratio);
                         if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && rounds <= 8 {
