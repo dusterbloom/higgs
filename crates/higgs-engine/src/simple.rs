@@ -1539,37 +1539,84 @@ impl SimpleEngine {
         let mut ratio_ema = 2.0_f64;
         let mut in_ar = true;
         let mut ar_run: u32 = 0;
-        // Re-probe spec sparsely: in a sustained high-entropy region each probe
-        // is a wasted slow spec round, so amortize it over many AR steps.
-        const AR_PROBE_EVERY: u32 = 32;
+        // Re-probe spec sparsely with exponential backoff. In a sustained
+        // high-entropy region every probe is a wasted slow spec round (~4
+        // decode-units for ~1-2 tokens), so a fixed cadence taxed the floor by
+        // ~probe_cost/cadence (≈11% at 32 — the measured 0.89× prose gap; the
+        // per-step taps were free, see dflash_floor_tapless_vs_taps_per_step_cost).
+        // Each losing probe doubles the interval (amortizing the cost toward 0 on
+        // sustained prose); a winning probe resets to base so a regime shift back
+        // to spec-friendly text is caught within `AR_PROBE_BASE` tokens.
+        const AR_PROBE_BASE: u32 = 32;
+        // ponytail: cap the backoff at 512 — residual probe tax <1% (≈0.99×),
+        // and recovery never lags a regime change by more than ~512 tokens.
+        const AR_PROBE_MAX: u32 = 512;
+        let mut probe_every = AR_PROBE_BASE;
+
+        // The first decode after prefill is kernel-cold on Metal (~8× steady
+        // state: measured t_ar=187ms vs ~23ms warm). Seeding the gate's AR
+        // reference from it froze t_ar high, so the realized-speedup ratio was
+        // always >1 and the gate NEVER floored — a dead no-op. Fix: spend a short
+        // warm-up window in AR, discard the cold sample, seed t_ar from the warm
+        // steps, then hand off to spec. These are real greedy tokens, not waste.
+        // ponytail: no periodic re-calibration — t_ar only updates on floored
+        // steps, so during a spec-winning streak it holds its last warm value
+        // (can't drift high to mask a loss); a real degradation re-floors and
+        // refreshes it. Add periodic recal only if AR-baseline thermal drift
+        // during long spec streaks ever proves to matter.
+        const T_AR_CALIB: u32 = 3;
+        let mut calibrated = false;
 
         loop {
             let round_t0 = std::time::Instant::now();
             if gate && in_ar {
-                // AR floor: plain S=1 decode (byte-exact). Measures T_ar live and
-                // produces the taps the drafter needs if we re-enter spec.
+                // AR floor: plain S=1 decode (byte-exact). Measures T_ar live.
+                //
+                // Taps are only consumed by the drafter when we re-enter spec next
+                // round, i.e. on the step that hands control back ("leaving"): the
+                // end of the initial calibration window, or a probe cooldown. Use
+                // the optimized tap-less `forward` for every other floored step.
+                // The two paths share `forward_raw_hidden` (identical layer loop,
+                // mask, and KV/GDN cache mutation) and the same `project_logits`,
+                // so logits + cache are byte-identical; the only thing dropped is a
+                // tap clone the next floored step would overwrite unused.
+                let calibrating = !calibrated;
+                let window = if calibrating { T_AR_CALIB } else { probe_every };
+                let leaving = ar_run + 1 >= window;
+                let need_taps = leaving;
                 let single = Array::from_slice(&[last_token], &[1, 1]);
-                let (ar_logits, ar_taps) = model
-                    .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
-                    .map_err(EngineError::Mlx)?;
+                let ar_logits = if need_taps {
+                    let (logits, ar_taps) = model
+                        .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
+                        .map_err(EngineError::Mlx)?;
+                    current_taps = ar_taps;
+                    logits
+                } else {
+                    model
+                        .forward(&single, None, &mut cache)
+                        .map_err(EngineError::Mlx)?
+                };
                 let ar_next =
                     sample(&ar_logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
                 eval([&ar_next]).map_err(EngineError::Mlx)?;
                 let dt = round_t0.elapsed().as_secs_f64();
-                let was_none = t_ar_ema.is_none();
-                t_ar_ema = Some(t_ar_ema.map_or(dt, |e| 0.7f64.mul_add(e, 0.3 * dt)));
-                current_taps = ar_taps;
+                // Skip the kernel-cold first decode (ar_run == 0 of the initial
+                // calibration window); every later floored step is warm.
+                if !(calibrating && ar_run == 0) {
+                    t_ar_ema = Some(t_ar_ema.map_or(dt, |e| 0.7f64.mul_add(e, 0.3 * dt)));
+                }
                 let ar_id: u32 = ar_next.item();
                 tokens.push(ar_id);
                 last_token = i32::try_from(ar_id)
                     .map_err(|_| EngineError::Generation("ar token overflow".to_owned()))?;
                 start += 1;
                 ar_run += 1;
-                // Leave AR after the initial T_ar calibration, or after a probe
-                // cooldown to re-test whether spec has become worthwhile again.
-                if was_none || ar_run >= AR_PROBE_EVERY {
+                // Hand back to spec once the warm calibration window completes, or
+                // after a probe cooldown re-tests whether spec is worthwhile again.
+                if leaving {
                     in_ar = false;
                     ar_run = 0;
+                    calibrated = true;
                 }
             } else {
                 // a. Build block: [anchor, mask, mask, ...]
@@ -1714,13 +1761,34 @@ impl SimpleEngine {
                     if let Some(t_ar) = t_ar_ema {
                         let ratio = f64::from(n_accepted) * t_ar / step_wall;
                         ratio_ema = 0.6f64.mul_add(ratio_ema, 0.4 * ratio);
+                        if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && rounds <= 8 {
+                            tracing::info!(
+                                round = rounds,
+                                n_accepted,
+                                t_ar_ms = format!("{:.1}", t_ar * 1e3),
+                                step_wall_ms = format!("{:.1}", step_wall * 1e3),
+                                ratio = format!("{ratio:.2}"),
+                                ratio_ema = format!("{ratio_ema:.2}"),
+                                "GATE"
+                            );
+                        }
                         if ratio_ema < 1.0 {
+                            // Losing probe: floor and back off so the next probe
+                            // amortizes over a longer AR run (sustained prose).
                             in_ar = true;
                             ar_run = 0;
+                            probe_every = probe_every.saturating_mul(2).min(AR_PROBE_MAX);
+                        } else {
+                            // Winning: stay in spec, but reset the cadence so a
+                            // later degradation is re-probed promptly, not lazily.
+                            probe_every = AR_PROBE_BASE;
                         }
                     } else {
+                        // No T_ar sample yet (initial calibration) — floor at base
+                        // cadence; this isn't a losing probe, so don't back off.
                         in_ar = true;
                         ar_run = 0;
+                        probe_every = AR_PROBE_BASE;
                     }
                 }
             } // end spec-round branch
@@ -1778,6 +1846,8 @@ impl SimpleEngine {
                 tracing::info!(
                     tokens = tokens.len(),
                     accept_len = format!("{accept_len:.2}"),
+                    spec_rounds = rounds,
+                    probe_every = probe_every,
                     tok_per_sec = format!("{tok_per_sec:.1}"),
                     "DFlash generation complete (length limit)"
                 );
@@ -3492,6 +3562,89 @@ mod tests {
         assert!(
             long.starts_with(short),
             "DFlash diverged from AR greedy:\n AR={ar_text:?}\n DF={df_text:?}"
+        );
+    }
+
+    /// Isolates the per-step cost the gate's AR floor pays for taps. Floored
+    /// steps now call `forward` (tap-less) instead of `forward_with_taps`; this
+    /// interleaves the two over many single-token decodes so thermal drift
+    /// averages out (the end-to-end ratio is hopelessly thermally confounded on
+    /// this serial-load harness) and prints mean µs/token for each. If the delta
+    /// is ~0 the tap clones are lazy/dropped and the fast-decode path is a no-op;
+    /// a real delta is the prose-parity win. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "p5: loads real 35B target; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn dflash_floor_tapless_vs_taps_per_step_cost() {
+        use super::{SimpleEngine, lock_or_recover};
+        use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
+        use higgs_models::turboquant::KvCacheConfig;
+        use mlx_rs::{Array, ops::indexing::IndexOp, transforms::eval};
+
+        let Ok(target) = std::env::var("HIGGS_DFLASH_TARGET_DIR") else {
+            eprintln!("skip: set HIGGS_DFLASH_TARGET_DIR");
+            return;
+        };
+        let drafter =
+            std::env::var("HIGGS_DFLASH_DRAFTER_DIR").expect("set HIGGS_DFLASH_DRAFTER_DIR");
+        let tuning =
+            MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
+        let engine = SimpleEngine::load_with_dflash(
+            &target,
+            KvCacheConfig::default(),
+            tuning,
+            false,
+            Some(Path::new(&drafter)),
+        )
+        .expect("load target + drafter");
+        let tap_layers = engine.dflash.as_ref().expect("dflash").tap_layers.clone();
+        let cfg = engine.kv_cache_config;
+        let mut model = lock_or_recover(&engine.model);
+        let mut cache = model.make_cache_with_config(cfg).expect("cache");
+
+        // Prefill so decode steps run at a realistic cache offset.
+        let prompt: Vec<i32> = (1..=32).collect();
+        let parr = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
+        let (logits, _t) = model
+            .forward_with_taps(&parr, None, &mut cache, &tap_layers)
+            .expect("prefill");
+        let am = mlx_rs::argmax_axis!(logits.index((.., -1, ..)), -1).expect("argmax");
+        eval([&am]).expect("eval");
+        let mut next: i32 = i32::try_from(am.item::<u32>()).expect("tok");
+
+        let (warm, iters) = (8u32, 160u32);
+        let (mut t_taps, mut n_taps, mut t_plain, mut n_plain) = (0f64, 0u32, 0f64, 0u32);
+        for i in 0..(warm + iters) {
+            let single = Array::from_slice(&[next], &[1, 1]);
+            let use_taps = i % 2 == 0;
+            let start = std::time::Instant::now();
+            let logits = if use_taps {
+                model
+                    .forward_with_taps(&single, None, &mut cache, &tap_layers)
+                    .expect("taps")
+                    .0
+            } else {
+                model.forward(&single, None, &mut cache).expect("plain")
+            };
+            let am = mlx_rs::argmax_axis!(logits.index((.., -1, ..)), -1).expect("argmax");
+            eval([&am]).expect("eval");
+            let dt = start.elapsed().as_secs_f64();
+            next = i32::try_from(am.item::<u32>()).expect("tok");
+            if i >= warm {
+                if use_taps {
+                    t_taps += dt;
+                    n_taps += 1;
+                } else {
+                    t_plain += dt;
+                    n_plain += 1;
+                }
+            }
+        }
+        let us_taps = t_taps / f64::from(n_taps) * 1e6;
+        let us_plain = t_plain / f64::from(n_plain) * 1e6;
+        eprintln!(
+            "floor step cost: forward_with_taps {us_taps:.0} µs/tok | forward(tap-less) {us_plain:.0} µs/tok | taps overhead {:.1}% ({n_taps} taps / {n_plain} plain)",
+            (us_taps - us_plain) / us_taps * 100.0
         );
     }
 
