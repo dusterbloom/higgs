@@ -45,6 +45,10 @@ pub struct DFlashConfig {
     #[serde(default = "default_block_size")]
     pub block_size: i32,
     pub vocab_size: i32,
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub sliding_window: Option<i32>,
     dflash_config: DFlashSubConfig,
 }
 
@@ -146,14 +150,22 @@ struct DFlashAttention {
     num_key_value_heads: i32,
     head_dim: i32,
     scale: f32,
+    is_sliding: bool,
+    sliding_window: i32,
 }
 
 impl DFlashAttention {
-    fn new(config: &DFlashConfig) -> Result<Self, Exception> {
+    fn new(config: &DFlashConfig, layer_idx: usize) -> Result<Self, Exception> {
         let head_dim = config.head_dim;
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
         let hidden = config.hidden_size;
+        let is_sliding = config
+            .layer_types
+            .as_ref()
+            .and_then(|lt| lt.get(layer_idx))
+            .is_some_and(|t| t == "sliding_attention");
+        let sliding_window = config.sliding_window.unwrap_or(0);
 
         Ok(Self {
             q_proj: nn::LinearBuilder::new(hidden, n_heads * head_dim)
@@ -189,6 +201,8 @@ impl DFlashAttention {
             )
             .sqrt()
             .recip(),
+            is_sliding,
+            sliding_window,
         })
     }
 
@@ -207,6 +221,8 @@ impl DFlashAttention {
         cache: &mut Option<(Array, Array)>,
         cache_offset: i32,
     ) -> Result<Array, Exception> {
+        use mlx_rs::ops::indexing::IndexOp;
+
         let B = *noise
             .shape()
             .first()
@@ -261,6 +277,21 @@ impl DFlashAttention {
         } else {
             (ctx_k, ctx_v)
         };
+        let (ctx_k, ctx_v) = if self.is_sliding && self.sliding_window > 1 {
+            let keep = self.sliding_window - 1;
+            let len = ctx_k.shape().get(2).copied().unwrap_or(0);
+            if len > keep {
+                let skip = len - keep;
+                (
+                    ctx_k.index((.., .., skip.., ..)),
+                    ctx_v.index((.., .., skip.., ..)),
+                )
+            } else {
+                (ctx_k, ctx_v)
+            }
+        } else {
+            (ctx_k, ctx_v)
+        };
         *cache = Some((ctx_k.clone(), ctx_v.clone()));
 
         // Attention over cached_context + fresh_noise
@@ -301,9 +332,9 @@ struct DFlashDecoderLayer {
 }
 
 impl DFlashDecoderLayer {
-    fn new(config: &DFlashConfig) -> Result<Self, Exception> {
+    fn new(config: &DFlashConfig, layer_idx: usize) -> Result<Self, Exception> {
         Ok(Self {
-            self_attn: DFlashAttention::new(config)?,
+            self_attn: DFlashAttention::new(config, layer_idx)?,
             mlp: DFlashMLP::new(config.hidden_size, config.intermediate_size)?,
             input_layernorm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
@@ -359,7 +390,7 @@ impl DFlashDrafter {
             .map_err(|e| Exception::custom(format!("num_taps too large for i32: {e}")))?
             * config.hidden_size;
         let layers = (0..config.num_hidden_layers)
-            .map(|_| DFlashDecoderLayer::new(&config))
+            .map(|i| DFlashDecoderLayer::new(&config, usize::try_from(i).unwrap_or(0)))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
@@ -406,11 +437,12 @@ impl DFlashDrafter {
             )));
         }
 
-        // Cache offset = current cached seq length (0 on first round)
+        // Cache offset = max cached seq length (0 on first round)
         let cache_offset = cache
-            .first()
-            .and_then(|c| c.as_ref())
-            .and_then(|(k, _)| k.shape().get(2).copied())
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .filter_map(|(k, _)| k.shape().get(2).copied())
+            .max()
             .unwrap_or(0);
 
         // Concatenate tap hidden states: [B, T, num_taps * hidden_size]
@@ -627,6 +659,68 @@ mod tests {
         let draft = vec![1, 2, 3];
         let verify = vec![1, 2]; // wrong length
         let _ = accept_prefix(&draft, &verify);
+    }
+
+    /// Sliding-window eviction: a tiny random drafter with layer 0 = sliding
+    /// (window 4) and layer 1 = full. Driving several rounds must cap the
+    /// sliding layer's context KV at `sliding_window - 1` while the full layer
+    /// accumulates all context — and the rope offset (max cache length across
+    /// layers) must keep advancing absolutely. No weights needed.
+    #[test]
+    fn sliding_layer_cache_caps_while_full_layer_grows() {
+        use super::{DFlashConfig, DFlashDrafter, DFlashSubConfig};
+        use mlx_rs::Array;
+
+        let hidden = 8i32;
+        let config = DFlashConfig {
+            hidden_size: hidden,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: 16,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1e7,
+            block_size: 4,
+            vocab_size: 32,
+            layer_types: Some(vec![
+                "sliding_attention".to_owned(),
+                "full_attention".to_owned(),
+            ]),
+            sliding_window: Some(4),
+            dflash_config: DFlashSubConfig {
+                target_layer_ids: vec![0],
+                mask_token_id: Some(1),
+            },
+        };
+        let mut drafter = DFlashDrafter::new(config).unwrap();
+        let mut cache = drafter.make_cache();
+
+        let ctx_len = 2i32; // context positions added per round
+        let rounds = 6;
+        let zeros = |t: i32| Array::from_slice(&vec![0f32; (t * hidden) as usize], &[1, t, hidden]);
+        for _ in 0..rounds {
+            let taps = vec![zeros(ctx_len)]; // num_taps = 1
+            let noise = zeros(4); // block_size noise positions
+            drafter.forward(&noise, &taps, &mut cache).unwrap();
+        }
+
+        let sliding_len = cache[0].as_ref().unwrap().0.shape()[2];
+        let full_len = cache[1].as_ref().unwrap().0.shape()[2];
+        assert!(
+            sliding_len <= 3,
+            "sliding cache must cap at window-1=3, got {sliding_len}"
+        );
+        assert_eq!(
+            full_len,
+            ctx_len * rounds,
+            "full-attn cache must accumulate all {} context positions, got {full_len}",
+            ctx_len * rounds
+        );
+        assert!(
+            full_len > sliding_len,
+            "eviction must make the sliding cache shorter than the full one"
+        );
     }
 
     /// The "drop-in drafter, no MLX port" claim: the config-driven loader must
