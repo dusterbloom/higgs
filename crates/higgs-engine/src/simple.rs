@@ -3648,6 +3648,155 @@ mod tests {
         );
     }
 
+    /// Localizes the pre-existing DFlash-vs-greedy prose divergence. The spec
+    /// round commits exactly the verify forward's per-position argmax
+    /// (`accept_prefix` is textbook-correct), so any divergence from AR greedy is
+    /// `verify_argmax[j] != ar_argmax[j]` — the S>1 batched verify flips an
+    /// argmax vs S=1 sequential AR. The GDN tape makes the SSM layers bit-exact,
+    /// but the full-attention layers run batched in verify and drift on near-ties.
+    /// Feeds the AR-correct tokens through the real verify path and reports which
+    /// positions flip + the top-2 logit gap there (small gap == near-tie ==
+    /// numerical, not a logic bug). Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "p5: loads real 35B target; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn dflash_verify_vs_ar_argmax_divergence() {
+        use super::{SimpleEngine, lock_or_recover};
+        use crate::chat_template::ChatMessage;
+        use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
+        use higgs_models::turboquant::KvCacheConfig;
+        use mlx_rs::{Array, Dtype, ops::indexing::IndexOp, transforms::eval};
+
+        let Ok(target) = std::env::var("HIGGS_DFLASH_TARGET_DIR") else {
+            eprintln!("skip: set HIGGS_DFLASH_TARGET_DIR");
+            return;
+        };
+        let drafter =
+            std::env::var("HIGGS_DFLASH_DRAFTER_DIR").expect("set HIGGS_DFLASH_DRAFTER_DIR");
+        let tuning =
+            MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
+        let engine = SimpleEngine::load_with_dflash(
+            &target,
+            KvCacheConfig::default(),
+            tuning,
+            false,
+            Some(Path::new(&drafter)),
+        )
+        .expect("load target + drafter");
+
+        let prompt = std::env::var("HIGGS_TEST_PROMPT").unwrap_or_else(|_| {
+            "Write several paragraphs about the history and cultural significance of tea across different civilizations.".to_owned()
+        });
+        let messages = [ChatMessage {
+            role: "user".to_owned(),
+            content: prompt,
+            tool_calls: None,
+        }];
+        let prompt_ids = engine
+            .prepare_chat_prompt_with_thinking(&messages, None, false)
+            .expect("chat prompt");
+        let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
+
+        let tap_layers = engine.dflash.as_ref().expect("dflash").tap_layers.clone();
+        let cfg = engine.kv_cache_config;
+        let mut model = lock_or_recover(&engine.model);
+
+        // top-1 token + (top1 - top2) logit gap from a [.., 1, vocab] tensor.
+        let argmax_gap = |logits: &Array| -> (u32, f32) {
+            let row = logits
+                .index((.., -1, ..))
+                .reshape(&[-1])
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap();
+            eval([&row]).unwrap();
+            let h: Vec<f32> = row.as_slice::<f32>().to_vec();
+            let (mut i1, mut v1) = (0usize, f32::MIN);
+            for (i, &v) in h.iter().enumerate() {
+                if v > v1 {
+                    v1 = v;
+                    i1 = i;
+                }
+            }
+            let mut v2 = f32::MIN;
+            for (i, &v) in h.iter().enumerate() {
+                if i != i1 && v > v2 {
+                    v2 = v;
+                }
+            }
+            (i1 as u32, v1 - v2)
+        };
+
+        let k = 48usize;
+        let parr = Array::from_slice(&prompt_i32, &[1, prompt_i32.len() as i32]);
+
+        // Ground-truth sequential AR greedy: ar_seq[0..=k]; ar_gap[i] is the
+        // top-2 gap of the forward that predicts ar_seq[i+1].
+        let mut cache_ar = model.make_cache_with_config(cfg).expect("cache");
+        let l0 = model
+            .forward(&parr, None, &mut cache_ar)
+            .expect("prefill ar");
+        let (mut tok, _g0) = argmax_gap(&l0);
+        let mut ar_seq = vec![tok];
+        let mut ar_gap = Vec::with_capacity(k);
+        for _ in 0..k {
+            let single = Array::from_slice(&[tok as i32], &[1, 1]);
+            let l = model
+                .forward(&single, None, &mut cache_ar)
+                .expect("ar step");
+            let (t, g) = argmax_gap(&l);
+            ar_seq.push(t);
+            ar_gap.push(g);
+            tok = t;
+        }
+
+        // Verify path on a fresh cache: prefill the prompt, then ONE batched
+        // verify forward over the AR-correct tokens (anchor + ar_seq[0..k-1]),
+        // exactly as a fully-accepted spec round would see them.
+        let mut cache_v = model.make_cache_with_config(cfg).expect("cache");
+        let _ = model.forward(&parr, None, &mut cache_v).expect("prefill v");
+        let verify_in: Vec<i32> = ar_seq[..k].iter().map(|&u| u as i32).collect();
+        let vin = Array::from_slice(&verify_in, &[1, k as i32]);
+        let (vlogits, _taps, _tapes) = model
+            .forward_with_taps_tape(&vin, None, &mut cache_v, &tap_layers)
+            .expect("verify");
+        let vargmax = mlx_rs::argmax_axis!(vlogits, -1).expect("argmax");
+        eval([&vargmax]).expect("eval");
+        let vflat: Vec<u32> = vargmax
+            .reshape(&[-1])
+            .expect("reshape")
+            .as_slice::<u32>()
+            .to_vec();
+
+        // verify position i predicts the token after ar_seq[i] -> compare ar_seq[i+1].
+        let mut nmis = 0u32;
+        let mut first = None;
+        let (mut min_gap_mis, mut min_gap_match) = (f32::MAX, f32::MAX);
+        for i in 0..k {
+            let ar_next = ar_seq[i + 1];
+            if vflat[i] == ar_next {
+                min_gap_match = min_gap_match.min(ar_gap[i]);
+            } else {
+                nmis += 1;
+                if first.is_none() {
+                    first = Some(i);
+                }
+                min_gap_mis = min_gap_mis.min(ar_gap[i]);
+                eprintln!(
+                    "MISMATCH pos {i}: verify={} ar={ar_next} ar_top2_gap={:.4}",
+                    vflat[i], ar_gap[i]
+                );
+            }
+        }
+        eprintln!(
+            "verify-vs-AR over {k} positions: {nmis} mismatches, first at {first:?}; min top2-gap at mismatch={min_gap_mis:.4} vs match={min_gap_match:.4}"
+        );
+    }
+
     /// Gemma chat models stop on `<end_of_turn>`, which their `config.json` often
     /// omits from `eos_token_id`. It must be resolved from the tokenizer and added.
     #[test]
