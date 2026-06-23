@@ -1543,7 +1543,7 @@ impl SimpleEngine {
         // high-entropy region every probe is a wasted slow spec round (~4
         // decode-units for ~1-2 tokens), so a fixed cadence taxed the floor by
         // ~probe_cost/cadence (≈11% at 32 — the measured 0.89× prose gap; the
-        // per-step taps were free, see dflash_floor_tapless_vs_taps_per_step_cost).
+        // per-step taps were measured free, ~0% — they are lazy clones).
         // Each losing probe doubles the interval (amortizing the cost toward 0 on
         // sustained prose); a winning probe resets to base so a regime shift back
         // to spec-friendly text is caught within `AR_PROBE_BASE` tokens.
@@ -1654,12 +1654,6 @@ impl SimpleEngine {
                         // cooled over one AR step). need_taps was true, so
                         // current_taps is fresh for the next draft.
                         recal = false;
-                        if std::env::var("HIGGS_DFLASH_TRACE").is_ok() {
-                            tracing::info!(
-                                t_ar_ms = format!("{:.1}", t_ar_ema.unwrap_or(0.0) * 1e3),
-                                "GATE t_ar recal"
-                            );
-                        }
                     } else {
                         // Grant the fresh spec burst its cold-start grace and
                         // re-seed the EMA to the optimistic prior. Re-seeding (not
@@ -1816,15 +1810,6 @@ impl SimpleEngine {
                         // cold-cache accept. The kernels warm and the drafter
                         // cache fills over these rounds.
                         spec_warmup_left -= 1;
-                        if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && rounds <= 8 {
-                            tracing::info!(
-                                round = rounds,
-                                n_accepted,
-                                step_wall_ms = format!("{:.1}", step_wall * 1e3),
-                                warmup_left = spec_warmup_left,
-                                "GATE warmup (discarded)"
-                            );
-                        }
                     } else if let Some(t_ar) = t_ar_ema {
                         let ratio = f64::from(n_accepted) * t_ar / step_wall;
                         ratio_ema = 0.6f64.mul_add(ratio_ema, 0.4 * ratio);
@@ -3642,238 +3627,6 @@ mod tests {
         assert!(
             long.starts_with(short),
             "DFlash diverged from AR greedy:\n AR={ar_text:?}\n DF={df_text:?}"
-        );
-    }
-
-    /// Isolates the per-step cost the gate's AR floor pays for taps. Floored
-    /// steps now call `forward` (tap-less) instead of `forward_with_taps`; this
-    /// interleaves the two over many single-token decodes so thermal drift
-    /// averages out (the end-to-end ratio is hopelessly thermally confounded on
-    /// this serial-load harness) and prints mean µs/token for each. If the delta
-    /// is ~0 the tap clones are lazy/dropped and the fast-decode path is a no-op;
-    /// a real delta is the prose-parity win. Run with `--ignored --nocapture`.
-    #[test]
-    #[ignore = "p5: loads real 35B target; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-    fn dflash_floor_tapless_vs_taps_per_step_cost() {
-        use super::{SimpleEngine, lock_or_recover};
-        use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
-        use higgs_models::turboquant::KvCacheConfig;
-        use mlx_rs::{Array, ops::indexing::IndexOp, transforms::eval};
-
-        let Ok(target) = std::env::var("HIGGS_DFLASH_TARGET_DIR") else {
-            eprintln!("skip: set HIGGS_DFLASH_TARGET_DIR");
-            return;
-        };
-        let drafter =
-            std::env::var("HIGGS_DFLASH_DRAFTER_DIR").expect("set HIGGS_DFLASH_DRAFTER_DIR");
-        let tuning =
-            MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
-        let engine = SimpleEngine::load_with_dflash(
-            &target,
-            KvCacheConfig::default(),
-            tuning,
-            false,
-            Some(Path::new(&drafter)),
-        )
-        .expect("load target + drafter");
-        let tap_layers = engine.dflash.as_ref().expect("dflash").tap_layers.clone();
-        let cfg = engine.kv_cache_config;
-        let mut model = lock_or_recover(&engine.model);
-        let mut cache = model.make_cache_with_config(cfg).expect("cache");
-
-        // Prefill so decode steps run at a realistic cache offset.
-        let prompt: Vec<i32> = (1..=32).collect();
-        let parr = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
-        let (logits, _t) = model
-            .forward_with_taps(&parr, None, &mut cache, &tap_layers)
-            .expect("prefill");
-        let am = mlx_rs::argmax_axis!(logits.index((.., -1, ..)), -1).expect("argmax");
-        eval([&am]).expect("eval");
-        let mut next: i32 = i32::try_from(am.item::<u32>()).expect("tok");
-
-        let (warm, iters) = (8u32, 160u32);
-        let (mut t_taps, mut n_taps, mut t_plain, mut n_plain) = (0f64, 0u32, 0f64, 0u32);
-        for i in 0..(warm + iters) {
-            let single = Array::from_slice(&[next], &[1, 1]);
-            let use_taps = i % 2 == 0;
-            let start = std::time::Instant::now();
-            let logits = if use_taps {
-                model
-                    .forward_with_taps(&single, None, &mut cache, &tap_layers)
-                    .expect("taps")
-                    .0
-            } else {
-                model.forward(&single, None, &mut cache).expect("plain")
-            };
-            let am = mlx_rs::argmax_axis!(logits.index((.., -1, ..)), -1).expect("argmax");
-            eval([&am]).expect("eval");
-            let dt = start.elapsed().as_secs_f64();
-            next = i32::try_from(am.item::<u32>()).expect("tok");
-            if i >= warm {
-                if use_taps {
-                    t_taps += dt;
-                    n_taps += 1;
-                } else {
-                    t_plain += dt;
-                    n_plain += 1;
-                }
-            }
-        }
-        let us_taps = t_taps / f64::from(n_taps) * 1e6;
-        let us_plain = t_plain / f64::from(n_plain) * 1e6;
-        eprintln!(
-            "floor step cost: forward_with_taps {us_taps:.0} µs/tok | forward(tap-less) {us_plain:.0} µs/tok | taps overhead {:.1}% ({n_taps} taps / {n_plain} plain)",
-            (us_taps - us_plain) / us_taps * 100.0
-        );
-    }
-
-    /// Localizes the pre-existing DFlash-vs-greedy prose divergence. The spec
-    /// round commits exactly the verify forward's per-position argmax
-    /// (`accept_prefix` is textbook-correct), so any divergence from AR greedy is
-    /// `verify_argmax[j] != ar_argmax[j]` — the S>1 batched verify flips an
-    /// argmax vs S=1 sequential AR. The GDN tape makes the SSM layers bit-exact,
-    /// but the full-attention layers run batched in verify and drift on near-ties.
-    /// Feeds the AR-correct tokens through the real verify path and reports which
-    /// positions flip + the top-2 logit gap there (small gap == near-tie ==
-    /// numerical, not a logic bug). Run with `--ignored --nocapture`.
-    #[test]
-    #[ignore = "p5: loads real 35B target; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    fn dflash_verify_vs_ar_argmax_divergence() {
-        use super::{SimpleEngine, lock_or_recover};
-        use crate::chat_template::ChatMessage;
-        use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
-        use higgs_models::turboquant::KvCacheConfig;
-        use mlx_rs::{Array, Dtype, ops::indexing::IndexOp, transforms::eval};
-
-        let Ok(target) = std::env::var("HIGGS_DFLASH_TARGET_DIR") else {
-            eprintln!("skip: set HIGGS_DFLASH_TARGET_DIR");
-            return;
-        };
-        let drafter =
-            std::env::var("HIGGS_DFLASH_DRAFTER_DIR").expect("set HIGGS_DFLASH_DRAFTER_DIR");
-        let tuning =
-            MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
-        let engine = SimpleEngine::load_with_dflash(
-            &target,
-            KvCacheConfig::default(),
-            tuning,
-            false,
-            Some(Path::new(&drafter)),
-        )
-        .expect("load target + drafter");
-
-        let prompt = std::env::var("HIGGS_TEST_PROMPT").unwrap_or_else(|_| {
-            "Write several paragraphs about the history and cultural significance of tea across different civilizations.".to_owned()
-        });
-        let messages = [ChatMessage {
-            role: "user".to_owned(),
-            content: prompt,
-            tool_calls: None,
-        }];
-        let prompt_ids = engine
-            .prepare_chat_prompt_with_thinking(&messages, None, false)
-            .expect("chat prompt");
-        let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
-
-        let tap_layers = engine.dflash.as_ref().expect("dflash").tap_layers.clone();
-        let cfg = engine.kv_cache_config;
-        let mut model = lock_or_recover(&engine.model);
-
-        // top-1 token + (top1 - top2) logit gap from a [.., 1, vocab] tensor.
-        let argmax_gap = |logits: &Array| -> (u32, f32) {
-            let row = logits
-                .index((.., -1, ..))
-                .reshape(&[-1])
-                .unwrap()
-                .as_dtype(Dtype::Float32)
-                .unwrap();
-            eval([&row]).unwrap();
-            let h: Vec<f32> = row.as_slice::<f32>().to_vec();
-            let (mut i1, mut v1) = (0usize, f32::MIN);
-            for (i, &v) in h.iter().enumerate() {
-                if v > v1 {
-                    v1 = v;
-                    i1 = i;
-                }
-            }
-            let mut v2 = f32::MIN;
-            for (i, &v) in h.iter().enumerate() {
-                if i != i1 && v > v2 {
-                    v2 = v;
-                }
-            }
-            (i1 as u32, v1 - v2)
-        };
-
-        let k = 48usize;
-        let parr = Array::from_slice(&prompt_i32, &[1, prompt_i32.len() as i32]);
-
-        // Ground-truth sequential AR greedy: ar_seq[0..=k]; ar_gap[i] is the
-        // top-2 gap of the forward that predicts ar_seq[i+1].
-        let mut cache_ar = model.make_cache_with_config(cfg).expect("cache");
-        let l0 = model
-            .forward(&parr, None, &mut cache_ar)
-            .expect("prefill ar");
-        let (mut tok, _g0) = argmax_gap(&l0);
-        let mut ar_seq = vec![tok];
-        let mut ar_gap = Vec::with_capacity(k);
-        for _ in 0..k {
-            let single = Array::from_slice(&[tok as i32], &[1, 1]);
-            let l = model
-                .forward(&single, None, &mut cache_ar)
-                .expect("ar step");
-            let (t, g) = argmax_gap(&l);
-            ar_seq.push(t);
-            ar_gap.push(g);
-            tok = t;
-        }
-
-        // Verify path on a fresh cache: prefill the prompt, then ONE batched
-        // verify forward over the AR-correct tokens (anchor + ar_seq[0..k-1]),
-        // exactly as a fully-accepted spec round would see them.
-        let mut cache_v = model.make_cache_with_config(cfg).expect("cache");
-        let _ = model.forward(&parr, None, &mut cache_v).expect("prefill v");
-        let verify_in: Vec<i32> = ar_seq[..k].iter().map(|&u| u as i32).collect();
-        let vin = Array::from_slice(&verify_in, &[1, k as i32]);
-        let (vlogits, _taps, _tapes) = model
-            .forward_with_taps_tape(&vin, None, &mut cache_v, &tap_layers)
-            .expect("verify");
-        let vargmax = mlx_rs::argmax_axis!(vlogits, -1).expect("argmax");
-        eval([&vargmax]).expect("eval");
-        let vflat: Vec<u32> = vargmax
-            .reshape(&[-1])
-            .expect("reshape")
-            .as_slice::<u32>()
-            .to_vec();
-
-        // verify position i predicts the token after ar_seq[i] -> compare ar_seq[i+1].
-        let mut nmis = 0u32;
-        let mut first = None;
-        let (mut min_gap_mis, mut min_gap_match) = (f32::MAX, f32::MAX);
-        for i in 0..k {
-            let ar_next = ar_seq[i + 1];
-            if vflat[i] == ar_next {
-                min_gap_match = min_gap_match.min(ar_gap[i]);
-            } else {
-                nmis += 1;
-                if first.is_none() {
-                    first = Some(i);
-                }
-                min_gap_mis = min_gap_mis.min(ar_gap[i]);
-                eprintln!(
-                    "MISMATCH pos {i}: verify={} ar={ar_next} ar_top2_gap={:.4}",
-                    vflat[i], ar_gap[i]
-                );
-            }
-        }
-        eprintln!(
-            "verify-vs-AR over {k} positions: {nmis} mismatches, first at {first:?}; min top2-gap at mismatch={min_gap_mis:.4} vs match={min_gap_match:.4}"
         );
     }
 
