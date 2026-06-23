@@ -12,7 +12,12 @@ use std::ffi::CStr;
 use mlx_rs::{Array, Stream, error::Exception};
 
 /// Quantization format for a packed weight tensor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `serde` deserialises from the lowercase strings MLX stores in `config.json`
+/// (`"affine"`, `"mxfp4"`). Missing / unknown values fall back to `Affine`
+/// via [`QuantMode::default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum QuantMode {
     /// Per-group affine: `w_q * scale + bias`.
     #[default]
