@@ -276,6 +276,7 @@ pub struct SimpleEngine {
     /// Optional `DFlash` block-diffusion speculative decoding state, enabled
     /// when `HIGGS_DFLASH_PATH` points at a drafter checkpoint.
     dflash: Option<DFlashState>,
+    last_dflash_accepts: std::sync::Mutex<Vec<u32>>,
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
@@ -519,6 +520,7 @@ impl SimpleEngine {
             kv_cache_config,
             tuning,
             dflash,
+            last_dflash_accepts: Mutex::new(Vec::new()),
         })
     }
 
@@ -540,6 +542,13 @@ impl SimpleEngine {
     /// Whether the engine has thinking mode enabled.
     pub const fn enable_thinking(&self) -> bool {
         self.enable_thinking
+    }
+
+    pub fn last_dflash_accepts(&self) -> Vec<u32> {
+        self.last_dflash_accepts
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
 
     /// Apply chat template and tokenize messages with explicit thinking control.
@@ -1453,6 +1462,9 @@ impl SimpleEngine {
             .ok_or_else(|| EngineError::Generation("DFlash state missing".to_owned()))?;
         let prompt_len = Self::prompt_len(prompt_tokens)?;
         let has_stop_sequences = !stop_sequences.is_empty();
+        if let Ok(mut v) = self.last_dflash_accepts.lock() {
+            v.clear();
+        }
 
         let mut model = lock_or_recover(&self.model);
         let mut drafter = lock_or_recover(&dflash.drafter);
@@ -1736,6 +1748,9 @@ impl SimpleEngine {
                     .as_slice::<u32>()
                     .to_vec();
                 let accepted = accept_prefix(&draft_u32, &verify_flat);
+                if let Ok(mut v) = self.last_dflash_accepts.lock() {
+                    v.push(u32::try_from(accepted.len()).unwrap_or(0));
+                }
                 let n_accepted = i32::try_from(accepted.len())
                     .map_err(|_| EngineError::Generation("n_accepted overflow".to_owned()))?;
                 rounds += 1;
@@ -3507,9 +3522,16 @@ fn chat_template_mentions_enable_thinking(model_dir: &Path) -> bool {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        IncrementalDetok, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
-        derive_model_name, detect_thinking_support, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, parse_enabled_flag,
+        IncrementalDetok, SimpleEngine, Tokenizer, adaptive_draft_depth_for_cap,
+        check_stop_sequences, derive_model_name, detect_thinking_support, estimate_paged_kv_blocks,
+        extract_eos_tokens, find_stop_in_tail, lock_or_recover, parse_enabled_flag,
+    };
+    use crate::chat_template::ChatMessage;
+    use higgs_models::SamplingParams;
+    use mlx_rs::{
+        Array, Dtype,
+        ops::indexing::{IndexOp, NewAxis},
+        transforms::eval,
     };
     use std::path::Path;
 
@@ -3628,6 +3650,414 @@ mod tests {
             long.starts_with(short),
             "DFlash diverged from AR greedy:\n AR={ar_text:?}\n DF={df_text:?}"
         );
+    }
+
+    struct DFlashArMetrics {
+        h_bits: f64,
+        top1_prob: f64,
+        tokens: Vec<u32>,
+        text: String,
+    }
+
+    struct DFlashRunMetrics {
+        text: String,
+        accept_mean: f64,
+        p10: u32,
+        p50: u32,
+        p90: u32,
+        accept_frac: f64,
+    }
+
+    struct DFlashSweepRow {
+        task: String,
+        h_bits: f64,
+        top1_prob: f64,
+        accept_mean: f64,
+        p10: u32,
+        p50: u32,
+        p90: u32,
+        accept_frac: f64,
+        byte_exact: bool,
+    }
+
+    #[allow(unsafe_code)]
+    fn dflash_set_test_env(key: &str, value: &str) {
+        // SAFETY: This ignored manual harness mutates DFlash env knobs before
+        // model loading/generation and is intended to be run alone.
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    fn dflash_set_fixed_block_env(block_size: u32) {
+        dflash_set_test_env("HIGGS_DFLASH_GATE", "0");
+        dflash_set_test_env("HIGGS_DFLASH_ADAPTIVE", "0");
+        dflash_set_test_env("HIGGS_DFLASH_BLOCK_SIZE", &block_size.to_string());
+    }
+
+    fn dflash_chat_tokens(engine: &SimpleEngine, prompt: &str) -> Vec<u32> {
+        let messages = [ChatMessage {
+            role: "user".to_owned(),
+            content: prompt.to_owned(),
+            tool_calls: None,
+        }];
+        engine
+            .prepare_chat_prompt_with_thinking(&messages, None, false)
+            .expect("chat prompt")
+    }
+
+    fn dflash_entropy_and_top1(row: &[f32]) -> (u32, f64, f64) {
+        assert!(!row.is_empty(), "empty logits row");
+        let mut ranked: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let max_logit = f64::from(ranked[0].1);
+        let denom = row
+            .iter()
+            .map(|&v| (f64::from(v) - max_logit).exp())
+            .sum::<f64>();
+        let denom = denom.max(f64::MIN_POSITIVE);
+        let top_n = ranked.len().min(50);
+        let top_probs: Vec<f64> = ranked
+            .iter()
+            .take(top_n)
+            .map(|&(_, v)| (f64::from(v) - max_logit).exp() / denom)
+            .collect();
+        let top_mass = top_probs.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+        let entropy = top_probs
+            .iter()
+            .map(|&p| {
+                let q = p / top_mass;
+                if q > 0.0 { -q * q.log2() } else { 0.0 }
+            })
+            .sum::<f64>();
+        let top1_prob = top_probs.first().copied().unwrap_or(0.0);
+        let token = u32::try_from(ranked[0].0).expect("vocab id overflow");
+        (token, entropy, top1_prob)
+    }
+
+    fn dflash_ar_entropy_pass(
+        engine: &SimpleEngine,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> DFlashArMetrics {
+        let prompt_tokens = dflash_chat_tokens(engine, prompt);
+        let mut model = lock_or_recover(&engine.model);
+        let mut cache = model
+            .make_cache_with_config(engine.kv_cache_config)
+            .expect("cache");
+        let prompt_array = Array::from(prompt_tokens.as_slice()).index(NewAxis);
+        let seq_len = prompt_array.shape().get(1).copied().unwrap_or(0);
+        let mut logits = if seq_len > engine.tuning.chunked_prefill_threshold() {
+            model
+                .forward_chunked(
+                    &prompt_array,
+                    &mut cache,
+                    engine.tuning.chunked_prefill_chunk_size(),
+                )
+                .expect("chunked prefill")
+        } else {
+            model
+                .forward_last_token(&prompt_array, None, &mut cache)
+                .expect("prefill")
+        };
+
+        let max_tokens_usize = usize::try_from(max_tokens).expect("max_tokens overflow");
+        let mut tokens = Vec::with_capacity(max_tokens_usize);
+        let mut entropy_sum = 0.0_f64;
+        let mut top1_sum = 0.0_f64;
+
+        for step in 0..max_tokens_usize {
+            let row = logits
+                .index((.., -1, ..))
+                .reshape(&[-1])
+                .expect("reshape logits")
+                .as_dtype(Dtype::Float32)
+                .expect("f32 logits");
+            eval([&row]).expect("eval logits");
+            let (next_token, entropy, top1_prob) = dflash_entropy_and_top1(row.as_slice::<f32>());
+            entropy_sum += entropy;
+            top1_sum += top1_prob;
+            tokens.push(next_token);
+
+            if step + 1 < max_tokens_usize {
+                let next_token_i32 = i32::try_from(next_token).expect("token id overflow");
+                let single = Array::from_slice(&[next_token_i32], &[1, 1]);
+                logits = model
+                    .forward(&single, None, &mut cache)
+                    .expect("decode step");
+            }
+        }
+        drop(model);
+
+        let text = engine.decode_tokens(&tokens).expect("decode AR tokens");
+        let denom = f64::from(max_tokens);
+        DFlashArMetrics {
+            h_bits: entropy_sum / denom,
+            top1_prob: top1_sum / denom,
+            tokens,
+            text,
+        }
+    }
+
+    fn dflash_accept_metrics(accepts: &[u32], block_size: u32) -> (f64, u32, u32, u32, f64) {
+        if accepts.is_empty() {
+            return (0.0, 0, 0, 0, 0.0);
+        }
+        let mean = accepts.iter().map(|&n| f64::from(n)).sum::<f64>() / accepts.len() as f64;
+        let mut sorted = accepts.to_vec();
+        sorted.sort_unstable();
+        let last = sorted.len() - 1;
+        let p10 = sorted[last * 10 / 100];
+        let p50 = sorted[last * 50 / 100];
+        let p90 = sorted[last * 90 / 100];
+        let accept_frac = mean / f64::from(block_size.max(1));
+        (mean, p10, p50, p90, accept_frac)
+    }
+
+    fn dflash_generation_pass(
+        engine: &SimpleEngine,
+        prompt: &str,
+        max_tokens: u32,
+        block_size: u32,
+        greedy: &SamplingParams,
+    ) -> DFlashRunMetrics {
+        dflash_set_fixed_block_env(block_size);
+        let prompt_tokens = dflash_chat_tokens(engine, prompt);
+        let out = engine
+            .generate_with_thinking(
+                &prompt_tokens,
+                max_tokens,
+                greedy,
+                &[],
+                false,
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("DFlash generation");
+        let accepts = engine.last_dflash_accepts();
+        let (accept_mean, p10, p50, p90, accept_frac) = dflash_accept_metrics(&accepts, block_size);
+        DFlashRunMetrics {
+            text: out.text,
+            accept_mean,
+            p10,
+            p50,
+            p90,
+            accept_frac,
+        }
+    }
+
+    fn dflash_prefix_consistent(left: &str, right: &str) -> bool {
+        if left.len() <= right.len() {
+            right.starts_with(left)
+        } else {
+            left.starts_with(right)
+        }
+    }
+
+    fn dflash_row_from_metrics(
+        task: impl Into<String>,
+        ar: &DFlashArMetrics,
+        df: DFlashRunMetrics,
+    ) -> DFlashSweepRow {
+        DFlashSweepRow {
+            task: task.into(),
+            h_bits: ar.h_bits,
+            top1_prob: ar.top1_prob,
+            accept_mean: df.accept_mean,
+            p10: df.p10,
+            p50: df.p50,
+            p90: df.p90,
+            accept_frac: df.accept_frac,
+            byte_exact: !ar.tokens.is_empty() && dflash_prefix_consistent(&ar.text, &df.text),
+        }
+    }
+
+    fn dflash_sweep_row(
+        engine: &SimpleEngine,
+        task: impl Into<String>,
+        prompt: &str,
+        max_tokens: u32,
+        block_size: u32,
+        greedy: &SamplingParams,
+    ) -> DFlashSweepRow {
+        let ar = dflash_ar_entropy_pass(engine, prompt, max_tokens);
+        let df = dflash_generation_pass(engine, prompt, max_tokens, block_size, greedy);
+        dflash_row_from_metrics(task, &ar, df)
+    }
+
+    fn dflash_print_table(title: &str, rows: &[DFlashSweepRow]) {
+        println!("\n{title}");
+        println!(
+            "| task | H_bits | top1_prob | accept_mean | p10 | p50 | p90 | accept_frac | byte_exact |"
+        );
+        println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |");
+        for row in rows {
+            println!(
+                "| {} | {:.3} | {:.3} | {:.2} | {} | {} | {} | {:.3} | {} |",
+                row.task,
+                row.h_bits,
+                row.top1_prob,
+                row.accept_mean,
+                row.p10,
+                row.p50,
+                row.p90,
+                row.accept_frac,
+                row.byte_exact
+            );
+        }
+    }
+
+    fn dflash_repeat_prompt_to_chat_tokens(
+        engine: &SimpleEngine,
+        prompt: &str,
+        target_tokens: usize,
+    ) -> String {
+        let base_len = dflash_chat_tokens(engine, prompt).len().max(1);
+        let reps = (target_tokens / base_len).max(1);
+        let mut padded = std::iter::repeat_n(prompt, reps)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        while dflash_chat_tokens(engine, &padded).len() < target_tokens {
+            padded.push_str("\n\n");
+            padded.push_str(prompt);
+        }
+        padded
+    }
+
+    #[test]
+    #[ignore = "loads real DFlash target + drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        clippy::as_conversions
+    )]
+    fn dflash_entropy_sweep() {
+        use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
+        use higgs_models::turboquant::KvCacheConfig;
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_test_writer()
+            .try_init();
+
+        let (target, drafter) = match (
+            std::env::var("HIGGS_DFLASH_TARGET_DIR"),
+            std::env::var("HIGGS_DFLASH_DRAFTER_DIR"),
+        ) {
+            (Ok(target), Ok(drafter)) => (target, drafter),
+            _ => {
+                println!(
+                    "skipping dflash_entropy_sweep: set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"
+                );
+                return;
+            }
+        };
+
+        const MAX_TOKENS: u32 = 160;
+        const DEFAULT_BLOCK_SIZE: u32 = 16;
+        const MULT_TABLES: &str = "Print the multiplication tables from 1 x 1 through 12 x 12 in ascending order. Use one equation per line.";
+        const COUNT_200: &str = "Count from 1 to 200. Print only the numbers separated by commas.";
+        const JSON_RECORDS: &str = "Emit 24 JSON objects, one per line, with schema {\"id\": number, \"name\": \"item-N\", \"active\": true, \"score\": number}. Use deterministic ascending ids.";
+        const CSV_TABLE: &str = "Create a CSV table with columns day,city,temperature_c,condition for 40 rows. Use predictable city names City01 through City40.";
+        const STRUCT_GETTERS: &str = "Write repetitive Rust code for a UserProfile struct with fields id, name, email, age, city, country, plan, created_at, and add simple getter methods for every field.";
+        const SORT_ALGORITHM: &str = "Write an iterative insertion sort implementation in Python, then walk through sorting [9, 4, 7, 1, 3, 8] step by step.";
+        const CAPITALS: &str = "List the capitals of these countries in order: France, Germany, Italy, Spain, Portugal, Netherlands, Belgium, Austria, Poland, Czechia, Denmark, Sweden, Norway, Finland, Ireland, Greece, Turkey, Egypt, Japan, Canada.";
+        const UNIT_CONVERSIONS: &str = "Create a unit conversion table for meters to feet from 1 through 40 meters. Use four decimal places.";
+        const TRANSLATION: &str = "Translate this paragraph from English to French: The research team tested a compact solar pump in three villages. During the dry season, farmers used it to irrigate tomato fields, compare fuel savings, and record maintenance issues.";
+        const GSM8K: &str = "Solve this word problem with clear arithmetic steps: A bakery made 186 muffins. It sold 48 before lunch, baked 3 more trays with 24 muffins each, then packed the rest equally into 7 boxes. How many muffins were in each box, and how many were left over?";
+        const PHOTOSYNTHESIS: &str = "Explain photosynthesis for a technically curious reader. Cover chlorophyll, light reactions, carbon fixation, water splitting, and why the process matters to ecosystems.";
+        const STORY: &str = "Write a vivid short story about an archivist who discovers that a city map changes every midnight. Include sensory detail and an unresolved final image.";
+
+        const PROMPTS: [(&str, &str); 12] = [
+            ("multiplication tables", MULT_TABLES),
+            ("count 1..200", COUNT_200),
+            ("fixed-schema JSON", JSON_RECORDS),
+            ("CSV table", CSV_TABLE),
+            ("struct getters", STRUCT_GETTERS),
+            ("iterative sort", SORT_ALGORITHM),
+            ("capitals list", CAPITALS),
+            ("unit conversion", UNIT_CONVERSIONS),
+            ("EN-FR translation", TRANSLATION),
+            ("GSM8K word problem", GSM8K),
+            ("photosynthesis", PHOTOSYNTHESIS),
+            ("short story", STORY),
+        ];
+
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+
+        let load_engine = |block_size: u32| -> SimpleEngine {
+            dflash_set_fixed_block_env(block_size);
+            let tuning =
+                MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
+            SimpleEngine::load_with_dflash(
+                &target,
+                KvCacheConfig::default(),
+                tuning,
+                false,
+                Some(Path::new(&drafter)),
+            )
+            .expect("load DFlash engine")
+        };
+
+        let engine = load_engine(DEFAULT_BLOCK_SIZE);
+
+        let mut entropy_rows = Vec::new();
+        for &(label, prompt) in &PROMPTS {
+            entropy_rows.push(dflash_sweep_row(
+                &engine,
+                label,
+                prompt,
+                MAX_TOKENS,
+                DEFAULT_BLOCK_SIZE,
+                &greedy,
+            ));
+        }
+        entropy_rows.sort_by(|a, b| a.h_bits.total_cmp(&b.h_bits));
+        dflash_print_table("## ENTROPY", &entropy_rows);
+
+        let mut context_rows = Vec::new();
+        for &(label, prompt) in &[
+            ("context multiplication", MULT_TABLES),
+            ("context story", STORY),
+        ] {
+            for target_tokens in [512_usize, 4096, 16_384] {
+                let padded = dflash_repeat_prompt_to_chat_tokens(&engine, prompt, target_tokens);
+                context_rows.push(dflash_sweep_row(
+                    &engine,
+                    format!("{label}-{target_tokens}"),
+                    &padded,
+                    MAX_TOKENS,
+                    DEFAULT_BLOCK_SIZE,
+                    &greedy,
+                ));
+            }
+        }
+        dflash_print_table("## CONTEXT", &context_rows);
+
+        let sort_ar = dflash_ar_entropy_pass(&engine, SORT_ALGORITHM, MAX_TOKENS);
+        drop(engine);
+
+        let mut block_rows = Vec::new();
+        for block_size in [4_u32, 8, 16] {
+            let block_engine = load_engine(block_size);
+            let df = dflash_generation_pass(
+                &block_engine,
+                SORT_ALGORITHM,
+                MAX_TOKENS,
+                block_size,
+                &greedy,
+            );
+            block_rows.push(dflash_row_from_metrics(
+                format!("iterative sort block {block_size}"),
+                &sort_ar,
+                df,
+            ));
+        }
+        dflash_print_table("## BLOCK", &block_rows);
     }
 
     /// Gemma chat models stop on `<end_of_turn>`, which their `config.json` often
