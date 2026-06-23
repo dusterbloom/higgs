@@ -3315,10 +3315,19 @@ impl FfnBlock {
             .as_ref()
             .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
 
-        let fused_out = if use_fused_gemv {
-            qgemv_4bit(x, fw, fs, fb, gp.group_size)?
-        } else {
-            quantized_forward(x, fw, fs, fb, gp.group_size, gp.bits)?
+        let fused_out = match gp.mode {
+            crate::quant_mode::QuantMode::MxFp4 => crate::quant_mode::quantized_matmul(
+                x, fw, fs, None, true, gp.group_size, gp.bits, gp.mode,
+            )?,
+            crate::quant_mode::QuantMode::Dense => dense_linear_no_bias_forward(fw, x)?,
+            // Affine fast path — GEMV for single-token decode, else standard matmul.
+            crate::quant_mode::QuantMode::Affine => {
+                if use_fused_gemv {
+                    qgemv_4bit(x, fw, fs, fb, gp.group_size)?
+                } else {
+                    quantized_forward(x, fw, fs, fb, gp.group_size, gp.bits)?
+                }
+            }
         };
         let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
         let gate_out = parts
