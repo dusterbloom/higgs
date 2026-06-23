@@ -262,6 +262,57 @@ fn model_label(model: &crate::config::ModelConfig) -> String {
     )
 }
 
+fn validate_dflash_drafter_dir(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err("path does not exist".to_owned());
+    }
+    if !path.is_dir() {
+        return Err("path is not a directory".to_owned());
+    }
+
+    let config_path = path.join("config.json");
+    if !config_path.is_file() {
+        return Err("missing config.json".to_owned());
+    }
+    let config = std::fs::read_to_string(&config_path)
+        .map_err(|err| format!("cannot read config.json: {err}"))?;
+    serde_json::from_str::<higgs_models::dflash::DFlashConfig>(&config)
+        .map_err(|err| format!("cannot parse DFlash config.json: {err}"))?;
+
+    if path.join("model.safetensors").is_file() {
+        return Ok(());
+    }
+
+    let index_path = path.join("model.safetensors.index.json");
+    if !index_path.is_file() {
+        return Err("missing model.safetensors or model.safetensors.index.json".to_owned());
+    }
+
+    let index_json = std::fs::read_to_string(&index_path)
+        .map_err(|err| format!("cannot read model.safetensors.index.json: {err}"))?;
+    let index_value: serde_json::Value = serde_json::from_str(&index_json)
+        .map_err(|err| format!("cannot parse model.safetensors.index.json: {err}"))?;
+    let weight_map = index_value
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "model.safetensors.index.json missing weight_map".to_owned())?;
+    if weight_map.is_empty() {
+        return Err("model.safetensors.index.json has empty weight_map".to_owned());
+    }
+    for file in weight_map.values() {
+        let file = file.as_str().ok_or_else(|| {
+            "model.safetensors.index.json weight_map contains a non-string file name".to_owned()
+        })?;
+        if !path.join(file).is_file() {
+            return Err(format!(
+                "missing safetensors shard referenced by index: {file}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     for model in &config.models {
         let label = model_label(model);
@@ -285,9 +336,11 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             continue;
         }
         if let Some(ref drafter) = model.draft_model {
-            if !std::path::Path::new(drafter).exists() {
+            if let Err(err) = validate_dflash_drafter_dir(std::path::Path::new(drafter)) {
                 fail(
-                    &format!("model {label} draft_model path does not exist: {drafter}"),
+                    &format!(
+                        "model {label} draft_model is not a valid DFlash drafter directory ({drafter}): {err}"
+                    ),
                     result,
                 );
                 continue;
@@ -573,6 +626,25 @@ mod tests {
         }
     }
 
+    fn write_valid_dflash_config(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+                "hidden_size": 2048,
+                "num_hidden_layers": 6,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "intermediate_size": 11008,
+                "vocab_size": 248064,
+                "dflash_config": {
+                    "target_layer_ids": [1, 6, 11, 16, 22, 27, 32, 37],
+                    "mask_token_id": 248077
+                }
+            }"#,
+        )
+        .unwrap();
+    }
+
     // -- Helper function counter tests --
 
     #[test]
@@ -600,6 +672,39 @@ mod tests {
         assert_eq!(result.passes, 0);
         assert_eq!(result.warnings, 0);
         assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn dflash_drafter_validation_accepts_single_safetensors_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_dflash_config(dir.path());
+        std::fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+
+        assert!(validate_dflash_drafter_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn dflash_drafter_validation_rejects_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("drafter");
+        std::fs::write(&file, b"not a directory").unwrap();
+
+        let err = validate_dflash_drafter_dir(&file).unwrap_err();
+        assert!(err.contains("not a directory"));
+    }
+
+    #[test]
+    fn dflash_drafter_validation_rejects_missing_index_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_dflash_config(dir.path());
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"layer.weight":"missing.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let err = validate_dflash_drafter_dir(dir.path()).unwrap_err();
+        assert!(err.contains("missing safetensors shard"));
     }
 
     // -- Duplicate model detection --

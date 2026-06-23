@@ -37,6 +37,7 @@ use crate::{
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 const DEFAULT_PAGED_KV_BLOCK_SIZE: usize = 64;
+const THINKING_BUDGET: u32 = 256;
 
 /// Acquire a `Mutex` lock, recovering from poison by reusing the inner data.
 /// Used in this crate to keep session-management methods infallible while
@@ -60,6 +61,48 @@ fn experimental_paged_kv_enabled() -> bool {
 
 fn prompt_lookup_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_PROMPT_LOOKUP").ok().as_deref()).unwrap_or(false)
+}
+
+#[allow(clippy::float_cmp)]
+fn dflash_supports_plain_greedy(
+    params: &SamplingParams,
+    logprobs: bool,
+    top_logprobs: Option<u32>,
+) -> bool {
+    !logprobs
+        && top_logprobs.unwrap_or(0) == 0
+        && params.temperature == 0.0
+        && params.top_p == 1.0
+        && params.top_k.is_none()
+        && params.min_p.is_none()
+        && !params.has_penalties()
+}
+
+fn enforce_thinking_budget_token(
+    token_id: &mut u32,
+    think_close_token: Option<u32>,
+    thinking_tokens: &mut u32,
+    seen_think_close: &mut bool,
+) -> bool {
+    if let Some(close_id) = think_close_token {
+        if !*seen_think_close {
+            if *token_id == close_id {
+                *seen_think_close = true;
+            } else {
+                *thinking_tokens += 1;
+                if *thinking_tokens >= THINKING_BUDGET {
+                    *token_id = close_id;
+                    *seen_think_close = true;
+                    tracing::info!(
+                        budget = THINKING_BUDGET,
+                        "Thinking budget reached, forcing </think>"
+                    );
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn unchecked_prompt_lookup_enabled() -> bool {
@@ -1110,9 +1153,19 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
         // DFlash speculative decoding: use the draft-verify loop when a drafter
-        // is loaded, no constraints active, and no multimodal input.
-        if self.dflash.is_some() && constraint.is_none() && pixel_values.is_none() {
-            return self.generate_dflash_inner(prompt_tokens, max_tokens, params, stop_sequences);
+        // is loaded and the request is plain greedy text generation.
+        if self.dflash.is_some()
+            && constraint.is_none()
+            && pixel_values.is_none()
+            && dflash_supports_plain_greedy(params, logprobs, top_logprobs)
+        {
+            return self.generate_dflash_inner(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                enable_thinking,
+            );
         }
 
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
@@ -1256,7 +1309,6 @@ impl SimpleEngine {
         let mut step_count: u32 = 0;
 
         // Thinking budget: force </think> after N tokens if model hasn't closed it.
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -1455,6 +1507,7 @@ impl SimpleEngine {
         max_tokens: u32,
         params: &SamplingParams,
         stop_sequences: &[String],
+        enable_thinking: bool,
     ) -> Result<GenerationOutput, EngineError> {
         let dflash = self
             .dflash
@@ -1487,6 +1540,14 @@ impl SimpleEngine {
 
         let first_token_id: u32 = first_token.item();
         let mut tokens: Vec<u32> = vec![first_token_id];
+        let think_close_token = if enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
+        let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
+        let mut seen_think_close =
+            think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
         if self.eos_token_ids.contains(&first_token_id) || max_tokens <= 1 {
             let finish_reason = if self.eos_token_ids.contains(&first_token_id) {
@@ -1648,7 +1709,13 @@ impl SimpleEngine {
                 if !(calibrating && ar_run == 0) {
                     t_ar_ema = Some(t_ar_ema.map_or(dt, |e| 0.7f64.mul_add(e, 0.3 * dt)));
                 }
-                let ar_id: u32 = ar_next.item();
+                let mut ar_id: u32 = ar_next.item();
+                enforce_thinking_budget_token(
+                    &mut ar_id,
+                    think_close_token,
+                    &mut thinking_tokens,
+                    &mut seen_think_close,
+                );
                 tokens.push(ar_id);
                 last_token = i32::try_from(ar_id)
                     .map_err(|_| EngineError::Generation("ar token overflow".to_owned()))?;
@@ -1747,7 +1814,38 @@ impl SimpleEngine {
                     .map_err(EngineError::Mlx)?
                     .as_slice::<u32>()
                     .to_vec();
-                let accepted = accept_prefix(&draft_u32, &verify_flat);
+                let mut accepted = accept_prefix(&draft_u32, &verify_flat);
+                let remaining_u32 = max_tokens.saturating_sub(Self::completion_len(&tokens)?);
+                let remaining = usize::try_from(remaining_u32).map_err(|_| {
+                    EngineError::Generation("remaining token budget overflow".to_owned())
+                })?;
+                accepted.truncate(remaining);
+                for idx in 0..accepted.len() {
+                    if enforce_thinking_budget_token(
+                        &mut accepted[idx],
+                        think_close_token,
+                        &mut thinking_tokens,
+                        &mut seen_think_close,
+                    ) {
+                        accepted.truncate(idx + 1);
+                        break;
+                    }
+                }
+                if let Some(eos_pos) = accepted
+                    .iter()
+                    .position(|tok| self.eos_token_ids.contains(tok))
+                {
+                    accepted.truncate(eos_pos + 1);
+                }
+                if accepted.is_empty() {
+                    return Ok(GenerationOutput {
+                        text: self.decode_tokens(&tokens)?,
+                        finish_reason: "length".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: Self::completion_len(&tokens)?,
+                        token_logprobs: None,
+                    });
+                }
                 if let Ok(mut v) = self.last_dflash_accepts.lock() {
                     v.push(u32::try_from(accepted.len()).unwrap_or(0));
                 }
@@ -3594,16 +3692,26 @@ mod tests {
 
         let run = |with_drafter: bool| -> (String, f64) {
             let drafter_path = with_drafter.then(|| Path::new(&drafter));
+            let saved_dflash_path = if with_drafter {
+                None
+            } else {
+                let previous = std::env::var_os("HIGGS_DFLASH_PATH");
+                dflash_restore_test_env("HIGGS_DFLASH_PATH", None);
+                Some(previous)
+            };
             let tuning =
                 MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
-            let engine = SimpleEngine::load_with_dflash(
+            let engine_result = SimpleEngine::load_with_dflash(
                 &target,
                 KvCacheConfig::default(),
                 tuning,
                 false,
                 drafter_path,
-            )
-            .expect("load target");
+            );
+            if let Some(previous) = saved_dflash_path {
+                dflash_restore_test_env("HIGGS_DFLASH_PATH", previous);
+            }
+            let engine = engine_result.expect("load target");
             let messages = [ChatMessage {
                 role: "user".to_owned(),
                 content: user_prompt.to_owned(),
@@ -3685,6 +3793,16 @@ mod tests {
         // SAFETY: This ignored manual harness mutates DFlash env knobs before
         // model loading/generation and is intended to be run alone.
         unsafe { std::env::set_var(key, value) };
+    }
+
+    #[allow(unsafe_code)]
+    fn dflash_restore_test_env(key: &str, value: Option<std::ffi::OsString>) {
+        // SAFETY: These ignored manual DFlash harnesses mutate process env before
+        // model loading/generation and are intended to be run alone.
+        match value {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     fn dflash_set_fixed_block_env(block_size: u32) {
