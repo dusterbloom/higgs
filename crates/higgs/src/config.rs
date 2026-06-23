@@ -414,7 +414,7 @@ pub struct ModelConfig {
     /// Seed used by `TurboQuant` setup.
     #[serde(default)]
     pub kv_seed: u64,
-    /// Optional path to a DFlash drafter (simple engine); overrides HIGGS_DFLASH_PATH.
+    /// Optional path to a `DFlash` drafter (simple engine); overrides `HIGGS_DFLASH_PATH`.
     #[serde(default)]
     pub draft_model: Option<String>,
 }

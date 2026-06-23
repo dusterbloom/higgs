@@ -224,10 +224,17 @@ async fn create_message_non_streaming(
     engine: Arc<Engine>,
 ) -> Result<CreateMessageResponse, ServerError> {
     let max_tokens = req.max_tokens;
+    let speculation =
+        higgs_models::Speculation::parse(req.speculation.as_deref()).map_err(|v| {
+            ServerError::BadRequest(format!(
+                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
+            ))
+        })?;
     let sampling = SamplingParams {
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k,
+        speculation,
         ..SamplingParams::default()
     };
     let stop_sequences = req.stop_sequences.unwrap_or_default();
@@ -310,10 +317,17 @@ fn create_message_stream(
     routing_method: crate::router::RoutingMethod,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
     let max_tokens = req.max_tokens;
+    let speculation =
+        higgs_models::Speculation::parse(req.speculation.as_deref()).map_err(|v| {
+            ServerError::BadRequest(format!(
+                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
+            ))
+        })?;
     let sampling = SamplingParams {
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k,
+        speculation,
         ..SamplingParams::default()
     };
     let stop_sequences = req.stop_sequences.unwrap_or_default();

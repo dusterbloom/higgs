@@ -41,6 +41,7 @@ This document collects the full CLI, environment, and config-file reference for 
 - `HIGGS_MTP_DRAFT_N_MAX` controls the maximum MTP draft tokens per speculative cycle. The default is `2` for huge checkpoints and `1` otherwise, clamped to `1..=8`.
 - `HIGGS_MTP_ADAPTIVE_DRAFT=1` lets the decode loop increase or decrease the MTP draft window based on recent verifier acceptance.
 - `HIGGS_MTP_PROMPT_LOOKUP=1` enables a hybrid MTP loop that tries verified prompt-lookup drafts when the prompt/history has a repeated suffix, then keeps the MTP cache synchronized for later MTP-head cycles.
+- Per request, the OpenAI and Anthropic bodies accept `"speculation": "auto" | "dflash" | "mtp" | "none"` to choose the speculative method for that request. `auto` (default) uses the DFlash drafter when one is loaded — including while streaming — and otherwise the MTP head; `mtp` forces the MTP head even when a drafter is loaded; `none` forces plain autoregressive decode. (DFlash requires `draft_model` and the simple engine; it is unavailable under `batch = true`.)
 - `HIGGS_CLEAR_CACHE_AFTER_PREFILL` overrides the selected MLX profile behavior for cache clearing.
 - `HIGGS_TURBOQUANT_MIN_TOKENS` overrides the TurboQuant activation threshold. The default is `2048`.
 - `HIGGS_EXPERIMENTAL_PAGED_KV=1` enables the experimental paged-KV path.
@@ -76,6 +77,7 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # name = "llama"
 # mlx_profile = "throughput"
 # batch = false
+# draft_model = "/path/to/dflash-drafter"   # enables DFlash speculative decoding (simple engine only)
 # kv_cache = "turboquant"
 # kv_bits = 3
 # kv_key_bits = 2

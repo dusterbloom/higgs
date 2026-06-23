@@ -253,7 +253,7 @@ async fn chat_completions_non_streaming(
     engine: Arc<Engine>,
 ) -> Result<ChatCompletionResponse, ServerError> {
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
-    let sampling = build_sampling_params(&req);
+    let sampling = build_sampling_params(&req)?;
     let stop_sequences = StopSequence::extract(req.stop);
     let want_logprobs = req.logprobs.unwrap_or(false);
     let top_logprobs = req.top_logprobs;
@@ -435,7 +435,7 @@ fn chat_completions_stream(
     }
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
-    let sampling = build_sampling_params(&req);
+    let sampling = build_sampling_params(&req)?;
     let stop_sequences = StopSequence::extract(req.stop);
     let want_logprobs = req.logprobs.unwrap_or(false);
     let top_logprobs = req.top_logprobs;
@@ -843,8 +843,14 @@ fn inject_image_placeholders(messages: &[ChatCompletionMessage]) -> Vec<ChatComp
         .collect()
 }
 
-fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
-    SamplingParams {
+fn build_sampling_params(req: &ChatCompletionRequest) -> Result<SamplingParams, ServerError> {
+    let speculation =
+        higgs_models::Speculation::parse(req.speculation.as_deref()).map_err(|v| {
+            ServerError::BadRequest(format!(
+                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
+            ))
+        })?;
+    Ok(SamplingParams {
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k,
@@ -852,7 +858,8 @@ fn build_sampling_params(req: &ChatCompletionRequest) -> SamplingParams {
         repetition_penalty: req.repetition_penalty,
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
-    }
+        speculation,
+    })
 }
 
 /// Build a constrained generator from the request's `response_format`.

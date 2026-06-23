@@ -24,6 +24,11 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// Per-request speculative-decoding method: `auto` (default), `dflash`,
+    /// `mtp`, or `none`. `auto` uses the `DFlash` drafter when one is loaded
+    /// (including while streaming), else the built-in MTP head.
+    #[serde(default)]
+    pub speculation: Option<String>,
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]

@@ -299,6 +299,9 @@ fn build_sampling_params(req: &CompletionRequest) -> SamplingParams {
         repetition_penalty: req.repetition_penalty,
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
+        // Legacy text-completion endpoint: speculation method stays at the
+        // load-time default (DFlash if a drafter is loaded, else MTP).
+        speculation: higgs_models::Speculation::Auto,
     }
 }
 

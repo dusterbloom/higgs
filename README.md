@@ -198,6 +198,10 @@ Measured on DeepSeek-V2-Lite-4bit with global batch sorting before `gather_qmm`.
     llama.cpp-compatible `prompt_progress` chunks (`{total, cache, processed,
     time_ms}`) during chunked prefill.
 - Anthropic: `/v1/messages`, `/v1/messages/count_tokens`
+- OpenAI and Anthropic requests accept an optional `"speculation"` field
+  (`auto` | `dflash` | `mtp` | `none`) to pick the speculative-decode method per
+  request. `auto` (default) uses the DFlash drafter when one is loaded — including
+  while streaming — otherwise the MTP head; `none` disables speculation.
 - Metrics: `/metrics`
 - Health: `/health`
 
