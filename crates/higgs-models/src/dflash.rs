@@ -514,21 +514,6 @@ impl GdnStateBackup {
     }
 }
 
-/// Rollback only KV cache layers by `rollback` positions. GDN layers are
-/// left untouched. Used with stateless GDN verify where GDN state was never
-/// corrupted by speculative tokens.
-pub fn rollback_kv_only(kv_cache: &mut [Option<crate::qwen3_next::LayerCache>], rollback: i32) {
-    if rollback <= 0 {
-        return;
-    }
-    for kv in kv_cache.iter_mut().filter_map(|lc| match lc {
-        Some(crate::qwen3_next::LayerCache::KV(kv)) => Some(kv),
-        _ => None,
-    }) {
-        kv.trim_by(rollback.unsigned_abs().try_into().unwrap_or(usize::MAX));
-    }
-}
-
 /// Crop the drafter KV cache to `keep_len` along the sequence dim.
 ///
 /// Called after verify to discard rejected positions.
@@ -538,22 +523,6 @@ pub fn crop_drafter_cache(cache: &mut [Option<(Array, Array)>], keep_len: i32) {
     for (k, v) in cache.iter_mut().filter_map(Option::as_mut) {
         *k = k.index((.., .., ..keep_len, ..));
         *v = v.index((.., .., ..keep_len, ..));
-    }
-}
-
-/// Trim `n` entries from the END of the drafter KV cache.
-///
-/// Reference: `trim_draft_cache(draft_cache, block_size)` in `dflash-mlx`.
-/// After each draft forward, the cache has `prev + ctx_len + block_size` entries.
-/// Trimming `block_size` removes the noise K/V while keeping the accumulated
-/// target context K/V that conditions future rounds.
-pub fn trim_drafter_cache(cache: &mut [Option<(Array, Array)>], n: i32) {
-    use mlx_rs::ops::indexing::IndexOp;
-    for (k, v) in cache.iter_mut().filter_map(Option::as_mut) {
-        let seq_len = k.shape().get(2).copied().unwrap_or(0);
-        let keep = (seq_len - n).max(0);
-        *k = k.index((.., .., ..keep, ..));
-        *v = v.index((.., .., ..keep, ..));
     }
 }
 
