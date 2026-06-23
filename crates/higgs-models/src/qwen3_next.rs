@@ -357,10 +357,19 @@ impl QLinear {
         mode: crate::quant_mode::QuantMode,
     ) -> Result<Self, Exception> {
         let (weight, scales, biases) = init_quantized_params();
+        // mxfp4 tensors ship without `.biases` on disk (E2M1 has no zero-point).
+        // Replace the [1] placeholder with a [0] empty array so the weight-loader's
+        // completeness check (`shape == [1]` ⇒ missing) doesn't flag it. The mxfp4
+        // forward path passes `None` for biases to the FFI, so this value is never used.
+        let biases_param = if mode.is_mxfp4() {
+            Param::new(Array::from_slice::<f32>(&[], &[0]))
+        } else {
+            biases
+        };
         Ok(Self {
             weight,
             scales,
-            biases,
+            biases: biases_param,
             group_size,
             bits,
             mode,
@@ -475,10 +484,15 @@ impl QEmbedding {
 
     pub(crate) fn new_spec(spec: QuantSpec) -> Self {
         let (weight, scales, biases) = init_quantized_params();
+        let biases_param = if spec.mode.is_mxfp4() {
+            Param::new(Array::from_slice::<f32>(&[], &[0]))
+        } else {
+            biases
+        };
         Self {
             weight,
             scales,
-            biases,
+            biases: biases_param,
             group_size: spec.group_size,
             bits: spec.bits,
             mode: spec.mode,
@@ -14298,6 +14312,84 @@ mod tests {
             "Dense model should NOT get decoder_sparse_step=1"
         );
         assert_eq!(args.num_experts, 0);
+    }
+
+    /// mxfp4 QLinears ship without `.biases` on disk. The construction must
+    /// set biases to a non-`[1]` shape so `placeholder_param_names` (which
+    /// flags `shape == [1]` as "missing") doesn't reject them during weight
+    /// loading. Affine QLinears keep the standard `[1]` placeholder so genuinely
+    /// missing affine biases are still caught.
+    #[test]
+    fn mxfp4_qlinear_biases_not_flagged_as_missing() {
+        let mxfp4 = QLinear::new_spec(QuantSpec {
+            group_size: 32,
+            bits: 4,
+            mode: crate::quant_mode::QuantMode::MxFp4,
+        })
+        .unwrap();
+        let affine = QLinear::new_spec(QuantSpec {
+            group_size: 64,
+            bits: 4,
+            mode: crate::quant_mode::QuantMode::Affine,
+        })
+        .unwrap();
+
+        // mxfp4 biases: empty [0] — NOT flagged as placeholder
+        assert_ne!(
+            mxfp4.biases.shape(),
+            &[1],
+            "mxfp4 biases must not be [1] placeholder"
+        );
+        assert_eq!(
+            mxfp4.biases.size(),
+            0,
+            "mxfp4 biases should be empty (no zero-point in E2M1)"
+        );
+
+        // Affine biases: [1] placeholder — still caught by completeness check
+        assert_eq!(
+            affine.biases.shape(),
+            &[1],
+            "affine biases should be [1] placeholder before weight loading"
+        );
+    }
+
+    /// Per-path quantization overrides are parsed from config.json's
+    /// `quantization` map (mixed-precision checkpoints). Verifies the override
+    /// resolver picks per-tensor specs correctly.
+    #[test]
+    fn quant_spec_for_resolves_per_path_overrides() {
+        let mut args = valid_causal_lm_args();
+        args.quantization = Some(QuantizationConfig {
+            group_size: 32,
+            bits: 4,
+            mode: crate::quant_mode::QuantMode::MxFp4,
+        });
+        args.quantization_overrides.insert(
+            "model.layers.3.self_attn.k_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 8,
+                mode: crate::quant_mode::QuantMode::Affine,
+            },
+        );
+
+        // Global default
+        let default = args.default_quant_spec();
+        assert_eq!(default.group_size, 32);
+        assert_eq!(default.bits, 4);
+        assert!(default.mode.is_mxfp4());
+
+        // Override for k_proj on layer 3
+        let kv = args.quant_spec_for("model.layers.3.self_attn.k_proj");
+        assert_eq!(kv.group_size, 64);
+        assert_eq!(kv.bits, 8);
+        assert!(!kv.mode.is_mxfp4());
+
+        // No override for q_proj — falls back to global mxfp4 default
+        let q = args.quant_spec_for("model.layers.3.self_attn.q_proj");
+        assert_eq!(q.bits, 4);
+        assert!(q.mode.is_mxfp4());
     }
 
     #[test]
