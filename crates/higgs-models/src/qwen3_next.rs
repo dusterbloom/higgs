@@ -263,11 +263,25 @@ pub(crate) struct QLinear {
     pub(crate) biases: Param<Array>,
     pub(crate) group_size: i32,
     pub(crate) bits: i32,
+    /// Quantization format. `Affine` (default) keeps the existing mlx-rs fast
+    /// path; `MxFp4` routes through the FFI bypass in [`crate::quant_mode`].
+    pub(crate) mode: crate::quant_mode::QuantMode,
 }
 
 impl QLinear {
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn new(group_size: i32, bits: i32) -> Result<Self, Exception> {
+        Self::new_with_mode(group_size, bits, crate::quant_mode::QuantMode::Affine)
+    }
+
+    /// Construct with an explicit quantization mode. Used by loaders that read
+    /// per-tensor `"mode"` from `config.json` (e.g. mxfp4 bulk + affine islands).
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn new_with_mode(
+        group_size: i32,
+        bits: i32,
+        mode: crate::quant_mode::QuantMode,
+    ) -> Result<Self, Exception> {
         let (weight, scales, biases) = init_quantized_params();
         Ok(Self {
             weight,
@@ -275,25 +289,44 @@ impl QLinear {
             biases,
             group_size,
             bits,
+            mode,
         })
     }
 
     pub(crate) fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        quantized_forward(
-            x,
-            &self.weight,
-            &self.scales,
-            &self.biases,
-            self.group_size,
-            self.bits,
-        )
+        match self.mode {
+            crate::quant_mode::QuantMode::MxFp4 => crate::quant_mode::quantized_matmul(
+                x,
+                &self.weight,
+                &self.scales,
+                None,
+                true,
+                self.group_size,
+                self.bits,
+                crate::quant_mode::QuantMode::MxFp4,
+            ),
+            // Affine fast path — unchanged from the mlx-rs wrapper.
+            crate::quant_mode::QuantMode::Affine => quantized_forward(
+                x,
+                &self.weight,
+                &self.scales,
+                &self.biases,
+                self.group_size,
+                self.bits,
+            ),
+        }
     }
 
     /// Decode-only fast path for 4-bit single-token inference.
     ///
     /// Keeps the optimization opt-in so we can wire it into selected hot paths
     /// without changing the default behavior of every quantized linear.
+    /// Only supported for `Affine` — the custom `qgemv_4bit` kernel assumes
+    /// affine-packed weights; `MxFp4` falls through to the standard matmul.
     pub(crate) fn forward_decode_fast(&self, x: &Array) -> Result<Array, Exception> {
+        if self.mode.is_mxfp4() {
+            return self.forward(x);
+        }
         if decode_gemv_enabled()
             && self.bits == 4
             && matches!(x.shape(), [1, 1, _])
@@ -7626,6 +7659,7 @@ mod tests {
                 biases: Param::new(b),
                 group_size: gs,
                 bits,
+                mode: crate::quant_mode::QuantMode::Affine,
             }
         };
 
@@ -7641,6 +7675,7 @@ mod tests {
                 biases: Param::new(b),
                 group_size: gs,
                 bits,
+                mode: crate::quant_mode::QuantMode::Affine,
             }
         };
 
