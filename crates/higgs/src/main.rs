@@ -293,6 +293,7 @@ fn load_engines(
                 kv_cache_config,
                 tuning,
                 config.local.raise_wired_limit,
+                model_cfg.draft_model.as_deref().map(Path::new),
             )?
         };
         let name = model_cfg
