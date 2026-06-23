@@ -1671,6 +1671,7 @@ dependencies = [
  "tokenizers 0.23.1",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
