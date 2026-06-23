@@ -654,6 +654,10 @@ mod tests {
                 kv_norm_correction: true,
                 kv_adaptive_dense_layers: 0,
                 draft_model: None,
+                disk_cache_enabled: false,
+                disk_cache_path: None,
+                max_disk_blocks: higgs_engine::cache::DEFAULT_MAX_DISK_BLOCKS,
+                min_tokens_to_persist: higgs_engine::cache::DEFAULT_MIN_TOKENS_TO_PERSIST,
             }],
             ..HiggsConfig::default()
         }

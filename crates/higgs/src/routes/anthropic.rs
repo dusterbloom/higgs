@@ -262,6 +262,7 @@ async fn create_message_non_streaming(
             thinking_enabled,
             None,
             None,
+            None,
         )
     })
     .await
@@ -364,6 +365,7 @@ fn create_message_stream(
             thinking_enabled,
             // Anthropic streaming does not surface prefill progress.
             false,
+            None,
             None,
             None,
         );

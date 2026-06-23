@@ -158,6 +158,7 @@ async fn completions_non_streaming(
     let prompt_tokens = encoding.get_ids().to_vec();
 
     let tokenizer = engine.tokenizer().clone();
+    let checkpoint_id = req.checkpoint_id.clone();
     let output = tokio::task::spawn_blocking(move || {
         engine.generate(
             &prompt_tokens,
@@ -168,6 +169,7 @@ async fn completions_non_streaming(
             top_logprobs,
             None,
             None,
+            checkpoint_id.as_deref(),
         )
     })
     .await
@@ -225,6 +227,7 @@ fn completions_stream(
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
     let model = req.model;
+    let checkpoint_id = req.checkpoint_id;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
@@ -239,6 +242,7 @@ fn completions_stream(
             &tx,
             None,
             None,
+            checkpoint_id.as_deref(),
         );
         if let Err(e) = result {
             tracing::error!(error = %e, "Generation error during streaming");

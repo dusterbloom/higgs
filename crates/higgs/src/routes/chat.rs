@@ -300,6 +300,7 @@ async fn chat_completions_non_streaming(
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
     let tokenizer = engine.tokenizer().clone();
+    let checkpoint_id = req.checkpoint_id.clone();
     let output = tokio::task::spawn_blocking(move || {
         engine.generate_with_thinking(
             &prompt_tokens,
@@ -311,6 +312,7 @@ async fn chat_completions_non_streaming(
             thinking_enabled,
             constraint,
             pixel_values,
+            checkpoint_id.as_deref(),
         )
     })
     .await
@@ -495,6 +497,7 @@ fn chat_completions_stream(
     let return_progress = req.return_progress.unwrap_or(false);
     let created = current_unix_timestamp();
     let model = req.model;
+    let checkpoint_id = req.checkpoint_id;
     let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(0);
 
     let start = Instant::now();
@@ -529,6 +532,7 @@ fn chat_completions_stream(
             return_progress,
             constraint,
             pixel_values,
+            checkpoint_id.as_deref(),
         );
         if let Err(e) = result {
             tracing::error!(error = %e, "Generation error during streaming");

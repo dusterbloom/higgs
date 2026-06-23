@@ -136,8 +136,17 @@ pub fn classify_local(
         speculation: higgs_models::Speculation::Auto,
     };
 
-    let output = match engine.generate(&prompt_tokens, 64, &sampling, &[], false, None, None, None)
-    {
+    let output = match engine.generate(
+        &prompt_tokens,
+        64,
+        &sampling,
+        &[],
+        false,
+        None,
+        None,
+        None,
+        None,
+    ) {
         Ok(o) => o,
         Err(e) => {
             warn!(error = %e, "auto-router generation failed");
