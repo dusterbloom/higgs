@@ -1,6 +1,7 @@
 pub mod bonsai_q1;
 pub mod cache;
 pub mod deepseek_v2;
+pub mod dflash;
 pub mod error;
 pub mod gemma2;
 pub mod gemma3;
@@ -151,6 +152,22 @@ impl AnyCache {
             ),
         }
     }
+
+    /// Borrow the inner hybrid (KV+SSM) cache slice; errors on a KV-only cache.
+    pub fn as_hybrid(&self) -> Result<&[Option<LayerCache>], Exception> {
+        match self {
+            Self::Hybrid(c) => Ok(c),
+            Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
+        }
+    }
+
+    /// Mutably borrow the inner hybrid cache vec; errors on a KV-only cache.
+    pub fn as_hybrid_mut(&mut self) -> Result<&mut Vec<Option<LayerCache>>, Exception> {
+        match self {
+            Self::Hybrid(c) => Ok(c),
+            Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
+        }
+    }
 }
 
 /// Independent deep copy of an MTP head cache (`Vec<SteppingKeyValueCache>`).
@@ -258,6 +275,9 @@ fn make_turboquant_kv_cache(
     }
     Ok(AnyCache::KV(caches))
 }
+
+/// Output of [`AnyModel::forward_with_taps_tape`]: logits, tap hiddens, per-layer GDN tape.
+pub type TapsTapeOutput = (Array, Vec<Array>, Vec<Option<qwen3_next::GdnLayerTape>>);
 
 impl AnyModel {
     pub fn forward(
@@ -836,6 +856,103 @@ impl AnyModel {
             }
             _ => Err(Exception::custom(
                 "Model does not support multimodal forward",
+            )),
+        }
+    }
+
+    /// `DFlash`: forward returning logits + hidden states at `tap_layers` (drafter input).
+    pub fn forward_with_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// `DFlash` verify: forward returning logits + tap hiddens + per-layer GDN tape (for cheap rollback).
+    pub fn forward_with_taps_tape(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<TapsTapeOutput, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps_tape(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps_tape requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Replay GDN innovation tape for accepted prefix on partial accept.
+    ///
+    /// Used by `DFlash` verify path: after partial acceptance, restore each
+    /// GDN layer's state from the tape's initial snapshot, replay only the
+    /// SSM recurrence kernel for `n_accepted` accepted positions, and roll
+    /// KV layers back by `kv_rollback`. Avoids the cost of a full rerun.
+    pub fn replay_tape_rollback(
+        &self,
+        layer_tapes: &[Option<qwen3_next::GdnLayerTape>],
+        cache: &mut AnyCache,
+        n_accepted: i32,
+        kv_rollback: i32,
+    ) -> Result<(), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.replay_tape_rollback(layer_tapes, c, n_accepted, kv_rollback)
+            }
+            _ => Err(Exception::custom(
+                "replay_tape_rollback requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Embed raw token IDs through the target model's embedding layer.
+    pub fn embed_token_ids(&self, token_ids: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.embed_token_ids(token_ids),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
+                "embed_token_ids only implemented for Qwen3Next",
+            )),
+        }
+    }
+
+    /// Apply only the `lm_head` to pre-computed hidden states.
+    pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.forward_all_logits_from_hidden(hidden),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
+                "forward_all_logits_from_hidden only implemented for Qwen3Next",
             )),
         }
     }

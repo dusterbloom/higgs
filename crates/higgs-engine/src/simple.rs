@@ -10,7 +10,9 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use higgs_models::{
-    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
+    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties,
+    dflash::{DFlashDrafter, accept_prefix, crop_drafter_cache},
+    sample,
     turboquant::KvCacheConfig,
 };
 use mlx_rs::{
@@ -232,6 +234,15 @@ pub struct Session {
 /// Uses paged KV cache for efficient memory management during single-request
 /// generation. Session-based batched stepping APIs are not wired to real decode
 /// yet and return explicit errors instead of placeholder output.
+/// `DFlash` block-diffusion speculative decoding state, held alongside the
+/// target model when a drafter is loaded.
+struct DFlashState {
+    drafter: Mutex<DFlashDrafter>,
+    tap_layers: Vec<usize>,
+    block_size: i32,
+    mask_token_id: i32,
+}
+
 pub struct SimpleEngine {
     model: Mutex<AnyModel>,
     prefix_cache: Mutex<PagedPrefixCache>,
@@ -262,6 +273,10 @@ pub struct SimpleEngine {
     gen_prompt_suffix_len: usize,
     kv_cache_config: KvCacheConfig,
     tuning: MlxRuntimeTuning,
+    /// Optional `DFlash` block-diffusion speculative decoding state, enabled
+    /// when `HIGGS_DFLASH_PATH` points at a drafter checkpoint.
+    dflash: Option<DFlashState>,
+    last_dflash_accepts: std::sync::Mutex<Vec<u32>>,
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
@@ -281,6 +296,22 @@ impl SimpleEngine {
         kv_cache_config: KvCacheConfig,
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
+    ) -> Result<Self, EngineError> {
+        Self::load_with_dflash(dir, kv_cache_config, tuning, raise_wired_limit, None)
+    }
+
+    /// Load a model with an optional `DFlash` speculative-decoding drafter.
+    ///
+    /// The drafter path is taken from `dflash_path` when `Some`, otherwise from
+    /// the `HIGGS_DFLASH_PATH` env var. When a drafter is present, `generate`
+    /// dispatches to the block-diffusion draft-verify loop.
+    #[allow(clippy::too_many_lines)]
+    pub fn load_with_dflash<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+        tuning: MlxRuntimeTuning,
+        raise_wired_limit: bool,
+        dflash_path: Option<&Path>,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
@@ -429,6 +460,46 @@ impl SimpleEngine {
             })
             .transpose()?;
 
+        // DFlash speculative decoding: load the drafter from the explicit path
+        // or HIGGS_DFLASH_PATH. generate_inner then dispatches to the
+        // draft-verify loop for unconstrained text generation.
+        let dflash = dflash_path
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                std::env::var("HIGGS_DFLASH_PATH")
+                    .ok()
+                    .map(std::path::PathBuf::from)
+            })
+            .map(|dp| -> Result<DFlashState, EngineError> {
+                tracing::info!(drafter = %dp.display(), "Loading DFlash drafter");
+                let drafter = model_loader::load_dflash_drafter(&dp)?;
+                let tap_layers = drafter.config.target_layer_ids().to_vec();
+                // Decode block size: HIGGS_DFLASH_BLOCK_SIZE overrides the
+                // trained block_size, clamped to [1, trained]. Smaller blocks
+                // amortize the per-round verify + lm_head cost better when the
+                // accept length plateaus below the trained block.
+                let trained_block = drafter.config.block_size;
+                let block_size = std::env::var("HIGGS_DFLASH_BLOCK_SIZE")
+                    .ok()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .filter(|&v| v >= 1)
+                    .map_or(trained_block, |v| v.min(trained_block));
+                let mask_token_id = drafter.config.mask_token_id();
+                tracing::info!(
+                    tap_layers = ?tap_layers,
+                    block_size,
+                    mask_token_id,
+                    "DFlash drafter loaded — speculative decoding enabled"
+                );
+                Ok(DFlashState {
+                    drafter: Mutex::new(drafter),
+                    tap_layers,
+                    block_size,
+                    mask_token_id,
+                })
+            })
+            .transpose()?;
+
         Ok(Self {
             model: Mutex::new(model),
             prefix_cache: Mutex::new(PagedPrefixCache::new(
@@ -448,6 +519,8 @@ impl SimpleEngine {
             gen_prompt_suffix_len,
             kv_cache_config,
             tuning,
+            dflash,
+            last_dflash_accepts: Mutex::new(Vec::new()),
         })
     }
 
@@ -469,6 +542,13 @@ impl SimpleEngine {
     /// Whether the engine has thinking mode enabled.
     pub const fn enable_thinking(&self) -> bool {
         self.enable_thinking
+    }
+
+    pub fn last_dflash_accepts(&self) -> Vec<u32> {
+        self.last_dflash_accepts
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
 
     /// Apply chat template and tokenize messages with explicit thinking control.
@@ -1029,6 +1109,12 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
+        // DFlash speculative decoding: use the draft-verify loop when a drafter
+        // is loaded, no constraints active, and no multimodal input.
+        if self.dflash.is_some() && constraint.is_none() && pixel_values.is_none() {
+            return self.generate_dflash_inner(prompt_tokens, max_tokens, params, stop_sequences);
+        }
+
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
@@ -1348,6 +1434,507 @@ impl SimpleEngine {
                 next_token = following;
             }
             next_logprob_data = following_logprob_data;
+        }
+    }
+
+    /// `DFlash` block-diffusion speculative decode loop.
+    ///
+    /// Each round: drafter proposes a `block_size` block from the target's tap
+    /// hidden states, the target verifies the block in a single tape-recording
+    /// forward, `accept_prefix` takes the longest greedy-matching prefix, and a
+    /// GDN tape replay rolls partial-accept state back bit-exactly. Headline
+    /// metric for tuning is `accept_len` (mean accepted tokens per round).
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::as_conversions,
+        clippy::too_many_lines
+    )]
+    fn generate_dflash_inner(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+    ) -> Result<GenerationOutput, EngineError> {
+        let dflash = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| EngineError::Generation("DFlash state missing".to_owned()))?;
+        let prompt_len = Self::prompt_len(prompt_tokens)?;
+        let has_stop_sequences = !stop_sequences.is_empty();
+        if let Ok(mut v) = self.last_dflash_accepts.lock() {
+            v.clear();
+        }
+
+        let mut model = lock_or_recover(&self.model);
+        let mut drafter = lock_or_recover(&dflash.drafter);
+
+        let mut cache = model
+            .make_cache_with_config(self.kv_cache_config)
+            .map_err(EngineError::Mlx)?;
+
+        // Prefill with taps.
+        let prompt_array = Array::from(prompt_tokens).index(NewAxis);
+        let (prefill_logits, taps) = model
+            .forward_with_taps(&prompt_array, None, &mut cache, &dflash.tap_layers)
+            .map_err(EngineError::Mlx)?;
+        eval([&prefill_logits]).map_err(EngineError::Mlx)?;
+
+        // Sample first token.
+        let last_logits = prefill_logits.index((.., -1, ..));
+        let first_token = sample(&last_logits, params).map_err(EngineError::Mlx)?;
+        eval([&first_token]).map_err(EngineError::Mlx)?;
+
+        let first_token_id: u32 = first_token.item();
+        let mut tokens: Vec<u32> = vec![first_token_id];
+
+        if self.eos_token_ids.contains(&first_token_id) || max_tokens <= 1 {
+            let finish_reason = if self.eos_token_ids.contains(&first_token_id) {
+                "stop"
+            } else {
+                "length"
+            };
+            return Ok(GenerationOutput {
+                text: self.decode_tokens(&tokens)?,
+                finish_reason: finish_reason.to_owned(),
+                prompt_tokens: prompt_len,
+                completion_tokens: 1,
+                token_logprobs: None,
+            });
+        }
+
+        let mut current_taps = taps;
+        let mut draft_cache = drafter.make_cache();
+        let mut last_token = i32::try_from(first_token_id)
+            .map_err(|_| EngineError::Generation("first_token_id overflow for i32".to_owned()))?;
+        let mut start = i32::try_from(prompt_len)
+            .map_err(|_| EngineError::Generation("prompt_len overflow for i32".to_owned()))?;
+        // Adaptive (entropy-gated) block size. Acceptance length is the entropy
+        // proxy: predictable/low-entropy regions accept long blocks (big win,
+        // byte-exact), uncertain/high-entropy regions reject them. So grow the
+        // block toward `block_max` when a block is fully accepted and shrink
+        // toward `block_min` (≈ plain decode) when drafts are rejected — this
+        // both recovers throughput and keeps the S>1 verify off high-entropy
+        // near-ties (where it would flip argmax). Disable with
+        // HIGGS_DFLASH_ADAPTIVE=0; floor via HIGGS_DFLASH_MIN_BLOCK.
+        let block_max = dflash.block_size;
+        let block_min = std::env::var("HIGGS_DFLASH_MIN_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&v| v >= 1)
+            .map_or(2, |v| v.min(block_max));
+        let adaptive = std::env::var("HIGGS_DFLASH_ADAPTIVE").map_or(true, |v| v != "0");
+        let mut block_size = block_max;
+        // Smoothed utilization: a single hard token inside otherwise-predictable
+        // text (code dip ~0.38 ≈ prose plateau ~0.36) shouldn't collapse the
+        // block — only a *persistently* low utilization should. EMA separates
+        // "occasional dip" from "sustained high entropy".
+        let mut ema_util = 1.0_f64;
+        let mask_id = dflash.mask_token_id;
+        let t_start = std::time::Instant::now();
+        // Acceptance-length aggregation: mean accepted tokens per round is the
+        // headline metric for DFlash tuning (see P5).
+        let mut total_accepted: u64 = 0;
+        let mut rounds: u64 = 0;
+
+        // Realized-speedup gate (auto-calibrated, no per-model knob). Measure
+        // T_ar (wall per AR token) live; each spec round compute the realized
+        // speedup ratio = n_accepted * T_ar / step_wall. If the EMA of that
+        // ratio falls below 1.0, spec is actually slower than plain AR for this
+        // text (MoE's fast AR raises the bar; a fixed entropy threshold can't
+        // see that), so floor to AR and re-probe periodically. Flooring also
+        // keeps the S>1 verify off high-entropy near-ties (where it both slows
+        // down and flips argmax), so AR regions stay byte-exact. Start in AR for
+        // one step to calibrate T_ar, then enter spec. Disable: HIGGS_DFLASH_GATE=0.
+        let gate = std::env::var("HIGGS_DFLASH_GATE").map_or(true, |v| v != "0");
+        let mut t_ar_ema: Option<f64> = None;
+        let mut ratio_ema = 2.0_f64;
+        let mut in_ar = true;
+        let mut ar_run: u32 = 0;
+        // Re-probe spec sparsely with exponential backoff. In a sustained
+        // high-entropy region every probe is a wasted slow spec round (~4
+        // decode-units for ~1-2 tokens), so a fixed cadence taxed the floor by
+        // ~probe_cost/cadence (≈11% at 32 — the measured 0.89× prose gap; the
+        // per-step taps were measured free, ~0% — they are lazy clones).
+        // Each losing probe doubles the interval (amortizing the cost toward 0 on
+        // sustained prose); a winning probe resets to base so a regime shift back
+        // to spec-friendly text is caught within `AR_PROBE_BASE` tokens.
+        const AR_PROBE_BASE: u32 = 32;
+        // ponytail: cap the backoff at 512 — residual probe tax <1% (≈0.99×),
+        // and recovery never lags a regime change by more than ~512 tokens.
+        const AR_PROBE_MAX: u32 = 512;
+        let mut probe_every = AR_PROBE_BASE;
+
+        // The first decode after prefill is kernel-cold on Metal (~8× steady
+        // state: measured t_ar=187ms vs ~23ms warm). Seeding the gate's AR
+        // reference from it froze t_ar high, so the realized-speedup ratio was
+        // always >1 and the gate NEVER floored — a dead no-op. Fix: spend a short
+        // warm-up window in AR, discard the cold sample, seed t_ar from the warm
+        // steps, then hand off to spec. These are real greedy tokens, not waste.
+        // ponytail: no periodic re-calibration — t_ar only updates on floored
+        // steps, so during a spec-winning streak it holds its last warm value
+        // (can't drift high to mask a loss); a real degradation re-floors and
+        // refreshes it. Add periodic recal only if AR-baseline thermal drift
+        // during long spec streaks ever proves to matter.
+        const T_AR_CALIB: u32 = 3;
+        let mut calibrated = false;
+
+        // Spec-side cold-start grace (symmetric to T_AR_CALIB). The first spec
+        // rounds after every (re-)entry are cold on two axes the warm t_ar is
+        // not: the verify/drafter/lm_head Metal kernels are kernel-cold
+        // (step_wall ~2x inflated until they JIT-warm) and the drafter KV cache
+        // is empty (accept length climbs from ~3 to its steady ~6 as it fills).
+        // Judging those rounds floored winning workloads (9B code: 1.53x->0.83x)
+        // and then death-spiralled (floored -> spec re-cools -> re-probe also
+        // looks bad). So don't update ratio_ema or floor until the burst warms.
+        const SPEC_WARMUP: u32 = 3;
+        let mut spec_warmup_left: u32 = 0;
+
+        // Periodic t_ar re-calibration. t_ar is only measured during AR steps, so
+        // a long spec-winning streak never refreshes it — and t_ar drifts with
+        // thermal (measured 25ms cool vs 101ms throttled on the same model). A
+        // stale t_ar skews `ratio = n_acc*t_ar/step_wall` and the gate can miss a
+        // regime where spec started losing. So every RECAL_EVERY judged winning
+        // rounds, force ONE AR step to refresh t_ar at the current thermal state.
+        // ~1 AR token per ~240 generated (<0.5% overhead); unlike a probe it does
+        // not re-arm the warm-up grace or reset ratio_ema (1 AR step barely cools
+        // the drafter, and we want to keep the winning EMA).
+        const T_AR_RECAL_EVERY: u32 = 48;
+        let mut spec_since_recal: u32 = 0;
+        let mut recal = false;
+
+        loop {
+            let round_t0 = std::time::Instant::now();
+            if gate && in_ar {
+                // AR floor: plain S=1 decode (byte-exact). Measures T_ar live.
+                //
+                // Taps are only consumed by the drafter when we re-enter spec next
+                // round, i.e. on the step that hands control back ("leaving"): the
+                // end of the initial calibration window, or a probe cooldown. Use
+                // the optimized tap-less `forward` for every other floored step.
+                // The two paths share `forward_raw_hidden` (identical layer loop,
+                // mask, and KV/GDN cache mutation) and the same `project_logits`,
+                // so logits + cache are byte-identical; the only thing dropped is a
+                // tap clone the next floored step would overwrite unused.
+                let calibrating = !calibrated;
+                // recal: a single AR step to refresh a stale t_ar mid-streak.
+                let window = if recal {
+                    1
+                } else if calibrating {
+                    T_AR_CALIB
+                } else {
+                    probe_every
+                };
+                let leaving = ar_run + 1 >= window;
+                let need_taps = leaving;
+                let single = Array::from_slice(&[last_token], &[1, 1]);
+                let ar_logits = if need_taps {
+                    let (logits, ar_taps) = model
+                        .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
+                        .map_err(EngineError::Mlx)?;
+                    current_taps = ar_taps;
+                    logits
+                } else {
+                    model
+                        .forward(&single, None, &mut cache)
+                        .map_err(EngineError::Mlx)?
+                };
+                let ar_next =
+                    sample(&ar_logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
+                eval([&ar_next]).map_err(EngineError::Mlx)?;
+                let dt = round_t0.elapsed().as_secs_f64();
+                // Skip the kernel-cold first decode (ar_run == 0 of the initial
+                // calibration window); every later floored step is warm.
+                if !(calibrating && ar_run == 0) {
+                    t_ar_ema = Some(t_ar_ema.map_or(dt, |e| 0.7f64.mul_add(e, 0.3 * dt)));
+                }
+                let ar_id: u32 = ar_next.item();
+                tokens.push(ar_id);
+                last_token = i32::try_from(ar_id)
+                    .map_err(|_| EngineError::Generation("ar token overflow".to_owned()))?;
+                start += 1;
+                ar_run += 1;
+                // Hand back to spec once the warm calibration window completes, or
+                // after a probe cooldown re-tests whether spec is worthwhile again.
+                if leaving {
+                    in_ar = false;
+                    ar_run = 0;
+                    calibrated = true;
+                    if recal {
+                        // Just refreshed t_ar mid-streak: resume spec with the
+                        // winning EMA intact and no warm-up (the drafter barely
+                        // cooled over one AR step). need_taps was true, so
+                        // current_taps is fresh for the next draft.
+                        recal = false;
+                    } else {
+                        // Grant the fresh spec burst its cold-start grace and
+                        // re-seed the EMA to the optimistic prior. Re-seeding (not
+                        // blending) is load-bearing: otherwise a re-probe inherits
+                        // the stale sub-1.0 ratio_ema and re-floors in one warm
+                        // round, undoing the grace. Mirrors the t_ar_ema map_or seed.
+                        spec_warmup_left = SPEC_WARMUP;
+                        ratio_ema = 2.0;
+                    }
+                }
+            } else {
+                // a. Build block: [anchor, mask, mask, ...]
+                let block_size_us = usize::try_from(block_size).map_err(|_| {
+                    EngineError::Generation("block_size overflow for usize".to_owned())
+                })?;
+                let mut block_tokens = vec![mask_id; block_size_us];
+                if let Some(slot) = block_tokens.get_mut(0) {
+                    *slot = last_token;
+                }
+                let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
+
+                // b. Embed through target's embedding layer.
+                let noise_embedding = model
+                    .embed_token_ids(&block_ids)
+                    .map_err(EngineError::Mlx)?;
+
+                // c. Drafter forward.
+                let draft_hidden = drafter
+                    .forward(&noise_embedding, &current_taps, &mut draft_cache)
+                    .map_err(EngineError::Mlx)?;
+                crop_drafter_cache(&mut draft_cache, start);
+
+                // d. Target lm_head on sliced hidden -> argmax draft tokens.
+                let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
+                let draft_logits = model
+                    .forward_all_logits_from_hidden(&draft_hidden_sliced)
+                    .map_err(EngineError::Mlx)?;
+                let draft_token_arr =
+                    mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
+                eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
+                let draft_u32: Vec<u32> = draft_token_arr
+                    .reshape(&[-1])
+                    .map_err(EngineError::Mlx)?
+                    .as_slice::<u32>()
+                    .to_vec();
+                let draft_i32: Vec<i32> = draft_u32
+                    .iter()
+                    .map(|&x| {
+                        i32::try_from(x).map_err(|_| {
+                            EngineError::Generation("draft token overflow i32".to_owned())
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+
+                // e. Build verify input: [anchor, draft_0..draft_{N-2}].
+                let mut verify_tokens = vec![last_token];
+                verify_tokens.extend_from_slice(&draft_i32);
+                let verify_len = i32::try_from(verify_tokens.len())
+                    .map_err(|_| EngineError::Generation("verify_len overflow".to_owned()))?;
+                let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
+
+                // f. Tape-recording verify: forward with taps + GDN innovation tapes.
+                //    The tape kernel's recurrence is bit-exact with sequential AR
+                //    steps, fixing the S>1 vs S=1 numerical drift that a full-rerun
+                //    verify exhibits, and lets partial accept replay only the SSM
+                //    recurrence for accepted positions instead of a full rerun.
+                let (verify_logits, verify_taps, layer_tapes) = model
+                    .forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
+                    .map_err(EngineError::Mlx)?;
+
+                // g. Accept prefix. One host barrier per round: eval'ing the argmax
+                //    pulls verify_logits + the whole verify forward through the
+                //    graph, so a separate eval([&verify_logits]) is redundant.
+                let verify_argmax =
+                    mlx_rs::argmax_axis!(verify_logits, -1).map_err(EngineError::Mlx)?;
+                eval([&verify_argmax]).map_err(EngineError::Mlx)?;
+                let verify_flat: Vec<u32> = verify_argmax
+                    .reshape(&[-1])
+                    .map_err(EngineError::Mlx)?
+                    .as_slice::<u32>()
+                    .to_vec();
+                let accepted = accept_prefix(&draft_u32, &verify_flat);
+                if let Ok(mut v) = self.last_dflash_accepts.lock() {
+                    v.push(u32::try_from(accepted.len()).unwrap_or(0));
+                }
+                let n_accepted = i32::try_from(accepted.len())
+                    .map_err(|_| EngineError::Generation("n_accepted overflow".to_owned()))?;
+                rounds += 1;
+                total_accepted += accepted.len() as u64;
+
+                if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && tokens.len() <= 32 {
+                    tracing::info!(
+                        drafts = ?draft_u32,
+                        verify_argmax = ?verify_flat,
+                        n_accepted,
+                        accepted = ?accepted,
+                        "DFlash iter trace"
+                    );
+                }
+
+                // h. Partial accept — GDN-only replay from tape. The verify
+                //    advanced state for ALL positions; on partial rejection we
+                //    restore each GDN layer's snapshot, replay the SSM kernel for
+                //    the n_accepted positions, and trim KV layers by the rejected
+                //    count. Issued lazily (no eval) so it folds into the next
+                //    verify's host barrier.
+                if n_accepted < block_size {
+                    let kv_rollback = verify_len - n_accepted;
+                    model
+                        .replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
+                        .map_err(EngineError::Mlx)?;
+                }
+                // Slice verify taps to accepted positions (valid for both full and
+                // partial accept — earlier positions' hidden states are causally
+                // independent of later ones).
+                current_taps = verify_taps
+                    .into_iter()
+                    .map(|tap| tap.index((.., ..n_accepted, ..)))
+                    .collect();
+
+                // i. Update state.
+                for &tok in &accepted {
+                    tokens.push(tok);
+                }
+                last_token = i32::try_from(*accepted.last().ok_or_else(|| {
+                    EngineError::Generation("accept_prefix returned empty vec".to_owned())
+                })?)
+                .map_err(|_| EngineError::Generation("accepted token overflow i32".to_owned()))?;
+                start += n_accepted;
+
+                // Adapt the next round's block size by block UTILIZATION
+                // (n_accepted / block_size) — the entropy proxy. On low-entropy text
+                // acceptance scales with the block (util stays high → grow toward
+                // block_max for the biggest win); on high-entropy text acceptance
+                // plateaus (util drops → shrink so the verify isn't wasted, and the
+                // S>1 verify stays off near-ties). Gating on util, not raw accept,
+                // keeps big blocks where they pay off. (all block_size uses above.)
+                if adaptive {
+                    let util = f64::from(n_accepted) / f64::from(block_size);
+                    ema_util = 0.5f64.mul_add(ema_util, 0.5 * util);
+                    block_size = if ema_util >= 0.75 {
+                        (block_size * 2).min(block_max) // sustained high → grow
+                    } else if ema_util <= 0.5 {
+                        (block_size / 2).max(block_min) // sustained low → shrink
+                    } else {
+                        block_size
+                    };
+                }
+
+                // Realized-speedup gate: floor to AR next round if spec has become
+                // slower than plain AR (or to calibrate T_ar if we have no sample).
+                if gate {
+                    let step_wall = round_t0.elapsed().as_secs_f64().max(1e-9);
+                    if spec_warmup_left > 0 {
+                        // Cold spec warm-up: stay in spec, don't judge or floor,
+                        // don't poison ratio_ema with the cold step_wall / low
+                        // cold-cache accept. The kernels warm and the drafter
+                        // cache fills over these rounds.
+                        spec_warmup_left -= 1;
+                    } else if let Some(t_ar) = t_ar_ema {
+                        let ratio = f64::from(n_accepted) * t_ar / step_wall;
+                        ratio_ema = 0.6f64.mul_add(ratio_ema, 0.4 * ratio);
+                        if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && rounds <= 8 {
+                            tracing::info!(
+                                round = rounds,
+                                n_accepted,
+                                t_ar_ms = format!("{:.1}", t_ar * 1e3),
+                                step_wall_ms = format!("{:.1}", step_wall * 1e3),
+                                ratio = format!("{ratio:.2}"),
+                                ratio_ema = format!("{ratio_ema:.2}"),
+                                "GATE"
+                            );
+                        }
+                        if ratio_ema < 1.0 {
+                            // Losing probe: floor and back off so the next probe
+                            // amortizes over a longer AR run (sustained prose).
+                            in_ar = true;
+                            ar_run = 0;
+                            probe_every = probe_every.saturating_mul(2).min(AR_PROBE_MAX);
+                        } else {
+                            // Winning: stay in spec, but reset the cadence so a
+                            // later degradation is re-probed promptly, not lazily.
+                            probe_every = AR_PROBE_BASE;
+                            // Refresh t_ar periodically so a long winning streak
+                            // can't run on a thermally-stale AR reference.
+                            spec_since_recal += 1;
+                            if spec_since_recal >= T_AR_RECAL_EVERY {
+                                in_ar = true;
+                                ar_run = 0;
+                                recal = true;
+                                spec_since_recal = 0;
+                            }
+                        }
+                    } else {
+                        // No T_ar sample yet (initial calibration) — floor at base
+                        // cadence; this isn't a losing probe, so don't back off.
+                        in_ar = true;
+                        ar_run = 0;
+                        probe_every = AR_PROBE_BASE;
+                    }
+                }
+            } // end spec-round branch
+
+            // j. Check termination.
+            let completion_len = Self::completion_len(&tokens)?;
+            let accept_len = if rounds > 0 {
+                total_accepted as f64 / rounds as f64
+            } else {
+                0.0
+            };
+
+            if tokens.iter().any(|t| self.eos_token_ids.contains(t)) {
+                let secs = t_start.elapsed().as_secs_f64();
+                let tok_per_sec = if secs > 0.0 {
+                    tokens.len() as f64 / secs
+                } else {
+                    0.0
+                };
+                tracing::info!(
+                    tokens = tokens.len(),
+                    accept_len = format!("{accept_len:.2}"),
+                    tok_per_sec = format!("{tok_per_sec:.1}"),
+                    "DFlash generation complete"
+                );
+                return Ok(GenerationOutput {
+                    text: self.decode_tokens(&tokens)?,
+                    finish_reason: "stop".to_owned(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: completion_len,
+                    token_logprobs: None,
+                });
+            }
+
+            if has_stop_sequences {
+                let text = self.decode_tokens(&tokens)?;
+                if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
+                    return Ok(GenerationOutput {
+                        text: truncated,
+                        finish_reason: "stop".to_owned(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: completion_len,
+                        token_logprobs: None,
+                    });
+                }
+            }
+
+            if completion_len >= max_tokens {
+                let secs = t_start.elapsed().as_secs_f64();
+                let tok_per_sec = if secs > 0.0 {
+                    tokens.len() as f64 / secs
+                } else {
+                    0.0
+                };
+                tracing::info!(
+                    tokens = tokens.len(),
+                    accept_len = format!("{accept_len:.2}"),
+                    spec_rounds = rounds,
+                    probe_every = probe_every,
+                    tok_per_sec = format!("{tok_per_sec:.1}"),
+                    "DFlash generation complete (length limit)"
+                );
+                return Ok(GenerationOutput {
+                    text: self.decode_tokens(&tokens)?,
+                    finish_reason: "length".to_owned(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: completion_len,
+                    token_logprobs: None,
+                });
+            }
         }
     }
 
@@ -2935,15 +3522,542 @@ fn chat_template_mentions_enable_thinking(model_dir: &Path) -> bool {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        IncrementalDetok, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
-        derive_model_name, detect_thinking_support, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, parse_enabled_flag,
+        IncrementalDetok, SimpleEngine, Tokenizer, adaptive_draft_depth_for_cap,
+        check_stop_sequences, derive_model_name, detect_thinking_support, estimate_paged_kv_blocks,
+        extract_eos_tokens, find_stop_in_tail, lock_or_recover, parse_enabled_flag,
+    };
+    use crate::chat_template::ChatMessage;
+    use higgs_models::SamplingParams;
+    use mlx_rs::{
+        Array, Dtype,
+        ops::indexing::{IndexOp, NewAxis},
+        transforms::eval,
     };
     use std::path::Path;
 
     /// Write a config.json file into the given directory with the provided JSON content.
     fn write_config(dir: &std::path::Path, json: &str) {
         std::fs::write(dir.join("config.json"), json).unwrap();
+    }
+
+    /// P5: `DFlash` speculative decode must be byte-identical to plain AR greedy
+    /// decode (T=0) and reports acceptance length + tok/s. Loads the real 35B
+    /// target twice (AR then `DFlash`, sequentially to bound memory). Manual:
+    ///
+    /// ```text
+    /// HIGGS_DFLASH_TARGET_DIR=<target dir> \
+    /// HIGGS_DFLASH_DRAFTER_DIR=<modal drafter snapshot dir> \
+    /// cargo test -p higgs-engine dflash_matches_ar_greedy -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "p5: loads real 35B target; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+    fn dflash_matches_ar_greedy_and_reports_accept_len() {
+        use super::SimpleEngine;
+        use crate::chat_template::ChatMessage;
+        use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
+        use higgs_models::{SamplingParams, turboquant::KvCacheConfig};
+
+        // Surface the engine's accept_len / per-iter trace logs.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_test_writer()
+            .try_init();
+
+        let target = std::env::var("HIGGS_DFLASH_TARGET_DIR")
+            .expect("set HIGGS_DFLASH_TARGET_DIR to the 35B target model dir");
+        let drafter = std::env::var("HIGGS_DFLASH_DRAFTER_DIR")
+            .expect("set HIGGS_DFLASH_DRAFTER_DIR to the Modal drafter snapshot dir");
+
+        // Match the reference benchmark workload: chat template + thinking
+        // enabled, a code/reasoning prompt (DFlash is trained/measured on
+        // GSM8K/HumanEval/MT-Bench, not raw factual completions). Keep
+        // max_tokens under the 256-token thinking budget so the AR (MTP) path
+        // never force-closes </think> while DFlash wouldn't.
+        let user_prompt = std::env::var("HIGGS_TEST_PROMPT").unwrap_or_else(|_| {
+            "Write a Python function that returns the n-th Fibonacci number iteratively.".to_owned()
+        });
+        let user_prompt = user_prompt.as_str();
+        // Toggle with HIGGS_TEST_THINKING=0 to measure the thinking-disabled
+        // workload (default: enabled, matching the reference benchmark).
+        let enable_thinking = std::env::var("HIGGS_TEST_THINKING")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let max_tokens = std::env::var("HIGGS_TEST_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(200);
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+
+        let run = |with_drafter: bool| -> (String, f64) {
+            let drafter_path = with_drafter.then(|| Path::new(&drafter));
+            let tuning =
+                MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
+            let engine = SimpleEngine::load_with_dflash(
+                &target,
+                KvCacheConfig::default(),
+                tuning,
+                false,
+                drafter_path,
+            )
+            .expect("load target");
+            let messages = [ChatMessage {
+                role: "user".to_owned(),
+                content: user_prompt.to_owned(),
+                tool_calls: None,
+            }];
+            let toks = engine
+                .prepare_chat_prompt_with_thinking(&messages, None, enable_thinking)
+                .expect("chat prompt");
+            let t = std::time::Instant::now();
+            let out = engine
+                .generate_with_thinking(
+                    &toks,
+                    max_tokens,
+                    &greedy,
+                    &[],
+                    false,
+                    None,
+                    enable_thinking,
+                    None,
+                    None,
+                )
+                .expect("generate");
+            let tps = f64::from(out.completion_tokens) / t.elapsed().as_secs_f64();
+            (out.text, tps)
+        };
+
+        let (ar_text, ar_tps) = run(false);
+        let (df_text, df_tps) = run(true);
+
+        println!("AR     {ar_tps:.1} tok/s: {ar_text:?}");
+        println!("DFLASH {df_tps:.1} tok/s: {df_text:?}");
+        println!("speedup vs AR: {:.2}x", df_tps / ar_tps);
+
+        // Correctness gate: greedy outputs identical up to a block-overshoot tail
+        // (DFlash commits whole blocks, so it may emit a few extra trailing
+        // tokens past max_tokens — the shorter must be a prefix of the longer).
+        let (short, long) = if ar_text.len() <= df_text.len() {
+            (ar_text.as_str(), df_text.as_str())
+        } else {
+            (df_text.as_str(), ar_text.as_str())
+        };
+        assert!(!short.is_empty(), "empty generation");
+        assert!(
+            long.starts_with(short),
+            "DFlash diverged from AR greedy:\n AR={ar_text:?}\n DF={df_text:?}"
+        );
+    }
+
+    struct DFlashArMetrics {
+        h_bits: f64,
+        top1_prob: f64,
+        tokens: Vec<u32>,
+        text: String,
+    }
+
+    struct DFlashRunMetrics {
+        text: String,
+        accept_mean: f64,
+        p10: u32,
+        p50: u32,
+        p90: u32,
+        accept_frac: f64,
+    }
+
+    struct DFlashSweepRow {
+        task: String,
+        h_bits: f64,
+        top1_prob: f64,
+        accept_mean: f64,
+        p10: u32,
+        p50: u32,
+        p90: u32,
+        accept_frac: f64,
+        byte_exact: bool,
+    }
+
+    #[allow(unsafe_code)]
+    fn dflash_set_test_env(key: &str, value: &str) {
+        // SAFETY: This ignored manual harness mutates DFlash env knobs before
+        // model loading/generation and is intended to be run alone.
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    fn dflash_set_fixed_block_env(block_size: u32) {
+        dflash_set_test_env("HIGGS_DFLASH_GATE", "0");
+        dflash_set_test_env("HIGGS_DFLASH_ADAPTIVE", "0");
+        dflash_set_test_env("HIGGS_DFLASH_BLOCK_SIZE", &block_size.to_string());
+    }
+
+    fn dflash_chat_tokens(engine: &SimpleEngine, prompt: &str) -> Vec<u32> {
+        let messages = [ChatMessage {
+            role: "user".to_owned(),
+            content: prompt.to_owned(),
+            tool_calls: None,
+        }];
+        engine
+            .prepare_chat_prompt_with_thinking(&messages, None, false)
+            .expect("chat prompt")
+    }
+
+    fn dflash_entropy_and_top1(row: &[f32]) -> (u32, f64, f64) {
+        assert!(!row.is_empty(), "empty logits row");
+        let mut ranked: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let max_logit = f64::from(ranked[0].1);
+        let denom = row
+            .iter()
+            .map(|&v| (f64::from(v) - max_logit).exp())
+            .sum::<f64>();
+        let denom = denom.max(f64::MIN_POSITIVE);
+        let top_n = ranked.len().min(50);
+        let top_probs: Vec<f64> = ranked
+            .iter()
+            .take(top_n)
+            .map(|&(_, v)| (f64::from(v) - max_logit).exp() / denom)
+            .collect();
+        let top_mass = top_probs.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+        let entropy = top_probs
+            .iter()
+            .map(|&p| {
+                let q = p / top_mass;
+                if q > 0.0 { -q * q.log2() } else { 0.0 }
+            })
+            .sum::<f64>();
+        let top1_prob = top_probs.first().copied().unwrap_or(0.0);
+        let token = u32::try_from(ranked[0].0).expect("vocab id overflow");
+        (token, entropy, top1_prob)
+    }
+
+    fn dflash_ar_entropy_pass(
+        engine: &SimpleEngine,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> DFlashArMetrics {
+        let prompt_tokens = dflash_chat_tokens(engine, prompt);
+        let mut model = lock_or_recover(&engine.model);
+        let mut cache = model
+            .make_cache_with_config(engine.kv_cache_config)
+            .expect("cache");
+        let prompt_array = Array::from(prompt_tokens.as_slice()).index(NewAxis);
+        let seq_len = prompt_array.shape().get(1).copied().unwrap_or(0);
+        let mut logits = if seq_len > engine.tuning.chunked_prefill_threshold() {
+            model
+                .forward_chunked(
+                    &prompt_array,
+                    &mut cache,
+                    engine.tuning.chunked_prefill_chunk_size(),
+                )
+                .expect("chunked prefill")
+        } else {
+            model
+                .forward_last_token(&prompt_array, None, &mut cache)
+                .expect("prefill")
+        };
+
+        let max_tokens_usize = usize::try_from(max_tokens).expect("max_tokens overflow");
+        let mut tokens = Vec::with_capacity(max_tokens_usize);
+        let mut entropy_sum = 0.0_f64;
+        let mut top1_sum = 0.0_f64;
+
+        for step in 0..max_tokens_usize {
+            let row = logits
+                .index((.., -1, ..))
+                .reshape(&[-1])
+                .expect("reshape logits")
+                .as_dtype(Dtype::Float32)
+                .expect("f32 logits");
+            eval([&row]).expect("eval logits");
+            let (next_token, entropy, top1_prob) = dflash_entropy_and_top1(row.as_slice::<f32>());
+            entropy_sum += entropy;
+            top1_sum += top1_prob;
+            tokens.push(next_token);
+
+            if step + 1 < max_tokens_usize {
+                let next_token_i32 = i32::try_from(next_token).expect("token id overflow");
+                let single = Array::from_slice(&[next_token_i32], &[1, 1]);
+                logits = model
+                    .forward(&single, None, &mut cache)
+                    .expect("decode step");
+            }
+        }
+        drop(model);
+
+        let text = engine.decode_tokens(&tokens).expect("decode AR tokens");
+        let denom = f64::from(max_tokens);
+        DFlashArMetrics {
+            h_bits: entropy_sum / denom,
+            top1_prob: top1_sum / denom,
+            tokens,
+            text,
+        }
+    }
+
+    fn dflash_accept_metrics(accepts: &[u32], block_size: u32) -> (f64, u32, u32, u32, f64) {
+        if accepts.is_empty() {
+            return (0.0, 0, 0, 0, 0.0);
+        }
+        let mean = accepts.iter().map(|&n| f64::from(n)).sum::<f64>() / accepts.len() as f64;
+        let mut sorted = accepts.to_vec();
+        sorted.sort_unstable();
+        let last = sorted.len() - 1;
+        let p10 = sorted[last * 10 / 100];
+        let p50 = sorted[last * 50 / 100];
+        let p90 = sorted[last * 90 / 100];
+        let accept_frac = mean / f64::from(block_size.max(1));
+        (mean, p10, p50, p90, accept_frac)
+    }
+
+    fn dflash_generation_pass(
+        engine: &SimpleEngine,
+        prompt: &str,
+        max_tokens: u32,
+        block_size: u32,
+        greedy: &SamplingParams,
+    ) -> DFlashRunMetrics {
+        dflash_set_fixed_block_env(block_size);
+        let prompt_tokens = dflash_chat_tokens(engine, prompt);
+        let out = engine
+            .generate_with_thinking(
+                &prompt_tokens,
+                max_tokens,
+                greedy,
+                &[],
+                false,
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("DFlash generation");
+        let accepts = engine.last_dflash_accepts();
+        let (accept_mean, p10, p50, p90, accept_frac) = dflash_accept_metrics(&accepts, block_size);
+        DFlashRunMetrics {
+            text: out.text,
+            accept_mean,
+            p10,
+            p50,
+            p90,
+            accept_frac,
+        }
+    }
+
+    fn dflash_prefix_consistent(left: &str, right: &str) -> bool {
+        if left.len() <= right.len() {
+            right.starts_with(left)
+        } else {
+            left.starts_with(right)
+        }
+    }
+
+    fn dflash_row_from_metrics(
+        task: impl Into<String>,
+        ar: &DFlashArMetrics,
+        df: DFlashRunMetrics,
+    ) -> DFlashSweepRow {
+        DFlashSweepRow {
+            task: task.into(),
+            h_bits: ar.h_bits,
+            top1_prob: ar.top1_prob,
+            accept_mean: df.accept_mean,
+            p10: df.p10,
+            p50: df.p50,
+            p90: df.p90,
+            accept_frac: df.accept_frac,
+            byte_exact: !ar.tokens.is_empty() && dflash_prefix_consistent(&ar.text, &df.text),
+        }
+    }
+
+    fn dflash_sweep_row(
+        engine: &SimpleEngine,
+        task: impl Into<String>,
+        prompt: &str,
+        max_tokens: u32,
+        block_size: u32,
+        greedy: &SamplingParams,
+    ) -> DFlashSweepRow {
+        let ar = dflash_ar_entropy_pass(engine, prompt, max_tokens);
+        let df = dflash_generation_pass(engine, prompt, max_tokens, block_size, greedy);
+        dflash_row_from_metrics(task, &ar, df)
+    }
+
+    fn dflash_print_table(title: &str, rows: &[DFlashSweepRow]) {
+        println!("\n{title}");
+        println!(
+            "| task | H_bits | top1_prob | accept_mean | p10 | p50 | p90 | accept_frac | byte_exact |"
+        );
+        println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |");
+        for row in rows {
+            println!(
+                "| {} | {:.3} | {:.3} | {:.2} | {} | {} | {} | {:.3} | {} |",
+                row.task,
+                row.h_bits,
+                row.top1_prob,
+                row.accept_mean,
+                row.p10,
+                row.p50,
+                row.p90,
+                row.accept_frac,
+                row.byte_exact
+            );
+        }
+    }
+
+    fn dflash_repeat_prompt_to_chat_tokens(
+        engine: &SimpleEngine,
+        prompt: &str,
+        target_tokens: usize,
+    ) -> String {
+        let base_len = dflash_chat_tokens(engine, prompt).len().max(1);
+        let reps = (target_tokens / base_len).max(1);
+        let mut padded = std::iter::repeat_n(prompt, reps)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        while dflash_chat_tokens(engine, &padded).len() < target_tokens {
+            padded.push_str("\n\n");
+            padded.push_str(prompt);
+        }
+        padded
+    }
+
+    #[test]
+    #[ignore = "loads real DFlash target + drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        clippy::as_conversions
+    )]
+    fn dflash_entropy_sweep() {
+        use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
+        use higgs_models::turboquant::KvCacheConfig;
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_test_writer()
+            .try_init();
+
+        let (target, drafter) = match (
+            std::env::var("HIGGS_DFLASH_TARGET_DIR"),
+            std::env::var("HIGGS_DFLASH_DRAFTER_DIR"),
+        ) {
+            (Ok(target), Ok(drafter)) => (target, drafter),
+            _ => {
+                println!(
+                    "skipping dflash_entropy_sweep: set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"
+                );
+                return;
+            }
+        };
+
+        const MAX_TOKENS: u32 = 160;
+        const DEFAULT_BLOCK_SIZE: u32 = 16;
+        const MULT_TABLES: &str = "Print the multiplication tables from 1 x 1 through 12 x 12 in ascending order. Use one equation per line.";
+        const COUNT_200: &str = "Count from 1 to 200. Print only the numbers separated by commas.";
+        const JSON_RECORDS: &str = "Emit 24 JSON objects, one per line, with schema {\"id\": number, \"name\": \"item-N\", \"active\": true, \"score\": number}. Use deterministic ascending ids.";
+        const CSV_TABLE: &str = "Create a CSV table with columns day,city,temperature_c,condition for 40 rows. Use predictable city names City01 through City40.";
+        const STRUCT_GETTERS: &str = "Write repetitive Rust code for a UserProfile struct with fields id, name, email, age, city, country, plan, created_at, and add simple getter methods for every field.";
+        const SORT_ALGORITHM: &str = "Write an iterative insertion sort implementation in Python, then walk through sorting [9, 4, 7, 1, 3, 8] step by step.";
+        const CAPITALS: &str = "List the capitals of these countries in order: France, Germany, Italy, Spain, Portugal, Netherlands, Belgium, Austria, Poland, Czechia, Denmark, Sweden, Norway, Finland, Ireland, Greece, Turkey, Egypt, Japan, Canada.";
+        const UNIT_CONVERSIONS: &str = "Create a unit conversion table for meters to feet from 1 through 40 meters. Use four decimal places.";
+        const TRANSLATION: &str = "Translate this paragraph from English to French: The research team tested a compact solar pump in three villages. During the dry season, farmers used it to irrigate tomato fields, compare fuel savings, and record maintenance issues.";
+        const GSM8K: &str = "Solve this word problem with clear arithmetic steps: A bakery made 186 muffins. It sold 48 before lunch, baked 3 more trays with 24 muffins each, then packed the rest equally into 7 boxes. How many muffins were in each box, and how many were left over?";
+        const PHOTOSYNTHESIS: &str = "Explain photosynthesis for a technically curious reader. Cover chlorophyll, light reactions, carbon fixation, water splitting, and why the process matters to ecosystems.";
+        const STORY: &str = "Write a vivid short story about an archivist who discovers that a city map changes every midnight. Include sensory detail and an unresolved final image.";
+
+        const PROMPTS: [(&str, &str); 12] = [
+            ("multiplication tables", MULT_TABLES),
+            ("count 1..200", COUNT_200),
+            ("fixed-schema JSON", JSON_RECORDS),
+            ("CSV table", CSV_TABLE),
+            ("struct getters", STRUCT_GETTERS),
+            ("iterative sort", SORT_ALGORITHM),
+            ("capitals list", CAPITALS),
+            ("unit conversion", UNIT_CONVERSIONS),
+            ("EN-FR translation", TRANSLATION),
+            ("GSM8K word problem", GSM8K),
+            ("photosynthesis", PHOTOSYNTHESIS),
+            ("short story", STORY),
+        ];
+
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+
+        let load_engine = |block_size: u32| -> SimpleEngine {
+            dflash_set_fixed_block_env(block_size);
+            let tuning =
+                MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
+            SimpleEngine::load_with_dflash(
+                &target,
+                KvCacheConfig::default(),
+                tuning,
+                false,
+                Some(Path::new(&drafter)),
+            )
+            .expect("load DFlash engine")
+        };
+
+        let engine = load_engine(DEFAULT_BLOCK_SIZE);
+
+        let mut entropy_rows = Vec::new();
+        for &(label, prompt) in &PROMPTS {
+            entropy_rows.push(dflash_sweep_row(
+                &engine,
+                label,
+                prompt,
+                MAX_TOKENS,
+                DEFAULT_BLOCK_SIZE,
+                &greedy,
+            ));
+        }
+        entropy_rows.sort_by(|a, b| a.h_bits.total_cmp(&b.h_bits));
+        dflash_print_table("## ENTROPY", &entropy_rows);
+
+        let mut context_rows = Vec::new();
+        for &(label, prompt) in &[
+            ("context multiplication", MULT_TABLES),
+            ("context story", STORY),
+        ] {
+            for target_tokens in [512_usize, 4096, 16_384] {
+                let padded = dflash_repeat_prompt_to_chat_tokens(&engine, prompt, target_tokens);
+                context_rows.push(dflash_sweep_row(
+                    &engine,
+                    format!("{label}-{target_tokens}"),
+                    &padded,
+                    MAX_TOKENS,
+                    DEFAULT_BLOCK_SIZE,
+                    &greedy,
+                ));
+            }
+        }
+        dflash_print_table("## CONTEXT", &context_rows);
+
+        let sort_ar = dflash_ar_entropy_pass(&engine, SORT_ALGORITHM, MAX_TOKENS);
+        drop(engine);
+
+        let mut block_rows = Vec::new();
+        for block_size in [4_u32, 8, 16] {
+            let block_engine = load_engine(block_size);
+            let df = dflash_generation_pass(
+                &block_engine,
+                SORT_ALGORITHM,
+                MAX_TOKENS,
+                block_size,
+                &greedy,
+            );
+            block_rows.push(dflash_row_from_metrics(
+                format!("iterative sort block {block_size}"),
+                &sort_ar,
+                df,
+            ));
+        }
+        dflash_print_table("## BLOCK", &block_rows);
     }
 
     /// Gemma chat models stop on `<end_of_turn>`, which their `config.json` often
