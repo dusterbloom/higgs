@@ -866,6 +866,12 @@ impl AnyModel {
         cache: &mut AnyCache,
         tap_layers: &[usize],
     ) -> Result<(Array, Vec<Array>), Exception> {
+        if mask.is_some() {
+            return Err(Exception::custom(
+                "forward_with_taps does not support external masks",
+            ));
+        }
+
         match (self, cache) {
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
                 m.forward_with_taps(inputs, mask, c, tap_layers)
@@ -884,6 +890,12 @@ impl AnyModel {
         cache: &mut AnyCache,
         tap_layers: &[usize],
     ) -> Result<TapsTapeOutput, Exception> {
+        if mask.is_some() {
+            return Err(Exception::custom(
+                "forward_with_taps_tape does not support external masks",
+            ));
+        }
+
         match (self, cache) {
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
                 m.forward_with_taps_tape(inputs, mask, c, tap_layers)
@@ -907,8 +919,69 @@ impl AnyModel {
         n_accepted: i32,
         kv_rollback: i32,
     ) -> Result<(), Exception> {
+        if n_accepted < 0 {
+            return Err(Exception::custom(format!(
+                "replay_tape_rollback requires n_accepted >= 0, got {n_accepted}"
+            )));
+        }
+
+        if kv_rollback < 0 {
+            return Err(Exception::custom(format!(
+                "replay_tape_rollback requires kv_rollback >= 0, got {kv_rollback}"
+            )));
+        }
+
         match (self, cache) {
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                if layer_tapes.len() != c.len() {
+                    return Err(Exception::custom(format!(
+                        "replay_tape_rollback layer_tapes length ({}) must match cache length ({})",
+                        layer_tapes.len(),
+                        c.len()
+                    )));
+                }
+
+                for (idx, (layer_cache, layer_tape)) in c.iter().zip(layer_tapes.iter()).enumerate()
+                {
+                    match (layer_cache, layer_tape) {
+                        (Some(LayerCache::Arrays(_)), Some(gdn_tape)) => {
+                            for (name, tensor) in [
+                                ("delta_tape", &gdn_tape.delta_tape),
+                                ("norm_k", &gdn_tape.norm_k),
+                                ("a_proj", &gdn_tape.a_proj),
+                            ] {
+                                let tape_len = *tensor.shape().get(1).ok_or_else(|| {
+                                    Exception::custom(format!(
+                                        "replay_tape_rollback layer {idx} {name} must have a sequence dimension"
+                                    ))
+                                })?;
+
+                                if n_accepted > tape_len {
+                                    return Err(Exception::custom(format!(
+                                        "replay_tape_rollback n_accepted ({n_accepted}) exceeds layer {idx} {name} sequence length ({tape_len})"
+                                    )));
+                                }
+                            }
+                        }
+                        (Some(LayerCache::Arrays(_)), None) => {
+                            return Err(Exception::custom(format!(
+                                "replay_tape_rollback missing GDN tape for Arrays cache layer {idx}"
+                            )));
+                        }
+                        (Some(LayerCache::KV(_)), Some(_)) => {
+                            return Err(Exception::custom(format!(
+                                "replay_tape_rollback got GDN tape for KV cache layer {idx}"
+                            )));
+                        }
+                        (None, Some(_)) => {
+                            return Err(Exception::custom(format!(
+                                "replay_tape_rollback got GDN tape for empty cache layer {idx}"
+                            )));
+                        }
+                        (Some(LayerCache::KV(_)) | None, None) => {}
+                    }
+                }
+
                 m.replay_tape_rollback(layer_tapes, c, n_accepted, kv_rollback)
             }
             _ => Err(Exception::custom(
