@@ -24,13 +24,18 @@ pub enum QuantMode {
     Affine,
     /// MX-format E2M1 (4-bit) with a shared 8-bit block exponent, no bias.
     MxFp4,
+    /// Unquantized dense weights (bf16/fp16). Used when a tensor has no
+    /// `.scales` in the checkpoint (e.g. GDN dynamics in mixed-precision models).
+    /// Not a config.json value — set by the loader after checkpoint pre-scan.
+    Dense,
 }
 
 impl QuantMode {
     /// The C-string MLX expects for this mode.
     pub const fn cstr(&self) -> &'static CStr {
         match self {
-            Self::Affine => c"affine",
+            // Dense never reaches the C FFI — QLinear uses plain matmul.
+            Self::Affine | Self::Dense => c"affine",
             Self::MxFp4 => c"mxfp4",
         }
     }
@@ -48,6 +53,10 @@ impl QuantMode {
 
     pub const fn is_mxfp4(&self) -> bool {
         matches!(self, Self::MxFp4)
+    }
+
+    pub const fn is_dense(&self) -> bool {
+        matches!(self, Self::Dense)
     }
 }
 

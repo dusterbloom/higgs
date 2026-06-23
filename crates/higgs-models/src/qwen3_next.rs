@@ -358,17 +358,24 @@ impl QLinear {
     ) -> Result<Self, Exception> {
         let (weight, scales, biases) = init_quantized_params();
         // mxfp4 tensors ship without `.biases` on disk (E2M1 has no zero-point).
+        // Dense tensors ship without `.scales` or `.biases` (just a weight matrix).
         // Replace the [1] placeholder with a [0] empty array so the weight-loader's
-        // completeness check (`shape == [1]` ⇒ missing) doesn't flag it. The mxfp4
-        // forward path passes `None` for biases to the FFI, so this value is never used.
-        let biases_param = if mode.is_mxfp4() {
+        // completeness check (`shape == [1]` ⇒ missing) doesn't flag them.
+        // The forward path ignores scales/biases for these modes.
+        let needs_no_aux = mode.is_mxfp4() || mode.is_dense();
+        let biases_param = if needs_no_aux {
             Param::new(Array::from_slice::<f32>(&[], &[0]))
         } else {
             biases
         };
+        let scales_param = if mode.is_dense() {
+            Param::new(Array::from_slice::<f32>(&[], &[0]))
+        } else {
+            scales
+        };
         Ok(Self {
             weight,
-            scales,
+            scales: scales_param,
             biases: biases_param,
             group_size,
             bits,
@@ -388,6 +395,10 @@ impl QLinear {
                 self.bits,
                 crate::quant_mode::QuantMode::MxFp4,
             ),
+            // Dense: plain matmul on the raw weight (bf16/fp16).
+            crate::quant_mode::QuantMode::Dense => {
+                dense_linear_no_bias_forward(&self.weight, x)
+            }
             // Affine fast path — unchanged from the mlx-rs wrapper.
             crate::quant_mode::QuantMode::Affine => quantized_forward(
                 x,
@@ -407,7 +418,7 @@ impl QLinear {
     /// Only supported for `Affine` — the custom `qgemv_4bit` kernel assumes
     /// affine-packed weights; `MxFp4` falls through to the standard matmul.
     pub(crate) fn forward_decode_fast(&self, x: &Array) -> Result<Array, Exception> {
-        if self.mode.is_mxfp4() {
+        if self.mode.is_mxfp4() || self.mode.is_dense() {
             return self.forward(x);
         }
         if decode_gemv_enabled()
@@ -484,14 +495,20 @@ impl QEmbedding {
 
     pub(crate) fn new_spec(spec: QuantSpec) -> Self {
         let (weight, scales, biases) = init_quantized_params();
-        let biases_param = if spec.mode.is_mxfp4() {
+        let needs_no_aux = spec.mode.is_mxfp4() || spec.mode.is_dense();
+        let biases_param = if needs_no_aux {
             Param::new(Array::from_slice::<f32>(&[], &[0]))
         } else {
             biases
         };
+        let scales_param = if spec.mode.is_dense() {
+            Param::new(Array::from_slice::<f32>(&[], &[0]))
+        } else {
+            scales
+        };
         Self {
             weight,
-            scales,
+            scales: scales_param,
             biases: biases_param,
             group_size: spec.group_size,
             bits: spec.bits,
@@ -512,6 +529,8 @@ impl QEmbedding {
             crate::quant_mode::QuantMode::Affine => {
                 ops::dequantize(&w, &s, &b, self.group_size, self.bits)?
             }
+            // Dense: weights are already full-precision; just gather rows.
+            crate::quant_mode::QuantMode::Dense => w,
         };
         let mut ret_shape: Vec<i32> = shape;
         ret_shape.push(-1);
@@ -545,6 +564,10 @@ impl QEmbedding {
                         self.bits,
                     )
                 }
+            }
+            // Dense: plain matmul on full-precision weights.
+            crate::quant_mode::QuantMode::Dense => {
+                dense_linear_no_bias_forward(&self.weight, x)
             }
         }
     }
@@ -2734,7 +2757,7 @@ struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
-    fn new(args: &Qwen3NextModelArgs, spec: QuantSpec) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs, layer_idx: i32, spec: QuantSpec) -> Result<Self, Exception> {
         let num_k_heads = args.linear_num_key_heads;
         let num_v_heads = args.linear_num_value_heads;
         let head_k_dim = args.linear_key_head_dim;
@@ -2745,12 +2768,17 @@ impl GatedDeltaNet {
         let conv_kernel_size = args.linear_conv_kernel_dim;
 
         let use_sep = args.use_separate_gdn_projections;
+        // Resolve per-projection quantization: a/b may be Dense (bf16) in
+        // mixed-precision checkpoints (e.g. AEON mxfp4 + bf16 GDN dynamics).
+        let ab_spec = args.quant_spec_for(&format!(
+            "model.layers.{layer_idx}.linear_attn.in_proj_a"
+        ));
         let in_proj_qkvz = QLinear::new_spec(spec)?;
-        let in_proj_ba = QLinear::new_spec(spec)?;
+        let in_proj_ba = QLinear::new_spec(ab_spec)?;
         let in_proj_qkv = use_sep.then(|| QLinear::new_spec(spec)).transpose()?;
         let in_proj_z = use_sep.then(|| QLinear::new_spec(spec)).transpose()?;
-        let in_proj_a = use_sep.then(|| QLinear::new_spec(spec)).transpose()?;
-        let in_proj_b = use_sep.then(|| QLinear::new_spec(spec)).transpose()?;
+        let in_proj_a = use_sep.then(|| QLinear::new_spec(ab_spec)).transpose()?;
+        let in_proj_b = use_sep.then(|| QLinear::new_spec(ab_spec)).transpose()?;
         let conv1d = nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
             .bias(false)
             .groups(conv_dim)
@@ -3444,7 +3472,7 @@ impl DecoderLayer {
         let is_linear = (layer_idx + 1) % args.full_attention_interval != 0;
 
         let linear_attn = is_linear
-            .then(|| GatedDeltaNet::new(args, spec))
+            .then(|| GatedDeltaNet::new(args, layer_idx, spec))
             .transpose()?;
         // Resolve per-layer k/v quantization override (e.g. AEON's 8-bit affine
         // k/v islands on full-attention layers). Falls back to the global spec
@@ -4807,6 +4835,21 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
 
     let mut args: Qwen3NextModelArgs = serde_json::from_value(obj)?;
     args.quantization_overrides = quantization_overrides;
+
+    // Pre-scan checkpoint for dense GDN projections (bf16, no .scales).
+    // Mixed-precision models like AEON keep GDN dynamics (in_proj_a, in_proj_b)
+    // in bf16 while quantizing the bulk. The model constructs these as QLinear
+    // (from the global mxfp4 default); without a Dense override the weight
+    // loader rejects them for missing .scales. Detect from the safetensors
+    // index and inject Dense overrides for paths that have .weight but no .scales.
+    detect_dense_gdn_projections(model_dir.as_ref(), &mut args.quantization_overrides);
+
+    // Dense GDN projections can't be fused into in_proj_ba (no scales to
+    // concatenate). Force separate projections when any Dense override exists.
+    if args.quantization_overrides.values().any(|qc| qc.mode.is_dense()) {
+        args.use_separate_gdn_projections = true;
+    }
+
     Ok(args)
 }
 
@@ -4823,6 +4866,69 @@ fn qwen3_5_quantization_config(value: &serde_json::Value) -> Option<Quantization
         bits,
         mode,
     })
+}
+
+/// Pre-scan the safetensors index to detect GDN projections that are dense
+/// (bf16, no `.scales`) in the checkpoint but would default to mxfp4/affine
+/// from the config. Injects `QuantMode::Dense` overrides for those paths so
+/// the model constructs them with plain matmul instead of `quantized_matmul`.
+///
+/// Without this, mixed-precision checkpoints (e.g. AEON mxfp4 + bf16 GDN
+/// dynamics) fail to load because the weight loader can't find `.scales`
+/// for the dense projections.
+fn detect_dense_gdn_projections(
+    model_dir: &Path,
+    overrides: &mut HashMap<String, QuantizationConfig>,
+) {
+    let index_path = model_dir.join("model.safetensors.index.json");
+    let Ok(index_text) = std::fs::read_to_string(&index_path) else {
+        return; // single-shard models have no index; nothing to scan
+    };
+    let Ok(index) = serde_json::from_str::<crate::WeightMapIndex>(&index_text) else {
+        return;
+    };
+
+    // Collect all tensor keys that have `.scales` (i.e. are quantized).
+    // Any GDN projection path that has `.weight` but NOT `.scales` is dense.
+    let quantized_paths: std::collections::HashSet<&str> = index
+        .weight_map
+        .keys()
+        .filter_map(|k| k.strip_suffix(".scales"))
+        .collect();
+
+    let dense_spec = QuantizationConfig {
+        group_size: 0,
+        bits: 0,
+        mode: crate::quant_mode::QuantMode::Dense,
+    };
+
+    let mut added = 0usize;
+    for weight_key in index.weight_map.keys() {
+        // Look for GDN projection weights: ...linear_attn.in_proj_{a,b}.weight
+        let Some(base) = weight_key
+            .strip_prefix("language_model.")
+            .and_then(|k| k.strip_suffix(".weight"))
+        else {
+            continue;
+        };
+        if !(base.ends_with(".linear_attn.in_proj_a")
+            || base.ends_with(".linear_attn.in_proj_b"))
+        {
+            continue;
+        }
+        // If this path is NOT quantized (no .scales key) and not already overridden
+        if !quantized_paths.contains(base) && !overrides.contains_key(base) {
+            overrides.insert(base.to_owned(), dense_spec.clone());
+            added += 1;
+        }
+    }
+
+    if added > 0 {
+        tracing::info!(
+            added,
+            "Detected dense (unquantized) GDN projections from checkpoint; added Dense overrides"
+        );
+    }
 }
 
 /// Scan the per-layer `quantization` map and return layer indices where the GDN
@@ -6690,7 +6796,7 @@ mod tests {
         use mlx_rs::Dtype;
 
         let args = valid_causal_lm_args();
-        let mut gdn = GatedDeltaNet::new(&args, crate::qwen3_next::QuantSpec::default()).unwrap();
+        let mut gdn = GatedDeltaNet::new(&args, 0, crate::qwen3_next::QuantSpec::default()).unwrap();
         let conv_w = mlx_rs::random::uniform::<f32, f32>(
             -0.5,
             0.5,
