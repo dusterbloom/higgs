@@ -6594,7 +6594,21 @@ pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausa
         head_v_dim: args.linear_value_head_dim,
     };
     gdn_dims.validate()?;
-    let model = load_qwen3_5_model_with_gdn_fallback(model_path, args, &gdn_dims)?;
+    let mut model = load_qwen3_5_model_with_gdn_fallback(model_path, args, &gdn_dims)?;
+
+    // Optional: re-quantize Dense (bf16) GDN in_proj_a/b to 8-bit affine at
+    // load time. Saves ~0.7GB/token bandwidth with negligible precision loss
+    // (8-bit has 256 levels vs 4-bit E2M1's 8 levels that corrupt the recurrence).
+    // The model card warns against quantizing GDN dynamics, but that's for 4-bit.
+    if std::env::var("HIGGS_DENSE_REQUANT_8BIT").is_ok() {
+        let n = requant_dense_gdn_to_8bit(&mut model)?;
+        if n > 0 {
+            tracing::info!(
+                n,
+                "Re-quantized Dense GDN projections to 8-bit affine (load-time optimization)"
+            );
+        }
+    }
 
     tracing::info!("Qwen3.5 dense model loaded successfully");
     Ok(model)
@@ -6647,6 +6661,42 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
 /// the direct loader. Otherwise try the fused loader; if it reports a mixed-bit
 /// `in_proj_ba` shape mismatch, rebuild the model with separate projections and
 /// retry via the direct loader.
+/// Re-quantize Dense (bf16) GDN `in_proj_a`/`in_proj_b` QLinears to 8-bit
+/// affine at load time. Walks the model tree, finds Dense QLinears in GDN
+/// layers, calls `ops::quantize(weight, 64, 8)` and swaps the params + mode.
+///
+/// Returns the number of QLinears requantized.
+fn requant_dense_gdn_to_8bit(model: &mut Qwen3NextCausalLM) -> Result<usize, ModelError> {
+    let mut count = 0usize;
+    for layer in &mut model.model.layers {
+        if let Some(ref mut gdn) = layer.linear_attn {
+            for ql_opt in [&mut gdn.in_proj_a, &mut gdn.in_proj_b] {
+                if let Some(ql) = ql_opt {
+                    if ql.mode.is_dense() {
+                        requant_one_to_8bit(ql)?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Quantize a single Dense QLinear's bf16 weight to 8-bit affine in-place.
+fn requant_one_to_8bit(ql: &mut QLinear) -> Result<(), ModelError> {
+    let (wq, scales, biases) = ops::quantize(&ql.weight, 64, 8)
+        .map_err(ModelError::Mlx)?;
+    mlx_rs::transforms::eval([&wq, &scales, &biases]).map_err(ModelError::Mlx)?;
+    ql.weight = Param::new(wq);
+    ql.scales = Param::new(scales);
+    ql.biases = Param::new(biases);
+    ql.group_size = 64;
+    ql.bits = 8;
+    ql.mode = crate::quant_mode::QuantMode::Affine;
+    Ok(())
+}
+
 fn load_qwen3_5_model_with_gdn_fallback(
     model_path: &Path,
     mut args: Qwen3NextModelArgs,
