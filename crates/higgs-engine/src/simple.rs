@@ -612,24 +612,15 @@ impl SimpleEngine {
     /// best-effort: a layer that can't be packed stays dense and continuation
     /// still works, just uncompressed.
     #[allow(clippy::doc_markdown)]
-    fn stash_retained(&self, session_id: u64, mut cache: AnyCache, tokens: Vec<u32>) {
+    /// Publish an ALREADY-PREPARED retained cache (TurboQuant-compressed AND
+    /// evaluated by the caller while the model lock was held — see
+    /// `generate_continued`) into the session map. This does NO MLX work: MLX's
+    /// Metal command buffer is process-global and aborts on concurrent eval, so
+    /// all GPU work must stay serialized under the model lock, which this
+    /// function does not hold.
+    fn stash_retained(&self, session_id: u64, cache: AnyCache, tokens: Vec<u32>) {
         // ponytail: small fixed cap; make it a config knob if multi-tenant.
         const MAX_RETAINED: usize = 8;
-
-        match cache.quantize_for_retention(self.kv_cache_config) {
-            Ok(layers) if layers > 0 => tracing::debug!(
-                session_id,
-                compressed_layers = layers,
-                "Compressed retained KV to TurboQuant for between-turn retention"
-            ),
-            Ok(_) => {}
-            // Leave the cache dense on failure — correctness over footprint.
-            Err(e) => tracing::warn!(
-                session_id,
-                error = %e,
-                "Failed to TurboQuant-compress retained KV; retaining dense"
-            ),
-        }
 
         let mut map = lock_or_recover(&self.retained);
         map.insert(
@@ -1053,9 +1044,35 @@ impl SimpleEngine {
         }
 
         // Retain the live cache + the exact tokens it now holds (prompt +
-        // generated) so the next hop continues from here. Drop the model guard
-        // first so we stash only the cache.
-        let PreparedGeneration { cache, model, .. } = prepared;
+        // generated) so the next hop continues from here.
+        //
+        // Compress (TurboQuant) AND evaluate the cache while the model lock is
+        // STILL HELD. MLX's Metal command buffer is process-global and aborts on
+        // concurrent eval across threads, so every MLX/GPU operation must be
+        // serialized by the model Mutex (the engine's de-facto MLX-execution
+        // lock). Doing this before `drop(model)` keeps this request's GPU work
+        // from racing the next request's forward pass; `stash_retained` then only
+        // publishes the already-evaluated cache.
+        let PreparedGeneration {
+            mut cache, model, ..
+        } = prepared;
+        match cache.quantize_for_retention(self.kv_cache_config) {
+            Ok(layers) if layers > 0 => tracing::debug!(
+                session_id,
+                compressed_layers = layers,
+                "Compressed retained KV to TurboQuant for between-turn retention"
+            ),
+            Ok(_) => {}
+            // Leave the cache dense on failure — correctness over footprint.
+            Err(e) => tracing::warn!(
+                session_id,
+                error = %e,
+                "Failed to TurboQuant-compress retained KV; retaining dense"
+            ),
+        }
+        if let Err(e) = cache.eval() {
+            tracing::warn!(session_id, error = %e, "Failed to eval retained cache before stash");
+        }
         drop(model);
         let mut full = prompt_tokens.to_vec();
         full.extend_from_slice(&generated);

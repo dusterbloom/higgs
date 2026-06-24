@@ -144,6 +144,42 @@ impl AnyCache {
         }
     }
 
+    /// Force-evaluate every array this cache holds. Required before the cache is
+    /// shared across threads — e.g. stashed for a later turn that resumes on a
+    /// different blocking-pool thread, or after a lazy `quantize_for_retention`.
+    /// Sharing a pending lazy MLX graph across threads is a data race; evaluating
+    /// first makes the handoff a read-only transfer of concrete buffers. No-op
+    /// for an empty cache.
+    pub fn eval(&self) -> Result<(), Exception> {
+        let mut targets: Vec<&Array> = Vec::new();
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter().flatten() {
+                    targets.extend(layer.eval_targets());
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter().flatten() {
+                    match layer {
+                        LayerCache::KV(kv) => targets.extend(kv.eval_targets()),
+                        LayerCache::Arrays(a) => {
+                            if let Some(ref cs) = a.conv_state {
+                                targets.push(cs);
+                            }
+                            if let Some(ref ss) = a.ssm_state {
+                                targets.push(ss);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        mlx_rs::transforms::eval(targets)
+    }
+
     /// Prune the token span `[a, b)` from every dense KV layer, compacting
     /// survivors and renumbering positions (see
     /// [`cache::SteppingKeyValueCache::prune_span`]). Recurrent (SSM) layers are

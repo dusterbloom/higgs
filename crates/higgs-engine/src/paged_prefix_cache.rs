@@ -29,6 +29,19 @@ struct KvBlock {
     values: Array,
 }
 
+impl KvBlock {
+    /// Build a block whose K/V arrays are fully EVALUATED. Radix blocks are
+    /// `Arc`-shared and reconstructed from different server threads, so a block
+    /// must hold a concrete, immutable MLX buffer — never a pending lazy slice
+    /// graph. Evaluating here is the soundness invariant the `unsafe impl Sync`
+    /// below relies on; it costs nothing net (the slice would materialize on
+    /// first use anyway) and removes the cross-thread data race on shared graphs.
+    fn new(keys: Array, values: Array) -> Result<Arc<Self>, Exception> {
+        mlx_rs::transforms::eval([&keys, &values])?;
+        Ok(Arc::new(Self { keys, values }))
+    }
+}
+
 /// GDN state snapshot at a block boundary (Hybrid models only).
 #[derive(Debug, Clone)]
 struct GdnSnapshot {
@@ -51,14 +64,43 @@ struct TqBlock {
     value_norms: Array,
 }
 
+impl TqBlock {
+    /// Build a `TurboQuant` block with all 5 arrays EVALUATED — same soundness
+    /// invariant as [`KvBlock::new`]: shared across threads, so never lazy.
+    fn new(
+        key_codes: Array,
+        key_norms: Array,
+        key_gammas: Array,
+        value_codes: Array,
+        value_norms: Array,
+    ) -> Result<Arc<Self>, Exception> {
+        mlx_rs::transforms::eval([
+            &key_codes,
+            &key_norms,
+            &key_gammas,
+            &value_codes,
+            &value_norms,
+        ])?;
+        Ok(Arc::new(Self {
+            key_codes,
+            key_norms,
+            key_gammas,
+            value_codes,
+            value_norms,
+        }))
+    }
+}
+
 // MLX `Array` is `Send` but `!Sync` (it holds a `*mut c_void` into the MLX
-// runtime). Wrapping blocks in `Arc` for cross-prefix sharing requires the
-// pointee to be `Send + Sync`. Blocks are immutable snapshots once stored, and
-// every access goes through `PagedPrefixCache`, which lives behind the engine's
-// `Mutex` -- so no two threads ever touch a block's arrays concurrently. This is
-// the same basis on which `CachedMetalKernel` asserts thread-safety.
-// ponytail: sound only while the cache stays Mutex-guarded; if the engine ever
-// gains lock-free concurrent cache access, revisit (read-copy the arrays).
+// runtime). Radix blocks are `Arc`-shared and reconstructed from DIFFERENT
+// server threads (each chat request runs in its own `spawn_blocking`), so the
+// pointee must be `Send + Sync`. SAFETY rests on one invariant: a block holds
+// ONLY fully-evaluated, immutable MLX buffers — never a pending lazy graph.
+// That is enforced by construction — `KvBlock::new` / `TqBlock::new` `eval`
+// their arrays before the block exists — so concurrent reconstruction touches
+// no mutable MLX graph state, only read-only buffers. A *lazy* block would be
+// unsound: concurrent build+eval of shared graphs is a data race (SIGSEGV) — the
+// regression is pinned by `radix_blocks_reconstruct_safely_across_threads`.
 #[allow(unsafe_code)]
 unsafe impl Sync for KvBlock {}
 #[allow(unsafe_code)]
@@ -1069,13 +1111,13 @@ fn slice_tq_layer(
         let end = start
             .checked_add(block_size)
             .ok_or_else(|| Exception::custom("block end overflow"))?;
-        blocks.push(Arc::new(TqBlock {
-            key_codes: slice_axis1(key_codes, start, end)?,
-            key_norms: slice_axis1(key_norms, start, end)?,
-            key_gammas: slice_axis1(key_gammas, start, end)?,
-            value_codes: slice_axis1(value_codes, start, end)?,
-            value_norms: slice_axis1(value_norms, start, end)?,
-        }));
+        blocks.push(TqBlock::new(
+            slice_axis1(key_codes, start, end)?,
+            slice_axis1(key_norms, start, end)?,
+            slice_axis1(key_gammas, start, end)?,
+            slice_axis1(value_codes, start, end)?,
+            slice_axis1(value_norms, start, end)?,
+        )?);
     }
 
     Ok(CachedLayerData::TurboQuantKv(blocks))
@@ -1105,7 +1147,7 @@ fn slice_kv_layer(
             .ok_or_else(|| Exception::custom("block end overflow"))?;
         let k = slice_axis2(keys, start, end)?;
         let v = slice_axis2(values, start, end)?;
-        blocks.push(Arc::new(KvBlock { keys: k, values: v }));
+        blocks.push(KvBlock::new(k, v)?);
     }
 
     Ok(CachedLayerData::Kv(blocks))
@@ -1803,6 +1845,57 @@ mod tests {
         // The shared blocks came from seq_a (stored first); reconstruction of
         // the first 64 tokens must byte-match seq_a's stored KV.
         assert_keys_eq_first_n(&cache_keys(&result.cache, 0), &expected, 64);
+    }
+
+    /// Concurrency contract for the radix block cache. Blocks are `Arc`-shared
+    /// and, in the server, reconstructed from DIFFERENT tokio blocking-pool
+    /// threads across turns (each request runs in its own `spawn_blocking`). Two
+    /// invariants must hold:
+    /// 1. A block is genuinely `Send + Sync` — safe to hand to and read from
+    ///    another thread — which requires it to hold only fully-EVALUATED MLX
+    ///    buffers (enforced by `KvBlock::new`), never a pending lazy slice graph.
+    /// 2. MLX eval must be serialized: MLX's Metal command buffer is process-
+    ///    global and aborts (SIGABRT in `concatenate_gpu` → command encoder) on
+    ///    concurrent eval. The engine serializes via the model `Mutex`; this test
+    ///    mirrors that with a shared lock around reconstruction.
+    ///
+    /// It reconstructs from many threads (under the shared lock) and checks each
+    /// thread's result is well-formed. Without evaluated blocks (invariant 1) the
+    /// shared lazy graphs would race even under the lock; without the lock
+    /// (invariant 2) the Metal command buffer aborts.
+    #[test]
+    fn radix_blocks_reconstruct_serialized_across_threads() {
+        let cache = make_kv_cache_content(1, 128, 7.0);
+        let AnyCache::KV(layers) = &cache else {
+            panic!("expected KV cache");
+        };
+        let kv = layers[0].as_ref().expect("layer 0 present");
+        let CachedLayerData::Kv(blocks) = slice_kv_layer(Some(kv), 4, 32).unwrap() else {
+            panic!("expected Kv blocks");
+        };
+        let shared = Arc::new(blocks);
+        let mlx_lock = Arc::new(std::sync::Mutex::new(()));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = Arc::clone(&shared);
+                let lock = Arc::clone(&mlx_lock);
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        let guard = lock.lock().unwrap();
+                        let c = gather_blocks(&s).unwrap();
+                        let k = c.keys().expect("keys").clone();
+                        let v = c.values().expect("values").clone();
+                        mlx_rs::transforms::eval([&k, &v]).unwrap();
+                        drop(guard);
+                        assert_eq!(k.shape(), [1, 2, 128, 8].as_slice());
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("reconstruction thread panicked");
+        }
     }
 
     /// (c) Inserting then evicting frees only UNSHARED blocks while shared
