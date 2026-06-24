@@ -1777,6 +1777,89 @@ if (valid) {
 }
 ";
 
+/// Quantized GEMM kernel — batched matmul for DFlash verify (T>1).
+///
+/// Same fused weight-unpack + dot-product as QGEMV_4BIT_KERNEL_SOURCE
+/// but processes T input vectors per output row. Each thread group
+/// accumulates T separate dot products, eliminating T x dispatch overhead.
+const QGEMM_4BIT_KERNEL_SOURCE: &str = r"
+constexpr int CHUNK = (K <= 512) ? K : 512;
+constexpr int MAX_T = (T > 1) ? T : 1;
+
+threadgroup OutT x_sh[MAX_T][CHUNK];
+
+auto tg = threadgroup_position_in_grid.x;
+auto sg = simdgroup_index_in_threadgroup;
+auto lane = thread_index_in_simdgroup;
+auto tid = thread_index_in_threadgroup;
+auto n_sg = simdgroups_per_threadgroup;
+uint tg_sz = n_sg * 32u;
+
+int row = tg * int(n_sg) + int(sg);
+bool valid = (row < n_param);
+
+float acc[MAX_T];
+for (int t = 0; t < MAX_T; t++) acc[t] = 0.0f;
+
+for (int k_off = 0; k_off < K; k_off += CHUNK) {
+    int k_end = min(k_off + CHUNK, K);
+    int k_len = k_end - k_off;
+
+    for (uint i = tid; i < uint(k_len * MAX_T); i += tg_sz) {
+        int t = int(i) / k_len;
+        int k = int(i) % k_len;
+        if (t < MAX_T) {
+            x_sh[t][k] = x[t * K + k_off + k];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (valid) {
+        int wp_off = k_off / 8;
+        int wp_end = k_end / 8;
+        auto w_row = w + row * KPacked;
+
+        for (int idx = wp_off + int(lane); idx < wp_end; idx += 32) {
+            uint packed = w_row[idx];
+            int kl = (idx - wp_off) * 8;
+
+            int g = idx * 8 / GroupSize;
+            float s_val = float(sc[row * NumGroups + g]);
+            float b_val = float(bi[row * NumGroups + g]);
+
+            float dot_vals[MAX_T];
+            float sum_x[MAX_T];
+            for (int t = 0; t < MAX_T; t++) { dot_vals[t] = 0.0f; sum_x[t] = 0.0f; }
+
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                float w_val = float((packed >> (j * 4u)) & 0xFu);
+                for (int t = 0; t < MAX_T; t++) {
+                    float xv = float(x_sh[t][kl + j]);
+                    dot_vals[t] += w_val * xv;
+                    sum_x[t] += xv;
+                }
+            }
+
+            for (int t = 0; t < MAX_T; t++) {
+                acc[t] += s_val * dot_vals[t] + b_val * sum_x[t];
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (valid) {
+    for (int t = 0; t < MAX_T; t++) {
+        acc[t] = simd_sum(acc[t]);
+        if (lane == 0) {
+            y[t * n_param + row] = OutT(acc[t]);
+        }
+    }
+}
+";
+
 static QGEMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static QGEMV_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 static GATED_DELTA_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1906,6 +1989,132 @@ fn run_compiled_gdn_decode(cache: &mut ArraysCache, inputs: &[Array]) -> Result<
         out.pop()
             .ok_or_else(|| Exception::custom("compiled GDN decode returned no outputs"))
     })
+}
+
+// ---------------------------------------------------------------------------
+// QGEMM 4-bit: batched quantized matmul for DFlash verify (T>1)
+// ---------------------------------------------------------------------------
+
+#[allow(unsafe_code)]
+fn create_qgemm_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let input_names: [&std::ffi::CStr; 5] = [c"w", c"sc", c"bi", c"x", c"n_param"];
+    let output_names: [&std::ffi::CStr; 1] = [c"y"];
+    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
+    let source = CString::new(QGEMM_4BIT_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+    unsafe {
+        let in_vec = mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let out_vec = mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_qgemm_4bit".as_ptr(), in_vec, out_vec,
+            source.as_ptr(), c"".as_ptr(), false, false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+static QGEMM_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+/// Batched quantized matmul for affine 4-bit weights.
+///
+/// Replaces T separate `quantized_matmul` calls with one fused Metal kernel.
+/// Input x: [T, K], weight: [N, K/8] uint32 packed, scales/biases: [N, K/gs].
+/// Output: [T, N]. Used during DFlash verify to eliminate T× dispatch overhead.
+#[allow(unsafe_code, clippy::too_many_lines)]
+pub(crate) fn qgemm_4bit(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+    t_len: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    let n_rows = weight_shape.first().copied()
+        .ok_or_else(|| Exception::custom("qgemm_4bit: weight has no rows"))?;
+    let k_packed = weight_shape.get(1).copied()
+        .ok_or_else(|| Exception::custom("qgemm_4bit: weight has no columns"))?;
+    let k_dim = k_packed * 8;
+    let t = t_len.max(1);
+
+    // Flatten x to [T, K]
+    let x_flat = x.reshape(&[t, k_dim])?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.flatten(None, None)?;
+    let b_flat = biases.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    let cached = QGEMM_KERNEL.get_or_init(|| CachedMetalKernel(create_qgemm_kernel()));
+
+    // Configure: same as qgemv but with T template arg
+    let n_sg = qgemv_nsg_override().unwrap_or(8);
+    let config = unsafe { mlx_sys::mlx_fast_metal_kernel_config_new() };
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, c"OutT".as_ptr(), out_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, c"K".as_ptr(), k_dim,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, c"GroupSize".as_ptr(), group_size,
+        );
+        let k_packed_val = k_dim / 8;
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, c"KPacked".as_ptr(), k_packed_val,
+        );
+        let num_groups = k_dim / group_size;
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, c"NumGroups".as_ptr(), num_groups,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, c"T".as_ptr(), t,
+        );
+        let grid_n = (n_rows + n_sg - 1) / n_sg;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config, grid_n, 1, 1,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(
+            config, 32, n_sg, 1,
+        );
+    }
+
+    let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
+    let input_ptrs = [w_flat.as_ptr(), s_flat.as_ptr(), b_flat.as_ptr(), x_flat.as_ptr(), n_scalar];
+    let inputs_vec = unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec, cached.0, inputs_vec, config, stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        let mlx_msg = FFI_LAST_ERROR.with(|cell| cell.borrow_mut().take()).unwrap_or_default();
+        unsafe { mlx_sys::mlx_array_free(n_scalar); }
+        Err(Exception::custom(format!("qgemm_4bit failed: {mlx_msg}")))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0); }
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        unsafe { mlx_sys::mlx_array_free(n_scalar); }
+        Ok(y.reshape(&[t, n_rows])?)
+    };
+
+    unsafe {
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+    }
+    result
 }
 
 #[allow(unsafe_code)]
