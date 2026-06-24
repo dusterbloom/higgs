@@ -5804,6 +5804,13 @@ impl Qwen3NextCausalLM {
             }
         }
 
+        // Pad layer_tapes to full model length when early exit was used.
+        if let Some(max) = max_layers {
+            while layer_tapes.len() < self.model.layers.len() {
+                layer_tapes.push(None);
+            }
+        }
+
         let normed = self.model.norm.forward(&h)?;
         let logits = self.project_logits(&normed)?;
 
