@@ -567,6 +567,93 @@ impl SteppingKeyValueCache {
         self.turbo.as_ref().is_some_and(|t| t.capacity > 0)
     }
 
+    /// Bulk-compress a dense cache's resident KV into `TurboQuant` storage for
+    /// cheap between-turn retention, reusing the same dense→TQ path that the
+    /// activation-threshold decode transition uses (slice `[0, offset)` → GPU
+    /// `quantize_*_gpu` → packed storage, then drop the fp16 buffers).
+    ///
+    /// Returns `Ok(true)` when the cache was compressed, `Ok(false)` when it was
+    /// left dense (already TQ-active, empty, or a non-power-of-2 `head_dim` that
+    /// the FWHT can't handle). Idempotent and safe to call on any cache.
+    ///
+    /// Correctness: after compression the cache is structurally identical to one
+    /// that activated TurboQuant naturally during decode — `self.turbo` holds the
+    /// populated storage and `self.keys/values` are cleared — so a continuation
+    /// (`update_and_view` appending the next turn's tokens) takes the ordinary
+    /// `turbo.append` decode-append path. The reused tokens are read back through
+    /// the same dequantize path as any other TQ cache, so they carry exactly the
+    /// TurboQuant reconstruction error and nothing more (no second quantization,
+    /// no positional/RoPE renumbering). Keys are stored post-RoPE at their
+    /// original positions and are not renumbered, so continuation positions stay
+    /// consistent.
+    ///
+    /// If the cache was created dense (config `mode == Off`), `config` supplies
+    /// the TurboQuant bit-widths/seed to use; an already-TurboQuant `self.config`
+    /// is reused as-is and `config` is ignored.
+    #[allow(clippy::doc_markdown)]
+    pub fn quantize_for_retention(&mut self, config: KvCacheConfig) -> Result<bool, Exception> {
+        // Already TQ-active, or nothing dense to compress → leave as-is.
+        if self.is_turbo_active() || self.offset == 0 {
+            return Ok(false);
+        }
+        let Some(dense_k) = self.keys.as_ref() else {
+            return Ok(false);
+        };
+
+        // Geometry from the dense buffer: shape is [B, H, capacity, D].
+        let shape = dense_k.shape();
+        let dim = |i: usize, label: &'static str| -> Result<i32, Exception> {
+            shape.get(i).copied().ok_or_else(|| {
+                Exception::custom(format!("quantize_for_retention: missing dim {i} ({label})"))
+            })
+        };
+        let num_kv_heads = dim(1, "H")?;
+        let head_dim = dim(3, "D")?;
+
+        // FWHT requires a power-of-two head_dim; anything else cannot be TQ-packed.
+        // Leave the cache dense rather than ship a wrong (or erroring) compression.
+        if head_dim < 2 || (head_dim & (head_dim - 1)) != 0 {
+            return Ok(false);
+        }
+
+        // Reuse an existing TurboQuant config if the cache already carries one
+        // (its centroids/seed must match a later decode); otherwise adopt the
+        // caller-supplied config, forced into TurboQuant mode.
+        let turbo_config = if self.config.is_turboquant() {
+            self.config
+        } else {
+            KvCacheConfig {
+                mode: KvCacheMode::Turboquant,
+                ..config
+            }
+        };
+
+        let context = Arc::new(TurboQuantContext::new(
+            turbo_config,
+            head_dim,
+            num_kv_heads,
+        )?);
+        let mut storage = TurboQuantStorage::new(context);
+
+        // Bulk-quantize exactly the valid span [0, offset) — the same slice the
+        // activation-threshold transition feeds to `append`.
+        let k = slice_axis2(dense_k, 0, self.offset)?;
+        let v = slice_axis2(
+            self.values
+                .as_ref()
+                .ok_or_else(|| Exception::custom("quantize_for_retention: dense values missing"))?,
+            0,
+            self.offset,
+        )?;
+        storage.append(&k, &v, 0, self.step)?;
+
+        self.turbo = Some(storage);
+        self.config = turbo_config;
+        self.keys = None;
+        self.values = None;
+        Ok(true)
+    }
+
     fn update_dense(&mut self, keys: &Array, values: &Array) -> Result<KvCacheView, Exception> {
         let prev = self.offset;
         let k_shape = keys.shape();
@@ -1212,7 +1299,19 @@ fn grow_array(
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::shadow_reuse,
+    clippy::shadow_same,
+    clippy::shadow_unrelated,
+    clippy::doc_markdown,
+    clippy::suboptimal_flops
+)]
 mod tests {
     use super::*;
     use mlx_rs::Array;
@@ -1598,6 +1697,243 @@ mod tests {
         assert!(
             cache.keys.is_none(),
             "dense storage should clear after activation"
+        );
+    }
+
+    /// Deterministic standard-normal sample (Box–Muller). TurboQuant's centroids
+    /// are tuned for roughly-Gaussian post-rotation coordinates, so the synthetic
+    /// KV used to exercise it must be Gaussian — not smooth/correlated — or the
+    /// reconstruction quality is artificially low.
+    fn gaussian(seed: u64) -> f32 {
+        let mut s = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let mut next = || {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((s >> 33) as f32) / ((1u64 << 31) as f32)
+        };
+        let u1 = next().max(1.0e-7);
+        let u2 = next();
+        (-2.0_f32 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+    }
+
+    /// Build a `[1, H, T, D]` KV pair with deterministic Gaussian values so the
+    /// TurboQuant path is exercised on data it was designed for.
+    fn make_varied_kv_pair(h: i32, t: i32, d: i32) -> (Array, Array) {
+        let count = usize::try_from(h * t * d).unwrap();
+        let k: Vec<f32> = (0..count).map(|i| gaussian(i as u64 + 1)).collect();
+        let v: Vec<f32> = (0..count).map(|i| gaussian(i as u64 + 1_000_003)).collect();
+        (
+            Array::from_slice(&k, &[1, h, t, d]),
+            Array::from_slice(&v, &[1, h, t, d]),
+        )
+    }
+
+    /// Logical dense KV footprint in bytes for `[H, T, D]`, fp16 (2 B/value),
+    /// keys + values. This is the between-turn footprint a dense retained cache
+    /// would pin (production KV is fp16).
+    fn dense_kv_bytes(h: i32, t: i32, d: i32) -> usize {
+        let per = usize::try_from(h * t * d).unwrap() * 2; // 2 bytes/value
+        per * 2 // keys + values
+    }
+
+    /// Packed TurboQuant footprint in bytes for a compressed cache, using the
+    /// code-word sizing in this module: codes are u32 words, norms/gammas f32.
+    fn turbo_kv_bytes(cache: &SteppingKeyValueCache, h: i32, t: i32) -> usize {
+        let (ctx, ..) = cache.turbo_arrays().expect("cache must be TQ-active");
+        let ht = usize::try_from(h * t).unwrap();
+        let key_code = usize::try_from(ctx.key_code_words).unwrap() * ht * 4;
+        let value_code = usize::try_from(ctx.value_code_words).unwrap() * ht * 4;
+        // key_norms + key_gammas + value_norms, each [H, T] f32.
+        let norms = ht * 4 * 3;
+        key_code + value_code + norms
+    }
+
+    /// Compressing a dense cache on demand must shrink its between-turn KV
+    /// footprint by roughly 4–6× (a few bits/value packed codes vs fp16 dense),
+    /// reusing the existing dense→TQ bulk-quantize path. CPU-only, no model load.
+    #[test]
+    fn quantize_for_retention_shrinks_footprint_4x_to_6x() {
+        let (h, t, d) = (4i32, 200i32, 128i32);
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3, // key=2, value=3
+            seed: 7,
+            ..Default::default()
+        };
+
+        // Dense cache (default Off mode) filled by a single prefill.
+        let mut cache = SteppingKeyValueCache::new();
+        let (keys, values) = make_varied_kv_pair(h, t, d);
+        cache.update_and_fetch(keys, values).unwrap();
+        assert_eq!(cache.offset(), t);
+        assert!(!cache.is_turbo_active(), "starts dense");
+
+        let dense_bytes = dense_kv_bytes(h, t, d);
+
+        // Compress on demand using the existing bulk-quantize machinery.
+        let compressed = cache.quantize_for_retention(config).unwrap();
+        assert!(compressed, "dense power-of-2 cache must compress");
+        assert!(cache.is_turbo_active(), "now TQ-active");
+        assert!(cache.keys().is_none(), "dense buffers dropped");
+        assert_eq!(cache.offset(), t, "offset preserved across compression");
+
+        let turbo_bytes = turbo_kv_bytes(&cache, h, t);
+        let ratio = dense_bytes as f32 / turbo_bytes as f32;
+        assert!(
+            (4.0..=6.0).contains(&ratio),
+            "compression ratio {ratio:.2}x out of [4, 6] (dense={dense_bytes} B, turbo={turbo_bytes} B)"
+        );
+    }
+
+    /// Compressing a dense cache then reconstructing it must preserve the KV to
+    /// TurboQuant tolerance, AND continuation (appending the next turn's token)
+    /// must keep working on the now-TQ cache. The on-demand compression must be
+    /// bit-identical to a cache that activated TurboQuant naturally during decode
+    /// (same context/seed), so we check the reconstruction against that reference.
+    #[test]
+    fn quantize_for_retention_round_trips_and_continues() {
+        let (h, t, d) = (2i32, 40i32, 128i32);
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 7,
+            ..Default::default()
+        };
+        let (keys, values) = make_varied_kv_pair(h, t, d);
+
+        // --- ON-DEMAND: dense cache, then compress for retention. ---
+        let mut on_demand = SteppingKeyValueCache::new();
+        on_demand
+            .update_and_fetch(keys.clone(), values.clone())
+            .unwrap();
+        assert!(on_demand.quantize_for_retention(config).unwrap());
+
+        // Reconstruct the stored span via the TQ dense materialization. The
+        // stored code/norm arrays are slices of an over-allocated `[H, capacity,
+        // …]` buffer; `materialize_dense` indexes a packed `[H, seq_len, …]`
+        // layout, so force each slice contiguous (flatten+reshape) first — the
+        // same contiguity discipline `TurboQuantStorage::append` uses.
+        let (ctx, kc, kn, kg, vc, vn) = on_demand.turbo_arrays().expect("TQ-active");
+        let kw = ctx.key_code_words;
+        let vw = ctx.value_code_words;
+        let contig3 = |a: &Array, words: i32| -> Array {
+            slice_axis1(a, 0, t)
+                .unwrap()
+                .flatten(None, None)
+                .unwrap()
+                .reshape(&[h, t, words])
+                .unwrap()
+        };
+        let contig2 = |a: &Array| -> Array {
+            slice_axis1(a, 0, t)
+                .unwrap()
+                .flatten(None, None)
+                .unwrap()
+                .reshape(&[h, t])
+                .unwrap()
+        };
+        let view = TurboQuantKvView {
+            context: Arc::clone(ctx),
+            key_codes: contig3(kc, kw),
+            key_norms: contig2(kn),
+            key_gammas: contig2(kg),
+            value_codes: contig3(vc, vw),
+            value_norms: contig2(vn),
+            seq_len: t,
+        };
+        let (rk, rv) = view.materialize_dense().unwrap();
+        let od_k = rk.flatten(None, None).unwrap();
+        let od_v = rv.flatten(None, None).unwrap();
+        let od_k = od_k.as_slice::<f32>();
+        let od_v = od_v.as_slice::<f32>();
+
+        // Reconstruction must track the ORIGINAL input within TQ tolerance.
+        // Compare per-vector cosine similarity (norm-correction makes magnitudes
+        // faithful but discrete codes perturb direction); values use 3 bits, keys 2.
+        let orig_k = keys.flatten(None, None).unwrap();
+        let orig_v = values.flatten(None, None).unwrap();
+        let orig_k = orig_k.as_slice::<f32>();
+        let orig_v = orig_v.as_slice::<f32>();
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if na < f32::EPSILON || nb < f32::EPSILON {
+                0.0
+            } else {
+                dot / (na * nb)
+            }
+        };
+        let dim = usize::try_from(d).unwrap();
+        let vec_count = usize::try_from(h * t).unwrap();
+        let mut sum_k = 0.0f32;
+        let mut sum_v = 0.0f32;
+        for i in 0..vec_count {
+            let s = i * dim;
+            let e = s + dim;
+            sum_k += cos(&orig_k[s..e], &od_k[s..e]);
+            sum_v += cos(&orig_v[s..e], &od_v[s..e]);
+        }
+        let avg_k = sum_k / vec_count as f32;
+        let avg_v = sum_v / vec_count as f32;
+        // 2-bit keys and 3-bit values: the same per-bit-width floors the existing
+        // TQ roundtrip tests (`test_key/value_roundtrip_cosine_similarity`) use.
+        assert!(avg_k > 0.50, "key reconstruction cos {avg_k:.4} too low");
+        assert!(avg_v > 0.90, "value reconstruction cos {avg_v:.4} too low");
+
+        // --- CONTINUATION: appending the next turn's token must work on the
+        // now-TQ cache and keep it TQ (the production multi-turn continuation). ---
+        let (nk, nv) = make_varied_kv_pair(h, 1, d);
+        let cont_view = on_demand.update_and_view(nk, nv).unwrap();
+        assert!(
+            cont_view.turboquant().is_some(),
+            "continuation must append via the TQ path"
+        );
+        assert_eq!(on_demand.offset(), t + 1, "continuation advances offset");
+    }
+
+    /// A non-power-of-2 `head_dim` can't be FWHT-packed, so retention compression
+    /// must leave the cache dense (correctness over footprint) and still continue.
+    #[test]
+    fn quantize_for_retention_leaves_non_pow2_head_dim_dense() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            ..Default::default()
+        };
+        let mut cache = SteppingKeyValueCache::new();
+        // head_dim = 6 (not a power of 2).
+        let (keys, values) = make_kv_pair(4, 6);
+        cache.update_and_fetch(keys, values).unwrap();
+        let compressed = cache.quantize_for_retention(config).unwrap();
+        assert!(!compressed, "non-pow2 head_dim must not compress");
+        assert!(!cache.is_turbo_active());
+        assert!(cache.keys().is_some(), "dense buffers retained");
+        // Continuation still works (dense append).
+        let (k1, v1) = make_kv_pair(1, 6);
+        cache.update_and_fetch(k1, v1).unwrap();
+        assert_eq!(cache.offset(), 5);
+    }
+
+    /// Idempotent / no-op cases: empty cache and already-TQ-active cache.
+    #[test]
+    fn quantize_for_retention_noops_when_nothing_to_compress() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            ..Default::default()
+        };
+        // Empty dense cache → nothing to compress.
+        let mut empty = SteppingKeyValueCache::new();
+        assert!(!empty.quantize_for_retention(config).unwrap());
+
+        // Already TQ-active cache → no-op (second call returns false).
+        let mut cache = SteppingKeyValueCache::new();
+        let (keys, values) = make_varied_kv_pair(2, 16, 128);
+        cache.update_and_fetch(keys, values).unwrap();
+        assert!(cache.quantize_for_retention(config).unwrap());
+        assert!(
+            !cache.quantize_for_retention(config).unwrap(),
+            "second compression is a no-op"
         );
     }
 

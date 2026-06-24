@@ -43,6 +43,19 @@ fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// How many leading tokens a retained cache already covers, if `prior_tokens`
+/// is a strict prefix of `full` AND `full` actually extends it. `None` means the
+/// conversation diverged (client edited/retried/reordered) or didn't grow — the
+/// caller must then fall back to a clean full prefill. The cache-poisoning guard.
+fn continuation_prior_len(prior_tokens: &[u32], full: &[u32]) -> Option<usize> {
+    let prior = prior_tokens.len();
+    if prior == 0 || prior >= full.len() || full.get(..prior) != Some(prior_tokens) {
+        None
+    } else {
+        Some(prior)
+    }
+}
+
 fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("1" | "true" | "on" | "yes") => Some(true),
@@ -241,6 +254,9 @@ pub struct SimpleEngine {
     scheduler: Mutex<RoundRobinScheduler>,
     /// Active sessions
     sessions: Mutex<std::collections::HashMap<u64, Session>>,
+    /// Retained per-conversation live KV caches for cache-resident multi-turn
+    /// tool loops (suffix-only prefill across tool hops). Keyed by session id.
+    retained: Mutex<std::collections::HashMap<u64, RetainedKv>>,
     tokenizer: Tokenizer,
     template: Option<ChatTemplateRenderer>,
     model_name: String,
@@ -264,6 +280,16 @@ pub struct SimpleEngine {
     tuning: MlxRuntimeTuning,
 }
 
+/// A live KV cache retained across tool turns for a conversation, so the next
+/// turn prefills only the new suffix instead of re-prefilling the whole history.
+/// Holds the actual `AnyCache` instance (not a clone), the exact tokens it
+/// represents (for the prefix guard), and a last-touched stamp for idle eviction.
+struct RetainedKv {
+    cache: AnyCache,
+    tokens: Vec<u32>,
+    last_used: std::time::Instant,
+}
+
 /// Intermediate state after prefix cache lookup and model locking.
 struct PreparedGeneration<'a> {
     model: MutexGuard<'a, AnyModel>,
@@ -272,6 +298,24 @@ struct PreparedGeneration<'a> {
     prompt_array: Array,
     prompt_len: u32,
     pixel_values: Option<Array>,
+}
+
+/// Result of [`SimpleEngine::generate_session`] — a cache-resident turn whose
+/// prefill cost is `prefilled_tokens` (the suffix), not the whole conversation.
+#[derive(Debug, Clone)]
+pub struct SessionGeneration {
+    /// Decoded completion text for this turn.
+    pub text: String,
+    /// Completion tokens generated this turn.
+    pub completion_tokens: u32,
+    /// Total prompt length for this turn (full conversation).
+    pub prompt_tokens: u32,
+    /// Tokens actually prefilled this turn — the headline win. On a continued
+    /// turn this is just the new suffix (tool result + generation prompt), not
+    /// `prompt_tokens`.
+    pub prefilled_tokens: u32,
+    /// Whether a retained cache was reused (true) or a clean prefill ran (false).
+    pub continued: bool,
 }
 
 impl SimpleEngine {
@@ -438,6 +482,7 @@ impl SimpleEngine {
             paged_cache: paged_cache.map(Mutex::new),
             scheduler: Mutex::new(RoundRobinScheduler::new()),
             sessions: Mutex::new(std::collections::HashMap::new()),
+            retained: Mutex::new(std::collections::HashMap::new()),
             tokenizer,
             template,
             model_name,
@@ -456,6 +501,110 @@ impl SimpleEngine {
         &self.model_name
     }
 
+    /// Number of conversations holding a retained live KV cache.
+    pub fn retained_session_count(&self) -> usize {
+        lock_or_recover(&self.retained).len()
+    }
+
+    /// The exact token sequence the retained KV cache for `session_id` covers
+    /// (prompt + generated), or `None` if nothing is retained. This is the
+    /// ground truth the continuation guard ([`continuation_prior_len`]) matches
+    /// against — exposed so callers can build a genuine token-prefix extension
+    /// for the next turn without round-tripping generated text through the
+    /// tokenizer (BPE detok→retok is not always stable).
+    ///
+    /// [`continuation_prior_len`]: continuation_prior_len
+    pub fn retained_session_tokens(&self, session_id: u64) -> Option<Vec<u32>> {
+        lock_or_recover(&self.retained)
+            .get(&session_id)
+            .map(|kept| kept.tokens.clone())
+    }
+
+    /// Drop a conversation's retained KV cache, freeing its KV memory.
+    pub fn drop_retained_session(&self, session_id: u64) {
+        lock_or_recover(&self.retained).remove(&session_id);
+    }
+
+    /// Evict retained caches idle longer than `ttl`; returns how many were
+    /// dropped. Retained caches pin real KV memory, so this must be called
+    /// periodically (and `generate_continued` will also enforce a count cap).
+    pub fn evict_idle_retained(&self, ttl: std::time::Duration) -> usize {
+        let mut map = lock_or_recover(&self.retained);
+        let before = map.len();
+        map.retain(|_, kept| kept.last_used.elapsed() < ttl);
+        before.saturating_sub(map.len())
+    }
+
+    /// Look up the retained cache for `session_id` whose tokens are a prefix of
+    /// `full_tokens`, returning the cache and the suffix that still needs
+    /// prefilling. Returns `None` (and drops any stale entry) when there is no
+    /// retained cache or the conversation diverged from it — the caller then
+    /// falls back to a clean full prefill. This is the cache-poisoning guard.
+    fn take_continuable(&self, session_id: u64, full_tokens: &[u32]) -> Option<(AnyCache, usize)> {
+        let mut map = lock_or_recover(&self.retained);
+        let prior = match map.get(&session_id) {
+            Some(entry) => continuation_prior_len(&entry.tokens, full_tokens),
+            None => return None,
+        };
+        if let Some(p) = prior {
+            map.remove(&session_id).map(|kept| (kept.cache, p))
+        } else {
+            map.remove(&session_id); // drop the diverged/stale entry
+            None
+        }
+    }
+
+    /// Stash a live cache and the exact tokens it now represents for `session_id`,
+    /// so the next turn prefills only the suffix. Caps the number of resident
+    /// sessions (each pins GB-scale KV), evicting the least-recently-used.
+    ///
+    /// Before stashing, the cache's resident KV is TurboQuant-compressed
+    /// ([`AnyCache::quantize_for_retention`]) so a conversation that decoded dense
+    /// — the default, or any turn below the TQ activation threshold — does not pin
+    /// fp16 KV between turns. The next turn continues by appending to the now-TQ
+    /// cache (the ordinary TurboQuant decode-append path). Compression is
+    /// best-effort: a layer that can't be packed stays dense and continuation
+    /// still works, just uncompressed.
+    #[allow(clippy::doc_markdown)]
+    fn stash_retained(&self, session_id: u64, mut cache: AnyCache, tokens: Vec<u32>) {
+        // ponytail: small fixed cap; make it a config knob if multi-tenant.
+        const MAX_RETAINED: usize = 8;
+
+        match cache.quantize_for_retention(self.kv_cache_config) {
+            Ok(layers) if layers > 0 => tracing::debug!(
+                session_id,
+                compressed_layers = layers,
+                "Compressed retained KV to TurboQuant for between-turn retention"
+            ),
+            Ok(_) => {}
+            // Leave the cache dense on failure — correctness over footprint.
+            Err(e) => tracing::warn!(
+                session_id,
+                error = %e,
+                "Failed to TurboQuant-compress retained KV; retaining dense"
+            ),
+        }
+
+        let mut map = lock_or_recover(&self.retained);
+        map.insert(
+            session_id,
+            RetainedKv {
+                cache,
+                tokens,
+                last_used: std::time::Instant::now(),
+            },
+        );
+        if map.len() > MAX_RETAINED {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, kept)| kept.last_used)
+                .map(|(&id, _)| id);
+            if let Some(id) = oldest {
+                map.remove(&id);
+            }
+        }
+    }
+
     /// Get a reference to the tokenizer.
     pub const fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
@@ -471,6 +620,29 @@ impl SimpleEngine {
         self.enable_thinking
     }
 
+    /// Render the chat template to its prompt STRING with explicit thinking
+    /// control — the exact text [`prepare_chat_prompt_with_thinking`] tokenizes.
+    ///
+    /// Exposed so the HTTP layer can compute a continuation delta in TEXT space:
+    /// the route decodes the retained tokens (special tokens preserved) and, when
+    /// this rendered string starts with that decoded prefix, re-tokenizes only
+    /// the trailing slice. That keeps the cached prefix tokens byte-exact instead
+    /// of round-tripping the model's generated tokens through detok→retok (BPE is
+    /// not round-trip stable), so the continuation guard actually matches.
+    pub fn render_chat_prompt_with_thinking(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+    ) -> Result<String, EngineError> {
+        let renderer = self.template.as_ref().ok_or_else(|| {
+            EngineError::Template(
+                "This model has no chat template; use /v1/completions instead".to_owned(),
+            )
+        })?;
+        renderer.apply_with_thinking(messages, tools, true, enable_thinking)
+    }
+
     /// Apply chat template and tokenize messages with explicit thinking control.
     pub fn prepare_chat_prompt_with_thinking(
         &self,
@@ -478,12 +650,7 @@ impl SimpleEngine {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
     ) -> Result<Vec<u32>, EngineError> {
-        let renderer = self.template.as_ref().ok_or_else(|| {
-            EngineError::Template(
-                "This model has no chat template; use /v1/completions instead".to_owned(),
-            )
-        })?;
-        let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
+        let prompt = self.render_chat_prompt_with_thinking(messages, tools, enable_thinking)?;
         let encoding = self
             .tokenizer
             .encode(prompt.as_str(), false)
@@ -767,6 +934,103 @@ impl SimpleEngine {
         };
 
         Ok((next_token, logprob_data))
+    }
+
+    /// Cache-resident multi-turn generation: keep the conversation's KV cache
+    /// alive across tool hops and prefill ONLY the new suffix on the next turn
+    /// (no re-prefill of history). Opt-in per conversation via `session_id`. On
+    /// the first turn — or a conversation that diverged from the retained cache —
+    /// it falls back to a clean full prefill (the [`take_continuable`] guard) and
+    /// retains the resulting cache; on a continuation it reuses the live cache.
+    /// Greedy plain sequential decode (no MTP/prompt-lookup for now).
+    ///
+    /// [`take_continuable`]: Self::take_continuable
+    pub fn generate_continued(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+    ) -> Result<SessionGeneration, EngineError> {
+        let total = u32::try_from(prompt_tokens.len())
+            .map_err(|_| EngineError::Generation("prompt too long".to_owned()))?;
+
+        let (mut prepared, prefilled, continued) = if let Some((cache, prior)) =
+            self.take_continuable(session_id, prompt_tokens)
+        {
+            let suffix: Vec<u32> = prompt_tokens.get(prior..).unwrap_or_default().to_vec();
+            let prefilled = u32::try_from(suffix.len()).unwrap_or(u32::MAX);
+            let prompt_array = Array::from(suffix.as_slice()).index(NewAxis);
+            let model = self
+                .model
+                .lock()
+                .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+            let prepared = PreparedGeneration {
+                model,
+                cache,
+                actual_prompt_tokens: suffix,
+                prompt_array,
+                prompt_len: total,
+                pixel_values: None,
+            };
+            (prepared, prefilled, true)
+        } else {
+            let prepared = self.prepare_generation(prompt_tokens, None)?;
+            let prefilled = u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
+            (prepared, prefilled, false)
+        };
+
+        let (current_token, _, _) =
+            self.run_prefill(prompt_tokens, &mut prepared, params, None, None, false)?;
+        let first_id: u32 = current_token.item();
+        let mut generated: Vec<u32> = vec![first_id];
+
+        if !self.eos_token_ids.contains(&first_id) && max_tokens > 1 {
+            let mut cur = current_token;
+            while u32::try_from(generated.len()).unwrap_or(u32::MAX) < max_tokens {
+                let (next, _) = Self::decode_step(
+                    &cur,
+                    &mut prepared.model,
+                    &mut prepared.cache,
+                    params,
+                    &generated,
+                    None,
+                    None,
+                )?;
+                let next_id: u32 = next.item();
+                generated.push(next_id);
+                if self.eos_token_ids.contains(&next_id) {
+                    break;
+                }
+                cur = next;
+            }
+        }
+
+        // Retain the live cache + the exact tokens it now holds (prompt +
+        // generated) so the next hop continues from here. Drop the model guard
+        // first so we stash only the cache.
+        let PreparedGeneration { cache, model, .. } = prepared;
+        drop(model);
+        let mut full = prompt_tokens.to_vec();
+        full.extend_from_slice(&generated);
+        self.stash_retained(session_id, cache, full);
+
+        tracing::info!(
+            session_id,
+            continued,
+            prompt_tokens = total,
+            prefilled_tokens = prefilled,
+            prefill_saved = total.saturating_sub(prefilled),
+            "cache-resident turn"
+        );
+
+        Ok(SessionGeneration {
+            text: self.decode_tokens(&generated)?,
+            completion_tokens: u32::try_from(generated.len()).unwrap_or(u32::MAX),
+            prompt_tokens: total,
+            prefilled_tokens: prefilled,
+            continued,
+        })
     }
 
     /// Decode the token buffer and return the text, mapping tokenizer errors.
@@ -2936,10 +3200,27 @@ fn chat_template_mentions_enable_thinking(model_dir: &Path) -> bool {
 mod tests {
     use super::{
         IncrementalDetok, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
-        derive_model_name, detect_thinking_support, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, parse_enabled_flag,
+        continuation_prior_len, derive_model_name, detect_thinking_support,
+        estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail, parse_enabled_flag,
     };
     use std::path::Path;
+
+    #[test]
+    fn continuation_prior_len_guard() {
+        // Retained tokens are a strict prefix AND the new prompt extends them → continue.
+        assert_eq!(
+            continuation_prior_len(&[1, 2, 3], &[1, 2, 3, 4, 5]),
+            Some(3)
+        );
+        // Diverged mid-prefix (client edited/retried) → clean fallback.
+        assert_eq!(continuation_prior_len(&[1, 2, 3], &[1, 2, 9, 4]), None);
+        // No new tokens (same length) → nothing to continue.
+        assert_eq!(continuation_prior_len(&[1, 2, 3], &[1, 2, 3]), None);
+        // Empty retained → nothing to reuse.
+        assert_eq!(continuation_prior_len(&[], &[1, 2]), None);
+        // Retained longer than the new prompt → not a prefix.
+        assert_eq!(continuation_prior_len(&[1, 2, 3, 4], &[1, 2]), None);
+    }
 
     /// Write a config.json file into the given directory with the provided JSON content.
     fn write_config(dir: &std::path::Path, json: &str) {

@@ -49,6 +49,12 @@ pub struct ChatCompletionRequest {
     /// processed, time_ms}`). Ignored for non-streaming requests.
     #[serde(default)]
     pub return_progress: Option<bool>,
+    /// Opt-in multi-turn KV-cache reuse. When set (non-streaming, Simple engine
+    /// only) the conversation's KV cache is retained across turns so that a
+    /// continued turn prefills only the new suffix instead of the full history.
+    /// Omitted by default — behavior is unchanged when absent.
+    #[serde(default)]
+    pub session_id: Option<u64>,
 }
 
 /// Optional request-level controls for streaming responses.

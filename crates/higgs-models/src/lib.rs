@@ -123,6 +123,41 @@ impl AnyCache {
         }
     }
 
+    /// Compress every dense KV layer into `TurboQuant` storage for cheap
+    /// between-turn retention (see
+    /// [`cache::SteppingKeyValueCache::quantize_for_retention`]). Recurrent
+    /// (SSM/`Arrays`) layers are left untouched — they have no dense KV to pack.
+    ///
+    /// `config` supplies the TurboQuant bit-widths/seed for layers that were
+    /// created dense; layers already on a TurboQuant config reuse their own.
+    /// Returns the number of layers actually compressed (0 when every layer was
+    /// already TQ-active, empty, or otherwise left dense). Best-effort: a layer
+    /// that cannot be packed (e.g. non-power-of-2 `head_dim`) stays dense and is
+    /// simply not counted, so a continuation still works — just uncompressed.
+    #[allow(clippy::doc_markdown)]
+    pub fn quantize_for_retention(&mut self, config: KvCacheConfig) -> Result<usize, Exception> {
+        let mut compressed = 0usize;
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if layer.quantize_for_retention(config)? {
+                        compressed += 1;
+                    }
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        if kv.quantize_for_retention(config)? {
+                            compressed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(compressed)
+    }
+
     /// An **independent** deep copy for use as a speculative-decode checkpoint.
     /// KV layers are deep-cloned (their in-place `slice_update` buffers must not
     /// be shared — see [`cache::SteppingKeyValueCache::deep_clone`]); GDN/SSM

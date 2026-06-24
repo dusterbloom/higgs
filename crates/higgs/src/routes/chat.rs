@@ -299,7 +299,98 @@ async fn chat_completions_non_streaming(
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
+    // Opt-in multi-turn KV-cache reuse. Only honored on the non-streaming path
+    // for the Simple engine; `generate_continued` errors for other variants and
+    // we never reach this branch for them because `retained`/`generate_continued`
+    // degrade cleanly. Images and constrained decoding are not supported by the
+    // continued path, so fall back to the normal generation when present.
+    let session_id = req
+        .session_id
+        .filter(|_| pixel_values.is_none() && constraint.is_none());
+
     let tokenizer = engine.tokenizer().clone();
+    let request_id = generate_request_id();
+    let has_tools = tools.is_some();
+
+    if let Some(sid) = session_id {
+        // Build the token sequence to feed `generate_continued`. The engine's
+        // guard prefills only the suffix IFF the retained cache's tokens are a
+        // strict token-prefix of what we pass; otherwise it does a clean full
+        // prefill. We therefore must hand it `retained ++ delta`, where `delta`
+        // is ONLY the genuinely-new content appended since the retained point.
+        //
+        // The delta is computed in TEXT space, anchored on the retained tokens'
+        // own detokenization — never by re-tokenizing the assistant's prior
+        // reply. BPE detok->retok is not round-trip stable, so the model's
+        // generated tokens differ from the re-tokenized reply text; matching on
+        // re-tokenized text diverges at the assistant turn and the guard
+        // rejects the continuation. Decoding the retained tokens (special tokens
+        // preserved) and diffing against the freshly-rendered conversation
+        // string keeps the cached prefix byte-exact.
+        let continued_prompt = match engine.retained_session_tokens(sid) {
+            Some(retained) => {
+                // Detok the retained tokens with special tokens PRESERVED so the
+                // result byte-matches the rendered conversation framing
+                // (`<|im_start|>`, `<|im_end|>`, `<think>`, ...).
+                let retained_text = engine.tokenizer().decode(&retained, false).map_err(|e| {
+                    ServerError::Engine(higgs_engine::error::EngineError::Tokenization(
+                        e.to_string(),
+                    ))
+                })?;
+                // The full rendered conversation STRING for this request — the
+                // same text `prepare_chat_prompt_with_thinking` would tokenize.
+                let full_text = engine
+                    .render_chat_prompt_with_thinking(&messages, tools, thinking_enabled)
+                    .map_err(ServerError::Engine)?;
+
+                if let Some(delta_text) = full_text.strip_prefix(&retained_text) {
+                    // Genuine continuation: append only the new content's tokens
+                    // to the retained tokens verbatim. `retained` is then a
+                    // trivial prefix, so the engine prefills only `delta_tokens`.
+                    let delta_tokens = engine
+                        .tokenizer()
+                        .encode(delta_text, false)
+                        .map_err(|e| {
+                            ServerError::Engine(higgs_engine::error::EngineError::Tokenization(
+                                e.to_string(),
+                            ))
+                        })?
+                        .get_ids()
+                        .to_vec();
+                    let mut combined = retained;
+                    combined.extend_from_slice(&delta_tokens);
+                    combined
+                } else {
+                    // Client edited/diverged the history: the retained prefix is
+                    // no longer a textual prefix of this conversation. Fall back
+                    // to a clean full prefill (the engine guard will also reject
+                    // and re-prefill); correctness over cache reuse.
+                    prompt_tokens.clone()
+                }
+            }
+            // First turn / evicted: full prefill, which retains the cache.
+            None => prompt_tokens.clone(),
+        };
+
+        let sampling_c = sampling.clone();
+        let engine_c = Arc::clone(&engine);
+        let session_output = tokio::task::spawn_blocking(move || {
+            engine_c.generate_continued(sid, &continued_prompt, max_tokens, &sampling_c)
+        })
+        .await
+        .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
+        .map_err(ServerError::Engine)?;
+
+        return Ok(build_session_response(
+            &req.model,
+            &request_id,
+            session_output,
+            tools,
+            has_tools,
+            thinking_enabled,
+        ));
+    }
+
     let output = tokio::task::spawn_blocking(move || {
         engine.generate_with_thinking(
             &prompt_tokens,
@@ -316,9 +407,6 @@ async fn chat_completions_non_streaming(
     .await
     .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
     .map_err(ServerError::Engine)?;
-
-    let request_id = generate_request_id();
-    let has_tools = tools.is_some();
 
     let logprobs_response = output
         .token_logprobs
@@ -410,6 +498,102 @@ async fn chat_completions_non_streaming(
             total_tokens: output.prompt_tokens + output.completion_tokens,
         },
     })
+}
+
+/// Map a [`SessionGeneration`] (cache-resident continued turn) onto the same
+/// `ChatCompletionResponse` shape as the normal path, preserving reasoning
+/// extraction, tool-call parsing, and the `finish_reason: "tool_calls"`
+/// override. The continued path uses greedy decode without logprobs/streaming,
+/// so logprobs are absent and `finish_reason` defaults to `"stop"`.
+fn build_session_response(
+    model: &str,
+    request_id: &str,
+    output: higgs_engine::simple::SessionGeneration,
+    tools: Option<&[serde_json::Value]>,
+    has_tools: bool,
+    thinking_enabled: bool,
+) -> ChatCompletionResponse {
+    let output_text = output.text;
+    // Same reasoning-tag handling as the normal path: the template opens
+    // `<think>` in the prompt, so generated text starts inside the think block.
+    let (raw_text, reasoning_content) = if thinking_enabled {
+        let parse_input = if output_text.contains("</think>") {
+            format!("<think>{output_text}")
+        } else {
+            format!("<think>{output_text}</think>")
+        };
+        let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
+        let raw_text = if reasoning_result.reasoning.is_some() {
+            reasoning_result.text
+        } else {
+            output_text
+        };
+        (raw_text, reasoning_result.reasoning)
+    } else {
+        (output_text, None)
+    };
+
+    let (content, tool_calls, finish_reason) = if has_tools {
+        let schema = higgs_engine::tool_parser::ToolSchema::from_tools(tools);
+        let parsed = higgs_engine::tool_parser::parse_tool_calls(&raw_text, schema.as_ref());
+        if parsed.tool_calls.is_empty() {
+            (
+                Some(MessageContent::Text(raw_text)),
+                None,
+                "stop".to_owned(),
+            )
+        } else {
+            let calls: Vec<ToolCall> = parsed
+                .tool_calls
+                .iter()
+                .enumerate()
+                .map(|(i, tc)| ToolCall {
+                    id: format!("call_{i}_{}", uuid::Uuid::new_v4()),
+                    r#type: "function".to_owned(),
+                    function: ToolCallFunction {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.to_string(),
+                    },
+                })
+                .collect();
+            let text = if parsed.text.is_empty() {
+                None
+            } else {
+                Some(MessageContent::Text(parsed.text))
+            };
+            (text, Some(calls), "tool_calls".to_owned())
+        }
+    } else {
+        (
+            Some(MessageContent::Text(raw_text)),
+            None,
+            "stop".to_owned(),
+        )
+    };
+
+    ChatCompletionResponse {
+        id: request_id.to_owned(),
+        object: "chat.completion",
+        created: current_unix_timestamp(),
+        model: model.to_owned(),
+        choices: vec![ChatCompletionChoice {
+            index: 0,
+            message: ChatCompletionMessage {
+                role: "assistant".to_owned(),
+                content,
+                reasoning_content,
+                tool_calls,
+                tool_call_id: None,
+            },
+            finish_reason,
+            logprobs: None,
+        }],
+        usage: CompletionUsage {
+            prompt_tokens: output.prompt_tokens,
+            completion_tokens: output.completion_tokens,
+            total_tokens: output.prompt_tokens + output.completion_tokens,
+        },
+    }
 }
 
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]

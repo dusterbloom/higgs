@@ -6,7 +6,7 @@ use higgs_engine::chat_template::ChatMessage;
 use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::MlxRuntimeTuning;
-use higgs_engine::simple::SimpleEngine;
+use higgs_engine::simple::{SessionGeneration, SimpleEngine};
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
 use higgs_models::turboquant::KvCacheConfig;
@@ -148,6 +148,62 @@ impl Engine {
             Self::Batch(e) => e.prepare_chat_prompt_with_thinking(messages, tools, enable_thinking),
             #[cfg(test)]
             Self::Stub(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Render the chat template to its prompt STRING (the exact text
+    /// [`Self::prepare_chat_prompt_with_thinking`] tokenizes). Only the Simple
+    /// engine, which owns retained session caches, needs this — it lets the
+    /// continuation path compute a text-anchored delta against the retained
+    /// tokens' own detokenization. Other variants have no retained cache, so
+    /// this is unreachable for them.
+    pub fn render_chat_prompt_with_thinking(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+    ) -> Result<String, EngineError> {
+        match self {
+            Self::Simple(e) => e.render_chat_prompt_with_thinking(messages, tools, enable_thinking),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "render_chat_prompt_with_thinking is only used by the Simple engine".to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Ok(String::new()),
+        }
+    }
+
+    /// The exact token sequence a retained session cache currently holds
+    /// (prompt + previously generated tokens), or `None` when no live cache
+    /// exists for this `session_id`. Only the Simple engine retains caches.
+    pub fn retained_session_tokens(&self, session_id: u64) -> Option<Vec<u32>> {
+        match self {
+            Self::Simple(e) => e.retained_session_tokens(session_id),
+            Self::Batch(_) => None,
+            #[cfg(test)]
+            Self::Stub(_) => None,
+        }
+    }
+
+    /// Cache-resident multi-turn generation: prefill only the new suffix when
+    /// the retained cache is an exact token-prefix of `prompt_tokens`, else a
+    /// clean full prefill. Only the Simple engine supports this; other variants
+    /// return an error so the caller can fall back to a normal generation.
+    pub fn generate_continued(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+    ) -> Result<SessionGeneration, EngineError> {
+        match self {
+            Self::Simple(e) => e.generate_continued(session_id, prompt_tokens, max_tokens, params),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "session_id (continued generation) is only supported by the Simple engine"
+                    .to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
         }
     }
 

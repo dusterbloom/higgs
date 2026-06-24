@@ -51,14 +51,32 @@ struct TqBlock {
     value_norms: Array,
 }
 
-/// Per-layer cached data.
+// MLX `Array` is `Send` but `!Sync` (it holds a `*mut c_void` into the MLX
+// runtime). Wrapping blocks in `Arc` for cross-prefix sharing requires the
+// pointee to be `Send + Sync`. Blocks are immutable snapshots once stored, and
+// every access goes through `PagedPrefixCache`, which lives behind the engine's
+// `Mutex` -- so no two threads ever touch a block's arrays concurrently. This is
+// the same basis on which `CachedMetalKernel` asserts thread-safety.
+// ponytail: sound only while the cache stays Mutex-guarded; if the engine ever
+// gains lock-free concurrent cache access, revisit (read-copy the arrays).
+#[allow(unsafe_code)]
+unsafe impl Sync for KvBlock {}
+#[allow(unsafe_code)]
+unsafe impl Sync for TqBlock {}
+
+/// Per-layer cached data covering a single radix edge's token run.
+///
+/// Blocks are wrapped in `Arc` so that, after an edge split, the shared leading
+/// blocks live on a single parent edge and are physically referenced (not
+/// copied) by every descendant path. `Arc::strong_count` therefore reflects how
+/// many stored prefixes share a given block.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum CachedLayerData {
     /// Attention layer: sequence of dense K/V blocks.
-    Kv(Vec<KvBlock>),
+    Kv(Vec<Arc<KvBlock>>),
     /// Attention layer: sequence of `TurboQuant` blocks.
-    TurboQuantKv(Vec<TqBlock>),
+    TurboQuantKv(Vec<Arc<TqBlock>>),
     /// GDN/SSM layer: state snapshot at block boundary.
     Gdn(GdnSnapshot),
     /// Layer had no cache data.
@@ -69,19 +87,42 @@ enum CachedLayerData {
 // Cache entry stored in radix trie
 // ---------------------------------------------------------------------------
 
-/// What's stored at each radix trie node.
+/// Per-edge block payload for a paged prefix.
+///
+/// One `EdgeBlocks` describes exactly the tokens spanned by the radix edge it
+/// sits on; the full cache for a node is the concatenation of the `EdgeBlocks`
+/// of every edge on the root -> node path (see `gather_path`). Because the
+/// vectors hold `Arc`-wrapped blocks, splitting an edge moves the shared leading
+/// blocks onto the parent edge and both children reference them through the
+/// same `Arc`s -- block storage is deduplicated across overlapping prefixes.
+struct EdgeBlocks {
+    layers: Vec<CachedLayerData>,
+    tokens: usize,
+    /// `TurboQuant` context when these blocks are quantized; `None` for dense.
+    /// Carried on the edge so a block-aligned match that lands *inside* an edge
+    /// (not on a stored endpoint) can still reconstruct correctly.
+    context: Option<Arc<TurboQuantContext>>,
+}
+
+/// Block payload carried by a radix edge.
+enum EdgeData {
+    /// Dense / `TurboQuant` paged blocks for this edge's tokens.
+    Paged(EdgeBlocks),
+    /// No paged payload (edges that only carry tokens for a `Cloned` endpoint,
+    /// or purely structural internal edges).
+    None,
+}
+
+/// Endpoint metadata for a stored prefix.
+///
+/// The actual KV blocks live on the path's edges (`EdgeData::Paged`); this only
+/// records how to interpret them and any non-paged fallback.
 enum CachedData {
-    /// Block-paged cache -- shared block references (dense KV).
-    Paged {
-        layers: Vec<CachedLayerData>,
-        total_tokens: usize,
-        is_hybrid: bool,
-    },
+    /// Block-paged cache (dense KV). Blocks are reconstructed from the path.
+    Paged { is_hybrid: bool },
     /// Block-paged `TurboQuant` cache with shared quantization context.
     TurboQuantPaged {
-        layers: Vec<CachedLayerData>,
         context: Arc<TurboQuantContext>,
-        total_tokens: usize,
         is_hybrid: bool,
     },
     /// Full clone fallback (cache too short for paging).
@@ -99,8 +140,46 @@ struct CachedState {
 
 struct RadixNode {
     edge: Vec<u32>,
+    /// Blocks covering exactly `edge`'s tokens. Shared across descendant paths.
+    edge_blocks: EdgeData,
     cached: Option<CachedState>,
     children: HashMap<u32, Self>,
+}
+
+/// Endpoint kind for a lookup match.
+enum MatchEndpoint<'a> {
+    /// A stored trie endpoint (full metadata available).
+    Stored(&'a CachedData),
+    /// A block-aligned position inside an edge (no stored endpoint). Paged
+    /// caches are never hybrid; only the optional TQ context is needed.
+    PartialPaged {
+        context: Option<Arc<TurboQuantContext>>,
+    },
+}
+
+/// A candidate lookup match: how deep it reaches, how to interpret its blocks,
+/// the path of full edges, and an optional partially-matched final edge.
+struct MatchResult<'a> {
+    prefix_len: usize,
+    kind: MatchEndpoint<'a>,
+    full_path: Vec<&'a EdgeBlocks>,
+    partial_tail: Option<EdgeBlocks>,
+    touch: Option<&'a Cell<Instant>>,
+}
+
+/// Pick the deeper of two candidate matches.
+fn deeper_of<'a>(
+    a: Option<MatchResult<'a>>,
+    b: Option<MatchResult<'a>>,
+) -> Option<MatchResult<'a>> {
+    match (a, b) {
+        (Some(am), Some(bm)) => Some(if bm.prefix_len > am.prefix_len {
+            bm
+        } else {
+            am
+        }),
+        (left, right) => left.or(right),
+    }
 }
 
 /// Result of a paged prefix cache lookup.
@@ -133,14 +212,16 @@ impl RadixNode {
     fn empty() -> Self {
         Self {
             edge: Vec::new(),
+            edge_blocks: EdgeData::None,
             cached: None,
             children: HashMap::new(),
         }
     }
 
-    fn leaf(edge: Vec<u32>, data: CachedData) -> Self {
+    fn leaf(edge: Vec<u32>, edge_blocks: EdgeData, data: CachedData) -> Self {
         Self {
             edge,
+            edge_blocks,
             cached: Some(CachedState {
                 data,
                 last_accessed: Cell::new(Instant::now()),
@@ -149,50 +230,169 @@ impl RadixNode {
         }
     }
 
-    fn find_deepest_match(
-        &self,
+    /// Walk the trie matching `tokens`, accumulating the path's edge blocks, and
+    /// return the DEEPEST valid match.
+    ///
+    /// A match is valid at:
+    /// - a stored endpoint (`cached`) reached at this `depth`, or
+    /// - a block-aligned position *inside* a partially-matched child edge (true
+    ///   `RadixAttention` sub-prefix sharing): if the query and an edge share the
+    ///   first `k` whole blocks but then diverge, those `k` blocks form a valid
+    ///   reusable prefix even though no endpoint was stored there.
+    ///
+    /// `full_path` references the `EdgeBlocks` of every fully-traversed edge from
+    /// the root to the matched node; `partial_tail` (owned, cheap `Arc` clones)
+    /// holds the leading whole blocks of a partially-matched final edge. The
+    /// caller concatenates `full_path` then `partial_tail` to rebuild a
+    /// byte-identical KV cache for the matched prefix.
+    fn find_deepest_match<'a>(
+        &'a self,
         tokens: &[u32],
         depth: usize,
         min_prefix: usize,
-    ) -> Option<(usize, &CachedState)> {
-        let mut best = self
+        block_size: usize,
+        path: &mut Vec<&'a EdgeBlocks>,
+    ) -> Option<MatchResult<'a>> {
+        // Record this edge's blocks on the running path (root edge is empty).
+        if let EdgeData::Paged(blocks) = &self.edge_blocks {
+            path.push(blocks);
+        }
+
+        // Block-token depth reachable here from the path's paged edges. May be
+        // less than the edge-token `depth` after a non-block-aligned ancestor
+        // split; it is exactly the reconstructable prefix length.
+        let block_depth: usize = path.iter().map(|e| e.tokens).sum();
+
+        // Candidate 1: a stored endpoint at this node (gives a `touch` handle and
+        // handles the Cloned fallback).
+        let mut deepest: Option<MatchResult<'a>> = self
             .cached
             .as_ref()
-            .filter(|cs| {
-                // Cloned entries are valid at any depth > 0 (no block alignment needed).
-                // Paged entries require at least min_prefix tokens for block alignment.
-                match &cs.data {
-                    CachedData::Cloned(_) => depth > 0,
-                    CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => {
-                        depth >= min_prefix
-                    }
+            .filter(|cs| match &cs.data {
+                CachedData::Cloned(_) => depth > 0,
+                CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => {
+                    depth >= min_prefix
                 }
             })
-            .map(|cs| (depth, cs));
+            .map(|cs| MatchResult {
+                prefix_len: match &cs.data {
+                    CachedData::Cloned(_) => depth,
+                    CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => block_depth,
+                },
+                kind: MatchEndpoint::Stored(&cs.data),
+                full_path: path.clone(),
+                partial_tail: None,
+                touch: Some(&cs.last_accessed),
+            });
 
-        let Some(&next_token) = tokens.get(depth) else {
-            return best;
-        };
+        // Candidate 2: this node itself sits at a reconstructable block-aligned
+        // prefix (e.g. a shared split node with no stored endpoint). The full
+        // path's blocks reconstruct it exactly -- true RadixAttention prefix
+        // sharing even when no endpoint was stored at this boundary.
+        if block_depth >= min_prefix && matches!(&self.edge_blocks, EdgeData::Paged(_)) {
+            let node_match = MatchResult {
+                prefix_len: block_depth,
+                kind: MatchEndpoint::PartialPaged {
+                    context: path.last().and_then(|e| e.context.clone()),
+                },
+                full_path: path.clone(),
+                partial_tail: None,
+                touch: None,
+            };
+            deepest = deeper_of(deepest, Some(node_match));
+        }
 
-        let Some(child) = self.children.get(&next_token) else {
-            return best;
-        };
+        if let Some(&next_token) = tokens.get(depth) {
+            if let Some(child) = self.children.get(&next_token) {
+                let remaining = tokens.get(depth..).unwrap_or_default();
+                let common = child
+                    .edge
+                    .iter()
+                    .zip(remaining.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
 
-        let remaining = tokens.get(depth..).unwrap_or_default();
-        let common = child
-            .edge
-            .iter()
-            .zip(remaining.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-
-        if common == child.edge.len() {
-            if let Some(deeper) = child.find_deepest_match(tokens, depth + common, min_prefix) {
-                best = Some(deeper);
+                if common == child.edge.len() {
+                    // Whole edge matched: descend.
+                    if let Some(found) = child.find_deepest_match(
+                        tokens,
+                        depth + common,
+                        min_prefix,
+                        block_size,
+                        path,
+                    ) {
+                        deepest = deeper_of(deepest, Some(found));
+                    }
+                } else {
+                    // Partial edge match: reuse the leading whole blocks that the
+                    // query shares with this child edge (RadixAttention sub-prefix).
+                    if let Some(found) =
+                        child.partial_edge_match(common, min_prefix, block_size, path.as_slice())
+                    {
+                        deepest = deeper_of(deepest, Some(found));
+                    }
+                }
             }
         }
 
-        best
+        // Pop this edge's blocks so siblings explored by the caller don't inherit them.
+        if matches!(&self.edge_blocks, EdgeData::Paged(_)) {
+            path.pop();
+        }
+
+        deepest
+    }
+
+    /// Build a match from the leading whole blocks of THIS edge that the query
+    /// shares (`common` tokens matched before divergence). Returns `None` when
+    /// fewer than one block is shared or the edge carries no paged blocks.
+    fn partial_edge_match<'a>(
+        &'a self,
+        common: usize,
+        min_prefix: usize,
+        block_size: usize,
+        path: &[&'a EdgeBlocks],
+    ) -> Option<MatchResult<'a>> {
+        let EdgeData::Paged(blocks) = &self.edge_blocks else {
+            return None;
+        };
+        let n_blocks = common / block_size;
+        if n_blocks == 0 {
+            return None;
+        }
+        let matched_tokens = n_blocks * block_size;
+        // Derive the reachable prefix length from the ACTUAL block-token sum of
+        // the path so far (not the edge-token depth, which can exceed the block
+        // sum after a non-block-aligned ancestor split). This keeps `prefix_len`
+        // exactly equal to the reconstructed cache's token count.
+        let base: usize = path.iter().map(|e| e.tokens).sum();
+        let prefix_len = base + matched_tokens;
+        if prefix_len < min_prefix {
+            return None;
+        }
+        // Take the leading `n_blocks` of every layer on this edge (Arc clones).
+        let tail_layers: Vec<CachedLayerData> = blocks
+            .layers
+            .iter()
+            .map(|l| l.split_at_blocks(n_blocks).0)
+            .collect();
+        let partial = EdgeBlocks {
+            layers: tail_layers,
+            tokens: matched_tokens,
+            context: blocks.context.clone(),
+        };
+        Some(MatchResult {
+            prefix_len,
+            kind: MatchEndpoint::PartialPaged {
+                context: blocks.context.clone(),
+            },
+            // The path up to (but excluding) this edge -- this edge's blocks are
+            // not on `path` yet (the parent pushes its own edge; this child edge
+            // is represented by `partial_tail`).
+            full_path: path.to_vec(),
+            partial_tail: Some(partial),
+            touch: None,
+        })
     }
 
     fn oldest_cached_time(&self) -> Option<Instant> {
@@ -241,8 +441,181 @@ impl RadixNode {
                 return;
             };
             self.edge.append(&mut only_child.edge);
+            self.edge_blocks = EdgeData::merge(
+                std::mem::replace(&mut self.edge_blocks, EdgeData::None),
+                only_child.edge_blocks,
+            );
             self.cached = only_child.cached;
             self.children = only_child.children;
+        }
+    }
+}
+
+impl EdgeData {
+    /// Concatenate two consecutive edges' block payloads into one. Used when
+    /// `prune` collapses a node into its sole child after eviction.
+    fn merge(parent: Self, child: Self) -> Self {
+        match (parent, child) {
+            (Self::Paged(mut p), Self::Paged(c)) => {
+                p.tokens += c.tokens;
+                p.context = p.context.or(c.context);
+                for (pl, cl) in p.layers.iter_mut().zip(c.layers) {
+                    pl.append_from(cl);
+                }
+                Self::Paged(p)
+            }
+            // A paged edge followed by a non-paged one (or vice versa) only
+            // happens around Cloned endpoints, which carry no path blocks; the
+            // paged side (if any) is structurally irrelevant once merged.
+            (Self::Paged(p), Self::None) => Self::Paged(p),
+            (Self::None, other) => other,
+        }
+    }
+}
+
+impl CachedLayerData {
+    /// Append another edge segment's blocks for the same layer onto `self`.
+    fn append_from(&mut self, other: Self) {
+        match (self, other) {
+            (Self::Kv(a), Self::Kv(b)) => a.extend(b),
+            (Self::TurboQuantKv(a), Self::TurboQuantKv(b)) => a.extend(b),
+            // Empty/Gdn layers carry no per-block run; keep the existing one.
+            // (Gdn snapshots are endpoint-level, not split across edges, and
+            // only ever appear on a single terminal edge.)
+            _ => {}
+        }
+    }
+
+    /// Split this layer's block run at `n` blocks, returning `(head, tail)`.
+    /// `Arc` clones are reference bumps -- no array data is copied.
+    fn split_at_blocks(&self, n: usize) -> (Self, Self) {
+        match self {
+            Self::Kv(blocks) => {
+                let head = blocks.iter().take(n).map(Arc::clone).collect();
+                let tail = blocks.iter().skip(n).map(Arc::clone).collect();
+                (Self::Kv(head), Self::Kv(tail))
+            }
+            Self::TurboQuantKv(blocks) => {
+                let head = blocks.iter().take(n).map(Arc::clone).collect();
+                let tail = blocks.iter().skip(n).map(Arc::clone).collect();
+                (Self::TurboQuantKv(head), Self::TurboQuantKv(tail))
+            }
+            Self::Gdn(snap) => (Self::Gdn(snap.clone()), Self::Empty),
+            Self::Empty => (Self::Empty, Self::Empty),
+        }
+    }
+
+    /// Drop the leading `n` blocks, returning the remaining tail.
+    fn drop_leading(&self, n: usize) -> Self {
+        self.split_at_blocks(n).1
+    }
+
+    /// Keep only the last `n` blocks of this layer's run.
+    fn take_last_blocks(&self, n: usize) -> Self {
+        match self {
+            Self::Kv(blocks) => {
+                let start = blocks.len().saturating_sub(n);
+                Self::Kv(blocks.iter().skip(start).map(Arc::clone).collect())
+            }
+            Self::TurboQuantKv(blocks) => {
+                let start = blocks.len().saturating_sub(n);
+                Self::TurboQuantKv(blocks.iter().skip(start).map(Arc::clone).collect())
+            }
+            Self::Gdn(snap) => Self::Gdn(snap.clone()),
+            Self::Empty => Self::Empty,
+        }
+    }
+}
+
+/// Shared insert/lookup parameters threaded through the recursion.
+struct Ctx {
+    block_size: usize,
+    context: Option<Arc<TurboQuantContext>>,
+}
+
+/// Build an `EdgeData::Paged` from a per-layer block run spanning `tokens`,
+/// or `EdgeData::None` when there are no blocks (e.g. the remainder of a
+/// `Cloned` insert). `context` is the shared `TurboQuant` context (dense: `None`).
+fn edge_blocks_from(
+    blocks: Option<Vec<CachedLayerData>>,
+    context: Option<Arc<TurboQuantContext>>,
+) -> EdgeData {
+    blocks.map_or(EdgeData::None, |layers| {
+        let tokens = layer_run_tokens(&layers);
+        EdgeData::Paged(EdgeBlocks {
+            layers,
+            tokens,
+            context,
+        })
+    })
+}
+
+/// Number of tokens a per-layer block run covers (block count x block size,
+/// inferred from a non-`Empty` layer's block dimension).
+fn layer_run_tokens(layers: &[CachedLayerData]) -> usize {
+    for layer in layers {
+        match layer {
+            CachedLayerData::Kv(blocks) => {
+                if let Some(b) = blocks.first() {
+                    let per_block =
+                        usize::try_from(b.keys.shape().get(2).copied().unwrap_or(0)).unwrap_or(0);
+                    return blocks.len() * per_block;
+                }
+            }
+            CachedLayerData::TurboQuantKv(blocks) => {
+                if let Some(b) = blocks.first() {
+                    let per_block =
+                        usize::try_from(b.key_norms.shape().get(1).copied().unwrap_or(0))
+                            .unwrap_or(0);
+                    return blocks.len() * per_block;
+                }
+            }
+            CachedLayerData::Gdn(_) | CachedLayerData::Empty => {}
+        }
+    }
+    0
+}
+
+/// Drop the leading `n_tokens` worth of blocks (`n_tokens / block_size` blocks)
+/// from every layer of an incoming block run. Used to discard the incoming
+/// duplicates of blocks that already live on the trie's shared edges.
+fn drop_leading_blocks(
+    blocks: Option<Vec<CachedLayerData>>,
+    n_tokens: usize,
+    block_size: usize,
+) -> Option<Vec<CachedLayerData>> {
+    let n_blocks = n_tokens / block_size;
+    blocks.map(|layers| layers.iter().map(|l| l.drop_leading(n_blocks)).collect())
+}
+
+/// Split an existing edge's blocks at `n_tokens` (`n_tokens / block_size`
+/// blocks), returning `(shared_head, leftover_tail)` as `EdgeData`s.
+fn split_edge_blocks(edge: EdgeData, n_tokens: usize, block_size: usize) -> (EdgeData, EdgeData) {
+    match edge {
+        EdgeData::None => (EdgeData::None, EdgeData::None),
+        EdgeData::Paged(blocks) => {
+            let n_blocks = n_tokens / block_size;
+            let head_tokens = n_blocks * block_size;
+            let tail_tokens = blocks.tokens.saturating_sub(head_tokens);
+            let mut head_layers = Vec::with_capacity(blocks.layers.len());
+            let mut tail_layers = Vec::with_capacity(blocks.layers.len());
+            for layer in &blocks.layers {
+                let (h, t) = layer.split_at_blocks(n_blocks);
+                head_layers.push(h);
+                tail_layers.push(t);
+            }
+            (
+                EdgeData::Paged(EdgeBlocks {
+                    layers: head_layers,
+                    tokens: head_tokens,
+                    context: blocks.context.clone(),
+                }),
+                EdgeData::Paged(EdgeBlocks {
+                    layers: tail_layers,
+                    tokens: tail_tokens,
+                    context: blocks.context,
+                }),
+            )
         }
     }
 }
@@ -265,28 +638,42 @@ impl PagedPrefixCache {
     /// Find the longest cached prefix that matches the beginning of `tokens`.
     ///
     /// Returns `None` if no prefix matches or if the match is shorter than one
-    /// block. On hit, blocks are gathered into a contiguous `AnyCache`.
+    /// block. On hit, blocks along the matched path are gathered into a
+    /// contiguous `AnyCache`.
     pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<PagedPrefixMatch> {
-        self.root
-            .find_deepest_match(tokens, 0, self.block_size)
-            .and_then(|(prefix_len, cs)| match materialize(&cs.data) {
-                Ok(cache) => {
-                    tracing::debug!(prefix_len, "Prefix cache hit");
-                    cs.last_accessed.set(Instant::now());
-                    Some(PagedPrefixMatch { prefix_len, cache })
+        let mut scratch: Vec<&EdgeBlocks> = Vec::new();
+        let m = self.root.find_deepest_match(
+            tokens,
+            0,
+            self.block_size,
+            self.block_size,
+            &mut scratch,
+        )?;
+        let prefix_len = m.prefix_len;
+        match materialize(&m) {
+            Ok(cache) => {
+                tracing::debug!(prefix_len, "Prefix cache hit");
+                if let Some(touch) = m.touch {
+                    touch.set(Instant::now());
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Prefix cache materialize failed");
-                    None
-                }
-            })
+                Some(PagedPrefixMatch { prefix_len, cache })
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Prefix cache materialize failed");
+                None
+            }
+        }
     }
 
     /// Store a prefix and its cache state as paged blocks.
     ///
     /// For dense KV caches, the K/V arrays are sliced into block-sized views
-    /// (lazy, nearly free). For `TurboQuant` caches, a full clone fallback is
-    /// used. Only block-aligned tokens are stored in the trie.
+    /// (lazy, nearly free) and inserted into the radix trie one block per edge
+    /// segment. Where the new sequence shares a leading run of blocks with an
+    /// existing entry, the shared blocks already live on the trie's edges and
+    /// are reused -- the incoming duplicates are dropped, so storage is
+    /// deduplicated. For `TurboQuant` caches with deferred quantization a full
+    /// clone fallback is used. Only block-aligned tokens are stored in the trie.
     pub fn store(&mut self, prefix_tokens: &[u32], cache: &AnyCache) {
         if self.max_cached == 0 {
             return;
@@ -297,8 +684,8 @@ impl PagedPrefixCache {
         // CachedData::TurboQuantPaged variant but requires the TQ arrays to be
         // populated (post-activation). For now, use clone fallback when TQ config
         // is set but arrays aren't yet quantized to avoid cache corruption.
-        let data = match slice_into_blocks(cache, self.block_size, prefix_tokens.len()) {
-            Ok(d) => d,
+        let prepared = match slice_into_blocks(cache, self.block_size, prefix_tokens.len()) {
+            Ok(p) => p,
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to page cache, using clone fallback");
                 match kv_offset(cache).and_then(|offset| usize::try_from(offset).ok()) {
@@ -310,16 +697,17 @@ impl PagedPrefixCache {
                         );
                         return;
                     }
-                    _ => CachedData::Cloned(cache.clone()),
+                    _ => PreparedStore {
+                        blocks: None,
+                        context: None,
+                        total_tokens: prefix_tokens.len(),
+                        endpoint: CachedData::Cloned(cache.clone()),
+                    },
                 }
             }
         };
 
-        let stored_len = match &data {
-            CachedData::Paged { total_tokens, .. }
-            | CachedData::TurboQuantPaged { total_tokens, .. } => *total_tokens,
-            CachedData::Cloned(_) => prefix_tokens.len(),
-        };
+        let stored_len = prepared.total_tokens;
         let Some(tokens_to_store) = prefix_tokens.get(..stored_len) else {
             tracing::warn!(
                 key_tokens = prefix_tokens.len(),
@@ -329,7 +717,19 @@ impl PagedPrefixCache {
             return;
         };
 
-        let added = Self::insert(&mut self.root, tokens_to_store, 0, data);
+        let ctx = Ctx {
+            block_size: self.block_size,
+            context: prepared.context,
+        };
+        let added = Self::insert(
+            &mut self.root,
+            tokens_to_store,
+            0,
+            prepared.blocks.clone(),
+            prepared.blocks.as_ref(),
+            prepared.endpoint,
+            &ctx,
+        );
 
         if added {
             self.num_cached += 1;
@@ -339,11 +739,45 @@ impl PagedPrefixCache {
         }
     }
 
-    fn insert(node: &mut RadixNode, tokens: &[u32], pos: usize, data: CachedData) -> bool {
+    /// Insert `tokens` (with optional per-layer block run `blocks` spanning all
+    /// of `tokens`) marking the terminal node with `endpoint`.
+    ///
+    /// `blocks` covers exactly the tokens still being placed (`[pos, len)`).
+    /// As the trie is descended, the block run is sliced so that each edge
+    /// segment carries precisely the blocks for the tokens on that edge. When
+    /// the descent reaches an already-stored edge whose tokens match, the
+    /// existing edge blocks are reused and the incoming ones for that span are
+    /// discarded -- this is where shared prefixes deduplicate.
+    fn insert(
+        node: &mut RadixNode,
+        tokens: &[u32],
+        pos: usize,
+        blocks: Option<Vec<CachedLayerData>>,
+        full_blocks: Option<&Vec<CachedLayerData>>,
+        endpoint: CachedData,
+        ctx: &Ctx,
+    ) -> bool {
+        let block_size = ctx.block_size;
         if pos >= tokens.len() {
             let is_new = node.cached.is_none();
+            // Overwrite: refresh this terminal edge's blocks from the full
+            // incoming run so a re-store with changed KV replaces the stale
+            // blocks. (For identical tokens the model produces identical KV, so
+            // this is a no-op in production; it keeps re-stores correct.) The
+            // terminal edge owns the LAST `edge.len()/block_size` blocks of the
+            // sequence; slice those from the full run.
+            if !is_new {
+                if let Some(full) = full_blocks {
+                    let edge_blocks = node.edge.len() / block_size;
+                    let refreshed: Vec<CachedLayerData> = full
+                        .iter()
+                        .map(|l| l.take_last_blocks(edge_blocks))
+                        .collect();
+                    node.edge_blocks = edge_blocks_from(Some(refreshed), ctx.context.clone());
+                }
+            }
             node.cached = Some(CachedState {
-                data,
+                data: endpoint,
                 last_accessed: Cell::new(Instant::now()),
             });
             return is_new;
@@ -367,13 +801,25 @@ impl PagedPrefixCache {
                 .count();
 
             if common == child.edge.len() {
+                // Whole child edge matched: its blocks are reused as-is. Drop
+                // the incoming blocks for this span (they are byte-identical KV)
+                // and recurse with the remainder.
+                let remainder = drop_leading_blocks(blocks, common, block_size);
                 let Some(child_mut) = node.children.get_mut(&next_token) else {
                     return false;
                 };
-                return Self::insert(child_mut, tokens, pos + common, data);
+                return Self::insert(
+                    child_mut,
+                    tokens,
+                    pos + common,
+                    remainder,
+                    full_blocks,
+                    endpoint,
+                    ctx,
+                );
             }
 
-            // Partial match -- split the edge at `common`
+            // Partial match -- split the child edge at `common`.
             let Some(mut old_child) = node.children.remove(&next_token) else {
                 return false;
             };
@@ -386,16 +832,28 @@ impl PagedPrefixCache {
             };
             old_child.edge = leftover_edge;
 
+            // Split the existing edge's blocks at the same token boundary so the
+            // shared leading blocks live on the new `split` parent (referenced by
+            // both children's paths) and the rest stay on `old_child`.
+            let (shared_blocks, leftover_blocks) =
+                split_edge_blocks(old_child.edge_blocks, common, block_size);
+            old_child.edge_blocks = leftover_blocks;
+
             let mut split = RadixNode {
                 edge: common_edge,
+                edge_blocks: shared_blocks,
                 cached: None,
                 children: HashMap::new(),
             };
             split.children.insert(leftover_key, old_child);
 
+            // The incoming blocks for `[pos, pos+common)` are duplicates of the
+            // shared blocks now on `split`; drop them and keep the remainder.
+            let remainder = drop_leading_blocks(blocks, common, block_size);
+
             if pos + common >= tokens.len() {
                 split.cached = Some(CachedState {
-                    data,
+                    data: endpoint,
                     last_accessed: Cell::new(Instant::now()),
                 });
                 node.children.insert(next_token, split);
@@ -407,16 +865,24 @@ impl PagedPrefixCache {
                 node.children.insert(next_token, split);
                 return false;
             };
-            let new_leaf = RadixNode::leaf(new_edge, data);
+            let new_leaf = RadixNode::leaf(
+                new_edge,
+                edge_blocks_from(remainder, ctx.context.clone()),
+                endpoint,
+            );
             split.children.insert(new_key, new_leaf);
 
             node.children.insert(next_token, split);
             return true;
         }
 
-        // No matching child -- create a new leaf
+        // No matching child -- create a new leaf carrying all remaining blocks.
         let new_edge = tokens.get(pos..).unwrap_or_default().to_vec();
-        let new_leaf = RadixNode::leaf(new_edge, data);
+        let new_leaf = RadixNode::leaf(
+            new_edge,
+            edge_blocks_from(blocks, ctx.context.clone()),
+            endpoint,
+        );
         node.children.insert(next_token, new_leaf);
         true
     }
@@ -441,6 +907,37 @@ impl PagedPrefixCache {
     pub fn clear(&mut self) {
         self.root = RadixNode::empty();
         self.num_cached = 0;
+    }
+
+    /// Test-only: collect, per layer-0 dense block, its `Arc` pointer identity
+    /// and `strong_count` across every edge in the trie. Distinct pointers ==
+    /// distinct stored blocks (no duplication); a `strong_count > 1` means the
+    /// block is physically shared by multiple prefixes' paths.
+    #[cfg(test)]
+    #[allow(clippy::as_conversions)]
+    fn layer0_block_stats(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        self.root.collect_layer0_blocks(&mut out);
+        out
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::as_conversions)]
+impl RadixNode {
+    /// Walk the trie, appending `(arc_ptr_as_usize, strong_count)` for the
+    /// layer-0 dense KV blocks on every edge.
+    fn collect_layer0_blocks(&self, out: &mut Vec<(usize, usize)>) {
+        if let EdgeData::Paged(blocks) = &self.edge_blocks {
+            if let Some(CachedLayerData::Kv(layer0)) = blocks.layers.first() {
+                for b in layer0 {
+                    out.push((Arc::as_ptr(b) as usize, Arc::strong_count(b)));
+                }
+            }
+        }
+        for child in self.children.values() {
+            child.collect_layer0_blocks(out);
+        }
     }
 }
 
@@ -476,17 +973,33 @@ fn kv_offset(cache: &AnyCache) -> Option<i32> {
     }
 }
 
+/// Outcome of preparing a cache for storage: the per-layer block run (if paged),
+/// how many tokens it covers, and the endpoint metadata for the trie node.
+struct PreparedStore {
+    /// `None` for `Cloned` endpoints (no path blocks).
+    blocks: Option<Vec<CachedLayerData>>,
+    /// Shared `TurboQuant` context for paged-TQ blocks; `None` for dense/clone.
+    context: Option<Arc<TurboQuantContext>>,
+    total_tokens: usize,
+    endpoint: CachedData,
+}
+
 /// Slice a cache into block-aligned paged data.
 fn slice_into_blocks(
     cache: &AnyCache,
     block_size: usize,
     max_tokens: usize,
-) -> Result<CachedData, Exception> {
+) -> Result<PreparedStore, Exception> {
     // Hybrid caches (GDN+KV) can't be block-paged because GDN sequential state
     // doesn't align to block boundaries. The KV offset would mismatch the GDN
     // offset after materialization, producing corrupt attention. Use clone instead.
     let AnyCache::KV(kv_layers) = cache else {
-        return Ok(CachedData::Cloned(cache.clone()));
+        return Ok(PreparedStore {
+            blocks: None,
+            context: None,
+            total_tokens: max_tokens,
+            endpoint: CachedData::Cloned(cache.clone()),
+        });
     };
 
     let offset = kv_offset(cache).unwrap_or(0);
@@ -518,20 +1031,21 @@ fn slice_into_blocks(
         })
         .collect::<Result<_, _>>()?;
 
-    if let Some(context) = tq_context {
-        Ok(CachedData::TurboQuantPaged {
-            layers,
-            context,
-            total_tokens,
-            is_hybrid: false,
-        })
-    } else {
-        Ok(CachedData::Paged {
-            layers,
-            total_tokens,
-            is_hybrid: false,
-        })
-    }
+    let endpoint = tq_context
+        .as_ref()
+        .map_or(CachedData::Paged { is_hybrid: false }, |context| {
+            CachedData::TurboQuantPaged {
+                context: Arc::clone(context),
+                is_hybrid: false,
+            }
+        });
+
+    Ok(PreparedStore {
+        blocks: Some(layers),
+        context: tq_context,
+        total_tokens,
+        endpoint,
+    })
 }
 
 /// Slice a single `TurboQuant` KV layer into blocks along axis 1.
@@ -555,13 +1069,13 @@ fn slice_tq_layer(
         let end = start
             .checked_add(block_size)
             .ok_or_else(|| Exception::custom("block end overflow"))?;
-        blocks.push(TqBlock {
+        blocks.push(Arc::new(TqBlock {
             key_codes: slice_axis1(key_codes, start, end)?,
             key_norms: slice_axis1(key_norms, start, end)?,
             key_gammas: slice_axis1(key_gammas, start, end)?,
             value_codes: slice_axis1(value_codes, start, end)?,
             value_norms: slice_axis1(value_norms, start, end)?,
-        });
+        }));
     }
 
     Ok(CachedLayerData::TurboQuantKv(blocks))
@@ -591,36 +1105,69 @@ fn slice_kv_layer(
             .ok_or_else(|| Exception::custom("block end overflow"))?;
         let k = slice_axis2(keys, start, end)?;
         let v = slice_axis2(values, start, end)?;
-        blocks.push(KvBlock { keys: k, values: v });
+        blocks.push(Arc::new(KvBlock { keys: k, values: v }));
     }
 
     Ok(CachedLayerData::Kv(blocks))
 }
 
-/// Materialize block references into a contiguous `AnyCache`.
-fn materialize(data: &CachedData) -> Result<AnyCache, Exception> {
-    match data {
-        CachedData::Cloned(cache) => Ok(cache.clone()),
-        CachedData::Paged {
-            layers, is_hybrid, ..
-        } => {
-            if *is_hybrid {
-                materialize_hybrid(layers)
-            } else {
-                materialize_kv(layers)
+/// Flatten the per-edge block runs along a root -> node path (plus an optional
+/// partially-matched final edge) into a single per-layer block run, in order.
+///
+/// Each `EdgeBlocks` has the same layer layout, so layer `l`'s full run is the
+/// in-order concatenation of every edge's `layers[l]`.
+fn flatten_path_layers(
+    full_path: &[&EdgeBlocks],
+    partial_tail: Option<&EdgeBlocks>,
+) -> Vec<CachedLayerData> {
+    let mut out: Vec<CachedLayerData> = Vec::new();
+    let segments = full_path.iter().copied().chain(partial_tail);
+    for edge in segments {
+        if out.is_empty() {
+            out.clone_from(&edge.layers);
+        } else {
+            for (acc, seg) in out.iter_mut().zip(edge.layers.iter()) {
+                acc.append_from(seg.clone());
             }
         }
-        CachedData::TurboQuantPaged {
-            layers,
-            context,
-            is_hybrid,
-            ..
-        } => {
+    }
+    out
+}
+
+/// Materialize a matched prefix into a contiguous `AnyCache`.
+///
+/// Blocks are gathered from every edge along the match's `full_path` (root ->
+/// matched node) plus any `partial_tail` (leading whole blocks of a partially
+/// matched final edge). Shared leading edges contribute their blocks exactly
+/// once, so the reconstruction is byte-identical to the originally stored KV
+/// for the matched span.
+fn materialize(m: &MatchResult) -> Result<AnyCache, Exception> {
+    match &m.kind {
+        MatchEndpoint::Stored(CachedData::Cloned(cache)) => Ok(cache.clone()),
+        MatchEndpoint::Stored(CachedData::Paged { is_hybrid, .. }) => {
+            let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
             if *is_hybrid {
-                materialize_tq_hybrid(layers, context)
+                materialize_hybrid(&layers)
             } else {
-                materialize_tq_kv(layers, context)
+                materialize_kv(&layers)
             }
+        }
+        MatchEndpoint::Stored(CachedData::TurboQuantPaged {
+            context, is_hybrid, ..
+        }) => {
+            let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
+            if *is_hybrid {
+                materialize_tq_hybrid(&layers, context)
+            } else {
+                materialize_tq_kv(&layers, context)
+            }
+        }
+        MatchEndpoint::PartialPaged { context } => {
+            let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
+            context.as_ref().map_or_else(
+                || materialize_kv(&layers),
+                |ctx| materialize_tq_kv(&layers, ctx),
+            )
         }
     }
 }
@@ -702,7 +1249,7 @@ fn materialize_tq_hybrid(
 }
 
 /// Gather KV blocks into a single contiguous `SteppingKeyValueCache`.
-fn gather_blocks(blocks: &[KvBlock]) -> Result<SteppingKeyValueCache, Exception> {
+fn gather_blocks(blocks: &[Arc<KvBlock>]) -> Result<SteppingKeyValueCache, Exception> {
     let Some(first) = blocks.first() else {
         return Ok(SteppingKeyValueCache::new());
     };
@@ -721,7 +1268,7 @@ fn gather_blocks(blocks: &[KvBlock]) -> Result<SteppingKeyValueCache, Exception>
 
 /// Gather TQ blocks into a single `SteppingKeyValueCache` with TQ storage.
 fn gather_tq_blocks(
-    blocks: &[TqBlock],
+    blocks: &[Arc<TqBlock>],
     context: &Arc<TurboQuantContext>,
 ) -> Result<SteppingKeyValueCache, Exception> {
     if blocks.is_empty() {
@@ -770,7 +1317,13 @@ fn gather_tq_blocks(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::shadow_unrelated
+    clippy::shadow_unrelated,
+    clippy::as_conversions,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::identity_op,
+    clippy::suboptimal_flops,
+    clippy::doc_markdown
 )]
 mod tests {
     use super::*;
@@ -1068,5 +1621,246 @@ mod tests {
         assert_eq!(rk.shape(), &[1, 2, 33, 8]);
         assert_eq!(rv.shape(), &[1, 2, 33, 8]);
         assert_eq!(KeyValueCache::offset(&kv), 33);
+    }
+
+    // -- Radix-tree block sharing tests --------------------------------------
+
+    /// KV cache whose K/V values are a deterministic function of absolute token
+    /// position, so block content is position-distinct and reconstruction can be
+    /// verified byte-for-byte. Element at (token `t`, head `h`, dim `d`) =
+    /// `base + t*1000 + h*100 + d`.
+    fn make_kv_cache_content(num_layers: usize, seq_len: i32, base: f32) -> AnyCache {
+        let s = seq_len as usize;
+        let layers: Vec<Option<SteppingKeyValueCache>> = (0..num_layers)
+            .map(|layer| {
+                let mut data = vec![0.0_f32; 1 * 2 * s * 8];
+                for h in 0..2 {
+                    for t in 0..s {
+                        for d in 0..8 {
+                            let idx = ((h * s) + t) * 8 + d;
+                            data[idx] = base
+                                + (layer as f32) * 1_000_000.0
+                                + (t as f32) * 1000.0
+                                + (h as f32) * 100.0
+                                + d as f32;
+                        }
+                    }
+                }
+                let keys = Array::from_slice(&data, &[1, 2, seq_len, 8]);
+                let values = Array::from_slice(&data, &[1, 2, seq_len, 8]);
+                Some(SteppingKeyValueCache::from_arrays(keys, values).unwrap())
+            })
+            .collect();
+        AnyCache::KV(layers)
+    }
+
+    /// Layer-0 keys array of a KV cache.
+    fn cache_keys(cache: &AnyCache, layer: usize) -> Array {
+        match cache {
+            AnyCache::KV(layers) => layers[layer].as_ref().unwrap().keys().unwrap().clone(),
+            AnyCache::Hybrid(_) => panic!("expected KV"),
+        }
+    }
+
+    /// Assert the first `n` tokens (axis 2) of two `[1, H, *, 8]` key arrays are
+    /// byte-identical. Uses MLX `array_eq` + `all` so strided slice views are
+    /// compared by VALUE (raw `as_slice` would read the contiguous backing
+    /// buffer and ignore strides).
+    fn assert_keys_eq_first_n(got: &Array, expected: &Array, n: i32) {
+        let g = slice_axis2(got, 0, n).unwrap();
+        let e = slice_axis2(expected, 0, n).unwrap();
+        let eq = g.array_eq(&e, None).unwrap();
+        let all = eq.all(None).unwrap();
+        assert!(
+            all.item::<bool>(),
+            "reconstructed keys differ from stored KV over first {n} tokens"
+        );
+    }
+
+    /// (a) Two inserts sharing a leading prefix must PHYSICALLY share the
+    /// overlapping blocks: one stored `Arc` per shared block (not 2x), with a
+    /// strong_count reflecting the shared reference.
+    #[test]
+    fn test_shared_prefix_dedups_blocks() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+
+        // Both sequences share the first 64 tokens (2 blocks), diverge after.
+        let mut seq_a: Vec<u32> = (0..64).collect();
+        seq_a.extend(1000..1064);
+        let mut seq_b: Vec<u32> = (0..64).collect();
+        seq_b.extend(2000..2064);
+
+        cache.store(&seq_a, &make_kv_cache(1, 128));
+        cache.store(&seq_b, &make_kv_cache(1, 128));
+        assert_eq!(cache.len(), 2);
+
+        // Total distinct layer-0 blocks: 2 shared + 2 (a-only) + 2 (b-only) = 6.
+        // Without sharing (storing each prefix's blocks independently) it would
+        // be 2*4 = 8. Distinct-Arc count == 6 IS the dedup proof: the shared
+        // leading blocks are stored once on the common parent edge, not copied
+        // into each prefix's storage.
+        let stats = cache.layer0_block_stats();
+        assert_eq!(stats.len(), 6, "expected 6 distinct blocks, got {stats:?}");
+
+        // Both prefixes still reconstruct correctly.
+        let mut q_a = seq_a.clone();
+        q_a.push(9);
+        let mut q_b = seq_b.clone();
+        q_b.push(9);
+        assert_eq!(cache.find_longest_prefix(&q_a).unwrap().prefix_len, 128);
+        assert_eq!(cache.find_longest_prefix(&q_b).unwrap().prefix_len, 128);
+    }
+
+    /// Stronger sharing proof: store a short prefix, then a longer one extending
+    /// it. The short prefix's blocks are REUSED by the long prefix's path (same
+    /// Arc), so storing the extension adds no duplicate of the shared blocks.
+    #[test]
+    fn test_extension_reuses_shared_block_arcs() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+
+        let short: Vec<u32> = (0..64).collect(); // 2 blocks
+        cache.store(&short, &make_kv_cache(1, 64));
+        let before = cache.layer0_block_stats();
+        assert_eq!(before.len(), 2);
+
+        // Extend: shares the first 64 tokens, adds 64 more (2 new blocks).
+        let long: Vec<u32> = (0..128).collect(); // 4 blocks
+        cache.store(&long, &make_kv_cache(1, 128));
+
+        let after = cache.layer0_block_stats();
+        // 4 distinct blocks total (2 shared reused + 2 new) -- not 2 + 4 = 6.
+        assert_eq!(
+            after.len(),
+            4,
+            "extension must reuse shared blocks: {after:?}"
+        );
+
+        // The two original block Arcs are still present by pointer identity.
+        let before_ptrs: std::collections::HashSet<usize> =
+            before.iter().map(|(p, _)| *p).collect();
+        let after_ptrs: std::collections::HashSet<usize> = after.iter().map(|(p, _)| *p).collect();
+        assert!(
+            before_ptrs.is_subset(&after_ptrs),
+            "original shared block Arcs must survive the extension"
+        );
+    }
+
+    /// (b) `find_longest_prefix` returns the DEEPEST shared match for a query
+    /// that overlaps the stored prefix only partially -- including divergence
+    /// in the MIDDLE of a block, where only whole shared blocks may be reused.
+    #[test]
+    fn test_deepest_match_mid_block_divergence() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+
+        // Store 96 tokens (3 blocks) of content-distinct KV.
+        let stored: Vec<u32> = (0..96).collect();
+        let kv = make_kv_cache_content(2, 96, 7.0);
+        let expected_keys = cache_keys(&kv, 0);
+        cache.store(&stored, &kv);
+
+        // Query shares 40 tokens then diverges mid-block-2 (block boundary 32).
+        // No endpoint is stored at depth 32 -- this exercises the RadixAttention
+        // intra-edge block-boundary match.
+        let mut query: Vec<u32> = (0..40).collect();
+        query.extend(5000..5060);
+        let result = cache.find_longest_prefix(&query).unwrap();
+
+        // Deepest block-aligned match below 40 tokens is 32 (1 block).
+        assert_eq!(result.prefix_len, 32);
+        assert_eq!(kv_cache_offset(&result.cache), 32);
+
+        // Reconstruction must be byte-identical to the first 32 tokens of the
+        // originally stored KV.
+        assert_keys_eq_first_n(&cache_keys(&result.cache, 0), &expected_keys, 32);
+    }
+
+    /// Byte-identical reconstruction across a SHARED block boundary: a query
+    /// reusing a fully-shared 2-block prefix rebuilds the exact stored KV.
+    #[test]
+    fn test_shared_block_reconstruction_byte_identical() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+
+        let mut seq_a: Vec<u32> = (0..64).collect();
+        seq_a.extend(1000..1032);
+        let kv_a = make_kv_cache_content(1, 96, 11.0);
+        let expected = cache_keys(&kv_a, 0);
+        cache.store(&seq_a, &kv_a);
+
+        // seq_b shares the first 64 tokens, then diverges. After the split the
+        // first two blocks live on the shared parent edge.
+        let mut seq_b: Vec<u32> = (0..64).collect();
+        seq_b.extend(3000..3032);
+        cache.store(&seq_b, &make_kv_cache_content(1, 96, 22.0));
+
+        // Query reusing the shared 64-token (2-block) prefix. The match lands on
+        // the shared parent edge (no stored endpoint there) via an intra-edge
+        // block-boundary match.
+        let mut query: Vec<u32> = (0..64).collect();
+        query.push(9);
+        let result = cache.find_longest_prefix(&query).unwrap();
+        assert_eq!(result.prefix_len, 64);
+
+        // The shared blocks came from seq_a (stored first); reconstruction of
+        // the first 64 tokens must byte-match seq_a's stored KV.
+        assert_keys_eq_first_n(&cache_keys(&result.cache, 0), &expected, 64);
+    }
+
+    /// (c) Inserting then evicting frees only UNSHARED blocks while shared
+    /// blocks stay alive as long as another prefix references them.
+    #[test]
+    fn test_eviction_frees_only_unshared_blocks() {
+        let mut cache = PagedPrefixCache::new(2, DEFAULT_BLOCK_SIZE);
+
+        // A and B share the first 64 tokens (2 blocks), diverge after.
+        let mut seq_a: Vec<u32> = (0..64).collect();
+        seq_a.extend(1000..1064);
+        let mut seq_b: Vec<u32> = (0..64).collect();
+        seq_b.extend(2000..2064);
+
+        cache.store(&seq_a, &make_kv_cache(1, 128));
+        cache.store(&seq_b, &make_kv_cache(1, 128));
+        assert_eq!(cache.len(), 2);
+        // 6 distinct blocks: 2 shared + 2 (a) + 2 (b).
+        assert_eq!(cache.layer0_block_stats().len(), 6);
+
+        // Touch A so it is the most-recently-used; B becomes the LRU victim
+        // when C arrives.
+        let mut q_a = seq_a.clone();
+        q_a.push(9);
+        assert!(cache.find_longest_prefix(&q_a).is_some());
+
+        // Insert C (disjoint) -> evicts the LRU (B). B's UNSHARED blocks (the 2
+        // after the shared prefix) are freed; the 2 SHARED blocks remain because
+        // A still references them.
+        let mut seq_c: Vec<u32> = (5000..5064).collect();
+        seq_c.extend(6000..6064);
+        cache.store(&seq_c, &make_kv_cache(1, 128));
+        assert_eq!(cache.len(), 2);
+
+        // A must still reconstruct fully (its shared blocks were NOT freed).
+        let result_a = cache.find_longest_prefix(&q_a).unwrap();
+        assert_eq!(result_a.prefix_len, 128);
+
+        // Distinct blocks now: A keeps 4 (2 shared + 2 a-only), C has 4.
+        // B's 2 unshared blocks are gone; the 2 formerly-shared blocks survive
+        // (now referenced only by A). Total distinct = 8.
+        let stats = cache.layer0_block_stats();
+        assert_eq!(
+            stats.len(),
+            8,
+            "B's unshared blocks should be freed, shared+A+C kept: {stats:?}"
+        );
+
+        // B is gone: a B-only query no longer reaches depth 128.
+        let mut q_b = seq_b.clone();
+        q_b.push(9);
+        match cache.find_longest_prefix(&q_b) {
+            None => {}
+            Some(m) => assert!(
+                m.prefix_len <= 64,
+                "evicted B must not yield its full 128-token prefix, got {}",
+                m.prefix_len
+            ),
+        }
     }
 }
