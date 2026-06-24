@@ -232,6 +232,18 @@ impl Router {
         names
     }
 
+    /// Sorted `(name, is_vlm)` for all loaded local engines (snapshot under a
+    /// read lock). Used by `GET /v1/models` to advertise image-input support.
+    pub fn local_models_with_vlm(&self) -> Vec<(String, bool)> {
+        let mut models: Vec<(String, bool)> = self
+            .engines_read()
+            .iter()
+            .map(|(name, engine)| (name.clone(), engine.is_vlm()))
+            .collect();
+        models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        models
+    }
+
     /// Whether a local engine is currently registered under `name`.
     pub fn contains_engine(&self, name: &str) -> bool {
         self.engines_read().contains_key(name)

@@ -250,6 +250,22 @@ An in-flight request keeps the model resident until it completes; `DELETE` remov
 it from routing immediately and frees memory once the last request drains. A model
 bound to the auto-router cannot be unloaded.
 
+**Capability discovery.** `GET /v1/models` adds two OpenAI-compatible *additive*
+fields (standard clients ignore unknown keys) so a client can check before acting:
+the top-level **`runtime_model_load`** (bool) mirrors `allow_runtime_model_load`
+-- if `false`, switch/load/unload will `403`; and per-model **`vision`** (bool)
+reports whether the model accepts image input (true only for VLMs).
+
+```jsonc
+{
+  "object": "list",
+  "runtime_model_load": true,
+  "data": [
+    { "id": "qwen36-35b", "object": "model", "created": 0, "owned_by": "local", "vision": false }
+  ]
+}
+```
+
 **Core commands**
 
 - `higgs serve`: start in the foreground

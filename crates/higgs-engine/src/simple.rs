@@ -131,7 +131,7 @@ pub(crate) fn should_clear_mlx_cache_after_prefill() -> bool {
 }
 
 #[allow(unsafe_code)]
-pub(crate) fn maybe_clear_mlx_cache(enabled: bool, reason: &str) {
+pub fn maybe_clear_mlx_cache(enabled: bool, reason: &str) {
     if !enabled {
         return;
     }

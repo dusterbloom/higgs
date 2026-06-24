@@ -25,11 +25,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// `GET /v1/models` -- list the locally loaded models.
 pub async fn list_models(State(state): State<SharedState>) -> Json<ModelList> {
-    let names = state.router.local_model_names();
-    let data = model_objects_sorted(names.iter().map(String::as_str));
+    let data = state
+        .router
+        .local_models_with_vlm()
+        .into_iter()
+        .map(|(name, vision)| model_object(name, vision))
+        .collect();
     Json(ModelList {
         object: "list",
         data,
+        runtime_model_load: state.config.local.allow_runtime_model_load,
     })
 }
 
@@ -90,6 +95,7 @@ pub async fn load_model(
         .await
         .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?
         .map_err(ServerError::BadRequest)?;
+    let vision = engine.is_vlm();
 
     state
         .router
@@ -97,7 +103,7 @@ pub async fn load_model(
         .map_err(|n| ServerError::Conflict(format!("model '{n}' is already loaded")))?;
 
     tracing::info!(model_name = %name, "Model loaded at runtime");
-    Ok(Json(model_object(name)))
+    Ok(Json(model_object(name, vision)))
 }
 
 /// `DELETE /v1/models/{name}` -- unload a model and free its GPU memory.
@@ -146,6 +152,11 @@ async fn drain_and_drop(mut engine: Arc<Engine>, timeout: Duration) -> bool {
         match Arc::try_unwrap(engine) {
             Ok(owned) => {
                 drop(owned);
+                // The engine's KV/prefix caches and weights are now freed, but
+                // MLX parks the buffers in its allocator pool — return them to
+                // the OS so a free-then-load swap actually reclaims memory. No
+                // `eval`, so this is safe outside the GPU gate (same as `drop`).
+                higgs_engine::simple::maybe_clear_mlx_cache(true, "model unload/swap");
                 return true;
             }
             Err(shared) => {
@@ -166,6 +177,7 @@ async fn drain_in_background(mut engine: Arc<Engine>) {
         match Arc::try_unwrap(engine) {
             Ok(owned) => {
                 drop(owned);
+                higgs_engine::simple::maybe_clear_mlx_cache(true, "model unload/swap (deferred)");
                 return;
             }
             Err(shared) => {
@@ -176,23 +188,14 @@ async fn drain_in_background(mut engine: Arc<Engine>) {
     }
 }
 
-fn model_object(name: String) -> ModelObject {
+fn model_object(name: String, vision: bool) -> ModelObject {
     ModelObject {
         id: name,
         object: "model",
         created: chrono::Utc::now().timestamp(),
         owned_by: "local".to_owned(),
+        vision,
     }
-}
-
-/// Build a sorted, stable list of [`ModelObject`]s from an iterator of model names.
-fn model_objects_sorted<'a>(names: impl Iterator<Item = &'a str>) -> Vec<ModelObject> {
-    let mut sorted: Vec<&str> = names.collect();
-    sorted.sort_unstable();
-    sorted
-        .into_iter()
-        .map(|name| model_object(name.to_owned()))
-        .collect()
 }
 
 #[cfg(test)]
@@ -229,26 +232,34 @@ mod tests {
     }
 
     #[test]
-    fn test_model_list_is_sorted_alphabetically() {
-        let names = ["zebra", "alpha", "middle"];
-        let data = model_objects_sorted(names.iter().copied());
-        let ids: Vec<&str> = data.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["alpha", "middle", "zebra"]);
-    }
-
-    #[test]
-    fn test_model_list_empty_input() {
-        let data = model_objects_sorted(std::iter::empty());
-        assert!(data.is_empty());
-    }
-
-    #[test]
     fn test_model_objects_have_correct_fields() {
-        let data = model_objects_sorted(std::iter::once("test-model"));
-        let obj = data.first().unwrap();
+        let obj = model_object("test-model".to_owned(), false);
         assert_eq!(obj.object, "model");
         assert_eq!(obj.owned_by, "local");
         assert!(obj.created > 0);
+        assert!(!obj.vision);
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_capabilities() {
+        // runtime_model_load mirrors the config flag; vision is per-model
+        // (stub engines are text-only); names stay sorted.
+        let on = build_state(
+            "[local]\nallow_runtime_model_load = true\n",
+            stub_engines(&["zebra", "alpha"]),
+        );
+        let Json(list) = list_models(State(on)).await;
+        assert!(list.runtime_model_load);
+        let ids: Vec<&str> = list.data.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "zebra"]);
+        assert!(list.data.iter().all(|m| !m.vision));
+
+        let off = build_state(
+            "[local]\nallow_runtime_model_load = false\n",
+            HashMap::new(),
+        );
+        let Json(list) = list_models(State(off)).await;
+        assert!(!list.runtime_model_load);
     }
 
     #[tokio::test]

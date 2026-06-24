@@ -402,6 +402,9 @@ pub struct CompletionUsage {
 pub struct ModelList {
     pub object: &'static str,
     pub data: Vec<ModelObject>,
+    /// higgs extension (additive, `OpenAI` clients ignore unknown keys): whether
+    /// runtime model load/switch is enabled (`local.allow_runtime_model_load`).
+    pub runtime_model_load: bool,
 }
 
 /// A model in the models list.
@@ -411,6 +414,8 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: i64,
     pub owned_by: String,
+    /// higgs extension (additive): whether this model accepts image input (VLM).
+    pub vision: bool,
 }
 
 /// POST /v1/embeddings request body.
@@ -601,7 +606,9 @@ mod tests {
                 object: "model",
                 created: 1_234_567_890,
                 owned_by: "local".to_owned(),
+                vision: false,
             }],
+            runtime_model_load: false,
         };
         let json = serde_json::to_string(&list).unwrap();
         assert!(json.contains("test-model"));
