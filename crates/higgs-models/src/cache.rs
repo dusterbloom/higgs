@@ -5,6 +5,19 @@ use std::sync::{
 
 use mlx_rs::{Array, Dtype, Stream, error::Exception, ops, ops::concatenate_axis};
 
+/// RoPE parameters needed to re-rotate cached keys when token positions are
+/// renumbered after a prune. Mirrors the `nn::Rope` fields the model builds
+/// (`base`, `dimensions`, `scale`, `traditional`). Only non-traditional
+/// (NeoX half-split) RoPE is supported — the Qwen3 path uses `traditional(false)`.
+#[allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
+#[derive(Debug, Clone, Copy)]
+pub struct RopeShift {
+    pub base: f32,
+    pub dims: i32,
+    pub scale: f32,
+    pub traditional: bool,
+}
+
 use crate::turboquant::{
     KvCacheConfig, KvCacheMode, QuantizedKey, QuantizedValue, TurboQuantContext,
 };
@@ -426,6 +439,81 @@ impl SteppingKeyValueCache {
     pub fn trim_by(&mut self, n: usize) {
         let trim = i32::try_from(n).unwrap_or(i32::MAX);
         self.offset = self.offset.saturating_sub(trim).max(0);
+    }
+
+    /// Prune the half-open token span `[a, b)` from a dense cache, compacting the
+    /// survivors and renumbering positions so they stay dense (TIM-style KV prune
+    /// + positional reuse).
+    ///
+    /// Keys are stored *post-RoPE* at their insertion position, so dropping a span
+    /// and shifting the suffix down by `Δ = b - a` requires left-multiplying the
+    /// surviving suffix keys by `R(-Δ)` — one uniform rotation (values are not
+    /// roped). The result is bit-equivalent to a cache built as if the pruned
+    /// tokens never existed; see `prune_span_equiv_never_inserted`.
+    ///
+    /// Dense path only. Returns an error on a TurboQuant cache: re-roping quantized
+    /// keys would need dequant→re-rope→requant.
+    // ponytail: dense KV only; add TurboQuant prune when long-context + prune are
+    // both needed at once.
+    #[allow(clippy::doc_markdown)]
+    pub fn prune_span(&mut self, a: i32, b: i32, rope: RopeShift) -> Result<(), Exception> {
+        if self.turbo.is_some() {
+            return Err(Exception::custom(
+                "prune_span: dense KV only (TurboQuant unsupported)",
+            ));
+        }
+        let off = self.offset;
+        if a < 0 || a > b || b > off {
+            return Err(Exception::custom(format!(
+                "prune_span: invalid span [{a}, {b}) for offset {off}"
+            )));
+        }
+        let delta = b - a;
+        if delta == 0 {
+            return Ok(());
+        }
+        if a == 0 && b == off {
+            return Err(Exception::custom(
+                "prune_span: refusing to prune the entire cache",
+            ));
+        }
+
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| Exception::custom("prune_span: dense keys missing"))?;
+        let values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Exception::custom("prune_span: dense values missing"))?;
+
+        let mut key_parts: Vec<Array> = Vec::with_capacity(2);
+        let mut value_parts: Vec<Array> = Vec::with_capacity(2);
+        if a > 0 {
+            key_parts.push(slice_axis2(keys, 0, a)?);
+            value_parts.push(slice_axis2(values, 0, a)?);
+        }
+        if off > b {
+            let key_tail = slice_axis2(keys, b, off)?;
+            key_parts.push(rope_shift_back(&key_tail, delta, rope)?);
+            value_parts.push(slice_axis2(values, b, off)?);
+        }
+
+        let new_keys = if key_parts.len() == 1 {
+            key_parts.remove(0)
+        } else {
+            concatenate_axis(&key_parts, 2)?
+        };
+        let new_values = if value_parts.len() == 1 {
+            value_parts.remove(0)
+        } else {
+            concatenate_axis(&value_parts, 2)?
+        };
+
+        self.keys = Some(new_keys);
+        self.values = Some(new_values);
+        self.offset = off - delta;
+        Ok(())
     }
 
     /// An **independent** deep copy: every MLX buffer is materialized into a
@@ -1131,6 +1219,77 @@ fn checked_add(lhs: usize, rhs: usize, label: &str) -> Result<usize, Exception> 
         .ok_or_else(|| Exception::custom(format!("{label} overflow")))
 }
 
+/// Re-rotate a `[1, H, T, D]` block of post-RoPE keys by `R(-delta)`, shifting
+/// every token's effective position down by `delta`.
+///
+/// For non-traditional (NeoX) RoPE the head dim splits into halves
+/// `x1 = x[..:dims/2]`, `x2 = x[dims/2:dims]`, rotated per frequency
+/// `f_i = base^(-2i/dims)` by angle `delta * scale * f_i`. Applying `R(-delta)`:
+///
+/// ```text
+/// out1 =  x1*cos + x2*sin
+/// out2 = -x1*sin + x2*cos
+/// ```
+///
+/// Dims beyond `dims` (partial rotary) pass through unrotated. The angles are
+/// constant across tokens and heads, so this is one broadcast multiply — cheap.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown
+)]
+fn rope_shift_back(block: &Array, delta: i32, rope: RopeShift) -> Result<Array, Exception> {
+    if rope.traditional {
+        return Err(Exception::custom(
+            "rope_shift_back: traditional (interleaved) RoPE unsupported",
+        ));
+    }
+    let dims = rope.dims;
+    if dims < 2 || dims % 2 != 0 {
+        return Err(Exception::custom(format!(
+            "rope_shift_back: rope dims must be even and >= 2, got {dims}"
+        )));
+    }
+    let full_dim = *block
+        .shape()
+        .last()
+        .ok_or_else(|| Exception::custom("rope_shift_back: block has no last dim"))?;
+    if dims > full_dim {
+        return Err(Exception::custom(format!(
+            "rope_shift_back: rope dims {dims} exceed head dim {full_dim}"
+        )));
+    }
+
+    let half = dims / 2;
+    let half_usize = usize::try_from(half).unwrap_or(0);
+    let ln_base = rope.base.ln();
+    let mut cos_vec = Vec::with_capacity(half_usize);
+    let mut sin_vec = Vec::with_capacity(half_usize);
+    for i in 0..half_usize {
+        let inv_freq = (-(2.0 * i as f32) / dims as f32 * ln_base).exp();
+        let angle = delta as f32 * rope.scale * inv_freq;
+        cos_vec.push(angle.cos());
+        sin_vec.push(angle.sin());
+    }
+    let cos = Array::from_slice(&cos_vec, &[1, 1, 1, half]);
+    let sin = Array::from_slice(&sin_vec, &[1, 1, 1, half]);
+
+    let x1 = slice_axis(block, 3, 0, half)?;
+    let x2 = slice_axis(block, 3, half, dims)?;
+    let out1 = x1.multiply(&cos)?.add(x2.multiply(&sin)?)?;
+    let out2 = x2.multiply(&cos)?.subtract(x1.multiply(&sin)?)?;
+    let rotated = concatenate_axis(&[out1, out2], 3)?;
+
+    if dims < full_dim {
+        let passthrough = slice_axis(block, 3, dims, full_dim)?;
+        concatenate_axis(&[rotated, passthrough], 3)
+    } else {
+        Ok(rotated)
+    }
+}
+
 /// Slice an array along axis 2: `arr[..., start:end, ...]`
 pub fn slice_axis2(arr: &Array, start: i32, end: i32) -> Result<Array, Exception> {
     slice_axis(arr, 2, start, end)
@@ -1489,6 +1648,121 @@ mod tests {
         assert!((k_data[0] - 1.0).abs() < 1e-6);
         assert!((k_data[4] - 1.0).abs() < 1e-6);
         assert!((k_data[8] - 2.0).abs() < 1e-6);
+    }
+
+    /// The core KV-prune invariant: pruning span `[a, b)` and re-roping the
+    /// survivors must leave the cache bit-equivalent (within f32 tolerance) to a
+    /// cache built as if those tokens never existed and the rest were renumbered
+    /// densely. Proves the compaction + `R(-Δ)` geometry generally, against the
+    /// model's real `apply_rope`, not a hand-picked expected tensor.
+    #[test]
+    fn prune_span_equiv_never_inserted() {
+        use crate::utils::apply_rope;
+        use mlx_rs::builder::Builder;
+        use mlx_rs::nn;
+
+        let (h, d, n) = (2i32, 8i32, 10i32);
+        let (a, b) = (3i32, 7i32); // prune [3, 7), Δ = 4
+        let base = 1_000_000.0_f32;
+        let rope = nn::RopeBuilder::new(d)
+            .traditional(false)
+            .base(base)
+            .scale(1.0)
+            .build()
+            .unwrap();
+        let shift = RopeShift {
+            base,
+            dims: d,
+            scale: 1.0,
+            traditional: false,
+        };
+
+        // Deterministic, varied raw (pre-RoPE) keys/values, distinct per element.
+        let count = usize::try_from(h * n * d).unwrap();
+        let raw_k: Vec<f32> = (0..count).map(|i| (i as f32 * 0.7).sin()).collect();
+        let raw_v: Vec<f32> = (0..count).map(|i| (i as f32 * 0.9 + 1.0).cos()).collect();
+        let raw_k = Array::from_slice(&raw_k, &[1, h, n, d]);
+        let raw_v = Array::from_slice(&raw_v, &[1, h, n, d]);
+
+        // LIVE: rope all tokens at positions 0..n, insert, then prune [a, b).
+        let roped_all = apply_rope(&raw_k, &rope, 0).unwrap();
+        let mut live = SteppingKeyValueCache::new();
+        live.update_and_fetch(roped_all, raw_v.clone()).unwrap();
+        live.prune_span(a, b, shift).unwrap();
+        assert_eq!(live.offset(), n - (b - a));
+
+        // REFERENCE: survivors only (raw rows [0,a) ++ [b,n)) roped at compacted
+        // positions 0..n-Δ, inserted into a fresh cache.
+        let surv_k = concatenate_axis(
+            &[
+                slice_axis2(&raw_k, 0, a).unwrap(),
+                slice_axis2(&raw_k, b, n).unwrap(),
+            ],
+            2,
+        )
+        .unwrap();
+        let surv_v = concatenate_axis(
+            &[
+                slice_axis2(&raw_v, 0, a).unwrap(),
+                slice_axis2(&raw_v, b, n).unwrap(),
+            ],
+            2,
+        )
+        .unwrap();
+        let ref_roped = apply_rope(&surv_k, &rope, 0).unwrap();
+        let mut reference = SteppingKeyValueCache::new();
+        reference.update_and_fetch(ref_roped, surv_v).unwrap();
+
+        // Compare the valid regions [0:offset). `as_slice` returns *storage*
+        // order (see `test_as_slice_after_transpose_order`); the reference keys
+        // are a non-contiguous slice of the 256-slot buffer, so flatten both to
+        // logical order before comparing.
+        let off = live.offset();
+        let logical = |a: &Array| -> Vec<f32> {
+            let v = slice_axis2(a, 0, off).unwrap().flatten(None, None).unwrap();
+            v.eval().unwrap();
+            v.as_slice::<f32>().to_vec()
+        };
+        let live_k = logical(live.keys().unwrap());
+        let ref_k = logical(reference.keys().unwrap());
+        let live_v = logical(live.values().unwrap());
+        let ref_v = logical(reference.values().unwrap());
+
+        let max_abs = |x: &[f32], y: &[f32]| -> f32 {
+            x.iter()
+                .zip(y)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0_f32, f32::max)
+        };
+        let key_err = max_abs(&live_k, &ref_k);
+        let val_err = max_abs(&live_v, &ref_v);
+        assert!(
+            key_err < 2e-3,
+            "keys diverge after prune+re-rope: {key_err}"
+        );
+        assert!(
+            val_err < 1e-6,
+            "values must match exactly (not roped): {val_err}"
+        );
+    }
+
+    #[test]
+    fn prune_span_rejects_turboquant() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            ..Default::default()
+        };
+        let mut cache = SteppingKeyValueCache::new_turbo(config, 2, 8).unwrap();
+        let (keys, values) = make_kv_pair(4, 8);
+        cache.update_and_fetch(keys, values).unwrap();
+        let shift = RopeShift {
+            base: 1_000_000.0,
+            dims: 8,
+            scale: 1.0,
+            traditional: false,
+        };
+        assert!(cache.prune_span(1, 2, shift).is_err());
     }
 
     #[test]

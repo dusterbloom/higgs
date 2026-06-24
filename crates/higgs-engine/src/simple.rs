@@ -300,6 +300,52 @@ struct PreparedGeneration<'a> {
     pixel_values: Option<Array>,
 }
 
+/// Result of [`SimpleEngine::generate_with_prune`], carrying the sweep metrics
+/// alongside the text.
+#[derive(Debug, Clone)]
+pub struct PrunedGeneration {
+    /// Decoded completion text.
+    pub text: String,
+    /// Number of completion tokens generated.
+    pub completion_tokens: u32,
+    /// Peak resident KV length (tokens) across the decode — the memory headline.
+    pub peak_resident_kv: u32,
+    /// Wall-clock decode seconds (excludes prefill), for tokens/s.
+    pub decode_seconds: f32,
+    /// How many decode steps triggered a prune.
+    pub pruned_steps: u32,
+}
+
+/// Configuration for [`SimpleEngine::generate_self_maintained`].
+#[derive(Debug, Clone, Copy)]
+pub struct SelfMaintainCfg {
+    /// Per-segment generation budget. A segment that hits this without finishing
+    /// (no EOS) triggers a checkpoint — this is the context-length trigger.
+    pub seg_max_tokens: u32,
+    /// Token budget for each self-summary checkpoint.
+    pub summary_max_tokens: u32,
+    /// Safety cap on the number of segments.
+    pub max_segments: u32,
+    /// Whether to render prompts in thinking mode.
+    pub enable_thinking: bool,
+}
+
+/// Result of [`SimpleEngine::generate_self_maintained`].
+#[derive(Debug, Clone)]
+pub struct SelfMaintainedOutput {
+    /// Text of the final (answer-bearing) segment.
+    pub text: String,
+    /// Number of segments generated (1 = finished in one shot, no checkpoint).
+    pub segments: u32,
+    /// Peak resident KV across all segments — bounded by task + segment budget,
+    /// constant in the number of segments (the self-maintenance memory win).
+    pub peak_resident_kv: u32,
+    /// Total completion tokens across segments and summaries.
+    pub total_tokens: u32,
+    /// The model-authored progress summaries used to carry state across segments.
+    pub summaries: Vec<String>,
+}
+
 /// Result of [`SimpleEngine::generate_session`] — a cache-resident turn whose
 /// prefill cost is `prefilled_tokens` (the suffix), not the whole conversation.
 #[derive(Debug, Clone)]
@@ -1031,6 +1077,218 @@ impl SimpleEngine {
             prefilled_tokens: prefilled,
             continued,
         })
+    }
+
+    /// Greedy decode with a token-age KV-prune policy applied after every step.
+    ///
+    /// This is the prune-rate sweep driver: a deliberately plain sequential loop
+    /// (no MTP, prompt-lookup, constraints, or logprobs) so the only variable is
+    /// the prune policy. Reuses the production `run_prefill` / `decode_step`, so
+    /// sampling and detokenization match a normal request. `rope` carries the
+    /// model's RoPE params (`base = rope_theta`, `dims = head_dim`, `scale = 1.0`,
+    /// `traditional = false` for Qwen3).
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::doc_markdown
+    )]
+    pub fn generate_with_prune(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        policy: &crate::prune::PrunePolicy,
+        rope: higgs_models::cache::RopeShift,
+    ) -> Result<PrunedGeneration, EngineError> {
+        let mut prepared = self.prepare_generation(prompt_tokens, None)?;
+        let prompt_len = usize::try_from(prepared.prompt_len)
+            .map_err(|_| EngineError::Generation("prompt_len overflow".to_owned()))?;
+        let (current_token, _, _) =
+            self.run_prefill(prompt_tokens, &mut prepared, params, None, None, false)?;
+
+        let first_id: u32 = current_token.item();
+        let mut tokens: Vec<u32> = vec![first_id];
+        let mut peak_resident = prepared.cache.resident_len();
+
+        if self.eos_token_ids.contains(&first_id) || max_tokens <= 1 {
+            return Ok(PrunedGeneration {
+                text: self.decode_tokens(&tokens)?,
+                completion_tokens: 1,
+                peak_resident_kv: u32::try_from(peak_resident).unwrap_or(0),
+                decode_seconds: 0.0,
+                pruned_steps: 0,
+            });
+        }
+
+        // Structural policy: a per-resident-token "protected" mask (sinks +
+        // fact-bearing tokens) kept in lockstep with the cache. Empty for the
+        // age-based policy so its decode perf is unchanged.
+        let protect = policy.protect_facts;
+        let sink_usize = usize::try_from(policy.sink.max(0)).unwrap_or(0);
+        let resident0 = usize::try_from(prepared.cache.resident_len()).unwrap_or(0);
+        let mut protected: Vec<bool> = if protect {
+            let apt = &prepared.actual_prompt_tokens;
+            (0..resident0)
+                .map(|i| i < sink_usize || apt.get(i).is_some_and(|&id| self.token_is_fact(id)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut cur = current_token;
+        let mut cur_id = first_id;
+        let mut pruned_steps = 0_u32;
+        let start = std::time::Instant::now();
+        while u32::try_from(tokens.len()).unwrap_or(u32::MAX) < max_tokens {
+            let (next, _) = Self::decode_step(
+                &cur,
+                &mut prepared.model,
+                &mut prepared.cache,
+                params,
+                &tokens,
+                None,
+                None,
+            )?;
+            // The token just forwarded (`cur`) is now resident; keep the mask aligned.
+            if protect {
+                protected.push(self.token_is_fact(cur_id));
+            }
+            // Logical length as if nothing were ever pruned: prompt + tokens
+            // forwarded so far (the token just forwarded is the last in `tokens`).
+            let full_len = i32::try_from(prompt_len + tokens.len()).unwrap_or(i32::MAX);
+            let pruned_now = if protect {
+                crate::prune::apply_structural_prune(
+                    &mut prepared.cache,
+                    &mut protected,
+                    full_len,
+                    policy,
+                    rope,
+                )? > 0
+            } else {
+                crate::prune::apply_prune(&mut prepared.cache, full_len, policy, rope)?
+            };
+            if pruned_now {
+                pruned_steps += 1;
+            }
+            peak_resident = peak_resident.max(prepared.cache.resident_len());
+
+            let next_id: u32 = next.item();
+            tokens.push(next_id);
+            if self.eos_token_ids.contains(&next_id) {
+                break;
+            }
+            cur = next;
+            cur_id = next_id;
+        }
+        let decode_seconds = start.elapsed().as_secs_f32();
+
+        Ok(PrunedGeneration {
+            text: self.decode_tokens(&tokens)?,
+            completion_tokens: u32::try_from(tokens.len()).unwrap_or(u32::MAX),
+            peak_resident_kv: u32::try_from(peak_resident).unwrap_or(0),
+            decode_seconds,
+            pruned_steps,
+        })
+    }
+
+    /// Render a single user message to prompt tokens.
+    fn render_user(&self, content: String, enable_thinking: bool) -> Result<Vec<u32>, EngineError> {
+        let msg = ChatMessage {
+            role: "user".to_owned(),
+            content,
+            tool_calls: None,
+        };
+        self.prepare_chat_prompt_with_thinking(std::slice::from_ref(&msg), None, enable_thinking)
+    }
+
+    /// Long-horizon generation with **model-driven context self-maintenance**.
+    ///
+    /// Instead of pruning KV, the model curates its own working context: each
+    /// segment generates up to `seg_max_tokens`; if it runs out without finishing
+    /// (no EOS), the model is asked to write a concise progress summary, and the
+    /// next segment continues from `[task + summary]` with a fresh, bounded cache.
+    /// Resident KV stays bounded by task + segment budget regardless of how long
+    /// the reasoning runs — the win we measured against KV-pruning.
+    ///
+    /// This is the generic, engine-driven version (the caller does not pre-chunk
+    /// the task): it relies on the model summarizing both its state and its
+    /// position well enough to resume — verified in `self_maintained_engine`.
+    #[allow(clippy::option_if_let_else)] // the match reads clearer than map_or_else
+    pub fn generate_self_maintained(
+        &self,
+        task: &str,
+        params: &SamplingParams,
+        rope: higgs_models::cache::RopeShift,
+        cfg: &SelfMaintainCfg,
+    ) -> Result<SelfMaintainedOutput, EngineError> {
+        let disabled = crate::prune::PrunePolicy::disabled();
+        let mut carried: Option<String> = None;
+        let mut peak = 0_u32;
+        let mut total = 0_u32;
+        let mut summaries = Vec::new();
+
+        for seg in 0..cfg.max_segments.max(1) {
+            let prompt = match &carried {
+                None => format!(
+                    "{task}\n\nSolve this step by step. When you reach the final result, end with a line 'Answer: <answer>'."
+                ),
+                Some(progress) => format!(
+                    "{task}\n\nYou have already started and made progress. Progress so far:\n{progress}\n\nContinue from this exact state — do not restart. When you reach the final result, end with a line 'Answer: <answer>'."
+                ),
+            };
+            let toks = self.render_user(prompt, cfg.enable_thinking)?;
+            let out =
+                self.generate_with_prune(&toks, cfg.seg_max_tokens, params, &disabled, rope)?;
+            peak = peak.max(out.peak_resident_kv);
+            total = total.saturating_add(out.completion_tokens);
+
+            // A segment that stopped before its budget hit EOS → the model finished.
+            if out.completion_tokens < cfg.seg_max_tokens {
+                return Ok(SelfMaintainedOutput {
+                    text: out.text,
+                    segments: seg + 1,
+                    peak_resident_kv: peak,
+                    total_tokens: total,
+                    summaries,
+                });
+            }
+
+            // Truncated → checkpoint: have the model summarize its own progress.
+            let sum_prompt = format!(
+                "{task}\n\nWork in progress (possibly incomplete):\n{}\n\nWrite a concise progress note capturing exactly what you have completed so far and the current state needed to continue: which steps are done, the key running values, and what remains. Do NOT give the final answer yet.",
+                out.text
+            );
+            let sum_toks = self.render_user(sum_prompt, cfg.enable_thinking)?;
+            let summary = self.generate_with_prune(
+                &sum_toks,
+                cfg.summary_max_tokens,
+                params,
+                &disabled,
+                rope,
+            )?;
+            peak = peak.max(summary.peak_resident_kv);
+            total = total.saturating_add(summary.completion_tokens);
+            summaries.push(summary.text.clone());
+            carried = Some(summary.text);
+        }
+
+        // Exhausted the segment budget without an explicit finish.
+        Ok(SelfMaintainedOutput {
+            text: carried.unwrap_or_default(),
+            segments: cfg.max_segments.max(1),
+            peak_resident_kv: peak,
+            total_tokens: total,
+            summaries,
+        })
+    }
+
+    /// Whether a token decodes to text containing a digit — a cheap, schema-free
+    /// proxy for "fact-bearing" (conclusion) tokens in arithmetic reasoning. The
+    /// structural prune policy protects these from eviction.
+    fn token_is_fact(&self, id: u32) -> bool {
+        self.tokenizer
+            .decode(std::slice::from_ref(&id), false)
+            .is_ok_and(|s| s.bytes().any(|b| b.is_ascii_digit()))
     }
 
     /// Decode the token buffer and return the text, mapping tokenizer errors.

@@ -123,6 +123,50 @@ impl AnyCache {
         }
     }
 
+    /// Resident token count (the dense KV offset) of the first KV layer, or 0.
+    /// All KV layers advance in lockstep, so layer 0 is representative.
+    #[must_use]
+    pub fn resident_len(&self) -> i32 {
+        match self {
+            Self::KV(layers) => layers
+                .iter()
+                .flatten()
+                .next()
+                .map_or(0, cache::KeyValueCache::offset),
+            Self::Hybrid(layers) => layers
+                .iter()
+                .flatten()
+                .find_map(|l| match l {
+                    LayerCache::KV(kv) => Some(cache::KeyValueCache::offset(kv)),
+                    LayerCache::Arrays(_) => None,
+                })
+                .unwrap_or(0),
+        }
+    }
+
+    /// Prune the token span `[a, b)` from every dense KV layer, compacting
+    /// survivors and renumbering positions (see
+    /// [`cache::SteppingKeyValueCache::prune_span`]). Recurrent (SSM) layers are
+    /// left untouched — like [`Self::trim_by`], their state can't be sliced by
+    /// offset. Returns the first layer error, if any.
+    pub fn prune_span(&mut self, a: i32, b: i32, rope: cache::RopeShift) -> Result<(), Exception> {
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    layer.prune_span(a, b, rope)?;
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        kv.prune_span(a, b, rope)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Compress every dense KV layer into `TurboQuant` storage for cheap
     /// between-turn retention (see
     /// [`cache::SteppingKeyValueCache::quantize_for_retention`]). Recurrent
