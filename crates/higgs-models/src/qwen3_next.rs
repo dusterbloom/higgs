@@ -5804,11 +5804,13 @@ impl Qwen3NextCausalLM {
             }
         }
 
-        // Pad layer_tapes to full model length when early exit was used.
+        // Pad layer_tapes when early exit was used (None for skipped layers).
         if let Some(max) = max_layers {
             while layer_tapes.len() < self.model.layers.len() {
                 layer_tapes.push(None);
             }
+            // Note: taps for layers past the exit point are NOT collected here.
+            // The DFlash loop merges partial taps with the previous round's.
         }
 
         let normed = self.model.norm.forward(&h)?;

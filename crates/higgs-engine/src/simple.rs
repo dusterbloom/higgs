@@ -1788,13 +1788,17 @@ impl SimpleEngine {
                         .replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
                         .map_err(EngineError::Mlx)?;
                 }
-                // Slice verify taps to accepted positions (valid for both full and
-                // partial accept — earlier positions' hidden states are causally
-                // independent of later ones).
-                current_taps = verify_taps
-                    .into_iter()
-                    .map(|tap| tap.index((.., ..n_accepted, ..)))
-                    .collect();
+                // Update taps for next drafter round. When early exit produced
+                // fewer taps than needed, reuse previous round's taps entirely
+                // (stale but dimensionally consistent — avoids shape mismatch).
+                let n_expected = dflash.tap_layers.len();
+                if verify_taps.len() >= n_expected {
+                    current_taps = verify_taps
+                        .into_iter()
+                        .map(|tap| tap.index((.., ..n_accepted, ..)))
+                        .collect();
+                }
+                // else: keep current_taps from previous round
 
                 // i. Update state.
                 for &tok in &accepted {
