@@ -42,6 +42,54 @@ static BONSAI_IGNORED_MASK_WARNED: AtomicBool = AtomicBool::new(false);
 // SamplingParams -- configurable sampling parameters
 // ---------------------------------------------------------------------------
 
+/// Per-request speculative-decoding method selector.
+///
+/// The chosen method is otherwise fixed at model load (`DFlash` if a drafter is
+/// loaded, MTP otherwise); this lets a single loaded engine alternate per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Speculation {
+    /// Use `DFlash` when a drafter is loaded, else the built-in MTP head (default).
+    #[default]
+    Auto,
+    /// Force the `DFlash` drafter; falls through to the non-DFlash path if none is loaded.
+    DFlash,
+    /// Force the built-in MTP head (reachable even when a `DFlash` drafter is loaded).
+    Mtp,
+    /// Disable speculation entirely; plain autoregressive decode.
+    None,
+}
+
+impl Speculation {
+    /// Parse a request value; absent (`None`) → [`Speculation::Auto`].
+    ///
+    /// # Errors
+    /// Returns the offending value when it is not one of `auto|dflash|mtp|none`.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        let Some(raw) = value else {
+            return Ok(Self::Auto);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "dflash" => Ok(Self::DFlash),
+            "mtp" => Ok(Self::Mtp),
+            "none" | "off" => Ok(Self::None),
+            other => Err(other.to_owned()),
+        }
+    }
+
+    /// Whether the `DFlash` drafter may be used (when one is loaded).
+    #[must_use]
+    pub const fn allows_dflash(self) -> bool {
+        matches!(self, Self::Auto | Self::DFlash)
+    }
+
+    /// Whether the MTP / prompt-lookup speculative paths may be used.
+    #[must_use]
+    pub const fn allows_mtp(self) -> bool {
+        matches!(self, Self::Auto | Self::Mtp)
+    }
+}
+
 /// Parameters controlling token sampling behavior.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -52,6 +100,8 @@ pub struct SamplingParams {
     pub repetition_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
+    /// Per-request speculative-decoding method (defaults to [`Speculation::Auto`]).
+    pub speculation: Speculation,
 }
 
 impl Default for SamplingParams {
@@ -64,6 +114,7 @@ impl Default for SamplingParams {
             repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
+            speculation: Speculation::Auto,
         }
     }
 }
@@ -1746,6 +1797,27 @@ mod tests {
             top_p,
             ..SamplingParams::default()
         }
+    }
+
+    #[test]
+    fn speculation_parse_known_absent_and_invalid() {
+        assert_eq!(Speculation::parse(None), Ok(Speculation::Auto));
+        assert_eq!(Speculation::parse(Some("")), Ok(Speculation::Auto));
+        assert_eq!(Speculation::parse(Some("AUTO")), Ok(Speculation::Auto));
+        assert_eq!(
+            Speculation::parse(Some(" DFlash ")),
+            Ok(Speculation::DFlash)
+        );
+        assert_eq!(Speculation::parse(Some("mtp")), Ok(Speculation::Mtp));
+        assert_eq!(Speculation::parse(Some("none")), Ok(Speculation::None));
+        assert_eq!(Speculation::parse(Some("off")), Ok(Speculation::None));
+        assert_eq!(Speculation::parse(Some("bogus")), Err("bogus".to_owned()));
+        // Default carrier value rides on SamplingParams.
+        assert_eq!(SamplingParams::default().speculation, Speculation::Auto);
+        assert!(Speculation::Auto.allows_dflash() && Speculation::Auto.allows_mtp());
+        assert!(Speculation::DFlash.allows_dflash() && !Speculation::DFlash.allows_mtp());
+        assert!(!Speculation::Mtp.allows_dflash() && Speculation::Mtp.allows_mtp());
+        assert!(!Speculation::None.allows_dflash() && !Speculation::None.allows_mtp());
     }
 
     fn assert_sample_shape(

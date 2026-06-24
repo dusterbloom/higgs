@@ -63,21 +63,6 @@ fn prompt_lookup_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_PROMPT_LOOKUP").ok().as_deref()).unwrap_or(false)
 }
 
-#[allow(clippy::float_cmp)]
-fn dflash_supports_plain_greedy(
-    params: &SamplingParams,
-    logprobs: bool,
-    top_logprobs: Option<u32>,
-) -> bool {
-    !logprobs
-        && top_logprobs.unwrap_or(0) == 0
-        && params.temperature == 0.0
-        && params.top_p == 1.0
-        && params.top_k.is_none()
-        && params.min_p.is_none()
-        && !params.has_penalties()
-}
-
 fn unchecked_prompt_lookup_enabled() -> bool {
     parse_enabled_flag(
         std::env::var("HIGGS_PROMPT_LOOKUP_UNCHECKED")
@@ -1126,11 +1111,12 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
     ) -> Result<GenerationOutput, EngineError> {
         // DFlash speculative decoding: use the draft-verify loop when a drafter
-        // is loaded and the request is plain greedy text generation.
+        // is loaded, the request allows it (`speculation` = auto/dflash), no
+        // constraints active, and no multimodal input.
         if self.dflash.is_some()
+            && params.speculation.allows_dflash()
             && constraint.is_none()
             && pixel_values.is_none()
-            && dflash_supports_plain_greedy(params, logprobs, top_logprobs)
         {
             return self.generate_dflash_inner(prompt_tokens, max_tokens, params, stop_sequences);
         }
@@ -1206,7 +1192,11 @@ impl SimpleEngine {
         // batched verifier logits. Explicitly opt-in while benchmark data is
         // collected because the normal path has a pipelined single-token loop.
         #[allow(clippy::float_cmp)]
-        if prompt_lookup_enabled() && constraint.is_none() && !logprobs && params.temperature == 0.0
+        if prompt_lookup_enabled()
+            && params.speculation.allows_mtp()
+            && constraint.is_none()
+            && !logprobs
+            && params.temperature == 0.0
         {
             return self.prompt_lookup_generate(
                 &mut prepared.model,
@@ -1224,6 +1214,7 @@ impl SimpleEngine {
         // Only for greedy (temperature == 0), no constraints, no logprobs.
         #[allow(clippy::float_cmp)]
         if self.tuning.enable_mtp()
+            && params.speculation.allows_mtp()
             && prepared.model.has_mtp()
             && constraint.is_none()
             && !logprobs
@@ -1468,19 +1459,25 @@ impl SimpleEngine {
         clippy::as_conversions,
         clippy::too_many_lines
     )]
-    fn generate_dflash_inner(
+    /// Shared `DFlash` draft-verify decode loop. The gate/EMA/thermal logic is
+    /// written once here; the [`DflashSink`] decides how produced tokens are
+    /// delivered — buffered into a [`GenerationOutput`] ([`DflashBufferedSink`])
+    /// or streamed chunk-by-chunk ([`DflashStreamSink`]). Token production is
+    /// identical across sinks, so a streamed response is byte-for-byte equal to
+    /// the buffered one (asserted by `dflash_streaming_matches_nonstreaming`).
+    fn dflash_decode<S: DflashSink>(
         &self,
         prompt_tokens: &[u32],
         max_tokens: u32,
         params: &SamplingParams,
         stop_sequences: &[String],
-    ) -> Result<GenerationOutput, EngineError> {
+        mut sink: S,
+    ) -> Result<S::Output, EngineError> {
         let dflash = self
             .dflash
             .as_ref()
             .ok_or_else(|| EngineError::Generation("DFlash state missing".to_owned()))?;
         let prompt_len = Self::prompt_len(prompt_tokens)?;
-        let has_stop_sequences = !stop_sequences.is_empty();
         if let Ok(mut v) = self.last_dflash_accepts.lock() {
             v.clear();
         }
@@ -1507,19 +1504,32 @@ impl SimpleEngine {
         let first_token_id: u32 = first_token.item();
         let mut tokens: Vec<u32> = vec![first_token_id];
 
-        if self.eos_token_ids.contains(&first_token_id) || max_tokens <= 1 {
-            let finish_reason = if self.eos_token_ids.contains(&first_token_id) {
-                "stop"
-            } else {
-                "length"
-            };
-            return Ok(GenerationOutput {
-                text: self.decode_tokens(&tokens)?,
-                finish_reason: finish_reason.to_owned(),
-                prompt_tokens: prompt_len,
-                completion_tokens: 1,
-                token_logprobs: None,
-            });
+        // Deliver the first token, then terminate early if it is EOS or the
+        // request asked for a single token.
+        let first_completion = Self::completion_len(&tokens)?;
+        let first_forced = if self.eos_token_ids.contains(&first_token_id) {
+            Some("stop")
+        } else if max_tokens <= 1 {
+            Some("length")
+        } else {
+            None
+        };
+        let first_stop = sink.emit(
+            self,
+            &tokens,
+            stop_sequences,
+            prompt_len,
+            first_completion,
+            first_forced,
+        )?;
+        if first_forced.is_some() || first_stop {
+            return sink.finish(
+                self,
+                &tokens,
+                first_forced.unwrap_or("stop"),
+                prompt_len,
+                first_completion,
+            );
         }
 
         let mut current_taps = taps;
@@ -1888,71 +1898,48 @@ impl SimpleEngine {
                 }
             } // end spec-round branch
 
-            // j. Check termination.
+            // j. Deliver this round's tokens and check termination via the sink.
             let completion_len = Self::completion_len(&tokens)?;
-            let accept_len = if rounds > 0 {
-                total_accepted as f64 / rounds as f64
+            let eos = tokens.iter().any(|t| self.eos_token_ids.contains(t));
+            let forced = if eos {
+                Some("stop")
+            } else if completion_len >= max_tokens {
+                Some("length")
             } else {
-                0.0
+                None
             };
-
-            if tokens.iter().any(|t| self.eos_token_ids.contains(t)) {
+            let stop_hit = sink.emit(
+                self,
+                &tokens,
+                stop_sequences,
+                prompt_len,
+                completion_len,
+                forced,
+            )?;
+            if forced.is_some() || stop_hit {
+                let accept_len = if rounds > 0 {
+                    total_accepted as f64 / rounds as f64
+                } else {
+                    0.0
+                };
                 let secs = t_start.elapsed().as_secs_f64();
                 let tok_per_sec = if secs > 0.0 {
                     tokens.len() as f64 / secs
                 } else {
                     0.0
                 };
-                tracing::info!(
-                    tokens = tokens.len(),
-                    accept_len = format!("{accept_len:.2}"),
-                    tok_per_sec = format!("{tok_per_sec:.1}"),
-                    "DFlash generation complete"
-                );
-                return Ok(GenerationOutput {
-                    text: self.decode_tokens(&tokens)?,
-                    finish_reason: "stop".to_owned(),
-                    prompt_tokens: prompt_len,
-                    completion_tokens: completion_len,
-                    token_logprobs: None,
-                });
-            }
-
-            if has_stop_sequences {
-                let text = self.decode_tokens(&tokens)?;
-                if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
-                    return Ok(GenerationOutput {
-                        text: truncated,
-                        finish_reason: "stop".to_owned(),
-                        prompt_tokens: prompt_len,
-                        completion_tokens: completion_len,
-                        token_logprobs: None,
-                    });
-                }
-            }
-
-            if completion_len >= max_tokens {
-                let secs = t_start.elapsed().as_secs_f64();
-                let tok_per_sec = if secs > 0.0 {
-                    tokens.len() as f64 / secs
-                } else {
-                    0.0
-                };
+                // `stop_hit` without a forced reason means a stop sequence fired.
+                let finish_reason = forced.unwrap_or("stop");
                 tracing::info!(
                     tokens = tokens.len(),
                     accept_len = format!("{accept_len:.2}"),
                     spec_rounds = rounds,
                     probe_every = probe_every,
                     tok_per_sec = format!("{tok_per_sec:.1}"),
-                    "DFlash generation complete (length limit)"
+                    finish_reason,
+                    "DFlash generation complete"
                 );
-                return Ok(GenerationOutput {
-                    text: self.decode_tokens(&tokens)?,
-                    finish_reason: "length".to_owned(),
-                    prompt_tokens: prompt_len,
-                    completion_tokens: completion_len,
-                    token_logprobs: None,
-                });
+                return sink.finish(self, &tokens, finish_reason, prompt_len, completion_len);
             }
         }
     }
@@ -2828,6 +2815,25 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
     ) -> Result<(), EngineError> {
+        // DFlash streaming: branch BEFORE the normal prefill — the DFlash loop
+        // runs its own tap-prefill, so dispatching here (mirroring the
+        // non-streaming site) avoids a double prefill. Logprobs requests fall
+        // through to the MTP/AR path, which produces per-token logprobs.
+        if self.dflash.is_some()
+            && params.speculation.allows_dflash()
+            && constraint.is_none()
+            && pixel_values.is_none()
+            && !logprobs
+        {
+            return self.generate_dflash_streaming(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                sender,
+            );
+        }
+
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
@@ -2961,6 +2967,7 @@ impl SimpleEngine {
         // MTP speculative decode (streaming): greedy, no constraints, no logprobs.
         #[allow(clippy::float_cmp)]
         if self.tuning.enable_mtp()
+            && params.speculation.allows_mtp()
             && prepared.model.has_mtp()
             && constraint.is_none()
             && !logprobs
@@ -3537,6 +3544,216 @@ fn chat_template_mentions_enable_thinking(model_dir: &Path) -> bool {
     false
 }
 
+/// Delivery target for tokens produced by [`SimpleEngine::dflash_decode`].
+///
+/// The draft-verify loop is written once; this trait lets the same loop feed a
+/// buffered response ([`DflashBufferedSink`]) or a streaming channel
+/// ([`DflashStreamSink`]) without duplicating the gate/EMA logic. Token
+/// production is identical for both, so a streamed response is byte-for-byte
+/// equal to the buffered one.
+trait DflashSink {
+    type Output;
+
+    /// Deliver the round's tokens. `tokens` is the full sequence so far;
+    /// `forced` is `Some(reason)` when the loop already knows generation ends
+    /// this round (EOS / length). Returns `true` if generation should also stop
+    /// because a stop sequence fired (or a streaming client disconnected).
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &mut self,
+        engine: &SimpleEngine,
+        tokens: &[u32],
+        stop_sequences: &[String],
+        prompt_len: u32,
+        completion_len: u32,
+        forced: Option<&'static str>,
+    ) -> Result<bool, EngineError>;
+
+    /// Produce the final result once the loop terminates.
+    fn finish(
+        self,
+        engine: &SimpleEngine,
+        tokens: &[u32],
+        finish_reason: &str,
+        prompt_len: u32,
+        completion_len: u32,
+    ) -> Result<Self::Output, EngineError>;
+}
+
+/// Buffered sink: accumulates the full output and returns a [`GenerationOutput`].
+/// Mirrors the original non-streaming `DFlash` behavior exactly.
+#[derive(Default)]
+struct DflashBufferedSink {
+    /// Set when a stop sequence truncated the output, so `finish` returns the
+    /// truncated text rather than the full decode.
+    truncated: Option<String>,
+}
+
+impl DflashSink for DflashBufferedSink {
+    type Output = GenerationOutput;
+
+    fn emit(
+        &mut self,
+        engine: &SimpleEngine,
+        tokens: &[u32],
+        stop_sequences: &[String],
+        _prompt_len: u32,
+        _completion_len: u32,
+        _forced: Option<&'static str>,
+    ) -> Result<bool, EngineError> {
+        if stop_sequences.is_empty() {
+            return Ok(false);
+        }
+        let text = engine.decode_tokens(tokens)?;
+        if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
+            self.truncated = Some(truncated);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn finish(
+        self,
+        engine: &SimpleEngine,
+        tokens: &[u32],
+        finish_reason: &str,
+        prompt_len: u32,
+        completion_len: u32,
+    ) -> Result<GenerationOutput, EngineError> {
+        let text = match self.truncated {
+            Some(t) => t,
+            None => engine.decode_tokens(tokens)?,
+        };
+        Ok(GenerationOutput {
+            text,
+            finish_reason: finish_reason.to_owned(),
+            prompt_tokens: prompt_len,
+            completion_tokens: completion_len,
+            token_logprobs: None,
+        })
+    }
+}
+
+/// Streaming sink: emits one [`StreamingOutput`] chunk per round over the
+/// channel, mirroring the MTP streaming contract (incremental text, stop-tail
+/// truncation, a final `finished: true` chunk).
+struct DflashStreamSink<'a> {
+    sender: &'a tokio::sync::mpsc::Sender<StreamingOutput>,
+    detok: IncrementalDetok,
+}
+
+impl DflashSink for DflashStreamSink<'_> {
+    type Output = ();
+
+    fn emit(
+        &mut self,
+        engine: &SimpleEngine,
+        tokens: &[u32],
+        stop_sequences: &[String],
+        prompt_len: u32,
+        completion_len: u32,
+        forced: Option<&'static str>,
+    ) -> Result<bool, EngineError> {
+        let new_text = self.detok.append(&engine.tokenizer, tokens)?;
+        let emitted_before = self.detok.text.len() - new_text.len();
+        let (mut final_new_text, hit_stop_seq) = if stop_sequences.is_empty() {
+            (new_text, false)
+        } else {
+            find_stop_in_tail(&self.detok.text, new_text.len(), stop_sequences).map_or(
+                (new_text, false),
+                |pos| {
+                    let emit = self
+                        .detok
+                        .text
+                        .get(emitted_before..pos)
+                        .unwrap_or_default()
+                        .to_owned();
+                    (emit, true)
+                },
+            )
+        };
+        let finished = forced.is_some() || hit_stop_seq;
+        // EOS / length terminate without a stop sequence: flush any buffered
+        // partial bytes. A stop sequence already emitted only up to the cut.
+        if finished && !hit_stop_seq {
+            final_new_text.push_str(&self.detok.flush(&engine.tokenizer, tokens)?);
+        }
+        let finish_reason = finished.then(|| forced.unwrap_or("stop").to_owned());
+        if self
+            .sender
+            .blocking_send(StreamingOutput {
+                new_text: final_new_text,
+                finished,
+                finish_reason,
+                prompt_tokens: prompt_len,
+                completion_tokens: completion_len,
+                token_logprob: None,
+                prefill_progress: None,
+            })
+            .is_err()
+        {
+            // Receiver dropped (client disconnected) — stop generating.
+            return Ok(true);
+        }
+        Ok(hit_stop_seq)
+    }
+
+    fn finish(
+        self,
+        _engine: &SimpleEngine,
+        _tokens: &[u32],
+        _finish_reason: &str,
+        _prompt_len: u32,
+        _completion_len: u32,
+    ) -> Result<(), EngineError> {
+        // The terminal `finished: true` chunk was already sent by `emit`.
+        Ok(())
+    }
+}
+
+impl SimpleEngine {
+    /// Buffered `DFlash` generation (non-streaming response path).
+    fn generate_dflash_inner(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+    ) -> Result<GenerationOutput, EngineError> {
+        self.dflash_decode(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            DflashBufferedSink::default(),
+        )
+    }
+
+    /// Streaming `DFlash` generation: same draft-verify loop, tokens delivered
+    /// chunk-by-chunk over `sender` as they are accepted.
+    fn generate_dflash_streaming(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+    ) -> Result<(), EngineError> {
+        let detok = IncrementalDetok::new(
+            String::new(),
+            0,
+            std::sync::Arc::clone(&self.decode_skip_ids),
+        );
+        self.dflash_decode(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            DflashStreamSink { sender, detok },
+        )
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::panic,
@@ -3571,6 +3788,158 @@ mod tests {
     /// Write a config.json file into the given directory with the provided JSON content.
     fn write_config(dir: &std::path::Path, json: &str) {
         std::fs::write(dir.join("config.json"), json).unwrap();
+    }
+
+    /// The streaming DFlash path must produce byte-for-byte the same text as the
+    /// non-streaming DFlash path — only delivery differs — and the `speculation`
+    /// selector must route correctly. Greedy + a low-entropy counting prompt so
+    /// the exact decoders agree. Manual:
+    ///
+    /// ```text
+    /// HIGGS_DFLASH_TARGET_DIR=<target dir> HIGGS_DFLASH_DRAFTER_DIR=<drafter dir> \
+    /// cargo test -p higgs-engine dflash_streaming_matches_nonstreaming -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "loads real DFlash target + drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+    fn dflash_streaming_matches_nonstreaming() {
+        use super::{SimpleEngine, StreamingOutput};
+        use crate::chat_template::ChatMessage;
+        use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
+        use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_test_writer()
+            .try_init();
+
+        let (Ok(target), Ok(drafter)) = (
+            std::env::var("HIGGS_DFLASH_TARGET_DIR"),
+            std::env::var("HIGGS_DFLASH_DRAFTER_DIR"),
+        ) else {
+            println!(
+                "skipping dflash_streaming_matches_nonstreaming: set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"
+            );
+            return;
+        };
+
+        let tuning =
+            MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
+        let engine = SimpleEngine::load_with_dflash(
+            &target,
+            KvCacheConfig::default(),
+            tuning,
+            false,
+            Some(Path::new(&drafter)),
+        )
+        .expect("load DFlash engine");
+
+        let messages = [ChatMessage {
+            role: "user".to_owned(),
+            content: "Count from 1 to 40. Print only the numbers separated by commas.".to_owned(),
+            tool_calls: None,
+        }];
+        // Thinking OFF: compare the raw counting stream.
+        let toks = engine
+            .prepare_chat_prompt_with_thinking(&messages, None, false)
+            .expect("chat prompt");
+        let max_tokens = 96;
+        let params = |spec| SamplingParams {
+            temperature: 0.0,
+            speculation: spec,
+            ..SamplingParams::default()
+        };
+        // Make DFlash deterministic for an exact streaming-vs-buffered diff. The
+        // realized-speedup gate is wall-clock dependent (cold vs warm kernels
+        // floor to AR differently → different block overshoot at the length
+        // limit), so two *separate* gated runs can differ in length. Gate OFF +
+        // a fixed block removes that timing dependence; both runs then follow
+        // the identical trajectory and must match byte-for-byte.
+        dflash_set_fixed_block_env(16);
+
+        // speculation=mtp must reach the MTP head even though a drafter is
+        // loaded. `dflash_decode` clears `last_dflash_accepts` on entry and is
+        // the only writer; running MTP first leaves it empty, proving the
+        // DFlash loop was not entered.
+        let mtp = engine
+            .generate_with_thinking(
+                &toks,
+                max_tokens,
+                &params(Speculation::Mtp),
+                &[],
+                false,
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("mtp");
+        assert!(!mtp.text.is_empty(), "speculation=mtp produced output");
+        assert!(
+            engine.last_dflash_accepts().is_empty(),
+            "speculation=mtp must not enter the DFlash loop"
+        );
+
+        // Non-streaming DFlash.
+        let non_stream = engine
+            .generate_with_thinking(
+                &toks,
+                max_tokens,
+                &params(Speculation::DFlash),
+                &[],
+                false,
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("non-stream dflash");
+        assert!(
+            !engine.last_dflash_accepts().is_empty(),
+            "speculation=dflash must drive the DFlash loop"
+        );
+
+        // Streaming DFlash. Capacity exceeds the chunk count, so the engine's
+        // blocking_send never blocks without a concurrent receiver.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamingOutput>(8192);
+        engine
+            .generate_streaming_with_thinking(
+                &toks,
+                max_tokens,
+                &params(Speculation::DFlash),
+                &[],
+                false,
+                None,
+                &tx,
+                false,
+                false,
+                None,
+                None,
+            )
+            .expect("stream dflash");
+        drop(tx);
+        let mut streamed = String::new();
+        let mut saw_finished = false;
+        while let Ok(chunk) = rx.try_recv() {
+            streamed.push_str(&chunk.new_text);
+            saw_finished |= chunk.finished;
+        }
+        assert!(
+            saw_finished,
+            "streaming must emit a terminal finished chunk"
+        );
+        assert_eq!(
+            non_stream.text, streamed,
+            "streaming DFlash must equal non-streaming DFlash byte-for-byte"
+        );
+
+        // Exact greedy decoders agree on token values for this deterministic
+        // prompt; lengths may differ by block overshoot, so check prefix.
+        assert!(
+            dflash_prefix_consistent(&non_stream.text, &mtp.text),
+            "MTP and DFlash must agree on the counting sequence:\n dflash={:?}\n mtp={:?}",
+            non_stream.text,
+            mtp.text
+        );
     }
 
     /// P5: `DFlash` speculative decode must be byte-identical to plain AR greedy
