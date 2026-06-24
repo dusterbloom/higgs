@@ -262,6 +262,57 @@ fn model_label(model: &crate::config::ModelConfig) -> String {
     )
 }
 
+fn validate_dflash_drafter_dir(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err("path does not exist".to_owned());
+    }
+    if !path.is_dir() {
+        return Err("path is not a directory".to_owned());
+    }
+
+    let config_path = path.join("config.json");
+    if !config_path.is_file() {
+        return Err("missing config.json".to_owned());
+    }
+    let config = std::fs::read_to_string(&config_path)
+        .map_err(|err| format!("cannot read config.json: {err}"))?;
+    serde_json::from_str::<higgs_models::dflash::DFlashConfig>(&config)
+        .map_err(|err| format!("cannot parse DFlash config.json: {err}"))?;
+
+    if path.join("model.safetensors").is_file() {
+        return Ok(());
+    }
+
+    let index_path = path.join("model.safetensors.index.json");
+    if !index_path.is_file() {
+        return Err("missing model.safetensors or model.safetensors.index.json".to_owned());
+    }
+
+    let index_json = std::fs::read_to_string(&index_path)
+        .map_err(|err| format!("cannot read model.safetensors.index.json: {err}"))?;
+    let index_value: serde_json::Value = serde_json::from_str(&index_json)
+        .map_err(|err| format!("cannot parse model.safetensors.index.json: {err}"))?;
+    let weight_map = index_value
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "model.safetensors.index.json missing weight_map".to_owned())?;
+    if weight_map.is_empty() {
+        return Err("model.safetensors.index.json has empty weight_map".to_owned());
+    }
+    for file in weight_map.values() {
+        let file_name = file.as_str().ok_or_else(|| {
+            "model.safetensors.index.json weight_map contains a non-string file name".to_owned()
+        })?;
+        if !path.join(file_name).is_file() {
+            return Err(format!(
+                "missing safetensors shard referenced by index: {file_name}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     for model in &config.models {
         let label = model_label(model);
@@ -283,6 +334,26 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 result,
             );
             continue;
+        }
+        if let Some(ref drafter) = model.draft_model {
+            if let Err(err) = validate_dflash_drafter_dir(std::path::Path::new(drafter)) {
+                fail(
+                    &format!(
+                        "model {label} draft_model is not a valid DFlash drafter directory ({drafter}): {err}"
+                    ),
+                    result,
+                );
+                continue;
+            }
+            if model.batch {
+                fail(
+                    &format!(
+                        "model {label} sets draft_model but DFlash is simple-engine only (batch=true)"
+                    ),
+                    result,
+                );
+                continue;
+            }
         }
         match model_resolver::resolve(&model.path) {
             Ok(resolved) => {
@@ -555,6 +626,25 @@ mod tests {
         }
     }
 
+    fn write_valid_dflash_config(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+                "hidden_size": 2048,
+                "num_hidden_layers": 6,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "intermediate_size": 11008,
+                "vocab_size": 248064,
+                "dflash_config": {
+                    "target_layer_ids": [1, 6, 11, 16, 22, 27, 32, 37],
+                    "mask_token_id": 248077
+                }
+            }"#,
+        )
+        .unwrap();
+    }
+
     // -- Helper function counter tests --
 
     #[test]
@@ -584,6 +674,39 @@ mod tests {
         assert_eq!(result.failures, 1);
     }
 
+    #[test]
+    fn dflash_drafter_validation_accepts_single_safetensors_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_dflash_config(dir.path());
+        std::fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+
+        assert!(validate_dflash_drafter_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn dflash_drafter_validation_rejects_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("drafter");
+        std::fs::write(&file, b"not a directory").unwrap();
+
+        let err = validate_dflash_drafter_dir(&file).unwrap_err();
+        assert!(err.contains("not a directory"));
+    }
+
+    #[test]
+    fn dflash_drafter_validation_rejects_missing_index_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_dflash_config(dir.path());
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"layer.weight":"missing.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let err = validate_dflash_drafter_dir(dir.path()).unwrap_err();
+        assert!(err.contains("missing safetensors shard"));
+    }
+
     // -- Duplicate model detection --
 
     #[test]
@@ -598,6 +721,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    draft_model: None,
                     kv_key_bits: None,
                     kv_value_bits: None,
                     kv_norm_correction: true,
@@ -611,6 +735,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    draft_model: None,
                     kv_key_bits: None,
                     kv_value_bits: None,
                     kv_norm_correction: true,
@@ -637,6 +762,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    draft_model: None,
                     kv_key_bits: None,
                     kv_value_bits: None,
                     kv_norm_correction: true,
@@ -650,6 +776,7 @@ mod tests {
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
                     kv_seed: 0,
+                    draft_model: None,
                     kv_key_bits: None,
                     kv_value_bits: None,
                     kv_norm_correction: true,
@@ -1125,6 +1252,7 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                draft_model: None,
                 kv_key_bits: None,
                 kv_value_bits: None,
                 kv_norm_correction: true,
@@ -1155,6 +1283,7 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                draft_model: None,
                 kv_key_bits: None,
                 kv_value_bits: None,
                 kv_norm_correction: true,
@@ -1187,6 +1316,7 @@ mod tests {
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
                 kv_seed: 0,
+                draft_model: None,
                 kv_key_bits: None,
                 kv_value_bits: None,
                 kv_norm_correction: true,

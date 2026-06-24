@@ -414,6 +414,9 @@ pub struct ModelConfig {
     /// Seed used by `TurboQuant` setup.
     #[serde(default)]
     pub kv_seed: u64,
+    /// Optional path to a `DFlash` drafter (simple engine); overrides `HIGGS_DFLASH_PATH`.
+    #[serde(default)]
+    pub draft_model: Option<String>,
 }
 
 const fn default_norm_correction() -> bool {
@@ -666,6 +669,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_norm_correction: !args.kv_no_norm_correction,
             kv_adaptive_dense_layers: args.kv_adaptive_dense_layers.unwrap_or(0),
             kv_seed: args.kv_seed.unwrap_or_default(),
+            draft_model: None,
         })
         .collect();
 
@@ -753,6 +757,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_norm_correction: !serve_args.kv_no_norm_correction,
                     kv_adaptive_dense_layers: serve_args.kv_adaptive_dense_layers.unwrap_or(0),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
+                    draft_model: None,
                 })
                 .collect();
             let mut existing = figment
@@ -924,6 +929,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_norm_correction: true,
         kv_adaptive_dense_layers: 0,
         kv_seed: 0,
+        draft_model: None,
     });
     config.auto_router.model = name;
 }
