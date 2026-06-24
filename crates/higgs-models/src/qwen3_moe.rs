@@ -292,7 +292,11 @@ impl Qwen3MoeMlpBlock {
         }
         Ok(Self {
             gate: Some(QLinear::new(ql, qb)?),
-            switch_mlp: Some(SwitchMlpWeights::new(crate::qwen3_next::QuantSpec { group_size: ql, bits: qb, mode: crate::quant_mode::QuantMode::Affine })?),
+            switch_mlp: Some(SwitchMlpWeights::new(crate::qwen3_next::QuantSpec {
+                group_size: ql,
+                bits: qb,
+                mode: crate::quant_mode::QuantMode::Affine,
+            })?),
             gate_proj: None,
             down_proj: None,
             up_proj: None,
@@ -304,7 +308,11 @@ impl Qwen3MoeMlpBlock {
     }
 
     fn new_dense(ql: i32, qb: i32) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections(crate::qwen3_next::QuantSpec { group_size: ql, bits: qb, mode: crate::quant_mode::QuantMode::Affine })?;
+        let (gate_proj, down_proj, up_proj) = new_mlp_projections(crate::qwen3_next::QuantSpec {
+            group_size: ql,
+            bits: qb,
+            mode: crate::quant_mode::QuantMode::Affine,
+        })?;
         Ok(Self {
             gate: None,
             switch_mlp: None,

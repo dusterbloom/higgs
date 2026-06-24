@@ -577,7 +577,11 @@ impl DeepSeekV2MlpBlock {
                     .bias(false)
                     .build()?,
             ),
-            switch_mlp: Some(SwitchMlpWeights::new(crate::qwen3_next::QuantSpec { group_size: ql, bits: qb, mode: crate::quant_mode::QuantMode::Affine })?),
+            switch_mlp: Some(SwitchMlpWeights::new(crate::qwen3_next::QuantSpec {
+                group_size: ql,
+                bits: qb,
+                mode: crate::quant_mode::QuantMode::Affine,
+            })?),
             shared_experts: shared,
             gate_proj: None,
             down_proj: None,
@@ -590,7 +594,11 @@ impl DeepSeekV2MlpBlock {
     }
 
     fn new_dense(ql: i32, qb: i32) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections(crate::qwen3_next::QuantSpec { group_size: ql, bits: qb, mode: crate::quant_mode::QuantMode::Affine })?;
+        let (gate_proj, down_proj, up_proj) = new_mlp_projections(crate::qwen3_next::QuantSpec {
+            group_size: ql,
+            bits: qb,
+            mode: crate::quant_mode::QuantMode::Affine,
+        })?;
         Ok(Self {
             gate: None,
             switch_mlp: None,

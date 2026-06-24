@@ -386,6 +386,28 @@ impl QLinear {
     }
 
     pub(crate) fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        // Fast path: batched quantized GEMM for verify (T>1, T<=16).
+        // Fuses T matmuls into one Metal kernel dispatch — eliminates
+        // pipeline bubbles. Gated by env var until validated.
+        if let Some(t) = self.qgemm_verify_shape(x) {
+            let fast = if self.mode == crate::quant_mode::QuantMode::MxFp4 {
+                qgemm_mxfp4_4bit(x, &self.weight, &self.scales, self.group_size, t)
+            } else {
+                qgemm_4bit(
+                    x,
+                    &self.weight,
+                    &self.scales,
+                    &self.biases,
+                    self.group_size,
+                    t,
+                )
+            };
+            if let Ok(result) = fast {
+                return Ok(result);
+            }
+            // Fall through to standard path if kernel fails.
+        }
+
         match self.mode {
             crate::quant_mode::QuantMode::MxFp4 => crate::quant_mode::quantized_matmul(
                 x,
@@ -398,9 +420,7 @@ impl QLinear {
                 crate::quant_mode::QuantMode::MxFp4,
             ),
             // Dense: plain matmul on the raw weight (bf16/fp16).
-            crate::quant_mode::QuantMode::Dense => {
-                dense_linear_no_bias_forward(&self.weight, x)
-            }
+            crate::quant_mode::QuantMode::Dense => dense_linear_no_bias_forward(&self.weight, x),
             // Affine fast path — unchanged from the mlx-rs wrapper.
             crate::quant_mode::QuantMode::Affine => quantized_forward(
                 x,
@@ -410,6 +430,52 @@ impl QLinear {
                 self.group_size,
                 self.bits,
             ),
+        }
+    }
+
+    fn qgemm_verify_shape(&self, x: &Array) -> Option<i32> {
+        if !qgemm_verify_enabled()
+            || self.bits != 4
+            || !self.qgemm_mode_enabled()
+            || self.group_size <= 0
+            || self.weight.shape().len() != 2
+        {
+            return None;
+        }
+
+        let x_shape = x.shape();
+        let [1, t, k_in] = *x_shape else {
+            return None;
+        };
+        if !(2..=16).contains(&t) {
+            return None;
+        }
+
+        let weight_shape = self.weight.shape();
+        let k_packed = *weight_shape.get(1)?;
+        let k_dim = k_packed.checked_mul(8)?;
+        if k_dim != k_in || k_dim % self.group_size != 0 {
+            return None;
+        }
+
+        let num_groups = k_dim / self.group_size;
+        let n_rows = *weight_shape.first()?;
+        if self.scales.shape().iter().product::<i32>() != n_rows * num_groups {
+            return None;
+        }
+        if self.mode == crate::quant_mode::QuantMode::Affine
+            && self.biases.shape().iter().product::<i32>() != n_rows * num_groups
+        {
+            return None;
+        }
+        Some(t)
+    }
+
+    fn qgemm_mode_enabled(&self) -> bool {
+        match self.mode {
+            crate::quant_mode::QuantMode::Affine => true,
+            crate::quant_mode::QuantMode::MxFp4 => qgemm_mxfp4_enabled(),
+            crate::quant_mode::QuantMode::Dense => false,
         }
     }
 
@@ -553,7 +619,9 @@ impl QEmbedding {
             ),
             // Affine fast path — custom 4-bit gemv kernel for single-token decode.
             crate::quant_mode::QuantMode::Affine => {
-                if self.bits == 4 && matches!(x.shape(), [1, 1, _]) && self.weight.shape().len() == 2
+                if self.bits == 4
+                    && matches!(x.shape(), [1, 1, _])
+                    && self.weight.shape().len() == 2
                 {
                     qgemv_4bit(x, &self.weight, &self.scales, &self.biases, self.group_size)
                 } else {
@@ -568,9 +636,7 @@ impl QEmbedding {
                 }
             }
             // Dense: plain matmul on full-precision weights.
-            crate::quant_mode::QuantMode::Dense => {
-                dense_linear_no_bias_forward(&self.weight, x)
-            }
+            crate::quant_mode::QuantMode::Dense => dense_linear_no_bias_forward(&self.weight, x),
         }
     }
 }
@@ -1782,6 +1848,8 @@ if (valid) {
 /// Same fused weight-unpack + dot-product as QGEMV_4BIT_KERNEL_SOURCE
 /// but processes T input vectors per output row. Each thread group
 /// accumulates T separate dot products, eliminating T x dispatch overhead.
+///
+/// Template: `OutT`, `K`, `GroupSize`, `KPacked`, `NumGroups`, `T`.
 const QGEMM_4BIT_KERNEL_SOURCE: &str = r"
 constexpr int CHUNK = (K <= 512) ? K : 512;
 constexpr int MAX_T = (T > 1) ? T : 1;
@@ -1860,6 +1928,194 @@ if (valid) {
 }
 ";
 
+/// MXFP4 GEMM kernel — same launch shape as affine qgemm, but E2M1 weights
+/// and per-block uint8 exponent scales. Kept separate from affine so the hot
+/// path has no mode branch and source-level constants.
+const QGEMM_MXFP4_4BIT_KERNEL_SOURCE: &str = r"
+constexpr int CHUNK = (K <= 512) ? K : 512;
+constexpr int MAX_T = (T > 1) ? T : 1;
+
+threadgroup OutT x_sh[MAX_T][CHUNK];
+
+auto tg = threadgroup_position_in_grid.x;
+auto sg = simdgroup_index_in_threadgroup;
+auto lane = thread_index_in_simdgroup;
+auto tid = thread_index_in_threadgroup;
+auto n_sg = simdgroups_per_threadgroup;
+uint tg_sz = n_sg * 32u;
+
+int row = tg * int(n_sg) + int(sg);
+bool valid = (row < n_param);
+
+float acc[MAX_T];
+for (int t = 0; t < MAX_T; t++) acc[t] = 0.0f;
+
+for (int k_off = 0; k_off < K; k_off += CHUNK) {
+    int k_end = min(k_off + CHUNK, K);
+    int k_len = k_end - k_off;
+
+    for (uint i = tid; i < uint(k_len * MAX_T); i += tg_sz) {
+        int t = int(i) / k_len;
+        int k = int(i) % k_len;
+        if (t < MAX_T) {
+            x_sh[t][k] = x[t * K + k_off + k];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (valid) {
+        int wp_off = k_off / 8;
+        int wp_end = k_end / 8;
+        auto w_row = w + row * KPacked;
+
+        for (int idx = wp_off + int(lane); idx < wp_end; idx += 32) {
+            uint packed = w_row[idx];
+            int kl = (idx - wp_off) * 8;
+
+            int g = idx * 8 / GroupSize;
+            uint scale_bits = uint(sc[row * NumGroups + g]) << 23u;
+            float block_scale = as_type<float>(scale_bits);
+            float mag_lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+            float dot_vals[MAX_T];
+            for (int t = 0; t < MAX_T; t++) dot_vals[t] = 0.0f;
+
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                uint nibble = (packed >> (j * 4u)) & 0xFu;
+                float mag = mag_lut[nibble & 0x7u];
+                float w_val = ((nibble & 0x8u) != 0u) ? -mag : mag;
+                w_val *= block_scale;
+                for (int t = 0; t < MAX_T; t++) {
+                    dot_vals[t] += w_val * float(x_sh[t][kl + j]);
+                }
+            }
+
+            for (int t = 0; t < MAX_T; t++) {
+                acc[t] += dot_vals[t];
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (valid) {
+    for (int t = 0; t < MAX_T; t++) {
+        acc[t] = simd_sum(acc[t]);
+        if (lane == 0) {
+            y[t * n_param + row] = OutT(acc[t]);
+        }
+    }
+}
+";
+
+/// MXFP4 gate/up SwiGLU kernel for verifier windows.
+///
+/// Computes `silu(x @ gate_w.T) * (x @ up_w.T)` in one dispatch without
+/// materializing separate gate/up activations or concatenating weights.
+const MXFP4_GATE_UP_SILU_4BIT_KERNEL_SOURCE: &str = r"
+constexpr int CHUNK = (K <= 512) ? K : 512;
+constexpr int MAX_T = (T > 1) ? T : 1;
+
+threadgroup OutT x_sh[MAX_T][CHUNK];
+
+auto tg = threadgroup_position_in_grid.x;
+auto sg = simdgroup_index_in_threadgroup;
+auto lane = thread_index_in_simdgroup;
+auto tid = thread_index_in_threadgroup;
+auto n_sg = simdgroups_per_threadgroup;
+uint tg_sz = n_sg * 32u;
+
+int row = tg * int(n_sg) + int(sg);
+bool valid = (row < n_param);
+
+float gate_acc[MAX_T];
+float up_acc[MAX_T];
+for (int t = 0; t < MAX_T; t++) {
+    gate_acc[t] = 0.0f;
+    up_acc[t] = 0.0f;
+}
+float mag_lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+for (int k_off = 0; k_off < K; k_off += CHUNK) {
+    int k_end = min(k_off + CHUNK, K);
+    int k_len = k_end - k_off;
+
+    for (uint i = tid; i < uint(k_len * MAX_T); i += tg_sz) {
+        int t = int(i) / k_len;
+        int k = int(i) % k_len;
+        if (t < MAX_T) {
+            x_sh[t][k] = x[t * K + k_off + k];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (valid) {
+        int wp_off = k_off / 8;
+        int wp_end = k_end / 8;
+        auto gate_row = gate_w + row * KPacked;
+        auto up_row = up_w + row * KPacked;
+
+        for (int idx = wp_off + int(lane); idx < wp_end; idx += 32) {
+            uint gate_packed = gate_row[idx];
+            uint up_packed = up_row[idx];
+            int kl = (idx - wp_off) * 8;
+
+            int g = idx * 8 / GroupSize;
+            uint gate_scale_bits = uint(gate_sc[row * NumGroups + g]) << 23u;
+            uint up_scale_bits = uint(up_sc[row * NumGroups + g]) << 23u;
+            float gate_scale = as_type<float>(gate_scale_bits);
+            float up_scale = as_type<float>(up_scale_bits);
+
+            float gate_dot[MAX_T];
+            float up_dot[MAX_T];
+            for (int t = 0; t < MAX_T; t++) {
+                gate_dot[t] = 0.0f;
+                up_dot[t] = 0.0f;
+            }
+
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                uint gate_nibble = (gate_packed >> (j * 4u)) & 0xFu;
+                uint up_nibble = (up_packed >> (j * 4u)) & 0xFu;
+
+                float gate_mag = mag_lut[gate_nibble & 0x7u];
+                float up_mag = mag_lut[up_nibble & 0x7u];
+                float gate_val = ((gate_nibble & 0x8u) != 0u) ? -gate_mag : gate_mag;
+                float up_val = ((up_nibble & 0x8u) != 0u) ? -up_mag : up_mag;
+                gate_val *= gate_scale;
+                up_val *= up_scale;
+
+                for (int t = 0; t < MAX_T; t++) {
+                    float xv = float(x_sh[t][kl + j]);
+                    gate_dot[t] += gate_val * xv;
+                    up_dot[t] += up_val * xv;
+                }
+            }
+
+            for (int t = 0; t < MAX_T; t++) {
+                gate_acc[t] += gate_dot[t];
+                up_acc[t] += up_dot[t];
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (valid) {
+    for (int t = 0; t < MAX_T; t++) {
+        float gate = simd_sum(gate_acc[t]);
+        float up = simd_sum(up_acc[t]);
+        if (lane == 0) {
+            float hidden = (gate / (1.0f + exp(-gate))) * up;
+            y[t * n_param + row] = OutT(hidden);
+        }
+    }
+}
+";
+
 static QGEMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static QGEMV_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 static GATED_DELTA_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1867,6 +2123,7 @@ static DECODE_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 static QGEMV_NSG_OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
 static DENSE_FFN_GEMV_MODE: OnceLock<DenseFfnGemvMode> = OnceLock::new();
 static DENSE_FFN_FUSE_GATE_UP: OnceLock<bool> = OnceLock::new();
+static MXFP4_FUSED_FFN_VERIFY_ENABLED: OnceLock<bool> = OnceLock::new();
 static MOE_FFN_FUSE_GATE_UP: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1899,6 +2156,20 @@ struct GatedDeltaKernelConfigKey {
 
 fn decode_gemv_enabled() -> bool {
     *DECODE_GEMV_ENABLED.get_or_init(|| std::env::var("HIGGS_ENABLE_SELECTED_DECODE_GEMV").is_ok())
+}
+
+static QGEMM_VERIFY_ENABLED: OnceLock<bool> = OnceLock::new();
+fn qgemm_verify_enabled() -> bool {
+    *QGEMM_VERIFY_ENABLED.get_or_init(|| truthy_env_var("HIGGS_QGEMM_VERIFY"))
+}
+
+static QGEMM_MXFP4_ENABLED: OnceLock<bool> = OnceLock::new();
+fn qgemm_mxfp4_enabled() -> bool {
+    *QGEMM_MXFP4_ENABLED.get_or_init(|| truthy_env_var("HIGGS_QGEMM_MXFP4"))
+}
+
+fn mxfp4_fused_ffn_verify_enabled() -> bool {
+    *MXFP4_FUSED_FFN_VERIFY_ENABLED.get_or_init(|| truthy_env_var("HIGGS_MXFP4_FUSED_FFN_VERIFY"))
 }
 
 fn truthy_env_var(name: &str) -> bool {
@@ -2003,11 +2274,18 @@ fn create_qgemm_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
     let source = CString::new(QGEMM_4BIT_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
     unsafe {
-        let in_vec = mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
-        let out_vec = mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
+        let in_vec =
+            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
         let kernel = mlx_sys::mlx_fast_metal_kernel_new(
-            c"higgs_qgemm_4bit".as_ptr(), in_vec, out_vec,
-            source.as_ptr(), c"".as_ptr(), false, false,
+            c"higgs_qgemm_4bit".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            false,
+            false,
         );
         mlx_sys::mlx_vector_string_free(in_vec);
         mlx_sys::mlx_vector_string_free(out_vec);
@@ -2016,6 +2294,57 @@ fn create_qgemm_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 }
 
 static QGEMM_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static QGEMM_MXFP4_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn configure_qgemm_kernel(
+    out_dtype: mlx_sys::mlx_dtype,
+    n_rows: i32,
+    k_dim: i32,
+    group_size: i32,
+    t: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    let n_sg = qgemv_nsg_override().unwrap_or(8);
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OutT".as_ptr(),
+            out_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"GroupSize".as_ptr(),
+            group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"KPacked".as_ptr(),
+            k_dim / 8,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NumGroups".as_ptr(),
+            k_dim / group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"T".as_ptr(), t);
+
+        let n_tgs = (n_rows + n_sg - 1) / n_sg;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tgs * 32, n_sg, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, n_sg, 1);
+
+        let y_shape = [t, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            out_dtype,
+        );
+
+        config
+    }
+}
 
 /// Batched quantized matmul for affine 4-bit weights.
 ///
@@ -2033,11 +2362,14 @@ pub(crate) fn qgemm_4bit(
 ) -> Result<Array, Exception> {
     ensure_ffi_error_handler();
 
-    let x_shape = x.shape();
     let weight_shape = weight.shape();
-    let n_rows = weight_shape.first().copied()
+    let n_rows = weight_shape
+        .first()
+        .copied()
         .ok_or_else(|| Exception::custom("qgemm_4bit: weight has no rows"))?;
-    let k_packed = weight_shape.get(1).copied()
+    let k_packed = weight_shape
+        .get(1)
+        .copied()
         .ok_or_else(|| Exception::custom("qgemm_4bit: weight has no columns"))?;
     let k_dim = k_packed * 8;
     let t = t_len.max(1);
@@ -2053,60 +2385,48 @@ pub(crate) fn qgemm_4bit(
 
     let cached = QGEMM_KERNEL.get_or_init(|| CachedMetalKernel(create_qgemm_kernel()));
 
-    // Configure: same as qgemv but with T template arg
-    let n_sg = qgemv_nsg_override().unwrap_or(8);
-    let config = unsafe { mlx_sys::mlx_fast_metal_kernel_config_new() };
-    unsafe {
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
-            config, c"OutT".as_ptr(), out_dtype,
-        );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"K".as_ptr(), k_dim,
-        );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"GroupSize".as_ptr(), group_size,
-        );
-        let k_packed_val = k_dim / 8;
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"KPacked".as_ptr(), k_packed_val,
-        );
-        let num_groups = k_dim / group_size;
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"NumGroups".as_ptr(), num_groups,
-        );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config, c"T".as_ptr(), t,
-        );
-        let grid_n = (n_rows + n_sg - 1) / n_sg;
-        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
-            config, grid_n, 1, 1,
-        );
-        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(
-            config, 32, n_sg, 1,
-        );
-    }
+    let config = configure_qgemm_kernel(out_dtype, n_rows, k_dim, group_size, t);
 
     let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
-    let input_ptrs = [w_flat.as_ptr(), s_flat.as_ptr(), b_flat.as_ptr(), x_flat.as_ptr(), n_scalar];
-    let inputs_vec = unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+    let input_ptrs = [
+        w_flat.as_ptr(),
+        s_flat.as_ptr(),
+        b_flat.as_ptr(),
+        x_flat.as_ptr(),
+        n_scalar,
+    ];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
 
     let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
     let status = unsafe {
         mlx_sys::mlx_fast_metal_kernel_apply(
-            &raw mut outputs_vec, cached.0, inputs_vec, config, stream.as_ptr(),
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
         )
     };
 
     let result = if status != 0 {
-        let mlx_msg = FFI_LAST_ERROR.with(|cell| cell.borrow_mut().take()).unwrap_or_default();
-        unsafe { mlx_sys::mlx_array_free(n_scalar); }
+        let mlx_msg = FFI_LAST_ERROR
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
+        unsafe {
+            mlx_sys::mlx_array_free(n_scalar);
+        }
         Err(Exception::custom(format!("qgemm_4bit failed: {mlx_msg}")))
     } else {
         let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
-        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0); }
+        unsafe {
+            mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0);
+        }
         let y = unsafe { Array::from_ptr(y_ptr) };
-        unsafe { mlx_sys::mlx_array_free(n_scalar); }
-        Ok(y.reshape(&[t, n_rows])?)
+        unsafe {
+            mlx_sys::mlx_array_free(n_scalar);
+        }
+        Ok(y.reshape(&[1, t, n_rows])?)
     };
 
     unsafe {
@@ -2114,6 +2434,248 @@ pub(crate) fn qgemm_4bit(
         mlx_sys::mlx_vector_array_free(outputs_vec);
         mlx_sys::mlx_fast_metal_kernel_config_free(config);
     }
+    result
+}
+
+#[allow(unsafe_code)]
+fn create_qgemm_mxfp4_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let input_names: [&std::ffi::CStr; 4] = [c"w", c"sc", c"x", c"n_param"];
+    let output_names: [&std::ffi::CStr; 1] = [c"y"];
+    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
+    let source =
+        CString::new(QGEMM_MXFP4_4BIT_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+    unsafe {
+        let in_vec =
+            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_qgemm_mxfp4_4bit".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            false,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+/// Batched quantized matmul for MXFP4 4-bit weights.
+///
+/// Decodes E2M1 nibbles with a per-group uint8 exponent scale, matching MLX's
+/// `mode="mxfp4"` quantized matmul but fusing verifier windows into one dispatch.
+#[allow(unsafe_code)]
+pub(crate) fn qgemm_mxfp4_4bit(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    group_size: i32,
+    t_len: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let weight_shape = weight.shape();
+    let n_rows = weight_shape
+        .first()
+        .copied()
+        .ok_or_else(|| Exception::custom("qgemm_mxfp4_4bit: weight has no rows"))?;
+    let k_packed = weight_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| Exception::custom("qgemm_mxfp4_4bit: weight has no columns"))?;
+    let k_dim = k_packed * 8;
+    let t = t_len.max(1);
+
+    let x_flat = x.reshape(&[t, k_dim])?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    let cached = QGEMM_MXFP4_KERNEL.get_or_init(|| CachedMetalKernel(create_qgemm_mxfp4_kernel()));
+    let config = configure_qgemm_kernel(out_dtype, n_rows, k_dim, group_size, t);
+
+    let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
+    let input_ptrs = [w_flat.as_ptr(), s_flat.as_ptr(), x_flat.as_ptr(), n_scalar];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        let mlx_msg = FFI_LAST_ERROR
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
+        Err(Exception::custom(format!(
+            "qgemm_mxfp4_4bit failed: {mlx_msg}"
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe {
+            mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0);
+        }
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        Ok(y.reshape(&[1, t, n_rows])?)
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(n_scalar);
+    }
+
+    result
+}
+
+#[allow(unsafe_code)]
+fn create_mxfp4_gate_up_silu_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let input_names: [&std::ffi::CStr; 6] =
+        [c"gate_w", c"gate_sc", c"up_w", c"up_sc", c"x", c"n_param"];
+    let output_names: [&std::ffi::CStr; 1] = [c"y"];
+    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
+    let source =
+        CString::new(MXFP4_GATE_UP_SILU_4BIT_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+    unsafe {
+        let in_vec =
+            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_mxfp4_gate_up_silu_4bit".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            false,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+static MXFP4_GATE_UP_SILU_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+/// Fused verifier hidden activation for dense MXFP4 SwiGLU.
+///
+/// Computes gate/up projections and `SiLU(gate) * up` directly from the two
+/// packed MXFP4 matrices. The down projection remains a normal QLinear call.
+#[allow(unsafe_code)]
+pub(crate) fn mxfp4_gate_up_silu_4bit(
+    x: &Array,
+    gate_weight: &Array,
+    gate_scales: &Array,
+    up_weight: &Array,
+    up_scales: &Array,
+    group_size: i32,
+    t_len: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let gate_shape = gate_weight.shape();
+    let up_shape = up_weight.shape();
+    if gate_shape != up_shape {
+        return Err(Exception::custom(format!(
+            "mxfp4_gate_up_silu_4bit: gate/up weight shape mismatch {gate_shape:?} vs {up_shape:?}"
+        )));
+    }
+    let n_rows = gate_shape
+        .first()
+        .copied()
+        .ok_or_else(|| Exception::custom("mxfp4_gate_up_silu_4bit: weight has no rows"))?;
+    let k_packed = gate_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| Exception::custom("mxfp4_gate_up_silu_4bit: weight has no columns"))?;
+    let k_dim = k_packed * 8;
+    let t = t_len.max(1);
+
+    let expected_scales = n_rows * (k_dim / group_size);
+    if gate_scales.shape().iter().product::<i32>() != expected_scales
+        || up_scales.shape().iter().product::<i32>() != expected_scales
+    {
+        return Err(Exception::custom(
+            "mxfp4_gate_up_silu_4bit: scale shape mismatch",
+        ));
+    }
+
+    let x_flat = x.reshape(&[t, k_dim])?;
+    let gate_w_flat = gate_weight.reshape(&[-1])?;
+    let gate_s_flat = gate_scales.flatten(None, None)?;
+    let up_w_flat = up_weight.reshape(&[-1])?;
+    let up_s_flat = up_scales.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    let cached = MXFP4_GATE_UP_SILU_KERNEL
+        .get_or_init(|| CachedMetalKernel(create_mxfp4_gate_up_silu_kernel()));
+    let config = configure_qgemm_kernel(out_dtype, n_rows, k_dim, group_size, t);
+
+    let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
+    let input_ptrs = [
+        gate_w_flat.as_ptr(),
+        gate_s_flat.as_ptr(),
+        up_w_flat.as_ptr(),
+        up_s_flat.as_ptr(),
+        x_flat.as_ptr(),
+        n_scalar,
+    ];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        let mlx_msg = FFI_LAST_ERROR
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
+        Err(Exception::custom(format!(
+            "mxfp4_gate_up_silu_4bit failed: {mlx_msg}"
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe {
+            mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0);
+        }
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        Ok(y.reshape(&[1, t, n_rows])?)
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(n_scalar);
+    }
+
     result
 }
 
@@ -2355,7 +2917,11 @@ impl Qwen3NextAttention {
     /// For mixed-precision checkpoints (e.g. AEON mxfp4 bulk + 8-bit affine k/v
     /// islands), the caller resolves `kv_spec` via `args.quant_spec_for(...)`.
     /// For uniform checkpoints, pass the same `spec` for both.
-    fn new(args: &Qwen3NextModelArgs, spec: QuantSpec, kv_spec: QuantSpec) -> Result<Self, Exception> {
+    fn new(
+        args: &Qwen3NextModelArgs,
+        spec: QuantSpec,
+        kv_spec: QuantSpec,
+    ) -> Result<Self, Exception> {
         let head_dim = args.head_dim;
         let head_dim_f32 = f32::from(
             i16::try_from(head_dim).map_err(|_| Exception::custom("head_dim out of i16 range"))?,
@@ -2672,7 +3238,9 @@ pub struct Qwen3NextMLP {
     up_proj: QLinear,
 }
 
-pub(crate) fn new_mlp_projections(spec: QuantSpec) -> Result<(QLinear, QLinear, QLinear), Exception> {
+pub(crate) fn new_mlp_projections(
+    spec: QuantSpec,
+) -> Result<(QLinear, QLinear, QLinear), Exception> {
     Ok((
         QLinear::new_spec(spec)?,
         QLinear::new_spec(spec)?,
@@ -3534,9 +4102,8 @@ impl GatedDeltaNet {
         let use_sep = args.use_separate_gdn_projections;
         // Resolve per-projection quantization: a/b may be Dense (bf16) in
         // mixed-precision checkpoints (e.g. AEON mxfp4 + bf16 GDN dynamics).
-        let ab_spec = args.quant_spec_for(&format!(
-            "model.layers.{layer_idx}.linear_attn.in_proj_a"
-        ));
+        let ab_spec =
+            args.quant_spec_for(&format!("model.layers.{layer_idx}.linear_attn.in_proj_a"));
         let in_proj_qkvz = QLinear::new_spec(spec)?;
         let in_proj_ba = QLinear::new_spec(ab_spec)?;
         let in_proj_qkv = use_sep.then(|| QLinear::new_spec(spec)).transpose()?;
@@ -4386,8 +4953,7 @@ impl GatedDeltaNet {
         cache.ssm_state = Some(new_state);
         cache.offset += S;
 
-        let normed = self.norm.forward(&y)?;
-        let gated_out = swiglu(&z, &normed)?;
+        let gated_out = gdn_output_gate(&y, self.norm.weight.as_ref(), self.norm.eps, &z)?;
         let out_flat = gated_out.reshape(&[B, S, -1])?;
         let output = self.out_proj.forward(&out_flat)?;
 
@@ -4514,7 +5080,14 @@ impl FfnBlock {
 
         let fused_out = match gp.mode {
             crate::quant_mode::QuantMode::MxFp4 => crate::quant_mode::quantized_matmul(
-                x, fw, fs, None, true, gp.group_size, gp.bits, gp.mode,
+                x,
+                fw,
+                fs,
+                None,
+                true,
+                gp.group_size,
+                gp.bits,
+                gp.mode,
             )?,
             crate::quant_mode::QuantMode::Dense => dense_linear_no_bias_forward(fw, x)?,
             // Affine fast path — GEMV for single-token decode, else standard matmul.
@@ -4534,6 +5107,62 @@ impl FfnBlock {
             .get(1)
             .ok_or_else(|| Exception::custom("fused split failed"))?;
         silu_mul(gate_out, up_out)
+    }
+
+    fn dense_hidden_mxfp4_fused_verify(&self, x: &Array) -> Result<Option<Array>, Exception> {
+        if !mxfp4_fused_ffn_verify_enabled() {
+            return Ok(None);
+        }
+
+        let gp = self
+            .gate_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
+        let up = self
+            .up_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
+
+        if gp.mode != crate::quant_mode::QuantMode::MxFp4
+            || up.mode != crate::quant_mode::QuantMode::MxFp4
+            || gp.bits != 4
+            || up.bits != 4
+            || gp.group_size != up.group_size
+            || gp.group_size <= 0
+        {
+            return Ok(None);
+        }
+
+        let x_shape = x.shape();
+        let [1, t, k_in] = *x_shape else {
+            return Ok(None);
+        };
+        if !(2..=16).contains(&t) {
+            return Ok(None);
+        }
+
+        let gate_shape = gp.weight.shape();
+        if gate_shape != up.weight.shape() {
+            return Ok(None);
+        }
+        let Some(&k_packed) = gate_shape.get(1) else {
+            return Ok(None);
+        };
+        let k_dim = k_packed * 8;
+        if k_dim != k_in || k_dim % gp.group_size != 0 {
+            return Ok(None);
+        }
+
+        mxfp4_gate_up_silu_4bit(
+            x,
+            &gp.weight,
+            &gp.scales,
+            &up.weight,
+            &up.scales,
+            gp.group_size,
+            t,
+        )
+        .map(Some)
     }
 
     fn dense_hidden_separate(&self, x: &Array) -> Result<Array, Exception> {
@@ -4633,7 +5262,9 @@ impl FfnBlock {
                     DenseFfnGemvMode::Both | DenseFfnGemvMode::DownOnly
                 );
 
-            let hidden = if dense_ffn_fuse_gate_up() {
+            let hidden = if let Some(hidden) = self.dense_hidden_mxfp4_fused_verify(x)? {
+                hidden
+            } else if dense_ffn_fuse_gate_up() {
                 self.dense_hidden_fused(x, use_fused_gemv)?
             } else {
                 self.dense_hidden_separate(x)?
@@ -4683,9 +5314,7 @@ impl DecoderLayer {
         // Resolve per-layer k/v quantization override (e.g. AEON's 8-bit affine
         // k/v islands on full-attention layers). Falls back to the global spec
         // when no per-path override exists for this layer.
-        let kv_spec = args.quant_spec_for(&format!(
-            "model.layers.{layer_idx}.self_attn.k_proj"
-        ));
+        let kv_spec = args.quant_spec_for(&format!("model.layers.{layer_idx}.self_attn.k_proj"));
         let self_attn = (!is_linear)
             .then(|| Qwen3NextAttention::new(args, spec, kv_spec))
             .transpose()?;
@@ -5935,6 +6564,24 @@ impl Qwen3NextCausalLM {
         let layer_timing = std::env::var("HIGGS_DFLASH_LAYER_TIMING")
             .map(|v| v == "1")
             .unwrap_or(false);
+        let layer_detail_timing = std::env::var("HIGGS_DFLASH_LAYER_DETAIL_TIMING")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        #[derive(Default)]
+        struct LayerDetailTiming {
+            input_norm_ms: f64,
+            gdn_attn_ms: f64,
+            fa_attn_ms: f64,
+            residual1_ms: f64,
+            post_norm_ms: f64,
+            mlp_ms: f64,
+            residual2_ms: f64,
+            final_norm_ms: f64,
+            logits_ms: f64,
+            gdn_layers: usize,
+            fa_layers: usize,
+        }
+        let mut detail = LayerDetailTiming::default();
         let mut gdn_total_ms = 0.0_f64;
         let mut fa_total_ms = 0.0_f64;
         let mut gdn_count = 0usize;
@@ -5964,7 +6611,20 @@ impl Qwen3NextCausalLM {
             let is_linear = layer.is_linear;
             let mask_ref = if is_linear { None } else { fa_mask.as_ref() };
 
+            let mut detail_ckpt = if layer_detail_timing {
+                mlx_rs::transforms::eval([&h])?;
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
             let normed = layer.input_layernorm.forward(&h)?;
+            if let Some(ckpt) = detail_ckpt.as_mut() {
+                mlx_rs::transforms::eval([&normed])?;
+                let now = std::time::Instant::now();
+                detail.input_norm_ms += now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                *ckpt = now;
+            }
 
             let (r, tape) = if is_linear {
                 let attn = layer
@@ -5986,16 +6646,52 @@ impl Qwen3NextCausalLM {
                 };
                 (attn.forward(&normed, mask_ref, layer_kv)?, None)
             };
+            if let Some(ckpt) = detail_ckpt.as_mut() {
+                mlx_rs::transforms::eval([&r])?;
+                let now = std::time::Instant::now();
+                let dt_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                if is_linear {
+                    detail.gdn_attn_ms += dt_ms;
+                    detail.gdn_layers += 1;
+                } else {
+                    detail.fa_attn_ms += dt_ms;
+                    detail.fa_layers += 1;
+                }
+                *ckpt = now;
+            }
 
             layer_tapes.push(tape);
 
             let h2 = h.add(r)?;
+            if let Some(ckpt) = detail_ckpt.as_mut() {
+                mlx_rs::transforms::eval([&h2])?;
+                let now = std::time::Instant::now();
+                detail.residual1_ms += now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                *ckpt = now;
+            }
             let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            if let Some(ckpt) = detail_ckpt.as_mut() {
+                mlx_rs::transforms::eval([&normed_post])?;
+                let now = std::time::Instant::now();
+                detail.post_norm_ms += now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                *ckpt = now;
+            }
             let mlp_out = layer.mlp.forward(&normed_post)?;
+            if let Some(ckpt) = detail_ckpt.as_mut() {
+                mlx_rs::transforms::eval([&mlp_out])?;
+                let now = std::time::Instant::now();
+                detail.mlp_ms += now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                *ckpt = now;
+            }
             h = h2.add(mlp_out)?;
 
             if tap_layers.contains(&layer_idx) {
                 taps.push(h.clone());
+            }
+            if let Some(ckpt) = detail_ckpt.as_mut() {
+                mlx_rs::transforms::eval([&h])?;
+                let now = std::time::Instant::now();
+                detail.residual2_ms += now.duration_since(*ckpt).as_secs_f64() * 1000.0;
             }
 
             if let Some(ckpt) = layer_ckpt.as_mut() {
@@ -6014,7 +6710,7 @@ impl Qwen3NextCausalLM {
         }
 
         // Pad layer_tapes when early exit was used (None for skipped layers).
-        if let Some(max) = max_layers {
+        if max_layers.is_some() {
             while layer_tapes.len() < self.model.layers.len() {
                 layer_tapes.push(None);
             }
@@ -6022,8 +6718,25 @@ impl Qwen3NextCausalLM {
             // The DFlash loop merges partial taps with the previous round's.
         }
 
+        let mut tail_detail_ckpt = if layer_detail_timing {
+            mlx_rs::transforms::eval([&h])?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let normed = self.model.norm.forward(&h)?;
+        if let Some(ckpt) = tail_detail_ckpt.as_mut() {
+            mlx_rs::transforms::eval([&normed])?;
+            let now = std::time::Instant::now();
+            detail.final_norm_ms += now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+            *ckpt = now;
+        }
         let logits = self.project_logits(&normed)?;
+        if let Some(ckpt) = tail_detail_ckpt.as_mut() {
+            mlx_rs::transforms::eval([&logits])?;
+            let now = std::time::Instant::now();
+            detail.logits_ms += now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+        }
 
         if layer_timing {
             mlx_rs::transforms::eval([&logits])?;
@@ -6043,6 +6756,35 @@ impl Qwen3NextCausalLM {
                     fa_total_ms,
                     fa_total_ms / fa_count.max(1) as f64,
                     tail_ms,
+                );
+            }
+        }
+        if layer_detail_timing {
+            #[allow(clippy::as_conversions)]
+            {
+                tracing::info!(
+                    "dflash_layer_detail seq={} gdn_layers={} fa_layers={} \
+                     input_norm_ms={:.1} input_norm_avg={:.2} \
+                     gdn_attn_ms={:.1} gdn_attn_avg={:.2} \
+                     fa_attn_ms={:.1} fa_attn_avg={:.2} \
+                     residual1_ms={:.1} post_norm_ms={:.1} mlp_ms={:.1} mlp_avg={:.2} \
+                     residual2_ms={:.1} final_norm_ms={:.1} logits_ms={:.1}",
+                    T,
+                    detail.gdn_layers,
+                    detail.fa_layers,
+                    detail.input_norm_ms,
+                    detail.input_norm_ms / (detail.gdn_layers + detail.fa_layers).max(1) as f64,
+                    detail.gdn_attn_ms,
+                    detail.gdn_attn_ms / detail.gdn_layers.max(1) as f64,
+                    detail.fa_attn_ms,
+                    detail.fa_attn_ms / detail.fa_layers.max(1) as f64,
+                    detail.residual1_ms,
+                    detail.post_norm_ms,
+                    detail.mlp_ms,
+                    detail.mlp_ms / (detail.gdn_layers + detail.fa_layers).max(1) as f64,
+                    detail.residual2_ms,
+                    detail.final_norm_ms,
+                    detail.logits_ms,
                 );
             }
         }
@@ -6591,7 +7333,8 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
                 .filter_map(|(key, val)| {
                     // Skip scalar defaults (group_size/bits/mode are non-objects).
                     let entry = val.as_object()?;
-                    let qc = qwen3_5_quantization_config(&serde_json::Value::Object(entry.clone()))?;
+                    let qc =
+                        qwen3_5_quantization_config(&serde_json::Value::Object(entry.clone()))?;
                     // Strip `language_model.` prefix to match stripped param keys.
                     let stripped = key.strip_prefix("language_model.").unwrap_or(key);
                     Some((stripped.to_owned(), qc))
@@ -6675,7 +7418,12 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     // BUT: when 8-bit requant is enabled, Dense a/b become Affine at load time,
     // making fused projections viable (2 dispatches instead of 4 per GDN layer).
     let will_requant_8bit = std::env::var("HIGGS_DENSE_REQUANT_8BIT").is_ok();
-    if args.quantization_overrides.values().any(|qc| qc.mode.is_dense()) && !will_requant_8bit {
+    if args
+        .quantization_overrides
+        .values()
+        .any(|qc| qc.mode.is_dense())
+        && !will_requant_8bit
+    {
         args.use_separate_gdn_projections = true;
     }
 
@@ -6689,7 +7437,10 @@ fn qwen3_5_quantization_config(value: &serde_json::Value) -> Option<Quantization
     let mode = value
         .get("mode")
         .and_then(serde_json::Value::as_str)
-        .map_or(crate::quant_mode::QuantMode::Affine, crate::quant_mode::QuantMode::parse);
+        .map_or(
+            crate::quant_mode::QuantMode::Affine,
+            crate::quant_mode::QuantMode::parse,
+        );
     Some(QuantizationConfig {
         group_size,
         bits,
@@ -6740,9 +7491,7 @@ fn detect_dense_gdn_projections(
         else {
             continue;
         };
-        if !(base.ends_with(".linear_attn.in_proj_a")
-            || base.ends_with(".linear_attn.in_proj_b"))
-        {
+        if !(base.ends_with(".linear_attn.in_proj_a") || base.ends_with(".linear_attn.in_proj_b")) {
             continue;
         }
         // If this path is NOT quantized (no .scales key) and not already overridden
@@ -6919,7 +7668,10 @@ fn requant_dense_gdn_to_8bit(model: &mut Qwen3NextCausalLM) -> Result<usize, Mod
     for layer in &mut model.model.layers {
         if let Some(ref mut gdn) = layer.linear_attn {
             // Handle separate projections (in_proj_a, in_proj_b)
-            for ql in [&mut gdn.in_proj_a, &mut gdn.in_proj_b].into_iter().flatten() {
+            for ql in [&mut gdn.in_proj_a, &mut gdn.in_proj_b]
+                .into_iter()
+                .flatten()
+            {
                 if ql.mode.is_dense() {
                     requant_one_to_8bit(ql)?;
                     count += 1;
@@ -6938,8 +7690,7 @@ fn requant_dense_gdn_to_8bit(model: &mut Qwen3NextCausalLM) -> Result<usize, Mod
 
 /// Quantize a single Dense `QLinear`'s bf16 weight to 8-bit affine in-place.
 fn requant_one_to_8bit(ql: &mut QLinear) -> Result<(), ModelError> {
-    let (wq, scales, biases) = ops::quantize(&ql.weight, 64, 8)
-        .map_err(ModelError::Mlx)?;
+    let (wq, scales, biases) = ops::quantize(&ql.weight, 64, 8).map_err(ModelError::Mlx)?;
     mlx_rs::transforms::eval([&wq, &scales, &biases]).map_err(ModelError::Mlx)?;
     ql.weight = Param::new(wq);
     ql.scales = Param::new(scales);
@@ -8457,7 +9208,8 @@ mod tests {
             mode: crate::quant_mode::QuantMode::Affine,
         });
 
-        let mut block = SparseMoeBlock::new(&args, crate::qwen3_next::QuantSpec::default()).unwrap();
+        let mut block =
+            SparseMoeBlock::new(&args, crate::qwen3_next::QuantSpec::default()).unwrap();
 
         // Set router gate weights: [num_experts, hidden_size]
         let gate_w = Array::ones::<f32>(&[4, 64]).unwrap();
@@ -8877,7 +9629,8 @@ mod tests {
         use mlx_rs::Dtype;
 
         let args = valid_causal_lm_args();
-        let mut gdn = GatedDeltaNet::new(&args, 0, crate::qwen3_next::QuantSpec::default()).unwrap();
+        let mut gdn =
+            GatedDeltaNet::new(&args, 0, crate::qwen3_next::QuantSpec::default()).unwrap();
         let conv_w = mlx_rs::random::uniform::<f32, f32>(
             -0.5,
             0.5,
@@ -17572,6 +18325,196 @@ mod tests {
         // Realistic dims: gate+up fused (2*intermediate) and down projection
         assert_qgemv_matches_reference(512, 1024, 64, "N=512 K=1024");
         assert_qgemv_matches_reference(2048, 1024, 64, "N=2048 K=1024");
+    }
+
+    #[test]
+    fn test_qgemm_affine_matches_reference() {
+        use mlx_rs::Dtype;
+
+        let t = 4;
+        let k = 256;
+        let n = 16;
+        let group_size = 64;
+        let x =
+            mlx_rs::random::uniform_device::<_, f32>(0.0, 1.0, &[1, t, k], None, Stream::default())
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+        let w_dense =
+            mlx_rs::random::uniform_device::<_, f32>(-1.0, 1.0, &[n, k], None, Stream::default())
+                .unwrap();
+        let (w_q, scales, biases) = mlx_rs::ops::quantize(&w_dense, group_size, 4).unwrap();
+        mlx_rs::transforms::eval([&w_q, &scales, &biases, &x]).unwrap();
+
+        let ref_out = quantized_forward(&x, &w_q, &scales, &biases, group_size, 4).unwrap();
+        mlx_rs::transforms::eval([&ref_out]).unwrap();
+
+        let custom_out = qgemm_4bit(&x, &w_q, &scales, &biases, group_size, t).unwrap();
+        mlx_rs::transforms::eval([&custom_out]).unwrap();
+
+        assert_eq!(ref_out.shape(), custom_out.shape());
+
+        let ref_f32 = ref_out.as_dtype(Dtype::Float32).unwrap();
+        let cust_f32 = custom_out.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&ref_f32, &cust_f32]).unwrap();
+        let ref_vals = ref_f32.as_slice::<f32>();
+        let cust_vals = cust_f32.as_slice::<f32>();
+
+        assert_eq!(ref_vals.len(), cust_vals.len());
+        for (i, (&r, &c)) in ref_vals.iter().zip(cust_vals.iter()).enumerate() {
+            let diff = (r - c).abs();
+            assert!(
+                diff < 0.5,
+                "qgemm affine mismatch at {i}: ref={r}, custom={c}, diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_qgemm_mxfp4_matches_reference() {
+        use crate::quant_mode::{QuantMode, quantize as quantize_with_mode, quantized_matmul};
+        use mlx_rs::Dtype;
+
+        let t = 4;
+        let k = 256;
+        let n = 16;
+        let group_size = 32;
+        let x = mlx_rs::random::uniform_device::<_, f32>(
+            -0.5,
+            0.5,
+            &[1, t, k],
+            None,
+            Stream::default(),
+        )
+        .unwrap()
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let w_dense =
+            mlx_rs::random::uniform_device::<_, f32>(-1.0, 1.0, &[n, k], None, Stream::default())
+                .unwrap();
+        let (w_q, scales, _biases) =
+            quantize_with_mode(&w_dense, group_size, 4, QuantMode::MxFp4).unwrap();
+        mlx_rs::transforms::eval([&w_q, &scales, &x]).unwrap();
+
+        let ref_out = quantized_matmul(
+            &x,
+            &w_q,
+            &scales,
+            None,
+            true,
+            group_size,
+            4,
+            QuantMode::MxFp4,
+        )
+        .unwrap();
+        mlx_rs::transforms::eval([&ref_out]).unwrap();
+
+        let custom_out = qgemm_mxfp4_4bit(&x, &w_q, &scales, group_size, t).unwrap();
+        mlx_rs::transforms::eval([&custom_out]).unwrap();
+
+        assert_eq!(ref_out.shape(), custom_out.shape());
+
+        let ref_f32 = ref_out.as_dtype(Dtype::Float32).unwrap();
+        let cust_f32 = custom_out.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&ref_f32, &cust_f32]).unwrap();
+        let ref_vals = ref_f32.as_slice::<f32>();
+        let cust_vals = cust_f32.as_slice::<f32>();
+
+        assert_eq!(ref_vals.len(), cust_vals.len());
+        let mut max_diff = 0.0f32;
+        for (i, (&r, &c)) in ref_vals.iter().zip(cust_vals.iter()).enumerate() {
+            let diff = (r - c).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 0.5,
+                "qgemm mxfp4 mismatch at {i}: ref={r}, custom={c}, diff={diff}"
+            );
+        }
+        println!("qgemm mxfp4 PASS: N={n} K={k} T={t} gs={group_size} max_diff={max_diff:.4}");
+    }
+
+    #[test]
+    fn test_mxfp4_gate_up_silu_matches_reference() {
+        use crate::quant_mode::{QuantMode, quantize as quantize_with_mode, quantized_matmul};
+        use mlx_rs::Dtype;
+
+        let t = 4;
+        let k = 256;
+        let n = 16;
+        let group_size = 32;
+        let x = mlx_rs::random::uniform_device::<_, f32>(
+            -0.5,
+            0.5,
+            &[1, t, k],
+            None,
+            Stream::default(),
+        )
+        .unwrap()
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let gate_dense =
+            mlx_rs::random::uniform_device::<_, f32>(-1.0, 1.0, &[n, k], None, Stream::default())
+                .unwrap();
+        let up_dense =
+            mlx_rs::random::uniform_device::<_, f32>(-1.0, 1.0, &[n, k], None, Stream::default())
+                .unwrap();
+        let (gate_q, gate_scales, _gate_biases) =
+            quantize_with_mode(&gate_dense, group_size, 4, QuantMode::MxFp4).unwrap();
+        let (up_q, up_scales, _up_biases) =
+            quantize_with_mode(&up_dense, group_size, 4, QuantMode::MxFp4).unwrap();
+        mlx_rs::transforms::eval([&gate_q, &gate_scales, &up_q, &up_scales, &x]).unwrap();
+
+        let gate_ref = quantized_matmul(
+            &x,
+            &gate_q,
+            &gate_scales,
+            None,
+            true,
+            group_size,
+            4,
+            QuantMode::MxFp4,
+        )
+        .unwrap();
+        let up_ref = quantized_matmul(
+            &x,
+            &up_q,
+            &up_scales,
+            None,
+            true,
+            group_size,
+            4,
+            QuantMode::MxFp4,
+        )
+        .unwrap();
+        let ref_out = silu_mul(&gate_ref, &up_ref).unwrap();
+        mlx_rs::transforms::eval([&ref_out]).unwrap();
+
+        let custom_out =
+            mxfp4_gate_up_silu_4bit(&x, &gate_q, &gate_scales, &up_q, &up_scales, group_size, t)
+                .unwrap();
+        mlx_rs::transforms::eval([&custom_out]).unwrap();
+
+        assert_eq!(ref_out.shape(), custom_out.shape());
+
+        let ref_f32 = ref_out.as_dtype(Dtype::Float32).unwrap();
+        let cust_f32 = custom_out.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&ref_f32, &cust_f32]).unwrap();
+        let ref_vals = ref_f32.as_slice::<f32>();
+        let cust_vals = cust_f32.as_slice::<f32>();
+
+        assert_eq!(ref_vals.len(), cust_vals.len());
+        let mut max_diff = 0.0f32;
+        for (i, (&r, &c)) in ref_vals.iter().zip(cust_vals.iter()).enumerate() {
+            let diff = (r - c).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 0.5,
+                "mxfp4 gate/up silu mismatch at {i}: ref={r}, custom={c}, diff={diff}"
+            );
+        }
+        println!(
+            "mxfp4 gate/up silu PASS: N={n} K={k} T={t} gs={group_size} max_diff={max_diff:.4}"
+        );
     }
 
     /// Benchmark helper: time GEMV vs quantized_matmul for given dims.

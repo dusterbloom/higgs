@@ -97,13 +97,6 @@ const fn default_block_size() -> i32 {
     16
 }
 
-/// Runtime decode `block_size` used at inference.
-///
-/// Overridable via `HIGGS_DFLASH_BLOCK_SIZE`. Diverges from the drafter's
-/// trained `block_size` (16) because acceptance rate plateaus at ~3 tokens
-/// and smaller blocks amortize verify cost better.
-pub const DEFAULT_DECODE_BLOCK_SIZE: i32 = 4;
-
 // ---------------------------------------------------------------------------
 // SwiGLU MLP (non-quantized)
 // ---------------------------------------------------------------------------
@@ -119,7 +112,11 @@ struct DFlashMLP {
 }
 
 impl DFlashMLP {
-    fn new(_hidden_size: i32, _intermediate_size: i32, spec: crate::qwen3_next::QuantSpec) -> Result<Self, Exception> {
+    fn new(
+        _hidden_size: i32,
+        _intermediate_size: i32,
+        spec: crate::qwen3_next::QuantSpec,
+    ) -> Result<Self, Exception> {
         Ok(Self {
             gate_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
             up_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
@@ -164,7 +161,11 @@ struct DFlashAttention {
 }
 
 impl DFlashAttention {
-    fn new(config: &DFlashConfig, layer_idx: usize, spec: crate::qwen3_next::QuantSpec) -> Result<Self, Exception> {
+    fn new(
+        config: &DFlashConfig,
+        layer_idx: usize,
+        spec: crate::qwen3_next::QuantSpec,
+    ) -> Result<Self, Exception> {
         let head_dim = config.head_dim;
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
@@ -333,7 +334,11 @@ struct DFlashDecoderLayer {
 }
 
 impl DFlashDecoderLayer {
-    fn new(config: &DFlashConfig, layer_idx: usize, spec: crate::qwen3_next::QuantSpec) -> Result<Self, Exception> {
+    fn new(
+        config: &DFlashConfig,
+        layer_idx: usize,
+        spec: crate::qwen3_next::QuantSpec,
+    ) -> Result<Self, Exception> {
         Ok(Self {
             self_attn: DFlashAttention::new(config, layer_idx, spec)?,
             mlp: DFlashMLP::new(config.hidden_size, config.intermediate_size, spec)?,
@@ -616,7 +621,13 @@ pub fn accept_prefix(draft: &[u32], verify_argmax: &[u32]) -> Vec<u32> {
 // surface.
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::as_conversions, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::as_conversions,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::accept_prefix;
 
@@ -752,5 +763,28 @@ mod tests {
             c.num_taps(),
             c.num_taps() as i32 * c.hidden_size
         );
+    }
+}
+
+#[cfg(test)]
+mod weight_check {
+    #[test]
+    #[ignore = "needs HIGGS_DFLASH_DRAFTER_DIR"]
+    fn check_weights_loaded() {
+        let dir = std::env::var("HIGGS_DFLASH_DRAFTER_DIR").unwrap();
+        let d = super::load_dflash_drafter(std::path::Path::new(&dir)).unwrap();
+        let fc_w = &d.fc.weight;
+        let fc_s = &d.fc.scales;
+        let q_w = &d.layers[0].self_attn.q_proj.weight;
+        let q_s = &d.layers[0].self_attn.q_proj.scales;
+        eprintln!("fc.weight: {:?} {:?}", fc_w.shape(), fc_w.dtype());
+        eprintln!("fc.scales: {:?} {:?}", fc_s.shape(), fc_s.dtype());
+        eprintln!("q_proj.weight: {:?} {:?}", q_w.shape(), q_w.dtype());
+        eprintln!("q_proj.scales: {:?} {:?}", q_s.shape(), q_s.dtype());
+        let fc_prod: i32 = fc_w.shape().iter().product();
+        let q_prod: i32 = q_w.shape().iter().product();
+        assert!(fc_prod > 1, "fc.weight placeholder! shape={:?}", fc_w.shape());
+        assert!(q_prod > 1, "q_proj.weight placeholder! shape={:?}", q_w.shape());
+        eprintln!("ALL WEIGHTS LOADED OK");
     }
 }

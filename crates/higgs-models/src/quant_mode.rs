@@ -345,9 +345,8 @@ mod tests {
         let x = Array::from_slice(&x_data, &[1, in_features]);
 
         let (wq, sq, bq) = quantize(&w, 64, 4, QuantMode::Affine).unwrap();
-        let affine_out =
-            quantized_matmul(&x, &wq, &sq, Some(&bq), true, 64, 4, QuantMode::Affine)
-                .expect("affine quantized_matmul");
+        let affine_out = quantized_matmul(&x, &wq, &sq, Some(&bq), true, 64, 4, QuantMode::Affine)
+            .expect("affine quantized_matmul");
 
         let w_deq = dequantize(&wq, &sq, Some(&bq), 64, 4, QuantMode::Affine).unwrap();
         let ref_out = x.matmul(w_deq.transpose().unwrap()).unwrap();
