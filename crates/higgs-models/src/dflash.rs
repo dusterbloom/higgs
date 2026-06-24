@@ -1,14 +1,15 @@
 //! `DFlash` block-diffusion drafter for speculative decoding.
 //!
 //! A 0.5B drafter that produces 16 draft tokens per round via a single
-//! non-causal forward pass. Conditions on hidden states tapped from 5
-//! target model layers during the previous verify step.
+//! non-causal forward pass. The Modal drafter checkpoints verified by the
+//! loader tests use 8 target-layer taps: `[1, 6, 11, 16, 22, 27, 32, 37]`.
 //!
-//! Architecture: 8 decoder layers with dual-stream attention —
+//! Architecture: 6 decoder layers with dual-stream attention —
 //! Q from noise embedding, K/V from `concat(target_hidden, noise)`.
 //! No `embed_tokens` or `lm_head` — uses the target model's `lm_head`.
 //!
-//! Reference: `dflash.py` in `z-lab/Qwen3.5-35B-A3B-DFlash`.
+//! Reference checkpoints: `modal-labs/Qwen3.6-35B-A3B-DFlash` and
+//! `modal-labs/Qwen3.5-9B-DFlash`.
 use std::path::Path;
 
 use mlx_rs::{
