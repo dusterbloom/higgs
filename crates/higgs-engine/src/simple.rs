@@ -1732,8 +1732,18 @@ impl SimpleEngine {
                 //    steps, fixing the S>1 vs S=1 numerical drift that a full-rerun
                 //    verify exhibits, and lets partial accept replay only the SSM
                 //    recurrence for accepted positions instead of a full rerun.
+                let early_exit = std::env::var("HIGGS_DFLASH_EARLY_EXIT_LAYERS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|&v| v > 0 && v < 64);
                 let (verify_logits, verify_taps, layer_tapes) = model
-                    .forward_with_taps_tape(&verify_input, None, &mut cache, &dflash.tap_layers)
+                    .forward_with_taps_tape_n(
+                        &verify_input,
+                        None,
+                        &mut cache,
+                        &dflash.tap_layers,
+                        early_exit,
+                    )
                     .map_err(EngineError::Mlx)?;
 
                 // g. Accept prefix. One host barrier per round: eval'ing the argmax

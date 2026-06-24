@@ -5656,6 +5656,25 @@ impl Qwen3NextCausalLM {
         kv_cache: &mut Vec<Option<LayerCache>>,
         tap_layers: &[usize],
     ) -> Result<(Array, Vec<Array>, Vec<Option<GdnLayerTape>>), Exception> {
+        self.forward_with_taps_tape_n(inputs, _mask, kv_cache, tap_layers, None)
+    }
+
+    /// Tape-recording verify with optional early exit after `max_layers`.
+    ///
+    /// When `max_layers` is `Some(N)`, only the first N decoder layers run,
+    /// then the final norm + lm_head project logits from the intermediate
+    /// hidden state. This is used for two-phase speculative verify: a fast
+    /// partial pass resolves obvious accept/reject decisions; only borderline
+    /// rounds need the full 64-layer pass.
+    #[allow(non_snake_case)]
+    pub fn forward_with_taps_tape_n(
+        &mut self,
+        inputs: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+        max_layers: Option<usize>,
+    ) -> Result<(Array, Vec<Array>, Vec<Option<GdnLayerTape>>), Exception> {
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
         if kv_cache.is_empty() {
@@ -5725,6 +5744,11 @@ impl Qwen3NextCausalLM {
             .zip(kv_cache.iter_mut())
             .enumerate()
         {
+            if let Some(max) = max_layers {
+                if layer_idx >= max {
+                    break;
+                }
+            }
             let cache = layer_cache
                 .as_mut()
                 .ok_or_else(|| Exception::custom("Layer cache is None"))?;
@@ -5788,18 +5812,21 @@ impl Qwen3NextCausalLM {
             let tail_ms = layer_ckpt
                 .map(|c| c.elapsed().as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
-            tracing::info!(
-                "dflash_layer_timing seq={} gdn_layers={} gdn_total_ms={:.1} gdn_avg={:.2}ms \
-                 fa_layers={} fa_total_ms={:.1} fa_avg={:.2}ms tail_ms={:.1}",
-                T,
-                gdn_count,
-                gdn_total_ms,
-                gdn_total_ms / gdn_count.max(1) as f64,
-                fa_count,
-                fa_total_ms,
-                fa_total_ms / fa_count.max(1) as f64,
-                tail_ms,
-            );
+            #[allow(clippy::as_conversions)]
+            {
+                tracing::info!(
+                    "dflash_layer_timing seq={} gdn_layers={} gdn_total_ms={:.1} gdn_avg={:.2}ms \
+                     fa_layers={} fa_total_ms={:.1} fa_avg={:.2}ms tail_ms={:.1}",
+                    T,
+                    gdn_count,
+                    gdn_total_ms,
+                    gdn_total_ms / gdn_count.max(1) as f64,
+                    fa_count,
+                    fa_total_ms,
+                    fa_total_ms / fa_count.max(1) as f64,
+                    tail_ms,
+                );
+            }
         }
 
         Ok((logits, taps, layer_tapes))

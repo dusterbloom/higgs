@@ -886,9 +886,21 @@ impl AnyModel {
         cache: &mut AnyCache,
         tap_layers: &[usize],
     ) -> Result<TapsTapeOutput, Exception> {
+        self.forward_with_taps_tape_n(inputs, mask, cache, tap_layers, None)
+    }
+
+    /// Tape-recording verify with optional early exit after `max_layers`.
+    pub fn forward_with_taps_tape_n(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+        max_layers: Option<usize>,
+    ) -> Result<TapsTapeOutput, Exception> {
         match (self, cache) {
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
-                m.forward_with_taps_tape(inputs, mask, c, tap_layers)
+                m.forward_with_taps_tape_n(inputs, mask, c, tap_layers, max_layers)
             }
             _ => Err(Exception::custom(
                 "forward_with_taps_tape requires Qwen3Next + Hybrid cache",
