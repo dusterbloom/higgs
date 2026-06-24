@@ -57,7 +57,7 @@ pub struct DFlashConfig {
 }
 
 impl DFlashConfig {
-    pub fn quant_spec(&self) -> crate::qwen3_next::QuantSpec {
+    pub const fn quant_spec(&self) -> crate::qwen3_next::QuantSpec {
         match &self.quantization {
             Some(q) => q.spec(),
             None => crate::qwen3_next::QuantSpec {
@@ -119,7 +119,7 @@ struct DFlashMLP {
 }
 
 impl DFlashMLP {
-    fn new(hidden_size: i32, intermediate_size: i32, spec: crate::qwen3_next::QuantSpec) -> Result<Self, Exception> {
+    fn new(_hidden_size: i32, _intermediate_size: i32, spec: crate::qwen3_next::QuantSpec) -> Result<Self, Exception> {
         Ok(Self {
             gate_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
             up_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
@@ -168,7 +168,7 @@ impl DFlashAttention {
         let head_dim = config.head_dim;
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
-        let hidden = config.hidden_size;
+        let _hidden = config.hidden_size;
         let is_sliding = config
             .layer_types
             .as_ref()
@@ -388,7 +388,7 @@ pub struct DFlashDrafter {
 impl DFlashDrafter {
     pub fn new(config: DFlashConfig) -> Result<Self, Exception> {
         let spec = config.quant_spec();
-        let fc_in = i32::try_from(config.num_taps())
+        let _fc_in = i32::try_from(config.num_taps())
             .map_err(|e| Exception::custom(format!("num_taps too large for i32: {e}")))?
             * config.hidden_size;
         let layers = (0..config.num_hidden_layers)
@@ -411,6 +411,32 @@ impl DFlashDrafter {
     /// Create an empty per-layer KV cache for the drafter.
     pub fn make_cache(&self) -> Vec<Option<(Array, Array)>> {
         vec![None; self.layers.len()]
+    }
+
+    /// Initialize all `QLinear` weights to zero at the correct shapes.
+    /// Only for tests — `QLinear` (unlike `nn::Linear`) starts with [1] placeholders.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    pub fn init_test_weights(&mut self) {
+        use mlx_rs::module::Param;
+        let h = self.config.hidden_size;
+        let n_heads = self.config.num_attention_heads;
+        let n_kv = self.config.num_key_value_heads;
+        let hd = self.config.head_dim;
+        let inter = self.config.intermediate_size;
+        let fc_in = i32::try_from(self.config.num_taps()).unwrap_or(1) * h;
+        let qo = n_heads * hd;
+        let kv = n_kv * hd;
+        for layer in &mut self.layers {
+            layer.self_attn.q_proj.weight = Param::new(Array::zeros::<f32>(&[qo, h]).unwrap());
+            layer.self_attn.k_proj.weight = Param::new(Array::zeros::<f32>(&[kv, h]).unwrap());
+            layer.self_attn.v_proj.weight = Param::new(Array::zeros::<f32>(&[kv, h]).unwrap());
+            layer.self_attn.o_proj.weight = Param::new(Array::zeros::<f32>(&[h, qo]).unwrap());
+            layer.mlp.gate_proj.weight = Param::new(Array::zeros::<f32>(&[inter, h]).unwrap());
+            layer.mlp.up_proj.weight = Param::new(Array::zeros::<f32>(&[inter, h]).unwrap());
+            layer.mlp.down_proj.weight = Param::new(Array::zeros::<f32>(&[h, inter]).unwrap());
+        }
+        self.fc.weight = Param::new(Array::zeros::<f32>(&[h, fc_in]).unwrap());
     }
 
     /// Run the drafter forward pass.
@@ -590,7 +616,7 @@ pub fn accept_prefix(draft: &[u32], verify_argmax: &[u32]) -> Vec<u32> {
 // surface.
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::as_conversions, clippy::indexing_slicing)]
 mod tests {
     use super::accept_prefix;
 
@@ -657,12 +683,16 @@ mod tests {
                 "full_attention".to_owned(),
             ]),
             sliding_window: Some(4),
+            quantization: None,
             dflash_config: DFlashSubConfig {
                 target_layer_ids: vec![0],
                 mask_token_id: Some(1),
             },
         };
         let mut drafter = DFlashDrafter::new(config).unwrap();
+        // QLinear (unlike nn::Linear) starts with [1] placeholder weights.
+        // Initialize them to zero at the correct shapes so forward() works.
+        drafter.init_test_weights();
         let mut cache = drafter.make_cache();
 
         let ctx_len = 2i32; // context positions added per round

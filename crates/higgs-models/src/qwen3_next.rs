@@ -6661,21 +6661,19 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
 /// the direct loader. Otherwise try the fused loader; if it reports a mixed-bit
 /// `in_proj_ba` shape mismatch, rebuild the model with separate projections and
 /// retry via the direct loader.
-/// Re-quantize Dense (bf16) GDN `in_proj_a`/`in_proj_b` QLinears to 8-bit
-/// affine at load time. Walks the model tree, finds Dense QLinears in GDN
+/// Re-quantize Dense (bf16) GDN `in_proj_a`/`in_proj_b` `QLinears` to 8-bit
+/// affine at load time. Walks the model tree, finds Dense `QLinears` in GDN
 /// layers, calls `ops::quantize(weight, 64, 8)` and swaps the params + mode.
 ///
-/// Returns the number of QLinears requantized.
+/// Returns the number of `QLinears` requantized.
 fn requant_dense_gdn_to_8bit(model: &mut Qwen3NextCausalLM) -> Result<usize, ModelError> {
     let mut count = 0usize;
     for layer in &mut model.model.layers {
         if let Some(ref mut gdn) = layer.linear_attn {
-            for ql_opt in [&mut gdn.in_proj_a, &mut gdn.in_proj_b] {
-                if let Some(ql) = ql_opt {
-                    if ql.mode.is_dense() {
-                        requant_one_to_8bit(ql)?;
-                        count += 1;
-                    }
+            for ql in [&mut gdn.in_proj_a, &mut gdn.in_proj_b].into_iter().flatten() {
+                if ql.mode.is_dense() {
+                    requant_one_to_8bit(ql)?;
+                    count += 1;
                 }
             }
         }
@@ -6683,7 +6681,7 @@ fn requant_dense_gdn_to_8bit(model: &mut Qwen3NextCausalLM) -> Result<usize, Mod
     Ok(count)
 }
 
-/// Quantize a single Dense QLinear's bf16 weight to 8-bit affine in-place.
+/// Quantize a single Dense `QLinear`'s bf16 weight to 8-bit affine in-place.
 fn requant_one_to_8bit(ql: &mut QLinear) -> Result<(), ModelError> {
     let (wq, scales, biases) = ops::quantize(&ql.weight, 64, 8)
         .map_err(ModelError::Mlx)?;
