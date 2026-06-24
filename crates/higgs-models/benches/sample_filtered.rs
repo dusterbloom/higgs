@@ -61,6 +61,7 @@ fn bench_sample_filtered(c: &mut Criterion) {
                 frequency_penalty: None,
                 presence_penalty: None,
                 speculation: higgs_models::Speculation::Auto,
+                thinking_budget: None,
             };
             let label = format!(
                 "{vocab_label}/top_k={}",

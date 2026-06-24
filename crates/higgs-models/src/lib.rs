@@ -102,6 +102,9 @@ pub struct SamplingParams {
     pub presence_penalty: Option<f32>,
     /// Per-request speculative-decoding method (defaults to [`Speculation::Auto`]).
     pub speculation: Speculation,
+    /// Max tokens of `<think>` reasoning before `</think>` is force-closed.
+    /// `None` falls back to the engine's default budget.
+    pub thinking_budget: Option<u32>,
 }
 
 impl Default for SamplingParams {
@@ -115,6 +118,7 @@ impl Default for SamplingParams {
             frequency_penalty: None,
             presence_penalty: None,
             speculation: Speculation::Auto,
+            thinking_budget: None,
         }
     }
 }

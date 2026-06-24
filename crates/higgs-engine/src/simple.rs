@@ -37,6 +37,8 @@ use crate::{
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 const DEFAULT_PAGED_KV_BLOCK_SIZE: usize = 64;
+/// Default `<think>` budget (tokens) when a request omits `reasoning_budget`.
+const DEFAULT_THINKING_BUDGET: u32 = 256;
 
 /// Acquire a `Mutex` lock, recovering from poison by reusing the inner data.
 /// Used in this crate to keep session-management methods infallible while
@@ -351,7 +353,18 @@ impl SimpleEngine {
             tracing::warn!("No chat template found; /v1/chat/completions will be unavailable");
         }
 
-        let eos_token_ids = extract_eos_tokens(model_dir);
+        // Some Qwen checkpoints (e.g. VibeThinker-3B) list only `<|endoftext|>`
+        // in `eos_token_id`, but the chat template ends every turn with
+        // `<|im_end|>`. Resolve the turn terminator from the tokenizer itself so
+        // chat generation stops instead of running to max_tokens.
+        let im_end_id = single_special_token_id(&tokenizer, "<|im_end|>");
+        let base_eos = extract_eos_tokens(model_dir);
+        if let Some(id) = im_end_id {
+            if !base_eos.contains(&id) {
+                tracing::info!(im_end = id, "Added <|im_end|> to EOS tokens from tokenizer");
+            }
+        }
+        let eos_token_ids = with_chat_terminator(base_eos, im_end_id);
 
         // Control tokens that must never surface in decoded text (EOS + the
         // `<|…|>` chat-control delimiters + classic sentinels). Shared via `Arc`
@@ -1157,6 +1170,7 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
+        let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
         // DFlash speculative decoding: use the draft-verify loop when a drafter
         // is loaded, the request allows it (`speculation` = auto/dflash), no
         // constraints active, and no multimodal input.
@@ -1255,6 +1269,7 @@ impl SimpleEngine {
                 &mut tokens,
                 stop_sequences,
                 enable_thinking,
+                thinking_budget,
             );
         }
 
@@ -1280,6 +1295,7 @@ impl SimpleEngine {
                 &mut tokens,
                 stop_sequences,
                 enable_thinking,
+                thinking_budget,
             );
         }
 
@@ -1315,7 +1331,6 @@ impl SimpleEngine {
         let mut step_count: u32 = 0;
 
         // Thinking budget: force </think> after N tokens if model hasn't closed it.
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -1378,11 +1393,11 @@ impl SimpleEngine {
                         seen_think_close = true;
                     } else {
                         thinking_tokens += 1;
-                        if thinking_tokens >= THINKING_BUDGET {
+                        if thinking_tokens >= thinking_budget {
                             token_id = close_id;
                             seen_think_close = true;
                             tracing::info!(
-                                budget = THINKING_BUDGET,
+                                budget = thinking_budget,
                                 "Thinking budget reached, forcing </think>"
                             );
                         }
@@ -1484,7 +1499,7 @@ impl SimpleEngine {
 
             // If thinking budget was just reached, override the pipelined token
             // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == THINKING_BUDGET {
+            if seen_think_close && thinking_tokens == thinking_budget {
                 if let Some(close_id) = think_close_token {
                     next_token = Array::from_slice(&[close_id], &[1]);
                 }
@@ -2073,6 +2088,7 @@ impl SimpleEngine {
         tokens: &mut Vec<u32>,
         stop_sequences: &[String],
         enable_thinking: bool,
+        thinking_budget: u32,
     ) -> Result<GenerationOutput, EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
         let unchecked_lookup = unchecked_prompt_lookup_enabled();
@@ -2091,7 +2107,6 @@ impl SimpleEngine {
         let mut stats = crate::mtp::MtpStats::default();
         let t_start = std::time::Instant::now();
 
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -2142,11 +2157,11 @@ impl SimpleEngine {
                             seen_think_close = true;
                         } else {
                             thinking_tokens += 1;
-                            if thinking_tokens >= THINKING_BUDGET {
+                            if thinking_tokens >= thinking_budget {
                                 tokens.push(close_id);
                                 seen_think_close = true;
                                 tracing::info!(
-                                    budget = THINKING_BUDGET,
+                                    budget = thinking_budget,
                                     "Prompt lookup: thinking budget reached, forcing </think>"
                                 );
                                 if self.eos_token_ids.contains(&close_id) {
@@ -2266,6 +2281,7 @@ impl SimpleEngine {
         tokens: &mut Vec<u32>,
         stop_sequences: &[String],
         enable_thinking: bool,
+        thinking_budget: u32,
     ) -> Result<GenerationOutput, EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
 
@@ -2303,7 +2319,6 @@ impl SimpleEngine {
         let t_start = std::time::Instant::now();
 
         // Thinking budget: force </think> after N tokens if model hasn't closed it.
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -2378,11 +2393,11 @@ impl SimpleEngine {
                             seen_think_close = true;
                         } else {
                             thinking_tokens += 1;
-                            if thinking_tokens >= THINKING_BUDGET {
+                            if thinking_tokens >= thinking_budget {
                                 tokens.push(close_id);
                                 seen_think_close = true;
                                 tracing::info!(
-                                    budget = THINKING_BUDGET,
+                                    budget = thinking_budget,
                                     "MTP: thinking budget reached, forcing </think>"
                                 );
                                 if self.eos_token_ids.contains(&close_id) {
@@ -2506,6 +2521,7 @@ impl SimpleEngine {
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         mut detok: IncrementalDetok,
         enable_thinking: bool,
+        thinking_budget: u32,
     ) -> Result<(), EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
 
@@ -2541,7 +2557,6 @@ impl SimpleEngine {
         let hybrid_prompt_lookup_config = prompt_lookup_config();
         let t_start = std::time::Instant::now();
 
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -2615,11 +2630,11 @@ impl SimpleEngine {
                             seen_think_close = true;
                         } else {
                             thinking_tokens += 1;
-                            if thinking_tokens >= THINKING_BUDGET {
+                            if thinking_tokens >= thinking_budget {
                                 tokens.push(close_id);
                                 seen_think_close = true;
                                 tracing::info!(
-                                    budget = THINKING_BUDGET,
+                                    budget = thinking_budget,
                                     "MTP streaming: thinking budget reached, forcing </think>"
                                 );
 
@@ -2869,6 +2884,7 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
+        let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
         // DFlash streaming: branch BEFORE the normal prefill — the DFlash loop
         // runs its own tap-prefill, so dispatching here (mirroring the
         // non-streaming site) avoids a double prefill. Logprobs requests fall
@@ -3042,11 +3058,11 @@ impl SimpleEngine {
                 sender,
                 detok,
                 enable_thinking,
+                thinking_budget,
             );
         }
 
         // Thinking budget (streaming): force </think> after N tokens.
-        const THINKING_BUDGET: u32 = 256;
         let think_close_token = if enable_thinking {
             self.think_close_token
         } else {
@@ -3118,11 +3134,11 @@ impl SimpleEngine {
                         seen_think_close = true;
                     } else {
                         thinking_tokens += 1;
-                        if thinking_tokens >= THINKING_BUDGET {
+                        if thinking_tokens >= thinking_budget {
                             token_id = close_id;
                             seen_think_close = true;
                             tracing::info!(
-                                budget = THINKING_BUDGET,
+                                budget = thinking_budget,
                                 "Thinking budget reached, forcing </think>"
                             );
                         }
@@ -3197,7 +3213,7 @@ impl SimpleEngine {
 
             // If thinking budget was just reached, override the pipelined token
             // so the next decode step gets </think> as input.
-            if seen_think_close && thinking_tokens == THINKING_BUDGET {
+            if seen_think_close && thinking_tokens == thinking_budget {
                 if let Some(close_id) = think_close_token {
                     next_token = Array::from_slice(&[close_id], &[1]);
                 }
@@ -3436,6 +3452,30 @@ pub(crate) fn derive_model_name(model_dir: &Path) -> String {
 }
 
 /// Extract EOS token IDs from config.json.
+/// Resolve a special token (e.g. `<|im_end|>`) to its single vocab id via the
+/// tokenizer, or `None` if it does not encode to exactly one token.
+fn single_special_token_id(tokenizer: &Tokenizer, token: &str) -> Option<u32> {
+    tokenizer
+        .encode(token, false)
+        .ok()
+        .and_then(|enc| match enc.get_ids() {
+            [single] => Some(*single),
+            _ => None,
+        })
+}
+
+/// Merge the chat turn terminator (`<|im_end|>`) into the config-derived EOS set,
+/// deduped. Qwen checkpoints that already list it are unaffected; non-Qwen models
+/// (`terminator == None`) pass through unchanged.
+fn with_chat_terminator(mut eos: Vec<u32>, terminator: Option<u32>) -> Vec<u32> {
+    if let Some(id) = terminator {
+        if !eos.contains(&id) {
+            eos.push(id);
+        }
+    }
+    eos
+}
+
 pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
     let config_path = model_dir.join("config.json");
     let config_str = match std::fs::read_to_string(&config_path) {
@@ -3816,6 +3856,7 @@ mod tests {
         IncrementalDetok, SimpleEngine, Tokenizer, adaptive_draft_depth_for_cap,
         check_stop_sequences, derive_model_name, detect_thinking_support, estimate_paged_kv_blocks,
         extract_eos_tokens, find_stop_in_tail, lock_or_recover, parse_enabled_flag,
+        with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use higgs_models::SamplingParams;
@@ -4642,6 +4683,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path(), json);
         super::extract_eos_tokens(dir.path())
+    }
+
+    #[test]
+    fn test_with_chat_terminator() {
+        // VibeThinker case: config lists only <|endoftext|>; tokenizer adds <|im_end|>.
+        assert_eq!(
+            with_chat_terminator(vec![151643], Some(151645)),
+            vec![151643, 151645]
+        );
+        // Already present (Qwen3.5/3.6): no duplicate.
+        assert_eq!(
+            with_chat_terminator(vec![151643, 151645], Some(151645)),
+            vec![151643, 151645]
+        );
+        // Non-Qwen model with no <|im_end|>: unchanged.
+        assert_eq!(with_chat_terminator(vec![2], None), vec![2]);
     }
 
     #[test]

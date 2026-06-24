@@ -57,6 +57,24 @@ pub struct ChatCompletionRequest {
     /// Optional Higgs extension naming a disk prefix-cache checkpoint to load/store.
     #[serde(default)]
     pub checkpoint_id: Option<String>,
+    /// Max `<think>` tokens before `</think>` is force-closed (de-facto local
+    /// extension; sent by clients like nanobot's `/thinking N`). `None` falls
+    /// back to the engine default budget.
+    #[serde(default)]
+    pub reasoning_budget: Option<u32>,
+    /// Jinja chat-template kwargs (vLLM/Qwen convention). Only
+    /// `enable_thinking` is honored: it overrides per-request whether the model
+    /// reasons.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+/// Subset of `chat_template_kwargs` that Higgs acts on.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatTemplateKwargs {
+    /// Per-request override for the model's reasoning mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
 }
 
 /// Optional request-level controls for streaming responses.

@@ -306,6 +306,7 @@ fn build_sampling_params(req: &CompletionRequest) -> SamplingParams {
         // Legacy text-completion endpoint: speculation method stays at the
         // load-time default (DFlash if a drafter is loaded, else MTP).
         speculation: higgs_models::Speculation::Auto,
+        thinking_budget: None,
     }
 }
 

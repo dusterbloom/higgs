@@ -245,6 +245,7 @@ async fn create_message_non_streaming(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
         None,
+        None,
     );
 
     let prompt_tokens = engine
@@ -338,6 +339,7 @@ fn create_message_stream(
     let thinking_enabled = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
+        None,
         None,
     );
 
@@ -544,6 +546,7 @@ pub async fn count_tokens(
             let thinking_enabled = crate::reasoning::effective_thinking_enabled(
                 engine.enable_thinking(),
                 &[engine.model_name(), model_name.as_str()],
+                None,
                 None,
             );
 

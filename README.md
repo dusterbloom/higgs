@@ -207,6 +207,26 @@ Measured on DeepSeek-V2-Lite-4bit with global batch sorting before `gather_qmm`.
 - Metrics: `/metrics`
 - Health: `/health`
 
+### Reasoning / thinking budget
+
+For thinking-capable models, `/v1/chat/completions` accepts two extra body fields
+(additive, OpenAI clients ignore them):
+
+- **`reasoning_budget`** (int) — max `<think>` tokens before `</think>` is
+  force-closed. Omitted → engine default (256). Sent by clients like nanobot's
+  `/thinking N`.
+- **`chat_template_kwargs.enable_thinking`** (bool) — per-request override of the
+  model's reasoning mode; wins over `reasoning.effort`. `false` forces reasoning
+  off; `true` enables it on a thinking-capable model.
+
+```bash
+curl http://localhost:8000/v1/chat/completions -d '{
+  "model": "active", "messages": [{"role":"user","content":"hi"}],
+  "reasoning_budget": 1024,
+  "chat_template_kwargs": {"enable_thinking": true}
+}'
+```
+
 ### Runtime model management
 
 By default the set of loaded models is fixed at startup. To add or remove models

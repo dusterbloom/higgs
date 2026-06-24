@@ -274,6 +274,9 @@ async fn chat_completions_non_streaming(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
         req.reasoning.as_ref(),
+        req.chat_template_kwargs
+            .as_ref()
+            .and_then(|k| k.enable_thinking),
     );
 
     let mut prompt_tokens = engine
@@ -348,7 +351,16 @@ async fn chat_completions_non_streaming(
         };
         (raw_text, reasoning_result.reasoning)
     } else {
-        (output_text, None)
+        // Model-emitted reasoning (e.g. VibeThinker writes its own
+        // `<think>...</think>`): parse it out without the prompt-injection
+        // prepend used for template-opened thinking. No-op when absent, so it
+        // matches the streaming path's `new()` tracker for every model.
+        let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&output_text);
+        if reasoning_result.reasoning.is_some() {
+            (reasoning_result.text, reasoning_result.reasoning)
+        } else {
+            (output_text, None)
+        }
     };
 
     let (content, tool_calls, finish_reason) = if has_tools {
@@ -455,6 +467,9 @@ fn chat_completions_stream(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
         req.reasoning.as_ref(),
+        req.chat_template_kwargs
+            .as_ref()
+            .and_then(|k| k.enable_thinking),
     );
 
     // Pass tools into prompt rendering so the chat template emits the
@@ -863,6 +878,7 @@ fn build_sampling_params(req: &ChatCompletionRequest) -> Result<SamplingParams, 
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
         speculation,
+        thinking_budget: req.reasoning_budget,
     })
 }
 
