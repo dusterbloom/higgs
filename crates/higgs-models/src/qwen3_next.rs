@@ -6463,7 +6463,10 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
 
     // Dense GDN projections can't be fused into in_proj_ba (no scales to
     // concatenate). Force separate projections when any Dense override exists.
-    if args.quantization_overrides.values().any(|qc| qc.mode.is_dense()) {
+    // BUT: when 8-bit requant is enabled, Dense a/b become Affine at load time,
+    // making fused projections viable (2 dispatches instead of 4 per GDN layer).
+    let will_requant_8bit = std::env::var("HIGGS_DENSE_REQUANT_8BIT").is_ok();
+    if args.quantization_overrides.values().any(|qc| qc.mode.is_dense()) && !will_requant_8bit {
         args.use_separate_gdn_projections = true;
     }
 
@@ -6706,11 +6709,18 @@ fn requant_dense_gdn_to_8bit(model: &mut Qwen3NextCausalLM) -> Result<usize, Mod
     let mut count = 0usize;
     for layer in &mut model.model.layers {
         if let Some(ref mut gdn) = layer.linear_attn {
+            // Handle separate projections (in_proj_a, in_proj_b)
             for ql in [&mut gdn.in_proj_a, &mut gdn.in_proj_b].into_iter().flatten() {
                 if ql.mode.is_dense() {
                     requant_one_to_8bit(ql)?;
                     count += 1;
                 }
+            }
+            // Handle fused projection (in_proj_ba) — when GDN uses fused mode,
+            // a+b are concatenated into a single QLinear.
+            if gdn.in_proj_ba.mode.is_dense() {
+                requant_one_to_8bit(&mut gdn.in_proj_ba)?;
+                count += 1;
             }
         }
     }
