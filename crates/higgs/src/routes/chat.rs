@@ -313,63 +313,47 @@ async fn chat_completions_non_streaming(
     let has_tools = tools.is_some();
 
     if let Some(sid) = session_id {
-        // Build the token sequence to feed `generate_continued`. The engine's
-        // guard prefills only the suffix IFF the retained cache's tokens are a
-        // strict token-prefix of what we pass; otherwise it does a clean full
-        // prefill. We therefore must hand it `retained ++ delta`, where `delta`
-        // is ONLY the genuinely-new content appended since the retained point.
+        // Build the token sequence fed to `generate_continued`. The engine guard
+        // prefills only the suffix IFF the retained tokens are a strict token-
+        // prefix of what we pass, so we hand it `retained ++ delta`.
         //
-        // The delta is computed in TEXT space, anchored on the retained tokens'
-        // own detokenization — never by re-tokenizing the assistant's prior
-        // reply. BPE detok->retok is not round-trip stable, so the model's
-        // generated tokens differ from the re-tokenized reply text; matching on
-        // re-tokenized text diverges at the assistant turn and the guard
-        // rejects the continuation. Decoding the retained tokens (special tokens
-        // preserved) and diffing against the freshly-rendered conversation
-        // string keeps the cached prefix byte-exact.
-        let continued_prompt = match engine.retained_session_tokens(sid) {
-            Some(retained) => {
-                // Detok the retained tokens with special tokens PRESERVED so the
-                // result byte-matches the rendered conversation framing
-                // (`<|im_start|>`, `<|im_end|>`, `<think>`, ...).
-                let retained_text = engine.tokenizer().decode(&retained, false).map_err(|e| {
-                    ServerError::Engine(higgs_engine::error::EngineError::Tokenization(
-                        e.to_string(),
-                    ))
-                })?;
-                // The full rendered conversation STRING for this request — the
-                // same text `prepare_chat_prompt_with_thinking` would tokenize.
-                let full_text = engine
-                    .render_chat_prompt_with_thinking(&messages, tools, thinking_enabled)
-                    .map_err(ServerError::Engine)?;
-
-                if let Some(delta_text) = full_text.strip_prefix(&retained_text) {
-                    // Genuine continuation: append only the new content's tokens
-                    // to the retained tokens verbatim. `retained` is then a
-                    // trivial prefix, so the engine prefills only `delta_tokens`.
-                    let delta_tokens = engine
-                        .tokenizer()
-                        .encode(delta_text, false)
-                        .map_err(|e| {
-                            ServerError::Engine(higgs_engine::error::EngineError::Tokenization(
-                                e.to_string(),
-                            ))
-                        })?
-                        .get_ids()
-                        .to_vec();
-                    let mut combined = retained;
-                    combined.extend_from_slice(&delta_tokens);
-                    combined
-                } else {
-                    // Client edited/diverged the history: the retained prefix is
-                    // no longer a textual prefix of this conversation. Fall back
-                    // to a clean full prefill (the engine guard will also reject
-                    // and re-prefill); correctness over cache reuse.
-                    prompt_tokens.clone()
-                }
-            }
-            // First turn / evicted: full prefill, which retains the cache.
-            None => prompt_tokens.clone(),
+        // `retained` carries the `<think>...</think>` block the chat template
+        // injects for the assistant turn answering the *latest* query (it was the
+        // current turn when generated). The canonical multi-turn render STRIPS
+        // `<think>` from historical assistant turns (template `last_query_index`
+        // logic), so `retained` is never a literal prefix of the freshly-rendered
+        // conversation. We match a think-stripped copy of `retained` against the
+        // full render to find the new-turn delta, then append that delta to the
+        // ORIGINAL `retained` tokens: the mid-sequence think block is valid KV, so
+        // `retained` stays a strict token-prefix and the guard continues, prefilling
+        // only the delta.
+        //
+        // ponytail: assumes `<think>..</think>` delimiters (Qwen3.x family); any
+        // other template just fails the strip_prefix and falls back to a clean full
+        // prefill. A thinking-on continuation keeps the prior turn's reasoning
+        // resident (a fresh render would drop it) — acceptable for the tool loop.
+        let continued_prompt = 'cont: {
+            let Some(retained) = engine.retained_session_tokens(sid) else {
+                break 'cont prompt_tokens.clone(); // first turn / evicted -> full prefill
+            };
+            let (Ok(retained_text), Ok(full_text)) = (
+                engine.tokenizer().decode(&retained, false),
+                engine.render_chat_prompt_with_thinking(&messages, tools, thinking_enabled),
+            ) else {
+                break 'cont prompt_tokens.clone();
+            };
+            let normalized = strip_think_blocks(&retained_text);
+            let Some(delta_text) = full_text.strip_prefix(normalized.as_str()) else {
+                // History diverged (edited reply, evicted cache, or a template we
+                // don't recognise) -> clean full prefill. Correctness over reuse.
+                break 'cont prompt_tokens.clone();
+            };
+            let Ok(delta_enc) = engine.tokenizer().encode(delta_text, false) else {
+                break 'cont prompt_tokens.clone();
+            };
+            let mut combined = retained;
+            combined.extend_from_slice(delta_enc.get_ids());
+            combined
         };
 
         let sampling_c = sampling.clone();
@@ -498,6 +482,31 @@ async fn chat_completions_non_streaming(
             total_tokens: output.prompt_tokens + output.completion_tokens,
         },
     })
+}
+
+/// Remove `<think>...</think>` blocks — and the single `\n\n` the chat template
+/// emits after each — from a rendered prompt string. Used by the cache-resident
+/// continuation path to reconcile a retained KV's detokenization (which carries
+/// the per-turn think injection) with the canonical multi-turn render (which
+/// strips think from historical turns), so the retained prefix can be matched.
+fn strip_think_blocks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(rest.get(..start).unwrap_or(""));
+        let after_open = rest.get(start..).unwrap_or("");
+        if let Some(close) = after_open.find("</think>") {
+            let resume_at = start + close + "</think>".len();
+            let tail = rest.get(resume_at..).unwrap_or("");
+            rest = tail.strip_prefix("\n\n").unwrap_or(tail);
+        } else {
+            out.push_str(after_open);
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Map a [`SessionGeneration`] (cache-resident continued turn) onto the same
@@ -1131,6 +1140,31 @@ fn current_unix_timestamp() -> i64 {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_think_blocks_removes_injection_and_real_reasoning() {
+        // Empty no-think injection right after the assistant open.
+        let noinjected = "<|im_start|>assistant\n<think>\n\n</think>\n\nParis.<|im_end|>";
+        assert_eq!(
+            strip_think_blocks(noinjected),
+            "<|im_start|>assistant\nParis.<|im_end|>"
+        );
+        // A real reasoning block is removed too (historical turns drop it).
+        let reasoned = "a<think>\nlots of\nreasoning\n</think>\n\nanswer";
+        assert_eq!(strip_think_blocks(reasoned), "aanswer");
+        // Multiple blocks (multi-turn) all go.
+        assert_eq!(
+            strip_think_blocks("<think>\n\n</think>\n\nX y <think>\nz\n</think>\n\nW"),
+            "X y W"
+        );
+        // No think block: identity.
+        assert_eq!(strip_think_blocks("plain text"), "plain text");
+        // Unterminated block: keep the remainder verbatim (don't lose data).
+        assert_eq!(
+            strip_think_blocks("keep<think>dangling"),
+            "keep<think>dangling"
+        );
+    }
 
     fn simple_message(role: &str, content: Option<&str>) -> ChatCompletionMessage {
         ChatCompletionMessage {

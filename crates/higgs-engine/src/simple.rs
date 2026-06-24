@@ -1059,6 +1059,15 @@ impl SimpleEngine {
         drop(model);
         let mut full = prompt_tokens.to_vec();
         full.extend_from_slice(&generated);
+        // The predicted stop token has no KV in the cache — it was the final
+        // prediction and was never fed back through `decode_step` — and it is not
+        // part of the conversation. Drop it so the retained tokens align 1:1 with
+        // the cache and end at the turn boundary; a continuation then resumes with
+        // the next turn's framing instead of after a mid-sequence EOS (which never
+        // matches the freshly-rendered conversation, forcing a full re-prefill).
+        if full.last().is_some_and(|t| self.eos_token_ids.contains(t)) {
+            full.pop();
+        }
         self.stash_retained(session_id, cache, full);
 
         tracing::info!(
