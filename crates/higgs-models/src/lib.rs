@@ -8,6 +8,7 @@ pub mod gemma4;
 pub mod llava_qwen2;
 /// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
 mod metal_kernel;
+pub mod mlx_exec;
 pub mod phi3;
 pub mod progress;
 pub mod qwen3_moe;
@@ -25,9 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::mlx_exec::eval;
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::transforms::eval;
 use mlx_rs::{Array, argmax_axis, array, categorical, error::Exception};
 use serde::Deserialize;
 use serde_json::Value;
@@ -177,7 +178,7 @@ impl AnyCache {
         if targets.is_empty() {
             return Ok(());
         }
-        mlx_rs::transforms::eval(targets)
+        crate::mlx_exec::eval(targets)
     }
 
     /// Prune the token span `[a, b)` from every dense KV layer, compacting

@@ -9,6 +9,7 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
     turboquant::KvCacheConfig,
@@ -16,7 +17,6 @@ use higgs_models::{
 use mlx_rs::{
     Array, Dtype, Stream,
     ops::indexing::{IndexOp, NewAxis},
-    transforms::{async_eval, eval},
     with_new_default_stream,
 };
 use tokenizers::Tokenizer;
@@ -298,6 +298,12 @@ struct PreparedGeneration<'a> {
     prompt_array: Array,
     prompt_len: u32,
     pixel_values: Option<Array>,
+    /// Process-global MLX-execution gate, held for the whole prefill + decode +
+    /// stash scope. This is the single sanctioned acquisition that makes every
+    /// `eval` / `async_eval` on this path pass the gate's `debug_assert`. Declared
+    /// last so it is dropped *after* the model guard — the gate is released only
+    /// once no more eval can occur on this generation.
+    _mlx_gate: higgs_models::mlx_exec::MlxExecToken,
 }
 
 /// Result of [`SimpleEngine::generate_with_prune`], carrying the sweep metrics
@@ -772,6 +778,10 @@ impl SimpleEngine {
             .lock()
             .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
 
+        // Acquire the MLX-execution gate the moment we own the model, before any
+        // forward/eval. Held via PreparedGeneration for the entire generation.
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+
         let (actual_prompt_tokens, cache) = if let Some(matched) = prefix_match {
             tracing::debug!(
                 prefix_len = matched.prefix_len,
@@ -812,6 +822,7 @@ impl SimpleEngine {
             prompt_array,
             prompt_len,
             pixel_values,
+            _mlx_gate: mlx_gate,
         })
     }
 
@@ -1002,6 +1013,10 @@ impl SimpleEngine {
                 .model
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+            // Same single sanctioned MLX-gate acquisition as prepare_generation —
+            // the continuation path builds PreparedGeneration by hand, so it must
+            // take the gate too or its eval would fire the off-gate assert.
+            let mlx_gate = higgs_models::mlx_exec::acquire();
             let prepared = PreparedGeneration {
                 model,
                 cache,
@@ -1009,6 +1024,7 @@ impl SimpleEngine {
                 prompt_array,
                 prompt_len: total,
                 pixel_values: None,
+                _mlx_gate: mlx_gate,
             };
             (prepared, prefilled, true)
         } else {
@@ -1054,7 +1070,10 @@ impl SimpleEngine {
         // from racing the next request's forward pass; `stash_retained` then only
         // publishes the already-evaluated cache.
         let PreparedGeneration {
-            mut cache, model, ..
+            mut cache,
+            model,
+            _mlx_gate: mlx_gate,
+            ..
         } = prepared;
         match cache.quantize_for_retention(self.kv_cache_config) {
             Ok(layers) if layers > 0 => tracing::debug!(
@@ -1073,7 +1092,9 @@ impl SimpleEngine {
         if let Err(e) = cache.eval() {
             tracing::warn!(session_id, error = %e, "Failed to eval retained cache before stash");
         }
+        // Release model lock and MLX gate together, only after the last eval.
         drop(model);
+        drop(mlx_gate);
         let mut full = prompt_tokens.to_vec();
         full.extend_from_slice(&generated);
         // The predicted stop token has no KV in the cache — it was the final
@@ -1369,6 +1390,8 @@ impl SimpleEngine {
                 .model
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+            // Gate MLX eval for the embed forward (held until end of this block).
+            let _mlx_gate = higgs_models::mlx_exec::acquire();
             let mut cache = model
                 .make_cache_with_config(self.kv_cache_config)
                 .map_err(EngineError::Mlx)?;

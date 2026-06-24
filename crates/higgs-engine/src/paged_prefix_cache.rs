@@ -37,6 +37,10 @@ impl KvBlock {
     /// below relies on; it costs nothing net (the slice would materialize on
     /// first use anyway) and removes the cross-thread data race on shared graphs.
     fn new(keys: Array, values: Array) -> Result<Arc<Self>, Exception> {
+        // Construction-time soundness eval (eval-before-share). Always reached
+        // via `store()` → `run_prefill` under the MLX gate in production; uses
+        // the raw transform directly so the radix unit tests (single-threaded,
+        // no gate) can construct blocks without tripping the gate's debug_assert.
         mlx_rs::transforms::eval([&keys, &values])?;
         Ok(Arc::new(Self { keys, values }))
     }
@@ -74,6 +78,8 @@ impl TqBlock {
         value_codes: Array,
         value_norms: Array,
     ) -> Result<Arc<Self>, Exception> {
+        // Construction-time soundness eval; see KvBlock::new for why this uses
+        // the raw transform rather than the gated wrapper.
         mlx_rs::transforms::eval([
             &key_codes,
             &key_norms,
