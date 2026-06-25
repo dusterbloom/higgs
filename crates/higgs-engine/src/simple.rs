@@ -257,6 +257,14 @@ pub struct SimpleEngine {
     /// Retained per-conversation live KV caches for cache-resident multi-turn
     /// tool loops (suffix-only prefill across tool hops). Keyed by session id.
     retained: Mutex<std::collections::HashMap<u64, RetainedKv>>,
+    /// Per-`session_id` serialization locks, held for the whole duration of a
+    /// `generate_continued` call so two concurrent requests for the same
+    /// conversation can never interleave their take/generate/stash of the
+    /// retained cache — the second queues behind the first and then continues
+    /// from its result (or full-prefills if it diverged). Pruned in
+    /// `evict_idle_retained`. Distinct sessions do not contend on this lock; they
+    /// still serialize on the model lock for GPU work.
+    session_locks: Mutex<std::collections::HashMap<u64, std::sync::Arc<Mutex<()>>>>,
     tokenizer: Tokenizer,
     template: Option<ChatTemplateRenderer>,
     model_name: String,
@@ -535,6 +543,7 @@ impl SimpleEngine {
             scheduler: Mutex::new(RoundRobinScheduler::new()),
             sessions: Mutex::new(std::collections::HashMap::new()),
             retained: Mutex::new(std::collections::HashMap::new()),
+            session_locks: Mutex::new(std::collections::HashMap::new()),
             tokenizer,
             template,
             model_name,
@@ -596,7 +605,14 @@ impl SimpleEngine {
         let mut map = lock_or_recover(&self.retained);
         let before = map.len();
         map.retain(|_, kept| kept.last_used.elapsed() < ttl);
-        before.saturating_sub(map.len())
+        let dropped = before.saturating_sub(map.len());
+        drop(map);
+        // Drop per-session locks no longer referenced by any in-flight request
+        // (strong_count == 1 ⇒ only this map holds the Arc). Bounds the lock map
+        // so a long-lived server doesn't accumulate one entry per distinct id.
+        lock_or_recover(&self.session_locks)
+            .retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
+        dropped
     }
 
     /// Look up the retained cache for `session_id` whose tokens are a prefix of
@@ -1029,6 +1045,22 @@ impl SimpleEngine {
         max_tokens: u32,
         params: &SamplingParams,
     ) -> Result<SessionGeneration, EngineError> {
+        // Serialize all work for this conversation: hold the per-session lock for
+        // the entire call so a second concurrent request for the same session_id
+        // queues here and only proceeds once this one has stashed its result
+        // (it then continues from that result, or full-prefills if it diverged).
+        // Acquired BEFORE the model lock — the global order is session -> model,
+        // so this can never deadlock. The map lock itself is released immediately;
+        // only the per-session lock is held across the body.
+        let session_lock = std::sync::Arc::clone(
+            lock_or_recover(&self.session_locks)
+                .entry(session_id)
+                .or_default(),
+        );
+        let _session_guard = session_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let total = u32::try_from(prompt_tokens.len())
             .map_err(|_| EngineError::Generation("prompt too long".to_owned()))?;
 
@@ -3556,6 +3588,16 @@ mod tests {
         assert_eq!(continuation_prior_len(&[], &[1, 2]), None);
         // Retained longer than the new prompt → not a prefix.
         assert_eq!(continuation_prior_len(&[1, 2, 3, 4], &[1, 2]), None);
+        // session_id collision: a DIFFERENT conversation reuses the same id and
+        // shares no prefix → clean fallback, never wrong reuse.
+        assert_eq!(continuation_prior_len(&[1, 2, 3], &[7, 8, 9, 10]), None);
+        // History edited at the very first token → fallback.
+        assert_eq!(continuation_prior_len(&[1, 2, 3], &[9, 2, 3, 4]), None);
+        // A genuine prefix is accepted even across a collision — and that is
+        // SOUND: a retained cache is always paired with its exact tokens, so
+        // reuse is only ever offered when those tokens really do lead the new
+        // prompt; the reconstructed KV therefore always matches the sequence.
+        assert_eq!(continuation_prior_len(&[5, 6], &[5, 6, 7]), Some(2));
     }
 
     /// Write a config.json file into the given directory with the provided JSON content.
