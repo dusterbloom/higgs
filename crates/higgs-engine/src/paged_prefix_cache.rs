@@ -320,8 +320,13 @@ impl RadixNode {
             .as_ref()
             .filter(|cs| match &cs.data {
                 CachedData::Cloned(_) => depth > 0,
+                // Filter on the BLOCK-token sum we actually report as prefix_len
+                // (and can reconstruct), not the raw edge depth. After a
+                // non-block-aligned ancestor split these differ, and gating on
+                // raw `depth` could "match" an endpoint whose block_depth is 0 —
+                // returning an empty (prefix_len == 0) reconstruction.
                 CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => {
-                    depth >= min_prefix
+                    block_depth >= min_prefix
                 }
             })
             .map(|cs| MatchResult {
@@ -1371,6 +1376,8 @@ fn gather_tq_blocks(
     clippy::as_conversions,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
     clippy::identity_op,
     clippy::suboptimal_flops,
     clippy::doc_markdown,
@@ -1963,6 +1970,169 @@ mod tests {
         // The shared blocks came from seq_a (stored first); reconstruction of
         // the first 64 tokens must byte-match seq_a's stored KV.
         assert_keys_eq_first_n(&cache_keys(&result.cache, 0), &expected, 64);
+    }
+
+    /// Deterministic KV content as a PURE function of (token value, position,
+    /// layer, head, dim). Because it depends on the token VALUE, two prefixes
+    /// that share tokens share content (so block dedup is invisible to the
+    /// check), while a wrong-block reuse or an offset shift yields different
+    /// content — exactly the corruption a fuzzer must catch.
+    fn token_val(token: u32, t: usize, layer: usize, h: usize, d: usize) -> f32 {
+        (token as f32).mul_add(
+            31.0,
+            (t as f32) * 7.0 + (layer as f32) * 1_000_000.0 + (h as f32) * 100.0 + d as f32,
+        )
+    }
+
+    fn make_kv_from_tokens(num_layers: usize, tokens: &[u32]) -> AnyCache {
+        let s = tokens.len();
+        let layers: Vec<Option<SteppingKeyValueCache>> = (0..num_layers)
+            .map(|layer| {
+                let mut data = vec![0.0_f32; 2 * s * 8];
+                for h in 0..2 {
+                    for (t, &tok) in tokens.iter().enumerate() {
+                        for d in 0..8 {
+                            data[((h * s) + t) * 8 + d] = token_val(tok, t, layer, h, d);
+                        }
+                    }
+                }
+                let keys = Array::from_slice(&data, &[1, 2, s as i32, 8]);
+                let values = Array::from_slice(&data, &[1, 2, s as i32, 8]);
+                Some(SteppingKeyValueCache::from_arrays(keys, values).unwrap())
+            })
+            .collect();
+        AnyCache::KV(layers)
+    }
+
+    /// Tiny deterministic xorshift64 PRNG (seed must be non-zero) — keeps the
+    /// fuzzer reproducible without a `rand` dev-dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    /// Fuzz the radix trie: thousands of randomized store/query/clear ops over a
+    /// small shared-prefix alphabet, asserting after every op that
+    ///   1. every reconstruction is byte-identical to the content implied by the
+    ///      query's tokens (catches wrong-block reuse AND offset shifts),
+    ///   2. `prefix_len` is block-aligned and within the query,
+    ///   3. the LRU entry cap holds,
+    ///   4. `clear()` frees every block, and
+    ///   5. stored blocks never explode past the live bound (leak guard).
+    ///
+    /// Pure-Rust trie logic over small synthetic MLX arrays — no model/GPU. loom
+    /// is intentionally not used: it cannot model the MLX FFI buffers the blocks
+    /// hold; the `Send + Sync` soundness invariant plus
+    /// `radix_blocks_reconstruct_serialized_across_threads` cover the concurrency
+    /// contract.
+    #[test]
+    fn fuzz_radix_random_ops_reconstruct_and_stay_bounded() {
+        const BLOCK: usize = 4;
+        const LAYERS: usize = 2;
+        const MAX_ENTRIES: usize = 6;
+        const ALPHABET: u64 = 5;
+        const MAX_LEN: u64 = 20;
+        let block_cap = MAX_ENTRIES * (MAX_LEN as usize / BLOCK);
+
+        for seed in [0x1234_5678_u64, 0x9E37_79B9, 0xDEAD_BEEF, 0x0BAD_F00D] {
+            let mut rng = Rng(seed);
+            let mut cache = PagedPrefixCache::new(MAX_ENTRIES, BLOCK);
+            let mut recent: Vec<Vec<u32>> = Vec::new();
+
+            for _ in 0..700 {
+                match rng.below(10) {
+                    0 => {
+                        cache.clear();
+                        assert!(cache.is_empty());
+                        assert!(
+                            cache.layer0_block_stats().is_empty(),
+                            "clear must free every block"
+                        );
+                        recent.clear();
+                    }
+                    1..=4 => {
+                        let len = 1 + rng.below(MAX_LEN) as usize;
+                        let toks: Vec<u32> = (0..len).map(|_| rng.below(ALPHABET) as u32).collect();
+                        cache.store(&toks, &make_kv_from_tokens(LAYERS, &toks));
+                        recent.push(toks);
+                        if recent.len() > 32 {
+                            recent.remove(0);
+                        }
+                    }
+                    _ => {
+                        let q: Vec<u32> = if !recent.is_empty() && rng.below(4) != 0 {
+                            recent[rng.below(recent.len() as u64) as usize].clone()
+                        } else {
+                            let len = 1 + rng.below(MAX_LEN) as usize;
+                            (0..len).map(|_| rng.below(ALPHABET) as u32).collect()
+                        };
+                        if let Some(m) = cache.find_longest_prefix(&q) {
+                            // A reported match must be a real, non-empty prefix of
+                            // the query. (Block-paged matches are block-aligned and
+                            // >= BLOCK; a sub-block KV cache is stored as a Cloned
+                            // endpoint and reused at its exact, shorter length —
+                            // both are valid, but prefix_len must never be 0, the
+                            // empty-match bug this fuzzer caught.)
+                            assert!(
+                                m.prefix_len >= 1 && m.prefix_len <= q.len(),
+                                "prefix_len {} out of range for query len {} (seed {seed:#x})",
+                                m.prefix_len,
+                                q.len()
+                            );
+                            // The contract: prefix_len equals the reconstructed
+                            // cache's actual token count.
+                            assert_eq!(
+                                kv_cache_offset(&m.cache) as usize,
+                                m.prefix_len,
+                                "offset != prefix_len (seed {seed:#x}, q {q:?}, prefix_len {})",
+                                m.prefix_len
+                            );
+                            let expected = make_kv_from_tokens(LAYERS, &q[..m.prefix_len]);
+                            let AnyCache::KV(rec) = &m.cache else {
+                                panic!("expected KV reconstruction");
+                            };
+                            assert_eq!(
+                                rec.len(),
+                                LAYERS,
+                                "reconstruction changed layer count (seed {seed:#x}, q {q:?})"
+                            );
+                            for (layer, rl) in rec.iter().enumerate() {
+                                let rk = rl.as_ref().and_then(|c| c.keys());
+                                assert!(
+                                    rk.is_some(),
+                                    "reconstructed layer {layer} missing keys: seed={seed:#x} q={q:?} prefix_len={} offset={}",
+                                    m.prefix_len,
+                                    kv_cache_offset(&m.cache),
+                                );
+                                assert_keys_eq_first_n(
+                                    rk.unwrap(),
+                                    &cache_keys(&expected, layer),
+                                    m.prefix_len as i32,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                assert!(cache.len() <= MAX_ENTRIES, "LRU entry cap exceeded");
+                let stats = cache.layer0_block_stats();
+                assert!(
+                    stats.iter().all(|&(_, c)| c >= 1),
+                    "every stored block must have strong_count >= 1"
+                );
+                assert!(stats.len() <= block_cap, "stored-block explosion (leak)");
+            }
+        }
     }
 
     /// Concurrency contract for the radix block cache. Blocks are `Arc`-shared
