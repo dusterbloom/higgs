@@ -558,6 +558,18 @@ impl SimpleEngine {
         lock_or_recover(&self.retained).len()
     }
 
+    /// Number of stored prefixes in the radix prefix cache. Observability hook
+    /// (and a test seam for proving prefix reuse actually happened).
+    pub fn prefix_cache_len(&self) -> usize {
+        lock_or_recover(&self.prefix_cache).len()
+    }
+
+    /// Drop every entry in the radix prefix cache, forcing the next generation
+    /// to prefill densely from scratch. Lets a caller establish a cold baseline.
+    pub fn clear_prefix_cache(&self) {
+        lock_or_recover(&self.prefix_cache).clear();
+    }
+
     /// The exact token sequence the retained KV cache for `session_id` covers
     /// (prompt + generated), or `None` if nothing is retained. This is the
     /// ground truth the continuation guard ([`continuation_prior_len`]) matches
@@ -913,16 +925,33 @@ impl SimpleEngine {
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            // Strip generation prompt suffix so multi-turn conversations
-            // share their common history prefix. The suffix tokens
-            // (`<|im_start|>assistant\n<think>\n`) change between turns.
-            let cache_key = prompt_tokens
-                .get(
-                    ..prompt_tokens
-                        .len()
-                        .saturating_sub(self.gen_prompt_suffix_len),
-                )
-                .unwrap_or(prompt_tokens);
+            // Dense KV caches block-page, so stripping the generation-prompt
+            // suffix lets multi-turn conversations share their common history
+            // prefix (the suffix tokens `<|im_start|>assistant\n<think>\n` change
+            // between turns) — block-aligned reconstruction stays exact.
+            //
+            // Hybrid (GDN/SSM) caches are stored as a whole CLONE, not paged: a
+            // GDN cache's sequential state cannot be truncated to a shorter
+            // (suffix-stripped) prefix without corrupting it (mlx-lm #980). If we
+            // keyed a hybrid clone at the stripped length, a later partial match
+            // would reuse a clone whose offset (full prompt) exceeds the matched
+            // prefix_len — carrying the previous turn's stale gen-suffix KV and
+            // shifting the suffix's RoPE positions, which silently diverges from a
+            // cold prefill. So key hybrid clones at their FULL prefilled length:
+            // reuse then only fires on a genuine full-prefix match (offset ==
+            // prefix_len) and is exact. (Cross-turn hybrid reuse is handled by the
+            // per-session retained cache instead.)
+            let cache_key = if matches!(prepared.cache, AnyCache::Hybrid(_)) {
+                prompt_tokens
+            } else {
+                prompt_tokens
+                    .get(
+                        ..prompt_tokens
+                            .len()
+                            .saturating_sub(self.gen_prompt_suffix_len),
+                    )
+                    .unwrap_or(prompt_tokens)
+            };
             pc.store(cache_key, &prepared.cache);
         }
         maybe_clear_mlx_cache(
