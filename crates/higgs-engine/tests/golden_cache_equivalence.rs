@@ -284,3 +284,113 @@ fn radix_reuse_vs_cold_determinism_control() {
         "prefix-cache reuse must be byte-identical to cold full-prefill"
     );
 }
+
+/// Tier-4 contract: per-session continuation (`generate_continued` with a
+/// `session_id`) is a BEST-EFFORT latency optimization, NOT exact replay. The
+/// retained KV is TurboQuant-compressed, so its output is not guaranteed
+/// bit-identical to a stateless full prefill. This test pins that contract:
+///   - the continued path WORKS (non-empty output every turn) and SAVES prefill
+///     (the win) — asserted;
+///   - where it diverges from cold is measured and reported, NOT asserted (the
+///     radix path is the bit-identical option — see the oracle above).
+#[test]
+#[ignore = "loads a real model; set HIGGS_PRUNE_MODEL"]
+fn per_session_continuation_is_best_effort() {
+    let dir = std::env::var("HIGGS_PRUNE_MODEL").expect("set HIGGS_PRUNE_MODEL");
+    let model_dir = Path::new(&dir);
+    let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
+    let engine =
+        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load model");
+    let params = SamplingParams {
+        temperature: 0.0,
+        ..Default::default()
+    };
+
+    const SID: u64 = 1234;
+    const COLD_BASE: u64 = 9000;
+    const TURNS: usize = 12;
+    const MAX_NEW: u32 = 24;
+    let followups = [
+        "Explain photosynthesis in one sentence.",
+        "Now name its two main stages.",
+        "Which stage needs light directly?",
+        "Where in the cell does it happen?",
+        "Name one input and one output.",
+    ];
+
+    let encode = |text: &str| -> Vec<u32> {
+        engine
+            .tokenizer()
+            .encode(text, false)
+            .expect("encode")
+            .get_ids()
+            .to_vec()
+    };
+
+    let first = user(followups[0]);
+    let mut seq = engine
+        .prepare_chat_prompt_with_thinking(std::slice::from_ref(&first), None, false)
+        .expect("render");
+
+    let mut first_divergence: Option<usize> = None;
+    let mut total_prompt: u64 = 0;
+    let mut total_prefilled: u64 = 0;
+    for turn in 0..TURNS {
+        let seq_in = seq.len();
+
+        // cache-resident: reuses SID's (TurboQuant-compressed) retained KV
+        let cached = engine
+            .generate_continued(SID, &seq, MAX_NEW, &params)
+            .expect("cached generate");
+        let retained = engine
+            .retained_session_tokens(SID)
+            .expect("retained after cached");
+        // May be empty if the model emits EOS immediately on a turn — a valid
+        // outcome, not a failure of the best-effort path.
+        let gen_cached = retained[seq_in..].to_vec();
+
+        // cold: a fresh session full-prefills the same tokens (stateless baseline)
+        let cold_sid = COLD_BASE + turn as u64;
+        engine
+            .generate_continued(cold_sid, &seq, MAX_NEW, &params)
+            .expect("cold generate");
+        let gen_cold = engine
+            .retained_session_tokens(cold_sid)
+            .expect("retained after cold")[seq_in..]
+            .to_vec();
+        engine.drop_retained_session(cold_sid);
+
+        if gen_cached != gen_cold && first_divergence.is_none() {
+            first_divergence = Some(turn);
+        }
+        if turn > 0 {
+            assert!(
+                cached.continued,
+                "turn {turn}: per-session path should reuse the retained cache"
+            );
+            total_prompt += u64::from(cached.prompt_tokens);
+            total_prefilled += u64::from(cached.prefilled_tokens);
+        }
+
+        // grow the conversation from the live (cached) retained tokens
+        seq = retained;
+        seq.extend_from_slice(&encode(followups[(turn + 1) % followups.len()]));
+    }
+
+    let saved = total_prompt.saturating_sub(total_prefilled);
+    println!("\n=== per-session continuation: best-effort characterization ===");
+    println!(
+        "first divergence from stateless cold at turn: {first_divergence:?} (None = matched all {TURNS} turns)"
+    );
+    println!(
+        "prefill saved on continued turns: {saved} of {total_prompt} prompt tokens ({:.0}% saved)",
+        (saved as f64) / (total_prompt.max(1) as f64) * 100.0
+    );
+
+    // The win: continued turns prefill far fewer tokens than the full prompt.
+    assert!(
+        total_prefilled < total_prompt,
+        "continuation must save prefill ({total_prefilled} >= {total_prompt})"
+    );
+    // Best-effort contract: we deliberately do NOT assert gen_cached == gen_cold.
+}

@@ -428,6 +428,9 @@ pub struct SessionGeneration {
     /// `prompt_tokens`.
     pub prefilled_tokens: u32,
     /// Whether a retained cache was reused (true) or a clean prefill ran (false).
+    /// A `true` is a best-effort latency win, NOT an exact-replay guarantee: the
+    /// reused KV is TurboQuant-compressed, so the turn's output may differ
+    /// slightly from a stateless full prefill (see `generate_continued`).
     pub continued: bool,
 }
 
@@ -1072,6 +1075,20 @@ impl SimpleEngine {
     /// it falls back to a clean full prefill (the [`take_continuable`] guard) and
     /// retains the resulting cache; on a continuation it reuses the live cache.
     /// Greedy plain sequential decode (no MTP/prompt-lookup for now).
+    ///
+    /// # Best-effort: output is approximate, not bit-identical
+    ///
+    /// This per-session path is a **latency optimization, not an exact-replay
+    /// guarantee**. A continued turn's output can differ slightly from a stateless
+    /// full prefill of the same conversation, because (1) the retained KV is
+    /// TurboQuant-compressed for between-turn storage (`quantize_for_retention`),
+    /// which is lossy, and (2) the continuation prompt is reconciled in text space
+    /// (decode the retained tokens, strip `<think>` blocks, re-match the prefix),
+    /// which can diverge from a cleanly-rendered stateless prompt.
+    ///
+    /// For **bit-identical** reuse, omit `session_id`: the radix prefix cache on
+    /// the normal generate path reconstructs dense KV exactly (proven
+    /// token-for-token in `tests/golden_cache_equivalence.rs`).
     ///
     /// [`take_continuable`]: Self::take_continuable
     pub fn generate_continued(

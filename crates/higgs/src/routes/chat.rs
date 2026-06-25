@@ -304,6 +304,12 @@ async fn chat_completions_non_streaming(
     // we never reach this branch for them because `retained`/`generate_continued`
     // degrade cleanly. Images and constrained decoding are not supported by the
     // continued path, so fall back to the normal generation when present.
+    //
+    // BEST-EFFORT, not exact replay: the retained KV is TurboQuant-compressed
+    // (lossy) and the prompt is reconciled in text space below, so a continued
+    // turn may differ slightly from a stateless full prefill. Clients needing
+    // bit-identical output should omit `session_id` — the radix prefix cache on
+    // the normal path is exact. See `SimpleEngine::generate_continued`.
     let session_id = req
         .session_id
         .filter(|_| pixel_values.is_none() && constraint.is_none());

@@ -192,6 +192,7 @@ That means Higgs supports:
 - `higgs doctor` and server startup now reject unsupported `batch=true` combinations instead of silently degrading.
 - `[local].raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
 - Source builds on macOS require `mlx.metallib`. Higgs restores it from Cargo build output when possible and fails startup if it still cannot be resolved.
+- The `session_id` chat-request field opts a conversation into cache-resident multi-turn reuse (prefill only the new turn instead of the whole history). It is a **best-effort latency optimization, not exact replay** — the retained KV is TurboQuant-compressed, so a continued turn's output may differ slightly from a stateless full prefill. Omit `session_id` for bit-identical output; the radix prefix cache on the normal path reuses dense KV exactly. Per-conversation KV is bounded by the `kv_max_sessions` / `kv_max_session_tokens` / `kv_retained_idle_secs` model settings above.
 
 ## Shell Integration
 
