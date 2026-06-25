@@ -11,7 +11,8 @@
     clippy::expect_used,
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::unusual_byte_groupings
+    clippy::unusual_byte_groupings,
+    clippy::disallowed_methods
 )]
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};

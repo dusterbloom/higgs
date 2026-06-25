@@ -28,6 +28,19 @@
 //! a release build still serializes correctly as long as callers acquire the
 //! token. The assert + the test suite (run in debug) exist to make a *future*
 //! off-gate eval impossible to merge silently.
+//!
+//! # Release-mode policy
+//!
+//! In `--release` the `debug_assert` is gone, so safety rests on two pillars:
+//! 1. the gate `Mutex`, which serializes evaluation in *every* build; and
+//! 2. a workspace `clippy.toml` `disallowed-methods` ban on raw
+//!    `mlx_rs::transforms::eval` / `async_eval` (clippy runs with `-Dwarnings`),
+//!    so a *new* off-gate eval fails the build instead of slipping in.
+//!
+//! That compile-time ban is strictly stronger than a runtime release check would
+//! be — it stops the bug before it ships — so we deliberately do NOT add a
+//! release-only assertion feature. If one is ever wanted, gate the
+//! `debug_assert` behind a `mlx-exec-checks` cfg and run it in a release CI job.
 
 use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard};
@@ -86,6 +99,7 @@ pub fn held() -> bool {
 ///
 /// # Panics
 /// In debug builds, if called without a live [`MlxExecToken`] on this thread.
+#[allow(clippy::disallowed_methods)] // this IS the sanctioned wrapper; it must call the raw transform
 pub fn eval<'a, T>(outputs: T) -> Result<(), Exception>
 where
     T: IntoIterator<Item = &'a Array>,
@@ -102,6 +116,7 @@ where
 ///
 /// # Panics
 /// In debug builds, if called without a live [`MlxExecToken`] on this thread.
+#[allow(clippy::disallowed_methods)] // this IS the sanctioned wrapper; it must call the raw transform
 pub fn async_eval<'a, T>(outputs: T) -> Result<(), Exception>
 where
     T: IntoIterator<Item = &'a Array>,
@@ -119,7 +134,8 @@ where
     clippy::expect_used,
     clippy::as_conversions,
     clippy::cast_precision_loss,
-    clippy::shadow_reuse
+    clippy::shadow_reuse,
+    clippy::disallowed_methods
 )]
 mod tests {
     use std::sync::Arc;

@@ -36,6 +36,7 @@ impl KvBlock {
     /// graph. Evaluating here is the soundness invariant the `unsafe impl Sync`
     /// below relies on; it costs nothing net (the slice would materialize on
     /// first use anyway) and removes the cross-thread data race on shared graphs.
+    #[allow(clippy::disallowed_methods)] // eval-before-share soundness; on-gate in prod, off-gate only in single-threaded radix tests
     fn new(keys: Array, values: Array) -> Result<Arc<Self>, Exception> {
         // Construction-time soundness eval (eval-before-share). Always reached
         // via `store()` → `run_prefill` under the MLX gate in production; uses
@@ -71,6 +72,7 @@ struct TqBlock {
 impl TqBlock {
     /// Build a `TurboQuant` block with all 5 arrays EVALUATED — same soundness
     /// invariant as [`KvBlock::new`]: shared across threads, so never lazy.
+    #[allow(clippy::disallowed_methods)] // eval-before-share soundness (see KvBlock::new)
     fn new(
         key_codes: Array,
         key_norms: Array,
@@ -1371,7 +1373,8 @@ fn gather_tq_blocks(
     clippy::cast_precision_loss,
     clippy::identity_op,
     clippy::suboptimal_flops,
-    clippy::doc_markdown
+    clippy::doc_markdown,
+    clippy::disallowed_methods
 )]
 mod tests {
     use super::*;
@@ -1546,6 +1549,115 @@ mod tests {
             }
             AnyCache::KV(_) => panic!("Expected Hybrid cache"),
         }
+    }
+
+    /// Hybrid (GDN/SSM + KV) caches are deliberately NOT block-paged: GDN
+    /// sequential state cannot be split at a block boundary without corrupting
+    /// attention (the failure mlx-lm #980 reports as "hybrid + paging is
+    /// impossible"). higgs sidesteps it by storing the whole cache as a clone.
+    ///
+    /// This test pins that decision two ways:
+    ///   (1) `slice_into_blocks` on a hybrid returns the `Cloned` endpoint with
+    ///       no blocks — the moment someone makes hybrid block-paged, this fails;
+    ///   (2) the clone round-trips GDN state (`conv_state`/`ssm_state`) and KV
+    ///       byte-identically over a non-block-aligned length (65 tokens), proving
+    ///       reconstruction is exact and length-agnostic (a paged path would
+    ///       realign to 64 and drop the GDN state).
+    /// A future change that *correctly* enables hybrid paging must keep this green.
+    #[test]
+    fn test_hybrid_cache_is_cloned_not_paged_and_byte_identical() {
+        // array_eq over the whole array, by value (respects strided slice views).
+        let arrays_equal = |a: &Array, b: &Array| -> bool {
+            a.array_eq(b, None)
+                .unwrap()
+                .all(None)
+                .unwrap()
+                .item::<bool>()
+        };
+
+        // Distinct, non-zero content so byte-identity is meaningful, not vacuous.
+        let conv = Array::from_slice(
+            &(0..16).map(|x| x as f32 + 1.0).collect::<Vec<_>>(),
+            &[1, 4, 4],
+        );
+        let ssm = Array::from_slice(
+            &(0..16)
+                .map(|x| (x as f32).mul_add(0.5, -3.0))
+                .collect::<Vec<_>>(),
+            &[1, 16],
+        );
+        let seq: i32 = 65; // intentionally NOT a multiple of DEFAULT_BLOCK_SIZE
+        let n = (2 * seq * 8) as usize;
+        let keys = Array::from_slice(
+            &(0..n).map(|x| x as f32 * 0.01).collect::<Vec<_>>(),
+            &[1, 2, seq, 8],
+        );
+        let values = Array::from_slice(
+            &(0..n).map(|x| x as f32 * -0.02).collect::<Vec<_>>(),
+            &[1, 2, seq, 8],
+        );
+
+        let hybrid = AnyCache::Hybrid(vec![
+            Some(LayerCache::Arrays(ArraysCache {
+                conv_state: Some(conv.clone()),
+                ssm_state: Some(ssm.clone()),
+                conv_pos: 3,
+                offset: seq,
+            })),
+            Some(LayerCache::KV(
+                SteppingKeyValueCache::from_arrays(keys.clone(), values.clone()).unwrap(),
+            )),
+        ]);
+
+        // (1) Invariant: hybrid is stored as a CLONE, never sliced into blocks.
+        let prepared = slice_into_blocks(&hybrid, DEFAULT_BLOCK_SIZE, seq as usize).unwrap();
+        assert!(
+            prepared.blocks.is_none(),
+            "hybrid must NOT be sliced into blocks (GDN state can't split at a boundary)"
+        );
+        assert!(
+            matches!(prepared.endpoint, CachedData::Cloned(_)),
+            "hybrid endpoint must be Cloned — the deliberate mlx-lm #980 avoidance"
+        );
+
+        // (2) Byte-identity: store -> retrieve reconstructs GDN state + KV exactly,
+        // for the full non-block-aligned length.
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let prefix: Vec<u32> = (0..seq as u32).collect();
+        cache.store(&prefix, &hybrid);
+        let mut query = prefix.clone();
+        query.push(999);
+        let matched = cache
+            .find_longest_prefix(&query)
+            .expect("hybrid clone must be retrievable");
+
+        let AnyCache::Hybrid(layers) = &matched.cache else {
+            panic!("expected hybrid cache");
+        };
+        let Some(LayerCache::Arrays(ac)) = layers[0].as_ref() else {
+            panic!("layer 0 must be GDN");
+        };
+        assert!(
+            arrays_equal(ac.conv_state.as_ref().unwrap(), &conv),
+            "conv_state must round-trip byte-identically"
+        );
+        assert!(
+            arrays_equal(ac.ssm_state.as_ref().unwrap(), &ssm),
+            "ssm_state must round-trip byte-identically"
+        );
+        assert_eq!(ac.conv_pos, 3, "conv_pos must survive the clone");
+        assert_eq!(ac.offset, seq, "offset must survive the clone");
+        let Some(LayerCache::KV(kv)) = layers[1].as_ref() else {
+            panic!("layer 1 must be KV");
+        };
+        assert!(
+            arrays_equal(kv.keys().unwrap(), &keys),
+            "KV keys must round-trip byte-identically"
+        );
+        assert!(
+            arrays_equal(kv.values().unwrap(), &values),
+            "KV values must round-trip byte-identically"
+        );
     }
 
     #[test]

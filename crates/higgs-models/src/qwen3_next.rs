@@ -1,4 +1,9 @@
 #![allow(clippy::items_after_test_module)]
+// Model forward passes call raw `mlx_rs::transforms::eval`; they are only ever
+// run by the engine while it holds the MLX gate, so they are structurally
+// on-gate. The clippy `disallowed-methods` ban stays active across engine/
+// server code, where an off-gate eval would be the real hazard. See clippy.toml.
+#![allow(clippy::disallowed_methods)]
 
 //! Qwen3-Coder-Next model implementation.
 //!
