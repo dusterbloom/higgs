@@ -7,6 +7,7 @@
 )]
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use higgs_models::mlx_exec::{async_eval, eval};
@@ -68,12 +69,12 @@ fn stash_into(
     tokens: Vec<u32>,
     max_sessions: usize,
     max_session_tokens: usize,
-) {
+) -> usize {
     if max_session_tokens > 0 && tokens.len() > max_session_tokens {
         // Too large to retain — also forget any prior smaller cache for this id
-        // so it can't linger past the cap.
+        // so it can't linger past the cap. Not counted as an eviction.
         map.remove(&session_id);
-        return;
+        return 0;
     }
     map.insert(
         session_id,
@@ -84,6 +85,7 @@ fn stash_into(
         },
     );
     let cap = max_sessions.max(1);
+    let mut evicted = 0;
     while map.len() > cap {
         let oldest = map
             .iter()
@@ -92,10 +94,12 @@ fn stash_into(
         match oldest {
             Some(id) => {
                 map.remove(&id);
+                evicted += 1;
             }
             None => break,
         }
     }
+    evicted
 }
 
 /// Drop retained caches idle longer than `ttl`; returns how many were removed.
@@ -293,6 +297,36 @@ pub struct Session {
     pub max_tokens: usize,
 }
 
+/// Cumulative cache-effectiveness counters (lock-free), surfaced via
+/// [`SimpleEngine::cache_stats`] for observability.
+#[derive(Default)]
+struct CacheMetrics {
+    radix_lookups: AtomicU64,
+    radix_hits: AtomicU64,
+    prefill_saved_tokens: AtomicU64,
+    continuations: AtomicU64,
+    sessions_evicted: AtomicU64,
+}
+
+/// Snapshot of cache effectiveness for the `/metrics` endpoint.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheStats {
+    /// Radix prefix-cache lookups on the normal generate path.
+    pub radix_lookups: u64,
+    /// Radix prefix-cache hits (a stored prefix was reused).
+    pub radix_hits: u64,
+    /// Prompt tokens NOT re-prefilled thanks to reuse (radix + continuation).
+    pub prefill_saved_tokens: u64,
+    /// Per-session continuations (a retained cache was reused).
+    pub continuations: u64,
+    /// Retained sessions evicted (count cap + idle TTL).
+    pub sessions_evicted: u64,
+    /// Currently retained per-session caches.
+    pub retained_sessions: usize,
+    /// Currently stored radix prefixes.
+    pub radix_entries: usize,
+}
+
 /// Simple single-request inference engine with paged KV caching.
 ///
 /// Uses paged KV cache for efficient memory management during single-request
@@ -318,6 +352,8 @@ pub struct SimpleEngine {
     /// `evict_idle_retained`. Distinct sessions do not contend on this lock; they
     /// still serialize on the model lock for GPU work.
     session_locks: Mutex<std::collections::HashMap<u64, std::sync::Arc<Mutex<()>>>>,
+    /// Cumulative cache-effectiveness counters (observability only).
+    cache_metrics: CacheMetrics,
     tokenizer: Tokenizer,
     template: Option<ChatTemplateRenderer>,
     model_name: String,
@@ -600,6 +636,7 @@ impl SimpleEngine {
             sessions: Mutex::new(std::collections::HashMap::new()),
             retained: Mutex::new(std::collections::HashMap::new()),
             session_locks: Mutex::new(std::collections::HashMap::new()),
+            cache_metrics: CacheMetrics::default(),
             tokenizer,
             template,
             model_name,
@@ -621,6 +658,23 @@ impl SimpleEngine {
     /// Number of conversations holding a retained live KV cache.
     pub fn retained_session_count(&self) -> usize {
         lock_or_recover(&self.retained).len()
+    }
+
+    /// Snapshot of cache effectiveness (hit rate, prefill saved, evictions,
+    /// resident sizes) for observability / the `/metrics` endpoint.
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            radix_lookups: self.cache_metrics.radix_lookups.load(Ordering::Relaxed),
+            radix_hits: self.cache_metrics.radix_hits.load(Ordering::Relaxed),
+            prefill_saved_tokens: self
+                .cache_metrics
+                .prefill_saved_tokens
+                .load(Ordering::Relaxed),
+            continuations: self.cache_metrics.continuations.load(Ordering::Relaxed),
+            sessions_evicted: self.cache_metrics.sessions_evicted.load(Ordering::Relaxed),
+            retained_sessions: self.retained_session_count(),
+            radix_entries: self.prefix_cache_len(),
+        }
     }
 
     /// Number of stored prefixes in the radix prefix cache. Observability hook
@@ -659,6 +713,11 @@ impl SimpleEngine {
     /// periodically (and `generate_continued` will also enforce a count cap).
     pub fn evict_idle_retained(&self, ttl: std::time::Duration) -> usize {
         let dropped = evict_idle_from(&mut lock_or_recover(&self.retained), ttl);
+        if dropped > 0 {
+            self.cache_metrics
+                .sessions_evicted
+                .fetch_add(u64::try_from(dropped).unwrap_or(0), Ordering::Relaxed);
+        }
         // Drop per-session locks no longer referenced by any in-flight request
         // (strong_count == 1 ⇒ only this map holds the Arc). Bounds the lock map
         // so a long-lived server doesn't accumulate one entry per distinct id.
@@ -705,7 +764,7 @@ impl SimpleEngine {
     /// all GPU work must stay serialized under the model lock, which this
     /// function does not hold.
     fn stash_retained(&self, session_id: u64, cache: AnyCache, tokens: Vec<u32>) {
-        stash_into(
+        let evicted = stash_into(
             &mut lock_or_recover(&self.retained),
             session_id,
             cache,
@@ -713,6 +772,11 @@ impl SimpleEngine {
             self.kv_cache_config.max_retained_sessions,
             self.kv_cache_config.max_session_tokens,
         );
+        if evicted > 0 {
+            self.cache_metrics
+                .sessions_evicted
+                .fetch_add(u64::try_from(evicted).unwrap_or(0), Ordering::Relaxed);
+        }
     }
 
     /// Get a reference to the tokenizer.
@@ -839,6 +903,25 @@ impl SimpleEngine {
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
             pc.find_longest_prefix(prompt_tokens)
         };
+        if !has_images {
+            self.cache_metrics
+                .radix_lookups
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(ref m) = prefix_match {
+                debug_assert!(
+                    m.prefix_len <= prompt_tokens.len(),
+                    "radix prefix_len {} exceeds prompt length {}",
+                    m.prefix_len,
+                    prompt_tokens.len()
+                );
+                self.cache_metrics
+                    .radix_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                self.cache_metrics
+                    .prefill_saved_tokens
+                    .fetch_add(u64::try_from(m.prefix_len).unwrap_or(0), Ordering::Relaxed);
+            }
+        }
 
         let model = self
             .model
@@ -1129,6 +1212,11 @@ impl SimpleEngine {
         let (mut prepared, prefilled, continued) = if let Some((cache, prior)) =
             self.take_continuable(session_id, prompt_tokens)
         {
+            debug_assert!(
+                prior <= prompt_tokens.len(),
+                "continuation prior {prior} exceeds prompt length {}",
+                prompt_tokens.len()
+            );
             let suffix: Vec<u32> = prompt_tokens.get(prior..).unwrap_or_default().to_vec();
             let prefilled = u32::try_from(suffix.len()).unwrap_or(u32::MAX);
             let prompt_array = Array::from(suffix.as_slice()).index(NewAxis);
@@ -1155,6 +1243,16 @@ impl SimpleEngine {
             let prefilled = u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
             (prepared, prefilled, false)
         };
+
+        if continued {
+            self.cache_metrics
+                .continuations
+                .fetch_add(1, Ordering::Relaxed);
+            self.cache_metrics.prefill_saved_tokens.fetch_add(
+                u64::from(total.saturating_sub(prefilled)),
+                Ordering::Relaxed,
+            );
+        }
 
         let (current_token, _, _) =
             self.run_prefill(prompt_tokens, &mut prepared, params, None, None, false)?;
@@ -3678,6 +3776,16 @@ mod tests {
             stash_into(&mut map, sid, dummy(), vec![1, 2, 3], 2, 0);
         }
         assert_eq!(map.len(), 2, "count cap must bound retained sessions");
+
+        // stash_into reports how many sessions it LRU-evicted (for the metrics counter).
+        let mut cap_map: HashMap<u64, RetainedKv> = HashMap::new();
+        assert_eq!(stash_into(&mut cap_map, 1, dummy(), vec![1], 2, 0), 0);
+        assert_eq!(stash_into(&mut cap_map, 2, dummy(), vec![1], 2, 0), 0);
+        assert_eq!(
+            stash_into(&mut cap_map, 3, dummy(), vec![1], 2, 0),
+            1,
+            "inserting past the cap evicts exactly one"
+        );
 
         // max_sessions=0 is clamped to 1 (never retain nothing-but-evict-all).
         let mut one: HashMap<u64, RetainedKv> = HashMap::new();

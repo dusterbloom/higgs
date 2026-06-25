@@ -69,4 +69,24 @@ fn retained_count_cap_bounds_live_sessions() {
         "retained count cap holds: {} live sessions after 4 distinct conversations",
         engine.retained_session_count()
     );
+
+    // Observability (Tier-6): the stats snapshot reflects the same reality.
+    let stats = engine.cache_stats();
+    assert_eq!(
+        stats.retained_sessions, 2,
+        "cache_stats.retained_sessions matches the live count"
+    );
+    assert!(
+        stats.sessions_evicted >= 2,
+        "cache_stats reports the LRU evictions (4 sessions, cap 2): got {}",
+        stats.sessions_evicted
+    );
+    println!(
+        "cache_stats: retained={} evicted={} continuations={} radix_hits={}/{}",
+        stats.retained_sessions,
+        stats.sessions_evicted,
+        stats.continuations,
+        stats.radix_hits,
+        stats.radix_lookups
+    );
 }

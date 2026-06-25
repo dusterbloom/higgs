@@ -6,7 +6,7 @@ use higgs_engine::chat_template::ChatMessage;
 use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::MlxRuntimeTuning;
-use higgs_engine::simple::{SessionGeneration, SimpleEngine};
+use higgs_engine::simple::{CacheStats, SessionGeneration, SimpleEngine};
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
 use higgs_models::turboquant::KvCacheConfig;
@@ -179,6 +179,17 @@ impl Engine {
     pub fn retained_session_tokens(&self, session_id: u64) -> Option<Vec<u32>> {
         match self {
             Self::Simple(e) => e.retained_session_tokens(session_id),
+            Self::Batch(_) => None,
+            #[cfg(test)]
+            Self::Stub(_) => None,
+        }
+    }
+
+    /// Cache-effectiveness snapshot for observability. Only the Simple engine
+    /// has a cache-resident path; other variants report `None`.
+    pub fn cache_stats(&self) -> Option<CacheStats> {
+        match self {
+            Self::Simple(e) => Some(e.cache_stats()),
             Self::Batch(_) => None,
             #[cfg(test)]
             Self::Stub(_) => None,
