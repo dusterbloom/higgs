@@ -643,21 +643,7 @@ mod tests {
         HiggsConfig {
             models: vec![ModelConfig {
                 path: "mlx-community/Llama-3.2-1B-Instruct-4bit".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
-                draft_model: None,
-                disk_cache_enabled: false,
-                disk_cache_path: None,
-                max_disk_blocks: higgs_engine::cache::DEFAULT_MAX_DISK_BLOCKS,
-                min_tokens_to_persist: higgs_engine::cache::DEFAULT_MIN_TOKENS_TO_PERSIST,
+                ..Default::default()
             }],
             ..HiggsConfig::default()
         }

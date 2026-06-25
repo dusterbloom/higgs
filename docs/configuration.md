@@ -85,6 +85,10 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # kv_norm_correction = true
 # kv_adaptive_dense_layers = 0
 # kv_seed = 0
+# # Cache-resident multi-turn KV retention limits (bound resident KV memory):
+# kv_max_sessions = 8           # max retained conversations, LRU-evicted (>= 1)
+# kv_max_session_tokens = 0     # drop a conversation's KV past N tokens (0 = unlimited)
+# kv_retained_idle_secs = 1800  # evict KV idle longer than N seconds (0 = never)
 
 # --- Remote providers ---
 [provider.anthropic]
@@ -124,6 +128,8 @@ provider = "higgs"
 # timeout_ms = 2000
 
 # --- Metrics & dashboard ---
+# [retention] controls how long request metrics are kept for the dashboard.
+# It is NOT the KV cache retention — that is per-model (kv_retained_idle_secs above).
 [retention]
 enabled = true
 minutes = 60
@@ -188,6 +194,7 @@ That means Higgs supports:
 - `higgs doctor` and server startup now reject unsupported `batch=true` combinations instead of silently degrading.
 - `[local].raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
 - Source builds on macOS require `mlx.metallib`. Higgs restores it from Cargo build output when possible and fails startup if it still cannot be resolved.
+- The `session_id` chat-request field opts a conversation into cache-resident multi-turn reuse (prefill only the new turn instead of the whole history). It is a **best-effort latency optimization, not exact replay** — the retained KV is TurboQuant-compressed, so a continued turn's output may differ slightly from a stateless full prefill. Omit `session_id` for bit-identical output; the radix prefix cache on the normal path reuses dense KV exactly. Per-conversation KV is bounded by the `kv_max_sessions` / `kv_max_session_tokens` / `kv_retained_idle_secs` model settings above.
 
 ## Shell Integration
 

@@ -14,6 +14,26 @@ pub struct MetricsResponse {
     pub tokens_per_minute: Vec<u64>,
     pub models: Vec<MetricsGroup>,
     pub providers: Vec<MetricsGroup>,
+    pub cache: CacheMetricsView,
+}
+
+/// Cache-resident KV effectiveness, aggregated across all local engines.
+#[derive(Debug, Default, Serialize)]
+pub struct CacheMetricsView {
+    /// Radix prefix-cache lookups on the normal generate path.
+    pub radix_lookups: u64,
+    /// Radix prefix-cache hits (a stored prefix was reused).
+    pub radix_hits: u64,
+    /// Prompt tokens NOT re-prefilled thanks to reuse (radix + continuation).
+    pub prefill_saved_tokens: u64,
+    /// Per-session continuations (best-effort retained-cache reuse).
+    pub continuations: u64,
+    /// Retained sessions evicted (count cap + idle TTL).
+    pub sessions_evicted: u64,
+    /// Currently retained per-session caches.
+    pub retained_sessions: u64,
+    /// Currently stored radix prefixes.
+    pub radix_entries: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,7 +61,9 @@ pub async fn metrics(
     let Some(metrics) = state.metrics.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    Ok(Json(build_metrics_response(metrics)))
+    let mut response = build_metrics_response(metrics);
+    response.cache = aggregate_cache(&state.router);
+    Ok(Json(response))
 }
 
 fn build_metrics_response(metrics: &MetricsStore) -> MetricsResponse {
@@ -64,7 +86,25 @@ fn build_metrics_response(metrics: &MetricsStore) -> MetricsResponse {
         tokens_per_minute: MetricsStore::tokens_per_minute(&snapshot, num_buckets),
         models: build_groups(MetricsStore::group_by(&snapshot, |r| r.model.clone())),
         providers: build_groups(MetricsStore::group_by(&snapshot, |r| r.provider.clone())),
+        cache: CacheMetricsView::default(),
     }
+}
+
+/// Aggregate cache-effectiveness counters across all local engines.
+fn aggregate_cache(router: &crate::router::Router) -> CacheMetricsView {
+    let mut v = CacheMetricsView::default();
+    for engine in router.local_engines().values() {
+        if let Some(s) = engine.cache_stats() {
+            v.radix_lookups += s.radix_lookups;
+            v.radix_hits += s.radix_hits;
+            v.prefill_saved_tokens += s.prefill_saved_tokens;
+            v.continuations += s.continuations;
+            v.sessions_evicted += s.sessions_evicted;
+            v.retained_sessions += u64::try_from(s.retained_sessions).unwrap_or(0);
+            v.radix_entries += u64::try_from(s.radix_entries).unwrap_or(0);
+        }
+    }
+    v
 }
 
 fn build_groups(groups: HashMap<String, Vec<&crate::metrics::RequestRecord>>) -> Vec<MetricsGroup> {

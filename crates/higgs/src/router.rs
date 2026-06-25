@@ -273,6 +273,12 @@ impl Router {
         self.auto_router_model_name.as_deref()
     }
 
+    /// Read-locked view of all local engines (name → engine). The guard lives
+    /// only for the caller's expression; used by metrics cache aggregation.
+    pub fn local_engines(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<Engine>>> {
+        self.engines_read()
+    }
+
     // -- Private helpers ---------------------------------------------------
 
     fn engines_read(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<Engine>>> {

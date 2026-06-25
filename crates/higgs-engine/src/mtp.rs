@@ -6,11 +6,11 @@
 //!
 //! Expected speedup: ~1.5x on dense models at ~80% acceptance rate.
 
+use higgs_models::mlx_exec::eval;
 use higgs_models::{AnyCache, AnyModel, MtpCache, deep_clone_mtp_cache};
 use mlx_rs::{
     Array, argmax_axis,
     ops::{self, concatenate_axis, indexing::IndexOp},
-    transforms::eval,
 };
 
 use crate::error::EngineError;

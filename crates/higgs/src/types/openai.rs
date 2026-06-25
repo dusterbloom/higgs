@@ -67,6 +67,12 @@ pub struct ChatCompletionRequest {
     /// reasons.
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// Opt-in multi-turn KV-cache reuse. When set (non-streaming, Simple engine
+    /// only) the conversation's KV cache is retained across turns so that a
+    /// continued turn prefills only the new suffix instead of the full history.
+    /// Omitted by default — behavior is unchanged when absent.
+    #[serde(default)]
+    pub session_id: Option<u64>,
 }
 
 /// Subset of `chat_template_kwargs` that Higgs acts on.

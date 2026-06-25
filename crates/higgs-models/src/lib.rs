@@ -9,6 +9,7 @@ pub mod gemma4;
 pub mod llava_qwen2;
 /// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
 mod metal_kernel;
+pub mod mlx_exec;
 pub mod phi3;
 pub mod progress;
 pub mod qwen3_moe;
@@ -26,9 +27,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::mlx_exec::eval;
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::transforms::eval;
 use mlx_rs::{Array, argmax_axis, array, categorical, error::Exception};
 use serde::Deserialize;
 use serde_json::Value;
@@ -177,6 +178,121 @@ impl AnyCache {
                 }
             }
         }
+    }
+
+    /// Resident token count (the dense KV offset) of the first KV layer, or 0.
+    /// All KV layers advance in lockstep, so layer 0 is representative.
+    #[must_use]
+    pub fn resident_len(&self) -> i32 {
+        match self {
+            Self::KV(layers) => layers
+                .iter()
+                .flatten()
+                .next()
+                .map_or(0, cache::KeyValueCache::offset),
+            Self::Hybrid(layers) => layers
+                .iter()
+                .flatten()
+                .find_map(|l| match l {
+                    LayerCache::KV(kv) => Some(cache::KeyValueCache::offset(kv)),
+                    LayerCache::Arrays(_) => None,
+                })
+                .unwrap_or(0),
+        }
+    }
+
+    /// Force-evaluate every array this cache holds. Required before the cache is
+    /// shared across threads — e.g. stashed for a later turn that resumes on a
+    /// different blocking-pool thread, or after a lazy `quantize_for_retention`.
+    /// Sharing a pending lazy MLX graph across threads is a data race; evaluating
+    /// first makes the handoff a read-only transfer of concrete buffers. No-op
+    /// for an empty cache.
+    pub fn eval(&self) -> Result<(), Exception> {
+        let mut targets: Vec<&Array> = Vec::new();
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter().flatten() {
+                    targets.extend(layer.eval_targets());
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter().flatten() {
+                    match layer {
+                        LayerCache::KV(kv) => targets.extend(kv.eval_targets()),
+                        LayerCache::Arrays(a) => {
+                            if let Some(ref cs) = a.conv_state {
+                                targets.push(cs);
+                            }
+                            if let Some(ref ss) = a.ssm_state {
+                                targets.push(ss);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        crate::mlx_exec::eval(targets)
+    }
+
+    /// Prune the token span `[a, b)` from every dense KV layer, compacting
+    /// survivors and renumbering positions (see
+    /// [`cache::SteppingKeyValueCache::prune_span`]). Recurrent (SSM) layers are
+    /// left untouched — like [`Self::trim_by`], their state can't be sliced by
+    /// offset. Returns the first layer error, if any.
+    pub fn prune_span(&mut self, a: i32, b: i32, rope: cache::RopeShift) -> Result<(), Exception> {
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    layer.prune_span(a, b, rope)?;
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        kv.prune_span(a, b, rope)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compress every dense KV layer into `TurboQuant` storage for cheap
+    /// between-turn retention (see
+    /// [`cache::SteppingKeyValueCache::quantize_for_retention`]). Recurrent
+    /// (SSM/`Arrays`) layers are left untouched — they have no dense KV to pack.
+    ///
+    /// `config` supplies the TurboQuant bit-widths/seed for layers that were
+    /// created dense; layers already on a TurboQuant config reuse their own.
+    /// Returns the number of layers actually compressed (0 when every layer was
+    /// already TQ-active, empty, or otherwise left dense). Best-effort: a layer
+    /// that cannot be packed (e.g. non-power-of-2 `head_dim`) stays dense and is
+    /// simply not counted, so a continuation still works — just uncompressed.
+    #[allow(clippy::doc_markdown)]
+    pub fn quantize_for_retention(&mut self, config: KvCacheConfig) -> Result<usize, Exception> {
+        let mut compressed = 0usize;
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if layer.quantize_for_retention(config)? {
+                        compressed += 1;
+                    }
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        if kv.quantize_for_retention(config)? {
+                            compressed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(compressed)
     }
 
     /// An **independent** deep copy for use as a speculative-decode checkpoint.
@@ -1717,7 +1833,12 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::disallowed_methods
+)]
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
