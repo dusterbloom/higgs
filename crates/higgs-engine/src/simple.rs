@@ -56,6 +56,59 @@ fn continuation_prior_len(prior_tokens: &[u32], full: &[u32]) -> Option<usize> {
     }
 }
 
+/// Insert a retained KV cache for `session_id`, enforcing the resident-memory
+/// bounds: a per-session token cap (drop instead of retain once the
+/// conversation's KV exceeds `max_session_tokens`; `0` = unlimited) and a count
+/// cap (LRU-evict until at most `max_sessions`, clamped to >= 1). Pure map logic,
+/// so the bounds are unit-testable without loading a model.
+fn stash_into(
+    map: &mut std::collections::HashMap<u64, RetainedKv>,
+    session_id: u64,
+    cache: AnyCache,
+    tokens: Vec<u32>,
+    max_sessions: usize,
+    max_session_tokens: usize,
+) {
+    if max_session_tokens > 0 && tokens.len() > max_session_tokens {
+        // Too large to retain — also forget any prior smaller cache for this id
+        // so it can't linger past the cap.
+        map.remove(&session_id);
+        return;
+    }
+    map.insert(
+        session_id,
+        RetainedKv {
+            cache,
+            tokens,
+            last_used: std::time::Instant::now(),
+        },
+    );
+    let cap = max_sessions.max(1);
+    while map.len() > cap {
+        let oldest = map
+            .iter()
+            .min_by_key(|(_, kept)| kept.last_used)
+            .map(|(&id, _)| id);
+        match oldest {
+            Some(id) => {
+                map.remove(&id);
+            }
+            None => break,
+        }
+    }
+}
+
+/// Drop retained caches idle longer than `ttl`; returns how many were removed.
+/// Pure map logic, unit-testable without a model.
+fn evict_idle_from(
+    map: &mut std::collections::HashMap<u64, RetainedKv>,
+    ttl: std::time::Duration,
+) -> usize {
+    let before = map.len();
+    map.retain(|_, kept| kept.last_used.elapsed() < ttl);
+    before.saturating_sub(map.len())
+}
+
 fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("1" | "true" | "on" | "yes") => Some(true),
@@ -602,11 +655,7 @@ impl SimpleEngine {
     /// dropped. Retained caches pin real KV memory, so this must be called
     /// periodically (and `generate_continued` will also enforce a count cap).
     pub fn evict_idle_retained(&self, ttl: std::time::Duration) -> usize {
-        let mut map = lock_or_recover(&self.retained);
-        let before = map.len();
-        map.retain(|_, kept| kept.last_used.elapsed() < ttl);
-        let dropped = before.saturating_sub(map.len());
-        drop(map);
+        let dropped = evict_idle_from(&mut lock_or_recover(&self.retained), ttl);
         // Drop per-session locks no longer referenced by any in-flight request
         // (strong_count == 1 ⇒ only this map holds the Arc). Bounds the lock map
         // so a long-lived server doesn't accumulate one entry per distinct id.
@@ -653,27 +702,14 @@ impl SimpleEngine {
     /// all GPU work must stay serialized under the model lock, which this
     /// function does not hold.
     fn stash_retained(&self, session_id: u64, cache: AnyCache, tokens: Vec<u32>) {
-        // ponytail: small fixed cap; make it a config knob if multi-tenant.
-        const MAX_RETAINED: usize = 8;
-
-        let mut map = lock_or_recover(&self.retained);
-        map.insert(
+        stash_into(
+            &mut lock_or_recover(&self.retained),
             session_id,
-            RetainedKv {
-                cache,
-                tokens,
-                last_used: std::time::Instant::now(),
-            },
+            cache,
+            tokens,
+            self.kv_cache_config.max_retained_sessions,
+            self.kv_cache_config.max_session_tokens,
         );
-        if map.len() > MAX_RETAINED {
-            let oldest = map
-                .iter()
-                .min_by_key(|(_, kept)| kept.last_used)
-                .map(|(&id, _)| id);
-            if let Some(id) = oldest {
-                map.remove(&id);
-            }
-        }
     }
 
     /// Get a reference to the tokenizer.
@@ -1060,6 +1096,15 @@ impl SimpleEngine {
         let _session_guard = session_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Opportunistic idle eviction: free retained caches abandoned longer than
+        // the configured TTL. Cheap (bounded by max_retained_sessions) and runs
+        // on each cache-resident request, so memory is reclaimed without a
+        // background task. 0 = disabled.
+        let idle_secs = self.kv_cache_config.retained_idle_secs;
+        if idle_secs > 0 {
+            self.evict_idle_retained(std::time::Duration::from_secs(idle_secs));
+        }
 
         let total = u32::try_from(prompt_tokens.len())
             .map_err(|_| EngineError::Generation("prompt too long".to_owned()))?;
@@ -3598,6 +3643,69 @@ mod tests {
         // reuse is only ever offered when those tokens really do lead the new
         // prompt; the reconstructed KV therefore always matches the sequence.
         assert_eq!(continuation_prior_len(&[5, 6], &[5, 6, 7]), Some(2));
+    }
+
+    #[test]
+    fn retention_caps_bound_the_retained_map() {
+        use super::{RetainedKv, evict_idle_from, stash_into};
+        use higgs_models::AnyCache;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        // An empty KV cache is a valid `AnyCache` and needs no GPU.
+        let dummy = || AnyCache::KV(Vec::new());
+
+        // -- count cap: never exceed max_sessions (LRU-evicted) --
+        let mut map: HashMap<u64, RetainedKv> = HashMap::new();
+        for sid in 0..5u64 {
+            stash_into(&mut map, sid, dummy(), vec![1, 2, 3], 2, 0);
+        }
+        assert_eq!(map.len(), 2, "count cap must bound retained sessions");
+
+        // max_sessions=0 is clamped to 1 (never retain nothing-but-evict-all).
+        let mut one: HashMap<u64, RetainedKv> = HashMap::new();
+        stash_into(&mut one, 1, dummy(), vec![1], 0, 0);
+        assert_eq!(one.len(), 1, "max_sessions=0 clamps to 1");
+
+        // -- per-session token cap: oversized conversation is not retained --
+        let mut tc: HashMap<u64, RetainedKv> = HashMap::new();
+        stash_into(&mut tc, 7, dummy(), vec![0; 5], 8, 10); // 5 <= 10 → kept
+        assert!(tc.contains_key(&7));
+        stash_into(&mut tc, 7, dummy(), vec![0; 20], 8, 10); // 20 > 10 → dropped
+        assert!(
+            !tc.contains_key(&7),
+            "oversized session must not be retained, and its prior cache is forgotten"
+        );
+
+        // token cap 0 = unlimited
+        let mut un: HashMap<u64, RetainedKv> = HashMap::new();
+        stash_into(&mut un, 1, dummy(), vec![0; 100_000], 8, 0);
+        assert!(un.contains_key(&1), "max_session_tokens=0 means unlimited");
+
+        // -- TTL eviction boundary --
+        let mut ttl: HashMap<u64, RetainedKv> = HashMap::new();
+        for sid in 0..2u64 {
+            ttl.insert(
+                sid,
+                RetainedKv {
+                    cache: dummy(),
+                    tokens: vec![1],
+                    last_used: Instant::now(),
+                },
+            );
+        }
+        assert_eq!(
+            evict_idle_from(&mut ttl, Duration::from_secs(999)),
+            0,
+            "fresh entries survive a long TTL"
+        );
+        assert_eq!(ttl.len(), 2);
+        assert_eq!(
+            evict_idle_from(&mut ttl, Duration::ZERO),
+            2,
+            "a zero TTL evicts everything"
+        );
+        assert!(ttl.is_empty());
     }
 
     /// Write a config.json file into the given directory with the provided JSON content.

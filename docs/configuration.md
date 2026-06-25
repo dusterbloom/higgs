@@ -83,6 +83,10 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # kv_norm_correction = true
 # kv_adaptive_dense_layers = 0
 # kv_seed = 0
+# # Cache-resident multi-turn KV retention limits (bound resident KV memory):
+# kv_max_sessions = 8           # max retained conversations, LRU-evicted (>= 1)
+# kv_max_session_tokens = 0     # drop a conversation's KV past N tokens (0 = unlimited)
+# kv_retained_idle_secs = 1800  # evict KV idle longer than N seconds (0 = never)
 
 # --- Remote providers ---
 [provider.anthropic]
@@ -122,6 +126,8 @@ provider = "higgs"
 # timeout_ms = 2000
 
 # --- Metrics & dashboard ---
+# [retention] controls how long request metrics are kept for the dashboard.
+# It is NOT the KV cache retention — that is per-model (kv_retained_idle_secs above).
 [retention]
 enabled = true
 minutes = 60

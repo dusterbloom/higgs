@@ -155,6 +155,10 @@ port = 8000
 # name = "llama"
 # mlx_profile = "throughput"
 # batch = false
+# # Cache-resident multi-turn KV retention limits (bound resident memory):
+# kv_max_sessions = 8           # max retained conversations, LRU-evicted (>= 1)
+# kv_max_session_tokens = 0     # drop a conversation's KV past N tokens (0 = unlimited)
+# kv_retained_idle_secs = 1800  # evict KV idle longer than N seconds (0 = never)
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.

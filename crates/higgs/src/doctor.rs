@@ -275,6 +275,28 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 continue;
             }
         }
+        // Cache-resident retention limits: catch values that "work" but quietly
+        // defeat the cache (a too-low cap drops it almost every turn → constant
+        // full-prefill). 0 = disabled, which is fine.
+        let kv = model.kv_cache_config();
+        if kv.max_session_tokens > 0 && kv.max_session_tokens < 512 {
+            warn(
+                &format!(
+                    "model {label} kv_max_session_tokens={} is very low — most turns will drop the retained cache and full-prefill (use 0 to disable the cap, or a larger value)",
+                    kv.max_session_tokens
+                ),
+                result,
+            );
+        }
+        if kv.retained_idle_secs > 0 && kv.retained_idle_secs < 30 {
+            warn(
+                &format!(
+                    "model {label} kv_retained_idle_secs={} is very low — retained caches will be evicted almost immediately (use 0 to disable idle eviction, or a larger value)",
+                    kv.retained_idle_secs
+                ),
+                result,
+            );
+        }
         if model.batch && model.kv_cache_config().is_turboquant() {
             fail(
                 &format!(
@@ -592,29 +614,11 @@ mod tests {
             models: vec![
                 ModelConfig {
                     path: "org/model-a".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
+                    ..Default::default()
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
+                    ..Default::default()
                 },
             ],
             ..HiggsConfig::default()
@@ -631,29 +635,11 @@ mod tests {
             models: vec![
                 ModelConfig {
                     path: "org/model-a".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
+                    ..Default::default()
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
+                    ..Default::default()
                 },
             ],
             ..HiggsConfig::default()
@@ -1119,16 +1105,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/other-model".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
+                ..Default::default()
             }],
             ..HiggsConfig::default()
         };
@@ -1149,16 +1126,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/router-model".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
+                ..Default::default()
             }],
             ..HiggsConfig::default()
         };
@@ -1181,16 +1149,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/router-model".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
+                ..Default::default()
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),

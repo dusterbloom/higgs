@@ -63,6 +63,20 @@ pub struct KvCacheConfig {
     /// historical default behavior when this field is omitted from config.
     #[serde(default)]
     pub seed: u64,
+    /// Max conversations whose live KV cache is retained between turns for
+    /// cache-resident multi-turn. LRU-evicted beyond this; bounds the *number*
+    /// of resident caches. Must be >= 1. Default 8.
+    #[serde(default = "default_max_retained_sessions")]
+    pub max_retained_sessions: usize,
+    /// Drop a conversation's retained KV once it covers more than this many
+    /// tokens (`0` = unlimited). Bounds a single conversation's resident KV; the
+    /// next turn then full-prefills. Default 0.
+    #[serde(default)]
+    pub max_session_tokens: usize,
+    /// Evict a retained KV cache idle longer than this many seconds (`0` =
+    /// never). Frees memory from abandoned conversations. Default 1800 (30 min).
+    #[serde(default = "default_retained_idle_secs")]
+    pub retained_idle_secs: u64,
 }
 
 const fn default_bits() -> u8 {
@@ -71,6 +85,14 @@ const fn default_bits() -> u8 {
 
 const fn default_norm_correction() -> bool {
     true
+}
+
+const fn default_max_retained_sessions() -> usize {
+    8
+}
+
+const fn default_retained_idle_secs() -> u64 {
+    1800
 }
 
 impl Default for KvCacheConfig {
@@ -83,6 +105,9 @@ impl Default for KvCacheConfig {
             norm_correction: true,
             adaptive_dense_layers: 0,
             seed: 0,
+            max_retained_sessions: default_max_retained_sessions(),
+            max_session_tokens: 0,
+            retained_idle_secs: default_retained_idle_secs(),
         }
     }
 }
@@ -109,6 +134,13 @@ impl KvCacheConfig {
                     "TurboQuant value bits must be in [2, 4], got {vb}"
                 )));
             }
+        }
+        // Retention limits apply regardless of TurboQuant mode (dense caches are
+        // retained too). A zero session cap would evict every cache immediately.
+        if self.max_retained_sessions == 0 {
+            return Err(Exception::custom(
+                "max_retained_sessions must be >= 1 (0 would retain nothing)",
+            ));
         }
         Ok(())
     }

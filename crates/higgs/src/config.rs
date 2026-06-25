@@ -414,6 +414,18 @@ pub struct ModelConfig {
     /// Seed used by `TurboQuant` setup.
     #[serde(default)]
     pub kv_seed: u64,
+    /// Max conversations whose live KV cache is retained between turns for
+    /// cache-resident multi-turn. LRU-evicted beyond this. Must be >= 1.
+    #[serde(default = "default_kv_max_sessions")]
+    pub kv_max_sessions: usize,
+    /// Drop a conversation's retained KV once it exceeds this many tokens
+    /// (`0` = unlimited). Bounds a single conversation's resident KV.
+    #[serde(default)]
+    pub kv_max_session_tokens: usize,
+    /// Evict a retained KV cache idle longer than this many seconds
+    /// (`0` = never).
+    #[serde(default = "default_kv_retained_idle_secs")]
+    pub kv_retained_idle_secs: u64,
 }
 
 const fn default_norm_correction() -> bool {
@@ -422,6 +434,14 @@ const fn default_norm_correction() -> bool {
 
 const fn default_kv_bits() -> u8 {
     3
+}
+
+const fn default_kv_max_sessions() -> usize {
+    8
+}
+
+const fn default_kv_retained_idle_secs() -> u64 {
+    1800
 }
 
 impl ModelConfig {
@@ -434,6 +454,9 @@ impl ModelConfig {
             norm_correction: self.kv_norm_correction,
             adaptive_dense_layers: self.kv_adaptive_dense_layers,
             seed: self.kv_seed,
+            max_retained_sessions: self.kv_max_sessions,
+            max_session_tokens: self.kv_max_session_tokens,
+            retained_idle_secs: self.kv_retained_idle_secs,
         }
     }
 
@@ -441,6 +464,27 @@ impl ModelConfig {
         match self.mlx_profile {
             Some(profile) => profile.to_requested(),
             None => local.requested_mlx_profile,
+        }
+    }
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            name: None,
+            mlx_profile: None,
+            batch: false,
+            kv_cache: KvCacheMode::Off,
+            kv_bits: default_kv_bits(),
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_norm_correction: default_norm_correction(),
+            kv_adaptive_dense_layers: 0,
+            kv_seed: 0,
+            kv_max_sessions: default_kv_max_sessions(),
+            kv_max_session_tokens: 0,
+            kv_retained_idle_secs: default_kv_retained_idle_secs(),
         }
     }
 }
@@ -666,6 +710,9 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_norm_correction: !args.kv_no_norm_correction,
             kv_adaptive_dense_layers: args.kv_adaptive_dense_layers.unwrap_or(0),
             kv_seed: args.kv_seed.unwrap_or_default(),
+            kv_max_sessions: default_kv_max_sessions(),
+            kv_max_session_tokens: 0,
+            kv_retained_idle_secs: default_kv_retained_idle_secs(),
         })
         .collect();
 
@@ -753,6 +800,9 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_norm_correction: !serve_args.kv_no_norm_correction,
                     kv_adaptive_dense_layers: serve_args.kv_adaptive_dense_layers.unwrap_or(0),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
+                    kv_max_sessions: default_kv_max_sessions(),
+                    kv_max_session_tokens: 0,
+                    kv_retained_idle_secs: default_kv_retained_idle_secs(),
                 })
                 .collect();
             let mut existing = figment
@@ -924,6 +974,9 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_norm_correction: true,
         kv_adaptive_dense_layers: 0,
         kv_seed: 0,
+        kv_max_sessions: default_kv_max_sessions(),
+        kv_max_session_tokens: 0,
+        kv_retained_idle_secs: default_kv_retained_idle_secs(),
     });
     config.auto_router.model = name;
 }
@@ -1448,6 +1501,58 @@ mod tests {
         let config = HiggsConfig::default();
         assert!(config.retention.enabled);
         assert_eq!(config.retention.minutes, 60);
+    }
+
+    #[test]
+    fn test_kv_retention_defaults_parse_and_map() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Defaults when unspecified.
+        let path = dir.path().join("default.toml");
+        std::fs::write(&path, "[[models]]\npath = \"some/model\"\n").unwrap();
+        let model = load_config_file(&path, None)
+            .unwrap()
+            .models
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(model.kv_max_sessions, 8);
+        assert_eq!(model.kv_max_session_tokens, 0);
+        assert_eq!(model.kv_retained_idle_secs, 1800);
+        let kv = model.kv_cache_config();
+        assert_eq!(kv.max_retained_sessions, 8);
+        assert_eq!(kv.max_session_tokens, 0);
+        assert_eq!(kv.retained_idle_secs, 1800);
+
+        // Explicit values parse and map into KvCacheConfig.
+        let path2 = dir.path().join("explicit.toml");
+        std::fs::write(
+            &path2,
+            "[[models]]\npath = \"some/model\"\nkv_max_sessions = 4\nkv_max_session_tokens = 4096\nkv_retained_idle_secs = 300\n",
+        )
+        .unwrap();
+        let kv2 = load_config_file(&path2, None)
+            .unwrap()
+            .models
+            .into_iter()
+            .next()
+            .unwrap()
+            .kv_cache_config();
+        assert_eq!(kv2.max_retained_sessions, 4);
+        assert_eq!(kv2.max_session_tokens, 4096);
+        assert_eq!(kv2.retained_idle_secs, 300);
+
+        // kv_max_sessions = 0 is rejected at load (validate catches it).
+        let path3 = dir.path().join("bad.toml");
+        std::fs::write(
+            &path3,
+            "[[models]]\npath = \"some/model\"\nkv_max_sessions = 0\n",
+        )
+        .unwrap();
+        assert!(
+            load_config_file(&path3, None).is_err(),
+            "kv_max_sessions = 0 must be rejected"
+        );
     }
 
     #[test]
