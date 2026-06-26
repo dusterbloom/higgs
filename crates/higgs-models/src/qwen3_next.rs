@@ -13,7 +13,7 @@
 //! All layers use Sparse `MoE` for the feed-forward block.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -122,7 +122,7 @@ const fn default_norm_topk_prob() -> bool {
 }
 
 /// Quantization parameters from config.json (top-level defaults).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct QuantizationConfig {
     pub group_size: i32,
     pub bits: i32,
@@ -206,9 +206,29 @@ pub struct Qwen3NextModelArgs {
     #[serde(default)]
     pub gate_quantization: Option<QuantizationConfig>,
 
+    /// Per-tensor quantization overrides keyed by canonical module path
+    /// (e.g. `"language_model.model.layers.3.self_attn.q_proj"`,
+    /// `"language_model.lm_head"`).
+    ///
+    /// Lifted from `quantization.<key>` entries by the loader. Consumed
+    /// by [`resolve_quant_for`] to pick `(group_size, bits)` per `QLinear`,
+    /// falling back to `quantization` when no entry matches. Empty for
+    /// uniform-bit checkpoints; non-empty for Unsloth UD mix-bit and
+    /// similar mixed-precision configs.
+    #[serde(default)]
+    pub quant_overrides: BTreeMap<String, QuantizationConfig>,
+
     /// Use separate GDN projections (qwen3.5-style) instead of combined (qwen3_next-style).
     #[serde(default)]
     pub use_separate_gdn_projections: bool,
+
+    /// Store attention output projections (`self_attn.o_proj`, `linear_attn.out_proj`,
+    /// `linear_attn.in_proj_a`, `linear_attn.in_proj_b`, `linear_attn.in_proj_ba`)
+    /// as BF16-dense rather than quantized. Set by the `qwen3_5` / `qwen3_5_moe`
+    /// loaders to match the Unsloth UD checkpoint layout. Left `false` for the
+    /// original `qwen3_next` `model_type` to preserve historical behavior.
+    #[serde(default)]
+    pub dense_attention_outputs: bool,
 
     /// Number of MTP (Multi-Token Prediction) hidden layers.
     /// 0 = no MTP head, 1 = one transformer layer for next-next-token prediction.
@@ -247,6 +267,17 @@ pub(crate) fn init_quantized_params() -> QuantizedParams {
     (placeholder(), placeholder(), placeholder())
 }
 
+/// Init params for a BF16-dense `QLinear` (`bits == 0`): only `.weight` is
+/// loaded from the checkpoint. Scales/biases get shape `[0]` so they bypass
+/// the shape-`[1]` placeholder check after weight loading completes.
+pub(crate) fn init_unquantized_params() -> Result<QuantizedParams, Exception> {
+    Ok((
+        Param::new(Array::zeros::<f32>(&[1])?),
+        Param::new(Array::zeros::<f32>(&[0])?),
+        Param::new(Array::zeros::<f32>(&[0])?),
+    ))
+}
+
 pub(crate) fn quantized_forward(
     x: &Array,
     weight: &Array,
@@ -275,7 +306,11 @@ pub(crate) struct QLinear {
 impl QLinear {
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn new(group_size: i32, bits: i32) -> Result<Self, Exception> {
-        let (weight, scales, biases) = init_quantized_params();
+        let (weight, scales, biases) = if bits == 0 {
+            init_unquantized_params()?
+        } else {
+            init_quantized_params()
+        };
         Ok(Self {
             weight,
             scales,
@@ -286,6 +321,11 @@ impl QLinear {
     }
 
     pub(crate) fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        if self.bits == 0 {
+            // BF16-dense path: weight stored as [out, in], compute x @ weight.T.
+            let w = (*self.weight).as_dtype(x.dtype())?;
+            return x.matmul(&w.transpose()?);
+        }
         quantized_forward(
             x,
             &self.weight,
@@ -365,7 +405,11 @@ pub(crate) struct QEmbedding {
 impl QEmbedding {
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn new(group_size: i32, bits: i32) -> Result<Self, Exception> {
-        let (weight, scales, biases) = init_quantized_params();
+        let (weight, scales, biases) = if bits == 0 {
+            init_unquantized_params()?
+        } else {
+            init_quantized_params()
+        };
         Ok(Self {
             weight,
             scales,
@@ -388,6 +432,11 @@ impl QEmbedding {
     }
 
     pub(crate) fn as_linear(&self, x: &Array) -> Result<Array, Exception> {
+        if self.bits == 0 {
+            // BF16-dense path: weight stored as [vocab, hidden], compute x @ weight.T.
+            let w = (*self.weight).as_dtype(x.dtype())?;
+            return x.matmul(&w.transpose()?);
+        }
         if self.bits == 4 && matches!(x.shape(), [1, 1, _]) && self.weight.shape().len() == 2 {
             qgemv_4bit(x, &self.weight, &self.scales, &self.biases, self.group_size)
         } else {
@@ -1968,7 +2017,7 @@ pub struct Qwen3NextAttention {
 }
 
 impl Qwen3NextAttention {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs, attn_prefix: &str) -> Result<Self, Exception> {
         let head_dim = args.head_dim;
         let head_dim_f32 = f32::from(
             i16::try_from(head_dim).map_err(|_| Exception::custom("head_dim out of i16 range"))?,
@@ -1981,11 +2030,21 @@ impl Qwen3NextAttention {
         #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
         let partial_dim = (rope_dim_f32 * args.partial_rotary_factor).round() as i32;
 
+        let (q_ql, q_qb) = resolve_quant_for(args, &format!("{attn_prefix}.q_proj"));
+        let (k_ql, k_qb) = resolve_quant_for(args, &format!("{attn_prefix}.k_proj"));
+        let (v_ql, v_qb) = resolve_quant_for(args, &format!("{attn_prefix}.v_proj"));
+        let (o_ql, o_qb_resolved) = resolve_quant_for(args, &format!("{attn_prefix}.o_proj"));
+        let o_qb = if args.dense_attention_outputs {
+            0
+        } else {
+            o_qb_resolved
+        };
+
         Ok(Self {
-            q_proj: QLinear::new(ql, qb)?,
-            k_proj: QLinear::new(ql, qb)?,
-            v_proj: QLinear::new(ql, qb)?,
-            o_proj: QLinear::new(ql, qb)?,
+            q_proj: QLinear::new(q_ql, q_qb)?,
+            k_proj: QLinear::new(k_ql, k_qb)?,
+            v_proj: QLinear::new(v_ql, v_qb)?,
+            o_proj: QLinear::new(o_ql, o_qb)?,
             q_norm: nn::RmsNormBuilder::new(head_dim)
                 .eps(args.rms_norm_eps)
                 .build()?,
@@ -2286,6 +2345,24 @@ pub struct Qwen3NextMLP {
 }
 
 pub(crate) fn new_mlp_projections(
+    args: &Qwen3NextModelArgs,
+    mlp_prefix: &str,
+) -> Result<(QLinear, QLinear, QLinear), Exception> {
+    let (g_ql, g_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.gate_proj"));
+    let (d_ql, d_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.down_proj"));
+    let (u_ql, u_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.up_proj"));
+    Ok((
+        QLinear::new(g_ql, g_qb)?,
+        QLinear::new(d_ql, d_qb)?,
+        QLinear::new(u_ql, u_qb)?,
+    ))
+}
+
+/// Build the three MLP projections with a single shared `(group_size, bits)`.
+///
+/// Used by callers that don't carry a `Qwen3NextModelArgs` and therefore can't
+/// participate in path-aware override resolution (e.g. `qwen3_moe`).
+pub(crate) fn new_mlp_projections_from_quant(
     ql: i32,
     qb: i32,
 ) -> Result<(QLinear, QLinear, QLinear), Exception> {
@@ -2297,8 +2374,8 @@ pub(crate) fn new_mlp_projections(
 }
 
 impl Qwen3NextMLP {
-    fn new(ql: i32, qb: i32) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections(ql, qb)?;
+    fn new(args: &Qwen3NextModelArgs, mlp_prefix: &str) -> Result<Self, Exception> {
+        let (gate_proj, down_proj, up_proj) = new_mlp_projections(args, mlp_prefix)?;
         Ok(Self {
             gate_proj,
             down_proj,
@@ -2431,21 +2508,22 @@ impl MtpFc {
 }
 
 impl MtpHead {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs) -> Result<Self, Exception> {
         let n = usize::try_from(args.mtp_num_hidden_layers)
             .map_err(|_| Exception::custom("mtp_num_hidden_layers must be non-negative"))?;
 
         let layers = (0..n)
-            .map(|_| {
+            .map(|i| {
+                let layer_prefix = format!("language_model.mtp.layers.{i}");
                 Ok(MtpTransformerLayer {
-                    self_attn: Qwen3NextAttention::new(args, ql, qb)?,
+                    self_attn: Qwen3NextAttention::new(args, &format!("{layer_prefix}.self_attn"))?,
                     input_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
                         .eps(args.rms_norm_eps)
                         .build()?,
                     post_attention_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
                         .eps(args.rms_norm_eps)
                         .build()?,
-                    mlp: Qwen3NextMLP::new(ql, qb)?,
+                    mlp: Qwen3NextMLP::new(args, &format!("{layer_prefix}.mlp"))?,
                 })
             })
             .collect::<Result<Vec<_>, Exception>>()?;
@@ -2541,7 +2619,7 @@ pub struct MoeMtpHead {
 }
 
 impl MoeMtpHead {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs) -> Result<Self, Exception> {
         let n = usize::try_from(args.mtp_num_hidden_layers)
             .map_err(|_| Exception::custom("mtp_num_hidden_layers must be non-negative"))?;
 
@@ -2551,21 +2629,26 @@ impl MoeMtpHead {
         let mut mtp_args = args.clone();
         mtp_args.gate_quantization = None;
 
+        // Prefixes feed `resolve_quant_for` only (not weight loading); the MoE-MTP
+        // sidecar is uniformly quantized, so these fall back to the global width
+        // unless a checkpoint ships per-tensor MTP overrides.
         let layers = (0..n)
-            .map(|_| {
+            .map(|i| {
+                let lp = format!("model.mtp.layers.{i}");
                 Ok(MoeMtpTransformerLayer {
-                    self_attn: Qwen3NextAttention::new(args, ql, qb)?,
+                    self_attn: Qwen3NextAttention::new(args, &format!("{lp}.self_attn"))?,
                     input_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
                         .eps(args.rms_norm_eps)
                         .build()?,
                     post_attention_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
                         .eps(args.rms_norm_eps)
                         .build()?,
-                    mlp: SparseMoeBlock::new(&mtp_args, ql, qb)?,
+                    mlp: SparseMoeBlock::new(&mtp_args, &format!("{lp}.mlp"))?,
                 })
             })
             .collect::<Result<Vec<_>, Exception>>()?;
 
+        let (fc_g, fc_b) = resolve_quant_for(args, "model.mtp.fc");
         Ok(Self {
             pre_fc_norm_hidden: nn::RmsNormBuilder::new(args.hidden_size)
                 .eps(args.rms_norm_eps)
@@ -2573,7 +2656,7 @@ impl MoeMtpHead {
             pre_fc_norm_embedding: nn::RmsNormBuilder::new(args.hidden_size)
                 .eps(args.rms_norm_eps)
                 .build()?,
-            fc: QLinear::new(ql, qb)?,
+            fc: QLinear::new(fc_g, fc_b)?,
             layers,
             norm: nn::RmsNormBuilder::new(args.hidden_size)
                 .eps(args.rms_norm_eps)
@@ -2599,8 +2682,20 @@ pub(crate) struct SwitchMlpWeights {
 }
 
 impl SwitchMlpWeights {
-    pub(crate) fn new(ql: i32, qb: i32) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections(ql, qb)?;
+    pub(crate) fn new(args: &Qwen3NextModelArgs, prefix: &str) -> Result<Self, Exception> {
+        let (gate_proj, down_proj, up_proj) = new_mlp_projections(args, prefix)?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            fused_gate_up: None,
+        })
+    }
+
+    /// Build with a single shared `(group_size, bits)` — for callers without
+    /// a `Qwen3NextModelArgs`.
+    pub(crate) fn from_quant(ql: i32, qb: i32) -> Result<Self, Exception> {
+        let (gate_proj, down_proj, up_proj) = new_mlp_projections_from_quant(ql, qb)?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -2889,7 +2984,7 @@ struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs, mlp_prefix: &str) -> Result<Self, Exception> {
         if args.num_experts <= 0 {
             return Err(Exception::custom("num_experts must be > 0"));
         }
@@ -2901,16 +2996,17 @@ impl SparseMoeBlock {
                 "num_experts_per_tok must be <= num_experts",
             ));
         }
-        // Gate quantization: use per-layer override if present, else global
-        let (gate_ql, gate_qb) = args
-            .gate_quantization
-            .as_ref()
-            .map_or((ql, qb), |gq| (gq.group_size, gq.bits));
+        let gate_path = format!("{mlp_prefix}.gate");
+        let shared_expert_gate_path = format!("{mlp_prefix}.shared_expert_gate");
+        let (gate_ql, gate_qb) = resolve_gate_quant(args, &gate_path);
+        let (seg_ql, seg_qb) = resolve_gate_quant(args, &shared_expert_gate_path);
+        let switch_mlp_prefix = format!("{mlp_prefix}.switch_mlp");
+        let shared_expert_prefix = format!("{mlp_prefix}.shared_expert");
         Ok(Self {
             gate: QLinear::new(gate_ql, gate_qb)?,
-            switch_mlp: SwitchMlpWeights::new(ql, qb)?,
-            shared_expert: Qwen3NextMLP::new(ql, qb)?,
-            shared_expert_gate: QLinear::new(gate_ql, gate_qb)?,
+            switch_mlp: SwitchMlpWeights::new(args, &switch_mlp_prefix)?,
+            shared_expert: Qwen3NextMLP::new(args, &shared_expert_prefix)?,
+            shared_expert_gate: QLinear::new(seg_ql, seg_qb)?,
             top_k: args.num_experts_per_tok,
             norm_topk_prob: args.norm_topk_prob,
         })
@@ -3137,7 +3233,7 @@ struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs, gdn_prefix: &str) -> Result<Self, Exception> {
         let num_k_heads = args.linear_num_key_heads;
         let num_v_heads = args.linear_num_value_heads;
         let head_k_dim = args.linear_key_head_dim;
@@ -3148,35 +3244,55 @@ impl GatedDeltaNet {
         let conv_kernel_size = args.linear_conv_kernel_dim;
 
         let use_sep = args.use_separate_gdn_projections;
-        let in_proj_qkvz = QLinear::new(ql, qb)?;
-        let in_proj_ba = QLinear::new(ql, qb)?;
-        let in_proj_qkv = use_sep.then(|| QLinear::new(ql, qb)).transpose()?;
-        let in_proj_z = use_sep.then(|| QLinear::new(ql, qb)).transpose()?;
-        let in_proj_a = use_sep.then(|| QLinear::new(ql, qb)).transpose()?;
-        let in_proj_b = use_sep.then(|| QLinear::new(ql, qb)).transpose()?;
-        let conv1d = nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
-            .bias(false)
-            .groups(conv_dim)
-            .padding(0)
-            .build()?;
-        let norm = nn::RmsNormBuilder::new(head_v_dim)
-            .eps(args.rms_norm_eps)
-            .build()?;
-        let out_proj = QLinear::new(ql, qb)?;
-        let a_log = Param::new(Array::zeros::<f32>(&[num_v_heads])?);
-        let dt_bias = Param::new(Array::zeros::<f32>(&[num_v_heads])?);
+        let resolve = |name: &str| {
+            let (g, b) = resolve_quant_for(args, &format!("{gdn_prefix}.{name}"));
+            QLinear::new(g, b)
+        };
+        // Names whose checkpoint tensors are BF16-dense (no `.scales`/`.biases`)
+        // when `args.dense_attention_outputs` is true.
+        let resolve_maybe_dense = |name: &str| {
+            let (g, b_resolved) = resolve_quant_for(args, &format!("{gdn_prefix}.{name}"));
+            let b = if args.dense_attention_outputs {
+                0
+            } else {
+                b_resolved
+            };
+            QLinear::new(g, b)
+        };
         Ok(Self {
-            in_proj_qkvz,
-            in_proj_ba,
-            in_proj_qkv,
-            in_proj_z,
-            in_proj_a,
-            in_proj_b,
-            conv1d,
-            norm,
-            out_proj,
-            A_log: a_log,
-            dt_bias,
+            in_proj_qkvz: resolve("in_proj_qkvz")?,
+            in_proj_ba: resolve_maybe_dense("in_proj_ba")?,
+            in_proj_qkv: if use_sep {
+                Some(resolve("in_proj_qkv")?)
+            } else {
+                None
+            },
+            in_proj_z: if use_sep {
+                Some(resolve("in_proj_z")?)
+            } else {
+                None
+            },
+            in_proj_a: if use_sep {
+                Some(resolve_maybe_dense("in_proj_a")?)
+            } else {
+                None
+            },
+            in_proj_b: if use_sep {
+                Some(resolve_maybe_dense("in_proj_b")?)
+            } else {
+                None
+            },
+            conv1d: nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
+                .bias(false)
+                .groups(conv_dim)
+                .padding(0)
+                .build()?,
+            norm: nn::RmsNormBuilder::new(head_v_dim)
+                .eps(args.rms_norm_eps)
+                .build()?,
+            out_proj: resolve_maybe_dense("out_proj")?,
+            A_log: Param::new(Array::zeros::<f32>(&[num_v_heads])?),
+            dt_bias: Param::new(Array::zeros::<f32>(&[num_v_heads])?),
             num_k_heads,
             num_v_heads,
             head_k_dim,
@@ -4057,8 +4173,8 @@ struct FfnBlock {
 }
 
 impl FfnBlock {
-    fn new_moe(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
-        let moe = SparseMoeBlock::new(args, ql, qb)?;
+    fn new_moe(args: &Qwen3NextModelArgs, mlp_prefix: &str) -> Result<Self, Exception> {
+        let moe = SparseMoeBlock::new(args, mlp_prefix)?;
         Ok(Self {
             gate: Some(moe.gate),
             switch_mlp: Some(moe.switch_mlp),
@@ -4074,15 +4190,18 @@ impl FfnBlock {
         })
     }
 
-    fn new_dense(ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new_dense(args: &Qwen3NextModelArgs, mlp_prefix: &str) -> Result<Self, Exception> {
+        let (g_ql, g_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.gate_proj"));
+        let (u_ql, u_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.up_proj"));
+        let (d_ql, d_qb) = resolve_quant_for(args, &format!("{mlp_prefix}.down_proj"));
         Ok(Self {
             gate: None,
             switch_mlp: None,
             shared_expert: None,
             shared_expert_gate: None,
-            gate_proj: Some(QLinear::new(ql, qb)?),
-            up_proj: Some(QLinear::new(ql, qb)?),
-            down_proj: Some(QLinear::new(ql, qb)?),
+            gate_proj: Some(QLinear::new(g_ql, g_qb)?),
+            up_proj: Some(QLinear::new(u_ql, u_qb)?),
+            down_proj: Some(QLinear::new(d_ql, d_qb)?),
             is_moe: false,
             top_k: 0,
             norm_topk_prob: false,
@@ -4276,20 +4395,32 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(args: &Qwen3NextModelArgs, layer_idx: i32, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs, layer_idx: i32) -> Result<Self, Exception> {
         let is_linear = (layer_idx + 1) % args.full_attention_interval != 0;
 
-        let linear_attn = is_linear
-            .then(|| GatedDeltaNet::new(args, ql, qb))
-            .transpose()?;
-        let self_attn = (!is_linear)
-            .then(|| Qwen3NextAttention::new(args, ql, qb))
-            .transpose()?;
-
-        let ffn = if args.num_experts > 0 {
-            FfnBlock::new_moe(args, ql, qb)?
+        let layer_prefix = format!("language_model.model.layers.{layer_idx}");
+        let linear_attn = if is_linear {
+            Some(GatedDeltaNet::new(
+                args,
+                &format!("{layer_prefix}.linear_attn"),
+            )?)
         } else {
-            FfnBlock::new_dense(ql, qb)?
+            None
+        };
+        let self_attn = if is_linear {
+            None
+        } else {
+            Some(Qwen3NextAttention::new(
+                args,
+                &format!("{layer_prefix}.self_attn"),
+            )?)
+        };
+
+        let mlp_prefix = format!("{layer_prefix}.mlp");
+        let ffn = if args.num_experts > 0 {
+            FfnBlock::new_moe(args, &mlp_prefix)?
+        } else {
+            FfnBlock::new_dense(args, &mlp_prefix)?
         };
         Ok(Self {
             linear_attn,
@@ -4367,13 +4498,14 @@ struct Qwen3NextInner {
 }
 
 impl Qwen3NextInner {
-    fn new(args: &Qwen3NextModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(args: &Qwen3NextModelArgs) -> Result<Self, Exception> {
         let layers = (0..args.num_hidden_layers)
-            .map(|i| DecoderLayer::new(args, i, ql, qb))
+            .map(|i| DecoderLayer::new(args, i))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let (embed_ql, embed_qb) = resolve_quant_for(args, "language_model.model.embed_tokens");
         Ok(Self {
-            embed_tokens: QEmbedding::new(ql, qb)?,
+            embed_tokens: QEmbedding::new(embed_ql, embed_qb)?,
             layers,
             norm: nn::RmsNormBuilder::new(args.hidden_size)
                 .eps(args.rms_norm_eps)
@@ -4503,23 +4635,21 @@ impl Qwen3NextCausalLM {
             return Err(Exception::custom("linear_conv_kernel_dim must be > 0"));
         }
 
-        let ql = args.quantization.as_ref().map_or(64, |q| q.group_size);
-        let qb = args.quantization.as_ref().map_or(4, |q| q.bits);
-
-        let model = Qwen3NextInner::new(&args, ql, qb)?;
+        let model = Qwen3NextInner::new(&args)?;
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(QLinear::new(ql, qb)?)
+            let (lm_ql, lm_qb) = resolve_quant_for(&args, "language_model.lm_head");
+            Some(QLinear::new(lm_ql, lm_qb)?)
         };
         let mtp = (args.mtp_num_hidden_layers > 0 && !args.use_dense_mtp && !args.use_moe_mtp)
-            .then(|| MtpHead::new(&args, ql, qb))
+            .then(|| MtpHead::new(&args))
             .transpose()?;
         let dense_mtp = (args.mtp_num_hidden_layers > 0 && args.use_dense_mtp)
             .then(|| DenseMtpHead::new(&args))
             .transpose()?;
         let moe_mtp = (args.mtp_num_hidden_layers > 0 && args.use_moe_mtp)
-            .then(|| MoeMtpHead::new(&args, ql, qb))
+            .then(|| MoeMtpHead::new(&args))
             .transpose()?;
 
         Ok(Self {
@@ -5842,7 +5972,75 @@ pub fn load_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextModelArg
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
     let config: serde_json::Value = serde_json::from_reader(file)?;
-    load_qwen3_next_args_from_value(config)
+    let mut args = load_qwen3_next_args_from_value(config)?;
+    args.dense_attention_outputs = detect_dense_attention_outputs(model_dir.as_ref());
+    Ok(args)
+}
+
+/// Returns `true` only when the checkpoint stores its attention / GDN output
+/// projections as raw BF16 — a `.weight` with no `.scales` sibling (the
+/// Unsloth-UD-dense layout). Quantized checkpoints (Ornith, stock MLX quants)
+/// keep `.scales`, so those projections must stay on the quantized forward
+/// path (`bits != 0`). A missing or unreadable index defaults to `false`.
+fn detect_dense_attention_outputs(model_dir: &Path) -> bool {
+    let index_path = model_dir.join("model.safetensors.index.json");
+    let Ok(file) = std::fs::File::open(&index_path) else {
+        return false;
+    };
+    let Ok(index) = serde_json::from_reader::<_, serde_json::Value>(file) else {
+        return false;
+    };
+    let Some(weight_map) = index
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    let mut saw_output = false;
+    for key in weight_map.keys() {
+        let Some(base) = key.strip_suffix(".weight") else {
+            continue;
+        };
+        if base.ends_with("o_proj") || base.ends_with("out_proj") {
+            saw_output = true;
+            if weight_map.contains_key(&format!("{base}.scales")) {
+                return false; // quantized output projection -> not dense
+            }
+        }
+    }
+    saw_output
+}
+
+/// Resolve `(group_size, bits)` for a canonical tensor path.
+///
+/// Looks up `path` in [`Qwen3NextModelArgs::quant_overrides`]; falls back to
+/// `quantization` (the global default) when no override applies. Returns
+/// `(64, 4)` if neither is set, matching the historical default.
+pub(crate) fn resolve_quant_for(args: &Qwen3NextModelArgs, path: &str) -> (i32, i32) {
+    if let Some(o) = args.quant_overrides.get(path) {
+        return (o.group_size, o.bits);
+    }
+    args.quantization
+        .as_ref()
+        .map_or((64, 4), |q| (q.group_size, q.bits))
+}
+
+/// Resolve `(group_size, bits)` for an `MoE` gate-style tensor.
+///
+/// Resolution order: `quant_overrides[path]` → `gate_quantization` → global
+/// `quantization` → `(64, 4)`. The middle `gate_quantization` step preserves
+/// backward compat with checkpoints that publish a single gate-quantization
+/// override but no per-tensor override map.
+fn resolve_gate_quant(args: &Qwen3NextModelArgs, path: &str) -> (i32, i32) {
+    if let Some(o) = args.quant_overrides.get(path) {
+        return (o.group_size, o.bits);
+    }
+    if let Some(gq) = args.gate_quantization.as_ref() {
+        return (gq.group_size, gq.bits);
+    }
+    args.quantization
+        .as_ref()
+        .map_or((64, 4), |q| (q.group_size, q.bits))
 }
 
 fn gate_quantization_override(config: &serde_json::Value) -> Option<serde_json::Value> {
@@ -5858,10 +6056,118 @@ fn gate_quantization_override(config: &serde_json::Value) -> Option<serde_json::
     None
 }
 
+/// Collect per-tensor mix-bit overrides from a config.json blob.
+///
+/// Reads `config["quantization"]` (preferred) or `config["quantization_config"]`
+/// (sibling fallback used by some Unsloth UD checkpoints). Every nested entry
+/// that is a JSON object carrying both `group_size` and `bits` is treated as
+/// an override and copied — keyed by the canonical tensor path that holds it.
+/// Scalar siblings (`bits`, `group_size`, `mode`) are skipped, and `mode` is
+/// dropped from override entries since [`QuantizationConfig`] only carries
+/// `(group_size, bits)`.
+///
+/// Synthesizes a fused-key override at `<prefix>.linear_attn.in_proj_qkvz`
+/// whenever both `<prefix>.linear_attn.in_proj_qkv` and `<prefix>.linear_attn.in_proj_z`
+/// are present and agree on `(group_size, bits)`. Unsloth UD checkpoints publish
+/// GDN overrides under the on-disk SPLIT keys, but the model resolves the FUSED
+/// key when running with default (non-separate) GDN projections; without this
+/// synthesis the fused `QLinear` silently picks up the global default and the
+/// runtime quantized matmul fails on the on-disk packing shape.
+fn collect_quant_overrides(
+    config: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut overrides = serde_json::Map::new();
+    let Some(quant) = config
+        .get("quantization")
+        .or_else(|| config.get("quantization_config"))
+    else {
+        return overrides;
+    };
+    let Some(obj) = quant.as_object() else {
+        return overrides;
+    };
+    for (key, value) in obj {
+        let Some(entry) = value.as_object() else {
+            continue; // scalar default (`bits`, `group_size`, `mode`).
+        };
+        let (Some(group_size), Some(bits)) = (entry.get("group_size"), entry.get("bits")) else {
+            continue;
+        };
+        let mut clean = serde_json::Map::with_capacity(2);
+        clean.insert("group_size".to_owned(), group_size.clone());
+        clean.insert("bits".to_owned(), bits.clone());
+        overrides.insert(key.clone(), serde_json::Value::Object(clean));
+    }
+    synthesize_fused_gdn_overrides(&mut overrides);
+    overrides
+}
+
+/// For each `<prefix>.linear_attn.in_proj_qkv` entry, insert a sibling
+/// `<prefix>.linear_attn.in_proj_qkvz` override copied from the matching
+/// `in_proj_qkv` / `in_proj_z` pair when they agree on `(group_size, bits)`.
+/// No-op if `in_proj_qkvz` is already present, if the matching `in_proj_z`
+/// sibling is missing, or if the two sides disagree.
+fn synthesize_fused_gdn_overrides(overrides: &mut serde_json::Map<String, serde_json::Value>) {
+    // When `use_separate_gdn_projections` is off the model builds fused GDN
+    // projections (`in_proj_qkvz`, `in_proj_ba`) and the weight loader rearranges
+    // the separate checkpoint tensors into them. Per-tensor quant overrides,
+    // however, are keyed by the split names — so synthesize the fused-key
+    // override from the split parts when they agree on (bits, group_size).
+    // Covers both qkv+z -> qkvz and b+a -> ba.
+    fn fuse_from_parts(
+        overrides: &serde_json::Map<String, serde_json::Value>,
+        first_suffix: &str,
+        second_suffix: &str,
+        fused_suffix: &str,
+    ) -> Vec<(String, serde_json::Value)> {
+        overrides
+            .iter()
+            .filter_map(|(key, value)| {
+                let prefix = key.strip_suffix(first_suffix)?;
+                let fused_key = format!("{prefix}{fused_suffix}");
+                if overrides.contains_key(&fused_key) {
+                    return None;
+                }
+                let second_key = format!("{prefix}{second_suffix}");
+                let second_entry = overrides.get(&second_key)?;
+                if second_entry != value {
+                    tracing::warn!(
+                        first_key = %key,
+                        second_key = %second_key,
+                        first = %value,
+                        second = %second_entry,
+                        "GDN split overrides disagree; skipping fused-key synthesis"
+                    );
+                    return None;
+                }
+                Some((fused_key, value.clone()))
+            })
+            .collect()
+    }
+
+    let mut synthesized = fuse_from_parts(
+        overrides,
+        ".linear_attn.in_proj_qkv",
+        ".linear_attn.in_proj_z",
+        ".linear_attn.in_proj_qkvz",
+    );
+    synthesized.extend(fuse_from_parts(
+        overrides,
+        ".linear_attn.in_proj_b",
+        ".linear_attn.in_proj_a",
+        ".linear_attn.in_proj_ba",
+    ));
+
+    for (key, value) in synthesized {
+        overrides.insert(key, value);
+    }
+}
+
 fn load_qwen3_next_args_from_value(
     mut config: serde_json::Value,
 ) -> Result<Qwen3NextModelArgs, ModelError> {
     let gate_override = gate_quantization_override(&config);
+    let quant_overrides = collect_quant_overrides(&config);
     let map = config
         .as_object_mut()
         .ok_or_else(|| ModelError::UnsupportedModel("config.json root is not an object".into()))?;
@@ -5869,6 +6175,12 @@ fn load_qwen3_next_args_from_value(
         if let Some(gate_q) = gate_override {
             map.insert("gate_quantization".to_owned(), gate_q);
         }
+    }
+    if !quant_overrides.is_empty() && !map.contains_key("quant_overrides") {
+        map.insert(
+            "quant_overrides".to_owned(),
+            serde_json::Value::Object(quant_overrides),
+        );
     }
     Ok(serde_json::from_value(config)?)
 }
@@ -6183,12 +6495,39 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
         );
     }
 
+    // Default off; `load_model_args` refines this per-checkpoint by inspecting
+    // the safetensors index. Some Unsloth-UD checkpoints store the attention
+    // output projections as raw BF16 (a `.weight` with no `.scales` sibling),
+    // but others (e.g. Ornith) quantize them, so this cannot be assumed from
+    // config alone — see `detect_dense_attention_outputs`.
+    map.insert(
+        "dense_attention_outputs".to_owned(),
+        serde_json::Value::from(false),
+    );
+
     // Detect per-layer gate quantization override from top-level quantization config
     if let Some(gate_q) = gate_quantization_override(&config) {
         map.insert("gate_quantization".to_owned(), gate_q);
     }
 
-    Ok(serde_json::from_value(obj)?)
+    // Mix-bit per-tensor overrides live on the OUTER `config["quantization"]`
+    // (not under `text_config`) for Qwen3.5 VLM-wrapped checkpoints such as
+    // Unsloth's UD-Q2_K_XL builds. Lift them so the inner args carry them.
+    let quant_overrides = collect_quant_overrides(&config);
+    if !quant_overrides.is_empty() {
+        map.insert(
+            "quant_overrides".to_owned(),
+            serde_json::Value::Object(quant_overrides),
+        );
+    }
+
+    let mut args: Qwen3NextModelArgs = serde_json::from_value(obj)?;
+    // Refine the config-only default by inspecting the checkpoint: attention /
+    // GDN output projections are BF16-dense only when they ship a `.weight`
+    // with no `.scales` sibling (Unsloth-UD-dense). Quantized checkpoints
+    // (e.g. Ornith) keep `.scales`, so they stay on the quantized path.
+    args.dense_attention_outputs = detect_dense_attention_outputs(model_dir.as_ref());
+    Ok(args)
 }
 
 /// Parse a `{group_size, bits}` quantization spec from a JSON node.
@@ -6964,7 +7303,7 @@ mod tests {
         let mut args = minimal_qwen3_next_args();
         args.num_experts = 4;
         args.num_experts_per_tok = 4; // top_k == num_experts is fine
-        let result = SparseMoeBlock::new(&args, 64, 4);
+        let result = SparseMoeBlock::new(&args, "test.layer.mlp");
         assert!(result.is_ok());
     }
 
@@ -6974,7 +7313,7 @@ mod tests {
     ) {
         let mut args = minimal_qwen3_next_args();
         mutate(&mut args);
-        let result = SparseMoeBlock::new(&args, 64, 4);
+        let result = SparseMoeBlock::new(&args, "test.layer.mlp");
         assert!(result.is_err(), "Should reject invalid args");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -7193,6 +7532,381 @@ mod tests {
     }
 
     #[test]
+    fn test_load_args_lifts_mix_bit_overrides_into_quant_overrides() {
+        // Unsloth UD-style: top-level `quantization` carries default `(group_size, bits)`
+        // plus per-tensor override entries keyed by canonical module path.
+        // Loader must lift those entries into `args.quant_overrides`.
+        let config = serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 1024,
+            "max_position_embeddings": 4096,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 4,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4,
+            "quantization": {
+                "group_size": 64,
+                "bits": 2,
+                "language_model.lm_head": { "group_size": 64, "bits": 5, "mode": "affine" },
+                "language_model.model.embed_tokens": { "group_size": 64, "bits": 4, "mode": "affine" },
+                "language_model.model.layers.0.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" },
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": { "group_size": 64, "bits": 4, "mode": "affine" },
+                "language_model.model.layers.3.self_attn.q_proj": { "group_size": 64, "bits": 4, "mode": "affine" }
+            }
+        });
+
+        let args = load_qwen3_next_args_from_value(config).unwrap();
+
+        // Default still parses.
+        let q = args.quantization.as_ref().unwrap();
+        assert_eq!((q.group_size, q.bits), (64, 2));
+
+        // Every override key landed.
+        assert_eq!(
+            args.quant_overrides
+                .get("language_model.lm_head")
+                .map(|o| (o.group_size, o.bits)),
+            Some((64, 5))
+        );
+        assert_eq!(
+            args.quant_overrides
+                .get("language_model.model.embed_tokens")
+                .map(|o| (o.group_size, o.bits)),
+            Some((64, 4))
+        );
+        assert_eq!(
+            args.quant_overrides
+                .get("language_model.model.layers.0.mlp.down_proj")
+                .map(|o| (o.group_size, o.bits)),
+            Some((64, 3))
+        );
+        assert_eq!(
+            args.quant_overrides
+                .get("language_model.model.layers.0.linear_attn.in_proj_qkv")
+                .map(|o| (o.group_size, o.bits)),
+            Some((64, 4))
+        );
+        assert_eq!(
+            args.quant_overrides
+                .get("language_model.model.layers.3.self_attn.q_proj")
+                .map(|o| (o.group_size, o.bits)),
+            Some((64, 4))
+        );
+
+        // Scalar default keys (`bits`, `group_size`) must not pollute the override map.
+        assert!(!args.quant_overrides.contains_key("bits"));
+        assert!(!args.quant_overrides.contains_key("group_size"));
+    }
+
+    #[test]
+    fn test_collect_quant_overrides_synthesizes_fused_gdn_key() {
+        // Real Unsloth UD-Q2 checkpoints publish GDN per-tensor overrides under
+        // the on-disk SPLIT keys (`in_proj_qkv` / `in_proj_z`). The model in
+        // default (non-separate) GDN mode resolves the FUSED key
+        // (`in_proj_qkvz`) at QLinear construction time. The lift step must
+        // synthesize a fused-key entry from agreeing split entries, otherwise
+        // the global default applies and the quantized matmul shape check fails
+        // at runtime against the 4-bit-packed weight on disk.
+        let config = serde_json::json!({
+            "quantization": {
+                "group_size": 64,
+                "bits": 2,
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": {
+                    "group_size": 64, "bits": 4, "mode": "affine"
+                },
+                "language_model.model.layers.0.linear_attn.in_proj_z": {
+                    "group_size": 64, "bits": 4, "mode": "affine"
+                }
+            }
+        });
+
+        let overrides = collect_quant_overrides(&config);
+        let fused = overrides
+            .get("language_model.model.layers.0.linear_attn.in_proj_qkvz")
+            .and_then(|v| v.as_object())
+            .expect("fused-key override synthesized");
+        assert_eq!(fused.get("group_size"), Some(&serde_json::json!(64)));
+        assert_eq!(fused.get("bits"), Some(&serde_json::json!(4)));
+    }
+
+    #[test]
+    fn test_collect_quant_overrides_skips_synthesis_when_split_overrides_disagree() {
+        let config = serde_json::json!({
+            "quantization": {
+                "group_size": 64,
+                "bits": 2,
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": {
+                    "group_size": 64, "bits": 4, "mode": "affine"
+                },
+                "language_model.model.layers.0.linear_attn.in_proj_z": {
+                    "group_size": 64, "bits": 3, "mode": "affine"
+                }
+            }
+        });
+        let overrides = collect_quant_overrides(&config);
+        assert!(
+            !overrides.contains_key("language_model.model.layers.0.linear_attn.in_proj_qkvz"),
+            "must not synthesize when split overrides disagree on (group_size, bits)"
+        );
+    }
+
+    #[test]
+    fn test_collect_quant_overrides_does_not_overwrite_existing_fused_override() {
+        let config = serde_json::json!({
+            "quantization": {
+                "group_size": 64,
+                "bits": 2,
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": {
+                    "group_size": 64, "bits": 4, "mode": "affine"
+                },
+                "language_model.model.layers.0.linear_attn.in_proj_z": {
+                    "group_size": 64, "bits": 4, "mode": "affine"
+                },
+                "language_model.model.layers.0.linear_attn.in_proj_qkvz": {
+                    "group_size": 64, "bits": 5, "mode": "affine"
+                }
+            }
+        });
+        let overrides = collect_quant_overrides(&config);
+        let fused = overrides
+            .get("language_model.model.layers.0.linear_attn.in_proj_qkvz")
+            .and_then(|v| v.as_object())
+            .expect("explicit fused override preserved");
+        // Explicit user override wins over synthesized split-pair.
+        assert_eq!(fused.get("bits"), Some(&serde_json::json!(5)));
+    }
+
+    #[test]
+    fn test_resolve_quant_for_falls_back_to_default_when_no_override() {
+        let mut args: Qwen3NextModelArgs = serde_json::from_value(serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 1024,
+            "max_position_embeddings": 4096,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 4,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4,
+            "quantization": { "group_size": 64, "bits": 2 }
+        }))
+        .unwrap();
+
+        // Default fallback: no overrides yet.
+        assert_eq!(
+            resolve_quant_for(&args, "language_model.model.layers.0.mlp.down_proj"),
+            (64, 2)
+        );
+
+        // Insert an override; resolver picks it up over the default.
+        args.quant_overrides.insert(
+            "language_model.model.layers.0.mlp.down_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 3,
+            },
+        );
+        assert_eq!(
+            resolve_quant_for(&args, "language_model.model.layers.0.mlp.down_proj"),
+            (64, 3)
+        );
+
+        // Unrelated key still falls back to the default.
+        assert_eq!(resolve_quant_for(&args, "language_model.lm_head"), (64, 2));
+    }
+
+    #[test]
+    fn test_decoder_layer_routes_overrides_to_qlinears() {
+        // A full-attention layer (idx 3 with full_attention_interval=4) for the
+        // dense Qwen3.5 path. We override mlp.down_proj to 3-bit and self_attn.q_proj
+        // to 5-bit; everything else must stay at the global default (64, 2).
+        let mut args = valid_causal_lm_args();
+        args.num_experts = 0; // dense FFN path
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 2,
+        });
+        args.quant_overrides.insert(
+            "language_model.model.layers.3.mlp.down_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 3,
+            },
+        );
+        args.quant_overrides.insert(
+            "language_model.model.layers.3.self_attn.q_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 5,
+            },
+        );
+
+        let layer = DecoderLayer::new(&args, 3).unwrap();
+        assert!(!layer.is_linear, "layer 3 should be full-attention");
+
+        let attn = layer.self_attn.as_ref().expect("self_attn present");
+        assert_eq!(attn.q_proj.bits, 5, "q_proj override applied");
+        assert_eq!(attn.k_proj.bits, 2, "k_proj falls back to global");
+        assert_eq!(attn.v_proj.bits, 2, "v_proj falls back to global");
+        assert_eq!(attn.o_proj.bits, 2, "o_proj falls back to global");
+
+        let down = layer
+            .mlp
+            .down_proj
+            .as_ref()
+            .expect("dense down_proj present");
+        let gate = layer
+            .mlp
+            .gate_proj
+            .as_ref()
+            .expect("dense gate_proj present");
+        let up = layer.mlp.up_proj.as_ref().expect("dense up_proj present");
+        assert_eq!(down.bits, 3, "down_proj override applied");
+        assert_eq!(gate.bits, 2, "gate_proj falls back to global");
+        assert_eq!(up.bits, 2, "up_proj falls back to global");
+    }
+
+    #[test]
+    fn test_decoder_layer_moe_routes_overrides_to_shared_expert_and_switch_mlp() {
+        // MoE layer at idx 3 (full attention). Overrides target the shared expert
+        // down_proj, switch_mlp gate_proj, and the router gate.
+        let mut args = valid_causal_lm_args();
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 4,
+        });
+        args.quant_overrides.insert(
+            "language_model.model.layers.3.mlp.shared_expert.down_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 3,
+            },
+        );
+        args.quant_overrides.insert(
+            "language_model.model.layers.3.mlp.switch_mlp.gate_proj".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 5,
+            },
+        );
+        args.quant_overrides.insert(
+            "language_model.model.layers.3.mlp.gate".to_owned(),
+            QuantizationConfig {
+                group_size: 64,
+                bits: 8,
+            },
+        );
+
+        let layer = DecoderLayer::new(&args, 3).unwrap();
+
+        let gate = layer.mlp.gate.as_ref().expect("MoE gate present");
+        assert_eq!(gate.bits, 8, "router gate override applied");
+
+        let switch = layer.mlp.switch_mlp.as_ref().expect("switch_mlp present");
+        assert_eq!(
+            switch.gate_proj.bits, 5,
+            "switch_mlp.gate_proj override applied"
+        );
+        assert_eq!(
+            switch.down_proj.bits, 4,
+            "switch_mlp.down_proj falls back to global"
+        );
+
+        let shared = layer
+            .mlp
+            .shared_expert
+            .as_ref()
+            .expect("shared_expert present");
+        assert_eq!(
+            shared.down_proj.bits, 3,
+            "shared_expert.down_proj override applied"
+        );
+        assert_eq!(
+            shared.gate_proj.bits, 4,
+            "shared_expert.gate_proj falls back to global"
+        );
+    }
+
+    #[test]
+    fn test_o_proj_and_out_proj_are_bf16_in_qwen3_5() {
+        // `dense_attention_outputs` forces the four checkpoint-BF16-dense
+        // attention output projections to bits=0, while leaving every other
+        // QLinear at the resolved (overrides → global) bit width.
+        let mut args = valid_causal_lm_args();
+        args.dense_attention_outputs = true;
+        args.use_separate_gdn_projections = true;
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 4,
+        });
+
+        // Full-attention layer (idx 3): only o_proj drops to BF16-dense.
+        let attn_layer = DecoderLayer::new(&args, 3).unwrap();
+        let attn = attn_layer
+            .self_attn
+            .as_ref()
+            .expect("self_attn at full-attention layer");
+        assert_eq!(attn.q_proj.bits, 4, "q_proj keeps global quant");
+        assert_eq!(attn.k_proj.bits, 4, "k_proj keeps global quant");
+        assert_eq!(attn.v_proj.bits, 4, "v_proj keeps global quant");
+        assert_eq!(attn.o_proj.bits, 0, "o_proj forced to BF16-dense");
+
+        // Linear (GDN) layer (idx 0): out_proj, in_proj_ba, in_proj_a, in_proj_b
+        // drop to BF16-dense; in_proj_qkvz / in_proj_qkv / in_proj_z keep quant.
+        let gdn_layer = DecoderLayer::new(&args, 0).unwrap();
+        let gdn = gdn_layer
+            .linear_attn
+            .as_ref()
+            .expect("linear_attn at GDN layer");
+        assert_eq!(gdn.in_proj_qkvz.bits, 4, "in_proj_qkvz keeps global quant");
+        assert_eq!(gdn.in_proj_ba.bits, 0, "in_proj_ba forced to BF16-dense");
+        assert_eq!(gdn.out_proj.bits, 0, "out_proj forced to BF16-dense");
+        assert_eq!(
+            gdn.in_proj_qkv.as_ref().expect("separate in_proj_qkv").bits,
+            4,
+            "in_proj_qkv keeps global quant",
+        );
+        assert_eq!(
+            gdn.in_proj_z.as_ref().expect("separate in_proj_z").bits,
+            4,
+            "in_proj_z keeps global quant",
+        );
+        assert_eq!(
+            gdn.in_proj_a.as_ref().expect("separate in_proj_a").bits,
+            0,
+            "in_proj_a forced to BF16-dense",
+        );
+        assert_eq!(
+            gdn.in_proj_b.as_ref().expect("separate in_proj_b").bits,
+            0,
+            "in_proj_b forced to BF16-dense",
+        );
+
+        // Scales/biases for bits=0 use shape [0] so they bypass the
+        // placeholder-`[1]` missing-param check after weight loading.
+        assert_eq!(attn.o_proj.scales.shape(), [0]);
+        assert_eq!(attn.o_proj.biases.shape(), [0]);
+        assert_eq!(gdn.out_proj.scales.shape(), [0]);
+        assert_eq!(gdn.out_proj.biases.shape(), [0]);
+    }
+
+    #[test]
     fn test_placeholder_param_names_finds_shape_one_tensors() {
         let loaded = Array::from_slice(&[1.0f32, 2.0], &[2]);
         let placeholder = Array::from_slice(&[0.0f32], &[1]);
@@ -7264,7 +7978,7 @@ mod tests {
     #[test]
     fn test_sparse_moe_happy_path_construction() {
         let args = minimal_qwen3_next_args();
-        let result = SparseMoeBlock::new(&args, 64, 4);
+        let result = SparseMoeBlock::new(&args, "test.layer.mlp");
         assert!(result.is_ok());
         let block = result.unwrap();
         assert_eq!(block.top_k, args.num_experts_per_tok);
@@ -7587,7 +8301,8 @@ mod tests {
     #[test]
     fn test_forward_gather_global_sort_shape() {
         // RED: forward_gather_global_sort should produce [B, L, top_k, D]
-        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+        let args = minimal_qwen3_next_args();
+        let mut block = SwitchMlpWeights::new(&args, "test.layer.mlp.switch_mlp").unwrap();
 
         let gate_w = Array::ones::<f32>(&[4, 64, 64]).unwrap();
         let (gw, gs, gb) = quantize_weights(&gate_w, 64, 4);
@@ -7618,7 +8333,8 @@ mod tests {
     #[test]
     fn test_forward_gather_global_sort_equivalence() {
         // RED: global sort must produce the same values as forward_gather
-        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+        let args = minimal_qwen3_next_args();
+        let mut block = SwitchMlpWeights::new(&args, "test.layer.mlp.switch_mlp").unwrap();
 
         let gate_w = Array::ones::<f32>(&[4, 64, 64]).unwrap();
         let (gw, gs, gb) = quantize_weights(&gate_w, 64, 4);
@@ -7664,7 +8380,8 @@ mod tests {
         let b = 1;
         let l = 16;
 
-        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+        let args = minimal_qwen3_next_args();
+        let mut block = SwitchMlpWeights::new(&args, "test.layer.mlp.switch_mlp").unwrap();
 
         let gate_w =
             mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[num_experts, hidden, hidden], None)
@@ -7727,7 +8444,7 @@ mod tests {
         let b = 1;
         let l = 16;
 
-        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+        let mut block = SwitchMlpWeights::from_quant(64, 4).unwrap();
 
         let gate_w = mlx_rs::random::uniform::<f32, f32>(
             -1.0,
@@ -7795,7 +8512,8 @@ mod tests {
     fn test_switch_mlp_forward_gather_shapes() {
         // Verify forward_gather produces the correct output shape with the
         // double expand_dims pattern matching Python's SwitchGLU.
-        let mut block = SwitchMlpWeights::new(64, 4).unwrap();
+        let args = minimal_qwen3_next_args();
+        let mut block = SwitchMlpWeights::new(&args, "test.layer.mlp.switch_mlp").unwrap();
 
         // 4 experts, intermediate=64, hidden=64
         let gate_w = Array::ones::<f32>(&[4, 64, 64]).unwrap();
@@ -7839,7 +8557,7 @@ mod tests {
             bits: 8,
         });
 
-        let mut block = SparseMoeBlock::new(&args, 64, 4).unwrap();
+        let mut block = SparseMoeBlock::new(&args, "test.layer.mlp").unwrap();
 
         // Set router gate weights: [num_experts, hidden_size]
         let gate_w = Array::ones::<f32>(&[4, 64]).unwrap();
@@ -8259,7 +8977,7 @@ mod tests {
         use mlx_rs::Dtype;
 
         let args = valid_causal_lm_args();
-        let mut gdn = GatedDeltaNet::new(&args, 64, 4).unwrap();
+        let mut gdn = GatedDeltaNet::new(&args, "test.layer.linear_attn").unwrap();
         let conv_w = mlx_rs::random::uniform::<f32, f32>(
             -0.5,
             0.5,
@@ -17018,7 +17736,8 @@ mod tests {
             layer.bits = 4;
         }
 
-        let mut block = FfnBlock::new_dense(64, 4).unwrap();
+        let args = minimal_qwen3_next_args();
+        let mut block = FfnBlock::new_dense(&args, "test.layer.mlp").unwrap();
         assign_qlinear(block.gate_proj.as_mut().unwrap(), 96, 64);
         assign_qlinear(block.up_proj.as_mut().unwrap(), 96, 64);
         assign_qlinear(block.down_proj.as_mut().unwrap(), 64, 96);
@@ -17105,6 +17824,350 @@ mod tests {
             state_max < 1e-5,
             "compiled GDN decode state mismatch by {state_max}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 5 Layer 1: synthetic mix-bit safetensors fixture end-to-end test
+    // -----------------------------------------------------------------------
+
+    mod mixbit_fixture_tests {
+        use super::*;
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        fn random_f32(shape: &[i32], scale: f32) -> Array {
+            let arr = mlx_rs::random::uniform::<f32, f32>(-scale, scale, shape, None).unwrap();
+            arr.eval().unwrap();
+            arr
+        }
+
+        fn ones_f32(shape: &[i32]) -> Array {
+            let arr = Array::ones::<f32>(shape).unwrap();
+            arr.eval().unwrap();
+            arr
+        }
+
+        fn zeros_f32(shape: &[i32]) -> Array {
+            let arr = Array::zeros::<f32>(shape).unwrap();
+            arr.eval().unwrap();
+            arr
+        }
+
+        fn insert_qlinear(
+            map: &mut HashMap<String, Array>,
+            base: &str,
+            out_features: i32,
+            in_features: i32,
+            group_size: i32,
+            bits: i32,
+        ) {
+            let w = random_f32(&[out_features, in_features], 0.05);
+            let (qw, s, b) = mlx_rs::ops::quantize(&w, group_size, bits).unwrap();
+            mlx_rs::transforms::eval([&qw, &s, &b]).unwrap();
+            map.insert(format!("{base}.weight"), qw);
+            map.insert(format!("{base}.scales"), s);
+            map.insert(format!("{base}.biases"), b);
+        }
+
+        fn insert_dense(map: &mut HashMap<String, Array>, base: &str, shape: &[i32]) {
+            map.insert(format!("{base}.weight"), random_f32(shape, 0.05));
+        }
+
+        fn config_json() -> serde_json::Value {
+            serde_json::json!({
+                "tie_word_embeddings": false,
+                "text_config": {
+                    "model_type": "qwen3_5",
+                    "hidden_size": 256,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 512,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 64,
+                    "rms_norm_eps": 1e-6,
+                    "vocab_size": 1024,
+                    "max_position_embeddings": 512,
+                    "full_attention_interval": 4,
+                    "linear_num_key_heads": 2,
+                    "linear_num_value_heads": 4,
+                    "linear_key_head_dim": 32,
+                    "linear_value_head_dim": 16,
+                    "linear_conv_kernel_dim": 4,
+                    "num_experts": 0,
+                    "num_experts_per_tok": 0
+                },
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 2,
+                    "language_model.lm_head": { "group_size": 64, "bits": 5, "mode": "affine" },
+                    "language_model.model.embed_tokens": { "group_size": 64, "bits": 4, "mode": "affine" },
+                    "language_model.model.layers.0.linear_attn.in_proj_qkvz": { "group_size": 64, "bits": 4, "mode": "affine" },
+                    "language_model.model.layers.1.linear_attn.in_proj_qkvz": { "group_size": 64, "bits": 4, "mode": "affine" },
+                    "language_model.model.layers.2.linear_attn.in_proj_qkvz": { "group_size": 64, "bits": 4, "mode": "affine" },
+                    "language_model.model.layers.0.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" },
+                    "language_model.model.layers.1.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" },
+                    "language_model.model.layers.2.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" },
+                    "language_model.model.layers.3.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" }
+                }
+            })
+        }
+
+        fn write_fixture(dir: &Path) {
+            std::fs::write(
+                dir.join("config.json"),
+                serde_json::to_string_pretty(&config_json()).unwrap(),
+            )
+            .unwrap();
+
+            let hidden = 256i32;
+            let vocab = 1024i32;
+            let inter = 512i32;
+            let n_heads = 4i32;
+            let n_kv = 2i32;
+            let head_dim = 64i32;
+            let nk = 2i32;
+            let nv = 4i32;
+            let dk = 32i32;
+            let dv = 16i32;
+            let key_dim = nk * dk; // 64
+            let value_dim = nv * dv; // 64
+            let conv_dim = key_dim * 2 + value_dim; // 192
+            let kernel = 4i32;
+            let qkv_rows = key_dim * 2 + value_dim; // 192
+
+            let prefix = "language_model.";
+            let mut map: HashMap<String, Array> = HashMap::new();
+
+            // Embedding (4-bit) and lm_head (5-bit)
+            insert_qlinear(
+                &mut map,
+                &format!("{prefix}model.embed_tokens"),
+                vocab,
+                hidden,
+                64,
+                4,
+            );
+            insert_qlinear(&mut map, &format!("{prefix}lm_head"), vocab, hidden, 64, 5);
+            map.insert(format!("{prefix}model.norm.weight"), ones_f32(&[hidden]));
+
+            for i in 0..4 {
+                let layer = format!("{prefix}model.layers.{i}");
+                map.insert(
+                    format!("{layer}.input_layernorm.weight"),
+                    ones_f32(&[hidden]),
+                );
+                map.insert(
+                    format!("{layer}.post_attention_layernorm.weight"),
+                    ones_f32(&[hidden]),
+                );
+                // MLP: gate/up at default (2-bit), down at 3-bit
+                insert_qlinear(
+                    &mut map,
+                    &format!("{layer}.mlp.gate_proj"),
+                    inter,
+                    hidden,
+                    64,
+                    2,
+                );
+                insert_qlinear(
+                    &mut map,
+                    &format!("{layer}.mlp.up_proj"),
+                    inter,
+                    hidden,
+                    64,
+                    2,
+                );
+                insert_qlinear(
+                    &mut map,
+                    &format!("{layer}.mlp.down_proj"),
+                    hidden,
+                    inter,
+                    64,
+                    3,
+                );
+
+                if (i + 1) % 4 == 0 {
+                    // Layer 3: full self-attention
+                    let q_out = 2 * n_heads * head_dim; // 512 (gated)
+                    let kv_out = n_kv * head_dim; // 128
+                    insert_qlinear(
+                        &mut map,
+                        &format!("{layer}.self_attn.q_proj"),
+                        q_out,
+                        hidden,
+                        64,
+                        2,
+                    );
+                    insert_qlinear(
+                        &mut map,
+                        &format!("{layer}.self_attn.k_proj"),
+                        kv_out,
+                        hidden,
+                        64,
+                        2,
+                    );
+                    insert_qlinear(
+                        &mut map,
+                        &format!("{layer}.self_attn.v_proj"),
+                        kv_out,
+                        hidden,
+                        64,
+                        2,
+                    );
+                    insert_dense(
+                        &mut map,
+                        &format!("{layer}.self_attn.o_proj"),
+                        &[hidden, n_heads * head_dim],
+                    );
+                    map.insert(
+                        format!("{layer}.self_attn.q_norm.weight"),
+                        ones_f32(&[head_dim]),
+                    );
+                    map.insert(
+                        format!("{layer}.self_attn.k_norm.weight"),
+                        ones_f32(&[head_dim]),
+                    );
+                } else {
+                    // Layers 0/1/2: GDN linear attention. Disk has split
+                    // in_proj_qkv / in_proj_z (quantized) and BF16-dense
+                    // in_proj_b / in_proj_a / out_proj. The fused loader
+                    // concatenates qkv+z into in_proj_qkvz and b+a into
+                    // in_proj_ba on the model side.
+                    insert_qlinear(
+                        &mut map,
+                        &format!("{layer}.linear_attn.in_proj_qkv"),
+                        qkv_rows,
+                        hidden,
+                        64,
+                        4,
+                    );
+                    insert_qlinear(
+                        &mut map,
+                        &format!("{layer}.linear_attn.in_proj_z"),
+                        value_dim,
+                        hidden,
+                        64,
+                        4,
+                    );
+                    insert_dense(
+                        &mut map,
+                        &format!("{layer}.linear_attn.in_proj_b"),
+                        &[nv, hidden],
+                    );
+                    insert_dense(
+                        &mut map,
+                        &format!("{layer}.linear_attn.in_proj_a"),
+                        &[nv, hidden],
+                    );
+                    insert_dense(
+                        &mut map,
+                        &format!("{layer}.linear_attn.out_proj"),
+                        &[hidden, value_dim],
+                    );
+                    map.insert(
+                        format!("{layer}.linear_attn.conv1d.weight"),
+                        random_f32(&[conv_dim, kernel, 1], 0.1),
+                    );
+                    map.insert(format!("{layer}.linear_attn.norm.weight"), ones_f32(&[dv]));
+                    map.insert(format!("{layer}.linear_attn.A_log"), zeros_f32(&[nv]));
+                    map.insert(format!("{layer}.linear_attn.dt_bias"), zeros_f32(&[nv]));
+                }
+            }
+
+            let path = dir.join("model.safetensors");
+            Array::save_safetensors(&map, None, &path).unwrap();
+
+            let weight_map: serde_json::Map<String, serde_json::Value> = map
+                .keys()
+                .map(|k| {
+                    (
+                        k.clone(),
+                        serde_json::Value::String("model.safetensors".to_owned()),
+                    )
+                })
+                .collect();
+            let index = serde_json::json!({"metadata": {}, "weight_map": weight_map});
+            std::fs::write(
+                dir.join("model.safetensors.index.json"),
+                serde_json::to_string(&index).unwrap(),
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn test_qwen3_5_mixbit_synthetic_fixture_loads_and_runs_forward() {
+            let dir = tempfile::tempdir().unwrap();
+            write_fixture(dir.path());
+
+            let mut model = load_qwen3_5_model(dir.path()).expect("model loads");
+
+            // Bit widths land where overrides + dense_attention_outputs say
+            assert_eq!(
+                model.lm_head.as_ref().expect("lm_head not tied").bits,
+                5,
+                "lm_head override (5-bit) applied"
+            );
+            assert_eq!(
+                model.model.embed_tokens.bits, 4,
+                "embed override (4-bit) applied"
+            );
+
+            let layer0 = &model.model.layers[0];
+            let gdn = layer0.linear_attn.as_ref().expect("layer 0 is GDN");
+            assert_eq!(
+                gdn.in_proj_qkvz.bits, 4,
+                "layer 0 in_proj_qkvz override (4-bit) applied"
+            );
+            assert_eq!(gdn.in_proj_ba.bits, 0, "layer 0 in_proj_ba is BF16-dense");
+            assert_eq!(gdn.out_proj.bits, 0, "layer 0 out_proj is BF16-dense");
+            let l0_down = layer0.mlp.down_proj.as_ref().expect("dense mlp.down_proj");
+            assert_eq!(
+                l0_down.bits, 3,
+                "layer 0 mlp.down_proj override (3-bit) applied"
+            );
+
+            let layer3 = &model.model.layers[3];
+            let attn = layer3
+                .self_attn
+                .as_ref()
+                .expect("layer 3 is full attention");
+            assert_eq!(attn.o_proj.bits, 0, "layer 3 o_proj is BF16-dense");
+            assert_eq!(attn.q_proj.bits, 2, "layer 3 q_proj at default 2-bit");
+
+            // No shape-[1] placeholders survive after loading
+            use mlx_rs::module::ModuleParameters;
+            let params = model.parameters().flatten();
+            let placeholders: Vec<String> = params
+                .iter()
+                .filter_map(|(k, v): (&std::rc::Rc<str>, &&Array)| {
+                    if v.shape() == [1] {
+                        Some((**k).to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(
+                placeholders.is_empty(),
+                "expected no [1] placeholders, got: {placeholders:?}"
+            );
+
+            // Forward pass produces finite logits of expected shape
+            let tokens = Array::from_slice(&[1u32, 2, 3, 4], &[1, 4]);
+            let mut cache: Vec<Option<LayerCache>> = Vec::new();
+            let logits = model
+                .forward(&tokens, None, &mut cache)
+                .expect("forward succeeds");
+            mlx_rs::transforms::eval([&logits]).unwrap();
+            // Qwen3NextCausalLM::forward returns the last-position logits only
+            assert_eq!(logits.shape(), [1, 1, 1024], "logits shape [B, 1, vocab]");
+
+            let finite = logits.is_finite().unwrap();
+            let all_finite = finite.all(None).unwrap();
+            mlx_rs::transforms::eval([&all_finite]).unwrap();
+            let ok: bool = all_finite.item();
+            assert!(ok, "logits should be finite");
+        }
     }
 }
 
