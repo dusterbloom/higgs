@@ -67,6 +67,12 @@ pub struct ChatCompletionRequest {
     /// reasons.
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// Top-level alias for `chat_template_kwargs.enable_thinking`, accepted
+    /// because many OpenAI-compatible clients send the toggle here. When both
+    /// are present, `chat_template_kwargs.enable_thinking` wins; otherwise this
+    /// value is used.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
     /// Opt-in multi-turn KV-cache reuse. When set (non-streaming, Simple engine
     /// only) the conversation's KV cache is retained across turns so that a
     /// continued turn prefills only the new suffix instead of the full history.

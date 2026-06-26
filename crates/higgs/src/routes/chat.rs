@@ -276,7 +276,8 @@ async fn chat_completions_non_streaming(
         req.reasoning.as_ref(),
         req.chat_template_kwargs
             .as_ref()
-            .and_then(|k| k.enable_thinking),
+            .and_then(|k| k.enable_thinking)
+            .or(req.enable_thinking),
     );
 
     let mut prompt_tokens = engine
@@ -668,7 +669,8 @@ fn chat_completions_stream(
         req.reasoning.as_ref(),
         req.chat_template_kwargs
             .as_ref()
-            .and_then(|k| k.enable_thinking),
+            .and_then(|k| k.enable_thinking)
+            .or(req.enable_thinking),
     );
 
     // Pass tools into prompt rendering so the chat template emits the

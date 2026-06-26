@@ -217,7 +217,9 @@ For thinking-capable models, `/v1/chat/completions` accepts two extra body field
   `/thinking N`.
 - **`chat_template_kwargs.enable_thinking`** (bool) — per-request override of the
   model's reasoning mode; wins over `reasoning.effort`. `false` forces reasoning
-  off; `true` enables it on a thinking-capable model.
+  off; `true` enables it on a thinking-capable model. A top-level
+  **`enable_thinking`** (bool) is accepted as an alias for clients that send it
+  there; `chat_template_kwargs.enable_thinking` takes precedence when both are set.
 
 ```bash
 curl http://localhost:8000/v1/chat/completions -d '{
