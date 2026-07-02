@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -324,48 +325,14 @@ async fn chat_completions_non_streaming(
     let has_tools = tools.is_some();
 
     if let Some(sid) = session_id {
-        // Build the token sequence fed to `generate_continued`. The engine guard
-        // prefills only the suffix IFF the retained tokens are a strict token-
-        // prefix of what we pass, so we hand it `retained ++ delta`.
-        //
-        // `retained` carries the `<think>...</think>` block the chat template
-        // injects for the assistant turn answering the *latest* query (it was the
-        // current turn when generated). The canonical multi-turn render STRIPS
-        // `<think>` from historical assistant turns (template `last_query_index`
-        // logic), so `retained` is never a literal prefix of the freshly-rendered
-        // conversation. We match a think-stripped copy of `retained` against the
-        // full render to find the new-turn delta, then append that delta to the
-        // ORIGINAL `retained` tokens: the mid-sequence think block is valid KV, so
-        // `retained` stays a strict token-prefix and the guard continues, prefilling
-        // only the delta.
-        //
-        // ponytail: assumes `<think>..</think>` delimiters (Qwen3.x family); any
-        // other template just fails the strip_prefix and falls back to a clean full
-        // prefill. A thinking-on continuation keeps the prior turn's reasoning
-        // resident (a fresh render would drop it) — acceptable for the tool loop.
-        let continued_prompt = 'cont: {
-            let Some(retained) = engine.retained_session_tokens(sid) else {
-                break 'cont prompt_tokens.clone(); // first turn / evicted -> full prefill
-            };
-            let (Ok(retained_text), Ok(full_text)) = (
-                engine.tokenizer().decode(&retained, false),
-                engine.render_chat_prompt_with_thinking(&messages, tools, thinking_enabled),
-            ) else {
-                break 'cont prompt_tokens.clone();
-            };
-            let normalized = strip_think_blocks(&retained_text);
-            let Some(delta_text) = full_text.strip_prefix(normalized.as_str()) else {
-                // History diverged (edited reply, evicted cache, or a template we
-                // don't recognise) -> clean full prefill. Correctness over reuse.
-                break 'cont prompt_tokens.clone();
-            };
-            let Ok(delta_enc) = engine.tokenizer().encode(delta_text, false) else {
-                break 'cont prompt_tokens.clone();
-            };
-            let mut combined = retained;
-            combined.extend_from_slice(delta_enc.get_ids());
-            combined
-        };
+        let continued_prompt = continued_prompt_tokens(
+            &engine,
+            sid,
+            &prompt_tokens,
+            &messages,
+            tools,
+            thinking_enabled,
+        );
 
         let sampling_c = sampling.clone();
         let engine_c = Arc::clone(&engine);
@@ -505,6 +472,129 @@ async fn chat_completions_non_streaming(
     })
 }
 
+/// Build the token sequence fed to `generate_continued`. The engine guard
+/// prefills only the suffix IFF the retained tokens are a strict token-prefix of
+/// what we pass, so we hand it `retained ++ delta`.
+///
+/// `retained` carries the `<think>...</think>` block the chat template injected
+/// for the prior assistant turn. The canonical multi-turn render strips
+/// `<think>` from historical assistant turns, so match a think-stripped copy of
+/// `retained` against the full render to find the new-turn delta, then append
+/// that delta to the original retained tokens.
+// `print_stderr`: env-gated (HIGGS_DIAG_SESSION_TIMING) diagnostics only.
+#[allow(clippy::print_stderr)]
+fn continued_prompt_tokens(
+    engine: &Arc<Engine>,
+    session_id: u64,
+    prompt_tokens: &[u32],
+    messages: &[higgs_engine::chat_template::ChatMessage],
+    tools: Option<&[serde_json::Value]>,
+    thinking_enabled: bool,
+) -> Vec<u32> {
+    let diag = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
+    let Some(retained) = engine.retained_session_tokens(session_id) else {
+        if diag {
+            eprintln!(
+                "DIAG session-continue-fallback: reason=no_retained_cache session_id={session_id} prompt_tokens={}",
+                prompt_tokens.len()
+            );
+        }
+        return prompt_tokens.to_vec();
+    };
+    let retained_text = match engine.tokenizer().decode(&retained, false) {
+        Ok(text) => text,
+        Err(error) => {
+            if diag {
+                eprintln!(
+                    "DIAG session-continue-fallback: reason=decode_retained_failed session_id={session_id} retained_tokens={} error={error}",
+                    retained.len()
+                );
+            }
+            return prompt_tokens.to_vec();
+        }
+    };
+    let full_text = match engine.render_chat_prompt_with_thinking(messages, tools, thinking_enabled)
+    {
+        Ok(text) => text,
+        Err(error) => {
+            if diag {
+                eprintln!(
+                    "DIAG session-continue-fallback: reason=render_full_failed session_id={session_id} retained_tokens={} prompt_tokens={} error={error}",
+                    retained.len(),
+                    prompt_tokens.len()
+                );
+            }
+            return prompt_tokens.to_vec();
+        }
+    };
+    let normalized = strip_think_blocks(&retained_text);
+    let Some(delta_text) = full_text.strip_prefix(normalized.as_str()) else {
+        if diag {
+            let common = common_prefix_bytes(&normalized, &full_text);
+            eprintln!(
+                "DIAG session-continue-fallback: reason=text_prefix_mismatch session_id={session_id} retained_tokens={} prompt_tokens={} normalized_bytes={} full_bytes={} common_bytes={} retained_tail={:?} full_at_mismatch={:?}",
+                retained.len(),
+                prompt_tokens.len(),
+                normalized.len(),
+                full_text.len(),
+                common,
+                preview_around(&normalized, common),
+                preview_around(&full_text, common)
+            );
+        }
+        return prompt_tokens.to_vec();
+    };
+    let Ok(delta_enc) = engine.tokenizer().encode(delta_text, false) else {
+        if diag {
+            eprintln!(
+                "DIAG session-continue-fallback: reason=encode_delta_failed session_id={session_id} delta_bytes={}",
+                delta_text.len()
+            );
+        }
+        return prompt_tokens.to_vec();
+    };
+    if diag {
+        eprintln!(
+            "DIAG session-continue: matched session_id={session_id} retained_tokens={} delta_tokens={} full_prompt_tokens={}",
+            retained.len(),
+            delta_enc.get_ids().len(),
+            prompt_tokens.len()
+        );
+    }
+    let mut combined = retained;
+    combined.extend_from_slice(delta_enc.get_ids());
+    combined
+}
+
+fn common_prefix_bytes(left: &str, right: &str) -> usize {
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .take_while(|(l, r)| l == r)
+        .count()
+}
+
+fn preview_around(text: &str, byte_pos: usize) -> String {
+    let start = char_boundary_at_or_before(text, byte_pos.saturating_sub(80));
+    let end = char_boundary_at_or_after(text, byte_pos.saturating_add(80));
+    text.get(start..end).unwrap_or_default().to_owned()
+}
+
+fn char_boundary_at_or_before(text: &str, byte_pos: usize) -> usize {
+    let pos = byte_pos.min(text.len());
+    (0..=pos)
+        .rev()
+        .find(|idx| text.is_char_boundary(*idx))
+        .unwrap_or(0)
+}
+
+fn char_boundary_at_or_after(text: &str, byte_pos: usize) -> usize {
+    let pos = byte_pos.min(text.len());
+    (pos..=text.len())
+        .find(|idx| text.is_char_boundary(*idx))
+        .unwrap_or(text.len())
+}
+
 /// Remove `<think>...</think>` blocks — and the single `\n\n` the chat template
 /// emits after each — from a rendered prompt string. Used by the cache-resident
 /// continuation path to reconcile a retained KV's detokenization (which carries
@@ -633,7 +723,7 @@ fn chat_completions_stream(
     engine: Arc<Engine>,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
-) -> Result<impl Stream<Item = Result<Event, Infallible>>, ServerError> {
+) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, ServerError> {
     let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     // Built here (before the `async_stream::stream!` block, which captures by
     // move) so the tracker can coerce XML-format tool-call values to their
@@ -712,6 +802,8 @@ fn chat_completions_stream(
         .is_some_and(|opts| opts.include_usage.unwrap_or(false));
     let return_progress = req.return_progress.unwrap_or(false);
     let created = current_unix_timestamp();
+    let tools_for_session = req.tools.clone();
+    let request_session_id = req.session_id;
     let model = req.model;
     let checkpoint_id = req.checkpoint_id;
     let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(0);
@@ -732,6 +824,131 @@ fn chat_completions_stream(
             error_body: None,
         })
     });
+
+    let stream_session_id = request_session_id
+        .filter(|_| pixel_values.is_none() && constraint.is_none() && !want_logprobs)
+        .filter(|_| checkpoint_id.is_none());
+    if let Some(sid) = stream_session_id {
+        let continued_prompt = continued_prompt_tokens(
+            &engine,
+            sid,
+            &prompt_tokens,
+            &messages,
+            prompt_tools,
+            thinking_enabled_stream,
+        );
+        let engine_c = Arc::clone(&engine);
+        let sampling_c = sampling.clone();
+        let request_id_c = request_id.clone();
+        let model_c = model.clone();
+        let stream = async_stream::stream! {
+            let mut writer = crate::sse::ChatChunkWriter::new(&request_id_c, created, &model_c);
+
+            macro_rules! emit_delta {
+                ($delta:expr, $finish:expr, $logprobs:expr) => {
+                    match writer.write_delta($delta, $finish, $logprobs) {
+                        Ok(json) => yield Ok(Event::default().data(json)),
+                        Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+                    }
+                };
+            }
+
+            let role_delta = ChatCompletionDelta {
+                role: Some("assistant".to_owned()),
+                content: None,
+                reasoning_content: None,
+                tool_calls: None,
+            };
+            emit_delta!(&role_delta, None, None);
+
+            let session_result = tokio::task::spawn_blocking(move || {
+                engine_c.generate_continued(sid, &continued_prompt, max_tokens, &sampling_c)
+            })
+            .await;
+
+            match session_result {
+                Ok(Ok(output)) => {
+                    let tools = tools_for_session.as_deref().filter(|t| !t.is_empty());
+                    let response = build_session_response(
+                        &model_c,
+                        &request_id_c,
+                        output,
+                        tools,
+                        stream_includes_tools,
+                        thinking_enabled_stream,
+                    );
+                    if let Some(choice) = response.choices.first() {
+                        if let Some(reasoning) = choice.message.reasoning_content.clone() {
+                            let d = ChatCompletionDelta {
+                                role: None,
+                                content: None,
+                                reasoning_content: Some(reasoning),
+                                tool_calls: None,
+                            };
+                            emit_delta!(&d, None, None);
+                        }
+                        if let Some(content) = choice.message.content.as_ref() {
+                            let text = content.text();
+                            if !text.is_empty() {
+                                let d = ChatCompletionDelta {
+                                    role: None,
+                                    content: Some(text),
+                                    reasoning_content: None,
+                                    tool_calls: None,
+                                };
+                                emit_delta!(&d, None, None);
+                            }
+                        }
+                        if let Some(tool_calls) = choice.message.tool_calls.as_ref() {
+                            for (index, tool_call) in tool_calls.iter().enumerate() {
+                                let d = ChatCompletionDelta {
+                                    role: None,
+                                    content: None,
+                                    reasoning_content: None,
+                                    tool_calls: Some(vec![ToolCallDelta {
+                                        index: u32::try_from(index).unwrap_or(u32::MAX),
+                                        id: Some(tool_call.id.clone()),
+                                        r#type: Some(tool_call.r#type.clone()),
+                                        function: Some(ToolCallFunctionDelta {
+                                            name: Some(tool_call.function.name.clone()),
+                                            arguments: Some(tool_call.function.arguments.clone()),
+                                        }),
+                                    }]),
+                                };
+                                emit_delta!(&d, None, None);
+                            }
+                        }
+                        let final_delta = ChatCompletionDelta {
+                            role: None,
+                            content: None,
+                            reasoning_content: None,
+                            tool_calls: None,
+                        };
+                        emit_delta!(&final_delta, Some(choice.finish_reason.as_str()), None);
+                    }
+
+                    if include_usage {
+                        match writer.write_usage(&response.usage) {
+                            Ok(json) => yield Ok(Event::default().data(json)),
+                            Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
+                        }
+                    }
+                    if let Some(ref m) = metrics {
+                        if let Some(id) = metrics_id {
+                            m.finalize_stream(id, u64::from(response.usage.completion_tokens), start.elapsed());
+                        }
+                    }
+                }
+                Ok(Err(e)) => tracing::error!(error = %e, "Session generation error during streaming"),
+                Err(e) => tracing::error!(error = %e, "Session generation task join error during streaming"),
+            }
+
+            yield Ok(Event::default().data("[DONE]"));
+        };
+
+        return Ok(Box::pin(stream));
+    }
+
     let tokenizer = engine.tokenizer().clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
@@ -969,7 +1186,7 @@ fn chat_completions_stream(
         yield Ok(Event::default().data("[DONE]"));
     };
 
-    Ok(stream)
+    Ok(Box::pin(stream))
 }
 
 fn convert_messages(
