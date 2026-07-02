@@ -39,6 +39,7 @@
 )]
 
 use std::path::Path;
+use std::time::Instant;
 
 use higgs_engine::chat_template::ChatMessage;
 use higgs_engine::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
@@ -187,4 +188,180 @@ fn session_continuation_saves_prefill() {
              — continuation guard regression"
         );
     }
+}
+
+// On-demand decode-throughput probe: sequential decode tok/s at ~4k context.
+// Run with HIGGS_DIAG_SESSION_TIMING=1 and read the decode= bucket
+// (2026-07-02 baseline on Qwen3.6-35B-A3B-4bit, debug build: ~24 tok/s).
+#[test]
+#[ignore = "loads a real model; set HIGGS_PRUNE_MODEL"]
+fn decode_throughput_probe() {
+    let dir = std::env::var("HIGGS_PRUNE_MODEL").expect("set HIGGS_PRUNE_MODEL");
+    let model_dir = Path::new(&dir);
+    let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
+    let engine =
+        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load");
+    let params = SamplingParams {
+        temperature: 0.0,
+        ..Default::default()
+    };
+    let mut content = String::new();
+    while engine
+        .prepare_chat_prompt_with_thinking(
+            &[ChatMessage {
+                role: "user".to_owned(),
+                content: content.clone(),
+                tool_calls: None,
+            }],
+            None,
+            false,
+        )
+        .expect("render")
+        .len()
+        < std::env::var("HIGGS_SESSION_BENCH_TARGET_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4096)
+    {
+        content.push_str(
+            " Explain photosynthesis, chloroplast structure, electron transport, ATP synthesis, NADPH production, Calvin-cycle carbon fixation, and ecological carbon flow in precise terms.",
+        );
+    }
+    let toks = engine
+        .prepare_chat_prompt_with_thinking(
+            &[ChatMessage {
+                role: "user".to_owned(),
+                content,
+                tool_calls: None,
+            }],
+            None,
+            false,
+        )
+        .expect("render");
+    let out = engine
+        .generate_continued(777, &toks, 192, &params)
+        .expect("generate");
+    println!(
+        "decode probe: prompt={} completion={}",
+        toks.len(),
+        out.completion_tokens
+    );
+}
+
+#[test]
+#[ignore = "loads a real model; set HIGGS_PRUNE_MODEL"]
+fn long_context_session_continuation_beats_cold_prefill() {
+    let dir = std::env::var("HIGGS_PRUNE_MODEL").expect("set HIGGS_PRUNE_MODEL");
+    let model_dir = Path::new(&dir);
+    let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
+    let engine =
+        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load");
+    let params = SamplingParams {
+        temperature: 0.0,
+        ..Default::default()
+    };
+
+    let target_tokens = std::env::var("HIGGS_SESSION_BENCH_TARGET_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1536);
+    let mut content = String::new();
+    while engine
+        .prepare_chat_prompt_with_thinking(
+            &[ChatMessage {
+                role: "user".to_owned(),
+                content: content.clone(),
+                tool_calls: None,
+            }],
+            None,
+            false,
+        )
+        .expect("render growing prompt")
+        .len()
+        < target_tokens
+    {
+        content.push_str(
+            " Explain photosynthesis, chloroplast structure, electron transport, ATP synthesis, NADPH production, Calvin-cycle carbon fixation, and ecological carbon flow in precise terms.",
+        );
+    }
+
+    let turn1 = ChatMessage {
+        role: "user".to_owned(),
+        content,
+        tool_calls: None,
+    };
+    let toks1 = engine
+        .prepare_chat_prompt_with_thinking(std::slice::from_ref(&turn1), None, false)
+        .expect("render long turn 1");
+
+    const SID: u64 = 4242;
+    let turn1_start = Instant::now();
+    let out1 = engine
+        .generate_continued(SID, &toks1, 1, &params)
+        .expect("turn 1 generate");
+    let turn1_elapsed = turn1_start.elapsed();
+    assert!(!out1.continued);
+
+    let retained = engine
+        .retained_session_tokens(SID)
+        .expect("turn 1 must retain a live cache");
+    let suffix_ids = encode_ids(&engine, "\nNow answer in exactly five words.");
+    let mut turn2 = retained.clone();
+    turn2.extend_from_slice(&suffix_ids);
+
+    let continued_start = Instant::now();
+    let continued = engine
+        .generate_continued(SID, &turn2, 1, &params)
+        .expect("continued generate");
+    let continued_elapsed = continued_start.elapsed();
+
+    engine.drop_retained_session(SID + 1);
+    engine.clear_prefix_cache();
+    let cold_start = Instant::now();
+    let cold = engine
+        .generate_continued(SID + 1, &turn2, 1, &params)
+        .expect("cold generate");
+    let cold_elapsed = cold_start.elapsed();
+    engine.drop_retained_session(SID + 1);
+
+    let saved = continued
+        .prompt_tokens
+        .saturating_sub(continued.prefilled_tokens);
+    let saved_pct = saved as f64 / continued.prompt_tokens.max(1) as f64;
+
+    println!("\n=== long-context session continuation ===");
+    println!(
+        "turn1 prompt={} prefilled={} wall={turn1_elapsed:.2?}",
+        out1.prompt_tokens, out1.prefilled_tokens
+    );
+    println!(
+        "turn2 continued: prompt={} prefilled={} saved={} ({:.1}%) wall={continued_elapsed:.2?}",
+        continued.prompt_tokens,
+        continued.prefilled_tokens,
+        saved,
+        saved_pct * 100.0
+    );
+    println!(
+        "turn2 cold:      prompt={} prefilled={} wall={cold_elapsed:.2?}",
+        cold.prompt_tokens, cold.prefilled_tokens
+    );
+
+    assert!(
+        continued.continued,
+        "turn 2 must use the retained session cache"
+    );
+    assert_eq!(
+        continued.prefilled_tokens as usize,
+        suffix_ids.len(),
+        "continued turn must prefill only the appended suffix"
+    );
+    assert!(
+        saved_pct >= 0.90,
+        "continued path saved only {:.1}%",
+        saved_pct * 100.0
+    );
+    assert!(
+        continued_elapsed < cold_elapsed,
+        "continued turn ({continued_elapsed:.2?}) must beat cold full prefill ({cold_elapsed:.2?})"
+    );
 }
