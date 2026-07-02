@@ -159,6 +159,28 @@ fn mtp_prefill_priming_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_MTP_PRIME_PREFILL").ok().as_deref()).unwrap_or(true)
 }
 
+/// DFlash confidence-truncation threshold (`HIGGS_DFLASH_CONF_TRUNC`, a
+/// drafter top-1 probability in (0,1]); `None` disables truncation.
+///
+/// Training-free port of DSpark's confidence scheduler: verify only the
+/// prefix of the draft block the drafter itself is confident about, skip the
+/// doomed tail. Extra profitable on MoE targets, where verify cost scales
+/// with verified positions (unique experts activated), unlike dense targets.
+/// Default 0.5 (measured on Qwen3.6-35B-A3B: code 56->70 tok/s now beating
+/// MTP, deterministic 87->92, prose unchanged and still MTP-floored, all
+/// byte-exact gates green). Set to `0` to disable.
+fn dflash_conf_trunc_threshold() -> Option<f32> {
+    static THRESHOLD: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| match std::env::var("HIGGS_DFLASH_CONF_TRUNC") {
+        Err(_) => Some(0.5),
+        Ok(raw) => raw
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|t| *t > 0.0 && *t <= 1.0),
+    })
+}
+
 fn parse_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -3686,13 +3708,57 @@ impl SimpleEngine {
                     .forward_all_logits_from_hidden(&draft_hidden_sliced)
                     .map_err(EngineError::Mlx)?;
                 let draft_token_arr =
-                    mlx_rs::argmax_axis!(draft_logits, -1).map_err(EngineError::Mlx)?;
-                eval([&draft_token_arr]).map_err(EngineError::Mlx)?;
-                let draft_u32: Vec<u32> = draft_token_arr
+                    mlx_rs::argmax_axis!(&draft_logits, -1).map_err(EngineError::Mlx)?;
+                // d2. Confidence truncation (training-free DSpark scheduler):
+                // per-position drafter top-1 probability in log space
+                // (max - logsumexp), computed lazily so it joins the argmax's
+                // host barrier below.
+                let conf_logp = if dflash_conf_trunc_threshold().is_some() {
+                    let max_l =
+                        mlx_rs::ops::max_axis(&draft_logits, -1, None).map_err(EngineError::Mlx)?;
+                    let lse = mlx_rs::ops::logsumexp_axis(&draft_logits, -1, None)
+                        .map_err(EngineError::Mlx)?;
+                    Some(
+                        max_l
+                            .subtract(&lse)
+                            .map_err(EngineError::Mlx)?
+                            .as_dtype(mlx_rs::Dtype::Float32)
+                            .map_err(EngineError::Mlx)?,
+                    )
+                } else {
+                    None
+                };
+                match conf_logp.as_ref() {
+                    Some(lp) => eval([&draft_token_arr, lp]).map_err(EngineError::Mlx)?,
+                    None => eval([&draft_token_arr]).map_err(EngineError::Mlx)?,
+                }
+                let mut draft_u32: Vec<u32> = draft_token_arr
                     .reshape(&[-1])
                     .map_err(EngineError::Mlx)?
                     .as_slice::<u32>()
                     .to_vec();
+                if let (Some(threshold), Some(lp)) =
+                    (dflash_conf_trunc_threshold(), conf_logp.as_ref())
+                {
+                    let logp: Vec<f32> = lp
+                        .reshape(&[-1])
+                        .map_err(EngineError::Mlx)?
+                        .as_slice::<f32>()
+                        .to_vec();
+                    let log_thresh = threshold.ln();
+                    // Truncate at the FIRST low-confidence position: everything
+                    // after it is conditioned on a token the drafter itself
+                    // doubts, so verifying it mostly buys rejected work. Keep
+                    // at least one draft so a spec round always verifies
+                    // [anchor, d0].
+                    let keep = logp
+                        .iter()
+                        .take(draft_u32.len())
+                        .take_while(|&&l| l >= log_thresh)
+                        .count()
+                        .max(1);
+                    draft_u32.truncate(keep);
+                }
                 let draft_i32: Vec<i32> = draft_u32
                     .iter()
                     .map(|&x| {
@@ -3754,7 +3820,10 @@ impl SimpleEngine {
                 //    the n_accepted positions, and trim KV layers by the rejected
                 //    count. Issued lazily (no eval) so it folds into the next
                 //    verify's host barrier.
-                if n_accepted < block_size {
+                // `verify_len`, not `block_size`: with confidence truncation the
+                // chain can be shorter than the block, and a fully-accepted
+                // truncated chain needs no rollback.
+                if n_accepted < verify_len {
                     let kv_rollback = verify_len - n_accepted;
                     model
                         .replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
