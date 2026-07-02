@@ -326,6 +326,20 @@ impl QLinear {
             let w = (*self.weight).as_dtype(x.dtype())?;
             return x.matmul(&w.transpose()?);
         }
+        // DIAGNOSTIC (HIGGS_DIAG_DEQUANT=1): force the dense dequantized matmul
+        // (row-independent) instead of quantized_matmul, to test whether
+        // quantized_matmul's length-dependence is the divergence source.
+        if std::env::var("HIGGS_DIAG_DEQUANT").is_ok_and(|v| v == "1") {
+            let wdq = mlx_rs::ops::dequantize(
+                &*self.weight,
+                &*self.scales,
+                Some(&*self.biases),
+                Some(self.group_size),
+                Some(self.bits),
+            )?
+            .as_dtype(x.dtype())?;
+            return x.matmul(&wdq.transpose()?);
+        }
         quantized_forward(
             x,
             &self.weight,
@@ -2098,19 +2112,129 @@ impl Qwen3NextAttention {
             .q_norm
             .forward(queries_pre)?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let mut keys = self
-            .k_norm
-            .forward(&keys_raw.reshape(&[B, L, self.num_key_value_heads, -1])?)?
-            .transpose_axes(&[0, 2, 1, 3])?;
+        let keys_normed =
+            self.k_norm
+                .forward(&keys_raw.reshape(&[B, L, self.num_key_value_heads, -1])?)?;
+        // DIAGNOSTIC: capture k_norm output (pre-transpose, pre-rope) to split
+        // k_norm from rope. Requires the raw capture flag.
+        let diag_keys_normed = if L > 1 && DIAG_NORM_CAPTURE_REQ.with(|c| c.replace(false)) {
+            diag_materialize(&keys_normed)
+        } else {
+            None
+        };
+        let mut keys = keys_normed.transpose_axes(&[0, 2, 1, 3])?;
         let values = values_raw
             .reshape(&[B, L, self.num_key_value_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // RoPE with cache offset
+        // RoPE with cache offset.
+        //
+        // Prefill (L>1) uses a manual, length-independent rope
+        // (`apply_rope_manual`) instead of `mlx_fast_rope`, because
+        // `mlx_fast_rope` is length-dependent: for identical input at the same
+        // offset it produces different output depending on the total sequence
+        // length, which breaks cross-turn prefix-cache reuse for Hybrid models
+        // (the stored clone's KV diverges from a cold full prefill). The manual
+        // rope computes the rotation from explicit per-position frequencies, so
+        // it is length-independent by construction. Verified FP-equivalent to
+        // `mlx_fast_rope` for a fixed length (bf16 cos/sin precision) and
+        // produces identical greedy output. Decode (L==1) keeps `mlx_fast_rope`
+        // (L=1 is always length-independent, and the fused kernel is faster on
+        // the per-token hot path).
         let offset = cache.offset();
-        queries = apply_rope(&queries, &self.rope, offset)?;
-        keys = apply_rope(&keys, &self.rope, offset)?;
+        let rope_dim = self.rope.dimensions;
+        let rope_base = self.rope.base;
+        let rope_scale = self.rope.scale;
+        // DIAGNOSTIC (HIGGS_DIAG_ROPE_COMPARE=1): verify apply_rope_manual
+        // computes the SAME rotation as mlx_fast_rope for a fixed length — the
+        // correctness gate before landing the manual rope as the default. Fires
+        // once (first FA layer, offset==0, L>1). Compares on the PRE-rope keys.
+        #[allow(
+            clippy::print_stderr,
+            clippy::indexing_slicing,
+            clippy::shadow_unrelated
+        )]
+        if std::env::var("HIGGS_DIAG_ROPE_COMPARE").is_ok_and(|v| v == "1")
+            && offset == 0
+            && L > 1
+            && DIAG_ROPE_COMPARE_FIRED
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            let pos: Vec<i32> = (offset..offset + L).collect();
+            let positions = Array::from_slice(&pos, &[L]);
+            let keys_fast = apply_rope(&keys, &self.rope, offset);
+            let keys_manual = apply_rope_manual(&keys, &positions, rope_dim, rope_base, rope_scale);
+            if let (Ok(kf), Ok(km)) = (keys_fast, keys_manual) {
+                let (kfv, _) = diag_materialize(&kf).unwrap_or((vec![], vec![]));
+                let (kmv, _) = diag_materialize(&km).unwrap_or((vec![], vec![]));
+                let n = kfv.len().min(kmv.len());
+                let mut max_abs = 0.0f32;
+                let mut diffs = 0usize;
+                for i in 0..n {
+                    let d = (kfv[i] - kmv[i]).abs();
+                    if d > max_abs {
+                        max_abs = d;
+                    }
+                    if kfv[i].to_bits() != kmv[i].to_bits() {
+                        diffs += 1;
+                    }
+                }
+                eprintln!(
+                    "DIAG ROPE-COMPARE fast-vs-manual (fixed len, first FA): max_abs={max_abs:.3e} diffs={diffs}/{n}"
+                );
+            }
+        }
+        queries = apply_qwen3_next_rope(queries, &self.rope, offset)?;
+        keys = apply_qwen3_next_rope(keys, &self.rope, offset)?;
+
+        // DIAGNOSTIC: probe-driven capture of this FA layer's keys (first FA
+        // layer of a forward: offset==0, L>1). Captures pre-write (post-rope)
+        // and post-write (cache-stored) keys, materialized immediately so the
+        // probe can compare two forwards directly.
+        let diag_attn = offset == 0 && L > 1 && DIAG_ATTN_CAPTURE_REQ.with(|c| c.replace(false));
+        // Capture x (attention input = normed h), keys post-rope pre-write, and
+        // stored keys — all as fully-materialized Vec<f32>. Comparing x across
+        // forwards isolates whether k_proj/norm/rope is length-dependent
+        // (identical x but different keys) vs the input differing.
+        let mat_vec = |a: &Array| -> Option<(Vec<f32>, Vec<i32>)> {
+            let af = a.as_dtype(mlx_rs::Dtype::Float32).ok()?;
+            mlx_rs::transforms::eval([&af]).ok()?;
+            Some((af.as_slice::<f32>().to_vec(), af.shape().to_vec()))
+        };
+        // DIAGNOSTIC: capture k_proj's RAW output (pre-norm) to split the matmul
+        // from k_norm. Requires the first-FA capture flag (set a SEPARATE raw
+        // request so it doesn't collide with the post-rope capture).
+        let diag_keys_raw =
+            if offset == 0 && L > 1 && DIAG_RAW_CAPTURE_REQ.with(|c| c.replace(false)) {
+                mat_vec(&keys_raw)
+            } else {
+                None
+            };
+        let keys_raw_cap = diag_keys_raw;
+        let diag_x = if diag_attn { mat_vec(x) } else { None };
+        let diag_keys_pre = if diag_attn { mat_vec(&keys) } else { None };
+
         let view = cache.update_and_view(keys, values)?;
+
+        if diag_attn {
+            let stored_vec = cache.keys().and_then(mat_vec);
+            DIAG_ATTN_CAPTURED.with(|c| {
+                *c.borrow_mut() = Some((
+                    L,
+                    diag_x,
+                    diag_keys_pre,
+                    stored_vec,
+                    keys_raw_cap,
+                    diag_keys_normed,
+                ))
+            });
+        }
         let try_tq_decode = mask.is_none() && L == 1;
         let output = match view {
             crate::cache::KvCacheView::TurboQuant(tq_view) if try_tq_decode => {
@@ -2283,8 +2407,8 @@ impl DenseQwen3NextAttention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let offset = cache.offset();
-        queries = apply_rope(&queries, &self.rope, offset)?;
-        keys = apply_rope(&keys, &self.rope, offset)?;
+        queries = apply_qwen3_next_rope(queries, &self.rope, offset)?;
+        keys = apply_qwen3_next_rope(keys, &self.rope, offset)?;
 
         let view = cache.update_and_view(keys, values)?;
         let try_tq_decode = mask.is_none() && L == 1;
@@ -3508,10 +3632,44 @@ impl GatedDeltaNet {
         let mixed_qkv = ops::concatenate_axis(&[&q_flat, &k_flat, &v_flat], -1)?;
         let n_keep = self.conv_kernel_size - 1;
 
+        // DIAGNOSTIC: capture conv input/output + SSM output for the first GDN
+        // prefill forward when requested by a probe (to split conv1d vs fused
+        // gated_delta_kernel length-dependence).
+        let diag_gdn = S > 1 && DIAG_GDN_CAPTURE_REQ.with(|c| c.replace(false));
+        let diag_mixed = if diag_gdn {
+            diag_materialize(&mixed_qkv)
+        } else {
+            None
+        };
+
+        let mut diag_conv_input: Option<(Vec<f32>, Vec<i32>)> = None;
         let conv_out = if S == 1 {
             self.decode_conv1d_step(&mixed_qkv, cache, B)?
         } else {
             let conv_state = self.chronological_conv_state(cache, B, inputs.dtype())?;
+            let diag_conv_state_mat = if diag_gdn {
+                diag_materialize(&conv_state)
+            } else {
+                None
+            };
+            let _ = diag_conv_state_mat; // inspected via print below
+            #[allow(clippy::print_stderr, clippy::shadow_unrelated)]
+            if diag_gdn {
+                if let Some((sv, _)) = diag_conv_state_mat.as_ref() {
+                    let nz = sv.iter().filter(|x| **x != 0.0f32).count();
+                    let mx = sv.iter().cloned().fold(0.0f32, f32::max);
+                    eprintln!(
+                        "DIAG GDN conv_state: len={} nonzero={} max_abs={mx:.3e} first4=[{}]",
+                        sv.len(),
+                        nz,
+                        sv.iter()
+                            .take(4)
+                            .map(|v| format!("{v:.3}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                }
+            }
             let conv_input = ops::concatenate_axis(&[&conv_state, &mixed_qkv], 1)?;
             let conv_input_len = *conv_input
                 .shape()
@@ -3520,7 +3678,69 @@ impl GatedDeltaNet {
             let keep_start = conv_input_len - n_keep;
             cache.conv_state = Some(conv_input.index((.., keep_start.., ..)));
             cache.conv_pos = if n_keep > 0 { n_keep - 1 } else { -1 };
-            silu_direct(&self.conv1d.forward(&conv_input)?)?
+            let diag_conv_input_val = if diag_gdn {
+                diag_materialize(&conv_input.index((.., 0..self.conv_kernel_size, ..)))
+            } else {
+                None
+            };
+            diag_conv_input = diag_conv_input_val;
+            // DIAGNOSTIC (HIGGS_DIAG_CONV_MANUAL=1): use a length-independent
+            // windowed conv (per-position slice * weight * sum) instead of MLX's
+            // conv1d, which is length-dependent at the first n_keep (left-pad)
+            // boundary positions. Mirrors forward_stateless's windowed conv.
+            #[allow(
+                clippy::shadow_unrelated,
+                clippy::shadow_reuse,
+                clippy::indexing_slicing,
+                clippy::as_conversions
+            )]
+            if std::env::var("HIGGS_DIAG_CONV_MANUAL").is_ok_and(|v| v == "1") {
+                // Materialize conv_input to a CONCRETE array first when
+                // HIGGS_DIAG_CONV_EVAL_INPUT=1, to test whether MLX's lazy
+                // graph (concatenate of lazy zeros + lazy mixed_qkv) is the
+                // source of the length-dependent boundary output.
+                let conv_input_mat =
+                    if std::env::var("HIGGS_DIAG_CONV_EVAL_INPUT").is_ok_and(|v| v == "1") {
+                        let _ = mlx_rs::transforms::eval([&conv_input]);
+                        conv_input.clone()
+                    } else {
+                        conv_input.clone()
+                    };
+                let wt = {
+                    let shape = self.conv1d.weight.shape();
+                    let w = if shape.len() == 3 && shape[2] == 1 {
+                        self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?
+                    } else if shape.len() == 3 && shape[1] == 1 {
+                        self.conv1d.weight.squeeze_axes(&[1])?.transpose()?
+                    } else {
+                        return Err(Exception::custom(format!(
+                            "Unexpected conv1d weight shape: {shape:?}"
+                        )));
+                    };
+                    w.as_dtype(inputs.dtype())?
+                };
+                let ks = self.conv_kernel_size;
+                let mut windows = Vec::with_capacity(S as usize);
+                for i in 0..S {
+                    windows.push(
+                        conv_input_mat
+                            .index((.., i..i + ks, ..))
+                            .multiply(&wt)?
+                            .sum_axes(&[1], true)?,
+                    );
+                }
+                silu_direct(&ops::concatenate_axis(
+                    &windows.iter().collect::<Vec<_>>(),
+                    1,
+                )?)?
+            } else {
+                silu_direct(&self.conv1d.forward(&conv_input)?)?
+            }
+        };
+        let diag_conv_out = if diag_gdn {
+            diag_materialize(&conv_out)
+        } else {
+            None
         };
 
         if S == 1 && async_layer_state_eval_enabled() {
@@ -3620,6 +3840,12 @@ impl GatedDeltaNet {
             self.num_v_heads,
             self.head_v_dim,
         )?;
+        let diag_y = if diag_gdn { diag_materialize(&y) } else { None };
+        if diag_gdn {
+            DIAG_GDN_CAPTURED.with(|c| {
+                *c.borrow_mut() = Some((S, diag_mixed, diag_conv_input, diag_conv_out, diag_y))
+            });
+        }
         cache.ssm_state = Some(new_state);
         cache.offset += S;
 
@@ -4533,8 +4759,42 @@ pub struct Qwen3NextCausalLM {
     moe_mtp: Option<MoeMtpHead>,
 }
 
+// Diag flags read once: this dispatcher runs per q/k per FA layer per chunk,
+// and `std::env::var` takes a process-wide lock. The flags are only ever set
+// before process start (no `set_var` in the tree).
+static DIAG_ROPE_MANUAL: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("HIGGS_DIAG_ROPE_MANUAL").is_ok_and(|v| v == "1"));
+static DIAG_ROPE_PERHEAD: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("HIGGS_DIAG_ROPE_PERHEAD").is_ok_and(|v| v == "1"));
+
+// `shadow_reuse` for the positions Vec→Array rebind; `indexing_slicing` for the
+// diag per-head branch's fixed 4-dim shape access.
+#[allow(clippy::shadow_reuse, clippy::indexing_slicing)]
+fn apply_qwen3_next_rope(x: Array, rope: &nn::Rope, offset: i32) -> Result<Array, Exception> {
+    let shape = x.shape();
+    let seq_len = shape[shape.len() - 2];
+    if seq_len > 1 || *DIAG_ROPE_MANUAL {
+        let positions: Vec<i32> = (offset..offset + seq_len).collect();
+        let positions = Array::from_slice(&positions, &[seq_len]);
+        return apply_rope_manual(&x, &positions, rope.dimensions, rope.base, rope.scale);
+    }
+
+    if *DIAG_ROPE_PERHEAD {
+        let shape = shape.to_vec();
+        let batch_heads = shape[0] * shape[1];
+        let seq = shape[2];
+        let dim = shape[3];
+        let flat = x.reshape(&[batch_heads, seq, dim])?;
+        return apply_rope(&flat, rope, offset)?.reshape(&shape);
+    }
+
+    apply_rope(&x, rope, offset)
+}
+
 // Manual RoPE implementation for arbitrary positions
-/// Manual `RoPE` implementation for arbitrary positions
+/// Manual `RoPE` implementation for arbitrary positions (non-traditional,
+/// partial-rotary aware). Rotates the first `dimensions` elements of the last
+/// axis and passes the remainder through unchanged.
 #[allow(dead_code)]
 fn apply_rope_manual(
     x: &Array,
@@ -4548,7 +4808,6 @@ fn apply_rope_manual(
     // x shape: [B, H, L, D] or [B, L, D]
     let shape = x.shape();
     let ndim = shape.len();
-
     if ndim < 2 {
         return Err(Exception::custom("Input must have at least 2 dimensions"));
     }
@@ -4569,30 +4828,19 @@ fn apply_rope_manual(
         .collect();
     let inv_freq_arr = Array::from_slice(&inv_freq, &[half_dim_i32]);
 
-    // Get positions as [L] or [B, L]
     let pos_shape = positions.shape();
     let l_dim = *pos_shape
         .last()
         .ok_or_else(|| Exception::custom("positions must have at least 1 dim"))?;
 
-    tracing::debug!(
-        "apply_rope_manual: x.shape={:?}, positions.shape={:?}, dimensions={}, base={}",
-        x.shape(),
-        positions.shape(),
-        dimensions,
-        base
-    );
-    // Compute angles: positions * inv_freq
-    // positions: [L], inv_freq: [half_dim] -> angles: [L, half_dim]
+    // Compute angles: positions[L] * inv_freq[half_dim] -> [L, half_dim]
     let positions_expanded = positions.reshape(&[l_dim, 1])?;
     let inv_freq_expanded = inv_freq_arr.reshape(&[1, half_dim_i32])?;
     let angles = ops::multiply(&positions_expanded, &inv_freq_expanded)?;
-
-    // Compute cos and sin
     let cos_raw = ops::cos(&angles)?;
     let sin_raw = ops::sin(&angles)?;
 
-    // Reshape for broadcasting: [1, 1, L, half_dim] or [1, L, half_dim]
+    // Broadcast shape: [1, 1, L, half_dim] (4D) or [1, L, half_dim] (3D).
     let cos_shape: Vec<i32> = if ndim == 4 {
         vec![1, 1, l_dim, half_dim_i32]
     } else {
@@ -4601,26 +4849,324 @@ fn apply_rope_manual(
     let cos = cos_raw.reshape(&cos_shape)?;
     let sin = sin_raw.reshape(&cos_shape)?;
 
-    // Split x into two halves along last dimension
-    let x_first = x.index((.., .., .., ..half_dim));
-    let x_second = x.index((.., .., .., half_dim..));
+    // Partial rotary: rotate the first `dimensions` elems, pass the rest.
+    let x_rot = x.index((.., .., .., ..dimensions));
+    let x_first = x_rot.index((.., .., .., ..half_dim));
+    let x_second = x_rot.index((.., .., .., half_dim..));
 
-    // Apply RoPE rotation
-    // output_first = x_first * cos - x_second * sin
-    // output_second = x_first * sin + x_second * cos
+    // Rotate in f32 (cos/sin precision), then cast back to the input dtype.
+    // Post-rope keys are written into the KV cache, so letting f32 escape here
+    // silently promotes the FA KV cache and SDPA to f32 — 2x KV memory and 2x
+    // attention bandwidth on every prefill chunk and decode step.
+    let x_dtype = x.dtype();
     let output_first = ops::subtract(
         &ops::multiply(&x_first, &cos)?,
         &ops::multiply(&x_second, &sin)?,
-    )?;
+    )?
+    .as_dtype(x_dtype)?;
     let output_second = ops::add(
         &ops::multiply(&x_first, &sin)?,
         &ops::multiply(&x_second, &cos)?,
-    )?;
+    )?
+    .as_dtype(x_dtype)?;
 
-    // Concatenate back
     let last_axis = i32::try_from(ndim.saturating_sub(1))
         .map_err(|_| Exception::custom("ndim too large for i32"))?;
-    ops::concatenate_axis(&[&output_first, &output_second], last_axis)
+    let rotated = ops::concatenate_axis(&[&output_first, &output_second], last_axis)?;
+    // Append the pass-through (non-rotated) tail if dimensions < D.
+    let d = *shape.last().unwrap_or(&dimensions);
+    if dimensions < d {
+        let x_pass = x.index((.., .., .., dimensions..));
+        ops::concatenate_axis(&[&rotated, &x_pass], last_axis)
+    } else {
+        Ok(rotated)
+    }
+}
+
+// DIAGNOSTIC: probe-driven per-layer hidden-state capture. A probe calls
+// `diag_request_hidden_capture()` then a forward; forward_raw_hidden fills the
+// slot with fully-materialized Vec<f32> per layer. The probe takes both captures
+// and compares them directly (no "previous forward" thread-local that gets
+// polluted by intervening suffix/decode forwards).
+pub type DiagLayer = (usize, bool, Vec<f32>, i32); // (layer_idx, is_linear, flat f32, hidden_dim)
+
+thread_local! {
+    static DIAG_CAPTURE_REQ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DIAG_CAPTURED: std::cell::RefCell<Option<Vec<DiagLayer>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Request that the NEXT `forward_raw_hidden` (on this thread) capture its
+/// per-layer hidden states. The probe then retrieves them with
+/// [`diag_take_hidden_capture`].
+pub fn diag_request_hidden_capture() {
+    DIAG_CAPTURE_REQ.with(|c| c.set(true));
+}
+
+/// Retrieve the per-layer hidden-state capture from the most recent requested
+/// forward, clearing the slot.
+pub fn diag_take_hidden_capture() -> Option<Vec<DiagLayer>> {
+    DIAG_CAPTURED.with(|c| c.borrow_mut().take())
+}
+
+/// Compare two captured forwards over the shared prefix length, reporting the
+/// first layer where positions diverge and the per-position max-abs pattern.
+// Diagnostic-only reporting (env-gated probes): stderr output and direct
+// indexing over probe-owned buffers are the point, not a hazard.
+#[allow(clippy::print_stderr, clippy::indexing_slicing, clippy::as_conversions)]
+pub fn diag_report_hidden_diff(label: &str, short: &[DiagLayer], long: &[DiagLayer]) {
+    if short.is_empty() || long.is_empty() {
+        eprintln!("DIAG HIDDEN {label}: empty capture");
+        return;
+    }
+    // short forward produced h of shape [1, short_len, H]; long produced
+    // [1, long_len, H]. Compare the first short_len positions per layer.
+    let hdim = (short[0].3 as usize).max(1);
+    let per_pos = short[0].2.len() / hdim;
+    let long_hdim = (long[0].3 as usize).max(1);
+    let short_elems = per_pos * hdim;
+    eprintln!(
+        "DIAG HIDDEN {label}: comparing short_len={per_pos} (hdim={hdim}) vs long (hdim={long_hdim}) over first {per_pos} positions"
+    );
+    for ((li_s, lin_s, hs, _), (li_l, _lin_l, hl, _)) in short.iter().zip(long.iter()) {
+        if li_s != li_l {
+            break;
+        }
+        let li = *li_s;
+        let is_linear = *lin_s;
+        if hs.len() < short_elems || hl.len() < short_elems {
+            eprintln!("DIAG HIDDEN L{li}: data too short");
+            continue;
+        }
+        let mut per_pos_max = vec![0.0f32; per_pos];
+        let mut max_abs = 0.0f32;
+        let mut diffs = 0usize;
+        for i in 0..short_elems {
+            let x = hs[i];
+            let y = hl[i];
+            let pos = i / hdim;
+            let d = (x - y).abs();
+            if d > per_pos_max[pos] {
+                per_pos_max[pos] = d;
+            }
+            if d > max_abs {
+                max_abs = d;
+            }
+            if x.to_bits() != y.to_bits() {
+                diffs += 1;
+            }
+        }
+        let nz: Vec<String> = per_pos_max
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| **m > 0.0)
+            .map(|(p, m)| format!("p{p}:{m:.1e}"))
+            .collect();
+        let kind = if is_linear { "GDN" } else { "FA" };
+        eprintln!(
+            "DIAG HIDDEN L{li:02}({kind}): max_abs={max_abs:.3e} diffs={diffs}/{short_elems} nonzero_positions[{}]",
+            nz.join(" ")
+        );
+    }
+}
+
+// DIAGNOSTIC: probe-driven capture of the first FA layer's keys (pre-write and
+// post-write), as fully-materialized owned Vec<f32>. The probe requests capture,
+// runs a forward, retrieves, then compares two forwards directly.
+static DIAG_ROPE_COMPARE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+type DiagAttnCapture = (
+    i32,
+    Option<(Vec<f32>, Vec<i32>)>, // x (attention input = normed h)
+    Option<(Vec<f32>, Vec<i32>)>, // keys post-rope, pre-write
+    Option<(Vec<f32>, Vec<i32>)>, // post-write stored keys
+    Option<(Vec<f32>, Vec<i32>)>, // keys_raw = k_proj output, pre-norm
+    Option<(Vec<f32>, Vec<i32>)>, // keys_normed = k_norm output, pre-rope
+);
+
+/// Materialize an MLX array to owned `(Vec<f32>, shape)` for uncontaminatable
+/// cross-forward comparison.
+fn diag_materialize(a: &Array) -> Option<(Vec<f32>, Vec<i32>)> {
+    let af = a.as_dtype(mlx_rs::Dtype::Float32).ok()?;
+    mlx_rs::transforms::eval([&af]).ok()?;
+    Some((af.as_slice::<f32>().to_vec(), af.shape().to_vec()))
+}
+
+// DIAGNOSTIC: probe-driven capture of the first GDN prefill layer's conv
+// input/output and SSM output, to split conv1d length-dependence from the fused
+// gated_delta_kernel.
+pub type DiagGdnCapture = (
+    i32,                          // S
+    Option<(Vec<f32>, Vec<i32>)>, // mixed_qkv (conv input)
+    Option<(Vec<f32>, Vec<i32>)>, // conv_input[0..ks] (the first window)
+    Option<(Vec<f32>, Vec<i32>)>, // conv_out (silu(conv1d))
+    Option<(Vec<f32>, Vec<i32>)>, // y (fused SSM kernel output)
+);
+thread_local! {
+    static DIAG_GDN_CAPTURE_REQ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DIAG_GDN_CAPTURED: std::cell::RefCell<Option<DiagGdnCapture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Request that the NEXT GDN prefill forward (first GDN layer, S>1) capture its
+/// conv input/output and SSM output.
+pub fn diag_request_gdn_capture() {
+    DIAG_GDN_CAPTURE_REQ.with(|c| c.set(true));
+}
+
+/// Retrieve the captured GDN internals.
+pub fn diag_take_gdn_capture() -> Option<DiagGdnCapture> {
+    DIAG_GDN_CAPTURED.with(|c| c.borrow_mut().take())
+}
+
+/// Compare two captured GDN forwards over the shared prefix length.
+// Diagnostic-only reporting — see `diag_report_hidden_diff`.
+#[allow(clippy::print_stderr, clippy::indexing_slicing, clippy::as_conversions)]
+pub fn diag_report_gdn_diff(label: &str, short: &DiagGdnCapture, long: &DiagGdnCapture) {
+    let short_i = i32::try_from(short.0).unwrap_or(i32::MAX);
+    let report = |tag: &str, a: Option<&(Vec<f32>, Vec<i32>)>, b: Option<&(Vec<f32>, Vec<i32>)>| {
+        let (Some((av, ashape)), Some((bv, _bshape))) = (a, b) else {
+            eprintln!("DIAG GDN {label} {tag}: missing");
+            return;
+        };
+        // shape [B, S, D] -> position on axis 1 = (flat / D) % S
+        let d = (*ashape.last().unwrap_or(&1)).max(1) as usize;
+        let per_pos = short_i as usize;
+        let short_elems = per_pos * d;
+        let elems = av.len().min(bv.len()).min(short_elems);
+        let mut per_pos_max = vec![0.0f32; per_pos];
+        let mut max_abs = 0.0f32;
+        let mut diffs = 0usize;
+        for i in 0..elems {
+            let diff = (av[i] - bv[i]).abs();
+            let pos = (i / d) % per_pos;
+            if diff > per_pos_max[pos] {
+                per_pos_max[pos] = diff;
+            }
+            if diff > max_abs {
+                max_abs = diff;
+            }
+            if av[i].to_bits() != bv[i].to_bits() {
+                diffs += 1;
+            }
+        }
+        let nz: Vec<String> = per_pos_max
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| **m > 0.0)
+            .map(|(p, m)| format!("p{p}:{m:.1e}"))
+            .collect();
+        eprintln!(
+            "DIAG GDN {label} {tag}: max_abs={max_abs:.3e} diffs={diffs}/{elems} nonzero_count={} sample[{}]",
+            nz.len(),
+            nz.iter().take(6).cloned().collect::<Vec<_>>().join(" ")
+        );
+    };
+    eprintln!(
+        "DIAG GDN {label}: short_len={} vs long_len={}",
+        short.0, long.0
+    );
+    report("mixed_qkv(conv input)", short.1.as_ref(), long.1.as_ref());
+    report(
+        "conv_input[0..ks](first window)",
+        short.2.as_ref(),
+        long.2.as_ref(),
+    );
+    report("conv_out(silu conv1d)", short.3.as_ref(), long.3.as_ref());
+    report("y(fused SSM kernel)", short.4.as_ref(), long.4.as_ref());
+}
+thread_local! {
+    static DIAG_ATTN_CAPTURE_REQ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DIAG_ATTN_CAPTURED: std::cell::RefCell<Option<DiagAttnCapture>> =
+        const { std::cell::RefCell::new(None) };
+    static DIAG_RAW_CAPTURE_REQ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DIAG_NORM_CAPTURE_REQ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Request that the NEXT FA attention forward (first FA layer, offset==0, L>1)
+/// capture its pre-write and post-write keys. Retrieved via
+/// [`diag_take_attn_capture`].
+pub fn diag_request_attn_capture() {
+    DIAG_ATTN_CAPTURE_REQ.with(|c| c.set(true));
+    DIAG_RAW_CAPTURE_REQ.with(|c| c.set(true));
+    DIAG_NORM_CAPTURE_REQ.with(|c| c.set(true));
+}
+
+/// Retrieve the captured (L, pre-write keys, post-write stored keys) from the
+/// most recent requested FA forward, clearing the slot.
+pub fn diag_take_attn_capture() -> Option<DiagAttnCapture> {
+    DIAG_ATTN_CAPTURED.with(|c| c.borrow_mut().take())
+}
+
+/// Compare two captured FA forwards' keys over the shared prefix length.
+// Diagnostic-only reporting — see `diag_report_hidden_diff`.
+#[allow(clippy::print_stderr, clippy::indexing_slicing, clippy::as_conversions)]
+pub fn diag_report_attn_diff(label: &str, short: &DiagAttnCapture, long: &DiagAttnCapture) {
+    let short_i = i32::try_from(short.0).unwrap_or(i32::MAX);
+    let report = |tag: &str, a: Option<&(Vec<f32>, Vec<i32>)>, b: Option<&(Vec<f32>, Vec<i32>)>| {
+        let (Some((av, ashape)), Some((bv, _bshape))) = (a, b) else {
+            eprintln!("DIAG ATTN {label} {tag}: missing");
+            return;
+        };
+        let d = (*ashape.get(3).unwrap_or(&1)).max(1) as usize;
+        let per_pos = short_i as usize;
+        // Walk ALL elements (every head), not just per_pos*d (which is one head).
+        let short_elems = av.len().min(bv.len());
+        if av.len() < short_elems || bv.len() < short_elems {
+            eprintln!(
+                "DIAG ATTN {label} {tag}: data too short ({} vs {}, need {short_elems})",
+                av.len(),
+                bv.len()
+            );
+            return;
+        }
+        let mut per_pos_max = vec![0.0f32; per_pos];
+        let mut max_abs = 0.0f32;
+        let mut diffs = 0usize;
+        for i in 0..short_elems {
+            let x = av[i];
+            let y = bv[i];
+            let diff = (x - y).abs();
+            let pos = (i / d) % per_pos;
+            if diff > per_pos_max[pos] {
+                per_pos_max[pos] = diff;
+            }
+            if diff > max_abs {
+                max_abs = diff;
+            }
+            if x.to_bits() != y.to_bits() {
+                diffs += 1;
+            }
+        }
+        let nz: Vec<String> = per_pos_max
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| **m > 0.0)
+            .map(|(p, m)| format!("p{p}:{m:.1e}"))
+            .collect();
+        eprintln!(
+            "DIAG ATTN {label} {tag}: short_len={} max_abs={max_abs:.3e} diffs={diffs}/{short_elems} nonzero[{}]",
+            short.0,
+            nz.join(" ")
+        );
+    };
+    eprintln!(
+        "DIAG ATTN {label}: short_len={} vs long_len={}",
+        short.0, long.0
+    );
+    report("X(input)", short.1.as_ref(), long.1.as_ref());
+    report(
+        "KEYS_RAW(k_proj,pre-norm)",
+        short.4.as_ref(),
+        long.4.as_ref(),
+    );
+    report(
+        "KEYS_NORMED(k_norm,pre-rope)",
+        short.5.as_ref(),
+        long.5.as_ref(),
+    );
+    report("PRE-WRITE(post-rope)", short.2.as_ref(), long.2.as_ref());
+    report("POST-WRITE(stored)", short.3.as_ref(), long.3.as_ref());
 }
 
 impl Qwen3NextCausalLM {
@@ -4710,9 +5256,6 @@ impl Qwen3NextCausalLM {
     }
 
     /// Forward pass returning raw hidden states (before final `RMSNorm`).
-    ///
-    /// Used internally by `forward_hidden` (which adds norm) and
-    /// `forward_with_hidden` (which needs raw states for MTP).
     #[allow(non_snake_case, clippy::too_many_lines)]
     fn forward_raw_hidden(
         &mut self,
@@ -4720,6 +5263,16 @@ impl Qwen3NextCausalLM {
         _mask: Option<&Array>,
         kv_cache: &mut Vec<Option<LayerCache>>,
     ) -> Result<Array, Exception> {
+        // DIAGNOSTIC: capture h after each layer when a probe has requested it
+        // (higgs_models::diag_request_hidden_capture). The probe then compares
+        // two captured forwards (e.g. body vs full) directly — no "previous
+        // forward" thread-local that gets polluted by intervening forwards.
+        let do_diag_capture = DIAG_CAPTURE_REQ.with(|c| c.get());
+        if do_diag_capture {
+            DIAG_CAPTURE_REQ.with(|c| c.set(false));
+        }
+        let mut diag_layers: Vec<DiagLayer> = Vec::new();
+
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
         if kv_cache.is_empty() {
@@ -4849,6 +5402,28 @@ impl Qwen3NextCausalLM {
             if should_eval_between_prefill_layers(T, layer_idx) {
                 mlx_rs::transforms::eval([&h])?;
             }
+            // DIAGNOSTIC (HIGGS_DIAG_EVAL_EVERY_LAYER=1): force-eval h after
+            // EVERY layer so the production hidden state is materialized before
+            // the next layer's projections read it. Tests whether lazy-graph
+            // context-dependent FP eval is the divergence source.
+            if std::env::var("HIGGS_DIAG_EVAL_EVERY_LAYER").is_ok_and(|v| v == "1") {
+                mlx_rs::transforms::eval([&h])?;
+            }
+
+            if do_diag_capture {
+                // Store FULLY MATERIALIZED owned data (Vec<f32>), not a lazy
+                // Array clone — a lazy clone gets contaminated when eval'd after
+                // later forwards reuse the shared graph nodes.
+                let hf = h.as_dtype(mlx_rs::Dtype::Float32)?;
+                let _ = mlx_rs::transforms::eval([&hf]);
+                let hdim = *hf.shape().last().unwrap_or(&1);
+                diag_layers.push((
+                    layer_idx,
+                    layer.is_linear,
+                    hf.as_slice::<f32>().to_vec(),
+                    hdim,
+                ));
+            }
         }
 
         if profiling && prof_gdn_samples > 0 && prof_fa_samples > 0 {
@@ -4871,10 +5446,12 @@ impl Qwen3NextCausalLM {
             }
         }
 
+        if do_diag_capture {
+            DIAG_CAPTURED.with(|c| *c.borrow_mut() = Some(std::mem::take(&mut diag_layers)));
+        }
+
         Ok(h)
     }
-
-    /// Forward pass returning hidden states (after final `RMSNorm`, before LM head).
     #[allow(non_snake_case)]
     pub fn forward_hidden(
         &mut self,
@@ -5357,10 +5934,26 @@ impl Qwen3NextCausalLM {
     pub fn forward_with_taps(
         &mut self,
         inputs: &Array,
-        _mask: Option<&Array>,
+        mask: Option<&Array>,
         kv_cache: &mut Vec<Option<LayerCache>>,
         tap_layers: &[usize],
     ) -> Result<(Array, Vec<Array>), Exception> {
+        let (_h, logits, taps) =
+            self.forward_with_hidden_taps(inputs, mask, kv_cache, tap_layers)?;
+        Ok((logits, taps))
+    }
+
+    /// `forward_with_taps` that also returns the raw (pre-norm) last-layer
+    /// hidden state, so a caller can run tap-consuming (DFlash drafter) and
+    /// hidden-consuming (MTP head) speculation off one backbone pass.
+    #[allow(non_snake_case)]
+    pub fn forward_with_hidden_taps(
+        &mut self,
+        inputs: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Array, Vec<Array>), Exception> {
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
         if kv_cache.is_empty() {
@@ -5454,7 +6047,7 @@ impl Qwen3NextCausalLM {
         let normed = self.model.norm.forward(&h)?;
         let logits = self.project_logits(&normed)?;
 
-        Ok((logits, taps))
+        Ok((h, logits, taps))
     }
 
     /// Stateless verify pass: identical to `forward_with_taps` but GDN layers
@@ -7205,6 +7798,20 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
+
+    /// The manual prefill rope must not promote bf16 q/k to f32: post-rope
+    /// keys are written into the KV cache, so a dtype promotion here doubles
+    /// FA KV memory and SDPA bandwidth for every subsequent token.
+    #[test]
+    fn manual_rope_preserves_input_dtype() {
+        let x = mlx_rs::ops::ones::<f32>(&[1, 2, 8, 16])
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap();
+        let positions = Array::from_slice(&[0i32, 1, 2, 3, 4, 5, 6, 7], &[8]);
+        let out = apply_rope_manual(&x, &positions, 8, 10000.0, 1.0).unwrap();
+        assert_eq!(out.dtype(), mlx_rs::Dtype::Bfloat16);
+    }
 
     #[test]
     fn test_config_deserialization() {

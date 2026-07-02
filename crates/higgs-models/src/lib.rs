@@ -139,7 +139,12 @@ impl SamplingParams {
     }
 }
 
-pub use qwen3_next::{LayerCache, MtpHead, Qwen3NextCausalLM};
+pub use qwen3_next::{
+    DiagGdnCapture, DiagLayer, LayerCache, MtpHead, Qwen3NextCausalLM, diag_report_attn_diff,
+    diag_report_gdn_diff, diag_report_hidden_diff, diag_request_attn_capture,
+    diag_request_gdn_capture, diag_request_hidden_capture, diag_take_attn_capture,
+    diag_take_gdn_capture, diag_take_hidden_capture,
+};
 pub use transformer::{Model, ModelArgs};
 
 /// MTP (Multi-Token Prediction) KV cache — one `SteppingKeyValueCache` per MTP layer.
@@ -295,11 +300,13 @@ impl AnyCache {
         Ok(compressed)
     }
 
-    /// An **independent** deep copy for use as a speculative-decode checkpoint.
-    /// KV layers are deep-cloned (their in-place `slice_update` buffers must not
-    /// be shared — see [`cache::SteppingKeyValueCache::deep_clone`]); GDN/SSM
-    /// (`Arrays`) layers update by full reassignment, never in place, so a cheap
-    /// shallow `clone()` of those is safe.
+    /// An **independent** deep copy for use as a speculative-decode checkpoint
+    /// or cross-turn prefix snapshot. KV layers are deep-cloned because their
+    /// in-place `slice_update` buffers must not be shared (see
+    /// [`cache::SteppingKeyValueCache::deep_clone`]). Hybrid GDN/SSM (`Arrays`)
+    /// state is deep-cloned too: MLX `Array::clone()` is a shared handle, and a
+    /// boundary snapshot must remain independent of the suffix/decode forwards
+    /// that continue mutating the live cache.
     #[must_use]
     pub fn deep_clone(&self) -> Self {
         match self {
@@ -315,7 +322,7 @@ impl AnyCache {
                     .map(|l| {
                         l.as_ref().map(|lc| match lc {
                             LayerCache::KV(kv) => LayerCache::KV(kv.deep_clone()),
-                            recurrent @ LayerCache::Arrays(_) => recurrent.clone(),
+                            LayerCache::Arrays(a) => LayerCache::Arrays(a.deep_clone()),
                         })
                     })
                     .collect(),
@@ -336,6 +343,20 @@ impl AnyCache {
         match self {
             Self::Hybrid(c) => Ok(c),
             Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
+        }
+    }
+}
+
+impl qwen3_next::ArraysCache {
+    /// Independent copy of recurrent Hybrid state for cross-turn cache storage.
+    /// Device-side copy — see [`cache::eval_deep_clone`].
+    #[must_use]
+    pub fn deep_clone(&self) -> Self {
+        Self {
+            conv_state: self.conv_state.as_ref().map(cache::eval_deep_clone),
+            ssm_state: self.ssm_state.as_ref().map(cache::eval_deep_clone),
+            conv_pos: self.conv_pos,
+            offset: self.offset,
         }
     }
 }
@@ -1044,6 +1065,26 @@ impl AnyModel {
             }
             _ => Err(Exception::custom(
                 "forward_with_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Forward returning raw hidden + logits + tap hiddens: one backbone pass
+    /// feeding both hidden-consuming (MTP head) and tap-consuming (`DFlash`
+    /// drafter context) speculation.
+    pub fn forward_with_hidden_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Array, Vec<Array>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_hidden_taps(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_hidden_taps requires Qwen3Next + Hybrid cache",
             )),
         }
     }

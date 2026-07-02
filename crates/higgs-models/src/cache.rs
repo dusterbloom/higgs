@@ -800,6 +800,12 @@ impl SteppingKeyValueCache {
 
         let updated_k = slice_update_axis2(k, keys, prev, new_tokens)?;
         let updated_v = slice_update_axis2(v, values, prev, new_tokens)?;
+        // DIAGNOSTIC (HIGGS_DIAG_EVAL_CACHE=1): force-eval the slice_update result
+        // so the stored cache is concrete (independent of later layer temporaries).
+        // Tests the lazy-recycling corruption hypothesis.
+        if std::env::var("HIGGS_DIAG_EVAL_CACHE").is_ok_and(|flag| flag == "1") {
+            mlx_rs::transforms::eval([&updated_k, &updated_v])?;
+        }
         self.keys = Some(updated_k);
         self.values = Some(updated_v);
 
@@ -1302,23 +1308,41 @@ pub fn slice_axis1(arr: &Array, start: i32, end: i32) -> Result<Array, Exception
     slice_axis(arr, 1, start, end)
 }
 
-/// Evaluate, then independently deep-copy an MLX array.
+/// Independently deep-copy an MLX array, staying on device.
 ///
-/// `Array::deep_clone` copies bytes straight from the buffer pointer
-/// (`mlx_array_data_*`), which is only valid once the array is evaluated. The
-/// cache stores *lazy* `slice_update` results (see `update_dense`), so cloning a
-/// checkpoint without forcing evaluation first reads an unmaterialized pointer
-/// and segfaults. Eval makes the snapshot both valid and buffer-independent of
-/// the live cache (no shared buffer for a later in-place update to donate/free).
+/// `Array::deep_clone` round-trips the buffer through **host** memory
+/// (`mlx_array_data_*` → CPU copy → re-upload on next use). For a multi-GB
+/// hybrid cache snapshot that is seconds of wall time per store/materialize —
+/// it dominated warm-turn TTFT. `mlx_copy` runs the copy as a GPU kernel
+/// instead. The immediate `eval` materializes the copy into its own buffer, so
+/// a later in-place `slice_update` of the live cache cannot donate/free
+/// storage this snapshot holds (same checkpoint-safety contract as before; see
+/// `SteppingKeyValueCache::deep_clone`).
 //
-// `expect`: a failed `eval` on a live cache array leaves nothing safe to copy —
-// a loud panic here is strictly better than the segfault a lazy `deep_clone`
-// would cause, and the infallible signature keeps every checkpoint call site
+// `expect`: a failed copy/eval on a live cache array leaves nothing safe to
+// snapshot — a loud panic is strictly better than a silently-shared buffer,
+// and the infallible signature keeps every checkpoint call site
 // (`AnyCache::deep_clone`, `deep_clone_mtp_cache`, the MTP cycle) clone-and-go.
-#[allow(clippy::expect_used)]
-fn eval_deep_clone(a: &Array) -> Array {
-    a.eval().expect("eval before deep_clone checkpoint");
-    a.deep_clone()
+#[allow(clippy::expect_used, unsafe_code)]
+pub(crate) fn eval_deep_clone(a: &Array) -> Array {
+    let copy = unsafe {
+        let mut result = mlx_sys::mlx_array_new();
+        let status = mlx_sys::mlx_copy(
+            &raw mut result,
+            a.as_ptr(),
+            Stream::task_local_or_default().as_ptr(),
+        );
+        if status == 0 {
+            Some(Array::from_ptr(result))
+        } else {
+            mlx_sys::mlx_array_free(result);
+            None
+        }
+    }
+    .expect("mlx_copy failed for deep_clone checkpoint");
+    copy.eval()
+        .expect("eval device copy for deep_clone checkpoint");
+    copy
 }
 
 /// Write `update` into `target` at `[..., start:start+n, ...]` on axis 2.
