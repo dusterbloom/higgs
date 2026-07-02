@@ -412,6 +412,15 @@ struct PreparedGeneration<'a> {
     prompt_array: Array,
     prompt_len: u32,
     pixel_values: Option<Array>,
+    /// Snapshot of the cache at the conversation boundary (full prompt minus
+    /// the generation-prompt suffix), captured for HYBRID caches only. Hybrid
+    /// (GDN/SSM) state can't be trimmed after the fact, so the only way to store
+    /// a clone that excludes the non-recurring gen-suffix (`<|im_start|>
+    /// assistant\n…`, which never reappears at the same position once the
+    /// assistant's real reply is in history) is to snapshot it BEFORE the suffix
+    /// is prefilled. `None` for dense caches (block-pageable, suffix stripped at
+    /// store time) and for multimodal/suffix-less paths.
+    stored_clone: Option<AnyCache>,
     /// Process-global MLX-execution gate, held for the whole prefill + decode +
     /// stash scope. This is the single sanctioned acquisition that makes every
     /// `eval` / `async_eval` on this path pass the gate's `debug_assert`. Declared
@@ -890,6 +899,17 @@ impl SimpleEngine {
     /// all GPU work must stay serialized under the model lock, which this
     /// function does not hold.
     fn stash_retained(&self, session_id: u64, cache: AnyCache, tokens: Vec<u32>) {
+        #[allow(clippy::print_stderr)] // env-gated diagnostic
+        if self.kv_cache_config.max_session_tokens > 0
+            && tokens.len() > self.kv_cache_config.max_session_tokens
+            && std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1")
+        {
+            eprintln!(
+                "DIAG session-retain-drop: reason=max_session_tokens session_id={session_id} tokens={} cap={}",
+                tokens.len(),
+                self.kv_cache_config.max_session_tokens
+            );
+        }
         let evicted = stash_into(
             &mut lock_or_recover(&self.retained),
             session_id,
@@ -1106,6 +1126,7 @@ impl SimpleEngine {
             prompt_array,
             prompt_len,
             pixel_values,
+            stored_clone: None,
             _mlx_gate: mlx_gate,
         })
     }
@@ -1122,8 +1143,17 @@ impl SimpleEngine {
         logprob_top_n: Option<u32>,
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
         capture_hidden: bool,
+        store_prefix_cache: bool,
         checkpoint_id: Option<&str>,
     ) -> Result<(Array, Option<LogprobArrays>, Option<Array>), EngineError> {
+        // DIAGNOSTIC (HIGGS_DIAG_WARM_DRIFT=1): when reuse is active (the
+        // prepared cache is a reused clone with offset > 0), forward the FULL
+        // prompt on a fresh cache and compare the reused clone's KV to the fresh
+        // full forward's prefix KV. Localizes whether the warm incremental reuse
+        // path drifts from a cold full forward.
+        if Self::probe_warm_drift_enabled(prompt_tokens, prepared.cache.resident_len()) {
+            self.probe_warm_drift(prompt_tokens, prepared);
+        }
         let mut prefill_hidden = None;
         let logits = if let Some(ref pixel_values) = prepared.pixel_values {
             // Multimodal path: full forward (VLMs need all tokens for vision)
@@ -1137,7 +1167,111 @@ impl SimpleEngine {
             let seq_len = prepared.prompt_array.shape().get(1).copied().unwrap_or(0);
             let chunked_threshold = self.tuning.chunked_prefill_threshold();
             let chunked_size = self.tuning.chunked_prefill_chunk_size();
-            if capture_hidden && seq_len <= chunked_threshold {
+
+            // Hybrid (GDN/SSM) two-phase split. A hybrid cache can't be trimmed
+            // after prefill, so the only way to store a clone that excludes the
+            // non-recurring generation-prompt suffix (which diverges cross-turn
+            // once the assistant's real reply is in history) is to snapshot the
+            // cache BEFORE the suffix is prefilled. Forward the conversation body,
+            // snapshot, then forward the suffix to obtain the generation logits.
+            // Bit-identical to a single-pass prefill: chunked prefill already
+            // advances the cache token-by-token, so body-then-suffix == full.
+            let is_hybrid = matches!(prepared.cache, AnyCache::Hybrid(_));
+            let split_at = if store_prefix_cache && is_hybrid && self.gen_prompt_suffix_len > 0 {
+                prepared
+                    .actual_prompt_tokens
+                    .len()
+                    .saturating_sub(self.gen_prompt_suffix_len)
+            } else {
+                0
+            };
+
+            if split_at > 0 {
+                // Phase 1: advance the cache over the conversation body. When the
+                // caller wants hidden states (MTP priming), capture the body's
+                // hidden here so the full-prompt hidden can be reconstructed by
+                // concatenation after Phase 2 (the MTP head needs every prompt
+                // token's hidden, not just the suffix's).
+                // `split_at` is `len().saturating_sub(..)` so `get` cannot miss;
+                // the fallback keeps the lint-clean non-panicking form.
+                let body_ids = prepared
+                    .actual_prompt_tokens
+                    .get(..split_at)
+                    .unwrap_or_default();
+                let body_array = Array::from(body_ids).index(NewAxis);
+                let chunked_threshold_len =
+                    usize::try_from(chunked_threshold).unwrap_or(usize::MAX);
+                let body_hidden = if capture_hidden {
+                    let (hidden, _logits) = prepared
+                        .model
+                        .forward_with_hidden(&body_array, None, &mut prepared.cache)
+                        .map_err(EngineError::Mlx)?;
+                    Some(hidden)
+                } else if body_ids.len() > chunked_threshold_len {
+                    prepared
+                        .model
+                        .forward_chunked(&body_array, &mut prepared.cache, chunked_size)
+                        .map_err(EngineError::Mlx)?;
+                    None
+                } else {
+                    prepared
+                        .model
+                        .forward_last_token(&body_array, None, &mut prepared.cache)
+                        .map_err(EngineError::Mlx)?;
+                    None
+                };
+                // Snapshot at the clean conversation boundary. KV layers update
+                // in place (append to the same buffer), so a shallow `clone()`
+                // would share that buffer and Phase 2's suffix forward below would
+                // append the gen-suffix KV into the snapshot, corrupting it (silent
+                // decode divergence on reuse, ~token 10). `deep_clone()` evals and
+                // deep-copies the in-place KV buffers into independent storage
+                // (GDN/SSM layers are functional and stay cheap-shallow), freezing
+                // the snapshot independent of Phase 2.
+                prepared.stored_clone = Some(prepared.cache.deep_clone());
+                // DIAGNOSTIC (env HIGGS_DIAG_STORE_DRIFT=1): throwaway cold
+                // forward over the FULL prompt on a second fresh cache, compare
+                // its [..split_at] KV to the two-phase stored_clone. If they
+                // differ, the body snapshot's KV drifts from a cold single-pass
+                // forward at a different seq_len — the store-side drift Route A
+                // targets. Runs once per process when the body is large enough
+                // (>= HIGGS_DIAG_STORE_DRIFT_MIN_LEN, default 0) to also probe
+                // the large-body regime where the secondary divergence appears.
+                if Self::probe_store_drift_enabled(split_at) {
+                    self.probe_store_drift(prepared, split_at);
+                }
+                // Phase 2: forward the gen-suffix to obtain the final logits.
+                let suffix_ids = prepared
+                    .actual_prompt_tokens
+                    .get(split_at..)
+                    .unwrap_or_default();
+                let suffix_array = Array::from(suffix_ids).index(NewAxis);
+                if capture_hidden {
+                    let (suffix_hidden, logits) = prepared
+                        .model
+                        .forward_with_hidden(&suffix_array, None, &mut prepared.cache)
+                        .map_err(EngineError::Mlx)?;
+                    // Reconstruct the full-prompt hidden for the MTP head.
+                    prefill_hidden = match body_hidden {
+                        Some(bh) => Some(
+                            mlx_rs::ops::concatenate_axis(&[&bh, &suffix_hidden], 1)
+                                .map_err(EngineError::Mlx)?,
+                        ),
+                        None => Some(suffix_hidden),
+                    };
+                    logits
+                } else if suffix_ids.len() > chunked_threshold_len {
+                    prepared
+                        .model
+                        .forward_chunked(&suffix_array, &mut prepared.cache, chunked_size)
+                        .map_err(EngineError::Mlx)?
+                } else {
+                    prepared
+                        .model
+                        .forward_last_token(&suffix_array, None, &mut prepared.cache)
+                        .map_err(EngineError::Mlx)?
+                }
+            } else if capture_hidden && seq_len <= chunked_threshold {
                 let (hidden, logits) = prepared
                     .model
                     .forward_with_hidden(&prepared.prompt_array, None, &mut prepared.cache)
@@ -1194,39 +1328,39 @@ impl SimpleEngine {
         }
 
         // Skip prefix cache for multimodal (image-specific KV states)
-        if prepared.pixel_values.is_none() {
+        if store_prefix_cache && prepared.pixel_values.is_none() {
             let mut pc = self
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            // Dense KV caches block-page, so stripping the generation-prompt
-            // suffix lets multi-turn conversations share their common history
-            // prefix (the suffix tokens `<|im_start|>assistant\n<think>\n` change
-            // between turns) — block-aligned reconstruction stays exact.
+            // Strip the generation-prompt suffix from the key so multi-turn
+            // conversations share their common history prefix (the suffix tokens
+            // `<|im_start|>assistant\n…` change between turns).
             //
-            // Hybrid (GDN/SSM) caches are stored as a whole CLONE, not paged: a
-            // GDN cache's sequential state cannot be truncated to a shorter
-            // (suffix-stripped) prefix without corrupting it (mlx-lm #980). If we
-            // keyed a hybrid clone at the stripped length, a later partial match
-            // would reuse a clone whose offset (full prompt) exceeds the matched
-            // prefix_len — carrying the previous turn's stale gen-suffix KV and
-            // shifting the suffix's RoPE positions, which silently diverges from a
-            // cold prefill. So key hybrid clones at their FULL prefilled length:
-            // reuse then only fires on a genuine full-prefix match (offset ==
-            // prefix_len) and is exact. (Cross-turn hybrid reuse is handled by the
-            // per-session retained cache instead.)
-            let cache_key = if matches!(prepared.cache, AnyCache::Hybrid(_)) {
-                prompt_tokens
-            } else {
-                prompt_tokens
-                    .get(
-                        ..prompt_tokens
-                            .len()
-                            .saturating_sub(self.gen_prompt_suffix_len),
-                    )
-                    .unwrap_or(prompt_tokens)
-            };
-            pc.store(cache_key, &prepared.cache, checkpoint_id);
+            // Dense KV caches block-page: the suffix is dropped at block
+            // boundaries and reconstruction stays exact.
+            //
+            // Hybrid (GDN/SSM) caches are stored as a whole CLONE and their
+            // sequential state cannot be truncated after the fact (mlx-lm #980).
+            // `run_prefill` therefore two-phase splits a hybrid prefill: it
+            // snapshots `stored_clone` at the conversation boundary (BEFORE the
+            // suffix) and keys that snapshot at the stripped length. The
+            // snapshot's offset == stripped key length, so reuse is exact (no
+            // RoPE/SSM shift) AND cross-turn matching fires (the conversation
+            // boundary recurs verbatim in the next turn). This replaces the old
+            // "key hybrid at full length" path, which was correct but never
+            // matched cross-turn (the suffix diverges), forcing a full re-prefill
+            // every turn.
+            let stripped = prompt_tokens
+                .get(
+                    ..prompt_tokens
+                        .len()
+                        .saturating_sub(self.gen_prompt_suffix_len),
+                )
+                .filter(|k| k.len() < prompt_tokens.len())
+                .unwrap_or(prompt_tokens);
+            let cache_to_store = prepared.stored_clone.as_ref().unwrap_or(&prepared.cache);
+            pc.store(stripped, cache_to_store, checkpoint_id);
         }
         maybe_clear_mlx_cache(
             self.tuning.clear_cache_after_prefill(),
@@ -1234,6 +1368,688 @@ impl SimpleEngine {
         );
 
         Ok((current_token, logprob_data, prefill_hidden))
+    }
+
+    /// Env-gated, runs-once flag for the store-drift diagnostic probe. Only
+    /// fires once the body length reaches `HIGGS_DIAG_STORE_DRIFT_MIN_LEN`
+    /// (default 0), so it can target the large-body regime.
+    fn probe_store_drift_enabled(split_at: usize) -> bool {
+        static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let on = std::env::var("HIGGS_DIAG_STORE_DRIFT")
+            .ok()
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let min_len = std::env::var("HIGGS_DIAG_STORE_DRIFT_MIN_LEN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        on && split_at >= min_len && !FIRED.swap(true, Ordering::Relaxed)
+    }
+
+    /// Env-gated flag for the warm-path drift probe. Fires on EVERY turn where
+    /// reuse is active (prepared cache offset > 0) and the full prompt reaches
+    /// `HIGGS_DIAG_WARM_DRIFT_MIN_LEN` (default 400) — to track per-turn
+    /// accumulation.
+    fn probe_warm_drift_enabled(prompt_tokens: &[u32], resident: i32) -> bool {
+        let on = std::env::var("HIGGS_DIAG_WARM_DRIFT")
+            .ok()
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let min_len = std::env::var("HIGGS_DIAG_WARM_DRIFT_MIN_LEN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(400);
+        on && resident > 0 && prompt_tokens.len() >= min_len
+    }
+
+    /// Warm-path drift diagnostic: forward the FULL prompt on a fresh cache and
+    /// compare the reused clone's KV (prepared.cache[..offset]) to the fresh full
+    /// forward's prefix KV. If they differ, the warm incremental reuse path
+    /// (clone built over many turns) drifts from a cold full forward.
+    // Diagnostic-only probe (env-gated, runs once): stderr reporting and direct
+    // indexing over probe-owned buffers are the point, not a hazard.
+    #[allow(
+        clippy::print_stderr,
+        clippy::indexing_slicing,
+        clippy::as_conversions,
+        clippy::shadow_unrelated,
+        clippy::shadow_reuse
+    )]
+    fn probe_warm_drift(&self, prompt_tokens: &[u32], prepared: &mut PreparedGeneration<'_>) {
+        use higgs_models::LayerCache;
+        let resident = prepared.cache.resident_len();
+        let mut fresh = match prepared
+            .model
+            .make_cache_with_config(self.kv_cache_config)
+            .map_err(EngineError::Mlx)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("DIAG warm-drift: make_cache err {e:?}");
+                return;
+            }
+        };
+        let full_array = Array::from(prompt_tokens).index(NewAxis);
+        // Fresh-vs-fresh control: forward the body and the full prompt on TWO
+        // independent fresh caches and compare. (Both caches must be genuinely
+        // fresh — forwarding `fresh` twice would pollute its conv_state and
+        // confound the comparison.)
+        let mut fresh_body = match prepared
+            .model
+            .make_cache_with_config(self.kv_cache_config)
+            .map_err(EngineError::Mlx)
+        {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("DIAG warm-drift: make_cache(fresh_body) err");
+                return;
+            }
+        };
+        let body_tokens = &prompt_tokens[..(resident as usize).min(prompt_tokens.len())];
+        let body_array = Array::from(body_tokens).index(NewAxis);
+        higgs_models::diag_request_hidden_capture();
+        higgs_models::diag_request_gdn_capture();
+        let _ = prepared
+            .model
+            .forward_with_hidden(&body_array, None, &mut fresh_body);
+        let body_h = higgs_models::diag_take_hidden_capture();
+        let body_gdn = higgs_models::diag_take_gdn_capture();
+        higgs_models::diag_request_hidden_capture();
+        higgs_models::diag_request_gdn_capture();
+        let _ = prepared
+            .model
+            .forward_with_hidden(&full_array, None, &mut fresh);
+        let full_h = higgs_models::diag_take_hidden_capture();
+        let full_gdn = higgs_models::diag_take_gdn_capture();
+        if let (Some(bh), Some(fh)) = (body_h.as_ref(), full_h.as_ref()) {
+            higgs_models::diag_report_hidden_diff("WARM-FRESH body-vs-full", bh, fh);
+        }
+        if let (Some(bg), Some(fg)) = (body_gdn.as_ref(), full_gdn.as_ref()) {
+            higgs_models::diag_report_gdn_diff("WARM-FRESH body-vs-full", bg, fg);
+        }
+        let resident_i = resident;
+        if resident_i <= 0 {
+            return;
+        }
+        let cmp = |a: Option<&Array>, b: Option<&Array>| -> (f32, usize, Vec<f32>) {
+            let (Some(a), Some(b)) = (a, b) else {
+                return (f32::INFINITY, 0, vec![]);
+            };
+            let af = match a.as_dtype(Dtype::Float32) {
+                Ok(v) => v,
+                Err(_) => return (f32::INFINITY, 0, vec![]),
+            };
+            let bf = match b.as_dtype(Dtype::Float32) {
+                Ok(v) => v,
+                Err(_) => return (f32::INFINITY, 0, vec![]),
+            };
+            let pa = af.index((.., .., 0..resident_i, ..));
+            let pb = bf.index((.., .., 0..resident_i, ..));
+            if eval([&pa, &pb]).is_err() {
+                return (f32::INFINITY, 0, vec![]);
+            }
+            let sa = pa.as_slice::<f32>();
+            let sb = pb.as_slice::<f32>();
+            let d = (*af.shape().get(3).unwrap_or(&1)).max(1) as usize;
+            let per_pos = resident_i as usize;
+            let mut per_pos_max = vec![0.0f32; per_pos];
+            let mut max_abs = 0.0f32;
+            let mut diffs = 0usize;
+            for (i, (x, y)) in sa.iter().zip(sb.iter()).enumerate() {
+                let diff = (x - y).abs();
+                let pos = (i / d) % per_pos;
+                if diff > per_pos_max[pos] {
+                    per_pos_max[pos] = diff;
+                }
+                if diff > max_abs {
+                    max_abs = diff;
+                }
+                if x.to_bits() != y.to_bits() {
+                    diffs += 1;
+                }
+            }
+            (max_abs, diffs, per_pos_max)
+        };
+        let (AnyCache::Hybrid(reused_layers), AnyCache::Hybrid(fresh_layers)) =
+            (&prepared.cache, &fresh)
+        else {
+            eprintln!("DIAG warm-drift: not Hybrid");
+            return;
+        };
+        eprintln!(
+            "DIAG warm-drift: comparing reused clone[..{resident_i}] vs fresh full({}) forward",
+            prompt_tokens.len()
+        );
+        let mut global_max = 0.0f32;
+        let mut all_per_pos: Vec<f32> = Vec::new();
+        for (i, (rl, fl)) in reused_layers.iter().zip(fresh_layers.iter()).enumerate() {
+            let (Some(LayerCache::KV(rk)), Some(LayerCache::KV(fk))) = (rl, fl) else {
+                continue;
+            };
+            let (kmax, _kdiff, kpos) = cmp(rk.keys(), fk.keys());
+            let (vmax, _vdiff, _vpos) = cmp(rk.values(), fk.values());
+            global_max = global_max.max(kmax).max(vmax);
+            if i == 3 {
+                // Capture the first FA layer's per-position pattern (layer 3).
+                all_per_pos = kpos;
+            }
+        }
+        // Characterize the huge-tiny-huge band: count positions in tiny (<0.1)
+        // vs huge (>1.0) buckets, and report the longest contiguous tiny run.
+        let tiny = all_per_pos.iter().filter(|m| **m < 0.1).count();
+        let huge = all_per_pos.iter().filter(|m| **m > 1.0).count();
+        let mut best_run = 0usize;
+        let mut cur = 0usize;
+        let mut best_start = 0usize;
+        let mut cur_start = 0usize;
+        for (p, m) in all_per_pos.iter().enumerate() {
+            if *m < 0.1 {
+                if cur == 0 {
+                    cur_start = p;
+                }
+                cur += 1;
+                if cur > best_run {
+                    best_run = cur;
+                    best_start = cur_start;
+                }
+            } else {
+                cur = 0;
+            }
+        }
+        eprintln!(
+            "DIAG warm-drift SUMMARY: global_max={global_max:.3e} resident={resident_i} tiny(<0.1)={tiny}/{} huge(>1)={huge} longest_tiny_run=p{best_start}..{}",
+            all_per_pos.len(),
+            best_start + best_run
+        );
+        // Fresh-vs-fresh control: fresh_body(=forward body) vs fresh_full[..resident].
+        let mut ff_max = 0.0f32;
+        if let (AnyCache::Hybrid(bl), AnyCache::Hybrid(fl)) = (&fresh_body, &fresh) {
+            for (bl, fl) in bl.iter().zip(fl.iter()) {
+                let (Some(LayerCache::KV(bk)), Some(LayerCache::KV(fk))) = (bl, fl) else {
+                    continue;
+                };
+                let (km, _, _) = cmp(bk.keys(), fk.keys());
+                let (vm, _, _) = cmp(bk.values(), fk.values());
+                ff_max = ff_max.max(km).max(vm);
+            }
+        }
+        eprintln!(
+            "DIAG warm-drift FRESH-vs-FRESH (forward(body) vs forward(full)[..body]): max={ff_max:.3e} — clean=>store corrupts clone; dirty=>forward length-dependent at this size"
+        );
+    }
+
+    /// Store-side drift diagnostic (see [`Self::probe_store_drift_enabled`]).
+    /// Forwards the full prompt on a second fresh cache (mirroring a cold
+    /// single-pass) and compares `[..split_at]` KV to the stored body snapshot.
+    // Diagnostic-only probe — see `probe_warm_drift`.
+    #[allow(
+        clippy::print_stderr,
+        clippy::indexing_slicing,
+        clippy::as_conversions,
+        clippy::shadow_unrelated,
+        clippy::shadow_reuse
+    )]
+    fn probe_store_drift(&self, prepared: &mut PreparedGeneration<'_>, split_at: usize) {
+        use higgs_models::LayerCache;
+
+        // Capture per-layer hidden states for the FULL forward (cold-like).
+        higgs_models::diag_request_hidden_capture();
+        higgs_models::diag_request_attn_capture();
+        let mut fresh = match prepared
+            .model
+            .make_cache_with_config(self.kv_cache_config)
+            .map_err(EngineError::Mlx)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("DIAG store-drift: make_cache err {e:?}");
+                return;
+            }
+        };
+        let chunk_body = std::env::var("HIGGS_DIAG_CHUNK_BODY").is_ok_and(|v| v == "1");
+        let chunk_sz = std::env::var("HIGGS_DIAG_CHUNK_SZ")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(self.tuning.chunked_prefill_chunk_size());
+        let fwd_diag = |model: &mut AnyModel, inputs: &Array, cache: &mut AnyCache| -> bool {
+            if chunk_body {
+                model.forward_chunked(inputs, cache, chunk_sz).is_ok()
+            } else {
+                model.forward_with_hidden(inputs, None, cache).is_ok()
+            }
+        };
+        if !fwd_diag(&mut prepared.model, &prepared.prompt_array, &mut fresh) {
+            eprintln!("DIAG store-drift: forward(full) failed");
+            return;
+        }
+        let full_hidden = higgs_models::diag_take_hidden_capture();
+        let full_attn = higgs_models::diag_take_attn_capture();
+        // deep_clone `fresh` IMMEDIATELY after its forward, mirroring how
+        // production `snap` is captured. The cache stores LAZY slice_update
+        // nodes; reading `fresh` later (after other forwards) would let MLX
+        // recycle its temporaries and corrupt the comparison. This clone gives a
+        // concrete, independent snapshot to compare against `snap`.
+        let fresh_snapshot = fresh.deep_clone();
+        let Some(snap) = prepared.stored_clone.as_ref() else {
+            return;
+        };
+        let split_i = i32::try_from(split_at).unwrap_or(i32::MAX);
+        // CONTROL A (determinism): forward the BODY twice on two fresh caches.
+        // If their KV differs, the drift is Metal run-to-run nondeterminism,
+        // NOT a seq-len effect — and Route A cannot fix nondeterminism.
+        let body_arr = Array::from(&prepared.actual_prompt_tokens[..split_at]).index(NewAxis);
+        let mut body_a = match prepared
+            .model
+            .make_cache_with_config(self.kv_cache_config)
+            .map_err(EngineError::Mlx)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("DIAG controlA: make_cache err {e:?}");
+                return;
+            }
+        };
+        let mut body_b = match prepared
+            .model
+            .make_cache_with_config(self.kv_cache_config)
+            .map_err(EngineError::Mlx)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("DIAG controlA: make_cache err {e:?}");
+                return;
+            }
+        };
+        // Capture per-layer hidden states for the BODY forward (store-like).
+        higgs_models::diag_request_hidden_capture();
+        higgs_models::diag_request_attn_capture();
+        let _ = fwd_diag(&mut prepared.model, &body_arr, &mut body_a);
+        let body_hidden = higgs_models::diag_take_hidden_capture();
+        let body_attn = higgs_models::diag_take_attn_capture();
+        let _ = prepared
+            .model
+            .forward_with_hidden(&body_arr, None, &mut body_b);
+        // Direct per-layer hidden-state diff: forward(body=90) vs forward(full=95),
+        // the exact pair that the KV store-drift measures. Localizes the layer
+        // where the body's hidden state first diverges.
+        if let (Some(bh), Some(fh)) = (body_hidden.as_ref(), full_hidden.as_ref()) {
+            higgs_models::diag_report_hidden_diff("BODY-vs-FULL", bh, fh);
+        }
+        // Direct first-FA-layer keys diff: pre-write (k_proj+rope) and post-write
+        // (cache-stored). If PRE-WRITE differs, h differs (or k_proj/rope is
+        // length-dependent). If PRE-WRITE is identical but POST-WRITE differs,
+        // the cache write path (update_and_view / mlx_slice_update) corrupts.
+        if let (Some(ba), Some(fa)) = (body_attn.as_ref(), full_attn.as_ref()) {
+            higgs_models::diag_report_attn_diff("BODY-vs-FULL", ba, fa);
+        }
+        // DECISIVE: for the FULL forward, compare PRE-write keys (k_proj+rope,
+        // eval'd directly) vs POST-write keys (the slice_update result) of the
+        // SAME forward. If they differ, `slice_update` corrupts the
+        // non-contiguous keys when materializing — the cache write is the bug.
+        if let Some((_, Some(pre), Some(post), _, _, _)) = full_attn.as_ref() {
+            let a = &pre.0;
+            let b = &post.0;
+            let d = (*pre.1.get(3).unwrap_or(&1)).max(1) as usize;
+            let per_pos = split_at;
+            let elems = per_pos * d;
+            let mut max_abs = 0.0f32;
+            let mut diffs = 0usize;
+            let mut per_pos_max = vec![0.0f32; per_pos];
+            for i in 0..elems.min(a.len()).min(b.len()) {
+                let diff = (a[i] - b[i]).abs();
+                let pos = i / d;
+                if diff > per_pos_max[pos] {
+                    per_pos_max[pos] = diff;
+                }
+                if diff > max_abs {
+                    max_abs = diff;
+                }
+                if a[i].to_bits() != b[i].to_bits() {
+                    diffs += 1;
+                }
+            }
+            let nz: Vec<String> = per_pos_max
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| **m > 0.0)
+                .map(|(p, m)| format!("p{p}:{m:.1e}"))
+                .collect();
+            eprintln!(
+                "DIAG PRE-vs-POST same-forward(full): max_abs={max_abs:.3e} diffs={diffs}/{elems} nonzero[{}]",
+                nz.join(" ")
+            );
+        }
+        // DECISIVE: does `fresh`'s first-FA cache change between immediate
+        // post-write (full_attn capture, mid-forward) and post-forward
+        // (fresh_snapshot, deep_clone after the forward)? If yes, the cache is
+        // corrupted during the rest of the forward. Compare full_attn.POST-WRITE
+        // (Vec) vs fresh_snapshot's first-FA-layer keys read now.
+        if let Some((_, _, Some((imm_v, imm_shape)), _, _, _)) = full_attn.as_ref() {
+            let AnyCache::Hybrid(fresh_layers) = &fresh_snapshot else {
+                eprintln!("DIAG SELF: fresh_snapshot not Hybrid");
+                return;
+            };
+            for fl in fresh_layers.iter() {
+                let Some(higgs_models::LayerCache::KV(fk)) = fl else {
+                    continue;
+                };
+                let Some(fka) = fk.keys() else { break };
+                let Ok(fkaf) = fka.as_dtype(Dtype::Float32) else {
+                    break;
+                };
+                let pa = fkaf.index((.., .., 0..split_i, ..));
+                let _ = eval([&pa]);
+                let now_v = pa.as_slice::<f32>().to_vec();
+                let d = (*imm_shape.get(3).unwrap_or(&1)).max(1) as usize;
+                let per_pos = split_at;
+                let elems = per_pos * d;
+                let mut max_abs = 0.0f32;
+                let mut diffs = 0usize;
+                let mut nz: Vec<String> = Vec::new();
+                let mut per_pos_max = vec![0.0f32; per_pos];
+                for i in 0..elems.min(imm_v.len()).min(now_v.len()) {
+                    let diff = (imm_v[i] - now_v[i]).abs();
+                    let pos = i / d;
+                    if diff > per_pos_max[pos] {
+                        per_pos_max[pos] = diff;
+                    }
+                    if diff > max_abs {
+                        max_abs = diff;
+                    }
+                    if imm_v[i].to_bits() != now_v[i].to_bits() {
+                        diffs += 1;
+                    }
+                }
+                for (p, m) in per_pos_max.iter().enumerate() {
+                    if *m > 0.0 {
+                        nz.push(format!("p{p}:{m:.1e}"));
+                    }
+                }
+                eprintln!(
+                    "DIAG SELF fresh first-FA: immediate-vs-postforward max_abs={max_abs:.3e} diffs={diffs}/{elems} nonzero[{}]",
+                    nz.join(" ")
+                );
+                break;
+            }
+        }
+        let cmp = |label: &str, a: Option<&Array>, b: Option<&Array>| -> (bool, f32, usize) {
+            let (Some(a), Some(b)) = (a, b) else {
+                eprintln!("DIAG {label}: missing array");
+                return (false, 0.0, 0);
+            };
+            // Cast to f32 (lossless for bf16->f32; no-op for f32). Comparing
+            // the cast bits is still bit-exact: equal bf16 -> equal f32.
+            let a = match a.as_dtype(Dtype::Float32) {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("DIAG {label}: as_dtype f32 failed");
+                    return (false, 0.0, 0);
+                }
+            };
+            let b = match b.as_dtype(Dtype::Float32) {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("DIAG {label}: as_dtype f32 failed");
+                    return (false, 0.0, 0);
+                }
+            };
+            let pa = a.index((.., .., 0..split_i, ..));
+            let pb = b.index((.., .., 0..split_i, ..));
+            if eval([&pa, &pb]).is_err() {
+                eprintln!("DIAG {label}: eval failed");
+                return (false, 0.0, 0);
+            }
+            let sa = pa.as_slice::<f32>();
+            let sb = pb.as_slice::<f32>();
+            if sa.len() != sb.len() {
+                eprintln!(
+                    "DIAG {label}: shape mismatch {} vs {} (split={split_i})",
+                    sa.len(),
+                    sb.len()
+                );
+                return (false, f32::INFINITY, sa.len().max(sb.len()));
+            }
+            let mut exact = true;
+            let mut max_abs = 0.0f32;
+            let mut diffs = 0usize;
+            for (x, y) in sa.iter().zip(sb.iter()) {
+                if x.to_bits() != y.to_bits() {
+                    exact = false;
+                    diffs += 1;
+                }
+                let d = (x - y).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+            }
+            eprintln!(
+                "DIAG {label}: bit_exact={exact} max_abs={max_abs:.3e} diff_elems={diffs}/{}",
+                sa.len()
+            );
+            (exact, max_abs, diffs)
+        };
+        let (AnyCache::Hybrid(fresh_layers), AnyCache::Hybrid(snap_layers)) =
+            (&fresh_snapshot, snap)
+        else {
+            eprintln!("DIAG store-drift: cache not Hybrid, skipping");
+            return;
+        };
+        // Dump raw values: first-FA-layer keys, position 0, head 0, first 4 elems
+        // for fresh_snapshot vs snap vs full_attn.POST (X). Rules out comparison
+        // artifacts and shows whose data is actually wrong.
+        for (fl, sl) in fresh_layers.iter().zip(snap_layers.iter()) {
+            let (Some(LayerCache::KV(fk)), Some(LayerCache::KV(sk))) = (fl, sl) else {
+                continue;
+            };
+            let dump = |label: &str, a: Option<&Array>| -> String {
+                let Some(a) = a else {
+                    return format!("{label}: none");
+                };
+                let Ok(af) = a.as_dtype(Dtype::Float32) else {
+                    return format!("{label}: dtype err");
+                };
+                let p = af.index((.., .., 0..1, ..));
+                let _ = eval([&p]);
+                let s = p.as_slice::<f32>();
+                format!(
+                    "{label} offset={} [{}]",
+                    a.shape()[2],
+                    s.iter()
+                        .take(4)
+                        .map(|v| format!("{v:.3}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            eprintln!(
+                "DIAG VALS first-FA p0: {} | {}",
+                dump("fresh", fk.keys()),
+                dump("snap", sk.keys())
+            );
+            break;
+        }
+        // Localize the diff per position (axis 2) for the FIRST KV layer keys,
+        // collapsing across heads/head-dim, to see if it concentrates at the
+        // body tail (windowing/offset leak) vs spread (tiling) vs misaligned.
+        for (fl, sl) in fresh_layers.iter().zip(snap_layers.iter()) {
+            let (Some(LayerCache::KV(fk)), Some(LayerCache::KV(sk))) = (fl, sl) else {
+                continue;
+            };
+            let (Some(ak), Some(bk)) = (fk.keys(), sk.keys()) else {
+                break;
+            };
+            let (Ok(af), Ok(bf)) = (ak.as_dtype(Dtype::Float32), bk.as_dtype(Dtype::Float32))
+            else {
+                break;
+            };
+            let pa = af.index((.., .., 0..split_i, ..));
+            let pb = bf.index((.., .., 0..split_i, ..));
+            let _ = eval([&pa, &pb]);
+            let shape = pa.shape();
+            let h = *shape.get(1).unwrap_or(&1);
+            let split = *shape.get(2).unwrap_or(&1);
+            let d = *shape.get(3).unwrap_or(&1).max(&1);
+            let sa = pa.as_slice::<f32>();
+            let sb = pb.as_slice::<f32>();
+            let mut per_pos_max = vec![0.0f32; split as usize];
+            let mut per_pos_diffs = vec![0u32; split as usize];
+            for (i, (x, y)) in sa.iter().zip(sb.iter()).enumerate() {
+                let pos = ((i as i32 / d) % split) as usize;
+                let dd = (x - y).abs();
+                if dd > per_pos_max[pos] {
+                    per_pos_max[pos] = dd;
+                }
+                if x.to_bits() != y.to_bits() {
+                    per_pos_diffs[pos] += 1;
+                }
+            }
+            eprintln!(
+                "DIAG LOC first-KV-keys: H={h} split={split} D={d} fresh.offset={} snap.offset={}",
+                fresh_snapshot.resident_len(),
+                snap.resident_len()
+            );
+            // Print compact per-position summary: only positions with nonzero diff.
+            let nz: Vec<String> = per_pos_max
+                .iter()
+                .enumerate()
+                .filter(|&(_, &m)| m > 0.0)
+                .map(|(p, &m)| format!("pos{p}:{m:.2e}/{}", per_pos_diffs[p]))
+                .collect();
+            eprintln!(
+                "DIAG LOC nonzero positions (pos:max_abs/diffs): {}",
+                nz.join(" ")
+            );
+            break;
+        }
+        let mut all_exact = true;
+        let mut global_max = 0.0f32;
+        for (i, (fl, sl)) in fresh_layers.iter().zip(snap_layers.iter()).enumerate() {
+            let (Some(LayerCache::KV(fk)), Some(LayerCache::KV(sk))) = (fl, sl) else {
+                continue;
+            };
+            let (ke, km, _) = cmp(&format!("L{i:02}_keys"), fk.keys(), sk.keys());
+            let (ve, vm, _) = cmp(&format!("L{i:02}_vals"), fk.values(), sk.values());
+            all_exact &= ke & ve;
+            global_max = global_max.max(km).max(vm);
+        }
+        eprintln!(
+            "DIAG store-drift SUMMARY: all_bit_exact={all_exact} global_max_abs={global_max:.3e} (split_at={split_at}, full_len={})",
+            prepared.actual_prompt_tokens.len()
+        );
+        // CONTROL A report: body-vs-body (run-to-run determinism). If this is
+        // NOT bit_exact, the engine's forward is nondeterministic and the
+        // store-drift above is partly/wholly nondeterminism, not a seq-len effect.
+        let (AnyCache::Hybrid(ba), AnyCache::Hybrid(bb)) = (&body_a, &body_b) else {
+            return;
+        };
+        let mut ctrl_exact = true;
+        let mut ctrl_max = 0.0f32;
+        let mut ctrl_diffs = 0usize;
+        for (la, lb) in ba.iter().zip(bb.iter()) {
+            let (Some(LayerCache::KV(ka)), Some(LayerCache::KV(kb))) = (la, lb) else {
+                continue;
+            };
+            let (ke, km, kd) = cmp("CTRL", ka.keys(), kb.keys());
+            let (ve, vm, vd) = cmp("CTRL", ka.values(), kb.values());
+            ctrl_exact &= ke & ve;
+            ctrl_max = ctrl_max.max(km).max(vm);
+            ctrl_diffs += kd + vd;
+        }
+        eprintln!(
+            "DIAG CONTROL-A (body-vs-body determinism): bit_exact={ctrl_exact} max_abs={ctrl_max:.3e} total_diffs={ctrl_diffs}"
+        );
+        // CONTROL-B (prepared.cache cleanliness): compare snap (body forward on
+        // prepared.cache) vs body_a (body forward on a truly fresh cache). If
+        // they differ, prepared.cache was NOT empty before the body forward —
+        // residual tokens shifted the KV layout, and the "store drift" is an
+        // unclean-cache artifact, not a seq-len tiling effect.
+        let (AnyCache::Hybrid(snap_layers), AnyCache::Hybrid(ba_layers)) = (snap, &body_a) else {
+            return;
+        };
+        let mut cb_exact = true;
+        let mut cb_max = 0.0f32;
+        let mut cb_diffs = 0usize;
+        for (ls, la) in snap_layers.iter().zip(ba_layers.iter()) {
+            let (Some(LayerCache::KV(ks)), Some(LayerCache::KV(ka))) = (ls, la) else {
+                continue;
+            };
+            let (ke, km, kd) = cmp("CTRLB-K", ks.keys(), ka.keys());
+            let (ve, vm, vd) = cmp("CTRLB-V", ks.values(), ka.values());
+            cb_exact &= ke & ve;
+            cb_max = cb_max.max(km).max(vm);
+            cb_diffs += kd + vd;
+        }
+        eprintln!(
+            "DIAG CONTROL-B (snap-vs-freshbody, prepared.cache clean?): bit_exact={cb_exact} max_abs={cb_max:.3e} total_diffs={cb_diffs}"
+        );
+        // VARY-SUFFIX SWEEP: forward body+K for K in {2,5,10} on fresh caches,
+        // compare [..split_at] KV to body_a. If appending K tokens changes the
+        // FIRST K body positions, the model has a structural non-causal op
+        // (Route A chunking cannot fix that). If it changes the LAST ~K (near
+        // the boundary) or spreads as tiny FP tiling, it's a tiling effect.
+        let total = prepared.actual_prompt_tokens.len();
+        for k in [2usize, 5, 10] {
+            let end = (split_at + k).min(total);
+            if end <= split_at {
+                continue;
+            }
+            let arr = Array::from(&prepared.actual_prompt_tokens[..end]).index(NewAxis);
+            let mut c = match prepared
+                .model
+                .make_cache_with_config(self.kv_cache_config)
+                .map_err(EngineError::Mlx)
+            {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let _ = prepared.model.forward_with_hidden(&arr, None, &mut c);
+            let (AnyCache::Hybrid(cl), AnyCache::Hybrid(bl)) = (&c, &body_a) else {
+                continue;
+            };
+            // Localize on the first KV layer keys.
+            for (cf, bf) in cl.iter().zip(bl.iter()) {
+                let (Some(LayerCache::KV(ck)), Some(LayerCache::KV(bk))) = (cf, bf) else {
+                    continue;
+                };
+                let (Some(ak), Some(bk2)) = (ck.keys(), bk.keys()) else {
+                    break;
+                };
+                let (Ok(af), Ok(bf2)) = (ak.as_dtype(Dtype::Float32), bk2.as_dtype(Dtype::Float32))
+                else {
+                    break;
+                };
+                let pa = af.index((.., .., 0..split_i, ..));
+                let pb = bf2.index((.., .., 0..split_i, ..));
+                let _ = eval([&pa, &pb]);
+                let shape = pa.shape();
+                let d = *shape.get(3).unwrap_or(&1).max(&1);
+                let split = *shape.get(2).unwrap_or(&1);
+                let sa = pa.as_slice::<f32>();
+                let sb = pb.as_slice::<f32>();
+                let mut per_pos_max = vec![0.0f32; split as usize];
+                for (i, (x, y)) in sa.iter().zip(sb.iter()).enumerate() {
+                    let pos = ((i as i32 / d) % split) as usize;
+                    let dd = (x - y).abs();
+                    if dd > per_pos_max[pos] {
+                        per_pos_max[pos] = dd;
+                    }
+                }
+                let nz: Vec<String> = per_pos_max
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &m)| m > 0.0)
+                    .map(|(p, &m)| format!("pos{p}:{m:.1e}"))
+                    .collect();
+                eprintln!(
+                    "DIAG SWEEP body+{k} (len={end}) vs body: first-KV-keys nonzero positions: {}",
+                    nz.join(" ")
+                );
+                break;
+            }
+        }
     }
 
     /// Decode a single step: forward pass on the current token, apply penalties
@@ -1299,15 +2115,19 @@ impl SimpleEngine {
     ///
     /// This per-session path is a **latency optimization, not an exact-replay
     /// guarantee**. A continued turn's output can differ slightly from a stateless
-    /// full prefill of the same conversation, because (1) the retained KV is
-    /// TurboQuant-compressed for between-turn storage (`quantize_for_retention`),
-    /// which is lossy, and (2) the continuation prompt is reconciled in text space
+    /// full prefill of the same conversation, because (1) when TurboQuant is
+    /// enabled, the retained KV is compressed for between-turn storage
+    /// (`quantize_for_retention`), which is lossy (with `kv_cache = off` the
+    /// retained KV stays dense and exact), and (2) the continuation prompt is
+    /// reconciled in text space
     /// (decode the retained tokens, strip `<think>` blocks, re-match the prefix),
     /// which can diverge from a cleanly-rendered stateless prompt.
     ///
-    /// For **bit-identical** reuse, omit `session_id`: the radix prefix cache on
-    /// the normal generate path reconstructs dense KV exactly (proven
-    /// token-for-token in `tests/golden_cache_equivalence.rs`).
+    /// For dense KV models, the normal radix prefix cache reconstructs cached KV
+    /// exactly. For Hybrid models, both radix and session continuation are
+    /// latency optimizations with bounded deterministic drift versus a cold
+    /// one-shot full prefill; the session path is the right option when the user
+    /// experience depends on avoiding repeated long-context prefill.
     ///
     /// [`take_continuable`]: Self::take_continuable
     pub fn generate_continued(
@@ -1317,6 +2137,8 @@ impl SimpleEngine {
         max_tokens: u32,
         params: &SamplingParams,
     ) -> Result<SessionGeneration, EngineError> {
+        let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
+        let total_start = std::time::Instant::now();
         // Serialize all work for this conversation: hold the per-session lock for
         // the entire call so a second concurrent request for the same session_id
         // queues here and only proceeds once this one has stashed its result
@@ -1371,6 +2193,7 @@ impl SimpleEngine {
                 prompt_array,
                 prompt_len: total,
                 pixel_values: None,
+                stored_clone: None,
                 _mlx_gate: mlx_gate,
             };
             (prepared, prefilled, true)
@@ -1390,6 +2213,7 @@ impl SimpleEngine {
             );
         }
 
+        let prefill_start = std::time::Instant::now();
         let (current_token, _, _) = self.run_prefill(
             prompt_tokens,
             &mut prepared,
@@ -1397,11 +2221,14 @@ impl SimpleEngine {
             None,
             None,
             false,
+            false,
             None,
         )?;
+        let prefill_elapsed = prefill_start.elapsed();
         let first_id: u32 = current_token.item();
         let mut generated: Vec<u32> = vec![first_id];
 
+        let decode_start = std::time::Instant::now();
         if !self.eos_token_ids.contains(&first_id) && max_tokens > 1 {
             let mut cur = current_token;
             while u32::try_from(generated.len()).unwrap_or(u32::MAX) < max_tokens {
@@ -1422,6 +2249,7 @@ impl SimpleEngine {
                 cur = next;
             }
         }
+        let decode_elapsed = decode_start.elapsed();
 
         // Retain the live cache + the exact tokens it now holds (prompt +
         // generated) so the next hop continues from here.
@@ -1439,23 +2267,36 @@ impl SimpleEngine {
             _mlx_gate: mlx_gate,
             ..
         } = prepared;
-        match cache.quantize_for_retention(self.kv_cache_config) {
-            Ok(layers) if layers > 0 => tracing::debug!(
-                session_id,
-                compressed_layers = layers,
-                "Compressed retained KV to TurboQuant for between-turn retention"
-            ),
-            Ok(_) => {}
-            // Leave the cache dense on failure — correctness over footprint.
-            Err(e) => tracing::warn!(
-                session_id,
-                error = %e,
-                "Failed to TurboQuant-compress retained KV; retaining dense"
-            ),
+        let retain_start = std::time::Instant::now();
+        // Only compress retained KV when TurboQuant is actually enabled. With
+        // mode=Off (the default) the user opted out of quantization — and the
+        // compress/dequant round trip is pure loss there: ~2s CPU to pack at
+        // turn end, then EVERY full-attention layer re-dequantizes the whole
+        // cache on CPU during the next continuation's prefill (measured ~4s of
+        // a 4.1s warm-turn TTFT at 4k tokens on Qwen3.6-35B). Dense retention
+        // is also exact, removing one documented lossiness source. Resident
+        // memory stays bounded by max_retained_sessions / max_session_tokens /
+        // the idle TTL, which apply either way.
+        if self.kv_cache_config.is_turboquant() {
+            match cache.quantize_for_retention(self.kv_cache_config) {
+                Ok(layers) if layers > 0 => tracing::debug!(
+                    session_id,
+                    compressed_layers = layers,
+                    "Compressed retained KV to TurboQuant for between-turn retention"
+                ),
+                Ok(_) => {}
+                // Leave the cache dense on failure — correctness over footprint.
+                Err(e) => tracing::warn!(
+                    session_id,
+                    error = %e,
+                    "Failed to TurboQuant-compress retained KV; retaining dense"
+                ),
+            }
         }
         if let Err(e) = cache.eval() {
             tracing::warn!(session_id, error = %e, "Failed to eval retained cache before stash");
         }
+        let retain_elapsed = retain_start.elapsed();
         // Release model lock and MLX gate together, only after the last eval.
         drop(model);
         drop(mlx_gate);
@@ -1471,6 +2312,15 @@ impl SimpleEngine {
             full.pop();
         }
         self.stash_retained(session_id, cache, full);
+        let total_elapsed = total_start.elapsed();
+
+        #[allow(clippy::print_stderr)] // env-gated diagnostic
+        if timing {
+            eprintln!(
+                "DIAG session-timing: continued={continued} prompt={total} prefilled={prefilled} generated={} prefill={prefill_elapsed:.2?} decode={decode_elapsed:.2?} retain_eval={retain_elapsed:.2?} total={total_elapsed:.2?}",
+                generated.len()
+            );
+        }
 
         tracing::info!(
             session_id,
@@ -1521,6 +2371,7 @@ impl SimpleEngine {
             None,
             None,
             false,
+            true,
             None,
         )?;
 
@@ -2008,6 +2859,7 @@ impl SimpleEngine {
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
+            true,
             checkpoint_id,
         )?;
 
@@ -2317,6 +3169,31 @@ impl SimpleEngine {
         }
     }
 
+    /// Append per-layer tap hiddens (`[1, T, H]` each) to the drafter's
+    /// unconsumed backlog along the sequence axis. Used by the MTP floor to
+    /// keep the drafter's context contiguous across floored stretches; the
+    /// next spec round's drafter forward ingests the whole backlog at once.
+    fn append_taps(
+        current: &mut Vec<Array>,
+        new: &[Array],
+    ) -> Result<(), mlx_rs::error::Exception> {
+        if current.is_empty() {
+            *current = new.to_vec();
+            return Ok(());
+        }
+        if current.len() != new.len() {
+            return Err(mlx_rs::error::Exception::custom(format!(
+                "tap layer count mismatch: backlog {} vs step {}",
+                current.len(),
+                new.len()
+            )));
+        }
+        for (cur, add) in current.iter_mut().zip(new) {
+            *cur = mlx_rs::ops::concatenate_axis(&[&*cur, add], 1)?;
+        }
+        Ok(())
+    }
+
     /// `DFlash` block-diffusion speculative decode loop.
     ///
     /// Each round: drafter proposes a `block_size` block from the target's tap
@@ -2324,17 +3201,18 @@ impl SimpleEngine {
     /// forward, `accept_prefix` takes the longest greedy-matching prefix, and a
     /// GDN tape replay rolls partial-accept state back bit-exactly. Headline
     /// metric for tuning is `accept_len` (mean accepted tokens per round).
+    ///
+    /// The gate/EMA/thermal logic is written once here; the [`DflashSink`]
+    /// decides how produced tokens are delivered — buffered into a
+    /// [`GenerationOutput`] ([`DflashBufferedSink`]) or streamed
+    /// chunk-by-chunk ([`DflashStreamSink`]). Token production is identical
+    /// across sinks, so a streamed response is byte-for-byte equal to the
+    /// buffered one (asserted by `dflash_streaming_matches_nonstreaming`).
     #[allow(
         clippy::cast_precision_loss,
         clippy::as_conversions,
         clippy::too_many_lines
     )]
-    /// Shared `DFlash` draft-verify decode loop. The gate/EMA/thermal logic is
-    /// written once here; the [`DflashSink`] decides how produced tokens are
-    /// delivered — buffered into a [`GenerationOutput`] ([`DflashBufferedSink`])
-    /// or streamed chunk-by-chunk ([`DflashStreamSink`]). Token production is
-    /// identical across sinks, so a streamed response is byte-for-byte equal to
-    /// the buffered one (asserted by `dflash_streaming_matches_nonstreaming`).
     fn dflash_decode<S: DflashSink>(
         &self,
         prompt_tokens: &[u32],
@@ -2502,6 +3380,29 @@ impl SimpleEngine {
         let mut spec_since_recal: u32 = 0;
         let mut recal = false;
 
+        // MTP floor. When the target ships a native MTP head (Qwen3.6-A3B) and
+        // decoding is greedy, floored rounds run MTP speculative cycles instead
+        // of plain AR steps. Plain AR is the wrong floor on such models: MTP
+        // decodes ~1.5x faster than AR on Qwen3.6-35B-A3B (measured 48 vs 34
+        // tok/s), so gating DFlash against AR keeps DFlash active in regions
+        // where MTP would win (measured: DFlash 39 tok/s on thinking prose).
+        // With the MTP floor, t_ar_ema measures the MTP per-token rate, so the
+        // gate floors DFlash to MTP unless DFlash genuinely beats it. The head
+        // hidden/cache are re-seeded at each floor entry — the backbone
+        // advances during spec rounds, so a prior window's state is stale.
+        let mtp_floor = gate && model.has_mtp() && params.temperature <= f32::EPSILON;
+        let mut mtp_floor_hidden: Option<Array> = None;
+        let mut mtp_floor_cache: Option<higgs_models::MtpCache> = None;
+        let mut spec_entered_once = false;
+        // MTP-cycle convention: `last_token` is sampled but NOT yet emitted
+        // (the next cycle emits it as its confirmed token). The dflash AR/spec
+        // convention is the opposite (`last_token` already emitted, pending a
+        // forward). This flag tracks which convention `last_token` is in;
+        // leaving the cycle chain flushes the pending token exactly once.
+        // Getting this wrong duplicates a token at floor entry and drops one
+        // at floor exit (measured: "1,, 2" / "4 55" on deterministic output).
+        let mut mtp_pending = false;
+
         loop {
             let round_t0 = std::time::Instant::now();
             if gate && in_ar {
@@ -2516,49 +3417,218 @@ impl SimpleEngine {
                 // so logits + cache are byte-identical; the only thing dropped is a
                 // tap clone the next floored step would overwrite unused.
                 let calibrating = !calibrated;
-                // recal: a single AR step to refresh a stale t_ar mid-streak.
+                // recal: a short window to refresh a stale t_ar mid-streak. With
+                // the MTP floor it must span entry+cycle+leaving (3 steps) so it
+                // actually measures an MTP cycle — a 1-step window is
+                // leaving-only plain AR, which would recalibrate the floor to
+                // the AR rate and let a losing spec streak keep running.
                 let window = if recal {
-                    1
+                    if mtp_floor { 3 } else { 1 }
                 } else if calibrating {
-                    T_AR_CALIB
+                    // MTP-floor calibration needs 2 extra steps: the entry step
+                    // seeds the hidden (no cycle yet) and the first cycle is
+                    // kernel-cold on the batched verify path — neither is a
+                    // valid floor sample.
+                    if mtp_floor {
+                        T_AR_CALIB + 2
+                    } else {
+                        T_AR_CALIB
+                    }
                 } else {
                     probe_every
                 };
                 let leaving = ar_run + 1 >= window;
                 let need_taps = leaving;
-                let single = Array::from_slice(&[last_token], &[1, 1]);
-                let ar_logits = if need_taps {
-                    let (logits, ar_taps) = model
-                        .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
-                        .map_err(EngineError::Mlx)?;
-                    current_taps = ar_taps;
-                    logits
+                // Tokens emitted by this floored step (MTP cycles emit several);
+                // t_ar_ema below is per-token, so it stays comparable across
+                // plain-AR and MTP-floor steps.
+                let mut floor_tokens: u32 = 1;
+                let mut was_mtp_cycle = false;
+                if let (false, Some(hidden)) = (need_taps, mtp_floor_hidden.take()) {
+                    was_mtp_cycle = true;
+                    // MTP-floor cycle: draft with the native head, batch-verify,
+                    // rollback rejected drafts. Head KV was (re)built at this
+                    // floor entry; `hidden` is the backbone hidden of the token
+                    // preceding `last_token` from the previous entry step/cycle.
+                    let mtp_cache = match mtp_floor_cache.as_mut() {
+                        Some(c) => c,
+                        None => {
+                            mtp_floor_cache.insert(model.make_mtp_cache().ok_or_else(|| {
+                                EngineError::Generation("MTP cache creation failed".to_owned())
+                            })?)
+                        }
+                    };
+                    let confirmed = u32::try_from(last_token).map_err(|_| {
+                        EngineError::Generation("confirmed token overflow u32".to_owned())
+                    })?;
+                    // Tapped cycle: collect the emitted positions' tap hiddens
+                    // and append them to the drafter's backlog, keeping its
+                    // context cache contiguous across the floored stretch. A
+                    // context hole blinds the drafter at the next probe (it
+                    // cannot continue "…, 87, 88," without the recent tokens)
+                    // — measured accept collapse ~6 → ~1.2 on deterministic
+                    // text, which made every probe a false negative.
+                    let (result, cycle_taps) = crate::mtp::mtp_cycle_tapped(
+                        &mut model,
+                        &mut cache,
+                        mtp_cache,
+                        &hidden,
+                        confirmed,
+                        self.tuning.mtp_draft_n_max(),
+                        &dflash.tap_layers,
+                    )?;
+                    Self::append_taps(&mut current_taps, &cycle_taps).map_err(EngineError::Mlx)?;
+                    // `result.tokens` begins with the (previously unemitted)
+                    // pending confirmed token — the cycle emits it.
+                    floor_tokens = 0;
+                    for &tok in &result.tokens {
+                        tokens.push(tok);
+                        floor_tokens += 1;
+                        if self.eos_token_ids.contains(&tok) {
+                            break;
+                        }
+                    }
+                    // The backbone cache advanced by the full accepted batch
+                    // regardless of EOS truncation above.
+                    start += i32::try_from(result.tokens.len())
+                        .map_err(|_| EngineError::Generation("cycle len overflow".to_owned()))?;
+                    last_token = i32::try_from(result.next_token_id).map_err(|_| {
+                        EngineError::Generation("mtp next token overflow i32".to_owned())
+                    })?;
+                    mtp_pending = true;
+                    mtp_floor_hidden = Some(result.hidden);
+                    if std::env::var("HIGGS_DFLASH_TRACE").is_ok() {
+                        tracing::info!(
+                            drafted = result.drafted,
+                            accepted = result.accepted_drafts,
+                            emitted = floor_tokens,
+                            dt_ms = format!("{:.1}", round_t0.elapsed().as_secs_f64() * 1e3),
+                            "MTP-floor cycle"
+                        );
+                    }
                 } else {
-                    model
-                        .forward(&single, None, &mut cache)
-                        .map_err(EngineError::Mlx)?
-                };
-                let ar_next =
-                    sample(&ar_logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
-                eval([&ar_next]).map_err(EngineError::Mlx)?;
-                let dt = round_t0.elapsed().as_secs_f64();
-                // Skip the kernel-cold first decode (ar_run == 0 of the initial
-                // calibration window); every later floored step is warm.
-                if !(calibrating && ar_run == 0) {
-                    t_ar_ema = Some(t_ar_ema.map_or(dt, |e| 0.7f64.mul_add(e, 0.3 * dt)));
+                    // Leaving the cycle chain: flush the pending confirmed token
+                    // (cycles sample it but never emit it — see `mtp_pending`).
+                    // It is emitted BEFORE this step forwards it, keeping text
+                    // order; if it is EOS, skip the forward and let the loop
+                    // bottom finish (a forward would sample a post-EOS token).
+                    let mut pending_was_eos = false;
+                    if mtp_pending {
+                        let pend = u32::try_from(last_token).map_err(|_| {
+                            EngineError::Generation("pending token overflow u32".to_owned())
+                        })?;
+                        tokens.push(pend);
+                        mtp_pending = false;
+                        pending_was_eos = self.eos_token_ids.contains(&pend);
+                    }
+                    if pending_was_eos {
+                        floor_tokens = 1;
+                    } else {
+                        let single = Array::from_slice(&[last_token], &[1, 1]);
+                        let ar_logits = if need_taps && mtp_floor {
+                            // MTP-floor leaving step: APPEND this position's taps to
+                            // the drafter backlog (the drafter has not consumed the
+                            // floored stretch yet), unlike the plain-AR leaving step
+                            // which replaces already-consumed taps.
+                            let (logits, ar_taps) = model
+                                .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
+                                .map_err(EngineError::Mlx)?;
+                            Self::append_taps(&mut current_taps, &ar_taps)
+                                .map_err(EngineError::Mlx)?;
+                            logits
+                        } else if need_taps {
+                            let (logits, ar_taps) = model
+                                .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
+                                .map_err(EngineError::Mlx)?;
+                            current_taps = ar_taps;
+                            logits
+                        } else if mtp_floor {
+                            // MTP-floor entry step: a plain AR step that also keeps
+                            // the backbone hidden (so the next floored step can run
+                            // an MTP cycle — mirrors `mtp_generate`'s bootstrap) and
+                            // this position's taps for the drafter backlog.
+                            let (hidden, logits, step_taps) = model
+                                .forward_with_hidden_taps(
+                                    &single,
+                                    None,
+                                    &mut cache,
+                                    &dflash.tap_layers,
+                                )
+                                .map_err(EngineError::Mlx)?;
+                            mtp_floor_hidden = Some(hidden.index((.., -1.., ..)));
+                            Self::append_taps(&mut current_taps, &step_taps)
+                                .map_err(EngineError::Mlx)?;
+                            logits
+                        } else {
+                            model
+                                .forward(&single, None, &mut cache)
+                                .map_err(EngineError::Mlx)?
+                        };
+                        let ar_next = sample(&ar_logits.index((.., -1, ..)), params)
+                            .map_err(EngineError::Mlx)?;
+                        eval([&ar_next]).map_err(EngineError::Mlx)?;
+                        let ar_id: u32 = ar_next.item();
+                        if mtp_floor && !need_taps {
+                            // MTP-floor entry step: the sampled token becomes the
+                            // pending confirmed for the next cycle — NOT emitted
+                            // here (the cycle emits it; pushing it here duplicates
+                            // it in the output).
+                            last_token = i32::try_from(ar_id).map_err(|_| {
+                                EngineError::Generation("ar token overflow".to_owned())
+                            })?;
+                            mtp_pending = true;
+                            floor_tokens = 0;
+                        } else {
+                            tokens.push(ar_id);
+                            last_token = i32::try_from(ar_id).map_err(|_| {
+                                EngineError::Generation("ar token overflow".to_owned())
+                            })?;
+                        }
+                        start += 1;
+                    }
                 }
-                let ar_id: u32 = ar_next.item();
-                tokens.push(ar_id);
-                last_token = i32::try_from(ar_id)
-                    .map_err(|_| EngineError::Generation("ar token overflow".to_owned()))?;
-                start += 1;
+                let dt = round_t0.elapsed().as_secs_f64();
+                // Floor-rate sample validity. Plain floor: skip only the
+                // kernel-cold first decode of the initial calibration window.
+                // MTP floor: the floor rate is the MTP-cycle rate, so sample
+                // ONLY cycles (entry/leaving are 1-token AR steps ~1.5x slower
+                // — blending them in overestimates the floor and lets a losing
+                // spec streak survive the gate), and skip the first-ever cycle
+                // (kernel-cold batched verify, measured ~2x steady state).
+                let update_ema = if mtp_floor {
+                    was_mtp_cycle && !(calibrating && ar_run <= 1)
+                } else {
+                    !(calibrating && ar_run == 0)
+                };
+                if update_ema {
+                    let dt_tok = dt / f64::from(floor_tokens.max(1));
+                    t_ar_ema = Some(t_ar_ema.map_or(dt_tok, |e| 0.7f64.mul_add(e, 0.3 * dt_tok)));
+                }
                 ar_run += 1;
                 // Hand back to spec once the warm calibration window completes, or
                 // after a probe cooldown re-tests whether spec is worthwhile again.
-                if leaving {
+                //
+                // Exception — start floored on MTP-floor targets: the floor is
+                // the strong default there (~1.5x AR on Qwen3.6-A3B), so spec
+                // must prove itself at the first probe instead of getting the
+                // benefit of the doubt. This drops the front-loaded spec grace +
+                // losing probes on floor-winning workloads (measured ~20% of a
+                // short code run); a spec-winning workload engages at the first
+                // probe, ~probe_every floored steps in. The head cache/hidden
+                // stay valid across this handoff: the whole calibration window
+                // ran through the floor, so backbone and MTP head are aligned.
+                let start_floored = mtp_floor && calibrating;
+                if leaving && start_floored {
+                    ar_run = 0;
+                    calibrated = true;
+                } else if leaving {
                     in_ar = false;
                     ar_run = 0;
                     calibrated = true;
+                    // The spec rounds advance the backbone without the MTP head,
+                    // so the head KV is stale for the next floor window; the
+                    // hidden was already drained by the leaving step's take().
+                    mtp_floor_cache = None;
                     if recal {
                         // Just refreshed t_ar mid-streak: resume spec with the
                         // winning EMA intact and no warm-up (the drafter barely
@@ -2571,7 +3641,20 @@ impl SimpleEngine {
                         // blending) is load-bearing: otherwise a re-probe inherits
                         // the stale sub-1.0 ratio_ema and re-floors in one warm
                         // round, undoing the grace. Mirrors the t_ar_ema map_or seed.
-                        spec_warmup_left = SPEC_WARMUP;
+                        //
+                        // With the MTP floor the cost asymmetry flips: flooring a
+                        // winning workload briefly costs little (the floor is MTP,
+                        // ~1.5x AR), while each unjudged warm-up round on a losing
+                        // workload costs a full spec round (~150-200ms for ~2
+                        // tokens) per probe. So re-probes get a 1-round grace; the
+                        // full grace applies only to the first spec entry (and
+                        // always on plain-AR floors, where mis-flooring is costly).
+                        spec_warmup_left = if mtp_floor && spec_entered_once {
+                            1
+                        } else {
+                            SPEC_WARMUP
+                        };
+                        spec_entered_once = true;
                         ratio_ema = 2.0;
                     }
                 }
@@ -3768,6 +4851,7 @@ impl SimpleEngine {
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
+            true,
             checkpoint_id,
         )?;
         // Prefill done — decode must not report progress. Dropping the Option

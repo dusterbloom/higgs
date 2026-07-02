@@ -572,6 +572,27 @@ fn backbone_verify_batch(
     Ok((hidden, target_ids))
 }
 
+/// `backbone_verify_batch` that optionally also collects DFlash tap-layer
+/// hiddens, so MTP cycles run as the floor of a DFlash gate can keep the
+/// drafter's context cache fed (tap clones are lazy — measured ~free).
+fn backbone_verify_batch_tapped(
+    model: &mut AnyModel,
+    cache: &mut AnyCache,
+    tokens: &[u32],
+    tap_layers: Option<&[usize]>,
+) -> Result<(Array, Vec<u32>, Option<Vec<Array>>), EngineError> {
+    let Some(layers) = tap_layers else {
+        let (hidden, targets) = backbone_verify_batch(model, cache, tokens)?;
+        return Ok((hidden, targets, None));
+    };
+    let input = token_input(tokens)?;
+    let (hidden, logits, taps) = model
+        .forward_with_hidden_taps(&input, None, cache, layers)
+        .map_err(EngineError::Mlx)?;
+    let target_ids = greedy_token_ids(&logits)?;
+    Ok((hidden, target_ids, Some(taps)))
+}
+
 fn commit_mtp_cache(
     model: &mut AnyModel,
     mtp_cache: &mut MtpCache,
@@ -645,6 +666,54 @@ pub fn mtp_cycle(
     confirmed_token_id: u32,
     draft_n_max: usize,
 ) -> Result<MtpCycleResult, EngineError> {
+    Ok(mtp_cycle_inner(
+        model,
+        cache,
+        mtp_cache,
+        hidden,
+        confirmed_token_id,
+        draft_n_max,
+        None,
+    )?
+    .0)
+}
+
+/// `mtp_cycle` that also returns DFlash tap-layer hiddens for the emitted
+/// tokens, so MTP cycles run as the floor of a DFlash gate keep the drafter's
+/// context cache contiguous across floored stretches (a context hole blinds
+/// the drafter at the next spec probe — measured accept collapse from ~6 to
+/// ~1.2 on deterministic text).
+pub fn mtp_cycle_tapped(
+    model: &mut AnyModel,
+    cache: &mut AnyCache,
+    mtp_cache: &mut MtpCache,
+    hidden: &Array,
+    confirmed_token_id: u32,
+    draft_n_max: usize,
+    tap_layers: &[usize],
+) -> Result<(MtpCycleResult, Vec<Array>), EngineError> {
+    let (result, taps) = mtp_cycle_inner(
+        model,
+        cache,
+        mtp_cache,
+        hidden,
+        confirmed_token_id,
+        draft_n_max,
+        Some(tap_layers),
+    )?;
+    Ok((result, taps.unwrap_or_default()))
+}
+
+#[allow(clippy::too_many_lines)]
+fn mtp_cycle_inner(
+    model: &mut AnyModel,
+    cache: &mut AnyCache,
+    mtp_cache: &mut MtpCache,
+    hidden: &Array,
+    confirmed_token_id: u32,
+    draft_n_max: usize,
+    tap_layers: Option<&[usize]>,
+) -> Result<(MtpCycleResult, Option<Vec<Array>>), EngineError> {
     let draft_limit = draft_n_max.max(1);
     let base_cache = capture_backbone_checkpoint(cache);
     let base_mtp_cache = deep_clone_mtp_cache(mtp_cache);
@@ -679,7 +748,8 @@ pub fn mtp_cycle(
     verify_tokens.push(confirmed_token_id);
     verify_tokens.extend(drafts.iter().copied());
 
-    let (verify_hidden, verifier_targets) = backbone_verify_batch(model, cache, &verify_tokens)?;
+    let (verify_hidden, verifier_targets, verify_taps) =
+        backbone_verify_batch_tapped(model, cache, &verify_tokens, tap_layers)?;
     let verify_hidden_for_mtp = verify_hidden.clone();
     if verifier_targets.len() < verify_tokens.len() {
         return Err(EngineError::Generation(format!(
@@ -699,16 +769,18 @@ pub fn mtp_cycle(
     };
     let tokens = emitted_tokens(confirmed_token_id, &drafts, accepted_drafts);
 
-    let (accepted_hidden_rows, next_token_id) = if accepted_drafts == drafts.len() {
+    let (accepted_hidden_rows, next_token_id, accepted_taps) = if accepted_drafts == drafts.len() {
         let next = *verifier_targets.get(accepted_drafts).ok_or_else(|| {
             EngineError::Generation(format!(
                 "MTP verifier missing target at accepted index {accepted_drafts}"
             ))
         })?;
-        (verify_hidden, next)
+        // Taps cover the verify batch == the emitted tokens on full accept.
+        (verify_hidden, next, verify_taps)
     } else {
         rollback_backbone(cache, base_cache, verify_tokens.len());
-        let (replay_hidden, replay_targets) = backbone_verify_batch(model, cache, &tokens)?;
+        let (replay_hidden, replay_targets, replay_taps) =
+            backbone_verify_batch_tapped(model, cache, &tokens, tap_layers)?;
         let next = *replay_targets.get(accepted_drafts).ok_or_else(|| {
             EngineError::Generation(format!(
                 "MTP replay returned {} target ids for accepted index {}",
@@ -716,7 +788,8 @@ pub fn mtp_cycle(
                 accepted_drafts
             ))
         })?;
-        (replay_hidden, next)
+        // The replay batch is exactly the emitted tokens, so its taps align 1:1.
+        (replay_hidden, next, replay_taps)
     };
 
     let h_last = hidden_row(&accepted_hidden_rows, accepted_drafts)?;
@@ -748,13 +821,16 @@ pub fn mtp_cycle(
         "MTP must always emit the confirmed token"
     );
 
-    Ok(MtpCycleResult {
-        tokens,
-        hidden: h_last,
-        next_token_id,
-        drafted: drafts.len(),
-        accepted_drafts,
-    })
+    Ok((
+        MtpCycleResult {
+            tokens,
+            hidden: h_last,
+            next_token_id,
+            drafted: drafts.len(),
+            accepted_drafts,
+        },
+        accepted_taps,
+    ))
 }
 
 #[cfg(test)]

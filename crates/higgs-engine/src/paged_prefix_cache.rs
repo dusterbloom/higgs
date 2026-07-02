@@ -734,6 +734,17 @@ impl PagedPrefixCache {
             return;
         }
 
+        if let Some(offset) = kv_offset(cache).and_then(|o| usize::try_from(o).ok()) {
+            if offset > prefix_tokens.len() {
+                tracing::warn!(
+                    cache_tokens = offset,
+                    key_tokens = prefix_tokens.len(),
+                    "Skipping prefix cache store: cache longer than key"
+                );
+                return;
+            }
+        }
+
         // TurboQuant caches with deferred quantization are stored as dense
         // blocks until TQ activates. Full TQ block paging is implemented in the
         // CachedData::TurboQuantPaged variant but requires the TQ arrays to be
@@ -1198,7 +1209,14 @@ fn flatten_path_layers(
 /// for the matched span.
 fn materialize(m: &MatchResult) -> Result<AnyCache, Exception> {
     match &m.kind {
-        MatchEndpoint::Stored(CachedData::Cloned(cache)) => Ok(cache.clone()),
+        // deep_clone (not shallow clone): a Hybrid Cloned cache's KV layers
+        // update IN PLACE, so a shallow clone shares those buffers with the
+        // stored radix entry. The reuser's suffix prefill would then mutate the
+        // stored entry, corrupting it for every subsequent reuse (cascading
+        // wholesale divergence). deep_clone gives the reuser independent
+        // buffers and leaves the stored entry frozen. Dense paged caches are
+        // reconstructed from blocks below and are already independent.
+        MatchEndpoint::Stored(CachedData::Cloned(cache)) => Ok(cache.deep_clone()),
         MatchEndpoint::Stored(CachedData::Paged { is_hybrid, .. }) => {
             let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
             if *is_hybrid {
@@ -1665,6 +1683,23 @@ mod tests {
             arrays_equal(kv.values().unwrap(), &values),
             "KV values must round-trip byte-identically"
         );
+    }
+
+    #[test]
+    fn hybrid_store_skips_clone_when_cache_offset_exceeds_key_len() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let hybrid = make_hybrid_cache(8, 65);
+        let stripped_key: Vec<u32> = (0..60).collect();
+
+        cache.store(&stripped_key, &hybrid);
+
+        let mut query = stripped_key;
+        query.push(999);
+        assert!(
+            cache.find_longest_prefix(&query).is_none(),
+            "Hybrid clones are whole-cache snapshots; storing offset>key_len would replay stale suffix state"
+        );
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
