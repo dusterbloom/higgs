@@ -2131,7 +2131,9 @@ impl SimpleEngine {
     /// the first turn — or a conversation that diverged from the retained cache —
     /// it falls back to a clean full prefill (the [`take_continuable`] guard) and
     /// retains the resulting cache; on a continuation it reuses the live cache.
-    /// Greedy plain sequential decode (no MTP/prompt-lookup for now).
+    /// Greedy decode with MTP speculation when the model ships a head (the
+    /// stop-aware cycle keeps the retained cache 1:1 with the stashed tokens);
+    /// plain sequential decode otherwise.
     ///
     /// # Best-effort: output is approximate, not bit-identical
     ///
@@ -2236,13 +2238,17 @@ impl SimpleEngine {
         }
 
         let prefill_start = std::time::Instant::now();
-        let (current_token, _, _) = self.run_prefill(
+        // capture_hidden: the MTP head primes from the prefilled tokens'
+        // hidden states (unprimed acceptance measured ~75% vs 85-97% primed).
+        // Chunked long prefills return no hidden — priming is then skipped.
+        let want_mtp = prepared.model.has_mtp() && max_tokens > 1;
+        let (current_token, _, prefill_hidden) = self.run_prefill(
             prompt_tokens,
             &mut prepared,
             params,
             None,
             None,
-            false,
+            want_mtp,
             false,
             None,
         )?;
@@ -2251,7 +2257,95 @@ impl SimpleEngine {
         let mut generated: Vec<u32> = vec![first_id];
 
         let decode_start = std::time::Instant::now();
-        if !self.eos_token_ids.contains(&first_id) && max_tokens > 1 {
+        // MTP speculative decode for the session path when the model ships a
+        // head. Verify targets are sampled at the request temperature when it
+        // is nonzero (`verify_targets`), so speculation preserves the output
+        // distribution — drafts only decide how many positions commit per
+        // cycle. The stop-aware cycle (`mtp_cycle_bounded`) never advances the
+        // backbone past a stop token, so the retained cache stays 1:1 with the
+        // stashed token list after the EOS pop below — the invariant
+        // sequential decode provided for free. Falls back to sequential
+        // decode for dense models without a head.
+        let mtp_cache = (want_mtp && !self.eos_token_ids.contains(&first_id))
+            .then(|| prepared.model.make_mtp_cache())
+            .flatten();
+        let mut mtp_stats = crate::mtp::MtpStats::default();
+        if let Some(mut session_mtp_cache) = mtp_cache {
+            // Prime the head over the freshly-prefilled tokens, then mirror
+            // the first emitted token — same warm-up `mtp_generate` does.
+            if let Some(ref hidden) = prefill_hidden {
+                crate::mtp::prime_mtp_cache(
+                    &mut prepared.model,
+                    &mut session_mtp_cache,
+                    &prepared.actual_prompt_tokens,
+                    hidden,
+                )?;
+            }
+            // Bootstrap identical to `mtp_generate`: forward the already-
+            // emitted first token, keep its hidden, sample the next confirmed
+            // token (pending, NOT emitted — the first cycle emits it).
+            let first_input = Array::from_slice(
+                &[i32::try_from(first_id)
+                    .map_err(|_| EngineError::Generation("first token overflow i32".to_owned()))?],
+                &[1, 1],
+            );
+            let (hidden, logits) = prepared
+                .model
+                .forward_with_hidden(&first_input, None, &mut prepared.cache)
+                .map_err(EngineError::Mlx)?;
+            if let Some(prev_hidden) = prefill_hidden
+                .as_ref()
+                .filter(|_| !prepared.actual_prompt_tokens.is_empty())
+                .map(|prefill| {
+                    Self::hidden_row_from_sequence(prefill, prepared.actual_prompt_tokens.len() - 1)
+                })
+                .transpose()?
+            {
+                crate::mtp::mirror_mtp_token(
+                    &mut prepared.model,
+                    &mut session_mtp_cache,
+                    &prev_hidden,
+                    first_id,
+                )?;
+            }
+            let next_arr = sample(&logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
+            let h = hidden.index((.., -1.., ..));
+            eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
+            let mut current_hidden = h;
+            let mut confirmed: u32 = next_arr.item();
+            loop {
+                if self.eos_token_ids.contains(&confirmed) {
+                    // Pending stop token: emit without forwarding — the stash
+                    // pops it, matching the cache exactly.
+                    generated.push(confirmed);
+                    break;
+                }
+                let completion = u32::try_from(generated.len()).unwrap_or(u32::MAX);
+                if completion >= max_tokens {
+                    break; // pending token dropped, unforwarded — aligned.
+                }
+                let remaining = usize::try_from(max_tokens.saturating_sub(completion))
+                    .map_err(|_| EngineError::Generation("max_tokens overflow".to_owned()))?;
+                let draft_depth = self
+                    .tuning
+                    .mtp_draft_n_max()
+                    .min(remaining.saturating_sub(1).max(1));
+                let result = crate::mtp::mtp_cycle_bounded(
+                    &mut prepared.model,
+                    &mut prepared.cache,
+                    &mut session_mtp_cache,
+                    &current_hidden,
+                    confirmed,
+                    draft_depth,
+                    &self.eos_token_ids,
+                    Some(params),
+                )?;
+                mtp_stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
+                generated.extend_from_slice(&result.tokens);
+                current_hidden = result.hidden;
+                confirmed = result.next_token_id;
+            }
+        } else if !self.eos_token_ids.contains(&first_id) && max_tokens > 1 {
             let mut cur = current_token;
             while u32::try_from(generated.len()).unwrap_or(u32::MAX) < max_tokens {
                 let (next, _) = Self::decode_step(
@@ -2272,6 +2366,17 @@ impl SimpleEngine {
             }
         }
         let decode_elapsed = decode_start.elapsed();
+        if mtp_stats.cycles() > 0 {
+            tracing::info!(
+                session_id,
+                cycles = mtp_stats.cycles(),
+                drafted = mtp_stats.drafted(),
+                accepted_drafts = mtp_stats.accepted_drafts(),
+                emitted = mtp_stats.emitted(),
+                accept_rate = format!("{:.1}%", mtp_stats.acceptance_rate_percent()),
+                "session MTP decode"
+            );
+        }
 
         // Retain the live cache + the exact tokens it now holds (prompt +
         // generated) so the next hop continues from here.
