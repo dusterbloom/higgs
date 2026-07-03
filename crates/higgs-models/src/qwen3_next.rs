@@ -96,6 +96,7 @@ use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
     utils::{AttentionMask, apply_rope, create_causal_mask},
+    yarn::{compute_yarn_freqs, yarn_get_mscale},
 };
 
 // ---------------------------------------------------------------------------
@@ -2951,6 +2952,129 @@ pub(crate) fn qgemv_4bit(
 }
 
 // ---------------------------------------------------------------------------
+// YaRN rope scaling (long-context Qwen3.5 / Qwen3-Next checkpoints)
+// ---------------------------------------------------------------------------
+
+/// `YaRN` parameters parsed from `rope_scaling` (populated from the nested
+/// `rope_parameters` object by the config loaders). Defaults match mlx-lm's
+/// `YarnRoPE` signature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct YarnRopeParams {
+    pub factor: f32,
+    pub original_max_position_embeddings: i32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub mscale: f32,
+    pub mscale_all_dim: f32,
+}
+
+/// Parse `YaRN` params out of `args.rope_scaling`. Returns `None` unless the
+/// scaling object declares `type`/`rope_type` == `"yarn"` — base checkpoints
+/// carry `rope_parameters` too (mrope layout hints, theta) but no `type`, and
+/// must keep the default rope path bit-for-bit.
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+pub(crate) fn yarn_rope_params(args: &Qwen3NextModelArgs) -> Option<YarnRopeParams> {
+    let scaling = args.rope_scaling.as_ref()?;
+    let rope_type = scaling
+        .get("type")
+        .or_else(|| scaling.get("rope_type"))?
+        .as_str()?;
+    if rope_type != "yarn" {
+        return None;
+    }
+    let get_f32 = |key: &str, default: f64| -> f32 {
+        scaling
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(default) as f32
+    };
+    Some(YarnRopeParams {
+        factor: get_f32("factor", 1.0),
+        original_max_position_embeddings: scaling
+            .get("original_max_position_embeddings")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(4096) as i32,
+        beta_fast: get_f32("beta_fast", 32.0),
+        beta_slow: get_f32("beta_slow", 1.0),
+        mscale: get_f32("mscale", 1.0),
+        mscale_all_dim: get_f32("mscale_all_dim", 0.0),
+    })
+}
+
+/// Precomputed `YaRN` state for one attention module. `None` on default-rope
+/// checkpoints, whose rope path stays bit-identical to the pre-`YaRN` code.
+#[derive(Debug, Clone)]
+struct YarnRope {
+    /// Per-dimension rope periods (yarn-interpolated `base^(2i/dims)`), f32
+    /// `[rope_dim/2]`. Passed as the `freqs` argument of `mlx_fast_rope` on
+    /// the decode path; the manual prefill path uses `reciprocal(freqs)` —
+    /// the exact op the MLX rope kernel applies internally.
+    freqs: Array,
+    /// `YaRN` attention-magnitude scale `yarn_get_mscale(factor, mscale) /
+    /// yarn_get_mscale(factor, mscale_all_dim)` (`0.1*ln(factor)+1` for the
+    /// standard config). Applied to the ROTARY dims of q/k before rotation,
+    /// matching mlx-lm `YarnRoPE.__call__`
+    /// (`x[..., :dims] = mscale * x[..., :dims]`) and HF's
+    /// `cos/sin * attention_scaling`. The pass-through dims stay unscaled, so
+    /// this is NOT folded into the softmax scale.
+    mscale: f32,
+    /// `[head_dim]` f32 broadcast vector: `mscale` on the first `rope_dim`
+    /// entries, 1.0 on the tail. Cast to the activation dtype per call so the
+    /// prescale never upcasts bf16 activations (see `apply_yarn_rope`'s dtype
+    /// note in yarn.rs).
+    prescale: Array,
+}
+
+impl YarnRope {
+    /// Scale the rotary dims of `x` by `mscale` (identity on the tail).
+    /// Multiplying by 1.0 is exact in IEEE floats, so the pass-through dims
+    /// are bit-identical to a slice-assign.
+    fn prescale_rotary(&self, x: &Array) -> Result<Array, Exception> {
+        if (self.mscale - 1.0).abs() <= f32::EPSILON {
+            return Ok(x.clone());
+        }
+        let scale = self.prescale.as_dtype(x.dtype())?;
+        x.multiply(&scale)
+    }
+}
+
+/// Build the per-attention `YaRN` state from the model args, or `None` when the
+/// checkpoint uses default rope.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing
+)]
+fn build_yarn_rope(args: &Qwen3NextModelArgs, rope_dim: i32, head_dim: i32) -> Option<YarnRope> {
+    let params = yarn_rope_params(args)?;
+    let freqs = compute_yarn_freqs(
+        rope_dim,
+        args.rope_theta,
+        params.factor,
+        params.original_max_position_embeddings,
+        params.beta_fast,
+        params.beta_slow,
+    );
+    let mscale = yarn_get_mscale(params.factor, params.mscale)
+        / yarn_get_mscale(params.factor, params.mscale_all_dim);
+    let mut prescale_vec = vec![1.0_f32; head_dim.max(0) as usize];
+    prescale_vec[..rope_dim.max(0) as usize].fill(mscale);
+    let prescale = Array::from_slice(&prescale_vec, &[head_dim]);
+    tracing::debug!(
+        factor = params.factor,
+        original_max_position_embeddings = params.original_max_position_embeddings,
+        rope_dim,
+        mscale,
+        "YaRN rope scaling active"
+    );
+    Some(YarnRope {
+        freqs,
+        mscale,
+        prescale,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Qwen3NextAttention (full attention with gated Q and partial RoPE)
 // ---------------------------------------------------------------------------
 
@@ -2970,6 +3094,8 @@ pub struct Qwen3NextAttention {
     k_norm: nn::RmsNorm,
     #[param]
     rope: nn::Rope,
+    /// `YaRN` long-context state; `None` for default-rope checkpoints.
+    yarn: Option<YarnRope>,
     num_attention_heads: i32,
     num_key_value_heads: i32,
     scale: f32,
@@ -3046,6 +3172,7 @@ impl Qwen3NextAttention {
                 .scale(1.0)
                 .build()
                 .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?,
+            yarn: build_yarn_rope(args, partial_dim, head_dim),
             num_attention_heads: args.num_attention_heads,
             num_key_value_heads: args.num_key_value_heads,
             scale,
@@ -3165,8 +3292,8 @@ impl Qwen3NextAttention {
                 );
             }
         }
-        queries = apply_qwen3_next_rope(queries, &self.rope, offset)?;
-        keys = apply_qwen3_next_rope(keys, &self.rope, offset)?;
+        queries = apply_qwen3_next_rope(queries, &self.rope, offset, self.yarn.as_ref())?;
+        keys = apply_qwen3_next_rope(keys, &self.rope, offset, self.yarn.as_ref())?;
 
         // DIAGNOSTIC: probe-driven capture of this FA layer's keys (first FA
         // layer of a forward: offset==0, L>1). Captures pre-write (post-rope)
@@ -3265,21 +3392,33 @@ impl Qwen3NextAttention {
         keys: &Array,
         positions: &Array,
     ) -> Result<(Array, Array), Exception> {
-        // Use manual RoPE implementation for per-token positions
-        let queries_with_rope = apply_rope_manual(
-            queries,
+        // Use manual RoPE implementation for per-token positions. `YaRN`
+        // models prescale the rotary dims and rotate with the
+        // yarn-interpolated frequencies — same treatment as the main forward.
+        let (q_in, k_in, yarn_freqs) = match self.yarn.as_ref() {
+            Some(yarn) => (
+                yarn.prescale_rotary(queries)?,
+                yarn.prescale_rotary(keys)?,
+                Some(&yarn.freqs),
+            ),
+            None => (queries.clone(), keys.clone(), None),
+        };
+        let queries_with_rope = apply_rope_manual_with_freqs(
+            &q_in,
             positions,
             self.rope.dimensions,
             self.rope.base,
             self.rope.scale,
+            yarn_freqs,
         )?;
 
-        let keys_with_rope = apply_rope_manual(
-            keys,
+        let keys_with_rope = apply_rope_manual_with_freqs(
+            &k_in,
             positions,
             self.rope.dimensions,
             self.rope.base,
             self.rope.scale,
+            yarn_freqs,
         )?;
 
         Ok((queries_with_rope, keys_with_rope))
@@ -3302,6 +3441,8 @@ struct DenseQwen3NextAttention {
     k_norm: nn::RmsNorm,
     #[param]
     rope: nn::Rope,
+    /// `YaRN` long-context state; `None` for default-rope checkpoints.
+    yarn: Option<YarnRope>,
     num_attention_heads: i32,
     num_key_value_heads: i32,
     scale: f32,
@@ -3334,6 +3475,7 @@ impl DenseQwen3NextAttention {
                 .scale(1.0)
                 .build()
                 .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?,
+            yarn: build_yarn_rope(args, partial_dim, head_dim),
             num_attention_heads: args.num_attention_heads,
             num_key_value_heads: args.num_key_value_heads,
             scale,
@@ -3382,8 +3524,8 @@ impl DenseQwen3NextAttention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let offset = cache.offset();
-        queries = apply_qwen3_next_rope(queries, &self.rope, offset)?;
-        keys = apply_qwen3_next_rope(keys, &self.rope, offset)?;
+        queries = apply_qwen3_next_rope(queries, &self.rope, offset, self.yarn.as_ref())?;
+        keys = apply_qwen3_next_rope(keys, &self.rope, offset, self.yarn.as_ref())?;
 
         let view = cache.update_and_view(keys, values)?;
         let try_tq_decode = mask.is_none() && L == 1;
@@ -5857,28 +5999,77 @@ static DIAG_ROPE_MANUAL: std::sync::LazyLock<bool> =
 static DIAG_ROPE_PERHEAD: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("HIGGS_DIAG_ROPE_PERHEAD").is_ok_and(|v| v == "1"));
 
-// `shadow_reuse` for the positions Vec→Array rebind; `indexing_slicing` for the
-// diag per-head branch's fixed 4-dim shape access.
+// `shadow_reuse` for the positions Vec→Array rebind (and the YaRN prescale
+// rebind of `x`); `indexing_slicing` for the diag per-head branch's fixed
+// 4-dim shape access.
 #[allow(clippy::shadow_reuse, clippy::indexing_slicing)]
-fn apply_qwen3_next_rope(x: Array, rope: &nn::Rope, offset: i32) -> Result<Array, Exception> {
-    let shape = x.shape();
-    let seq_len = shape[shape.len() - 2];
+fn apply_qwen3_next_rope(
+    x: Array,
+    rope: &nn::Rope,
+    offset: i32,
+    yarn: Option<&YarnRope>,
+) -> Result<Array, Exception> {
+    let seq_len = {
+        let shape = x.shape();
+        shape[shape.len() - 2]
+    };
+    // YaRN: prescale the rotary dims by mscale, then rotate with the
+    // yarn-interpolated frequencies. The SAME prescale + freqs feed both the
+    // manual prefill branch and the fast decode branch below — decode and
+    // prefill diverging on effective frequencies is the warm/cold drift bug
+    // class, so they must stay in lockstep.
+    let (x, yarn_freqs) = match yarn {
+        Some(yarn) => (yarn.prescale_rotary(&x)?, Some(&yarn.freqs)),
+        None => (x, None),
+    };
     if seq_len > 1 || *DIAG_ROPE_MANUAL {
         let positions: Vec<i32> = (offset..offset + seq_len).collect();
         let positions = Array::from_slice(&positions, &[seq_len]);
-        return apply_rope_manual(&x, &positions, rope.dimensions, rope.base, rope.scale);
+        return apply_rope_manual_with_freqs(
+            &x,
+            &positions,
+            rope.dimensions,
+            rope.base,
+            rope.scale,
+            yarn_freqs,
+        );
     }
 
     if *DIAG_ROPE_PERHEAD {
-        let shape = shape.to_vec();
+        let shape = x.shape().to_vec();
         let batch_heads = shape[0] * shape[1];
         let seq = shape[2];
         let dim = shape[3];
         let flat = x.reshape(&[batch_heads, seq, dim])?;
-        return apply_rope(&flat, rope, offset)?.reshape(&shape);
+        return apply_fast_rope_with_freqs(&flat, rope, offset, yarn_freqs)?.reshape(&shape);
     }
 
-    apply_rope(&x, rope, offset)
+    apply_fast_rope_with_freqs(&x, rope, offset, yarn_freqs)
+}
+
+/// Decode-path rope: `mlx_fast_rope`, with optional precomputed `YaRN` periods.
+/// When `freqs` is set, `base` must be omitted (MLX rejects both at once);
+/// the default path stays on [`apply_rope`] and is bit-identical to before.
+fn apply_fast_rope_with_freqs(
+    x: &Array,
+    rope: &nn::Rope,
+    offset: i32,
+    freqs: Option<&Array>,
+) -> Result<Array, Exception> {
+    freqs.map_or_else(
+        || apply_rope(x, rope, offset),
+        |periods| {
+            mlx_rs::fast::rope(
+                x,
+                rope.dimensions,
+                rope.traditional,
+                None::<f32>,
+                rope.scale,
+                offset,
+                periods,
+            )
+        },
+    )
 }
 
 // Manual RoPE implementation for arbitrary positions
@@ -5891,7 +6082,44 @@ fn apply_rope_manual(
     positions: &Array,
     dimensions: i32,
     base: f32,
+    scale: f32,
+) -> Result<Array, Exception> {
+    apply_rope_manual_with_freqs(x, positions, dimensions, base, scale, None)
+}
+
+/// Default-path inverse frequencies for the manual rope:
+/// `base^(-2i/dimensions)` for `i in [0, half_dim)`. Kept as a standalone fn
+/// so a unit test can pin the values bit-for-bit — the default rope path must
+/// stay byte-identical across refactors.
+fn manual_rope_inv_freqs(dimensions: i32, base: f32) -> Vec<f32> {
+    let half_dim = dimensions / 2;
+    #[allow(clippy::cast_precision_loss)]
+    let dimensions_f32 = f32::from(i16::try_from(dimensions).unwrap_or(i16::MAX));
+    (0..half_dim)
+        .map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            let i_f32 = f32::from(i16::try_from(i).unwrap_or(i16::MAX));
+            let power = -2.0 * i_f32 / dimensions_f32;
+            base.powf(power)
+        })
+        .collect()
+}
+
+/// [`apply_rope_manual`] with optional precomputed `YaRN` rope periods.
+///
+/// `yarn_freqs` uses `mlx_fast_rope` conventions: it holds PERIODS
+/// (`base^(2i/dims)`-shaped, yarn-interpolated), and the rotation angle is
+/// `position / period` — computed here as `reciprocal(freqs)`, the exact op
+/// the MLX rope kernel applies internally, so prefill (this fn) and decode
+/// (`mlx_fast_rope`) see the same effective frequencies. `None` keeps the
+/// inline default-path computation bit-identical to the pre-`YaRN` code.
+fn apply_rope_manual_with_freqs(
+    x: &Array,
+    positions: &Array,
+    dimensions: i32,
+    base: f32,
     _scale: f32,
+    yarn_freqs: Option<&Array>,
 ) -> Result<Array, Exception> {
     use mlx_rs::ops;
 
@@ -5904,19 +6132,14 @@ fn apply_rope_manual(
 
     let half_dim = dimensions / 2;
     let half_dim_i32 = half_dim;
-    #[allow(clippy::cast_precision_loss)]
-    let dimensions_f32 = f32::from(i16::try_from(dimensions).unwrap_or(i16::MAX));
 
-    // Compute frequencies: base^(-2i/dimensions) for i in [0, half_dim)
-    let inv_freq: Vec<f32> = (0..half_dim)
-        .map(|i| {
-            #[allow(clippy::cast_precision_loss)]
-            let i_f32 = f32::from(i16::try_from(i).unwrap_or(i16::MAX));
-            let power = -2.0 * i_f32 / dimensions_f32;
-            base.powf(power)
-        })
-        .collect();
-    let inv_freq_arr = Array::from_slice(&inv_freq, &[half_dim_i32]);
+    let inv_freq_arr = if let Some(periods) = yarn_freqs {
+        periods.reciprocal()?
+    } else {
+        // Compute frequencies: base^(-2i/dimensions) for i in [0, half_dim)
+        let inv_freq = manual_rope_inv_freqs(dimensions, base);
+        Array::from_slice(&inv_freq, &[half_dim_i32])
+    };
 
     let pos_shape = positions.shape();
     let l_dim = *pos_shape
@@ -8012,7 +8235,33 @@ fn load_qwen3_next_args_from_value(
             serde_json::Value::Object(quant_overrides),
         );
     }
+    // Newer transformers exports nest rope fields under a top-level
+    // `rope_parameters` object instead of `rope_theta`/`rope_scaling` — the
+    // same layout the text_config loader flattens.
+    flatten_rope_parameters(map);
     Ok(serde_json::from_value(config)?)
+}
+
+/// Flatten a `rope_parameters` object (transformers-v5 style nesting) into
+/// the top-level fields serde reads (`rope_theta`, `partial_rotary_factor`)
+/// and carry the full object as `rope_scaling` so long-context checkpoints
+/// reach the attention layers with their `YaRN` geometry
+/// (`type`/`factor`/`original_max_position_embeddings`/betas). Matches
+/// mlx-lm `qwen3_5`'s `rope_scaling = rope_parameters`. Base checkpoints
+/// carry mrope layout hints here but no `type`, which [`yarn_rope_params`]
+/// treats as default rope. No-op when the config has no `rope_parameters`.
+fn flatten_rope_parameters(map: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(rope_params) = map.get("rope_parameters").cloned() else {
+        return;
+    };
+    if let Some(theta) = rope_params.get("rope_theta") {
+        map.entry("rope_theta").or_insert_with(|| theta.clone());
+    }
+    if let Some(prf) = rope_params.get("partial_rotary_factor") {
+        map.entry("partial_rotary_factor")
+            .or_insert_with(|| prf.clone());
+    }
+    map.entry("rope_scaling").or_insert(rope_params);
 }
 
 fn placeholder_param_names<'a, I, K>(params: I) -> Vec<String>
@@ -8261,15 +8510,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
         .ok_or_else(|| ModelError::UnsupportedModel("text_config is not an object".into()))?;
 
     // Flatten rope_parameters into top-level fields
-    if let Some(rope_params) = text_config.get("rope_parameters") {
-        if let Some(theta) = rope_params.get("rope_theta") {
-            map.entry("rope_theta").or_insert_with(|| theta.clone());
-        }
-        if let Some(prf) = rope_params.get("partial_rotary_factor") {
-            map.entry("partial_rotary_factor")
-                .or_insert_with(|| prf.clone());
-        }
-    }
+    flatten_rope_parameters(map);
 
     // Merge top-level quantization config
     if let Some(quant) = config.get("quantization") {
@@ -8384,6 +8625,13 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     }
 
     let mut args: Qwen3NextModelArgs = serde_json::from_value(obj)?;
+    if let Some(yarn) = yarn_rope_params(&args) {
+        tracing::info!(
+            factor = yarn.factor,
+            original_max_position_embeddings = yarn.original_max_position_embeddings,
+            "YaRN rope scaling detected in config"
+        );
+    }
     // Refine the config-only default by inspecting the checkpoint: attention /
     // GDN output projections are BF16-dense only when they ship a `.weight`
     // with no `.scales` sibling (Unsloth-UD-dense). Quantized checkpoints
@@ -9243,6 +9491,137 @@ mod tests {
             .unwrap();
         let positions = Array::from_slice(&[0i32, 1, 2, 3, 4, 5, 6, 7], &[8]);
         let out = apply_rope_manual(&x, &positions, 8, 10000.0, 1.0).unwrap();
+        assert_eq!(out.dtype(), mlx_rs::Dtype::Bfloat16);
+    }
+
+    /// Default-rope byte-exactness gate: the inverse frequencies of the
+    /// manual prefill path must stay bit-for-bit identical to the historical
+    /// inline formula `base^(-2i/dims)` — any drift here silently changes
+    /// every non-`YaRN` qwen3_next/qwen3_5 checkpoint.
+    #[test]
+    fn manual_rope_default_inv_freqs_bit_exact() {
+        for (dims, base) in [
+            (64_i32, 10_000_000.0_f32),
+            (128, 10_000.0),
+            (8, 5_000_000.0),
+        ] {
+            let got = manual_rope_inv_freqs(dims, base);
+            assert_eq!(got.len(), (dims / 2) as usize);
+            for (i, v) in got.iter().enumerate() {
+                let expected = base.powf(-2.0 * i as f32 / dims as f32);
+                assert_eq!(
+                    v.to_bits(),
+                    expected.to_bits(),
+                    "inv_freq[{i}] changed for dims={dims} base={base}: {v} != {expected}"
+                );
+            }
+        }
+    }
+
+    /// `YaRN` frequency values against an independent transcription of the
+    /// reference formula (HF `_compute_yarn_parameters` / mlx-lm `YarnRoPE`),
+    /// at the Qwythos-1M geometry: 64 rotary dims, theta 1e7, factor 4,
+    /// original context 262144. Also pins the attention mscale.
+    #[test]
+    fn yarn_freqs_and_mscale_match_reference() {
+        let dims = 64_i32;
+        let base = 10_000_000.0_f32;
+        let factor = 4.0_f32;
+        let orig_max = 262_144_i32;
+
+        let periods = compute_yarn_freqs(dims, base, factor, orig_max, 32.0, 1.0);
+        let periods: Vec<f32> = periods.as_slice().to_vec();
+        assert_eq!(periods.len(), 32);
+
+        // Independent reference (inv_freq form): linear interpolation between
+        // extrapolated and interpolated inverse frequencies over the
+        // beta_fast..beta_slow wavelength ramp.
+        let ln_base = f64::from(base).ln();
+        let corr_dim = |rot: f64| -> f64 {
+            f64::from(dims) * (f64::from(orig_max) / (rot * 2.0 * std::f64::consts::PI)).ln()
+                / (2.0 * ln_base)
+        };
+        let low = corr_dim(32.0).floor().max(0.0);
+        let high = corr_dim(1.0).ceil().min(f64::from(dims) - 1.0);
+        for (i, period) in periods.iter().enumerate() {
+            let pos_freq = f64::from(base).powf(2.0 * i as f64 / f64::from(dims));
+            let inv_extra = 1.0 / pos_freq;
+            let inv_inter = 1.0 / (f64::from(factor) * pos_freq);
+            let ramp = ((i as f64 - low) / (high - low)).clamp(0.0, 1.0);
+            let mask = 1.0 - ramp; // extrapolation weight
+            let inv_ref = inv_inter * (1.0 - mask) + inv_extra * mask;
+            let inv_got = 1.0 / f64::from(*period);
+            let rel = ((inv_got - inv_ref) / inv_ref).abs();
+            assert!(
+                rel < 1e-4,
+                "dim {i}: inv_freq {inv_got:.6e} vs reference {inv_ref:.6e} (rel {rel:.2e})"
+            );
+        }
+        // Band structure: lowest dims are pure extrapolation (original rope,
+        // period[0] == base^0 == 1), highest dims pure interpolation
+        // (period == factor * base^(2i/dims)).
+        assert_eq!(periods[0].to_bits(), 1.0_f32.to_bits());
+        let last_extra = base.powf(2.0 * 31.0 / dims as f32);
+        let ratio = periods[31] / last_extra;
+        assert!(
+            (ratio - factor).abs() < 1e-3,
+            "highest dim should be fully interpolated: ratio {ratio} != {factor}"
+        );
+
+        // Attention mscale: 0.1*ln(4)+1 with the mlx-lm default
+        // mscale=1 / mscale_all_dim=0 pair.
+        let mscale = yarn_get_mscale(factor, 1.0) / yarn_get_mscale(factor, 0.0);
+        assert!(
+            (mscale - 1.138_629_4).abs() < 1e-6,
+            "mscale {mscale} != 1.1386294"
+        );
+    }
+
+    /// Prefill (manual rope) and decode (`mlx_fast_rope`) must agree on the
+    /// SAME yarn frequencies — divergence here is the warm/cold drift bug
+    /// class. Rotates a full L=6 window manually, then rotates each position
+    /// as a single-token decode step with the same freqs, and compares.
+    /// Also guards the bf16 cast-back on the yarn prefill path.
+    #[test]
+    fn yarn_prefill_decode_rope_agree() {
+        let dims = 8_i32; // partial rotary: 8 of 16
+        let head_dim = 16_i32;
+        let seq = 6_i32;
+        let freqs = compute_yarn_freqs(dims, 10_000.0, 4.0, 2048, 32.0, 1.0);
+
+        let data: Vec<f32> = (0..2 * seq * head_dim)
+            .map(|i| ((i as f32) * 0.37).sin())
+            .collect();
+        let x = Array::from_slice(&data, &[1, 2, seq, head_dim]);
+
+        let positions: Vec<i32> = (0..seq).collect();
+        let positions = Array::from_slice(&positions, &[seq]);
+        let manual =
+            apply_rope_manual_with_freqs(&x, &positions, dims, 10_000.0, 1.0, Some(&freqs))
+                .unwrap();
+
+        for pos in 0..seq {
+            let x_tok = x.index((.., .., pos..pos + 1, ..));
+            let fast =
+                mlx_rs::fast::rope(&x_tok, dims, false, None::<f32>, 1.0, pos, &freqs).unwrap();
+            let manual_tok = manual.index((.., .., pos..pos + 1, ..));
+            let diff = fast
+                .subtract(&manual_tok)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            assert!(diff < 1e-5, "pos {pos}: manual vs fast rope diff {diff}");
+        }
+
+        // bf16 in -> bf16 out on the yarn variant (same guarantee as
+        // `manual_rope_preserves_input_dtype` for the default path).
+        let x_bf16 = x.as_dtype(mlx_rs::Dtype::Bfloat16).unwrap();
+        let out =
+            apply_rope_manual_with_freqs(&x_bf16, &positions, dims, 10_000.0, 1.0, Some(&freqs))
+                .unwrap();
         assert_eq!(out.dtype(), mlx_rs::Dtype::Bfloat16);
     }
 
@@ -18647,6 +19026,87 @@ mod tests {
             "Dense model should NOT get decoder_sparse_step=1"
         );
         assert_eq!(args.num_experts, 0);
+    }
+
+    /// Dense fixture with a `rope_parameters` object spliced in.
+    fn qwen35_dense_text_config_with_rope(rope_parameters: &str) -> String {
+        let base = qwen35_dense_text_config();
+        let (head, tail) = base.split_at(base.rfind('}').unwrap());
+        format!("{head},\n            \"rope_parameters\": {rope_parameters}{tail}")
+    }
+
+    /// End-to-end `YaRN` activation: a Qwythos-shaped config (`rope_parameters`
+    /// with `type: "yarn"`) must flow through the text_config loader into
+    /// active yarn state on the attention modules — the field the flattener
+    /// used to drop silently. Base-9B-shaped configs (mrope hints, no `type`)
+    /// must keep the byte-exact default rope path.
+    #[test]
+    fn qwen35_yarn_config_flows_to_attention() {
+        let dir = tempfile::tempdir().unwrap();
+        write_qwen35_config(
+            dir.path(),
+            &qwen35_dense_text_config_with_rope(
+                r#"{
+                    "factor": 4.0,
+                    "original_max_position_embeddings": 262144,
+                    "mrope_interleaved": true,
+                    "mrope_section": [11, 11, 10],
+                    "rope_theta": 10000000,
+                    "type": "yarn",
+                    "partial_rotary_factor": 0.25
+                }"#,
+            ),
+        );
+        let args = load_qwen3_5_moe_text_config_args(dir.path()).unwrap();
+        assert!((args.rope_theta - 10_000_000.0).abs() < 1.0);
+        assert!((args.partial_rotary_factor - 0.25).abs() < 1e-6);
+        let params = yarn_rope_params(&args).expect("yarn params should parse");
+        assert!((params.factor - 4.0).abs() < f32::EPSILON);
+        assert_eq!(params.original_max_position_embeddings, 262_144);
+        assert!(
+            (params.beta_fast - 32.0).abs() < f32::EPSILON,
+            "default beta_fast"
+        );
+        assert!(
+            (params.beta_slow - 1.0).abs() < f32::EPSILON,
+            "default beta_slow"
+        );
+
+        let attn = Qwen3NextAttention::new(&args, "model.layers.3.self_attn").unwrap();
+        let yarn = attn.yarn.as_ref().expect("yarn state active on attention");
+        assert!(
+            (yarn.mscale - 1.138_629_4).abs() < 1e-6,
+            "mscale {} != 1.1386294",
+            yarn.mscale
+        );
+        // head_dim 64 * 0.25 = 16 rotary dims -> 8 periods.
+        assert_eq!(yarn.freqs.shape(), &[8]);
+        assert_eq!(yarn.prescale.shape(), &[64]);
+
+        // Base-9B-shaped: same rope_parameters minus `type` -> default rope.
+        let dir_base = tempfile::tempdir().unwrap();
+        write_qwen35_config(
+            dir_base.path(),
+            &qwen35_dense_text_config_with_rope(
+                r#"{
+                    "mrope_interleaved": true,
+                    "mrope_section": [11, 11, 10],
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25
+                }"#,
+            ),
+        );
+        let args_base = load_qwen3_5_moe_text_config_args(dir_base.path()).unwrap();
+        assert!(
+            args_base.rope_scaling.is_some(),
+            "rope_parameters carried through as rope_scaling"
+        );
+        assert!(yarn_rope_params(&args_base).is_none());
+        let attn_base = Qwen3NextAttention::new(&args_base, "model.layers.3.self_attn").unwrap();
+        assert!(
+            attn_base.yarn.is_none(),
+            "default rope path must stay inactive"
+        );
     }
 
     /// mxfp4 QLinears ship without `.biases` on disk. The construction must
