@@ -920,16 +920,25 @@ impl SimpleEngine {
     /// Metal command buffer is process-global and aborts on concurrent eval, so
     /// all GPU work must stay serialized under the model lock, which this
     /// function does not hold.
-    fn stash_retained(&self, session_id: u64, cache: AnyCache, tokens: Vec<u32>) {
+    fn stash_retained(&self, session_id: u64, cache: AnyCache, tokens: Vec<u32>, cap_exempt: bool) {
+        // `cap_exempt`: the caller compressed this cache to TurboQuant because
+        // it exceeded the dense token cap — retain it anyway (bounded footprint
+        // beats the measured 150s full re-prefill a drop would cost the
+        // session's next turn).
+        let effective_cap = if cap_exempt {
+            0
+        } else {
+            self.kv_cache_config.max_session_tokens
+        };
         #[allow(clippy::print_stderr)] // env-gated diagnostic
-        if self.kv_cache_config.max_session_tokens > 0
-            && tokens.len() > self.kv_cache_config.max_session_tokens
+        if effective_cap > 0
+            && tokens.len() > effective_cap
             && std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1")
         {
             eprintln!(
                 "DIAG session-retain-drop: reason=max_session_tokens session_id={session_id} tokens={} cap={}",
                 tokens.len(),
-                self.kv_cache_config.max_session_tokens
+                effective_cap
             );
         }
         let evicted = stash_into(
@@ -2371,7 +2380,9 @@ impl SimpleEngine {
                     first_id,
                 )?;
             }
-            let next_arr = sample(&logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
+            let boot_logits = apply_penalties(&logits.index((.., -1, ..)), &generated, params)
+                .map_err(EngineError::Mlx)?;
+            let next_arr = sample(&boot_logits, params).map_err(EngineError::Mlx)?;
             let h = hidden.index((.., -1.., ..));
             eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
             let mut current_hidden: Option<Array> = Some(h);
@@ -2421,6 +2432,7 @@ impl SimpleEngine {
                             &mut drafter_pos,
                             confirmed,
                             params,
+                            &generated,
                             dflash_state,
                         )?;
                         let wall = round_t0.elapsed().as_secs_f64().max(1e-9);
@@ -2487,8 +2499,10 @@ impl SimpleEngine {
                         Self::append_taps(&mut tap_backlog, &step_taps)
                             .map_err(EngineError::Mlx)?;
                     }
-                    let reseed_next = sample(&reseed_logits.index((.., -1, ..)), params)
-                        .map_err(EngineError::Mlx)?;
+                    let reseed_pen =
+                        apply_penalties(&reseed_logits.index((.., -1, ..)), &generated, params)
+                            .map_err(EngineError::Mlx)?;
+                    let reseed_next = sample(&reseed_pen, params).map_err(EngineError::Mlx)?;
                     let reseed_h = reseed_hidden.index((.., -1.., ..));
                     eval([&reseed_next, &reseed_h]).map_err(EngineError::Mlx)?;
                     tokens_since_probe = tokens_since_probe.saturating_add(1);
@@ -2521,6 +2535,7 @@ impl SimpleEngine {
                         drafter_guard
                             .as_ref()
                             .map_or::<&[usize], _>(&[], |(d, _)| &d.tap_layers),
+                        &generated,
                     )?;
                     (r, Some(t))
                 } else {
@@ -2534,6 +2549,7 @@ impl SimpleEngine {
                             draft_depth,
                             &self.eos_token_ids,
                             Some(params),
+                            &generated,
                         )?,
                         None,
                     )
@@ -2615,13 +2631,27 @@ impl SimpleEngine {
         // is also exact, removing one documented lossiness source. Resident
         // memory stays bounded by max_retained_sessions / max_session_tokens /
         // the idle TTL, which apply either way.
-        if self.kv_cache_config.is_turboquant() {
+        // Over the dense token cap, fall back to TurboQuant retention instead
+        // of dropping: a 39.5k-token session that lost retention re-prefilled
+        // for 149.8s on the next turn, versus a bounded ~4-6x-smaller TQ
+        // resident and a CPU dequant on resume (tens of seconds at that size,
+        // and GPU dequant work is in flight). Exactness was already
+        // best-effort on this path.
+        let cap = self.kv_cache_config.max_session_tokens;
+        let total_turn_tokens = prompt_tokens.len().saturating_add(generated.len());
+        let over_dense_cap = cap > 0 && total_turn_tokens > cap;
+        let mut cap_exempt = false;
+        if self.kv_cache_config.is_turboquant() || over_dense_cap {
             match cache.quantize_for_retention(self.kv_cache_config) {
-                Ok(layers) if layers > 0 => tracing::debug!(
-                    session_id,
-                    compressed_layers = layers,
-                    "Compressed retained KV to TurboQuant for between-turn retention"
-                ),
+                Ok(layers) if layers > 0 => {
+                    cap_exempt = over_dense_cap;
+                    tracing::debug!(
+                        session_id,
+                        compressed_layers = layers,
+                        over_dense_cap,
+                        "Compressed retained KV to TurboQuant for between-turn retention"
+                    );
+                }
                 Ok(_) => {}
                 // Leave the cache dense on failure — correctness over footprint.
                 Err(e) => tracing::warn!(
@@ -2649,7 +2679,7 @@ impl SimpleEngine {
         if full.last().is_some_and(|t| self.eos_token_ids.contains(t)) {
             full.pop();
         }
-        self.stash_retained(session_id, cache, full);
+        self.stash_retained(session_id, cache, full, cap_exempt);
         let total_elapsed = total_start.elapsed();
 
         #[allow(clippy::print_stderr)] // env-gated diagnostic
@@ -3569,6 +3599,7 @@ impl SimpleEngine {
         drafter_pos: &mut i32,
         confirmed: u32,
         params: &SamplingParams,
+        history: &[u32],
         dflash: &DFlashState,
     ) -> Result<(Vec<u32>, u32, Vec<Array>), EngineError> {
         let block_size = dflash.block_size;
@@ -3658,7 +3689,14 @@ impl SimpleEngine {
 
         // d. Targets (sampled at temperature when nonzero) + greedy-match
         //    acceptance, capped BEFORE any stop token.
-        let targets = crate::mtp::verify_targets(&verify_logits, Some(params))?;
+        let chain_history: Vec<u32> = {
+            let mut v = Vec::with_capacity(history.len() + 1);
+            v.extend_from_slice(history);
+            v.push(confirmed);
+            v
+        };
+        let targets =
+            crate::mtp::verify_targets(&verify_logits, Some(params), Some(&chain_history))?;
         let mut n_match = draft_u32
             .iter()
             .zip(&targets)

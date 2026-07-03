@@ -7,7 +7,9 @@
 //! Expected speedup: ~1.5x on dense models at ~80% acceptance rate.
 
 use higgs_models::mlx_exec::eval;
-use higgs_models::{AnyCache, AnyModel, MtpCache, SamplingParams, deep_clone_mtp_cache, sample};
+use higgs_models::{
+    AnyCache, AnyModel, MtpCache, SamplingParams, apply_penalties, deep_clone_mtp_cache, sample,
+};
 use mlx_rs::{
     Array, argmax_axis,
     ops::{self, concatenate_axis, indexing::IndexOp},
@@ -581,6 +583,7 @@ fn backbone_verify_batch_tapped(
     tokens: &[u32],
     tap_layers: Option<&[usize]>,
     sampling: Option<&SamplingParams>,
+    history: Option<&[u32]>,
 ) -> Result<(Array, Vec<u32>, Option<Vec<Array>>), EngineError> {
     let input = token_input(tokens)?;
     let (hidden, logits, taps) = match tap_layers {
@@ -597,7 +600,7 @@ fn backbone_verify_batch_tapped(
             (hidden, logits, None)
         }
     };
-    let target_ids = verify_targets(&logits, sampling)?;
+    let target_ids = verify_targets(&logits, sampling, history)?;
     Ok((hidden, target_ids, taps))
 }
 
@@ -609,20 +612,50 @@ fn backbone_verify_batch_tapped(
 pub(crate) fn verify_targets(
     logits: &Array,
     sampling: Option<&SamplingParams>,
+    history: Option<&[u32]>,
 ) -> Result<Vec<u32>, EngineError> {
-    let Some(params) = sampling.filter(|p| p.temperature > f32::EPSILON) else {
+    // No history and greedy: the fast batched argmax (normal-path behavior).
+    let Some(params) = sampling else {
         return greedy_token_ids(logits);
     };
+    let sampled = params.temperature > f32::EPSILON;
+    let penalized = history.is_some()
+        && (params.repetition_penalty.is_some()
+            || params.frequency_penalty.is_some()
+            || params.presence_penalty.is_some());
+    if !sampled && !penalized {
+        return greedy_token_ids(logits);
+    }
+    // Per-position walk. Penalties are applied over the caller's generated
+    // history PLUS the targets chosen earlier in this chain — the sequential
+    // semantics `decode_step` provides (dropping them here reintroduced the
+    // sampling loops nanobot's repeat_penalty exists to break).
     let positions = usize::try_from(*logits.shape().get(1).unwrap_or(&0))
         .map_err(|_| EngineError::Generation("verify logits shape".to_owned()))?;
+    let mut chain: Vec<u32> = history.map(<[u32]>::to_vec).unwrap_or_default();
     let mut out = Vec::with_capacity(positions);
     for i in 0..positions {
         let i_idx = i32::try_from(i)
             .map_err(|_| EngineError::Generation("verify position overflow".to_owned()))?;
-        let row = logits.index((.., i_idx, ..));
-        let tok = sample(&row, params).map_err(EngineError::Mlx)?;
-        eval([&tok]).map_err(EngineError::Mlx)?;
-        out.push(tok.item());
+        let raw_row = logits.index((.., i_idx, ..));
+        let row = if penalized {
+            apply_penalties(&raw_row, &chain, params).map_err(EngineError::Mlx)?
+        } else {
+            raw_row
+        };
+        let tok: u32 = if sampled {
+            let t = sample(&row, params).map_err(EngineError::Mlx)?;
+            eval([&t]).map_err(EngineError::Mlx)?;
+            t.item()
+        } else {
+            let t = argmax_axis!(&row, -1).map_err(EngineError::Mlx)?;
+            eval([&t]).map_err(EngineError::Mlx)?;
+            t.item()
+        };
+        if history.is_some() {
+            chain.push(tok);
+        }
+        out.push(tok);
     }
     Ok(out)
 }
@@ -710,6 +743,7 @@ pub fn mtp_cycle(
         None,
         None,
         None,
+        None,
     )?
     .0)
 }
@@ -728,6 +762,7 @@ pub fn mtp_cycle_bounded(
     draft_n_max: usize,
     stop_ids: &[u32],
     sampling: Option<&SamplingParams>,
+    history: &[u32],
 ) -> Result<MtpCycleResult, EngineError> {
     Ok(mtp_cycle_inner(
         model,
@@ -739,6 +774,7 @@ pub fn mtp_cycle_bounded(
         None,
         Some(stop_ids),
         sampling,
+        Some(history),
     )?
     .0)
 }
@@ -757,6 +793,7 @@ pub fn mtp_cycle_session(
     stop_ids: &[u32],
     sampling: Option<&SamplingParams>,
     tap_layers: &[usize],
+    history: &[u32],
 ) -> Result<(MtpCycleResult, Vec<Array>), EngineError> {
     let (result, taps) = mtp_cycle_inner(
         model,
@@ -768,6 +805,7 @@ pub fn mtp_cycle_session(
         Some(tap_layers),
         Some(stop_ids),
         sampling,
+        Some(history),
     )?;
     Ok((result, taps.unwrap_or_default()))
 }
@@ -796,6 +834,7 @@ pub fn mtp_cycle_tapped(
         Some(tap_layers),
         None,
         None,
+        None,
     )?;
     Ok((result, taps.unwrap_or_default()))
 }
@@ -811,6 +850,7 @@ fn mtp_cycle_inner(
     tap_layers: Option<&[usize]>,
     stop_ids: Option<&[u32]>,
     sampling: Option<&SamplingParams>,
+    history: Option<&[u32]>,
 ) -> Result<(MtpCycleResult, Option<Vec<Array>>), EngineError> {
     let draft_limit = draft_n_max.max(1);
     let base_cache = capture_backbone_checkpoint(cache);
@@ -846,8 +886,20 @@ fn mtp_cycle_inner(
     verify_tokens.push(confirmed_token_id);
     verify_tokens.extend(drafts.iter().copied());
 
-    let (verify_hidden, verifier_targets, verify_taps) =
-        backbone_verify_batch_tapped(model, cache, &verify_tokens, tap_layers, sampling)?;
+    let chain_history: Option<Vec<u32>> = history.map(|h| {
+        let mut v = Vec::with_capacity(h.len() + 1);
+        v.extend_from_slice(h);
+        v.push(confirmed_token_id);
+        v
+    });
+    let (verify_hidden, verifier_targets, verify_taps) = backbone_verify_batch_tapped(
+        model,
+        cache,
+        &verify_tokens,
+        tap_layers,
+        sampling,
+        chain_history.as_deref(),
+    )?;
     let verify_hidden_for_mtp = verify_hidden.clone();
     if verifier_targets.len() < verify_tokens.len() {
         return Err(EngineError::Generation(format!(
@@ -894,8 +946,14 @@ fn mtp_cycle_inner(
         (verify_hidden, next, verify_taps)
     } else {
         rollback_backbone(cache, base_cache, verify_tokens.len());
-        let (replay_hidden, replay_targets, replay_taps) =
-            backbone_verify_batch_tapped(model, cache, &tokens, tap_layers, sampling)?;
+        let (replay_hidden, replay_targets, replay_taps) = backbone_verify_batch_tapped(
+            model,
+            cache,
+            &tokens,
+            tap_layers,
+            sampling,
+            chain_history.as_deref(),
+        )?;
         let next = *replay_targets.get(accepted_drafts).ok_or_else(|| {
             EngineError::Generation(format!(
                 "MTP replay returned {} target ids for accepted index {}",
