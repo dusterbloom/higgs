@@ -606,7 +606,7 @@ fn backbone_verify_batch_tapped(
 /// output distribution exact under speculation — the emitted tokens are
 /// ALWAYS the targets themselves; drafts only decide how many positions
 /// commit per cycle.
-fn verify_targets(
+pub(crate) fn verify_targets(
     logits: &Array,
     sampling: Option<&SamplingParams>,
 ) -> Result<Vec<u32>, EngineError> {
@@ -741,6 +741,35 @@ pub fn mtp_cycle_bounded(
         sampling,
     )?
     .0)
+}
+
+/// `mtp_cycle_bounded` that also returns DFlash tap-layer hiddens for the
+/// emitted tokens, so session-path MTP floor cycles can keep a drafter
+/// context backlog contiguous (same rationale as `mtp_cycle_tapped`).
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_cycle_session(
+    model: &mut AnyModel,
+    cache: &mut AnyCache,
+    mtp_cache: &mut MtpCache,
+    hidden: &Array,
+    confirmed_token_id: u32,
+    draft_n_max: usize,
+    stop_ids: &[u32],
+    sampling: Option<&SamplingParams>,
+    tap_layers: &[usize],
+) -> Result<(MtpCycleResult, Vec<Array>), EngineError> {
+    let (result, taps) = mtp_cycle_inner(
+        model,
+        cache,
+        mtp_cache,
+        hidden,
+        confirmed_token_id,
+        draft_n_max,
+        Some(tap_layers),
+        Some(stop_ids),
+        sampling,
+    )?;
+    Ok((result, taps.unwrap_or_default()))
 }
 
 /// `mtp_cycle` that also returns DFlash tap-layer hiddens for the emitted

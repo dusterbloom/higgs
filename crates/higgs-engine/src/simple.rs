@@ -1167,6 +1167,11 @@ impl SimpleEngine {
         capture_hidden: bool,
         store_prefix_cache: bool,
         checkpoint_id: Option<&str>,
+        // When Some, the single-pass capture_hidden prefill ALSO collects tap
+        // hiddens for these layers (session DFlash drafter context). Chunked
+        // and two-phase prefills skip taps — callers must tolerate None.
+        prefill_tap_layers: Option<&[usize]>,
+        prefill_taps_out: Option<&mut Vec<Array>>,
     ) -> Result<(Array, Option<LogprobArrays>, Option<Array>), EngineError> {
         // DIAGNOSTIC (HIGGS_DIAG_WARM_DRIFT=1): when reuse is active (the
         // prepared cache is a reused clone with offset > 0), forward the FULL
@@ -1294,10 +1299,27 @@ impl SimpleEngine {
                         .map_err(EngineError::Mlx)?
                 }
             } else if capture_hidden && seq_len <= chunked_threshold {
-                let (hidden, logits) = prepared
-                    .model
-                    .forward_with_hidden(&prepared.prompt_array, None, &mut prepared.cache)
-                    .map_err(EngineError::Mlx)?;
+                let (hidden, logits) = match prefill_tap_layers {
+                    Some(layers) if !layers.is_empty() => {
+                        let (hidden, logits, taps) = prepared
+                            .model
+                            .forward_with_hidden_taps(
+                                &prepared.prompt_array,
+                                None,
+                                &mut prepared.cache,
+                                layers,
+                            )
+                            .map_err(EngineError::Mlx)?;
+                        if let Some(out) = prefill_taps_out {
+                            *out = taps;
+                        }
+                        (hidden, logits)
+                    }
+                    _ => prepared
+                        .model
+                        .forward_with_hidden(&prepared.prompt_array, None, &mut prepared.cache)
+                        .map_err(EngineError::Mlx)?,
+                };
                 prefill_hidden = Some(hidden);
                 logits
             } else if seq_len > chunked_threshold {
@@ -2242,6 +2264,16 @@ impl SimpleEngine {
         // hidden states (unprimed acceptance measured ~75% vs 85-97% primed).
         // Chunked long prefills return no hidden — priming is then skipped.
         let want_mtp = prepared.model.has_mtp() && max_tokens > 1;
+        // Delta-prefill taps seed the session drafter's context with the new
+        // messages (tool results / user turn) — without them the drafter
+        // drafts blind to the instruction it is continuing (measured: short
+        // under-confident blocks that never beat the MTP floor).
+        let session_tap_layers: Option<Vec<usize>> = self
+            .dflash
+            .as_ref()
+            .filter(|_| want_mtp)
+            .map(|d| d.tap_layers.clone());
+        let mut delta_taps: Vec<Array> = Vec::new();
         let (current_token, _, prefill_hidden) = self.run_prefill(
             prompt_tokens,
             &mut prepared,
@@ -2251,6 +2283,8 @@ impl SimpleEngine {
             want_mtp,
             false,
             None,
+            session_tap_layers.as_deref(),
+            Some(&mut delta_taps),
         )?;
         let prefill_elapsed = prefill_start.elapsed();
         let first_id: u32 = current_token.item();
@@ -2281,6 +2315,21 @@ impl SimpleEngine {
                     hidden,
                 )?;
             }
+            // Session DFlash state (declared before the bootstrap so the
+            // bootstrap's tap joins the backlog — the drafter's context stream
+            // must start at the generation's position 0, or every draft is
+            // conditioned one token behind and acceptance collapses).
+            let mut drafter_guard = self
+                .dflash
+                .as_ref()
+                .map(|d| (d, lock_or_recover(&d.drafter)));
+            let mut draft_cache = drafter_guard
+                .as_mut()
+                .map(|(_, g)| g.make_cache())
+                .unwrap_or_default();
+            let mut tap_backlog: Vec<Array> = std::mem::take(&mut delta_taps);
+            let mut drafter_pos: i32 = 0;
+
             // Bootstrap identical to `mtp_generate`: forward the already-
             // emitted first token, keep its hidden, sample the next confirmed
             // token (pending, NOT emitted — the first cycle emits it).
@@ -2289,10 +2338,24 @@ impl SimpleEngine {
                     .map_err(|_| EngineError::Generation("first token overflow i32".to_owned()))?],
                 &[1, 1],
             );
-            let (hidden, logits) = prepared
-                .model
-                .forward_with_hidden(&first_input, None, &mut prepared.cache)
-                .map_err(EngineError::Mlx)?;
+            let (hidden, logits) = if let Some((dflash_state, _)) = drafter_guard.as_ref() {
+                let (hidden, logits, boot_taps) = prepared
+                    .model
+                    .forward_with_hidden_taps(
+                        &first_input,
+                        None,
+                        &mut prepared.cache,
+                        &dflash_state.tap_layers,
+                    )
+                    .map_err(EngineError::Mlx)?;
+                Self::append_taps(&mut tap_backlog, &boot_taps).map_err(EngineError::Mlx)?;
+                (hidden, logits)
+            } else {
+                prepared
+                    .model
+                    .forward_with_hidden(&first_input, None, &mut prepared.cache)
+                    .map_err(EngineError::Mlx)?
+            };
             if let Some(prev_hidden) = prefill_hidden
                 .as_ref()
                 .filter(|_| !prepared.actual_prompt_tokens.is_empty())
@@ -2311,8 +2374,23 @@ impl SimpleEngine {
             let next_arr = sample(&logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
             let h = hidden.index((.., -1.., ..));
             eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
-            let mut current_hidden = h;
+            let mut current_hidden: Option<Array> = Some(h);
             let mut confirmed: u32 = next_arr.item();
+
+            // Session DFlash: gated spec rounds on top of the MTP floor when a
+            // drafter is loaded. The drafter's context backlog is built from
+            // this request only (bootstrap + tapped floor cycles + accepted
+            // rounds) — after a resume it drafts on thin context, so the gate
+            // starts floored and a round must beat the measured MTP rate to
+            // stay engaged.
+            const SPEC_PROBE_BASE: u32 = 48;
+            const SPEC_PROBE_MAX: u32 = 512;
+            let mut probe_every = SPEC_PROBE_BASE;
+            let mut tokens_since_probe: u32 = 0;
+            let mut spec_active = false;
+            let mut spec_ratio_ema = 1.3_f64;
+            let mut t_mtp: Option<f64> = None;
+            let mut mtp_cycles_seen: u32 = 0;
             loop {
                 if self.eos_token_ids.contains(&confirmed) {
                     // Pending stop token: emit without forwarding — the stash
@@ -2324,25 +2402,158 @@ impl SimpleEngine {
                 if completion >= max_tokens {
                     break; // pending token dropped, unforwarded — aligned.
                 }
+
+                // DFlash spec round: while engaged, or as a probe once enough
+                // floor tokens have accumulated context and an MTP rate exists.
+                let probe_due = tokens_since_probe >= probe_every;
+                if let Some((dflash_state, guard)) = drafter_guard.as_mut() {
+                    if (spec_active || probe_due)
+                        && t_mtp.is_some()
+                        && (!tap_backlog.is_empty() || drafter_pos > 0)
+                    {
+                        let round_t0 = std::time::Instant::now();
+                        let (emitted, next_pending, round_taps) = self.session_dflash_round(
+                            &mut prepared.model,
+                            &mut prepared.cache,
+                            guard,
+                            &mut draft_cache,
+                            &mut tap_backlog,
+                            &mut drafter_pos,
+                            confirmed,
+                            params,
+                            dflash_state,
+                        )?;
+                        let wall = round_t0.elapsed().as_secs_f64().max(1e-9);
+                        let n = emitted.len();
+                        generated.extend_from_slice(&emitted);
+                        confirmed = next_pending;
+                        // Verify taps of the emitted positions feed the backlog.
+                        Self::append_taps(&mut tap_backlog, &round_taps)
+                            .map_err(EngineError::Mlx)?;
+                        // Head hidden is stale after a spec round; the reseed
+                        // branch below rebuilds it on the next floor step.
+                        current_hidden = None;
+                        let ratio = t_mtp.map_or(1.0, |t| {
+                            f64::from(u32::try_from(n).unwrap_or(u32::MAX)) * t / wall
+                        });
+                        spec_ratio_ema = 0.6f64.mul_add(spec_ratio_ema, 0.4 * ratio);
+                        tracing::info!(
+                            session_id,
+                            emitted = n,
+                            wall_ms = format!("{:.1}", wall * 1e3),
+                            ratio = format!("{ratio:.2}"),
+                            ratio_ema = format!("{spec_ratio_ema:.2}"),
+                            engaged = spec_ratio_ema >= 1.0,
+                            "session DFlash round"
+                        );
+                        if spec_ratio_ema >= 1.0 {
+                            spec_active = true;
+                            probe_every = SPEC_PROBE_BASE;
+                        } else {
+                            spec_active = false;
+                            spec_ratio_ema = 1.3;
+                            probe_every = probe_every.saturating_mul(2).min(SPEC_PROBE_MAX);
+                        }
+                        tokens_since_probe = 0;
+                        continue;
+                    }
+                }
+
+                if current_hidden.is_none() {
+                    // Reseed after a spec round: flush the pending token (emit),
+                    // forward it with hidden+taps, sample the next pending.
+                    generated.push(confirmed);
+                    if self.eos_token_ids.contains(&confirmed) {
+                        break;
+                    }
+                    let single = Array::from_slice(
+                        &[i32::try_from(confirmed).map_err(|_| {
+                            EngineError::Generation("pending overflow i32".to_owned())
+                        })?],
+                        &[1, 1],
+                    );
+                    let (reseed_hidden, reseed_logits, step_taps) = prepared
+                        .model
+                        .forward_with_hidden_taps(
+                            &single,
+                            None,
+                            &mut prepared.cache,
+                            drafter_guard
+                                .as_ref()
+                                .map_or::<&[usize], _>(&[], |(d, _)| &d.tap_layers),
+                        )
+                        .map_err(EngineError::Mlx)?;
+                    if drafter_guard.is_some() {
+                        Self::append_taps(&mut tap_backlog, &step_taps)
+                            .map_err(EngineError::Mlx)?;
+                    }
+                    let reseed_next = sample(&reseed_logits.index((.., -1, ..)), params)
+                        .map_err(EngineError::Mlx)?;
+                    let reseed_h = reseed_hidden.index((.., -1.., ..));
+                    eval([&reseed_next, &reseed_h]).map_err(EngineError::Mlx)?;
+                    tokens_since_probe = tokens_since_probe.saturating_add(1);
+                    current_hidden = Some(reseed_h);
+                    confirmed = reseed_next.item();
+                    continue;
+                }
+                let hidden_ref = current_hidden.as_ref().ok_or_else(|| {
+                    EngineError::Generation("session hidden missing after reseed".to_owned())
+                })?;
+
+                // MTP floor cycle (tapped when a drafter needs the backlog).
                 let remaining = usize::try_from(max_tokens.saturating_sub(completion))
                     .map_err(|_| EngineError::Generation("max_tokens overflow".to_owned()))?;
                 let draft_depth = self
                     .tuning
                     .mtp_draft_n_max()
                     .min(remaining.saturating_sub(1).max(1));
-                let result = crate::mtp::mtp_cycle_bounded(
-                    &mut prepared.model,
-                    &mut prepared.cache,
-                    &mut session_mtp_cache,
-                    &current_hidden,
-                    confirmed,
-                    draft_depth,
-                    &self.eos_token_ids,
-                    Some(params),
-                )?;
+                let cycle_t0 = std::time::Instant::now();
+                let (result, cycle_taps) = if drafter_guard.is_some() {
+                    let (r, t) = crate::mtp::mtp_cycle_session(
+                        &mut prepared.model,
+                        &mut prepared.cache,
+                        &mut session_mtp_cache,
+                        hidden_ref,
+                        confirmed,
+                        draft_depth,
+                        &self.eos_token_ids,
+                        Some(params),
+                        drafter_guard
+                            .as_ref()
+                            .map_or::<&[usize], _>(&[], |(d, _)| &d.tap_layers),
+                    )?;
+                    (r, Some(t))
+                } else {
+                    (
+                        crate::mtp::mtp_cycle_bounded(
+                            &mut prepared.model,
+                            &mut prepared.cache,
+                            &mut session_mtp_cache,
+                            hidden_ref,
+                            confirmed,
+                            draft_depth,
+                            &self.eos_token_ids,
+                            Some(params),
+                        )?,
+                        None,
+                    )
+                };
+                let dt = cycle_t0.elapsed().as_secs_f64();
+                let n = result.tokens.len().max(1);
+                let dt_tok = dt / f64::from(u32::try_from(n).unwrap_or(u32::MAX));
+                // Skip the first (kernel-cold) cycle when seeding the floor rate.
+                if mtp_cycles_seen > 0 {
+                    t_mtp = Some(t_mtp.map_or(dt_tok, |e| 0.7f64.mul_add(e, 0.3 * dt_tok)));
+                }
+                mtp_cycles_seen += 1;
+                if let Some(taps) = cycle_taps {
+                    Self::append_taps(&mut tap_backlog, &taps).map_err(EngineError::Mlx)?;
+                }
                 mtp_stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
+                tokens_since_probe = tokens_since_probe
+                    .saturating_add(u32::try_from(result.tokens.len()).unwrap_or(0));
                 generated.extend_from_slice(&result.tokens);
-                current_hidden = result.hidden;
+                current_hidden = Some(result.hidden);
                 confirmed = result.next_token_id;
             }
         } else if !self.eos_token_ids.contains(&first_id) && max_tokens > 1 {
@@ -2499,6 +2710,8 @@ impl SimpleEngine {
             None,
             false,
             true,
+            None,
+            None,
             None,
         )?;
 
@@ -2988,6 +3201,8 @@ impl SimpleEngine {
             capture_mtp_prefill,
             true,
             checkpoint_id,
+            None,
+            None,
         )?;
 
         // Capture T1 (already eval'd inside run_prefill).
@@ -3319,6 +3534,166 @@ impl SimpleEngine {
             *cur = mlx_rs::ops::concatenate_axis(&[&*cur, add], 1)?;
         }
         Ok(())
+    }
+
+    /// One lean DFlash speculative round for the SESSION path.
+    ///
+    /// Same core as `dflash_decode`'s spec branch (block draft off tap
+    /// hiddens, confidence truncation, tape-recording verify, GDN tape
+    /// rollback on partial accept) with the session path's three extra
+    /// contracts:
+    ///
+    /// - Pending-token convention: `confirmed` is sampled-but-unemitted (the
+    ///   MTP loop's convention). The round emits it as the anchor (verify
+    ///   forwards it), and the round's correction token becomes the NEXT
+    ///   pending confirmed — returned, never emitted or forwarded here.
+    /// - Stop-exact: acceptance is capped BEFORE any stop token, so a stop can
+    ///   only surface as the returned pending token and the retained cache
+    ///   stays 1:1 with the stashed token list.
+    /// - Distribution-preserving: verify targets are sampled at the request
+    ///   temperature when nonzero; emitted tokens are always the targets.
+    ///
+    /// The drafter sees only this request's tap backlog (bootstrap + floor
+    /// cycles + prior rounds), not the retained history — early rounds after a
+    /// resume draft on thin context and the caller's gate keeps them off
+    /// until they pay. Returns `(emitted_tokens, next_pending_confirmed,
+    /// verify_taps_for_emitted)`.
+    #[allow(clippy::too_many_arguments)]
+    fn session_dflash_round(
+        &self,
+        model: &mut higgs_models::AnyModel,
+        cache: &mut higgs_models::AnyCache,
+        drafter: &mut higgs_models::dflash::DFlashDrafter,
+        draft_cache: &mut Vec<Option<(Array, Array)>>,
+        current_taps: &mut Vec<Array>,
+        drafter_pos: &mut i32,
+        confirmed: u32,
+        params: &SamplingParams,
+        dflash: &DFlashState,
+    ) -> Result<(Vec<u32>, u32, Vec<Array>), EngineError> {
+        let block_size = dflash.block_size;
+        let block_size_us = usize::try_from(block_size)
+            .map_err(|_| EngineError::Generation("block_size overflow".to_owned()))?;
+        let anchor = i32::try_from(confirmed)
+            .map_err(|_| EngineError::Generation("anchor overflow i32".to_owned()))?;
+
+        // a. Block: [anchor, mask, ...] → embed → drafter forward on backlog.
+        let mut block_tokens = vec![dflash.mask_token_id; block_size_us];
+        if let Some(slot) = block_tokens.get_mut(0) {
+            *slot = anchor;
+        }
+        let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
+        let noise_embedding = model
+            .embed_token_ids(&block_ids)
+            .map_err(EngineError::Mlx)?;
+        let draft_hidden = drafter
+            .forward(&noise_embedding, current_taps, draft_cache)
+            .map_err(EngineError::Mlx)?;
+        *drafter_pos += i32::try_from(current_taps.first().map_or(0, |t| {
+            usize::try_from(*t.shape().get(1).unwrap_or(&0)).unwrap_or(0)
+        }))
+        .unwrap_or(0);
+        current_taps.clear();
+        crop_drafter_cache(draft_cache, *drafter_pos);
+
+        // b. Draft tokens + confidence truncation (same rule as dflash_decode).
+        let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
+        let draft_logits = model
+            .forward_all_logits_from_hidden(&draft_hidden_sliced)
+            .map_err(EngineError::Mlx)?;
+        let draft_token_arr = mlx_rs::argmax_axis!(&draft_logits, -1).map_err(EngineError::Mlx)?;
+        let conf_logp = if dflash_conf_trunc_threshold().is_some() {
+            let max_l = mlx_rs::ops::max_axis(&draft_logits, -1, None).map_err(EngineError::Mlx)?;
+            let lse =
+                mlx_rs::ops::logsumexp_axis(&draft_logits, -1, None).map_err(EngineError::Mlx)?;
+            Some(
+                max_l
+                    .subtract(&lse)
+                    .map_err(EngineError::Mlx)?
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .map_err(EngineError::Mlx)?,
+            )
+        } else {
+            None
+        };
+        match conf_logp.as_ref() {
+            Some(lp) => eval([&draft_token_arr, lp]).map_err(EngineError::Mlx)?,
+            None => eval([&draft_token_arr]).map_err(EngineError::Mlx)?,
+        }
+        let mut draft_u32: Vec<u32> = draft_token_arr
+            .reshape(&[-1])
+            .map_err(EngineError::Mlx)?
+            .as_slice::<u32>()
+            .to_vec();
+        if let (Some(threshold), Some(lp)) = (dflash_conf_trunc_threshold(), conf_logp.as_ref()) {
+            let logp: Vec<f32> = lp
+                .reshape(&[-1])
+                .map_err(EngineError::Mlx)?
+                .as_slice::<f32>()
+                .to_vec();
+            let log_thresh = threshold.ln();
+            let keep = logp
+                .iter()
+                .take(draft_u32.len())
+                .take_while(|&&l| l >= log_thresh)
+                .count()
+                .max(1);
+            draft_u32.truncate(keep);
+        }
+
+        // c. Tape-recording verify over [anchor, drafts...].
+        let mut verify_tokens = vec![anchor];
+        for &d in &draft_u32 {
+            verify_tokens.push(
+                i32::try_from(d)
+                    .map_err(|_| EngineError::Generation("draft overflow i32".to_owned()))?,
+            );
+        }
+        let verify_len = i32::try_from(verify_tokens.len())
+            .map_err(|_| EngineError::Generation("verify_len overflow".to_owned()))?;
+        let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
+        let (verify_logits, verify_taps, layer_tapes) = model
+            .forward_with_taps_tape(&verify_input, None, cache, &dflash.tap_layers)
+            .map_err(EngineError::Mlx)?;
+
+        // d. Targets (sampled at temperature when nonzero) + greedy-match
+        //    acceptance, capped BEFORE any stop token.
+        let targets = crate::mtp::verify_targets(&verify_logits, Some(params))?;
+        let mut n_match = draft_u32
+            .iter()
+            .zip(&targets)
+            .take_while(|(d, t)| *d == *t)
+            .count();
+        if let Some(stop_at) = targets
+            .get(..n_match)
+            .unwrap_or(&[])
+            .iter()
+            .position(|t| self.eos_token_ids.contains(t))
+        {
+            n_match = stop_at;
+        }
+        // Emitted: anchor + matched drafts. Next pending: target at n_match
+        // (the correction — or the stop token — never forwarded here).
+        let next_pending = *targets.get(n_match).ok_or_else(|| {
+            EngineError::Generation("verify targets missing correction".to_owned())
+        })?;
+        let mut emitted = Vec::with_capacity(n_match + 1);
+        emitted.push(confirmed);
+        emitted.extend_from_slice(draft_u32.get(..n_match).unwrap_or(&[]));
+
+        // e. Roll back unaccepted positions (cache advance == emitted count).
+        let n_accepted = i32::try_from(n_match + 1)
+            .map_err(|_| EngineError::Generation("n_accepted overflow".to_owned()))?;
+        if n_accepted < verify_len {
+            model
+                .replay_tape_rollback(&layer_tapes, cache, n_accepted, verify_len - n_accepted)
+                .map_err(EngineError::Mlx)?;
+        }
+        let kept_taps: Vec<Array> = verify_taps
+            .into_iter()
+            .map(|tap| tap.index((.., ..n_accepted, ..)))
+            .collect();
+        Ok((emitted, next_pending, kept_taps))
     }
 
     /// `DFlash` block-diffusion speculative decode loop.
@@ -5027,6 +5402,8 @@ impl SimpleEngine {
             capture_mtp_prefill,
             true,
             checkpoint_id,
+            None,
+            None,
         )?;
         // Prefill done — decode must not report progress. Dropping the Option
         // uninstalls the sink when present; a no-op when progress was off.
