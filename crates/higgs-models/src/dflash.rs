@@ -783,8 +783,16 @@ mod weight_check {
         eprintln!("q_proj.scales: {:?} {:?}", q_s.shape(), q_s.dtype());
         let fc_prod: i32 = fc_w.shape().iter().product();
         let q_prod: i32 = q_w.shape().iter().product();
-        assert!(fc_prod > 1, "fc.weight placeholder! shape={:?}", fc_w.shape());
-        assert!(q_prod > 1, "q_proj.weight placeholder! shape={:?}", q_w.shape());
+        assert!(
+            fc_prod > 1,
+            "fc.weight placeholder! shape={:?}",
+            fc_w.shape()
+        );
+        assert!(
+            q_prod > 1,
+            "q_proj.weight placeholder! shape={:?}",
+            q_w.shape()
+        );
         eprintln!("ALL WEIGHTS LOADED OK");
     }
 }

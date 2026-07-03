@@ -587,14 +587,18 @@ impl QEmbedding {
     pub(crate) fn forward(&self, indices: &Array) -> Result<Array, Exception> {
         let shape = indices.shape().to_vec();
         let flat = indices.flatten(None, None)?;
+        // Gather aux arrays only for the modes that ship them: mxfp4 has no
+        // `.biases` (empty [0] placeholder) and dense has neither — an
+        // unconditional take on an empty axis throws at the first forward.
         let w = (*self.weight).take_axis(&flat, 0)?;
-        let s = (*self.scales).take_axis(&flat, 0)?;
-        let b = (*self.biases).take_axis(&flat, 0)?;
         let out = match self.mode {
             crate::quant_mode::QuantMode::MxFp4 => {
+                let s = (*self.scales).take_axis(&flat, 0)?;
                 crate::quant_mode::dequantize(&w, &s, None, self.group_size, self.bits, self.mode)?
             }
             crate::quant_mode::QuantMode::Affine => {
+                let s = (*self.scales).take_axis(&flat, 0)?;
+                let b = (*self.biases).take_axis(&flat, 0)?;
                 ops::dequantize(&w, &s, &b, self.group_size, self.bits)?
             }
             // Dense: weights are already full-precision; just gather rows.
@@ -7470,10 +7474,18 @@ fn detect_dense_gdn_projections(
 
     // Collect all tensor keys that have `.scales` (i.e. are quantized).
     // Any GDN projection path that has `.weight` but NOT `.scales` is dense.
+    // Normalize keys to the model's parameter form (`language_model.` prefix
+    // stripped) so the membership check below compares like with like. mxfp4
+    // exports ship quantized GDN projections as `.weight` + `.scales` with no
+    // `.biases` (E2M1 has no zero-point) — scales presence alone decides.
+    fn strip_prefix(k: &str) -> &str {
+        k.strip_prefix("language_model.").unwrap_or(k)
+    }
     let quantized_paths: std::collections::HashSet<&str> = index
         .weight_map
         .keys()
         .filter_map(|k| k.strip_suffix(".scales"))
+        .map(strip_prefix)
         .collect();
 
     let dense_spec = QuantizationConfig {
@@ -7485,10 +7497,7 @@ fn detect_dense_gdn_projections(
     let mut added = 0usize;
     for weight_key in index.weight_map.keys() {
         // Look for GDN projection weights: ...linear_attn.in_proj_{a,b}.weight
-        let Some(base) = weight_key
-            .strip_prefix("language_model.")
-            .and_then(|k| k.strip_suffix(".weight"))
-        else {
+        let Some(base) = strip_prefix(weight_key).strip_suffix(".weight") else {
             continue;
         };
         if !(base.ends_with(".linear_attn.in_proj_a") || base.ends_with(".linear_attn.in_proj_b")) {
@@ -17330,6 +17339,113 @@ mod tests {
         let q = args.quant_spec_for("model.layers.3.self_attn.q_proj");
         assert_eq!(q.bits, 4);
         assert!(q.mode.is_mxfp4());
+    }
+
+    /// Dense-GDN detection keys on `.scales` presence, comparing prefix-
+    /// normalized paths. Regression: mxfp4 exports ship quantized GDN
+    /// projections (`.weight` + `.scales`, no `.biases`) under the
+    /// `language_model.` prefix; the scales set was built from unstripped keys
+    /// while the lookup used stripped ones, so every projection was misread
+    /// as dense and left unloaded. Genuinely dense (weight-only) projections
+    /// must still be detected.
+    #[test]
+    fn detect_dense_gdn_projections_keys_on_scales_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        write_weight_index(
+            dir.path(),
+            &[
+                // Layer 0: quantized GDN dynamics (mxfp4: weight + scales, no biases)
+                "language_model.model.layers.0.linear_attn.in_proj_a.weight",
+                "language_model.model.layers.0.linear_attn.in_proj_a.scales",
+                "language_model.model.layers.0.linear_attn.in_proj_b.weight",
+                "language_model.model.layers.0.linear_attn.in_proj_b.scales",
+                // Layer 1: dense GDN dynamics (bf16: weight only, AEON-style)
+                "language_model.model.layers.1.linear_attn.in_proj_a.weight",
+                "language_model.model.layers.1.linear_attn.in_proj_b.weight",
+            ],
+        );
+
+        let mut overrides = HashMap::new();
+        detect_dense_gdn_projections(dir.path(), &mut overrides);
+
+        assert!(
+            !overrides.contains_key("model.layers.0.linear_attn.in_proj_a"),
+            "quantized in_proj_a (has .scales) must NOT be marked dense"
+        );
+        assert!(
+            !overrides.contains_key("model.layers.0.linear_attn.in_proj_b"),
+            "quantized in_proj_b (has .scales) must NOT be marked dense"
+        );
+        for key in [
+            "model.layers.1.linear_attn.in_proj_a",
+            "model.layers.1.linear_attn.in_proj_b",
+        ] {
+            let qc = overrides
+                .get(key)
+                .unwrap_or_else(|| panic!("dense {key} (weight-only) must get a Dense override"));
+            assert!(qc.mode.is_dense());
+        }
+        assert_eq!(overrides.len(), 2);
+    }
+
+    /// mxfp4 embeddings ship `.weight` + `.scales` only; `biases` stays an
+    /// empty `[0]` placeholder. Regression: `QEmbedding::forward` gathered
+    /// biases unconditionally, throwing "[take] Cannot do a non-empty take
+    /// from an empty axis" on the first forward of any mxfp4 model. The
+    /// gather must round-trip to the dequantized rows.
+    #[test]
+    fn qembedding_mxfp4_forward_gathers_without_biases() {
+        let vocab = 8;
+        let dim = 64;
+        let group_size = 32;
+        let data: Vec<f32> = (0..vocab * dim).map(|i| (i as f32 * 0.37).sin()).collect();
+        let w = Array::from_slice(&data, &[vocab, dim]);
+        let (wq, scales, _) =
+            crate::quant_mode::quantize(&w, group_size, 4, crate::quant_mode::QuantMode::MxFp4)
+                .unwrap();
+
+        let mut emb = QEmbedding::new_spec(QuantSpec {
+            group_size,
+            bits: 4,
+            mode: crate::quant_mode::QuantMode::MxFp4,
+        });
+        *emb.weight = wq.clone();
+        *emb.scales = scales.clone();
+
+        let indices = Array::from_slice(&[1_u32, 5, 2], &[1, 3]);
+        let out = emb.forward(&indices).unwrap();
+        assert_eq!(out.shape(), &[1, 3, dim]);
+
+        let full = crate::quant_mode::dequantize(
+            &wq,
+            &scales,
+            None,
+            group_size,
+            4,
+            crate::quant_mode::QuantMode::MxFp4,
+        )
+        .unwrap();
+        let expected = full
+            .take_axis(&Array::from_slice(&[1_u32, 5, 2], &[3]), 0)
+            .unwrap();
+        // mxfp4 dequantize yields bf16; cast both sides for CPU comparison.
+        let got = out
+            .reshape(&[3, dim])
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+        let got = got.as_slice::<f32>();
+        let want = expected.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let want = want.as_slice::<f32>();
+        assert_eq!(got.len(), want.len(), "output length mismatch");
+        let mut max_abs_err = 0.0_f32;
+        for (&g, &w) in got.iter().zip(want.iter()) {
+            max_abs_err = max_abs_err.max((g - w).abs());
+        }
+        assert!(
+            max_abs_err < 1e-6,
+            "gathered rows must match dequantized rows, max diff {max_abs_err}"
+        );
     }
 
     #[test]
