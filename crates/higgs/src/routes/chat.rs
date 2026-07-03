@@ -527,18 +527,19 @@ fn continued_prompt_tokens(
             return prompt_tokens.to_vec();
         }
     };
-    let normalized = strip_think_blocks(&retained_text);
-    let Some(delta_text) = full_text.strip_prefix(normalized.as_str()) else {
+    let Some(delta_text) = message_boundary_delta(&retained_text, &full_text) else {
         if diag {
-            let common = common_prefix_bytes(&normalized, &full_text);
+            let common = common_prefix_bytes(&retained_text, &full_text);
             eprintln!(
-                "DIAG session-continue-fallback: reason=text_prefix_mismatch session_id={session_id} retained_tokens={} prompt_tokens={} normalized_bytes={} full_bytes={} common_bytes={} retained_tail={:?} full_at_mismatch={:?}",
+                "DIAG session-continue-fallback: reason=boundary_splice_failed session_id={session_id} retained_tokens={} prompt_tokens={} retained_bytes={} full_bytes={} retained_msgs={} full_msgs={} common_bytes={} retained_tail={:?} full_at_mismatch={:?}",
                 retained.len(),
                 prompt_tokens.len(),
-                normalized.len(),
+                retained_text.len(),
                 full_text.len(),
+                retained_text.matches(IM_START).count(),
+                full_text.matches(IM_START).count(),
                 common,
-                preview_around(&normalized, common),
+                preview_around(&retained_text, common),
                 preview_around(&full_text, common)
             );
         }
@@ -600,24 +601,58 @@ fn char_boundary_at_or_after(text: &str, byte_pos: usize) -> usize {
 /// continuation path to reconcile a retained KV's detokenization (which carries
 /// the per-turn think injection) with the canonical multi-turn render (which
 /// strips think from historical turns), so the retained prefix can be matched.
-fn strip_think_blocks(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(start) = rest.find("<think>") {
-        out.push_str(rest.get(..start).unwrap_or(""));
-        let after_open = rest.get(start..).unwrap_or("");
-        if let Some(close) = after_open.find("</think>") {
-            let resume_at = start + close + "</think>".len();
-            let tail = rest.get(resume_at..).unwrap_or("");
-            rest = tail.strip_prefix("\n\n").unwrap_or(tail);
-        } else {
-            out.push_str(after_open);
-            rest = "";
-            break;
-        }
+const IM_START: &str = "<|im_start|>";
+const IM_END: &str = "<|im_end|>";
+
+/// Splice point for a continued turn: the suffix of the canonical render that
+/// covers the messages the retained KV does NOT yet cover.
+///
+/// The retained detokenization can never byte-match the canonical re-render of
+/// the same messages — think blocks are stripped or replaced by a placeholder
+/// depending on the turn's position relative to the conversation's last user
+/// message, and content/tool-call join whitespace differs from what the model
+/// generated. Instead of canonicalizing (template lore, position-dependent),
+/// splice at message boundaries: the retained text covers as many messages as
+/// it has `<|im_start|>` markers; everything from that boundary onward in the
+/// fresh render is the delta to prefill. The retained prefix keeps the model's
+/// original per-turn text (real thinking, original whitespace) — a known,
+/// accepted divergence source of the best-effort continuation path.
+///
+/// The last retained message usually ends without `<|im_end|>` (the engine
+/// pops the EOS token before stashing), so the delta starts AT the covered
+/// messages' final `<|im_end|>`; when the retained text does end with it, the
+/// delta starts right after instead. Returns `None` (caller falls back to a
+/// full prefill) when the render has fewer messages than the retained text or
+/// the shared first message diverges (client mutated history).
+fn message_boundary_delta<'a>(retained_text: &str, full_text: &'a str) -> Option<&'a str> {
+    let covered = retained_text.matches(IM_START).count();
+    if covered == 0 {
+        return None;
     }
-    out.push_str(rest);
-    out
+    // Mutation guard: the first message (system/user opener) must agree
+    // byte-for-byte between the retained text and the fresh render.
+    let first_end = retained_text
+        .find(IM_END)
+        .map_or_else(|| retained_text.len().min(256), |p| p.min(256));
+    if full_text.get(..first_end) != retained_text.get(..first_end) {
+        return None;
+    }
+    // Offset of the `covered`-th message's closing <|im_end|> in the render:
+    // each covered message renders exactly one.
+    let mut pos = 0usize;
+    for _ in 0..covered {
+        let found = full_text.get(pos..)?.find(IM_END)?;
+        pos = pos + found + IM_END.len();
+    }
+    // pos is just past the covered messages' final <|im_end|>. The retained
+    // text usually lacks that closer (EOS popped at stash time) — include it
+    // in the delta; skip it when the retained text already ends with it.
+    let trimmed = retained_text.trim_end_matches('\n');
+    if trimmed.ends_with(IM_END) {
+        full_text.get(pos..)
+    } else {
+        full_text.get(pos - IM_END.len()..)
+    }
 }
 
 /// Map a [`SessionGeneration`] (cache-resident continued turn) onto the same
@@ -1394,28 +1429,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_think_blocks_removes_injection_and_real_reasoning() {
-        // Empty no-think injection right after the assistant open.
-        let noinjected = "<|im_start|>assistant\n<think>\n\n</think>\n\nParis.<|im_end|>";
+    fn boundary_delta_splices_after_covered_messages() {
+        // Retained: system + user + generated assistant reply (EOS popped, so
+        // no trailing <|im_end|>), with real thinking the render won't have.
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nanswer1";
+        // Fresh render: same three messages canonically rendered (thinking
+        // stripped, whitespace differs) plus a new user turn + gen suffix.
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nanswer1<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>";
+        let delta = message_boundary_delta(retained, full).unwrap();
+        // Delta starts at the covered messages' closing <|im_end|> (retained
+        // lacks it) and carries everything new.
         assert_eq!(
-            strip_think_blocks(noinjected),
-            "<|im_start|>assistant\nParis.<|im_end|>"
+            delta,
+            "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>"
         );
-        // A real reasoning block is removed too (historical turns drop it).
-        let reasoned = "a<think>\nlots of\nreasoning\n</think>\n\nanswer";
-        assert_eq!(strip_think_blocks(reasoned), "aanswer");
-        // Multiple blocks (multi-turn) all go.
-        assert_eq!(
-            strip_think_blocks("<think>\n\n</think>\n\nX y <think>\nz\n</think>\n\nW"),
-            "X y W"
-        );
-        // No think block: identity.
-        assert_eq!(strip_think_blocks("plain text"), "plain text");
-        // Unterminated block: keep the remainder verbatim (don't lose data).
-        assert_eq!(
-            strip_think_blocks("keep<think>dangling"),
-            "keep<think>dangling"
-        );
+    }
+
+    #[test]
+    fn boundary_delta_skips_closer_when_retained_has_it() {
+        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>";
+        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+        let delta = message_boundary_delta(retained, full).unwrap();
+        assert_eq!(delta, "\n<|im_start|>user\nq2<|im_end|>");
+    }
+
+    #[test]
+    fn boundary_delta_rejects_mutated_first_message() {
+        // Client rewrote the system prompt between turns: no splice.
+        let retained = "<|im_start|>system\noriginal<|im_end|>\n<|im_start|>user\nq<|im_end|>";
+        let full = "<|im_start|>system\nMUTATED!<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_render_with_fewer_messages() {
+        // Render has fewer message closers than retained covers (history
+        // shrank): no splice.
+        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans";
+        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>";
+        assert!(message_boundary_delta(retained, full).is_none());
     }
 
     fn simple_message(role: &str, content: Option<&str>) -> ChatCompletionMessage {
