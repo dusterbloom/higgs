@@ -639,6 +639,7 @@ mod tests {
             quantization: Some(QuantizationConfig {
                 group_size: 64,
                 bits: 4,
+                mode: crate::quant_mode::QuantMode::Affine,
             }),
         }
     }

@@ -50,10 +50,25 @@ pub struct DFlashConfig {
     pub layer_types: Option<Vec<String>>,
     #[serde(default)]
     pub sliding_window: Option<i32>,
+    /// Quantization config for the drafter. When present, linear layers use
+    /// quantized matmul; when absent, they use dense matmul.
+    #[serde(default)]
+    pub quantization: Option<crate::qwen3_next::QuantizationConfig>,
     dflash_config: DFlashSubConfig,
 }
 
 impl DFlashConfig {
+    pub const fn quant_spec(&self) -> crate::qwen3_next::QuantSpec {
+        match &self.quantization {
+            Some(q) => q.spec(),
+            None => crate::qwen3_next::QuantSpec {
+                group_size: 0,
+                bits: 0,
+                mode: crate::quant_mode::QuantMode::Dense,
+            },
+        }
+    }
+
     pub fn target_layer_ids(&self) -> &[usize] {
         &self.dflash_config.target_layer_ids
     }
@@ -83,13 +98,6 @@ const fn default_block_size() -> i32 {
     16
 }
 
-/// Runtime decode `block_size` used at inference.
-///
-/// Overridable via `HIGGS_DFLASH_BLOCK_SIZE`. Diverges from the drafter's
-/// trained `block_size` (16) because acceptance rate plateaus at ~3 tokens
-/// and smaller blocks amortize verify cost better.
-pub const DEFAULT_DECODE_BLOCK_SIZE: i32 = 4;
-
 // ---------------------------------------------------------------------------
 // SwiGLU MLP (non-quantized)
 // ---------------------------------------------------------------------------
@@ -97,25 +105,23 @@ pub const DEFAULT_DECODE_BLOCK_SIZE: i32 = 4;
 #[derive(Debug, ModuleParameters)]
 struct DFlashMLP {
     #[param]
-    gate_proj: nn::Linear,
+    gate_proj: crate::qwen3_next::QLinear,
     #[param]
-    up_proj: nn::Linear,
+    up_proj: crate::qwen3_next::QLinear,
     #[param]
-    down_proj: nn::Linear,
+    down_proj: crate::qwen3_next::QLinear,
 }
 
 impl DFlashMLP {
-    fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
+    fn new(
+        _hidden_size: i32,
+        _intermediate_size: i32,
+        spec: crate::qwen3_next::QuantSpec,
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            gate_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
-                .bias(false)
-                .build()?,
-            up_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
-                .bias(false)
-                .build()?,
-            down_proj: nn::LinearBuilder::new(intermediate_size, hidden_size)
-                .bias(false)
-                .build()?,
+            gate_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
+            up_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
+            down_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
         })
     }
 
@@ -134,13 +140,13 @@ impl DFlashMLP {
 #[derive(Debug, ModuleParameters)]
 struct DFlashAttention {
     #[param]
-    q_proj: nn::Linear,
+    q_proj: crate::qwen3_next::QLinear,
     #[param]
-    k_proj: nn::Linear,
+    k_proj: crate::qwen3_next::QLinear,
     #[param]
-    v_proj: nn::Linear,
+    v_proj: crate::qwen3_next::QLinear,
     #[param]
-    o_proj: nn::Linear,
+    o_proj: crate::qwen3_next::QLinear,
     #[param]
     q_norm: nn::RmsNorm,
     #[param]
@@ -156,11 +162,15 @@ struct DFlashAttention {
 }
 
 impl DFlashAttention {
-    fn new(config: &DFlashConfig, layer_idx: usize) -> Result<Self, Exception> {
+    fn new(
+        config: &DFlashConfig,
+        layer_idx: usize,
+        spec: crate::qwen3_next::QuantSpec,
+    ) -> Result<Self, Exception> {
         let head_dim = config.head_dim;
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
-        let hidden = config.hidden_size;
+        let _hidden = config.hidden_size;
         let is_sliding = config
             .layer_types
             .as_ref()
@@ -169,18 +179,10 @@ impl DFlashAttention {
         let sliding_window = config.sliding_window.unwrap_or(0);
 
         Ok(Self {
-            q_proj: nn::LinearBuilder::new(hidden, n_heads * head_dim)
-                .bias(false)
-                .build()?,
-            k_proj: nn::LinearBuilder::new(hidden, n_kv_heads * head_dim)
-                .bias(false)
-                .build()?,
-            v_proj: nn::LinearBuilder::new(hidden, n_kv_heads * head_dim)
-                .bias(false)
-                .build()?,
-            o_proj: nn::LinearBuilder::new(n_heads * head_dim, hidden)
-                .bias(false)
-                .build()?,
+            q_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
+            k_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
+            v_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
+            o_proj: crate::qwen3_next::QLinear::new_spec(spec)?,
             q_norm: nn::RmsNormBuilder::new(head_dim)
                 .eps(config.rms_norm_eps)
                 .build()?,
@@ -333,10 +335,14 @@ struct DFlashDecoderLayer {
 }
 
 impl DFlashDecoderLayer {
-    fn new(config: &DFlashConfig, layer_idx: usize) -> Result<Self, Exception> {
+    fn new(
+        config: &DFlashConfig,
+        layer_idx: usize,
+        spec: crate::qwen3_next::QuantSpec,
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            self_attn: DFlashAttention::new(config, layer_idx)?,
-            mlp: DFlashMLP::new(config.hidden_size, config.intermediate_size)?,
+            self_attn: DFlashAttention::new(config, layer_idx, spec)?,
+            mlp: DFlashMLP::new(config.hidden_size, config.intermediate_size, spec)?,
             input_layernorm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
                 .build()?,
@@ -375,7 +381,7 @@ impl DFlashDecoderLayer {
 #[derive(Debug, ModuleParameters)]
 pub struct DFlashDrafter {
     #[param]
-    fc: nn::Linear,
+    fc: crate::qwen3_next::QLinear,
     #[param]
     hidden_norm: nn::RmsNorm,
     #[param]
@@ -387,17 +393,16 @@ pub struct DFlashDrafter {
 
 impl DFlashDrafter {
     pub fn new(config: DFlashConfig) -> Result<Self, Exception> {
-        let fc_in = i32::try_from(config.num_taps())
+        let spec = config.quant_spec();
+        let _fc_in = i32::try_from(config.num_taps())
             .map_err(|e| Exception::custom(format!("num_taps too large for i32: {e}")))?
             * config.hidden_size;
         let layers = (0..config.num_hidden_layers)
-            .map(|i| DFlashDecoderLayer::new(&config, usize::try_from(i).unwrap_or(0)))
+            .map(|i| DFlashDecoderLayer::new(&config, usize::try_from(i).unwrap_or(0), spec))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
-            fc: nn::LinearBuilder::new(fc_in, config.hidden_size)
-                .bias(false)
-                .build()?,
+            fc: crate::qwen3_next::QLinear::new_spec(spec)?,
             hidden_norm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
                 .build()?,
@@ -412,6 +417,32 @@ impl DFlashDrafter {
     /// Create an empty per-layer KV cache for the drafter.
     pub fn make_cache(&self) -> Vec<Option<(Array, Array)>> {
         vec![None; self.layers.len()]
+    }
+
+    /// Initialize all `QLinear` weights to zero at the correct shapes.
+    /// Only for tests — `QLinear` (unlike `nn::Linear`) starts with [1] placeholders.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    pub fn init_test_weights(&mut self) {
+        use mlx_rs::module::Param;
+        let h = self.config.hidden_size;
+        let n_heads = self.config.num_attention_heads;
+        let n_kv = self.config.num_key_value_heads;
+        let hd = self.config.head_dim;
+        let inter = self.config.intermediate_size;
+        let fc_in = i32::try_from(self.config.num_taps()).unwrap_or(1) * h;
+        let qo = n_heads * hd;
+        let kv = n_kv * hd;
+        for layer in &mut self.layers {
+            layer.self_attn.q_proj.weight = Param::new(Array::zeros::<f32>(&[qo, h]).unwrap());
+            layer.self_attn.k_proj.weight = Param::new(Array::zeros::<f32>(&[kv, h]).unwrap());
+            layer.self_attn.v_proj.weight = Param::new(Array::zeros::<f32>(&[kv, h]).unwrap());
+            layer.self_attn.o_proj.weight = Param::new(Array::zeros::<f32>(&[h, qo]).unwrap());
+            layer.mlp.gate_proj.weight = Param::new(Array::zeros::<f32>(&[inter, h]).unwrap());
+            layer.mlp.up_proj.weight = Param::new(Array::zeros::<f32>(&[inter, h]).unwrap());
+            layer.mlp.down_proj.weight = Param::new(Array::zeros::<f32>(&[h, inter]).unwrap());
+        }
+        self.fc.weight = Param::new(Array::zeros::<f32>(&[h, fc_in]).unwrap());
     }
 
     /// Run the drafter forward pass.
@@ -591,7 +622,13 @@ pub fn accept_prefix(draft: &[u32], verify_argmax: &[u32]) -> Vec<u32> {
 // surface.
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::as_conversions,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::accept_prefix;
 
@@ -658,12 +695,16 @@ mod tests {
                 "full_attention".to_owned(),
             ]),
             sliding_window: Some(4),
+            quantization: None,
             dflash_config: DFlashSubConfig {
                 target_layer_ids: vec![0],
                 mask_token_id: Some(1),
             },
         };
         let mut drafter = DFlashDrafter::new(config).unwrap();
+        // QLinear (unlike nn::Linear) starts with [1] placeholder weights.
+        // Initialize them to zero at the correct shapes so forward() works.
+        drafter.init_test_weights();
         let mut cache = drafter.make_cache();
 
         let ctx_len = 2i32; // context positions added per round
@@ -723,5 +764,36 @@ mod tests {
             c.num_taps(),
             c.num_taps() as i32 * c.hidden_size
         );
+    }
+}
+
+#[cfg(test)]
+mod weight_check {
+    #[test]
+    #[ignore = "needs HIGGS_DFLASH_DRAFTER_DIR"]
+    fn check_weights_loaded() {
+        let dir = std::env::var("HIGGS_DFLASH_DRAFTER_DIR").unwrap();
+        let d = super::load_dflash_drafter(std::path::Path::new(&dir)).unwrap();
+        let fc_w = &d.fc.weight;
+        let fc_s = &d.fc.scales;
+        let q_w = &d.layers[0].self_attn.q_proj.weight;
+        let q_s = &d.layers[0].self_attn.q_proj.scales;
+        eprintln!("fc.weight: {:?} {:?}", fc_w.shape(), fc_w.dtype());
+        eprintln!("fc.scales: {:?} {:?}", fc_s.shape(), fc_s.dtype());
+        eprintln!("q_proj.weight: {:?} {:?}", q_w.shape(), q_w.dtype());
+        eprintln!("q_proj.scales: {:?} {:?}", q_s.shape(), q_s.dtype());
+        let fc_prod: i32 = fc_w.shape().iter().product();
+        let q_prod: i32 = q_w.shape().iter().product();
+        assert!(
+            fc_prod > 1,
+            "fc.weight placeholder! shape={:?}",
+            fc_w.shape()
+        );
+        assert!(
+            q_prod > 1,
+            "q_proj.weight placeholder! shape={:?}",
+            q_w.shape()
+        );
+        eprintln!("ALL WEIGHTS LOADED OK");
     }
 }
