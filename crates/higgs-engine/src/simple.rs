@@ -1077,8 +1077,27 @@ impl SimpleEngine {
         let prompt_len = Self::prompt_len(prompt_tokens)?;
         let has_images = pixel_values.is_some();
 
+        let model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+
+        // Acquire the MLX-execution gate the moment we own the model, before any
+        // forward/eval. Held via PreparedGeneration for the entire generation.
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+
         // Skip prefix caching for multimodal requests: different images
         // produce different KV states even with identical token sequences.
+        //
+        // The lookup MUST run under the model lock + MLX gate: a radix hit on a
+        // hybrid (GDN) entry `deep_clone`s the stored cache, and a disk-snapshot
+        // hit rebuilds `KvBlock`s — both eval MLX graphs. Doing this before the
+        // gate ran that eval concurrently with another request's in-flight
+        // generation on the shared default stream, and MLX's process-global
+        // Metal command buffer aborts on concurrent use (observed as
+        // `-[_MTLCommandBuffer addCompletedHandler:]` / `IOGPUMetalCommandBuffer
+        // validate` failed assertions during a session-continuation fallback
+        // prefill racing a concurrent request's prefix lookup).
         let prefix_match = if has_images {
             None
         } else {
@@ -1107,15 +1126,6 @@ impl SimpleEngine {
                     .fetch_add(u64::try_from(m.prefix_len).unwrap_or(0), Ordering::Relaxed);
             }
         }
-
-        let model = self
-            .model
-            .lock()
-            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
-
-        // Acquire the MLX-execution gate the moment we own the model, before any
-        // forward/eval. Held via PreparedGeneration for the entire generation.
-        let mlx_gate = higgs_models::mlx_exec::acquire();
 
         let (actual_prompt_tokens, cache) = if let Some(matched) = prefix_match {
             tracing::debug!(
