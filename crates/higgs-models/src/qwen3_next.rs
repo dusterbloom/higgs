@@ -2314,6 +2314,21 @@ thread_local! {
     static COMPILED_GDN_DECODE_FN: RefCell<Option<Box<CompiledGdnDecodeFn>>> = RefCell::new(None);
 }
 
+// HIGGS_PROFILE=1 TurboQuant decode attribution: per-FA-layer append(quantize) vs
+// attn(kernels) nanoseconds, accumulated across a token's FA layers and printed +
+// reset once per token by the top-level forward. Confirms the Phase 0 microbench
+// finding (append dominates below ~18K) on the real model.
+thread_local! {
+    static PROF_TQ_APPEND_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+    static PROF_TQ_ATTN_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+    static PROF_TQ_N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn tq_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1"))
+}
+
 fn make_compiled_gdn_decode() -> Box<CompiledGdnDecodeFn> {
     Box::new(compile_with_state(compiled_gdn_decode_step, true))
 }
@@ -3322,7 +3337,17 @@ impl Qwen3NextAttention {
         let diag_x = if diag_attn { mat_vec(x) } else { None };
         let diag_keys_pre = if diag_attn { mat_vec(&keys) } else { None };
 
+        let tq_prof = tq_profile_enabled() && L == 1;
+        let append_t0 = tq_prof.then(|| {
+            let _ = mlx_rs::transforms::eval([&keys, &values]);
+            std::time::Instant::now()
+        });
         let view = cache.update_and_view(keys, values)?;
+        if let Some(t0) = append_t0 {
+            let _ = mlx_rs::transforms::eval(cache.eval_targets());
+            PROF_TQ_APPEND_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+            PROF_TQ_N.with(|c| c.set(c.get() + 1));
+        }
 
         if diag_attn {
             let stored_vec = cache.keys().and_then(mat_vec);
@@ -3338,15 +3363,21 @@ impl Qwen3NextAttention {
             });
         }
         let try_tq_decode = mask.is_none() && L == 1;
+        let attn_t0 = tq_prof.then(std::time::Instant::now);
         let output = match view {
             crate::cache::KvCacheView::TurboQuant(tq_view) if try_tq_decode => {
                 let scores = tq_view.decode_scores(&queries, self.num_attention_heads)?;
                 let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
                 let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
-                tq_view
+                let attn_out = tq_view
                     .decode_values(&weights, self.num_attention_heads)?
                     .transpose_axes(&[0, 2, 1, 3])?
-                    .reshape(&[B, L, -1])?
+                    .reshape(&[B, L, -1])?;
+                if let Some(t0) = attn_t0 {
+                    let _ = mlx_rs::transforms::eval([&attn_out]);
+                    PROF_TQ_ATTN_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+                }
+                attn_out
             }
             other @ (crate::cache::KvCacheView::Dense { .. }
             | crate::cache::KvCacheView::TurboQuant(_)) => {
@@ -6757,6 +6788,26 @@ impl Qwen3NextCausalLM {
                     "PROFILE: per-layer avg (×48 GDN + ×16 FA)"
                 );
             }
+        }
+        if profiling {
+            let n = PROF_TQ_N.with(|c| c.get());
+            if n > 0 {
+                #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+                {
+                    let ap = PROF_TQ_APPEND_NS.with(|c| c.get()) as f64 / f64::from(n);
+                    let at = PROF_TQ_ATTN_NS.with(|c| c.get()) as f64 / f64::from(n);
+                    tracing::info!(
+                        fa_layers = n,
+                        append_ms = format!("{:.3}", ap / 1e6),
+                        attn_ms = format!("{:.3}", at / 1e6),
+                        append_over_attn = format!("{:.2}", ap / at.max(1.0)),
+                        "PROFILE-TQ: per-FA-layer append(quantize) vs attn(kernels)"
+                    );
+                }
+            }
+            PROF_TQ_APPEND_NS.with(|c| c.set(0));
+            PROF_TQ_ATTN_NS.with(|c| c.set(0));
+            PROF_TQ_N.with(|c| c.set(0));
         }
 
         if do_diag_capture {
