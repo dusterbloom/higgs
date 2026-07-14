@@ -13,9 +13,12 @@ Two layouts are supported:
   `qwen3_next` architecture with its affine 1-bit operations dispatched to the
   same Higgs Metal kernels.
 
-Single-token decode stays packed. Embedding lookup and multi-token prefill
+Single-token decode and narrow multi-token forwards stay packed. For Qwen3.5,
+the packed Metal path covers up to 8 flattened rows by default, including the
+small verifier batches used by speculative decoding. Wider prefill inputs
 dequantize the selected matrix to the input dtype before using regular MLX
-matmul.
+matmul. Set `HIGGS_BONSAI_QMM_MAX_ROWS=0` to disable the narrow packed path, or
+raise it up to 64 for A/B testing.
 
 For Qwen3.5 Q1 checkpoints, the loader validates every affine scale/bias pair.
 When a tensor is exactly symmetric (`bias = -scale / 2`), Higgs releases its

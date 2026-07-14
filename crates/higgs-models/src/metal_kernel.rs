@@ -390,16 +390,18 @@ pub fn bonsai_q1_qmv(
 }
 
 // ---------------------------------------------------------------------------
-// `qmv_fast`-class 1-bit matvec (decode hot path).
+// `qmv_fast`-class 1-bit narrow matrix multiply (decode / verify hot path).
 //
 // Ports MLX/PrismML `qmv_fast` tiling onto our uint32 packing: each simdgroup
-// computes RESULTS_PER_SIMDGROUP (4) output rows; each of its 32 lanes holds
-// VPT (32) input values in registers (no threadgroup memory, no barriers) and
-// reuses them across all 4 rows. Keeping one packed word per lane reduces
-// register pressure and raises occupancy for 1-bit weights. The bits=1 affine
-// math is identical to the legacy kernel — `scale * sum(bit*x) + bias * sum(x)`
-// — only the data movement differs. Group scales/biases are per-lane (a lane's
-// 32 values lie in one 128-wide group); per-row partials are simd_sum-reduced.
+// computes RESULTS_PER_SIMDGROUP (4) output rows for one input row; the grid's
+// z dimension covers narrow M > 1 verifier batches without materializing the
+// dense weight matrix. Each lane holds VPT (32) input values in registers and
+// reuses them across all 4 output rows. Keeping one packed word per lane
+// reduces register pressure and raises occupancy for 1-bit weights. The bits=1
+// affine math is identical to the legacy kernel —
+// `scale * sum(bit*x) + bias * sum(x)` — only the data movement differs.
+// Group scales/biases are per-lane (a lane's 32 values lie in one 128-wide
+// group); per-row partials are simd_sum-reduced.
 // ---------------------------------------------------------------------------
 
 const FAST_QMV_KERNEL_SOURCE: &str = r"
@@ -412,8 +414,10 @@ uint tgx = threadgroup_position_in_grid.x;
 uint sg  = simdgroup_index_in_threadgroup;
 uint lid = thread_index_in_simdgroup;
 uint nsg = simdgroups_per_threadgroup;
+uint batch = threadgroup_position_in_grid.z;
 
 int out_row = int(tgx) * (int(nsg) * RPS) + int(sg) * RPS;
+auto x_row = x + int(batch) * K;
 
 float xt[VPT];
 float result[RPS];
@@ -421,12 +425,12 @@ for (int r = 0; r < RPS; ++r) { result[r] = 0.0f; }
 
 int aligned_end = (K / BLK) * BLK;
 
-// Main loop: full 2048-element blocks (covers every real Bonsai layer, since
+// Main loop: full 1024-element blocks (covers every real Bonsai layer, since
 // all K are multiples of 2048).
 for (int k = 0; k < aligned_end; k += BLK) {
     int xbase = k + int(lid) * VPT;
     float sum = 0.0f;
-    for (int i = 0; i < VPT; ++i) { float v = float(x[xbase + i]); xt[i] = v; sum += v; }
+    for (int i = 0; i < VPT; ++i) { float v = float(x_row[xbase + i]); xt[i] = v; sum += v; }
 
     int wcol = (k / 32) + int(lid) * WPT;
     int g = xbase / GroupSize;   // all VPT values fall in one group
@@ -463,7 +467,7 @@ if (aligned_end < K) {
     bool in_bounds = xbase < K;
     float sum = 0.0f;
     for (int i = 0; i < VPT; ++i) {
-        float v = (in_bounds && (xbase + i) < K) ? float(x[xbase + i]) : 0.0f;
+        float v = (in_bounds && (xbase + i) < K) ? float(x_row[xbase + i]) : 0.0f;
         xt[i] = v;
         sum += v;
     }
@@ -501,7 +505,7 @@ for (int r = 0; r < RPS; ++r) {
     int row = out_row + r;
     float v = simd_sum(result[r]);
     if (lid == 0u && row < n_param) {
-        y[row] = OutT(v);
+        y[int(batch) * n_param + row] = OutT(v);
     }
 }
 ";
@@ -531,6 +535,7 @@ fn create_fast_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 fn configure_fast_qmv_kernel(
     out_dtype: mlx_sys::mlx_dtype,
     n_rows: i32,
+    m_rows: i32,
     k_dim: i32,
     group_size: i32,
     symmetric: bool,
@@ -568,10 +573,10 @@ fn configure_fast_qmv_kernel(
         let nsg = fast_qmv_nsg();
         let rows_per_tg = nsg * 4;
         let n_tgs = (n_rows + rows_per_tg - 1) / rows_per_tg;
-        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tgs * 32, nsg, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tgs * 32, nsg, m_rows);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, nsg, 1);
 
-        let y_shape = [1, n_rows];
+        let y_shape = [m_rows, n_rows];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
             y_shape.as_ptr(),
@@ -605,8 +610,12 @@ pub fn bonsai_q1_qmv_fast(
         .copied()
         .ok_or_else(|| Exception::custom("bonsai_q1_qmv_fast: weight has no columns"))?;
     let k_dim = k_packed * 32;
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
 
-    let x_flat = x.reshape(&[k_dim])?;
+    let x_flat = x.reshape(&[m_rows, k_dim])?;
     let w_flat = weight.reshape(&[-1])?;
     let s_flat = scales.flatten(None, None)?;
     let symmetric = biases.size() == 0;
@@ -620,7 +629,7 @@ pub fn bonsai_q1_qmv_fast(
     let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
 
     let cached = FAST_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_qmv_kernel()));
-    let config = configure_fast_qmv_kernel(out_dtype, n_rows, k_dim, group_size, symmetric);
+    let config = configure_fast_qmv_kernel(out_dtype, n_rows, m_rows, k_dim, group_size, symmetric);
 
     let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
     let input_ptrs = [
@@ -669,6 +678,22 @@ pub fn bonsai_q1_qmv_fast(
         mlx_sys::mlx_array_free(n_scalar);
     }
     result
+}
+
+/// Packed affine Q1 matrix multiply for narrow verifier batches.
+///
+/// This shares the decode-optimized kernel with [`bonsai_q1_qmv_fast`] but
+/// dispatches one grid slice per flattened input row. It intentionally targets
+/// small sequence lengths: weights stay packed and resident, avoiding the very
+/// large temporary produced by full dequantization.
+pub fn bonsai_q1_qmm(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    bonsai_q1_qmv_fast(x, weight, scales, biases, group_size)
 }
 
 // ---------------------------------------------------------------------------
