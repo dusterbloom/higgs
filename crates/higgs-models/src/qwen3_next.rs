@@ -351,7 +351,61 @@ pub(crate) fn quantized_forward(
     group_size: i32,
     bits: i32,
 ) -> Result<Array, Exception> {
-    ops::quantized_matmul(x, weight, scales, biases, true, group_size, bits)
+    if bits == 1 {
+        affine_q1_forward(x, weight, scales, biases, group_size)
+    } else {
+        ops::quantized_matmul(x, weight, scales, biases, true, group_size, bits)
+    }
+}
+
+/// Affine 1-bit matrix multiplication using Higgs' runtime Metal kernels.
+///
+/// Upstream MLX does not provide the affine `bits=1` kernels used by Bonsai
+/// checkpoints. Decode uses the fused packed matvec; multi-token forwards
+/// dequantize the current matrix to fp16 and use the regular MLX matmul. This
+/// is shared by the Qwen3.5 hybrid path (Bonsai-27B) and its LM head.
+fn affine_q1_forward(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    let x_shape = x.shape();
+    let input_dim = x_shape
+        .last()
+        .copied()
+        .ok_or_else(|| Exception::custom("1-bit affine input has no dimensions"))?;
+    let weight_shape = weight.shape();
+    let packed_dim = weight_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| Exception::custom("1-bit affine weight must be a matrix"))?;
+    let expected_input_dim = packed_dim
+        .checked_mul(32)
+        .ok_or_else(|| Exception::custom("1-bit affine input dimension overflow"))?;
+    if input_dim != expected_input_dim {
+        return Err(Exception::custom(format!(
+            "1-bit affine input dim {input_dim} does not match packed weight dim {expected_input_dim}"
+        )));
+    }
+    if group_size <= 0 || expected_input_dim % group_size != 0 {
+        return Err(Exception::custom(format!(
+            "invalid 1-bit affine group size {group_size} for input dim {expected_input_dim}"
+        )));
+    }
+
+    let row_count: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    if row_count == 1 {
+        crate::metal_kernel::bonsai_q1_qmv(x, weight, scales, biases, group_size)
+    } else {
+        let dense = crate::metal_kernel::bonsai_q1_dequant(weight, scales, biases, group_size)?
+            .as_dtype(x.dtype())?;
+        x.matmul(&dense.transpose()?)
+    }
 }
 
 /// Quantized linear layer stored as raw weight/scales/biases arrays.
@@ -462,6 +516,15 @@ impl QLinear {
             crate::quant_mode::QuantMode::Dense => dense_linear_no_bias_forward(&self.weight, x),
             // Affine fast path — unchanged from the mlx-rs wrapper.
             crate::quant_mode::QuantMode::Affine => {
+                if self.bits == 1 {
+                    return affine_q1_forward(
+                        x,
+                        &self.weight,
+                        &self.scales,
+                        &self.biases,
+                        self.group_size,
+                    );
+                }
                 // DIAGNOSTIC (HIGGS_DIAG_DEQUANT=1): force the dense dequantized
                 // matmul (row-independent) instead of quantized_matmul, to test
                 // whether quantized_matmul's length-dependence is the divergence
@@ -661,7 +724,11 @@ impl QEmbedding {
             crate::quant_mode::QuantMode::Affine => {
                 let s = (*self.scales).take_axis(&flat, 0)?;
                 let b = (*self.biases).take_axis(&flat, 0)?;
-                ops::dequantize(&w, &s, &b, self.group_size, self.bits)?
+                if self.bits == 1 {
+                    crate::metal_kernel::bonsai_q1_dequant(&w, &s, &b, self.group_size)?
+                } else {
+                    ops::dequantize(&w, &s, &b, self.group_size, self.bits)?
+                }
             }
             // Dense: weights are already full-precision; just gather rows.
             crate::quant_mode::QuantMode::Dense => w,
@@ -685,7 +752,9 @@ impl QEmbedding {
             ),
             // Affine fast path — custom 4-bit gemv kernel for single-token decode.
             crate::quant_mode::QuantMode::Affine => {
-                if self.bits == 4
+                if self.bits == 1 {
+                    affine_q1_forward(x, &self.weight, &self.scales, &self.biases, self.group_size)
+                } else if self.bits == 4
                     && matches!(x.shape(), [1, 1, _])
                     && self.weight.shape().len() == 2
                 {
@@ -5671,7 +5740,9 @@ impl FfnBlock {
             crate::quant_mode::QuantMode::Dense => dense_linear_no_bias_forward(fw, x)?,
             // Affine fast path — GEMV for single-token decode, else standard matmul.
             crate::quant_mode::QuantMode::Affine => {
-                if use_fused_gemv {
+                if gp.bits == 1 {
+                    affine_q1_forward(x, fw, fs, fb, gp.group_size)?
+                } else if use_fused_gemv {
                     qgemv_4bit(x, fw, fs, fb, gp.group_size)?
                 } else {
                     quantized_forward(x, fw, fs, fb, gp.group_size, gp.bits)?
@@ -9530,6 +9601,50 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
+
+    #[test]
+    fn affine_q1_linear_and_embedding_paths_match_known_values() {
+        let group_size = 128;
+        let input_dim = 128;
+        let weight = Array::from_slice(
+            &[
+                0_u32,
+                0,
+                0,
+                0, // row 0 dequantizes to bias = 1
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX, // row 1 dequantizes to scale + bias = 2
+            ],
+            &[2, input_dim / 32],
+        );
+        let scales = Array::from_slice(&[2.0_f32, 3.0], &[2, 1]);
+        let biases = Array::from_slice(&[1.0_f32, -1.0], &[2, 1]);
+
+        let decode = Array::from_slice(&vec![1.0_f32; input_dim as usize], &[1, 1, input_dim]);
+        let decode_out = affine_q1_forward(&decode, &weight, &scales, &biases, group_size).unwrap();
+
+        let mut prefill_values = vec![1.0_f32; input_dim as usize];
+        prefill_values.extend(vec![2.0_f32; input_dim as usize]);
+        let prefill = Array::from_slice(&prefill_values, &[1, 2, input_dim]);
+        let prefill_out =
+            affine_q1_forward(&prefill, &weight, &scales, &biases, group_size).unwrap();
+
+        let mut embedding = QEmbedding::new(group_size, 1).unwrap();
+        embedding.weight = Param::new(weight);
+        embedding.scales = Param::new(scales);
+        embedding.biases = Param::new(biases);
+        let ids = Array::from_slice(&[0_u32, 1], &[1, 2]);
+        let embedding_out = embedding.forward(&ids).unwrap();
+
+        mlx_rs::transforms::eval([&decode_out, &prefill_out, &embedding_out]).unwrap();
+        assert_eq!(decode_out.as_slice::<f32>(), &[128.0, 256.0]);
+        assert_eq!(prefill_out.as_slice::<f32>(), &[128.0, 256.0, 256.0, 512.0]);
+        let embedding_values = embedding_out.as_slice::<f32>();
+        assert!(embedding_values[..128].iter().all(|value| *value == 1.0));
+        assert!(embedding_values[128..].iter().all(|value| *value == 2.0));
+    }
 
     /// The manual prefill rope must not promote bf16 q/k to f32: post-rope
     /// keys are written into the KV cache, so a dtype promotion here doubles

@@ -1,18 +1,22 @@
 # Bonsai-Q1
 
-Bonsai-Q1 checkpoints are Qwen3-shaped models with MLX 1-bit affine
-quantization metadata:
+Higgs supports MLX affine 1-bit checkpoints with `quantization.bits = 1` and
+`quantization.group_size = 128` on the pinned upstream `oxideai/mlx-rs`
+revision. Upstream MLX does not ship the required 1-bit affine kernels, so Higgs
+provides runtime JIT Metal kernels for packed matvec and dequantization.
 
-- `model_type = "qwen3"`
-- `quantization.bits = 1`
-- `quantization.group_size = 128`
+Two layouts are supported:
 
-The Higgs workspace stays on the pinned upstream `oxideai/mlx-rs` dependency.
-That upstream revision does not yet include the MLX bits=1 affine Metal kernels,
-so `higgs-engine` detects Bonsai-Q1 configs and returns an explicit unsupported
-model error instead of routing them into the regular Qwen3 transformer loader.
+- Qwen3-shaped Bonsai checkpoints use the dedicated packed engine in
+  `crates/higgs-models/src/bonsai_q1.rs`.
+- Qwen3.5 hybrid checkpoints, including Bonsai-27B, use the existing
+  `qwen3_next` architecture with its affine 1-bit operations dispatched to the
+  same Higgs Metal kernels.
 
-The packed loader and engine live in `crates/higgs-models/src/bonsai_q1.rs` so
-the Rust-side code can be reviewed independently. Runtime enablement should wait
-until bits=1 affine quantization support lands upstream in the MLX dependency
-chain.
+Single-token decode stays packed. Embedding lookup and multi-token prefill
+dequantize the selected matrix to the input dtype before using regular MLX
+matmul.
+
+Qwen3.5 checkpoints packaged as multimodal models currently load the text
+backbone only. Their vision tower is not exposed by Higgs, so image input remains
+unsupported for those checkpoints.
