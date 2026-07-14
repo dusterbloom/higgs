@@ -253,6 +253,17 @@ fn has_symmetric_q1_biases(biases: &Array) -> bool {
     biases.size() == 0
 }
 
+fn bonsai_q1_qmm_max_rows() -> i32 {
+    static MAX_ROWS: OnceLock<i32> = OnceLock::new();
+    *MAX_ROWS.get_or_init(|| {
+        std::env::var("HIGGS_BONSAI_QMM_MAX_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|rows| (0..=64).contains(rows))
+            .unwrap_or(8)
+    })
+}
+
 pub(crate) fn quantized_forward(
     x: &Array,
     weight: &Array,
@@ -271,9 +282,10 @@ pub(crate) fn quantized_forward(
 /// Affine 1-bit matrix multiplication using Higgs' runtime Metal kernels.
 ///
 /// Upstream MLX does not provide the affine `bits=1` kernels used by Bonsai
-/// checkpoints. Decode uses the fused packed matvec; multi-token forwards
-/// dequantize the current matrix to the input dtype and use regular MLX matmul. This
-/// is shared by the Qwen3.5 hybrid path (Bonsai-27B) and its LM head.
+/// checkpoints. Decode uses the fused packed matvec. Narrow multi-token
+/// verifier batches use the same packed kernel over a z-dimension batch; wider
+/// prefill inputs retain the dense dequantize + MLX matmul fallback. This is
+/// shared by the Qwen3.5 hybrid path (Bonsai-27B) and its LM head.
 fn affine_q1_forward(
     x: &Array,
     weight: &Array,
@@ -311,6 +323,8 @@ fn affine_q1_forward(
         .product();
     if row_count == 1 {
         crate::metal_kernel::bonsai_q1_qmv(x, weight, scales, biases, group_size)
+    } else if row_count > 0 && row_count <= bonsai_q1_qmm_max_rows() {
+        crate::metal_kernel::bonsai_q1_qmm(x, weight, scales, biases, group_size)
     } else {
         let dense = crate::metal_kernel::bonsai_q1_dequant(weight, scales, biases, group_size)?
             .as_dtype(x.dtype())?;
@@ -4450,7 +4464,7 @@ fn q1_biases_are_symmetric(scales: &Array, biases: &Array) -> Result<bool, Model
     let scales_f32 = scales.as_dtype(Dtype::Float32).map_err(ModelError::Mlx)?;
     let biases_f32 = biases.as_dtype(Dtype::Float32).map_err(ModelError::Mlx)?;
     let expected = scales_f32
-        .multiply(&Array::from_f32(-0.5))
+        .multiply(Array::from_f32(-0.5))
         .map_err(ModelError::Mlx)?;
     let equal = biases_f32
         .array_eq(&expected, None)
@@ -4467,15 +4481,15 @@ fn compact_symmetric_q1_biases(
     let bias_keys = params
         .keys()
         .filter(|key| key.ends_with(".biases"))
-        .map(|key| key.to_string())
+        .map(std::string::ToString::to_string)
         .collect::<Vec<_>>();
     let mut compacted = SymmetricQ1Compaction::default();
 
     for bias_key in bias_keys {
-        let Some(scale_key) = bias_key.strip_suffix(".biases") else {
+        let Some(scale_prefix) = bias_key.strip_suffix(".biases") else {
             continue;
         };
-        let scale_key = format!("{scale_key}.scales");
+        let scale_key = format!("{scale_prefix}.scales");
         let Some(scales) = params
             .get(scale_key.as_str())
             .map(|value| (**value).clone())
@@ -5597,6 +5611,150 @@ mod tests {
                 .iter()
                 .all(|value| (*value - 2.0).abs() <= f32::EPSILON)
         );
+    }
+
+    #[test]
+    fn packed_q1_qmm_matches_dense_reference_for_m1_through_m9() {
+        const GROUP_SIZE: i32 = 128;
+        const K: i32 = 128;
+        const N: i32 = 9;
+
+        let mut packed = Vec::with_capacity((N * K / 32) as usize);
+        for row in 0..N {
+            let word = match row % 3 {
+                0 => 0_u32,
+                1 => u32::MAX,
+                _ => 0xAAAA_AAAA,
+            };
+            packed.extend(std::iter::repeat_n(word, (K / 32) as usize));
+        }
+        let weight = Array::from_slice(&packed, &[N, K / 32]);
+        let scales = Array::from_slice(
+            &(0..N)
+                .map(|row| 0.5_f32 + row as f32 * 0.125)
+                .collect::<Vec<_>>(),
+            &[N, 1],
+        );
+        let affine_biases = Array::from_slice(
+            &(0..N)
+                .map(|row| -0.25_f32 + row as f32 * 0.031_25)
+                .collect::<Vec<_>>(),
+            &[N, 1],
+        );
+        let symmetric_biases = symmetric_q1_bias_sentinel();
+
+        for biases in [&affine_biases, &symmetric_biases] {
+            let dense =
+                crate::metal_kernel::bonsai_q1_dequant(&weight, &scales, biases, GROUP_SIZE)
+                    .unwrap();
+
+            for m in 1..=9 {
+                let values = (0..m)
+                    .flat_map(|row| {
+                        (0..K).map(move |col| {
+                            0.25_f32 + row as f32 * 0.5 + (col % 7) as f32 * 0.062_5
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let x = Array::from_slice(&values, &[m, K]);
+                let actual = if m <= 8 {
+                    crate::metal_kernel::bonsai_q1_qmm(&x, &weight, &scales, biases, GROUP_SIZE)
+                        .unwrap()
+                } else {
+                    // M=9 exercises the dense fallback at the dispatch boundary.
+                    affine_q1_forward(&x, &weight, &scales, biases, GROUP_SIZE).unwrap()
+                };
+                let expected = x.matmul(&dense.transpose().unwrap()).unwrap();
+                mlx_rs::transforms::eval([&actual, &expected]).unwrap();
+
+                assert_eq!(actual.shape(), &[m, N]);
+                for (index, (got, want)) in actual
+                    .as_slice::<f32>()
+                    .iter()
+                    .zip(expected.as_slice::<f32>())
+                    .enumerate()
+                {
+                    let tolerance = 1e-3_f32 * want.abs().max(1.0);
+                    assert!(
+                        (*got - *want).abs() <= tolerance,
+                        "M={m} value {index}: packed={got}, dense={want}, tolerance={tolerance}"
+                    );
+                }
+            }
+
+            let leading = Array::from_slice(&vec![0.5_f32; (8 * K) as usize], &[2, 4, K]);
+            let output = affine_q1_forward(&leading, &weight, &scales, biases, GROUP_SIZE).unwrap();
+            mlx_rs::transforms::eval([&output]).unwrap();
+            assert_eq!(output.shape(), &[2, 4, N]);
+        }
+
+        // Exercise the fast kernel's full 1024-value block with the dtype used
+        // by the real Bonsai-27B backbone.
+        const MAIN_K: i32 = 1024;
+        const MAIN_M: i32 = 2;
+        let main_weight = Array::from_slice(
+            &(0..N * MAIN_K / 32)
+                .map(|index| {
+                    if index % 2 == 0 {
+                        0x5555_5555_u32
+                    } else {
+                        0xAAAA_AAAA_u32
+                    }
+                })
+                .collect::<Vec<_>>(),
+            &[N, MAIN_K / 32],
+        );
+        let main_scales = Array::from_slice(
+            &vec![0.75_f32; (N * MAIN_K / GROUP_SIZE) as usize],
+            &[N, MAIN_K / GROUP_SIZE],
+        )
+        .as_dtype(mlx_rs::Dtype::Bfloat16)
+        .unwrap();
+        let main_biases = Array::from_slice(
+            &vec![-0.375_f32; (N * MAIN_K / GROUP_SIZE) as usize],
+            &[N, MAIN_K / GROUP_SIZE],
+        )
+        .as_dtype(mlx_rs::Dtype::Bfloat16)
+        .unwrap();
+        let main_x = Array::from_slice(
+            &(0..MAIN_M * MAIN_K)
+                .map(|index| 0.125_f32 + (index % 11) as f32 * 0.031_25)
+                .collect::<Vec<_>>(),
+            &[MAIN_M, MAIN_K],
+        )
+        .as_dtype(mlx_rs::Dtype::Bfloat16)
+        .unwrap();
+        let main_actual = crate::metal_kernel::bonsai_q1_qmm(
+            &main_x,
+            &main_weight,
+            &main_scales,
+            &main_biases,
+            GROUP_SIZE,
+        )
+        .unwrap();
+        let main_dense = crate::metal_kernel::bonsai_q1_dequant(
+            &main_weight,
+            &main_scales,
+            &main_biases,
+            GROUP_SIZE,
+        )
+        .unwrap();
+        let main_expected = main_x.matmul(&main_dense.transpose().unwrap()).unwrap();
+        let main_actual_f32 = main_actual.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let main_expected_f32 = main_expected.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&main_actual_f32, &main_expected_f32]).unwrap();
+        for (index, (got, want)) in main_actual_f32
+            .as_slice::<f32>()
+            .iter()
+            .zip(main_expected_f32.as_slice::<f32>())
+            .enumerate()
+        {
+            let tolerance = 0.02_f32 * want.abs().max(1.0);
+            assert!(
+                (*got - *want).abs() <= tolerance,
+                "BF16 main block value {index}: packed={got}, dense={want}, tolerance={tolerance}"
+            );
+        }
     }
 
     #[test]
