@@ -378,18 +378,19 @@ pub fn bonsai_q1_qmv(
 //
 // Ports MLX/PrismML `qmv_fast` tiling onto our uint32 packing: each simdgroup
 // computes RESULTS_PER_SIMDGROUP (4) output rows; each of its 32 lanes holds
-// VPT (64) input values in registers (no threadgroup memory, no barriers) and
-// reuses them across all 4 rows. block_size = 64 * 32 = 2048. The bits=1 affine
+// VPT (32) input values in registers (no threadgroup memory, no barriers) and
+// reuses them across all 4 rows. Keeping one packed word per lane reduces
+// register pressure and raises occupancy for 1-bit weights. The bits=1 affine
 // math is identical to the legacy kernel — `scale * sum(bit*x) + bias * sum(x)`
 // — only the data movement differs. Group scales/biases are per-lane (a lane's
-// 64 values lie in one 128-wide group); per-row partials are simd_sum-reduced.
+// 32 values lie in one 128-wide group); per-row partials are simd_sum-reduced.
 // ---------------------------------------------------------------------------
 
 const FAST_QMV_KERNEL_SOURCE: &str = r"
-constexpr int VPT = 64;          // values_per_thread
+constexpr int VPT = 32;          // values_per_thread (one packed word per lane)
 constexpr int RPS = 4;           // results_per_simdgroup
-constexpr int WPT = VPT / 32;    // packed uint32 words per thread (2)
-constexpr int BLK = VPT * 32;    // block_size = 2048
+constexpr int WPT = VPT / 32;    // packed uint32 words per thread (1)
+constexpr int BLK = VPT * 32;    // block_size = 1024
 
 uint tgx = threadgroup_position_in_grid.x;
 uint sg  = simdgroup_index_in_threadgroup;
