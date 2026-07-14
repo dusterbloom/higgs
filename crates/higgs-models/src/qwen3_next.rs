@@ -5388,8 +5388,16 @@ mod tests {
         assert_eq!(decode_out.as_slice::<f32>(), &[128.0, 256.0]);
         assert_eq!(prefill_out.as_slice::<f32>(), &[128.0, 256.0, 256.0, 512.0]);
         let embedding_values = embedding_out.as_slice::<f32>();
-        assert!(embedding_values[..128].iter().all(|value| *value == 1.0));
-        assert!(embedding_values[128..].iter().all(|value| *value == 2.0));
+        assert!(
+            embedding_values[..128]
+                .iter()
+                .all(|value| (*value - 1.0).abs() <= f32::EPSILON)
+        );
+        assert!(
+            embedding_values[128..]
+                .iter()
+                .all(|value| (*value - 2.0).abs() <= f32::EPSILON)
+        );
     }
 
     #[test]
