@@ -16,6 +16,8 @@
 //! [`crate::qwen3_next`]; the kernel math mirrors
 //! [`crate::bonsai_q1::PackedQ1Linear::dequant_row_to_fp32`]:
 //! `W[r,c] = scale[r, c/G] * bit + bias[r, c/G]`, `bit = (w[r, c/32] >> (c%32)) & 1`.
+//! Checkpoints whose affine metadata is symmetric use an empty bias sentinel;
+//! their kernels derive `bias = -scale / 2` and never read a bias buffer.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
@@ -154,7 +156,7 @@ for (int k_off = 0; k_off < K; k_off += CHUNK) {
 
             int g = idx * 32 / GroupSize;
             float s_val = float(sc[row * NumGroups + g]);
-            float b_val = float(bi[row * NumGroups + g]);
+            float b_val = Symmetric ? (-0.5f * s_val) : float(bi[row * NumGroups + g]);
             acc += s_val * dot_val + b_val * sum_x;
         }
     }
@@ -197,6 +199,7 @@ fn configure_qmv_kernel(
     n_rows: i32,
     k_dim: i32,
     group_size: i32,
+    symmetric: bool,
 ) -> mlx_sys::mlx_fast_metal_kernel_config {
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
@@ -220,6 +223,11 @@ fn configure_qmv_kernel(
             config,
             c"NumGroups".as_ptr(),
             k_dim / group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Symmetric".as_ptr(),
+            i32::from(symmetric),
         );
 
         let nsg = qmv_nsg(k_dim);
@@ -266,13 +274,21 @@ pub fn bonsai_q1_qmv_legacy(
     let x_flat = x.reshape(&[k_dim])?;
     let w_flat = weight.reshape(&[-1])?;
     let s_flat = scales.flatten(None, None)?;
-    let b_flat = biases.flatten(None, None)?;
+    let symmetric = biases.size() == 0;
+    // FastMetal still binds the affine input signature. Reuse the scale array
+    // as a harmless dummy; the `Symmetric` template constant removes the bias
+    // load from the compiled kernel.
+    let b_flat = if symmetric {
+        s_flat.clone()
+    } else {
+        biases.flatten(None, None)?
+    };
 
     let stream = Stream::task_local_or_default();
     let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
 
     let cached = QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_qmv_kernel()));
-    let config = configure_qmv_kernel(out_dtype, n_rows, k_dim, group_size);
+    let config = configure_qmv_kernel(out_dtype, n_rows, k_dim, group_size, symmetric);
 
     let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
     let input_ptrs = [
@@ -436,7 +452,7 @@ for (int k = 0; k < aligned_end; k += BLK) {
             }
         }
         float s_val = float(sc[row * NumGroups + g]);
-        float b_val = float(bi[row * NumGroups + g]);
+        float b_val = Symmetric ? (-0.5f * s_val) : float(bi[row * NumGroups + g]);
         result[r] += s_val * accum + b_val * sum;
     }
 }
@@ -476,7 +492,7 @@ if (aligned_end < K) {
             }
         }
         float s_val = float(sc[row * NumGroups + g]);
-        float b_val = float(bi[row * NumGroups + g]);
+        float b_val = Symmetric ? (-0.5f * s_val) : float(bi[row * NumGroups + g]);
         result[r] += s_val * accum + b_val * sum;
     }
 }
@@ -517,6 +533,7 @@ fn configure_fast_qmv_kernel(
     n_rows: i32,
     k_dim: i32,
     group_size: i32,
+    symmetric: bool,
 ) -> mlx_sys::mlx_fast_metal_kernel_config {
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
@@ -540,6 +557,11 @@ fn configure_fast_qmv_kernel(
             config,
             c"NumGroups".as_ptr(),
             k_dim / group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Symmetric".as_ptr(),
+            i32::from(symmetric),
         );
 
         // Each simdgroup computes 4 rows; nsg simdgroups per threadgroup.
@@ -587,13 +609,18 @@ pub fn bonsai_q1_qmv_fast(
     let x_flat = x.reshape(&[k_dim])?;
     let w_flat = weight.reshape(&[-1])?;
     let s_flat = scales.flatten(None, None)?;
-    let b_flat = biases.flatten(None, None)?;
+    let symmetric = biases.size() == 0;
+    let b_flat = if symmetric {
+        s_flat.clone()
+    } else {
+        biases.flatten(None, None)?
+    };
 
     let stream = Stream::task_local_or_default();
     let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
 
     let cached = FAST_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_qmv_kernel()));
-    let config = configure_fast_qmv_kernel(out_dtype, n_rows, k_dim, group_size);
+    let config = configure_fast_qmv_kernel(out_dtype, n_rows, k_dim, group_size, symmetric);
 
     let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
     let input_ptrs = [
@@ -661,7 +688,7 @@ uint packed = w[gid];
 
 int g = int(idx) * 32 / GroupSize;
 float s_val = float(sc[n * uint(NumGroups) + uint(g)]);
-float b_val = float(bi[n * uint(NumGroups) + uint(g)]);
+float b_val = Symmetric ? (-0.5f * s_val) : float(bi[n * uint(NumGroups) + uint(g)]);
 
 uint base = n * uint(K) + idx * 32u;
 for (uint j = 0u; j < 32u; ++j) {
@@ -697,6 +724,7 @@ fn configure_dequant_kernel(
     n_rows: i32,
     k_dim: i32,
     group_size: i32,
+    symmetric: bool,
 ) -> mlx_sys::mlx_fast_metal_kernel_config {
     let k_packed = k_dim / 32;
     let n_words = n_rows * k_packed;
@@ -727,6 +755,11 @@ fn configure_dequant_kernel(
             config,
             c"NWords".as_ptr(),
             n_words,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Symmetric".as_ptr(),
+            i32::from(symmetric),
         );
 
         let tg: i32 = 256;
@@ -770,13 +803,18 @@ pub fn bonsai_q1_dequant(
 
     let w_flat = weight.reshape(&[-1])?;
     let s_flat = scales.flatten(None, None)?;
-    let b_flat = biases.flatten(None, None)?;
+    let symmetric = biases.size() == 0;
+    let b_flat = if symmetric {
+        s_flat.clone()
+    } else {
+        biases.flatten(None, None)?
+    };
 
     let stream = Stream::task_local_or_default();
     let out_dtype = unsafe { mlx_sys::mlx_array_dtype(scales.as_ptr()) };
 
     let cached = DEQUANT_KERNEL.get_or_init(|| CachedMetalKernel(create_dequant_kernel()));
-    let config = configure_dequant_kernel(out_dtype, n_rows, k_dim, group_size);
+    let config = configure_dequant_kernel(out_dtype, n_rows, k_dim, group_size, symmetric);
 
     let input_ptrs = [w_flat.as_ptr(), s_flat.as_ptr(), b_flat.as_ptr()];
     let inputs_vec =
