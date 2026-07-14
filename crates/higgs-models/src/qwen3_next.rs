@@ -343,6 +343,19 @@ pub(crate) fn init_quantized_params() -> QuantizedParams {
     (placeholder(), placeholder(), placeholder())
 }
 
+/// Zero-sized marker stored in place of validated symmetric Q1 biases.
+///
+/// Q1 affine weights with `bias = -scale / 2` need no resident bias buffer;
+/// the runtime Metal kernels derive it from the scale. A zero-sized array is
+/// distinct from the `[1]` unloaded-parameter placeholder used by the loader.
+fn symmetric_q1_bias_sentinel() -> Array {
+    Array::from_slice::<f32>(&[], &[0])
+}
+
+fn has_symmetric_q1_biases(biases: &Array) -> bool {
+    biases.size() == 0
+}
+
 pub(crate) fn quantized_forward(
     x: &Array,
     weight: &Array,
@@ -723,10 +736,20 @@ impl QEmbedding {
             }
             crate::quant_mode::QuantMode::Affine => {
                 let s = (*self.scales).take_axis(&flat, 0)?;
-                let b = (*self.biases).take_axis(&flat, 0)?;
                 if self.bits == 1 {
-                    crate::metal_kernel::bonsai_q1_dequant(&w, &s, &b, self.group_size)?
+                    if has_symmetric_q1_biases(&self.biases) {
+                        crate::metal_kernel::bonsai_q1_dequant(
+                            &w,
+                            &s,
+                            &self.biases,
+                            self.group_size,
+                        )?
+                    } else {
+                        let b = (*self.biases).take_axis(&flat, 0)?;
+                        crate::metal_kernel::bonsai_q1_dequant(&w, &s, &b, self.group_size)?
+                    }
                 } else {
+                    let b = (*self.biases).take_axis(&flat, 0)?;
                     ops::dequantize(&w, &s, &b, self.group_size, self.bits)?
                 }
             }
@@ -5694,6 +5717,20 @@ impl FfnBlock {
     }
 
     fn dense_hidden_fused(&mut self, x: &Array, use_fused_gemv: bool) -> Result<Array, Exception> {
+        // The optional persistent fusion path expects materialized affine bias
+        // arrays. Symmetric Q1 deliberately drops them; keep the memory-saving
+        // representation and use the normal two-projection path instead.
+        if self
+            .gate_proj
+            .as_ref()
+            .is_some_and(|proj| has_symmetric_q1_biases(&proj.biases))
+            || self
+                .up_proj
+                .as_ref()
+                .is_some_and(|proj| has_symmetric_q1_biases(&proj.biases))
+        {
+            return self.dense_hidden_separate(x);
+        }
         if self.fused_gate_up.is_none() {
             let gp = self
                 .gate_proj
@@ -8420,6 +8457,85 @@ where
     )))
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SymmetricQ1Compaction {
+    tensors: usize,
+    bytes: usize,
+}
+
+fn symmetric_q1_compaction_enabled() -> bool {
+    !std::env::var("HIGGS_BONSAI_SYMMETRIC_Q1").is_ok_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// Whether a Q1 affine bias tensor is exactly `-scale / 2` under the Float32
+/// arithmetic used by the Metal kernel. Any deviation keeps the original bias
+/// tensor and therefore preserves the generic affine fallback exactly.
+fn q1_biases_are_symmetric(scales: &Array, biases: &Array) -> Result<bool, ModelError> {
+    if scales.shape() != biases.shape()
+        || scales.size() == 0
+        || scales.shape() == [1]
+        || biases.shape() == [1]
+    {
+        return Ok(false);
+    }
+
+    let scales_f32 = scales.as_dtype(Dtype::Float32).map_err(ModelError::Mlx)?;
+    let biases_f32 = biases.as_dtype(Dtype::Float32).map_err(ModelError::Mlx)?;
+    let expected = scales_f32
+        .multiply(&Array::from_f32(-0.5))
+        .map_err(ModelError::Mlx)?;
+    let equal = biases_f32
+        .array_eq(&expected, None)
+        .map_err(ModelError::Mlx)?;
+    equal.try_item::<bool>().map_err(ModelError::Mlx)
+}
+
+/// Validate every loaded Q1 scale/bias pair, then replace only symmetric bias
+/// tensors with a zero-sized marker. Non-symmetric affine tensors remain fully
+/// supported and continue through the existing bias-reading kernels.
+fn compact_symmetric_q1_biases(
+    params: &mut HashMap<std::rc::Rc<str>, &mut Array>,
+) -> Result<SymmetricQ1Compaction, ModelError> {
+    let bias_keys = params
+        .keys()
+        .filter(|key| key.ends_with(".biases"))
+        .map(|key| key.to_string())
+        .collect::<Vec<_>>();
+    let mut compacted = SymmetricQ1Compaction::default();
+
+    for bias_key in bias_keys {
+        let Some(scale_key) = bias_key.strip_suffix(".biases") else {
+            continue;
+        };
+        let scale_key = format!("{scale_key}.scales");
+        let Some(scales) = params
+            .get(scale_key.as_str())
+            .map(|value| (**value).clone())
+        else {
+            continue;
+        };
+        let Some(biases) = params.get(bias_key.as_str()).map(|value| (**value).clone()) else {
+            continue;
+        };
+        if !q1_biases_are_symmetric(&scales, &biases)? {
+            continue;
+        }
+
+        compacted.tensors += 1;
+        compacted.bytes = compacted.bytes.saturating_add(biases.nbytes());
+        if let Some(param) = params.get_mut(bias_key.as_str()) {
+            **param = symmetric_q1_bias_sentinel();
+        }
+    }
+
+    Ok(compacted)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MtpWeightLayout {
     None,
@@ -8959,7 +9075,13 @@ pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausa
         head_v_dim: args.linear_value_head_dim,
     };
     gdn_dims.validate()?;
-    let mut model = load_qwen3_5_model_with_gdn_fallback(model_path, args, &gdn_dims)?;
+    let compact_symmetric_q1 = args
+        .quantization
+        .as_ref()
+        .is_some_and(|quantization| quantization.bits == 1)
+        && symmetric_q1_compaction_enabled();
+    let mut model =
+        load_qwen3_5_model_with_gdn_fallback(model_path, args, &gdn_dims, compact_symmetric_q1)?;
 
     // Optional: re-quantize Dense (bf16) GDN in_proj_a/b to 8-bit affine at
     // load time. Saves ~0.7GB/token bandwidth with negligible precision loss
@@ -8974,7 +9096,6 @@ pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausa
             );
         }
     }
-
     tracing::info!("Qwen3.5 dense model loaded successfully");
     Ok(model)
 }
@@ -9015,7 +9136,7 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
     // var or mixed-bit BA detection in load_qwen3_5_moe_text_config_args), and
     // falls back to separate projections at runtime if fusion finds a
     // shape-incompatible BA pair.
-    let model = load_qwen3_5_model_with_gdn_fallback(model_path, args, &gdn_dims)?;
+    let model = load_qwen3_5_model_with_gdn_fallback(model_path, args, &gdn_dims, false)?;
 
     tracing::info!("Qwen3.5-MoE model loaded successfully");
     Ok(model)
@@ -9073,19 +9194,25 @@ fn load_qwen3_5_model_with_gdn_fallback(
     model_path: &Path,
     mut args: Qwen3NextModelArgs,
     gdn_dims: &GdnDims,
+    compact_symmetric_q1: bool,
 ) -> Result<Qwen3NextCausalLM, ModelError> {
     let force_separate =
         args.use_separate_gdn_projections || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
     if force_separate {
         args.use_separate_gdn_projections = true;
         let mut model = Qwen3NextCausalLM::new(args)?;
-        load_qwen3_5_moe_weights_direct(&mut model, model_path)?;
+        load_qwen3_5_moe_weights_direct(&mut model, model_path, compact_symmetric_q1)?;
         tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
         return Ok(model);
     }
 
     let mut fused_model = Qwen3NextCausalLM::new(args.clone())?;
-    match load_qwen3_5_moe_weights_fused(&mut fused_model, model_path, gdn_dims) {
+    match load_qwen3_5_moe_weights_fused(
+        &mut fused_model,
+        model_path,
+        gdn_dims,
+        compact_symmetric_q1,
+    ) {
         Ok(()) => {
             tracing::info!("Using FUSED GDN projections (2 dispatches per layer)");
             Ok(fused_model)
@@ -9097,7 +9224,7 @@ fn load_qwen3_5_model_with_gdn_fallback(
             );
             args.use_separate_gdn_projections = true;
             let mut separate_model = Qwen3NextCausalLM::new(args)?;
-            load_qwen3_5_moe_weights_direct(&mut separate_model, model_path)?;
+            load_qwen3_5_moe_weights_direct(&mut separate_model, model_path, compact_symmetric_q1)?;
             tracing::info!(
                 "Using SEPARATE GDN projections (4 dispatches per layer, mixed-bit fallback)"
             );
@@ -9362,6 +9489,7 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
 fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
+    compact_symmetric_q1: bool,
 ) -> Result<(), crate::error::ModelError> {
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
     let mut params = model.parameters_mut().flatten();
@@ -9422,6 +9550,15 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     )?;
     tracing::info!(param_count, matched, "Total model parameters loaded");
 
+    if compact_symmetric_q1 {
+        let compacted = compact_symmetric_q1_biases(&mut params)?;
+        tracing::info!(
+            tensors = compacted.tensors,
+            bytes = compacted.bytes,
+            "Dropped validated symmetric Q1 bias tensors"
+        );
+    }
+
     model
         .eval()
         .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
@@ -9436,6 +9573,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
     gdn_dims: &GdnDims,
+    compact_symmetric_q1: bool,
 ) -> Result<(), crate::error::ModelError> {
     use std::collections::HashMap;
 
@@ -9553,6 +9691,15 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             .iter()
             .map(|(name, value)| (std::rc::Rc::<str>::clone(name), &**value)),
     )?;
+
+    if compact_symmetric_q1 {
+        let compacted = compact_symmetric_q1_biases(&mut params)?;
+        tracing::info!(
+            tensors = compacted.tensors,
+            bytes = compacted.bytes,
+            "Dropped validated symmetric Q1 bias tensors"
+        );
+    }
 
     model
         .eval()
@@ -9802,6 +9949,85 @@ mod tests {
             apply_rope_manual_with_freqs(&x_bf16, &positions, dims, 10_000.0, 1.0, Some(&freqs))
                 .unwrap();
         assert_eq!(out.dtype(), mlx_rs::Dtype::Bfloat16);
+    }
+
+    #[test]
+    fn symmetric_q1_linear_and_embedding_paths_derive_bias() {
+        let group_size = 128;
+        let input_dim = 128;
+        let weight = Array::from_slice(
+            &[
+                0_u32,
+                0,
+                0,
+                0, // row 0: bit=0, scale=2 => -1
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX, // row 1: bit=1, scale=4 => +2
+            ],
+            &[2, input_dim / 32],
+        );
+        let scales = Array::from_slice(&[2.0_f32, 4.0], &[2, 1]);
+        let no_biases = symmetric_q1_bias_sentinel();
+
+        let decode = Array::from_slice(&vec![1.0_f32; input_dim as usize], &[1, 1, input_dim]);
+        let decode_out =
+            affine_q1_forward(&decode, &weight, &scales, &no_biases, group_size).unwrap();
+
+        let mut prefill_values = vec![1.0_f32; input_dim as usize];
+        prefill_values.extend(vec![2.0_f32; input_dim as usize]);
+        let prefill = Array::from_slice(&prefill_values, &[1, 2, input_dim]);
+        let prefill_out =
+            affine_q1_forward(&prefill, &weight, &scales, &no_biases, group_size).unwrap();
+
+        let mut embedding = QEmbedding::new(group_size, 1).unwrap();
+        embedding.weight = Param::new(weight);
+        embedding.scales = Param::new(scales);
+        embedding.biases = Param::new(no_biases);
+        let ids = Array::from_slice(&[0_u32, 1], &[1, 2]);
+        let embedding_out = embedding.forward(&ids).unwrap();
+
+        mlx_rs::transforms::eval([&decode_out, &prefill_out, &embedding_out]).unwrap();
+        assert_eq!(decode_out.as_slice::<f32>(), &[-128.0, 256.0]);
+        assert_eq!(
+            prefill_out.as_slice::<f32>(),
+            &[-128.0, 256.0, -256.0, 512.0]
+        );
+        let embedding_values = embedding_out.as_slice::<f32>();
+        assert!(
+            embedding_values[..128]
+                .iter()
+                .all(|value| (*value + 1.0).abs() <= f32::EPSILON)
+        );
+        assert!(
+            embedding_values[128..]
+                .iter()
+                .all(|value| (*value - 2.0).abs() <= f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn symmetric_q1_bias_validation_and_compaction_preserve_affine_fallback() {
+        const FP16_MIN_SUBNORMAL: f32 = 5.960_464_5e-8;
+
+        let mut scales = Array::from_slice(&[2.0_f32, 4.0, 6.0, 2.0 * FP16_MIN_SUBNORMAL], &[2, 2]);
+        let mut symmetric =
+            Array::from_slice(&[-1.0_f32, -2.0, -3.0, -FP16_MIN_SUBNORMAL], &[2, 2]);
+        assert!(q1_biases_are_symmetric(&scales, &symmetric).unwrap());
+
+        let asymmetric = Array::from_slice(&[-1.0_f32, -2.0, -3.0, 0.0], &[2, 2]);
+        assert!(!q1_biases_are_symmetric(&scales, &asymmetric).unwrap());
+
+        let mut params = HashMap::new();
+        params.insert(std::rc::Rc::<str>::from("layer.scales"), &mut scales);
+        params.insert(std::rc::Rc::<str>::from("layer.biases"), &mut symmetric);
+        let compacted = compact_symmetric_q1_biases(&mut params).unwrap();
+        drop(params);
+
+        assert_eq!(compacted.tensors, 1);
+        assert_eq!(compacted.bytes, 4 * std::mem::size_of::<f32>());
+        assert!(has_symmetric_q1_biases(&symmetric));
     }
 
     #[test]
