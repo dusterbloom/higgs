@@ -4602,6 +4602,8 @@ pub struct GdnLayerTape {
     pub conv_state_init: Option<Array>,
     /// Pre-forward `ssm_state` for rollback: `[B, Hv, Dv, Dk]`
     pub ssm_state_init: Option<Array>,
+    /// Pre-forward convolution ring cursor for rollback
+    pub conv_pos_init: i32,
     /// Pre-forward cache offset for rollback
     pub offset_init: i32,
 }
@@ -5514,15 +5516,13 @@ impl GatedDeltaNet {
         // Capture initial state for rollback (Python `_GDNStateCapture` equivalent)
         let conv_state_init = cache.conv_state.clone();
         let ssm_state_init = cache.ssm_state.clone();
+        let conv_pos_init = cache.conv_pos;
         let offset_init = cache.offset;
 
-        let conv_state = match cache.conv_state.take() {
-            Some(state) => state,
-            None => ops::zeros_dtype(
-                &[B, self.conv_kernel_size - 1, self.conv_dim],
-                inputs.dtype(),
-            )?,
-        };
+        // Single-token decode keeps convolution history as a ring buffer. A
+        // block verify needs the same history in chronological order before
+        // appending the drafted positions.
+        let conv_state = self.chronological_conv_state(cache, B, inputs.dtype())?;
         let conv_input = ops::concatenate_axis(&[&conv_state, &mixed_qkv], 1)?;
 
         let n_keep = self.conv_kernel_size - 1;
@@ -5534,6 +5534,7 @@ impl GatedDeltaNet {
         let cs = conv_input.index((.., keep_start.., ..));
         let cs_shape = cs.shape().to_vec();
         cache.conv_state = Some(cs.flatten(None, None)?.reshape(&cs_shape)?);
+        cache.conv_pos = if n_keep > 0 { n_keep - 1 } else { -1 };
 
         let conv_out = if S > 1 && S <= 32 {
             let wt = match &self.conv_weight_t {
@@ -5646,6 +5647,7 @@ impl GatedDeltaNet {
             qkv_input: qkv_for_replay,
             conv_state_init,
             ssm_state_init,
+            conv_pos_init,
             offset_init,
         };
 
@@ -8010,6 +8012,7 @@ impl Qwen3NextCausalLM {
                         // Restore from tape-captured initial state (Python _GDNStateCapture equivalent)
                         ac.conv_state.clone_from(&tape.conv_state_init);
                         ac.ssm_state.clone_from(&tape.ssm_state_init);
+                        ac.conv_pos = tape.conv_pos_init;
                         ac.offset = tape.offset_init;
 
                         let gdn_layer = self.model.layers[i]
@@ -8112,20 +8115,20 @@ impl Qwen3NextCausalLM {
             let start = offset as i32;
             let new_state = batched_new_state.index((start..start + 1, .., .., ..));
             ac.ssm_state = Some(new_state);
-            ac.offset += n_accepted;
 
             // Rebuild conv_state from recorded qkv input
             let ks = entry.layer.conv_kernel_size;
             let n_keep = ks - 1;
             if n_keep > 0 {
                 let qkv_slice = entry.tape.qkv_input.index((.., ..n_accepted, ..));
-                let prefix = match &ac.conv_state {
-                    Some(cs) => cs.clone(),
-                    None => ops::zeros_dtype(
-                        &[1, n_keep, entry.layer.conv_dim],
-                        entry.tape.qkv_input.dtype(),
-                    )?,
-                };
+                let batch = *entry.tape.qkv_input.shape().first().ok_or_else(|| {
+                    Exception::custom("conv rebuild: qkv input missing batch dim")
+                })?;
+                let prefix = entry.layer.chronological_conv_state(
+                    ac,
+                    batch,
+                    entry.tape.qkv_input.dtype(),
+                )?;
                 let full = ops::concatenate_axis(&[&prefix, &qkv_slice], 1)?;
                 let total_len = *full
                     .shape()
@@ -8135,7 +8138,11 @@ impl Qwen3NextCausalLM {
                 let cs = full.index((.., cs_start.., ..));
                 let cs_shape = cs.shape().to_vec();
                 ac.conv_state = Some(cs.flatten(None, None)?.reshape(&cs_shape)?);
+                ac.conv_pos = n_keep - 1;
+            } else {
+                ac.conv_pos = -1;
             }
+            ac.offset += n_accepted;
         }
 
         Ok(())
@@ -11959,6 +11966,234 @@ mod tests {
             t_replay * 1e3,
             t_forward * 1e3,
             t_replay / t_forward
+        );
+    }
+
+    fn tape_transition_dense_weight(shape: &[i32]) -> Array {
+        let weight = mlx_rs::random::uniform::<f32, f32>(-0.05, 0.05, shape, None)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        weight.eval().unwrap();
+        weight
+    }
+
+    fn install_tape_transition_dense(linear: &mut QLinear, rows: i32, columns: i32) {
+        linear.weight = Param::new(tape_transition_dense_weight(&[rows, columns]));
+        linear.scales = Param::new(Array::from_slice::<f32>(&[], &[0]));
+        linear.biases = Param::new(Array::from_slice::<f32>(&[], &[0]));
+        linear.group_size = 64;
+        linear.bits = 0;
+        linear.mode = crate::quant_mode::QuantMode::Dense;
+    }
+
+    fn tape_transition_model() -> Qwen3NextCausalLM {
+        let mut args = valid_causal_lm_args();
+        args.num_experts = 0;
+        args.num_experts_per_tok = 0;
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 0,
+            mode: crate::quant_mode::QuantMode::Dense,
+        });
+        let hidden_size = args.hidden_size;
+        let mut model = Qwen3NextCausalLM::new(args).unwrap();
+        let gdn = model.model.layers[0]
+            .linear_attn
+            .as_mut()
+            .expect("layer 0 must be GDN");
+        let value_dim = gdn.num_v_heads * gdn.head_v_dim;
+        install_tape_transition_dense(
+            &mut gdn.in_proj_qkvz,
+            2 * (gdn.key_dim + value_dim),
+            hidden_size,
+        );
+        install_tape_transition_dense(&mut gdn.in_proj_ba, 2 * gdn.num_v_heads, hidden_size);
+        install_tape_transition_dense(&mut gdn.out_proj, hidden_size, value_dim);
+        gdn.conv1d.weight = Param::new(tape_transition_dense_weight(&[
+            gdn.conv_dim,
+            gdn.conv_kernel_size,
+            1,
+        ]));
+        gdn.norm.weight = Param::new(
+            Array::ones::<f32>(&[gdn.head_v_dim])
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+        gdn.conv_weight_t = None;
+        model
+    }
+
+    fn tape_transition_input(seq_len: i32, hidden_size: i32) -> Array {
+        let input =
+            mlx_rs::random::uniform::<f32, f32>(-0.25, 0.25, &[1, seq_len, hidden_size], None)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+        input.eval().unwrap();
+        input
+    }
+
+    fn run_gdn_ar_steps(gdn: &mut GatedDeltaNet, inputs: &Array, cache: &mut ArraysCache) -> Array {
+        let seq_len = inputs.shape()[1];
+        let mut outputs = Vec::with_capacity(seq_len as usize);
+        for index in 0..seq_len {
+            let input = inputs.index((.., index..index + 1, ..));
+            let output = gdn.forward(&input, None, cache).unwrap();
+            output.eval().unwrap();
+            cache.eval_arrays().unwrap();
+            outputs.push(output);
+        }
+        let refs: Vec<&Array> = outputs.iter().collect();
+        ops::concatenate_axis(&refs, 1).unwrap()
+    }
+
+    fn chronological_tape_transition_state(gdn: &GatedDeltaNet, cache: &ArraysCache) -> Array {
+        let dtype = cache
+            .conv_state
+            .as_ref()
+            .map_or(Dtype::Bfloat16, Array::dtype);
+        let mut copy = cache.deep_clone();
+        gdn.chronological_conv_state(&mut copy, 1, dtype).unwrap()
+    }
+
+    fn assert_tape_transition_close(label: &str, actual: &Array, expected: &Array, limit: f32) {
+        let actual = actual.as_dtype(Dtype::Float32).unwrap();
+        let expected = expected.as_dtype(Dtype::Float32).unwrap();
+        let diff = actual
+            .subtract(&expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        diff.eval().unwrap();
+        let max_diff: f32 = diff.item();
+        assert!(
+            max_diff <= limit,
+            "{label} max diff {max_diff} exceeds {limit}"
+        );
+    }
+
+    fn warm_rotated_tape_transition_cache(model: &mut Qwen3NextCausalLM) -> ArraysCache {
+        let hidden_size = model.args.hidden_size;
+        let warmup = tape_transition_input(5, hidden_size);
+        let mut cache = ArraysCache::new();
+        let gdn = model.model.layers[0]
+            .linear_attn
+            .as_mut()
+            .expect("layer 0 must be GDN");
+        run_gdn_ar_steps(gdn, &warmup, &mut cache);
+        let canonical_pos = gdn.conv_kernel_size - 2;
+        assert_ne!(
+            cache.conv_pos, canonical_pos,
+            "warmup must leave the convolution ring rotated"
+        );
+        cache
+    }
+
+    #[test]
+    fn test_gdn_tape_block_after_ar_ring_matches_sequential() {
+        let mut model = tape_transition_model();
+        let mut tape_cache = warm_rotated_tape_transition_cache(&mut model);
+        let mut ar_cache = tape_cache.deep_clone();
+        let block = tape_transition_input(4, model.args.hidden_size);
+
+        let mut ar_gdn = model.model.layers[0]
+            .linear_attn
+            .as_ref()
+            .expect("layer 0 must be GDN")
+            .clone();
+        let ar_output = run_gdn_ar_steps(&mut ar_gdn, &block, &mut ar_cache);
+        let (tape_output, _) = model.model.layers[0]
+            .linear_attn
+            .as_mut()
+            .expect("layer 0 must be GDN")
+            .forward_with_tape(&block, None, &mut tape_cache)
+            .unwrap();
+        mlx_rs::transforms::eval([&ar_output, &tape_output]).unwrap();
+
+        assert_tape_transition_close("AR-to-block output", &tape_output, &ar_output, 2e-2);
+        assert_tape_transition_close(
+            "AR-to-block SSM state",
+            tape_cache.ssm_state.as_ref().unwrap(),
+            ar_cache.ssm_state.as_ref().unwrap(),
+            1e-4,
+        );
+        let tape_conv = chronological_tape_transition_state(&ar_gdn, &tape_cache);
+        let ar_conv = chronological_tape_transition_state(&ar_gdn, &ar_cache);
+        assert_tape_transition_close("AR-to-block conv state", &tape_conv, &ar_conv, 1e-3);
+        assert_eq!(tape_cache.offset, ar_cache.offset);
+        assert_eq!(tape_cache.conv_pos, ar_gdn.conv_kernel_size - 2);
+    }
+
+    #[test]
+    fn test_gdn_tape_partial_rollback_after_ar_ring_matches_sequential() {
+        let mut model = tape_transition_model();
+        let mut tape_cache = warm_rotated_tape_transition_cache(&mut model);
+        let initial_conv_pos = tape_cache.conv_pos;
+        let mut ar_cache = tape_cache.deep_clone();
+        let block = tape_transition_input(4, model.args.hidden_size);
+        let accepted = 2;
+
+        let mut ar_gdn = model.model.layers[0]
+            .linear_attn
+            .as_ref()
+            .expect("layer 0 must be GDN")
+            .clone();
+        run_gdn_ar_steps(
+            &mut ar_gdn,
+            &block.index((.., ..accepted, ..)),
+            &mut ar_cache,
+        );
+
+        let (_, tape) = model.model.layers[0]
+            .linear_attn
+            .as_mut()
+            .expect("layer 0 must be GDN")
+            .forward_with_tape(&block, None, &mut tape_cache)
+            .unwrap();
+        assert_eq!(tape.conv_pos_init, initial_conv_pos);
+
+        let mut caches = vec![Some(LayerCache::Arrays(tape_cache))];
+        model
+            .replay_tape_rollback(&[Some(tape)], &mut caches, accepted, 4 - accepted)
+            .unwrap();
+        let Some(LayerCache::Arrays(mut replay_cache)) = caches.pop().flatten() else {
+            panic!("expected replayed Arrays cache");
+        };
+        replay_cache.eval_arrays().unwrap();
+
+        assert_eq!(replay_cache.offset, ar_cache.offset);
+        assert_tape_transition_close(
+            "partial rollback SSM state",
+            replay_cache.ssm_state.as_ref().unwrap(),
+            ar_cache.ssm_state.as_ref().unwrap(),
+            1e-4,
+        );
+        let replay_conv = chronological_tape_transition_state(&ar_gdn, &replay_cache);
+        let ar_conv = chronological_tape_transition_state(&ar_gdn, &ar_cache);
+        assert_tape_transition_close("partial rollback conv state", &replay_conv, &ar_conv, 1e-3);
+
+        // A following AR token exercises the restored/canonicalized cursor,
+        // not just the equivalent history values.
+        let next = tape_transition_input(1, model.args.hidden_size);
+        let ar_next = run_gdn_ar_steps(&mut ar_gdn, &next, &mut ar_cache);
+        let replay_next = run_gdn_ar_steps(
+            model.model.layers[0]
+                .linear_attn
+                .as_mut()
+                .expect("layer 0 must be GDN"),
+            &next,
+            &mut replay_cache,
+        );
+        assert_tape_transition_close("post-rollback AR output", &replay_next, &ar_next, 2e-2);
+        assert_tape_transition_close(
+            "post-rollback AR SSM state",
+            replay_cache.ssm_state.as_ref().unwrap(),
+            ar_cache.ssm_state.as_ref().unwrap(),
+            1e-4,
         );
     }
 
