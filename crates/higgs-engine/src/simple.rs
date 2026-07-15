@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard};
 use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties,
-    dflash::{DFlashConfig, DFlashDrafter, accept_prefix, crop_drafter_cache},
+    dflash::{DFlashCache, DFlashConfig, DFlashDrafter, accept_prefix},
     sample,
     turboquant::KvCacheConfig,
 };
@@ -136,6 +136,10 @@ fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
 fn experimental_paged_kv_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_EXPERIMENTAL_PAGED_KV").ok().as_deref())
         .unwrap_or(false)
+}
+
+fn prefix_cache_enabled() -> bool {
+    parse_enabled_flag(std::env::var("HIGGS_PREFIX_CACHE").ok().as_deref()).unwrap_or(true)
 }
 
 fn prompt_lookup_enabled() -> bool {
@@ -265,6 +269,84 @@ fn dflash_verify_input(anchor: i32, proposal: &DflashProposal) -> Result<Array, 
         .as_dtype(mlx_rs::Dtype::Int32)
         .map_err(EngineError::Mlx)?;
     mlx_rs::ops::concatenate_axis(&[&anchor_array, &draft_i32], 1).map_err(EngineError::Mlx)
+}
+
+fn dflash_canonical_target_is_terminal(
+    position: usize,
+    target: u32,
+    draft_tokens: &[u32],
+    eos_token_ids: &[u32],
+    textual_stop: bool,
+    think_close_token: Option<u32>,
+) -> bool {
+    draft_tokens
+        .get(position)
+        .is_none_or(|draft| *draft != target)
+        || eos_token_ids.contains(&target)
+        || textual_stop
+        || think_close_token == Some(target)
+}
+
+fn dflash_new_stop_prefix_len<E, F>(
+    existing: &[u32],
+    candidates: &[u32],
+    stop_sequences: &[String],
+    mut decode: F,
+) -> Result<Option<usize>, E>
+where
+    F: FnMut(&[u32]) -> Result<String, E>,
+{
+    if stop_sequences.is_empty() {
+        return Ok(None);
+    }
+    let mut prefix = Vec::with_capacity(existing.len() + candidates.len());
+    prefix.extend_from_slice(existing);
+    let mut previous_text = decode(&prefix)?;
+    for (index, &candidate) in candidates.iter().enumerate() {
+        prefix.push(candidate);
+        let text = decode(&prefix)?;
+        let mut common_prefix = previous_text
+            .as_bytes()
+            .iter()
+            .zip(text.as_bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        while common_prefix > 0 && !text.is_char_boundary(common_prefix) {
+            common_prefix -= 1;
+        }
+        let new_len = text.len().saturating_sub(common_prefix);
+        if new_len > 0 && find_stop_in_tail(&text, new_len, stop_sequences).is_some() {
+            return Ok(Some(index + 1));
+        }
+        previous_text = text;
+    }
+    Ok(None)
+}
+
+fn dflash_resolve_target_then_draft<T, D, FT, FD>(
+    resolve_target: FT,
+    resolve_draft: FD,
+) -> Result<(T, D), EngineError>
+where
+    FT: FnOnce() -> Result<T, EngineError>,
+    FD: FnOnce() -> Result<D, EngineError>,
+{
+    // This ordering is a performance invariant: target resolution is the
+    // round's synchronization barrier, while the proposal remains on-device.
+    let target = resolve_target()?;
+    let draft = resolve_draft()?;
+    Ok((target, draft))
+}
+
+/// Narrow only dSpark's sequential proposal/verify prefix at a hard output
+/// boundary. The diffusion trunk retains its fixed trained block size.
+fn dflash_tail_draft_cap(configured: i32, remaining: usize, is_dspark: bool) -> i32 {
+    if !is_dspark {
+        return configured;
+    }
+    let useful = remaining.saturating_sub(1).max(1);
+    let useful = i32::try_from(useful).unwrap_or(i32::MAX);
+    configured.min(useful)
 }
 
 /// Turn a DFlash/dSpark trunk output into draft tokens.
@@ -531,6 +613,266 @@ pub struct CacheStats {
 /// yet and return explicit errors instead of placeholder output.
 /// `DFlash` block-diffusion speculative decoding state, held alongside the
 /// target model when a drafter is loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DFlashVerifyMode {
+    /// Fold the target's ordinary one-token transition until first rejection.
+    /// This is the fail-closed dSpark default and never needs rollback.
+    CanonicalS1,
+    /// Experimental S>1 target forward plus GDN innovation-tape commit.
+    BatchedTape,
+}
+
+impl DFlashVerifyMode {
+    fn for_drafter(is_dspark: bool, configured: Option<&str>) -> Self {
+        if !is_dspark {
+            return Self::BatchedTape;
+        }
+        match configured
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("block" | "batched" | "batched-tape") => Self::BatchedTape,
+            Some("canonical" | "sequential" | "s1") | None => Self::CanonicalS1,
+            // Unknown values fail closed instead of silently enabling an
+            // unproven numerical schedule.
+            Some(_) => Self::CanonicalS1,
+        }
+    }
+
+    /// Resolve the verifier inside the policy boundary it can preserve.
+    ///
+    /// The tape verifier does not yet own a transactional RNG/history or a
+    /// forced-token policy. Those requests therefore use the commit-only S=1
+    /// oracle even when block mode was selected for greedy profiling.
+    #[allow(clippy::float_cmp)]
+    fn for_request(
+        self,
+        is_dspark: bool,
+        params: &SamplingParams,
+        forced_token_policy: bool,
+    ) -> Self {
+        if is_dspark && (params.temperature != 0.0 || params.has_penalties() || forced_token_policy)
+        {
+            Self::CanonicalS1
+        } else {
+            self
+        }
+    }
+}
+
+/// Target-state ownership for one `DFlash` verification round.
+///
+/// A canonical round contains only already-committed S=1 transitions. A tape
+/// round owns every artifact needed to select one prefix from tentative S>1
+/// state. Keeping those cases distinct prevents a later output policy from
+/// accidentally applying rollback to committed state, or skipping rollback on
+/// tentative state.
+enum DFlashVerifyRound {
+    Committed {
+        target_tokens: Vec<u32>,
+        output_tokens: Vec<u32>,
+        taps: Vec<Array>,
+        pending_replaced: bool,
+        expected_taps: usize,
+    },
+    TentativeTape {
+        target_rows: i32,
+        target_tokens: Vec<u32>,
+        output_tokens: Vec<u32>,
+        taps: Vec<Array>,
+        layer_tapes: Vec<Option<higgs_models::qwen3_next::GdnLayerTape>>,
+        pending_replaced: bool,
+        expected_taps: usize,
+    },
+}
+
+impl DFlashVerifyRound {
+    fn committed(target_tokens: Vec<u32>, taps: Vec<Array>, expected_taps: usize) -> Self {
+        let output_tokens = target_tokens.clone();
+        Self::Committed {
+            target_tokens,
+            output_tokens,
+            taps,
+            pending_replaced: false,
+            expected_taps,
+        }
+    }
+
+    fn output_tokens(&self) -> &[u32] {
+        match self {
+            Self::Committed { output_tokens, .. } | Self::TentativeTape { output_tokens, .. } => {
+                output_tokens
+            }
+        }
+    }
+
+    fn target_tokens(&self) -> &[u32] {
+        match self {
+            Self::Committed { target_tokens, .. } | Self::TentativeTape { target_tokens, .. } => {
+                target_tokens
+            }
+        }
+    }
+
+    fn target_rows(&self) -> Result<i32, EngineError> {
+        match self {
+            Self::Committed { target_tokens, .. } => i32::try_from(target_tokens.len())
+                .map_err(|_| EngineError::Generation("committed target rows overflow".to_owned())),
+            Self::TentativeTape { target_rows, .. } => Ok(*target_rows),
+        }
+    }
+
+    fn validate_output_boundary(&self) -> Result<i32, EngineError> {
+        let target_rows = self.target_rows()?;
+        let (taps, expected_taps) = match self {
+            Self::Committed {
+                taps,
+                expected_taps,
+                ..
+            }
+            | Self::TentativeTape {
+                taps,
+                expected_taps,
+                ..
+            } => (taps, *expected_taps),
+        };
+        if taps.len() != expected_taps {
+            return Err(EngineError::Generation(format!(
+                "verifier returned {} taps for {expected_taps} configured layers",
+                taps.len()
+            )));
+        }
+        let target_count = i32::try_from(self.target_tokens().len())
+            .map_err(|_| EngineError::Generation("target token count overflow".to_owned()))?;
+        if target_count != target_rows {
+            return Err(EngineError::Generation(format!(
+                "verifier produced {target_count} target tokens for {target_rows} rows"
+            )));
+        }
+        let output_count = i32::try_from(self.output_tokens().len())
+            .map_err(|_| EngineError::Generation("output token count overflow".to_owned()))?;
+        if output_count <= 0 || output_count > target_rows {
+            return Err(EngineError::Generation(format!(
+                "verifier retained {output_count} outputs for {target_rows} target rows"
+            )));
+        }
+        if matches!(self, Self::Committed { .. }) && output_count != target_rows {
+            return Err(EngineError::Generation(format!(
+                "committed verifier advanced {target_rows} rows but output policy retained {output_count}"
+            )));
+        }
+        let (target_tokens, output_tokens, pending_replaced) = match self {
+            Self::Committed {
+                target_tokens,
+                output_tokens,
+                pending_replaced,
+                ..
+            }
+            | Self::TentativeTape {
+                target_tokens,
+                output_tokens,
+                pending_replaced,
+                ..
+            } => (target_tokens, output_tokens, pending_replaced),
+        };
+        let output_len = usize::try_from(output_count)
+            .map_err(|_| EngineError::Generation("negative verifier output count".to_owned()))?;
+        let exact_prefix_len = output_len.saturating_sub(usize::from(*pending_replaced));
+        if target_tokens.get(..exact_prefix_len) != output_tokens.get(..exact_prefix_len) {
+            return Err(EngineError::Generation(
+                "verifier outputs are not a prefix of target tokens".to_owned(),
+            ));
+        }
+        for (tap_index, tap) in taps.iter().enumerate() {
+            let tap_rows = tap.shape().get(1).copied().ok_or_else(|| {
+                EngineError::Generation(format!("verifier tap {tap_index} has no token axis"))
+            })?;
+            if tap_rows != target_rows {
+                return Err(EngineError::Generation(format!(
+                    "verifier tap {tap_index} has {tap_rows} rows for {target_rows} target rows"
+                )));
+            }
+        }
+        Ok(output_count)
+    }
+
+    /// Replace the final pending output token without pretending that a later
+    /// target transition was conditioned on the replacement. Tentative rows
+    /// after `index` are discarded transactionally; committed rounds may only
+    /// replace their already-final row.
+    fn replace_pending_output(&mut self, index: usize, token: u32) -> Result<(), EngineError> {
+        let committed = matches!(self, Self::Committed { .. });
+        let (output_tokens, pending_replaced) = match self {
+            Self::Committed {
+                output_tokens,
+                pending_replaced,
+                ..
+            }
+            | Self::TentativeTape {
+                output_tokens,
+                pending_replaced,
+                ..
+            } => (output_tokens, pending_replaced),
+        };
+        if index >= output_tokens.len() {
+            return Err(EngineError::Generation(format!(
+                "pending replacement index {index} exceeds {} verifier outputs",
+                output_tokens.len()
+            )));
+        }
+        if committed && index + 1 != output_tokens.len() {
+            return Err(EngineError::Generation(
+                "committed verifier cannot replace a non-final output".to_owned(),
+            ));
+        }
+        output_tokens.truncate(index + 1);
+        let pending = output_tokens.last_mut().ok_or_else(|| {
+            EngineError::Generation("pending replacement removed every output".to_owned())
+        })?;
+        *pending = token;
+        *pending_replaced = true;
+        Ok(())
+    }
+
+    fn commit_target_state(
+        self,
+        model: &AnyModel,
+        cache: &mut AnyCache,
+    ) -> Result<(Vec<u32>, Vec<Array>), EngineError> {
+        let output_count = self.validate_output_boundary()?;
+        match &self {
+            Self::TentativeTape {
+                target_rows,
+                layer_tapes,
+                ..
+            } if output_count < *target_rows => {
+                model
+                    .replay_tape_rollback(
+                        layer_tapes,
+                        cache,
+                        output_count,
+                        *target_rows - output_count,
+                    )
+                    .map_err(EngineError::Mlx)?;
+            }
+            Self::Committed { .. } | Self::TentativeTape { .. } => {}
+        }
+        Ok(match self {
+            Self::Committed {
+                output_tokens,
+                taps,
+                ..
+            }
+            | Self::TentativeTape {
+                output_tokens,
+                taps,
+                ..
+            } => (output_tokens, taps),
+        })
+    }
+}
+
 struct DFlashState {
     drafter: Mutex<DFlashDrafter>,
     tap_layers: Vec<usize>,
@@ -538,10 +880,21 @@ struct DFlashState {
     /// Number of dSpark positions sent through its vocabulary head and target
     /// verifier. The non-causal trunk still runs at its full trained block.
     draft_cap: i32,
+    is_dspark: bool,
     /// Use Bonsai's packed Q1 target head for base logits instead of dSpark's
     /// frozen Q4 copy. Verification keeps output exact either way.
     dspark_target_head: bool,
+    verify_mode: DFlashVerifyMode,
     mask_token_id: i32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+struct GenerationPhaseTiming {
+    prefill: std::time::Duration,
+    decode: std::time::Duration,
+    request: std::time::Duration,
+    decode_tokens: u32,
 }
 
 pub struct SimpleEngine {
@@ -591,6 +944,19 @@ pub struct SimpleEngine {
     /// when `HIGGS_DFLASH_PATH` points at a drafter checkpoint.
     dflash: Option<DFlashState>,
     last_dflash_accepts: std::sync::Mutex<Vec<u32>>,
+    /// Proposed draft tokens that matched the target before output truncation,
+    /// recorded once per DFlash round for exact acceptance telemetry.
+    last_dflash_draft_matches: std::sync::Mutex<Vec<u32>>,
+    /// Proposed draft-token count per round (the final length-bounded round may
+    /// be narrower than the configured cap).
+    last_dflash_draft_counts: std::sync::Mutex<Vec<u32>>,
+    /// Most recent plain-AR phase timing. Kept alongside the existing DFlash
+    /// telemetry so the paired release harness can compare identical phase
+    /// boundaries without scraping rounded tracing output.
+    last_ar_timing: std::sync::Mutex<Option<GenerationPhaseTiming>>,
+    /// Most recent DFlash phase timing, using the same first-token/prefill and
+    /// remaining-token/decode convention as [`Self::last_ar_timing`].
+    last_dflash_timing: std::sync::Mutex<Option<GenerationPhaseTiming>>,
 }
 
 /// A live KV cache retained across tool turns for a conversation, so the next
@@ -696,6 +1062,13 @@ pub struct SessionGeneration {
 }
 
 impl SimpleEngine {
+    #[allow(clippy::float_cmp)]
+    fn sampled_dspark_requires_ar(&self, params: &SamplingParams) -> bool {
+        self.dflash
+            .as_ref()
+            .is_some_and(|dflash| dflash.is_dspark && params.temperature != 0.0)
+    }
+
     /// Load a model and tokenizer from a directory.
     pub fn load<P: AsRef<Path>>(
         dir: P,
@@ -912,7 +1285,7 @@ impl SimpleEngine {
             })
             .map(|dp| -> Result<DFlashState, EngineError> {
                 tracing::info!(drafter = %dp.display(), "Loading DFlash drafter");
-                let drafter = model_loader::load_dflash_drafter(&dp)?;
+                let drafter = model_loader::load_dflash_drafter(&dp, model_dir)?;
                 validate_dspark_target(&model, &drafter.config)?;
                 let tap_layers = drafter.config.target_layer_ids().to_vec();
                 // Decode block size: HIGGS_DFLASH_BLOCK_SIZE overrides the
@@ -932,11 +1305,11 @@ impl SimpleEngine {
                         .map_or(trained_block, |v| v.min(trained_block))
                 };
                 let draft_cap = if drafter.config.is_dspark() {
-                    let tuned_default = if drafter.config.reuse_target_head() {
-                        trained_block
-                    } else {
-                        trained_block.min(3)
-                    };
+                    // Prism trains and publishes dSpark with four proposal
+                    // positions; keep the reference schedule for both the full
+                    // Q4 head and target-head sidecars. Any smaller cap is an
+                    // explicit experiment, never an implicit Apple default.
+                    let tuned_default = trained_block;
                     std::env::var("HIGGS_DSPARK_DRAFT_CAP")
                         .ok()
                         .and_then(|v| v.parse::<i32>().ok())
@@ -948,12 +1321,44 @@ impl SimpleEngine {
                 let dspark_target_head = drafter.config.is_dspark()
                     && (drafter.config.reuse_target_head()
                         || std::env::var("HIGGS_DSPARK_TARGET_HEAD").is_ok_and(|v| v != "0"));
+                let verify_mode_raw = std::env::var("HIGGS_DFLASH_VERIFY_MODE").ok();
+                let requested_verify_mode = DFlashVerifyMode::for_drafter(
+                    drafter.config.is_dspark(),
+                    verify_mode_raw.as_deref(),
+                );
+                let verify_rows = draft_cap.checked_add(1).ok_or_else(|| {
+                    EngineError::Generation("dSpark verify row count overflow".to_owned())
+                })?;
+                let verify_mode = if drafter.config.is_dspark()
+                    && requested_verify_mode == DFlashVerifyMode::BatchedTape
+                {
+                    let AnyModel::Qwen3Next(target) = &model else {
+                        return Err(EngineError::Generation(
+                            "dSpark target is not Qwen3Next".to_owned(),
+                        ));
+                    };
+                    let domain = target.validate_dflash_block_domain(verify_rows);
+                    if let Err(reason) = domain {
+                        tracing::warn!(
+                            %reason,
+                            verify_rows,
+                            "dSpark block verifier is outside its exact model domain; using canonical S=1"
+                        );
+                        DFlashVerifyMode::CanonicalS1
+                    } else {
+                        requested_verify_mode
+                    }
+                } else {
+                    requested_verify_mode
+                };
+                let is_dspark = drafter.config.is_dspark();
                 let mask_token_id = drafter.config.mask_token_id();
                 tracing::info!(
                     tap_layers = ?tap_layers,
                     block_size,
                     draft_cap,
                     dspark_target_head,
+                    ?verify_mode,
                     mask_token_id,
                     "DFlash drafter loaded — speculative decoding enabled"
                 );
@@ -962,7 +1367,9 @@ impl SimpleEngine {
                     tap_layers,
                     block_size,
                     draft_cap,
+                    is_dspark,
                     dspark_target_head,
+                    verify_mode,
                     mask_token_id,
                 })
             })
@@ -1009,6 +1416,10 @@ impl SimpleEngine {
             tuning,
             dflash,
             last_dflash_accepts: Mutex::new(Vec::new()),
+            last_dflash_draft_matches: Mutex::new(Vec::new()),
+            last_dflash_draft_counts: Mutex::new(Vec::new()),
+            last_ar_timing: Mutex::new(None),
+            last_dflash_timing: Mutex::new(None),
         })
     }
 
@@ -1179,6 +1590,36 @@ impl SimpleEngine {
             .unwrap_or_default()
     }
 
+    /// Exact pre-truncation matched-draft counts from the most recent request.
+    #[must_use]
+    pub fn last_dflash_draft_matches(&self) -> Vec<u32> {
+        self.last_dflash_draft_matches
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
+    /// Actual proposal width for every round in the most recent request.
+    #[must_use]
+    pub fn last_dflash_draft_counts(&self) -> Vec<u32> {
+        self.last_dflash_draft_counts
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn last_ar_timing(&self) -> Option<GenerationPhaseTiming> {
+        self.last_ar_timing.lock().map_or(None, |timing| *timing)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn last_dflash_timing(&self) -> Option<GenerationPhaseTiming> {
+        self.last_dflash_timing
+            .lock()
+            .map_or(None, |timing| *timing)
+    }
+
     /// Render the chat template to its prompt STRING with explicit thinking
     /// control — the exact text [`prepare_chat_prompt_with_thinking`] tokenizes.
     ///
@@ -1314,7 +1755,8 @@ impl SimpleEngine {
         // `-[_MTLCommandBuffer addCompletedHandler:]` / `IOGPUMetalCommandBuffer
         // validate` failed assertions during a session-continuation fallback
         // prefill racing a concurrent request's prefix lookup).
-        let prefix_match = if has_images {
+        let use_prefix_cache = !has_images && prefix_cache_enabled();
+        let prefix_match = if !use_prefix_cache {
             None
         } else {
             let mut pc = self
@@ -1334,7 +1776,7 @@ impl SimpleEngine {
                 (None, memory) => memory,
             }
         };
-        if !has_images {
+        if use_prefix_cache {
             self.cache_metrics
                 .radix_lookups
                 .fetch_add(1, Ordering::Relaxed);
@@ -2514,10 +2956,18 @@ impl SimpleEngine {
         // messages (tool results / user turn) — without them the drafter
         // drafts blind to the instruction it is continuing (measured: short
         // under-confident blocks that never beat the MTP floor).
+        let session_block_dflash = self.dflash.as_ref().is_some_and(|d| {
+            d.verify_mode.for_request(d.is_dspark, params, false) == DFlashVerifyMode::BatchedTape
+        });
+        if want_mtp && self.dflash.as_ref().is_some_and(|_| !session_block_dflash) {
+            tracing::debug!(
+                "canonical dSpark has no retained-session transaction; using the exact MTP/AR session path"
+            );
+        }
         let session_tap_layers: Option<Vec<usize>> = self
             .dflash
             .as_ref()
-            .filter(|_| want_mtp)
+            .filter(|_| want_mtp && session_block_dflash)
             .map(|d| d.tap_layers.clone());
         let mut delta_taps: Vec<Array> = Vec::new();
         let (current_token, _, prefill_hidden) = self.run_prefill(
@@ -2568,6 +3018,11 @@ impl SimpleEngine {
             let mut drafter_guard = self
                 .dflash
                 .as_ref()
+                // The session implementation currently has only the S>1 tape
+                // transaction. Fail closed for canonical dSpark rather than
+                // reintroducing the numerically divergent verifier on resumed
+                // conversations; the regular MTP/AR floor remains available.
+                .filter(|_| session_block_dflash)
                 .map(|d| (d, lock_or_recover(&d.drafter)));
             let mut draft_cache = drafter_guard
                 .as_mut()
@@ -2983,7 +3438,7 @@ impl SimpleEngine {
             None,
             None,
             false,
-            true,
+            prefix_cache_enabled(),
             None,
             None,
             None,
@@ -3426,7 +3881,8 @@ impl SimpleEngine {
     #[allow(
         clippy::significant_drop_tightening,
         clippy::too_many_lines,
-        clippy::too_many_arguments
+        clippy::too_many_arguments,
+        clippy::float_cmp
     )]
     fn generate_inner(
         &self,
@@ -3445,7 +3901,14 @@ impl SimpleEngine {
         // DFlash speculative decoding: use the draft-verify loop when a drafter
         // is loaded, the request allows it (`speculation` = auto/dflash), no
         // constraints active, and no multimodal input.
+        let sampled_dspark = self.sampled_dspark_requires_ar(params);
+        if sampled_dspark {
+            tracing::debug!(
+                "sampled dSpark request uses ordinary AR to preserve the shared RNG transition"
+            );
+        }
         if self.dflash.is_some()
+            && !sampled_dspark
             && params.speculation.allows_dflash()
             && constraint.is_none()
             && pixel_values.is_none()
@@ -3461,6 +3924,10 @@ impl SimpleEngine {
             );
         }
 
+        let ar_request_t0 = std::time::Instant::now();
+        if let Ok(mut timing) = self.last_ar_timing.lock() {
+            *timing = None;
+        }
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
         let mut prepared = self.prepare_generation(prompt_tokens, pixel_values, checkpoint_id)?;
@@ -3481,7 +3948,7 @@ impl SimpleEngine {
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
-            true,
+            prefix_cache_enabled(),
             checkpoint_id,
             None,
             None,
@@ -3489,6 +3956,7 @@ impl SimpleEngine {
 
         // Capture T1 (already eval'd inside run_prefill).
         let first_token_id: u32 = current_token.item();
+        let ar_prefill_elapsed = ar_request_t0.elapsed();
         // Advance the constraint past the first sampled token before decode.
         if let Some(ref mut cg) = constraint {
             cg.advance(first_token_id);
@@ -3502,6 +3970,13 @@ impl SimpleEngine {
 
         // Handle T1 termination before entering the pipeline.
         if self.eos_token_ids.contains(&first_token_id) {
+            self.record_ar_generation_timing(
+                ar_prefill_elapsed,
+                std::time::Duration::ZERO,
+                ar_request_t0.elapsed(),
+                1,
+                "stop",
+            );
             return Ok(GenerationOutput {
                 text: self.decode_tokens(&tokens)?,
                 finish_reason: "stop".to_owned(),
@@ -3513,6 +3988,13 @@ impl SimpleEngine {
         if has_stop_sequences {
             let text = self.decode_tokens(&tokens)?;
             if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
+                self.record_ar_generation_timing(
+                    ar_prefill_elapsed,
+                    std::time::Duration::ZERO,
+                    ar_request_t0.elapsed(),
+                    1,
+                    "stop",
+                );
                 return Ok(GenerationOutput {
                     text: truncated,
                     finish_reason: "stop".to_owned(),
@@ -3523,6 +4005,13 @@ impl SimpleEngine {
             }
         }
         if max_tokens <= 1 {
+            self.record_ar_generation_timing(
+                ar_prefill_elapsed,
+                std::time::Duration::ZERO,
+                ar_request_t0.elapsed(),
+                1,
+                "length",
+            );
             return Ok(GenerationOutput {
                 text: self.decode_tokens(&tokens)?,
                 finish_reason: "length".to_owned(),
@@ -3585,6 +4074,7 @@ impl SimpleEngine {
         // When constrained generation is active, pipelining would apply the FSM mask
         // one step behind (since we need the sampled token value to advance the FSM
         // before constraining the next step). Fall back to sequential decode instead.
+        let ar_decode_t0 = std::time::Instant::now();
         let (mut next_token, mut next_logprob_data) = Self::decode_step(
             &current_token,
             &mut prepared.model,
@@ -3625,6 +4115,14 @@ impl SimpleEngine {
 
         loop {
             let t0 = std::time::Instant::now();
+            // The currently queued token is guaranteed to terminate a
+            // length-bounded request when adding it reaches `max_tokens`.
+            // Do not launch the pipelined successor in that case: it can never
+            // be observed, and an async final forward would otherwise spill
+            // GPU work past the request's wall-clock boundary into the next
+            // benchmark sample.
+            let will_finish_by_length =
+                Self::completion_len(&tokens)?.saturating_add(1) >= max_tokens;
 
             // When constrained, extract the sampled token and advance the FSM
             // before building the next step, so the mask is always applied at the
@@ -3637,19 +4135,23 @@ impl SimpleEngine {
                 id
             });
 
-            let (following, following_logprob_data) = Self::decode_step(
-                &next_token,
-                &mut prepared.model,
-                &mut prepared.cache,
-                params,
-                &tokens,
-                logprob_top_n,
-                constraint.as_ref(),
-            )?;
+            let following = if will_finish_by_length {
+                None
+            } else {
+                Some(Self::decode_step(
+                    &next_token,
+                    &mut prepared.model,
+                    &mut prepared.cache,
+                    params,
+                    &tokens,
+                    logprob_top_n,
+                    constraint.as_ref(),
+                )?)
+            };
             let t1 = std::time::Instant::now();
-            {
-                let mut eval_targets: Vec<&Array> = vec![&following];
-                if let Some(ref lp) = following_logprob_data {
+            if let Some((following_token, following_logprob_data)) = &following {
+                let mut eval_targets: Vec<&Array> = vec![following_token];
+                if let Some(lp) = following_logprob_data {
                     eval_targets.extend(lp.eval_targets());
                 }
                 if constraint.is_some() {
@@ -3703,12 +4205,24 @@ impl SimpleEngine {
             total_item_ns += (t3 - t2).as_nanos();
             total_other_ns += (t4 - t3).as_nanos();
             step_count += 1;
+            let record_ar_finish = |finish_reason: &str| {
+                let decode_elapsed = ar_decode_t0.elapsed();
+                let request_elapsed = ar_request_t0.elapsed();
+                self.record_ar_generation_timing(
+                    ar_prefill_elapsed,
+                    decode_elapsed,
+                    request_elapsed,
+                    completion_len,
+                    finish_reason,
+                );
+            };
 
             // Check if constraint is in final state
             if constraint
                 .as_ref()
                 .is_some_and(crate::constrained::ConstrainedGenerator::is_finished)
             {
+                record_ar_finish("stop");
                 Self::log_decode_timing(
                     step_count,
                     total_forward_ns,
@@ -3726,6 +4240,7 @@ impl SimpleEngine {
             }
 
             if self.eos_token_ids.contains(&token_id) {
+                record_ar_finish("stop");
                 Self::log_decode_timing(
                     step_count,
                     total_forward_ns,
@@ -3745,6 +4260,7 @@ impl SimpleEngine {
             if has_stop_sequences {
                 let text = self.decode_tokens(&tokens)?;
                 if let Some(truncated) = check_stop_sequences(&text, stop_sequences) {
+                    record_ar_finish("stop");
                     Self::log_decode_timing(
                         step_count,
                         total_forward_ns,
@@ -3763,6 +4279,7 @@ impl SimpleEngine {
             }
 
             if completion_len >= max_tokens {
+                record_ar_finish("length");
                 Self::log_decode_timing(
                     step_count,
                     total_forward_ns,
@@ -3779,6 +4296,11 @@ impl SimpleEngine {
                 });
             }
 
+            let Some((following_token, following_logprob_data)) = following else {
+                return Err(EngineError::Generation(
+                    "length-final AR token did not terminate generation".to_owned(),
+                ));
+            };
             // If thinking budget was just reached, override the pipelined token
             // so the next decode step gets </think> as input.
             if seen_think_close && thinking_tokens == thinking_budget {
@@ -3787,7 +4309,7 @@ impl SimpleEngine {
                 }
                 thinking_tokens += 1; // prevent re-triggering
             } else {
-                next_token = following;
+                next_token = following_token;
             }
             next_logprob_data = following_logprob_data;
         }
@@ -3818,6 +4340,108 @@ impl SimpleEngine {
         Ok(())
     }
 
+    /// Prefill the target and dSpark context with bounded tap residency.
+    ///
+    /// Completed target chunks are projected into the drafter's per-layer
+    /// context cache immediately, then materialized and dropped. Only the last
+    /// chunk's taps survive for the first draft query. The target vocabulary
+    /// head likewise runs only on the final hidden row, matching ordinary
+    /// prefill instead of allocating `[prompt, vocab]` logits.
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_prefill_with_taps(
+        &self,
+        model: &mut AnyModel,
+        cache: &mut AnyCache,
+        drafter: &mut DFlashDrafter,
+        draft_cache: &mut DFlashCache,
+        prompt_tokens: &[u32],
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), EngineError> {
+        let prompt = Array::from(prompt_tokens).index(NewAxis);
+        let seq_len =
+            prompt.shape().get(1).copied().ok_or_else(|| {
+                EngineError::Generation("DFlash prompt has no token axis".to_owned())
+            })?;
+        let chunk_size = self.tuning.chunked_prefill_chunk_size();
+        let chunked = seq_len > self.tuning.chunked_prefill_threshold()
+            && chunk_size > 0
+            && chunk_size < seq_len;
+        let mut offset = 0_i32;
+
+        while chunked && offset + chunk_size < seq_len {
+            let chunk = prompt.index((.., offset..offset + chunk_size));
+            let (hidden, taps) = model
+                .forward_raw_with_taps(&chunk, None, cache, tap_layers)
+                .map_err(EngineError::Mlx)?;
+            if taps.len() != tap_layers.len()
+                || taps
+                    .iter()
+                    .any(|tap| tap.shape().get(1).copied() != Some(chunk_size))
+            {
+                return Err(EngineError::Generation(format!(
+                    "DFlash prefill chunk returned {} taps for {} configured layers",
+                    taps.len(),
+                    tap_layers.len()
+                )));
+            }
+            cache.eval().map_err(EngineError::Mlx)?;
+            let mut targets = Vec::with_capacity(taps.len() + 1);
+            targets.push(&hidden);
+            targets.extend(taps.iter());
+            eval(targets).map_err(EngineError::Mlx)?;
+            drafter
+                .prime_taps(&taps, draft_cache)
+                .map_err(EngineError::Mlx)?;
+            offset += chunk_size;
+            higgs_models::progress::report_prefill_progress(offset, seq_len);
+        }
+
+        let final_chunk = prompt.index((.., offset..));
+        let final_rows = seq_len - offset;
+        let (hidden, taps) = model
+            .forward_raw_with_taps(&final_chunk, None, cache, tap_layers)
+            .map_err(EngineError::Mlx)?;
+        if taps.len() != tap_layers.len()
+            || taps
+                .iter()
+                .any(|tap| tap.shape().get(1).copied() != Some(final_rows))
+        {
+            return Err(EngineError::Generation(format!(
+                "DFlash final prefill returned {} taps for {} configured layers",
+                taps.len(),
+                tap_layers.len()
+            )));
+        }
+        let logits = model
+            .project_raw_hidden_last(&hidden)
+            .map_err(EngineError::Mlx)?;
+        cache.eval().map_err(EngineError::Mlx)?;
+        let mut targets = Vec::with_capacity(taps.len() + 2);
+        targets.push(&hidden);
+        targets.push(&logits);
+        targets.extend(taps.iter());
+        eval(targets).map_err(EngineError::Mlx)?;
+        higgs_models::progress::report_prefill_progress(seq_len, seq_len);
+        Ok((logits, taps))
+    }
+
+    /// Return the shortest candidate prefix that completes a textual stop.
+    ///
+    /// `DFlash` commits multiple tokens per round, so stop detection belongs in
+    /// the verification transaction rather than only in the streaming sink.
+    /// Capping the prefix before cache commit keeps output length, taps, and
+    /// target state at the same token boundary.
+    fn dflash_stop_prefix_len(
+        &self,
+        existing: &[u32],
+        candidates: &[u32],
+        stop_sequences: &[String],
+    ) -> Result<Option<usize>, EngineError> {
+        dflash_new_stop_prefix_len(existing, candidates, stop_sequences, |tokens| {
+            self.decode_tokens(tokens)
+        })
+    }
+
     /// One lean DFlash speculative round for the SESSION path.
     ///
     /// Same core as `dflash_decode`'s spec branch (block draft off tap
@@ -3846,7 +4470,7 @@ impl SimpleEngine {
         model: &mut higgs_models::AnyModel,
         cache: &mut higgs_models::AnyCache,
         drafter: &mut higgs_models::dflash::DFlashDrafter,
-        draft_cache: &mut Vec<Option<(Array, Array)>>,
+        draft_cache: &mut DFlashCache,
         current_taps: &mut Vec<Array>,
         drafter_pos: &mut i32,
         confirmed: u32,
@@ -3875,21 +4499,15 @@ impl SimpleEngine {
         let noise_embedding = model
             .embed_token_ids(&block_ids)
             .map_err(EngineError::Mlx)?;
-        let draft_hidden = drafter
-            .forward(&noise_embedding, current_taps, draft_cache)
+        let draft_transaction = drafter
+            .stage_forward(&noise_embedding, current_taps, draft_cache)
             .map_err(EngineError::Mlx)?;
-        *drafter_pos += i32::try_from(current_taps.first().map_or(0, |t| {
-            usize::try_from(*t.shape().get(1).unwrap_or(&0)).unwrap_or(0)
-        }))
-        .unwrap_or(0);
-        current_taps.clear();
-        crop_drafter_cache(draft_cache, *drafter_pos);
 
         // b. Draft tokens: target-head DFlash or trained-head Prism dSpark.
         let proposal = dflash_propose_tokens(
             model,
             drafter,
-            &draft_hidden,
+            draft_transaction.hidden(),
             anchor,
             dflash.draft_cap,
             dflash.dspark_target_head,
@@ -3901,8 +4519,20 @@ impl SimpleEngine {
             .shape()
             .get(1)
             .ok_or_else(|| EngineError::Generation("verify input missing T axis".to_owned()))?;
+        let row_schedule = if dflash.is_dspark {
+            higgs_models::qwen3_next::DFlashRowSchedule::CanonicalS1
+        } else {
+            higgs_models::qwen3_next::DFlashRowSchedule::NativeBatch
+        };
         let (verify_logits, verify_taps, layer_tapes) = model
-            .forward_with_taps_tape(&verify_input, None, cache, &dflash.tap_layers)
+            .forward_with_taps_tape_scheduled(
+                &verify_input,
+                None,
+                cache,
+                &dflash.tap_layers,
+                None,
+                row_schedule,
+            )
             .map_err(EngineError::Mlx)?;
 
         // d. Targets (sampled at temperature when nonzero) + greedy-match
@@ -3913,9 +4543,31 @@ impl SimpleEngine {
             v.push(confirmed);
             v
         };
-        let targets =
-            crate::mtp::verify_targets(&verify_logits, Some(params), Some(&chain_history))?;
-        let draft_u32 = proposal.host_tokens()?;
+        let (targets, draft_u32) = dflash_resolve_target_then_draft(
+            || crate::mtp::verify_targets(&verify_logits, Some(params), Some(&chain_history)),
+            || proposal.host_tokens(),
+        )?;
+        let target_rows = i32::try_from(targets.len())
+            .map_err(|_| EngineError::Generation("session target count overflow".to_owned()))?;
+        if target_rows != verify_len || verify_taps.len() != dflash.tap_layers.len() {
+            return Err(EngineError::Generation(format!(
+                "session verifier transaction mismatch: rows={verify_len} targets={target_rows} taps={} expected_taps={}",
+                verify_taps.len(),
+                dflash.tap_layers.len()
+            )));
+        }
+        for (tap_index, tap) in verify_taps.iter().enumerate() {
+            if tap.shape().get(1).copied() != Some(verify_len) {
+                return Err(EngineError::Generation(format!(
+                    "session verifier tap {tap_index} does not cover {verify_len} rows"
+                )));
+            }
+        }
+        draft_transaction
+            .commit(draft_cache)
+            .map_err(EngineError::Mlx)?;
+        *drafter_pos = draft_cache.position();
+        current_taps.clear();
         let mut n_match = draft_u32
             .iter()
             .zip(&targets)
@@ -3973,6 +4625,7 @@ impl SimpleEngine {
     #[allow(
         clippy::cast_precision_loss,
         clippy::as_conversions,
+        clippy::float_cmp,
         clippy::too_many_lines
     )]
     fn dflash_decode<S: DflashSink>(
@@ -3985,6 +4638,7 @@ impl SimpleEngine {
         thinking_budget: u32,
         mut sink: S,
     ) -> Result<S::Output, EngineError> {
+        let request_t0 = std::time::Instant::now();
         let dflash = self
             .dflash
             .as_ref()
@@ -3993,20 +4647,42 @@ impl SimpleEngine {
         if let Ok(mut v) = self.last_dflash_accepts.lock() {
             v.clear();
         }
+        if let Ok(mut v) = self.last_dflash_draft_matches.lock() {
+            v.clear();
+        }
+        if let Ok(mut v) = self.last_dflash_draft_counts.lock() {
+            v.clear();
+        }
+        if let Ok(mut timing) = self.last_dflash_timing.lock() {
+            *timing = None;
+        }
 
         let mut model = lock_or_recover(&self.model);
+        // `generate_inner` dispatches DFlash before `prepare_generation`, whose
+        // `PreparedGeneration` normally owns this token for plain AR. Acquire
+        // the same process-global MLX gate here and retain it across shared
+        // prefill, draft, verify, rollback, and sink finalization. Without it,
+        // the first sanctioned eval panics in debug and concurrent release
+        // requests can race MLX's process-global Metal command buffer.
+        let _mlx_gate = higgs_models::mlx_exec::acquire();
+        debug_assert!(higgs_models::mlx_exec::held());
         let mut drafter = lock_or_recover(&dflash.drafter);
 
         let mut cache = model
             .make_cache_with_config(self.kv_cache_config)
             .map_err(EngineError::Mlx)?;
+        let mut draft_cache = drafter.make_cache();
 
-        // Prefill with taps.
-        let prompt_array = Array::from(prompt_tokens).index(NewAxis);
-        let (prefill_logits, taps) = model
-            .forward_with_taps(&prompt_array, None, &mut cache, &dflash.tap_layers)
-            .map_err(EngineError::Mlx)?;
-        eval([&prefill_logits]).map_err(EngineError::Mlx)?;
+        // Shared target/drafter prefill. Long prompts are consumed in bounded
+        // chunks and only the final target row reaches the vocabulary head.
+        let (prefill_logits, taps) = self.dflash_prefill_with_taps(
+            &mut model,
+            &mut cache,
+            &mut drafter,
+            &mut draft_cache,
+            prompt_tokens,
+            &dflash.tap_layers,
+        )?;
 
         // Sample first token.
         let last_logits = prefill_logits.index((.., -1, ..));
@@ -4014,6 +4690,7 @@ impl SimpleEngine {
         eval([&first_token]).map_err(EngineError::Mlx)?;
 
         let first_token_id: u32 = first_token.item();
+        let prefill_elapsed = request_t0.elapsed();
         let mut tokens: Vec<u32> = vec![first_token_id];
         let think_close_token = if enable_thinking {
             self.think_close_token
@@ -4043,6 +4720,14 @@ impl SimpleEngine {
             first_forced,
         )?;
         if first_forced.is_some() || first_stop {
+            if let Ok(mut timing) = self.last_dflash_timing.lock() {
+                *timing = Some(GenerationPhaseTiming {
+                    prefill: prefill_elapsed,
+                    decode: std::time::Duration::ZERO,
+                    request: request_t0.elapsed(),
+                    decode_tokens: 0,
+                });
+            }
             return sink.finish(
                 self,
                 &tokens,
@@ -4053,7 +4738,6 @@ impl SimpleEngine {
         }
 
         let mut current_taps = taps;
-        let mut draft_cache = drafter.make_cache();
         let mut last_token = i32::try_from(first_token_id)
             .map_err(|_| EngineError::Generation("first_token_id overflow for i32".to_owned()))?;
         let mut start = i32::try_from(prompt_len)
@@ -4062,10 +4746,10 @@ impl SimpleEngine {
         // proxy: predictable/low-entropy regions accept long blocks (big win,
         // byte-exact), uncertain/high-entropy regions reject them. So grow the
         // block toward `block_max` when a block is fully accepted and shrink
-        // toward `block_min` (≈ plain decode) when drafts are rejected — this
-        // both recovers throughput and keeps the S>1 verify off high-entropy
-        // near-ties (where it would flip argmax). Disable with
-        // HIGGS_DFLASH_ADAPTIVE=0; floor via HIGGS_DFLASH_MIN_BLOCK.
+        // toward `block_min` (≈ plain decode) when drafts are rejected, which
+        // avoids paying for wide target blocks that cannot amortize their
+        // work. Disable with HIGGS_DFLASH_ADAPTIVE=0; floor via
+        // HIGGS_DFLASH_MIN_BLOCK.
         let block_max = dflash.block_size;
         let block_min = std::env::var("HIGGS_DFLASH_MIN_BLOCK")
             .ok()
@@ -4077,6 +4761,25 @@ impl SimpleEngine {
         // resizing the trunk changes the trained distribution and shape-fails
         // the fixed conditioning tensor.
         let is_dspark = drafter.config.is_dspark();
+        // Batched dSpark currently has a greedy, no-thinking proof boundary.
+        // Sampling would consume RNG for discarded verifier rows, penalties
+        // would need a transactional history, and forced thinking tokens would
+        // replace a target after its successor had already advanced the cache.
+        // Fail closed to the commit-only S=1 oracle for those requests even if
+        // block mode was explicitly selected for profiling.
+        let request_verify_mode =
+            dflash
+                .verify_mode
+                .for_request(is_dspark, params, think_close_token.is_some());
+        let canonical_verify = request_verify_mode == DFlashVerifyMode::CanonicalS1;
+        if is_dspark && dflash.verify_mode == DFlashVerifyMode::BatchedTape && canonical_verify {
+            tracing::info!(
+                sampled = params.temperature != 0.0,
+                penalized = params.has_penalties(),
+                thinking = think_close_token.is_some(),
+                "dSpark block verifier is outside its exact policy boundary; using canonical S=1"
+            );
+        }
         let adaptive =
             !is_dspark && std::env::var("HIGGS_DFLASH_ADAPTIVE").map_or(true, |v| v != "0");
         let mut block_size = block_max;
@@ -4097,15 +4800,14 @@ impl SimpleEngine {
         // speedup ratio = n_accepted * T_ar / step_wall. If the EMA of that
         // ratio falls below 1.0, spec is actually slower than plain AR for this
         // text (MoE's fast AR raises the bar; a fixed entropy threshold can't
-        // see that), so floor to AR and re-probe periodically. Flooring also
-        // keeps the S>1 verify off high-entropy near-ties (where it both slows
-        // down and flips argmax), so AR regions stay byte-exact. Start in AR for
-        // one step to calibrate T_ar, then enter spec. Disable: HIGGS_DFLASH_GATE=0.
-        // The generic gate floors through AR steps whose taps are not yet
-        // replayed into dSpark's empty cache. Keep the public fixed-schedule
-        // runtime exact until that backlog path is made contiguous.
-        let gate = !is_dspark
-            && think_close_token.is_none()
+        // see that), so floor to AR and re-probe periodically. Start in AR for
+        // one step to calibrate T_ar, then enter spec. Disable:
+        // HIGGS_DFLASH_GATE=0.
+        // Thinking-budget token replacement is incompatible with the speed
+        // gate's pending-token convention; no-thinking dSpark can use the same
+        // realized-speed floor as Modal DFlash now that every AR-floor tap is
+        // accumulated into a contiguous drafter-context backlog below.
+        let gate = think_close_token.is_none()
             && std::env::var("HIGGS_DFLASH_GATE").map_or(true, |v| v != "0");
         let mut t_ar_ema: Option<f64> = None;
         let mut ratio_ema = 2.0_f64;
@@ -4173,7 +4875,18 @@ impl SimpleEngine {
         // gate floors DFlash to MTP unless DFlash genuinely beats it. The head
         // hidden/cache are re-seeded at each floor entry — the backbone
         // advances during spec rounds, so a prior window's state is stale.
-        let mtp_floor = gate && model.has_mtp() && params.temperature <= f32::EPSILON;
+        // The current MTP floor cycle is greedy-only and has no penalty-history
+        // input. Do not let a performance floor change request semantics: hot
+        // sampling and penalized greedy requests use the ordinary AR floor.
+        // dSpark's exact proof boundary is the ordinary S=1 target transition.
+        // A native MTP sidecar has its own S>1 verify/rollback schedule and
+        // cannot be introduced as a performance floor until it satisfies the
+        // same transaction gates.
+        let mtp_floor = gate
+            && !is_dspark
+            && model.has_mtp()
+            && params.temperature == 0.0
+            && !params.has_penalties();
         let mut mtp_floor_hidden: Option<Array> = None;
         let mut mtp_floor_cache: Option<higgs_models::MtpCache> = None;
         let mut spec_entered_once = false;
@@ -4319,11 +5032,22 @@ impl SimpleEngine {
                             Self::append_taps(&mut current_taps, &ar_taps)
                                 .map_err(EngineError::Mlx)?;
                             logits
-                        } else if need_taps {
+                        } else if need_taps || is_dspark {
                             let (logits, ar_taps) = model
                                 .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
                                 .map_err(EngineError::Mlx)?;
-                            current_taps = ar_taps;
+                            if is_dspark {
+                                // dSpark's cross-attention cache must see every
+                                // target position skipped while speculation is
+                                // floored. These lazy tap clones are appended to
+                                // the pending verify taps and consumed together
+                                // on the next probe, so cache length and `start`
+                                // remain contiguous across AR↔spec transitions.
+                                Self::append_taps(&mut current_taps, &ar_taps)
+                                    .map_err(EngineError::Mlx)?;
+                            } else {
+                                current_taps = ar_taps;
+                            }
                             logits
                         } else if mtp_floor {
                             // MTP-floor entry step: a plain AR step that also keeps
@@ -4347,8 +5071,10 @@ impl SimpleEngine {
                                 .forward(&single, None, &mut cache)
                                 .map_err(EngineError::Mlx)?
                         };
-                        let ar_next = sample(&ar_logits.index((.., -1, ..)), params)
-                            .map_err(EngineError::Mlx)?;
+                        let ar_row =
+                            apply_penalties(&ar_logits.index((.., -1, ..)), &tokens, params)
+                                .map_err(EngineError::Mlx)?;
+                        let ar_next = sample(&ar_row, params).map_err(EngineError::Mlx)?;
                         eval([&ar_next]).map_err(EngineError::Mlx)?;
                         let ar_id: u32 = ar_next.item();
                         if mtp_floor && !need_taps {
@@ -4458,84 +5184,220 @@ impl SimpleEngine {
                     .map_err(EngineError::Mlx)?;
 
                 // c. Drafter forward.
-                let draft_hidden = drafter
-                    .forward(&noise_embedding, &current_taps, &mut draft_cache)
+                let draft_transaction = drafter
+                    .stage_forward(&noise_embedding, &current_taps, &draft_cache)
                     .map_err(EngineError::Mlx)?;
-                crop_drafter_cache(&mut draft_cache, start);
+                let staged_position = draft_transaction.position().map_err(EngineError::Mlx)?;
+                if staged_position != start {
+                    return Err(EngineError::Generation(format!(
+                        "dSpark context transaction diverged: drafter={staged_position} target={start}"
+                    )));
+                }
+
+                let completion_len = Self::completion_len(&tokens)?;
+                let remaining = usize::try_from(max_tokens.saturating_sub(completion_len))
+                    .map_err(|_| EngineError::Generation("remaining tokens overflow".to_owned()))?;
+                // A length-bounded final round cannot emit more than
+                // `remaining` tokens, including its correction/bonus. Avoid
+                // generating and verifying dSpark rows that will be truncated
+                // unconditionally. The fixed four-position trunk still runs in
+                // its trained domain; only the sequential head and verifier
+                // prefix narrow. Keep one proposal for the remaining==1 case so
+                // the existing S1 branch can own the final target transition.
+                let round_draft_cap = dflash_tail_draft_cap(dflash.draft_cap, remaining, is_dspark);
 
                 // d. Target-head Modal DFlash or trained-head Prism dSpark.
                 let proposal = dflash_propose_tokens(
                     &model,
                     &drafter,
-                    &draft_hidden,
+                    draft_transaction.hidden(),
                     last_token,
-                    dflash.draft_cap,
+                    round_draft_cap,
                     dflash.dspark_target_head,
                 )?;
 
-                // e. Build verify input: [anchor, draft_0..draft_{N-2}].
-                let verify_input = dflash_verify_input(last_token, &proposal)?;
-                let verify_len = *verify_input.shape().get(1).ok_or_else(|| {
-                    EngineError::Generation("verify input missing T axis".to_owned())
-                })?;
+                let exact_sequential = canonical_verify || (is_dspark && remaining == 1);
 
-                // f. Tape-recording verify: forward with taps + GDN innovation tapes.
-                //    The tape kernel's recurrence is bit-exact with sequential AR
-                //    steps, fixing the S>1 vs S=1 numerical drift that a full-rerun
-                //    verify exhibits, and lets partial accept replay only the SSM
-                //    recurrence for accepted positions instead of a full rerun.
-                let early_exit = if is_dspark {
-                    None
-                } else {
-                    std::env::var("HIGGS_DFLASH_EARLY_EXIT_LAYERS")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .filter(|&v| v > 0 && v < 64)
-                };
-                let (verify_logits, verify_taps, layer_tapes) = model
-                    .forward_with_taps_tape_n(
-                        &verify_input,
-                        None,
-                        &mut cache,
-                        &dflash.tap_layers,
-                        early_exit,
+                // The correctness reference advances the target through the
+                // exact same S=1 transition as ordinary autoregressive decode.
+                // It stops at the first rejected draft (or the bonus token), so
+                // every cache position it creates is committed and rollback is
+                // impossible by construction. This is the default for dSpark
+                // until the S>1 Metal verifier is proven bit-identical to this
+                // transition. `HIGGS_DFLASH_VERIFY_MODE=block` opts into the
+                // experimental batched verifier for profiling.
+                let (mut verify_round, draft_u32, draft_matches) = if exact_sequential {
+                    // The S=1 oracle needs each draft token on the host to
+                    // decide whether to execute the next committed transition.
+                    let draft_u32 = proposal.host_tokens()?;
+                    let mut verify_targets = Vec::with_capacity(draft_u32.len() + 1);
+                    let mut committed = Vec::with_capacity(draft_u32.len() + 1);
+                    let mut committed_taps: Vec<Array> = Vec::new();
+                    let mut chain_history = tokens.clone();
+                    // If the thinking budget will force-replace a target,
+                    // do not speculatively advance any later input. The
+                    // forced token itself is still pending (not forwarded),
+                    // so stopping on that row preserves the S=1 cache
+                    // convention without rollback.
+                    let sequential_limit = think_close_token.map_or(remaining, |_| {
+                        if seen_think_close {
+                            remaining
+                        } else {
+                            let until_forced =
+                                thinking_budget.saturating_sub(thinking_tokens).max(1);
+                            remaining.min(usize::try_from(until_forced).unwrap_or(usize::MAX))
+                        }
+                    });
+                    let draft_inputs = draft_u32
+                        .iter()
+                        .map(|&token| i32::try_from(token))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| {
+                            EngineError::Generation(
+                                "draft token overflow for sequential verify".to_owned(),
+                            )
+                        })?;
+                    let verify_inputs = std::iter::once(last_token).chain(draft_inputs);
+
+                    for (position, input_token) in verify_inputs.enumerate() {
+                        if committed.len() >= sequential_limit {
+                            break;
+                        }
+                        let single = Array::from_slice(&[input_token], &[1, 1]);
+                        let (step_logits, step_taps) = model
+                            .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
+                            .map_err(EngineError::Mlx)?;
+                        let target = *crate::mtp::verify_targets(
+                            &step_logits,
+                            Some(params),
+                            Some(&chain_history),
+                        )?
+                        .first()
+                        .ok_or_else(|| {
+                            EngineError::Generation(
+                                "sequential verifier produced no target".to_owned(),
+                            )
+                        })?;
+                        Self::append_taps(&mut committed_taps, &step_taps)
+                            .map_err(EngineError::Mlx)?;
+                        verify_targets.push(target);
+                        committed.push(target);
+                        chain_history.push(target);
+
+                        let textual_stop = self
+                            .dflash_stop_prefix_len(&tokens, &committed, stop_sequences)?
+                            .is_some();
+                        if dflash_canonical_target_is_terminal(
+                            position,
+                            target,
+                            &draft_u32,
+                            &self.eos_token_ids,
+                            textual_stop,
+                            think_close_token,
+                        ) {
+                            break;
+                        }
+                    }
+
+                    let draft_matches = draft_u32
+                        .iter()
+                        .zip(&verify_targets)
+                        .take_while(|(draft, target)| draft == target)
+                        .count();
+                    debug_assert_eq!(verify_targets, committed);
+                    (
+                        DFlashVerifyRound::committed(
+                            verify_targets,
+                            committed_taps,
+                            dflash.tap_layers.len(),
+                        ),
+                        draft_u32,
+                        draft_matches,
                     )
+                } else {
+                    // Experimental throughput path: verify
+                    // [anchor, draft_0, ...] in one target forward and use
+                    // the GDN tape to select the committed prefix.
+                    let verify_input = dflash_verify_input(last_token, &proposal)?;
+                    let verify_len = *verify_input.shape().get(1).ok_or_else(|| {
+                        EngineError::Generation("verify input missing T axis".to_owned())
+                    })?;
+                    // A verifier transaction must advance every model layer.
+                    // The former early-exit experiment could not distinguish a
+                    // skipped attention layer from an advanced layer with no
+                    // GDN tape, so partial commit could trim retained history.
+                    let early_exit = None;
+                    let row_schedule = if is_dspark {
+                        higgs_models::qwen3_next::DFlashRowSchedule::CanonicalS1
+                    } else {
+                        higgs_models::qwen3_next::DFlashRowSchedule::NativeBatch
+                    };
+                    let (verify_logits, verify_taps, layer_tapes) = model
+                        .forward_with_taps_tape_scheduled(
+                            &verify_input,
+                            None,
+                            &mut cache,
+                            &dflash.tap_layers,
+                            early_exit,
+                            row_schedule,
+                        )
+                        .map_err(EngineError::Mlx)?;
+                    // Keep draft tokens device-resident until the target verify
+                    // graph reaches its single logits barrier. Pulling them
+                    // earlier serializes proposal and verification and can add
+                    // a full GPU/host synchronization to every round.
+                    let (verify_flat, draft_u32) = dflash_resolve_target_then_draft(
+                        || crate::mtp::verify_targets(&verify_logits, Some(params), Some(&tokens)),
+                        || proposal.host_tokens(),
+                    )?;
+                    let mut accepted = accept_prefix(&draft_u32, &verify_flat);
+                    let draft_matches = accepted.len().saturating_sub(1);
+                    // The cache convention retains one verify-input token
+                    // per emitted token, so the same truncation drives tape
+                    // rollback below.
+                    accepted.truncate(remaining);
+                    if let Some(eos_at) = accepted
+                        .iter()
+                        .position(|token| self.eos_token_ids.contains(token))
+                    {
+                        accepted.truncate(eos_at + 1);
+                    }
+                    if let Some(stop_len) =
+                        self.dflash_stop_prefix_len(&tokens, &accepted, stop_sequences)?
+                    {
+                        accepted.truncate(stop_len);
+                    }
+                    (
+                        DFlashVerifyRound::TentativeTape {
+                            target_rows: verify_len,
+                            target_tokens: verify_flat,
+                            output_tokens: accepted,
+                            taps: verify_taps,
+                            layer_tapes,
+                            pending_replaced: false,
+                            expected_taps: dflash.tap_layers.len(),
+                        },
+                        draft_u32,
+                        draft_matches,
+                    )
+                };
+
+                draft_transaction
+                    .commit(&mut draft_cache)
                     .map_err(EngineError::Mlx)?;
 
-                // g. Produce target tokens with the request's exact sampling
-                //    and penalty semantics. In the greedy/no-penalty case this
-                //    is one batched argmax barrier for the whole round; dSpark's
-                //    lazy proposal is a dependency of that target verify.
-                let verify_flat =
-                    crate::mtp::verify_targets(&verify_logits, Some(params), Some(&tokens))?;
-                let draft_u32 = proposal.host_tokens()?;
-                let mut accepted = accept_prefix(&draft_u32, &verify_flat);
-                // Never commit output beyond the request boundary. The cache
-                // convention retains one verify-input token per emitted token,
-                // so the same truncated length drives tape rollback below.
-                let completion_len = Self::completion_len(&tokens)?;
-                let remaining = usize::try_from(max_tokens.saturating_sub(completion_len))
-                    .map_err(|_| EngineError::Generation("remaining tokens overflow".to_owned()))?;
-                accepted.truncate(remaining);
-                if let Some(eos_at) = accepted
-                    .iter()
-                    .position(|token| self.eos_token_ids.contains(token))
-                {
-                    accepted.truncate(eos_at + 1);
-                }
                 if let Some(close_id) = think_close_token {
-                    let mut forced_keep = None;
+                    let mut forced_index = None;
                     if !seen_think_close {
-                        for (index, token) in accepted.iter_mut().enumerate() {
-                            if *token == close_id {
+                        for (index, &token) in verify_round.output_tokens().iter().enumerate() {
+                            if token == close_id {
                                 seen_think_close = true;
                                 break;
                             }
                             thinking_tokens = thinking_tokens.saturating_add(1);
                             if thinking_tokens >= thinking_budget {
-                                *token = close_id;
                                 seen_think_close = true;
-                                forced_keep = Some(index + 1);
+                                forced_index = Some(index);
                                 tracing::info!(
                                     budget = thinking_budget,
                                     "Thinking budget reached, forcing </think>"
@@ -4544,27 +5406,34 @@ impl SimpleEngine {
                             }
                         }
                     }
-                    if let Some(keep) = forced_keep {
+                    if let Some(index) = forced_index {
                         // The forced close becomes the pending token. Later
                         // verifier rows were conditioned on the replaced target
                         // and must not be committed.
-                        accepted.truncate(keep);
+                        verify_round.replace_pending_output(index, close_id)?;
                     }
                 }
                 if let Ok(mut v) = self.last_dflash_accepts.lock() {
-                    v.push(u32::try_from(accepted.len()).unwrap_or(0));
+                    v.push(u32::try_from(verify_round.output_tokens().len()).unwrap_or(0));
                 }
-                let n_accepted = i32::try_from(accepted.len())
-                    .map_err(|_| EngineError::Generation("n_accepted overflow".to_owned()))?;
+                if let Ok(mut v) = self.last_dflash_draft_matches.lock() {
+                    v.push(u32::try_from(draft_matches).unwrap_or(0));
+                }
+                if let Ok(mut v) = self.last_dflash_draft_counts.lock() {
+                    v.push(u32::try_from(draft_u32.len()).unwrap_or(0));
+                }
+                let n_accepted = verify_round.validate_output_boundary()?;
                 rounds += 1;
-                total_accepted += accepted.len() as u64;
+                total_accepted += verify_round.output_tokens().len() as u64;
 
-                if std::env::var("HIGGS_DFLASH_TRACE").is_ok() && tokens.len() <= 32 {
+                if std::env::var("HIGGS_DFLASH_TRACE").is_ok()
+                    && (tokens.len() <= 32 || std::env::var("HIGGS_DFLASH_TRACE_ALL").is_ok())
+                {
                     tracing::info!(
                         drafts = ?draft_u32,
-                        verify_argmax = ?verify_flat,
+                        verify_argmax = ?verify_round.target_tokens(),
                         n_accepted,
-                        accepted = ?accepted,
+                        accepted = ?verify_round.output_tokens(),
                         "DFlash iter trace"
                     );
                 }
@@ -4578,23 +5447,12 @@ impl SimpleEngine {
                 // `verify_len`, not `block_size`: with confidence truncation the
                 // chain can be shorter than the block, and a fully-accepted
                 // truncated chain needs no rollback.
-                if n_accepted < verify_len {
-                    let kv_rollback = verify_len - n_accepted;
-                    model
-                        .replay_tape_rollback(&layer_tapes, &mut cache, n_accepted, kv_rollback)
-                        .map_err(EngineError::Mlx)?;
-                }
-                // Update taps for next drafter round. When early exit produced
-                // fewer taps than needed, reuse previous round's taps entirely
-                // (stale but dimensionally consistent — avoids shape mismatch).
-                let n_expected = dflash.tap_layers.len();
-                if verify_taps.len() >= n_expected {
-                    current_taps = verify_taps
-                        .into_iter()
-                        .map(|tap| tap.index((.., ..n_accepted, ..)))
-                        .collect();
-                }
-                // else: keep current_taps from previous round
+                let (accepted, verify_taps) =
+                    verify_round.commit_target_state(&model, &mut cache)?;
+                current_taps = verify_taps
+                    .into_iter()
+                    .map(|tap| tap.index((.., ..n_accepted, ..)))
+                    .collect();
 
                 // i. Update state.
                 for &tok in &accepted {
@@ -4703,20 +5561,35 @@ impl SimpleEngine {
                 } else {
                     0.0
                 };
-                let secs = t_start.elapsed().as_secs_f64();
+                let decode_elapsed = t_start.elapsed();
+                let request_elapsed = request_t0.elapsed();
+                let secs = decode_elapsed.as_secs_f64();
                 let tok_per_sec = if secs > 0.0 {
-                    tokens.len() as f64 / secs
+                    total_accepted as f64 / secs
                 } else {
                     0.0
                 };
                 // `stop_hit` without a forced reason means a stop sequence fired.
                 let finish_reason = forced.unwrap_or("stop");
+                let decode_tokens = u32::try_from(total_accepted).unwrap_or(u32::MAX);
+                if let Ok(mut timing) = self.last_dflash_timing.lock() {
+                    *timing = Some(GenerationPhaseTiming {
+                        prefill: prefill_elapsed,
+                        decode: decode_elapsed,
+                        request: request_elapsed,
+                        decode_tokens,
+                    });
+                }
                 tracing::info!(
                     tokens = tokens.len(),
                     accept_len = format!("{accept_len:.2}"),
                     spec_rounds = rounds,
                     probe_every = probe_every,
+                    decode_tokens = total_accepted,
                     tok_per_sec = format!("{tok_per_sec:.1}"),
+                    prefill_ms = format!("{:.1}", prefill_elapsed.as_secs_f64() * 1e3),
+                    decode_ms = format!("{:.1}", secs * 1e3),
+                    request_ms = format!("{:.1}", request_elapsed.as_secs_f64() * 1e3),
                     finish_reason,
                     "DFlash generation complete"
                 );
@@ -4748,6 +5621,41 @@ impl SimpleEngine {
                 "Decode loop timing (per step avg)"
             );
         }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_ar_generation_timing(
+        &self,
+        prefill: std::time::Duration,
+        decode: std::time::Duration,
+        request: std::time::Duration,
+        completion_tokens: u32,
+        finish_reason: &str,
+    ) {
+        let decode_tokens = completion_tokens.saturating_sub(1);
+        let tok_per_sec = if decode.is_zero() {
+            0.0
+        } else {
+            f64::from(decode_tokens) / decode.as_secs_f64()
+        };
+        if let Ok(mut timing) = self.last_ar_timing.lock() {
+            *timing = Some(GenerationPhaseTiming {
+                prefill,
+                decode,
+                request,
+                decode_tokens,
+            });
+        }
+        tracing::info!(
+            completion_tokens,
+            decode_tokens,
+            tok_per_sec = format!("{tok_per_sec:.1}"),
+            prefill_ms = format!("{:.1}", prefill.as_secs_f64() * 1e3),
+            decode_ms = format!("{:.1}", decode.as_secs_f64() * 1e3),
+            request_ms = format!("{:.1}", request.as_secs_f64() * 1e3),
+            finish_reason,
+            "AR generation complete"
+        );
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -5606,7 +6514,14 @@ impl SimpleEngine {
         // runs its own tap-prefill, so dispatching here (mirroring the
         // non-streaming site) avoids a double prefill. Logprobs requests fall
         // through to the MTP/AR path, which produces per-token logprobs.
+        let sampled_dspark = self.sampled_dspark_requires_ar(params);
+        if sampled_dspark {
+            tracing::debug!(
+                "sampled streaming dSpark request uses ordinary AR to preserve the shared RNG transition"
+            );
+        }
         if self.dflash.is_some()
+            && !sampled_dspark
             && params.speculation.allows_dflash()
             && constraint.is_none()
             && pixel_values.is_none()
@@ -5681,7 +6596,7 @@ impl SimpleEngine {
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
-            true,
+            prefix_cache_enabled(),
             checkpoint_id,
             None,
             None,
@@ -6583,8 +7498,10 @@ impl SimpleEngine {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        IncrementalDetok, SimpleEngine, Tokenizer, adaptive_draft_depth_for_cap,
-        check_stop_sequences, continuation_prior_len, derive_model_name, detect_thinking_support,
+        DFlashVerifyMode, DFlashVerifyRound, IncrementalDetok, SimpleEngine, Tokenizer,
+        adaptive_draft_depth_for_cap, check_stop_sequences, continuation_prior_len,
+        derive_model_name, detect_thinking_support, dflash_canonical_target_is_terminal,
+        dflash_new_stop_prefix_len, dflash_resolve_target_then_draft, dflash_tail_draft_cap,
         estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail, lock_or_recover,
         parse_enabled_flag, with_chat_terminator,
     };
@@ -6596,6 +7513,159 @@ mod tests {
         transforms::eval,
     };
     use std::path::Path;
+
+    #[test]
+    fn dspark_verify_mode_fails_closed() {
+        assert_eq!(
+            DFlashVerifyMode::for_drafter(true, None),
+            DFlashVerifyMode::CanonicalS1
+        );
+        assert_eq!(
+            DFlashVerifyMode::for_drafter(true, Some("sequential")),
+            DFlashVerifyMode::CanonicalS1
+        );
+        assert_eq!(
+            DFlashVerifyMode::for_drafter(true, Some("block")),
+            DFlashVerifyMode::BatchedTape
+        );
+        assert_eq!(
+            DFlashVerifyMode::for_drafter(true, Some("typo")),
+            DFlashVerifyMode::CanonicalS1
+        );
+        assert_eq!(
+            DFlashVerifyMode::for_drafter(false, Some("sequential")),
+            DFlashVerifyMode::BatchedTape
+        );
+
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        assert_eq!(
+            DFlashVerifyMode::BatchedTape.for_request(true, &greedy, false),
+            DFlashVerifyMode::BatchedTape
+        );
+        assert_eq!(
+            DFlashVerifyMode::BatchedTape.for_request(true, &SamplingParams::default(), false),
+            DFlashVerifyMode::CanonicalS1
+        );
+        let penalized = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: Some(1.1),
+            ..SamplingParams::default()
+        };
+        assert_eq!(
+            DFlashVerifyMode::BatchedTape.for_request(true, &penalized, false),
+            DFlashVerifyMode::CanonicalS1
+        );
+        assert_eq!(
+            DFlashVerifyMode::BatchedTape.for_request(true, &greedy, true),
+            DFlashVerifyMode::CanonicalS1
+        );
+        assert_eq!(
+            DFlashVerifyMode::BatchedTape.for_request(false, &penalized, true),
+            DFlashVerifyMode::BatchedTape
+        );
+
+        let mut committed = DFlashVerifyRound::committed(vec![1, 2], vec![], 0);
+        assert_eq!(committed.validate_output_boundary().unwrap(), 2);
+        assert!(committed.replace_pending_output(0, 9).is_err());
+        if let DFlashVerifyRound::Committed { output_tokens, .. } = &mut committed {
+            output_tokens.truncate(1);
+        }
+        assert!(
+            committed.validate_output_boundary().is_err(),
+            "an output policy cannot truncate already-committed target state"
+        );
+        let mut tentative = DFlashVerifyRound::TentativeTape {
+            target_rows: 2,
+            target_tokens: vec![1, 2],
+            output_tokens: vec![1, 2],
+            taps: vec![],
+            layer_tapes: vec![],
+            pending_replaced: false,
+            expected_taps: 0,
+        };
+        tentative.replace_pending_output(0, 9).unwrap();
+        assert_eq!(tentative.validate_output_boundary().unwrap(), 1);
+    }
+
+    #[test]
+    fn dspark_tail_cap_never_verifies_unemittable_rows() {
+        assert_eq!(dflash_tail_draft_cap(4, 128, true), 4);
+        assert_eq!(dflash_tail_draft_cap(4, 5, true), 4);
+        assert_eq!(dflash_tail_draft_cap(4, 4, true), 3);
+        assert_eq!(dflash_tail_draft_cap(4, 3, true), 2);
+        assert_eq!(dflash_tail_draft_cap(4, 2, true), 1);
+        assert_eq!(dflash_tail_draft_cap(4, 1, true), 1);
+        assert_eq!(
+            dflash_tail_draft_cap(16, 3, false),
+            16,
+            "generic DFlash confidence scheduling owns its width"
+        );
+    }
+
+    #[test]
+    fn dspark_canonical_stops_before_advancing_past_natural_think_close() {
+        let targets = [10_u32, 99, 12];
+        let drafts = [10_u32, 99, 12];
+        let mut committed = 0_usize;
+        for (position, &target) in targets.iter().enumerate() {
+            committed += 1;
+            if dflash_canonical_target_is_terminal(position, target, &drafts, &[], false, Some(99))
+            {
+                break;
+            }
+        }
+        assert_eq!(committed, 2, "the poison row after </think> was advanced");
+    }
+
+    #[test]
+    fn dspark_stop_boundary_detects_only_newly_completed_stops() {
+        let stops = vec!["STOP".to_owned()];
+        let decode = |tokens: &[u32]| -> Result<String, ()> {
+            Ok(tokens.iter().fold(String::new(), |mut text, token| {
+                text.push_str(match token {
+                    1 => "abcS",
+                    2 => "T",
+                    3 => "O",
+                    4 => "P",
+                    5 => "STOP-old",
+                    6 => "x",
+                    _ => "?",
+                });
+                text
+            }))
+        };
+        assert_eq!(
+            dflash_new_stop_prefix_len(&[1, 2], &[3, 4, 6], &stops, decode).unwrap(),
+            Some(2),
+            "stop spanning committed and candidate tokens must cap the transaction"
+        );
+        assert_eq!(
+            dflash_new_stop_prefix_len(&[5], &[6], &stops, decode).unwrap(),
+            None,
+            "a stop wholly inside old output must not terminate a new round"
+        );
+    }
+
+    #[test]
+    fn dspark_resolves_target_barrier_before_proposal_host_read() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let (target, draft) = dflash_resolve_target_then_draft(
+            || {
+                events.borrow_mut().push("target");
+                Ok(vec![1_u32])
+            },
+            || {
+                events.borrow_mut().push("draft");
+                Ok(vec![1_u32])
+            },
+        )
+        .unwrap();
+        assert_eq!((target, draft), (vec![1], vec![1]));
+        assert_eq!(*events.borrow(), ["target", "draft"]);
+    }
 
     #[test]
     fn continuation_prior_len_guard() {
@@ -6883,8 +7953,10 @@ mod tests {
     }
 
     /// P5: `DFlash` speculative decode must be byte-identical to plain AR greedy
-    /// decode (T=0) and reports acceptance length + tok/s. Loads the real 35B
-    /// target twice (AR then `DFlash`, sequentially to bound memory). Manual:
+    /// decode (T=0) and reports acceptance length + tok/s. Loads one paired
+    /// target/drafter engine, warms both request paths, then alternates plain AR
+    /// and `DFlash` in a palindromic order to reduce load and thermal bias.
+    /// Manual:
     ///
     /// ```text
     /// HIGGS_DFLASH_TARGET_DIR=<target dir> \
@@ -6894,10 +7966,10 @@ mod tests {
     #[test]
     #[ignore = "p5: loads real 35B target; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
     fn dflash_matches_ar_greedy_and_reports_accept_len() {
-        use super::SimpleEngine;
+        use super::{GenerationPhaseTiming, SimpleEngine};
         use crate::chat_template::ChatMessage;
         use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
-        use higgs_models::{SamplingParams, turboquant::KvCacheConfig};
+        use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
 
         // Surface the engine's accept_len / per-iter trace logs.
         let _ = tracing_subscriber::fmt()
@@ -6909,58 +7981,135 @@ mod tests {
             .expect("set HIGGS_DFLASH_TARGET_DIR to the 35B target model dir");
         let drafter = std::env::var("HIGGS_DFLASH_DRAFTER_DIR")
             .expect("set HIGGS_DFLASH_DRAFTER_DIR to the Modal drafter snapshot dir");
+        dflash_assert_benchmark_power_state("preflight");
 
-        // Match the reference benchmark workload: chat template + thinking
-        // enabled, a code/reasoning prompt (DFlash is trained/measured on
-        // GSM8K/HumanEval/MT-Bench, not raw factual completions). Keep
-        // max_tokens under the 256-token thinking budget so the AR (MTP) path
-        // never force-closes </think> while DFlash wouldn't.
+        // Own every performance-sensitive policy knob inside the ignored
+        // single-test process. In particular, disabling prefix caching makes
+        // AR use the same one-shot prompt schedule as DFlash and excludes
+        // cache snapshot/store work from the ppN+tg128 wall measurement.
+        let benchmark_draft_cap = std::env::var("HIGGS_TEST_DRAFT_CAP")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| (1..=4).contains(value))
+            .unwrap_or(4);
+        dflash_set_test_env("HIGGS_DFLASH_VERIFY_MODE", "block");
+        dflash_set_test_env("HIGGS_DFLASH_GATE", "0");
+        dflash_set_test_env("HIGGS_DSPARK_DRAFT_CAP", &benchmark_draft_cap.to_string());
+        dflash_set_test_env("HIGGS_PREFIX_CACHE", "0");
+
+        // Use a chat-templated code/reasoning prompt (dSpark is trained and
+        // measured on tasks such as GSM8K/HumanEval/MT-Bench, not raw factual
+        // completions). The block verifier's proven request boundary is
+        // greedy, no-thinking, no penalties, with the realized-speed gate off.
         let user_prompt = std::env::var("HIGGS_TEST_PROMPT").unwrap_or_else(|_| {
             "Write a Python function that returns the n-th Fibonacci number iteratively.".to_owned()
         });
         let user_prompt = user_prompt.as_str();
-        // Toggle with HIGGS_TEST_THINKING=0 to measure the thinking-disabled
-        // workload (default: enabled, matching the reference benchmark).
+        // This throughput harness deliberately rejects thinking mode: forced
+        // thinking tokens make the request fall back to canonical S=1.
         let enable_thinking = std::env::var("HIGGS_TEST_THINKING")
             .map(|v| v != "0")
-            .unwrap_or(true);
+            .unwrap_or(false);
+        assert!(
+            !enable_thinking,
+            "full-Q4 block benchmark requires HIGGS_TEST_THINKING=0"
+        );
         let max_tokens = std::env::var("HIGGS_TEST_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(200);
-        let greedy = SamplingParams {
+            .unwrap_or(128);
+        assert_eq!(max_tokens, 128, "paired benchmark is the tg128 workload");
+        assert!(
+            std::env::var("HIGGS_DFLASH_GATE").is_ok_and(|value| value == "0"),
+            "raw block benchmark requires HIGGS_DFLASH_GATE=0"
+        );
+        let params = |speculation| SamplingParams {
             temperature: 0.0,
+            speculation,
             ..SamplingParams::default()
         };
 
-        let run = |with_drafter: bool| -> (String, f64) {
-            let drafter_path = with_drafter.then(|| Path::new(&drafter));
-            let tuning =
-                MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
-            let engine = SimpleEngine::load_with_dflash(
-                &target,
-                KvCacheConfig::default(),
-                tuning,
-                false,
-                drafter_path,
-                None,
-            )
-            .expect("load target");
-            let messages = [ChatMessage {
-                role: "user".to_owned(),
-                content: user_prompt.to_owned(),
-                tool_calls: None,
-            }];
-            let toks = engine
-                .prepare_chat_prompt_with_thinking(&messages, None, enable_thinking)
-                .expect("chat prompt");
+        let tuning =
+            MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
+        let engine = SimpleEngine::load_with_dflash(
+            &target,
+            KvCacheConfig::default(),
+            tuning,
+            false,
+            Some(Path::new(&drafter)),
+            None,
+        )
+        .expect("load paired target + drafter");
+        let dflash = engine.dflash.as_ref().expect("DFlash state");
+        assert!(
+            dflash.is_dspark,
+            "paired benchmark requires a dSpark sidecar"
+        );
+        assert!(
+            !dflash.dspark_target_head,
+            "final reference benchmark requires the drafter's frozen Q4 head"
+        );
+        assert_eq!(dflash.block_size, 4, "Bonsai dSpark is trained for block 4");
+        assert_eq!(
+            dflash.draft_cap, benchmark_draft_cap,
+            "loaded draft cap must match the requested benchmark experiment"
+        );
+        assert_eq!(
+            dflash.verify_mode,
+            DFlashVerifyMode::BatchedTape,
+            "final throughput benchmark requires the block verifier"
+        );
+        let drafter_quant = {
+            let drafter = lock_or_recover(&dflash.drafter);
+            drafter
+                .config
+                .quantization
+                .clone()
+                .expect("full-Q4 drafter must declare quantization")
+        };
+        assert_eq!(drafter_quant.bits, 4, "frozen drafter head must be Q4");
+        assert_eq!(
+            drafter_quant.group_size, 32,
+            "frozen drafter head must use group size 32"
+        );
+        assert_eq!(
+            drafter_quant.mode,
+            higgs_models::quant_mode::QuantMode::Affine,
+            "frozen drafter head must use affine Q4"
+        );
+
+        let messages = [ChatMessage {
+            role: "user".to_owned(),
+            content: user_prompt.to_owned(),
+            tool_calls: None,
+        }];
+        let toks = engine
+            .prepare_chat_prompt_with_thinking(&messages, None, enable_thinking)
+            .expect("chat prompt");
+        println!(
+            "paired benchmark: prompt_tokens={} output_tokens={} full_q4=true block={} draft_cap={}",
+            toks.len(),
+            max_tokens,
+            dflash.block_size,
+            dflash.draft_cap
+        );
+
+        let run = |speculation: Speculation,
+                   output_tokens: u32|
+         -> (String, f64, GenerationPhaseTiming) {
+            // Benchmark a fresh pp+tg request on both paths. Plain AR normally
+            // benefits from the engine's in-memory radix cache on repeats,
+            // whereas DFlash owns a separate shared target/drafter prefill and
+            // does not consult that cache; retaining it here would compare a
+            // five-token AR suffix against a full DFlash prompt.
+            engine.clear_prefix_cache();
             let t = std::time::Instant::now();
             let out = engine
                 .generate_with_thinking(
                     &toks,
-                    max_tokens,
-                    &greedy,
+                    output_tokens,
+                    &params(speculation),
                     &[],
                     false,
                     None,
@@ -6970,23 +8119,203 @@ mod tests {
                     None,
                 )
                 .expect("generate");
-            let tps = f64::from(out.completion_tokens) / t.elapsed().as_secs_f64();
-            (out.text, tps)
+            assert_eq!(
+                out.completion_tokens, output_tokens,
+                "tg workload ended before its requested output length"
+            );
+            assert_eq!(
+                out.finish_reason, "length",
+                "tg workload must end by length"
+            );
+            let elapsed = t.elapsed().as_secs_f64();
+            let phase_timing = match speculation {
+                Speculation::None => engine
+                    .last_ar_timing()
+                    .expect("plain AR request must publish phase timing"),
+                Speculation::DFlash => engine
+                    .last_dflash_timing()
+                    .expect("DFlash request must publish phase timing"),
+                Speculation::Auto | Speculation::Mtp => unreachable!(),
+            };
+            assert_eq!(
+                phase_timing.decode_tokens,
+                output_tokens.saturating_sub(1),
+                "prefill owns token one and decode must own the remainder"
+            );
+            (out.text, elapsed, phase_timing)
         };
 
-        let (ar_text, ar_tps) = run(false);
-        let (df_text, df_tps) = run(true);
+        let warmup_tokens = std::env::var("HIGGS_TEST_WARMUP_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(8);
+        if warmup_tokens > 0 {
+            let _ = run(Speculation::None, warmup_tokens);
+            let _ = run(Speculation::DFlash, warmup_tokens);
+        }
 
-        println!("AR     {ar_tps:.1} tok/s: {ar_text:?}");
-        println!("DFLASH {df_tps:.1} tok/s: {df_text:?}");
-        println!("speedup vs AR: {:.2}x", df_tps / ar_tps);
+        let mut ar_text: Option<String> = None;
+        let mut ar_wall_secs = Vec::with_capacity(2);
+        let mut df_wall_secs = Vec::with_capacity(2);
+        let mut ar_phase_timings = Vec::with_capacity(2);
+        let mut df_phase_timings = Vec::with_capacity(2);
+        // AR, DFlash, DFlash, AR cancels a first-order thermal trend while
+        // keeping one model load and fresh request-local caches for every run.
+        for (index, speculation) in [
+            Speculation::None,
+            Speculation::DFlash,
+            Speculation::DFlash,
+            Speculation::None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (text, elapsed, phase_timing) = run(speculation, max_tokens);
+            let tps = f64::from(max_tokens) / elapsed;
+            println!("run={} mode={speculation:?} wall_tok_s={tps:.2}", index + 1);
+            println!(
+                "run={} mode={speculation:?} prefill_ms={:.1} decode_ms={:.1} request_ms={:.1} decode_tok_s={:.2}",
+                index + 1,
+                phase_timing.prefill.as_secs_f64() * 1e3,
+                phase_timing.decode.as_secs_f64() * 1e3,
+                phase_timing.request.as_secs_f64() * 1e3,
+                f64::from(phase_timing.decode_tokens) / phase_timing.decode.as_secs_f64()
+            );
+            match speculation {
+                Speculation::None => {
+                    if let Some(reference) = &ar_text {
+                        assert_eq!(&text, reference, "AR repeat changed greedy output");
+                    } else {
+                        ar_text = Some(text.clone());
+                    }
+                    ar_wall_secs.push(elapsed);
+                    ar_phase_timings.push(phase_timing);
+                }
+                Speculation::DFlash => {
+                    assert_eq!(
+                        Some(&text),
+                        ar_text.as_ref(),
+                        "DFlash diverged from AR greedy or crossed max_tokens"
+                    );
+                    let accepts = engine.last_dflash_accepts();
+                    let matches = engine.last_dflash_draft_matches();
+                    let draft_counts = engine.last_dflash_draft_counts();
+                    assert_eq!(
+                        accepts.len(),
+                        matches.len(),
+                        "each spec round needs emitted and matched-draft telemetry"
+                    );
+                    assert_eq!(
+                        accepts.len(),
+                        draft_counts.len(),
+                        "each spec round needs its actual proposal width"
+                    );
+                    let emitted: u32 = accepts.iter().copied().sum();
+                    let matched: u32 = matches.iter().copied().sum();
+                    assert_eq!(
+                        emitted,
+                        max_tokens - 1,
+                        "prefill emits token one; every remaining tg token must come from spec rounds"
+                    );
+                    let rounds = u32::try_from(accepts.len()).expect("round count fits u32");
+                    let drafted: u32 = draft_counts.iter().copied().sum();
+                    println!("DFlash accepts: {accepts:?}");
+                    println!("DFlash draft matches: {matches:?}");
+                    println!("DFlash draft counts: {draft_counts:?}");
+                    println!(
+                        "DFlash tau={:.3} exact_match_rate={:.2}%",
+                        f64::from(emitted) / f64::from(rounds),
+                        100.0 * f64::from(matched) / f64::from(drafted)
+                    );
+                    df_wall_secs.push(elapsed);
+                    df_phase_timings.push(phase_timing);
+                }
+                Speculation::Auto | Speculation::Mtp => unreachable!(),
+            }
+        }
+        dflash_assert_benchmark_power_state("postflight");
+
+        let aggregate_wall_tps = |samples: &[f64]| {
+            f64::from(max_tokens) * samples.len() as f64 / samples.iter().sum::<f64>()
+        };
+        let aggregate_decode_tps = |samples: &[GenerationPhaseTiming]| {
+            let tokens: u32 = samples.iter().map(|sample| sample.decode_tokens).sum();
+            let secs: f64 = samples
+                .iter()
+                .map(|sample| sample.decode.as_secs_f64())
+                .sum();
+            f64::from(tokens) / secs
+        };
+        let aggregate_request_tps = |samples: &[GenerationPhaseTiming]| {
+            f64::from(max_tokens) * samples.len() as f64
+                / samples
+                    .iter()
+                    .map(|sample| sample.request.as_secs_f64())
+                    .sum::<f64>()
+        };
+        let mean_prefill_ms = |samples: &[GenerationPhaseTiming]| {
+            samples
+                .iter()
+                .map(|sample| sample.prefill.as_secs_f64())
+                .sum::<f64>()
+                * 1e3
+                / samples.len() as f64
+        };
+        let relative_drift = |first: f64, last: f64| {
+            let midpoint = (first + last) * 0.5;
+            if midpoint > 0.0 {
+                (last - first).abs() / midpoint
+            } else {
+                0.0
+            }
+        };
+        let ar_first = ar_phase_timings.first().expect("first AR timing");
+        let ar_last = ar_phase_timings.last().expect("last AR timing");
+        let ar_decode_drift = relative_drift(
+            ar_first.decode.as_secs_f64() / f64::from(ar_first.decode_tokens),
+            ar_last.decode.as_secs_f64() / f64::from(ar_last.decode_tokens),
+        );
+        let ar_wall_drift = relative_drift(
+            *ar_wall_secs.first().expect("first AR wall sample"),
+            *ar_wall_secs.last().expect("last AR wall sample"),
+        );
+        let ar_endpoint_drift = ar_decode_drift.max(ar_wall_drift);
+        println!(
+            "AR endpoint drift: decode={:.2}% wall={:.2}% gate=3.00%",
+            ar_decode_drift * 100.0,
+            ar_wall_drift * 100.0
+        );
+        assert!(
+            ar_endpoint_drift <= 0.03,
+            "AR endpoint drift {:.2}% exceeds the 3% thermal-stability gate",
+            ar_endpoint_drift * 100.0
+        );
+
+        let ar_tps = aggregate_wall_tps(&ar_wall_secs);
+        let df_tps = aggregate_wall_tps(&df_wall_secs);
+        let ar_decode_tps = aggregate_decode_tps(&ar_phase_timings);
+        let df_decode_tps = aggregate_decode_tps(&df_phase_timings);
+        println!(
+            "AR aggregate: wall={ar_tps:.2} decode={ar_decode_tps:.2} request={:.2} tok/s prefill_mean={:.1} ms",
+            aggregate_request_tps(&ar_phase_timings),
+            mean_prefill_ms(&ar_phase_timings)
+        );
+        println!(
+            "DFlash aggregate: wall={df_tps:.2} decode={df_decode_tps:.2} request={:.2} tok/s prefill_mean={:.1} ms",
+            aggregate_request_tps(&df_phase_timings),
+            mean_prefill_ms(&df_phase_timings)
+        );
+        println!("wall speedup vs AR: {:.3}x", df_tps / ar_tps);
+        println!(
+            "decode speedup vs AR: {:.3}x",
+            df_decode_tps / ar_decode_tps
+        );
 
         // Correctness gate: speculative decode must obey the same output bound
         // and produce exactly the same greedy text as autoregressive decode.
-        assert!(!ar_text.is_empty(), "empty generation");
-        assert_eq!(
-            df_text, ar_text,
-            "DFlash diverged from AR greedy or crossed max_tokens"
+        assert!(
+            ar_text.is_some_and(|text| !text.is_empty()),
+            "empty generation"
         );
     }
 
@@ -7023,6 +8352,62 @@ mod tests {
         // SAFETY: This ignored manual harness mutates DFlash env knobs before
         // model loading/generation and is intended to be run alone.
         unsafe { std::env::set_var(key, value) };
+    }
+
+    fn dflash_assert_benchmark_power_state(stage: &str) {
+        #[cfg(target_os = "macos")]
+        {
+            if std::env::var("HIGGS_TEST_REQUIRE_AC").is_ok_and(|value| value == "0") {
+                return;
+            }
+
+            let pmset = std::process::Command::new("pmset")
+                .args(["-g", "batt"])
+                .output()
+                .expect("run pmset for dSpark benchmark power preflight");
+            assert!(
+                pmset.status.success(),
+                "dSpark benchmark {stage}: pmset failed with {}",
+                pmset.status
+            );
+            let pmset_stdout = String::from_utf8_lossy(&pmset.stdout);
+            assert!(
+                pmset_stdout.contains("AC Power"),
+                "dSpark benchmark {stage} requires AC power; pmset reported: {pmset_stdout}"
+            );
+
+            let minimum_percent = std::env::var("HIGGS_TEST_MIN_BATTERY_PERCENT")
+                .ok()
+                .and_then(|value| value.parse::<u8>().ok())
+                .unwrap_or(20);
+            let battery_percent = pmset_stdout.split_whitespace().find_map(|field| {
+                let percent_index = field.find('%')?;
+                field.get(..percent_index)?.parse::<u8>().ok()
+            });
+            if let Some(percent) = battery_percent {
+                assert!(
+                    percent >= minimum_percent,
+                    "dSpark benchmark {stage} requires battery >= {minimum_percent}%, got {percent}%"
+                );
+            }
+
+            let ioreg = std::process::Command::new("ioreg")
+                .args(["-rn", "AppleSmartBattery"])
+                .output()
+                .expect("run ioreg for dSpark benchmark charger preflight");
+            assert!(
+                ioreg.status.success(),
+                "dSpark benchmark {stage}: ioreg failed with {}",
+                ioreg.status
+            );
+            let ioreg_stdout = String::from_utf8_lossy(&ioreg.stdout);
+            if ioreg_stdout.contains("AppleSmartBattery") {
+                assert!(
+                    ioreg_stdout.contains("\"ExternalConnected\" = Yes"),
+                    "dSpark benchmark {stage}: charger is detected but not delivering external power"
+                );
+            }
+        }
     }
 
     fn dflash_set_fixed_block_env(block_size: u32) {
@@ -7147,8 +8532,24 @@ mod tests {
         let p10 = sorted[last * 10 / 100];
         let p50 = sorted[last * 50 / 100];
         let p90 = sorted[last * 90 / 100];
-        let accept_frac = mean / f64::from(block_size.max(1));
+        // Every emitted speculative round contains one target correction (or
+        // the full-match bonus). Only the remaining rows are accepted draft
+        // tokens. Subtract that mandatory target token before reporting the
+        // Prism-style draft acceptance fraction.
+        let matched_drafts = accepts
+            .iter()
+            .map(|&emitted| f64::from(emitted.saturating_sub(1).min(block_size)))
+            .sum::<f64>()
+            / accepts.len() as f64;
+        let accept_frac = matched_drafts / f64::from(block_size.max(1));
         (mean, p10, p50, p90, accept_frac)
+    }
+
+    #[test]
+    fn dspark_accept_fraction_excludes_correction_or_bonus_token() {
+        let (mean, _, _, _, fraction) = dflash_accept_metrics(&[5, 4], 4);
+        assert!((mean - 4.5).abs() < f64::EPSILON);
+        assert!((fraction - 0.875).abs() < f64::EPSILON);
     }
 
     fn dflash_generation_pass(
@@ -7158,7 +8559,15 @@ mod tests {
         block_size: u32,
         greedy: &SamplingParams,
     ) -> DFlashRunMetrics {
-        dflash_set_fixed_block_env(block_size);
+        let effective_block = engine
+            .dflash
+            .as_ref()
+            .and_then(|state| u32::try_from(state.block_size).ok())
+            .expect("DFlash engine missing a positive block size");
+        assert_eq!(
+            block_size, effective_block,
+            "metrics must use the block size selected when the engine loaded"
+        );
         let prompt_tokens = dflash_chat_tokens(engine, prompt);
         let out = engine
             .generate_with_thinking(
@@ -7344,6 +8753,12 @@ mod tests {
         };
 
         let engine = load_engine(DEFAULT_BLOCK_SIZE);
+        let effective_block = engine
+            .dflash
+            .as_ref()
+            .and_then(|state| u32::try_from(state.block_size).ok())
+            .expect("loaded DFlash state");
+        let is_dspark = engine.dflash.as_ref().is_some_and(|state| state.is_dspark);
 
         let mut entropy_rows = Vec::new();
         for &(label, prompt) in &PROMPTS {
@@ -7352,7 +8767,7 @@ mod tests {
                 label,
                 prompt,
                 MAX_TOKENS,
-                DEFAULT_BLOCK_SIZE,
+                effective_block,
                 &greedy,
             ));
         }
@@ -7371,7 +8786,7 @@ mod tests {
                     format!("{label}-{target_tokens}"),
                     &padded,
                     MAX_TOKENS,
-                    DEFAULT_BLOCK_SIZE,
+                    effective_block,
                     &greedy,
                 ));
             }
@@ -7382,17 +8797,30 @@ mod tests {
         drop(engine);
 
         let mut block_rows = Vec::new();
-        for block_size in [4_u32, 8, 16] {
+        let block_sizes = if is_dspark {
+            // dSpark's log-SNR/Markov schedule is trained for one fixed block.
+            // Pretending HIGGS_DFLASH_BLOCK_SIZE changed it produced duplicate
+            // runs with false 8/16 labels and wrong utilization denominators.
+            vec![effective_block]
+        } else {
+            vec![4_u32, 8, 16]
+        };
+        for block_size in block_sizes {
             let block_engine = load_engine(block_size);
+            let actual_block = block_engine
+                .dflash
+                .as_ref()
+                .and_then(|state| u32::try_from(state.block_size).ok())
+                .expect("loaded DFlash block state");
             let df = dflash_generation_pass(
                 &block_engine,
                 SORT_ALGORITHM,
                 MAX_TOKENS,
-                block_size,
+                actual_block,
                 &greedy,
             );
             block_rows.push(dflash_row_from_metrics(
-                format!("iterative sort block {block_size}"),
+                format!("iterative sort block {actual_block}"),
                 &sort_ar,
                 df,
             ));

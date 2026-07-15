@@ -15,17 +15,20 @@ Example::
 
     python scripts/convert_dspark_gguf.py \
       Bonsai-27B-dspark-Q4_1.gguf /tmp/Bonsai-27B-dspark-mlx \
-      --reuse-target-head
+      --target-dir ~/.cache/lm-studio/models/prism-ml/Bonsai-27B-mlx-1bit
 
 ``--reuse-target-head`` omits dSpark's frozen Q4 output copy and uses the
-paired Bonsai target's packed Q1 head for proposals. Target verification keeps
-generation exact, while the converted sidecar is roughly 0.75 GiB smaller.
+paired Bonsai target's packed Q1 head for proposals. This experimental compact
+profile keeps final generation exact through verification, but its proposals
+are not the trained Prism distribution and may have lower acceptance. The
+default preserves the frozen Q4 proposal head.
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -33,6 +36,50 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 from gguf import GGMLQuantizationType, GGUFReader, dequantize
+
+
+def _selected_target_files(target_dir: Path) -> list[Path]:
+    """Mirror Higgs' base-checkpoint selection, excluding MTP sidecars."""
+    index_path = target_dir / "model.safetensors.index.json"
+    single_path = target_dir / "model.safetensors"
+    if index_path.exists():
+        with index_path.open(encoding="utf-8") as file:
+            index = json.load(file)
+        files = sorted(
+            {target_dir / name for name in index.get("weight_map", {}).values()}
+        )
+        if files and not all(path.exists() for path in files) and single_path.exists():
+            files = [single_path]
+    elif single_path.exists():
+        files = [single_path]
+    else:
+        raise FileNotFoundError(f"no target safetensors found in {target_dir}")
+    if not files or not all(path.is_file() for path in files):
+        missing = [str(path) for path in files if not path.is_file()]
+        raise FileNotFoundError(f"target checkpoint shards are missing: {missing}")
+    return files
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _target_binding(target_dir: Path) -> dict[str, Any]:
+    config_path = target_dir / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"target config missing: {config_path}")
+    selected = [config_path, *_selected_target_files(target_dir)]
+    files = []
+    for path in sorted(selected, key=lambda item: item.relative_to(target_dir).as_posix()):
+        relative = path.relative_to(target_dir).as_posix()
+        files.append(
+            {"path": relative, "size": path.stat().st_size, "sha256": _sha256(path)}
+        )
+    return {"format": "higgs-target-artifact-v1", "files": files}
 
 
 def _field_values(reader: GGUFReader, name: str) -> list[Any]:
@@ -137,7 +184,11 @@ def _q4_1_to_mlx(tensor: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def convert(
-    source: Path, output_dir: Path, group_size: int, reuse_target_head: bool
+    source: Path,
+    output_dir: Path,
+    target_dir: Path,
+    group_size: int,
+    reuse_target_head: bool,
 ) -> None:
     reader = GGUFReader(source)
     if int(_scalar(reader, "dspark.dspark.block_size")) <= 0:
@@ -228,6 +279,7 @@ def convert(
         "quantization": {"group_size": group_size, "bits": 4, "mode": "affine"},
         "dflash_config": {
             "target_layer_ids": _target_layers(reader),
+            "tap_semantics": "post_layer_residual_v1",
             "mask_token_id": int(_scalar(reader, "dspark.dspark.mask_token_id")),
             "dspark": True,
             "markov_rank": int(_scalar(reader, "dspark.dspark.markov_rank")),
@@ -235,6 +287,7 @@ def convert(
             "min_log_snr": float(_scalar(reader, "dspark.dspark.min_log_snr")),
             "max_log_snr": float(_scalar(reader, "dspark.dspark.max_log_snr")),
             "reuse_target_head": reuse_target_head,
+            "target_binding": _target_binding(target_dir),
         },
     }
     with (output_dir / "config.json").open("w", encoding="utf-8") as file:
@@ -251,6 +304,12 @@ def main() -> None:
     parser.add_argument("source", type=Path, help="Prism dSpark GGUF")
     parser.add_argument("output_dir", type=Path, help="output MLX sidecar directory")
     parser.add_argument(
+        "--target-dir",
+        type=Path,
+        required=True,
+        help="exact paired target checkpoint directory to bind into the sidecar",
+    )
+    parser.add_argument(
         "--group-size",
         type=int,
         default=32,
@@ -263,7 +322,13 @@ def main() -> None:
         help="omit dSpark's Q4 output copy and use the paired target head",
     )
     args = parser.parse_args()
-    convert(args.source, args.output_dir, args.group_size, args.reuse_target_head)
+    convert(
+        args.source,
+        args.output_dir,
+        args.target_dir,
+        args.group_size,
+        args.reuse_target_head,
+    )
 
 
 if __name__ == "__main__":

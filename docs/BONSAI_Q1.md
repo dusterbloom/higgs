@@ -1,8 +1,8 @@
 # Bonsai-Q1
 
 Higgs supports MLX affine 1-bit checkpoints with `quantization.bits = 1` and
-`quantization.group_size = 128` on the pinned upstream `oxideai/mlx-rs`
-revision. Upstream MLX does not ship the required 1-bit affine kernels, so Higgs
+`quantization.group_size = 128` on the pinned `oxideai/mlx-rs` revision.
+Upstream MLX does not ship the required affine 1-bit decode kernels, so Higgs
 provides runtime JIT Metal kernels for packed matvec and dequantization.
 
 Two layouts are supported:
@@ -10,15 +10,22 @@ Two layouts are supported:
 - Qwen3-shaped Bonsai checkpoints use the dedicated packed engine in
   `crates/higgs-models/src/bonsai_q1.rs`.
 - Qwen3.5 hybrid checkpoints, including Bonsai-27B, use the existing
-  `qwen3_next` architecture with its affine 1-bit operations dispatched to the
+  `qwen3_next` architecture with affine 1-bit operations dispatched to the
   same Higgs Metal kernels.
 
-Single-token decode and narrow multi-token forwards stay packed. For Qwen3.5,
-the packed Metal path covers up to 8 flattened rows by default, including the
-small verifier batches used by speculative decoding. Wider prefill inputs
-dequantize the selected matrix to the input dtype before using regular MLX
-matmul. Set `HIGGS_BONSAI_QMM_MAX_ROWS=0` to disable the narrow packed path, or
-raise it up to 64 for A/B testing.
+Single-token decode and narrow multi-token forwards remain packed. For
+Qwen3.5, the packed path covers up to eight flattened rows by default,
+including speculative verifier batches. It applies the established QMV
+reduction independently in grid Z and is bit-exact with concatenated repeated
+QMV across the tested verifier domains. Set `HIGGS_BONSAI_QMM_MAX_ROWS=0` to
+disable it, or raise the cap to at most 64 for explicit A/B experiments.
+
+Wider prefill currently dequantizes each selected matrix to the input dtype
+before regular MLX matmul. This is a separate performance problem from exact
+narrow verification. The intended large-prefill optimization is a packed
+affine 1-bit QMM adapted from Prism/Steel BlockMMA, with its own target-prompt
+parity gates. A blocked QMM reduction must not silently replace the exact QMV
+order used by speculative verification.
 
 For Qwen3.5 Q1 checkpoints, the loader validates every affine scale/bias pair.
 When a tensor is exactly symmetric (`bias = -scale / 2`), Higgs releases its
@@ -26,54 +33,136 @@ bias array and derives the bias in the Metal kernel. Any non-symmetric tensor
 keeps the general affine path. Set `HIGGS_BONSAI_SYMMETRIC_Q1=0` to retain all
 bias tensors for A/B debugging.
 
-Qwen3.5 checkpoints packaged as multimodal models currently load the text
-backbone only. Their vision tower is not exposed by Higgs, so image input remains
-unsupported for those checkpoints.
+Qwen3.5 checkpoints packaged as multimodal models currently load only their
+text backbone. Higgs does not expose the vision tower, so image input remains
+unsupported for these checkpoints.
 
 ## Bonsai-27B dSpark
 
-Higgs can run Prism's public
+Higgs converts Prism's public
 [`Bonsai-27B-dspark-Q4_1.gguf`](https://huggingface.co/prism-ml/Bonsai-27B-gguf)
-through the DFlash recurrent tape verifier.
+into an MLX sidecar for the DFlash recurrent-tape implementation.
 
-A ready-to-run target-head conversion is published as
-[`peppi314/Bonsai-27B-dSpark-MLX-4bit`](https://huggingface.co/peppi314/Bonsai-27B-dSpark-MLX-4bit).
-To reproduce it from the source GGUF:
+The reference/default quality profile preserves dSpark's full frozen Q4 output
+head. Reproduce it with the exact paired target directory:
 
 ```bash
 python scripts/convert_dspark_gguf.py \
   Bonsai-27B-dspark-Q4_1.gguf Bonsai-27B-dspark-mlx \
-  --reuse-target-head
+  --target-dir ~/.cache/lm-studio/models/prism-ml/Bonsai-27B-mlx-1bit
 ```
 
 The converter losslessly repacks GGUF Q4_1 blocks into MLX affine Q4/group-32.
-It omits the duplicate token embedding because the published dSpark and target
-Q1 embeddings are bit-identical. `--reuse-target-head` also omits dSpark's
-frozen Q4 output copy and uses the resident Bonsai Q1 head for proposals. This
-reduces the sidecar tensors from about 1534 MiB to 776 MiB. The two output heads
-are not numerically identical, so omit this flag for Prism-head fidelity;
-target verification keeps generated tokens distribution-exact in either mode.
+It omits the duplicate token embedding because dSpark is tied to the paired
+target and uses that target embedding for the draft block. The generated
+configuration pins `tap_semantics = post_layer_residual_v1`: Prism's
+authoritative source captures post-layer `cur`, so Higgs rejects missing or
+different tap semantics.
 
-Load the converted directory as the configured `draft_model`, or set
-`HIGGS_DFLASH_PATH`. dSpark always runs its trained four-position non-causal
-trunk: generic DFlash adaptive sizing, wall-clock flooring, and early-exit
-verification are disabled for it. The runtime validates target hidden size,
-vocabulary size, and tap-layer indices at load.
+Conversion also creates a `higgs-target-artifact-v1` binding over the target
+`config.json` and every selected base safetensors file. Each entry contains its
+normalized relative path, size, and full SHA-256 digest. The paired-target
+loader recomputes this manifest and fails closed on any mismatch. Optional MTP
+sidecars are excluded from the base-target identity.
 
-Performance knobs:
+### Experimental compact profile
 
-- `HIGGS_DSPARK_DRAFT_CAP=1..4` caps vocabulary-head and verify positions while
-  retaining the full trained trunk. The target-head conversion defaults to 4;
-  the full Prism-head conversion defaults to 3 on Apple.
-- `HIGGS_DSPARK_TARGET_HEAD=1` lets a full conversion use the target Q1 head.
-  A sidecar converted with `--reuse-target-head` always uses it.
+`--reuse-target-head` omits dSpark's frozen Q4 output copy and uses the paired
+Bonsai Q1 head for proposals:
 
-In two final back-to-back local 64-token greedy, thinking-enabled code checks,
-the 776 MiB target-head sidecar committed 3.94 tokens per round, produced
-byte-identical output at the exact length limit, and measured 1.03x to 1.08x
-end-to-end versus plain Bonsai-27B autoregressive decoding. An earlier
-thinking-disabled run committed 4.50 tokens per round and reached 1.18x; it is
-not an apples-to-apples acceptance comparison. Fresh-engine prefill, lazy graph
-materialization, workload, and laptop thermals all move short-run tok/s, so use
-the paired harness in `docs/benchmarking.md` with identical thinking settings
-and warmed repetitions before treating these as headline numbers.
+```bash
+python scripts/convert_dspark_gguf.py \
+  Bonsai-27B-dspark-Q4_1.gguf Bonsai-27B-dspark-mlx-compact \
+  --target-dir ~/.cache/lm-studio/models/prism-ml/Bonsai-27B-mlx-1bit \
+  --reuse-target-head
+```
+
+This is an experimental storage optimization, not the reference quality
+profile. The Q1 target head and frozen Q4 dSpark head are not numerically
+identical, so the compact profile can lower proposal acceptance even though
+target verification preserves final generation semantics. The published
+[`peppi314/Bonsai-27B-dSpark-MLX-4bit`](https://huggingface.co/peppi314/Bonsai-27B-dSpark-MLX-4bit)
+is this compact target-head conversion; benchmark it as such rather than as the
+full Prism-head profile.
+
+Load the converted directory as `draft_model`, or set `HIGGS_DFLASH_PATH`.
+dSpark always runs its trained four-position non-causal trunk; generic adaptive
+block sizing and early-exit verification remain disabled. It defaults to the
+canonical `S=1` target verifier. `HIGGS_DFLASH_VERIFY_MODE=block` opts into the
+experimental batched verifier, with unsupported model, row, or sampling
+domains failing closed to canonical `S=1`. The generation loop is tail-aware:
+the final round caps proposal and verification work to the remaining output
+budget instead of always paying for four draft positions.
+
+No-thinking, greedy decoding is the reference benchmark mode for this
+checkpoint. Record which output-head profile is active whenever reporting
+acceptance. `HIGGS_DSPARK_DRAFT_CAP=1..4` may cap vocabulary-head and verify
+positions for an explicit experiment, but the trained/default block is four.
+`HIGGS_DSPARK_TARGET_HEAD=1` can make a full conversion use the target Q1 head;
+a sidecar created with `--reuse-target-head` always uses it.
+
+## Cache and numerical contract
+
+The dSpark cache has typed projected layer state, raw pending taps, and an
+explicit absolute target position. Position is never inferred from retained KV
+length, which can shrink under sliding attention. Cache mutations are staged,
+materialized, and committed together; stale forward transactions cannot commit
+against an advanced live cache.
+
+Raw concatenated post-layer taps use a fixed 32-row projection schedule.
+Incomplete tiles carry across outer target-prefill chunks, and proposal forward
+flushes the final fixed remainder. Given identical raw taps, changing how they
+are submitted to the drafter cannot select a different Q4 projection schedule.
+This is not a target-prefill chunk-invariance claim: the real Bonsai target has
+measurable sequence-shape drift, so changing the target's outer forward shape
+can change the taps before they reach the drafter.
+
+The target tape path uses one-position RoPE, one-row K/V append, one-query dense
+or TurboQuant attention, and the canonical convolution addition order. Plain
+GDN forward, tape capture, and prefix replay share one recurrence source, with
+an explicit f32 recurrent-state and replay-tape boundary. Normal and
+tap-producing target forwards also share one backbone traversal and its layer
+materialization barriers.
+
+## Performance status
+
+The real Bonsai-27B checkpoint loads and completes a target forward when run
+outside the restricted test sandbox. The earlier uncaught MLX exception came
+from the sandbox exposing no Metal devices; it was an environmental device-
+enumeration failure, not a checkpoint-loader failure.
+
+A normalized powered release-build Fibonacci baseline before the TG-LUT work
+used the full frozen Q4 proposal head, greedy/no-thinking decoding, block size
+and draft cap four, a fresh 26-token one-shot prefill, an eight-token warmup,
+and 128 generated tokens. Across two samples of that single prompt, it reported
+`tau = 4.536`, with 99 exact draft matches out of 110 comparisons (90%). The
+ABBA aggregate was 23.31 tok/s for AR decode and 22.55 tok/s for speculative
+decode, or 0.967x, with a 201.2 ms speculative round. Output was byte-exact, AR
+endpoint drift was 0.27%, and external power remained connected and charging.
+A cap-three trial was also near parity but performed worse than cap four, so
+four remains the default.
+
+The experimental row4 TG-LUT path later measured 19.51 tok/s AR decode and
+29.01 tok/s speculative decode (1.487x) in the ABBA harness, while wall
+throughput rose from 15.72 to 21.63 tok/s (1.376x). Its best speculative sample
+was 29.38 tok/s and its average speculative round was 156.35 ms. Acceptance and
+byte-exact parity were unchanged, and AR endpoint drift was 0.55%. Because this
+run was on a discharging battery, it is diagnostic rather than a promotable
+powered result. The earlier powered/battery AR ratio projects roughly 34.7
+tok/s, but only a powered rerun can confirm that estimate. These are narrow
+measurements, not evidence of 40 tok/s or a result that generalizes beyond this
+prompt and machine.
+
+[The Bonsai-27B paper](https://www.alphaxiv.org/abs/2607.bonsai-27b) reports its
+dSpark throughput gains on H100 CUDA. It explicitly leaves net-positive Apple
+Silicon verification as open work; the paper does not establish a Metal
+speedup. The earlier exact M5 row-cohort prototype was dropped after measuring
+only 0.96--1.00x the shipped grid-Z verifier path on the tested shapes. A custom
+BM8 matrix prototype was likewise slower than QMV. The later threadgroup-local
+row4 TG-LUT is a different kernel: its native M5 schedule shares each packed
+weight/scale read across five FP32 accumulators and produced the full-model
+diagnostic above. It currently duplicates about 2.241 GiB of MLP weights and
+therefore remains opt-in pending a replacement-layout integration and powered
+confirmation. See
+`docs/DSPARK_MLX_DESIGN.md` for the complete state contract, rejected paths,
+and promotion gates.

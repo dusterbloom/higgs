@@ -10,7 +10,12 @@
 //!
 //! Reference checkpoints: `modal-labs/Qwen3.6-35B-A3B-DFlash` and
 //! `modal-labs/Qwen3.5-9B-DFlash`.
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs::File,
+    io::{BufReader, Read},
+    path::{Component, Path, PathBuf},
+};
 
 use mlx_rs::{
     Array,
@@ -18,9 +23,11 @@ use mlx_rs::{
     error::Exception,
     macros::ModuleParameters,
     module::{Module, ModuleParameters as _, ModuleParametersExt as _, Param},
-    nn, ops,
+    nn,
+    ops::{self, indexing::IndexOp},
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::{error::ModelError, utils::apply_rope};
 
@@ -31,6 +38,10 @@ use crate::{error::ModelError, utils::apply_rope};
 #[derive(Debug, Clone, Deserialize)]
 struct DFlashSubConfig {
     target_layer_ids: Vec<usize>,
+    /// Meaning of each target-layer id. Prism's GGUF runtime captures the
+    /// residual stream after the indexed layer has completed.
+    #[serde(default)]
+    tap_semantics: Option<DFlashTapSemantics>,
     #[serde(default)]
     mask_token_id: Option<i32>,
     /// Prism dSpark checkpoints use the `DFlash` trunk plus log-SNR conditioning
@@ -49,6 +60,31 @@ struct DFlashSubConfig {
     /// Verification remains distribution-exact; this only changes proposals.
     #[serde(default)]
     reuse_target_head: bool,
+    /// Exact target artifact this trained dSpark sidecar is allowed to pair
+    /// with. Required for dSpark and ignored for generic DFlash checkpoints.
+    #[serde(default)]
+    target_binding: Option<TargetArtifactBinding>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+enum DFlashTapSemantics {
+    #[serde(rename = "post_layer_residual_v1")]
+    PostLayerResidualV1,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TargetArtifactBinding {
+    format: String,
+    files: Vec<TargetArtifactFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TargetArtifactFile {
+    path: String,
+    size: u64,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,23 +273,103 @@ impl DFlashAttention {
         })
     }
 
-    /// Dual-stream attention: Q from noise, K/V from `concat(target, noise)`.
-    ///
-    /// `noise`: `[B, block_size, hidden]` — the 16 draft positions.
-    /// `target_hidden`: `[B, ctx_len, hidden]` — projected+normed tap states.
-    /// `cache`: optional (K, V) from prior rounds, shape `[B, n_kv, cached_len, head_dim]`.
-    ///   Post-RoPE K and raw V. Updated in-place with the new K/V appended.
-    /// `cache_offset`: absolute position offset for `RoPE` (= cached seq length).
-    #[allow(non_snake_case, clippy::shadow_reuse)]
-    fn forward(
+    /// Project and append target tap context without running draft queries.
+    /// This lets long target prompts prime the drafter cache one bounded chunk
+    /// at a time instead of retaining every layer tap until the first round.
+    fn append_target_context(
         &mut self,
-        noise: &Array,
         target_hidden: &Array,
         cache: &mut Option<(Array, Array)>,
         cache_offset: i32,
-    ) -> Result<Array, Exception> {
-        use mlx_rs::ops::indexing::IndexOp;
+    ) -> Result<(Array, Array), Exception> {
+        let batch = *target_hidden
+            .shape()
+            .first()
+            .ok_or_else(|| Exception::custom("target context needs 3D input"))?;
+        let context_len = *target_hidden
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("target context needs 3D input"))?;
+        if cache_offset < 0 {
+            return Err(Exception::custom(
+                "drafter target-context position must be non-negative",
+            ));
+        }
+        let context_end = cache_offset
+            .checked_add(context_len)
+            .ok_or_else(|| Exception::custom("drafter target-context position overflow"))?;
+        let context_k = self.k_proj.forward(target_hidden)?;
+        let context_v = self.v_proj.forward(target_hidden)?;
+        let context_k =
+            context_k.reshape(&[batch, context_len, self.num_key_value_heads, self.head_dim])?;
+        let context_k = self
+            .k_norm
+            .forward(&context_k)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let context_v = context_v
+            .reshape(&[batch, context_len, self.num_key_value_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let positions = (cache_offset..context_end).collect::<Vec<_>>();
+        let positions = Array::from_slice(&positions, &[context_len]);
+        let context_k = crate::qwen3_next::apply_rope_manual(
+            &context_k,
+            &positions,
+            self.rope.dimensions,
+            self.rope.base,
+            self.rope.scale,
+        )?;
 
+        let (context_k, context_v) = if self.is_sliding && self.sliding_window > 1 {
+            let keep = self.sliding_window - 1;
+            // If the new chunk alone fills the window, old KV is provably
+            // unreachable. Slice it before concatenation: besides saving a
+            // graph node, this avoids making correctness depend on slicing a
+            // lazy concat whose prefix will be discarded in full.
+            let (context_k, context_v) = if context_len >= keep {
+                (context_k, context_v)
+            } else if let Some((cached_k, cached_v)) = cache.as_ref() {
+                (
+                    ops::concatenate_axis(&[cached_k, &context_k], 2)?,
+                    ops::concatenate_axis(&[cached_v, &context_v], 2)?,
+                )
+            } else {
+                (context_k, context_v)
+            };
+            let len = context_k.shape().get(2).copied().unwrap_or(0);
+            if len > keep {
+                let skip = len - keep;
+                (
+                    context_k.index((.., .., skip.., ..)),
+                    context_v.index((.., .., skip.., ..)),
+                )
+            } else {
+                (context_k, context_v)
+            }
+        } else if let Some((cached_k, cached_v)) = cache.as_ref() {
+            (
+                ops::concatenate_axis(&[cached_k, &context_k], 2)?,
+                ops::concatenate_axis(&[cached_v, &context_v], 2)?,
+            )
+        } else {
+            (context_k, context_v)
+        };
+        *cache = Some((context_k.clone(), context_v.clone()));
+        Ok((context_k, context_v))
+    }
+
+    /// Dual-stream attention after target context has been committed: Q from
+    /// noise, K/V from cached target context plus fresh noise.
+    ///
+    /// `noise`: `[B, block_size, hidden]` — the 16 draft positions.
+    /// `cache`: target-context K/V, shape `[B, n_kv, retained_len, head_dim]`.
+    /// `noise_position`: absolute first position of the draft block.
+    #[allow(non_snake_case, clippy::shadow_reuse)]
+    fn forward_noise(
+        &mut self,
+        noise: &Array,
+        cache: &Option<(Array, Array)>,
+        noise_position: i32,
+    ) -> Result<Array, Exception> {
         let B = *noise
             .shape()
             .first()
@@ -262,23 +378,10 @@ impl DFlashAttention {
             .shape()
             .get(1)
             .ok_or_else(|| Exception::custom("need 3D"))?;
-        let ctx_len = *target_hidden
-            .shape()
-            .get(1)
-            .ok_or_else(|| Exception::custom("need 3D"))?;
         // Q from noise only
         let q = self.q_proj.forward(noise)?;
         let q = q.reshape(&[B, q_len, self.num_attention_heads, self.head_dim])?;
         let q = self.q_norm.forward(&q)?.transpose_axes(&[0, 2, 1, 3])?;
-
-        // K/V from context (target_hidden) — SEPARATE from noise
-        let ctx_k = self.k_proj.forward(target_hidden)?;
-        let ctx_v = self.v_proj.forward(target_hidden)?;
-        let ctx_k = ctx_k.reshape(&[B, ctx_len, self.num_key_value_heads, self.head_dim])?;
-        let ctx_k = self.k_norm.forward(&ctx_k)?.transpose_axes(&[0, 2, 1, 3])?;
-        let ctx_v = ctx_v
-            .reshape(&[B, ctx_len, self.num_key_value_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
 
         // K/V from noise — freshly computed every round, never cached
         let noise_k = self.k_proj.forward(noise)?;
@@ -292,42 +395,15 @@ impl DFlashAttention {
             .reshape(&[B, q_len, self.num_key_value_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // RoPE with absolute positions:
-        // Context K: [cache_offset .. cache_offset + ctx_len]
-        // Noise K + Q: [cache_offset + ctx_len .. cache_offset + ctx_len + q_len]
-        let q = apply_rope(&q, &self.rope, cache_offset + ctx_len)?;
-        let ctx_k = apply_rope(&ctx_k, &self.rope, cache_offset)?;
-        let noise_k = apply_rope(&noise_k, &self.rope, cache_offset + ctx_len)?;
-
-        // Cache stores ONLY context K/V (append to prior rounds)
-        let (ctx_k, ctx_v) = if let Some((k_cached, v_cached)) = cache.as_ref() {
-            (
-                ops::concatenate_axis(&[k_cached, &ctx_k], 2)?,
-                ops::concatenate_axis(&[v_cached, &ctx_v], 2)?,
-            )
-        } else {
-            (ctx_k, ctx_v)
-        };
-        let (ctx_k, ctx_v) = if self.is_sliding && self.sliding_window > 1 {
-            let keep = self.sliding_window - 1;
-            let len = ctx_k.shape().get(2).copied().unwrap_or(0);
-            if len > keep {
-                let skip = len - keep;
-                (
-                    ctx_k.index((.., .., skip.., ..)),
-                    ctx_v.index((.., .., skip.., ..)),
-                )
-            } else {
-                (ctx_k, ctx_v)
-            }
-        } else {
-            (ctx_k, ctx_v)
-        };
-        *cache = Some((ctx_k.clone(), ctx_v.clone()));
+        let q = apply_rope(&q, &self.rope, noise_position)?;
+        let noise_k = apply_rope(&noise_k, &self.rope, noise_position)?;
+        let (ctx_k, ctx_v) = cache
+            .as_ref()
+            .ok_or_else(|| Exception::custom("drafter target context cache is empty"))?;
 
         // Attention over cached_context + fresh_noise
-        let k = ops::concatenate_axis(&[&ctx_k, &noise_k], 2)?;
-        let v = ops::concatenate_axis(&[&ctx_v, &noise_v], 2)?;
+        let k = ops::concatenate_axis(&[ctx_k, &noise_k], 2)?;
+        let v = ops::concatenate_axis(&[ctx_v, &noise_v], 2)?;
 
         // Non-causal SDPA (no mask)
         let output = mlx_rs::fast::scaled_dot_product_attention(
@@ -380,21 +456,31 @@ impl DFlashDecoderLayer {
         })
     }
 
-    fn forward(
+    fn forward_noise(
         &mut self,
         noise: &Array,
-        target_hidden: &Array,
-        cache: &mut Option<(Array, Array)>,
-        cache_offset: i32,
+        cache: &Option<(Array, Array)>,
+        noise_position: i32,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(noise)?;
         let attn_out = self
             .self_attn
-            .forward(&normed, target_hidden, cache, cache_offset)?;
+            .forward_noise(&normed, cache, noise_position)?;
         let h = noise.add(attn_out)?;
         let normed_post = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = self.mlp.forward(&normed_post)?;
         h.add(mlp_out)
+    }
+
+    fn prime_target_context(
+        &mut self,
+        target_hidden: &Array,
+        cache: &mut Option<(Array, Array)>,
+        cache_offset: i32,
+    ) -> Result<(), Exception> {
+        self.self_attn
+            .append_target_context(target_hidden, cache, cache_offset)?;
+        Ok(())
     }
 }
 
@@ -590,8 +676,121 @@ pub struct DFlashDrafter {
     pub config: DFlashConfig,
 }
 
+/// Transactional per-layer context owned by a DFlash/dSpark drafter.
+///
+/// `position` is the absolute number of target-context rows consumed.  It is
+/// deliberately independent of retained KV length: sliding-attention layers
+/// evict old rows, so their tensor length is not a valid RoPE position.
+#[derive(Debug, Clone, Default)]
+pub struct DFlashCache {
+    layers: Vec<Option<(Array, Array)>>,
+    /// Raw concatenated target taps not yet projected into a complete fixed
+    /// context tile. Bounded to fewer than `DSPARK_CONTEXT_TILE_ROWS` rows.
+    pending_taps: Option<Array>,
+    /// Total target rows ingested, including `pending_taps`.
+    position: i32,
+}
+
+/// A lazy drafter forward whose cache update has not been published yet.
+///
+/// The proposal and target-verification graphs may evaluate `hidden` before
+/// committing this transaction. If graph construction or evaluation fails,
+/// dropping the value leaves the live drafter cache unchanged.
+#[derive(Debug)]
+pub struct DFlashForwardTransaction {
+    hidden: Array,
+    layers: Vec<Option<(Array, Array)>>,
+    base_position: i32,
+    appended_rows: i32,
+}
+
+impl DFlashForwardTransaction {
+    #[must_use]
+    pub const fn hidden(&self) -> &Array {
+        &self.hidden
+    }
+
+    pub fn position(&self) -> Result<i32, Exception> {
+        self.base_position
+            .checked_add(self.appended_rows)
+            .ok_or_else(|| Exception::custom("drafter staged context position overflow"))
+    }
+
+    pub fn commit(self, cache: &mut DFlashCache) -> Result<(), Exception> {
+        if cache.position != self.base_position {
+            return Err(Exception::custom(format!(
+                "stale drafter transaction: base={} live={}",
+                self.base_position, cache.position
+            )));
+        }
+        cache.commit(self.layers, self.appended_rows, None)
+    }
+}
+
+impl DFlashCache {
+    #[must_use]
+    pub const fn position(&self) -> i32 {
+        self.position
+    }
+
+    fn pending_rows(&self) -> Result<i32, Exception> {
+        self.pending_taps.as_ref().map_or(Ok(0), |pending| {
+            pending
+                .shape()
+                .get(1)
+                .copied()
+                .ok_or_else(|| Exception::custom("drafter pending taps have no row axis"))
+        })
+    }
+
+    fn projected_position(&self) -> Result<i32, Exception> {
+        self.position
+            .checked_sub(self.pending_rows()?)
+            .ok_or_else(|| Exception::custom("drafter pending rows exceed absolute position"))
+    }
+
+    fn staged_layers(&self, expected: usize) -> Result<Vec<Option<(Array, Array)>>, Exception> {
+        if self.layers.len() != expected {
+            return Err(Exception::custom(format!(
+                "drafter cache has {} layers, expected {expected}",
+                self.layers.len()
+            )));
+        }
+        Ok(self.layers.clone())
+    }
+
+    fn commit(
+        &mut self,
+        layers: Vec<Option<(Array, Array)>>,
+        appended_rows: i32,
+        pending_taps: Option<Array>,
+    ) -> Result<(), Exception> {
+        let position = self
+            .position
+            .checked_add(appended_rows)
+            .ok_or_else(|| Exception::custom("drafter absolute context position overflow"))?;
+        self.layers = layers;
+        self.pending_taps = pending_taps;
+        self.position = position;
+        Ok(())
+    }
+}
+
+/// Context projection granularity is part of the dSpark numerical contract.
+/// Raw tap rows carry across outer target-prefill chunks until a full tile is
+/// available, so changing the memory-oriented prefill chunk size cannot select
+/// a different Q4 projection schedule or alter proposal quality.
+const DFLASH_CONTEXT_TILE_ROWS: i32 = 32;
+
 impl DFlashDrafter {
     pub fn new(config: DFlashConfig) -> Result<Self, Exception> {
+        if config.is_dspark()
+            && config.dflash_config.tap_semantics != Some(DFlashTapSemantics::PostLayerResidualV1)
+        {
+            return Err(Exception::custom(
+                "Prism dSpark requires tap_semantics=post_layer_residual_v1",
+            ));
+        }
         let spec = config.quant_spec();
         let _fc_in = i32::try_from(config.num_taps())
             .map_err(|e| Exception::custom(format!("num_taps too large for i32: {e}")))?
@@ -618,8 +817,143 @@ impl DFlashDrafter {
     }
 
     /// Create an empty per-layer KV cache for the drafter.
-    pub fn make_cache(&self) -> Vec<Option<(Array, Array)>> {
-        vec![None; self.layers.len()]
+    pub fn make_cache(&self) -> DFlashCache {
+        DFlashCache {
+            layers: vec![None; self.layers.len()],
+            pending_taps: None,
+            position: 0,
+        }
+    }
+
+    fn validate_context_taps(&self, taps: &[Array], operation: &str) -> Result<i32, Exception> {
+        if taps.len() != self.config.num_taps() {
+            return Err(Exception::custom(format!(
+                "drafter {operation} transaction mismatch: taps={}/{}",
+                taps.len(),
+                self.config.num_taps()
+            )));
+        }
+        let Some(first) = taps.first() else {
+            return Err(Exception::custom(format!(
+                "drafter {operation} requires at least one configured tap"
+            )));
+        };
+        let shape = first.shape();
+        if shape.len() != 3 || shape[1] <= 0 || shape[2] != self.config.hidden_size {
+            return Err(Exception::custom(format!(
+                "drafter {operation} tap must be [B, T, {}] with T > 0, got {shape:?}",
+                self.config.hidden_size
+            )));
+        }
+        let batch = shape[0];
+        let rows = shape[1];
+        for (index, tap) in taps.iter().enumerate().skip(1) {
+            if tap.shape() != [batch, rows, self.config.hidden_size] {
+                return Err(Exception::custom(format!(
+                    "drafter {operation} tap {index} shape mismatch: expected [{batch}, {rows}, {}], got {:?}",
+                    self.config.hidden_size,
+                    tap.shape()
+                )));
+            }
+        }
+        Ok(rows)
+    }
+
+    fn validate_noise(&self, noise: &Array, taps: &[Array]) -> Result<(), Exception> {
+        let batch = taps
+            .first()
+            .and_then(|tap| tap.shape().first())
+            .copied()
+            .ok_or_else(|| Exception::custom("drafter noise validation requires target taps"))?;
+        let expected = [batch, self.config.block_size, self.config.hidden_size];
+        if noise.shape() != expected {
+            return Err(Exception::custom(format!(
+                "drafter noise must be [B, block_size, hidden] = {expected:?}, got {:?}",
+                noise.shape()
+            )));
+        }
+        Ok(())
+    }
+
+    fn merge_pending_taps(cache: &DFlashCache, target_cat: &Array) -> Result<Array, Exception> {
+        cache.pending_taps.as_ref().map_or_else(
+            || Ok(target_cat.clone()),
+            |pending| ops::concatenate_axis(&[pending, target_cat], 1),
+        )
+    }
+
+    fn append_context_tiles(
+        &mut self,
+        raw_taps: &Array,
+        staged: &mut [Option<(Array, Array)>],
+        start_position: i32,
+        flush_remainder: bool,
+    ) -> Result<Option<Array>, Exception> {
+        let rows = raw_taps
+            .shape()
+            .get(1)
+            .copied()
+            .ok_or_else(|| Exception::custom("drafter raw taps have no row axis"))?;
+        let processed = if flush_remainder {
+            rows
+        } else {
+            rows - rows.rem_euclid(DFLASH_CONTEXT_TILE_ROWS)
+        };
+        let mut offset = 0_i32;
+        while offset < processed {
+            let end = (offset + DFLASH_CONTEXT_TILE_ROWS).min(processed);
+            let tile = raw_taps.index((.., offset..end, ..));
+            let projected = self.fc.forward(&tile)?;
+            let target_hidden = self.hidden_norm.forward(&projected)?;
+            let absolute = start_position
+                .checked_add(offset)
+                .ok_or_else(|| Exception::custom("drafter context tile position overflow"))?;
+            for (layer, layer_cache) in self.layers.iter_mut().zip(staged.iter_mut()) {
+                layer.prime_target_context(&target_hidden, layer_cache, absolute)?;
+            }
+            offset = end;
+        }
+        if processed < rows {
+            Ok(Some(raw_taps.index((.., processed.., ..))))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Append target tap context to every drafter layer without running the
+    /// draft trunk. Used by chunked target prefill to keep peak tap memory
+    /// bounded by one chunk.
+    pub fn prime_taps(&mut self, taps: &[Array], cache: &mut DFlashCache) -> Result<(), Exception> {
+        let rows = self.validate_context_taps(taps, "prime")?;
+        let projected_position = cache.projected_position()?;
+        let mut staged = cache.staged_layers(self.layers.len())?;
+        let tap_refs: Vec<&Array> = taps.iter().collect();
+        let target_cat = ops::concatenate_axis(&tap_refs, -1)?;
+        let combined = Self::merge_pending_taps(cache, &target_cat)?;
+        let pending =
+            self.append_context_tiles(&combined, &mut staged, projected_position, false)?;
+        Self::eval_parts(&staged, pending.as_ref())?;
+        cache.commit(staged, rows, pending)?;
+        Ok(())
+    }
+
+    /// Materialize a primed context cache between prompt chunks so lazy graphs
+    /// cannot retain the entire target prefill.
+    fn eval_parts(
+        layers: &[Option<(Array, Array)>],
+        pending_taps: Option<&Array>,
+    ) -> Result<(), Exception> {
+        let mut targets = layers
+            .iter()
+            .flatten()
+            .flat_map(|(keys, values)| [keys, values])
+            .collect::<Vec<_>>();
+        targets.extend(pending_taps);
+        mlx_rs::transforms::eval(targets)
+    }
+
+    pub fn eval_cache(cache: &DFlashCache) -> Result<(), Exception> {
+        Self::eval_parts(&cache.layers, cache.pending_taps.as_ref())
     }
 
     /// Initialize all `QLinear` weights to zero at the correct shapes.
@@ -654,49 +988,74 @@ impl DFlashDrafter {
     /// - `taps`: slice of hidden states from the target model at tap layers,
     ///   each `[B, T, target_hidden_size]`. Concatenated along the last dim,
     ///   projected via `fc`, then normalized.
-    /// - `cache`: per-layer KV cache. Grows each round; crop after verify.
+    /// - `cache`: transactional fixed-tile context cache.
     ///
     /// Returns `[B, block_size, hidden_size]` — pass to target's `lm_head` for logits.
     #[allow(non_snake_case)]
-    pub fn forward(
+    pub fn stage_forward(
         &mut self,
         noise: &Array,
         taps: &[Array],
-        cache: &mut [Option<(Array, Array)>],
-    ) -> Result<Array, Exception> {
-        if taps.len() != self.config.num_taps() {
-            return Err(Exception::custom(format!(
-                "expected {} taps, got {}",
-                self.config.num_taps(),
-                taps.len()
-            )));
-        }
+        cache: &DFlashCache,
+    ) -> Result<DFlashForwardTransaction, Exception> {
+        let rows = self.validate_context_taps(taps, "forward")?;
+        self.validate_noise(noise, taps)?;
+        let projected_position = cache.projected_position()?;
+        let mut staged = cache.staged_layers(self.layers.len())?;
 
-        // Cache offset = max cached seq length (0 on first round)
-        let cache_offset = cache
-            .iter()
-            .filter_map(|c| c.as_ref())
-            .filter_map(|(k, _)| k.shape().get(2).copied())
-            .max()
-            .unwrap_or(0);
-
-        // Concatenate tap hidden states: [B, T, num_taps * hidden_size]
         let tap_refs: Vec<&Array> = taps.iter().collect();
         let target_cat = ops::concatenate_axis(&tap_refs, -1)?;
-
-        // Project + norm: [B, T, hidden_size]
-        let target_projected = self.fc.forward(&target_cat)?;
-        let target_hidden = self.hidden_norm.forward(&target_projected)?;
+        let combined = Self::merge_pending_taps(cache, &target_cat)?;
+        let pending =
+            self.append_context_tiles(&combined, &mut staged, projected_position, true)?;
+        if pending.is_some() {
+            return Err(Exception::custom(
+                "drafter forward failed to flush its context-tile remainder",
+            ));
+        }
+        let noise_position = cache
+            .position
+            .checked_add(rows)
+            .ok_or_else(|| Exception::custom("drafter noise position overflow"))?;
 
         let mut h = match self.dspark.as_mut() {
             Some(dspark) => dspark.add_log_snr(noise)?,
             None => noise.clone(),
         };
-        for (layer, lc) in self.layers.iter_mut().zip(cache.iter_mut()) {
-            h = layer.forward(&h, &target_hidden, lc, cache_offset)?;
+        for (layer, lc) in self.layers.iter_mut().zip(staged.iter_mut()) {
+            h = layer.forward_noise(&h, lc, noise_position)?;
         }
+        let hidden = self.norm.forward(&h)?;
+        Ok(DFlashForwardTransaction {
+            hidden,
+            layers: staged,
+            base_position: cache.position,
+            appended_rows: rows,
+        })
+    }
 
-        self.norm.forward(&h)
+    /// Materialized convenience path for callers that do not fuse proposal
+    /// evaluation with target verification. Production speculative decoding
+    /// uses [`Self::stage_forward`] and commits after its synchronization
+    /// barrier instead.
+    pub fn forward(
+        &mut self,
+        noise: &Array,
+        taps: &[Array],
+        cache: &mut DFlashCache,
+    ) -> Result<Array, Exception> {
+        let transaction = self.stage_forward(noise, taps, cache)?;
+        let mut targets = transaction
+            .layers
+            .iter()
+            .flatten()
+            .flat_map(|(keys, values)| [keys, values])
+            .collect::<Vec<_>>();
+        targets.push(transaction.hidden());
+        mlx_rs::transforms::eval(targets)?;
+        let hidden = transaction.hidden.clone();
+        transaction.commit(cache)?;
+        Ok(hidden)
     }
 
     /// Produce Prism dSpark draft tokens from the normalized trunk output.
@@ -763,18 +1122,6 @@ impl GdnStateBackup {
                 Some(crate::qwen3_next::LayerCache::KV(_)) | None => {}
             }
         }
-    }
-}
-
-/// Crop the drafter KV cache to `keep_len` along the sequence dim.
-///
-/// Called after verify to discard rejected positions.
-/// Cache tensors have shape `[B, n_kv_heads, seq_len, head_dim]`.
-pub fn crop_drafter_cache(cache: &mut [Option<(Array, Array)>], keep_len: i32) {
-    use mlx_rs::ops::indexing::IndexOp;
-    for (k, v) in cache.iter_mut().filter_map(Option::as_mut) {
-        *k = k.index((.., .., ..keep_len, ..));
-        *v = v.index((.., .., ..keep_len, ..));
     }
 }
 
@@ -977,13 +1324,165 @@ fn load_dflash_weights(drafter: &mut DFlashDrafter, model_path: &Path) -> Result
     Ok(())
 }
 
-/// Load a `DFlash` drafter from a directory containing `config.json` + `model.safetensors`.
-pub fn load_dflash_drafter(model_path: &Path) -> Result<DFlashDrafter, ModelError> {
+const DSPARK_TARGET_BINDING_FORMAT: &str = "higgs-target-artifact-v1";
+
+fn target_binding_error(message: impl Into<String>) -> ModelError {
+    ModelError::UnsupportedModel(format!("dSpark target binding: {}", message.into()))
+}
+
+fn binding_relative_path(root: &Path, file: &Path) -> Result<String, ModelError> {
+    let relative = file.strip_prefix(root).map_err(|_| {
+        target_binding_error(format!(
+            "{} is outside target directory {}",
+            file.display(),
+            root.display()
+        ))
+    })?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(target_binding_error(format!(
+                "non-normal target artifact path {}",
+                relative.display()
+            )));
+        };
+        parts.push(
+            part.to_str()
+                .ok_or_else(|| target_binding_error("target artifact path is not UTF-8"))?,
+        );
+    }
+    if parts.is_empty() {
+        return Err(target_binding_error("target artifact path is empty"));
+    }
+    Ok(parts.join("/"))
+}
+
+fn selected_target_artifacts(target_path: &Path) -> Result<Vec<(String, PathBuf)>, ModelError> {
+    let mut files = vec![target_path.join("config.json")];
+    files.extend(crate::collect_base_safetensors_files(target_path)?);
+    let mut artifacts = files
+        .into_iter()
+        .map(|path| binding_relative_path(target_path, &path).map(|name| (name, path)))
+        .collect::<Result<Vec<_>, _>>()?;
+    artifacts.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(artifacts)
+}
+
+fn sha256_file(path: &Path) -> Result<(u64, String), ModelError> {
+    let file = File::open(path).map_err(|error| {
+        ModelError::Io(std::io::Error::other(format!(
+            "opening target artifact {}: {error}",
+            path.display()
+        )))
+    })?;
+    let size = file.metadata()?.len();
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut digest = Sha256::new();
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(buffer.get(..count).ok_or_else(|| {
+            ModelError::Io(std::io::Error::other("SHA-256 read buffer bounds failure"))
+        })?);
+    }
+    Ok((size, format!("{:x}", digest.finalize())))
+}
+
+fn verify_dspark_target_binding(
+    config: &DFlashConfig,
+    target_path: &Path,
+) -> Result<(), ModelError> {
+    let binding = config
+        .dflash_config
+        .target_binding
+        .as_ref()
+        .ok_or_else(|| target_binding_error("missing target_binding manifest"))?;
+    if binding.format != DSPARK_TARGET_BINDING_FORMAT {
+        return Err(target_binding_error(format!(
+            "unsupported format {:?}",
+            binding.format
+        )));
+    }
+
+    let mut declared = BTreeMap::new();
+    for artifact in &binding.files {
+        let path = Path::new(&artifact.path);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(target_binding_error(format!(
+                "manifest path {:?} must be normalized and relative",
+                artifact.path
+            )));
+        }
+        if artifact.sha256.len() != 64
+            || !artifact
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(target_binding_error(format!(
+                "manifest SHA-256 for {:?} must be 64 lowercase hex characters",
+                artifact.path
+            )));
+        }
+        if declared.insert(artifact.path.as_str(), artifact).is_some() {
+            return Err(target_binding_error(format!(
+                "duplicate manifest path {:?}",
+                artifact.path
+            )));
+        }
+    }
+
+    let selected = selected_target_artifacts(target_path)?;
+    let selected_names = selected
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    let declared_names = declared.keys().copied().collect::<Vec<_>>();
+    if selected_names != declared_names {
+        return Err(target_binding_error(format!(
+            "artifact set mismatch: selected={selected_names:?} manifest={declared_names:?}"
+        )));
+    }
+
+    tracing::info!(target = %target_path.display(), files = selected.len(), "Verifying dSpark target artifact binding");
+    for (name, path) in selected {
+        let expected = declared
+            .get(name.as_str())
+            .ok_or_else(|| target_binding_error(format!("missing manifest entry {name:?}")))?;
+        let (size, digest) = sha256_file(&path)?;
+        if size != expected.size || digest != expected.sha256 {
+            return Err(target_binding_error(format!(
+                "artifact {name:?} mismatch: expected {} bytes/{}, got {size} bytes/{digest}",
+                expected.size, expected.sha256
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn load_dflash_drafter_inner(
+    model_path: &Path,
+    target_path: Option<&Path>,
+) -> Result<DFlashDrafter, ModelError> {
     let config_path = model_path.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)
         .map_err(|e| ModelError::Io(std::io::Error::other(format!("reading config.json: {e}"))))?;
     let config: DFlashConfig = serde_json::from_str(&config_str)
         .map_err(|e| ModelError::Io(std::io::Error::other(format!("parsing config.json: {e}"))))?;
+
+    if config.is_dspark() {
+        let target_path = target_path.ok_or_else(|| {
+            target_binding_error("dSpark must be loaded through the paired-target API")
+        })?;
+        verify_dspark_target_binding(&config, target_path)?;
+    }
 
     let mut drafter = DFlashDrafter::new(config)
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
@@ -991,6 +1490,20 @@ pub fn load_dflash_drafter(model_path: &Path) -> Result<DFlashDrafter, ModelErro
     load_dflash_weights(&mut drafter, model_path)?;
 
     Ok(drafter)
+}
+
+/// Load a generic DFlash drafter. Trained dSpark checkpoints fail closed here
+/// because they require an explicitly attested target artifact.
+pub fn load_dflash_drafter(model_path: &Path) -> Result<DFlashDrafter, ModelError> {
+    load_dflash_drafter_inner(model_path, None)
+}
+
+/// Load a dSpark/DFlash drafter paired with the target checkpoint directory.
+pub fn load_dflash_drafter_for_target(
+    model_path: &Path,
+    target_path: &Path,
+) -> Result<DFlashDrafter, ModelError> {
+    load_dflash_drafter_inner(model_path, Some(target_path))
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,6 +1577,7 @@ mod tests {
             quantization: None,
             dflash_config: super::DFlashSubConfig {
                 target_layer_ids: vec![0],
+                tap_semantics: Some(super::DFlashTapSemantics::PostLayerResidualV1),
                 mask_token_id: Some(3),
                 dspark: true,
                 markov_rank: 1,
@@ -1071,7 +1585,191 @@ mod tests {
                 min_log_snr: -9.0,
                 max_log_snr: 9.0,
                 reuse_target_head: true,
+                target_binding: None,
             },
+        }
+    }
+
+    fn tiny_dense_config(sliding_window: Option<i32>) -> super::DFlashConfig {
+        super::DFlashConfig {
+            hidden_size: 4,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: 8,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1e7,
+            block_size: 2,
+            vocab_size: 8,
+            layer_types: sliding_window.map(|_| vec!["sliding_attention".to_owned()]),
+            sliding_window,
+            quantization: None,
+            dflash_config: super::DFlashSubConfig {
+                target_layer_ids: vec![0],
+                tap_semantics: None,
+                mask_token_id: Some(7),
+                dspark: false,
+                markov_rank: 0,
+                log_snr_conditioning: false,
+                min_log_snr: 0.0,
+                max_log_snr: 0.0,
+                reuse_target_head: false,
+                target_binding: None,
+            },
+        }
+    }
+
+    fn patterned(rows: i32, columns: i32, salt: usize) -> mlx_rs::Array {
+        let count = usize::try_from(rows * columns).unwrap();
+        let values = (0..count)
+            .map(|index| {
+                let centered = i32::try_from((index * 17 + salt) % 29).unwrap() - 14;
+                centered as f32 * 0.003
+            })
+            .collect::<Vec<_>>();
+        mlx_rs::Array::from_slice(&values, &[rows, columns])
+    }
+
+    fn init_patterned_weights(drafter: &mut super::DFlashDrafter) {
+        use mlx_rs::module::Param;
+
+        let hidden = drafter.config.hidden_size;
+        let intermediate = drafter.config.intermediate_size;
+        let query = drafter.config.num_attention_heads * drafter.config.head_dim;
+        let kv = drafter.config.num_key_value_heads * drafter.config.head_dim;
+        let fc_in = i32::try_from(drafter.config.num_taps()).unwrap() * hidden;
+        drafter.fc.weight = Param::new(patterned(hidden, fc_in, 1));
+        for (index, layer) in drafter.layers.iter_mut().enumerate() {
+            let salt = index * 31;
+            layer.self_attn.q_proj.weight = Param::new(patterned(query, hidden, salt + 2));
+            layer.self_attn.k_proj.weight = Param::new(patterned(kv, hidden, salt + 3));
+            layer.self_attn.v_proj.weight = Param::new(patterned(kv, hidden, salt + 4));
+            layer.self_attn.o_proj.weight = Param::new(patterned(hidden, query, salt + 5));
+            layer.mlp.gate_proj.weight = Param::new(patterned(intermediate, hidden, salt + 6));
+            layer.mlp.up_proj.weight = Param::new(patterned(intermediate, hidden, salt + 7));
+            layer.mlp.down_proj.weight = Param::new(patterned(hidden, intermediate, salt + 8));
+        }
+    }
+
+    fn init_patterned_q4_weights(drafter: &mut super::DFlashDrafter) {
+        use mlx_rs::module::Param;
+
+        fn install(linear: &mut crate::qwen3_next::QLinear, rows: i32, columns: i32, salt: usize) {
+            let words = usize::try_from(rows * columns / 8).unwrap();
+            let packed = (0..words)
+                .map(|index| {
+                    0xA5A5_5A5A_u32.rotate_left(u32::try_from((index + salt) % 31).unwrap())
+                })
+                .collect::<Vec<_>>();
+            let groups = usize::try_from(rows * columns / 32).unwrap();
+            let scales = (0..groups)
+                .map(|index| 0.01_f32 + ((index + salt) % 7) as f32 * 0.002)
+                .collect::<Vec<_>>();
+            let biases = scales.iter().map(|scale| -0.5 * scale).collect::<Vec<_>>();
+            linear.weight = Param::new(mlx_rs::Array::from_slice(&packed, &[rows, columns / 8]));
+            linear.scales = Param::new(mlx_rs::Array::from_slice(&scales, &[rows, columns / 32]));
+            linear.biases = Param::new(mlx_rs::Array::from_slice(&biases, &[rows, columns / 32]));
+        }
+
+        let hidden = drafter.config.hidden_size;
+        let intermediate = drafter.config.intermediate_size;
+        let query = drafter.config.num_attention_heads * drafter.config.head_dim;
+        let kv = drafter.config.num_key_value_heads * drafter.config.head_dim;
+        let fc_in = i32::try_from(drafter.config.num_taps()).unwrap() * hidden;
+        install(&mut drafter.fc, hidden, fc_in, 1);
+        for (index, layer) in drafter.layers.iter_mut().enumerate() {
+            let salt = index * 31;
+            install(&mut layer.self_attn.q_proj, query, hidden, salt + 2);
+            install(&mut layer.self_attn.k_proj, kv, hidden, salt + 3);
+            install(&mut layer.self_attn.v_proj, kv, hidden, salt + 4);
+            install(&mut layer.self_attn.o_proj, hidden, query, salt + 5);
+            install(&mut layer.mlp.gate_proj, intermediate, hidden, salt + 6);
+            install(&mut layer.mlp.up_proj, intermediate, hidden, salt + 7);
+            install(&mut layer.mlp.down_proj, hidden, intermediate, salt + 8);
+        }
+    }
+
+    fn input(rows: i32, hidden: i32, salt: usize) -> mlx_rs::Array {
+        let count = usize::try_from(rows * hidden).unwrap();
+        let values = (0..count)
+            .map(|index| ((index * 11 + salt) % 23) as f32 * 0.02 - 0.2)
+            .collect::<Vec<_>>();
+        mlx_rs::Array::from_slice(&values, &[1, rows, hidden])
+    }
+
+    fn assert_f32_bits_equal(left: &mlx_rs::Array, right: &mlx_rs::Array, label: &str) {
+        assert_eq!(left.shape(), right.shape(), "{label} shape");
+        let left_bits = left
+            .as_slice::<f32>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let right_bits = right
+            .as_slice::<f32>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        assert_eq!(left_bits, right_bits, "{label} values");
+    }
+
+    fn assert_cache_exact(left: &super::DFlashCache, right: &super::DFlashCache, label: &str) {
+        super::DFlashDrafter::eval_cache(left).unwrap();
+        super::DFlashDrafter::eval_cache(right).unwrap();
+        assert_eq!(left.position(), right.position(), "{label} position");
+        assert_eq!(left.layers.len(), right.layers.len(), "{label} layers");
+        for (index, (left_layer, right_layer)) in
+            left.layers.iter().zip(right.layers.iter()).enumerate()
+        {
+            match (left_layer, right_layer) {
+                (Some((left_k, left_v)), Some((right_k, right_v))) => {
+                    assert_f32_bits_equal(left_k, right_k, &format!("{label} layer {index} keys"));
+                    assert_f32_bits_equal(
+                        left_v,
+                        right_v,
+                        &format!("{label} layer {index} values"),
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("{label} layer {index} presence mismatch"),
+            }
+        }
+        match (&left.pending_taps, &right.pending_taps) {
+            (Some(left_pending), Some(right_pending)) => {
+                assert_f32_bits_equal(
+                    left_pending,
+                    right_pending,
+                    &format!("{label} pending taps"),
+                );
+            }
+            (None, None) => {}
+            _ => panic!("{label} pending-tap presence mismatch"),
+        }
+    }
+
+    fn target_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("config.json"), b"target-config-v1").unwrap();
+        std::fs::write(
+            directory.path().join("model.safetensors"),
+            b"target-weights-v1",
+        )
+        .unwrap();
+        directory
+    }
+
+    fn fixture_binding(target: &std::path::Path) -> super::TargetArtifactBinding {
+        let files = super::selected_target_artifacts(target)
+            .unwrap()
+            .into_iter()
+            .map(|(path, file)| {
+                let (size, sha256) = super::sha256_file(&file).unwrap();
+                super::TargetArtifactFile { path, size, sha256 }
+            })
+            .collect();
+        super::TargetArtifactBinding {
+            format: super::DSPARK_TARGET_BINDING_FORMAT.to_owned(),
+            files,
         }
     }
 
@@ -1080,6 +1778,94 @@ mod tests {
         let draft = vec![1, 2, 3];
         let verify = vec![1, 2, 3, 4];
         assert_eq!(accept_prefix(&draft, &verify), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn dspark_target_binding_attests_exact_selected_artifacts() {
+        let target = target_fixture();
+        let mut config = tiny_dspark_config();
+        config.dflash_config.target_binding = Some(fixture_binding(target.path()));
+
+        // Optional MTP files do not alter the base-target identity.
+        std::fs::write(target.path().join("mtp.safetensors"), b"optional-head").unwrap();
+        super::verify_dspark_target_binding(&config, target.path()).unwrap();
+
+        // Same file name and size is insufficient: every byte is attested.
+        std::fs::write(
+            target.path().join("model.safetensors"),
+            b"target-weights-v2",
+        )
+        .unwrap();
+        let error = super::verify_dspark_target_binding(&config, target.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("artifact \"model.safetensors\" mismatch")
+        );
+    }
+
+    #[test]
+    fn dspark_target_binding_fails_closed_for_missing_or_unknown_manifest() {
+        let target = target_fixture();
+        let config = tiny_dspark_config();
+        let missing = super::verify_dspark_target_binding(&config, target.path()).unwrap_err();
+        assert!(missing.to_string().contains("missing target_binding"));
+
+        let mut unknown = config;
+        let mut binding = fixture_binding(target.path());
+        binding.format = "future-unreviewed-format".to_owned();
+        unknown.dflash_config.target_binding = Some(binding);
+        let error = super::verify_dspark_target_binding(&unknown, target.path()).unwrap_err();
+        assert!(error.to_string().contains("unsupported format"));
+    }
+
+    #[test]
+    fn dspark_requires_pinned_post_layer_tap_semantics() {
+        let mut config = tiny_dspark_config();
+        config.dflash_config.tap_semantics = None;
+
+        let error = super::DFlashDrafter::new(config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("tap_semantics=post_layer_residual_v1")
+        );
+    }
+
+    #[test]
+    fn unpaired_dspark_loader_fails_before_reading_weights() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("config.json"),
+            r#"{
+                "model_type":"dspark",
+                "hidden_size":4,
+                "num_hidden_layers":1,
+                "num_attention_heads":1,
+                "num_key_value_heads":1,
+                "head_dim":4,
+                "intermediate_size":8,
+                "block_size":2,
+                "vocab_size":4,
+                "dflash_config":{
+                    "target_layer_ids":[0],
+                    "tap_semantics":"post_layer_residual_v1",
+                    "mask_token_id":3,
+                    "dspark":true,
+                    "markov_rank":1,
+                    "log_snr_conditioning":true,
+                    "min_log_snr":-9.0,
+                    "max_log_snr":9.0
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let error = super::load_dflash_drafter(directory.path()).unwrap_err();
+
+        assert!(error.to_string().contains("paired-target API"));
+        assert!(!error.to_string().contains("weight"));
     }
 
     #[test]
@@ -1144,6 +1930,264 @@ mod tests {
         assert_eq!(tokens.as_slice::<u32>(), &[1, 2]);
     }
 
+    #[test]
+    fn chunked_context_priming_is_exact_with_only_sliding_layers() {
+        use mlx_rs::ops::indexing::IndexOp;
+
+        let config = tiny_dense_config(Some(3));
+        let mut full = super::DFlashDrafter::new(config.clone()).unwrap();
+        let mut chunked = super::DFlashDrafter::new(config).unwrap();
+        init_patterned_weights(&mut full);
+        init_patterned_weights(&mut chunked);
+
+        let taps = input(6, 4, 3);
+        let prefix = taps.index((.., ..4, ..));
+        let suffix = taps.index((.., 4.., ..));
+        let noise = input(2, 4, 19);
+        let mut full_cache = full.make_cache();
+        let mut chunked_cache = chunked.make_cache();
+
+        let full_output = full.forward(&noise, &[taps], &mut full_cache).unwrap();
+        chunked.prime_taps(&[prefix], &mut chunked_cache).unwrap();
+        assert_eq!(chunked_cache.position(), 4);
+        // Incomplete fixed context tiles stay as bounded raw taps. Absolute
+        // position must still advance before any layer KV exists.
+        assert_eq!(chunked_cache.pending_rows().unwrap(), 4);
+        assert!(chunked_cache.layers[0].is_none());
+        let chunked_output = chunked
+            .forward(&noise, &[suffix], &mut chunked_cache)
+            .unwrap();
+
+        super::DFlashDrafter::eval_cache(&full_cache).unwrap();
+        super::DFlashDrafter::eval_cache(&chunked_cache).unwrap();
+        mlx_rs::transforms::eval([&full_output, &chunked_output]).unwrap();
+        assert_eq!(full_cache.position(), 6);
+        assert_eq!(chunked_cache.position(), 6);
+        assert_eq!(chunked_cache.pending_rows().unwrap(), 0);
+        assert_f32_bits_equal(&full_output, &chunked_output, "draft hidden");
+        let (full_k, full_v) = full_cache.layers[0].as_ref().unwrap();
+        let (chunked_k, chunked_v) = chunked_cache.layers[0].as_ref().unwrap();
+        // Once forward flushes the tile remainder, retained sliding KV is
+        // shorter than absolute position. Tensor length cannot be used as the
+        // next RoPE offset.
+        assert_eq!(chunked_k.shape()[2], 2);
+        assert_f32_bits_equal(full_k, chunked_k, "context keys");
+        assert_f32_bits_equal(full_v, chunked_v, "context values");
+    }
+
+    #[test]
+    fn uneven_multilayer_priming_and_next_round_are_exact() {
+        use mlx_rs::ops::indexing::IndexOp;
+
+        let mut config = tiny_dense_config(Some(4));
+        config.hidden_size = 32;
+        config.num_attention_heads = 4;
+        config.num_key_value_heads = 2;
+        config.head_dim = 8;
+        config.intermediate_size = 32;
+        config.num_hidden_layers = 6;
+        config.layer_types = Some(
+            (0..6)
+                .map(|index| {
+                    if index % 2 == 0 {
+                        "sliding_attention".to_owned()
+                    } else {
+                        "full_attention".to_owned()
+                    }
+                })
+                .collect(),
+        );
+        config.dflash_config.target_layer_ids = vec![0, 1, 2, 3, 4];
+        config.quantization = Some(crate::qwen3_next::QuantizationConfig {
+            group_size: 32,
+            bits: 4,
+            mode: crate::quant_mode::QuantMode::Affine,
+        });
+        let mut full = super::DFlashDrafter::new(config.clone()).unwrap();
+        let mut chunked = super::DFlashDrafter::new(config).unwrap();
+        init_patterned_q4_weights(&mut full);
+        init_patterned_q4_weights(&mut chunked);
+        let taps = (0..5)
+            .map(|tap| input(11, 32, tap * 7 + 1))
+            .collect::<Vec<_>>();
+        let noise = input(2, 32, 29);
+        let mut full_cache = full.make_cache();
+        let mut chunked_cache = chunked.make_cache();
+
+        let full_output = full.forward(&noise, &taps, &mut full_cache).unwrap();
+        for (start, end) in [(0_i32, 1_i32), (1, 4), (4, 6)] {
+            let chunk = taps
+                .iter()
+                .map(|tap| tap.index((.., start..end, ..)))
+                .collect::<Vec<_>>();
+            chunked.prime_taps(&chunk, &mut chunked_cache).unwrap();
+        }
+        let final_taps = taps
+            .iter()
+            .map(|tap| tap.index((.., 6.., ..)))
+            .collect::<Vec<_>>();
+        let chunked_output = chunked
+            .forward(&noise, &final_taps, &mut chunked_cache)
+            .unwrap();
+        mlx_rs::transforms::eval([&full_output, &chunked_output]).unwrap();
+        assert_f32_bits_equal(&full_output, &chunked_output, "uneven first round");
+        assert_cache_exact(&full_cache, &chunked_cache, "uneven first round cache");
+
+        let next_taps = (0..5)
+            .map(|tap| input(3, 32, tap * 11 + 2))
+            .collect::<Vec<_>>();
+        let next_noise = input(2, 32, 41);
+        let full_next = full
+            .forward(&next_noise, &next_taps, &mut full_cache)
+            .unwrap();
+        let chunked_next = chunked
+            .forward(&next_noise, &next_taps, &mut chunked_cache)
+            .unwrap();
+        mlx_rs::transforms::eval([&full_next, &chunked_next]).unwrap();
+        assert_f32_bits_equal(&full_next, &chunked_next, "next draft round");
+        assert_cache_exact(&full_cache, &chunked_cache, "next draft round cache");
+    }
+
+    #[test]
+    fn fixed_context_tiles_are_exact_across_32_and_64_row_boundaries() {
+        use mlx_rs::ops::indexing::IndexOp;
+
+        let mut config = tiny_dense_config(Some(16));
+        config.hidden_size = 32;
+        config.num_attention_heads = 4;
+        config.num_key_value_heads = 2;
+        config.head_dim = 8;
+        config.intermediate_size = 32;
+        config.num_hidden_layers = 2;
+        config.layer_types = Some(vec![
+            "sliding_attention".to_owned(),
+            "full_attention".to_owned(),
+        ]);
+        config.dflash_config.target_layer_ids = vec![0, 1];
+        config.quantization = Some(crate::qwen3_next::QuantizationConfig {
+            group_size: 32,
+            bits: 4,
+            mode: crate::quant_mode::QuantMode::Affine,
+        });
+
+        let mut full = super::DFlashDrafter::new(config.clone()).unwrap();
+        let mut chunked = super::DFlashDrafter::new(config).unwrap();
+        init_patterned_q4_weights(&mut full);
+        init_patterned_q4_weights(&mut chunked);
+        let taps = (0..2)
+            .map(|tap| input(67, 32, tap * 13 + 1))
+            .collect::<Vec<_>>();
+        let noise = input(2, 32, 37);
+        let mut full_cache = full.make_cache();
+        let mut chunked_cache = chunked.make_cache();
+
+        let full_output = full.forward(&noise, &taps, &mut full_cache).unwrap();
+        let mut start = 0_i32;
+        for end in [1_i32, 31, 32, 33, 64, 65] {
+            let chunk = taps
+                .iter()
+                .map(|tap| tap.index((.., start..end, ..)))
+                .collect::<Vec<_>>();
+            chunked.prime_taps(&chunk, &mut chunked_cache).unwrap();
+            assert_eq!(chunked_cache.position(), end);
+            assert!(chunked_cache.pending_rows().unwrap() < super::DFLASH_CONTEXT_TILE_ROWS);
+            start = end;
+        }
+        let final_taps = taps
+            .iter()
+            .map(|tap| tap.index((.., start.., ..)))
+            .collect::<Vec<_>>();
+        let chunked_output = chunked
+            .forward(&noise, &final_taps, &mut chunked_cache)
+            .unwrap();
+
+        mlx_rs::transforms::eval([&full_output, &chunked_output]).unwrap();
+        assert_f32_bits_equal(&full_output, &chunked_output, "multi-tile output");
+        assert_cache_exact(&full_cache, &chunked_cache, "multi-tile cache");
+        assert_eq!(chunked_cache.position(), 67);
+        assert_eq!(chunked_cache.pending_rows().unwrap(), 0);
+    }
+
+    #[test]
+    fn invalid_tap_batch_leaves_cache_transaction_unchanged() {
+        let mut config = tiny_dense_config(None);
+        config.dflash_config.target_layer_ids = vec![0, 1];
+        let mut drafter = super::DFlashDrafter::new(config).unwrap();
+        init_patterned_weights(&mut drafter);
+        let mut cache = drafter.make_cache();
+        let good = input(2, 4, 1);
+        drafter
+            .prime_taps(&[good.clone(), good], &mut cache)
+            .unwrap();
+        let before = cache.clone();
+        super::DFlashDrafter::eval_cache(&cache).unwrap();
+
+        let first = input(1, 4, 2);
+        let bad_batch = mlx_rs::Array::zeros::<f32>(&[2, 1, 4]).unwrap();
+        let error = drafter
+            .prime_taps(&[first, bad_batch], &mut cache)
+            .unwrap_err();
+        assert!(error.to_string().contains("shape mismatch"));
+        assert_cache_exact(&cache, &before, "invalid transaction");
+    }
+
+    #[test]
+    fn invalid_noise_shape_leaves_cache_transaction_unchanged() {
+        let mut drafter = super::DFlashDrafter::new(tiny_dense_config(None)).unwrap();
+        init_patterned_weights(&mut drafter);
+        let mut cache = drafter.make_cache();
+        let taps = input(2, 4, 1);
+        drafter.prime_taps(&[taps.clone()], &mut cache).unwrap();
+        let before = cache.clone();
+        let wrong_block = input(1, 4, 7);
+
+        let error = drafter
+            .forward(&wrong_block, &[taps], &mut cache)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("drafter noise must be"));
+        assert_cache_exact(&cache, &before, "invalid noise transaction");
+    }
+
+    #[test]
+    fn staged_forward_publishes_cache_only_after_successful_commit() {
+        let mut drafter = super::DFlashDrafter::new(tiny_dense_config(None)).unwrap();
+        init_patterned_weights(&mut drafter);
+        let mut cache = drafter.make_cache();
+        let before = cache.clone();
+        let taps = input(2, 4, 3);
+        let noise = input(2, 4, 11);
+
+        let transaction = drafter.stage_forward(&noise, &[taps], &cache).unwrap();
+        mlx_rs::transforms::eval([transaction.hidden()]).unwrap();
+        assert_eq!(transaction.position().unwrap(), 2);
+        assert_cache_exact(&cache, &before, "uncommitted forward");
+
+        transaction.commit(&mut cache).unwrap();
+        assert_eq!(cache.position(), 2);
+        assert!(cache.layers[0].is_some());
+        assert_eq!(cache.pending_rows().unwrap(), 0);
+    }
+
+    #[test]
+    fn stale_staged_forward_cannot_overwrite_newer_cache() {
+        let mut drafter = super::DFlashDrafter::new(tiny_dense_config(None)).unwrap();
+        init_patterned_weights(&mut drafter);
+        let mut cache = drafter.make_cache();
+        let taps = input(2, 4, 5);
+        let noise = input(2, 4, 13);
+        let first = drafter
+            .stage_forward(&noise, &[taps.clone()], &cache)
+            .unwrap();
+        let stale = drafter.stage_forward(&noise, &[taps], &cache).unwrap();
+
+        first.commit(&mut cache).unwrap();
+        let error = stale.commit(&mut cache).unwrap_err();
+
+        assert!(error.to_string().contains("stale drafter transaction"));
+        assert_eq!(cache.position(), 2);
+    }
+
     /// Sliding-window eviction: a tiny random drafter with layer 0 = sliding
     /// (window 4) and layer 1 = full. Driving several rounds must cap the
     /// sliding layer's context KV at `sliding_window - 1` while the full layer
@@ -1174,6 +2218,7 @@ mod tests {
             quantization: None,
             dflash_config: DFlashSubConfig {
                 target_layer_ids: vec![0],
+                tap_semantics: None,
                 mask_token_id: Some(1),
                 dspark: false,
                 markov_rank: 0,
@@ -1181,6 +2226,7 @@ mod tests {
                 min_log_snr: 0.0,
                 max_log_snr: 0.0,
                 reuse_target_head: false,
+                target_binding: None,
             },
         };
         let mut drafter = DFlashDrafter::new(config).unwrap();
@@ -1198,8 +2244,8 @@ mod tests {
             drafter.forward(&noise, &taps, &mut cache).unwrap();
         }
 
-        let sliding_len = cache[0].as_ref().unwrap().0.shape()[2];
-        let full_len = cache[1].as_ref().unwrap().0.shape()[2];
+        let sliding_len = cache.layers[0].as_ref().unwrap().0.shape()[2];
+        let full_len = cache.layers[1].as_ref().unwrap().0.shape()[2];
         assert!(
             sliding_len <= 3,
             "sliding cache must cap at window-1=3, got {sliding_len}"

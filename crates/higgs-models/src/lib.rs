@@ -1070,6 +1070,35 @@ impl AnyModel {
         }
     }
 
+    /// Run a Qwen3Next backbone with tap capture but without the vocabulary
+    /// projection, for chunked drafter-context prefill.
+    pub fn forward_raw_with_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(model), AnyCache::Hybrid(cache)) => {
+                model.forward_raw_with_taps(inputs, mask, cache, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_raw_with_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Apply the target's final norm and vocabulary head to one raw hidden row.
+    pub fn project_raw_hidden_last(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(model) => model.project_raw_hidden_last(hidden),
+            _ => Err(Exception::custom(
+                "project_raw_hidden_last requires Qwen3Next",
+            )),
+        }
+    }
+
     /// Forward returning raw hidden + logits + tap hiddens: one backbone pass
     /// feeding both hidden-consuming (MTP head) and tap-consuming (`DFlash`
     /// drafter context) speculation.
@@ -1116,6 +1145,31 @@ impl AnyModel {
             }
             _ => Err(Exception::custom(
                 "forward_with_taps_tape requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Tape-recording verify with an explicit short-row numerical schedule.
+    pub fn forward_with_taps_tape_scheduled(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+        max_layers: Option<usize>,
+        row_schedule: qwen3_next::DFlashRowSchedule,
+    ) -> Result<TapsTapeOutput, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_with_taps_tape_scheduled(
+                inputs,
+                mask,
+                c,
+                tap_layers,
+                max_layers,
+                row_schedule,
+            ),
+            _ => Err(Exception::custom(
+                "forward_with_taps_tape_scheduled requires Qwen3Next + Hybrid cache",
             )),
         }
     }
@@ -1802,43 +1856,23 @@ pub(crate) fn checkpoint_has_key_suffix(model_path: &Path, suffix: &str) -> bool
     })
 }
 
-/// Collect safetensors file paths from a model directory.
-pub(crate) fn collect_safetensors_files(
+/// Collect only the base checkpoint safetensors selected by the loader.
+/// Auxiliary MTP sidecars are deliberately excluded so artifact bindings can
+/// attest the target model independently of optional speculation heads.
+pub(crate) fn collect_base_safetensors_files(
     model_path: &Path,
 ) -> Result<Vec<std::path::PathBuf>, ModelError> {
-    fn existing_auxiliary_files(model_path: &Path) -> Vec<std::path::PathBuf> {
-        AUXILIARY_SAFETENSORS_FILES
-            .iter()
-            .map(|file_name| model_path.join(file_name))
-            .filter(|file_path| file_path.exists())
-            .collect()
-    }
-
-    fn append_existing_auxiliary_files(
-        model_path: &Path,
-        files: &mut Vec<std::path::PathBuf>,
-    ) -> Result<(), ModelError> {
-        let auxiliary_files = existing_auxiliary_files(model_path);
-        if auxiliary_files.len() > 1 {
-            return Err(ModelError::UnsupportedModel(
-                "ambiguous MTP sidecars: both mtp.safetensors and model-mtp.safetensors are present; remove one".to_owned(),
-            ));
-        }
-
-        if let Some(file_path) = auxiliary_files.into_iter().next() {
-            if !files.iter().any(|path| path == &file_path) {
-                files.push(file_path);
-            }
-        }
-        Ok(())
-    }
-
     let index_path = model_path.join("model.safetensors.index.json");
     let single_path = model_path.join("model.safetensors");
     if index_path.exists() {
         let json = std::fs::read_to_string(&index_path)?;
         let index: WeightMapIndex = serde_json::from_str(&json)?;
         let weight_files: HashSet<&String> = index.weight_map.values().collect();
+        if weight_files.is_empty() {
+            return Err(ModelError::MissingWeight(
+                "Safetensors index contains no weight files".to_owned(),
+            ));
+        }
         let mut files: Vec<_> = weight_files
             .into_iter()
             .map(|f| model_path.join(f))
@@ -1850,19 +1884,38 @@ pub(crate) fn collect_safetensors_files(
             files = vec![single_path];
         }
         files.sort();
-        append_existing_auxiliary_files(model_path, &mut files)?;
-        files.sort();
         Ok(files)
     } else if single_path.exists() {
-        let mut files = vec![single_path];
-        append_existing_auxiliary_files(model_path, &mut files)?;
-        files.sort();
-        Ok(files)
+        Ok(vec![single_path])
     } else {
         Err(ModelError::MissingWeight(
             "No safetensors files found".to_owned(),
         ))
     }
+}
+
+/// Collect base checkpoint files plus at most one optional MTP sidecar.
+pub(crate) fn collect_safetensors_files(
+    model_path: &Path,
+) -> Result<Vec<std::path::PathBuf>, ModelError> {
+    let mut files = collect_base_safetensors_files(model_path)?;
+    let auxiliary_files = AUXILIARY_SAFETENSORS_FILES
+        .iter()
+        .map(|file_name| model_path.join(file_name))
+        .filter(|file_path| file_path.exists())
+        .collect::<Vec<_>>();
+    if auxiliary_files.len() > 1 {
+        return Err(ModelError::UnsupportedModel(
+            "ambiguous MTP sidecars: both mtp.safetensors and model-mtp.safetensors are present; remove one".to_owned(),
+        ));
+    }
+    if let Some(file_path) = auxiliary_files.into_iter().next()
+        && !files.iter().any(|path| path == &file_path)
+    {
+        files.push(file_path);
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// Remap a safetensors key for quantized model parameter names.
@@ -2108,6 +2161,20 @@ mod tests {
         let result = collect_safetensors_files(dir.path()).unwrap();
         // Two unique shard files
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn collect_safetensors_rejects_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{}}"#,
+        )
+        .unwrap();
+
+        let error = collect_base_safetensors_files(dir.path()).unwrap_err();
+        assert!(matches!(error, ModelError::MissingWeight(_)));
+        assert!(error.to_string().contains("contains no weight files"));
     }
 
     #[test]

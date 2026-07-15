@@ -70,6 +70,15 @@ fn ensure_ffi_error_handler() {
 /// Wrapper for the cached `GatedDeltaNet` Metal kernel object.
 struct CachedMetalKernel(mlx_sys::mlx_fast_metal_kernel);
 
+/// Thread-local owner for a reusable FastMetal configuration.
+///
+/// mlx-c copies the configuration fields inside
+/// `mlx_fast_metal_kernel_apply`, so the original remains immutable and can
+/// be reused. Keeping this owner thread-local avoids sharing the underlying
+/// C++ object across callers even if a future engine path bypasses the
+/// process-global MLX gate.
+struct CachedMetalKernelConfig(mlx_sys::mlx_fast_metal_kernel_config);
+
 // SAFETY: The kernel handle is created once during initialization and used
 // read-only thereafter (only passed as an argument to `mlx_fast_metal_kernel_apply`).
 // No mutable state is shared across threads.
@@ -87,10 +96,20 @@ impl Drop for CachedMetalKernel {
     }
 }
 
+impl Drop for CachedMetalKernelConfig {
+    fn drop(&mut self) {
+        #[allow(unsafe_code)]
+        unsafe {
+            mlx_sys::mlx_fast_metal_kernel_config_free(self.0);
+        }
+    }
+}
+
 /// Cached `GatedDeltaNet` Metal kernel -- created once, reused for all layers.
 static GATED_DELTA_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static GATED_DELTA_TAPE_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static TAPE_REPLAY_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static CANONICAL_CONV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
@@ -354,6 +373,82 @@ fn symmetric_q1_bias_sentinel() -> Array {
 
 fn has_symmetric_q1_biases(biases: &Array) -> bool {
     biases.size() == 0
+}
+
+fn has_loaded_affine_q1_biases(scales: &Array, biases: &Array) -> bool {
+    biases.size() > 0
+        && biases.shape() == scales.shape()
+        && matches!(
+            biases.dtype(),
+            Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+        )
+}
+
+fn validate_dflash_q1_linear(
+    path: &str,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+    bits: i32,
+    mode: crate::quant_mode::QuantMode,
+) -> Result<(), Exception> {
+    if mode != crate::quant_mode::QuantMode::Affine || bits != 1 || group_size != 128 {
+        return Err(Exception::custom(format!(
+            "{path} is outside the proven dSpark Q1 domain: mode={mode:?} bits={bits} group_size={group_size}"
+        )));
+    }
+    let [rows, packed_columns] = *weight.shape() else {
+        return Err(Exception::custom(format!(
+            "{path} must have a loaded two-dimensional packed Q1 weight"
+        )));
+    };
+    let [scale_rows, scale_columns] = *scales.shape() else {
+        return Err(Exception::custom(format!(
+            "{path} must have two-dimensional Q1 scales"
+        )));
+    };
+    if weight.dtype() != Dtype::Uint32
+        || !matches!(
+            scales.dtype(),
+            Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+        )
+    {
+        return Err(Exception::custom(format!(
+            "{path} has invalid Q1 dtypes weight={:?} scales={:?}",
+            weight.dtype(),
+            scales.dtype()
+        )));
+    }
+    let logical_columns = packed_columns
+        .checked_mul(32)
+        .ok_or_else(|| Exception::custom(format!("{path} Q1 shape overflow")))?;
+    if logical_columns % group_size != 0 {
+        return Err(Exception::custom(format!(
+            "{path} logical Q1 width {logical_columns} is not divisible by group size {group_size}"
+        )));
+    }
+    let expected_scale_columns = logical_columns / group_size;
+    if rows <= 0
+        || packed_columns <= 0
+        || scale_rows != rows
+        || scale_columns != expected_scale_columns
+    {
+        return Err(Exception::custom(format!(
+            "{path} has inconsistent packed Q1 weight/scales shapes {:?}/{:?}",
+            weight.shape(),
+            scales.shape()
+        )));
+    }
+    if !has_symmetric_q1_biases(biases) && !has_loaded_affine_q1_biases(scales, biases) {
+        return Err(Exception::custom(format!(
+            "{path} must use the validated symmetric-Q1 bias sentinel or a nonempty floating-point affine bias matching scales shape {:?}; got shape {:?} dtype {:?}",
+            scales.shape(),
+            biases.shape(),
+            biases.dtype()
+        )));
+    }
+    Ok(())
 }
 
 fn bonsai_q1_qmm_max_rows() -> i32 {
@@ -913,6 +1008,10 @@ thread_local! {
         RefCell::new(HashMap::new());
     static GATED_DELTA_CONFIG_CACHE: RefCell<HashMap<GatedDeltaKernelConfigKey, mlx_sys::mlx_fast_metal_kernel_config>> =
         RefCell::new(HashMap::new());
+    static GATED_DELTA_TAPE_CONFIG_CACHE: RefCell<HashMap<GatedDeltaTapeKernelConfigKey, CachedMetalKernelConfig>> =
+        RefCell::new(HashMap::new());
+    static CANONICAL_CONV_CONFIG_CACHE: RefCell<HashMap<CanonicalConvKernelConfigKey, CachedMetalKernelConfig>> =
+        RefCell::new(HashMap::new());
 }
 
 fn silu_mul(gate: &Array, x: &Array) -> Result<Array, Exception> {
@@ -1060,14 +1159,261 @@ pub(crate) fn gather_qmm(
 // `GatedDeltaNet` custom Metal kernel
 // ---------------------------------------------------------------------------
 
-/// Metal kernel source for the fused `GatedDeltaNet` recurrence.
+/// Ordered short-block depthwise convolution used by the canonical verifier.
+///
+/// The output deliberately stops before `SiLU`. The caller applies the existing
+/// MLX `sigmoid` and multiply primitives once over the complete block, keeping
+/// their arithmetic identical to the S=1 path while collapsing the ordered
+/// multiply/add chain to one dispatch per GDN layer.
+const CANONICAL_CONV_KERNEL_SOURCE: &str = r"
+const int channel = static_cast<int>(thread_position_in_grid.x);
+const int position = static_cast<int>(thread_position_in_grid.y);
+const int batch_index = static_cast<int>(thread_position_in_grid.z);
+const int mixed_index = (batch_index * T + position) * D + channel;
+
+// Match canonical_conv1d_step exactly: current tap first, then one rounded
+// multiply and one rounded add for each available lag, newest to oldest.
+InT accumulator = static_cast<InT>(
+    mixed_qkv[mixed_index] * weight_t[(K - 1) * D + channel]);
+const int available = min(max(offset_init + position, 0), K - 1);
+for (int lag = 0; lag < available; ++lag) {
+  const int prior_position = position - 1 - lag;
+  InT prior;
+  if (prior_position >= 0) {
+    prior = mixed_qkv[(batch_index * T + prior_position) * D + channel];
+  } else {
+    const int history_index = (K - 2) - (lag - position);
+    prior = history[(batch_index * (K - 1) + history_index) * D + channel];
+  }
+  InT product = static_cast<InT>(prior * weight_t[(K - 2 - lag) * D + channel]);
+  accumulator = static_cast<InT>(accumulator + product);
+}
+preactivation[mixed_index] = accumulator;
+";
+
+#[allow(unsafe_code)]
+fn create_canonical_conv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let input_names: [&std::ffi::CStr; 4] = [c"mixed_qkv", c"history", c"weight_t", c"offset_init"];
+    let output_names: [&std::ffi::CStr; 1] = [c"preactivation"];
+    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|name| name.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|name| name.as_ptr()).collect();
+    let source = CString::new(CANONICAL_CONV_KERNEL_SOURCE).unwrap_or_default();
+
+    unsafe {
+        let inputs =
+            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let outputs =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"canonical_conv_ordered".as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(inputs);
+        mlx_sys::mlx_vector_string_free(outputs);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_canonical_conv_kernel(
+    in_dtype: mlx_sys::mlx_dtype,
+    batch: i32,
+    seq_len: i32,
+    conv_dim: i32,
+    kernel_size: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"InT".as_ptr(),
+            in_dtype,
+        );
+        for (name, value) in [
+            (c"B", batch),
+            (c"T", seq_len),
+            (c"D", conv_dim),
+            (c"K", kernel_size),
+        ] {
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config,
+                name.as_ptr(),
+                value,
+            );
+        }
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, conv_dim, seq_len, batch);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1);
+        let output_shape = [batch, seq_len, conv_dim];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            output_shape.as_ptr(),
+            output_shape.len(),
+            in_dtype,
+        );
+        config
+    }
+}
+
+fn canonical_conv_kernel_supported(
+    mixed_qkv: &Array,
+    history: &Array,
+    weight_t: &Array,
+    batch: i32,
+    seq_len: i32,
+    conv_dim: i32,
+    kernel_size: i32,
+) -> bool {
+    batch == 1
+        && (1..=5).contains(&seq_len)
+        && kernel_size == 4
+        && mixed_qkv.dtype() == Dtype::Bfloat16
+        && history.dtype() == Dtype::Bfloat16
+        && weight_t.dtype() == Dtype::Bfloat16
+        && mixed_qkv.shape() == [batch, seq_len, conv_dim]
+        && history.shape() == [batch, kernel_size - 1, conv_dim]
+        && weight_t.shape() == [kernel_size, conv_dim]
+}
+
+#[allow(unsafe_code, clippy::too_many_arguments)]
+fn canonical_conv_preactivation_ffi(
+    mixed_qkv: &Array,
+    history: &Array,
+    weight_t: &Array,
+    offset_init: i32,
+    batch: i32,
+    seq_len: i32,
+    conv_dim: i32,
+    kernel_size: i32,
+) -> Result<Array, Exception> {
+    if !canonical_conv_kernel_supported(
+        mixed_qkv,
+        history,
+        weight_t,
+        batch,
+        seq_len,
+        conv_dim,
+        kernel_size,
+    ) || offset_init < 0
+    {
+        return Err(Exception::custom(format!(
+            "unsupported canonical convolution domain: mixed={:?}/{:?} history={:?}/{:?} weight={:?}/{:?} B={batch} T={seq_len} D={conv_dim} K={kernel_size} offset={offset_init}",
+            mixed_qkv.shape(),
+            mixed_qkv.dtype(),
+            history.shape(),
+            history.dtype(),
+            weight_t.shape(),
+            weight_t.dtype(),
+        )));
+    }
+
+    ensure_ffi_error_handler();
+    let stream = Stream::task_local_or_default();
+    let in_dtype = unsafe { mlx_sys::mlx_array_dtype(mixed_qkv.as_ptr()) };
+    let key = CanonicalConvKernelConfigKey {
+        in_dtype,
+        batch,
+        seq_len,
+        conv_dim,
+        kernel_size,
+    };
+    let config = CANONICAL_CONV_CONFIG_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| {
+                CachedMetalKernelConfig(configure_canonical_conv_kernel(
+                    in_dtype,
+                    batch,
+                    seq_len,
+                    conv_dim,
+                    kernel_size,
+                ))
+            })
+            .0
+    });
+    let kernel =
+        CANONICAL_CONV_KERNEL.get_or_init(|| CachedMetalKernel(create_canonical_conv_kernel()));
+    let offset_scalar = unsafe { mlx_sys::mlx_array_new_int(offset_init) };
+    let input_ptrs = [
+        mixed_qkv.as_ptr(),
+        history.as_ptr(),
+        weight_t.as_ptr(),
+        offset_scalar,
+    ];
+    let inputs =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+    let mut outputs = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs,
+            kernel.0,
+            inputs,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status == 0 {
+        let mut output = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut output, outputs, 0) };
+        Ok(unsafe { Array::from_ptr(output) })
+    } else {
+        let message = FFI_LAST_ERROR
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
+        Err(Exception::custom(format!(
+            "canonical_conv_ordered failed: {message}"
+        )))
+    };
+
+    unsafe {
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_array_free(offset_scalar);
+    }
+    result
+}
+
+/// Shared recurrence algebra for every GDN Metal path.
+///
+/// Keep decay and innovation update as two statements. Combining them permits
+/// an FMA/reassociation that changes rollback state bits after partial accept.
+const GDN_RECURRENCE_METAL_PREAMBLE: &str = r"
+#define HIGGS_GDN_GATE(gate, a_value, dt_bias_value, a_log_value) \
+  float x = static_cast<float>(a_value) + dt_bias_value; \
+  float sp = fmax(x, 0.0f) + log1p(exp(-fabs(x))); \
+  float gate = exp(-exp(a_log_value) * sp)
+#define HIGGS_GDN_BETA(beta, b_value) \
+  float beta = 1.0f / (1.0f + exp(-static_cast<float>(b_value)))
+#define HIGGS_GDN_DECAY(state_value, gate) \
+  state_value = state_value * gate
+#define HIGGS_GDN_UPDATE(state_value, key_value, delta) \
+  state_value = state_value + key_value * delta
+";
+
+fn gdn_metal_source(defines: &str, body: &str) -> CString {
+    let mut source =
+        String::with_capacity(GDN_RECURRENCE_METAL_PREAMBLE.len() + defines.len() + body.len());
+    source.push_str(GDN_RECURRENCE_METAL_PREAMBLE);
+    source.push_str(defines);
+    source.push_str(body);
+    CString::new(source).unwrap_or_else(|_| CString::default())
+}
+
+/// Metal kernel source for the fused `GatedDeltaNet` recurrence. Plain and
+/// tape-recording kernels compile this same body with one tape feature flag.
 ///
 /// Computes `g = exp(-exp(a_log) * softplus(a + dt_bias))` and `beta = sigmoid(b)`
 /// inline, then runs the full recurrence -- all in one kernel dispatch.
 ///
 /// Template parameters: `InT` (dtype), `Dk`, `Dv`, `Hk`, `Hv` (int constants).
 /// Grid: `(32, Dv, B * Hv)`, Threadgroup: `(32, 4, 1)`.
-const GATED_DELTA_KERNEL_SOURCE: &str = r"
+const GATED_DELTA_FORWARD_KERNEL_SOURCE: &str = r"
 auto n = thread_position_in_grid.z;
 auto b_idx = n / Hv;
 auto hv_idx = n % Hv;
@@ -1079,6 +1425,9 @@ auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
 
 auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
 y += b_idx * T * Hv * Dv + hv_idx * Dv;
+#if HIGGS_GDN_RECORD_TAPE
+auto tape_ = innovation_tape + b_idx * T * Hv * Dv + hv_idx * Dv;
+#endif
 
 auto dk_idx = thread_position_in_threadgroup.x;
 auto dv_idx = thread_position_in_grid.y;
@@ -1103,19 +1452,14 @@ auto a_ = a + b_idx * T * Hv;
 auto b_ = b + b_idx * T * Hv;
 
 for (int t = 0; t < T; ++t) {
-  // Compute g = exp(-exp(a_log) * softplus(a + dt_bias))
-  float x = static_cast<float>(a_[hv_idx]) + dt_bias_val;
-  float sp = fmax(x, 0.0f) + log1p(exp(-fabs(x)));
-  float g_val = exp(-exp(a_log_val) * sp);
-
-  // beta = sigmoid(b)
-  float beta_val = 1.0f / (1.0f + exp(-static_cast<float>(b_[hv_idx])));
+  HIGGS_GDN_GATE(g_val, a_[hv_idx], dt_bias_val, a_log_val);
+  HIGGS_GDN_BETA(beta_val, b_[hv_idx]);
 
   {
     float kv_mem = 0.0f;
     for (int i = 0; i < n_per_t; ++i) {
       auto s_idx = n_per_t * dk_idx + i;
-      state[i] = state[i] * g_val;
+      HIGGS_GDN_DECAY(state[i], g_val);
       kv_mem += state[i] * k_[s_idx];
     }
     kv_mem = simd_sum(kv_mem);
@@ -1125,18 +1469,24 @@ for (int t = 0; t < T; ++t) {
     float out = 0.0f;
     for (int i = 0; i < n_per_t; ++i) {
       auto s_idx = n_per_t * dk_idx + i;
-      state[i] = state[i] + k_[s_idx] * delta;
+      HIGGS_GDN_UPDATE(state[i], k_[s_idx], delta);
       out += state[i] * q_[s_idx];
     }
     out = simd_sum(out);
     if (thread_index_in_simdgroup == 0) {
       y[dv_idx] = static_cast<InT>(out);
+#if HIGGS_GDN_RECORD_TAPE
+      tape_[dv_idx] = delta;
+#endif
     }
   }
   q_ += Hk * Dk;
   k_ += Hk * Dk;
   v_ += Hv * Dv;
   y += Hv * Dv;
+#if HIGGS_GDN_RECORD_TAPE
+  tape_ += Hv * Dv;
+#endif
   a_ += Hv;
   b_ += Hv;
 }
@@ -1165,8 +1515,10 @@ fn create_gated_delta_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
     let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
 
-    // The kernel source is a compile-time string literal with no interior NULs.
-    let source = CString::new(GATED_DELTA_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+    let source = gdn_metal_source(
+        "#define HIGGS_GDN_RECORD_TAPE 0\n",
+        GATED_DELTA_FORWARD_KERNEL_SOURCE,
+    );
 
     unsafe {
         let in_vec =
@@ -1300,6 +1652,45 @@ fn gated_delta_kernel_config(
     (config, true)
 }
 
+fn validate_gdn_kernel_state(
+    operation: &str,
+    state: &Array,
+    batch: i32,
+    seq_len: i32,
+    num_k_heads: i32,
+    head_k_dim: i32,
+    num_v_heads: i32,
+    head_v_dim: i32,
+) -> Result<(), Exception> {
+    if batch <= 0
+        || seq_len <= 0
+        || num_k_heads <= 0
+        || num_v_heads <= 0
+        || head_k_dim <= 0
+        || head_v_dim <= 0
+        || head_k_dim % 32 != 0
+        || num_v_heads % num_k_heads != 0
+    {
+        return Err(Exception::custom(format!(
+            "{operation}: invalid GDN Metal geometry B={batch} T={seq_len} Hk={num_k_heads} Dk={head_k_dim} Hv={num_v_heads} Dv={head_v_dim}"
+        )));
+    }
+    if state.dtype() != Dtype::Float32 {
+        return Err(Exception::custom(format!(
+            "{operation}: state must be Float32, got {:?}",
+            state.dtype()
+        )));
+    }
+    let expected = [batch, num_v_heads, head_v_dim, head_k_dim];
+    if state.shape() != expected {
+        return Err(Exception::custom(format!(
+            "{operation}: state shape must be {expected:?}, got {:?}",
+            state.shape()
+        )));
+    }
+    Ok(())
+}
+
 /// Fused `GatedDeltaNet` kernel: computes g, beta, AND the full recurrence in one dispatch.
 #[allow(unsafe_code, clippy::too_many_arguments)]
 fn gated_delta_kernel_ffi(
@@ -1318,6 +1709,16 @@ fn gated_delta_kernel_ffi(
     num_v_heads: i32,
     head_v_dim: i32,
 ) -> Result<(Array, Array), Exception> {
+    validate_gdn_kernel_state(
+        "gated_delta_kernel",
+        state_in,
+        batch,
+        seq_len,
+        num_k_heads,
+        head_k_dim,
+        num_v_heads,
+        head_v_dim,
+    )?;
     ensure_ffi_error_handler();
 
     let stream = Stream::task_local_or_default();
@@ -1443,90 +1844,6 @@ pub(crate) fn gated_delta_kernel_ffi_stateless(
 // Tape-recording GDN kernel: same recurrence, also outputs innovation delta
 // ---------------------------------------------------------------------------
 
-/// Tape-recording variant of the GDN kernel. Identical computation but also
-/// outputs `innovation_tape[B, T, Hv, Dv]` -- the delta residual at each step.
-/// Used for `DFlash` verify: on partial rejection, we replay only accepted steps
-/// from the tape instead of re-running the full forward.
-const GATED_DELTA_TAPE_KERNEL_SOURCE: &str = r"
-auto n = thread_position_in_grid.z;
-auto b_idx = n / Hv;
-auto hv_idx = n % Hv;
-auto hk_idx = hv_idx / (Hv / Hk);
-constexpr int n_per_t = Dk / 32;
-
-auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
-auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
-
-auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
-y += b_idx * T * Hv * Dv + hv_idx * Dv;
-auto tape_ = innovation_tape + b_idx * T * Hv * Dv + hv_idx * Dv;
-
-auto dk_idx = thread_position_in_threadgroup.x;
-auto dv_idx = thread_position_in_grid.y;
-
-// state_in/state_out are float32 buffers (must match the f32 precision of the
-// AR-decode kernel so verify argmax is bit-exact); reinterpret from InT*.
-auto i_state = reinterpret_cast<const device float*>(state_in) + (n * Dv + dv_idx) * Dk;
-auto o_state = reinterpret_cast<device float*>(state_out) + (n * Dv + dv_idx) * Dk;
-
-float state[n_per_t];
-for (int i = 0; i < n_per_t; ++i) {
-  auto s_idx = n_per_t * dk_idx + i;
-  state[i] = static_cast<float>(i_state[s_idx]);
-}
-
-float a_log_val = static_cast<float>(a_log[hv_idx]);
-float dt_bias_val = static_cast<float>(dt_bias[hv_idx]);
-
-auto a_ = a + b_idx * T * Hv;
-auto b_ = b + b_idx * T * Hv;
-
-for (int t = 0; t < T; ++t) {
-  float x = static_cast<float>(a_[hv_idx]) + dt_bias_val;
-  float sp = fmax(x, 0.0f) + log1p(exp(-fabs(x)));
-  float g_val = exp(-exp(a_log_val) * sp);
-
-  float beta_val = 1.0f / (1.0f + exp(-static_cast<float>(b_[hv_idx])));
-
-  {
-    float kv_mem = 0.0f;
-    for (int i = 0; i < n_per_t; ++i) {
-      auto s_idx = n_per_t * dk_idx + i;
-      state[i] = state[i] * g_val;
-      kv_mem += state[i] * k_[s_idx];
-    }
-    kv_mem = simd_sum(kv_mem);
-
-    auto delta = (v_[dv_idx] - kv_mem) * beta_val;
-
-    float out = 0.0f;
-    for (int i = 0; i < n_per_t; ++i) {
-      auto s_idx = n_per_t * dk_idx + i;
-      state[i] = state[i] + k_[s_idx] * delta;
-      out += state[i] * q_[s_idx];
-    }
-    out = simd_sum(out);
-    if (thread_index_in_simdgroup == 0) {
-      y[dv_idx] = static_cast<InT>(out);
-      tape_[dv_idx] = delta;
-    }
-  }
-  // Keep state in float32 across timesteps (no InT downcast) so the recurrence
-  // is bit-exact with the AR-decode kernel.
-  q_ += Hk * Dk;
-  k_ += Hk * Dk;
-  v_ += Hv * Dv;
-  y += Hv * Dv;
-  tape_ += Hv * Dv;
-  a_ += Hv;
-  b_ += Hv;
-}
-for (int i = 0; i < n_per_t; ++i) {
-  auto s_idx = n_per_t * dk_idx + i;
-  o_state[s_idx] = state[i];
-}
-";
-
 #[allow(unsafe_code)]
 fn create_gated_delta_tape_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let input_names: [&std::ffi::CStr; 9] = [
@@ -1545,8 +1862,10 @@ fn create_gated_delta_tape_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
     let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
 
-    let source =
-        CString::new(GATED_DELTA_TAPE_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+    let source = gdn_metal_source(
+        "#define HIGGS_GDN_RECORD_TAPE 1\n",
+        GATED_DELTA_FORWARD_KERNEL_SOURCE,
+    );
 
     unsafe {
         let in_vec =
@@ -1638,6 +1957,59 @@ fn configure_gated_delta_tape_kernel(
     }
 }
 
+fn gated_delta_tape_kernel_config(
+    in_dtype: mlx_sys::mlx_dtype,
+    batch: i32,
+    seq_len: i32,
+    num_k_heads: i32,
+    head_k_dim: i32,
+    num_v_heads: i32,
+    head_v_dim: i32,
+) -> (mlx_sys::mlx_fast_metal_kernel_config, bool) {
+    if !gated_delta_tape_config_cache_enabled() {
+        return (
+            configure_gated_delta_tape_kernel(
+                in_dtype,
+                batch,
+                seq_len,
+                num_k_heads,
+                head_k_dim,
+                num_v_heads,
+                head_v_dim,
+            ),
+            false,
+        );
+    }
+
+    let key = GatedDeltaTapeKernelConfigKey::new(
+        in_dtype,
+        batch,
+        seq_len,
+        num_k_heads,
+        head_k_dim,
+        num_v_heads,
+        head_v_dim,
+    );
+    let config = GATED_DELTA_TAPE_CONFIG_CACHE.with(|cache_cell| {
+        let mut cache_map = cache_cell.borrow_mut();
+        cache_map
+            .entry(key)
+            .or_insert_with(|| {
+                CachedMetalKernelConfig(configure_gated_delta_tape_kernel(
+                    in_dtype,
+                    batch,
+                    seq_len,
+                    num_k_heads,
+                    head_k_dim,
+                    num_v_heads,
+                    head_v_dim,
+                ))
+            })
+            .0
+    });
+    (config, true)
+}
+
 /// Tape-recording GDN kernel: returns `(y, state_out, innovation_tape)`.
 #[allow(unsafe_code, clippy::too_many_arguments)]
 pub(crate) fn gated_delta_kernel_ffi_with_tape(
@@ -1656,6 +2028,16 @@ pub(crate) fn gated_delta_kernel_ffi_with_tape(
     num_v_heads: i32,
     head_v_dim: i32,
 ) -> Result<(Array, Array, Array), Exception> {
+    validate_gdn_kernel_state(
+        "gated_delta_tape_kernel",
+        state_in,
+        batch,
+        seq_len,
+        num_k_heads,
+        head_k_dim,
+        num_v_heads,
+        head_v_dim,
+    )?;
     ensure_ffi_error_handler();
 
     let stream = Stream::task_local_or_default();
@@ -1663,7 +2045,7 @@ pub(crate) fn gated_delta_kernel_ffi_with_tape(
 
     let cached =
         GATED_DELTA_TAPE_KERNEL.get_or_init(|| CachedMetalKernel(create_gated_delta_tape_kernel()));
-    let config = configure_gated_delta_tape_kernel(
+    let (config, config_is_cached) = gated_delta_tape_kernel_config(
         in_dtype,
         batch,
         seq_len,
@@ -1723,7 +2105,9 @@ pub(crate) fn gated_delta_kernel_ffi_with_tape(
     };
 
     unsafe {
-        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        if !config_is_cached {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        }
         mlx_sys::mlx_vector_array_free(inputs_vec);
         mlx_sys::mlx_vector_array_free(outputs_vec);
         mlx_sys::mlx_array_free(t_scalar);
@@ -1767,9 +2151,7 @@ float dt_bias_val = static_cast<float>(dt_bias[b_idx * Hv + hv_idx]);
 auto a_ = a + b_idx * T * Hv;
 
 for (int t = 0; t < T; ++t) {
-  float x = static_cast<float>(a_[hv_idx]) + dt_bias_val;
-  float sp = fmax(x, 0.0f) + log1p(exp(-fabs(x)));
-  float g_val = exp(-exp(a_log_val) * sp);
+  HIGGS_GDN_GATE(g_val, a_[hv_idx], dt_bias_val, a_log_val);
 
   auto delta = tape_[dv_idx];
   // Replay the forward kernel's EXACT op sequence (decay as a separate
@@ -1778,8 +2160,8 @@ for (int t = 0; t < T; ++t) {
   // (FMA) and the ~1e-8 drift accumulates across rollbacks → argmax flips.
   for (int i = 0; i < n_per_t; ++i) {
     auto s_idx = n_per_t * dk_idx + i;
-    state[i] = state[i] * g_val;
-    state[i] = state[i] + k_[s_idx] * delta;
+    HIGGS_GDN_DECAY(state[i], g_val);
+    HIGGS_GDN_UPDATE(state[i], k_[s_idx], delta);
   }
   tape_ += Hv * Dv;
   k_ += Hk * Dk;
@@ -1800,7 +2182,7 @@ fn create_tape_replay_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
     let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
 
-    let source = CString::new(TAPE_REPLAY_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+    let source = gdn_metal_source("", TAPE_REPLAY_KERNEL_SOURCE);
 
     unsafe {
         let in_vec =
@@ -1839,6 +2221,29 @@ pub(crate) fn tape_replay_kernel_ffi(
     num_v_heads: i32,
     head_v_dim: i32,
 ) -> Result<Array, Exception> {
+    validate_gdn_kernel_state(
+        "tape_replay_kernel",
+        state_in,
+        batch,
+        seq_len,
+        num_k_heads,
+        head_k_dim,
+        num_v_heads,
+        head_v_dim,
+    )?;
+    if tape.dtype() != Dtype::Float32 {
+        return Err(Exception::custom(format!(
+            "tape_replay_kernel: innovation tape must be Float32, got {:?}",
+            tape.dtype()
+        )));
+    }
+    let expected_tape = [batch, seq_len, num_v_heads, head_v_dim];
+    if tape.shape() != expected_tape {
+        return Err(Exception::custom(format!(
+            "tape_replay_kernel: tape shape must be {expected_tape:?}, got {:?}",
+            tape.shape()
+        )));
+    }
     ensure_ffi_error_handler();
 
     let stream = Stream::task_local_or_default();
@@ -2291,6 +2696,8 @@ if (valid) {
 static QGEMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static QGEMV_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 static GATED_DELTA_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
+static GATED_DELTA_TAPE_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
+static CANONICAL_CONV_ENABLED: OnceLock<bool> = OnceLock::new();
 static DECODE_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 static QGEMV_NSG_OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
 static DENSE_FFN_GEMV_MODE: OnceLock<DenseFfnGemvMode> = OnceLock::new();
@@ -2326,6 +2733,53 @@ struct GatedDeltaKernelConfigKey {
     head_v_dim: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CanonicalConvKernelConfigKey {
+    in_dtype: mlx_sys::mlx_dtype,
+    batch: i32,
+    seq_len: i32,
+    conv_dim: i32,
+    kernel_size: i32,
+}
+
+/// Complete specialization and output-geometry key for the tape-recording GDN
+/// kernel. The output shapes are derived as
+/// `[batch, seq_len, num_v_heads, head_v_dim]` for `y` and the tape, and
+/// `[batch, num_v_heads, head_v_dim, head_k_dim]` for state. State and tape
+/// output dtypes are fixed to Float32; `in_dtype` also selects the `y` dtype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GatedDeltaTapeKernelConfigKey {
+    in_dtype: mlx_sys::mlx_dtype,
+    batch: i32,
+    seq_len: i32,
+    num_k_heads: i32,
+    head_k_dim: i32,
+    num_v_heads: i32,
+    head_v_dim: i32,
+}
+
+impl GatedDeltaTapeKernelConfigKey {
+    const fn new(
+        in_dtype: mlx_sys::mlx_dtype,
+        batch: i32,
+        seq_len: i32,
+        num_k_heads: i32,
+        head_k_dim: i32,
+        num_v_heads: i32,
+        head_v_dim: i32,
+    ) -> Self {
+        Self {
+            in_dtype,
+            batch,
+            seq_len,
+            num_k_heads,
+            head_k_dim,
+            num_v_heads,
+            head_v_dim,
+        }
+    }
+}
+
 fn decode_gemv_enabled() -> bool {
     *DECODE_GEMV_ENABLED.get_or_init(|| std::env::var("HIGGS_ENABLE_SELECTED_DECODE_GEMV").is_ok())
 }
@@ -2352,6 +2806,10 @@ fn truthy_env_var(name: &str) -> bool {
             .as_deref(),
         Some("1" | "true" | "on" | "yes")
     )
+}
+
+fn canonical_conv_enabled() -> bool {
+    *CANONICAL_CONV_ENABLED.get_or_init(|| truthy_env_var("HIGGS_DFLASH_FUSED_CONV"))
 }
 
 fn parse_dense_ffn_gemv_mode(raw: Option<&str>) -> DenseFfnGemvMode {
@@ -2402,6 +2860,11 @@ fn gated_delta_config_cache_enabled() -> bool {
                 )
             })
     })
+}
+
+fn gated_delta_tape_config_cache_enabled() -> bool {
+    *GATED_DELTA_TAPE_CONFIG_CACHE_ENABLED
+        .get_or_init(|| truthy_env_var("HIGGS_DFLASH_GDN_CONFIG_CACHE"))
 }
 
 fn qgemv_nsg_override() -> Option<i32> {
@@ -3222,6 +3685,19 @@ pub struct Qwen3NextAttention {
     scale: f32,
 }
 
+/// Numerical schedule for short full-attention blocks.
+///
+/// Speculative verification must use the same one-query `RoPE` and SDPA
+/// primitives as autoregressive decode. Ordinary prefill deliberately keeps
+/// the native multi-query schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DFlashRowSchedule {
+    /// Preserve the model's ordinary multi-row prefill schedule.
+    NativeBatch,
+    /// Fold the exact one-token stateful primitives across a short block.
+    CanonicalS1,
+}
+
 impl Qwen3NextAttention {
     /// Construct with per-tensor quantization resolved from module paths
     /// (`quant_overrides` / global default; mode-aware). `dense_attention_outputs`
@@ -3241,20 +3717,6 @@ impl Qwen3NextAttention {
             o_resolved
         };
         Self::from_specs(args, q_spec, k_spec, v_spec, o_spec)
-    }
-
-    /// Construct attention projections from explicit specs.
-    ///
-    /// `spec` applies to `q_proj`/`o_proj`; `kv_spec` applies to `k_proj`/`v_proj`.
-    /// For mixed-precision checkpoints (e.g. AEON mxfp4 bulk + 8-bit affine k/v
-    /// islands), the caller resolves `kv_spec` via `args.quant_spec_for(...)`.
-    /// For uniform checkpoints, pass the same `spec` for both.
-    fn new_with_specs(
-        args: &Qwen3NextModelArgs,
-        spec: QuantSpec,
-        kv_spec: QuantSpec,
-    ) -> Result<Self, Exception> {
-        Self::from_specs(args, spec, kv_spec, kv_spec, spec)
     }
 
     fn from_specs(
@@ -3306,6 +3768,75 @@ impl Qwen3NextAttention {
         x: &Array,
         mask: Option<&AttentionMask>,
         cache: &mut SteppingKeyValueCache,
+    ) -> Result<Array, Exception> {
+        self.forward_scheduled(x, mask, cache, DFlashRowSchedule::NativeBatch)
+    }
+
+    /// Forward a speculative short block with the exact one-row numerical
+    /// primitives used by autoregressive decode.
+    fn forward_canonical_rows(
+        &mut self,
+        x: &Array,
+        mask: Option<&AttentionMask>,
+        cache: &mut SteppingKeyValueCache,
+    ) -> Result<Array, Exception> {
+        let seq_len = *x
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("canonical attention input has no token axis"))?;
+        if !(1..=8).contains(&seq_len) {
+            return Err(Exception::custom(format!(
+                "canonical short-block attention requires 1..=8 rows, got {seq_len}"
+            )));
+        }
+        self.forward_scheduled(x, mask, cache, DFlashRowSchedule::CanonicalS1)
+    }
+
+    /// Attend one query against the cache view produced by one cache append.
+    ///
+    /// Both autoregressive decode and the canonical short-block schedule call
+    /// this primitive. Keeping the dispatch here is important: a `TurboQuant`
+    /// cache must remain in its code domain instead of being materialized to a
+    /// dense CPU buffer, and a dense cache must use the same one-query SDPA
+    /// reduction in both paths.
+    fn attend_one_query(
+        &self,
+        query: &Array,
+        view: crate::cache::KvCacheView,
+        batch: i32,
+    ) -> Result<Array, Exception> {
+        match view {
+            crate::cache::KvCacheView::TurboQuant(tq_view) => {
+                let scores = tq_view.decode_scores(query, self.num_attention_heads)?;
+                let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
+                let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
+                tq_view
+                    .decode_values(&weights, self.num_attention_heads)?
+                    .transpose_axes(&[0, 2, 1, 3])?
+                    .reshape(&[batch, 1, -1])
+            }
+            crate::cache::KvCacheView::Dense { keys, values } => {
+                fast::scaled_dot_product_attention(
+                    query,
+                    keys,
+                    values,
+                    self.scale,
+                    None,
+                    None::<&Array>,
+                )?
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[batch, 1, -1])
+            }
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn forward_scheduled(
+        &mut self,
+        x: &Array,
+        mask: Option<&AttentionMask>,
+        cache: &mut SteppingKeyValueCache,
+        row_schedule: DFlashRowSchedule,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let B = *shape
@@ -3413,8 +3944,20 @@ impl Qwen3NextAttention {
                 );
             }
         }
-        queries = apply_qwen3_next_rope(queries, &self.rope, offset, self.yarn.as_ref())?;
-        keys = apply_qwen3_next_rope(keys, &self.rope, offset, self.yarn.as_ref())?;
+        queries = apply_qwen3_next_rope_scheduled(
+            queries,
+            &self.rope,
+            offset,
+            self.yarn.as_ref(),
+            row_schedule,
+        )?;
+        keys = apply_qwen3_next_rope_scheduled(
+            keys,
+            &self.rope,
+            offset,
+            self.yarn.as_ref(),
+            row_schedule,
+        )?;
 
         // DIAGNOSTIC: probe-driven capture of this FA layer's keys (first FA
         // layer of a forward: offset==0, L>1). Captures pre-write (post-rope)
@@ -3444,15 +3987,56 @@ impl Qwen3NextAttention {
         let diag_keys_pre = if diag_attn { mat_vec(&keys) } else { None };
 
         let tq_prof = tq_profile_enabled() && L == 1;
-        let append_t0 = tq_prof.then(|| {
-            let _ = mlx_rs::transforms::eval([&keys, &values]);
-            std::time::Instant::now()
-        });
-        let view = cache.update_and_view(keys, values)?;
-        if let Some(t0) = append_t0 {
-            let _ = mlx_rs::transforms::eval(cache.eval_targets());
-            PROF_TQ_APPEND_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
-            PROF_TQ_N.with(|c| c.set(c.get() + 1));
+        let canonical_rows = L > 1 && row_schedule == DFlashRowSchedule::CanonicalS1;
+        let attn_t0 = tq_prof.then(std::time::Instant::now);
+        let output = if canonical_rows {
+            // Preserve the useful batched Q/K/V projections, then execute the
+            // stateful part as the exact S1 transition. Appending K/V one row
+            // at a time reproduces TurboQuant activation and code-domain
+            // updates at precisely the same token boundary as AR decode.
+            let row_capacity = usize::try_from(L)
+                .map_err(|_| Exception::custom("negative canonical attention row count"))?;
+            let mut rows = Vec::with_capacity(row_capacity);
+            for position in 0..L {
+                let query = queries.index((.., .., position..position + 1, ..));
+                let row_keys = keys.index((.., .., position..position + 1, ..));
+                let row_values = values.index((.., .., position..position + 1, ..));
+                let view = cache.update_and_view(row_keys, row_values)?;
+                rows.push(self.attend_one_query(&query, view, B)?);
+            }
+            ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1)?
+        } else {
+            let append_t0 = tq_prof.then(|| {
+                let _ = mlx_rs::transforms::eval([&keys, &values]);
+                std::time::Instant::now()
+            });
+            let view = cache.update_and_view(keys, values)?;
+            if let Some(t0) = append_t0 {
+                let _ = mlx_rs::transforms::eval(cache.eval_targets());
+                PROF_TQ_APPEND_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+                PROF_TQ_N.with(|c| c.set(c.get() + 1));
+            }
+
+            if mask.is_none() && L == 1 {
+                self.attend_one_query(&queries, view, B)?
+            } else {
+                let (cached_keys, cached_values) = view.into_dense()?;
+                let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
+                fast::scaled_dot_product_attention(
+                    queries,
+                    cached_keys,
+                    cached_values,
+                    self.scale,
+                    sdpa_mask,
+                    None::<&Array>,
+                )?
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[B, L, -1])?
+            }
+        };
+        if let Some(t0) = attn_t0 {
+            let _ = mlx_rs::transforms::eval([&output]);
+            PROF_TQ_ATTN_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
         }
 
         if diag_attn {
@@ -3468,39 +4052,6 @@ impl Qwen3NextAttention {
                 ))
             });
         }
-        let try_tq_decode = mask.is_none() && L == 1;
-        let attn_t0 = tq_prof.then(std::time::Instant::now);
-        let output = match view {
-            crate::cache::KvCacheView::TurboQuant(tq_view) if try_tq_decode => {
-                let scores = tq_view.decode_scores(&queries, self.num_attention_heads)?;
-                let scale_arr = Array::from_f32(self.scale).as_dtype(scores.dtype())?;
-                let weights = ops::softmax_axis(&scores.multiply(&scale_arr)?, -1, true)?;
-                let attn_out = tq_view
-                    .decode_values(&weights, self.num_attention_heads)?
-                    .transpose_axes(&[0, 2, 1, 3])?
-                    .reshape(&[B, L, -1])?;
-                if let Some(t0) = attn_t0 {
-                    let _ = mlx_rs::transforms::eval([&attn_out]);
-                    PROF_TQ_ATTN_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
-                }
-                attn_out
-            }
-            other @ (crate::cache::KvCacheView::Dense { .. }
-            | crate::cache::KvCacheView::TurboQuant(_)) => {
-                let (cached_keys, cached_values) = other.into_dense()?;
-                let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
-                fast::scaled_dot_product_attention(
-                    queries,
-                    cached_keys,
-                    cached_values,
-                    self.scale,
-                    sdpa_mask,
-                    None::<&Array>,
-                )?
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[B, L, -1])?
-            }
-        };
         if L == 1 && async_layer_state_eval_enabled() {
             mlx_rs::transforms::async_eval(cache.eval_targets())?;
         }
@@ -3768,16 +4319,6 @@ pub(crate) fn new_mlp_projections_from_quant(
 impl Qwen3NextMLP {
     fn new(args: &Qwen3NextModelArgs, mlp_prefix: &str) -> Result<Self, Exception> {
         let (gate_proj, down_proj, up_proj) = new_mlp_projections(args, mlp_prefix)?;
-        Ok(Self {
-            gate_proj,
-            down_proj,
-            up_proj,
-        })
-    }
-
-    /// Build from an explicit spec (uniformly quantized sidecar heads).
-    fn from_spec(spec: QuantSpec) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections_from_spec(spec)?;
         Ok(Self {
             gate_proj,
             down_proj,
@@ -4086,18 +4627,6 @@ pub(crate) struct SwitchMlpWeights {
 impl SwitchMlpWeights {
     pub(crate) fn new(args: &Qwen3NextModelArgs, prefix: &str) -> Result<Self, Exception> {
         let (gate_proj, down_proj, up_proj) = new_mlp_projections(args, prefix)?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            fused_gate_up: None,
-        })
-    }
-
-    /// Build from an explicit spec — for callers that resolve it themselves
-    /// (uniformly quantized MTP sidecars, tests).
-    pub(crate) fn from_spec(spec: QuantSpec) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections_from_spec(spec)?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -4755,6 +5284,33 @@ impl GatedDeltaNet {
         })
     }
 
+    /// One canonical depthwise-convolution transition shared by AR decode and
+    /// short-block verification. `previous(lag)` returns history from newest
+    /// to oldest. Keeping the multiply/add/activation source identical makes
+    /// the block schedule equivalent by construction instead of convention.
+    fn canonical_conv1d_step<F>(
+        &self,
+        current: &Array,
+        weight_t: &Array,
+        available: i32,
+        batch: i32,
+        mut previous: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(i32) -> Result<Array, Exception>,
+    {
+        let history_len = self.conv_kernel_size - 1;
+        let current_flat = current.reshape(&[batch, self.conv_dim])?;
+        let current_weight = weight_t.index((self.conv_kernel_size - 1, ..));
+        let mut conv_flat = current_flat.multiply(&current_weight)?;
+        for lag in 0..available {
+            let prior = previous(lag)?;
+            let weight = weight_t.index((history_len - 1 - lag, ..));
+            conv_flat = conv_flat.add(&prior.multiply(&weight)?)?;
+        }
+        silu_direct(&conv_flat.reshape(&[batch, 1, self.conv_dim])?)
+    }
+
     fn decode_conv1d_step(
         &mut self,
         mixed_qkv: &Array,
@@ -4773,11 +5329,7 @@ impl GatedDeltaNet {
             typed_w
         };
 
-        let current_flat = mixed_qkv.reshape(&[batch, self.conv_dim])?;
-        let current_weight = wt.index((self.conv_kernel_size - 1, ..));
-        let mut conv_flat = current_flat.multiply(&current_weight)?;
-
-        if history_len > 0 {
+        let conv_out = if history_len > 0 {
             if cache.conv_state.is_none() {
                 cache.conv_state = Some(ops::zeros_dtype(
                     &[batch, history_len, self.conv_dim],
@@ -4792,16 +5344,19 @@ impl GatedDeltaNet {
                 .ok_or_else(|| Exception::custom("decode conv history missing"))?;
 
             let available = cache.offset.min(history_len);
-            if cache.conv_pos >= 0 {
-                for lag in 0..available {
-                    let idx = (cache.conv_pos - lag).rem_euclid(history_len);
-                    let prev = history
+            let conv_out = if cache.conv_pos >= 0 {
+                let conv_pos = cache.conv_pos;
+                self.canonical_conv1d_step(mixed_qkv, &wt, available, batch, |lag| {
+                    let idx = (conv_pos - lag).rem_euclid(history_len);
+                    history
                         .index((.., idx..idx + 1, ..))
-                        .reshape(&[batch, self.conv_dim])?;
-                    let weight = wt.index((history_len - 1 - lag, ..));
-                    conv_flat = conv_flat.add(&prev.multiply(&weight)?)?;
-                }
-            }
+                        .reshape(&[batch, self.conv_dim])
+                })?
+            } else {
+                self.canonical_conv1d_step(mixed_qkv, &wt, 0, batch, |_| {
+                    Err(Exception::custom("unreachable empty convolution history"))
+                })?
+            };
 
             let next_pos = if cache.conv_pos < 0 {
                 0
@@ -4810,9 +5365,16 @@ impl GatedDeltaNet {
             };
             history.try_index_mut((.., next_pos..next_pos + 1, ..), mixed_qkv.clone())?;
             cache.conv_pos = next_pos;
-        }
+            conv_out
+        } else {
+            self.canonical_conv1d_step(mixed_qkv, &wt, 0, batch, |_| {
+                Err(Exception::custom(
+                    "unreachable zero-width convolution history",
+                ))
+            })?
+        };
 
-        silu_direct(&conv_flat.reshape(&[batch, 1, self.conv_dim])?)
+        Ok(conv_out)
     }
 
     fn chronological_conv_state(
@@ -5399,7 +5961,7 @@ impl GatedDeltaNet {
             Some(s) => s.clone(),
             None => ops::zeros_dtype(
                 &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
-                inputs.dtype(),
+                Dtype::Float32,
             )?,
         };
         let (y, _unchanged_state) = gated_delta_kernel_ffi_stateless(
@@ -5446,6 +6008,7 @@ impl GatedDeltaNet {
         inputs: &Array,
         _mask: Option<&AttentionMask>,
         cache: &mut ArraysCache,
+        row_schedule: DFlashRowSchedule,
     ) -> Result<(Array, GdnLayerTape), Exception> {
         let shape = inputs.shape();
         let B = *shape
@@ -5536,7 +6099,7 @@ impl GatedDeltaNet {
         cache.conv_state = Some(cs.flatten(None, None)?.reshape(&cs_shape)?);
         cache.conv_pos = if n_keep > 0 { n_keep - 1 } else { -1 };
 
-        let conv_out = if S > 1 && S <= 32 {
+        let conv_out = if S <= 8 && row_schedule == DFlashRowSchedule::CanonicalS1 {
             let wt = match &self.conv_weight_t {
                 Some(w) => w.clone(),
                 None => {
@@ -5556,20 +6119,64 @@ impl GatedDeltaNet {
                     w
                 }
             };
-            let ks = self.conv_kernel_size;
-            let mut windows = Vec::with_capacity(S as usize);
-            for i in 0..S {
-                windows.push(
-                    conv_input
-                        .index((.., i..i + ks, ..))
-                        .multiply(&wt)?
-                        .sum_axes(&[1], true)?,
-                );
+            if canonical_conv_enabled()
+                && canonical_conv_kernel_supported(
+                    &mixed_qkv,
+                    &conv_state,
+                    &wt,
+                    B,
+                    S,
+                    self.conv_dim,
+                    self.conv_kernel_size,
+                )
+            {
+                let preactivation = canonical_conv_preactivation_ffi(
+                    &mixed_qkv,
+                    &conv_state,
+                    &wt,
+                    offset_init,
+                    B,
+                    S,
+                    self.conv_dim,
+                    self.conv_kernel_size,
+                )?;
+                // Keep activation on the existing two MLX primitives. Running
+                // them over the complete block is elementwise-identical to the
+                // per-row S=1 calls and avoids embedding a second math contract
+                // in the custom kernel.
+                silu_direct(&preactivation)?
+            } else {
+                // Canonical short-block convolution. Reproduce the exact S=1
+                // transition's operation order for every row: current tap first,
+                // then newest-to-oldest history with one rounded add per lag. A
+                // `multiply(...).sum()` reduction is mathematically equivalent but
+                // dispatches a different reduction tree and can flip a later
+                // near-tie after 48 recurrent layers.
+                let row_capacity = usize::try_from(S)
+                    .map_err(|_| Exception::custom("negative canonical convolution row count"))?;
+                let mut rows = Vec::with_capacity(row_capacity);
+                for position in 0..S {
+                    let current = mixed_qkv
+                        .index((.., position..position + 1, ..))
+                        .reshape(&[B, 1, self.conv_dim])?;
+                    let available = (offset_init + position).clamp(0, n_keep);
+                    rows.push(
+                        self.canonical_conv1d_step(&current, &wt, available, B, |lag| {
+                            if lag < position {
+                                mixed_qkv
+                                    .index((.., position - 1 - lag..position - lag, ..))
+                                    .reshape(&[B, self.conv_dim])
+                            } else {
+                                let history_index = n_keep - 1 - (lag - position);
+                                conv_state
+                                    .index((.., history_index..history_index + 1, ..))
+                                    .reshape(&[B, self.conv_dim])
+                            }
+                        })?,
+                    );
+                }
+                ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1)?
             }
-            nn::silu(&ops::concatenate_axis(
-                &windows.iter().collect::<Vec<_>>(),
-                1,
-            )?)?
         } else {
             // Mirror the S>1 dtype coercion for the native Conv1d path.
             let in_dt = inputs.dtype();
@@ -5693,6 +6300,11 @@ struct FfnBlock {
     norm_topk_prob: bool,
     /// Cached fused gate+up weights for dense layers (lazily computed on first forward).
     fused_gate_up: Option<(Array, Array, Array, i32)>,
+    /// Trial-only row4 caches. These are intentionally not model parameters:
+    /// the canonical checkpoint arrays remain loadable and authoritative.
+    tg_lut4_gate: Option<crate::metal_kernel::BonsaiQ1Row4>,
+    tg_lut4_up: Option<crate::metal_kernel::BonsaiQ1Row4>,
+    tg_lut4_down: Option<crate::metal_kernel::BonsaiQ1Row4>,
 }
 
 impl FfnBlock {
@@ -5710,6 +6322,9 @@ impl FfnBlock {
             top_k: moe.top_k,
             norm_topk_prob: moe.norm_topk_prob,
             fused_gate_up: None,
+            tg_lut4_gate: None,
+            tg_lut4_up: None,
+            tg_lut4_down: None,
         })
     }
 
@@ -5729,7 +6344,133 @@ impl FfnBlock {
             top_k: 0,
             norm_topk_prob: false,
             fused_gate_up: None,
+            tg_lut4_gate: None,
+            tg_lut4_up: None,
+            tg_lut4_down: None,
         })
+    }
+
+    fn tg_lut4_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED
+            .get_or_init(|| std::env::var("HIGGS_BONSAI_TG_LUT4").is_ok_and(|value| value == "1"))
+    }
+
+    fn tg_lut4_projection_eligible(linear: &QLinear, x: &Array) -> bool {
+        Self::tg_lut4_projection_eligible_when(Self::tg_lut4_enabled(), linear, x)
+    }
+
+    fn tg_lut4_projection_eligible_when(enabled: bool, linear: &QLinear, x: &Array) -> bool {
+        if !enabled
+            || linear.mode != crate::quant_mode::QuantMode::Affine
+            || linear.bits != 1
+            || linear.group_size != 128
+            || !has_symmetric_q1_biases(&linear.biases)
+            || linear.weight.dtype() != Dtype::Uint32
+            || !matches!(linear.scales.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+            || !matches!(x.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+        {
+            return false;
+        }
+        let [n_rows, k_packed] = *linear.weight.shape() else {
+            return false;
+        };
+        let [scale_rows, groups] = *linear.scales.shape() else {
+            return false;
+        };
+        let Some(k_dim) = k_packed.checked_mul(32) else {
+            return false;
+        };
+        let m_rows: i32 = x.shape().iter().take(x.ndim().saturating_sub(1)).product();
+        n_rows > 0
+            && n_rows % 4 == 0
+            && k_dim > 0
+            && k_dim % 128 == 0
+            && scale_rows == n_rows
+            && groups == k_dim / 128
+            && x.shape().last().copied() == Some(k_dim)
+            && (1..=5).contains(&m_rows)
+    }
+
+    fn materialize_tg_lut4_cache(
+        slot: &mut Option<crate::metal_kernel::BonsaiQ1Row4>,
+        linear: &QLinear,
+        projection: &'static str,
+    ) -> Result<(), Exception> {
+        if slot.is_none() {
+            let packed =
+                crate::metal_kernel::BonsaiQ1Row4::from_row_major(&linear.weight, &linear.scales)?;
+            tracing::info!(
+                projection,
+                cached_bytes = packed.cached_bytes(),
+                "materialized Bonsai Q1 TG-LUT4 row4 cache"
+            );
+            *slot = Some(packed);
+        }
+        Ok(())
+    }
+
+    fn dense_hidden_tg_lut4(&mut self, x: &Array) -> Result<Option<Array>, Exception> {
+        let gp = self
+            .gate_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
+        let up = self
+            .up_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
+        let cached_eligible = self
+            .tg_lut4_gate
+            .as_ref()
+            .is_some_and(|cache| Self::tg_lut4_enabled() && cache.accepts_input(x))
+            && self
+                .tg_lut4_up
+                .as_ref()
+                .is_some_and(|cache| cache.accepts_input(x));
+        let uncached_eligible = self.tg_lut4_gate.is_none()
+            && self.tg_lut4_up.is_none()
+            && Self::tg_lut4_projection_eligible(gp, x)
+            && Self::tg_lut4_projection_eligible(up, x);
+        if !cached_eligible && !uncached_eligible {
+            return Ok(None);
+        }
+        Self::materialize_tg_lut4_cache(&mut self.tg_lut4_gate, gp, "gate_proj")?;
+        Self::materialize_tg_lut4_cache(&mut self.tg_lut4_up, up, "up_proj")?;
+        let gate = crate::metal_kernel::bonsai_q1_tg_lut4_qmm(
+            x,
+            self.tg_lut4_gate
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TG-LUT4 gate cache missing"))?,
+        )?;
+        let up = crate::metal_kernel::bonsai_q1_tg_lut4_qmm(
+            x,
+            self.tg_lut4_up
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TG-LUT4 up cache missing"))?,
+        )?;
+        silu_mul(&gate, &up).map(Some)
+    }
+
+    fn dense_down_tg_lut4(&mut self, x: &Array) -> Result<Option<Array>, Exception> {
+        let down = self
+            .down_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
+        let eligible = self.tg_lut4_down.as_ref().map_or_else(
+            || Self::tg_lut4_projection_eligible(down, x),
+            |cache| Self::tg_lut4_enabled() && cache.accepts_input(x),
+        );
+        if !eligible {
+            return Ok(None);
+        }
+        Self::materialize_tg_lut4_cache(&mut self.tg_lut4_down, down, "down_proj")?;
+        crate::metal_kernel::bonsai_q1_tg_lut4_qmm(
+            x,
+            self.tg_lut4_down
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TG-LUT4 down cache missing"))?,
+        )
+        .map(Some)
     }
 
     fn dense_hidden_fused(&mut self, x: &Array, use_fused_gemv: bool) -> Result<Array, Exception> {
@@ -5965,7 +6706,9 @@ impl FfnBlock {
                     DenseFfnGemvMode::Both | DenseFfnGemvMode::DownOnly
                 );
 
-            let hidden = if let Some(hidden) = self.dense_hidden_mxfp4_fused_verify(x)? {
+            let hidden = if let Some(hidden) = self.dense_hidden_tg_lut4(x)? {
+                hidden
+            } else if let Some(hidden) = self.dense_hidden_mxfp4_fused_verify(x)? {
                 hidden
             } else if dense_ffn_fuse_gate_up() {
                 self.dense_hidden_fused(x, use_fused_gemv)?
@@ -5974,14 +6717,18 @@ impl FfnBlock {
             };
 
             // Down projection
-            let dp = self
-                .down_proj
-                .as_ref()
-                .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
-            let out = if use_down_gemv {
-                qgemv_4bit(&hidden, &dp.weight, &dp.scales, &dp.biases, dp.group_size)
+            let out = if let Some(out) = self.dense_down_tg_lut4(&hidden)? {
+                Ok(out)
             } else {
-                dp.forward(&hidden)
+                let dp = self
+                    .down_proj
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
+                if use_down_gemv {
+                    qgemv_4bit(&hidden, &dp.weight, &dp.scales, &dp.biases, dp.group_size)
+                } else {
+                    dp.forward(&hidden)
+                }
             }?;
             if seq_len == 1 {
                 mlx_rs::stop_gradient(&out)
@@ -6164,6 +6911,17 @@ fn apply_qwen3_next_rope(
     offset: i32,
     yarn: Option<&YarnRope>,
 ) -> Result<Array, Exception> {
+    apply_qwen3_next_rope_scheduled(x, rope, offset, yarn, DFlashRowSchedule::NativeBatch)
+}
+
+#[allow(clippy::shadow_reuse, clippy::indexing_slicing)]
+fn apply_qwen3_next_rope_scheduled(
+    x: Array,
+    rope: &nn::Rope,
+    offset: i32,
+    yarn: Option<&YarnRope>,
+    row_schedule: DFlashRowSchedule,
+) -> Result<Array, Exception> {
     let seq_len = {
         let shape = x.shape();
         shape[shape.len() - 2]
@@ -6177,6 +6935,24 @@ fn apply_qwen3_next_rope(
         Some(yarn) => (yarn.prescale_rotary(&x)?, Some(&yarn.freqs)),
         None => (x, None),
     };
+    if seq_len > 1 && seq_len <= 8 && row_schedule == DFlashRowSchedule::CanonicalS1 {
+        // Exact verifier schedule: apply the ordinary one-position RoPE kernel
+        // independently at each absolute position. The surrounding graph stays
+        // lazy, but every row now executes the same numerical primitive as AR.
+        let row_capacity = usize::try_from(seq_len)
+            .map_err(|_| Exception::custom("negative canonical RoPE row count"))?;
+        let mut rows = Vec::with_capacity(row_capacity);
+        for position in 0..seq_len {
+            let row = x.index((.., .., position..position + 1, ..));
+            rows.push(apply_fast_rope_with_freqs(
+                &row,
+                rope,
+                offset + position,
+                yarn_freqs,
+            )?);
+        }
+        return ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 2);
+    }
     if seq_len > 1 || *DIAG_ROPE_MANUAL {
         let positions: Vec<i32> = (offset..offset + seq_len).collect();
         let positions = Array::from_slice(&positions, &[seq_len]);
@@ -6232,7 +7008,7 @@ fn apply_fast_rope_with_freqs(
 /// partial-rotary aware). Rotates the first `dimensions` elements of the last
 /// axis and passes the remainder through unchanged.
 #[allow(dead_code)]
-fn apply_rope_manual(
+pub(crate) fn apply_rope_manual(
     x: &Array,
     positions: &Array,
     dimensions: i32,
@@ -6676,6 +7452,144 @@ impl Qwen3NextCausalLM {
         })
     }
 
+    /// Validate the narrow domain in which the `DFlash` block schedule reuses
+    /// the same numerical primitives as repeated one-token decode.
+    ///
+    /// The engine calls this before enabling the experimental block verifier.
+    /// Keeping the model-specific constraints here prevents an engine policy
+    /// knob from silently selecting a different projection or recurrent
+    /// implementation.
+    pub fn validate_dflash_block_domain(&self, rows: i32) -> Result<(), Exception> {
+        if !(1..=8).contains(&rows) {
+            return Err(Exception::custom(format!(
+                "DFlash canonical block requires 1..=8 target rows, got {rows}"
+            )));
+        }
+        if compiled_gdn_decode_enabled() {
+            return Err(Exception::custom(
+                "HIGGS_COMPILED_GDN_DECODE uses a different S=1 recurrent primitive",
+            ));
+        }
+        if *DIAG_ROPE_MANUAL {
+            return Err(Exception::custom(
+                "HIGGS_DIAG_ROPE_MANUAL changes the S=1 RoPE primitive",
+            ));
+        }
+        if *DIAG_ROPE_PERHEAD {
+            return Err(Exception::custom(
+                "HIGGS_DIAG_ROPE_PERHEAD changes the S=1 RoPE primitive",
+            ));
+        }
+        if bonsai_q1_qmm_max_rows() < rows {
+            return Err(Exception::custom(format!(
+                "packed Q1 verifier supports {} rows, but DFlash requires {rows}",
+                bonsai_q1_qmm_max_rows()
+            )));
+        }
+        if self.args.num_experts != 0
+            || self.args.decoder_sparse_step != 0
+            || self.args.dense_attention_outputs
+        {
+            return Err(Exception::custom(
+                "dSpark block verification is proven only for the dense all-Q1 Bonsai target",
+            ));
+        }
+
+        let validate_linear = |path: &str, linear: &QLinear| {
+            validate_dflash_q1_linear(
+                path,
+                &linear.weight,
+                &linear.scales,
+                &linear.biases,
+                linear.group_size,
+                linear.bits,
+                linear.mode,
+            )
+        };
+        validate_dflash_q1_linear(
+            "model.embed_tokens",
+            &self.model.embed_tokens.weight,
+            &self.model.embed_tokens.scales,
+            &self.model.embed_tokens.biases,
+            self.model.embed_tokens.group_size,
+            self.model.embed_tokens.bits,
+            self.model.embed_tokens.mode,
+        )?;
+        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
+            Exception::custom("dSpark block verification requires an untied packed-Q1 LM head")
+        })?;
+        validate_linear("lm_head", lm_head)?;
+
+        for (layer_index, layer) in self.model.layers.iter().enumerate() {
+            if layer.mlp.is_moe {
+                return Err(Exception::custom(format!(
+                    "layer {layer_index} uses MoE outside the dSpark block domain"
+                )));
+            }
+            for (name, projection) in [
+                ("mlp.gate_proj", layer.mlp.gate_proj.as_ref()),
+                ("mlp.up_proj", layer.mlp.up_proj.as_ref()),
+                ("mlp.down_proj", layer.mlp.down_proj.as_ref()),
+            ] {
+                let projection = projection.ok_or_else(|| {
+                    Exception::custom(format!("layer {layer_index} is missing {name}"))
+                })?;
+                validate_linear(&format!("layers.{layer_index}.{name}"), projection)?;
+            }
+
+            if layer.is_linear {
+                let gdn = layer.linear_attn.as_ref().ok_or_else(|| {
+                    Exception::custom(format!("layer {layer_index} is missing GDN attention"))
+                })?;
+                if gdn.use_separate_projections {
+                    for (name, projection) in [
+                        ("in_proj_qkv", gdn.in_proj_qkv.as_ref()),
+                        ("in_proj_z", gdn.in_proj_z.as_ref()),
+                        ("in_proj_a", gdn.in_proj_a.as_ref()),
+                        ("in_proj_b", gdn.in_proj_b.as_ref()),
+                    ] {
+                        let projection = projection.ok_or_else(|| {
+                            Exception::custom(format!("layer {layer_index} is missing GDN {name}"))
+                        })?;
+                        validate_linear(
+                            &format!("layers.{layer_index}.linear_attn.{name}"),
+                            projection,
+                        )?;
+                    }
+                } else {
+                    validate_linear(
+                        &format!("layers.{layer_index}.linear_attn.in_proj_qkvz"),
+                        &gdn.in_proj_qkvz,
+                    )?;
+                    validate_linear(
+                        &format!("layers.{layer_index}.linear_attn.in_proj_ba"),
+                        &gdn.in_proj_ba,
+                    )?;
+                }
+                validate_linear(
+                    &format!("layers.{layer_index}.linear_attn.out_proj"),
+                    &gdn.out_proj,
+                )?;
+            } else {
+                let attention = layer.self_attn.as_ref().ok_or_else(|| {
+                    Exception::custom(format!("layer {layer_index} is missing full attention"))
+                })?;
+                for (name, projection) in [
+                    ("q_proj", &attention.q_proj),
+                    ("k_proj", &attention.k_proj),
+                    ("v_proj", &attention.v_proj),
+                    ("o_proj", &attention.o_proj),
+                ] {
+                    validate_linear(
+                        &format!("layers.{layer_index}.self_attn.{name}"),
+                        projection,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Create the per-layer cache vector.
     pub fn make_cache(&self) -> Vec<Option<LayerCache>> {
         self.model
@@ -6725,12 +7639,13 @@ impl Qwen3NextCausalLM {
 
     /// Forward pass returning raw hidden states (before final `RMSNorm`).
     #[allow(non_snake_case, clippy::too_many_lines)]
-    fn forward_raw_hidden(
+    fn forward_raw_hidden_with_taps(
         &mut self,
         inputs: &Array,
         _mask: Option<&Array>,
         kv_cache: &mut Vec<Option<LayerCache>>,
-    ) -> Result<Array, Exception> {
+        tap_layers: Option<&[usize]>,
+    ) -> Result<(Array, Vec<Array>), Exception> {
         // DIAGNOSTIC: capture h after each layer when a probe has requested it
         // (higgs_models::diag_request_hidden_capture). The probe then compares
         // two captured forwards (e.g. body vs full) directly — no "previous
@@ -6740,6 +7655,16 @@ impl Qwen3NextCausalLM {
             DIAG_CAPTURE_REQ.with(|c| c.set(false));
         }
         let mut diag_layers: Vec<DiagLayer> = Vec::new();
+        let mut taps = Vec::with_capacity(tap_layers.map_or(0, <[usize]>::len));
+
+        if let Some(layers) = tap_layers
+            && (layers.iter().any(|&index| index >= self.model.layers.len())
+                || layers.windows(2).any(|pair| pair[0] >= pair[1]))
+        {
+            return Err(Exception::custom(
+                "tap layers must be unique, strictly increasing, and in range",
+            ));
+        }
 
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
@@ -6864,6 +7789,10 @@ impl Qwen3NextCausalLM {
                 h = h2.add(mlp_out)?;
             }
 
+            if tap_layers.is_some_and(|layers| layers.binary_search(&layer_idx).is_ok()) {
+                taps.push(h.clone());
+            }
+
             // Eval every 8 layers during long prefill chunks to bound lazy
             // graph size. Short speculative verifier windows are intentionally
             // left fused; otherwise MTP pays several eval barriers per cycle.
@@ -6938,7 +7867,17 @@ impl Qwen3NextCausalLM {
             DIAG_CAPTURED.with(|c| *c.borrow_mut() = Some(std::mem::take(&mut diag_layers)));
         }
 
-        Ok(h)
+        Ok((h, taps))
+    }
+
+    fn forward_raw_hidden(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        self.forward_raw_hidden_with_taps(inputs, mask, kv_cache, None)
+            .map(|(hidden, _)| hidden)
     }
     #[allow(non_snake_case)]
     pub fn forward_hidden(
@@ -7431,6 +8370,19 @@ impl Qwen3NextCausalLM {
         Ok((logits, taps))
     }
 
+    /// Run the backbone and return raw final hidden plus configured tap rows,
+    /// without projecting the vocabulary head.
+    #[allow(non_snake_case)]
+    pub fn forward_raw_with_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        self.forward_raw_hidden_with_taps(inputs, mask, kv_cache, Some(tap_layers))
+    }
+
     /// `forward_with_taps` that also returns the raw (pre-norm) last-layer
     /// hidden state, so a caller can run tap-consuming (DFlash drafter) and
     /// hidden-consuming (MTP head) speculation off one backbone pass.
@@ -7438,104 +8390,32 @@ impl Qwen3NextCausalLM {
     pub fn forward_with_hidden_taps(
         &mut self,
         inputs: &Array,
-        _mask: Option<&Array>,
+        mask: Option<&Array>,
         kv_cache: &mut Vec<Option<LayerCache>>,
         tap_layers: &[usize],
     ) -> Result<(Array, Array, Vec<Array>), Exception> {
-        let mut h = self.model.embed_tokens.forward(inputs)?;
-
-        if kv_cache.is_empty() {
-            *kv_cache = self.make_cache();
-        }
-
-        if kv_cache.len() != self.model.layers.len() {
-            return Err(Exception::custom(format!(
-                "cache length ({}) must match num layers ({})",
-                kv_cache.len(),
-                self.model.layers.len()
-            )));
-        }
-
-        let shape = h.shape();
-        let T = *shape
-            .get(1)
-            .ok_or_else(|| Exception::custom("Hidden state must have >= 2 dims"))?;
-
-        let fa_mask: Option<AttentionMask> = if T > 1 {
-            let kv_offset = kv_cache
-                .iter()
-                .find_map(|lc| match lc.as_ref()? {
-                    LayerCache::KV(kv) => Some(kv.offset()),
-                    LayerCache::Arrays(_) => None,
-                })
-                .unwrap_or(0);
-
-            if kv_offset > 0 {
-                Some(AttentionMask::Array(create_causal_mask(
-                    T,
-                    Some(kv_offset),
-                )?))
-            } else {
-                Some(AttentionMask::Causal)
-            }
-        } else {
-            None
-        };
-
-        let mut taps = Vec::with_capacity(tap_layers.len());
-
-        for (layer_idx, (layer, layer_cache)) in self
-            .model
-            .layers
-            .iter_mut()
-            .zip(kv_cache.iter_mut())
-            .enumerate()
-        {
-            let cache = layer_cache
-                .as_mut()
-                .ok_or_else(|| Exception::custom("Layer cache is None"))?;
-            let mask_ref = if layer.is_linear {
-                None
-            } else {
-                fa_mask.as_ref()
-            };
-
-            let normed = layer.input_layernorm.forward(&h)?;
-
-            let r = if layer.is_linear {
-                let attn = layer
-                    .linear_attn
-                    .as_mut()
-                    .ok_or_else(|| Exception::custom("linear_attn missing"))?;
-                let LayerCache::Arrays(ssm_cache) = cache else {
-                    return Err(Exception::custom("Expected ArraysCache"));
-                };
-                attn.forward(&normed, mask_ref, ssm_cache)?
-            } else {
-                let attn = layer
-                    .self_attn
-                    .as_mut()
-                    .ok_or_else(|| Exception::custom("self_attn missing"))?;
-                let LayerCache::KV(layer_kv) = cache else {
-                    return Err(Exception::custom("Expected KVCache"));
-                };
-                attn.forward(&normed, mask_ref, layer_kv)?
-            };
-
-            let h2 = h.add(r)?;
-            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
-            let mlp_out = layer.mlp.forward(&normed_post)?;
-            h = h2.add(mlp_out)?;
-
-            if tap_layers.contains(&layer_idx) {
-                taps.push(h.clone());
-            }
-        }
-
-        let normed = self.model.norm.forward(&h)?;
+        let (hidden, taps) = self.forward_raw_with_taps(inputs, mask, kv_cache, tap_layers)?;
+        let normed = self.model.norm.forward(&hidden)?;
         let logits = self.project_logits(&normed)?;
+        Ok((hidden, logits, taps))
+    }
 
-        Ok((h, logits, taps))
+    /// Project only the final position of a raw backbone hidden block.
+    pub fn project_raw_hidden_last(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        // Keep the same RMSNorm shape/schedule as ordinary prefill, then slice
+        // before the large vocabulary projection. Normalizing only the final
+        // row is mathematically equivalent but can select a different MLX
+        // kernel and is not a construction-level equivalence guarantee.
+        let normed = self.model.norm.forward(hidden)?;
+        let last = normed.index((.., -1, ..));
+        let batch = hidden.shape().first().copied().ok_or_else(|| {
+            Exception::custom("project_raw_hidden_last: hidden has no batch axis")
+        })?;
+        let width = hidden.shape().last().copied().ok_or_else(|| {
+            Exception::custom("project_raw_hidden_last: hidden has no feature axis")
+        })?;
+        let last = last.reshape(&[batch, 1, width])?;
+        self.project_logits(&last)
     }
 
     /// Stateless verify pass: identical to `forward_with_taps` but GDN layers
@@ -7675,13 +8555,9 @@ impl Qwen3NextCausalLM {
         self.forward_with_taps_tape_n(inputs, _mask, kv_cache, tap_layers, None)
     }
 
-    /// Tape-recording verify with optional early exit after `max_layers`.
-    ///
-    /// When `max_layers` is `Some(N)`, only the first N decoder layers run,
-    /// then the final norm + lm_head project logits from the intermediate
-    /// hidden state. This is used for two-phase speculative verify: a fast
-    /// partial pass resolves obvious accept/reject decisions; only borderline
-    /// rounds need the full 64-layer pass.
+    /// Tape-recording verify. `max_layers` is retained for API compatibility,
+    /// but partial-model transactions fail closed because skipped attention
+    /// layers cannot be represented by the current per-GDN tape type.
     #[allow(non_snake_case)]
     pub fn forward_with_taps_tape_n(
         &mut self,
@@ -7691,6 +8567,37 @@ impl Qwen3NextCausalLM {
         tap_layers: &[usize],
         max_layers: Option<usize>,
     ) -> Result<(Array, Vec<Array>, Vec<Option<GdnLayerTape>>), Exception> {
+        self.forward_with_taps_tape_scheduled(
+            inputs,
+            _mask,
+            kv_cache,
+            tap_layers,
+            max_layers,
+            DFlashRowSchedule::NativeBatch,
+        )
+    }
+
+    /// Tape-recording verify with an explicit numerical row schedule.
+    ///
+    /// `CanonicalS1` is intentionally selected only by a verifier that has
+    /// passed [`Self::validate_dflash_block_domain`]. Keeping the choice in the
+    /// call prevents the dSpark proof boundary from changing ordinary DFlash
+    /// or prefill behavior process-wide.
+    #[allow(non_snake_case)]
+    pub fn forward_with_taps_tape_scheduled(
+        &mut self,
+        inputs: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+        max_layers: Option<usize>,
+        row_schedule: DFlashRowSchedule,
+    ) -> Result<(Array, Vec<Array>, Vec<Option<GdnLayerTape>>), Exception> {
+        if max_layers.is_some() {
+            return Err(Exception::custom(
+                "partial-layer tape verification is disabled: the transaction cannot represent skipped layers",
+            ));
+        }
         let mut h = self.model.embed_tokens.forward(inputs)?;
 
         if kv_cache.is_empty() {
@@ -7778,11 +8685,6 @@ impl Qwen3NextCausalLM {
             .zip(kv_cache.iter_mut())
             .enumerate()
         {
-            if let Some(max) = max_layers {
-                if layer_idx >= max {
-                    break;
-                }
-            }
             let cache = layer_cache
                 .as_mut()
                 .ok_or_else(|| Exception::custom("Layer cache is None"))?;
@@ -7812,7 +8714,8 @@ impl Qwen3NextCausalLM {
                 let LayerCache::Arrays(ssm_cache) = cache else {
                     return Err(Exception::custom("Expected ArraysCache"));
                 };
-                let (out, tape) = attn.forward_with_tape(&normed, mask_ref, ssm_cache)?;
+                let (out, tape) =
+                    attn.forward_with_tape(&normed, mask_ref, ssm_cache, row_schedule)?;
                 (out, Some(tape))
             } else {
                 let attn = layer
@@ -7822,7 +8725,13 @@ impl Qwen3NextCausalLM {
                 let LayerCache::KV(layer_kv) = cache else {
                     return Err(Exception::custom("Expected KVCache"));
                 };
-                (attn.forward(&normed, mask_ref, layer_kv)?, None)
+                let output = match row_schedule {
+                    DFlashRowSchedule::CanonicalS1 => {
+                        attn.forward_canonical_rows(&normed, mask_ref, layer_kv)?
+                    }
+                    DFlashRowSchedule::NativeBatch => attn.forward(&normed, mask_ref, layer_kv)?,
+                };
+                (output, None)
             };
             if let Some(ckpt) = detail_ckpt.as_mut() {
                 mlx_rs::transforms::eval([&r])?;
@@ -7885,15 +8794,6 @@ impl Qwen3NextCausalLM {
                 }
                 *ckpt = now;
             }
-        }
-
-        // Pad layer_tapes when early exit was used (None for skipped layers).
-        if max_layers.is_some() {
-            while layer_tapes.len() < self.model.layers.len() {
-                layer_tapes.push(None);
-            }
-            // Note: taps for layers past the exit point are NOT collected here.
-            // The DFlash loop merges partial taps with the previous round's.
         }
 
         let mut tail_detail_ckpt = if layer_detail_timing {
@@ -7994,7 +8894,101 @@ impl Qwen3NextCausalLM {
     ) -> Result<(), Exception> {
         use mlx_rs::ops;
 
-        // Collect GDN layer data for batched replay
+        if n_accepted <= 0 {
+            return Err(Exception::custom(format!(
+                "tape rollback requires a positive committed prefix, got {n_accepted}"
+            )));
+        }
+        if kv_rollback < 0 {
+            return Err(Exception::custom(format!(
+                "tape rollback count must be non-negative, got {kv_rollback}"
+            )));
+        }
+        let target_rows = n_accepted
+            .checked_add(kv_rollback)
+            .ok_or_else(|| Exception::custom("tape rollback row count overflow"))?;
+        if kv_cache.len() != self.model.layers.len() || layer_tapes.len() != self.model.layers.len()
+        {
+            return Err(Exception::custom(format!(
+                "tape transaction layer mismatch: model={} cache={} tapes={}",
+                self.model.layers.len(),
+                kv_cache.len(),
+                layer_tapes.len()
+            )));
+        }
+
+        // Validate the complete transaction before changing any live cache.
+        // A missing GDN tape must never degrade into keeping speculative state.
+        for (index, ((layer, cache), tape)) in self
+            .model
+            .layers
+            .iter()
+            .zip(kv_cache.iter())
+            .zip(layer_tapes.iter())
+            .enumerate()
+        {
+            match (layer.is_linear, cache.as_ref(), tape.as_ref()) {
+                (true, Some(LayerCache::Arrays(arrays)), Some(tape)) => {
+                    for (name, array) in [
+                        ("delta", &tape.delta_tape),
+                        ("key", &tape.norm_k),
+                        ("gate", &tape.a_proj),
+                        ("qkv", &tape.qkv_input),
+                    ] {
+                        let rows = array.shape().get(1).copied().ok_or_else(|| {
+                            Exception::custom(format!(
+                                "GDN layer {index} {name} tape has no token axis"
+                            ))
+                        })?;
+                        if rows != target_rows {
+                            return Err(Exception::custom(format!(
+                                "GDN layer {index} {name} tape has {rows} rows, expected {target_rows}"
+                            )));
+                        }
+                    }
+                    let expected_offset = tape
+                        .offset_init
+                        .checked_add(target_rows)
+                        .ok_or_else(|| Exception::custom("GDN tape offset overflow"))?;
+                    if arrays.offset != expected_offset {
+                        return Err(Exception::custom(format!(
+                            "GDN layer {index} live offset {} does not match tape transaction {expected_offset}",
+                            arrays.offset
+                        )));
+                    }
+                }
+                (false, Some(LayerCache::KV(kv)), None) => {
+                    if kv.offset() < kv_rollback {
+                        return Err(Exception::custom(format!(
+                            "attention layer {index} cannot roll back {kv_rollback} rows from offset {}",
+                            kv.offset()
+                        )));
+                    }
+                }
+                (true, Some(LayerCache::Arrays(_)), None) => {
+                    return Err(Exception::custom(format!(
+                        "GDN layer {index} is missing its rollback tape"
+                    )));
+                }
+                (false, Some(LayerCache::KV(_)), Some(_)) => {
+                    return Err(Exception::custom(format!(
+                        "attention layer {index} unexpectedly has a GDN rollback tape"
+                    )));
+                }
+                (true, Some(LayerCache::KV(_)), _) | (false, Some(LayerCache::Arrays(_)), _) => {
+                    return Err(Exception::custom(format!(
+                        "layer {index} cache variant does not match the model"
+                    )));
+                }
+                (_, None, _) => {
+                    return Err(Exception::custom(format!(
+                        "layer {index} cache is missing from the tape transaction"
+                    )));
+                }
+            }
+        }
+
+        // Collect GDN layer data for batched replay without mutating live state.
         struct GdnReplayEntry<'a> {
             cache_idx: usize,
             tape: &'a GdnLayerTape,
@@ -8004,53 +8998,45 @@ impl Qwen3NextCausalLM {
 
         let mut gdn_entries: Vec<GdnReplayEntry> = Vec::new();
 
-        // First pass: restore state from tape's initial snapshot, rollback KV, collect GDN entries
-        for (i, lc) in kv_cache.iter_mut().enumerate() {
-            match lc {
-                Some(LayerCache::Arrays(ac)) => {
-                    if let Some(Some(tape)) = layer_tapes.get(i) {
-                        // Restore from tape-captured initial state (Python _GDNStateCapture equivalent)
-                        ac.conv_state.clone_from(&tape.conv_state_init);
-                        ac.ssm_state.clone_from(&tape.ssm_state_init);
-                        ac.conv_pos = tape.conv_pos_init;
-                        ac.offset = tape.offset_init;
-
-                        let gdn_layer = self.model.layers[i]
-                            .linear_attn
-                            .as_ref()
-                            .ok_or_else(|| Exception::custom("linear_attn missing for replay"))?;
-
-                        let state = if let Some(s) = tape.ssm_state_init.clone() {
-                            s
-                        } else {
-                            let dt = tape.delta_tape.dtype();
-                            ops::zeros_dtype(
-                                &[
-                                    1,
-                                    gdn_layer.num_v_heads,
-                                    gdn_layer.head_v_dim,
-                                    gdn_layer.head_k_dim,
-                                ],
-                                dt,
-                            )?
-                        };
-
-                        gdn_entries.push(GdnReplayEntry {
-                            cache_idx: i,
-                            tape,
-                            layer: gdn_layer,
-                            snap_state: state,
-                        });
-                    }
-                }
-                Some(LayerCache::KV(kv)) if kv_rollback > 0 => {
-                    kv.trim_by(kv_rollback.unsigned_abs().try_into().unwrap_or(usize::MAX));
-                }
-                Some(LayerCache::KV(_)) | None => {}
-            }
+        for (index, tape) in layer_tapes.iter().enumerate() {
+            let Some(tape) = tape.as_ref() else {
+                continue;
+            };
+            let gdn_layer = self.model.layers[index]
+                .linear_attn
+                .as_ref()
+                .ok_or_else(|| Exception::custom("linear_attn missing for replay"))?;
+            let state = if let Some(state) = tape.ssm_state_init.clone() {
+                state
+            } else {
+                ops::zeros_dtype(
+                    &[
+                        1,
+                        gdn_layer.num_v_heads,
+                        gdn_layer.head_v_dim,
+                        gdn_layer.head_k_dim,
+                    ],
+                    tape.delta_tape.dtype(),
+                )?
+            };
+            gdn_entries.push(GdnReplayEntry {
+                cache_idx: index,
+                tape,
+                layer: gdn_layer,
+                snap_state: state,
+            });
         }
 
         if gdn_entries.is_empty() {
+            if kv_rollback > 0 {
+                let rollback = usize::try_from(kv_rollback)
+                    .map_err(|_| Exception::custom("KV rollback does not fit usize"))?;
+                for cache in kv_cache.iter_mut() {
+                    if let Some(LayerCache::KV(kv)) = cache {
+                        kv.trim_by(rollback);
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -8105,16 +9091,21 @@ impl Qwen3NextCausalLM {
             e0.layer.head_v_dim,
         )?;
 
-        // Split results back to individual layers and rebuild conv_state
+        // Build every accepted-prefix GDN state off to the side. Live GDN and
+        // KV caches are committed only after all fallible graph construction
+        // succeeds, so a malformed tape cannot leave a half-rolled-back model.
+        let mut staged_gdn = Vec::with_capacity(gdn_entries.len());
         for (offset, entry) in gdn_entries.iter().enumerate() {
-            let Some(LayerCache::Arrays(ac)) = &mut kv_cache[entry.cache_idx] else {
-                continue;
-            };
-
-            // Extract this layer's state from the batched result
-            let start = offset as i32;
+            let start = i32::try_from(offset)
+                .map_err(|_| Exception::custom("GDN replay layer index overflow"))?;
             let new_state = batched_new_state.index((start..start + 1, .., .., ..));
-            ac.ssm_state = Some(new_state);
+            let mut staged = ArraysCache {
+                conv_state: entry.tape.conv_state_init.clone(),
+                ssm_state: entry.tape.ssm_state_init.clone(),
+                conv_pos: entry.tape.conv_pos_init,
+                offset: entry.tape.offset_init,
+            };
+            staged.ssm_state = Some(new_state);
 
             // Rebuild conv_state from recorded qkv input
             let ks = entry.layer.conv_kernel_size;
@@ -8125,7 +9116,7 @@ impl Qwen3NextCausalLM {
                     Exception::custom("conv rebuild: qkv input missing batch dim")
                 })?;
                 let prefix = entry.layer.chronological_conv_state(
-                    ac,
+                    &mut staged,
                     batch,
                     entry.tape.qkv_input.dtype(),
                 )?;
@@ -8137,12 +9128,34 @@ impl Qwen3NextCausalLM {
                 let cs_start = total_len - n_keep;
                 let cs = full.index((.., cs_start.., ..));
                 let cs_shape = cs.shape().to_vec();
-                ac.conv_state = Some(cs.flatten(None, None)?.reshape(&cs_shape)?);
-                ac.conv_pos = n_keep - 1;
+                staged.conv_state = Some(cs.flatten(None, None)?.reshape(&cs_shape)?);
+                staged.conv_pos = n_keep - 1;
             } else {
-                ac.conv_pos = -1;
+                staged.conv_pos = -1;
             }
-            ac.offset += n_accepted;
+            staged.offset = staged
+                .offset
+                .checked_add(n_accepted)
+                .ok_or_else(|| Exception::custom("GDN committed offset overflow"))?;
+            staged_gdn.push((entry.cache_idx, staged));
+        }
+
+        for (cache_index, staged) in staged_gdn {
+            let Some(LayerCache::Arrays(cache)) = &mut kv_cache[cache_index] else {
+                return Err(Exception::custom(
+                    "validated GDN cache changed variant before commit",
+                ));
+            };
+            *cache = staged;
+        }
+        if kv_rollback > 0 {
+            let rollback = usize::try_from(kv_rollback)
+                .map_err(|_| Exception::custom("KV rollback does not fit usize"))?;
+            for cache in kv_cache.iter_mut() {
+                if let Some(LayerCache::KV(kv)) = cache {
+                    kv.trim_by(rollback);
+                }
+            }
         }
 
         Ok(())
@@ -9769,11 +10782,77 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     clippy::manual_assert,
     clippy::option_if_let_else,
     clippy::used_underscore_binding,
-    clippy::redundant_clone
+    clippy::redundant_clone,
+    clippy::as_conversions
 )]
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
+
+    #[test]
+    fn gated_delta_tape_config_key_covers_specialization_and_output_geometry() {
+        let f16 = mlx_sys::mlx_dtype__MLX_FLOAT16;
+        let f32 = mlx_sys::mlx_dtype__MLX_FLOAT32;
+        let base = GatedDeltaTapeKernelConfigKey::new(f16, 1, 5, 16, 128, 32, 128);
+        let variants = [
+            GatedDeltaTapeKernelConfigKey::new(f32, 1, 5, 16, 128, 32, 128),
+            GatedDeltaTapeKernelConfigKey::new(f16, 2, 5, 16, 128, 32, 128),
+            GatedDeltaTapeKernelConfigKey::new(f16, 1, 4, 16, 128, 32, 128),
+            GatedDeltaTapeKernelConfigKey::new(f16, 1, 5, 8, 128, 32, 128),
+            GatedDeltaTapeKernelConfigKey::new(f16, 1, 5, 16, 64, 32, 128),
+            GatedDeltaTapeKernelConfigKey::new(f16, 1, 5, 16, 128, 16, 128),
+            GatedDeltaTapeKernelConfigKey::new(f16, 1, 5, 16, 128, 32, 64),
+        ];
+
+        for variant in variants {
+            assert_ne!(base, variant);
+        }
+    }
+
+    #[test]
+    fn gated_delta_tape_config_reuse_preserves_outputs() {
+        let (batch, seq_len, hk, dk, hv, dv) = (1, 2, 1, 32, 1, 4);
+        let q = Array::ones::<f32>(&[batch, seq_len, hk, dk]).unwrap();
+        let k = Array::ones::<f32>(&[batch, seq_len, hk, dk]).unwrap();
+        let v = Array::ones::<f32>(&[batch, seq_len, hv, dv]).unwrap();
+        let a_log = Array::zeros::<f32>(&[hv]).unwrap();
+        let a = Array::ones::<f32>(&[batch, seq_len, hv]).unwrap();
+        let dt_bias = Array::zeros::<f32>(&[hv]).unwrap();
+        let beta = Array::zeros::<f32>(&[batch, seq_len, hv]).unwrap();
+        let state = Array::zeros::<f32>(&[batch, hv, dv, dk]).unwrap();
+
+        let first = gated_delta_kernel_ffi_with_tape(
+            &q, &k, &v, &a_log, &a, &dt_bias, &beta, &state, batch, seq_len, hk, dk, hv, dv,
+        )
+        .unwrap();
+        let second = gated_delta_kernel_ffi_with_tape(
+            &q, &k, &v, &a_log, &a, &dt_bias, &beta, &state, batch, seq_len, hk, dk, hv, dv,
+        )
+        .unwrap();
+
+        mlx_rs::transforms::eval([
+            &first.0, &first.1, &first.2, &second.0, &second.1, &second.2,
+        ])
+        .unwrap();
+        assert_eq!(first.0.as_slice::<f32>(), second.0.as_slice::<f32>());
+        assert_eq!(first.1.as_slice::<f32>(), second.1.as_slice::<f32>());
+        assert_eq!(first.2.as_slice::<f32>(), second.2.as_slice::<f32>());
+
+        if gated_delta_tape_config_cache_enabled() {
+            let key = GatedDeltaTapeKernelConfigKey::new(
+                mlx_sys::mlx_dtype__MLX_FLOAT32,
+                batch,
+                seq_len,
+                hk,
+                dk,
+                hv,
+                dv,
+            );
+            GATED_DELTA_TAPE_CONFIG_CACHE.with(|cache_cell| {
+                assert!(cache_cell.borrow().contains_key(&key));
+            });
+        }
+    }
 
     #[test]
     fn affine_q1_linear_and_embedding_paths_match_known_values() {
@@ -10173,6 +11252,237 @@ mod tests {
     }
 
     #[test]
+    fn packed_q1_qmm_matches_independent_cpu_affine_oracle() {
+        const GROUP_SIZE: i32 = 128;
+        const K: i32 = 256;
+        const N: i32 = 3;
+        const M: i32 = 5;
+
+        let packed = (0..N * K / 32)
+            .map(|index| {
+                let shift = u32::try_from((index * 7 + 3).rem_euclid(31)).unwrap();
+                0x963C_A5F0_u32.rotate_left(shift)
+            })
+            .collect::<Vec<_>>();
+        let scale_values = (0..N * K / GROUP_SIZE)
+            .map(|index| 0.125_f32 + (index % 5) as f32 * 0.062_5)
+            .collect::<Vec<_>>();
+        let bias_values = (0..N * K / GROUP_SIZE)
+            .map(|index| -0.093_75_f32 + (index % 4) as f32 * 0.031_25)
+            .collect::<Vec<_>>();
+        let x_values = (0..M * K)
+            .map(|index| ((index * 11 + 9).rem_euclid(53) - 26) as f32 * 0.007_812_5)
+            .collect::<Vec<_>>();
+        let weight = Array::from_slice(&packed, &[N, K / 32]);
+        let scales = Array::from_slice(&scale_values, &[N, K / GROUP_SIZE]);
+        let affine_biases = Array::from_slice(&bias_values, &[N, K / GROUP_SIZE]);
+        let symmetric_biases = symmetric_q1_bias_sentinel();
+        let x = Array::from_slice(&x_values, &[M, K]);
+
+        for (biases, symmetric) in [(&affine_biases, false), (&symmetric_biases, true)] {
+            let actual =
+                crate::metal_kernel::bonsai_q1_qmm(&x, &weight, &scales, biases, GROUP_SIZE)
+                    .unwrap();
+            mlx_rs::transforms::eval([&actual]).unwrap();
+            let got = actual.as_slice::<f32>();
+
+            for row in 0..M {
+                for output in 0..N {
+                    let mut expected = 0.0_f32;
+                    for column in 0..K {
+                        let word_index = usize::try_from(output * (K / 32) + column / 32).unwrap();
+                        let bit = ((packed[word_index]
+                            >> u32::try_from(column.rem_euclid(32)).unwrap())
+                            & 1) as f32;
+                        let group_index =
+                            usize::try_from(output * (K / GROUP_SIZE) + column / GROUP_SIZE)
+                                .unwrap();
+                        let scale = scale_values[group_index];
+                        let bias = if symmetric {
+                            -0.5 * scale
+                        } else {
+                            bias_values[group_index]
+                        };
+                        let input_index = usize::try_from(row * K + column).unwrap();
+                        expected += x_values[input_index] * scale.mul_add(bit, bias);
+                    }
+                    let index = usize::try_from(row * N + output).unwrap();
+                    let tolerance = 2e-5_f32 * expected.abs().max(1.0);
+                    assert!(
+                        (got[index] - expected).abs() <= tolerance,
+                        "row={row} output={output} symmetric={symmetric}: metal={} cpu={expected} tolerance={tolerance}",
+                        got[index]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_q1_qmm_is_bit_exact_with_repeated_qmv() {
+        const GROUP_SIZE: i32 = 128;
+        const K: i32 = 5120;
+        const N: i32 = 9;
+        let weight = Array::from_slice(
+            &(0..N * K / 32)
+                .map(|index| {
+                    let shift = u32::try_from(index.rem_euclid(31)).unwrap();
+                    0xA5A5_5A5A_u32.rotate_left(shift)
+                })
+                .collect::<Vec<_>>(),
+            &[N, K / 32],
+        );
+
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let scales = Array::from_slice(
+                &(0..N * K / GROUP_SIZE)
+                    .map(|index| 0.25_f32 + (index % 7) as f32 * 0.062_5)
+                    .collect::<Vec<_>>(),
+                &[N, K / GROUP_SIZE],
+            )
+            .as_dtype(dtype)
+            .unwrap();
+            let affine_biases = Array::from_slice(
+                &(0..N * K / GROUP_SIZE)
+                    .map(|index| -0.125_f32 + (index % 5) as f32 * 0.031_25)
+                    .collect::<Vec<_>>(),
+                &[N, K / GROUP_SIZE],
+            )
+            .as_dtype(dtype)
+            .unwrap();
+            let symmetric_biases = symmetric_q1_bias_sentinel();
+
+            for biases in [&affine_biases, &symmetric_biases] {
+                for m in [2_i32, 3, 4, 5, 7, 8, 9] {
+                    let x = Array::from_slice(
+                        &(0..m * K)
+                            .map(|index| ((index * 13 + 5).rem_euclid(41) - 20) as f32 * 0.015_625)
+                            .collect::<Vec<_>>(),
+                        &[m, K],
+                    )
+                    .as_dtype(dtype)
+                    .unwrap();
+                    let rows = (0..m)
+                        .map(|row| {
+                            crate::metal_kernel::bonsai_q1_qmv_fast(
+                                &x.index((row..row + 1, ..)),
+                                &weight,
+                                &scales,
+                                biases,
+                                GROUP_SIZE,
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let expected =
+                        ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0).unwrap();
+
+                    let actual = crate::metal_kernel::bonsai_q1_qmm(
+                        &x, &weight, &scales, biases, GROUP_SIZE,
+                    )
+                    .unwrap();
+                    assert_canonical_array_exact(
+                        &format!("Q1 grid-Z M={m} dtype={dtype:?}"),
+                        &actual,
+                        &expected,
+                    );
+                }
+            }
+        }
+
+        let scales = ops::ones::<f32>(&[N, K / GROUP_SIZE])
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        let biases = symmetric_q1_bias_sentinel();
+        let assert_shape_exact = |input: &Array, label: &str| {
+            let m = input
+                .shape()
+                .iter()
+                .take(input.ndim().saturating_sub(1))
+                .product::<i32>();
+            let flat = input.reshape(&[m, K]).unwrap();
+            let rows = (0..m)
+                .map(|row| {
+                    crate::metal_kernel::bonsai_q1_qmv_fast(
+                        &flat.index((row..row + 1, ..)),
+                        &weight,
+                        &scales,
+                        &biases,
+                        GROUP_SIZE,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let expected_flat = ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0).unwrap();
+            let mut expected_shape = input.shape()[..input.ndim() - 1].to_vec();
+            expected_shape.push(N);
+            let expected = expected_flat.reshape(&expected_shape).unwrap();
+            let actual =
+                crate::metal_kernel::bonsai_q1_qmm(input, &weight, &scales, &biases, GROUP_SIZE)
+                    .unwrap();
+            assert_canonical_array_exact(label, &actual, &expected);
+        };
+
+        let leading = Array::from_slice(
+            &(0..8 * K)
+                .map(|index| ((index * 7 + 3).rem_euclid(43) - 21) as f32 * 0.015_625)
+                .collect::<Vec<_>>(),
+            &[2, 4, K],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        assert_shape_exact(&leading, "Q1 leading dimensions");
+
+        let transposed = Array::from_slice(
+            &(0..5 * K)
+                .map(|index| ((index * 5 + 1).rem_euclid(47) - 23) as f32 * 0.015_625)
+                .collect::<Vec<_>>(),
+            &[K, 5],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap()
+        .transpose_axes(&[1, 0])
+        .unwrap();
+        assert_shape_exact(&transposed, "Q1 non-row-contiguous input");
+    }
+
+    #[test]
+    fn dense_tg_lut4_selection_is_strictly_opt_in() {
+        const N: i32 = 8;
+        const K: i32 = 256;
+        let mut linear = QLinear::new(128, 1).unwrap();
+        linear.weight = Param::new(Array::from_slice(
+            &(0..N * K / 32)
+                .map(|index| u32::try_from(index).unwrap())
+                .collect::<Vec<_>>(),
+            &[N, K / 32],
+        ));
+        linear.scales = Param::new(
+            Array::from_slice(
+                &(0..N * K / 128)
+                    .map(|index| 0.125 + index as f32 * 0.007_812_5)
+                    .collect::<Vec<_>>(),
+                &[N, K / 128],
+            )
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap(),
+        );
+        linear.biases = Param::new(symmetric_q1_bias_sentinel());
+        let input = Array::ones::<f32>(&[1, 5, K])
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+
+        assert!(FfnBlock::tg_lut4_projection_eligible_when(
+            true, &linear, &input
+        ));
+        assert!(!FfnBlock::tg_lut4_projection_eligible_when(
+            false, &linear, &input
+        ));
+    }
+
+    #[test]
     fn symmetric_q1_bias_validation_and_compaction_preserve_affine_fallback() {
         const FP16_MIN_SUBNORMAL: f32 = 5.960_464_5e-8;
 
@@ -10193,6 +11503,38 @@ mod tests {
         assert_eq!(compacted.tensors, 1);
         assert_eq!(compacted.bytes, 4 * std::mem::size_of::<f32>());
         assert!(has_symmetric_q1_biases(&symmetric));
+    }
+
+    #[test]
+    fn dflash_q1_bias_gate_accepts_compacted_and_loaded_affine_biases_only() {
+        let weight = Array::from_slice(&[0_u32; 8], &[2, 4]);
+        let scales = Array::from_slice(&[0.25_f32, 0.5], &[2, 1]);
+        let validate = |biases: &Array| {
+            validate_dflash_q1_linear(
+                "fixture",
+                &weight,
+                &scales,
+                biases,
+                128,
+                1,
+                crate::quant_mode::QuantMode::Affine,
+            )
+        };
+
+        assert!(validate(&symmetric_q1_bias_sentinel()).is_ok());
+        for dtype in [Dtype::Float16, Dtype::Bfloat16, Dtype::Float32] {
+            let biases = Array::from_slice(&[-0.125_f32, 0.375], &[2, 1])
+                .as_dtype(dtype)
+                .unwrap();
+            assert!(validate(&biases).is_ok(), "loaded {dtype:?} affine bias");
+        }
+
+        let unloaded_placeholder = Array::from_slice(&[0.0_f32], &[1]);
+        assert!(validate(&unloaded_placeholder).is_err());
+        let wrong_shape = Array::from_slice(&[-0.125_f32, 0.375], &[1, 2]);
+        assert!(validate(&wrong_shape).is_err());
+        let wrong_dtype = Array::from_slice(&[0_u32, 1], &[2, 1]);
+        assert!(validate(&wrong_dtype).is_err());
     }
 
     #[test]
@@ -11772,6 +13114,438 @@ mod tests {
         );
     }
 
+    fn canonical_exact_weight(rows: i32, columns: i32, salt: i32) -> Array {
+        let mut values = vec![0.0_f32; (rows * columns) as usize];
+        for row in 0..rows {
+            let column = (row * 17 + salt).rem_euclid(columns);
+            let coefficient = match row.rem_euclid(4) {
+                0 => -0.5_f32,
+                1 => -0.25_f32,
+                2 => 0.25_f32,
+                _ => 0.5_f32,
+            };
+            values[(row * columns + column) as usize] = coefficient;
+        }
+        let weight = Array::from_slice(&values, &[rows, columns])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        weight.eval().unwrap();
+        weight
+    }
+
+    fn install_canonical_exact_dense(linear: &mut QLinear, rows: i32, columns: i32, salt: i32) {
+        linear.weight = Param::new(canonical_exact_weight(rows, columns, salt));
+        linear.scales = Param::new(Array::from_slice::<f32>(&[], &[0]));
+        linear.biases = Param::new(Array::from_slice::<f32>(&[], &[0]));
+        linear.group_size = 64;
+        linear.bits = 0;
+        linear.mode = crate::quant_mode::QuantMode::Dense;
+    }
+
+    fn canonical_exact_input(seq_len: i32, hidden_size: i32, salt: i32) -> Array {
+        let values = (0..seq_len * hidden_size)
+            .map(|index| {
+                let value = (index * 11 + salt).rem_euclid(31) - 15;
+                value as f32 * 0.015_625
+            })
+            .collect::<Vec<_>>();
+        let input = Array::from_slice(&values, &[1, seq_len, hidden_size])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        input.eval().unwrap();
+        input
+    }
+
+    fn assert_canonical_array_exact(label: &str, actual: &Array, expected: &Array) {
+        assert_eq!(actual.shape(), expected.shape(), "{label} shape");
+        assert_eq!(actual.dtype(), expected.dtype(), "{label} dtype");
+        let actual_f32 = actual.as_dtype(Dtype::Float32).unwrap();
+        let expected_f32 = expected.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&actual_f32, &expected_f32]).unwrap();
+        for (index, (got, want)) in actual_f32
+            .as_slice::<f32>()
+            .iter()
+            .zip(expected_f32.as_slice::<f32>())
+            .enumerate()
+        {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{label}[{index}] differs: {got:?} != {want:?}"
+            );
+        }
+    }
+
+    fn assert_canonical_kv_cache_exact(
+        label: &str,
+        actual: &SteppingKeyValueCache,
+        expected: &SteppingKeyValueCache,
+    ) {
+        assert_eq!(actual.offset(), expected.offset(), "{label} offset");
+        let offset = actual.offset();
+        let actual_keys =
+            crate::cache::slice_axis2(actual.keys().expect("actual keys initialized"), 0, offset)
+                .unwrap();
+        let expected_keys = crate::cache::slice_axis2(
+            expected.keys().expect("expected keys initialized"),
+            0,
+            offset,
+        )
+        .unwrap();
+        let actual_values = crate::cache::slice_axis2(
+            actual.values().expect("actual values initialized"),
+            0,
+            offset,
+        )
+        .unwrap();
+        let expected_values = crate::cache::slice_axis2(
+            expected.values().expect("expected values initialized"),
+            0,
+            offset,
+        )
+        .unwrap();
+        assert_canonical_array_exact(&format!("{label} keys"), &actual_keys, &expected_keys);
+        assert_canonical_array_exact(&format!("{label} values"), &actual_values, &expected_values);
+    }
+
+    fn materialize_turboquant_prefix(array: &Array, offset: i32) -> Array {
+        let prefix = crate::cache::slice_axis1(array, 0, offset).unwrap();
+        let shape = prefix.shape().to_vec();
+        let contiguous = prefix.flatten(None, None).unwrap().reshape(&shape).unwrap();
+        contiguous.eval().unwrap();
+        contiguous
+    }
+
+    fn assert_turboquant_u32_exact(label: &str, actual: &Array, expected: &Array, offset: i32) {
+        let actual = materialize_turboquant_prefix(actual, offset);
+        let expected = materialize_turboquant_prefix(expected, offset);
+        assert_eq!(actual.shape(), expected.shape(), "{label} shape");
+        assert_eq!(
+            actual.as_slice::<u32>(),
+            expected.as_slice::<u32>(),
+            "{label}"
+        );
+    }
+
+    fn assert_turboquant_f32_exact(label: &str, actual: &Array, expected: &Array, offset: i32) {
+        let actual = materialize_turboquant_prefix(actual, offset);
+        let expected = materialize_turboquant_prefix(expected, offset);
+        assert_eq!(actual.shape(), expected.shape(), "{label} shape");
+        for (index, (got, want)) in actual
+            .as_slice::<f32>()
+            .iter()
+            .zip(expected.as_slice::<f32>())
+            .enumerate()
+        {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{label}[{index}] differs: {got:?} != {want:?}"
+            );
+        }
+    }
+
+    fn assert_canonical_turboquant_cache_exact(
+        label: &str,
+        actual: &SteppingKeyValueCache,
+        expected: &SteppingKeyValueCache,
+    ) {
+        assert_eq!(actual.offset(), expected.offset(), "{label} offset");
+        assert_eq!(
+            actual.kv_cache_config(),
+            expected.kv_cache_config(),
+            "{label} config"
+        );
+        assert!(actual.is_turbo_active() && expected.is_turbo_active());
+        assert!(actual.keys().is_none() && expected.keys().is_none());
+        assert!(actual.values().is_none() && expected.values().is_none());
+
+        let offset = actual.offset();
+        let (
+            actual_context,
+            actual_key_codes,
+            actual_key_norms,
+            actual_key_gammas,
+            actual_value_codes,
+            actual_value_norms,
+        ) = actual
+            .turbo_arrays()
+            .expect("actual TurboQuant cache active");
+        let (
+            expected_context,
+            expected_key_codes,
+            expected_key_norms,
+            expected_key_gammas,
+            expected_value_codes,
+            expected_value_norms,
+        ) = expected
+            .turbo_arrays()
+            .expect("expected TurboQuant cache active");
+        assert_eq!(
+            actual_context.config, expected_context.config,
+            "{label} context"
+        );
+        assert_eq!(
+            actual_context.head_dim, expected_context.head_dim,
+            "{label} head dim"
+        );
+        assert_eq!(
+            actual_context.num_kv_heads, expected_context.num_kv_heads,
+            "{label} KV heads"
+        );
+
+        assert_turboquant_u32_exact(
+            &format!("{label} key codes"),
+            actual_key_codes,
+            expected_key_codes,
+            offset,
+        );
+        assert_turboquant_u32_exact(
+            &format!("{label} value codes"),
+            actual_value_codes,
+            expected_value_codes,
+            offset,
+        );
+        assert_turboquant_f32_exact(
+            &format!("{label} key norms"),
+            actual_key_norms,
+            expected_key_norms,
+            offset,
+        );
+        assert_turboquant_f32_exact(
+            &format!("{label} key gammas"),
+            actual_key_gammas,
+            expected_key_gammas,
+            offset,
+        );
+        assert_turboquant_f32_exact(
+            &format!("{label} value norms"),
+            actual_value_norms,
+            expected_value_norms,
+            offset,
+        );
+    }
+
+    fn canonical_attention_fixture(yarn: bool) -> Qwen3NextAttention {
+        let mut args = valid_causal_lm_args();
+        args.hidden_size = 64;
+        args.num_attention_heads = 2;
+        args.num_key_value_heads = 1;
+        args.head_dim = 32;
+        args.partial_rotary_factor = 0.5;
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 0,
+            mode: crate::quant_mode::QuantMode::Dense,
+        });
+        args.quant_overrides.clear();
+        args.rope_scaling = yarn.then(|| {
+            serde_json::json!({
+                "type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 512,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0
+            })
+        });
+
+        let mut attention = Qwen3NextAttention::new(&args, "test.canonical.self_attn").unwrap();
+        let hidden = args.hidden_size;
+        let q_rows = 2 * args.num_attention_heads * args.head_dim;
+        let kv_rows = args.num_key_value_heads * args.head_dim;
+        install_canonical_exact_dense(&mut attention.q_proj, q_rows, hidden, 1);
+        install_canonical_exact_dense(&mut attention.k_proj, kv_rows, hidden, 3);
+        install_canonical_exact_dense(&mut attention.v_proj, kv_rows, hidden, 5);
+        install_canonical_exact_dense(
+            &mut attention.o_proj,
+            hidden,
+            args.num_attention_heads * args.head_dim,
+            7,
+        );
+        attention.q_norm.weight = Param::new(
+            Array::ones::<f32>(&[args.head_dim])
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+        attention.k_norm.weight = Param::new(
+            Array::ones::<f32>(&[args.head_dim])
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+        attention
+    }
+
+    #[test]
+    fn canonical_short_rope_matches_repeated_s1_exact_s2_through_s5() {
+        for yarn in [false, true] {
+            let attention = canonical_attention_fixture(yarn);
+            for offset in [0_i32, 7_i32] {
+                for seq_len in 2_i32..=5_i32 {
+                    let input = canonical_exact_input(
+                        seq_len,
+                        attention.num_attention_heads * 32,
+                        offset + seq_len,
+                    )
+                    .reshape(&[1, attention.num_attention_heads, seq_len, 32])
+                    .unwrap();
+                    let block = apply_qwen3_next_rope_scheduled(
+                        input.clone(),
+                        &attention.rope,
+                        offset,
+                        attention.yarn.as_ref(),
+                        DFlashRowSchedule::CanonicalS1,
+                    )
+                    .unwrap();
+                    let rows = (0..seq_len)
+                        .map(|position| {
+                            apply_qwen3_next_rope_scheduled(
+                                input.index((.., .., position..position + 1, ..)),
+                                &attention.rope,
+                                offset + position,
+                                attention.yarn.as_ref(),
+                                DFlashRowSchedule::NativeBatch,
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let repeated =
+                        ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 2).unwrap();
+                    assert_canonical_array_exact(
+                        &format!("canonical rope yarn={yarn} offset={offset} S={seq_len}"),
+                        &block,
+                        &repeated,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_full_attention_matches_repeated_s1_exact_s2_through_s5() {
+        for yarn in [false, true] {
+            let attention = canonical_attention_fixture(yarn);
+            for prefix_len in [0_i32, 3_i32] {
+                let mut prefix_attention = attention.clone();
+                let mut prefix_cache = SteppingKeyValueCache::new();
+                if prefix_len > 0 {
+                    let prefix = canonical_exact_input(prefix_len, 64, 41);
+                    for position in 0..prefix_len {
+                        let row = prefix.index((.., position..position + 1, ..));
+                        let output = prefix_attention
+                            .forward(&row, None, &mut prefix_cache)
+                            .unwrap();
+                        mlx_rs::transforms::eval([&output]).unwrap();
+                        mlx_rs::transforms::eval(prefix_cache.eval_targets()).unwrap();
+                    }
+                }
+
+                for seq_len in 2_i32..=5_i32 {
+                    let input = canonical_exact_input(seq_len, 64, prefix_len + seq_len + 71);
+                    let mut sequential_attention = attention.clone();
+                    let mut block_attention = attention.clone();
+                    let mut sequential_cache = prefix_cache.deep_clone();
+                    let mut block_cache = prefix_cache.deep_clone();
+
+                    let mut rows = Vec::with_capacity(seq_len as usize);
+                    for position in 0..seq_len {
+                        let row = input.index((.., position..position + 1, ..));
+                        let output = sequential_attention
+                            .forward(&row, None, &mut sequential_cache)
+                            .unwrap();
+                        mlx_rs::transforms::eval([&output]).unwrap();
+                        mlx_rs::transforms::eval(sequential_cache.eval_targets()).unwrap();
+                        rows.push(output);
+                    }
+                    let repeated =
+                        ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1).unwrap();
+                    let mask = AttentionMask::Array(
+                        create_causal_mask(seq_len, (prefix_len > 0).then_some(prefix_len))
+                            .unwrap(),
+                    );
+                    let block = block_attention
+                        .forward_canonical_rows(&input, Some(&mask), &mut block_cache)
+                        .unwrap();
+                    mlx_rs::transforms::eval([&block]).unwrap();
+                    mlx_rs::transforms::eval(block_cache.eval_targets()).unwrap();
+
+                    let label =
+                        format!("canonical attention yarn={yarn} prefix={prefix_len} S={seq_len}");
+                    assert_canonical_array_exact(&label, &block, &repeated);
+                    assert_canonical_kv_cache_exact(
+                        &format!("{label} cache"),
+                        &block_cache,
+                        &sequential_cache,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_turboquant_attention_matches_repeated_s1_exact_s2_through_s5() {
+        use crate::turboquant::{KvCacheConfig, KvCacheMode};
+
+        let attention = canonical_attention_fixture(false);
+        let prefix_len = 3;
+        let mut prefix_attention = attention.clone();
+        let mut prefix_cache = SteppingKeyValueCache::new();
+        let prefix = canonical_exact_input(prefix_len, 64, 41);
+        for position in 0..prefix_len {
+            let row = prefix.index((.., position..position + 1, ..));
+            let output = prefix_attention
+                .forward(&row, None, &mut prefix_cache)
+                .unwrap();
+            mlx_rs::transforms::eval([&output]).unwrap();
+            mlx_rs::transforms::eval(prefix_cache.eval_targets()).unwrap();
+        }
+
+        let turboquant = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 7,
+            ..Default::default()
+        };
+        assert!(prefix_cache.quantize_for_retention(turboquant).unwrap());
+        mlx_rs::transforms::eval(prefix_cache.eval_targets()).unwrap();
+        assert!(prefix_cache.is_turbo_active());
+
+        for seq_len in 2_i32..=5_i32 {
+            let input = canonical_exact_input(seq_len, 64, prefix_len + seq_len + 71);
+            let mut sequential_attention = attention.clone();
+            let mut block_attention = attention.clone();
+            let mut sequential_cache = prefix_cache.deep_clone();
+            let mut block_cache = prefix_cache.deep_clone();
+
+            let mut rows = Vec::with_capacity(seq_len as usize);
+            for position in 0..seq_len {
+                let row = input.index((.., position..position + 1, ..));
+                let output = sequential_attention
+                    .forward(&row, None, &mut sequential_cache)
+                    .unwrap();
+                mlx_rs::transforms::eval([&output]).unwrap();
+                mlx_rs::transforms::eval(sequential_cache.eval_targets()).unwrap();
+                rows.push(output);
+            }
+            let repeated = ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1).unwrap();
+            let mask = AttentionMask::Array(create_causal_mask(seq_len, Some(prefix_len)).unwrap());
+            let block = block_attention
+                .forward_canonical_rows(&input, Some(&mask), &mut block_cache)
+                .unwrap();
+            mlx_rs::transforms::eval([&block]).unwrap();
+            mlx_rs::transforms::eval(block_cache.eval_targets()).unwrap();
+
+            let label = format!("canonical TurboQuant attention S={seq_len}");
+            assert_canonical_array_exact(&label, &block, &repeated);
+            assert_canonical_turboquant_cache_exact(
+                &format!("{label} cache"),
+                &block_cache,
+                &sequential_cache,
+            );
+        }
+    }
+
     /// P2a gate (correctness): the DFlash tape replay must reconstruct the GDN
     /// SSM state at a partial-accept boundary *exactly* like a fresh forward over
     /// the accepted prefix. This bit-exactness is what makes greedy spec-decode
@@ -11836,20 +13610,7 @@ mod tests {
         )
         .unwrap();
 
-        mlx_rs::transforms::eval([&state_fwd, &state_replay]).unwrap();
-        let max_diff: f32 = state_fwd
-            .subtract(&state_replay)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item();
-        eprintln!("tape-replay vs forward SSM max_diff = {max_diff:.2e}");
-        assert!(
-            max_diff < 1e-3,
-            "tape replay differs from forward by {max_diff}"
-        );
+        assert_canonical_array_exact("tape replay state", &state_replay, &state_fwd);
     }
 
     /// DFlash verify must be bit-exact with AR decode. The verify path uses the
@@ -11887,24 +13648,8 @@ mod tests {
         )
         .unwrap();
 
-        let dmax = |x: &Array, y: &Array| -> f32 {
-            x.as_dtype(Dtype::Float32)
-                .unwrap()
-                .subtract(&y.as_dtype(Dtype::Float32).unwrap())
-                .unwrap()
-                .abs()
-                .unwrap()
-                .max(None)
-                .unwrap()
-                .item()
-        };
-        let y_diff = dmax(&y_plain, &y_tape);
-        let st_diff = dmax(&st_plain, &st_tape);
-        eprintln!("tape-vs-plain bf16: y_max_diff={y_diff:.2e} state_max_diff={st_diff:.2e}");
-        // y is stored bf16 in both kernels → identical. State is f32 in both →
-        // identical. Anything above bf16 epsilon means a precision divergence.
-        assert!(y_diff < 1e-2, "tape y differs from plain by {y_diff}");
-        assert!(st_diff < 1e-4, "tape state differs from plain by {st_diff}");
+        assert_canonical_array_exact("tape vs plain output", &y_tape, &y_plain);
+        assert_canonical_array_exact("tape vs plain state", &st_tape, &st_plain);
     }
 
     /// P2a gate (cost): rollback must be cheap vs recompute, or partial accepts
@@ -11969,17 +13714,11 @@ mod tests {
         );
     }
 
-    fn tape_transition_dense_weight(shape: &[i32]) -> Array {
-        let weight = mlx_rs::random::uniform::<f32, f32>(-0.05, 0.05, shape, None)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        weight.eval().unwrap();
-        weight
-    }
-
-    fn install_tape_transition_dense(linear: &mut QLinear, rows: i32, columns: i32) {
-        linear.weight = Param::new(tape_transition_dense_weight(&[rows, columns]));
+    fn install_tape_transition_dense(linear: &mut QLinear, rows: i32, columns: i32, salt: i32) {
+        // A sparse dyadic matrix makes batched and repeated-S1 projections
+        // exactly equal, so this test isolates the stateful GDN transition
+        // instead of MLX dense-GEMM reduction scheduling.
+        linear.weight = Param::new(canonical_exact_weight(rows, columns, salt));
         linear.scales = Param::new(Array::from_slice::<f32>(&[], &[0]));
         linear.biases = Param::new(Array::from_slice::<f32>(&[], &[0]));
         linear.group_size = 64;
@@ -11989,6 +13728,10 @@ mod tests {
 
     fn tape_transition_model() -> Qwen3NextCausalLM {
         let mut args = valid_causal_lm_args();
+        // This fixture isolates one GDN transition. Keep the configured model
+        // single-layer so its one cache and one tape are also a complete
+        // whole-model transaction under the fail-closed replay contract.
+        args.num_hidden_layers = 1;
         args.num_experts = 0;
         args.num_experts_per_tok = 0;
         args.quantization = Some(QuantizationConfig {
@@ -12007,14 +13750,15 @@ mod tests {
             &mut gdn.in_proj_qkvz,
             2 * (gdn.key_dim + value_dim),
             hidden_size,
-        );
-        install_tape_transition_dense(&mut gdn.in_proj_ba, 2 * gdn.num_v_heads, hidden_size);
-        install_tape_transition_dense(&mut gdn.out_proj, hidden_size, value_dim);
-        gdn.conv1d.weight = Param::new(tape_transition_dense_weight(&[
-            gdn.conv_dim,
-            gdn.conv_kernel_size,
             1,
-        ]));
+        );
+        install_tape_transition_dense(&mut gdn.in_proj_ba, 2 * gdn.num_v_heads, hidden_size, 3);
+        install_tape_transition_dense(&mut gdn.out_proj, hidden_size, value_dim, 5);
+        gdn.conv1d.weight = Param::new(
+            canonical_exact_weight(gdn.conv_dim, gdn.conv_kernel_size, 7)
+                .reshape(&[gdn.conv_dim, gdn.conv_kernel_size, 1])
+                .unwrap(),
+        );
         gdn.norm.weight = Param::new(
             Array::ones::<f32>(&[gdn.head_v_dim])
                 .unwrap()
@@ -12026,13 +13770,7 @@ mod tests {
     }
 
     fn tape_transition_input(seq_len: i32, hidden_size: i32) -> Array {
-        let input =
-            mlx_rs::random::uniform::<f32, f32>(-0.25, 0.25, &[1, seq_len, hidden_size], None)
-                .unwrap()
-                .as_dtype(Dtype::Bfloat16)
-                .unwrap();
-        input.eval().unwrap();
-        input
+        canonical_exact_input(seq_len, hidden_size, seq_len + 97)
     }
 
     fn run_gdn_ar_steps(gdn: &mut GatedDeltaNet, inputs: &Array, cache: &mut ArraysCache) -> Array {
@@ -12049,12 +13787,21 @@ mod tests {
         ops::concatenate_axis(&refs, 1).unwrap()
     }
 
+    fn deep_clone_tape_transition_cache(cache: &ArraysCache) -> ArraysCache {
+        ArraysCache {
+            conv_state: cache.conv_state.as_ref().map(crate::cache::eval_deep_clone),
+            ssm_state: cache.ssm_state.as_ref().map(crate::cache::eval_deep_clone),
+            conv_pos: cache.conv_pos,
+            offset: cache.offset,
+        }
+    }
+
     fn chronological_tape_transition_state(gdn: &GatedDeltaNet, cache: &ArraysCache) -> Array {
         let dtype = cache
             .conv_state
             .as_ref()
             .map_or(Dtype::Bfloat16, Array::dtype);
-        let mut copy = cache.deep_clone();
+        let mut copy = deep_clone_tape_transition_cache(cache);
         gdn.chronological_conv_state(&mut copy, 1, dtype).unwrap()
     }
 
@@ -12096,36 +13843,53 @@ mod tests {
     #[test]
     fn test_gdn_tape_block_after_ar_ring_matches_sequential() {
         let mut model = tape_transition_model();
-        let mut tape_cache = warm_rotated_tape_transition_cache(&mut model);
-        let mut ar_cache = tape_cache.deep_clone();
-        let block = tape_transition_input(4, model.args.hidden_size);
-
-        let mut ar_gdn = model.model.layers[0]
+        let initial_cache = warm_rotated_tape_transition_cache(&mut model);
+        let initial_gdn = model.model.layers[0]
             .linear_attn
             .as_ref()
             .expect("layer 0 must be GDN")
             .clone();
-        let ar_output = run_gdn_ar_steps(&mut ar_gdn, &block, &mut ar_cache);
-        let (tape_output, _) = model.model.layers[0]
-            .linear_attn
-            .as_mut()
-            .expect("layer 0 must be GDN")
-            .forward_with_tape(&block, None, &mut tape_cache)
-            .unwrap();
-        mlx_rs::transforms::eval([&ar_output, &tape_output]).unwrap();
 
-        assert_tape_transition_close("AR-to-block output", &tape_output, &ar_output, 2e-2);
-        assert_tape_transition_close(
-            "AR-to-block SSM state",
-            tape_cache.ssm_state.as_ref().unwrap(),
-            ar_cache.ssm_state.as_ref().unwrap(),
-            1e-4,
-        );
-        let tape_conv = chronological_tape_transition_state(&ar_gdn, &tape_cache);
-        let ar_conv = chronological_tape_transition_state(&ar_gdn, &ar_cache);
-        assert_tape_transition_close("AR-to-block conv state", &tape_conv, &ar_conv, 1e-3);
-        assert_eq!(tape_cache.offset, ar_cache.offset);
-        assert_eq!(tape_cache.conv_pos, ar_gdn.conv_kernel_size - 2);
+        for seq_len in 2..=5 {
+            // Every sequence length starts from the exact same independently
+            // cloned checkpoint. Reusing a cache between lengths would compare
+            // different absolute positions and produce a false numerical drift.
+            let mut ar_gdn = initial_gdn.clone();
+            let mut tape_gdn = initial_gdn.clone();
+            let mut ar_cache = deep_clone_tape_transition_cache(&initial_cache);
+            let mut tape_cache = deep_clone_tape_transition_cache(&initial_cache);
+            let block = tape_transition_input(seq_len, model.args.hidden_size);
+
+            let ar_output = run_gdn_ar_steps(&mut ar_gdn, &block, &mut ar_cache);
+            let (tape_output, _) = tape_gdn
+                .forward_with_tape(
+                    &block,
+                    None,
+                    &mut tape_cache,
+                    DFlashRowSchedule::CanonicalS1,
+                )
+                .unwrap();
+            mlx_rs::transforms::eval([&ar_output, &tape_output]).unwrap();
+            ar_cache.eval_arrays().unwrap();
+            tape_cache.eval_arrays().unwrap();
+
+            let label = format!("GDN repeated-S1 output S={seq_len}");
+            assert_canonical_array_exact(&label, &tape_output, &ar_output);
+            assert_canonical_array_exact(
+                &format!("GDN repeated-S1 SSM state S={seq_len}"),
+                tape_cache.ssm_state.as_ref().unwrap(),
+                ar_cache.ssm_state.as_ref().unwrap(),
+            );
+            let tape_conv = chronological_tape_transition_state(&tape_gdn, &tape_cache);
+            let ar_conv = chronological_tape_transition_state(&ar_gdn, &ar_cache);
+            assert_canonical_array_exact(
+                &format!("GDN repeated-S1 conv state S={seq_len}"),
+                &tape_conv,
+                &ar_conv,
+            );
+            assert_eq!(tape_cache.offset, ar_cache.offset);
+            assert_eq!(tape_cache.conv_pos, tape_gdn.conv_kernel_size - 2);
+        }
     }
 
     #[test]
@@ -12133,7 +13897,7 @@ mod tests {
         let mut model = tape_transition_model();
         let mut tape_cache = warm_rotated_tape_transition_cache(&mut model);
         let initial_conv_pos = tape_cache.conv_pos;
-        let mut ar_cache = tape_cache.deep_clone();
+        let mut ar_cache = deep_clone_tape_transition_cache(&tape_cache);
         let block = tape_transition_input(4, model.args.hidden_size);
         let accepted = 2;
 
@@ -12152,7 +13916,12 @@ mod tests {
             .linear_attn
             .as_mut()
             .expect("layer 0 must be GDN")
-            .forward_with_tape(&block, None, &mut tape_cache)
+            .forward_with_tape(
+                &block,
+                None,
+                &mut tape_cache,
+                DFlashRowSchedule::CanonicalS1,
+            )
             .unwrap();
         assert_eq!(tape.conv_pos_init, initial_conv_pos);
 
@@ -12194,6 +13963,845 @@ mod tests {
             replay_cache.ssm_state.as_ref().unwrap(),
             ar_cache.ssm_state.as_ref().unwrap(),
             1e-4,
+        );
+    }
+
+    fn deterministic_q1_params(rows: i32, columns: i32, salt: u32) -> (Array, Array, Array) {
+        const GROUP_SIZE: i32 = 128;
+        assert_eq!(columns % GROUP_SIZE, 0);
+        let words_per_row = columns / 32;
+        let patterns = [
+            0xA5A5_5A5A_u32,
+            0x3C3C_C3C3_u32,
+            0x9696_6969_u32,
+            0xF0F0_0F0F_u32,
+        ];
+        let packed = (0..rows * words_per_row)
+            .map(|index| {
+                let pattern = patterns[((index as u32 + salt) % patterns.len() as u32) as usize];
+                pattern.rotate_left((index as u32 * 7 + salt) % 32)
+            })
+            .collect::<Vec<_>>();
+        let groups_per_row = columns / GROUP_SIZE;
+        let scales = (0..rows * groups_per_row)
+            .map(|index| 0.015_625_f32 + (index.rem_euclid(3) as f32) * 0.003_906_25)
+            .collect::<Vec<_>>();
+        let weight = Array::from_slice(&packed, &[rows, words_per_row]);
+        let scales = Array::from_slice(&scales, &[rows, groups_per_row])
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        weight.eval().unwrap();
+        scales.eval().unwrap();
+        (weight, scales, symmetric_q1_bias_sentinel())
+    }
+
+    fn install_deterministic_q1(linear: &mut QLinear, rows: i32, columns: i32, salt: u32) {
+        let (weight, scales, biases) = deterministic_q1_params(rows, columns, salt);
+        linear.weight = Param::new(weight);
+        linear.scales = Param::new(scales);
+        linear.biases = Param::new(biases);
+        linear.group_size = 128;
+        linear.bits = 1;
+        linear.mode = crate::quant_mode::QuantMode::Affine;
+    }
+
+    fn install_deterministic_q1_embedding(
+        embedding: &mut QEmbedding,
+        rows: i32,
+        columns: i32,
+        salt: u32,
+    ) {
+        let (weight, scales, biases) = deterministic_q1_params(rows, columns, salt);
+        embedding.weight = Param::new(weight);
+        embedding.scales = Param::new(scales);
+        embedding.biases = Param::new(biases);
+        embedding.group_size = 128;
+        embedding.bits = 1;
+        embedding.mode = crate::quant_mode::QuantMode::Affine;
+    }
+
+    fn deterministic_hybrid_q1_model() -> Qwen3NextCausalLM {
+        let mut args = valid_causal_lm_args();
+        args.hidden_size = 128;
+        args.intermediate_size = 128;
+        args.vocab_size = 128;
+        args.num_hidden_layers = 2;
+        args.full_attention_interval = 2;
+        args.num_attention_heads = 2;
+        args.num_key_value_heads = 1;
+        args.head_dim = 64;
+        args.linear_num_key_heads = 1;
+        args.linear_key_head_dim = 32;
+        args.linear_num_value_heads = 2;
+        args.linear_value_head_dim = 64;
+        args.num_experts = 0;
+        args.num_experts_per_tok = 0;
+        args.decoder_sparse_step = 0;
+        args.quantization = Some(QuantizationConfig {
+            group_size: 128,
+            bits: 1,
+            mode: crate::quant_mode::QuantMode::Affine,
+        });
+        args.quant_overrides.clear();
+
+        let hidden = args.hidden_size;
+        let intermediate = args.intermediate_size;
+        let vocab = args.vocab_size;
+        let mut model = Qwen3NextCausalLM::new(args).unwrap();
+        install_deterministic_q1_embedding(&mut model.model.embed_tokens, vocab, hidden, 1);
+        install_deterministic_q1(
+            model.lm_head.as_mut().expect("untied LM head"),
+            vocab,
+            hidden,
+            3,
+        );
+        model.model.norm.weight = Param::new(Array::ones::<f32>(&[hidden]).unwrap());
+
+        for (layer_index, layer) in model.model.layers.iter_mut().enumerate() {
+            let salt = 11 + layer_index as u32 * 17;
+            layer.input_layernorm.weight = Param::new(Array::ones::<f32>(&[hidden]).unwrap());
+            layer.post_attention_layernorm.weight =
+                Param::new(Array::ones::<f32>(&[hidden]).unwrap());
+            install_deterministic_q1(
+                layer.mlp.gate_proj.as_mut().expect("dense gate projection"),
+                intermediate,
+                hidden,
+                salt,
+            );
+            install_deterministic_q1(
+                layer.mlp.up_proj.as_mut().expect("dense up projection"),
+                intermediate,
+                hidden,
+                salt + 1,
+            );
+            install_deterministic_q1(
+                layer.mlp.down_proj.as_mut().expect("dense down projection"),
+                hidden,
+                intermediate,
+                salt + 2,
+            );
+
+            if let Some(gdn) = layer.linear_attn.as_mut() {
+                let value_dim = gdn.num_v_heads * gdn.head_v_dim;
+                install_deterministic_q1(
+                    &mut gdn.in_proj_qkvz,
+                    2 * (gdn.key_dim + value_dim),
+                    hidden,
+                    salt + 3,
+                );
+                install_deterministic_q1(
+                    &mut gdn.in_proj_ba,
+                    2 * gdn.num_v_heads,
+                    hidden,
+                    salt + 4,
+                );
+                install_deterministic_q1(&mut gdn.out_proj, hidden, value_dim, salt + 5);
+                let conv_values = (0..gdn.conv_dim * gdn.conv_kernel_size)
+                    .map(|index| {
+                        const TAPS: [f32; 4] = [0.125, -0.0625, 0.03125, 0.25];
+                        TAPS[((index + layer_index as i32) % 4) as usize]
+                    })
+                    .collect::<Vec<_>>();
+                gdn.conv1d.weight = Param::new(Array::from_slice(
+                    &conv_values,
+                    &[gdn.conv_dim, gdn.conv_kernel_size, 1],
+                ));
+                gdn.norm.weight = Param::new(Array::ones::<f32>(&[gdn.head_v_dim]).unwrap());
+                gdn.A_log = Param::new(Array::zeros::<f32>(&[gdn.num_v_heads]).unwrap());
+                gdn.dt_bias = Param::new(Array::zeros::<f32>(&[gdn.num_v_heads]).unwrap());
+                gdn.conv_weight_t = None;
+            } else {
+                let attention = layer.self_attn.as_mut().expect("full attention layer");
+                let q_rows = 2 * attention.num_attention_heads * model.args.head_dim;
+                let kv_rows = attention.num_key_value_heads * model.args.head_dim;
+                install_deterministic_q1(&mut attention.q_proj, q_rows, hidden, salt + 3);
+                install_deterministic_q1(&mut attention.k_proj, kv_rows, hidden, salt + 4);
+                install_deterministic_q1(&mut attention.v_proj, kv_rows, hidden, salt + 5);
+                install_deterministic_q1(
+                    &mut attention.o_proj,
+                    hidden,
+                    attention.num_attention_heads * model.args.head_dim,
+                    salt + 6,
+                );
+                attention.q_norm.weight =
+                    Param::new(Array::ones::<f32>(&[model.args.head_dim]).unwrap());
+                attention.k_norm.weight =
+                    Param::new(Array::ones::<f32>(&[model.args.head_dim]).unwrap());
+            }
+        }
+        model
+    }
+
+    fn retain_loaded_affine_q1_bias(linear: &mut QLinear) {
+        linear.biases = Param::new((*linear.scales).clone());
+    }
+
+    fn retain_loaded_affine_q1_embedding_bias(embedding: &mut QEmbedding) {
+        embedding.biases = Param::new((*embedding.scales).clone());
+    }
+
+    fn retain_whole_model_affine_q1_biases(model: &mut Qwen3NextCausalLM) -> usize {
+        let mut retained = 0;
+        retain_loaded_affine_q1_embedding_bias(&mut model.model.embed_tokens);
+        retained += 1;
+        retain_loaded_affine_q1_bias(model.lm_head.as_mut().expect("untied LM head"));
+        retained += 1;
+
+        for layer in &mut model.model.layers {
+            retain_loaded_affine_q1_bias(
+                layer.mlp.gate_proj.as_mut().expect("dense gate projection"),
+            );
+            retain_loaded_affine_q1_bias(layer.mlp.up_proj.as_mut().expect("dense up projection"));
+            retain_loaded_affine_q1_bias(
+                layer.mlp.down_proj.as_mut().expect("dense down projection"),
+            );
+            retained += 3;
+
+            if layer.is_linear {
+                let gdn = layer.linear_attn.as_mut().expect("GDN layer");
+                if gdn.use_separate_projections {
+                    retain_loaded_affine_q1_bias(
+                        gdn.in_proj_qkv.as_mut().expect("separate QKV projection"),
+                    );
+                    retain_loaded_affine_q1_bias(
+                        gdn.in_proj_z.as_mut().expect("separate Z projection"),
+                    );
+                    retain_loaded_affine_q1_bias(
+                        gdn.in_proj_a.as_mut().expect("separate A projection"),
+                    );
+                    retain_loaded_affine_q1_bias(
+                        gdn.in_proj_b.as_mut().expect("separate B projection"),
+                    );
+                    retained += 4;
+                } else {
+                    retain_loaded_affine_q1_bias(&mut gdn.in_proj_qkvz);
+                    retain_loaded_affine_q1_bias(&mut gdn.in_proj_ba);
+                    retained += 2;
+                }
+                retain_loaded_affine_q1_bias(&mut gdn.out_proj);
+                retained += 1;
+            } else {
+                let attention = layer.self_attn.as_mut().expect("full-attention layer");
+                retain_loaded_affine_q1_bias(&mut attention.q_proj);
+                retain_loaded_affine_q1_bias(&mut attention.k_proj);
+                retain_loaded_affine_q1_bias(&mut attention.v_proj);
+                retain_loaded_affine_q1_bias(&mut attention.o_proj);
+                retained += 4;
+            }
+        }
+        retained
+    }
+
+    #[test]
+    fn dflash_block_capability_accepts_whole_model_loaded_affine_q1_biases() {
+        let mut model = deterministic_hybrid_q1_model();
+        let retained = retain_whole_model_affine_q1_biases(&mut model);
+
+        assert_eq!(retained, 15, "fixture must retain every active affine bias");
+        assert!(!has_symmetric_q1_biases(&model.model.embed_tokens.biases));
+        model.validate_dflash_block_domain(5).unwrap();
+    }
+
+    fn eval_hybrid_cache(cache: &[Option<LayerCache>]) {
+        for layer in cache.iter().flatten() {
+            match layer {
+                LayerCache::KV(kv) => mlx_rs::transforms::eval(kv.eval_targets()).unwrap(),
+                LayerCache::Arrays(arrays) => arrays.eval_arrays().unwrap(),
+            }
+        }
+    }
+
+    fn deep_clone_hybrid_cache(cache: &[Option<LayerCache>]) -> Vec<Option<LayerCache>> {
+        cache
+            .iter()
+            .map(|layer| {
+                layer.as_ref().map(|layer| match layer {
+                    LayerCache::KV(kv) => LayerCache::KV(kv.deep_clone()),
+                    LayerCache::Arrays(arrays) => {
+                        LayerCache::Arrays(deep_clone_tape_transition_cache(arrays))
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn assert_hybrid_q1_cache_exact(
+        model: &Qwen3NextCausalLM,
+        label: &str,
+        actual: &[Option<LayerCache>],
+        expected: &[Option<LayerCache>],
+    ) {
+        assert_eq!(actual.len(), expected.len(), "{label} cache count");
+        for (layer_index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            match (actual.as_ref(), expected.as_ref()) {
+                (Some(LayerCache::KV(actual)), Some(LayerCache::KV(expected))) => {
+                    assert_canonical_kv_cache_exact(
+                        &format!("{label} layer {layer_index} KV"),
+                        actual,
+                        expected,
+                    );
+                }
+                (Some(LayerCache::Arrays(actual)), Some(LayerCache::Arrays(expected))) => {
+                    assert_eq!(
+                        actual.offset, expected.offset,
+                        "{label} layer {layer_index} offset"
+                    );
+                    assert_canonical_array_exact(
+                        &format!("{label} layer {layer_index} SSM"),
+                        actual.ssm_state.as_ref().expect("actual SSM state"),
+                        expected.ssm_state.as_ref().expect("expected SSM state"),
+                    );
+                    let gdn = model.model.layers[layer_index]
+                        .linear_attn
+                        .as_ref()
+                        .expect("GDN layer");
+                    let actual_conv = chronological_tape_transition_state(gdn, actual);
+                    let expected_conv = chronological_tape_transition_state(gdn, expected);
+                    assert_canonical_array_exact(
+                        &format!("{label} layer {layer_index} convolution history"),
+                        &actual_conv,
+                        &expected_conv,
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("{label} layer {layer_index} cache variant differs"),
+            }
+        }
+    }
+
+    fn run_hybrid_q1_s1(
+        model: &mut Qwen3NextCausalLM,
+        tokens: &Array,
+        cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+    ) -> (Array, Vec<Array>) {
+        let seq_len = tokens.shape()[1];
+        let mut logits = Vec::with_capacity(seq_len as usize);
+        let mut taps = (0..tap_layers.len())
+            .map(|_| Vec::with_capacity(seq_len as usize))
+            .collect::<Vec<_>>();
+        for position in 0..seq_len {
+            let row = tokens.index((.., position..position + 1));
+            let (row_logits, row_taps) = model
+                .forward_with_taps(&row, None, cache, tap_layers)
+                .unwrap();
+            mlx_rs::transforms::eval(std::iter::once(&row_logits).chain(row_taps.iter())).unwrap();
+            eval_hybrid_cache(cache);
+            logits.push(row_logits);
+            for (tap_rows, row_tap) in taps.iter_mut().zip(row_taps) {
+                tap_rows.push(row_tap);
+            }
+        }
+        let logits = ops::concatenate_axis(&logits.iter().collect::<Vec<_>>(), 1).unwrap();
+        let taps = taps
+            .into_iter()
+            .map(|rows| ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1).unwrap())
+            .collect();
+        (logits, taps)
+    }
+
+    #[test]
+    fn hybrid_q1_taped_verify_matches_repeated_s1_exact_s2_through_s5() {
+        let mut warmed_model = deterministic_hybrid_q1_model();
+        warmed_model.validate_dflash_block_domain(5).unwrap();
+        let mut unsupported_model = warmed_model.clone();
+        unsupported_model.model.layers[0]
+            .linear_attn
+            .as_mut()
+            .unwrap()
+            .out_proj
+            .bits = 4;
+        assert!(
+            unsupported_model.validate_dflash_block_domain(5).is_err(),
+            "the block capability must positively attest every active Q1 projection"
+        );
+        let tap_layers = [0_usize, 1_usize];
+        let warmup = Array::from_slice(&[3_u32, 7, 11], &[1, 3]);
+        let mut initial_cache = warmed_model.make_cache();
+        let _ = run_hybrid_q1_s1(&mut warmed_model, &warmup, &mut initial_cache, &tap_layers);
+        eval_hybrid_cache(&initial_cache);
+
+        for seq_len in 2_i32..=5_i32 {
+            let values = (0..seq_len)
+                .map(|position| (19 + seq_len * 13 + position * 17) as u32 % 128)
+                .collect::<Vec<_>>();
+            let tokens = Array::from_slice(&values, &[1, seq_len]);
+            let mut sequential_model = warmed_model.clone();
+            let mut tape_model = warmed_model.clone();
+            let mut sequential_cache = deep_clone_hybrid_cache(&initial_cache);
+            let mut tape_cache = deep_clone_hybrid_cache(&initial_cache);
+
+            let (sequential_logits, sequential_taps) = run_hybrid_q1_s1(
+                &mut sequential_model,
+                &tokens,
+                &mut sequential_cache,
+                &tap_layers,
+            );
+            let (tape_logits, tape_taps, layer_tapes) = tape_model
+                .forward_with_taps_tape_scheduled(
+                    &tokens,
+                    None,
+                    &mut tape_cache,
+                    &tap_layers,
+                    None,
+                    DFlashRowSchedule::CanonicalS1,
+                )
+                .unwrap();
+            mlx_rs::transforms::eval(std::iter::once(&tape_logits).chain(tape_taps.iter()))
+                .unwrap();
+            eval_hybrid_cache(&tape_cache);
+
+            let label = format!("whole-model Q1 S={seq_len}");
+            assert_canonical_array_exact(
+                &format!("{label} logits"),
+                &tape_logits,
+                &sequential_logits,
+            );
+            assert_eq!(tape_taps.len(), sequential_taps.len(), "{label} tap count");
+            for (tap_index, (actual, expected)) in
+                tape_taps.iter().zip(&sequential_taps).enumerate()
+            {
+                assert_canonical_array_exact(&format!("{label} tap {tap_index}"), actual, expected);
+            }
+            assert_hybrid_q1_cache_exact(&tape_model, &label, &tape_cache, &sequential_cache);
+
+            if seq_len == 5 {
+                let mut fault_model = warmed_model.clone();
+                let mut fault_cache = deep_clone_hybrid_cache(&initial_cache);
+                let (_, _, mut fault_tapes) = fault_model
+                    .forward_with_taps_tape_scheduled(
+                        &tokens,
+                        None,
+                        &mut fault_cache,
+                        &tap_layers,
+                        None,
+                        DFlashRowSchedule::CanonicalS1,
+                    )
+                    .unwrap();
+                eval_hybrid_cache(&fault_cache);
+                let fault_cache_before = deep_clone_hybrid_cache(&fault_cache);
+                fault_tapes[0] = None;
+                assert!(
+                    fault_model
+                        .replay_tape_rollback(&fault_tapes, &mut fault_cache, 1, seq_len - 1,)
+                        .is_err(),
+                    "a missing GDN artifact must fail before cache mutation"
+                );
+                eval_hybrid_cache(&fault_cache);
+                assert_hybrid_q1_cache_exact(
+                    &fault_model,
+                    "missing-tape rollback is atomic",
+                    &fault_cache,
+                    &fault_cache_before,
+                );
+
+                for accepted in 1_i32..seq_len {
+                    let mut prefix_model = warmed_model.clone();
+                    let mut prefix_cache = deep_clone_hybrid_cache(&initial_cache);
+                    let _ = run_hybrid_q1_s1(
+                        &mut prefix_model,
+                        &tokens.index((.., ..accepted)),
+                        &mut prefix_cache,
+                        &tap_layers,
+                    );
+                    let mut rollback_model = tape_model.clone();
+                    let mut rollback_cache = deep_clone_hybrid_cache(&tape_cache);
+                    rollback_model
+                        .replay_tape_rollback(
+                            &layer_tapes,
+                            &mut rollback_cache,
+                            accepted,
+                            seq_len - accepted,
+                        )
+                        .unwrap();
+                    eval_hybrid_cache(&rollback_cache);
+                    assert_hybrid_q1_cache_exact(
+                        &rollback_model,
+                        &format!("whole-model Q1 rollback accepted={accepted}/{seq_len}"),
+                        &rollback_cache,
+                        &prefix_cache,
+                    );
+
+                    // A semantically restored ring can use a different raw
+                    // cursor/layout. The decisive invariant is that the next
+                    // S1 transition and a following block remain exact.
+                    let next =
+                        Array::from_slice(&[u32::try_from(101 + accepted).unwrap()], &[1, 1]);
+                    let (prefix_next_logits, prefix_next_taps) =
+                        run_hybrid_q1_s1(&mut prefix_model, &next, &mut prefix_cache, &tap_layers);
+                    let (rollback_next_logits, rollback_next_taps) = run_hybrid_q1_s1(
+                        &mut rollback_model,
+                        &next,
+                        &mut rollback_cache,
+                        &tap_layers,
+                    );
+                    assert_canonical_array_exact(
+                        &format!("rollback follow-through logits accepted={accepted}"),
+                        &rollback_next_logits,
+                        &prefix_next_logits,
+                    );
+                    for (tap_index, (actual, expected)) in
+                        rollback_next_taps.iter().zip(&prefix_next_taps).enumerate()
+                    {
+                        assert_canonical_array_exact(
+                            &format!("rollback follow-through tap {tap_index} accepted={accepted}"),
+                            actual,
+                            expected,
+                        );
+                    }
+                    assert_hybrid_q1_cache_exact(
+                        &rollback_model,
+                        &format!("rollback follow-through cache accepted={accepted}"),
+                        &rollback_cache,
+                        &prefix_cache,
+                    );
+
+                    let second = Array::from_slice(
+                        &[
+                            u32::try_from(109 + accepted).unwrap(),
+                            u32::try_from(117 + accepted).unwrap(),
+                        ],
+                        &[1, 2],
+                    );
+                    let (second_s1_logits, second_s1_taps) = run_hybrid_q1_s1(
+                        &mut prefix_model,
+                        &second,
+                        &mut prefix_cache,
+                        &tap_layers,
+                    );
+                    let (second_block_logits, second_block_taps, _) = rollback_model
+                        .forward_with_taps_tape_scheduled(
+                            &second,
+                            None,
+                            &mut rollback_cache,
+                            &tap_layers,
+                            None,
+                            DFlashRowSchedule::CanonicalS1,
+                        )
+                        .unwrap();
+                    mlx_rs::transforms::eval(
+                        std::iter::once(&second_block_logits).chain(second_block_taps.iter()),
+                    )
+                    .unwrap();
+                    eval_hybrid_cache(&rollback_cache);
+                    assert_canonical_array_exact(
+                        &format!("consecutive block logits accepted={accepted}"),
+                        &second_block_logits,
+                        &second_s1_logits,
+                    );
+                    for (tap_index, (actual, expected)) in
+                        second_block_taps.iter().zip(&second_s1_taps).enumerate()
+                    {
+                        assert_canonical_array_exact(
+                            &format!("consecutive block tap {tap_index} accepted={accepted}"),
+                            actual,
+                            expected,
+                        );
+                    }
+                    assert_hybrid_q1_cache_exact(
+                        &rollback_model,
+                        &format!("consecutive block cache accepted={accepted}"),
+                        &rollback_cache,
+                        &prefix_cache,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_conv_metal_matches_ordered_s1_bf16_exact_m1_through_m5() {
+        let args = valid_causal_lm_args();
+        let gdn = GatedDeltaNet::new(&args, "test.layer.linear_attn").unwrap();
+        let batch = 1;
+        let kernel_size = gdn.conv_kernel_size;
+        let history_len = kernel_size - 1;
+        let conv_dim = gdn.conv_dim;
+        assert_eq!(kernel_size, 4);
+
+        let bf16_pattern = |shape: &[i32], salt: i32, modulus: i32, divisor: f32| {
+            let size = shape.iter().product::<i32>();
+            let values = (0..size)
+                .map(|index| {
+                    let centered = (index * 29 + salt).rem_euclid(modulus) - modulus / 2;
+                    centered as f32 / divisor
+                })
+                .collect::<Vec<_>>();
+            let array = Array::from_slice(&values, shape)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            array.eval().unwrap();
+            array
+        };
+        let history = bf16_pattern(&[batch, history_len, conv_dim], 7, 61, 47.0);
+        let weight_t = bf16_pattern(&[kernel_size, conv_dim], 19, 67, 59.0);
+
+        for offset_init in [0, 1, 2, 3, 11] {
+            for seq_len in 1..=5 {
+                let mixed_qkv = bf16_pattern(&[batch, seq_len, conv_dim], 31 + seq_len, 71, 53.0);
+                let actual_preactivation = canonical_conv_preactivation_ffi(
+                    &mixed_qkv,
+                    &history,
+                    &weight_t,
+                    offset_init,
+                    batch,
+                    seq_len,
+                    conv_dim,
+                    kernel_size,
+                )
+                .unwrap();
+
+                let mut expected_preactivation_rows = Vec::with_capacity(seq_len as usize);
+                let mut expected_activated_rows = Vec::with_capacity(seq_len as usize);
+                for position in 0..seq_len {
+                    let current = mixed_qkv
+                        .index((.., position..position + 1, ..))
+                        .reshape(&[batch, conv_dim])
+                        .unwrap();
+                    let mut preactivation = current
+                        .multiply(&weight_t.index((kernel_size - 1, ..)))
+                        .unwrap();
+                    let available = (offset_init + position).clamp(0, history_len);
+                    for lag in 0..available {
+                        let prior = if lag < position {
+                            mixed_qkv
+                                .index((.., position - 1 - lag..position - lag, ..))
+                                .reshape(&[batch, conv_dim])
+                                .unwrap()
+                        } else {
+                            let history_index = history_len - 1 - (lag - position);
+                            history
+                                .index((.., history_index..history_index + 1, ..))
+                                .reshape(&[batch, conv_dim])
+                                .unwrap()
+                        };
+                        let product = prior
+                            .multiply(&weight_t.index((history_len - 1 - lag, ..)))
+                            .unwrap();
+                        preactivation = preactivation.add(&product).unwrap();
+                    }
+                    expected_preactivation_rows
+                        .push(preactivation.reshape(&[batch, 1, conv_dim]).unwrap());
+
+                    let current = mixed_qkv.index((.., position..position + 1, ..));
+                    expected_activated_rows.push(
+                        gdn.canonical_conv1d_step(&current, &weight_t, available, batch, |lag| {
+                            if lag < position {
+                                mixed_qkv
+                                    .index((.., position - 1 - lag..position - lag, ..))
+                                    .reshape(&[batch, conv_dim])
+                            } else {
+                                let history_index = history_len - 1 - (lag - position);
+                                history
+                                    .index((.., history_index..history_index + 1, ..))
+                                    .reshape(&[batch, conv_dim])
+                            }
+                        })
+                        .unwrap(),
+                    );
+                }
+                let expected_preactivation = ops::concatenate_axis(
+                    &expected_preactivation_rows.iter().collect::<Vec<_>>(),
+                    1,
+                )
+                .unwrap();
+                let expected_activated =
+                    ops::concatenate_axis(&expected_activated_rows.iter().collect::<Vec<_>>(), 1)
+                        .unwrap();
+                let actual_activated = silu_direct(&actual_preactivation).unwrap();
+                let label = format!("canonical conv offset={offset_init} M={seq_len}");
+                assert_canonical_array_exact(
+                    &format!("{label} preactivation"),
+                    &actual_preactivation,
+                    &expected_preactivation,
+                );
+                assert_canonical_array_exact(
+                    &format!("{label} activated"),
+                    &actual_activated,
+                    &expected_activated,
+                );
+            }
+        }
+
+        let fp16_history = history.as_dtype(Dtype::Float16).unwrap();
+        assert!(!canonical_conv_kernel_supported(
+            &bf16_pattern(&[batch, 5, conv_dim], 3, 71, 53.0),
+            &fp16_history,
+            &weight_t,
+            batch,
+            5,
+            conv_dim,
+            kernel_size,
+        ));
+    }
+
+    /// Measures only the divergent portion of CanonicalS1 short-block
+    /// convolution. History rotation is shared by both production paths, so
+    /// this benchmark materializes a fully warm, rotated ring before timing.
+    #[test]
+    #[ignore = "microbenchmark, requires Apple Metal GPU"]
+    fn bench_bonsai_canonical_conv_ordered_vs_fused_bf16_m5() {
+        use std::time::Instant;
+
+        const BATCH: i32 = 1;
+        const SEQ_LEN: i32 = 5;
+        const CONV_DIM: i32 = 10_240;
+        const KERNEL_SIZE: i32 = 4;
+        const HISTORY_LEN: i32 = KERNEL_SIZE - 1;
+        const OFFSET_INIT: i32 = 4_096;
+        const WARMUP_ITERS: usize = 20;
+        const DEFAULT_SAMPLES: usize = 201;
+        const ORDERED_ARITHMETIC_DISPATCHES: usize = 45;
+        const FUSED_ARITHMETIC_DISPATCHES: usize = 3;
+
+        let bf16_pattern = |shape: &[i32], salt: i32, modulus: i32, divisor: f32| {
+            let size = shape.iter().product::<i32>();
+            let values = (0..size)
+                .map(|index| {
+                    let centered = (index * 29 + salt).rem_euclid(modulus) - modulus / 2;
+                    centered as f32 / divisor
+                })
+                .collect::<Vec<_>>();
+            let array = Array::from_slice(&values, shape)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            array.eval().unwrap();
+            array
+        };
+
+        let mixed_qkv = bf16_pattern(&[BATCH, SEQ_LEN, CONV_DIM], 31, 71, 53.0);
+        let weight_t = bf16_pattern(&[KERNEL_SIZE, CONV_DIM], 19, 67, 59.0);
+
+        // Fully warm decode ring with newest row in slot zero. Production's
+        // chronological conversion therefore rotates slots [1, 2, 0].
+        let ring_state = bf16_pattern(&[BATCH, HISTORY_LEN, CONV_DIM], 7, 61, 47.0);
+        let ring_after_newest = ring_state.index((.., 1.., ..));
+        let ring_through_newest = ring_state.index((.., ..1, ..));
+        let history =
+            ops::concatenate_axis(&[&ring_after_newest, &ring_through_newest], 1).unwrap();
+        history.eval().unwrap();
+        assert_eq!(history.shape(), &[BATCH, HISTORY_LEN, CONV_DIM]);
+
+        let ordered = || {
+            let mut rows = Vec::with_capacity(SEQ_LEN as usize);
+            for position in 0..SEQ_LEN {
+                let current = mixed_qkv
+                    .index((.., position..position + 1, ..))
+                    .reshape(&[BATCH, CONV_DIM])
+                    .unwrap();
+                let mut preactivation = current
+                    .multiply(&weight_t.index((KERNEL_SIZE - 1, ..)))
+                    .unwrap();
+                let available = (OFFSET_INIT + position).clamp(0, HISTORY_LEN);
+                for lag in 0..available {
+                    let prior = if lag < position {
+                        mixed_qkv
+                            .index((.., position - 1 - lag..position - lag, ..))
+                            .reshape(&[BATCH, CONV_DIM])
+                            .unwrap()
+                    } else {
+                        let history_index = HISTORY_LEN - 1 - (lag - position);
+                        history
+                            .index((.., history_index..history_index + 1, ..))
+                            .reshape(&[BATCH, CONV_DIM])
+                            .unwrap()
+                    };
+                    let product = prior
+                        .multiply(&weight_t.index((HISTORY_LEN - 1 - lag, ..)))
+                        .unwrap();
+                    preactivation = preactivation.add(&product).unwrap();
+                }
+                rows.push(
+                    silu_direct(&preactivation.reshape(&[BATCH, 1, CONV_DIM]).unwrap()).unwrap(),
+                );
+            }
+            ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1).unwrap()
+        };
+
+        let fused = || {
+            let preactivation = canonical_conv_preactivation_ffi(
+                &mixed_qkv,
+                &history,
+                &weight_t,
+                OFFSET_INIT,
+                BATCH,
+                SEQ_LEN,
+                CONV_DIM,
+                KERNEL_SIZE,
+            )
+            .unwrap();
+            silu_direct(&preactivation).unwrap()
+        };
+
+        // Compile every primitive and prove the benchmark paths still obey the
+        // exact production contract before collecting timings.
+        let ordered_check = ordered();
+        let fused_check = fused();
+        mlx_rs::transforms::eval([&ordered_check, &fused_check]).unwrap();
+        assert_canonical_array_exact(
+            "Bonsai canonical conv microbenchmark",
+            &fused_check,
+            &ordered_check,
+        );
+
+        for iteration in 0..WARMUP_ITERS {
+            let outputs = if iteration % 2 == 0 {
+                [ordered(), fused()]
+            } else {
+                [fused(), ordered()]
+            };
+            mlx_rs::transforms::eval(outputs.iter()).unwrap();
+            std::hint::black_box(outputs);
+        }
+
+        let samples = std::env::var("HIGGS_DFLASH_CONV_BENCH_SAMPLES")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(DEFAULT_SAMPLES);
+        let mut ordered_us = Vec::with_capacity(samples);
+        let mut fused_us = Vec::with_capacity(samples);
+
+        let measure = |path: &dyn Fn() -> Array, timings: &mut Vec<f64>| {
+            let start = Instant::now();
+            let output = path();
+            mlx_rs::transforms::eval([&output]).unwrap();
+            timings.push(start.elapsed().as_secs_f64() * 1e6);
+            std::hint::black_box(output);
+        };
+        for sample in 0..samples {
+            if sample % 2 == 0 {
+                measure(&ordered, &mut ordered_us);
+                measure(&fused, &mut fused_us);
+            } else {
+                measure(&fused, &mut fused_us);
+                measure(&ordered, &mut ordered_us);
+            }
+        }
+
+        let summarize = |values: &mut [f64]| {
+            values.sort_by(f64::total_cmp);
+            let median = values[values.len() / 2];
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            (median, mean)
+        };
+        let (ordered_median_us, ordered_mean_us) = summarize(&mut ordered_us);
+        let (fused_median_us, fused_mean_us) = summarize(&mut fused_us);
+        let dispatch_reduction =
+            ORDERED_ARITHMETIC_DISPATCHES as f64 / FUSED_ARITHMETIC_DISPATCHES as f64;
+
+        eprintln!(
+            "Bonsai CanonicalS1 conv B={BATCH} M={SEQ_LEN} D={CONV_DIM} K={KERNEL_SIZE} BF16, warm rotated history, samples={samples}"
+        );
+        eprintln!("  ordered exact: median={ordered_median_us:.1}us mean={ordered_mean_us:.1}us");
+        eprintln!("  fused + SiLU:   median={fused_median_us:.1}us mean={fused_mean_us:.1}us");
+        eprintln!(
+            "  wall speedup:   median={:.2}x mean={:.2}x",
+            ordered_median_us / fused_median_us,
+            ordered_mean_us / fused_mean_us,
+        );
+        eprintln!(
+            "  nominal arithmetic dispatches: ordered={ORDERED_ARITHMETIC_DISPATCHES} + concatenate, fused={FUSED_ARITHMETIC_DISPATCHES}; reduction={dispatch_reduction:.1}x"
         );
     }
 
@@ -12406,10 +15014,9 @@ mod tests {
             .unwrap()
             .as_dtype(Dtype::Bfloat16)
             .unwrap();
-        let state = mlx_rs::random::uniform::<f32, f32>(-0.1, 0.1, &[batch, hv, dv, dk], None)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
+        // The recurrence state is always f32 even when activations are bf16.
+        let state =
+            mlx_rs::random::uniform::<f32, f32>(-0.1, 0.1, &[batch, hv, dv, dk], None).unwrap();
 
         // Kernel
         let (kern_y, kern_state) = gated_delta_kernel_ffi(
@@ -12429,6 +15036,55 @@ mod tests {
             y_abs_max.is_finite() && y_abs_max < 1e6,
             "bfloat16 kernel y has bad values: max abs = {y_abs_max}"
         );
+    }
+
+    #[test]
+    fn gdn_metal_paths_reject_non_f32_state() {
+        let (batch, seq_len, hk, dk, hv, dv) = (1, 1, 1, 32, 1, 1);
+        let bf16 = |shape: &[i32]| {
+            Array::zeros::<f32>(shape)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+        };
+        let q = bf16(&[batch, seq_len, hk, dk]);
+        let k = bf16(&[batch, seq_len, hk, dk]);
+        let v = bf16(&[batch, seq_len, hv, dv]);
+        let a = bf16(&[batch, seq_len, hv]);
+        let beta = bf16(&[batch, seq_len, hv]);
+        let a_log = bf16(&[hv]);
+        let dt_bias = bf16(&[hv]);
+        let bad_state = bf16(&[batch, hv, dv, dk]);
+
+        let plain = gated_delta_kernel_ffi(
+            &q, &k, &v, &a_log, &a, &dt_bias, &beta, &bad_state, batch, seq_len, hk, dk, hv, dv,
+        )
+        .unwrap_err();
+        assert!(plain.to_string().contains("state must be Float32"));
+
+        let tape = gated_delta_kernel_ffi_with_tape(
+            &q, &k, &v, &a_log, &a, &dt_bias, &beta, &bad_state, batch, seq_len, hk, dk, hv, dv,
+        )
+        .unwrap_err();
+        assert!(tape.to_string().contains("state must be Float32"));
+
+        let innovation = Array::zeros::<f32>(&[batch, seq_len, hv, dv]).unwrap();
+        let replay = tape_replay_kernel_ffi(
+            &innovation,
+            &k,
+            &a,
+            &a_log,
+            &dt_bias,
+            &bad_state,
+            batch,
+            seq_len,
+            hk,
+            dk,
+            hv,
+            dv,
+        )
+        .unwrap_err();
+        assert!(replay.to_string().contains("state must be Float32"));
     }
 
     #[allow(clippy::too_many_arguments)]

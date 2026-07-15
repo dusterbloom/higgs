@@ -618,7 +618,10 @@ pub(crate) fn verify_targets(
     let Some(params) = sampling else {
         return greedy_token_ids(logits);
     };
-    let sampled = params.temperature > f32::EPSILON;
+    // Match `higgs_models::sample` exactly. Treating tiny non-zero
+    // temperatures as greedy changes request semantics inside a verifier.
+    #[allow(clippy::float_cmp)]
+    let sampled = params.temperature != 0.0;
     let penalized = history.is_some()
         && (params.repetition_penalty.is_some()
             || params.frequency_penalty.is_some()

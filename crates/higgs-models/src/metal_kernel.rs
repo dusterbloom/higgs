@@ -22,7 +22,7 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
-use mlx_rs::{Array, Stream, error::Exception};
+use mlx_rs::{Array, Dtype, Stream, error::Exception};
 
 // ---------------------------------------------------------------------------
 // FFI error capture (per-thread, mirrors qwen3_next).
@@ -184,7 +184,7 @@ fn create_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
             out_vec,
             source.as_ptr(),
             c"".as_ptr(),
-            false, // ensure_row_contiguous
+            true,  // raw pointer arithmetic requires row-contiguous inputs
             false, // atomic_outputs
         );
         mlx_sys::mlx_vector_string_free(in_vec);
@@ -341,6 +341,8 @@ pub fn bonsai_q1_qmv_legacy(
 
 static QMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static FAST_QMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static TG_LUT4_CONTRACT_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static TG_LUT4_CONTRACT_M5_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 /// Simdgroups per threadgroup for the `qmv_fast`-class kernel. Each simdgroup
 /// computes `RESULTS_PER_SIMDGROUP` (= 4) output rows. Tunable via
@@ -354,6 +356,23 @@ fn fast_qmv_nsg() -> i32 {
             .filter(|n| matches!(n, 1 | 2 | 4 | 8))
             .unwrap_or(2)
     })
+}
+
+/// Whether the fast QMV kernel may specialize away output-row bounds checks.
+///
+/// This is deliberately opt-in while the specialization is benchmarked on
+/// real Bonsai verifier shapes. The unaligned kernel remains the fallback for
+/// shapes that do not fill a complete threadgroup's output-row tile.
+fn use_aligned_fast_qmv() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIGGS_BONSAI_ALIGNED_FAST_QMV").is_ok_and(|value| value == "1")
+    })
+}
+
+const fn fast_qmv_has_aligned_rows(n_rows: i32, nsg: i32, prefer_aligned: bool) -> bool {
+    const RESULTS_PER_SIMDGROUP: i32 = 4;
+    prefer_aligned && n_rows > 0 && n_rows % (nsg * RESULTS_PER_SIMDGROUP) == 0
 }
 
 /// Whether to route the decode matvec through the `qmv_fast`-class kernel.
@@ -437,7 +456,9 @@ for (int k = 0; k < aligned_end; k += BLK) {
 
     for (int r = 0; r < RPS; ++r) {
         int row = out_row + r;
-        if (row >= n_param) { continue; }
+        if constexpr (!AlignedN) {
+            if (row >= n_param) { continue; }
+        }
         float accum = 0.0f;
         for (int wp = 0; wp < WPT; ++wp) {
             uint packed = w[row * KPacked + wcol + wp];
@@ -475,7 +496,11 @@ if (aligned_end < K) {
     int g = in_bounds ? (xbase / GroupSize) : 0;
     for (int r = 0; r < RPS; ++r) {
         int row = out_row + r;
-        if (row >= n_param || !in_bounds) { continue; }
+        if constexpr (AlignedN) {
+            if (!in_bounds) { continue; }
+        } else {
+            if (row >= n_param || !in_bounds) { continue; }
+        }
         float accum = 0.0f;
         for (int wp = 0; wp < WPT; ++wp) {
             int widx = wcol + wp;
@@ -504,8 +529,12 @@ if (aligned_end < K) {
 for (int r = 0; r < RPS; ++r) {
     int row = out_row + r;
     float v = simd_sum(result[r]);
-    if (lid == 0u && row < n_param) {
-        y[int(batch) * n_param + row] = OutT(v);
+    if (lid == 0u) {
+        if constexpr (AlignedN) {
+            y[int(batch) * n_param + row] = OutT(v);
+        } else if (row < n_param) {
+            y[int(batch) * n_param + row] = OutT(v);
+        }
     }
 }
 ";
@@ -522,7 +551,7 @@ fn create_fast_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
             out_vec,
             source.as_ptr(),
             c"".as_ptr(),
-            false, // ensure_row_contiguous
+            true,  // raw pointer arithmetic requires row-contiguous inputs
             false, // atomic_outputs
         );
         mlx_sys::mlx_vector_string_free(in_vec);
@@ -539,6 +568,7 @@ fn configure_fast_qmv_kernel(
     k_dim: i32,
     group_size: i32,
     symmetric: bool,
+    prefer_aligned: bool,
 ) -> mlx_sys::mlx_fast_metal_kernel_config {
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
@@ -572,6 +602,12 @@ fn configure_fast_qmv_kernel(
         // Each simdgroup computes 4 rows; nsg simdgroups per threadgroup.
         let nsg = fast_qmv_nsg();
         let rows_per_tg = nsg * 4;
+        let aligned_n = fast_qmv_has_aligned_rows(n_rows, nsg, prefer_aligned);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"AlignedN".as_ptr(),
+            i32::from(aligned_n),
+        );
         let n_tgs = (n_rows + rows_per_tg - 1) / rows_per_tg;
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tgs * 32, nsg, m_rows);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, nsg, 1);
@@ -588,7 +624,10 @@ fn configure_fast_qmv_kernel(
 }
 
 /// `qmv_fast`-class variant of [`bonsai_q1_qmv_legacy`]. Same inputs/outputs and
-/// bit-exact result; faster tiling. See [`bonsai_q1_qmv`] for dispatch.
+/// bit-exact result; faster tiling. Set `HIGGS_BONSAI_ALIGNED_FAST_QMV=1` to
+/// specialize away row bounds checks when N fills complete threadgroup tiles.
+/// Unaligned shapes retain the guarded kernel. See [`bonsai_q1_qmv`] for
+/// dispatch.
 #[allow(unsafe_code)]
 pub fn bonsai_q1_qmv_fast(
     x: &Array,
@@ -596,6 +635,25 @@ pub fn bonsai_q1_qmv_fast(
     scales: &Array,
     biases: &Array,
     group_size: i32,
+) -> Result<Array, Exception> {
+    bonsai_q1_qmv_fast_impl(
+        x,
+        weight,
+        scales,
+        biases,
+        group_size,
+        use_aligned_fast_qmv(),
+    )
+}
+
+#[allow(unsafe_code)]
+fn bonsai_q1_qmv_fast_impl(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+    prefer_aligned: bool,
 ) -> Result<Array, Exception> {
     ensure_ffi_error_handler();
 
@@ -629,7 +687,15 @@ pub fn bonsai_q1_qmv_fast(
     let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
 
     let cached = FAST_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_qmv_kernel()));
-    let config = configure_fast_qmv_kernel(out_dtype, n_rows, m_rows, k_dim, group_size, symmetric);
+    let config = configure_fast_qmv_kernel(
+        out_dtype,
+        n_rows,
+        m_rows,
+        k_dim,
+        group_size,
+        symmetric,
+        prefer_aligned,
+    );
 
     let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
     let input_ptrs = [
@@ -694,6 +760,549 @@ pub fn bonsai_q1_qmm(
     group_size: i32,
 ) -> Result<Array, Exception> {
     bonsai_q1_qmv_fast(x, weight, scales, biases, group_size)
+}
+
+// ---------------------------------------------------------------------------
+// Experimental symmetric-Q1 threadgroup-local LUT4 path.
+//
+// This is deliberately exposed through a typed row4 container instead of raw
+// arrays. The kernel's pointer arithmetic requires the physical order encoded
+// by the shapes below; accepting a flat array merely because its byte count
+// matches would silently reinterpret ordinary row-major checkpoint weights.
+// ---------------------------------------------------------------------------
+
+/// One-time row4 materialization consumed by the TG-LUT4 kernels.
+///
+/// Physical shapes are `[N/4, K/128, 4 words, 4 output lanes]` for packed Q1
+/// bits and `[N/4, K/128, 4 output lanes]` for scales. Fields stay private so
+/// callers cannot construct this contract from ambiguous flat buffers.
+#[derive(Debug, Clone)]
+pub(crate) struct BonsaiQ1Row4 {
+    weights: Array,
+    scales: Array,
+    n_rows: i32,
+    k_dim: i32,
+    cached_bytes: usize,
+}
+
+impl BonsaiQ1Row4 {
+    /// Transform canonical checkpoint arrays `[N,K/32]` and `[N,K/128]` into
+    /// the row4 layout entirely through MLX. `mlx_contiguous(..., false)` is
+    /// essential: allowing column-major storage could preserve the transposed
+    /// view and make the kernel's flattened indexing incorrect.
+    pub(crate) fn from_row_major(weight: &Array, scales: &Array) -> Result<Self, Exception> {
+        let [n_rows, k_packed] = *weight.shape() else {
+            return Err(Exception::custom(
+                "BonsaiQ1Row4: canonical weight must have shape [N,K/32]",
+            ));
+        };
+        let [scale_rows, groups] = *scales.shape() else {
+            return Err(Exception::custom(
+                "BonsaiQ1Row4: canonical scales must have shape [N,K/128]",
+            ));
+        };
+        if weight.dtype() != Dtype::Uint32
+            || !matches!(scales.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+        {
+            return Err(Exception::custom(format!(
+                "BonsaiQ1Row4: expected Uint32 bits and Float16/Bfloat16 scales, got {:?}/{:?}",
+                weight.dtype(),
+                scales.dtype()
+            )));
+        }
+        let k_dim = k_packed
+            .checked_mul(32)
+            .ok_or_else(|| Exception::custom("BonsaiQ1Row4: K overflow"))?;
+        if n_rows <= 0
+            || k_dim <= 0
+            || n_rows % 4 != 0
+            || k_dim % 128 != 0
+            || scale_rows != n_rows
+            || groups != k_dim / 128
+        {
+            return Err(Exception::custom(format!(
+                "BonsaiQ1Row4: incompatible canonical shapes {:?}/{:?}; require N%4=0 and K%128=0",
+                weight.shape(),
+                scales.shape()
+            )));
+        }
+
+        let weights_reshaped = weight.reshape(&[n_rows / 4, 4, groups, 4])?;
+        let weights_view = weights_reshaped.transpose_axes(&[0, 2, 3, 1])?;
+        let scales_reshaped = scales.reshape(&[n_rows / 4, 4, groups])?;
+        let scales_view = scales_reshaped.transpose_axes(&[0, 2, 1])?;
+        let weights = row_contiguous_copy(&weights_view)?;
+        let packed_scales = row_contiguous_copy(&scales_view)?;
+        // Force the two device copies now. Keeping only lazy transpose graphs
+        // would repeat or defer the multi-GiB model-wide materialization into
+        // timed decode.
+        crate::mlx_exec::eval([&weights, &packed_scales])?;
+        Self::from_packed_parts(weights, packed_scales, n_rows, k_dim)
+    }
+
+    fn from_packed_parts(
+        weights: Array,
+        scales: Array,
+        n_rows: i32,
+        k_dim: i32,
+    ) -> Result<Self, Exception> {
+        let expected_weights = [n_rows / 4, k_dim / 128, 4, 4];
+        let expected_scales = [n_rows / 4, k_dim / 128, 4];
+        if n_rows <= 0
+            || k_dim <= 0
+            || n_rows % 4 != 0
+            || k_dim % 128 != 0
+            || weights.shape() != expected_weights
+            || scales.shape() != expected_scales
+            || weights.dtype() != Dtype::Uint32
+            || !matches!(scales.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+        {
+            return Err(Exception::custom(format!(
+                "BonsaiQ1Row4: invalid packed contract bits={:?}/{:?} scales={:?}/{:?}; expected {:?} Uint32 and {:?} Float16/Bfloat16",
+                weights.shape(),
+                weights.dtype(),
+                scales.shape(),
+                scales.dtype(),
+                expected_weights,
+                expected_scales
+            )));
+        }
+        if !array_is_row_contiguous(&weights)? || !array_is_row_contiguous(&scales)? {
+            return Err(Exception::custom(
+                "BonsaiQ1Row4: packed arrays must be physically row-contiguous",
+            ));
+        }
+        let cached_bytes = weights.nbytes().saturating_add(scales.nbytes());
+        Ok(Self {
+            weights,
+            scales,
+            n_rows,
+            k_dim,
+            cached_bytes,
+        })
+    }
+
+    pub(crate) const fn cached_bytes(&self) -> usize {
+        self.cached_bytes
+    }
+
+    pub(crate) fn accepts_input(&self, input: &Array) -> bool {
+        if !matches!(input.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+            || input.shape().last().copied() != Some(self.k_dim)
+        {
+            return false;
+        }
+        let rows: i32 = input
+            .shape()
+            .iter()
+            .take(input.shape().len().saturating_sub(1))
+            .product();
+        (1..=5).contains(&rows)
+    }
+}
+
+#[allow(unsafe_code)]
+fn row_contiguous_copy(array: &Array) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+    let stream = Stream::task_local_or_default();
+    let mut output = unsafe { mlx_sys::mlx_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_contiguous(
+            &raw mut output,
+            array.as_ptr(),
+            false, // never preserve a column-major transposed view
+            stream.as_ptr(),
+        )
+    };
+    if status != 0 {
+        unsafe { mlx_sys::mlx_array_free(output) };
+        Err(Exception::custom(format!(
+            "mlx_contiguous row-major copy failed: {}",
+            take_last_error()
+        )))
+    } else {
+        Ok(unsafe { Array::from_ptr(output) })
+    }
+}
+
+#[allow(unsafe_code)]
+fn array_is_row_contiguous(array: &Array) -> Result<bool, Exception> {
+    ensure_ffi_error_handler();
+    let mut result = false;
+    let status = unsafe { mlx_sys::_mlx_array_is_row_contiguous(&raw mut result, array.as_ptr()) };
+    if status == 0 {
+        Ok(result)
+    } else {
+        Err(Exception::custom(format!(
+            "MLX row-contiguous query failed: {}",
+            take_last_error()
+        )))
+    }
+}
+
+const TG_LUT4_CONTRACT_KERNEL_SOURCE: &str = r"
+constexpr int WG = 256;
+constexpr int NTILE = 256;
+constexpr int MTILE = 4;
+threadgroup half lut[2048];
+
+uint tid = thread_index_in_threadgroup;
+uint n = threadgroup_position_in_grid.x * uint(NTILE) + tid;
+uint mbase = threadgroup_position_in_grid.z * uint(MTILE);
+float acc0 = 0.0f;
+float acc1 = 0.0f;
+float acc2 = 0.0f;
+float acc3 = 0.0f;
+
+for (int g = 0; g < NumGroups; ++g) {
+    if (tid < 128u) {
+        int mlocal = int(tid) / 32;
+        int nibble = int(tid) & 31;
+        int m = int(mbase) + mlocal;
+        int kbase = g * 128 + nibble * 4;
+        float x0 = 0.0f;
+        float x1 = 0.0f;
+        float x2 = 0.0f;
+        float x3 = 0.0f;
+        if (m < MRows) {
+            int xb = m * K + kbase;
+            x0 = float(x[xb + 0]); x1 = float(x[xb + 1]);
+            x2 = float(x[xb + 2]); x3 = float(x[xb + 3]);
+        }
+        float xy = x0 + x1;
+        float xz = x0 + x2;
+        float yz = x1 + x2;
+        float xyz = xy + x2;
+        float c = 0.5f * (x0 + x1 + x2 + x3);
+        int base = (mlocal * 32 + nibble) * 16;
+        lut[base + 0] = half(-c);
+        lut[base + 1] = half(x0 - c);
+        lut[base + 2] = half(x1 - c);
+        lut[base + 3] = half(xy - c);
+        lut[base + 4] = half(x2 - c);
+        lut[base + 5] = half(xz - c);
+        lut[base + 6] = half(yz - c);
+        lut[base + 7] = half(xyz - c);
+        lut[base + 8] = half(x3 - c);
+        lut[base + 9] = half(x0 + x3 - c);
+        lut[base + 10] = half(x1 + x3 - c);
+        lut[base + 11] = half(xy + x3 - c);
+        lut[base + 12] = half(x2 + x3 - c);
+        lut[base + 13] = half(xz + x3 - c);
+        lut[base + 14] = half(yz + x3 - c);
+        lut[base + 15] = half(xyz + x3 - c);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (n < uint(NRows)) {
+        int row_tile = int(n) / 4;
+        int row_lane = int(n) & 3;
+        int group_base = (row_tile * NumGroups + g) * 4;
+        float qa0 = 0.0f;
+        float qa1 = 0.0f;
+        float qa2 = 0.0f;
+        float qa3 = 0.0f;
+#pragma clang loop unroll(full)
+        for (int word = 0; word < 4; ++word) {
+            uint packed = w[(group_base + word) * 4 + row_lane];
+#pragma clang loop unroll(full)
+            for (int ni = 0; ni < 8; ++ni) {
+                uint mask = (packed >> (uint(ni) * 4u)) & 0xFu;
+                int li = (word * 8 + ni) * 16 + int(mask);
+                qa0 += float(lut[li]);
+                qa1 += float(lut[512 + li]);
+                qa2 += float(lut[1024 + li]);
+                qa3 += float(lut[1536 + li]);
+            }
+        }
+        float scale = float(sc[group_base + row_lane]);
+        acc0 += scale * qa0;
+        acc1 += scale * qa1;
+        acc2 += scale * qa2;
+        acc3 += scale * qa3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (n < uint(NRows)) {
+    if (mbase + 0u < uint(MRows)) { y[int(mbase + 0u) * NRows + int(n)] = OutT(acc0); }
+    if (mbase + 1u < uint(MRows)) { y[int(mbase + 1u) * NRows + int(n)] = OutT(acc1); }
+    if (mbase + 2u < uint(MRows)) { y[int(mbase + 2u) * NRows + int(n)] = OutT(acc2); }
+    if (mbase + 3u < uint(MRows)) { y[int(mbase + 3u) * NRows + int(n)] = OutT(acc3); }
+}
+";
+
+// The five activation rows are independent of the four adjacent output rows
+// encoded by row4 packing. One scale and one packed-weight pass feed all five
+// accumulators.
+const TG_LUT4_CONTRACT_M5_KERNEL_SOURCE: &str = r"
+threadgroup half lut[2560];
+
+uint tid = thread_index_in_threadgroup;
+uint n = threadgroup_position_in_grid.x * uint(NTILE) + tid;
+float acc0 = 0.0f;
+float acc1 = 0.0f;
+float acc2 = 0.0f;
+float acc3 = 0.0f;
+float acc4 = 0.0f;
+
+for (int g = 0; g < NumGroups; ++g) {
+    for (uint build = tid; build < 160u; build += uint(WG)) {
+        int mlocal = int(build) / 32;
+        int nibble = int(build) & 31;
+        int kbase = g * 128 + nibble * 4;
+        int xb = mlocal * K + kbase;
+        float x0 = float(x[xb + 0]);
+        float x1 = float(x[xb + 1]);
+        float x2 = float(x[xb + 2]);
+        float x3 = float(x[xb + 3]);
+        float xy = x0 + x1;
+        float xz = x0 + x2;
+        float yz = x1 + x2;
+        float xyz = xy + x2;
+        float c = 0.5f * (x0 + x1 + x2 + x3);
+        int base = (mlocal * 32 + nibble) * 16;
+        lut[base + 0] = half(-c);
+        lut[base + 1] = half(x0 - c);
+        lut[base + 2] = half(x1 - c);
+        lut[base + 3] = half(xy - c);
+        lut[base + 4] = half(x2 - c);
+        lut[base + 5] = half(xz - c);
+        lut[base + 6] = half(yz - c);
+        lut[base + 7] = half(xyz - c);
+        lut[base + 8] = half(x3 - c);
+        lut[base + 9] = half(x0 + x3 - c);
+        lut[base + 10] = half(x1 + x3 - c);
+        lut[base + 11] = half(xy + x3 - c);
+        lut[base + 12] = half(x2 + x3 - c);
+        lut[base + 13] = half(xz + x3 - c);
+        lut[base + 14] = half(yz + x3 - c);
+        lut[base + 15] = half(xyz + x3 - c);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (n < uint(NRows)) {
+        int row_tile = int(n) / 4;
+        int row_lane = int(n) & 3;
+        int group_base = (row_tile * NumGroups + g) * 4;
+        float qa0 = 0.0f;
+        float qa1 = 0.0f;
+        float qa2 = 0.0f;
+        float qa3 = 0.0f;
+        float qa4 = 0.0f;
+#pragma clang loop unroll(full)
+        for (int word = 0; word < 4; ++word) {
+            uint packed = w[(group_base + word) * 4 + row_lane];
+#pragma clang loop unroll(full)
+            for (int ni = 0; ni < 8; ++ni) {
+                uint mask = (packed >> (uint(ni) * 4u)) & 0xFu;
+                int li = (word * 8 + ni) * 16 + int(mask);
+                qa0 += float(lut[li]);
+                qa1 += float(lut[512 + li]);
+                qa2 += float(lut[1024 + li]);
+                qa3 += float(lut[1536 + li]);
+                qa4 += float(lut[2048 + li]);
+            }
+        }
+        float scale = float(sc[group_base + row_lane]);
+        acc0 += scale * qa0;
+        acc1 += scale * qa1;
+        acc2 += scale * qa2;
+        acc3 += scale * qa3;
+        acc4 += scale * qa4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (n < uint(NRows)) {
+    y[int(n)] = OutT(acc0);
+    y[NRows + int(n)] = OutT(acc1);
+    y[2 * NRows + int(n)] = OutT(acc2);
+    y[3 * NRows + int(n)] = OutT(acc3);
+    y[4 * NRows + int(n)] = OutT(acc4);
+}
+";
+
+#[allow(unsafe_code)]
+fn create_tg_lut4_kernel(native_m5: bool) -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"x"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(if native_m5 {
+        TG_LUT4_CONTRACT_M5_KERNEL_SOURCE
+    } else {
+        TG_LUT4_CONTRACT_KERNEL_SOURCE
+    })
+    .unwrap_or_default();
+    let name = if native_m5 {
+        c"higgs_bonsai_q1_tg_lut4_contract_m5"
+    } else {
+        c"higgs_bonsai_q1_tg_lut4_contract"
+    };
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+const TG_LUT4_NATIVE_M5_WGS: [i32; 5] = [128, 160, 192, 224, 256];
+
+fn tg_lut4_native_m5_wg() -> i32 {
+    static WG: OnceLock<i32> = OnceLock::new();
+    *WG.get_or_init(|| {
+        std::env::var("HIGGS_BONSAI_TG_LUT4_M5_WG")
+            .ok()
+            .and_then(|raw| raw.parse::<i32>().ok())
+            .filter(|wg| TG_LUT4_NATIVE_M5_WGS.contains(wg))
+            .unwrap_or(256)
+    })
+}
+
+#[allow(unsafe_code)]
+fn configure_tg_lut4_kernel(
+    out_dtype: mlx_sys::mlx_dtype,
+    packed: &BonsaiQ1Row4,
+    m_rows: i32,
+    native_m5_wg: Option<i32>,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OutT".as_ptr(),
+            out_dtype,
+        );
+        for (name, value) in [
+            (c"NRows", packed.n_rows),
+            (c"MRows", m_rows),
+            (c"K", packed.k_dim),
+            (c"NumGroups", packed.k_dim / 128),
+        ] {
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config,
+                name.as_ptr(),
+                value,
+            );
+        }
+        let n_tile = native_m5_wg.unwrap_or(256);
+        if let Some(wg) = native_m5_wg {
+            for name in [c"WG", c"NTILE"] {
+                mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                    config,
+                    name.as_ptr(),
+                    wg,
+                );
+            }
+        }
+        let n_tiles = (packed.n_rows + n_tile - 1) / n_tile;
+        let m_tiles = if native_m5_wg.is_some() {
+            1
+        } else {
+            (m_rows + 3) / 4
+        };
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tiles * n_tile, 1, m_tiles);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, n_tile, 1, 1);
+        let output_shape = [m_rows, packed.n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            output_shape.as_ptr(),
+            output_shape.len(),
+            out_dtype,
+        );
+        config
+    }
+}
+
+/// Apply the faithful F16-LUT/F32-accumulation plan. M=1..4 use the scalar
+/// contract kernel; exactly M=5 uses the native five-accumulator kernel.
+#[allow(unsafe_code)]
+pub(crate) fn bonsai_q1_tg_lut4_qmm(x: &Array, packed: &BonsaiQ1Row4) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+    if !matches!(x.dtype(), Dtype::Float16 | Dtype::Bfloat16) {
+        return Err(Exception::custom(format!(
+            "bonsai_q1_tg_lut4_qmm: input must be Float16/Bfloat16, got {:?}",
+            x.dtype()
+        )));
+    }
+    let input_shape = x.shape();
+    if input_shape.last().copied() != Some(packed.k_dim) {
+        return Err(Exception::custom(format!(
+            "bonsai_q1_tg_lut4_qmm: input last dim {:?}, expected {}",
+            input_shape.last(),
+            packed.k_dim
+        )));
+    }
+    let m_rows: i32 = input_shape
+        .iter()
+        .take(input_shape.len().saturating_sub(1))
+        .product();
+    if !(1..=5).contains(&m_rows) {
+        return Err(Exception::custom(format!(
+            "bonsai_q1_tg_lut4_qmm: requires 1..=5 flattened rows, got {m_rows}"
+        )));
+    }
+    let native_m5_wg = (m_rows == 5).then(tg_lut4_native_m5_wg);
+    let cached = if native_m5_wg.is_some() {
+        TG_LUT4_CONTRACT_M5_KERNEL.get_or_init(|| CachedMetalKernel(create_tg_lut4_kernel(true)))
+    } else {
+        TG_LUT4_CONTRACT_KERNEL.get_or_init(|| CachedMetalKernel(create_tg_lut4_kernel(false)))
+    };
+    let config = configure_tg_lut4_kernel(
+        unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) },
+        packed,
+        m_rows,
+        native_m5_wg,
+    );
+    let x_flat = x.reshape(&[m_rows * packed.k_dim])?;
+    let input_ptrs = [
+        packed.weights.as_ptr(),
+        packed.scales.as_ptr(),
+        x_flat.as_ptr(),
+    ];
+    let inputs =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+    let mut outputs = unsafe { mlx_sys::mlx_vector_array_new() };
+    let stream = Stream::task_local_or_default();
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs,
+            cached.0,
+            inputs,
+            config,
+            stream.as_ptr(),
+        )
+    };
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q1_tg_lut4_qmm failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut output = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut output, outputs, 0) };
+        let output = unsafe { Array::from_ptr(output) };
+        let mut output_shape = input_shape
+            .get(..input_shape.len().saturating_sub(1))
+            .ok_or_else(|| Exception::custom("bonsai_q1_tg_lut4_qmm: invalid input shape"))?
+            .to_vec();
+        output_shape.push(packed.n_rows);
+        output.reshape(&output_shape)
+    };
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -876,3 +1485,340 @@ pub fn bonsai_q1_dequant(
 }
 
 static DEQUANT_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::print_stdout,
+    clippy::shadow_reuse,
+    clippy::too_many_lines
+)]
+mod tests {
+    use super::*;
+    use crate::mlx_exec::eval;
+    use mlx_rs::Dtype;
+
+    const GROUP_SIZE: i32 = 128;
+
+    fn patterned_weights(n: i32, k: i32, dtype: Dtype, symmetric: bool) -> (Array, Array, Array) {
+        assert_eq!(k % GROUP_SIZE, 0);
+        let packed = (0..n * k / 32)
+            .map(|index| {
+                let shift = u32::try_from((index * 7 + 3).rem_euclid(31)).unwrap();
+                0x963C_A5F0_u32.rotate_left(shift)
+            })
+            .collect::<Vec<_>>();
+        let scale_values = (0..n * k / GROUP_SIZE)
+            .map(|index| ((index % 7) as f32).mul_add(0.031_25, 0.125))
+            .collect::<Vec<_>>();
+        let bias_values = (0..n * k / GROUP_SIZE)
+            .map(|index| ((index % 5) as f32).mul_add(0.015_625, -0.093_75))
+            .collect::<Vec<_>>();
+
+        let weight = Array::from_slice(&packed, &[n, k / 32]);
+        let scales = Array::from_slice(&scale_values, &[n, k / GROUP_SIZE])
+            .as_dtype(dtype)
+            .unwrap();
+        let biases = if symmetric {
+            let empty = Vec::<f32>::new();
+            Array::from_slice(&empty, &[0])
+        } else {
+            Array::from_slice(&bias_values, &[n, k / GROUP_SIZE])
+                .as_dtype(dtype)
+                .unwrap()
+        };
+        (weight, scales, biases)
+    }
+
+    fn patterned_input(m: i32, k: i32, dtype: Dtype) -> Array {
+        Array::from_slice(
+            &(0..m * k)
+                .map(|index| ((index * 11 + 9).rem_euclid(53) - 26) as f32 * 0.007_812_5)
+                .collect::<Vec<_>>(),
+            &[m, k],
+        )
+        .as_dtype(dtype)
+        .unwrap()
+    }
+
+    fn assert_array_exact(label: &str, actual: &Array, expected: &Array) {
+        assert_eq!(actual.shape(), expected.shape(), "{label} shape");
+        assert_eq!(actual.dtype(), expected.dtype(), "{label} dtype");
+        let actual_f32 = actual.as_dtype(Dtype::Float32).unwrap();
+        let expected_f32 = expected.as_dtype(Dtype::Float32).unwrap();
+        eval([&actual_f32, &expected_f32]).unwrap();
+        for (index, (got, want)) in actual_f32
+            .as_slice::<f32>()
+            .iter()
+            .zip(expected_f32.as_slice::<f32>())
+            .enumerate()
+        {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{label}[{index}] differs: {got:?} != {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aligned_fast_qmv_matches_guarded_kernel_for_aligned_and_unaligned_n() {
+        const M: i32 = 5;
+        const K: i32 = 1024;
+        let _exec = crate::mlx_exec::acquire();
+        let nsg = fast_qmv_nsg();
+
+        for &(n, symmetric) in &[(64_i32, true), (65_i32, false)] {
+            assert_eq!(
+                fast_qmv_has_aligned_rows(n, nsg, true),
+                n == 64,
+                "test shape must select the intended specialization"
+            );
+            let (weight, scales, biases) = patterned_weights(n, K, Dtype::Bfloat16, symmetric);
+            let x = patterned_input(M, K, Dtype::Bfloat16);
+            let guarded =
+                bonsai_q1_qmv_fast_impl(&x, &weight, &scales, &biases, GROUP_SIZE, false).unwrap();
+            let candidate =
+                bonsai_q1_qmv_fast_impl(&x, &weight, &scales, &biases, GROUP_SIZE, true).unwrap();
+            let public = bonsai_q1_qmv_fast(&x, &weight, &scales, &biases, GROUP_SIZE).unwrap();
+            assert_array_exact(
+                if n == 64 {
+                    "aligned-N specialized QMV"
+                } else {
+                    "unaligned-N guarded fallback"
+                },
+                &candidate,
+                &guarded,
+            );
+            assert_array_exact("public aligned-QMV dispatch", &public, &guarded);
+        }
+    }
+
+    #[test]
+    fn tg_lut4_row4_transform_matches_index_oracle_and_rejects_flat_layout() {
+        const N: i32 = 8;
+        const K: i32 = 256;
+        let _exec = crate::mlx_exec::acquire();
+        let groups = K / GROUP_SIZE;
+        let k_packed = K / 32;
+        let bits = (0..N * k_packed)
+            .map(|index| u32::try_from(index).unwrap())
+            .collect::<Vec<_>>();
+        let scale_values = (0..N * groups)
+            .map(|index| index as f32 + 0.25)
+            .collect::<Vec<_>>();
+        let weight = Array::from_slice(&bits, &[N, k_packed]);
+        let scales = Array::from_slice(&scale_values, &[N, groups])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let packed = BonsaiQ1Row4::from_row_major(&weight, &scales).unwrap();
+        eval([&packed.weights, &packed.scales]).unwrap();
+
+        let packed_bits = packed.weights.as_slice::<u32>();
+        let packed_scales_f32 = packed.scales.as_dtype(Dtype::Float32).unwrap();
+        eval([&packed_scales_f32]).unwrap();
+        let packed_scales = packed_scales_f32.as_slice::<f32>();
+        for tile in 0..N / 4 {
+            for group in 0..groups {
+                for word in 0..4 {
+                    for lane in 0..4 {
+                        let src_row = tile * 4 + lane;
+                        let src = (src_row * k_packed + group * 4 + word) as usize;
+                        let dst = ((((tile * groups + group) * 4 + word) * 4) + lane) as usize;
+                        assert_eq!(packed_bits[dst], bits[src]);
+                    }
+                }
+                for lane in 0..4 {
+                    let src = ((tile * 4 + lane) * groups + group) as usize;
+                    let dst = ((tile * groups + group) * 4 + lane) as usize;
+                    let expected = half::bf16::from_f32(scale_values[src]).to_f32();
+                    assert_eq!(packed_scales[dst].to_bits(), expected.to_bits());
+                }
+            }
+        }
+
+        let flat_bits = Array::from_slice(&bits, &[bits.len() as i32]);
+        let flat_scales = scales.reshape(&[-1]).unwrap();
+        let error = BonsaiQ1Row4::from_packed_parts(flat_bits, flat_scales, N, K).unwrap_err();
+        assert!(error.to_string().contains("invalid packed contract"));
+    }
+
+    #[test]
+    fn tg_lut4_fp16_bf16_scales_preserve_leading_shape_and_m1_row_plan() {
+        const N: i32 = 64;
+        const K: i32 = 1024;
+        const MAX_M: i32 = 5;
+        let _exec = crate::mlx_exec::acquire();
+        let values = (0..MAX_M * K)
+            .map(|index| {
+                let row = index / K;
+                let col = index % K;
+                ((row * 29 + col * 11 + 7).rem_euclid(61) - 30) as f32 * 0.007_812_5
+            })
+            .collect::<Vec<_>>();
+
+        for dtype in [Dtype::Float16, Dtype::Bfloat16] {
+            let (weight, scales, _) = patterned_weights(N, K, dtype, true);
+            let packed = BonsaiQ1Row4::from_row_major(&weight, &scales).unwrap();
+            assert_eq!(packed.scales.dtype(), dtype);
+
+            for m in 1..=MAX_M {
+                let input = Array::from_slice(&values[..(m * K) as usize], &[1, m, K])
+                    .as_dtype(dtype)
+                    .unwrap();
+                let stacked = bonsai_q1_tg_lut4_qmm(&input, &packed).unwrap();
+                assert_eq!(stacked.shape(), &[1, m, N]);
+                let stacked_f32 = stacked.as_dtype(Dtype::Float32).unwrap();
+                eval([&stacked_f32]).unwrap();
+
+                for row in 0..m {
+                    let start = (row * K) as usize;
+                    let single = Array::from_slice(&values[start..start + K as usize], &[1, 1, K])
+                        .as_dtype(dtype)
+                        .unwrap();
+                    let single = bonsai_q1_tg_lut4_qmm(&single, &packed)
+                        .unwrap()
+                        .as_dtype(Dtype::Float32)
+                        .unwrap();
+                    eval([&single]).unwrap();
+                    for column in 0..N as usize {
+                        let got = stacked_f32.as_slice::<f32>()[(row * N) as usize + column];
+                        let expected = single.as_slice::<f32>()[column];
+                        assert_eq!(
+                            got.to_bits(),
+                            expected.to_bits(),
+                            "dtype={dtype:?} M={m} row={row} column={column}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compare the stock guarded QMV curve with the opt-in aligned-N
+    /// specialization on Bonsai-27B's dominant gate/up projection shape.
+    ///
+    /// ```bash
+    /// cargo test -p higgs-models --release -- \
+    ///   bench_aligned_fast_qmv_m_sweep --ignored --nocapture --exact
+    /// ```
+    #[test]
+    #[ignore = "microbenchmark, requires Apple Metal GPU"]
+    fn bench_aligned_fast_qmv_m_sweep() {
+        use std::time::Instant;
+
+        const N: i32 = 17_408;
+        const K: i32 = 5_120;
+        const M_VALUES: [i32; 6] = [1, 2, 3, 4, 5, 8];
+        const WARMUP_ITERS: usize = 8;
+        const DEFAULT_SAMPLES: usize = 51;
+
+        let _exec = crate::mlx_exec::acquire();
+        assert!(fast_qmv_has_aligned_rows(N, fast_qmv_nsg(), true));
+        let (weight, scales, biases) = patterned_weights(N, K, Dtype::Bfloat16, true);
+        let inputs = M_VALUES
+            .iter()
+            .map(|&m| (m, patterned_input(m, K, Dtype::Bfloat16)))
+            .collect::<Vec<_>>();
+        let mut resident = vec![&weight, &scales, &biases];
+        resident.extend(inputs.iter().map(|(_, input)| input));
+        eval(resident).unwrap();
+
+        let samples = std::env::var("HIGGS_BONSAI_ALIGNED_QMV_BENCH_SAMPLES")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(DEFAULT_SAMPLES);
+
+        let measure = |input: &Array, prefer_aligned: bool| -> f64 {
+            let start = Instant::now();
+            let output = bonsai_q1_qmv_fast_impl(
+                input,
+                &weight,
+                &scales,
+                &biases,
+                GROUP_SIZE,
+                prefer_aligned,
+            )
+            .unwrap();
+            eval([&output]).unwrap();
+            let elapsed_us = start.elapsed().as_secs_f64() * 1e6;
+            std::hint::black_box(output);
+            elapsed_us
+        };
+
+        let summarize = |values: &mut [f64]| -> (f64, f64) {
+            values.sort_by(f64::total_cmp);
+            let median = values[values.len() / 2];
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            (median, mean)
+        };
+
+        let mut rows = Vec::with_capacity(M_VALUES.len());
+        for (m, input) in &inputs {
+            let guarded_check =
+                bonsai_q1_qmv_fast_impl(input, &weight, &scales, &biases, GROUP_SIZE, false)
+                    .unwrap();
+            let aligned_check =
+                bonsai_q1_qmv_fast_impl(input, &weight, &scales, &biases, GROUP_SIZE, true)
+                    .unwrap();
+            assert_array_exact(
+                &format!("aligned-N benchmark M={m}"),
+                &aligned_check,
+                &guarded_check,
+            );
+
+            for iteration in 0..WARMUP_ITERS {
+                if iteration % 2 == 0 {
+                    std::hint::black_box(measure(input, false));
+                    std::hint::black_box(measure(input, true));
+                } else {
+                    std::hint::black_box(measure(input, true));
+                    std::hint::black_box(measure(input, false));
+                }
+            }
+
+            let mut guarded_us = Vec::with_capacity(samples);
+            let mut aligned_us = Vec::with_capacity(samples);
+            for sample in 0..samples {
+                if sample % 2 == 0 {
+                    guarded_us.push(measure(input, false));
+                    aligned_us.push(measure(input, true));
+                } else {
+                    aligned_us.push(measure(input, true));
+                    guarded_us.push(measure(input, false));
+                }
+            }
+            let (guarded_median, guarded_mean) = summarize(&mut guarded_us);
+            let (aligned_median, aligned_mean) = summarize(&mut aligned_us);
+            rows.push((
+                *m,
+                guarded_median,
+                guarded_mean,
+                aligned_median,
+                aligned_mean,
+            ));
+        }
+
+        let (_, guarded_m1_median, guarded_m1_mean, aligned_m1_median, aligned_m1_mean) = rows[0];
+        println!("Bonsai Q1 BF16 N={N} K={K}, samples={samples}");
+        println!(
+            " M | OFF median  mean  med/M1 mean/M1 | ON median  mean  med/M1 mean/M1 | ON speedup"
+        );
+        for (m, guarded_median, guarded_mean, aligned_median, aligned_mean) in rows {
+            println!(
+                "{m:>2} | {guarded_median:>9.1} {guarded_mean:>7.1} {guarded_median_norm:>6.2}x {guarded_mean_norm:>7.2}x | \
+                 {aligned_median:>9.1} {aligned_mean:>7.1} {aligned_median_norm:>6.2}x {aligned_mean_norm:>7.2}x | \
+                 {speedup:>8.3}x",
+                guarded_median_norm = guarded_median / guarded_m1_median,
+                guarded_mean_norm = guarded_mean / guarded_m1_mean,
+                aligned_median_norm = aligned_median / aligned_m1_median,
+                aligned_mean_norm = aligned_mean / aligned_m1_mean,
+                speedup = guarded_median / aligned_median,
+            );
+        }
+    }
+}

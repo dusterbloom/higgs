@@ -155,10 +155,12 @@ pub fn load_tokenizer<P: AsRef<Path>>(model_dir: P) -> Result<tokenizers::Tokeni
 ///
 /// The drafter is a small block-diffusion model that the `SimpleEngine` uses to
 /// propose draft tokens which the target verifies in a single forward.
-pub fn load_dflash_drafter<P: AsRef<Path>>(
+pub fn load_dflash_drafter<P: AsRef<Path>, T: AsRef<Path>>(
     model_dir: P,
+    target_dir: T,
 ) -> Result<dflash::DFlashDrafter, EngineError> {
-    dflash::load_dflash_drafter(model_dir.as_ref()).map_err(EngineError::Model)
+    dflash::load_dflash_drafter_for_target(model_dir.as_ref(), target_dir.as_ref())
+        .map_err(EngineError::Model)
 }
 
 #[cfg(test)]
