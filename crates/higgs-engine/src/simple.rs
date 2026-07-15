@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard};
 use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties,
-    dflash::{DFlashDrafter, accept_prefix, crop_drafter_cache},
+    dflash::{DFlashConfig, DFlashDrafter, accept_prefix, crop_drafter_cache},
     sample,
     turboquant::KvCacheConfig,
 };
@@ -186,6 +186,169 @@ fn dflash_conf_trunc_threshold() -> Option<f32> {
             .parse::<f32>()
             .ok()
             .filter(|t| *t > 0.0 && *t <= 1.0),
+    })
+}
+
+fn validate_dspark_target(model: &AnyModel, config: &DFlashConfig) -> Result<(), EngineError> {
+    if !config.is_dspark() {
+        return Ok(());
+    }
+    let AnyModel::Qwen3Next(target) = model else {
+        return Err(EngineError::Generation(
+            "Prism dSpark requires a Qwen3.5/Qwen3Next target".to_owned(),
+        ));
+    };
+    if target.args.hidden_size != config.hidden_size {
+        return Err(EngineError::Generation(format!(
+            "dSpark/target hidden-size mismatch: draft={} target={}",
+            config.hidden_size, target.args.hidden_size
+        )));
+    }
+    if target.args.vocab_size != config.vocab_size {
+        return Err(EngineError::Generation(format!(
+            "dSpark/target vocabulary mismatch: draft={} target={}",
+            config.vocab_size, target.args.vocab_size
+        )));
+    }
+    let target_layers = usize::try_from(target.args.num_hidden_layers)
+        .map_err(|_| EngineError::Generation("negative target layer count".to_owned()))?;
+    let taps = config.target_layer_ids();
+    if taps.is_empty()
+        || taps.iter().any(|&layer| layer >= target_layers)
+        || !taps
+            .windows(2)
+            .all(|pair| matches!(pair, [left, right] if left < right))
+    {
+        return Err(EngineError::Generation(format!(
+            "invalid dSpark target taps {taps:?} for {target_layers} target layers"
+        )));
+    }
+    Ok(())
+}
+
+/// Device-resident draft tokens plus an optional already-materialized host copy.
+struct DflashProposal {
+    tokens: Array,
+    host_tokens: Option<Vec<u32>>,
+}
+
+impl DflashProposal {
+    fn host_tokens(&self) -> Result<Vec<u32>, EngineError> {
+        self.host_tokens.clone().map_or_else(
+            || {
+                Ok(self
+                    .tokens
+                    .reshape(&[-1])
+                    .map_err(EngineError::Mlx)?
+                    .as_slice::<u32>()
+                    .to_vec())
+            },
+            Ok,
+        )
+    }
+}
+
+fn dflash_verify_input(anchor: i32, proposal: &DflashProposal) -> Result<Array, EngineError> {
+    let draft_count = *proposal
+        .tokens
+        .shape()
+        .get(1)
+        .ok_or_else(|| EngineError::Generation("draft proposal missing T axis".to_owned()))?;
+    if draft_count <= 0 {
+        return Err(EngineError::Generation(
+            "draft proposal must contain at least one token".to_owned(),
+        ));
+    }
+    let anchor_array = Array::from_slice(&[anchor], &[1, 1]);
+    let draft_i32 = proposal
+        .tokens
+        .as_dtype(mlx_rs::Dtype::Int32)
+        .map_err(EngineError::Mlx)?;
+    mlx_rs::ops::concatenate_axis(&[&anchor_array, &draft_i32], 1).map_err(EngineError::Mlx)
+}
+
+/// Turn a DFlash/dSpark trunk output into draft tokens.
+///
+/// Modal DFlash uses the target output head on positions `1..` and retains the
+/// existing training-free confidence truncation. Prism dSpark instead owns a
+/// Q4 output head and sequential Markov resampler. dSpark tokens stay lazy and
+/// device-resident so target verification is the round's only host barrier.
+fn dflash_propose_tokens(
+    model: &AnyModel,
+    drafter: &DFlashDrafter,
+    draft_hidden: &Array,
+    anchor: i32,
+    draft_cap: i32,
+    dspark_target_head: bool,
+) -> Result<DflashProposal, EngineError> {
+    let dspark_hidden = if drafter.config.is_dspark() {
+        draft_hidden.index((.., ..draft_cap, ..))
+    } else {
+        draft_hidden.clone()
+    };
+    let target_logits = if drafter.config.is_dspark() && dspark_target_head {
+        Some(
+            model
+                .forward_all_logits_from_hidden(&dspark_hidden)
+                .map_err(EngineError::Mlx)?,
+        )
+    } else {
+        None
+    };
+    if let Some(tokens) = drafter
+        .propose_dspark_tokens(&dspark_hidden, anchor, target_logits.as_ref())
+        .map_err(EngineError::Mlx)?
+    {
+        return Ok(DflashProposal {
+            tokens,
+            host_tokens: None,
+        });
+    }
+
+    let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
+    let draft_logits = model
+        .forward_all_logits_from_hidden(&draft_hidden_sliced)
+        .map_err(EngineError::Mlx)?;
+    let draft_token_arr = mlx_rs::argmax_axis!(&draft_logits, -1).map_err(EngineError::Mlx)?;
+    let conf_logp = if dflash_conf_trunc_threshold().is_some() {
+        let max_l = mlx_rs::ops::max_axis(&draft_logits, -1, None).map_err(EngineError::Mlx)?;
+        let lse = mlx_rs::ops::logsumexp_axis(&draft_logits, -1, None).map_err(EngineError::Mlx)?;
+        Some(
+            max_l
+                .subtract(&lse)
+                .map_err(EngineError::Mlx)?
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .map_err(EngineError::Mlx)?,
+        )
+    } else {
+        None
+    };
+    match conf_logp.as_ref() {
+        Some(logp) => eval([&draft_token_arr, logp]).map_err(EngineError::Mlx)?,
+        None => eval([&draft_token_arr]).map_err(EngineError::Mlx)?,
+    }
+    let mut draft = draft_token_arr
+        .reshape(&[-1])
+        .map_err(EngineError::Mlx)?
+        .as_slice::<u32>()
+        .to_vec();
+    if let (Some(threshold), Some(logp)) = (dflash_conf_trunc_threshold(), conf_logp.as_ref()) {
+        let logp_flat = logp.reshape(&[-1]).map_err(EngineError::Mlx)?;
+        let logp_values = logp_flat.as_slice::<f32>();
+        let log_threshold = threshold.ln();
+        let keep = logp_values
+            .iter()
+            .take(draft.len())
+            .take_while(|&&value| value >= log_threshold)
+            .count()
+            .max(1);
+        draft.truncate(keep);
+    }
+    let draft_len = i32::try_from(draft.len())
+        .map_err(|_| EngineError::Generation("draft length overflow i32".to_owned()))?;
+    Ok(DflashProposal {
+        tokens: Array::from_slice(&draft, &[1, draft_len]),
+        host_tokens: Some(draft),
     })
 }
 
@@ -372,6 +535,12 @@ struct DFlashState {
     drafter: Mutex<DFlashDrafter>,
     tap_layers: Vec<usize>,
     block_size: i32,
+    /// Number of dSpark positions sent through its vocabulary head and target
+    /// verifier. The non-causal trunk still runs at its full trained block.
+    draft_cap: i32,
+    /// Use Bonsai's packed Q1 target head for base logits instead of dSpark's
+    /// frozen Q4 copy. Verification keeps output exact either way.
+    dspark_target_head: bool,
     mask_token_id: i32,
 }
 
@@ -744,21 +913,47 @@ impl SimpleEngine {
             .map(|dp| -> Result<DFlashState, EngineError> {
                 tracing::info!(drafter = %dp.display(), "Loading DFlash drafter");
                 let drafter = model_loader::load_dflash_drafter(&dp)?;
+                validate_dspark_target(&model, &drafter.config)?;
                 let tap_layers = drafter.config.target_layer_ids().to_vec();
                 // Decode block size: HIGGS_DFLASH_BLOCK_SIZE overrides the
                 // trained block_size, clamped to [1, trained]. Smaller blocks
                 // amortize the per-round verify + lm_head cost better when the
                 // accept length plateaus below the trained block.
                 let trained_block = drafter.config.block_size;
-                let block_size = std::env::var("HIGGS_DFLASH_BLOCK_SIZE")
-                    .ok()
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .filter(|&v| v >= 1)
-                    .map_or(trained_block, |v| v.min(trained_block));
+                let block_size = if drafter.config.is_dspark() {
+                    // Prism's log-SNR pattern and Markov head are trained for
+                    // the checkpoint's fixed block; match the public runtime.
+                    trained_block
+                } else {
+                    std::env::var("HIGGS_DFLASH_BLOCK_SIZE")
+                        .ok()
+                        .and_then(|v| v.parse::<i32>().ok())
+                        .filter(|&v| v >= 1)
+                        .map_or(trained_block, |v| v.min(trained_block))
+                };
+                let draft_cap = if drafter.config.is_dspark() {
+                    let tuned_default = if drafter.config.reuse_target_head() {
+                        trained_block
+                    } else {
+                        trained_block.min(3)
+                    };
+                    std::env::var("HIGGS_DSPARK_DRAFT_CAP")
+                        .ok()
+                        .and_then(|v| v.parse::<i32>().ok())
+                        .filter(|&v| v >= 1)
+                        .map_or(tuned_default, |v| v.min(trained_block))
+                } else {
+                    trained_block
+                };
+                let dspark_target_head = drafter.config.is_dspark()
+                    && (drafter.config.reuse_target_head()
+                        || std::env::var("HIGGS_DSPARK_TARGET_HEAD").is_ok_and(|v| v != "0"));
                 let mask_token_id = drafter.config.mask_token_id();
                 tracing::info!(
                     tap_layers = ?tap_layers,
                     block_size,
+                    draft_cap,
+                    dspark_target_head,
                     mask_token_id,
                     "DFlash drafter loaded — speculative decoding enabled"
                 );
@@ -766,6 +961,8 @@ impl SimpleEngine {
                     drafter: Mutex::new(drafter),
                     tap_layers,
                     block_size,
+                    draft_cap,
+                    dspark_target_head,
                     mask_token_id,
                 })
             })
@@ -2443,15 +2640,15 @@ impl SimpleEngine {
             let mut t_mtp: Option<f64> = None;
             let mut mtp_cycles_seen: u32 = 0;
             loop {
+                let completion = u32::try_from(generated.len()).unwrap_or(u32::MAX);
+                if completion >= max_tokens {
+                    break; // pending token dropped, unforwarded — aligned.
+                }
                 if self.eos_token_ids.contains(&confirmed) {
                     // Pending stop token: emit without forwarding — the stash
                     // pops it, matching the cache exactly.
                     generated.push(confirmed);
                     break;
-                }
-                let completion = u32::try_from(generated.len()).unwrap_or(u32::MAX);
-                if completion >= max_tokens {
-                    break; // pending token dropped, unforwarded — aligned.
                 }
 
                 // DFlash spec round: while engaged, or as a probe once enough
@@ -2463,6 +2660,12 @@ impl SimpleEngine {
                         && (!tap_backlog.is_empty() || drafter_pos > 0)
                     {
                         let round_t0 = std::time::Instant::now();
+                        let max_emitted =
+                            usize::try_from(max_tokens - completion).map_err(|_| {
+                                EngineError::Generation(
+                                    "remaining session tokens overflow".to_owned(),
+                                )
+                            })?;
                         let (emitted, next_pending, round_taps) = self.session_dflash_round(
                             &mut prepared.model,
                             &mut prepared.cache,
@@ -2473,6 +2676,7 @@ impl SimpleEngine {
                             confirmed,
                             params,
                             &generated,
+                            max_emitted,
                             dflash_state,
                         )?;
                         let wall = round_t0.elapsed().as_secs_f64().max(1e-9);
@@ -3245,8 +3449,16 @@ impl SimpleEngine {
             && params.speculation.allows_dflash()
             && constraint.is_none()
             && pixel_values.is_none()
+            && !logprobs
         {
-            return self.generate_dflash_inner(prompt_tokens, max_tokens, params, stop_sequences);
+            return self.generate_dflash_inner(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                enable_thinking,
+                thinking_budget,
+            );
         }
 
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
@@ -3640,8 +3852,14 @@ impl SimpleEngine {
         confirmed: u32,
         params: &SamplingParams,
         history: &[u32],
+        max_emitted: usize,
         dflash: &DFlashState,
     ) -> Result<(Vec<u32>, u32, Vec<Array>), EngineError> {
+        if max_emitted == 0 {
+            return Err(EngineError::Generation(
+                "session DFlash round requires remaining output capacity".to_owned(),
+            ));
+        }
         let block_size = dflash.block_size;
         let block_size_us = usize::try_from(block_size)
             .map_err(|_| EngineError::Generation("block_size overflow".to_owned()))?;
@@ -3667,62 +3885,22 @@ impl SimpleEngine {
         current_taps.clear();
         crop_drafter_cache(draft_cache, *drafter_pos);
 
-        // b. Draft tokens + confidence truncation (same rule as dflash_decode).
-        let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
-        let draft_logits = model
-            .forward_all_logits_from_hidden(&draft_hidden_sliced)
-            .map_err(EngineError::Mlx)?;
-        let draft_token_arr = mlx_rs::argmax_axis!(&draft_logits, -1).map_err(EngineError::Mlx)?;
-        let conf_logp = if dflash_conf_trunc_threshold().is_some() {
-            let max_l = mlx_rs::ops::max_axis(&draft_logits, -1, None).map_err(EngineError::Mlx)?;
-            let lse =
-                mlx_rs::ops::logsumexp_axis(&draft_logits, -1, None).map_err(EngineError::Mlx)?;
-            Some(
-                max_l
-                    .subtract(&lse)
-                    .map_err(EngineError::Mlx)?
-                    .as_dtype(mlx_rs::Dtype::Float32)
-                    .map_err(EngineError::Mlx)?,
-            )
-        } else {
-            None
-        };
-        match conf_logp.as_ref() {
-            Some(lp) => eval([&draft_token_arr, lp]).map_err(EngineError::Mlx)?,
-            None => eval([&draft_token_arr]).map_err(EngineError::Mlx)?,
-        }
-        let mut draft_u32: Vec<u32> = draft_token_arr
-            .reshape(&[-1])
-            .map_err(EngineError::Mlx)?
-            .as_slice::<u32>()
-            .to_vec();
-        if let (Some(threshold), Some(lp)) = (dflash_conf_trunc_threshold(), conf_logp.as_ref()) {
-            let logp: Vec<f32> = lp
-                .reshape(&[-1])
-                .map_err(EngineError::Mlx)?
-                .as_slice::<f32>()
-                .to_vec();
-            let log_thresh = threshold.ln();
-            let keep = logp
-                .iter()
-                .take(draft_u32.len())
-                .take_while(|&&l| l >= log_thresh)
-                .count()
-                .max(1);
-            draft_u32.truncate(keep);
-        }
+        // b. Draft tokens: target-head DFlash or trained-head Prism dSpark.
+        let proposal = dflash_propose_tokens(
+            model,
+            drafter,
+            &draft_hidden,
+            anchor,
+            dflash.draft_cap,
+            dflash.dspark_target_head,
+        )?;
 
         // c. Tape-recording verify over [anchor, drafts...].
-        let mut verify_tokens = vec![anchor];
-        for &d in &draft_u32 {
-            verify_tokens.push(
-                i32::try_from(d)
-                    .map_err(|_| EngineError::Generation("draft overflow i32".to_owned()))?,
-            );
-        }
-        let verify_len = i32::try_from(verify_tokens.len())
-            .map_err(|_| EngineError::Generation("verify_len overflow".to_owned()))?;
-        let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
+        let verify_input = dflash_verify_input(anchor, &proposal)?;
+        let verify_len = *verify_input
+            .shape()
+            .get(1)
+            .ok_or_else(|| EngineError::Generation("verify input missing T axis".to_owned()))?;
         let (verify_logits, verify_taps, layer_tapes) = model
             .forward_with_taps_tape(&verify_input, None, cache, &dflash.tap_layers)
             .map_err(EngineError::Mlx)?;
@@ -3737,11 +3915,15 @@ impl SimpleEngine {
         };
         let targets =
             crate::mtp::verify_targets(&verify_logits, Some(params), Some(&chain_history))?;
+        let draft_u32 = proposal.host_tokens()?;
         let mut n_match = draft_u32
             .iter()
             .zip(&targets)
             .take_while(|(d, t)| *d == *t)
             .count();
+        // `confirmed` itself is always emitted, so at most `max_emitted - 1`
+        // matching drafts may join it in this round.
+        n_match = n_match.min(max_emitted.saturating_sub(1));
         if let Some(stop_at) = targets
             .get(..n_match)
             .unwrap_or(&[])
@@ -3799,6 +3981,8 @@ impl SimpleEngine {
         max_tokens: u32,
         params: &SamplingParams,
         stop_sequences: &[String],
+        enable_thinking: bool,
+        thinking_budget: u32,
         mut sink: S,
     ) -> Result<S::Output, EngineError> {
         let dflash = self
@@ -3831,6 +4015,14 @@ impl SimpleEngine {
 
         let first_token_id: u32 = first_token.item();
         let mut tokens: Vec<u32> = vec![first_token_id];
+        let think_close_token = if enable_thinking {
+            self.think_close_token
+        } else {
+            None
+        };
+        let mut thinking_tokens = u32::from(think_close_token.is_some());
+        let mut seen_think_close =
+            think_close_token.is_some_and(|close_id| first_token_id == close_id);
 
         // Deliver the first token, then terminate early if it is EOS or the
         // request asked for a single token.
@@ -3880,7 +4072,13 @@ impl SimpleEngine {
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|&v| v >= 1)
             .map_or(2, |v| v.min(block_max));
-        let adaptive = std::env::var("HIGGS_DFLASH_ADAPTIVE").map_or(true, |v| v != "0");
+        // dSpark's bidirectional trunk and log-SNR schedule are trained for a
+        // fixed block. Its output/verify work may be capped independently, but
+        // resizing the trunk changes the trained distribution and shape-fails
+        // the fixed conditioning tensor.
+        let is_dspark = drafter.config.is_dspark();
+        let adaptive =
+            !is_dspark && std::env::var("HIGGS_DFLASH_ADAPTIVE").map_or(true, |v| v != "0");
         let mut block_size = block_max;
         // Smoothed utilization: a single hard token inside otherwise-predictable
         // text (code dip ~0.38 ≈ prose plateau ~0.36) shouldn't collapse the
@@ -3903,7 +4101,12 @@ impl SimpleEngine {
         // keeps the S>1 verify off high-entropy near-ties (where it both slows
         // down and flips argmax), so AR regions stay byte-exact. Start in AR for
         // one step to calibrate T_ar, then enter spec. Disable: HIGGS_DFLASH_GATE=0.
-        let gate = std::env::var("HIGGS_DFLASH_GATE").map_or(true, |v| v != "0");
+        // The generic gate floors through AR steps whose taps are not yet
+        // replayed into dSpark's empty cache. Keep the public fixed-schedule
+        // runtime exact until that backlog path is made contiguous.
+        let gate = !is_dspark
+            && think_close_token.is_none()
+            && std::env::var("HIGGS_DFLASH_GATE").map_or(true, |v| v != "0");
         let mut t_ar_ema: Option<f64> = None;
         let mut ratio_ema = 2.0_f64;
         let mut in_ar = true;
@@ -4260,88 +4463,35 @@ impl SimpleEngine {
                     .map_err(EngineError::Mlx)?;
                 crop_drafter_cache(&mut draft_cache, start);
 
-                // d. Target lm_head on sliced hidden -> argmax draft tokens.
-                let draft_hidden_sliced = draft_hidden.index((.., 1.., ..));
-                let draft_logits = model
-                    .forward_all_logits_from_hidden(&draft_hidden_sliced)
-                    .map_err(EngineError::Mlx)?;
-                let draft_token_arr =
-                    mlx_rs::argmax_axis!(&draft_logits, -1).map_err(EngineError::Mlx)?;
-                // d2. Confidence truncation (training-free DSpark scheduler):
-                // per-position drafter top-1 probability in log space
-                // (max - logsumexp), computed lazily so it joins the argmax's
-                // host barrier below.
-                let conf_logp = if dflash_conf_trunc_threshold().is_some() {
-                    let max_l =
-                        mlx_rs::ops::max_axis(&draft_logits, -1, None).map_err(EngineError::Mlx)?;
-                    let lse = mlx_rs::ops::logsumexp_axis(&draft_logits, -1, None)
-                        .map_err(EngineError::Mlx)?;
-                    Some(
-                        max_l
-                            .subtract(&lse)
-                            .map_err(EngineError::Mlx)?
-                            .as_dtype(mlx_rs::Dtype::Float32)
-                            .map_err(EngineError::Mlx)?,
-                    )
-                } else {
-                    None
-                };
-                match conf_logp.as_ref() {
-                    Some(lp) => eval([&draft_token_arr, lp]).map_err(EngineError::Mlx)?,
-                    None => eval([&draft_token_arr]).map_err(EngineError::Mlx)?,
-                }
-                let mut draft_u32: Vec<u32> = draft_token_arr
-                    .reshape(&[-1])
-                    .map_err(EngineError::Mlx)?
-                    .as_slice::<u32>()
-                    .to_vec();
-                if let (Some(threshold), Some(lp)) =
-                    (dflash_conf_trunc_threshold(), conf_logp.as_ref())
-                {
-                    let logp: Vec<f32> = lp
-                        .reshape(&[-1])
-                        .map_err(EngineError::Mlx)?
-                        .as_slice::<f32>()
-                        .to_vec();
-                    let log_thresh = threshold.ln();
-                    // Truncate at the FIRST low-confidence position: everything
-                    // after it is conditioned on a token the drafter itself
-                    // doubts, so verifying it mostly buys rejected work. Keep
-                    // at least one draft so a spec round always verifies
-                    // [anchor, d0].
-                    let keep = logp
-                        .iter()
-                        .take(draft_u32.len())
-                        .take_while(|&&l| l >= log_thresh)
-                        .count()
-                        .max(1);
-                    draft_u32.truncate(keep);
-                }
-                let draft_i32: Vec<i32> = draft_u32
-                    .iter()
-                    .map(|&x| {
-                        i32::try_from(x).map_err(|_| {
-                            EngineError::Generation("draft token overflow i32".to_owned())
-                        })
-                    })
-                    .collect::<Result<_, _>>()?;
+                // d. Target-head Modal DFlash or trained-head Prism dSpark.
+                let proposal = dflash_propose_tokens(
+                    &model,
+                    &drafter,
+                    &draft_hidden,
+                    last_token,
+                    dflash.draft_cap,
+                    dflash.dspark_target_head,
+                )?;
 
                 // e. Build verify input: [anchor, draft_0..draft_{N-2}].
-                let mut verify_tokens = vec![last_token];
-                verify_tokens.extend_from_slice(&draft_i32);
-                let verify_len = i32::try_from(verify_tokens.len())
-                    .map_err(|_| EngineError::Generation("verify_len overflow".to_owned()))?;
-                let verify_input = Array::from_slice(&verify_tokens, &[1, verify_len]);
+                let verify_input = dflash_verify_input(last_token, &proposal)?;
+                let verify_len = *verify_input.shape().get(1).ok_or_else(|| {
+                    EngineError::Generation("verify input missing T axis".to_owned())
+                })?;
 
                 // f. Tape-recording verify: forward with taps + GDN innovation tapes.
                 //    The tape kernel's recurrence is bit-exact with sequential AR
                 //    steps, fixing the S>1 vs S=1 numerical drift that a full-rerun
                 //    verify exhibits, and lets partial accept replay only the SSM
                 //    recurrence for accepted positions instead of a full rerun.
-                let early_exit = std::env::var("HIGGS_DFLASH_EARLY_EXIT_LAYERS")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|&v| v > 0 && v < 64);
+                let early_exit = if is_dspark {
+                    None
+                } else {
+                    std::env::var("HIGGS_DFLASH_EARLY_EXIT_LAYERS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|&v| v > 0 && v < 64)
+                };
                 let (verify_logits, verify_taps, layer_tapes) = model
                     .forward_with_taps_tape_n(
                         &verify_input,
@@ -4352,18 +4502,55 @@ impl SimpleEngine {
                     )
                     .map_err(EngineError::Mlx)?;
 
-                // g. Accept prefix. One host barrier per round: eval'ing the argmax
-                //    pulls verify_logits + the whole verify forward through the
-                //    graph, so a separate eval([&verify_logits]) is redundant.
-                let verify_argmax =
-                    mlx_rs::argmax_axis!(verify_logits, -1).map_err(EngineError::Mlx)?;
-                eval([&verify_argmax]).map_err(EngineError::Mlx)?;
-                let verify_flat: Vec<u32> = verify_argmax
-                    .reshape(&[-1])
-                    .map_err(EngineError::Mlx)?
-                    .as_slice::<u32>()
-                    .to_vec();
-                let accepted = accept_prefix(&draft_u32, &verify_flat);
+                // g. Produce target tokens with the request's exact sampling
+                //    and penalty semantics. In the greedy/no-penalty case this
+                //    is one batched argmax barrier for the whole round; dSpark's
+                //    lazy proposal is a dependency of that target verify.
+                let verify_flat =
+                    crate::mtp::verify_targets(&verify_logits, Some(params), Some(&tokens))?;
+                let draft_u32 = proposal.host_tokens()?;
+                let mut accepted = accept_prefix(&draft_u32, &verify_flat);
+                // Never commit output beyond the request boundary. The cache
+                // convention retains one verify-input token per emitted token,
+                // so the same truncated length drives tape rollback below.
+                let completion_len = Self::completion_len(&tokens)?;
+                let remaining = usize::try_from(max_tokens.saturating_sub(completion_len))
+                    .map_err(|_| EngineError::Generation("remaining tokens overflow".to_owned()))?;
+                accepted.truncate(remaining);
+                if let Some(eos_at) = accepted
+                    .iter()
+                    .position(|token| self.eos_token_ids.contains(token))
+                {
+                    accepted.truncate(eos_at + 1);
+                }
+                if let Some(close_id) = think_close_token {
+                    let mut forced_keep = None;
+                    if !seen_think_close {
+                        for (index, token) in accepted.iter_mut().enumerate() {
+                            if *token == close_id {
+                                seen_think_close = true;
+                                break;
+                            }
+                            thinking_tokens = thinking_tokens.saturating_add(1);
+                            if thinking_tokens >= thinking_budget {
+                                *token = close_id;
+                                seen_think_close = true;
+                                forced_keep = Some(index + 1);
+                                tracing::info!(
+                                    budget = thinking_budget,
+                                    "Thinking budget reached, forcing </think>"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(keep) = forced_keep {
+                        // The forced close becomes the pending token. Later
+                        // verifier rows were conditioned on the replaced target
+                        // and must not be committed.
+                        accepted.truncate(keep);
+                    }
+                }
                 if let Ok(mut v) = self.last_dflash_accepts.lock() {
                     v.push(u32::try_from(accepted.len()).unwrap_or(0));
                 }
@@ -5431,6 +5618,8 @@ impl SimpleEngine {
                 params,
                 stop_sequences,
                 sender,
+                enable_thinking,
+                thinking_budget,
             );
         }
 
@@ -6347,12 +6536,16 @@ impl SimpleEngine {
         max_tokens: u32,
         params: &SamplingParams,
         stop_sequences: &[String],
+        enable_thinking: bool,
+        thinking_budget: u32,
     ) -> Result<GenerationOutput, EngineError> {
         self.dflash_decode(
             prompt_tokens,
             max_tokens,
             params,
             stop_sequences,
+            enable_thinking,
+            thinking_budget,
             DflashBufferedSink::default(),
         )
     }
@@ -6366,6 +6559,8 @@ impl SimpleEngine {
         params: &SamplingParams,
         stop_sequences: &[String],
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        thinking_budget: u32,
     ) -> Result<(), EngineError> {
         let detok = IncrementalDetok::new(
             String::new(),
@@ -6377,6 +6572,8 @@ impl SimpleEngine {
             max_tokens,
             params,
             stop_sequences,
+            enable_thinking,
+            thinking_budget,
             DflashStreamSink { sender, detok },
         )
     }
@@ -6784,18 +6981,12 @@ mod tests {
         println!("DFLASH {df_tps:.1} tok/s: {df_text:?}");
         println!("speedup vs AR: {:.2}x", df_tps / ar_tps);
 
-        // Correctness gate: greedy outputs identical up to a block-overshoot tail
-        // (DFlash commits whole blocks, so it may emit a few extra trailing
-        // tokens past max_tokens — the shorter must be a prefix of the longer).
-        let (short, long) = if ar_text.len() <= df_text.len() {
-            (ar_text.as_str(), df_text.as_str())
-        } else {
-            (df_text.as_str(), ar_text.as_str())
-        };
-        assert!(!short.is_empty(), "empty generation");
-        assert!(
-            long.starts_with(short),
-            "DFlash diverged from AR greedy:\n AR={ar_text:?}\n DF={df_text:?}"
+        // Correctness gate: speculative decode must obey the same output bound
+        // and produce exactly the same greedy text as autoregressive decode.
+        assert!(!ar_text.is_empty(), "empty generation");
+        assert_eq!(
+            df_text, ar_text,
+            "DFlash diverged from AR greedy or crossed max_tokens"
         );
     }
 
