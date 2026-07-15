@@ -10,10 +10,15 @@
 //!
 //! Reference checkpoints: `modal-labs/Qwen3.6-35B-A3B-DFlash` and
 //! `modal-labs/Qwen3.5-9B-DFlash`.
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use mlx_rs::{
-    Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn, ops,
+    Array,
+    builder::Builder,
+    error::Exception,
+    macros::ModuleParameters,
+    module::{Module, ModuleParameters as _, ModuleParametersExt as _, Param},
+    nn, ops,
 };
 use serde::Deserialize;
 
@@ -28,6 +33,22 @@ struct DFlashSubConfig {
     target_layer_ids: Vec<usize>,
     #[serde(default)]
     mask_token_id: Option<i32>,
+    /// Prism dSpark checkpoints use the `DFlash` trunk plus log-SNR conditioning
+    /// and a sequential low-rank Markov resampler.
+    #[serde(default)]
+    dspark: bool,
+    #[serde(default)]
+    markov_rank: i32,
+    #[serde(default)]
+    log_snr_conditioning: bool,
+    #[serde(default)]
+    min_log_snr: f32,
+    #[serde(default)]
+    max_log_snr: f32,
+    /// Omit dSpark's frozen Q4 output copy and use the paired target's head.
+    /// Verification remains distribution-exact; this only changes proposals.
+    #[serde(default)]
+    reuse_target_head: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,7 +79,7 @@ pub struct DFlashConfig {
 }
 
 impl DFlashConfig {
-    pub const fn quant_spec(&self) -> crate::qwen3_next::QuantSpec {
+    pub(crate) const fn quant_spec(&self) -> crate::qwen3_next::QuantSpec {
         match &self.quantization {
             Some(q) => q.spec(),
             None => crate::qwen3_next::QuantSpec {
@@ -79,6 +100,14 @@ impl DFlashConfig {
 
     pub fn mask_token_id(&self) -> i32 {
         self.dflash_config.mask_token_id.unwrap_or(248_070)
+    }
+
+    pub const fn is_dspark(&self) -> bool {
+        self.dflash_config.dspark
+    }
+
+    pub const fn reuse_target_head(&self) -> bool {
+        self.dflash_config.reuse_target_head
     }
 }
 
@@ -170,7 +199,6 @@ impl DFlashAttention {
         let head_dim = config.head_dim;
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
-        let _hidden = config.hidden_size;
         let is_sliding = config
             .layer_types
             .as_ref()
@@ -371,6 +399,175 @@ impl DFlashDecoderLayer {
 }
 
 // ---------------------------------------------------------------------------
+// Prism dSpark heads
+// ---------------------------------------------------------------------------
+
+const DSPARK_LOG_SNR_FEATURES: i32 = 128;
+
+#[derive(Debug, ModuleParameters)]
+struct DsparkExtras {
+    #[param]
+    log_snr_fc1: nn::Linear,
+    #[param]
+    log_snr_fc2: nn::Linear,
+    /// Dense `[vocab, rank]` lookup table indexed by the previous token.
+    #[param]
+    markov_head_a: Param<Array>,
+    /// Quantized `[vocab, rank]` projection producing the Markov logit bias.
+    #[param]
+    markov_head_b: crate::qwen3_next::QLinear,
+    /// dSpark's frozen, higher-precision copy of the target output head.
+    #[param]
+    output: Option<crate::qwen3_next::QLinear>,
+    log_snr_features: Array,
+    /// Materialized once after checkpoint loading. The log-SNR schedule is
+    /// constant for every speculative round, so rerunning its two dense MLPs
+    /// would only add dispatch and bandwidth overhead.
+    log_snr_embedding: Option<Array>,
+}
+
+impl DsparkExtras {
+    fn new(config: &DFlashConfig, spec: crate::qwen3_next::QuantSpec) -> Result<Self, Exception> {
+        if !config.dflash_config.log_snr_conditioning {
+            return Err(Exception::custom(
+                "Prism dSpark requires log_snr_conditioning=true",
+            ));
+        }
+        if config.dflash_config.markov_rank <= 0 {
+            return Err(Exception::custom("Prism dSpark requires markov_rank > 0"));
+        }
+        let min_log_snr = config.dflash_config.min_log_snr;
+        let max_log_snr = config.dflash_config.max_log_snr;
+        if !min_log_snr.is_finite() || !max_log_snr.is_finite() || max_log_snr <= min_log_snr {
+            return Err(Exception::custom(
+                "Prism dSpark requires finite min_log_snr < max_log_snr",
+            ));
+        }
+
+        Ok(Self {
+            log_snr_fc1: nn::LinearBuilder::new(DSPARK_LOG_SNR_FEATURES, config.hidden_size)
+                .bias(true)
+                .build()?,
+            log_snr_fc2: nn::LinearBuilder::new(config.hidden_size, config.hidden_size)
+                .bias(true)
+                .build()?,
+            markov_head_a: Param::new(Array::zeros::<f32>(&[1, 1])?),
+            markov_head_b: crate::qwen3_next::QLinear::new_spec(spec)?,
+            output: (!config.reuse_target_head())
+                .then(|| crate::qwen3_next::QLinear::new_spec(spec))
+                .transpose()?,
+            log_snr_features: build_log_snr_features(config.block_size, min_log_snr, max_log_snr)?,
+            log_snr_embedding: None,
+        })
+    }
+
+    fn add_log_snr(&mut self, noise: &Array) -> Result<Array, Exception> {
+        if self.log_snr_embedding.is_none() {
+            let features = self.log_snr_features.as_dtype(noise.dtype())?;
+            let hidden = nn::silu(&self.log_snr_fc1.forward(&features)?)?;
+            let embedding = self.log_snr_fc2.forward(&hidden)?.as_dtype(noise.dtype())?;
+            crate::mlx_exec::eval([&embedding])?;
+            self.log_snr_embedding = Some(embedding);
+        }
+        noise.add(
+            self.log_snr_embedding
+                .as_ref()
+                .ok_or_else(|| Exception::custom("dSpark log-SNR embedding cache missing"))?,
+        )
+    }
+
+    /// Prism's public scheduler performs a sequential low-rank Markov resample:
+    /// `argmax(base[k] + B(A(prev_token)))`, chaining each sampled token into
+    /// the next position. The arrays stay lazy, so the whole four-position
+    /// chain is evaluated with one host barrier by the caller.
+    fn propose_tokens(
+        &self,
+        hidden: &Array,
+        anchor: i32,
+        base_logits: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        use mlx_rs::ops::indexing::IndexOp;
+
+        let owned_logits = if base_logits.is_none() {
+            Some(
+                self.output
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Exception::custom(
+                            "dSpark sidecar reuses the target head; target logits are required",
+                        )
+                    })?
+                    .forward(hidden)?,
+            )
+        } else {
+            None
+        };
+        let resolved_logits = base_logits
+            .or(owned_logits.as_ref())
+            .ok_or_else(|| Exception::custom("dSpark base logits missing"))?;
+        let block_size = *hidden
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("dSpark hidden must be [B, T, D]"))?;
+        let vocab_size = *resolved_logits
+            .shape()
+            .last()
+            .ok_or_else(|| Exception::custom("dSpark logits must have a vocabulary axis"))?;
+        let mut previous = Array::from_slice(&[anchor], &[1]);
+        let mut sampled = Vec::with_capacity(usize::try_from(block_size).unwrap_or(0));
+
+        for position in 0..block_size {
+            let base = resolved_logits
+                .index((.., position..position + 1, ..))
+                .reshape(&[-1, vocab_size])?;
+            let markov_embedding = (*self.markov_head_a).take_axis(&previous, 0)?;
+            let markov_bias = self.markov_head_b.forward(&markov_embedding)?;
+            let logits = base.add(&markov_bias)?;
+            previous = mlx_rs::argmax_axis!(&logits, -1)?;
+            sampled.push(previous.clone());
+        }
+
+        let refs: Vec<&Array> = sampled.iter().collect();
+        ops::concatenate_axis(&refs, 0)?.reshape(&[1, block_size])
+    }
+}
+
+fn build_log_snr_features(
+    block_size: i32,
+    min_log_snr: f32,
+    max_log_snr: f32,
+) -> Result<Array, Exception> {
+    if block_size <= 0 {
+        return Err(Exception::custom("dSpark block_size must be positive"));
+    }
+    let half = DSPARK_LOG_SNR_FEATURES / 2;
+    let capacity = usize::try_from(block_size * DSPARK_LOG_SNR_FEATURES)
+        .map_err(|_| Exception::custom("dSpark log-SNR feature shape overflow"))?;
+    let mut features = Vec::with_capacity(capacity);
+    #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+    for position in 0..block_size {
+        let log_snr = if position % block_size == 0 {
+            max_log_snr
+        } else {
+            min_log_snr
+        };
+        let timestep = (log_snr - min_log_snr) / (max_log_snr - min_log_snr) * 1000.0;
+        for index in 0..half {
+            let frequency = (-10000.0_f32.ln() * index as f32 / half as f32).exp();
+            features.push((timestep * frequency).sin());
+        }
+        for index in 0..half {
+            let frequency = (-10000.0_f32.ln() * index as f32 / half as f32).exp();
+            features.push((timestep * frequency).cos());
+        }
+    }
+    Ok(Array::from_slice(
+        &features,
+        &[1, block_size, DSPARK_LOG_SNR_FEATURES],
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // DFlash drafter (top-level)
 // ---------------------------------------------------------------------------
 
@@ -388,6 +585,8 @@ pub struct DFlashDrafter {
     layers: Vec<DFlashDecoderLayer>,
     #[param]
     norm: nn::RmsNorm,
+    #[param]
+    dspark: Option<DsparkExtras>,
     pub config: DFlashConfig,
 }
 
@@ -410,6 +609,10 @@ impl DFlashDrafter {
             norm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
                 .build()?,
+            dspark: config
+                .is_dspark()
+                .then(|| DsparkExtras::new(&config, spec))
+                .transpose()?,
             config,
         })
     }
@@ -485,12 +688,29 @@ impl DFlashDrafter {
         let target_projected = self.fc.forward(&target_cat)?;
         let target_hidden = self.hidden_norm.forward(&target_projected)?;
 
-        let mut h = noise.clone();
+        let mut h = match self.dspark.as_mut() {
+            Some(dspark) => dspark.add_log_snr(noise)?,
+            None => noise.clone(),
+        };
         for (layer, lc) in self.layers.iter_mut().zip(cache.iter_mut()) {
             h = layer.forward(&h, &target_hidden, lc, cache_offset)?;
         }
 
         self.norm.forward(&h)
+    }
+
+    /// Produce Prism dSpark draft tokens from the normalized trunk output.
+    /// Returns `None` for ordinary Modal `DFlash` checkpoints.
+    pub fn propose_dspark_tokens(
+        &self,
+        hidden: &Array,
+        anchor: i32,
+        base_logits: Option<&Array>,
+    ) -> Result<Option<Array>, Exception> {
+        self.dspark
+            .as_ref()
+            .map(|dspark| dspark.propose_tokens(hidden, anchor, base_logits))
+            .transpose()
     }
 }
 
@@ -562,6 +782,201 @@ pub fn crop_drafter_cache(cache: &mut [Option<(Array, Array)>], keep_len: i32) {
 // Loading
 // ---------------------------------------------------------------------------
 
+fn validate_shape(key: &str, actual: &Array, expected: &[i32]) -> Result<(), ModelError> {
+    if actual.shape() == expected {
+        return Ok(());
+    }
+    Err(ModelError::ShapeMismatch(format!(
+        "DFlash tensor {key}: expected {expected:?}, got {:?}",
+        actual.shape()
+    )))
+}
+
+fn validate_qlinear_shape(
+    key: &str,
+    linear: &crate::qwen3_next::QLinear,
+    out_features: i32,
+    in_features: i32,
+) -> Result<(), ModelError> {
+    if linear.mode.is_dense() {
+        return validate_shape(
+            &format!("{key}.weight"),
+            &linear.weight,
+            &[out_features, in_features],
+        );
+    }
+    if linear.bits <= 0 || linear.group_size <= 0 || in_features % linear.group_size != 0 {
+        return Err(ModelError::ShapeMismatch(format!(
+            "DFlash tensor {key}: invalid quantization bits={}, group_size={} for input {in_features}",
+            linear.bits, linear.group_size
+        )));
+    }
+    let packed_bits = in_features.checked_mul(linear.bits).ok_or_else(|| {
+        ModelError::ShapeMismatch(format!("DFlash tensor {key}: packed shape overflow"))
+    })?;
+    if packed_bits % 32 != 0 {
+        return Err(ModelError::ShapeMismatch(format!(
+            "DFlash tensor {key}: {in_features} inputs at {} bits do not fill u32 words",
+            linear.bits
+        )));
+    }
+    let packed_columns = packed_bits / 32;
+    let groups = in_features / linear.group_size;
+    validate_shape(
+        &format!("{key}.weight"),
+        &linear.weight,
+        &[out_features, packed_columns],
+    )?;
+    validate_shape(
+        &format!("{key}.scales"),
+        &linear.scales,
+        &[out_features, groups],
+    )?;
+    if !linear.mode.is_mxfp4() {
+        validate_shape(
+            &format!("{key}.biases"),
+            &linear.biases,
+            &[out_features, groups],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_loaded_shapes(drafter: &DFlashDrafter) -> Result<(), ModelError> {
+    let config = &drafter.config;
+    let hidden = config.hidden_size;
+    let query_width = config
+        .num_attention_heads
+        .checked_mul(config.head_dim)
+        .ok_or_else(|| ModelError::ShapeMismatch("DFlash query width overflow".to_owned()))?;
+    let kv_width = config
+        .num_key_value_heads
+        .checked_mul(config.head_dim)
+        .ok_or_else(|| ModelError::ShapeMismatch("DFlash KV width overflow".to_owned()))?;
+    let tap_count = i32::try_from(config.num_taps())
+        .map_err(|_| ModelError::ShapeMismatch("DFlash tap count overflow".to_owned()))?;
+    let tap_width = tap_count
+        .checked_mul(hidden)
+        .ok_or_else(|| ModelError::ShapeMismatch("DFlash tap width overflow".to_owned()))?;
+
+    validate_qlinear_shape("fc", &drafter.fc, hidden, tap_width)?;
+    for (index, layer) in drafter.layers.iter().enumerate() {
+        let prefix = format!("layers.{index}");
+        validate_qlinear_shape(
+            &format!("{prefix}.self_attn.q_proj"),
+            &layer.self_attn.q_proj,
+            query_width,
+            hidden,
+        )?;
+        validate_qlinear_shape(
+            &format!("{prefix}.self_attn.k_proj"),
+            &layer.self_attn.k_proj,
+            kv_width,
+            hidden,
+        )?;
+        validate_qlinear_shape(
+            &format!("{prefix}.self_attn.v_proj"),
+            &layer.self_attn.v_proj,
+            kv_width,
+            hidden,
+        )?;
+        validate_qlinear_shape(
+            &format!("{prefix}.self_attn.o_proj"),
+            &layer.self_attn.o_proj,
+            hidden,
+            query_width,
+        )?;
+        validate_qlinear_shape(
+            &format!("{prefix}.mlp.gate_proj"),
+            &layer.mlp.gate_proj,
+            config.intermediate_size,
+            hidden,
+        )?;
+        validate_qlinear_shape(
+            &format!("{prefix}.mlp.up_proj"),
+            &layer.mlp.up_proj,
+            config.intermediate_size,
+            hidden,
+        )?;
+        validate_qlinear_shape(
+            &format!("{prefix}.mlp.down_proj"),
+            &layer.mlp.down_proj,
+            hidden,
+            config.intermediate_size,
+        )?;
+    }
+
+    if let Some(dspark) = drafter.dspark.as_ref() {
+        let rank = config.dflash_config.markov_rank;
+        validate_shape(
+            "dspark.markov_head_a",
+            &dspark.markov_head_a,
+            &[config.vocab_size, rank],
+        )?;
+        validate_qlinear_shape(
+            "dspark.markov_head_b",
+            &dspark.markov_head_b,
+            config.vocab_size,
+            rank,
+        )?;
+        if let Some(output) = dspark.output.as_ref() {
+            validate_qlinear_shape("dspark.output", output, config.vocab_size, hidden)?;
+        }
+    }
+    Ok(())
+}
+
+fn load_dflash_weights(drafter: &mut DFlashDrafter, model_path: &Path) -> Result<(), ModelError> {
+    let expected_shapes: HashMap<String, Vec<i32>> = drafter
+        .parameters()
+        .flatten()
+        .iter()
+        .filter(|(_, value)| value.shape().iter().product::<i32>() > 0)
+        .map(|(name, value)| (name.to_string(), value.shape().to_vec()))
+        .collect();
+    let mut missing: std::collections::HashSet<String> = expected_shapes.keys().cloned().collect();
+    let mut params = drafter.parameters_mut().flatten();
+
+    for file_path in crate::collect_safetensors_files(model_path)? {
+        tracing::debug!(file = %file_path.display(), "Loading DFlash weights");
+        for (key, value) in Array::load_safetensors(&file_path)? {
+            let Some(param) = params.get_mut(&*key) else {
+                tracing::warn!(key = %key, "Weight key not found in DFlash parameters");
+                continue;
+            };
+            if let Some(expected) = expected_shapes.get(&*key)
+                && expected.iter().product::<i32>() != 1
+                && value.shape() != expected.as_slice()
+            {
+                return Err(ModelError::ShapeMismatch(format!(
+                    "DFlash tensor {key}: expected {expected:?}, got {:?}",
+                    value.shape()
+                )));
+            }
+            **param = value;
+            missing.remove(&*key);
+        }
+    }
+
+    if !missing.is_empty() {
+        let mut names: Vec<_> = missing.into_iter().collect();
+        names.sort_unstable();
+        let examples = names
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ModelError::MissingWeight(format!(
+            "{} DFlash parameters were not loaded; examples: {examples}",
+            names.len()
+        )));
+    }
+    validate_loaded_shapes(drafter)?;
+    drafter.eval()?;
+    Ok(())
+}
+
 /// Load a `DFlash` drafter from a directory containing `config.json` + `model.safetensors`.
 pub fn load_dflash_drafter(model_path: &Path) -> Result<DFlashDrafter, ModelError> {
     let config_path = model_path.join("config.json");
@@ -573,7 +988,7 @@ pub fn load_dflash_drafter(model_path: &Path) -> Result<DFlashDrafter, ModelErro
     let mut drafter = DFlashDrafter::new(config)
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
 
-    crate::load_safetensors_weights(&mut drafter, model_path)?;
+    load_dflash_weights(&mut drafter, model_path)?;
 
     Ok(drafter)
 }
@@ -632,6 +1047,34 @@ pub fn accept_prefix(draft: &[u32], verify_argmax: &[u32]) -> Vec<u32> {
 mod tests {
     use super::accept_prefix;
 
+    fn tiny_dspark_config() -> super::DFlashConfig {
+        super::DFlashConfig {
+            hidden_size: 4,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: 8,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1e7,
+            block_size: 2,
+            vocab_size: 4,
+            layer_types: None,
+            sliding_window: None,
+            quantization: None,
+            dflash_config: super::DFlashSubConfig {
+                target_layer_ids: vec![0],
+                mask_token_id: Some(3),
+                dspark: true,
+                markov_rank: 1,
+                log_snr_conditioning: true,
+                min_log_snr: -9.0,
+                max_log_snr: 9.0,
+                reuse_target_head: true,
+            },
+        }
+    }
+
     #[test]
     fn accept_prefix_full_match_returns_draft_plus_bonus() {
         let draft = vec![1, 2, 3];
@@ -668,6 +1111,39 @@ mod tests {
         let _ = accept_prefix(&draft, &verify);
     }
 
+    #[test]
+    fn dspark_log_snr_schedule_uses_max_then_min() {
+        let features = super::build_log_snr_features(2, -9.0, 9.0).unwrap();
+        mlx_rs::transforms::eval([&features]).unwrap();
+        let values = features.as_slice::<f32>();
+        assert_eq!(features.shape(), &[1, 2, 128]);
+        assert!((values[0] - 1000.0_f32.sin()).abs() < 1e-6);
+        assert!((values[64] - 1000.0_f32.cos()).abs() < 1e-6);
+        assert!(values[128].abs() < f32::EPSILON);
+        assert!((values[192] - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dspark_markov_resampler_chains_sampled_token() {
+        use mlx_rs::{Array, module::Param};
+
+        let mut drafter = super::DFlashDrafter::new(tiny_dspark_config()).unwrap();
+        let extras = drafter.dspark.as_mut().unwrap();
+        // A(anchor=3)=3 makes token 1 beat base token 2 at position zero.
+        // Chaining the sampled token gives A(1)=1 at position one, where base
+        // token 2 wins. Reusing the anchor incorrectly would yield [1, 1].
+        extras.markov_head_a = Param::new(Array::from_slice(&[0.0, 1.0, 0.0, 3.0], &[4, 1]));
+        extras.markov_head_b.weight = Param::new(Array::from_slice(&[0.0, 1.0, 0.0, 0.0], &[4, 1]));
+        let hidden = Array::zeros::<f32>(&[1, 2, 4]).unwrap();
+        let base = Array::from_slice(&[0.0_f32, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0, 0.0], &[1, 2, 4]);
+        let tokens = drafter
+            .propose_dspark_tokens(&hidden, 3, Some(&base))
+            .unwrap()
+            .unwrap();
+        mlx_rs::transforms::eval([&tokens]).unwrap();
+        assert_eq!(tokens.as_slice::<u32>(), &[1, 2]);
+    }
+
     /// Sliding-window eviction: a tiny random drafter with layer 0 = sliding
     /// (window 4) and layer 1 = full. Driving several rounds must cap the
     /// sliding layer's context KV at `sliding_window - 1` while the full layer
@@ -699,6 +1175,12 @@ mod tests {
             dflash_config: DFlashSubConfig {
                 target_layer_ids: vec![0],
                 mask_token_id: Some(1),
+                dspark: false,
+                markov_rank: 0,
+                log_snr_conditioning: false,
+                min_log_snr: 0.0,
+                max_log_snr: 0.0,
+                reuse_target_head: false,
             },
         };
         let mut drafter = DFlashDrafter::new(config).unwrap();
