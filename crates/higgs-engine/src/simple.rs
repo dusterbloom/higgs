@@ -209,8 +209,12 @@ fn stash_into(
     evicted
 }
 
-fn retention_token_cap(config: KvCacheConfig, cap_exempt: bool) -> usize {
-    if cap_exempt {
+fn retention_token_cap(
+    config: KvCacheConfig,
+    target_only_cap_exempt: bool,
+    state: &RetainedState,
+) -> usize {
+    if target_only_cap_exempt && state.allows_target_only_cap_exemption() {
         0
     } else {
         config.max_session_tokens
@@ -713,6 +717,10 @@ pub struct CacheStats {
     pub retained_sessions: usize,
     /// Currently retained sessions that own an inseparable target/dSpark pair.
     pub retained_paired_sessions: usize,
+    /// Conservative target bytes retained by paired sessions.
+    pub retained_paired_target_bytes: usize,
+    /// Conservative dSpark bytes retained by paired sessions.
+    pub retained_paired_dflash_bytes: usize,
     /// Currently stored radix prefixes.
     pub radix_entries: usize,
     /// Currently stored paired radix endpoints.
@@ -1596,6 +1604,28 @@ struct RetainedKv {
     last_used: std::time::Instant,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RetainedPairedStats {
+    entries: usize,
+    target_bytes: usize,
+    dflash_bytes: usize,
+}
+
+fn retained_paired_stats(
+    retained: &std::collections::HashMap<u64, RetainedKv>,
+) -> RetainedPairedStats {
+    retained
+        .values()
+        .fold(RetainedPairedStats::default(), |mut stats, entry| {
+            if let Some((target_bytes, dflash_bytes)) = entry.state.paired_estimated_bytes() {
+                stats.entries = stats.entries.saturating_add(1);
+                stats.target_bytes = stats.target_bytes.saturating_add(target_bytes);
+                stats.dflash_bytes = stats.dflash_bytes.saturating_add(dflash_bytes);
+            }
+            stats
+        })
+}
+
 /// Intermediate state after prefix cache lookup and model locking.
 struct PreparedGeneration<'a> {
     model: MutexGuard<'a, AnyModel>,
@@ -2052,15 +2082,9 @@ impl SimpleEngine {
     /// Snapshot of cache effectiveness (hit rate, prefill saved, evictions,
     /// resident sizes) for observability / the `/metrics` endpoint.
     pub fn cache_stats(&self) -> CacheStats {
-        let (retained_sessions, retained_paired_sessions) = {
+        let (retained_sessions, retained_paired) = {
             let retained = lock_or_recover(&self.retained);
-            (
-                retained.len(),
-                retained
-                    .values()
-                    .filter(|entry| matches!(&entry.state, RetainedState::Paired(_)))
-                    .count(),
-            )
+            (retained.len(), retained_paired_stats(&retained))
         };
         let (radix_entries, paired_radix) = {
             let prefix_cache = lock_or_recover(&self.prefix_cache);
@@ -2081,7 +2105,9 @@ impl SimpleEngine {
             continuations: self.cache_metrics.continuations.load(Ordering::Relaxed),
             sessions_evicted: self.cache_metrics.sessions_evicted.load(Ordering::Relaxed),
             retained_sessions,
-            retained_paired_sessions,
+            retained_paired_sessions: retained_paired.entries,
+            retained_paired_target_bytes: retained_paired.target_bytes,
+            retained_paired_dflash_bytes: retained_paired.dflash_bytes,
             radix_entries,
             paired_radix_entries: paired_radix.entries,
             paired_radix_target_bytes: paired_radix.target_bytes,
@@ -2184,13 +2210,15 @@ impl SimpleEngine {
         session_id: u64,
         state: RetainedState,
         tokens: Vec<u32>,
-        cap_exempt: bool,
+        target_only_cap_exempt: bool,
     ) {
-        // `cap_exempt`: the caller compressed this cache to TurboQuant because
-        // it exceeded the dense token cap — retain it anyway (bounded footprint
-        // beats the measured 150s full re-prefill a drop would cost the
-        // session's next turn).
-        let effective_cap = retention_token_cap(self.kv_cache_config, cap_exempt);
+        // `target_only_cap_exempt`: the caller compressed target KV to
+        // TurboQuant because it exceeded the dense token cap. Preserve the
+        // historical exemption for target-only retention, but never apply it
+        // to a pair whose dSpark snapshot remains uncompressed and grows with
+        // context.
+        let effective_cap =
+            retention_token_cap(self.kv_cache_config, target_only_cap_exempt, &state);
         #[allow(clippy::print_stderr)] // env-gated diagnostic
         if effective_cap > 0
             && tokens.len() > effective_cap
@@ -8926,7 +8954,7 @@ mod tests {
     use higgs_models::{
         AnyCache, SamplingParams, Speculation,
         cache::SteppingKeyValueCache,
-        dflash::{DFlashCache, DFlashSnapshot},
+        dflash::{DFlashCache, DFlashConfig, DFlashDrafter, DFlashSnapshot},
     };
     use mlx_rs::{
         Array, Dtype,
@@ -8945,6 +8973,35 @@ mod tests {
         };
         let _exec = higgs_models::mlx_exec::acquire();
         ValidatedSessionTarget::evaluate(AnyCache::KV(vec![Some(layer)]), boundary).unwrap()
+    }
+
+    fn paired_retained_state(boundary: i32) -> crate::cache::paired::RetainedState {
+        let target = validated_session_target(boundary).cache;
+        let config: DFlashConfig = serde_json::from_str(
+            r#"{
+                "hidden_size": 4,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "intermediate_size": 8,
+                "vocab_size": 8,
+                "dflash_config": {
+                    "target_layer_ids": [0]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut drafter = DFlashDrafter::new(config).unwrap();
+        let cache = drafter.make_cache();
+        let taps = (boundary > 0)
+            .then(|| Array::zeros::<f32>(&[1, boundary, 4]).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let _exec = higgs_models::mlx_exec::acquire();
+        let snapshot = drafter.seal_after_taps(cache, &taps, boundary).unwrap();
+        let tokens = vec![7; usize::try_from(boundary).unwrap()];
+        crate::cache::paired::RetainedState::paired(target, snapshot, &tokens).unwrap()
     }
 
     #[test]
@@ -9455,16 +9512,19 @@ mod tests {
             max_session_tokens: 10,
             ..KvCacheConfig::default()
         };
-        assert_eq!(retention_token_cap(capped, false), 10);
-        assert_eq!(retention_token_cap(capped, true), 0);
+        let ordinary = dummy();
+        assert_eq!(retention_token_cap(capped, false, &ordinary), 10);
+        assert_eq!(retention_token_cap(capped, true, &ordinary), 0);
         let mut exempt: HashMap<u64, RetainedKv> = HashMap::new();
+        let ordinary = dummy();
+        let ordinary_cap = retention_token_cap(capped, true, &ordinary);
         stash_into(
             &mut exempt,
             99,
-            dummy(),
+            ordinary,
             vec![0; 20],
             capped.max_retained_sessions,
-            retention_token_cap(capped, true),
+            ordinary_cap,
         );
         assert!(
             exempt.contains_key(&99),
@@ -9495,6 +9555,62 @@ mod tests {
             "a zero TTL evicts everything"
         );
         assert!(ttl.is_empty());
+    }
+
+    #[test]
+    fn paired_retention_does_not_inherit_target_only_cap_exemption() {
+        use super::{RetainedKv, retention_token_cap, stash_into};
+        use higgs_models::turboquant::KvCacheConfig;
+        use std::collections::HashMap;
+
+        let config = KvCacheConfig {
+            max_session_tokens: 10,
+            ..KvCacheConfig::default()
+        };
+        let paired = paired_retained_state(20);
+
+        assert_eq!(
+            retention_token_cap(config, true, &paired),
+            config.max_session_tokens,
+            "target TurboQuant must not unbound the uncompressed dSpark half"
+        );
+
+        let mut retained: HashMap<u64, RetainedKv> = HashMap::new();
+        let effective_cap = retention_token_cap(config, true, &paired);
+        stash_into(
+            &mut retained,
+            100,
+            paired,
+            vec![0; 20],
+            config.max_retained_sessions,
+            effective_cap,
+        );
+        assert!(
+            retained.is_empty(),
+            "an over-cap target+dSpark pair must be dropped after target compression"
+        );
+    }
+
+    #[test]
+    fn paired_session_bytes_plateau_at_count_cap_plus_one() {
+        use super::{RetainedKv, retained_paired_stats, stash_into};
+        use std::collections::HashMap;
+
+        let mut retained: HashMap<u64, RetainedKv> = HashMap::new();
+        let sample = paired_retained_state(1);
+        let (target_bytes, dflash_bytes) = sample.paired_estimated_bytes().unwrap();
+        assert!(target_bytes > 0);
+        assert!(dflash_bytes > 0);
+        stash_into(&mut retained, 1, sample, vec![7], 2, 1);
+        stash_into(&mut retained, 2, paired_retained_state(1), vec![7], 2, 1);
+        let evicted = stash_into(&mut retained, 3, paired_retained_state(1), vec![7], 2, 1);
+
+        let plateau = retained_paired_stats(&retained);
+        assert_eq!(evicted, 1);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(plateau.entries, 2);
+        assert_eq!(plateau.target_bytes, target_bytes * 2);
+        assert_eq!(plateau.dflash_bytes, dflash_bytes * 2);
     }
 
     /// Write a config.json file into the given directory with the provided JSON content.

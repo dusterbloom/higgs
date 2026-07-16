@@ -153,6 +153,11 @@ impl SealedPair {
         self.metadata.stamp.matches(tokens)
     }
 
+    #[must_use]
+    fn estimated_bytes(&self) -> (usize, usize) {
+        (self.metadata.target_bytes, self.metadata.dflash_bytes)
+    }
+
     #[cfg(test)]
     fn into_live(
         self,
@@ -221,6 +226,11 @@ impl PairedCache {
     #[must_use]
     pub(crate) fn matches_prefix(&self, tokens: &[u32]) -> bool {
         self.sealed.matches_prefix(tokens)
+    }
+
+    #[must_use]
+    pub(crate) fn estimated_bytes(&self) -> (usize, usize) {
+        self.sealed.estimated_bytes()
     }
 
     /// Consume both immutable halves into one live target/dFlash branch.
@@ -401,6 +411,23 @@ impl RetainedState {
         tokens: &[u32],
     ) -> Result<Self, PairedCacheError> {
         PairedCache::new(target, dflash, tokens).map(Self::Paired)
+    }
+
+    /// Only target-only state may use the historical TurboQuant exemption from
+    /// `max_session_tokens`. A paired dSpark snapshot remains uncompressed and
+    /// grows with context, so exempting the target half would leave the whole
+    /// retained pair unbounded.
+    #[must_use]
+    pub(crate) const fn allows_target_only_cap_exemption(&self) -> bool {
+        matches!(self, Self::TargetOnly(_))
+    }
+
+    #[must_use]
+    pub(crate) fn paired_estimated_bytes(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::TargetOnly(_) => None,
+            Self::Paired(pair) => Some(pair.estimated_bytes()),
+        }
     }
 
     /// Consume paired state only when it still matches the requested key.
