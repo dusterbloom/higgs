@@ -48,6 +48,20 @@ estimates roughly 34.7 tok/s, but that number remains an estimate until the
 powered rerun. These are narrow measurements from one prompt and two samples,
 not a general Apple speedup claim.
 
+The row4 integration has since moved from a duplicate experimental side layout
+to the authoritative dense-MLP parameter representation. Synthetic exactness
+tests and a real Bonsai-27B load/forward smoke test pass. A one-launch gate/up
+kernel is also implemented behind a separate additional flag. A subsequent
+OFF--ON--OFF battery diagnostic measured 29.31 tok/s speculative decode and
+21.95 tok/s wall throughput with fusion off, versus 27.29 and 20.82 tok/s with
+fusion on; AR decode was effectively unchanged at 20.42 versus 20.33 tok/s.
+The off result therefore reached 1.435x decode and 1.325x wall speedup, and its
+best speculative sample reached 29.47 tok/s. Acceptance and byte parity were
+unchanged. This validates the primary-layout path under real decoding but does
+not support enabling gate/up fusion. The run ended at 61% on a discharging
+battery with no external source, so a powered primary-row4 result is still
+required for promotion.
+
 ## Pinned sidecar contract
 
 A dSpark sidecar is not a generic drafter that may be paired with any
@@ -325,21 +339,62 @@ variant measured:
 | 1 | 17,408 | 5,120 | 356.5 us | 337.7 us | 1.056x |
 | 1 | 5,120 | 17,408 | 364.5 us | 381.4 us | 0.956x |
 
-The generic M1--M4 plan uses a 256-thread/N256/K128 tile, a 4 KiB FP16
-threadgroup LUT, four scalar FP32 accumulators, and two barriers per K group.
-The native M5 specialization uses a 5 KiB LUT and five accumulators while
-sharing each packed weight/scale read across all five verifier rows. Distinct
-stacked rows matched their separate M1 evaluations bit-for-bit under the new
-plan.
+The generic M1--M4 and M6--M8 plans use a 256-thread/N256/K128 tile, an FP16
+threadgroup LUT, independent scalar FP32 accumulators, and two barriers per K
+group. The native M5 specialization uses a 5 KiB LUT and five accumulators
+while sharing each packed weight/scale read across all five verifier rows.
+Distinct stacked rows match their separate M1 evaluations bit-for-bit under
+the new plan.
 
 The opt-in full-model trial (`HIGGS_BONSAI_TG_LUT4=1`) produced the 29.01 tok/s
 battery result above with workgroup size 256. A 160-thread trial reached 29.59
 tok/s initially but fell to 27.56 tok/s and was rejected when AR endpoint drift
-reached 7.24%, above the 3% stability gate. The trial retains both canonical
-and row4-packed weights for 192 dense MLP projections, adding about 2.241 GiB.
-A supported integration must replace the row-major representation or otherwise
-prove a bounded memory budget; it cannot retain both layouts for the whole
-target.
+reached 7.24%, above the 3% stability gate.
+
+The supported integration no longer retains both canonical and row4-packed
+weights. At load time, each eligible projection moves its packed arrays into
+the authoritative `weight` and `scales` parameters and records only row4
+dimensions as layout metadata. Forward reconstructs a validated borrowed row4
+view from those current parameters, avoiding stale shadow handles if module
+parameters change. M=1 through M=8 execute the exact packed schedule (with the
+native M5 specialization), and wider inputs dequantize directly from row4
+before MLX matmul instead of first rebuilding canonical packing.
+
+The exact affine check promotes 191 of Bonsai-27B's 192 dense-MLP projections.
+`model.layers.31.mlp.down_proj` has one FP16 half-subnormal bias mismatch and
+therefore remains in the canonical general-affine path, retaining its required
+1.328125 MiB bias. That fallback retains only its canonical weight; it does not
+create a duplicate row4 copy. Synthetic row-count, layout, dequantization, and
+fused-projection exactness tests pass, as does a real-checkpoint load/forward
+smoke test.
+
+This physical parameter layout is currently an inference representation.
+Generic checkpoint export would mislabel the row4 buffers as source-canonical
+parameters, so exporting a promoted model requires explicit demotion and is
+unsupported as-is.
+
+The paired gate/up microbenchmark and full-model battery diagnostic reject the
+current fusion schedule as a throughput optimization:
+
+| Rows | Separate median | Fused median | Median speedup |
+|---:|---:|---:|---:|
+| 1 | 447.96 us | 446.83 us | 1.0025x |
+| 5 | 752.08 us | 762.42 us | 0.9864x |
+
+Each microbenchmark result contains 31 samples. In the stable end-to-end
+comparison, fusion-off versus fusion-on was 29.31 versus 27.29 tok/s for
+speculative decode and 21.95 versus 20.82 tok/s for wall throughput, while AR
+decode differed by only 0.44%. The leading fusion-off control was visibly cold,
+however. Latency-space interpolation between the two off controls estimates
+that fusion improved AR decode by 2.23% while reducing speculative decode by
+2.40%; the speculative speedup ratio fell from an interpolated 1.406x to
+1.342x. The fused kernel saves one launch and one activation-LUT construction,
+but it does not reduce gate/up weight traffic and keeps both projections'
+accumulators live. The measured M=5 regression is consistent with added
+register pressure or reduced scheduling freedom. That mechanism is an
+inference, not a profiler attribution, and the exact end-to-end penalty remains
+order- and battery-confounded. The fused path therefore remains opt-in and
+disabled by default.
 
 ## Remaining performance hypotheses
 
@@ -348,14 +403,19 @@ At the measured accepted length, 30 tok/s requires a 151.2 ms round, only about
 requires roughly 113.4 ms, about 42.9 ms or 27.5% below that round time. The
 remaining exact experiments are ranked as follows.
 
-1. **Projection-family fusion.** Run gate/up, Q/K/V, or qkvz/ba through one
-   multi-pointer launch while retaining an independent accumulator and the
-   current reduction order for every output. This reuses the activation tile
-   and removes launches without concatenating persistent packed weights. A
-   weighted real-shape M=5 sweep must show exact BF16 output and at least a 3%
-   stable gain before whole-model integration. Earlier concatenated-projection
-   work changed graph-build cost but moved end-to-end time by only about 1%, so
-   a few milliseconds is the defensible prior.
+1. **Rejected current gate/up fusion schedule.** With the base row4 path enabled,
+   `HIGGS_BONSAI_TG_LUT4_FUSED_MLP=1` now runs symmetric row4 gate and up
+   projections in one launch for M=1 through M=5. It shares the activation LUT
+   while preserving an independent FP32 accumulator and the existing output-
+   rounding boundary for each projection; SiLU/multiply remains a separate
+   authoritative operation. Synthetic fused-versus-separate outputs are exact.
+   The paired microbenchmark was flat at M=1 by median and 1.36% slower at M=5.
+   The adjacent stable battery passes observed 7.40% lower speculative decode
+   and 5.43% lower wall throughput with fusion, while sandwich interpolation
+   estimates a smaller 2.40% speculative-decode regression. The direction is
+   consistent; the magnitude is not yet causal. It remains available only for
+   explicit A/B work. Changing the tile or accumulator strategy would require
+   a new exactness and powered-performance promotion cycle.
 2. **Dense prefix attention.** Append all five post-RoPE K/V rows once, then
    evaluate each query against its exact chronological prefix. Grid rows must
    never reduce together, committed cache length advances only by the accepted

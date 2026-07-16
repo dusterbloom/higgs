@@ -530,8 +530,33 @@ fn affine_q1_forward(
     }
 }
 
-/// Quantized linear layer stored as raw weight/scales/biases arrays.
-/// Forward uses `quantized_matmul` directly.
+/// Physical storage contract for a [`QLinear`]'s weight and scale parameters.
+///
+/// The layout is deliberately metadata-only: the `Param<Array>` handles remain
+/// the sole authority for the resident buffers. Reconstructing a checked row4
+/// view from those handles on every use means parameter-tree replacement can
+/// never leave forward pointing at stale cloned arrays.
+///
+/// A promoted parameter tree stores physical row4 arrays under the original
+/// parameter names. Generic checkpoint serialization/export therefore requires
+/// an explicit row4-to-canonical demotion step and is unsupported as-is.
+#[derive(Debug, Clone)]
+enum QLinearWeightLayout {
+    Canonical,
+    BonsaiRow4 { n_rows: i32, k_dim: i32 },
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BonsaiRow4Promotion {
+    layers: usize,
+    projections: usize,
+    bytes: usize,
+}
+
+/// Quantized linear layer stored as weight/scales/biases arrays plus a typed
+/// physical-layout contract. Canonical forward uses `quantized_matmul`
+/// directly; promoted Bonsai dense MLP projections route through row4-native
+/// kernels and dequantize wide prefill directly from row4 storage.
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct QLinear {
     #[param]
@@ -545,6 +570,7 @@ pub(crate) struct QLinear {
     /// Quantization format. `Affine` (default) keeps the existing mlx-rs fast
     /// path; `MxFp4` routes through the FFI bypass in [`crate::quant_mode`].
     pub(crate) mode: crate::quant_mode::QuantMode,
+    weight_layout: QLinearWeightLayout,
 }
 
 impl QLinear {
@@ -597,10 +623,115 @@ impl QLinear {
             group_size,
             bits,
             mode,
+            weight_layout: QLinearWeightLayout::Canonical,
         })
     }
 
+    fn reset_weight_layout(&mut self) {
+        self.weight_layout = QLinearWeightLayout::Canonical;
+    }
+
+    fn bonsai_row4(&self) -> Result<Option<crate::metal_kernel::BonsaiQ1Row4Ref<'_>>, Exception> {
+        let QLinearWeightLayout::BonsaiRow4 { n_rows, k_dim } = &self.weight_layout else {
+            return Ok(None);
+        };
+        crate::metal_kernel::BonsaiQ1Row4Ref::from_primary_parts(
+            &self.weight,
+            &self.scales,
+            *n_rows,
+            *k_dim,
+        )
+        .map(Some)
+    }
+
+    /// Return the logical `[out,in]` shape and whether this canonical
+    /// projection can be promoted losslessly. A valid loaded affine bias is a
+    /// first-class canonical fallback: it must never be approximated by the
+    /// symmetric row4 kernels.
+    fn bonsai_row4_promotion_candidate(&self, path: &str) -> Result<((i32, i32), bool), Exception> {
+        match &self.weight_layout {
+            QLinearWeightLayout::BonsaiRow4 { n_rows, k_dim } => {
+                validate_dflash_qlinear(path, self)?;
+                Ok(((*n_rows, *k_dim), false))
+            }
+            QLinearWeightLayout::Canonical => {
+                validate_dflash_q1_linear(
+                    path,
+                    &self.weight,
+                    &self.scales,
+                    &self.biases,
+                    self.group_size,
+                    self.bits,
+                    self.mode,
+                )?;
+                let [n_rows, k_packed] = *self.weight.shape() else {
+                    return Err(Exception::custom(format!(
+                        "{path} canonical Q1 weight must have shape [N,K/32]"
+                    )));
+                };
+                let k_dim = k_packed
+                    .checked_mul(32)
+                    .ok_or_else(|| Exception::custom(format!("{path} Q1 width overflow")))?;
+                let eligible = has_symmetric_q1_biases(&self.biases)
+                    && matches!(self.scales.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+                    && n_rows % 4 == 0
+                    && k_dim % 128 == 0;
+                Ok(((n_rows, k_dim), eligible))
+            }
+        }
+    }
+
+    /// Validate the strict primary-row4 domain without allocating or mutating.
+    fn preflight_bonsai_row4_promotion(&self, path: &str) -> Result<(i32, i32), Exception> {
+        let (shape, eligible) = self.bonsai_row4_promotion_candidate(path)?;
+        if !matches!(self.weight_layout, QLinearWeightLayout::Canonical) || !eligible {
+            return Err(Exception::custom(format!(
+                "{path} is outside the primary row4 domain: mode={:?} bits={} group_size={} symmetric_bias={}",
+                self.mode,
+                self.bits,
+                self.group_size,
+                has_symmetric_q1_biases(&self.biases)
+            )));
+        }
+        Ok(shape)
+    }
+
+    fn prepare_bonsai_row4(
+        &self,
+        path: &str,
+    ) -> Result<crate::metal_kernel::BonsaiQ1Row4, Exception> {
+        self.preflight_bonsai_row4_promotion(path)?;
+        crate::metal_kernel::BonsaiQ1Row4::from_row_major(&self.weight, &self.scales)
+    }
+
+    /// Install the packed arrays as the actual, sole-authority model parameters.
+    fn install_bonsai_row4(&mut self, packed: crate::metal_kernel::BonsaiQ1Row4) {
+        let (weights, scales, n_rows, k_dim) = packed.into_primary_parts();
+        self.weight = Param::new(weights);
+        self.scales = Param::new(scales);
+        self.weight_layout = QLinearWeightLayout::BonsaiRow4 { n_rows, k_dim };
+    }
+
     pub(crate) fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        if let Some(packed) = self.bonsai_row4()? {
+            if packed.accepts_input(x) {
+                return crate::metal_kernel::bonsai_q1_tg_lut4_qmm_view(x, packed);
+            }
+            let row_count: i32 = x.shape().iter().take(x.ndim().saturating_sub(1)).product();
+            if (1..=8).contains(&row_count) {
+                return Err(Exception::custom(format!(
+                    "Bonsai row4 narrow input is outside the TG-LUT4 contract: shape={:?} dtype={:?}",
+                    x.shape(),
+                    x.dtype()
+                )));
+            }
+            // Wide prefill dequantizes directly from the authoritative row4
+            // buffers. No transient canonical packed copy is materialized.
+            let dense =
+                crate::metal_kernel::bonsai_q1_row4_dequant_view(packed)?.as_dtype(x.dtype())?;
+            return x.matmul(&dense.transpose()?);
+        }
+
         // Fast path: batched quantized GEMM for verify (T>1, T<=16).
         // Fuses T matmuls into one Metal kernel dispatch — eliminates
         // pipeline bubbles. Gated by env var until validated.
@@ -738,6 +869,47 @@ impl QLinear {
             qgemv_4bit(x, &self.weight, &self.scales, &self.biases, self.group_size)
         } else {
             self.forward(x)
+        }
+    }
+}
+
+fn validate_dflash_qlinear(path: &str, linear: &QLinear) -> Result<(), Exception> {
+    match &linear.weight_layout {
+        QLinearWeightLayout::Canonical => validate_dflash_q1_linear(
+            path,
+            &linear.weight,
+            &linear.scales,
+            &linear.biases,
+            linear.group_size,
+            linear.bits,
+            linear.mode,
+        ),
+        QLinearWeightLayout::BonsaiRow4 { .. } => {
+            if linear.mode != crate::quant_mode::QuantMode::Affine
+                || linear.bits != 1
+                || linear.group_size != 128
+                || !has_symmetric_q1_biases(&linear.biases)
+            {
+                return Err(Exception::custom(format!(
+                    "{path} has an invalid installed Bonsai row4 contract weight={:?}/{:?} scales={:?}/{:?} mode={:?} bits={} group_size={} symmetric_bias={}",
+                    linear.weight.shape(),
+                    linear.weight.dtype(),
+                    linear.scales.shape(),
+                    linear.scales.dtype(),
+                    linear.mode,
+                    linear.bits,
+                    linear.group_size,
+                    has_symmetric_q1_biases(&linear.biases)
+                )));
+            }
+            // Rebuild the typed view from the current parameter handles. This
+            // validates shape, dtype, contiguity, and the logical dimensions
+            // recorded in metadata, so a same-shaped parameter-tree update
+            // cannot silently leave forward using an older cloned handle.
+            linear.bonsai_row4()?.ok_or_else(|| {
+                Exception::custom(format!("{path} lost its Bonsai row4 layout metadata"))
+            })?;
+            Ok(())
         }
     }
 }
@@ -6300,11 +6472,6 @@ struct FfnBlock {
     norm_topk_prob: bool,
     /// Cached fused gate+up weights for dense layers (lazily computed on first forward).
     fused_gate_up: Option<(Array, Array, Array, i32)>,
-    /// Trial-only row4 caches. These are intentionally not model parameters:
-    /// the canonical checkpoint arrays remain loadable and authoritative.
-    tg_lut4_gate: Option<crate::metal_kernel::BonsaiQ1Row4>,
-    tg_lut4_up: Option<crate::metal_kernel::BonsaiQ1Row4>,
-    tg_lut4_down: Option<crate::metal_kernel::BonsaiQ1Row4>,
 }
 
 impl FfnBlock {
@@ -6322,9 +6489,6 @@ impl FfnBlock {
             top_k: moe.top_k,
             norm_topk_prob: moe.norm_topk_prob,
             fused_gate_up: None,
-            tg_lut4_gate: None,
-            tg_lut4_up: None,
-            tg_lut4_down: None,
         })
     }
 
@@ -6344,9 +6508,6 @@ impl FfnBlock {
             top_k: 0,
             norm_topk_prob: false,
             fused_gate_up: None,
-            tg_lut4_gate: None,
-            tg_lut4_up: None,
-            tg_lut4_down: None,
         })
     }
 
@@ -6356,61 +6517,114 @@ impl FfnBlock {
             .get_or_init(|| std::env::var("HIGGS_BONSAI_TG_LUT4").is_ok_and(|value| value == "1"))
     }
 
-    fn tg_lut4_projection_eligible(linear: &QLinear, x: &Array) -> bool {
-        Self::tg_lut4_projection_eligible_when(Self::tg_lut4_enabled(), linear, x)
+    fn tg_lut4_fused_mlp_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("HIGGS_BONSAI_TG_LUT4_FUSED_MLP").is_ok_and(|value| value == "1")
+        })
     }
 
-    fn tg_lut4_projection_eligible_when(enabled: bool, linear: &QLinear, x: &Array) -> bool {
-        if !enabled
-            || linear.mode != crate::quant_mode::QuantMode::Affine
-            || linear.bits != 1
-            || linear.group_size != 128
-            || !has_symmetric_q1_biases(&linear.biases)
-            || linear.weight.dtype() != Dtype::Uint32
-            || !matches!(linear.scales.dtype(), Dtype::Float16 | Dtype::Bfloat16)
-            || !matches!(x.dtype(), Dtype::Float16 | Dtype::Bfloat16)
-        {
-            return false;
+    /// Promote each eligible dense projection independently. Logical MLP shapes
+    /// are validated first and every required row4 transform completes before
+    /// any parameter is replaced, so an error cannot leave a partially mutated
+    /// layer. Exact non-symmetric affine projections deliberately remain in
+    /// canonical storage and continue through [`QLinear::forward`].
+    fn promote_bonsai_row4(
+        &mut self,
+        layer_index: usize,
+    ) -> Result<BonsaiRow4Promotion, Exception> {
+        if self.is_moe {
+            return Err(Exception::custom(format!(
+                "layer {layer_index} uses MoE and cannot be promoted to dense Bonsai row4"
+            )));
         }
-        let [n_rows, k_packed] = *linear.weight.shape() else {
-            return false;
-        };
-        let [scale_rows, groups] = *linear.scales.shape() else {
-            return false;
-        };
-        let Some(k_dim) = k_packed.checked_mul(32) else {
-            return false;
-        };
-        let m_rows: i32 = x.shape().iter().take(x.ndim().saturating_sub(1)).product();
-        n_rows > 0
-            && n_rows % 4 == 0
-            && k_dim > 0
-            && k_dim % 128 == 0
-            && scale_rows == n_rows
-            && groups == k_dim / 128
-            && x.shape().last().copied() == Some(k_dim)
-            && (1..=5).contains(&m_rows)
-    }
+        let gate = self
+            .gate_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom(format!("layer {layer_index} gate_proj missing")))?;
+        let up = self
+            .up_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom(format!("layer {layer_index} up_proj missing")))?;
+        let down = self
+            .down_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom(format!("layer {layer_index} down_proj missing")))?;
 
-    fn materialize_tg_lut4_cache(
-        slot: &mut Option<crate::metal_kernel::BonsaiQ1Row4>,
-        linear: &QLinear,
-        projection: &'static str,
-    ) -> Result<(), Exception> {
-        if slot.is_none() {
-            let packed =
-                crate::metal_kernel::BonsaiQ1Row4::from_row_major(&linear.weight, &linear.scales)?;
-            tracing::info!(
-                projection,
-                cached_bytes = packed.cached_bytes(),
-                "materialized Bonsai Q1 TG-LUT4 row4 cache"
+        let gate_path = format!("layers.{layer_index}.mlp.gate_proj");
+        let up_path = format!("layers.{layer_index}.mlp.up_proj");
+        let down_path = format!("layers.{layer_index}.mlp.down_proj");
+        let (gate_shape, promote_gate) = gate.bonsai_row4_promotion_candidate(&gate_path)?;
+        let (up_shape, promote_up) = up.bonsai_row4_promotion_candidate(&up_path)?;
+        let (down_shape, promote_down) = down.bonsai_row4_promotion_candidate(&down_path)?;
+        if gate_shape != up_shape || down_shape != (gate_shape.1, gate_shape.0) {
+            return Err(Exception::custom(format!(
+                "layer {layer_index} dense MLP logical shapes are inconsistent: gate={gate_shape:?} up={up_shape:?} down={down_shape:?}; require gate==up [I,H] and down [H,I] in [out,in] order"
+            )));
+        }
+
+        // Prepare every eligible copy before installing the first one. This is
+        // the transactional boundary for both transform and allocation errors.
+        let gate_packed = promote_gate
+            .then(|| gate.prepare_bonsai_row4(&gate_path))
+            .transpose()?;
+        let up_packed = promote_up
+            .then(|| up.prepare_bonsai_row4(&up_path))
+            .transpose()?;
+        let down_packed = promote_down
+            .then(|| down.prepare_bonsai_row4(&down_path))
+            .transpose()?;
+        let projections = [
+            gate_packed.is_some(),
+            up_packed.is_some(),
+            down_packed.is_some(),
+        ]
+        .into_iter()
+        .filter(|promoted| *promoted)
+        .count();
+        let bytes = gate_packed
+            .as_ref()
+            .map_or(0, crate::metal_kernel::BonsaiQ1Row4::cached_bytes)
+            .saturating_add(
+                up_packed
+                    .as_ref()
+                    .map_or(0, crate::metal_kernel::BonsaiQ1Row4::cached_bytes),
+            )
+            .saturating_add(
+                down_packed
+                    .as_ref()
+                    .map_or(0, crate::metal_kernel::BonsaiQ1Row4::cached_bytes),
             );
-            *slot = Some(packed);
+
+        let (Some(gate), Some(up), Some(down)) = (
+            self.gate_proj.as_mut(),
+            self.up_proj.as_mut(),
+            self.down_proj.as_mut(),
+        ) else {
+            return Err(Exception::custom(
+                "dense MLP projections disappeared during row4 promotion",
+            ));
+        };
+        if let Some(packed) = gate_packed {
+            gate.install_bonsai_row4(packed);
         }
-        Ok(())
+        if let Some(packed) = up_packed {
+            up.install_bonsai_row4(packed);
+        }
+        if let Some(packed) = down_packed {
+            down.install_bonsai_row4(packed);
+        }
+        Ok(BonsaiRow4Promotion {
+            layers: usize::from(projections != 0),
+            projections,
+            bytes,
+        })
     }
 
-    fn dense_hidden_tg_lut4(&mut self, x: &Array) -> Result<Option<Array>, Exception> {
+    fn dense_hidden_tg_lut4(&self, x: &Array) -> Result<Option<Array>, Exception> {
+        if !Self::tg_lut4_enabled() {
+            return Ok(None);
+        }
         let gp = self
             .gate_proj
             .as_ref()
@@ -6419,58 +6633,41 @@ impl FfnBlock {
             .up_proj
             .as_ref()
             .ok_or_else(|| Exception::custom("dense up_proj missing"))?;
-        let cached_eligible = self
-            .tg_lut4_gate
-            .as_ref()
-            .is_some_and(|cache| Self::tg_lut4_enabled() && cache.accepts_input(x))
-            && self
-                .tg_lut4_up
-                .as_ref()
-                .is_some_and(|cache| cache.accepts_input(x));
-        let uncached_eligible = self.tg_lut4_gate.is_none()
-            && self.tg_lut4_up.is_none()
-            && Self::tg_lut4_projection_eligible(gp, x)
-            && Self::tg_lut4_projection_eligible(up, x);
-        if !cached_eligible && !uncached_eligible {
+        let (Some(gate_packed), Some(up_packed)) = (gp.bonsai_row4()?, up.bonsai_row4()?) else {
+            return Ok(None);
+        };
+        if !gate_packed.accepts_input(x) || !up_packed.accepts_input(x) {
             return Ok(None);
         }
-        Self::materialize_tg_lut4_cache(&mut self.tg_lut4_gate, gp, "gate_proj")?;
-        Self::materialize_tg_lut4_cache(&mut self.tg_lut4_up, up, "up_proj")?;
-        let gate = crate::metal_kernel::bonsai_q1_tg_lut4_qmm(
-            x,
-            self.tg_lut4_gate
-                .as_ref()
-                .ok_or_else(|| Exception::custom("TG-LUT4 gate cache missing"))?,
-        )?;
-        let up = crate::metal_kernel::bonsai_q1_tg_lut4_qmm(
-            x,
-            self.tg_lut4_up
-                .as_ref()
-                .ok_or_else(|| Exception::custom("TG-LUT4 up cache missing"))?,
-        )?;
+        let (gate, up) = if Self::tg_lut4_fused_mlp_enabled()
+            && gate_packed.accepts_fused_gate_up(x)
+            && up_packed.accepts_fused_gate_up(x)
+        {
+            crate::metal_kernel::bonsai_q1_tg_lut4_gate_up_view(x, gate_packed, up_packed)?
+        } else {
+            (
+                crate::metal_kernel::bonsai_q1_tg_lut4_qmm_view(x, gate_packed)?,
+                crate::metal_kernel::bonsai_q1_tg_lut4_qmm_view(x, up_packed)?,
+            )
+        };
         silu_mul(&gate, &up).map(Some)
     }
 
-    fn dense_down_tg_lut4(&mut self, x: &Array) -> Result<Option<Array>, Exception> {
+    fn dense_down_tg_lut4(&self, x: &Array) -> Result<Option<Array>, Exception> {
+        if !Self::tg_lut4_enabled() {
+            return Ok(None);
+        }
         let down = self
             .down_proj
             .as_ref()
             .ok_or_else(|| Exception::custom("dense down_proj missing"))?;
-        let eligible = self.tg_lut4_down.as_ref().map_or_else(
-            || Self::tg_lut4_projection_eligible(down, x),
-            |cache| Self::tg_lut4_enabled() && cache.accepts_input(x),
-        );
-        if !eligible {
+        let Some(packed) = down.bonsai_row4()? else {
+            return Ok(None);
+        };
+        if !packed.accepts_input(x) {
             return Ok(None);
         }
-        Self::materialize_tg_lut4_cache(&mut self.tg_lut4_down, down, "down_proj")?;
-        crate::metal_kernel::bonsai_q1_tg_lut4_qmm(
-            x,
-            self.tg_lut4_down
-                .as_ref()
-                .ok_or_else(|| Exception::custom("TG-LUT4 down cache missing"))?,
-        )
-        .map(Some)
+        crate::metal_kernel::bonsai_q1_tg_lut4_qmm_view(x, packed).map(Some)
     }
 
     fn dense_hidden_fused(&mut self, x: &Array, use_fused_gemv: bool) -> Result<Array, Exception> {
@@ -7452,6 +7649,17 @@ impl Qwen3NextCausalLM {
         })
     }
 
+    fn promote_bonsai_dense_mlps_to_row4(&mut self) -> Result<BonsaiRow4Promotion, Exception> {
+        let mut promoted = BonsaiRow4Promotion::default();
+        for (layer_index, layer) in self.model.layers.iter_mut().enumerate() {
+            let layer = layer.mlp.promote_bonsai_row4(layer_index)?;
+            promoted.layers = promoted.layers.saturating_add(layer.layers);
+            promoted.projections = promoted.projections.saturating_add(layer.projections);
+            promoted.bytes = promoted.bytes.saturating_add(layer.bytes);
+        }
+        Ok(promoted)
+    }
+
     /// Validate the narrow domain in which the `DFlash` block schedule reuses
     /// the same numerical primitives as repeated one-token decode.
     ///
@@ -7495,17 +7703,7 @@ impl Qwen3NextCausalLM {
             ));
         }
 
-        let validate_linear = |path: &str, linear: &QLinear| {
-            validate_dflash_q1_linear(
-                path,
-                &linear.weight,
-                &linear.scales,
-                &linear.biases,
-                linear.group_size,
-                linear.bits,
-                linear.mode,
-            )
-        };
+        let validate_linear = |path: &str, linear: &QLinear| validate_dflash_qlinear(path, linear);
         validate_dflash_q1_linear(
             "model.embed_tokens",
             &self.model.embed_tokens.weight,
@@ -10087,6 +10285,13 @@ fn qwen3_5_mixed_ba_quantization_layers(
 /// Reads `text_config` for model args, strips `language_model.` prefix from
 /// safetensors weight keys. Unlike [`load_qwen3_5_moe_model`], does NOT force
 /// `decoder_sparse_step=1` or attempt `MoE` gate fusion.
+///
+/// With `HIGGS_BONSAI_TG_LUT4=1`, eligible dense Q1 MLP parameters are
+/// rewritten in place to Higgs' physical row4 inference layout. The resulting
+/// parameter tree is authoritative for inference, but generic
+/// `ModuleParametersExt::save_safetensors` output is not a canonical MLX
+/// checkpoint. Export requires an explicit row4-to-canonical demotion (not yet
+/// provided), or a separately loaded canonical model instance.
 pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let mut args = load_qwen3_5_moe_text_config_args(model_path)?;
@@ -10129,6 +10334,22 @@ pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausa
                 "Re-quantized Dense GDN projections to 8-bit affine (load-time optimization)"
             );
         }
+    }
+    if FfnBlock::tg_lut4_enabled() {
+        // Row4 promotion eagerly evaluates each packed copy so the canonical
+        // checkpoint buffers can be released immediately. Model loading is
+        // normally called before the engine acquires its long-lived MLX token,
+        // while tests and embedding callers may already hold one. Acquire only
+        // for the former case: the process-global gate is deliberately not
+        // reentrant.
+        let _promotion_exec = (!crate::mlx_exec::held()).then(crate::mlx_exec::acquire);
+        let promoted = model.promote_bonsai_dense_mlps_to_row4()?;
+        tracing::info!(
+            layers = promoted.layers,
+            projections = promoted.projections,
+            resident_bytes = promoted.bytes,
+            "Promoted dense Bonsai MLP parameters to primary row4 storage"
+        );
     }
     tracing::info!("Qwen3.5 dense model loaded successfully");
     Ok(model)
@@ -10221,6 +10442,7 @@ fn requant_one_to_8bit(ql: &mut QLinear) -> Result<(), ModelError> {
     ql.group_size = 64;
     ql.bits = 8;
     ql.mode = crate::quant_mode::QuantMode::Affine;
+    ql.reset_weight_layout();
     Ok(())
 }
 
@@ -11447,39 +11669,354 @@ mod tests {
         assert_shape_exact(&transposed, "Q1 non-row-contiguous input");
     }
 
-    #[test]
-    fn dense_tg_lut4_selection_is_strictly_opt_in() {
-        const N: i32 = 8;
-        const K: i32 = 256;
+    fn row4_fixture_linear(n_rows: i32, k_dim: i32, salt: u32) -> QLinear {
         let mut linear = QLinear::new(128, 1).unwrap();
         linear.weight = Param::new(Array::from_slice(
-            &(0..N * K / 32)
-                .map(|index| u32::try_from(index).unwrap())
+            &(0..n_rows * k_dim / 32)
+                .map(|index| {
+                    u32::try_from(index)
+                        .unwrap()
+                        .wrapping_mul(0x9e37_79b9)
+                        .wrapping_add(salt)
+                })
                 .collect::<Vec<_>>(),
-            &[N, K / 32],
+            &[n_rows, k_dim / 32],
         ));
         linear.scales = Param::new(
             Array::from_slice(
-                &(0..N * K / 128)
-                    .map(|index| 0.125 + index as f32 * 0.007_812_5)
+                &(0..n_rows * k_dim / 128)
+                    .map(|index| 0.125 + (index.rem_euclid(17) as f32) * 0.007_812_5)
                     .collect::<Vec<_>>(),
-                &[N, K / 128],
+                &[n_rows, k_dim / 128],
             )
             .as_dtype(Dtype::Bfloat16)
             .unwrap(),
         );
         linear.biases = Param::new(symmetric_q1_bias_sentinel());
-        let input = Array::ones::<f32>(&[1, 5, K])
+        linear
+    }
+
+    fn exceptional_affine_q1_linear(n_rows: i32, k_dim: i32, salt: u32) -> QLinear {
+        const FP16_MIN_SUBNORMAL: f32 = 5.960_464_5e-8;
+        let mut linear = row4_fixture_linear(n_rows, k_dim, salt);
+        let count = (n_rows * k_dim / 128) as usize;
+        let mut scales = vec![0.25_f32; count];
+        let mut biases = vec![-0.125_f32; count];
+        // The stored F16 bias differs from the unrounded `-scale / 2` by
+        // exactly half an F16 subnormal. This models Bonsai-27B layer 31's
+        // down projection and must remain an exact affine projection.
+        // Actual checkpoint pattern: 223 * min-subnormal divided by two is
+        // exactly halfway between representable F16 values, so round-to-even
+        // stores -112 * min-subnormal rather than the kernel's unrounded
+        // Float32 value of -111.5 * min-subnormal.
+        scales[count - 1] = 223.0 * FP16_MIN_SUBNORMAL;
+        biases[count - 1] = -112.0 * FP16_MIN_SUBNORMAL;
+        linear.scales = Param::new(
+            Array::from_slice(&scales, &[n_rows, k_dim / 128])
+                .as_dtype(Dtype::Float16)
+                .unwrap(),
+        );
+        linear.biases = Param::new(
+            Array::from_slice(&biases, &[n_rows, k_dim / 128])
+                .as_dtype(Dtype::Float16)
+                .unwrap(),
+        );
+        linear
+    }
+
+    #[test]
+    fn dense_row4_promotion_installs_primary_parameter_shapes() {
+        let _exec = crate::mlx_exec::acquire();
+        let args = minimal_qwen3_next_args();
+        let mut block = FfnBlock::new_dense(&args, "fixture.mlp").unwrap();
+        block.gate_proj = Some(row4_fixture_linear(128, 256, 1));
+        block.up_proj = Some(row4_fixture_linear(128, 256, 2));
+        block.down_proj = Some(row4_fixture_linear(256, 128, 3));
+
+        let promoted = block.promote_bonsai_row4(7).unwrap();
+        assert_eq!(promoted.layers, 1);
+        assert_eq!(promoted.projections, 3);
+        assert!(promoted.bytes > 0);
+        for (name, projection, weight_shape, scale_shape) in [
+            (
+                "gate",
+                block.gate_proj.as_ref().unwrap(),
+                &[32, 2, 4, 4][..],
+                &[32, 2, 4][..],
+            ),
+            (
+                "up",
+                block.up_proj.as_ref().unwrap(),
+                &[32, 2, 4, 4][..],
+                &[32, 2, 4][..],
+            ),
+            (
+                "down",
+                block.down_proj.as_ref().unwrap(),
+                &[64, 1, 4, 4][..],
+                &[64, 1, 4][..],
+            ),
+        ] {
+            assert_eq!(projection.weight.shape(), weight_shape, "{name} weight");
+            assert_eq!(projection.scales.shape(), scale_shape, "{name} scales");
+            assert!(projection.bonsai_row4().unwrap().is_some(), "{name} layout");
+            validate_dflash_qlinear(name, projection).unwrap();
+        }
+        assert_eq!(
+            block.promote_bonsai_row4(7).unwrap(),
+            BonsaiRow4Promotion::default()
+        );
+    }
+
+    #[test]
+    fn dense_row4_exceptional_affine_down_stays_canonical_and_exact() {
+        let _exec = crate::mlx_exec::acquire();
+        let args = minimal_qwen3_next_args();
+        let mut block = FfnBlock::new_dense(&args, "fixture.mlp").unwrap();
+        block.gate_proj = Some(row4_fixture_linear(128, 256, 31));
+        block.up_proj = Some(row4_fixture_linear(128, 256, 32));
+        block.down_proj = Some(exceptional_affine_q1_linear(256, 128, 33));
+        let mut canonical = block.clone();
+
+        let expected_bytes = [&block.gate_proj, &block.up_proj]
+            .into_iter()
+            .map(|projection| {
+                let projection = projection.as_ref().unwrap();
+                projection.weight.nbytes() + projection.scales.nbytes()
+            })
+            .sum::<usize>();
+        assert!(
+            !q1_biases_are_symmetric(
+                &block.down_proj.as_ref().unwrap().scales,
+                &block.down_proj.as_ref().unwrap().biases,
+            )
+            .unwrap(),
+            "half-subnormal exception must not compact as symmetric"
+        );
+
+        let promoted = block.promote_bonsai_row4(31).unwrap();
+        assert_eq!(
+            promoted,
+            BonsaiRow4Promotion {
+                layers: 1,
+                projections: 2,
+                bytes: expected_bytes,
+            }
+        );
+        for (name, projection) in [
+            ("gate", block.gate_proj.as_ref().unwrap()),
+            ("up", block.up_proj.as_ref().unwrap()),
+        ] {
+            assert!(projection.bonsai_row4().unwrap().is_some(), "{name}");
+            validate_dflash_qlinear(name, projection).unwrap();
+        }
+        let down = block.down_proj.as_ref().unwrap();
+        assert!(matches!(down.weight_layout, QLinearWeightLayout::Canonical));
+        assert!(down.bonsai_row4().unwrap().is_none());
+        assert!(down.biases.size() > 0);
+        validate_dflash_qlinear("down", down).unwrap();
+
+        for rows in [1_i32, 5, 6, 9] {
+            let input = Array::from_slice(
+                &(0..rows * 256)
+                    .map(|index| ((index * 17 + rows * 3).rem_euclid(61) - 30) as f32 * 0.007_812_5)
+                    .collect::<Vec<_>>(),
+                &[1, rows, 256],
+            )
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+            let expected = canonical.forward(&input).unwrap();
+            let actual = block.forward(&input).unwrap();
+            assert_canonical_array_exact(
+                &format!("mixed row4/affine dense MLP M={rows}"),
+                &actual,
+                &expected,
+            );
+        }
+
+        assert_eq!(
+            block.promote_bonsai_row4(31).unwrap(),
+            BonsaiRow4Promotion::default(),
+            "second promotion must accept the mixed steady state"
+        );
+    }
+
+    #[test]
+    fn promoted_row4_parameter_replacement_is_authoritative_and_fails_closed() {
+        let _exec = crate::mlx_exec::acquire();
+        const N: i32 = 8;
+        const K: i32 = 256;
+
+        let input = Array::from_slice(
+            &(0..5 * K)
+                .map(|index| ((index * 13 + 7).rem_euclid(43) - 21) as f32 * 0.015_625)
+                .collect::<Vec<_>>(),
+            &[1, 5, K],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let mut promoted = row4_fixture_linear(N, K, 19);
+        let packed = promoted.prepare_bonsai_row4("fixture").unwrap();
+        promoted.install_bonsai_row4(packed);
+
+        let f32_bits = |array: &Array| {
+            let values = array.as_dtype(Dtype::Float32).unwrap();
+            values.eval().unwrap();
+            values
+                .as_slice::<f32>()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        let baseline = promoted.forward(&input).unwrap();
+
+        // Replace the authoritative Param with a same-shaped row4 buffer. A
+        // stale layout-owned handle would keep producing `baseline`; rebuilding
+        // a borrowed view must instead observe this replacement immediately.
+        let weight_shape = promoted.weight.shape().to_vec();
+        let weight_len = weight_shape.iter().product::<i32>() as usize;
+        promoted.weight = Param::new(Array::from_slice(&vec![0_u32; weight_len], &weight_shape));
+        let fresh_weight_view = promoted.bonsai_row4().unwrap().unwrap();
+        let direct_after_weight =
+            crate::metal_kernel::bonsai_q1_tg_lut4_qmm_view(&input, fresh_weight_view).unwrap();
+        let forward_after_weight = promoted.forward(&input).unwrap();
+        assert_canonical_array_exact(
+            "same-shaped row4 weight replacement",
+            &forward_after_weight,
+            &direct_after_weight,
+        );
+        assert_ne!(
+            f32_bits(&forward_after_weight),
+            f32_bits(&baseline),
+            "forward retained a stale pre-replacement weight handle"
+        );
+
+        // Replacing the scales is authoritative too. Zero scales give an exact
+        // zero result, which cannot be explained by either old resident array.
+        let scale_shape = promoted.scales.shape().to_vec();
+        promoted.scales = Param::new(
+            Array::zeros::<f32>(&scale_shape)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+        let fresh_scale_view = promoted.bonsai_row4().unwrap().unwrap();
+        let direct_after_scales =
+            crate::metal_kernel::bonsai_q1_tg_lut4_qmm_view(&input, fresh_scale_view).unwrap();
+        let forward_after_scales = promoted.forward(&input).unwrap();
+        assert_canonical_array_exact(
+            "same-shaped row4 scale replacement",
+            &forward_after_scales,
+            &direct_after_scales,
+        );
+        let expected_zero = Array::zeros::<f32>(&[1, 5, N])
             .unwrap()
             .as_dtype(Dtype::Bfloat16)
             .unwrap();
+        assert_canonical_array_exact(
+            "zero replacement scales",
+            &forward_after_scales,
+            &expected_zero,
+        );
+        validate_dflash_qlinear("fixture", &promoted).unwrap();
 
-        assert!(FfnBlock::tg_lut4_projection_eligible_when(
-            true, &linear, &input
-        ));
-        assert!(!FfnBlock::tg_lut4_projection_eligible_when(
-            false, &linear, &input
-        ));
+        // A same-shaped but wrong-dtype parameter replacement cannot satisfy
+        // the physical row4 contract and must fail before any kernel dispatch.
+        promoted.weight = Param::new(
+            Array::zeros::<f32>(&weight_shape)
+                .unwrap()
+                .as_dtype(Dtype::Float16)
+                .unwrap(),
+        );
+        assert!(promoted.bonsai_row4().is_err());
+        assert!(promoted.forward(&input).is_err());
+        assert!(validate_dflash_qlinear("fixture", &promoted).is_err());
+    }
+
+    #[test]
+    fn dense_row4_promotion_rejection_is_atomic() {
+        let _exec = crate::mlx_exec::acquire();
+        let args = minimal_qwen3_next_args();
+        let mut block = FfnBlock::new_dense(&args, "fixture.mlp").unwrap();
+        block.gate_proj = Some(row4_fixture_linear(128, 256, 1));
+        block.up_proj = Some(row4_fixture_linear(256, 256, 2));
+        block.down_proj = Some(row4_fixture_linear(256, 128, 3));
+
+        let before = [
+            block.gate_proj.as_ref().unwrap().weight.shape().to_vec(),
+            block.up_proj.as_ref().unwrap().weight.shape().to_vec(),
+            block.down_proj.as_ref().unwrap().weight.shape().to_vec(),
+        ];
+        assert!(block.promote_bonsai_row4(9).is_err());
+        for (projection, expected_shape) in [
+            block.gate_proj.as_ref().unwrap(),
+            block.up_proj.as_ref().unwrap(),
+            block.down_proj.as_ref().unwrap(),
+        ]
+        .into_iter()
+        .zip(before)
+        {
+            assert!(matches!(
+                &projection.weight_layout,
+                QLinearWeightLayout::Canonical
+            ));
+            assert_eq!(projection.weight.shape(), expected_shape);
+        }
+    }
+
+    #[test]
+    fn promoted_row4_m6_wide_prefill_and_clone_match_canonical() {
+        let _exec = crate::mlx_exec::acquire();
+        const N: i32 = 8;
+        const K: i32 = 256;
+        let canonical = row4_fixture_linear(N, K, 11);
+        let input = Array::from_slice(
+            &(0..6 * K)
+                .map(|index| ((index * 7 + 5).rem_euclid(37) - 18) as f32 * 0.015_625)
+                .collect::<Vec<_>>(),
+            &[1, 6, K],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let expected = canonical.forward(&input).unwrap();
+
+        let mut promoted = canonical.clone();
+        let packed = promoted.prepare_bonsai_row4("fixture").unwrap();
+        promoted.install_bonsai_row4(packed);
+        let cloned = promoted.clone();
+        let actual = promoted.forward(&input).unwrap();
+        let cloned_actual = cloned.forward(&input).unwrap();
+        assert_canonical_array_exact("promoted row4 M6 TG-LUT4", &actual, &expected);
+        assert_canonical_array_exact("cloned promoted row4", &cloned_actual, &expected);
+
+        let prefill_rows = 9;
+        let prefill = Array::from_slice(
+            &(0..prefill_rows * K)
+                .map(|index| ((index * 5 + 9).rem_euclid(41) - 20) as f32 * 0.015_625)
+                .collect::<Vec<_>>(),
+            &[1, prefill_rows, K],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let expected_prefill = canonical.forward(&prefill).unwrap();
+        let actual_prefill = promoted.forward(&prefill).unwrap();
+        assert_canonical_array_exact(
+            "promoted row4 direct-dequant prefill",
+            &actual_prefill,
+            &expected_prefill,
+        );
+
+        let narrow = Array::ones::<f32>(&[1, 5, K])
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        assert!(
+            promoted
+                .bonsai_row4()
+                .unwrap()
+                .unwrap()
+                .accepts_input(&narrow)
+        );
     }
 
     #[test]
@@ -16000,6 +16537,7 @@ mod tests {
                 group_size: gs,
                 bits,
                 mode: crate::quant_mode::QuantMode::Affine,
+                weight_layout: QLinearWeightLayout::Canonical,
             }
         };
 
@@ -16016,6 +16554,7 @@ mod tests {
                 group_size: gs,
                 bits,
                 mode: crate::quant_mode::QuantMode::Affine,
+                weight_layout: QLinearWeightLayout::Canonical,
             }
         };
 
