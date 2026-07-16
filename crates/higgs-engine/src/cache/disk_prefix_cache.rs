@@ -337,7 +337,8 @@ impl DiskPrefixCache {
                 return None;
             }
         };
-        self.memory.store(prefix_tokens, &cache);
+        self.memory
+            .store_disk_refresh_preserving_pair(prefix_tokens, &cache);
         Some(PagedPrefixMatch {
             prefix_len: snapshot.token_count,
             cache,
@@ -818,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_target_disk_refresh_cannot_reuse_same_key_paired_metadata() {
+    fn same_key_disk_refresh_preserves_the_memory_paired_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
@@ -828,10 +829,10 @@ mod tests {
         let tokens = vec![7];
         let cache = make_kv_cache(1, 1);
         let mut prefix_cache = DiskPrefixCache::new(8, 1, config, 2, 4).unwrap();
+        prefix_cache.store(&tokens, &cache, Some("paired"));
         prefix_cache
             .store_paired(&tokens, &cache, dflash_snapshot(1), Some("paired"))
             .unwrap();
-        prefix_cache.store(&tokens, &cache, Some("paired"));
 
         let candidate = prefix_cache
             .find_disk_prefix_candidate(&tokens, Some("paired"), 0)
@@ -841,8 +842,8 @@ mod tests {
             .expect("forced target-only refresh should load");
 
         assert!(
-            find_memory_pair(&mut prefix_cache, &tokens).is_none(),
-            "refreshed disk/target state must never be combined with an older drafter snapshot"
+            find_memory_pair(&mut prefix_cache, &tokens).is_some(),
+            "a trusted same-key disk refresh must not erase paired endpoint metadata"
         );
     }
 

@@ -8989,10 +8989,10 @@ mod tests {
     }
 
     #[test]
-    fn dspark_radix_publish_boundary_is_exact_for_hybrid_and_dense() {
+    fn dspark_radix_publish_boundary_uses_each_existing_target_storage_path() {
         assert_eq!(SimpleEngine::dflash_pair_boundary(37, true), 37);
-        assert_eq!(SimpleEngine::dflash_pair_boundary(37, false), 37);
-        assert_eq!(SimpleEngine::dflash_pair_boundary(15, false), 15);
+        assert_eq!(SimpleEngine::dflash_pair_boundary(37, false), 32);
+        assert_eq!(SimpleEngine::dflash_pair_boundary(15, false), 0);
     }
 
     #[test]
