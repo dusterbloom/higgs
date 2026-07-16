@@ -370,25 +370,58 @@ impl AnyCache {
     /// boundary snapshot must remain independent of the suffix/decode forwards
     /// that continue mutating the live cache.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn deep_clone(&self) -> Self {
+        self.try_deep_clone()
+            .expect("device copy failed for cache checkpoint")
+    }
+
+    /// Fallible independent device-side copy for retained/prefix snapshots.
+    pub fn try_deep_clone(&self) -> Result<Self, Exception> {
         match self {
-            Self::KV(layers) => Self::KV(
+            Self::KV(layers) => Ok(Self::KV(
                 layers
                     .iter()
-                    .map(|l| l.as_ref().map(cache::SteppingKeyValueCache::deep_clone))
-                    .collect(),
-            ),
-            Self::Hybrid(layers) => Self::Hybrid(
-                layers
-                    .iter()
-                    .map(|l| {
-                        l.as_ref().map(|lc| match lc {
-                            LayerCache::KV(kv) => LayerCache::KV(kv.deep_clone()),
-                            LayerCache::Arrays(a) => LayerCache::Arrays(a.deep_clone()),
-                        })
+                    .map(|layer| {
+                        layer
+                            .as_ref()
+                            .map(cache::SteppingKeyValueCache::try_deep_clone)
+                            .transpose()
                     })
-                    .collect(),
-            ),
+                    .collect::<Result<Vec<_>, Exception>>()?,
+            )),
+            Self::Hybrid(layers) => Ok(Self::Hybrid(
+                layers
+                    .iter()
+                    .map(|layer| {
+                        layer
+                            .as_ref()
+                            .map(|cache| match cache {
+                                LayerCache::KV(kv) => kv.try_deep_clone().map(LayerCache::KV),
+                                LayerCache::Arrays(arrays) => {
+                                    arrays.try_deep_clone().map(LayerCache::Arrays)
+                                }
+                            })
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, Exception>>()?,
+            )),
+        }
+    }
+
+    /// Estimated device bytes retained by all cache arrays.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::KV(layers) => layers.iter().flatten().fold(0usize, |total, cache| {
+                total.saturating_add(cache.estimated_bytes())
+            }),
+            Self::Hybrid(layers) => layers.iter().flatten().fold(0usize, |total, cache| {
+                total.saturating_add(match cache {
+                    LayerCache::KV(kv) => kv.estimated_bytes(),
+                    LayerCache::Arrays(arrays) => arrays.estimated_bytes(),
+                })
+            }),
         }
     }
 
@@ -411,15 +444,37 @@ impl AnyCache {
 
 impl qwen3_next::ArraysCache {
     /// Independent copy of recurrent Hybrid state for cross-turn cache storage.
-    /// Device-side copy — see [`cache::eval_deep_clone`].
+    /// Device-side copy — see [`cache::try_eval_deep_clone`].
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn deep_clone(&self) -> Self {
-        Self {
-            conv_state: self.conv_state.as_ref().map(cache::eval_deep_clone),
-            ssm_state: self.ssm_state.as_ref().map(cache::eval_deep_clone),
+        self.try_deep_clone()
+            .expect("device copy failed for recurrent cache checkpoint")
+    }
+
+    pub fn try_deep_clone(&self) -> Result<Self, Exception> {
+        Ok(Self {
+            conv_state: self
+                .conv_state
+                .as_ref()
+                .map(cache::try_eval_deep_clone)
+                .transpose()?,
+            ssm_state: self
+                .ssm_state
+                .as_ref()
+                .map(cache::try_eval_deep_clone)
+                .transpose()?,
             conv_pos: self.conv_pos,
             offset: self.offset,
-        }
+        })
+    }
+
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        self.conv_state
+            .as_ref()
+            .map_or(0, mlx_rs::Array::nbytes)
+            .saturating_add(self.ssm_state.as_ref().map_or(0, mlx_rs::Array::nbytes))
     }
 }
 
@@ -2319,6 +2374,41 @@ mod tests {
     fn any_cache_hybrid_variant() {
         let cache = AnyCache::Hybrid(Vec::new());
         assert!(matches!(cache, AnyCache::Hybrid(_)));
+    }
+
+    #[test]
+    fn arrays_cache_deep_clone_materializes_both_recurrent_states() {
+        let _exec = crate::mlx_exec::acquire();
+        let live = qwen3_next::ArraysCache {
+            conv_state: Some(
+                Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4])
+                    .as_dtype(mlx_rs::Dtype::Float16)
+                    .unwrap(),
+            ),
+            ssm_state: Some(Array::from_slice(&[5.0_f32, 6.0, 7.0, 8.0], &[1, 2, 2])),
+            conv_pos: 3,
+            offset: 11,
+        };
+        let checkpoint = live.try_deep_clone().unwrap();
+
+        assert_eq!(checkpoint.conv_pos, live.conv_pos);
+        assert_eq!(checkpoint.offset, live.offset);
+        let live_conv = live.conv_state.as_ref().unwrap();
+        let copied_conv = checkpoint.conv_state.as_ref().unwrap();
+        assert_eq!(copied_conv.dtype(), live_conv.dtype());
+        assert_eq!(copied_conv.shape(), live_conv.shape());
+        assert_ne!(
+            copied_conv.as_slice::<half::f16>().as_ptr(),
+            live_conv.as_slice::<half::f16>().as_ptr()
+        );
+
+        let live_ssm = live.ssm_state.as_ref().unwrap();
+        let copied_ssm = checkpoint.ssm_state.as_ref().unwrap();
+        assert_eq!(copied_ssm.as_slice::<f32>(), live_ssm.as_slice::<f32>());
+        assert_ne!(
+            copied_ssm.as_slice::<f32>().as_ptr(),
+            live_ssm.as_slice::<f32>().as_ptr()
+        );
     }
 
     fn kv_cache_at(offset: i32) -> cache::SteppingKeyValueCache {

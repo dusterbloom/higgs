@@ -18,7 +18,7 @@ use crate::cache::disk_storage::{
 use crate::cache::paired::PairedCacheError;
 use crate::paged_prefix_cache::{
     PagedPairedLookupPlan, PagedPrefixCache, PagedPrefixMatch, PairedPrefixCacheStats,
-    PreparedPairedPrefix,
+    PairedPrepareTicket, PairedTouchToken, PreparedPairedPrefix,
 };
 
 pub const DEFAULT_MIN_TOKENS_TO_PERSIST: usize = 512;
@@ -119,10 +119,24 @@ impl DiskPrefixCache {
     /// dFlash snapshots are deliberately never persisted, so this method must
     /// not fall back to the target-only disk index.
     pub(crate) fn plan_memory_paired_prefix(
-        &mut self,
+        &self,
         tokens: &[u32],
     ) -> Result<Option<PagedPairedLookupPlan>, PairedCacheError> {
         self.memory.plan_longest_paired_prefix(tokens)
+    }
+
+    #[must_use]
+    pub(crate) const fn paired_store_boundary(requested: usize, is_hybrid: bool) -> usize {
+        PagedPrefixCache::paired_store_boundary(requested, is_hybrid)
+    }
+
+    #[must_use]
+    pub(crate) const fn paired_prepare_ticket(&self) -> PairedPrepareTicket {
+        self.memory.paired_prepare_ticket()
+    }
+
+    pub(crate) fn touch_memory_paired(&mut self, token: PairedTouchToken) -> bool {
+        self.memory.touch_paired(token)
     }
 
     pub fn find_disk_prefix_candidate(
@@ -192,12 +206,12 @@ impl DiskPrefixCache {
     /// First-release dSpark state is memory-only. Ordinary target-only stores
     /// retain their existing disk behavior through [`Self::store`].
     pub(crate) fn prepare_memory_paired_prefix(
-        block_size: usize,
+        ticket: PairedPrepareTicket,
         prefix_tokens: &[u32],
         cache: &AnyCache,
         snapshot: DFlashSnapshot,
     ) -> Result<PreparedPairedPrefix, PairedCacheError> {
-        PagedPrefixCache::prepare_paired_prefix(block_size, prefix_tokens, cache, snapshot)
+        PagedPrefixCache::prepare_paired_prefix(ticket, prefix_tokens, cache, snapshot)
     }
 
     /// Commit a fully prepared memory pair using only ownership/trie mutation.
@@ -216,9 +230,9 @@ impl DiskPrefixCache {
         snapshot: DFlashSnapshot,
         _checkpoint_id: Option<&str>,
     ) -> Result<(), PairedCacheError> {
+        let ticket = self.paired_prepare_ticket();
         let _exec = higgs_models::mlx_exec::acquire();
-        let prepared =
-            Self::prepare_memory_paired_prefix(self.block_size, prefix_tokens, cache, snapshot)?;
+        let prepared = Self::prepare_memory_paired_prefix(ticket, prefix_tokens, cache, snapshot)?;
         self.commit_memory_paired_prefix(prepared)
     }
 
@@ -621,10 +635,17 @@ mod tests {
     fn find_memory_pair(
         cache: &mut DiskPrefixCache,
         tokens: &[u32],
-    ) -> Option<crate::paged_prefix_cache::PagedPairedPrefixMatch> {
+    ) -> Option<crate::paged_prefix_cache::MaterializedPairedPrefix> {
         let plan = cache.plan_memory_paired_prefix(tokens).unwrap()?;
-        let _exec = higgs_models::mlx_exec::acquire();
-        Some(plan.materialize().unwrap())
+        let (matched, touch) = {
+            let _exec = higgs_models::mlx_exec::acquire();
+            plan.materialize().unwrap().into_materialized_and_touch()
+        };
+        assert!(
+            cache.touch_memory_paired(touch),
+            "successful paired materialization must refresh memory LRU"
+        );
+        Some(matched)
     }
 
     #[test]
@@ -687,9 +708,11 @@ mod tests {
         let tokens = vec![7];
         let target = make_kv_cache(1, 1);
         let snapshot = dflash_snapshot(1);
+        let ticket = cache.paired_prepare_ticket();
         let prepared = {
             let _exec = higgs_models::mlx_exec::acquire();
-            DiskPrefixCache::prepare_memory_paired_prefix(1, &tokens, &target, snapshot).unwrap()
+            DiskPrefixCache::prepare_memory_paired_prefix(ticket, &tokens, &target, snapshot)
+                .unwrap()
         };
         assert!(!higgs_models::mlx_exec::held());
         cache.commit_memory_paired_prefix(prepared).unwrap();
@@ -704,7 +727,7 @@ mod tests {
 
         cache.memory.clear();
         let _exec = higgs_models::mlx_exec::acquire();
-        let matched = plan.materialize().unwrap();
+        let (matched, _touch) = plan.materialize().unwrap().into_materialized_and_touch();
         assert_eq!(matched.prefix_len, 1);
         assert_eq!(matched.dflash_cache.position(), 1);
     }
@@ -766,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_persistence_failure_leaves_the_paired_memory_entry_intact() {
+    fn target_refresh_demotes_pair_even_when_disk_persistence_fails() {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
@@ -783,8 +806,8 @@ mod tests {
         prefix_cache.store(&tokens, &cache, Some("paired"));
 
         assert!(
-            find_memory_pair(&mut prefix_cache, &tokens).is_some(),
-            "the already-published pair must survive a disk capacity failure"
+            find_memory_pair(&mut prefix_cache, &tokens).is_none(),
+            "a target-only refresh must demote speculative continuity regardless of disk outcome"
         );
         assert!(
             prefix_cache
@@ -795,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_target_disk_refresh_preserves_same_key_paired_metadata() {
+    fn forced_target_disk_refresh_cannot_reuse_same_key_paired_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
@@ -817,10 +840,10 @@ mod tests {
             .load_disk_prefix_candidate(&tokens, candidate)
             .expect("forced target-only refresh should load");
 
-        let paired = find_memory_pair(&mut prefix_cache, &tokens)
-            .expect("same-key target refresh must preserve paired metadata");
-        assert_eq!(paired.prefix_len, 1);
-        assert_eq!(paired.dflash_cache.position(), 1);
+        assert!(
+            find_memory_pair(&mut prefix_cache, &tokens).is_none(),
+            "refreshed disk/target state must never be combined with an older drafter snapshot"
+        );
     }
 
     #[test]

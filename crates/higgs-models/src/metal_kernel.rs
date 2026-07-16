@@ -103,6 +103,141 @@ fn cstr_vec(names: &[&CStr]) -> mlx_sys::mlx_vector_string {
 }
 
 // ---------------------------------------------------------------------------
+// Materializing device copy.
+//
+// MLX 0.30.6's `mlx_copy` is a copy-on-write alias: evaluation calls
+// `copy_shared_buffer`, so a small view can keep a much larger backing
+// allocation alive. A FastMetal custom-kernel output has a stronger backend
+// contract: `CustomKernel::eval_gpu` unconditionally allocates
+// `allocator::malloc(out.nbytes())` before dispatch and has no donation path.
+// This per-element identity assignment therefore preserves dtype bits while
+// guaranteeing fresh, logical-size device storage.
+// ---------------------------------------------------------------------------
+
+const MATERIALIZED_COPY_KERNEL_SOURCE: &str = r"
+uint elem = thread_position_in_grid.x;
+dst[elem] = src[elem];
+";
+
+fn create_materialized_copy_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"src"]);
+    let out_vec = cstr_vec(&[c"dst"]);
+    let source = CString::new(MATERIALIZED_COPY_KERNEL_SOURCE).unwrap_or_default();
+    #[allow(unsafe_code)]
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_materialized_device_copy".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,  // linear indexing requires row-contiguous input
+            false, // atomic_outputs
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+static MATERIALIZED_COPY_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+/// Copy `src` into independent, compact device storage without a host roundtrip.
+///
+/// Unlike `mlx_copy` under the pinned MLX 0.30.6 backend, FastMetal custom
+/// outputs cannot alias or donate an input buffer: the backend allocates
+/// exactly `out.nbytes()` before running this bit-preserving identity kernel.
+#[allow(unsafe_code)]
+pub(crate) fn materialized_device_copy(src: &Array) -> Result<Array, Exception> {
+    if src.size() == 0 {
+        let empty = mlx_rs::ops::zeros_dtype(src.shape(), src.dtype())?;
+        let _token = (!crate::mlx_exec::held()).then(crate::mlx_exec::acquire);
+        crate::mlx_exec::eval([&empty])?;
+        return Ok(empty);
+    }
+
+    let element_count = i32::try_from(src.size()).map_err(|_| {
+        Exception::custom("materialized device copy exceeds Metal's i32 grid limit")
+    })?;
+    ensure_ffi_error_handler();
+
+    let stream = Stream::task_local_or_default();
+    let result = unsafe {
+        let dtype = mlx_sys::mlx_array_dtype(src.as_ptr());
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        let thread_count = element_count.min(256);
+        let config_status =
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+                config,
+                c"T".as_ptr(),
+                dtype,
+            ) | mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, element_count, 1, 1)
+                | mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(
+                    config,
+                    thread_count,
+                    1,
+                    1,
+                )
+                | mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+                    config,
+                    src.shape().as_ptr(),
+                    src.shape().len(),
+                    dtype,
+                );
+
+        if config_status != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            return Err(Exception::custom(format!(
+                "configure materialized device copy failed: {}",
+                take_last_error()
+            )));
+        }
+
+        let cached = MATERIALIZED_COPY_KERNEL
+            .get_or_init(|| CachedMetalKernel(create_materialized_copy_kernel()));
+        let input_ptrs = [src.as_ptr()];
+        let inputs_vec = mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len());
+        let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+        let status = mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        );
+
+        let result = if status != 0 {
+            Err(Exception::custom(format!(
+                "materialized device copy failed: {}",
+                take_last_error()
+            )))
+        } else {
+            let mut output_ptr = mlx_sys::mlx_array_new();
+            let get_status = mlx_sys::mlx_vector_array_get(&raw mut output_ptr, outputs_vec, 0);
+            if get_status == 0 {
+                Ok(Array::from_ptr(output_ptr))
+            } else {
+                mlx_sys::mlx_array_free(output_ptr);
+                Err(Exception::custom(format!(
+                    "read materialized device copy output failed: {}",
+                    take_last_error()
+                )))
+            }
+        };
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        result
+    };
+
+    let result = result?;
+    let _token = (!crate::mlx_exec::held()).then(crate::mlx_exec::acquire);
+    crate::mlx_exec::eval([&result])?;
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
 // Fused 1-bit quantized matvec (decode hot path).
 //
 // y = x @ dequant(W).T  for a single token (M = 1).

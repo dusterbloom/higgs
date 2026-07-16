@@ -1,5 +1,7 @@
 //! Correct-by-construction ownership for target/dSpark retained state.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use higgs_models::{
@@ -65,6 +67,148 @@ pub(crate) enum PairedCacheError {
     DFlashFork { details: String },
     #[error("failed to materialize retained target state: {details}")]
     TargetMaterialization { details: String },
+    #[error(
+        "prepared paired prefix belongs to cache instance {prepared}, current instance is {current}"
+    )]
+    ForeignCacheInstance { prepared: u64, current: u64 },
+    #[error("prepared paired prefix belongs to cache epoch {prepared}, current epoch is {current}")]
+    StaleEpoch { prepared: u64, current: u64 },
+    #[error(
+        "prepared paired prefix belongs to cache publication revision {prepared}, current revision is {current}"
+    )]
+    StaleRevision { prepared: u64, current: u64 },
+}
+
+/// Immutable identity and accounting shared by every ownership form.
+///
+/// Radix plans clone this `Arc` for lock-free exact-key selection while the
+/// single target+dFlash payload remains protected by its mutex.
+#[derive(Debug)]
+struct PairMetadata {
+    stamp: PrefixStamp,
+    target_bytes: usize,
+    dflash_bytes: usize,
+}
+
+/// The one validated target+dFlash ownership core.
+///
+/// Session retention owns this directly. Radix retention puts the same type
+/// behind a mutex and shares only its immutable metadata with lookup plans.
+#[derive(Debug)]
+struct SealedPair {
+    target: AnyCache,
+    dflash: DFlashSnapshot,
+    metadata: Arc<PairMetadata>,
+}
+
+impl SealedPair {
+    fn new(
+        target: AnyCache,
+        dflash: DFlashSnapshot,
+        tokens: &[u32],
+    ) -> Result<Self, PairedCacheError> {
+        let stamp = PrefixStamp::new(tokens);
+        let expected = stamp.boundary()?;
+        Self::validate_boundaries(&target, dflash.position(), expected)?;
+        let metadata = Arc::new(PairMetadata {
+            target_bytes: target.estimated_bytes(),
+            dflash_bytes: dflash.estimated_bytes(),
+            stamp,
+        });
+        Ok(Self {
+            target,
+            dflash,
+            metadata,
+        })
+    }
+
+    fn validate_boundaries(
+        target: &AnyCache,
+        dflash_position: i32,
+        expected: i32,
+    ) -> Result<(), PairedCacheError> {
+        target
+            .validate_absolute_boundary(expected)
+            .map_err(|error| PairedCacheError::TargetBoundary {
+                expected,
+                details: error.to_string(),
+            })?;
+        if dflash_position != expected {
+            return Err(PairedCacheError::DFlashBoundary {
+                expected,
+                actual: dflash_position,
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    fn prefix_len(&self) -> usize {
+        self.metadata.stamp.len
+    }
+
+    #[must_use]
+    fn matches_prefix(&self, tokens: &[u32]) -> bool {
+        self.metadata.stamp.matches(tokens)
+    }
+
+    #[cfg(test)]
+    fn into_live(
+        self,
+        expected_tokens: &[u32],
+    ) -> Result<(AnyCache, DFlashCache), PairedCacheError> {
+        if !self.matches_prefix(expected_tokens) {
+            return Err(PairedCacheError::PrefixMismatch {
+                stored_len: self.prefix_len(),
+                requested_len: expected_tokens.len(),
+            });
+        }
+        Ok(self.into_live_unchecked())
+    }
+
+    fn into_live_unchecked(self) -> (AnyCache, DFlashCache) {
+        let Self {
+            target,
+            dflash,
+            metadata: _,
+        } = self;
+        (target, dflash.into_live())
+    }
+
+    #[must_use]
+    fn demote(self) -> AnyCache {
+        let Self {
+            target,
+            dflash,
+            metadata: _,
+        } = self;
+        drop(dflash);
+        target
+    }
+
+    /// Fork both live halves while the caller holds the radix payload mutex.
+    fn try_fork_live(&self) -> Result<(AnyCache, DFlashCache), PairedCacheError> {
+        let target = self.target.try_deep_clone().map_err(|error| {
+            PairedCacheError::TargetMaterialization {
+                details: error.to_string(),
+            }
+        })?;
+        let dflash = self
+            .dflash
+            .fork_live()
+            .map_err(|error| PairedCacheError::DFlashFork {
+                details: error.to_string(),
+            })?;
+        let expected = self.metadata.stamp.boundary()?;
+        Self::validate_boundaries(&target, dflash.position(), expected)?;
+        Ok((target, dflash))
+    }
+
+    #[must_use]
+    fn metadata(&self) -> Arc<PairMetadata> {
+        Arc::clone(&self.metadata)
+    }
 }
 
 /// One immutable retained target/dFlash boundary.
@@ -73,9 +217,7 @@ pub(crate) enum PairedCacheError {
 /// publish or move one retained half independently of the other.
 #[derive(Debug)]
 pub(crate) struct PairedCache {
-    target: AnyCache,
-    dflash: DFlashSnapshot,
-    stamp: PrefixStamp,
+    sealed: SealedPair,
 }
 
 impl PairedCache {
@@ -89,51 +231,31 @@ impl PairedCache {
         dflash: DFlashSnapshot,
         tokens: &[u32],
     ) -> Result<Self, PairedCacheError> {
-        let stamp = PrefixStamp::new(tokens);
-        let expected = stamp.boundary()?;
-        target
-            .validate_absolute_boundary(expected)
-            .map_err(|error| PairedCacheError::TargetBoundary {
-                expected,
-                details: error.to_string(),
-            })?;
-        let actual = dflash.position();
-        if actual != expected {
-            return Err(PairedCacheError::DFlashBoundary { expected, actual });
-        }
-        Ok(Self {
-            target,
-            dflash,
-            stamp,
-        })
+        SealedPair::new(target, dflash, tokens).map(|sealed| Self { sealed })
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn prefix_len(&self) -> usize {
-        self.stamp.len
+        self.sealed.prefix_len()
     }
 
     /// Revalidate the lookup key before this pair is selected for reuse.
     #[must_use]
     pub(crate) fn matches_prefix(&self, tokens: &[u32]) -> bool {
-        self.stamp.matches(tokens)
+        self.sealed.matches_prefix(tokens)
     }
 
     /// Consume both immutable halves into one live target/dFlash branch.
     ///
     /// Rechecking the private stamp here prevents a stale session/radix lookup
     /// from turning a structurally valid pair into continuity for another key.
+    #[cfg(test)]
     pub(crate) fn into_live(
         self,
         expected_tokens: &[u32],
     ) -> Result<(AnyCache, DFlashCache), PairedCacheError> {
-        if !self.matches_prefix(expected_tokens) {
-            return Err(PairedCacheError::PrefixMismatch {
-                stored_len: self.prefix_len(),
-                requested_len: expected_tokens.len(),
-            });
-        }
-        Ok(self.into_live_unchecked())
+        self.sealed.into_live(expected_tokens)
     }
 
     /// Explicitly abandon speculative continuity and retain only target state.
@@ -142,131 +264,127 @@ impl PairedCache {
     /// drafter snapshot cannot remain accidentally associated with the target.
     #[must_use]
     pub(crate) fn demote(self) -> AnyCache {
-        let Self {
-            target,
-            dflash,
-            stamp: _,
-        } = self;
-        drop(dflash);
-        target
+        self.sealed.demote()
     }
 
     fn into_live_unchecked(self) -> (AnyCache, DFlashCache) {
-        let Self {
-            target,
-            dflash,
-            stamp: _,
-        } = self;
-        (target, dflash.into_live())
+        self.sealed.into_live_unchecked()
     }
 }
 
-/// Immutable dFlash sidecar attached to one exact radix endpoint.
+/// One Arc-owned frozen target+dFlash boundary for radix reuse.
 ///
-/// The target half remains represented by the radix path's paged blocks, so
-/// this type owns only the drafter snapshot plus the private token stamp that
-/// proves which endpoint it belongs to. Reuse always forks; the stored snapshot
-/// is never consumed or exposed.
+/// The payload mutex safely shares MLX's `!Sync` array handles. It is acquired
+/// only after the radix lock has been released, and both halves are forked
+/// while holding the same guard so they cannot be mixed across publications.
 #[derive(Debug)]
-pub(crate) struct RadixDFlashSnapshot {
-    // `DFlashSnapshot` is immutable after sealing but its MLX arrays are
-    // `!Sync`. A small sidecar mutex provides safe shared ownership for lookup
-    // plans; it is never acquired while the radix/prefix mutex is held.
-    dflash: Mutex<DFlashSnapshot>,
-    stamp: PrefixStamp,
-    estimated_bytes: usize,
+pub(crate) struct RadixPairedSnapshot {
+    sealed: Mutex<SealedPair>,
+    metadata: Arc<PairMetadata>,
+    #[cfg(test)]
+    fail_next_fork: AtomicBool,
 }
 
-impl RadixDFlashSnapshot {
-    pub(crate) fn new(dflash: DFlashSnapshot, tokens: &[u32]) -> Result<Self, PairedCacheError> {
-        let stamp = PrefixStamp::new(tokens);
-        let expected = stamp.boundary()?;
-        let actual = dflash.position();
-        if actual != expected {
-            return Err(PairedCacheError::DFlashBoundary { expected, actual });
-        }
-        let estimated_bytes = dflash.estimated_bytes();
+impl RadixPairedSnapshot {
+    pub(crate) fn new(
+        frozen_target: AnyCache,
+        dflash: DFlashSnapshot,
+        tokens: &[u32],
+    ) -> Result<Self, PairedCacheError> {
+        let sealed = SealedPair::new(frozen_target, dflash, tokens)?;
+        let metadata = sealed.metadata();
         Ok(Self {
-            dflash: Mutex::new(dflash),
-            stamp,
-            estimated_bytes,
+            sealed: Mutex::new(sealed),
+            metadata,
+            #[cfg(test)]
+            fail_next_fork: AtomicBool::new(false),
         })
     }
 
     #[must_use]
     pub(crate) fn prefix_len(&self) -> usize {
-        self.stamp.len
+        self.metadata.stamp.len
     }
 
     #[must_use]
     pub(crate) fn matches_prefix(&self, tokens: &[u32]) -> bool {
-        self.stamp.matches(tokens)
+        self.metadata.stamp.matches(tokens)
     }
 
     #[must_use]
-    pub(crate) const fn estimated_bytes(&self) -> usize {
-        self.estimated_bytes
+    pub(crate) fn target_bytes(&self) -> usize {
+        self.metadata.target_bytes
     }
 
-    /// Select an exact immutable snapshot without doing any MLX work.
+    #[must_use]
+    pub(crate) fn dflash_bytes(&self) -> usize {
+        self.metadata.dflash_bytes
+    }
+
+    /// Select the exact frozen pair without doing any MLX work.
     ///
     /// The returned plan owns the snapshot through an `Arc`, so callers may
-    /// release the radix/prefix mutex before materializing the live branch.
+    /// release the radix/prefix mutex before forking both live halves.
     pub(crate) fn plan_fork(
         self: &Arc<Self>,
         expected_tokens: &[u32],
-    ) -> Result<RadixDFlashForkPlan, PairedCacheError> {
+    ) -> Result<RadixPairedForkPlan, PairedCacheError> {
         if !self.matches_prefix(expected_tokens) {
             return Err(PairedCacheError::PrefixMismatch {
                 stored_len: self.prefix_len(),
                 requested_len: expected_tokens.len(),
             });
         }
-        Ok(RadixDFlashForkPlan {
+        Ok(RadixPairedForkPlan {
             snapshot: Arc::clone(self),
         })
     }
 
-    /// Fork an independent live drafter branch while retaining this snapshot.
-    fn fork_live(&self) -> Result<DFlashCache, PairedCacheError> {
+    fn fork_live(&self) -> Result<(AnyCache, DFlashCache), PairedCacheError> {
         debug_assert!(
             higgs_models::mlx_exec::held(),
-            "radix dFlash fork requires the process MLX execution gate"
+            "radix paired fork requires the process MLX execution gate"
         );
-        let snapshot = self
-            .dflash
+        #[cfg(test)]
+        if self.fail_next_fork.swap(false, Ordering::SeqCst) {
+            return Err(PairedCacheError::TargetMaterialization {
+                details: "injected paired fork failure".to_owned(),
+            });
+        }
+        let sealed = self
+            .sealed
             .lock()
             .map_err(|error| PairedCacheError::DFlashFork {
-                details: format!("retained dFlash snapshot lock is poisoned: {error}"),
+                details: format!("retained paired snapshot lock is poisoned: {error}"),
             })?;
-        let live = snapshot
-            .fork_live()
-            .map_err(|error| PairedCacheError::DFlashFork {
-                details: error.to_string(),
-            })?;
-        let expected = self.stamp.boundary()?;
-        let actual = live.position();
-        if actual != expected {
-            return Err(PairedCacheError::DFlashBoundary { expected, actual });
-        }
-        Ok(live)
+        sealed.try_fork_live()
+    }
+
+    #[cfg(test)]
+    fn fail_next_fork_for_test(&self) {
+        self.fail_next_fork.store(true, Ordering::SeqCst);
     }
 }
 
-/// Owned, exact-identity plan for a post-prefix-lock dFlash fork.
+/// Owned, exact-identity plan for a post-prefix-lock paired fork.
 #[derive(Debug)]
-pub(crate) struct RadixDFlashForkPlan {
-    snapshot: Arc<RadixDFlashSnapshot>,
+pub(crate) struct RadixPairedForkPlan {
+    snapshot: Arc<RadixPairedSnapshot>,
 }
 
-impl RadixDFlashForkPlan {
+impl RadixPairedForkPlan {
     #[must_use]
     pub(crate) fn prefix_len(&self) -> usize {
         self.snapshot.prefix_len()
     }
 
-    pub(crate) fn materialize(self) -> Result<DFlashCache, PairedCacheError> {
+    pub(crate) fn materialize(self) -> Result<(AnyCache, DFlashCache), PairedCacheError> {
         self.snapshot.fork_live()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_materialization_for_test(&self) {
+        self.snapshot.fail_next_fork_for_test();
     }
 }
 

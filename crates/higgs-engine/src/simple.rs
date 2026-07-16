@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard};
 use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, Speculation, apply_penalties,
-    dflash::{DFlashCache, DFlashConfig, DFlashDrafter, accept_prefix},
+    dflash::{DFlashCache, DFlashConfig, DFlashDrafter, DFlashSnapshot, accept_prefix},
     sample,
     turboquant::KvCacheConfig,
 };
@@ -32,7 +32,7 @@ use crate::{
     error::EngineError,
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
-    paged_prefix_cache::DEFAULT_BLOCK_SIZE,
+    paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPairedLookupPlan, PairedPrepareTicket},
     scheduler::RoundRobinScheduler,
 };
 
@@ -41,6 +41,54 @@ const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 const DEFAULT_PAGED_KV_BLOCK_SIZE: usize = 64;
 /// Default `<think>` budget (tokens) when a request omits `reasoning_budget`.
 const DEFAULT_THINKING_BUDGET: u32 = 256;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GenerationPromptSuffixes {
+    no_thinking: Box<[u32]>,
+    thinking: Box<[u32]>,
+}
+
+impl GenerationPromptSuffixes {
+    #[must_use]
+    fn for_request(&self, enable_thinking: bool) -> &[u32] {
+        if enable_thinking {
+            &self.thinking
+        } else {
+            &self.no_thinking
+        }
+    }
+}
+
+fn generation_prompt_suffix(
+    template: &ChatTemplateRenderer,
+    tokenizer: &Tokenizer,
+    enable_thinking: bool,
+) -> Option<Box<[u32]>> {
+    let test_msg = [ChatMessage {
+        role: "user".to_owned(),
+        content: "x".to_owned(),
+        tool_calls: None,
+    }];
+    let with_gen = template
+        .apply_with_thinking(&test_msg, None, true, enable_thinking)
+        .ok()?;
+    let without_gen = template
+        .apply_with_thinking(&test_msg, None, false, enable_thinking)
+        .ok()?;
+    let toks_with = tokenizer.encode(with_gen.as_str(), false).ok()?;
+    let toks_without = tokenizer.encode(without_gen.as_str(), false).ok()?;
+    toks_with
+        .get_ids()
+        .strip_prefix(toks_without.get_ids())
+        .map(Into::into)
+}
+
+fn exact_generation_body<'a>(prompt: &'a [u32], generation_suffix: &[u32]) -> Option<&'a [u32]> {
+    if generation_suffix.is_empty() || generation_suffix.len() >= prompt.len() {
+        return None;
+    }
+    prompt.strip_suffix(generation_suffix)
+}
 
 /// Acquire a `Mutex` lock, recovering from poison by reusing the inner data.
 /// Used in this crate to keep session-management methods infallible while
@@ -637,6 +685,8 @@ pub struct Session {
 struct CacheMetrics {
     radix_lookups: AtomicU64,
     radix_hits: AtomicU64,
+    paired_radix_lookups: AtomicU64,
+    paired_radix_hits: AtomicU64,
     prefill_saved_tokens: AtomicU64,
     continuations: AtomicU64,
     sessions_evicted: AtomicU64,
@@ -649,6 +699,10 @@ pub struct CacheStats {
     pub radix_lookups: u64,
     /// Radix prefix-cache hits (a stored prefix was reused).
     pub radix_hits: u64,
+    /// Memory-only paired target/dSpark radix lookups.
+    pub paired_radix_lookups: u64,
+    /// Paired radix hits that materialized and forked both cache halves.
+    pub paired_radix_hits: u64,
     /// Prompt tokens NOT re-prefilled thanks to reuse (radix + continuation).
     pub prefill_saved_tokens: u64,
     /// Per-session continuations (a retained cache was reused).
@@ -657,8 +711,16 @@ pub struct CacheStats {
     pub sessions_evicted: u64,
     /// Currently retained per-session caches.
     pub retained_sessions: usize,
+    /// Currently retained sessions that own an inseparable target/dSpark pair.
+    pub retained_paired_sessions: usize,
     /// Currently stored radix prefixes.
     pub radix_entries: usize,
+    /// Currently stored paired radix endpoints.
+    pub paired_radix_entries: usize,
+    /// Conservative target bytes retained by paired radix endpoints.
+    pub paired_radix_target_bytes: usize,
+    /// Conservative dSpark bytes retained by paired radix endpoints.
+    pub paired_radix_dflash_bytes: usize,
 }
 
 /// Simple single-request inference engine with paged KV caching.
@@ -756,13 +818,158 @@ struct DflashTapFrontier {
     expected_taps: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DflashSealDemotion {
+    MissingOrUnsupportedTaps {
+        rows: i32,
+        collected: usize,
+        required: usize,
+    },
+    DraftBoundaryMismatch {
+        expected: i32,
+        actual: i32,
+    },
+    TargetBoundaryMismatch {
+        expected: i32,
+        actual: i32,
+    },
+}
+
+#[derive(Debug)]
+struct DflashSealInput {
+    draft_cache: DFlashCache,
+    taps: Vec<Array>,
+    expected_target_boundary: i32,
+}
+
+#[derive(Debug)]
+enum DflashSealEligibility {
+    Eligible(DflashSealInput),
+    Ineligible {
+        expected_target_boundary: i32,
+        reason: DflashSealDemotion,
+    },
+}
+
+impl DflashSealEligibility {
+    #[must_use]
+    const fn expected_target_boundary(&self) -> i32 {
+        match self {
+            Self::Eligible(input) => input.expected_target_boundary,
+            Self::Ineligible {
+                expected_target_boundary,
+                ..
+            } => *expected_target_boundary,
+        }
+    }
+}
+
+/// Target state that has independently proved its exact absolute boundary and
+/// completed all lazy MLX work needed for cross-turn publication.
+///
+/// The field is private and the only production constructor validates both
+/// before and after evaluation, so `TargetOnly` demotion cannot be built from
+/// an unchecked or unevaluated target cache.
+#[derive(Debug)]
+struct ValidatedSessionTarget {
+    cache: AnyCache,
+    boundary: i32,
+}
+
+impl ValidatedSessionTarget {
+    fn evaluate(cache: AnyCache, boundary: i32) -> Result<Self, EngineError> {
+        cache
+            .validate_absolute_boundary(boundary)
+            .map_err(EngineError::Mlx)?;
+        cache.eval().map_err(EngineError::Mlx)?;
+        cache
+            .validate_absolute_boundary(boundary)
+            .map_err(EngineError::Mlx)?;
+        Ok(Self { cache, boundary })
+    }
+}
+
+#[derive(Debug)]
+enum SessionDsparkRetention {
+    Paired(RetainedState),
+    TargetOnly {
+        target: AnyCache,
+        reason: DflashSealDemotion,
+    },
+}
+
+impl SessionDsparkRetention {
+    #[must_use]
+    fn into_state(self) -> RetainedState {
+        match self {
+            Self::Paired(state) => state,
+            Self::TargetOnly { target, .. } => RetainedState::TargetOnly(target),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum SessionDsparkRetentionError {
+    #[error(
+        "target proof boundary {target} does not match dSpark eligibility boundary {eligibility}"
+    )]
+    BoundaryProofMismatch { target: i32, eligibility: i32 },
+    #[error("dSpark seal execution failed: {0}")]
+    SealExecution(String),
+    #[error("paired session publication failed: {0}")]
+    PairPublication(String),
+}
+
+/// Resolve the only two publishable session states from one validated target.
+///
+/// Deterministic pre-seal capability loss may consume the proof into
+/// target-only state. Once effectful dSpark sealing begins, any error publishes
+/// nothing; the target proof is consumed and dropped with the failed attempt.
+fn resolve_session_dspark_retention<F, E>(
+    target: ValidatedSessionTarget,
+    eligibility: DflashSealEligibility,
+    tokens: &[u32],
+    seal: F,
+) -> Result<SessionDsparkRetention, SessionDsparkRetentionError>
+where
+    F: FnOnce(DFlashCache, &[Array], i32) -> Result<DFlashSnapshot, E>,
+    E: std::fmt::Display,
+{
+    let eligibility_boundary = eligibility.expected_target_boundary();
+    if target.boundary != eligibility_boundary {
+        return Err(SessionDsparkRetentionError::BoundaryProofMismatch {
+            target: target.boundary,
+            eligibility: eligibility_boundary,
+        });
+    }
+    match eligibility {
+        DflashSealEligibility::Ineligible { reason, .. } => {
+            Ok(SessionDsparkRetention::TargetOnly {
+                target: target.cache,
+                reason,
+            })
+        }
+        DflashSealEligibility::Eligible(input) => {
+            let snapshot = seal(
+                input.draft_cache,
+                &input.taps,
+                input.expected_target_boundary,
+            )
+            .map_err(|error| SessionDsparkRetentionError::SealExecution(error.to_string()))?;
+            let state = RetainedState::paired(target.cache, snapshot, tokens)
+                .map_err(|error| SessionDsparkRetentionError::PairPublication(error.to_string()))?;
+            Ok(SessionDsparkRetention::Paired(state))
+        }
+    }
+}
+
 impl DflashTapFrontier {
-    fn new(
+    fn validate_parts(
         draft_boundary: i32,
         target_boundary: i32,
-        taps: Vec<Array>,
+        taps: &[Array],
         expected_taps: usize,
-    ) -> Result<Self, EngineError> {
+    ) -> Result<(), EngineError> {
         if draft_boundary < 0 || target_boundary < draft_boundary {
             return Err(EngineError::Generation(format!(
                 "invalid dSpark tap frontier: draft={draft_boundary} target={target_boundary}"
@@ -794,6 +1001,16 @@ impl DflashTapFrontier {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn new(
+        draft_boundary: i32,
+        target_boundary: i32,
+        taps: Vec<Array>,
+        expected_taps: usize,
+    ) -> Result<Self, EngineError> {
+        Self::validate_parts(draft_boundary, target_boundary, &taps, expected_taps)?;
         Ok(Self {
             draft_boundary,
             target_boundary,
@@ -858,20 +1075,84 @@ impl DflashTapFrontier {
         )
     }
 
-    fn into_seal_taps(
+    fn into_seal_eligibility(
         self,
-        draft_cache: &DFlashCache,
+        draft_cache: DFlashCache,
         expected_target_boundary: i32,
-    ) -> Result<Vec<Array>, EngineError> {
-        self.validate_live_draft(draft_cache)?;
-        if self.target_boundary != expected_target_boundary {
-            return Err(EngineError::Generation(format!(
-                "dSpark tap frontier ends at {}, expected retained boundary {expected_target_boundary}",
-                self.target_boundary
-            )));
+        required_seal_taps: usize,
+    ) -> DflashSealEligibility {
+        let actual_draft_boundary = draft_cache.position();
+        if actual_draft_boundary != self.draft_boundary {
+            return DflashSealEligibility::Ineligible {
+                expected_target_boundary,
+                reason: DflashSealDemotion::DraftBoundaryMismatch {
+                    expected: self.draft_boundary,
+                    actual: actual_draft_boundary,
+                },
+            };
         }
-        Ok(self.taps)
+        if self.target_boundary != expected_target_boundary {
+            return DflashSealEligibility::Ineligible {
+                expected_target_boundary,
+                reason: DflashSealDemotion::TargetBoundaryMismatch {
+                    expected: expected_target_boundary,
+                    actual: self.target_boundary,
+                },
+            };
+        }
+        let rows = self.target_boundary - self.draft_boundary;
+        if rows > 0
+            && (self.expected_taps != required_seal_taps || self.taps.len() != required_seal_taps)
+        {
+            return DflashSealEligibility::Ineligible {
+                expected_target_boundary,
+                reason: DflashSealDemotion::MissingOrUnsupportedTaps {
+                    rows,
+                    collected: self.taps.len(),
+                    required: required_seal_taps,
+                },
+            };
+        }
+        DflashSealEligibility::Eligible(DflashSealInput {
+            draft_cache,
+            taps: self.taps,
+            expected_target_boundary,
+        })
     }
+}
+
+/// Advance the final response-visible token into target KV without sampling.
+///
+/// Beginning the ledger transition happens before the injected forward. Any
+/// forward or tap-frontier error therefore leaves the ledger in
+/// `ForwardInFlight`, whose retention API cannot produce a publishable token
+/// boundary. Only a successful target transition and tap append consume the
+/// ticket and return a seal-eligible frontier.
+fn complete_session_dflash_tail_forward<F>(
+    token_ledger: &mut TokenLedger,
+    tap_frontier: DflashTapFrontier,
+    token: u32,
+    forward: F,
+) -> Result<DflashTapFrontier, EngineError>
+where
+    F: FnOnce(i32) -> Result<Vec<Array>, EngineError>,
+{
+    let ticket = token_ledger
+        .begin_cache_only_forward()
+        .map_err(session_ledger_error)?;
+    let input_token = i32::try_from(token).map_err(|_| {
+        EngineError::Generation("session DFlash retained token overflow i32".to_owned())
+    })?;
+    let final_taps = forward(input_token)?;
+    let next_target_boundary = tap_frontier
+        .target_boundary()
+        .checked_add(1)
+        .ok_or_else(|| EngineError::Generation("session target boundary overflow".to_owned()))?;
+    let tap_frontier = tap_frontier.append(next_target_boundary, final_taps)?;
+    token_ledger
+        .complete_cache_only_forward(ticket)
+        .map_err(session_ledger_error)?;
+    Ok(tap_frontier)
 }
 
 struct CanonicalDflashRound {
@@ -1165,6 +1446,75 @@ struct DFlashState {
     mask_token_id: i32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DflashPromptPartition<'a> {
+    prompt: &'a [u32],
+    body_end: usize,
+}
+
+impl<'a> DflashPromptPartition<'a> {
+    #[must_use]
+    fn new(prompt: &'a [u32], generation_suffix: &[u32]) -> Option<Self> {
+        let body_end = exact_generation_body(prompt, generation_suffix)?.len();
+        Some(Self { prompt, body_end })
+    }
+
+    #[must_use]
+    fn body(self) -> &'a [u32] {
+        self.prompt.get(..self.body_end).unwrap_or_default()
+    }
+
+    #[must_use]
+    fn from_boundary(self, boundary: usize) -> Option<&'a [u32]> {
+        (boundary <= self.prompt.len())
+            .then(|| self.prompt.get(boundary..))
+            .flatten()
+    }
+}
+
+struct DflashPrefillOutcome {
+    cache: AnyCache,
+    draft_cache: DFlashCache,
+    logits: Array,
+    taps: Vec<Array>,
+    reused_prefix_len: usize,
+}
+
+struct DflashPairedPrefixPlan {
+    lookup: Option<PagedPairedLookupPlan>,
+    publication_ticket: PairedPrepareTicket,
+}
+
+impl DflashPrefillOutcome {
+    #[allow(clippy::too_many_arguments)]
+    fn validated(
+        cache: AnyCache,
+        draft_cache: DFlashCache,
+        logits: Array,
+        taps: Vec<Array>,
+        reused_prefix_len: usize,
+        expected_target_boundary: i32,
+        expected_taps: usize,
+    ) -> Result<Self, EngineError> {
+        cache
+            .validate_absolute_boundary(expected_target_boundary)
+            .map_err(EngineError::Mlx)?;
+        DflashTapFrontier::validate_parts(
+            draft_cache.position(),
+            expected_target_boundary,
+            &taps,
+            expected_taps,
+        )?;
+        Ok(Self {
+            cache,
+            draft_cache,
+            logits,
+            taps,
+            reused_prefix_len,
+        })
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 struct GenerationPhaseTiming {
@@ -1211,10 +1561,10 @@ pub struct SimpleEngine {
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
     /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
     think_close_token: Option<u32>,
-    /// Number of trailing tokens added by `add_generation_prompt=true`.
-    /// Stripped from the prefix cache key so that multi-turn conversations
-    /// share the same token prefix (the generation prompt changes between turns).
-    gen_prompt_suffix_len: usize,
+    /// Request-mode-specific exact trailing tokens added by
+    /// `add_generation_prompt=true`. A reusable boundary is accepted only when
+    /// the request prompt ends in the corresponding proven suffix.
+    gen_prompt_suffixes: GenerationPromptSuffixes,
     kv_cache_config: KvCacheConfig,
     tuning: MlxRuntimeTuning,
     /// Optional `DFlash` block-diffusion speculative decoding state, enabled
@@ -1462,37 +1812,26 @@ impl SimpleEngine {
 
         set_wired_limit_to_max(raise_wired_limit);
 
-        // Compute the generation prompt suffix length: tokens added by
-        // `add_generation_prompt=true` (e.g., `<|im_start|>assistant\n<think>\n`).
-        // We strip these from the prefix cache key so multi-turn conversations
-        // share their common history prefix.
-        let gen_prompt_suffix_len = template
-            .as_ref()
-            .and_then(|tmpl| {
-                let test_msg = vec![crate::chat_template::ChatMessage {
-                    role: "user".to_owned(),
-                    content: "x".to_owned(),
-                    tool_calls: None,
-                }];
-                let with_gen = tmpl
-                    .apply_with_thinking(&test_msg, None, true, enable_thinking)
-                    .ok()?;
-                let without_gen = tmpl
-                    .apply_with_thinking(&test_msg, None, false, enable_thinking)
-                    .ok()?;
-                let toks_with = tokenizer.encode(with_gen.as_str(), false).ok()?;
-                let toks_without = tokenizer.encode(without_gen.as_str(), false).ok()?;
-                let suffix = toks_with
-                    .get_ids()
-                    .len()
-                    .saturating_sub(toks_without.get_ids().len());
-                tracing::info!(
-                    gen_prompt_suffix_len = suffix,
-                    "Computed generation prompt suffix length for prefix cache"
-                );
-                Some(suffix)
-            })
-            .unwrap_or(0);
+        // Compute both request variants. A no-thinking override on a
+        // thinking-capable model may remove `<think>\n` from the generation
+        // prompt, so one load-time default is not a valid cache boundary.
+        let gen_prompt_suffixes =
+            template
+                .as_ref()
+                .map_or_else(GenerationPromptSuffixes::default, |tmpl| {
+                    GenerationPromptSuffixes {
+                        no_thinking: generation_prompt_suffix(tmpl, &tokenizer, false)
+                            .unwrap_or_default(),
+                        thinking: generation_prompt_suffix(tmpl, &tokenizer, true)
+                            .unwrap_or_default(),
+                    }
+                });
+        tracing::info!(
+            no_thinking = gen_prompt_suffixes.no_thinking.len(),
+            thinking = gen_prompt_suffixes.thinking.len(),
+            default = gen_prompt_suffixes.for_request(enable_thinking).len(),
+            "Proved request-specific generation prompt suffixes for prefix cache"
+        );
 
         let experimental_paged_kv = experimental_paged_kv_enabled();
         if experimental_paged_kv {
@@ -1688,7 +2027,7 @@ impl SimpleEngine {
             decode_skip_ids,
             enable_thinking,
             think_close_token,
-            gen_prompt_suffix_len,
+            gen_prompt_suffixes,
             kv_cache_config,
             tuning,
             dflash,
@@ -1713,17 +2052,40 @@ impl SimpleEngine {
     /// Snapshot of cache effectiveness (hit rate, prefill saved, evictions,
     /// resident sizes) for observability / the `/metrics` endpoint.
     pub fn cache_stats(&self) -> CacheStats {
+        let (retained_sessions, retained_paired_sessions) = {
+            let retained = lock_or_recover(&self.retained);
+            (
+                retained.len(),
+                retained
+                    .values()
+                    .filter(|entry| matches!(&entry.state, RetainedState::Paired(_)))
+                    .count(),
+            )
+        };
+        let (radix_entries, paired_radix) = {
+            let prefix_cache = lock_or_recover(&self.prefix_cache);
+            (prefix_cache.len(), prefix_cache.paired_stats())
+        };
         CacheStats {
             radix_lookups: self.cache_metrics.radix_lookups.load(Ordering::Relaxed),
             radix_hits: self.cache_metrics.radix_hits.load(Ordering::Relaxed),
+            paired_radix_lookups: self
+                .cache_metrics
+                .paired_radix_lookups
+                .load(Ordering::Relaxed),
+            paired_radix_hits: self.cache_metrics.paired_radix_hits.load(Ordering::Relaxed),
             prefill_saved_tokens: self
                 .cache_metrics
                 .prefill_saved_tokens
                 .load(Ordering::Relaxed),
             continuations: self.cache_metrics.continuations.load(Ordering::Relaxed),
             sessions_evicted: self.cache_metrics.sessions_evicted.load(Ordering::Relaxed),
-            retained_sessions: self.retained_session_count(),
-            radix_entries: self.prefix_cache_len(),
+            retained_sessions,
+            retained_paired_sessions,
+            radix_entries,
+            paired_radix_entries: paired_radix.entries,
+            paired_radix_target_bytes: paired_radix.target_bytes,
+            paired_radix_dflash_bytes: paired_radix.dflash_bytes,
         }
     }
 
@@ -2135,6 +2497,7 @@ impl SimpleEngine {
     fn run_prefill(
         &self,
         prompt_tokens: &[u32],
+        generation_suffix: &[u32],
         prepared: &mut PreparedGeneration<'_>,
         params: &SamplingParams,
         logprob_top_n: Option<u32>,
@@ -2179,11 +2542,9 @@ impl SimpleEngine {
             // Bit-identical to a single-pass prefill: chunked prefill already
             // advances the cache token-by-token, so body-then-suffix == full.
             let is_hybrid = matches!(prepared.cache, AnyCache::Hybrid(_));
-            let split_at = if store_prefix_cache && is_hybrid && self.gen_prompt_suffix_len > 0 {
-                prepared
-                    .actual_prompt_tokens
-                    .len()
-                    .saturating_sub(self.gen_prompt_suffix_len)
+            let split_at = if store_prefix_cache && is_hybrid {
+                exact_generation_body(&prepared.actual_prompt_tokens, generation_suffix)
+                    .map_or(0, <[u32]>::len)
             } else {
                 0
             };
@@ -2194,8 +2555,8 @@ impl SimpleEngine {
                 // hidden here so the full-prompt hidden can be reconstructed by
                 // concatenation after Phase 2 (the MTP head needs every prompt
                 // token's hidden, not just the suffix's).
-                // `split_at` is `len().saturating_sub(..)` so `get` cannot miss;
-                // the fallback keeps the lint-clean non-panicking form.
+                // `split_at` came from a successful exact `strip_suffix`, so the
+                // body slice is structurally within the prompt.
                 let body_ids = prepared
                     .actual_prompt_tokens
                     .get(..split_at)
@@ -2370,14 +2731,8 @@ impl SimpleEngine {
             // "key hybrid at full length" path, which was correct but never
             // matched cross-turn (the suffix diverges), forcing a full re-prefill
             // every turn.
-            let stripped = prompt_tokens
-                .get(
-                    ..prompt_tokens
-                        .len()
-                        .saturating_sub(self.gen_prompt_suffix_len),
-                )
-                .filter(|k| k.len() < prompt_tokens.len())
-                .unwrap_or(prompt_tokens);
+            let stripped =
+                exact_generation_body(prompt_tokens, generation_suffix).unwrap_or(prompt_tokens);
             let cache_to_store = prepared.stored_clone.as_ref().unwrap_or(&prepared.cache);
             pc.store(stripped, cache_to_store, checkpoint_id);
         }
@@ -3287,6 +3642,7 @@ impl SimpleEngine {
         // remaining selectors are deliberately sidecar-free MTP or AR.
         let (current_token, _, prefill_hidden) = self.run_prefill(
             prompt_tokens,
+            self.gen_prompt_suffixes.for_request(enable_thinking),
             &mut prepared,
             params,
             None,
@@ -3630,8 +3986,9 @@ impl SimpleEngine {
     /// pair is move-reused only when both private halves match the exact prior
     /// token prefix; target-only state is intentionally discarded because its
     /// historical tap stream cannot reconstruct drafter continuity. Every
-    /// successful turn publishes either one sealed pair or one explicit
-    /// target-only downgrade after drafter sealing fails.
+    /// successful turn publishes one sealed pair, or one explicit target-only
+    /// downgrade when a deterministic tap precondition is unavailable. Once
+    /// effectful sealing begins, any error publishes neither half.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn generate_continued_dflash_locked(
         &self,
@@ -3850,26 +4207,18 @@ impl SimpleEngine {
                     .map_err(session_ledger_error)?;
             }
             RetentionAction::CacheOnlyForward { token } => {
-                let ticket = token_ledger
-                    .begin_cache_only_forward()
-                    .map_err(session_ledger_error)?;
-                let input_token = i32::try_from(token).map_err(|_| {
-                    EngineError::Generation("session DFlash retained token overflow i32".to_owned())
-                })?;
-                let input = Array::from_slice(&[input_token], &[1, 1]);
-                let (_hidden, final_taps) = model
-                    .forward_raw_with_taps(&input, None, &mut cache, &dflash.tap_layers)
-                    .map_err(EngineError::Mlx)?;
-                let next_target_boundary = tap_frontier
-                    .target_boundary()
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        EngineError::Generation("session target boundary overflow".to_owned())
-                    })?;
-                tap_frontier = tap_frontier.append(next_target_boundary, final_taps)?;
-                token_ledger
-                    .complete_cache_only_forward(ticket)
-                    .map_err(session_ledger_error)?;
+                tap_frontier = complete_session_dflash_tail_forward(
+                    &mut token_ledger,
+                    tap_frontier,
+                    token,
+                    |input_token| {
+                        let input = Array::from_slice(&[input_token], &[1, 1]);
+                        model
+                            .forward_raw_with_taps(&input, None, &mut cache, &dflash.tap_layers)
+                            .map(|(_hidden, taps)| taps)
+                            .map_err(EngineError::Mlx)
+                    },
+                )?;
             }
             RetentionAction::ForwardInFlight { token } => {
                 return Err(EngineError::Generation(format!(
@@ -3890,13 +4239,11 @@ impl SimpleEngine {
         let expected_boundary_i32 = i32::try_from(expected_boundary).map_err(|_| {
             EngineError::Generation("session retained boundary overflow i32".to_owned())
         })?;
-        if tap_frontier.target_boundary() != expected_boundary_i32 {
-            return Err(EngineError::Generation(format!(
-                "session ledger/target boundary mismatch: ledger={expected_boundary_i32} target={}",
-                tap_frontier.target_boundary()
-            )));
-        }
-
+        let seal_eligibility = tap_frontier.into_seal_eligibility(
+            draft_cache,
+            expected_boundary_i32,
+            drafter.config.num_taps(),
+        );
         let target_valid = cache
             .validate_absolute_boundary(expected_boundary_i32)
             .map_or_else(
@@ -3911,25 +4258,6 @@ impl SimpleEngine {
                 },
                 |()| true,
             );
-        let sealed_dflash = if target_valid {
-            let seal_taps = tap_frontier.into_seal_taps(&draft_cache, expected_boundary_i32)?;
-            match drafter.seal_after_taps(draft_cache, &seal_taps, expected_boundary_i32) {
-                Ok(snapshot) => Some(snapshot),
-                Err(error) => {
-                    tracing::warn!(
-                        session_id,
-                        error = %error,
-                        expected = expected_boundary_i32,
-                        "Failed to seal retained dSpark cache; downgrading to target-only"
-                    );
-                    None
-                }
-            }
-        } else {
-            drop(tap_frontier);
-            drop(draft_cache);
-            None
-        };
 
         let cap = self.kv_cache_config.max_session_tokens;
         let over_dense_cap = cap > 0 && expected_boundary > cap;
@@ -3953,38 +4281,58 @@ impl SimpleEngine {
                 ),
             }
         }
-        let target_evaluated = target_valid
-            && match cache.eval() {
-                Ok(()) => true,
+        let validated_target = if target_valid {
+            match ValidatedSessionTarget::evaluate(cache, expected_boundary_i32) {
+                Ok(target) => Some(target),
                 Err(error) => {
                     tracing::warn!(
                         session_id,
                         error = %error,
-                        "Failed to eval retained dSpark target cache; dropping session retention"
+                        expected = expected_boundary_i32,
+                        "Failed to prove retained dSpark target state; dropping session retention"
                     );
-                    false
+                    None
                 }
-            };
+            }
+        } else {
+            drop(cache);
+            None
+        };
 
         let mut full = prompt_tokens.to_vec();
         full.extend_from_slice(&retained_generated);
-        let retained_state = if target_evaluated {
-            match sealed_dflash {
-                Some(snapshot) => match RetainedState::paired(cache, snapshot, &full) {
-                    Ok(state) => Some(state),
-                    Err(error) => {
+        let retained_state = match validated_target {
+            Some(target) => match resolve_session_dspark_retention(
+                target,
+                seal_eligibility,
+                &full,
+                |draft_cache, taps, boundary| drafter.seal_after_taps(draft_cache, taps, boundary),
+            ) {
+                Ok(publication) => {
+                    if let SessionDsparkRetention::TargetOnly { reason, .. } = &publication {
                         tracing::warn!(
                             session_id,
-                            error = %error,
-                            "Failed to publish an exact retained dSpark pair"
+                            ?reason,
+                            expected = expected_boundary_i32,
+                            "dSpark retention is ineligible; publishing validated target only"
                         );
-                        None
                     }
-                },
-                None => Some(RetainedState::TargetOnly(cache)),
+                    Some(publication.into_state())
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        expected = expected_boundary_i32,
+                        "Failed to retain exact session dSpark state; publishing nothing"
+                    );
+                    None
+                }
+            },
+            None => {
+                drop(seal_eligibility);
+                None
             }
-        } else {
-            None
         };
         let retain_elapsed = retain_start.elapsed();
 
@@ -4055,6 +4403,7 @@ impl SimpleEngine {
             .map_err(|_| EngineError::Generation("prompt_len overflow".to_owned()))?;
         let (current_token, _, _) = self.run_prefill(
             prompt_tokens,
+            self.gen_prompt_suffixes.for_request(self.enable_thinking),
             &mut prepared,
             params,
             None,
@@ -4565,6 +4914,7 @@ impl SimpleEngine {
 
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
             prompt_tokens,
+            self.gen_prompt_suffixes.for_request(enable_thinking),
             &mut prepared,
             params,
             logprob_top_n,
@@ -4970,7 +5320,7 @@ impl SimpleEngine {
     /// head likewise runs only on the final hidden row, matching ordinary
     /// prefill instead of allocating `[prompt, vocab]` logits.
     #[allow(clippy::too_many_arguments)]
-    fn dflash_prefill_with_taps(
+    fn dflash_prefill_raw_with_taps(
         &self,
         model: &mut AnyModel,
         cache: &mut AnyCache,
@@ -4979,6 +5329,11 @@ impl SimpleEngine {
         prompt_tokens: &[u32],
         tap_layers: &[usize],
     ) -> Result<(Array, Vec<Array>), EngineError> {
+        if prompt_tokens.is_empty() {
+            return Err(EngineError::Generation(
+                "DFlash prefill requires at least one token".to_owned(),
+            ));
+        }
         let prompt = Array::from(prompt_tokens).index(NewAxis);
         let seq_len =
             prompt.shape().get(1).copied().ok_or_else(|| {
@@ -5034,17 +5389,277 @@ impl SimpleEngine {
                 tap_layers.len()
             )));
         }
+        cache.eval().map_err(EngineError::Mlx)?;
+        higgs_models::progress::report_prefill_progress(seq_len, seq_len);
+        Ok((hidden, taps))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_advance_with_taps(
+        &self,
+        model: &mut AnyModel,
+        cache: &mut AnyCache,
+        drafter: &mut DFlashDrafter,
+        draft_cache: &mut DFlashCache,
+        prompt_tokens: &[u32],
+        tap_layers: &[usize],
+    ) -> Result<Vec<Array>, EngineError> {
+        let (hidden, taps) = self.dflash_prefill_raw_with_taps(
+            model,
+            cache,
+            drafter,
+            draft_cache,
+            prompt_tokens,
+            tap_layers,
+        )?;
+        let mut targets = Vec::with_capacity(taps.len() + 1);
+        targets.push(&hidden);
+        targets.extend(taps.iter());
+        eval(targets).map_err(EngineError::Mlx)?;
+        Ok(taps)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_prefill_with_taps(
+        &self,
+        model: &mut AnyModel,
+        cache: &mut AnyCache,
+        drafter: &mut DFlashDrafter,
+        draft_cache: &mut DFlashCache,
+        prompt_tokens: &[u32],
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), EngineError> {
+        let (hidden, taps) = self.dflash_prefill_raw_with_taps(
+            model,
+            cache,
+            drafter,
+            draft_cache,
+            prompt_tokens,
+            tap_layers,
+        )?;
         let logits = model
             .project_raw_hidden_last(&hidden)
             .map_err(EngineError::Mlx)?;
-        cache.eval().map_err(EngineError::Mlx)?;
         let mut targets = Vec::with_capacity(taps.len() + 2);
         targets.push(&hidden);
         targets.push(&logits);
         targets.extend(taps.iter());
         eval(targets).map_err(EngineError::Mlx)?;
-        higgs_models::progress::report_prefill_progress(seq_len, seq_len);
         Ok((logits, taps))
+    }
+
+    #[must_use]
+    const fn dflash_pair_boundary(body_end: usize, is_hybrid: bool) -> usize {
+        DiskPrefixCache::paired_store_boundary(body_end, is_hybrid)
+    }
+
+    fn dflash_cold_prefill(
+        &self,
+        model: &mut AnyModel,
+        drafter: &mut DFlashDrafter,
+        prompt_tokens: &[u32],
+        dflash: &DFlashState,
+    ) -> Result<DflashPrefillOutcome, EngineError> {
+        let mut cache = model
+            .make_cache_with_config(self.kv_cache_config)
+            .map_err(EngineError::Mlx)?;
+        let mut draft_cache = drafter.make_cache();
+        let (logits, taps) = self.dflash_prefill_with_taps(
+            model,
+            &mut cache,
+            drafter,
+            &mut draft_cache,
+            prompt_tokens,
+            &dflash.tap_layers,
+        )?;
+        let expected = i32::try_from(prompt_tokens.len()).map_err(|_| {
+            EngineError::Generation("DFlash prompt boundary overflow i32".to_owned())
+        })?;
+        DflashPrefillOutcome::validated(
+            cache,
+            draft_cache,
+            logits,
+            taps,
+            0,
+            expected,
+            dflash.tap_layers.len(),
+        )
+    }
+
+    /// Materialize or build one exact paired conversation-body prefix, then
+    /// prefill the request-specific generation tail into its live branch.
+    ///
+    /// `paired_plan` was selected while the prefix mutex was held, but owns all
+    /// resources needed here after that mutex is released. Pair preparation,
+    /// target cloning, dSpark sealing and snapshot forking happen under the MLX
+    /// gate; the prefix mutex is reacquired only for CPU-only publication.
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_prepare_prefill(
+        &self,
+        model: &mut AnyModel,
+        drafter: &mut DFlashDrafter,
+        prompt_tokens: &[u32],
+        partition: Option<DflashPromptPartition<'_>>,
+        paired_plan: Option<DflashPairedPrefixPlan>,
+        dflash: &DFlashState,
+    ) -> Result<DflashPrefillOutcome, EngineError> {
+        let (Some(partition), Some(paired_plan)) = (partition, paired_plan) else {
+            return self.dflash_cold_prefill(model, drafter, prompt_tokens, dflash);
+        };
+
+        let DflashPairedPrefixPlan {
+            lookup,
+            publication_ticket,
+        } = paired_plan;
+        let reusable = lookup.and_then(|plan| match plan.materialize() {
+            Ok(matched) => {
+                let (matched, touch) = matched.into_materialized_and_touch();
+                if lock_or_recover(&self.prefix_cache).touch_memory_paired(touch) {
+                    Some((matched.cache, matched.dflash_cache, matched.prefix_len))
+                } else {
+                    tracing::debug!(
+                        prefix_len = matched.prefix_len,
+                        "Discarding stale paired dSpark radix materialization"
+                    );
+                    None
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Failed to materialize paired dSpark radix state; cold-prefilling"
+                );
+                None
+            }
+        });
+        let (mut cache, mut draft_cache, reused_prefix_len) =
+            if let Some((cache, draft_cache, prefix_len)) = reusable {
+                (cache, draft_cache, prefix_len)
+            } else {
+                (
+                    model
+                        .make_cache_with_config(self.kv_cache_config)
+                        .map_err(EngineError::Mlx)?,
+                    drafter.make_cache(),
+                    0,
+                )
+            };
+
+        let publish_boundary =
+            Self::dflash_pair_boundary(partition.body_end, matches!(&cache, AnyCache::Hybrid(_)));
+        if publish_boundary == 0 || reused_prefix_len > publish_boundary {
+            drop(cache);
+            drop(draft_cache);
+            return self.dflash_cold_prefill(model, drafter, prompt_tokens, dflash);
+        }
+
+        if reused_prefix_len < publish_boundary {
+            let body_delta = partition
+                .prompt
+                .get(reused_prefix_len..publish_boundary)
+                .ok_or_else(|| {
+                    EngineError::Generation("paired dSpark body boundary exceeds prompt".to_owned())
+                })?;
+            let body_taps = self.dflash_advance_with_taps(
+                model,
+                &mut cache,
+                drafter,
+                &mut draft_cache,
+                body_delta,
+                &dflash.tap_layers,
+            )?;
+            let expected = i32::try_from(publish_boundary).map_err(|_| {
+                EngineError::Generation("paired dSpark boundary overflow i32".to_owned())
+            })?;
+            cache
+                .validate_absolute_boundary(expected)
+                .map_err(EngineError::Mlx)?;
+            let snapshot = match drafter.seal_after_taps(draft_cache, &body_taps, expected) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        expected,
+                        "Failed to seal a paired radix dSpark boundary; cold-prefilling"
+                    );
+                    drop(cache);
+                    drop(body_taps);
+                    return self.dflash_cold_prefill(model, drafter, prompt_tokens, dflash);
+                }
+            };
+            let (live_draft, snapshot_to_publish) = match snapshot.fork_live() {
+                Ok(cache) => (cache, Some(snapshot)),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        expected,
+                        "Failed to fork a newly sealed radix dSpark snapshot; continuing live without publication"
+                    );
+                    (snapshot.into_live(), None)
+                }
+            };
+            let prefix_tokens = partition.prompt.get(..publish_boundary).ok_or_else(|| {
+                EngineError::Generation(
+                    "paired dSpark publication boundary exceeds prompt".to_owned(),
+                )
+            })?;
+            draft_cache = live_draft;
+            if let Some(snapshot) = snapshot_to_publish {
+                let prepared = DiskPrefixCache::prepare_memory_paired_prefix(
+                    publication_ticket,
+                    prefix_tokens,
+                    &cache,
+                    snapshot,
+                );
+                match prepared {
+                    Ok(prepared) => {
+                        let publish = lock_or_recover(&self.prefix_cache)
+                            .commit_memory_paired_prefix(prepared);
+                        if let Err(error) = publish {
+                            tracing::warn!(
+                                error = %error,
+                                "Failed to publish prepared paired dSpark radix state"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Failed to freeze paired dSpark radix state; continuing with the validated live pair"
+                        );
+                    }
+                }
+            }
+        }
+
+        let tail = partition
+            .from_boundary(publish_boundary)
+            .filter(|tokens| !tokens.is_empty())
+            .ok_or_else(|| {
+                EngineError::Generation(
+                    "paired dSpark full hit has no cached logits or generation suffix".to_owned(),
+                )
+            })?;
+        let (logits, taps) = self.dflash_prefill_with_taps(
+            model,
+            &mut cache,
+            drafter,
+            &mut draft_cache,
+            tail,
+            &dflash.tap_layers,
+        )?;
+        let expected = i32::try_from(prompt_tokens.len()).map_err(|_| {
+            EngineError::Generation("DFlash prompt boundary overflow i32".to_owned())
+        })?;
+        DflashPrefillOutcome::validated(
+            cache,
+            draft_cache,
+            logits,
+            taps,
+            reused_prefix_len,
+            expected,
+            dflash.tap_layers.len(),
+        )
     }
 
     /// Return the shortest candidate prefix that completes a textual stop.
@@ -5282,6 +5897,15 @@ impl SimpleEngine {
             *timing = None;
         }
 
+        let partition = (dflash.is_dspark && prefix_cache_enabled())
+            .then(|| {
+                DflashPromptPartition::new(
+                    prompt_tokens,
+                    self.gen_prompt_suffixes.for_request(enable_thinking),
+                )
+            })
+            .flatten();
+
         let mut model = lock_or_recover(&self.model);
         // `generate_inner` dispatches DFlash before `prepare_generation`, whose
         // `PreparedGeneration` normally owns this token for plain AR. Acquire
@@ -5291,24 +5915,67 @@ impl SimpleEngine {
         // requests can race MLX's process-global Metal command buffer.
         let _mlx_gate = higgs_models::mlx_exec::acquire();
         debug_assert!(higgs_models::mlx_exec::held());
+        let paired_plan = if let Some(partition) = partition {
+            self.cache_metrics
+                .radix_lookups
+                .fetch_add(1, Ordering::Relaxed);
+            self.cache_metrics
+                .paired_radix_lookups
+                .fetch_add(1, Ordering::Relaxed);
+            let prefix_cache = lock_or_recover(&self.prefix_cache);
+            let publication_ticket = prefix_cache.paired_prepare_ticket();
+            let lookup = match prefix_cache.plan_memory_paired_prefix(partition.body()) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Paired dSpark radix selection failed; cold-prefilling"
+                    );
+                    None
+                }
+            };
+            Some(DflashPairedPrefixPlan {
+                lookup,
+                publication_ticket,
+            })
+        } else {
+            None
+        };
         let mut drafter = lock_or_recover(&dflash.drafter);
         let is_dspark = drafter.config.is_dspark();
 
-        let mut cache = model
-            .make_cache_with_config(self.kv_cache_config)
-            .map_err(EngineError::Mlx)?;
-        let mut draft_cache = drafter.make_cache();
-
-        // Shared target/drafter prefill. Long prompts are consumed in bounded
-        // chunks and only the final target row reaches the vocabulary head.
-        let (prefill_logits, taps) = self.dflash_prefill_with_taps(
+        let prefill = self.dflash_prepare_prefill(
             &mut model,
-            &mut cache,
             &mut drafter,
-            &mut draft_cache,
             prompt_tokens,
-            &dflash.tap_layers,
+            partition,
+            paired_plan,
+            dflash,
         )?;
+        let DflashPrefillOutcome {
+            mut cache,
+            mut draft_cache,
+            logits: prefill_logits,
+            taps,
+            reused_prefix_len,
+        } = prefill;
+        if reused_prefix_len > 0 {
+            let reused = u64::try_from(reused_prefix_len).unwrap_or(u64::MAX);
+            self.cache_metrics
+                .radix_hits
+                .fetch_add(1, Ordering::Relaxed);
+            self.cache_metrics
+                .paired_radix_hits
+                .fetch_add(1, Ordering::Relaxed);
+            self.cache_metrics
+                .prefill_saved_tokens
+                .fetch_add(reused, Ordering::Relaxed);
+            tracing::debug!(
+                reused_prefix_len,
+                prompt_len = prompt_tokens.len(),
+                "Paired dSpark radix hit"
+            );
+        }
 
         // Sample first token.
         let last_logits = prefill_logits.index((.., -1, ..));
@@ -7335,6 +8002,7 @@ impl SimpleEngine {
 
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
             prompt_tokens,
+            self.gen_prompt_suffixes.for_request(enable_thinking),
             &mut prepared,
             params,
             logprob_top_n,
@@ -8242,23 +8910,42 @@ impl SimpleEngine {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        CanonicalDflashRound, DFlashVerifyMode, DFlashVerifyRound, DflashTapFrontier, EngineError,
-        IncrementalDetok, SessionDecodeMode, SessionGeneration, SimpleEngine, Tokenizer,
-        adaptive_draft_depth_for_cap, check_stop_sequences, continuation_prior_len,
-        derive_model_name, detect_thinking_support, dflash_canonical_target_is_terminal,
-        dflash_new_stop_prefix_len, dflash_resolve_target_then_draft, dflash_tail_draft_cap,
-        estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail, lock_or_recover,
-        parse_enabled_flag, session_decode_mode, with_chat_terminator,
+        CanonicalDflashRound, DFlashVerifyMode, DFlashVerifyRound, DflashPromptPartition,
+        DflashSealDemotion, DflashTapFrontier, EngineError, GenerationPromptSuffixes,
+        IncrementalDetok, SessionDecodeMode, SessionDsparkRetention, SessionDsparkRetentionError,
+        SessionGeneration, SimpleEngine, Tokenizer, ValidatedSessionTarget,
+        adaptive_draft_depth_for_cap, check_stop_sequences, complete_session_dflash_tail_forward,
+        continuation_prior_len, derive_model_name, detect_thinking_support,
+        dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
+        dflash_resolve_target_then_draft, dflash_tail_draft_cap, estimate_paged_kv_blocks,
+        extract_eos_tokens, find_stop_in_tail, lock_or_recover, parse_enabled_flag,
+        resolve_session_dspark_retention, session_decode_mode, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
-    use higgs_models::{SamplingParams, Speculation};
+    use higgs_models::{
+        AnyCache, SamplingParams, Speculation,
+        cache::SteppingKeyValueCache,
+        dflash::{DFlashCache, DFlashSnapshot},
+    };
     use mlx_rs::{
         Array, Dtype,
         ops::indexing::{IndexOp, NewAxis},
         transforms::eval,
     };
     use std::path::Path;
+
+    fn validated_session_target(boundary: i32) -> ValidatedSessionTarget {
+        let layer = if boundary == 0 {
+            SteppingKeyValueCache::new()
+        } else {
+            let keys = Array::zeros::<f32>(&[1, 1, boundary, 1]).unwrap();
+            let values = Array::zeros::<f32>(&[1, 1, boundary, 1]).unwrap();
+            SteppingKeyValueCache::from_arrays(keys, values).unwrap()
+        };
+        let _exec = higgs_models::mlx_exec::acquire();
+        ValidatedSessionTarget::evaluate(AnyCache::KV(vec![Some(layer)]), boundary).unwrap()
+    }
 
     #[test]
     fn continued_generation_exposes_request_scoped_thinking_control() {
@@ -8271,6 +8958,41 @@ mod tests {
             bool,
         ) -> Result<SessionGeneration, EngineError> =
             SimpleEngine::generate_continued_with_thinking;
+    }
+
+    #[test]
+    fn dspark_radix_partition_uses_the_request_specific_generation_suffix() {
+        let suffixes = GenerationPromptSuffixes {
+            no_thinking: Box::from([14, 15, 16]),
+            thinking: Box::from([12, 13, 14, 15, 16]),
+        };
+        assert_eq!(suffixes.for_request(false), &[14, 15, 16]);
+        assert_eq!(suffixes.for_request(true), &[12, 13, 14, 15, 16]);
+
+        let prompt = [10, 11, 12, 13, 14, 15, 16];
+        let no_thinking = DflashPromptPartition::new(&prompt, suffixes.for_request(false)).unwrap();
+        assert_eq!(no_thinking.body(), &[10, 11, 12, 13]);
+        assert_eq!(no_thinking.from_boundary(4).unwrap(), &[14, 15, 16]);
+
+        let thinking = DflashPromptPartition::new(&prompt, suffixes.for_request(true)).unwrap();
+        assert_eq!(thinking.body(), &[10, 11]);
+        assert_eq!(thinking.from_boundary(2).unwrap(), &[12, 13, 14, 15, 16]);
+    }
+
+    #[test]
+    fn dspark_radix_partition_rejects_a_full_hit_without_generation_tail() {
+        let prompt = [1, 2, 3];
+        assert!(DflashPromptPartition::new(&prompt, &[]).is_none());
+        assert!(DflashPromptPartition::new(&prompt, &prompt).is_none());
+        assert!(DflashPromptPartition::new(&prompt, &[0, 2, 3]).is_none());
+        assert!(DflashPromptPartition::new(&prompt, &[2, 3, 4]).is_none());
+    }
+
+    #[test]
+    fn dspark_radix_publish_boundary_is_exact_for_hybrid_and_dense() {
+        assert_eq!(SimpleEngine::dflash_pair_boundary(37, true), 37);
+        assert_eq!(SimpleEngine::dflash_pair_boundary(37, false), 37);
+        assert_eq!(SimpleEngine::dflash_pair_boundary(15, false), 15);
     }
 
     #[test]
@@ -8340,6 +9062,88 @@ mod tests {
             ledger.retention_action(&[]),
             super::RetentionAction::ForwardInFlight { token: 41 }
         );
+    }
+
+    #[test]
+    fn session_dspark_seal_execution_failure_publishes_no_state() {
+        let target = validated_session_target(0);
+        let eligibility = DflashTapFrontier::new(0, 0, vec![], 0)
+            .unwrap()
+            .into_seal_eligibility(DFlashCache::default(), 0, 0);
+
+        let result = resolve_session_dspark_retention(
+            target,
+            eligibility,
+            &[],
+            |_draft, _taps, _boundary| -> Result<DFlashSnapshot, &'static str> {
+                Err("injected seal failure")
+            },
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            SessionDsparkRetentionError::SealExecution("injected seal failure".to_owned())
+        );
+    }
+
+    #[test]
+    fn session_dspark_final_target_forward_failure_cannot_publish() {
+        let mut ledger = TokenLedger::new(3);
+        ledger.emit_pending(7).unwrap();
+        let frontier = DflashTapFrontier::new(3, 3, vec![], 1).unwrap();
+
+        let result =
+            complete_session_dflash_tail_forward(&mut ledger, frontier, 7, |_input_token| {
+                Err(EngineError::Generation(
+                    "injected final target-forward failure".to_owned(),
+                ))
+            });
+
+        assert!(result.is_err());
+        assert_eq!(
+            ledger.retention_action(&[]),
+            super::RetentionAction::ForwardInFlight { token: 7 }
+        );
+        assert!(
+            ledger.retainable_tokens().is_err(),
+            "an in-flight failed forward must not yield a retention key"
+        );
+    }
+
+    #[test]
+    fn session_dspark_missing_seal_tap_demotes_only_a_validated_target() {
+        let target = validated_session_target(1);
+        let tap = Array::zeros::<f32>(&[1, 1, 4]).unwrap();
+        let eligibility = DflashTapFrontier::new(0, 1, vec![tap], 1)
+            .unwrap()
+            .into_seal_eligibility(DFlashCache::default(), 1, 2);
+
+        let publication = resolve_session_dspark_retention(
+            target,
+            eligibility,
+            &[7],
+            |_draft, _taps, _boundary| -> Result<DFlashSnapshot, &'static str> {
+                panic!("an ineligible transition must never execute dSpark sealing")
+            },
+        )
+        .unwrap();
+
+        match publication {
+            SessionDsparkRetention::TargetOnly { target, reason } => {
+                target.validate_absolute_boundary(1).unwrap();
+                assert_eq!(
+                    reason,
+                    DflashSealDemotion::MissingOrUnsupportedTaps {
+                        rows: 1,
+                        collected: 1,
+                        required: 2,
+                    }
+                );
+            }
+            SessionDsparkRetention::Paired(_) => {
+                panic!("missing a required seal tap must demote to target-only")
+            }
+        }
     }
 
     #[test]

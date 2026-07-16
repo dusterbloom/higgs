@@ -14326,8 +14326,14 @@ mod tests {
 
     fn deep_clone_tape_transition_cache(cache: &ArraysCache) -> ArraysCache {
         ArraysCache {
-            conv_state: cache.conv_state.as_ref().map(crate::cache::eval_deep_clone),
-            ssm_state: cache.ssm_state.as_ref().map(crate::cache::eval_deep_clone),
+            conv_state: cache
+                .conv_state
+                .as_ref()
+                .map(|array| crate::cache::try_eval_deep_clone(array).unwrap()),
+            ssm_state: cache
+                .ssm_state
+                .as_ref()
+                .map(|array| crate::cache::try_eval_deep_clone(array).unwrap()),
             conv_pos: cache.conv_pos,
             offset: cache.offset,
         }

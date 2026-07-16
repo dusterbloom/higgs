@@ -536,24 +536,48 @@ impl SteppingKeyValueCache {
         Ok(())
     }
 
-    /// An **independent** deep copy: every MLX buffer is materialized into a
-    /// fresh buffer (`Array::deep_clone`), so the result shares no storage with
-    /// `self`. The derived `Clone` only bumps MLX refcounts (shared buffers),
-    /// which is unsafe as a speculative-decode rollback checkpoint: the live
-    /// cache's in-place `slice_update` lets MLX donate (reuse/free) a buffer the
-    /// checkpoint still references, double-freeing it (the MTP `malloc: pointer
-    /// being freed was not allocated` abort). Use this for any checkpoint that
-    /// will outlive an in-place update of the live cache.
+    /// An **independent** deep copy: every MLX buffer is copied and materialized
+    /// on-device, so the result shares no storage with `self`. The derived
+    /// `Clone` only bumps MLX refcounts (shared buffers), which is unsafe as a
+    /// speculative-decode rollback checkpoint: the live cache's in-place
+    /// `slice_update` lets MLX donate (reuse/free) a buffer the checkpoint still
+    /// references, double-freeing it (the MTP `malloc: pointer being freed was
+    /// not allocated` abort). Use this for any checkpoint that will outlive an
+    /// in-place update of the live cache.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn deep_clone(&self) -> Self {
-        Self {
-            keys: self.keys.as_ref().map(eval_deep_clone),
-            values: self.values.as_ref().map(eval_deep_clone),
-            turbo: self.turbo.as_ref().map(TurboQuantStorage::deep_clone),
+        self.try_deep_clone()
+            .expect("device copy failed for KV cache checkpoint")
+    }
+
+    /// Fallible independent device-side copy of every retained KV buffer.
+    pub fn try_deep_clone(&self) -> Result<Self, Exception> {
+        Ok(Self {
+            keys: self.keys.as_ref().map(try_eval_deep_clone).transpose()?,
+            values: self.values.as_ref().map(try_eval_deep_clone).transpose()?,
+            turbo: self
+                .turbo
+                .as_ref()
+                .map(TurboQuantStorage::try_deep_clone)
+                .transpose()?,
             config: self.config,
             offset: self.offset,
             step: self.step,
-        }
+        })
+    }
+
+    /// Estimated device bytes retained by this cache's allocated arrays.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        let dense = self
+            .keys
+            .as_ref()
+            .map_or(0, Array::nbytes)
+            .saturating_add(self.values.as_ref().map_or(0, Array::nbytes));
+        self.turbo
+            .as_ref()
+            .map_or(dense, |turbo| dense.saturating_add(turbo.estimated_bytes()))
     }
 
     /// References to internal arrays that must be eval'd between chunked-prefill steps.
@@ -1008,16 +1032,46 @@ impl TurboQuantStorage {
     /// shared read-only `context` is refcounted (safe to share); every packed
     /// array is materialized into its own buffer so an in-place update of the
     /// live cache cannot donate/free a buffer this snapshot holds.
-    fn deep_clone(&self) -> Self {
-        Self {
+    fn try_deep_clone(&self) -> Result<Self, Exception> {
+        Ok(Self {
             context: Arc::clone(&self.context),
-            key_codes: self.key_codes.as_ref().map(eval_deep_clone),
-            key_norms: self.key_norms.as_ref().map(eval_deep_clone),
-            key_gammas: self.key_gammas.as_ref().map(eval_deep_clone),
-            value_codes: self.value_codes.as_ref().map(eval_deep_clone),
-            value_norms: self.value_norms.as_ref().map(eval_deep_clone),
+            key_codes: self
+                .key_codes
+                .as_ref()
+                .map(try_eval_deep_clone)
+                .transpose()?,
+            key_norms: self
+                .key_norms
+                .as_ref()
+                .map(try_eval_deep_clone)
+                .transpose()?,
+            key_gammas: self
+                .key_gammas
+                .as_ref()
+                .map(try_eval_deep_clone)
+                .transpose()?,
+            value_codes: self
+                .value_codes
+                .as_ref()
+                .map(try_eval_deep_clone)
+                .transpose()?,
+            value_norms: self
+                .value_norms
+                .as_ref()
+                .map(try_eval_deep_clone)
+                .transpose()?,
             capacity: self.capacity,
-        }
+        })
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.key_codes
+            .as_ref()
+            .map_or(0, Array::nbytes)
+            .saturating_add(self.key_norms.as_ref().map_or(0, Array::nbytes))
+            .saturating_add(self.key_gammas.as_ref().map_or(0, Array::nbytes))
+            .saturating_add(self.value_codes.as_ref().map_or(0, Array::nbytes))
+            .saturating_add(self.value_norms.as_ref().map_or(0, Array::nbytes))
     }
 
     fn ensure_capacity(&mut self, required: i32, step: i32) -> Result<(), Exception> {
@@ -1333,36 +1387,20 @@ pub fn slice_axis1(arr: &Array, start: i32, end: i32) -> Result<Array, Exception
 /// `Array::deep_clone` round-trips the buffer through **host** memory
 /// (`mlx_array_data_*` → CPU copy → re-upload on next use). For a multi-GB
 /// hybrid cache snapshot that is seconds of wall time per store/materialize —
-/// it dominated warm-turn TTFT. `mlx_copy` runs the copy as a GPU kernel
-/// instead. The immediate `eval` materializes the copy into its own buffer, so
-/// a later in-place `slice_update` of the live cache cannot donate/free
-/// storage this snapshot holds (same checkpoint-safety contract as before; see
-/// `SteppingKeyValueCache::deep_clone`).
-//
-// `expect`: a failed copy/eval on a live cache array leaves nothing safe to
-// snapshot — a loud panic is strictly better than a silently-shared buffer,
-// and the infallible signature keeps every checkpoint call site
-// (`AnyCache::deep_clone`, `deep_clone_mtp_cache`, the MTP cycle) clone-and-go.
-#[allow(clippy::expect_used, unsafe_code)]
-pub(crate) fn eval_deep_clone(a: &Array) -> Array {
-    let copy = unsafe {
-        let mut result = mlx_sys::mlx_array_new();
-        let status = mlx_sys::mlx_copy(
-            &raw mut result,
-            a.as_ptr(),
-            Stream::task_local_or_default().as_ptr(),
-        );
-        if status == 0 {
-            Some(Array::from_ptr(result))
-        } else {
-            mlx_sys::mlx_array_free(result);
-            None
-        }
-    }
-    .expect("mlx_copy failed for deep_clone checkpoint");
-    copy.eval()
-        .expect("eval device copy for deep_clone checkpoint");
-    copy
+/// it dominated warm-turn TTFT. Pinned MLX 0.30.6's `mlx_copy` is not enough:
+/// evaluation only creates a copy-on-write alias, so a small recurrent-state
+/// view can retain its much larger prompt backing allocation.
+///
+/// [`crate::metal_kernel::materialized_device_copy`] uses an identity Metal
+/// kernel whose output allocation is unconditionally fresh and exactly
+/// `out.nbytes()`. The immediate evaluation therefore gives the checkpoint
+/// independent, compact device storage before the live cache can mutate.
+///
+/// The fallible form lets publication paths reject a snapshot atomically when
+/// the device copy or evaluation fails. Public clone-and-go APIs add their
+/// infallible `expect` adapter at the whole-cache boundary.
+pub(crate) fn try_eval_deep_clone(a: &Array) -> Result<Array, Exception> {
+    crate::metal_kernel::materialized_device_copy(a)
 }
 
 /// Write `update` into `target` at `[..., start:start+n, ...]` on axis 2.
@@ -1811,6 +1849,7 @@ mod tests {
 
     #[test]
     fn deep_clone_preserves_contents_and_offset() {
+        let _exec = crate::mlx_exec::acquire();
         // deep_clone must be a faithful, independent copy.
         let mut cache = SteppingKeyValueCache::new();
         let ones_k = Array::ones::<f32>(&[1, 2, 2, 8]).unwrap();
@@ -1834,7 +1873,217 @@ mod tests {
     }
 
     #[test]
+    fn device_deep_clone_compacts_large_backing_view() {
+        let _exec = crate::mlx_exec::acquire();
+        const BACKING_TOKENS: i32 = 262_144;
+        const RETAINED_TOKENS: i32 = 4;
+        let values: Vec<f32> = (0..BACKING_TOKENS * 4).map(|index| index as f32).collect();
+        let backing = Array::from_slice(&values, &[1, 1, BACKING_TOKENS, 4]);
+        backing.eval().unwrap();
+        let retained =
+            slice_axis2(&backing, BACKING_TOKENS - RETAINED_TOKENS, BACKING_TOKENS).unwrap();
+        retained.eval().unwrap();
+
+        assert!(
+            backing.nbytes() > retained.nbytes() * 1_000,
+            "regression requires a tiny view over a much larger allocation"
+        );
+        let expected = retained.as_slice::<f32>().to_vec();
+        let retained_ptr = retained.as_slice::<f32>().as_ptr();
+
+        let checkpoint = try_eval_deep_clone(&retained).unwrap();
+        assert_eq!(checkpoint.shape(), retained.shape());
+        assert_eq!(checkpoint.dtype(), retained.dtype());
+        assert_eq!(checkpoint.nbytes(), retained.nbytes());
+        assert_ne!(
+            checkpoint.as_slice::<f32>().as_ptr(),
+            retained_ptr,
+            "checkpoint must own a distinct evaluated device allocation"
+        );
+
+        drop(retained);
+        drop(backing);
+        let pressure = Array::zeros::<f32>(&[1, 1, BACKING_TOKENS, 4]).unwrap();
+        pressure.eval().unwrap();
+        drop(pressure);
+
+        assert_eq!(
+            checkpoint.as_slice::<f32>(),
+            expected,
+            "compact checkpoint must remain valid after its large backing is released"
+        );
+    }
+
+    #[test]
+    fn device_deep_clone_preserves_cache_dtypes_shapes_and_bits() {
+        let _exec = crate::mlx_exec::acquire();
+        let values = Array::from_slice(&[0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], &[2, 2, 2]);
+        for dtype in [
+            Dtype::Float16,
+            Dtype::Bfloat16,
+            Dtype::Float32,
+            Dtype::Uint32,
+        ] {
+            let typed = values.as_dtype(dtype).unwrap();
+            let copy = try_eval_deep_clone(&typed).unwrap();
+            assert_eq!(copy.shape(), &[2, 2, 2]);
+            assert_eq!(copy.dtype(), dtype);
+            assert_eq!(
+                copy.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>(),
+                typed.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>()
+            );
+        }
+
+        let bit_patterns = [
+            0.0_f32.to_bits(),
+            (-0.0_f32).to_bits(),
+            f32::from_bits(0x7fc1_2345).to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+        ];
+        let bit_values: Vec<f32> = bit_patterns.iter().copied().map(f32::from_bits).collect();
+        let bit_source = Array::from_slice(&bit_values, &[2, 2]);
+        let bit_copy = try_eval_deep_clone(&bit_source).unwrap();
+        let copied_bits: Vec<u32> = bit_copy
+            .as_slice::<f32>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(copied_bits, bit_patterns);
+
+        let f16_patterns = [0x0000_u16, 0x8000, 0x7e01, 0xfc00];
+        let f16_values: Vec<half::f16> = f16_patterns
+            .iter()
+            .copied()
+            .map(half::f16::from_bits)
+            .collect();
+        let f16_source = Array::from_slice(&f16_values, &[2, 2]);
+        let f16_copy = try_eval_deep_clone(&f16_source).unwrap();
+        let copied_f16_bits: Vec<u16> = f16_copy
+            .as_slice::<half::f16>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(copied_f16_bits, f16_patterns);
+
+        let bf16_patterns = [0x0000_u16, 0x8000, 0x7fc1, 0xff80];
+        let bf16_values: Vec<half::bf16> = bf16_patterns
+            .iter()
+            .copied()
+            .map(half::bf16::from_bits)
+            .collect();
+        let bf16_source = Array::from_slice(&bf16_values, &[2, 2]);
+        let bf16_copy = try_eval_deep_clone(&bf16_source).unwrap();
+        let copied_bf16_bits: Vec<u16> = bf16_copy
+            .as_slice::<half::bf16>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(copied_bf16_bits, bf16_patterns);
+
+        let empty = Array::zeros::<u32>(&[2, 0, 3]).unwrap();
+        let empty_copy = try_eval_deep_clone(&empty).unwrap();
+        assert_eq!(empty_copy.shape(), &[2, 0, 3]);
+        assert_eq!(empty_copy.dtype(), Dtype::Uint32);
+        assert_eq!(empty_copy.nbytes(), 0);
+    }
+
+    #[test]
+    fn device_deep_clone_materializes_noncontiguous_logical_order() {
+        let _exec = crate::mlx_exec::acquire();
+        let values: Vec<f32> = (0_u8..24).map(f32::from).collect();
+        let backing = Array::from_slice(&values, &[1, 3, 2, 4]);
+        let transposed = backing.transpose_axes(&[0, 2, 1, 3]).unwrap();
+        let expected = transposed
+            .flatten(None, None)
+            .unwrap()
+            .reshape(transposed.shape())
+            .unwrap();
+        expected.eval().unwrap();
+
+        let checkpoint = try_eval_deep_clone(&transposed).unwrap();
+        assert_eq!(checkpoint.shape(), transposed.shape());
+        assert_eq!(checkpoint.dtype(), Dtype::Float32);
+        assert_eq!(
+            checkpoint.as_slice::<f32>(),
+            expected.as_slice::<f32>(),
+            "materialization must preserve the logical order of a strided view"
+        );
+        assert_ne!(
+            checkpoint.as_slice::<f32>().as_ptr(),
+            backing.as_slice::<f32>().as_ptr(),
+            "materialized output must not alias the transposed backing allocation"
+        );
+    }
+
+    #[test]
+    fn turboquant_deep_clone_materializes_all_mutable_arrays() {
+        let _exec = crate::mlx_exec::acquire();
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Turboquant,
+            bits: 3,
+            seed: 17,
+            ..Default::default()
+        };
+        let mut cache = SteppingKeyValueCache::new_turbo(config, 2, 8).unwrap();
+        let (keys, values) = make_kv_pair(4, 8);
+        cache
+            .update_and_view_with_activation_threshold(&keys, &values, 0)
+            .unwrap();
+        let (decode_key, decode_value) = make_kv_pair(1, 8);
+        cache
+            .update_and_view_with_activation_threshold(&decode_key, &decode_value, 0)
+            .unwrap();
+        let checkpoint = cache.try_deep_clone().unwrap();
+        let live = cache.turbo.as_ref().unwrap();
+        let copied = checkpoint.turbo.as_ref().unwrap();
+
+        assert!(Arc::ptr_eq(&live.context, &copied.context));
+        let assert_distinct = |left: &Array, right: &Array| {
+            left.eval().unwrap();
+            right.eval().unwrap();
+            assert_eq!(left.shape(), right.shape());
+            assert_eq!(left.dtype(), right.dtype());
+            if left.dtype() == Dtype::Uint32 {
+                assert_eq!(left.as_slice::<u32>(), right.as_slice::<u32>());
+                assert_ne!(
+                    left.as_slice::<u32>().as_ptr(),
+                    right.as_slice::<u32>().as_ptr()
+                );
+            } else {
+                assert_eq!(left.dtype(), Dtype::Float32);
+                assert_eq!(left.as_slice::<f32>(), right.as_slice::<f32>());
+                assert_ne!(
+                    left.as_slice::<f32>().as_ptr(),
+                    right.as_slice::<f32>().as_ptr()
+                );
+            }
+        };
+
+        assert_distinct(
+            live.key_codes.as_ref().unwrap(),
+            copied.key_codes.as_ref().unwrap(),
+        );
+        assert_distinct(
+            live.key_norms.as_ref().unwrap(),
+            copied.key_norms.as_ref().unwrap(),
+        );
+        assert_distinct(
+            live.key_gammas.as_ref().unwrap(),
+            copied.key_gammas.as_ref().unwrap(),
+        );
+        assert_distinct(
+            live.value_codes.as_ref().unwrap(),
+            copied.value_codes.as_ref().unwrap(),
+        );
+        assert_distinct(
+            live.value_norms.as_ref().unwrap(),
+            copied.value_norms.as_ref().unwrap(),
+        );
+    }
+
+    #[test]
     fn deep_clone_checkpoint_survives_live_in_place_update() {
+        let _exec = crate::mlx_exec::acquire();
         // The speculative-decode invariant: a checkpoint captured before the
         // live cache is advanced must NOT change when the live cache does an
         // in-place `slice_update`. A shallow `clone()` shares the KV buffer, so
