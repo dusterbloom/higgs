@@ -25,7 +25,7 @@ use mlx_rs::{
 use tokenizers::Tokenizer;
 
 use crate::{
-    cache::{DiskPrefixCache, DiskPrefixCacheConfig, PagedKvCache},
+    cache::{DiskPrefixCache, DiskPrefixCacheConfig, PagedKvCache, paired::RetainedState},
     chat_template::{ChatMessage, ChatTemplateRenderer},
     engine::{GenerationOutput, StreamingOutput},
     error::EngineError,
@@ -119,7 +119,7 @@ fn session_decode_mode(
 fn stash_into(
     map: &mut std::collections::HashMap<u64, RetainedKv>,
     session_id: u64,
-    cache: AnyCache,
+    state: RetainedState,
     tokens: Vec<u32>,
     max_sessions: usize,
     max_session_tokens: usize,
@@ -133,7 +133,7 @@ fn stash_into(
     map.insert(
         session_id,
         RetainedKv {
-            cache,
+            state,
             tokens,
             last_used: std::time::Instant::now(),
         },
@@ -1014,7 +1014,7 @@ pub struct SimpleEngine {
 /// Holds the actual `AnyCache` instance (not a clone), the exact tokens it
 /// represents (for the prefix guard), and a last-touched stamp for idle eviction.
 struct RetainedKv {
-    cache: AnyCache,
+    state: RetainedState,
     tokens: Vec<u32>,
     last_used: std::time::Instant,
 }
@@ -1554,14 +1554,18 @@ impl SimpleEngine {
     /// prefilling. Returns `None` (and drops any stale entry) when there is no
     /// retained cache or the conversation diverged from it — the caller then
     /// falls back to a clean full prefill. This is the cache-poisoning guard.
-    fn take_continuable(&self, session_id: u64, full_tokens: &[u32]) -> Option<(AnyCache, usize)> {
+    fn take_continuable(
+        &self,
+        session_id: u64,
+        full_tokens: &[u32],
+    ) -> Option<(RetainedState, usize)> {
         let mut map = lock_or_recover(&self.retained);
         let prior = match map.get(&session_id) {
             Some(entry) => continuation_prior_len(&entry.tokens, full_tokens),
             None => return None,
         };
         if let Some(p) = prior {
-            map.remove(&session_id).map(|kept| (kept.cache, p))
+            map.remove(&session_id).map(|kept| (kept.state, p))
         } else {
             map.remove(&session_id); // drop the diverged/stale entry
             None
@@ -1586,7 +1590,13 @@ impl SimpleEngine {
     /// Metal command buffer is process-global and aborts on concurrent eval, so
     /// all GPU work must stay serialized under the model lock, which this
     /// function does not hold.
-    fn stash_retained(&self, session_id: u64, cache: AnyCache, tokens: Vec<u32>, cap_exempt: bool) {
+    fn stash_retained(
+        &self,
+        session_id: u64,
+        state: RetainedState,
+        tokens: Vec<u32>,
+        cap_exempt: bool,
+    ) {
         // `cap_exempt`: the caller compressed this cache to TurboQuant because
         // it exceeded the dense token cap — retain it anyway (bounded footprint
         // beats the measured 150s full re-prefill a drop would cost the
@@ -1606,7 +1616,7 @@ impl SimpleEngine {
         let evicted = stash_into(
             &mut lock_or_recover(&self.retained),
             session_id,
-            cache,
+            state,
             tokens,
             self.kv_cache_config.max_retained_sessions,
             effective_cap,
@@ -2951,9 +2961,10 @@ impl SimpleEngine {
         let total = u32::try_from(prompt_tokens.len())
             .map_err(|_| EngineError::Generation("prompt too long".to_owned()))?;
 
-        let (mut prepared, prefilled, continued) = if let Some((cache, prior)) =
+        let (mut prepared, prefilled, continued) = if let Some((state, prior)) =
             self.take_continuable(session_id, prompt_tokens)
         {
+            let cache = state.demote();
             debug_assert!(
                 prior <= prompt_tokens.len(),
                 "continuation prior {prior} exceeds prompt length {}",
@@ -3428,7 +3439,12 @@ impl SimpleEngine {
         if full.last().is_some_and(|t| self.eos_token_ids.contains(t)) {
             full.pop();
         }
-        self.stash_retained(session_id, cache, full, cap_exempt);
+        self.stash_retained(
+            session_id,
+            RetainedState::TargetOnly(cache),
+            full,
+            cap_exempt,
+        );
         let total_elapsed = total_start.elapsed();
 
         #[allow(clippy::print_stderr)] // env-gated diagnostic
@@ -7820,13 +7836,14 @@ mod tests {
     #[test]
     fn retention_caps_bound_the_retained_map() {
         use super::{RetainedKv, evict_idle_from, retention_token_cap, stash_into};
+        use crate::cache::paired::RetainedState;
         use higgs_models::AnyCache;
         use higgs_models::turboquant::KvCacheConfig;
         use std::collections::HashMap;
         use std::time::{Duration, Instant};
 
         // An empty KV cache is a valid `AnyCache` and needs no GPU.
-        let dummy = || AnyCache::KV(Vec::new());
+        let dummy = || RetainedState::TargetOnly(AnyCache::KV(Vec::new()));
 
         // -- count cap: never exceed max_sessions (LRU-evicted) --
         let mut map: HashMap<u64, RetainedKv> = HashMap::new();
@@ -7894,7 +7911,7 @@ mod tests {
             ttl.insert(
                 sid,
                 RetainedKv {
-                    cache: dummy(),
+                    state: dummy(),
                     tokens: vec![1],
                     last_used: Instant::now(),
                 },
