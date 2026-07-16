@@ -15,6 +15,8 @@
     clippy::unwrap_used
 )]
 
+mod support;
+
 use std::path::Path;
 
 use higgs_engine::{
@@ -23,6 +25,7 @@ use higgs_engine::{
     simple::SimpleEngine,
 };
 use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
+use support::ReferenceDsparkEnv;
 
 fn greedy(speculation: Speculation) -> SamplingParams {
     SamplingParams {
@@ -52,6 +55,7 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
         .with_env_filter("info")
         .with_test_writer()
         .try_init();
+    let _reference_dspark = ReferenceDsparkEnv::install();
     let target = std::env::var("HIGGS_DFLASH_TARGET_DIR")
         .expect("set HIGGS_DFLASH_TARGET_DIR to the Bonsai target model");
     let drafter = std::env::var("HIGGS_DFLASH_DRAFTER_DIR")

@@ -19,6 +19,8 @@
     clippy::tests_outside_test_module
 )]
 
+mod support;
+
 use std::path::Path;
 
 use higgs_engine::{
@@ -27,38 +29,7 @@ use higgs_engine::{
     simple::SimpleEngine,
 };
 use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
-
-struct ScopedEnvVar {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl ScopedEnvVar {
-    #[allow(unsafe_code)]
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        // SAFETY: This ignored real-model gate is documented and asserted to
-        // run alone (`--test-threads=1`). The guard restores the process-global
-        // setting even if the test unwinds.
-        unsafe { std::env::set_var(key, value) };
-        Self { key, previous }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    #[allow(unsafe_code)]
-    fn drop(&mut self) {
-        // SAFETY: See `ScopedEnvVar::set`; restoration happens in the same
-        // serial ignored test that performed the mutation.
-        unsafe {
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
+use support::{ReferenceDsparkEnv, ScopedEnvVar};
 
 #[derive(Clone, Copy)]
 struct DflashAcceptance {
@@ -177,6 +148,7 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
         .with_env_filter("info")
         .with_test_writer()
         .try_init();
+    let _reference_dspark = ReferenceDsparkEnv::install();
     let _prefix_cache_enabled = ScopedEnvVar::set("HIGGS_PREFIX_CACHE", "1");
     let target = std::env::var("HIGGS_DFLASH_TARGET_DIR")
         .expect("set HIGGS_DFLASH_TARGET_DIR to the Bonsai target model");
