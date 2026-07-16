@@ -5,12 +5,15 @@ use std::time::Instant;
 use std::sync::Arc;
 
 use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis1, slice_axis2};
+use higgs_models::dflash::{DFlashCache, DFlashSnapshot};
 use higgs_models::qwen3_next::ArraysCache;
 use higgs_models::turboquant::TurboQuantContext;
 use higgs_models::{AnyCache, LayerCache};
 use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::concatenate_axis;
+
+use crate::cache::paired::{PairedCacheError, RadixDFlashForkPlan, RadixDFlashSnapshot};
 
 /// Default block size in tokens for paged caching.
 pub const DEFAULT_BLOCK_SIZE: usize = 32;
@@ -179,8 +182,45 @@ enum CachedData {
     Cloned(AnyCache),
 }
 
+/// One exact stored endpoint in the shared target radix.
+///
+/// The target payload interpretation and optional dFlash sidecar move and evict
+/// together. Target-only refreshes may replace the deterministic target blocks
+/// while retaining the already-validated sidecar at the same token endpoint.
+enum CachedEndpoint {
+    TargetOnly(CachedData),
+    TargetAndDflash {
+        target: CachedData,
+        dflash: Arc<RadixDFlashSnapshot>,
+    },
+}
+
+impl CachedEndpoint {
+    const fn target(&self) -> &CachedData {
+        match self {
+            Self::TargetOnly(target) | Self::TargetAndDflash { target, .. } => target,
+        }
+    }
+
+    const fn dflash(&self) -> Option<&Arc<RadixDFlashSnapshot>> {
+        match self {
+            Self::TargetOnly(_) => None,
+            Self::TargetAndDflash { dflash, .. } => Some(dflash),
+        }
+    }
+
+    fn replace_preserving_dflash(self, previous: Option<Self>) -> Self {
+        match (self, previous) {
+            (Self::TargetOnly(target), Some(Self::TargetAndDflash { dflash, target: _ })) => {
+                Self::TargetAndDflash { target, dflash }
+            }
+            (replacement, _) => replacement,
+        }
+    }
+}
+
 struct CachedState {
-    data: CachedData,
+    endpoint: CachedEndpoint,
     last_accessed: Cell<Instant>,
 }
 
@@ -199,12 +239,18 @@ struct RadixNode {
 /// Endpoint kind for a lookup match.
 enum MatchEndpoint<'a> {
     /// A stored trie endpoint (full metadata available).
-    Stored(&'a CachedData),
+    Stored(&'a CachedEndpoint),
     /// A block-aligned position inside an edge (no stored endpoint). Paged
     /// caches are never hybrid; only the optional TQ context is needed.
     PartialPaged {
         context: Option<Arc<TurboQuantContext>>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LookupPolicy {
+    TargetAny,
+    TargetAndDflashExact,
 }
 
 /// A candidate lookup match: how deep it reaches, how to interpret its blocks,
@@ -240,6 +286,110 @@ pub struct PagedPrefixMatch {
     pub cache: AnyCache,
 }
 
+/// Exact paired radix reuse: independently materialized target state plus a
+/// forked live dFlash branch from the immutable stored endpoint.
+pub(crate) struct PagedPairedPrefixMatch {
+    pub(crate) prefix_len: usize,
+    pub(crate) cache: AnyCache,
+    pub(crate) dflash_cache: DFlashCache,
+}
+
+/// Owned target reconstruction selected while the radix is locked.
+///
+/// This contains only shared array handles / immutable metadata. Device copies,
+/// concatenation, and evaluation are deferred to [`PagedPairedLookupPlan::materialize`].
+enum TargetMaterializationPlan {
+    Cloned(AnyCache),
+    DensePaged {
+        layers: Vec<CachedLayerData>,
+        is_hybrid: bool,
+    },
+    TurboQuantPaged {
+        layers: Vec<CachedLayerData>,
+        context: Arc<TurboQuantContext>,
+        is_hybrid: bool,
+    },
+}
+
+/// Exact paired radix hit whose resources are owned independently of the trie.
+///
+/// Constructing this plan is CPU-only and safe while the prefix mutex is held.
+/// Materialization requires the process MLX gate and must happen after that
+/// mutex is released.
+pub(crate) struct PagedPairedLookupPlan {
+    prefix_len: usize,
+    target: TargetMaterializationPlan,
+    dflash: RadixDFlashForkPlan,
+}
+
+impl PagedPairedLookupPlan {
+    #[must_use]
+    pub(crate) const fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
+
+    pub(crate) fn materialize(self) -> Result<PagedPairedPrefixMatch, PairedCacheError> {
+        debug_assert!(
+            higgs_models::mlx_exec::held(),
+            "paired radix materialization requires the process MLX execution gate"
+        );
+        let cache =
+            self.target
+                .materialize()
+                .map_err(|error| PairedCacheError::TargetMaterialization {
+                    details: error.to_string(),
+                })?;
+        let expected =
+            i32::try_from(self.prefix_len).map_err(|_| PairedCacheError::PrefixLengthOverflow {
+                len: self.prefix_len,
+            })?;
+        cache
+            .validate_absolute_boundary(expected)
+            .map_err(|error| PairedCacheError::TargetBoundary {
+                expected,
+                details: error.to_string(),
+            })?;
+        if self.dflash.prefix_len() != self.prefix_len {
+            return Err(PairedCacheError::DFlashBoundary {
+                expected,
+                actual: i32::try_from(self.dflash.prefix_len()).unwrap_or(i32::MAX),
+            });
+        }
+        let dflash_cache = self.dflash.materialize()?;
+        Ok(PagedPairedPrefixMatch {
+            prefix_len: self.prefix_len,
+            cache,
+            dflash_cache,
+        })
+    }
+}
+
+impl TargetMaterializationPlan {
+    fn materialize(self) -> Result<AnyCache, Exception> {
+        match self {
+            Self::Cloned(cache) => Ok(cache.deep_clone()),
+            Self::DensePaged { layers, is_hybrid } => {
+                if is_hybrid {
+                    materialize_hybrid(&layers)
+                } else {
+                    materialize_kv(&layers)
+                }
+            }
+            Self::TurboQuantPaged {
+                layers,
+                context,
+                is_hybrid,
+            } => {
+                if is_hybrid {
+                    materialize_tq_hybrid(&layers, &context)
+                } else {
+                    materialize_tq_kv(&layers, &context)
+                }
+            }
+        }
+    }
+}
+
 /// Paged prefix cache with block-level storage and LRU eviction.
 ///
 /// Instead of cloning entire `AnyCache` objects (which pins a full KV slab per
@@ -268,12 +418,12 @@ impl RadixNode {
         }
     }
 
-    fn leaf(edge: Vec<u32>, edge_blocks: EdgeData, data: CachedData) -> Self {
+    fn leaf(edge: Vec<u32>, edge_blocks: EdgeData, endpoint: CachedEndpoint) -> Self {
         Self {
             edge,
             edge_blocks,
             cached: Some(CachedState {
-                data,
+                endpoint,
                 last_accessed: Cell::new(Instant::now()),
             }),
             children: HashMap::new(),
@@ -301,6 +451,7 @@ impl RadixNode {
         depth: usize,
         min_prefix: usize,
         block_size: usize,
+        policy: LookupPolicy,
         path: &mut Vec<&'a EdgeBlocks>,
     ) -> Option<MatchResult<'a>> {
         // Record this edge's blocks on the running path (root edge is empty).
@@ -318,23 +469,40 @@ impl RadixNode {
         let mut deepest: Option<MatchResult<'a>> = self
             .cached
             .as_ref()
-            .filter(|cs| match &cs.data {
-                CachedData::Cloned(_) => depth > 0,
-                // Filter on the BLOCK-token sum we actually report as prefix_len
-                // (and can reconstruct), not the raw edge depth. After a
-                // non-block-aligned ancestor split these differ, and gating on
-                // raw `depth` could "match" an endpoint whose block_depth is 0 —
-                // returning an empty (prefix_len == 0) reconstruction.
-                CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => {
-                    block_depth >= min_prefix
-                }
+            .filter(|cs| {
+                let target = cs.endpoint.target();
+                let prefix_len = match target {
+                    CachedData::Cloned(_) => depth,
+                    CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => block_depth,
+                };
+                let target_qualifies = match target {
+                    CachedData::Cloned(_) => depth > 0,
+                    // Filter on the BLOCK-token sum we actually report as
+                    // prefix_len, not raw edge depth.
+                    CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => {
+                        block_depth >= min_prefix
+                    }
+                };
+                let policy_qualifies = match policy {
+                    LookupPolicy::TargetAny => true,
+                    LookupPolicy::TargetAndDflashExact => {
+                        cs.endpoint.dflash().is_some_and(|dflash| {
+                            prefix_len == depth
+                                && dflash.prefix_len() == prefix_len
+                                && tokens
+                                    .get(..prefix_len)
+                                    .is_some_and(|prefix| dflash.matches_prefix(prefix))
+                        })
+                    }
+                };
+                target_qualifies && policy_qualifies
             })
             .map(|cs| MatchResult {
-                prefix_len: match &cs.data {
+                prefix_len: match cs.endpoint.target() {
                     CachedData::Cloned(_) => depth,
                     CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => block_depth,
                 },
-                kind: MatchEndpoint::Stored(&cs.data),
+                kind: MatchEndpoint::Stored(&cs.endpoint),
                 full_path: path.clone(),
                 partial_tail: None,
                 touch: Some(&cs.last_accessed),
@@ -344,7 +512,10 @@ impl RadixNode {
         // prefix (e.g. a shared split node with no stored endpoint). The full
         // path's blocks reconstruct it exactly -- true RadixAttention prefix
         // sharing even when no endpoint was stored at this boundary.
-        if block_depth >= min_prefix && matches!(&self.edge_blocks, EdgeData::Paged(_)) {
+        if policy == LookupPolicy::TargetAny
+            && block_depth >= min_prefix
+            && matches!(&self.edge_blocks, EdgeData::Paged(_))
+        {
             let node_match = MatchResult {
                 prefix_len: block_depth,
                 kind: MatchEndpoint::PartialPaged {
@@ -374,6 +545,7 @@ impl RadixNode {
                         depth + common,
                         min_prefix,
                         block_size,
+                        policy,
                         path,
                     ) {
                         deepest = deeper_of(deepest, Some(found));
@@ -381,8 +553,13 @@ impl RadixNode {
                 } else {
                     // Partial edge match: reuse the leading whole blocks that the
                     // query shares with this child edge (RadixAttention sub-prefix).
-                    if let Some(found) =
-                        child.partial_edge_match(common, min_prefix, block_size, path.as_slice())
+                    if policy == LookupPolicy::TargetAny
+                        && let Some(found) = child.partial_edge_match(
+                            common,
+                            min_prefix,
+                            block_size,
+                            path.as_slice(),
+                        )
                     {
                         deepest = deeper_of(deepest, Some(found));
                     }
@@ -507,6 +684,13 @@ impl RadixNode {
 }
 
 impl EdgeData {
+    const fn tokens(&self) -> usize {
+        match self {
+            Self::Paged(blocks) => blocks.tokens,
+            Self::None => 0,
+        }
+    }
+
     /// Concatenate two consecutive edges' block payloads into one. Used when
     /// `prune` collapses a node into its sole child after eviction.
     fn merge(parent: Self, child: Self) -> Self {
@@ -702,6 +886,7 @@ impl PagedPrefixCache {
             0,
             self.block_size,
             self.block_size,
+            LookupPolicy::TargetAny,
             &mut scratch,
         )?;
         let prefix_len = m.prefix_len;
@@ -720,6 +905,52 @@ impl PagedPrefixCache {
         }
     }
 
+    /// Select the deepest exact stored endpoint that owns both target and
+    /// dFlash state.
+    ///
+    /// This performs no MLX materialization or dFlash fork. The returned plan
+    /// owns all array handles and sidecar state needed after the caller releases
+    /// the outer prefix-cache mutex.
+    pub(crate) fn plan_longest_paired_prefix(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<Option<PagedPairedLookupPlan>, PairedCacheError> {
+        let mut scratch: Vec<&EdgeBlocks> = Vec::new();
+        let Some(matched) = self.root.find_deepest_match(
+            tokens,
+            0,
+            self.block_size,
+            self.block_size,
+            LookupPolicy::TargetAndDflashExact,
+            &mut scratch,
+        ) else {
+            return Ok(None);
+        };
+        let MatchEndpoint::Stored(endpoint) = &matched.kind else {
+            return Ok(None);
+        };
+        let Some(dflash) = endpoint.dflash() else {
+            return Ok(None);
+        };
+        let prefix_len = matched.prefix_len;
+        let prefix_tokens = tokens
+            .get(..prefix_len)
+            .ok_or(PairedCacheError::PrefixMismatch {
+                stored_len: prefix_len,
+                requested_len: tokens.len(),
+            })?;
+        let target = own_target_materialization_plan(&matched)?;
+        let dflash = dflash.plan_fork(prefix_tokens)?;
+        if let Some(touch) = matched.touch {
+            touch.set(Instant::now());
+        }
+        Ok(Some(PagedPairedLookupPlan {
+            prefix_len,
+            target,
+            dflash,
+        }))
+    }
+
     /// Store a prefix and its cache state as paged blocks.
     ///
     /// For dense KV caches, the K/V arrays are sliced into block-sized views
@@ -733,67 +964,173 @@ impl PagedPrefixCache {
         if self.max_cached == 0 {
             return;
         }
+        let Some(prepared) = self.prepare_store(prefix_tokens, cache) else {
+            return;
+        };
+        let stored_len = prepared.total_tokens;
+        let target = CachedEndpoint::TargetOnly(prepared.endpoint);
+        self.publish_prepared(
+            prefix_tokens,
+            stored_len,
+            prepared.blocks,
+            prepared.context,
+            target,
+        );
+    }
 
-        if let Some(offset) = kv_offset(cache).and_then(|o| usize::try_from(o).ok()) {
-            if offset > prefix_tokens.len() {
-                tracing::warn!(
-                    cache_tokens = offset,
-                    key_tokens = prefix_tokens.len(),
-                    "Skipping prefix cache store: cache longer than key"
-                );
-                return;
-            }
+    /// Prepare one exact target/dFlash endpoint without borrowing the radix.
+    ///
+    /// Slicing/evaluation happens here under the process MLX gate. Because this
+    /// is an associated function rather than a method, callers do not need (and
+    /// should not hold) the prefix-cache mutex. The opaque result can only be
+    /// published through [`Self::commit_prepared_pair`].
+    pub(crate) fn prepare_paired_prefix(
+        block_size: usize,
+        prefix_tokens: &[u32],
+        cache: &AnyCache,
+        dflash: DFlashSnapshot,
+    ) -> Result<PreparedPairedPrefix, PairedCacheError> {
+        debug_assert!(
+            higgs_models::mlx_exec::held(),
+            "paired radix preparation requires the process MLX execution gate"
+        );
+        let prepared = Self::prepare_store_with_block_size(block_size, prefix_tokens, cache)
+            .ok_or_else(|| PairedCacheError::TargetMaterialization {
+                details: "target cache cannot be represented at this radix key".to_owned(),
+            })?;
+        validate_prepared_pair_boundary(&prepared)?;
+        let stored_len = prepared.total_tokens;
+        let tokens_to_store =
+            prefix_tokens
+                .get(..stored_len)
+                .ok_or(PairedCacheError::PrefixMismatch {
+                    stored_len,
+                    requested_len: prefix_tokens.len(),
+                })?;
+        let dflash = Arc::new(RadixDFlashSnapshot::new(dflash, tokens_to_store)?);
+        let endpoint = CachedEndpoint::TargetAndDflash {
+            target: prepared.endpoint,
+            dflash,
+        };
+        Ok(PreparedPairedPrefix {
+            block_size,
+            tokens: tokens_to_store.into(),
+            blocks: prepared.blocks,
+            context: prepared.context,
+            endpoint,
+        })
+    }
+
+    /// Publish a fully prepared pair using only ownership moves and trie/LRU
+    /// mutation. No MLX graph construction, evaluation, or dFlash fork occurs.
+    pub(crate) fn commit_prepared_pair(
+        &mut self,
+        prepared: PreparedPairedPrefix,
+    ) -> Result<(), PairedCacheError> {
+        if prepared.block_size != self.block_size {
+            return Err(PairedCacheError::TargetMaterialization {
+                details: format!(
+                    "paired prefix was prepared for block size {} but cache uses {}",
+                    prepared.block_size, self.block_size
+                ),
+            });
         }
+        if self.max_cached == 0 {
+            return Ok(());
+        }
+        let PreparedPairedPrefix {
+            block_size: _,
+            tokens,
+            blocks,
+            context,
+            endpoint,
+        } = prepared;
+        let stored_len = tokens.len();
+        self.publish_prepared(&tokens, stored_len, blocks, context, endpoint);
+        Ok(())
+    }
 
-        // TurboQuant caches with deferred quantization are stored as dense
-        // blocks until TQ activates. Full TQ block paging is implemented in the
-        // CachedData::TurboQuantPaged variant but requires the TQ arrays to be
-        // populated (post-activation). For now, use clone fallback when TQ config
-        // is set but arrays aren't yet quantized to avoid cache corruption.
-        let prepared = match slice_into_blocks(cache, self.block_size, prefix_tokens.len()) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to page cache, using clone fallback");
-                match kv_offset(cache).and_then(|offset| usize::try_from(offset).ok()) {
-                    Some(offset) if offset > prefix_tokens.len() => {
-                        tracing::warn!(
-                            cache_tokens = offset,
-                            key_tokens = prefix_tokens.len(),
-                            "Skipping prefix cache store: cache longer than key"
-                        );
-                        return;
-                    }
-                    _ => PreparedStore {
-                        blocks: None,
-                        context: None,
-                        total_tokens: prefix_tokens.len(),
-                        endpoint: CachedData::Cloned(cache.clone()),
-                    },
+    #[cfg(test)]
+    fn store_paired(
+        &mut self,
+        prefix_tokens: &[u32],
+        cache: &AnyCache,
+        dflash: DFlashSnapshot,
+    ) -> Result<(), PairedCacheError> {
+        let _exec = higgs_models::mlx_exec::acquire();
+        let prepared = Self::prepare_paired_prefix(self.block_size, prefix_tokens, cache, dflash)?;
+        self.commit_prepared_pair(prepared)
+    }
+
+    fn prepare_store(&self, prefix_tokens: &[u32], cache: &AnyCache) -> Option<PreparedStore> {
+        Self::prepare_store_with_block_size(self.block_size, prefix_tokens, cache)
+    }
+
+    fn prepare_store_with_block_size(
+        block_size: usize,
+        prefix_tokens: &[u32],
+        cache: &AnyCache,
+    ) -> Option<PreparedStore> {
+        // Dense KV may legitimately extend beyond a stripped key: paging slices
+        // only the key's complete blocks. Whole-clone fallbacks cannot be
+        // truncated and therefore require an exact cache/key boundary.
+        let prepared = match slice_into_blocks(cache, block_size, prefix_tokens.len()) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(error = %error, "Failed to page cache, using clone fallback");
+                let offset = kv_offset(cache).and_then(|value| usize::try_from(value).ok());
+                if offset.is_some_and(|value| value != prefix_tokens.len()) {
+                    tracing::warn!(
+                        cache_tokens = offset.unwrap_or_default(),
+                        key_tokens = prefix_tokens.len(),
+                        "Skipping whole-clone prefix cache store at a different boundary"
+                    );
+                    return None;
+                }
+                PreparedStore {
+                    blocks: None,
+                    context: None,
+                    total_tokens: prefix_tokens.len(),
+                    endpoint: CachedData::Cloned(cache.clone()),
                 }
             }
         };
+        if matches!(&prepared.endpoint, CachedData::Cloned(_)) {
+            let offset = kv_offset(cache).and_then(|value| usize::try_from(value).ok());
+            if offset.is_some_and(|value| value != prepared.total_tokens) {
+                tracing::warn!(
+                    cache_tokens = offset.unwrap_or_default(),
+                    key_tokens = prepared.total_tokens,
+                    "Skipping whole-clone prefix cache store at a different boundary"
+                );
+                return None;
+            }
+        }
+        Some(prepared)
+    }
 
-        let stored_len = prepared.total_tokens;
+    fn publish_prepared(
+        &mut self,
+        prefix_tokens: &[u32],
+        stored_len: usize,
+        blocks: Option<Vec<CachedLayerData>>,
+        context: Option<Arc<TurboQuantContext>>,
+        endpoint: CachedEndpoint,
+    ) {
         let Some(tokens_to_store) = prefix_tokens.get(..stored_len) else {
-            tracing::warn!(
-                key_tokens = prefix_tokens.len(),
-                stored_len,
-                "Skipping prefix cache store: cache longer than key"
-            );
             return;
         };
-
         let ctx = Ctx {
             block_size: self.block_size,
-            context: prepared.context,
+            context,
         };
         let added = Self::insert(
             &mut self.root,
             tokens_to_store,
             0,
-            prepared.blocks.clone(),
-            prepared.blocks.as_ref(),
-            prepared.endpoint,
+            blocks.clone(),
+            blocks.as_ref(),
+            endpoint,
             &ctx,
         );
 
@@ -820,7 +1157,7 @@ impl PagedPrefixCache {
         pos: usize,
         blocks: Option<Vec<CachedLayerData>>,
         full_blocks: Option<&Vec<CachedLayerData>>,
-        endpoint: CachedData,
+        endpoint: CachedEndpoint,
         ctx: &Ctx,
     ) -> bool {
         let block_size = ctx.block_size;
@@ -834,7 +1171,7 @@ impl PagedPrefixCache {
             // sequence; slice those from the full run.
             if !is_new {
                 if let Some(full) = full_blocks {
-                    let edge_blocks = node.edge.len() / block_size;
+                    let edge_blocks = node.edge_blocks.tokens() / block_size;
                     let refreshed: Vec<CachedLayerData> = full
                         .iter()
                         .map(|l| l.take_last_blocks(edge_blocks))
@@ -842,8 +1179,9 @@ impl PagedPrefixCache {
                     node.edge_blocks = edge_blocks_from(Some(refreshed), ctx.context.clone());
                 }
             }
+            let previous = node.cached.take().map(|cached| cached.endpoint);
             node.cached = Some(CachedState {
-                data: endpoint,
+                endpoint: endpoint.replace_preserving_dflash(previous),
                 last_accessed: Cell::new(Instant::now()),
             });
             return is_new;
@@ -919,7 +1257,7 @@ impl PagedPrefixCache {
 
             if pos + common >= tokens.len() {
                 split.cached = Some(CachedState {
-                    data: endpoint,
+                    endpoint,
                     last_accessed: Cell::new(Instant::now()),
                 });
                 node.children.insert(next_token, split);
@@ -1048,6 +1386,86 @@ struct PreparedStore {
     context: Option<Arc<TurboQuantContext>>,
     total_tokens: usize,
     endpoint: CachedData,
+}
+
+/// Opaque, fully evaluated paired endpoint ready for a CPU-only radix commit.
+pub(crate) struct PreparedPairedPrefix {
+    block_size: usize,
+    tokens: Box<[u32]>,
+    blocks: Option<Vec<CachedLayerData>>,
+    context: Option<Arc<TurboQuantContext>>,
+    endpoint: CachedEndpoint,
+}
+
+fn validate_prepared_pair_boundary(prepared: &PreparedStore) -> Result<(), PairedCacheError> {
+    let expected = i32::try_from(prepared.total_tokens).map_err(|_| {
+        PairedCacheError::PrefixLengthOverflow {
+            len: prepared.total_tokens,
+        }
+    })?;
+    match &prepared.endpoint {
+        CachedData::Cloned(cache) => cache.validate_absolute_boundary(expected).map_err(|error| {
+            PairedCacheError::TargetBoundary {
+                expected,
+                details: error.to_string(),
+            }
+        }),
+        CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => {
+            let layers =
+                prepared
+                    .blocks
+                    .as_ref()
+                    .ok_or_else(|| PairedCacheError::TargetBoundary {
+                        expected,
+                        details: "paged endpoint has no target block payload".to_owned(),
+                    })?;
+            if layers.is_empty() {
+                return Err(PairedCacheError::TargetBoundary {
+                    expected,
+                    details: "paged endpoint has no target layers".to_owned(),
+                });
+            }
+            for (index, layer) in layers.iter().enumerate() {
+                let actual = match layer {
+                    CachedLayerData::Kv(blocks) => blocks.iter().fold(0usize, |total, block| {
+                        total.saturating_add(
+                            block
+                                .keys
+                                .shape()
+                                .get(2)
+                                .copied()
+                                .and_then(|value| usize::try_from(value).ok())
+                                .unwrap_or(0),
+                        )
+                    }),
+                    CachedLayerData::TurboQuantKv(blocks) => {
+                        blocks.iter().fold(0usize, |total, block| {
+                            total.saturating_add(
+                                block
+                                    .key_norms
+                                    .shape()
+                                    .get(1)
+                                    .copied()
+                                    .and_then(|value| usize::try_from(value).ok())
+                                    .unwrap_or(0),
+                            )
+                        })
+                    }
+                    CachedLayerData::Gdn(_) | CachedLayerData::Empty => 0,
+                };
+                if actual != prepared.total_tokens {
+                    return Err(PairedCacheError::TargetBoundary {
+                        expected,
+                        details: format!(
+                            "paged target layer {index} covers {actual} tokens instead of {}",
+                            prepared.total_tokens
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Slice a cache into block-aligned paged data.
@@ -1200,6 +1618,34 @@ fn flatten_path_layers(
     out
 }
 
+/// Detach a paired target reconstruction recipe from the borrowed trie match.
+///
+/// All clones here are immutable MLX handles or `Arc` bumps; no concatenation,
+/// deep copy, graph construction, or evaluation occurs.
+fn own_target_materialization_plan(
+    matched: &MatchResult<'_>,
+) -> Result<TargetMaterializationPlan, PairedCacheError> {
+    let MatchEndpoint::Stored(endpoint) = &matched.kind else {
+        return Err(PairedCacheError::TargetMaterialization {
+            details: "paired lookup selected a structural target endpoint".to_owned(),
+        });
+    };
+    match endpoint.target() {
+        CachedData::Cloned(cache) => Ok(TargetMaterializationPlan::Cloned(cache.clone())),
+        CachedData::Paged { is_hybrid } => Ok(TargetMaterializationPlan::DensePaged {
+            layers: flatten_path_layers(&matched.full_path, matched.partial_tail.as_ref()),
+            is_hybrid: *is_hybrid,
+        }),
+        CachedData::TurboQuantPaged {
+            context, is_hybrid, ..
+        } => Ok(TargetMaterializationPlan::TurboQuantPaged {
+            layers: flatten_path_layers(&matched.full_path, matched.partial_tail.as_ref()),
+            context: Arc::clone(context),
+            is_hybrid: *is_hybrid,
+        }),
+    }
+}
+
 /// Materialize a matched prefix into a contiguous `AnyCache`.
 ///
 /// Blocks are gathered from every edge along the match's `full_path` (root ->
@@ -1216,25 +1662,27 @@ fn materialize(m: &MatchResult) -> Result<AnyCache, Exception> {
         // wholesale divergence). deep_clone gives the reuser independent
         // buffers and leaves the stored entry frozen. Dense paged caches are
         // reconstructed from blocks below and are already independent.
-        MatchEndpoint::Stored(CachedData::Cloned(cache)) => Ok(cache.deep_clone()),
-        MatchEndpoint::Stored(CachedData::Paged { is_hybrid, .. }) => {
-            let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
-            if *is_hybrid {
-                materialize_hybrid(&layers)
-            } else {
-                materialize_kv(&layers)
+        MatchEndpoint::Stored(endpoint) => match endpoint.target() {
+            CachedData::Cloned(cache) => Ok(cache.deep_clone()),
+            CachedData::Paged { is_hybrid, .. } => {
+                let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
+                if *is_hybrid {
+                    materialize_hybrid(&layers)
+                } else {
+                    materialize_kv(&layers)
+                }
             }
-        }
-        MatchEndpoint::Stored(CachedData::TurboQuantPaged {
-            context, is_hybrid, ..
-        }) => {
-            let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
-            if *is_hybrid {
-                materialize_tq_hybrid(&layers, context)
-            } else {
-                materialize_tq_kv(&layers, context)
+            CachedData::TurboQuantPaged {
+                context, is_hybrid, ..
+            } => {
+                let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
+                if *is_hybrid {
+                    materialize_tq_hybrid(&layers, context)
+                } else {
+                    materialize_tq_kv(&layers, context)
+                }
             }
-        }
+        },
         MatchEndpoint::PartialPaged { context } => {
             let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
             context.as_ref().map_or_else(
@@ -1404,6 +1852,7 @@ fn gather_tq_blocks(
 mod tests {
     use super::*;
     use higgs_models::cache::KeyValueCache;
+    use higgs_models::dflash::{DFlashConfig, DFlashDrafter, DFlashSnapshot};
 
     /// Create a KV cache with `num_layers` layers, each containing `seq_len`
     /// tokens of shape `[1, 2, seq_len, 8]`.
@@ -1464,6 +1913,42 @@ mod tests {
         }
     }
 
+    fn tiny_dflash_drafter() -> DFlashDrafter {
+        let config: DFlashConfig = serde_json::from_str(
+            r#"{
+                "hidden_size": 4,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "intermediate_size": 8,
+                "vocab_size": 8,
+                "dflash_config": {
+                    "target_layer_ids": [0]
+                }
+            }"#,
+        )
+        .unwrap();
+        DFlashDrafter::new(config).unwrap()
+    }
+
+    fn dflash_snapshot(boundary: i32) -> DFlashSnapshot {
+        let mut drafter = tiny_dflash_drafter();
+        let cache = drafter.make_cache();
+        let taps = (boundary > 0)
+            .then(|| Array::zeros::<f32>(&[1, boundary, 4]).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let _exec = higgs_models::mlx_exec::acquire();
+        drafter.seal_after_taps(cache, &taps, boundary).unwrap()
+    }
+
+    fn find_paired(cache: &mut PagedPrefixCache, tokens: &[u32]) -> Option<PagedPairedPrefixMatch> {
+        let plan = cache.plan_longest_paired_prefix(tokens).unwrap()?;
+        let _exec = higgs_models::mlx_exec::acquire();
+        Some(plan.materialize().unwrap())
+    }
+
     #[test]
     fn test_empty_cache_returns_none() {
         let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
@@ -1508,6 +1993,23 @@ mod tests {
 
         let matched = result.unwrap();
         // Should be block-aligned: floor(50/32)*32 = 32
+        assert_eq!(matched.prefix_len, 32);
+        assert_eq!(kv_cache_offset(&matched.cache), 32);
+    }
+
+    #[test]
+    fn dense_cache_longer_than_stripped_key_pages_to_key_floor() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let stripped_key: Vec<u32> = (0..50).collect();
+        let full_cache = make_kv_cache(2, 64);
+
+        cache.store(&stripped_key, &full_cache);
+
+        let mut query = stripped_key;
+        query.push(999);
+        let matched = cache
+            .find_longest_prefix(&query)
+            .expect("dense cache should slice to the stripped key's block floor");
         assert_eq!(matched.prefix_len, 32);
         assert_eq!(kv_cache_offset(&matched.cache), 32);
     }
@@ -2005,6 +2507,229 @@ mod tests {
         // The shared blocks came from seq_a (stored first); reconstruction of
         // the first 64 tokens must byte-match seq_a's stored KV.
         assert_keys_eq_first_n(&cache_keys(&result.cache, 0), &expected, 64);
+    }
+
+    #[test]
+    fn paired_store_rejects_snapshot_boundary_different_from_prepared_boundary() {
+        let mut cache = PagedPrefixCache::new(10, 4);
+        let tokens: Vec<u32> = (0..10).collect();
+        let target = make_kv_cache(1, 10);
+
+        let error = cache
+            .store_paired(&tokens, &target, dflash_snapshot(10))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::cache::paired::PairedCacheError::DFlashBoundary {
+                expected: 8,
+                actual: 10
+            }
+        ));
+        assert!(cache.is_empty(), "failed paired publication must be atomic");
+    }
+
+    #[test]
+    fn paired_lookup_selects_deepest_qualifying_exact_endpoint() {
+        let mut cache = PagedPrefixCache::new(10, 4);
+        let pair_short: Vec<u32> = (0..4).collect();
+        let target_deeper: Vec<u32> = (0..8).collect();
+        let pair_deepest: Vec<u32> = (0..12).collect();
+        let target_deepest: Vec<u32> = (0..16).collect();
+
+        cache
+            .store_paired(&pair_short, &make_kv_cache(1, 4), dflash_snapshot(4))
+            .unwrap();
+        cache.store(&target_deeper, &make_kv_cache(1, 8));
+        cache
+            .store_paired(&pair_deepest, &make_kv_cache(1, 12), dflash_snapshot(12))
+            .unwrap();
+        cache.store(&target_deepest, &make_kv_cache(1, 16));
+
+        let query: Vec<u32> = (0..20).collect();
+        let matched = find_paired(&mut cache, &query).expect("paired endpoint should match");
+        assert_eq!(matched.prefix_len, 12);
+        assert_eq!(kv_cache_offset(&matched.cache), 12);
+        assert_eq!(matched.dflash_cache.position(), 12);
+    }
+
+    #[test]
+    fn paired_lookup_selection_is_owned_and_mlx_free() {
+        let mut cache = PagedPrefixCache::new(10, 4);
+        let stored: Vec<u32> = (0..8).collect();
+        cache
+            .store_paired(&stored, &make_kv_cache(1, 8), dflash_snapshot(8))
+            .unwrap();
+        let mut query = stored;
+        query.push(99);
+
+        assert!(!higgs_models::mlx_exec::held());
+        let plan = cache
+            .plan_longest_paired_prefix(&query)
+            .unwrap()
+            .expect("paired endpoint should produce an owned plan");
+        assert_eq!(plan.prefix_len(), 8);
+
+        cache.clear();
+        assert!(
+            cache.is_empty(),
+            "the selected plan must not borrow the trie"
+        );
+
+        let _exec = higgs_models::mlx_exec::acquire();
+        let matched = plan.materialize().unwrap();
+        assert_eq!(kv_cache_offset(&matched.cache), 8);
+        assert_eq!(matched.dflash_cache.position(), 8);
+    }
+
+    #[test]
+    fn paired_prepare_and_commit_separate_mlx_from_trie_mutation() {
+        let mut cache = PagedPrefixCache::new(10, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        let target = make_kv_cache(1, 8);
+        let snapshot = dflash_snapshot(8);
+
+        let prepared = {
+            let _exec = higgs_models::mlx_exec::acquire();
+            PagedPrefixCache::prepare_paired_prefix(4, &tokens, &target, snapshot).unwrap()
+        };
+        assert!(
+            cache.is_empty(),
+            "preparation must not borrow or mutate the radix"
+        );
+        assert!(!higgs_models::mlx_exec::held());
+
+        cache.commit_prepared_pair(prepared).unwrap();
+        assert_eq!(cache.len(), 1);
+        let mut query = tokens;
+        query.push(99);
+        assert!(
+            cache.plan_longest_paired_prefix(&query).unwrap().is_some(),
+            "CPU-only commit must publish the complete pair"
+        );
+    }
+
+    #[test]
+    fn paired_lookup_never_uses_partial_edge_match() {
+        let mut cache = PagedPrefixCache::new(10, 4);
+        let paired_prefix: Vec<u32> = (0..4).collect();
+        let stored: Vec<u32> = (0..12).collect();
+        cache
+            .store_paired(&paired_prefix, &make_kv_cache(1, 4), dflash_snapshot(4))
+            .unwrap();
+        cache.store(&stored, &make_kv_cache(1, 12));
+
+        let mut query: Vec<u32> = (0..8).collect();
+        query.extend(100..104);
+        assert_eq!(
+            cache.find_longest_prefix(&query).unwrap().prefix_len,
+            8,
+            "ordinary target lookup should retain partial block sharing"
+        );
+        let paired = find_paired(&mut cache, &query)
+            .expect("shallower exact pair must survive a deeper partial target candidate");
+        assert_eq!(paired.prefix_len, 4);
+        assert_eq!(paired.dflash_cache.position(), 4);
+    }
+
+    #[test]
+    fn paired_lookup_forks_independent_live_dflash_branches() {
+        let mut cache = PagedPrefixCache::new(10, 4);
+        let stored: Vec<u32> = (0..4).collect();
+        cache
+            .store_paired(&stored, &make_kv_cache(1, 4), dflash_snapshot(4))
+            .unwrap();
+        let mut query = stored;
+        query.push(99);
+
+        let mut first = find_paired(&mut cache, &query).unwrap();
+        {
+            let _exec = higgs_models::mlx_exec::acquire();
+            let mut drafter = tiny_dflash_drafter();
+            let tap = Array::zeros::<f32>(&[1, 1, 4]).unwrap();
+            drafter.prime_taps(&[tap], &mut first.dflash_cache).unwrap();
+        }
+        assert_eq!(first.dflash_cache.position(), 5);
+
+        let second = find_paired(&mut cache, &query).unwrap();
+        assert_eq!(
+            second.dflash_cache.position(),
+            4,
+            "advancing one fork must not mutate the retained snapshot"
+        );
+    }
+
+    #[test]
+    fn target_only_refresh_preserves_same_key_dflash_sidecar() {
+        let mut cache = PagedPrefixCache::new(10, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        cache
+            .store_paired(
+                &tokens,
+                &make_kv_cache_content(1, 8, 11.0),
+                dflash_snapshot(8),
+            )
+            .unwrap();
+        let refreshed = make_kv_cache_content(1, 8, 29.0);
+        let refreshed_keys = cache_keys(&refreshed, 0);
+
+        cache.store(&tokens, &refreshed);
+
+        let mut query = tokens;
+        query.push(99);
+        let matched = find_paired(&mut cache, &query)
+            .expect("target-only refresh must not silently demote a valid pair");
+        assert_eq!(matched.dflash_cache.position(), 8);
+        assert_keys_eq_first_n(&cache_keys(&matched.cache, 0), &refreshed_keys, 8);
+    }
+
+    #[test]
+    fn mid_block_split_then_refresh_preserves_full_pair_boundary() {
+        let mut cache = PagedPrefixCache::new(10, 4);
+        let seq_a: Vec<u32> = (0..12).collect();
+        let mut seq_b: Vec<u32> = (0..6).collect();
+        seq_b.extend(100..106);
+        cache
+            .store_paired(&seq_a, &make_kv_cache(1, 12), dflash_snapshot(12))
+            .unwrap();
+        cache.store(&seq_b, &make_kv_cache(1, 12));
+
+        cache.store(&seq_a, &make_kv_cache(1, 12));
+
+        let mut query = seq_a;
+        query.push(99);
+        let matched = find_paired(&mut cache, &query).expect("pair should survive refresh");
+        assert_eq!(matched.prefix_len, 12);
+        assert_eq!(kv_cache_offset(&matched.cache), 12);
+        assert_eq!(matched.dflash_cache.position(), 12);
+    }
+
+    #[test]
+    fn lru_eviction_and_clear_drop_whole_paired_endpoints() {
+        let mut cache = PagedPrefixCache::new(2, 4);
+        let pair_a: Vec<u32> = (0..8).collect();
+        let pair_b: Vec<u32> = (100..108).collect();
+        let target_c: Vec<u32> = (200..208).collect();
+        cache
+            .store_paired(&pair_a, &make_kv_cache(1, 8), dflash_snapshot(8))
+            .unwrap();
+        cache
+            .store_paired(&pair_b, &make_kv_cache(1, 8), dflash_snapshot(8))
+            .unwrap();
+        let mut query_b = pair_b.clone();
+        query_b.push(999);
+        assert!(find_paired(&mut cache, &query_b).is_some());
+
+        cache.store(&target_c, &make_kv_cache(1, 8));
+
+        let mut query_a = pair_a;
+        query_a.push(999);
+        assert!(find_paired(&mut cache, &query_a).is_none());
+        assert!(find_paired(&mut cache, &query_b).is_some());
+
+        cache.clear();
+        assert!(cache.is_empty());
+        assert!(find_paired(&mut cache, &query_b).is_none());
     }
 
     /// Deterministic KV content as a PURE function of (token value, position,

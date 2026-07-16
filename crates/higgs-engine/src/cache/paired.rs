@@ -1,5 +1,7 @@
 //! Correct-by-construction ownership for target/dSpark retained state.
 
+use std::sync::{Arc, Mutex};
+
 use higgs_models::{
     AnyCache,
     dflash::{DFlashCache, DFlashSnapshot},
@@ -9,12 +11,13 @@ use super::disk_prefix_cache::hash_tokens;
 
 /// Private identity for the exact token boundary represented by both caches.
 ///
-/// The length prevents a hash-only boundary claim, while the hash makes lookup
-/// validation independent of either cache's internal representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The hash is only a fast rejection hint. Exact token equality is the
+/// authority, so even an equal-length FNV collision cannot claim continuity.
+#[derive(Debug, PartialEq, Eq)]
 struct PrefixStamp {
     hash: u64,
     len: usize,
+    tokens: Box<[u32]>,
 }
 
 impl PrefixStamp {
@@ -22,14 +25,19 @@ impl PrefixStamp {
         Self {
             hash: hash_tokens(tokens),
             len: tokens.len(),
+            tokens: tokens.into(),
         }
     }
 
-    fn matches(self, tokens: &[u32]) -> bool {
-        self.len == tokens.len() && self.hash == hash_tokens(tokens)
+    fn matches(&self, tokens: &[u32]) -> bool {
+        self.matches_hashed(tokens, hash_tokens(tokens))
     }
 
-    fn boundary(self) -> Result<i32, PairedCacheError> {
+    fn matches_hashed(&self, tokens: &[u32], hash: u64) -> bool {
+        self.len == tokens.len() && self.hash == hash && self.tokens.as_ref() == tokens
+    }
+
+    fn boundary(&self) -> Result<i32, PairedCacheError> {
         i32::try_from(self.len)
             .map_err(|_| PairedCacheError::PrefixLengthOverflow { len: self.len })
     }
@@ -53,6 +61,10 @@ pub(crate) enum PairedCacheError {
         "dFlash cache boundary {actual} does not match the retained prefix boundary {expected}"
     )]
     DFlashBoundary { expected: i32, actual: i32 },
+    #[error("failed to fork retained dFlash state: {details}")]
+    DFlashFork { details: String },
+    #[error("failed to materialize retained target state: {details}")]
+    TargetMaterialization { details: String },
 }
 
 /// One immutable retained target/dFlash boundary.
@@ -97,7 +109,7 @@ impl PairedCache {
     }
 
     #[must_use]
-    pub(crate) const fn prefix_len(&self) -> usize {
+    pub(crate) fn prefix_len(&self) -> usize {
         self.stamp.len
     }
 
@@ -146,6 +158,107 @@ impl PairedCache {
             stamp: _,
         } = self;
         (target, dflash.into_live())
+    }
+}
+
+/// Immutable dFlash sidecar attached to one exact radix endpoint.
+///
+/// The target half remains represented by the radix path's paged blocks, so
+/// this type owns only the drafter snapshot plus the private token stamp that
+/// proves which endpoint it belongs to. Reuse always forks; the stored snapshot
+/// is never consumed or exposed.
+#[derive(Debug)]
+pub(crate) struct RadixDFlashSnapshot {
+    // `DFlashSnapshot` is immutable after sealing but its MLX arrays are
+    // `!Sync`. A small sidecar mutex provides safe shared ownership for lookup
+    // plans; it is never acquired while the radix/prefix mutex is held.
+    dflash: Mutex<DFlashSnapshot>,
+    stamp: PrefixStamp,
+}
+
+impl RadixDFlashSnapshot {
+    pub(crate) fn new(dflash: DFlashSnapshot, tokens: &[u32]) -> Result<Self, PairedCacheError> {
+        let stamp = PrefixStamp::new(tokens);
+        let expected = stamp.boundary()?;
+        let actual = dflash.position();
+        if actual != expected {
+            return Err(PairedCacheError::DFlashBoundary { expected, actual });
+        }
+        Ok(Self {
+            dflash: Mutex::new(dflash),
+            stamp,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn prefix_len(&self) -> usize {
+        self.stamp.len
+    }
+
+    #[must_use]
+    pub(crate) fn matches_prefix(&self, tokens: &[u32]) -> bool {
+        self.stamp.matches(tokens)
+    }
+
+    /// Select an exact immutable snapshot without doing any MLX work.
+    ///
+    /// The returned plan owns the snapshot through an `Arc`, so callers may
+    /// release the radix/prefix mutex before materializing the live branch.
+    pub(crate) fn plan_fork(
+        self: &Arc<Self>,
+        expected_tokens: &[u32],
+    ) -> Result<RadixDFlashForkPlan, PairedCacheError> {
+        if !self.matches_prefix(expected_tokens) {
+            return Err(PairedCacheError::PrefixMismatch {
+                stored_len: self.prefix_len(),
+                requested_len: expected_tokens.len(),
+            });
+        }
+        Ok(RadixDFlashForkPlan {
+            snapshot: Arc::clone(self),
+        })
+    }
+
+    /// Fork an independent live drafter branch while retaining this snapshot.
+    fn fork_live(&self) -> Result<DFlashCache, PairedCacheError> {
+        debug_assert!(
+            higgs_models::mlx_exec::held(),
+            "radix dFlash fork requires the process MLX execution gate"
+        );
+        let snapshot = self
+            .dflash
+            .lock()
+            .map_err(|error| PairedCacheError::DFlashFork {
+                details: format!("retained dFlash snapshot lock is poisoned: {error}"),
+            })?;
+        let live = snapshot
+            .fork_live()
+            .map_err(|error| PairedCacheError::DFlashFork {
+                details: error.to_string(),
+            })?;
+        let expected = self.stamp.boundary()?;
+        let actual = live.position();
+        if actual != expected {
+            return Err(PairedCacheError::DFlashBoundary { expected, actual });
+        }
+        Ok(live)
+    }
+}
+
+/// Owned, exact-identity plan for a post-prefix-lock dFlash fork.
+#[derive(Debug)]
+pub(crate) struct RadixDFlashForkPlan {
+    snapshot: Arc<RadixDFlashSnapshot>,
+}
+
+impl RadixDFlashForkPlan {
+    #[must_use]
+    pub(crate) fn prefix_len(&self) -> usize {
+        self.snapshot.prefix_len()
+    }
+
+    pub(crate) fn materialize(self) -> Result<DFlashCache, PairedCacheError> {
+        self.snapshot.fork_live()
     }
 }
 
@@ -255,7 +368,11 @@ mod tests {
     #[test]
     fn prefix_length_must_fit_the_model_boundary_type() {
         let len = usize::try_from(i32::MAX).unwrap() + 1;
-        let stamp = PrefixStamp { hash: 0, len };
+        let stamp = PrefixStamp {
+            hash: 0,
+            len,
+            tokens: Vec::new().into_boxed_slice(),
+        };
 
         assert_eq!(
             stamp.boundary().unwrap_err(),
@@ -291,6 +408,16 @@ mod tests {
         let pair = PairedCache::new(target_cache(1), dflash_snapshot(1), &[11]).unwrap();
 
         assert!(!pair.matches_prefix(&[12]));
+    }
+
+    #[test]
+    fn exact_prefix_identity_rejects_a_simulated_hash_collision() {
+        let stamp = PrefixStamp::new(&[11, 22]);
+
+        assert!(
+            !stamp.matches_hashed(&[11, 23], stamp.hash),
+            "equal hash and length must not substitute for exact token equality"
+        );
     }
 
     #[test]

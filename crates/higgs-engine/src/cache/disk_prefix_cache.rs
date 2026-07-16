@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use half::f16;
 use higgs_models::AnyCache;
 use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis2};
+use higgs_models::dflash::DFlashSnapshot;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
@@ -14,7 +15,10 @@ use crate::cache::disk_storage::{
     DiskCacheBlock, DiskCacheEntryMetadata, DiskCacheError, DiskCacheFileHeader, DiskCacheLayer,
     DiskCacheSnapshot, DiskStorage,
 };
-use crate::paged_prefix_cache::{PagedPrefixCache, PagedPrefixMatch};
+use crate::cache::paired::PairedCacheError;
+use crate::paged_prefix_cache::{
+    PagedPairedLookupPlan, PagedPrefixCache, PagedPrefixMatch, PreparedPairedPrefix,
+};
 
 pub const DEFAULT_MIN_TOKENS_TO_PERSIST: usize = 512;
 pub const DEFAULT_MAX_DISK_BLOCKS: usize = 4096;
@@ -109,6 +113,17 @@ impl DiskPrefixCache {
         self.memory.find_longest_prefix(tokens)
     }
 
+    /// Find paired target/dFlash state in this process only.
+    ///
+    /// dFlash snapshots are deliberately never persisted, so this method must
+    /// not fall back to the target-only disk index.
+    pub(crate) fn plan_memory_paired_prefix(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<Option<PagedPairedLookupPlan>, PairedCacheError> {
+        self.memory.plan_longest_paired_prefix(tokens)
+    }
+
     pub fn find_disk_prefix_candidate(
         &self,
         tokens: &[u32],
@@ -168,7 +183,50 @@ impl DiskPrefixCache {
     /// disk. Unsupported cache shapes remain memory-only.
     pub fn store(&mut self, prefix_tokens: &[u32], cache: &AnyCache, checkpoint_id: Option<&str>) {
         self.memory.store(prefix_tokens, cache);
+        self.persist_target(prefix_tokens, cache, checkpoint_id);
+    }
 
+    /// Prepare paired state without borrowing the disk/prefix cache.
+    ///
+    /// First-release dSpark state is memory-only. Ordinary target-only stores
+    /// retain their existing disk behavior through [`Self::store`].
+    pub(crate) fn prepare_memory_paired_prefix(
+        block_size: usize,
+        prefix_tokens: &[u32],
+        cache: &AnyCache,
+        snapshot: DFlashSnapshot,
+    ) -> Result<PreparedPairedPrefix, PairedCacheError> {
+        PagedPrefixCache::prepare_paired_prefix(block_size, prefix_tokens, cache, snapshot)
+    }
+
+    /// Commit a fully prepared memory pair using only ownership/trie mutation.
+    pub(crate) fn commit_memory_paired_prefix(
+        &mut self,
+        prepared: PreparedPairedPrefix,
+    ) -> Result<(), PairedCacheError> {
+        self.memory.commit_prepared_pair(prepared)
+    }
+
+    #[cfg(test)]
+    fn store_paired(
+        &mut self,
+        prefix_tokens: &[u32],
+        cache: &AnyCache,
+        snapshot: DFlashSnapshot,
+        _checkpoint_id: Option<&str>,
+    ) -> Result<(), PairedCacheError> {
+        let _exec = higgs_models::mlx_exec::acquire();
+        let prepared =
+            Self::prepare_memory_paired_prefix(self.block_size, prefix_tokens, cache, snapshot)?;
+        self.commit_memory_paired_prefix(prepared)
+    }
+
+    fn persist_target(
+        &mut self,
+        prefix_tokens: &[u32],
+        cache: &AnyCache,
+        checkpoint_id: Option<&str>,
+    ) {
         if self.storage.is_none() || prefix_tokens.len() < self.min_tokens_to_persist {
             return;
         }
@@ -510,6 +568,7 @@ fn concat_blocks(mut arrays: Vec<Array>) -> Result<Array, Exception> {
 mod tests {
     use super::*;
     use higgs_models::cache::KeyValueCache;
+    use higgs_models::dflash::{DFlashConfig, DFlashDrafter, DFlashSnapshot};
 
     fn make_kv_cache(num_layers: usize, seq_len: i32) -> AnyCache {
         let layers: Vec<Option<SteppingKeyValueCache>> = (0..num_layers)
@@ -522,6 +581,41 @@ mod tests {
             })
             .collect();
         AnyCache::KV(layers)
+    }
+
+    fn dflash_snapshot(boundary: i32) -> DFlashSnapshot {
+        let config: DFlashConfig = serde_json::from_str(
+            r#"{
+                "hidden_size": 4,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "intermediate_size": 8,
+                "vocab_size": 8,
+                "dflash_config": {
+                    "target_layer_ids": [0]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut drafter = DFlashDrafter::new(config).unwrap();
+        let cache = drafter.make_cache();
+        let taps = (boundary == 1)
+            .then(|| Array::zeros::<f32>(&[1, 1, 4]).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let _exec = higgs_models::mlx_exec::acquire();
+        drafter.seal_after_taps(cache, &taps, boundary).unwrap()
+    }
+
+    fn find_memory_pair(
+        cache: &mut DiskPrefixCache,
+        tokens: &[u32],
+    ) -> Option<crate::paged_prefix_cache::PagedPairedPrefixMatch> {
+        let plan = cache.plan_memory_paired_prefix(tokens).unwrap()?;
+        let _exec = higgs_models::mlx_exec::acquire();
+        Some(plan.materialize().unwrap())
     }
 
     #[test]
@@ -553,6 +647,152 @@ mod tests {
             }
             AnyCache::Hybrid(_) => panic!("expected KV cache"),
         }
+    }
+
+    #[test]
+    fn paired_store_is_available_from_same_process_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskPrefixCacheConfig {
+            disk_path: dir.path().join("prefix.bin"),
+            max_disk_blocks: 16,
+            min_tokens_to_persist: 1,
+        };
+        let tokens = vec![7];
+        let cache = make_kv_cache(1, 1);
+        let mut prefix_cache = DiskPrefixCache::new(8, 1, config, 2, 4).unwrap();
+
+        prefix_cache
+            .store_paired(&tokens, &cache, dflash_snapshot(1), Some("paired"))
+            .unwrap();
+
+        let matched = find_memory_pair(&mut prefix_cache, &tokens)
+            .expect("same-process paired state should remain in memory");
+        assert_eq!(matched.prefix_len, 1);
+        matched.cache.validate_absolute_boundary(1).unwrap();
+        assert_eq!(matched.dflash_cache.position(), 1);
+    }
+
+    #[test]
+    fn paired_memory_selection_returns_an_owned_post_lock_plan() {
+        let mut cache = DiskPrefixCache::memory_only(4, 1);
+        let tokens = vec![7];
+        let target = make_kv_cache(1, 1);
+        let snapshot = dflash_snapshot(1);
+        let prepared = {
+            let _exec = higgs_models::mlx_exec::acquire();
+            DiskPrefixCache::prepare_memory_paired_prefix(1, &tokens, &target, snapshot).unwrap()
+        };
+        assert!(!higgs_models::mlx_exec::held());
+        cache.commit_memory_paired_prefix(prepared).unwrap();
+        let mut query = tokens;
+        query.push(8);
+
+        assert!(!higgs_models::mlx_exec::held());
+        let plan = cache
+            .plan_memory_paired_prefix(&query)
+            .unwrap()
+            .expect("memory pair should be selected without MLX work");
+
+        cache.memory.clear();
+        let _exec = higgs_models::mlx_exec::acquire();
+        let matched = plan.materialize().unwrap();
+        assert_eq!(matched.prefix_len, 1);
+        assert_eq!(matched.dflash_cache.position(), 1);
+    }
+
+    #[test]
+    fn paired_state_is_memory_only_while_ordinary_target_store_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskPrefixCacheConfig {
+            disk_path: dir.path().join("prefix.bin"),
+            max_disk_blocks: 16,
+            min_tokens_to_persist: 1,
+        };
+        let tokens = vec![7];
+        let cache = make_kv_cache(1, 1);
+
+        let mut writer = DiskPrefixCache::new(8, 1, config.clone(), 2, 4).unwrap();
+        writer
+            .store_paired(&tokens, &cache, dflash_snapshot(1), Some("paired"))
+            .unwrap();
+        writer.store(&tokens, &cache, Some("paired"));
+        drop(writer);
+
+        let mut reader = DiskPrefixCache::new(8, 1, config, 2, 4).unwrap();
+        let mut query = tokens.clone();
+        query.push(99);
+        assert!(
+            find_memory_pair(&mut reader, &query).is_none(),
+            "dFlash state must never be synthesized from target-only disk data"
+        );
+
+        let target = reader
+            .find_longest_prefix(&query, Some("paired"))
+            .expect("ordinary target lookup should restore the persisted snapshot");
+        assert_eq!(target.prefix_len, 1);
+        target.cache.validate_absolute_boundary(1).unwrap();
+        assert!(
+            find_memory_pair(&mut reader, &query).is_none(),
+            "loading target state from disk must remain explicitly target-only"
+        );
+    }
+
+    #[test]
+    fn disk_persistence_failure_leaves_the_paired_memory_entry_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskPrefixCacheConfig {
+            disk_path: dir.path().join("prefix.bin"),
+            max_disk_blocks: 0,
+            min_tokens_to_persist: 1,
+        };
+        let tokens = vec![7];
+        let cache = make_kv_cache(1, 1);
+        let mut prefix_cache = DiskPrefixCache::new(8, 1, config, 2, 4).unwrap();
+
+        prefix_cache
+            .store_paired(&tokens, &cache, dflash_snapshot(1), Some("paired"))
+            .expect("memory-only paired publication should succeed");
+        prefix_cache.store(&tokens, &cache, Some("paired"));
+
+        assert!(
+            find_memory_pair(&mut prefix_cache, &tokens).is_some(),
+            "the already-published pair must survive a disk capacity failure"
+        );
+        assert!(
+            prefix_cache
+                .find_disk_prefix_candidate(&tokens, Some("paired"), 0)
+                .is_none(),
+            "the failed disk write must not publish target metadata"
+        );
+    }
+
+    #[test]
+    fn forced_target_disk_refresh_preserves_same_key_paired_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskPrefixCacheConfig {
+            disk_path: dir.path().join("prefix.bin"),
+            max_disk_blocks: 16,
+            min_tokens_to_persist: 1,
+        };
+        let tokens = vec![7];
+        let cache = make_kv_cache(1, 1);
+        let mut prefix_cache = DiskPrefixCache::new(8, 1, config, 2, 4).unwrap();
+        prefix_cache
+            .store_paired(&tokens, &cache, dflash_snapshot(1), Some("paired"))
+            .unwrap();
+        prefix_cache.store(&tokens, &cache, Some("paired"));
+
+        let candidate = prefix_cache
+            .find_disk_prefix_candidate(&tokens, Some("paired"), 0)
+            .expect("ordinary target store should persist its target state");
+        prefix_cache
+            .load_disk_prefix_candidate(&tokens, candidate)
+            .expect("forced target-only refresh should load");
+
+        let paired = find_memory_pair(&mut prefix_cache, &tokens)
+            .expect("same-key target refresh must preserve paired metadata");
+        assert_eq!(paired.prefix_len, 1);
+        assert_eq!(paired.dflash_cache.position(), 1);
     }
 
     #[test]
