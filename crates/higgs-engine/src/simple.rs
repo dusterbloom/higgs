@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard};
 use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, Speculation, apply_penalties,
-    dflash::{DFlashCache, DFlashConfig, DFlashDrafter, DFlashSnapshot, accept_prefix},
+    dflash::{DFlashCache, DFlashConfig, DFlashDrafter, accept_prefix},
     sample,
     turboquant::KvCacheConfig,
 };
@@ -27,7 +27,7 @@ use tokenizers::Tokenizer;
 use crate::{
     cache::{
         DiskPrefixCache, DiskPrefixCacheConfig, PagedKvCache,
-        paired::{DflashSealDemotion, DflashSealEligibility, DflashTapFrontier, RetainedState},
+        paired::{DflashTapFrontier, LivePair, PairedCacheError, RetainedState},
     },
     chat_template::{ChatMessage, ChatTemplateRenderer},
     decode::token_ledger::{LedgerError, RetentionAction, SpeculativeTicket, TokenLedger},
@@ -177,6 +177,10 @@ fn session_ledger_error(error: LedgerError) -> EngineError {
     EngineError::Generation(format!("session token ledger: {error}"))
 }
 
+fn session_pair_error(error: PairedCacheError) -> EngineError {
+    EngineError::Generation(format!("session live dSpark pair: {error}"))
+}
+
 /// Insert a retained KV cache for `session_id`, enforcing the resident-memory
 /// bounds: a per-session token cap (drop instead of retain once the
 /// conversation's KV exceeds `max_session_tokens`; `0` = unlimited) and a count
@@ -186,11 +190,10 @@ fn stash_into(
     map: &mut std::collections::HashMap<u64, RetainedKv>,
     session_id: u64,
     state: RetainedState,
-    tokens: Vec<u32>,
     max_sessions: usize,
     max_session_tokens: usize,
 ) -> usize {
-    if max_session_tokens > 0 && tokens.len() > max_session_tokens {
+    if max_session_tokens > 0 && state.tokens().len() > max_session_tokens {
         // Too large to retain — also forget any prior smaller cache for this id
         // so it can't linger past the cap. Not counted as an eviction.
         map.remove(&session_id);
@@ -200,7 +203,6 @@ fn stash_into(
         session_id,
         RetainedKv {
             state,
-            tokens,
             last_used: std::time::Instant::now(),
         },
     );
@@ -825,143 +827,23 @@ enum DFlashVerifyRound {
     },
 }
 
-/// Target state that has independently proved its exact absolute boundary and
-/// completed all lazy MLX work needed for cross-turn publication.
-///
-/// The field is private and the only production constructor validates both
-/// before and after evaluation, so `TargetOnly` demotion cannot be built from
-/// an unchecked or unevaluated target cache.
-#[derive(Debug)]
-struct ValidatedSessionTarget {
-    cache: AnyCache,
-    boundary: i32,
-}
-
-impl ValidatedSessionTarget {
-    fn evaluate(cache: AnyCache, boundary: i32) -> Result<Self, EngineError> {
-        cache
-            .validate_absolute_boundary(boundary)
-            .map_err(EngineError::Mlx)?;
-        cache.eval().map_err(EngineError::Mlx)?;
-        cache
-            .validate_absolute_boundary(boundary)
-            .map_err(EngineError::Mlx)?;
-        Ok(Self { cache, boundary })
-    }
-}
-
-#[derive(Debug)]
-enum SessionDsparkRetention {
-    Paired(RetainedState),
-    TargetOnly {
-        target: AnyCache,
-        reason: DflashSealDemotion,
-    },
-}
-
-impl SessionDsparkRetention {
-    #[must_use]
-    fn into_state(self) -> RetainedState {
-        match self {
-            Self::Paired(state) => state,
-            Self::TargetOnly { target, .. } => RetainedState::TargetOnly(target),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-enum SessionDsparkRetentionError {
-    #[error(
-        "target proof boundary {target} does not match dSpark eligibility boundary {eligibility}"
-    )]
-    BoundaryProofMismatch { target: i32, eligibility: i32 },
-    #[error("dSpark seal execution failed: {0}")]
-    SealExecution(String),
-    #[error("paired session publication failed: {0}")]
-    PairPublication(String),
-}
-
-/// Resolve the only two publishable session states from one validated target.
-///
-/// Deterministic pre-seal capability loss may consume the proof into
-/// target-only state. Once effectful dSpark sealing begins, any error publishes
-/// nothing; the target proof is consumed and dropped with the failed attempt.
-fn resolve_session_dspark_retention<F, E>(
-    target: ValidatedSessionTarget,
-    eligibility: DflashSealEligibility,
-    tokens: &[u32],
-    seal: F,
-) -> Result<SessionDsparkRetention, SessionDsparkRetentionError>
-where
-    F: FnOnce(DFlashCache, &[Array], i32) -> Result<DFlashSnapshot, E>,
-    E: std::fmt::Display,
-{
-    let eligibility_boundary = eligibility.expected_target_boundary();
-    if target.boundary != eligibility_boundary {
-        return Err(SessionDsparkRetentionError::BoundaryProofMismatch {
-            target: target.boundary,
-            eligibility: eligibility_boundary,
-        });
-    }
-    match eligibility {
-        DflashSealEligibility::Ineligible { reason, .. } => {
-            Ok(SessionDsparkRetention::TargetOnly {
-                target: target.cache,
-                reason,
-            })
-        }
-        DflashSealEligibility::Eligible(input) => {
-            let snapshot = seal(
-                input.draft_cache,
-                &input.taps,
-                input.expected_target_boundary,
-            )
-            .map_err(|error| SessionDsparkRetentionError::SealExecution(error.to_string()))?;
-            let state = RetainedState::paired(target.cache, snapshot, tokens)
-                .map_err(|error| SessionDsparkRetentionError::PairPublication(error.to_string()))?;
-            Ok(SessionDsparkRetention::Paired(state))
-        }
-    }
-}
-
-/// Advance the final response-visible token into target KV without sampling.
-///
-/// Beginning the ledger transition happens before the injected forward. Any
-/// forward or tap-frontier error therefore leaves the ledger in
-/// `ForwardInFlight`, whose retention API cannot produce a publishable token
-/// boundary. Only a successful target transition and tap append consume the
-/// ticket and return a seal-eligible frontier.
-fn complete_session_dflash_tail_forward<F>(
-    token_ledger: &mut TokenLedger,
-    tap_frontier: DflashTapFrontier,
-    token: u32,
-    forward: F,
-) -> Result<DflashTapFrontier, EngineError>
-where
-    F: FnOnce(i32) -> Result<Vec<Array>, EngineError>,
-{
-    let ticket = token_ledger
-        .begin_cache_only_forward()
-        .map_err(session_ledger_error)?;
-    let input_token = i32::try_from(token).map_err(|_| {
-        EngineError::Generation("session DFlash retained token overflow i32".to_owned())
-    })?;
-    let final_taps = forward(input_token)?;
-    let next_target_boundary = tap_frontier
-        .target_boundary()
-        .checked_add(1)
-        .ok_or_else(|| EngineError::Generation("session target boundary overflow".to_owned()))?;
-    let tap_frontier = tap_frontier.append(next_target_boundary, final_taps)?;
-    token_ledger
-        .complete_cache_only_forward(ticket)
-        .map_err(session_ledger_error)?;
-    Ok(tap_frontier)
-}
-
 struct CanonicalDflashRound {
     anchor_ticket: SpeculativeTicket,
     successors: Vec<u32>,
     tap_frontier: DflashTapFrontier,
+    draft_tokens: Vec<u32>,
+    draft_matches: usize,
+}
+
+struct CanonicalDflashCommit {
+    anchor_ticket: SpeculativeTicket,
+    successors: Vec<u32>,
+    draft_tokens: Vec<u32>,
+    draft_matches: usize,
+}
+
+struct CanonicalCommittedPayload {
+    successors: Vec<u32>,
     draft_tokens: Vec<u32>,
     draft_matches: usize,
 }
@@ -996,15 +878,63 @@ impl CanonicalDflashRound {
     /// this adapter. The move-only ticket binds the target transition to the
     /// exact visible anchor; the typed frontier binds its successors to the
     /// exact target rows advanced by that transition.
+    fn into_lease_parts(self) -> Result<(DflashTapFrontier, CanonicalDflashCommit), EngineError> {
+        let Self {
+            anchor_ticket,
+            successors,
+            tap_frontier,
+            draft_tokens,
+            draft_matches,
+        } = self;
+        let accepted_rows = i32::try_from(successors.len()).map_err(|_| {
+            EngineError::Generation("session dSpark accepted row count overflow".to_owned())
+        })?;
+        let frontier_rows = tap_frontier.rows()?;
+        if frontier_rows != accepted_rows {
+            return Err(EngineError::Generation(format!(
+                "session dSpark tap/token mismatch: taps={frontier_rows} tokens={accepted_rows}"
+            )));
+        }
+        Ok((
+            tap_frontier,
+            CanonicalDflashCommit {
+                anchor_ticket,
+                successors,
+                draft_tokens,
+                draft_matches,
+            },
+        ))
+    }
+
     fn commit_output(
         self,
         ledger: &mut TokenLedger,
         generated: &mut Vec<u32>,
     ) -> Result<CanonicalCommittedRound, EngineError> {
+        let (tap_frontier, commit) = self.into_lease_parts()?;
+        let CanonicalCommittedPayload {
+            successors,
+            draft_tokens,
+            draft_matches,
+        } = commit.commit_output(ledger, generated)?;
+        Ok(CanonicalCommittedRound {
+            tap_frontier,
+            successors,
+            draft_tokens,
+            draft_matches,
+        })
+    }
+}
+
+impl CanonicalDflashCommit {
+    fn commit_output(
+        self,
+        ledger: &mut TokenLedger,
+        generated: &mut Vec<u32>,
+    ) -> Result<CanonicalCommittedPayload, EngineError> {
         let Self {
             anchor_ticket,
             successors,
-            tap_frontier,
             draft_tokens,
             draft_matches,
         } = self;
@@ -1020,16 +950,6 @@ impl CanonicalDflashRound {
                 generated.last()
             )));
         }
-        let accepted_tokens = successors.len();
-        let accepted_rows = i32::try_from(accepted_tokens).map_err(|_| {
-            EngineError::Generation("session dSpark accepted row count overflow".to_owned())
-        })?;
-        let frontier_rows = tap_frontier.rows()?;
-        if frontier_rows != accepted_rows {
-            return Err(EngineError::Generation(format!(
-                "session dSpark tap/token mismatch: taps={frontier_rows} tokens={accepted_rows}"
-            )));
-        }
         ledger
             .complete_speculative_round(anchor_ticket, &successors)
             .map_err(session_ledger_error)?;
@@ -1039,8 +959,7 @@ impl CanonicalDflashRound {
                 "session dSpark ledger/output sequence diverged after round commit".to_owned(),
             ));
         }
-        Ok(CanonicalCommittedRound {
-            tap_frontier,
+        Ok(CanonicalCommittedPayload {
             successors,
             draft_tokens,
             draft_matches,
@@ -1447,11 +1366,10 @@ pub struct SimpleEngine {
 
 /// A live KV cache retained across tool turns for a conversation, so the next
 /// turn prefills only the new suffix instead of re-prefilling the whole history.
-/// Holds the actual `AnyCache` instance (not a clone), the exact tokens it
-/// represents (for the prefix guard), and a last-touched stamp for idle eviction.
+/// The retained state owns both cache and exact prefix key; this wrapper adds
+/// only the last-touched stamp used for idle eviction.
 struct RetainedKv {
     state: RetainedState,
-    tokens: Vec<u32>,
     last_used: std::time::Instant,
 }
 
@@ -1989,7 +1907,7 @@ impl SimpleEngine {
     pub fn retained_session_tokens(&self, session_id: u64) -> Option<Vec<u32>> {
         lock_or_recover(&self.retained)
             .get(&session_id)
-            .map(|kept| kept.tokens.clone())
+            .map(|kept| kept.state.tokens().to_vec())
     }
 
     /// Drop a conversation's retained KV cache, freeing its KV memory.
@@ -2027,7 +1945,7 @@ impl SimpleEngine {
     ) -> Option<(RetainedState, usize)> {
         let mut map = lock_or_recover(&self.retained);
         let prior = match map.get(&session_id) {
-            Some(entry) => continuation_prior_len(&entry.tokens, full_tokens),
+            Some(entry) => continuation_prior_len(entry.state.tokens(), full_tokens),
             None => return None,
         };
         if let Some(p) = prior {
@@ -2056,13 +1974,7 @@ impl SimpleEngine {
     /// Metal command buffer is process-global and aborts on concurrent eval, so
     /// all GPU work must stay serialized under the model lock, which this
     /// function does not hold.
-    fn stash_retained(
-        &self,
-        session_id: u64,
-        state: RetainedState,
-        tokens: Vec<u32>,
-        target_only_cap_exempt: bool,
-    ) {
+    fn stash_retained(&self, session_id: u64, state: RetainedState, target_only_cap_exempt: bool) {
         // `target_only_cap_exempt`: the caller compressed target KV to
         // TurboQuant because it exceeded the dense token cap. Preserve the
         // historical exemption for target-only retention, but never apply it
@@ -2070,22 +1982,21 @@ impl SimpleEngine {
         // context.
         let effective_cap =
             retention_token_cap(self.kv_cache_config, target_only_cap_exempt, &state);
+        let token_len = state.tokens().len();
         #[allow(clippy::print_stderr)] // env-gated diagnostic
         if effective_cap > 0
-            && tokens.len() > effective_cap
+            && token_len > effective_cap
             && std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1")
         {
             eprintln!(
                 "DIAG session-retain-drop: reason=max_session_tokens session_id={session_id} tokens={} cap={}",
-                tokens.len(),
-                effective_cap
+                token_len, effective_cap
             );
         }
         let evicted = stash_into(
             &mut lock_or_recover(&self.retained),
             session_id,
             state,
-            tokens,
             self.kv_cache_config.max_retained_sessions,
             effective_cap,
         );
@@ -3809,31 +3720,30 @@ impl SimpleEngine {
                 ),
             }
         }
-        let retention_evaluated = boundary_valid
-            && match cache.eval() {
-                Ok(()) => true,
-                Err(e) => {
+        let retained_state = if boundary_valid {
+            let mut full = prompt_tokens.to_vec();
+            full.extend_from_slice(&retained_generated);
+            match RetainedState::target_only(cache, full, &mlx_gate) {
+                Ok(state) => Some(state),
+                Err(error) => {
                     tracing::warn!(
                         session_id,
-                        error = %e,
-                        "Failed to eval retained cache; dropping session retention"
+                        error = %error,
+                        "Failed to evaluate and key retained target state; dropping session retention"
                     );
-                    false
+                    None
                 }
-            };
+            }
+        } else {
+            drop(cache);
+            None
+        };
         let retain_elapsed = retain_start.elapsed();
         // Release model lock and MLX gate together, only after the last eval.
         drop(model);
         drop(mlx_gate);
-        let mut full = prompt_tokens.to_vec();
-        full.extend_from_slice(&retained_generated);
-        if retention_evaluated {
-            self.stash_retained(
-                session_id,
-                RetainedState::TargetOnly(cache),
-                full,
-                cap_exempt,
-            );
+        if let Some(state) = retained_state {
+            self.stash_retained(session_id, state, cap_exempt);
         }
         let total_elapsed = total_start.elapsed();
 
@@ -3911,15 +3821,15 @@ impl SimpleEngine {
         // Move a retained pair out of the session map before taking the model
         // lock. A target-only hit is not sufficient for dSpark because no
         // independent lookup may supply the missing historical tap frontier.
-        let reusable =
-            self.take_continuable(session_id, prompt_tokens)
-                .and_then(|(state, prior)| {
-                    let prefix = prompt_tokens.get(..prior)?;
-                    state
-                        .into_paired(prefix)
-                        .ok()
-                        .map(|(target, draft)| (target, draft, prior))
-                });
+        let reusable = self.take_continuable(session_id, prompt_tokens).and_then(
+            |(state, prior)| match state {
+                RetainedState::Paired(pair) => Some((pair, prior)),
+                RetainedState::TargetOnly(target) => {
+                    drop(target);
+                    None
+                }
+            },
+        );
 
         let mut model = self
             .model
@@ -3928,49 +3838,40 @@ impl SimpleEngine {
         let mlx_gate = higgs_models::mlx_exec::acquire();
         let mut drafter = lock_or_recover(&dflash.drafter);
 
-        let reusable = reusable.and_then(|(target, draft, prior)| {
-            let Ok(expected) = i32::try_from(prior) else {
+        let expected_taps = dflash.tap_layers.len();
+        let resumed = reusable.and_then(|(pair, prior)| {
+            let Some(prefix) = prompt_tokens.get(..prior) else {
                 tracing::warn!(
                     session_id,
                     prior,
-                    "Retained paired session boundary exceeds i32; cold-prefilling"
+                    "Retained paired session boundary exceeds prompt; cold-prefilling"
                 );
                 return None;
             };
-            if let Err(error) = target.validate_absolute_boundary(expected) {
-                tracing::warn!(
-                    session_id,
-                    error = %error,
-                    expected,
-                    "Retained paired target boundary is invalid; cold-prefilling"
-                );
-                return None;
+            match pair.resume(prefix, expected_taps) {
+                Ok(pair) => Some((pair, prior)),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        prior,
+                        "Retained paired session could not resume as one proven branch; cold-prefilling"
+                    );
+                    None
+                }
             }
-            if draft.position() != expected {
-                tracing::warn!(
-                    session_id,
-                    expected,
-                    actual = draft.position(),
-                    "Retained paired drafter boundary is invalid; cold-prefilling"
-                );
-                return None;
-            }
-            Some((target, draft, prior))
         });
 
-        let (mut cache, mut draft_cache, prefill_from, continued) =
-            if let Some((target, draft, prior)) = reusable {
-                (target, draft, prior, true)
-            } else {
-                (
-                    model
-                        .make_cache_with_config(self.kv_cache_config)
-                        .map_err(EngineError::Mlx)?,
-                    drafter.make_cache(),
-                    0,
-                    false,
-                )
-            };
+        let (pair, prefill_from, continued) = if let Some((pair, prior)) = resumed {
+            (pair, prior, true)
+        } else {
+            let target = model
+                .make_cache_with_config(self.kv_cache_config)
+                .map_err(EngineError::Mlx)?;
+            let pair = LivePair::cold(target, drafter.make_cache(), expected_taps)
+                .map_err(session_pair_error)?;
+            (pair, 0, false)
+        };
         let prefill_tokens = prompt_tokens.get(prefill_from..).ok_or_else(|| {
             EngineError::Generation("session DFlash prefill boundary exceeds prompt".to_owned())
         })?;
@@ -3992,23 +3893,33 @@ impl SimpleEngine {
         }
 
         let prefill_start = std::time::Instant::now();
-        let (prefill_logits, prefill_taps) = self.dflash_prefill_with_taps(
-            &mut model,
-            &mut cache,
-            &mut drafter,
-            &mut draft_cache,
-            prefill_tokens,
-            &dflash.tap_layers,
-        )?;
-        cache
-            .validate_absolute_boundary(prompt_boundary)
-            .map_err(EngineError::Mlx)?;
-        let mut tap_frontier = DflashTapFrontier::new(
-            draft_cache.position(),
-            prompt_boundary,
-            prefill_taps,
-            dflash.tap_layers.len(),
-        )?;
+        let (pair, prefill_logits) = pair
+            .advance_known(
+                prefill_tokens,
+                |exact_suffix, target_cache, draft_cache, frontier| {
+                    if frontier.rows()? != 0 {
+                        return Err(EngineError::Generation(
+                            "session dSpark known prefill requires an aligned frontier".to_owned(),
+                        ));
+                    }
+                    let (logits, taps) = self.dflash_prefill_with_taps(
+                        &mut model,
+                        target_cache,
+                        &mut drafter,
+                        draft_cache,
+                        exact_suffix,
+                        &dflash.tap_layers,
+                    )?;
+                    let next_frontier = DflashTapFrontier::new(
+                        draft_cache.position(),
+                        prompt_boundary,
+                        taps,
+                        expected_taps,
+                    )?;
+                    Ok::<_, EngineError>((next_frontier, logits))
+                },
+            )
+            .map_err(session_pair_error)?;
         let first_token =
             sample(&prefill_logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
         eval([&first_token]).map_err(EngineError::Mlx)?;
@@ -4016,7 +3927,9 @@ impl SimpleEngine {
 
         let first_id: u32 = first_token.item();
         let mut generated = vec![first_id];
-        let mut token_ledger = TokenLedger::new(prompt_tokens.len());
+        let (decode_lease, pair_key) = pair.begin_decode().map_err(session_pair_error)?;
+        let mut decode_lease = Some(decode_lease);
+        let mut token_ledger = TokenLedger::new_paired(pair_key);
         token_ledger
             .emit_pending(first_id)
             .map_err(session_ledger_error)?;
@@ -4047,23 +3960,31 @@ impl SimpleEngine {
             let anchor_ticket = token_ledger
                 .begin_speculative_round()
                 .map_err(session_ledger_error)?;
-            let round = self.canonical_dflash_round(
-                &mut model,
-                &mut cache,
-                &mut drafter,
-                &mut draft_cache,
-                tap_frontier,
-                anchor_ticket,
-                history_before_anchor,
-                remaining,
-                remaining,
-                params,
-                &[],
-                None,
-                dflash,
-            )?;
-            let committed = round.commit_output(&mut token_ledger, &mut generated)?;
-            tap_frontier = committed.tap_frontier;
+            let lease = decode_lease.take().ok_or_else(|| {
+                EngineError::Generation("session dSpark decode lease is unavailable".to_owned())
+            })?;
+            let (next_lease, commit) = lease
+                .run(|target_cache, draft_cache, tap_frontier| {
+                    let round = self.canonical_dflash_round(
+                        &mut model,
+                        target_cache,
+                        &mut drafter,
+                        draft_cache,
+                        tap_frontier,
+                        anchor_ticket,
+                        history_before_anchor,
+                        remaining,
+                        remaining,
+                        params,
+                        &[],
+                        None,
+                        dflash,
+                    )?;
+                    round.into_lease_parts()
+                })
+                .map_err(session_pair_error)?;
+            let committed = commit.commit_output(&mut token_ledger, &mut generated)?;
+            decode_lease = Some(next_lease);
 
             if let Ok(mut values) = self.last_dflash_accepts.lock() {
                 values.push(u32::try_from(committed.successors.len()).unwrap_or(0));
@@ -4090,18 +4011,37 @@ impl SimpleEngine {
                     .map_err(session_ledger_error)?;
             }
             RetentionAction::CacheOnlyForward { token } => {
-                tap_frontier = complete_session_dflash_tail_forward(
-                    &mut token_ledger,
-                    tap_frontier,
-                    token,
-                    |input_token| {
+                let ticket = token_ledger
+                    .begin_cache_only_forward()
+                    .map_err(session_ledger_error)?;
+                let input_token = i32::try_from(token).map_err(|_| {
+                    EngineError::Generation("session DFlash retained token overflow i32".to_owned())
+                })?;
+                let lease = decode_lease.take().ok_or_else(|| {
+                    EngineError::Generation("session dSpark decode lease is unavailable".to_owned())
+                })?;
+                let (next_lease, ()) = lease
+                    .run(|target_cache, _draft_cache, tap_frontier| {
                         let input = Array::from_slice(&[input_token], &[1, 1]);
-                        model
-                            .forward_raw_with_taps(&input, None, &mut cache, &dflash.tap_layers)
-                            .map(|(_hidden, taps)| taps)
-                            .map_err(EngineError::Mlx)
-                    },
-                )?;
+                        let (_hidden, taps) = model
+                            .forward_raw_with_taps(&input, None, target_cache, &dflash.tap_layers)
+                            .map_err(EngineError::Mlx)?;
+                        let next_target_boundary = tap_frontier
+                            .target_boundary()
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                EngineError::Generation(
+                                    "session target boundary overflow".to_owned(),
+                                )
+                            })?;
+                        let next_frontier = tap_frontier.append(next_target_boundary, taps)?;
+                        Ok::<_, EngineError>((next_frontier, ()))
+                    })
+                    .map_err(session_pair_error)?;
+                token_ledger
+                    .complete_cache_only_forward(ticket)
+                    .map_err(session_ledger_error)?;
+                decode_lease = Some(next_lease);
             }
             RetentionAction::ForwardInFlight { token } => {
                 return Err(EngineError::Generation(format!(
@@ -4111,42 +4051,20 @@ impl SimpleEngine {
         }
 
         debug_assert_eq!(token_ledger.emitted_tokens(), generated);
-        let retained_generated = token_ledger
-            .retainable_tokens()
-            .map_err(session_ledger_error)?
-            .to_vec();
-        let expected_boundary = prompt_tokens
-            .len()
-            .checked_add(retained_generated.len())
-            .ok_or_else(|| EngineError::Generation("session boundary overflow".to_owned()))?;
-        let expected_boundary_i32 = i32::try_from(expected_boundary).map_err(|_| {
-            EngineError::Generation("session retained boundary overflow i32".to_owned())
+        let proof = token_ledger
+            .into_paired_proof()
+            .map_err(session_ledger_error)?;
+        let lease = decode_lease.take().ok_or_else(|| {
+            EngineError::Generation("session dSpark decode lease is unavailable".to_owned())
         })?;
-        let seal_eligibility = tap_frontier.into_seal_eligibility(
-            draft_cache,
-            expected_boundary_i32,
-            drafter.config.num_taps(),
-        );
-        let target_valid = cache
-            .validate_absolute_boundary(expected_boundary_i32)
-            .map_or_else(
-                |error| {
-                    tracing::warn!(
-                        session_id,
-                        error = %error,
-                        expected = expected_boundary_i32,
-                        "Retained dSpark target cache is misaligned; dropping session retention"
-                    );
-                    false
-                },
-                |()| true,
-            );
+        let mut pair = lease.finish(proof).map_err(session_pair_error)?;
+        let expected_boundary = pair.token_len();
 
         let cap = self.kv_cache_config.max_session_tokens;
         let over_dense_cap = cap > 0 && expected_boundary > cap;
         let mut cap_exempt = false;
-        if target_valid && (self.kv_cache_config.is_turboquant() || over_dense_cap) {
-            match cache.quantize_for_retention(self.kv_cache_config) {
+        if self.kv_cache_config.is_turboquant() || over_dense_cap {
+            match pair.quantize_target_for_retention(self.kv_cache_config, &mlx_gate) {
                 Ok(layers) if layers > 0 => {
                     cap_exempt = over_dense_cap;
                     tracing::debug!(
@@ -4164,56 +4082,26 @@ impl SimpleEngine {
                 ),
             }
         }
-        let validated_target = if target_valid {
-            match ValidatedSessionTarget::evaluate(cache, expected_boundary_i32) {
-                Ok(target) => Some(target),
-                Err(error) => {
-                    tracing::warn!(
-                        session_id,
-                        error = %error,
-                        expected = expected_boundary_i32,
-                        "Failed to prove retained dSpark target state; dropping session retention"
-                    );
-                    None
-                }
-            }
-        } else {
-            drop(cache);
-            None
-        };
 
-        let mut full = prompt_tokens.to_vec();
-        full.extend_from_slice(&retained_generated);
-        let retained_state = match validated_target {
-            Some(target) => match resolve_session_dspark_retention(
-                target,
-                seal_eligibility,
-                &full,
-                |draft_cache, taps, boundary| drafter.seal_after_taps(draft_cache, taps, boundary),
-            ) {
-                Ok(publication) => {
-                    if let SessionDsparkRetention::TargetOnly { reason, .. } = &publication {
-                        tracing::warn!(
-                            session_id,
-                            ?reason,
-                            expected = expected_boundary_i32,
-                            "dSpark retention is ineligible; publishing validated target only"
-                        );
-                    }
-                    Some(publication.into_state())
-                }
-                Err(error) => {
+        let publication = match pair.seal_for_session(&mut drafter, &mlx_gate) {
+            Ok(publication) => {
+                if let Some(reason) = publication.demotion() {
                     tracing::warn!(
                         session_id,
-                        error = %error,
-                        expected = expected_boundary_i32,
-                        "Failed to retain exact session dSpark state; publishing nothing"
+                        ?reason,
+                        expected = expected_boundary,
+                        "dSpark retention is ineligible; publishing validated target only"
                     );
-                    None
                 }
-            },
-            None => {
-                drop(seal_eligibility);
+                Some(publication)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    expected = expected_boundary,
+                    "Failed to retain exact session dSpark state; publishing nothing"
+                );
                 None
             }
         };
@@ -4222,8 +4110,8 @@ impl SimpleEngine {
         drop(drafter);
         drop(model);
         drop(mlx_gate);
-        if let Some(state) = retained_state {
-            self.stash_retained(session_id, state, full, cap_exempt);
+        if let Some(publication) = publication {
+            self.stash_retained(session_id, publication.into_state(), cap_exempt);
         }
 
         let total_elapsed = total_start.elapsed();
@@ -8808,23 +8696,21 @@ impl SimpleEngine {
 mod tests {
     use super::{
         CanonicalDflashRound, DFlashVerifyMode, DFlashVerifyRound, DflashPromptPartition,
-        DflashSealDemotion, DflashTapFrontier, EngineError, GenerationPromptSuffixes,
-        IncrementalDetok, SessionDsparkRetention, SessionDsparkRetentionError, SessionGeneration,
-        SimpleEngine, SpeculationRoute, Tokenizer, ValidatedSessionTarget,
-        adaptive_draft_depth_for_cap, check_stop_sequences, complete_session_dflash_tail_forward,
-        continuation_prior_len, derive_model_name, detect_thinking_support,
+        DflashTapFrontier, EngineError, GenerationPromptSuffixes, IncrementalDetok,
+        SessionGeneration, SimpleEngine, SpeculationRoute, Tokenizer, adaptive_draft_depth_for_cap,
+        check_stop_sequences, continuation_prior_len, derive_model_name, detect_thinking_support,
         dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
         dflash_resolve_target_then_draft, dflash_tail_draft_cap, estimate_paged_kv_blocks,
         extract_eos_tokens, find_stop_in_tail, lock_or_recover, paired_dflash_exact_domain,
-        parse_enabled_flag, resolve_session_dspark_retention, resolve_speculation_route,
-        stateless_mtp_family_eligible, with_chat_terminator,
+        parse_enabled_flag, resolve_speculation_route, stateless_mtp_family_eligible,
+        with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
     use higgs_models::{
         AnyCache, SamplingParams, Speculation,
         cache::SteppingKeyValueCache,
-        dflash::{DFlashCache, DFlashConfig, DFlashDrafter, DFlashSnapshot},
+        dflash::{DFlashConfig, DFlashDrafter},
     };
     use mlx_rs::{
         Array, Dtype,
@@ -8833,7 +8719,7 @@ mod tests {
     };
     use std::path::Path;
 
-    fn validated_session_target(boundary: i32) -> ValidatedSessionTarget {
+    fn validated_session_target(boundary: i32) -> AnyCache {
         let layer = if boundary == 0 {
             SteppingKeyValueCache::new()
         } else {
@@ -8842,11 +8728,14 @@ mod tests {
             SteppingKeyValueCache::from_arrays(keys, values).unwrap()
         };
         let _exec = higgs_models::mlx_exec::acquire();
-        ValidatedSessionTarget::evaluate(AnyCache::KV(vec![Some(layer)]), boundary).unwrap()
+        let cache = AnyCache::KV(vec![Some(layer)]);
+        cache.eval().unwrap();
+        cache.validate_absolute_boundary(boundary).unwrap();
+        cache
     }
 
     fn paired_retained_state(boundary: i32) -> crate::cache::paired::RetainedState {
-        let target = validated_session_target(boundary).cache;
+        let target = validated_session_target(boundary);
         let config: DFlashConfig = serde_json::from_str(
             r#"{
                 "hidden_size": 4,
@@ -8961,7 +8850,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_round_rejects_boundary_divergence_before_output_publication() {
+    fn canonical_round_splits_frontier_before_output_publication() {
         let mut ledger = TokenLedger::new(10);
         ledger.emit_pending(41).unwrap();
         let anchor_ticket = ledger.begin_speculative_round().unwrap();
@@ -8972,9 +8861,9 @@ mod tests {
             draft_tokens: vec![42],
             draft_matches: 1,
         };
-        let mut output = vec![41];
+        let output = vec![41];
 
-        assert!(round.commit_output(&mut ledger, &mut output).is_err());
+        assert!(round.into_lease_parts().is_err());
 
         assert_eq!(output, [41]);
         assert_eq!(ledger.emitted_tokens(), [41]);
@@ -8982,88 +8871,6 @@ mod tests {
             ledger.retention_action(&[]),
             super::RetentionAction::ForwardInFlight { token: 41 }
         );
-    }
-
-    #[test]
-    fn session_dspark_seal_execution_failure_publishes_no_state() {
-        let target = validated_session_target(0);
-        let eligibility = DflashTapFrontier::new(0, 0, vec![], 0)
-            .unwrap()
-            .into_seal_eligibility(DFlashCache::default(), 0, 0);
-
-        let result = resolve_session_dspark_retention(
-            target,
-            eligibility,
-            &[],
-            |_draft, _taps, _boundary| -> Result<DFlashSnapshot, &'static str> {
-                Err("injected seal failure")
-            },
-        );
-
-        assert_eq!(
-            result.unwrap_err(),
-            SessionDsparkRetentionError::SealExecution("injected seal failure".to_owned())
-        );
-    }
-
-    #[test]
-    fn session_dspark_final_target_forward_failure_cannot_publish() {
-        let mut ledger = TokenLedger::new(3);
-        ledger.emit_pending(7).unwrap();
-        let frontier = DflashTapFrontier::new(3, 3, vec![], 1).unwrap();
-
-        let result =
-            complete_session_dflash_tail_forward(&mut ledger, frontier, 7, |_input_token| {
-                Err(EngineError::Generation(
-                    "injected final target-forward failure".to_owned(),
-                ))
-            });
-
-        assert!(result.is_err());
-        assert_eq!(
-            ledger.retention_action(&[]),
-            super::RetentionAction::ForwardInFlight { token: 7 }
-        );
-        assert!(
-            ledger.retainable_tokens().is_err(),
-            "an in-flight failed forward must not yield a retention key"
-        );
-    }
-
-    #[test]
-    fn session_dspark_missing_seal_tap_demotes_only_a_validated_target() {
-        let target = validated_session_target(1);
-        let tap = Array::zeros::<f32>(&[1, 1, 4]).unwrap();
-        let eligibility = DflashTapFrontier::new(0, 1, vec![tap], 1)
-            .unwrap()
-            .into_seal_eligibility(DFlashCache::default(), 1, 2);
-
-        let publication = resolve_session_dspark_retention(
-            target,
-            eligibility,
-            &[7],
-            |_draft, _taps, _boundary| -> Result<DFlashSnapshot, &'static str> {
-                panic!("an ineligible transition must never execute dSpark sealing")
-            },
-        )
-        .unwrap();
-
-        match publication {
-            SessionDsparkRetention::TargetOnly { target, reason } => {
-                target.validate_absolute_boundary(1).unwrap();
-                assert_eq!(
-                    reason,
-                    DflashSealDemotion::MissingOrUnsupportedTaps {
-                        rows: 1,
-                        collected: 1,
-                        required: 2,
-                    }
-                );
-            }
-            SessionDsparkRetention::Paired(_) => {
-                panic!("missing a required seal tap must demote to target-only")
-            }
-        }
     }
 
     #[test]
@@ -9418,35 +9225,37 @@ mod tests {
         use std::time::{Duration, Instant};
 
         // An empty KV cache is a valid `AnyCache` and needs no GPU.
-        let dummy = || RetainedState::TargetOnly(AnyCache::KV(Vec::new()));
+        let dummy = |tokens: Vec<u32>| {
+            RetainedState::target_only_unchecked_for_test(AnyCache::KV(Vec::new()), tokens)
+        };
 
         // -- count cap: never exceed max_sessions (LRU-evicted) --
         let mut map: HashMap<u64, RetainedKv> = HashMap::new();
         for sid in 0..5u64 {
-            stash_into(&mut map, sid, dummy(), vec![1, 2, 3], 2, 0);
+            stash_into(&mut map, sid, dummy(vec![1, 2, 3]), 2, 0);
         }
         assert_eq!(map.len(), 2, "count cap must bound retained sessions");
 
         // stash_into reports how many sessions it LRU-evicted (for the metrics counter).
         let mut cap_map: HashMap<u64, RetainedKv> = HashMap::new();
-        assert_eq!(stash_into(&mut cap_map, 1, dummy(), vec![1], 2, 0), 0);
-        assert_eq!(stash_into(&mut cap_map, 2, dummy(), vec![1], 2, 0), 0);
+        assert_eq!(stash_into(&mut cap_map, 1, dummy(vec![1]), 2, 0), 0);
+        assert_eq!(stash_into(&mut cap_map, 2, dummy(vec![1]), 2, 0), 0);
         assert_eq!(
-            stash_into(&mut cap_map, 3, dummy(), vec![1], 2, 0),
+            stash_into(&mut cap_map, 3, dummy(vec![1]), 2, 0),
             1,
             "inserting past the cap evicts exactly one"
         );
 
         // max_sessions=0 is clamped to 1 (never retain nothing-but-evict-all).
         let mut one: HashMap<u64, RetainedKv> = HashMap::new();
-        stash_into(&mut one, 1, dummy(), vec![1], 0, 0);
+        stash_into(&mut one, 1, dummy(vec![1]), 0, 0);
         assert_eq!(one.len(), 1, "max_sessions=0 clamps to 1");
 
         // -- per-session token cap: oversized conversation is not retained --
         let mut tc: HashMap<u64, RetainedKv> = HashMap::new();
-        stash_into(&mut tc, 7, dummy(), vec![0; 5], 8, 10); // 5 <= 10 → kept
+        stash_into(&mut tc, 7, dummy(vec![0; 5]), 8, 10); // 5 <= 10 → kept
         assert!(tc.contains_key(&7));
-        stash_into(&mut tc, 7, dummy(), vec![0; 20], 8, 10); // 20 > 10 → dropped
+        stash_into(&mut tc, 7, dummy(vec![0; 20]), 8, 10); // 20 > 10 → dropped
         assert!(
             !tc.contains_key(&7),
             "oversized session must not be retained, and its prior cache is forgotten"
@@ -9454,7 +9263,7 @@ mod tests {
 
         // token cap 0 = unlimited
         let mut un: HashMap<u64, RetainedKv> = HashMap::new();
-        stash_into(&mut un, 1, dummy(), vec![0; 100_000], 8, 0);
+        stash_into(&mut un, 1, dummy(vec![0; 100_000]), 8, 0);
         assert!(un.contains_key(&1), "max_session_tokens=0 means unlimited");
 
         // cap_exempt is used after over-cap caches are TurboQuant-compressed for
@@ -9464,17 +9273,16 @@ mod tests {
             max_session_tokens: 10,
             ..KvCacheConfig::default()
         };
-        let ordinary = dummy();
+        let ordinary = dummy(vec![0; 20]);
         assert_eq!(retention_token_cap(capped, false, &ordinary), 10);
         assert_eq!(retention_token_cap(capped, true, &ordinary), 0);
         let mut exempt: HashMap<u64, RetainedKv> = HashMap::new();
-        let ordinary = dummy();
+        let ordinary = dummy(vec![0; 20]);
         let ordinary_cap = retention_token_cap(capped, true, &ordinary);
         stash_into(
             &mut exempt,
             99,
             ordinary,
-            vec![0; 20],
             capped.max_retained_sessions,
             ordinary_cap,
         );
@@ -9489,8 +9297,7 @@ mod tests {
             ttl.insert(
                 sid,
                 RetainedKv {
-                    state: dummy(),
-                    tokens: vec![1],
+                    state: dummy(vec![1]),
                     last_used: Instant::now(),
                 },
             );
@@ -9533,7 +9340,6 @@ mod tests {
             &mut retained,
             100,
             paired,
-            vec![0; 20],
             config.max_retained_sessions,
             effective_cap,
         );
@@ -9553,9 +9359,9 @@ mod tests {
         let (target_bytes, dflash_bytes) = sample.paired_estimated_bytes().unwrap();
         assert!(target_bytes > 0);
         assert!(dflash_bytes > 0);
-        stash_into(&mut retained, 1, sample, vec![7], 2, 1);
-        stash_into(&mut retained, 2, paired_retained_state(1), vec![7], 2, 1);
-        let evicted = stash_into(&mut retained, 3, paired_retained_state(1), vec![7], 2, 1);
+        stash_into(&mut retained, 1, sample, 2, 1);
+        stash_into(&mut retained, 2, paired_retained_state(1), 2, 1);
+        let evicted = stash_into(&mut retained, 3, paired_retained_state(1), 2, 1);
 
         let plateau = retained_paired_stats(&retained);
         assert_eq!(evicted, 1);

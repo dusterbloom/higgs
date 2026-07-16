@@ -96,6 +96,16 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
     eprintln!("dspark-session checkpoint: turn1 complete");
     assert!(!first.continued);
     assert_eq!(first.prefilled_tokens as usize, prompt.len());
+    assert_eq!(first.completion_tokens, 1);
+    assert!(
+        engine.last_dflash_accepts().is_empty(),
+        "max_tokens=1 must perform no speculative rounds"
+    );
+    assert_eq!(
+        engine.cache_stats().retained_paired_sessions,
+        1,
+        "the one-token cache-only forward must publish one complete pair"
+    );
 
     let retained = engine
         .retained_session_tokens(SID)
@@ -134,6 +144,11 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
         !second_accepts.is_empty(),
         "direct session dSpark must run without an MTP checkpoint"
     );
+    assert_eq!(
+        engine.cache_stats().retained_paired_sessions,
+        1,
+        "a resumed dSpark turn must replace the session with one sealed pair"
+    );
 
     let paired_tokens = engine
         .retained_session_tokens(SID)
@@ -145,6 +160,16 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
         .expect("explicit autoregressive continuation");
     assert!(none.continued, "none may reuse the target half by demotion");
     assert_eq!(none.prefilled_tokens as usize, none_suffix_len);
+    assert_eq!(
+        engine.cache_stats().retained_paired_sessions,
+        0,
+        "an execution path without taps must atomically discard the dSpark sidecar"
+    );
+    assert_eq!(
+        engine.cache_stats().retained_sessions,
+        1,
+        "target-only continuity must remain retained after sidecar demotion"
+    );
 
     let target_only_tokens = engine
         .retained_session_tokens(SID)
@@ -170,5 +195,10 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
     assert_eq!(
         third.prefilled_tokens, third.prompt_tokens,
         "dSpark must cold-prefill after the sidecar was discarded"
+    );
+    assert_eq!(
+        engine.cache_stats().retained_paired_sessions,
+        1,
+        "the cold dSpark retry must restore one complete retained pair"
     );
 }

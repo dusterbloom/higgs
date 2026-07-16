@@ -9,6 +9,7 @@ use higgs_models::{
     AnyCache,
     dflash::{DFlashCache, DFlashDrafter, DFlashSnapshot},
     mlx_exec::MlxExecToken,
+    turboquant::KvCacheConfig,
 };
 use mlx_rs::Array;
 
@@ -37,43 +38,6 @@ pub(crate) enum DflashSealDemotion {
         collected: usize,
         required: usize,
     },
-    DraftBoundaryMismatch {
-        expected: i32,
-        actual: i32,
-    },
-    TargetBoundaryMismatch {
-        expected: i32,
-        actual: i32,
-    },
-}
-
-#[derive(Debug)]
-pub(crate) struct DflashSealInput {
-    pub(crate) draft_cache: DFlashCache,
-    pub(crate) taps: Vec<Array>,
-    pub(crate) expected_target_boundary: i32,
-}
-
-#[derive(Debug)]
-pub(crate) enum DflashSealEligibility {
-    Eligible(DflashSealInput),
-    Ineligible {
-        expected_target_boundary: i32,
-        reason: DflashSealDemotion,
-    },
-}
-
-impl DflashSealEligibility {
-    #[must_use]
-    pub(crate) const fn expected_target_boundary(&self) -> i32 {
-        match self {
-            Self::Eligible(input) => input.expected_target_boundary,
-            Self::Ineligible {
-                expected_target_boundary,
-                ..
-            } => *expected_target_boundary,
-        }
-    }
 }
 
 impl DflashTapFrontier {
@@ -201,51 +165,6 @@ impl DflashTapFrontier {
             self.expected_taps,
         )
     }
-
-    pub(crate) fn into_seal_eligibility(
-        self,
-        draft_cache: DFlashCache,
-        expected_target_boundary: i32,
-        required_seal_taps: usize,
-    ) -> DflashSealEligibility {
-        let actual_draft_boundary = draft_cache.position();
-        if actual_draft_boundary != self.draft_boundary {
-            return DflashSealEligibility::Ineligible {
-                expected_target_boundary,
-                reason: DflashSealDemotion::DraftBoundaryMismatch {
-                    expected: self.draft_boundary,
-                    actual: actual_draft_boundary,
-                },
-            };
-        }
-        if self.target_boundary != expected_target_boundary {
-            return DflashSealEligibility::Ineligible {
-                expected_target_boundary,
-                reason: DflashSealDemotion::TargetBoundaryMismatch {
-                    expected: expected_target_boundary,
-                    actual: self.target_boundary,
-                },
-            };
-        }
-        let rows = self.target_boundary - self.draft_boundary;
-        if rows > 0
-            && (self.expected_taps != required_seal_taps || self.taps.len() != required_seal_taps)
-        {
-            return DflashSealEligibility::Ineligible {
-                expected_target_boundary,
-                reason: DflashSealDemotion::MissingOrUnsupportedTaps {
-                    rows,
-                    collected: self.taps.len(),
-                    required: required_seal_taps,
-                },
-            };
-        }
-        DflashSealEligibility::Eligible(DflashSealInput {
-            draft_cache,
-            taps: self.taps,
-            expected_target_boundary,
-        })
-    }
 }
 
 /// Unforgeable-within-this-module identity for one live target/dSpark branch.
@@ -316,15 +235,18 @@ impl PrefixStamp {
     /// Temporary compatibility stamp. This proves exact lookup identity, but
     /// cannot prove that independently supplied cache halves came from it.
     fn new(tokens: &[u32]) -> Self {
+        Self::from_tokens(tokens.to_vec())
+    }
+
+    fn from_tokens(tokens: Vec<u32>) -> Self {
         Self {
             branch_epoch: None,
-            hash: hash_tokens(tokens),
+            hash: hash_tokens(&tokens),
             len: tokens.len(),
-            tokens: tokens.into(),
+            tokens: tokens.into_boxed_slice(),
         }
     }
 
-    #[allow(dead_code)] // removed when the shared coordinator migrates to LivePair
     fn from_live_branch(branch_epoch: PairBranchEpoch, tokens: Vec<u32>) -> Self {
         Self {
             branch_epoch: Some(branch_epoch),
@@ -380,16 +302,12 @@ pub(crate) enum PairedCacheError {
     UnprovenPair,
     #[error("retained target/dSpark pair metadata unexpectedly has another owner")]
     SharedPairMetadata,
-    #[allow(dead_code)] // exercised by the staged LivePair path pending migration
     #[error("live paired-cache advance carries a target half from another branch")]
     ForeignTargetBranch,
-    #[allow(dead_code)] // exercised by the staged LivePair path pending migration
     #[error("live paired-cache advance carries a dFlash half from another paired branch")]
     ForeignDFlashPairBranch,
-    #[allow(dead_code)] // exercised by the staged LivePair path pending migration
     #[error("live paired-cache branch revision overflow")]
     BranchRevisionOverflow,
-    #[allow(dead_code)] // exercised by the staged LivePair path pending migration
     #[error("failed to seal live dFlash branch: {details}")]
     DFlashSeal { details: String },
     #[error("live target/dSpark known advance failed: {details}")]
@@ -437,6 +355,7 @@ struct SealedPair {
 }
 
 impl SealedPair {
+    #[cfg(test)]
     fn new(
         target: AnyCache,
         dflash: DFlashSnapshot,
@@ -445,7 +364,6 @@ impl SealedPair {
         Self::from_stamp(target, dflash, PrefixStamp::new(tokens))
     }
 
-    #[allow(dead_code)] // removed when the shared coordinator migrates to LivePair
     fn from_live_branch(
         target: AnyCache,
         dflash: DFlashSnapshot,
@@ -505,6 +423,7 @@ impl SealedPair {
     }
 
     #[must_use]
+    #[cfg(test)]
     fn matches_prefix(&self, tokens: &[u32]) -> bool {
         self.metadata.stamp.matches(tokens)
     }
@@ -528,6 +447,7 @@ impl SealedPair {
         Ok(self.into_live_unchecked())
     }
 
+    #[cfg(test)]
     fn into_live_unchecked(self) -> (AnyCache, DFlashCache) {
         let Self {
             target,
@@ -558,32 +478,28 @@ impl SealedPair {
 /// - dFlash position = frontier draft boundary;
 /// - frontier target boundary = `tokens.len()`.
 ///
-/// The shared prefill/decode coordinator still needs to migrate onto this type.
-/// Until then, [`PairedCache::new`] remains an explicitly unproven compatibility
-/// layer for existing call sites.
+/// Session prefill/decode uses this coordinator directly. The radix path still
+/// has a temporary snapshot-sidecar compatibility layer until Phase 2 moves
+/// endpoint publication and fork reuse onto the same ownership flow.
 #[derive(Debug)]
-#[allow(dead_code)] // first provenance slice; production migration follows
 struct LiveTargetHalf {
     epoch: PairBranchEpoch,
     cache: AnyCache,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // first provenance slice; production migration follows
 struct LiveDFlashHalf {
     epoch: PairBranchEpoch,
     cache: DFlashCache,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // first provenance slice; production migration follows
 struct LiveFrontierHalf {
     epoch: PairBranchEpoch,
     frontier: DflashTapFrontier,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // first provenance slice; production migration follows
 pub(crate) struct LivePair {
     epoch: PairBranchEpoch,
     revision: u64,
@@ -595,7 +511,6 @@ pub(crate) struct LivePair {
 
 /// Move-only decode transaction for one exact live target/dSpark branch.
 #[derive(Debug)]
-#[allow(dead_code)] // first provenance slice; production migration follows
 pub(crate) struct LivePairDecodeLease {
     epoch: PairBranchEpoch,
     revision: u64,
@@ -606,7 +521,6 @@ pub(crate) struct LivePairDecodeLease {
     tokens: Vec<u32>,
 }
 
-#[allow(dead_code)] // first provenance slice; production migration follows
 impl LivePair {
     pub(crate) fn cold(
         target: AnyCache,
@@ -731,6 +645,108 @@ impl LivePair {
         Ok((lease, key))
     }
 
+    #[must_use]
+    pub(crate) fn token_len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Best-effort target-only retention compression without exposing either
+    /// cache half or an independently supplied token label.
+    pub(crate) fn quantize_target_for_retention(
+        &mut self,
+        config: KvCacheConfig,
+        _exec: &MlxExecToken,
+    ) -> Result<usize, PairedCacheError> {
+        self.validate_stable()?;
+        let expected = Self::token_boundary(self.tokens.len())?;
+        let layers = self
+            .target
+            .cache
+            .quantize_for_retention(config)
+            .map_err(|error| PairedCacheError::TargetMaterialization {
+                details: error.to_string(),
+            })?;
+        self.target
+            .cache
+            .validate_absolute_boundary(expected)
+            .map_err(|error| PairedCacheError::TargetBoundary {
+                expected,
+                details: error.to_string(),
+            })?;
+        Ok(layers)
+    }
+
+    /// Produce the only publishable session outcome from this live branch.
+    ///
+    /// A deterministic tap-capability mismatch is resolved before dFlash
+    /// sealing begins and may therefore retain the independently validated
+    /// target half. Once [`Self::seal`] starts, any error consumes the whole
+    /// branch and returns no publication.
+    pub(crate) fn seal_for_session(
+        self,
+        drafter: &mut DFlashDrafter,
+        exec: &MlxExecToken,
+    ) -> Result<SessionDsparkPublication, PairedCacheError> {
+        self.validate_stable()?;
+        let required = drafter.config.num_taps();
+        let configured = self.frontier.frontier.expected_taps();
+        if configured != required {
+            let rows = self
+                .frontier
+                .frontier
+                .rows()
+                .map_err(Self::frontier_error)?;
+            let reason = DflashSealDemotion::MissingOrUnsupportedTaps {
+                rows,
+                collected: self.frontier.frontier.taps.len(),
+                required,
+            };
+            return self.into_target_only_session_publication(reason, exec);
+        }
+
+        let pair = self.seal(drafter, exec)?;
+        Ok(SessionDsparkPublication {
+            state: RetainedState::Paired(pair),
+            demotion: None,
+        })
+    }
+
+    fn into_target_only_session_publication(
+        self,
+        reason: DflashSealDemotion,
+        _exec: &MlxExecToken,
+    ) -> Result<SessionDsparkPublication, PairedCacheError> {
+        self.validate_stable()?;
+        let Self {
+            target,
+            dflash,
+            frontier,
+            tokens,
+            ..
+        } = self;
+        let expected = Self::token_boundary(tokens.len())?;
+        target
+            .cache
+            .eval()
+            .map_err(|error| PairedCacheError::TargetMaterialization {
+                details: error.to_string(),
+            })?;
+        target
+            .cache
+            .validate_absolute_boundary(expected)
+            .map_err(|error| PairedCacheError::TargetBoundary {
+                expected,
+                details: error.to_string(),
+            })?;
+        drop(dflash);
+        drop(frontier);
+        let target = RetainedTarget::from_evaluated_tokens(target.cache, tokens)?;
+        Ok(SessionDsparkPublication {
+            state: RetainedState::TargetOnly(target),
+            demotion: Some(reason),
+        })
+    }
+
     /// Consume this exact live branch into one publishable retained pair.
     ///
     /// Sealing is direct: the only owned dFlash cache and frontier taps are
@@ -846,7 +862,6 @@ impl LivePair {
     }
 }
 
-#[allow(dead_code)] // first provenance slice; production migration follows
 impl LivePairDecodeLease {
     /// Run one target-authoritative decode transaction.
     ///
@@ -979,6 +994,7 @@ impl PairedCache {
     /// proves boundary/key equality but not shared prefill provenance. New code
     /// must use [`LivePair::seal`]. Delete this after `simple.rs` and radix
     /// publication migrate to the move-owned coordinator.
+    #[cfg(test)]
     pub(crate) fn new(
         target: AnyCache,
         dflash: DFlashSnapshot,
@@ -1048,6 +1064,7 @@ impl PairedCache {
 
     /// Revalidate the lookup key before this pair is selected for reuse.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn matches_prefix(&self, tokens: &[u32]) -> bool {
         self.sealed.matches_prefix(tokens)
     }
@@ -1078,6 +1095,7 @@ impl PairedCache {
         self.sealed.demote()
     }
 
+    #[cfg(test)]
     fn into_live_unchecked(self) -> (AnyCache, DFlashCache) {
         self.sealed.into_live_unchecked()
     }
@@ -1224,11 +1242,101 @@ impl RadixDFlashForkPlan {
 /// Session/radix retained ownership, with paired state represented atomically.
 #[derive(Debug)]
 pub(crate) enum RetainedState {
-    TargetOnly(AnyCache),
+    TargetOnly(RetainedTarget),
     Paired(PairedCache),
 }
 
+/// One target-only retained cache inseparably keyed by its exact token prefix.
+#[derive(Debug)]
+pub(crate) struct RetainedTarget {
+    cache: AnyCache,
+    stamp: PrefixStamp,
+}
+
+impl RetainedTarget {
+    fn from_evaluated_tokens(cache: AnyCache, tokens: Vec<u32>) -> Result<Self, PairedCacheError> {
+        let stamp = PrefixStamp::from_tokens(tokens);
+        let expected = stamp.boundary()?;
+        cache
+            .validate_absolute_boundary(expected)
+            .map_err(|error| PairedCacheError::TargetBoundary {
+                expected,
+                details: error.to_string(),
+            })?;
+        Ok(Self { cache, stamp })
+    }
+
+    fn evaluate(
+        cache: AnyCache,
+        tokens: Vec<u32>,
+        _exec: &MlxExecToken,
+    ) -> Result<Self, PairedCacheError> {
+        let retained = Self::from_evaluated_tokens(cache, tokens)?;
+        retained
+            .cache
+            .eval()
+            .map_err(|error| PairedCacheError::TargetMaterialization {
+                details: error.to_string(),
+            })?;
+        let expected = retained.stamp.boundary()?;
+        retained
+            .cache
+            .validate_absolute_boundary(expected)
+            .map_err(|error| PairedCacheError::TargetBoundary {
+                expected,
+                details: error.to_string(),
+            })?;
+        Ok(retained)
+    }
+
+    #[cfg(test)]
+    fn unchecked_for_test(cache: AnyCache, tokens: Vec<u32>) -> Self {
+        Self {
+            cache,
+            stamp: PrefixStamp::from_tokens(tokens),
+        }
+    }
+}
+
+/// Atomic session publication derived from one live pair-owned token ledger.
+///
+/// No constructor accepts a caller token vector, and no duplicate session key
+/// exists outside the retained state. Paired publication moves the live ledger
+/// into the private sealed stamp; target-only demotion moves it into the keyed
+/// target wrapper.
+#[derive(Debug)]
+pub(crate) struct SessionDsparkPublication {
+    state: RetainedState,
+    demotion: Option<DflashSealDemotion>,
+}
+
+impl SessionDsparkPublication {
+    #[must_use]
+    pub(crate) fn demotion(&self) -> Option<&DflashSealDemotion> {
+        self.demotion.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn into_state(self) -> RetainedState {
+        self.state
+    }
+}
+
 impl RetainedState {
+    pub(crate) fn target_only(
+        target: AnyCache,
+        tokens: Vec<u32>,
+        exec: &MlxExecToken,
+    ) -> Result<Self, PairedCacheError> {
+        RetainedTarget::evaluate(target, tokens, exec).map(Self::TargetOnly)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_only_unchecked_for_test(target: AnyCache, tokens: Vec<u32>) -> Self {
+        Self::TargetOnly(RetainedTarget::unchecked_for_test(target, tokens))
+    }
+
+    #[cfg(test)]
     pub(crate) fn paired(
         target: AnyCache,
         dflash: DFlashSnapshot,
@@ -1247,6 +1355,14 @@ impl RetainedState {
     }
 
     #[must_use]
+    pub(crate) fn tokens(&self) -> &[u32] {
+        match self {
+            Self::TargetOnly(target) => &target.stamp.tokens,
+            Self::Paired(pair) => &pair.sealed.metadata.stamp.tokens,
+        }
+    }
+
+    #[must_use]
     pub(crate) fn paired_estimated_bytes(&self) -> Option<(usize, usize)> {
         match self {
             Self::TargetOnly(_) => None,
@@ -1258,6 +1374,7 @@ impl RetainedState {
     ///
     /// Target-only state and mismatched pairs are returned intact so the
     /// caller may explicitly demote or discard them.
+    #[cfg(test)]
     pub(crate) fn into_paired(
         self,
         expected_tokens: &[u32],
@@ -1275,7 +1392,7 @@ impl RetainedState {
     #[must_use]
     pub(crate) fn demote(self) -> AnyCache {
         match self {
-            Self::TargetOnly(target) => target,
+            Self::TargetOnly(target) => target.cache,
             Self::Paired(pair) => pair.demote(),
         }
     }
@@ -1295,7 +1412,8 @@ mod tests {
     use crate::decode::token_ledger::TokenLedger;
 
     use super::{
-        DflashTapFrontier, LivePair, PairedCache, PairedCacheError, PrefixStamp, RetainedState,
+        DflashSealDemotion, DflashTapFrontier, LivePair, PairedCache, PairedCacheError,
+        PrefixStamp, RetainedState,
     };
 
     fn target_cache(boundary: i32) -> AnyCache {
@@ -1512,6 +1630,58 @@ mod tests {
     }
 
     #[test]
+    fn failed_cache_only_forward_returns_neither_lease_nor_paired_proof() {
+        let drafter = test_drafter();
+        let pair = LivePair::cold(target_cache(0), drafter.make_cache(), 1).unwrap();
+        let (lease, key) = pair.begin_decode().unwrap();
+        let mut ledger = TokenLedger::new_paired(key);
+        ledger.emit_pending(11).unwrap();
+        let _ticket = ledger.begin_cache_only_forward().unwrap();
+
+        let error = lease
+            .run(|target, _draft, _frontier| {
+                advance_target_one(target, 11);
+                Err::<(DflashTapFrontier, ()), _>("injected cache-only forward failure")
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            PairedCacheError::Decode {
+                details: "injected cache-only forward failure".to_owned()
+            }
+        );
+        assert!(
+            ledger.into_paired_proof().is_err(),
+            "the in-flight ledger must not mint a publication proof after the lease was consumed"
+        );
+    }
+
+    #[test]
+    fn visible_eos_is_excluded_before_live_pair_finish_and_session_seal() {
+        let tokens = vec![11];
+        let (pair, mut drafter) = target_ahead_live_pair(&tokens);
+        let (lease, key) = pair.begin_decode().unwrap();
+        let mut ledger = TokenLedger::new_paired(key);
+        let eos = 2;
+        ledger.emit_pending(eos).unwrap();
+        ledger.exclude_pending_eos(&[eos]).unwrap();
+
+        let pair = lease.finish(ledger.into_paired_proof().unwrap()).unwrap();
+
+        assert_eq!(pair.tokens, tokens);
+        pair.target.cache.validate_absolute_boundary(1).unwrap();
+        assert_eq!(pair.frontier.frontier.target_boundary(), 1);
+        let exec = higgs_models::mlx_exec::acquire();
+        let publication = pair.seal_for_session(&mut drafter, &exec).unwrap();
+        assert_eq!(
+            publication.into_state().tokens(),
+            [11],
+            "the visible terminal token must never enter the retained prefix stamp"
+        );
+    }
+
+    #[test]
     fn live_pair_direct_seal_consumes_frontier_without_a_publication_label() {
         // Keep this engine-level fixture below the dFlash 32-row projection
         // tile: dependency test builds intentionally expose placeholder model
@@ -1529,6 +1699,76 @@ mod tests {
             sealed.sealed.metadata.stamp.branch_epoch.is_some(),
             "the correct-by-construction path must retain its live branch epoch"
         );
+    }
+
+    #[test]
+    fn session_publication_derives_tokens_only_from_the_live_pair() {
+        let mut caller_tokens = vec![11];
+        let (pair, mut drafter) = target_ahead_live_pair(&caller_tokens);
+        let exec = higgs_models::mlx_exec::acquire();
+
+        let publication = pair.seal_for_session(&mut drafter, &exec).unwrap();
+        caller_tokens[0] = 99;
+        let state = publication.into_state();
+        let retained_tokens = state.tokens().to_vec();
+
+        assert_eq!(retained_tokens, [11]);
+        let RetainedState::Paired(pair) = state else {
+            panic!("matching tap capability must publish a paired session");
+        };
+        assert!(pair.matches_prefix(&retained_tokens));
+        assert!(!pair.matches_prefix(&caller_tokens));
+    }
+
+    #[test]
+    fn deterministic_session_tap_mismatch_demotes_the_validated_target() {
+        let (pair, _matching_drafter) = target_ahead_live_pair(&[11]);
+        let config: DFlashConfig = serde_json::from_str(
+            r#"{
+                "hidden_size": 4,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "intermediate_size": 8,
+                "vocab_size": 8,
+                "dflash_config": {
+                    "target_layer_ids": [0, 1]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut incompatible = DFlashDrafter::new(config).unwrap();
+        let exec = higgs_models::mlx_exec::acquire();
+
+        let publication = pair.seal_for_session(&mut incompatible, &exec).unwrap();
+
+        assert_eq!(
+            publication.demotion(),
+            Some(&DflashSealDemotion::MissingOrUnsupportedTaps {
+                rows: 1,
+                collected: 1,
+                required: 2,
+            })
+        );
+        let state = publication.into_state();
+        assert_eq!(state.tokens(), [11]);
+        let RetainedState::TargetOnly(target) = state else {
+            panic!("deterministic capability loss must retain only the target");
+        };
+        target.cache.validate_absolute_boundary(1).unwrap();
+    }
+
+    #[test]
+    fn effectful_session_seal_failure_returns_no_publication() {
+        let (pair, mut drafter) = target_ahead_live_pair(&[11]);
+        drafter.config.hidden_size = 5;
+        let exec = higgs_models::mlx_exec::acquire();
+
+        assert!(matches!(
+            pair.seal_for_session(&mut drafter, &exec).unwrap_err(),
+            PairedCacheError::DFlashSeal { .. }
+        ));
     }
 
     #[test]
@@ -1768,7 +2008,9 @@ mod tests {
 
     #[test]
     fn target_only_state_demotes_without_special_cases() {
-        let retained = RetainedState::TargetOnly(target_cache(0));
+        let target = target_cache(0);
+        let exec = higgs_models::mlx_exec::acquire();
+        let retained = RetainedState::target_only(target, vec![], &exec).unwrap();
 
         retained.demote().validate_absolute_boundary(0).unwrap();
     }
