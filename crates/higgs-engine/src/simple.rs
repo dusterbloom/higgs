@@ -106,6 +106,14 @@ fn stash_into(
     evicted
 }
 
+fn retention_token_cap(config: KvCacheConfig, cap_exempt: bool) -> usize {
+    if cap_exempt {
+        0
+    } else {
+        config.max_session_tokens
+    }
+}
+
 /// Drop retained caches idle longer than `ttl`; returns how many were removed.
 /// Pure map logic, unit-testable without a model.
 fn evict_idle_from(
@@ -925,11 +933,7 @@ impl SimpleEngine {
         // it exceeded the dense token cap — retain it anyway (bounded footprint
         // beats the measured 150s full re-prefill a drop would cost the
         // session's next turn).
-        let effective_cap = if cap_exempt {
-            0
-        } else {
-            self.kv_cache_config.max_session_tokens
-        };
+        let effective_cap = retention_token_cap(self.kv_cache_config, cap_exempt);
         #[allow(clippy::print_stderr)] // env-gated diagnostic
         if effective_cap > 0
             && tokens.len() > effective_cap
@@ -947,7 +951,7 @@ impl SimpleEngine {
             cache,
             tokens,
             self.kv_cache_config.max_retained_sessions,
-            self.kv_cache_config.max_session_tokens,
+            effective_cap,
         );
         if evicted > 0 {
             self.cache_metrics
@@ -1077,6 +1081,20 @@ impl SimpleEngine {
         let prompt_len = Self::prompt_len(prompt_tokens)?;
         let has_images = pixel_values.is_some();
 
+        // Disk lookup can scan many block-aligned candidates and hash the prompt.
+        // Keep that CPU-only candidate selection outside the model lock / MLX
+        // execution gate; the later materialization step still runs under the
+        // gate because it rebuilds MLX arrays.
+        let disk_prefix_candidate = if has_images {
+            None
+        } else {
+            let pc = self
+                .prefix_cache
+                .lock()
+                .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
+            pc.find_disk_prefix_candidate(prompt_tokens, checkpoint_id, 0)
+        };
+
         let model = self
             .model
             .lock()
@@ -1089,12 +1107,13 @@ impl SimpleEngine {
         // Skip prefix caching for multimodal requests: different images
         // produce different KV states even with identical token sequences.
         //
-        // The lookup MUST run under the model lock + MLX gate: a radix hit on a
-        // hybrid (GDN) entry `deep_clone`s the stored cache, and a disk-snapshot
-        // hit rebuilds `KvBlock`s — both eval MLX graphs. Doing this before the
-        // gate ran that eval concurrently with another request's in-flight
-        // generation on the shared default stream, and MLX's process-global
-        // Metal command buffer aborts on concurrent use (observed as
+        // Cache materialization MUST run under the model lock + MLX gate: a
+        // radix hit on a hybrid (GDN) entry `deep_clone`s the stored cache, and
+        // a disk-snapshot hit rebuilds `KvBlock`s — both eval MLX graphs. Doing
+        // that materialization before the gate ran eval concurrently with
+        // another request's in-flight generation on the shared default stream,
+        // and MLX's process-global Metal command buffer aborts on concurrent use
+        // (observed as
         // `-[_MTLCommandBuffer addCompletedHandler:]` / `IOGPUMetalCommandBuffer
         // validate` failed assertions during a session-continuation fallback
         // prefill racing a concurrent request's prefix lookup).
@@ -1105,7 +1124,18 @@ impl SimpleEngine {
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            pc.find_longest_prefix(prompt_tokens, checkpoint_id)
+            let memory_match = pc.find_memory_prefix(prompt_tokens);
+            let min_disk_prefix_len = memory_match
+                .as_ref()
+                .map_or(0, |matched| matched.prefix_len.saturating_add(1));
+            let disk_match = disk_prefix_candidate
+                .filter(|candidate| candidate.prefix_len() >= min_disk_prefix_len)
+                .and_then(|candidate| pc.load_disk_prefix_candidate(prompt_tokens, candidate));
+            match (disk_match, memory_match) {
+                (Some(disk), Some(memory)) if memory.prefix_len > disk.prefix_len => Some(memory),
+                (Some(disk), _) => Some(disk),
+                (None, memory) => memory,
+            }
         };
         if !has_images {
             self.cache_metrics
@@ -6399,8 +6429,9 @@ mod tests {
 
     #[test]
     fn retention_caps_bound_the_retained_map() {
-        use super::{RetainedKv, evict_idle_from, stash_into};
+        use super::{RetainedKv, evict_idle_from, retention_token_cap, stash_into};
         use higgs_models::AnyCache;
+        use higgs_models::turboquant::KvCacheConfig;
         use std::collections::HashMap;
         use std::time::{Duration, Instant};
 
@@ -6443,6 +6474,29 @@ mod tests {
         let mut un: HashMap<u64, RetainedKv> = HashMap::new();
         stash_into(&mut un, 1, dummy(), vec![0; 100_000], 8, 0);
         assert!(un.contains_key(&1), "max_session_tokens=0 means unlimited");
+
+        // cap_exempt is used after over-cap caches are TurboQuant-compressed for
+        // retention: the compressed cache should stay retained instead of
+        // forcing the next turn to re-prefill the full long context.
+        let capped = KvCacheConfig {
+            max_session_tokens: 10,
+            ..KvCacheConfig::default()
+        };
+        assert_eq!(retention_token_cap(capped, false), 10);
+        assert_eq!(retention_token_cap(capped, true), 0);
+        let mut exempt: HashMap<u64, RetainedKv> = HashMap::new();
+        stash_into(
+            &mut exempt,
+            99,
+            dummy(),
+            vec![0; 20],
+            capped.max_retained_sessions,
+            retention_token_cap(capped, true),
+        );
+        assert!(
+            exempt.contains_key(&99),
+            "cap-exempt compressed sessions must still be retained"
+        );
 
         // -- TTL eviction boundary --
         let mut ttl: HashMap<u64, RetainedKv> = HashMap::new();

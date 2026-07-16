@@ -11,8 +11,8 @@ use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::disk_storage::{
-    DiskCacheBlock, DiskCacheError, DiskCacheFileHeader, DiskCacheLayer, DiskCacheSnapshot,
-    DiskStorage,
+    DiskCacheBlock, DiskCacheEntryMetadata, DiskCacheError, DiskCacheFileHeader, DiskCacheLayer,
+    DiskCacheSnapshot, DiskStorage,
 };
 use crate::paged_prefix_cache::{PagedPrefixCache, PagedPrefixMatch};
 
@@ -32,6 +32,18 @@ pub struct DiskPrefixCache {
     storage: Option<DiskStorage>,
     block_size: usize,
     min_tokens_to_persist: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DiskPrefixCandidate {
+    session_id: u64,
+    prefix_len: usize,
+}
+
+impl DiskPrefixCandidate {
+    pub const fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
 }
 
 impl DiskPrefixCache {
@@ -71,19 +83,84 @@ impl DiskPrefixCache {
         })
     }
 
-    /// Find the longest matching prefix. Disk snapshots are consulted before
-    /// memory, then the longer of the two hits is returned.
+    /// Find the longest matching prefix. The cheap memory lookup runs first; a
+    /// disk snapshot is only materialized when its indexed metadata says it can
+    /// beat that memory hit.
     pub fn find_longest_prefix(
         &mut self,
         tokens: &[u32],
         checkpoint_id: Option<&str>,
     ) -> Option<PagedPrefixMatch> {
-        let disk_match = self.find_disk_prefix(tokens, checkpoint_id);
         let memory_match = self.memory.find_longest_prefix(tokens);
+        let min_disk_prefix_len = memory_match
+            .as_ref()
+            .map_or(0, |matched| matched.prefix_len.saturating_add(1));
+        let disk_match = self
+            .find_disk_prefix_candidate(tokens, checkpoint_id, min_disk_prefix_len)
+            .and_then(|candidate| self.load_disk_prefix_candidate(tokens, candidate));
         match (disk_match, memory_match) {
             (Some(disk), Some(memory)) if memory.prefix_len > disk.prefix_len => Some(memory),
             (Some(disk), _) => Some(disk),
             (None, memory) => memory,
+        }
+    }
+
+    pub fn find_memory_prefix(&mut self, tokens: &[u32]) -> Option<PagedPrefixMatch> {
+        self.memory.find_longest_prefix(tokens)
+    }
+
+    pub fn find_disk_prefix_candidate(
+        &self,
+        tokens: &[u32],
+        checkpoint_id: Option<&str>,
+        min_prefix_len: usize,
+    ) -> Option<DiskPrefixCandidate> {
+        let storage = self.storage.as_ref()?;
+
+        if let Some(checkpoint) = checkpoint_id {
+            let checkpoint_session_id = hash_checkpoint_id(checkpoint);
+            if let Some(metadata) = storage.snapshot_metadata(checkpoint_session_id) {
+                if snapshot_metadata_matches(tokens, metadata, min_prefix_len) {
+                    return Some(DiskPrefixCandidate {
+                        session_id: checkpoint_session_id,
+                        prefix_len: metadata.token_count,
+                    });
+                }
+            }
+        }
+
+        for prefix in block_prefix_hashes(tokens, self.block_size).iter().rev() {
+            if prefix.len < min_prefix_len {
+                break;
+            }
+            let Some(metadata) = storage.snapshot_metadata(prefix.session_id) else {
+                continue;
+            };
+            if metadata.token_count == prefix.len && metadata.token_hash == prefix.token_hash {
+                return Some(DiskPrefixCandidate {
+                    session_id: prefix.session_id,
+                    prefix_len: prefix.len,
+                });
+            }
+        }
+        None
+    }
+
+    pub fn load_disk_prefix_candidate(
+        &mut self,
+        tokens: &[u32],
+        candidate: DiskPrefixCandidate,
+    ) -> Option<PagedPrefixMatch> {
+        let matched = self.load_snapshot_match(tokens, candidate.session_id)?;
+        if matched.prefix_len == candidate.prefix_len {
+            Some(matched)
+        } else {
+            tracing::debug!(
+                expected_prefix_len = candidate.prefix_len,
+                found_prefix_len = matched.prefix_len,
+                "Skipping disk prefix cache snapshot whose indexed length changed"
+            );
+            None
         }
     }
 
@@ -153,35 +230,6 @@ impl DiskPrefixCache {
         self.memory.clear();
     }
 
-    fn find_disk_prefix(
-        &mut self,
-        tokens: &[u32],
-        checkpoint_id: Option<&str>,
-    ) -> Option<PagedPrefixMatch> {
-        if let Some(checkpoint) = checkpoint_id {
-            let checkpoint_session_id = hash_checkpoint_id(checkpoint);
-            if let Some(found) = self.load_snapshot_match(tokens, checkpoint_session_id) {
-                return Some(found);
-            }
-        }
-
-        let mut candidate_len = tokens.len() / self.block_size * self.block_size;
-        while candidate_len >= self.block_size {
-            let Some(candidate_tokens) = tokens.get(..candidate_len) else {
-                break;
-            };
-            let session_id = hash_tokens_for_session(candidate_tokens);
-            if let Some(found) = self.load_snapshot_match(tokens, session_id) {
-                return Some(found);
-            }
-            let Some(next_candidate) = candidate_len.checked_sub(self.block_size) else {
-                break;
-            };
-            candidate_len = next_candidate;
-        }
-        None
-    }
-
     fn load_snapshot_match(&mut self, tokens: &[u32], session_id: u64) -> Option<PagedPrefixMatch> {
         let storage = self.storage.as_ref()?;
         let snapshot = match storage.load_blocks(session_id) {
@@ -236,6 +284,52 @@ fn hash_tokens_for_session(tokens: &[u32]) -> u64 {
         }
     }
     hash
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockPrefixHash {
+    len: usize,
+    token_hash: u64,
+    session_id: u64,
+}
+
+fn block_prefix_hashes(tokens: &[u32], block_size: usize) -> Vec<BlockPrefixHash> {
+    if block_size == 0 {
+        return Vec::new();
+    }
+    let max_len = tokens.len() / block_size * block_size;
+    let mut prefixes = Vec::with_capacity(max_len / block_size);
+    let mut token_hash = FNV_OFFSET;
+    let mut session_hash = fnv_byte(FNV_OFFSET, b't');
+    for (index, token) in tokens.iter().take(max_len).enumerate() {
+        for byte in token.to_le_bytes() {
+            token_hash = fnv_byte(token_hash, byte);
+            session_hash = fnv_byte(session_hash, byte);
+        }
+        let len = index + 1;
+        if len % block_size == 0 {
+            prefixes.push(BlockPrefixHash {
+                len,
+                token_hash,
+                session_id: session_hash,
+            });
+        }
+    }
+    prefixes
+}
+
+fn snapshot_metadata_matches(
+    tokens: &[u32],
+    metadata: DiskCacheEntryMetadata,
+    min_prefix_len: usize,
+) -> bool {
+    if metadata.token_count < min_prefix_len || metadata.token_count > tokens.len() {
+        return false;
+    }
+    let Some(prefix_tokens) = tokens.get(..metadata.token_count) else {
+        return false;
+    };
+    hash_tokens(prefix_tokens) == metadata.token_hash
 }
 
 fn hash_checkpoint_id(checkpoint_id: &str) -> u64 {
@@ -462,6 +556,42 @@ mod tests {
     }
 
     #[test]
+    fn disk_prefix_candidates_respect_min_prefix_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskPrefixCacheConfig {
+            disk_path: dir.path().join("prefix.bin"),
+            max_disk_blocks: 16,
+            min_tokens_to_persist: 32,
+        };
+        let tokens: Vec<u32> = (0..64).collect();
+        let cache = make_kv_cache(1, 64);
+
+        let mut writer = DiskPrefixCache::new(8, 32, config.clone(), 2, 4).unwrap();
+        writer.store(&tokens, &cache, Some("checkpoint-a"));
+        drop(writer);
+
+        let mut reader = DiskPrefixCache::new(8, 32, config, 2, 4).unwrap();
+        let mut query = tokens.clone();
+        query.push(999);
+
+        assert!(
+            reader
+                .find_disk_prefix_candidate(&query, None, 65)
+                .is_none(),
+            "disk should not materialize a snapshot that cannot beat memory"
+        );
+
+        let candidate = reader
+            .find_disk_prefix_candidate(&query, None, 1)
+            .expect("stored token prefix should be a disk candidate");
+        assert_eq!(candidate.prefix_len(), 64);
+        let matched = reader
+            .load_disk_prefix_candidate(&query, candidate)
+            .expect("candidate should materialize under the MLX gate");
+        assert_eq!(matched.prefix_len, 64);
+    }
+
+    #[test]
     fn named_checkpoint_validates_prompt_hash() {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
@@ -483,5 +613,17 @@ mod tests {
                 .find_longest_prefix(&wrong_tokens, Some("checkpoint-a"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn block_prefix_hashes_match_legacy_hashes() {
+        let tokens: Vec<u32> = (0..96).collect();
+        let prefixes = block_prefix_hashes(&tokens, 32);
+        assert_eq!(prefixes.len(), 3);
+        for prefix in prefixes {
+            let prefix_tokens = &tokens[..prefix.len];
+            assert_eq!(prefix.token_hash, hash_tokens(prefix_tokens));
+            assert_eq!(prefix.session_id, hash_tokens_for_session(prefix_tokens));
+        }
     }
 }

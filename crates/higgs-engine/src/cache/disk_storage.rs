@@ -59,8 +59,15 @@ pub struct DiskCacheFileHeader {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct DiskCacheEntryMetadata {
+    pub token_count: usize,
+    pub token_hash: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct EntryIndex {
     offset: usize,
+    metadata: DiskCacheEntryMetadata,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,6 +133,10 @@ impl DiskStorage {
 
     pub const fn header(&self) -> &DiskCacheFileHeader {
         &self.header
+    }
+
+    pub fn snapshot_metadata(&self, session_id: u64) -> Option<DiskCacheEntryMetadata> {
+        self.index.get(&session_id).map(|entry| entry.metadata)
     }
 
     pub fn save_blocks(
@@ -196,6 +207,10 @@ impl DiskStorage {
             session_id,
             EntryIndex {
                 offset: append_offset,
+                metadata: DiskCacheEntryMetadata {
+                    token_count,
+                    token_hash,
+                },
             },
         );
         Ok(())
@@ -311,6 +326,10 @@ fn scan_index(bytes: &[u8]) -> HashMap<u64, EntryIndex> {
             entry_header.session_id,
             EntryIndex {
                 offset: entry_offset,
+                metadata: DiskCacheEntryMetadata {
+                    token_count: entry_header.token_count,
+                    token_hash: entry_header.token_hash,
+                },
             },
         );
         cursor = payload_end;

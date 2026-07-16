@@ -9516,9 +9516,14 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             )));
         }
         let Some(param) = params.get_mut(combined_key.as_str()) else {
-            return Err(crate::error::ModelError::Io(std::io::Error::other(
-                format!("Fused target key not found in model params: {combined_key}"),
-            )));
+            // Quantization metadata keys (global_scale, scales, etc.) don't
+            // have a fused target in the model's parameter dict — they're
+            // handled by the quant-mode loader. Skip them instead of erroring.
+            tracing::debug!(
+                key = %combined_key,
+                "GDN fusion: skipping key without fused target (likely quant metadata)"
+            );
+            continue;
         };
         let perm = if combined_key.contains("in_proj_qkvz") {
             &qkvz_perm
