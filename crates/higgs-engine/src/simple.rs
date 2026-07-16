@@ -12,7 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
-    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties,
+    AnyCache, AnyModel, LogprobArrays, SamplingParams, Speculation, apply_penalties,
     dflash::{DFlashCache, DFlashConfig, DFlashDrafter, accept_prefix},
     sample,
     turboquant::KvCacheConfig,
@@ -58,6 +58,56 @@ fn continuation_prior_len(prior_tokens: &[u32], full: &[u32]) -> Option<usize> {
         None
     } else {
         Some(prior)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionDecodeMode {
+    DFlash,
+    Mtp,
+    Autoregressive,
+}
+
+fn paired_dflash_exact_domain(params: &SamplingParams, thinking_enabled: bool) -> bool {
+    !thinking_enabled
+        && params.temperature <= f32::EPSILON
+        && (params.top_p - 1.0).abs() <= f32::EPSILON
+        && params.top_k.is_none()
+        && params.min_p.is_none()
+        && !params.has_penalties()
+}
+
+fn session_decode_mode(
+    params: &SamplingParams,
+    has_dflash: bool,
+    has_mtp: bool,
+    thinking_enabled: bool,
+) -> SessionDecodeMode {
+    match params.speculation {
+        Speculation::None => SessionDecodeMode::Autoregressive,
+        Speculation::Mtp => {
+            if has_mtp {
+                SessionDecodeMode::Mtp
+            } else {
+                SessionDecodeMode::Autoregressive
+            }
+        }
+        Speculation::DFlash => {
+            if has_dflash && paired_dflash_exact_domain(params, thinking_enabled) {
+                SessionDecodeMode::DFlash
+            } else {
+                SessionDecodeMode::Autoregressive
+            }
+        }
+        Speculation::Auto => {
+            if has_dflash && paired_dflash_exact_domain(params, thinking_enabled) {
+                SessionDecodeMode::DFlash
+            } else if has_mtp {
+                SessionDecodeMode::Mtp
+            } else {
+                SessionDecodeMode::Autoregressive
+            }
+        }
     }
 }
 
@@ -7498,21 +7548,94 @@ impl SimpleEngine {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        DFlashVerifyMode, DFlashVerifyRound, IncrementalDetok, SimpleEngine, Tokenizer,
-        adaptive_draft_depth_for_cap, check_stop_sequences, continuation_prior_len,
+        DFlashVerifyMode, DFlashVerifyRound, IncrementalDetok, SessionDecodeMode, SimpleEngine,
+        Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences, continuation_prior_len,
         derive_model_name, detect_thinking_support, dflash_canonical_target_is_terminal,
         dflash_new_stop_prefix_len, dflash_resolve_target_then_draft, dflash_tail_draft_cap,
         estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail, lock_or_recover,
-        parse_enabled_flag, with_chat_terminator,
+        parse_enabled_flag, session_decode_mode, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
-    use higgs_models::SamplingParams;
+    use higgs_models::{SamplingParams, Speculation};
     use mlx_rs::{
         Array, Dtype,
         ops::indexing::{IndexOp, NewAxis},
         transforms::eval,
     };
     use std::path::Path;
+
+    #[test]
+    fn session_decode_mode_honors_selector_and_dflash_without_mtp() {
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+
+        assert_eq!(
+            session_decode_mode(&greedy, true, false, false),
+            SessionDecodeMode::DFlash,
+            "Bonsai dSpark must not be nested behind an MTP head"
+        );
+
+        let none = SamplingParams {
+            speculation: Speculation::None,
+            ..greedy.clone()
+        };
+        assert_eq!(
+            session_decode_mode(&none, true, true, false),
+            SessionDecodeMode::Autoregressive
+        );
+
+        let mtp = SamplingParams {
+            speculation: Speculation::Mtp,
+            ..greedy.clone()
+        };
+        assert_eq!(
+            session_decode_mode(&mtp, true, true, false),
+            SessionDecodeMode::Mtp
+        );
+        assert_eq!(
+            session_decode_mode(&mtp, true, false, false),
+            SessionDecodeMode::Autoregressive
+        );
+
+        let forced_dflash = SamplingParams {
+            speculation: Speculation::DFlash,
+            ..greedy.clone()
+        };
+        assert_eq!(
+            session_decode_mode(&forced_dflash, true, true, false),
+            SessionDecodeMode::DFlash
+        );
+        assert_eq!(
+            session_decode_mode(&forced_dflash, false, true, false),
+            SessionDecodeMode::Autoregressive,
+            "forced dFlash must not silently become MTP"
+        );
+
+        let sampled = SamplingParams {
+            temperature: 0.7,
+            ..greedy.clone()
+        };
+        assert_eq!(
+            session_decode_mode(&sampled, true, true, false),
+            SessionDecodeMode::Mtp,
+            "auto may use MTP when paired dSpark is outside its exact domain"
+        );
+        let forced_sampled = SamplingParams {
+            speculation: Speculation::DFlash,
+            ..sampled
+        };
+        assert_eq!(
+            session_decode_mode(&forced_sampled, true, true, false),
+            SessionDecodeMode::Autoregressive
+        );
+        assert_eq!(
+            session_decode_mode(&greedy, true, true, true),
+            SessionDecodeMode::Mtp,
+            "paired dSpark initially requires no-thinking mode"
+        );
+    }
 
     #[test]
     fn dspark_verify_mode_fails_closed() {

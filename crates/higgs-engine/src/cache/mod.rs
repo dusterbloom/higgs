@@ -9,6 +9,7 @@ pub mod disk_prefix_cache;
 pub mod disk_storage;
 pub mod paged;
 pub mod pagetable;
+pub(crate) mod paired;
 pub mod storage;
 
 pub use allocator::BlockAllocator;
