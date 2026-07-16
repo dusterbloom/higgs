@@ -697,8 +697,14 @@ pub struct DFlashCache {
     revision: u64,
 }
 
+/// Opaque identity of one live drafter branch.
+///
+/// The numeric value is intentionally private. Engine-level paired-cache
+/// coordinators may compare identities, but cannot forge one or relabel a
+/// snapshot as having come from another live branch.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DFlashBranchId(u64);
+pub struct DFlashBranchId(u64);
 
 static NEXT_DFLASH_BRANCH_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -728,12 +734,20 @@ pub struct DFlashSnapshot {
     layers: Vec<Option<(Array, Array)>>,
     pending_taps: Option<Array>,
     position: i32,
+    source_branch: DFlashBranchId,
 }
 
 impl DFlashSnapshot {
     #[must_use]
     pub const fn position(&self) -> i32 {
         self.position
+    }
+
+    /// Live drafter branch consumed to create this immutable snapshot.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn source_branch_id(&self) -> DFlashBranchId {
+        self.source_branch
     }
 
     /// Estimated device bytes retained by this immutable snapshot.
@@ -875,6 +889,14 @@ impl DFlashCache {
     #[must_use]
     pub const fn position(&self) -> i32 {
         self.position
+    }
+
+    /// Opaque identity used by paired-cache sealing to reject a snapshot from
+    /// another same-position live drafter branch.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn branch_id(&self) -> DFlashBranchId {
+        self.branch
     }
 
     fn pending_rows(&self) -> Result<i32, Exception> {
@@ -1251,6 +1273,7 @@ impl DFlashDrafter {
             layers: cache.layers,
             pending_taps: cache.pending_taps,
             position: cache.position,
+            source_branch: cache.branch,
         })
     }
 
@@ -2512,6 +2535,7 @@ mod tests {
             layers: vec![Some((keys, values)), None],
             pending_taps: Some(pending),
             position: 5,
+            source_branch: super::next_dflash_branch_id(),
         };
 
         assert_eq!(snapshot.estimated_bytes(), expected);

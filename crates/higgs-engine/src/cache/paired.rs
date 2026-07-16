@@ -1,7 +1,8 @@
 //! Correct-by-construction ownership for target/dSpark retained state.
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use higgs_models::{
@@ -11,23 +12,56 @@ use higgs_models::{
 
 use super::disk_prefix_cache::hash_tokens;
 
+/// Unforgeable-within-this-module identity for one live target/dSpark branch.
+///
+/// A fresh epoch is minted only by [`LivePair::cold`]. The exact forwarded
+/// token ledger and both cache halves move with that epoch until sealing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PairBranchEpoch(u64);
+
+#[allow(dead_code)] // removed when the shared coordinator migrates to LivePair
+static NEXT_PAIR_BRANCH_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+#[allow(dead_code)] // removed when the shared coordinator migrates to LivePair
+fn next_pair_branch_epoch() -> PairBranchEpoch {
+    PairBranchEpoch(NEXT_PAIR_BRANCH_EPOCH.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Private identity for the exact token boundary represented by both caches.
 ///
 /// The hash is only a fast rejection hint. Exact token equality is the
 /// authority, so even an equal-length FNV collision cannot claim continuity.
 #[derive(Debug, PartialEq, Eq)]
 struct PrefixStamp {
+    /// `Some` only for the correct-by-construction [`LivePair`] path.
+    ///
+    /// `None` identifies the temporary compatibility constructor used by call
+    /// sites that have not yet migrated to the shared paired coordinator.
+    branch_epoch: Option<PairBranchEpoch>,
     hash: u64,
     len: usize,
     tokens: Box<[u32]>,
 }
 
 impl PrefixStamp {
+    /// Temporary compatibility stamp. This proves exact lookup identity, but
+    /// cannot prove that independently supplied cache halves came from it.
     fn new(tokens: &[u32]) -> Self {
         Self {
+            branch_epoch: None,
             hash: hash_tokens(tokens),
             len: tokens.len(),
             tokens: tokens.into(),
+        }
+    }
+
+    #[allow(dead_code)] // removed when the shared coordinator migrates to LivePair
+    fn from_live_branch(branch_epoch: PairBranchEpoch, tokens: Vec<u32>) -> Self {
+        Self {
+            branch_epoch: Some(branch_epoch),
+            hash: hash_tokens(&tokens),
+            len: tokens.len(),
+            tokens: tokens.into_boxed_slice(),
         }
     }
 
@@ -63,6 +97,21 @@ pub(crate) enum PairedCacheError {
         "dFlash cache boundary {actual} does not match the retained prefix boundary {expected}"
     )]
     DFlashBoundary { expected: i32, actual: i32 },
+    #[allow(dead_code)] // exercised by the staged LivePair path pending migration
+    #[error("live paired-cache advance carries a target half from another branch")]
+    ForeignTargetBranch,
+    #[allow(dead_code)] // exercised by the staged LivePair path pending migration
+    #[error("live paired-cache advance carries a dFlash half from another paired branch")]
+    ForeignDFlashPairBranch,
+    #[allow(dead_code)] // exercised by the staged LivePair path pending migration
+    #[error("live paired-cache branch revision overflow")]
+    BranchRevisionOverflow,
+    #[allow(dead_code)] // exercised by the staged LivePair path pending migration
+    #[error("failed to seal live dFlash branch: {details}")]
+    DFlashSeal { details: String },
+    #[allow(dead_code)] // exercised by the staged LivePair path pending migration
+    #[error("dFlash snapshot was sealed from another same-position live branch")]
+    ForeignDFlashBranch,
     #[error("failed to fork retained dFlash state: {details}")]
     DFlashFork { details: String },
     #[error("failed to materialize retained target state: {details}")]
@@ -107,7 +156,28 @@ impl SealedPair {
         dflash: DFlashSnapshot,
         tokens: &[u32],
     ) -> Result<Self, PairedCacheError> {
-        let stamp = PrefixStamp::new(tokens);
+        Self::from_stamp(target, dflash, PrefixStamp::new(tokens))
+    }
+
+    #[allow(dead_code)] // removed when the shared coordinator migrates to LivePair
+    fn from_live_branch(
+        target: AnyCache,
+        dflash: DFlashSnapshot,
+        branch_epoch: PairBranchEpoch,
+        tokens: Vec<u32>,
+    ) -> Result<Self, PairedCacheError> {
+        Self::from_stamp(
+            target,
+            dflash,
+            PrefixStamp::from_live_branch(branch_epoch, tokens),
+        )
+    }
+
+    fn from_stamp(
+        target: AnyCache,
+        dflash: DFlashSnapshot,
+        stamp: PrefixStamp,
+    ) -> Result<Self, PairedCacheError> {
         let expected = stamp.boundary()?;
         Self::validate_boundaries(&target, dflash.position(), expected)?;
         let metadata = Arc::new(PairMetadata {
@@ -193,6 +263,200 @@ impl SealedPair {
     }
 }
 
+/// Move-owned live target/dSpark branch with an exact forwarded-token ledger.
+///
+/// This is the first correct-by-construction publication path. Neither target,
+/// drafter nor token label can be supplied independently at seal time:
+///
+/// - [`Self::cold`] mints the private branch epoch at boundary zero;
+/// - [`Self::begin_aligned_advance`] consumes the pair into two stamped halves;
+/// - [`LivePairAdvance::commit`] reunites only halves from that same epoch and
+///   appends the exact forwarded tokens after both boundaries validate;
+/// - [`Self::seal`] consumes the owned drafter cache and rejects a snapshot
+///   sealed from any other live DFlash branch, even at the same position.
+///
+/// The shared prefill/decode coordinator still needs to migrate onto this type.
+/// Until then, [`PairedCache::new`] remains an explicitly unproven compatibility
+/// layer for existing call sites.
+#[derive(Debug)]
+#[allow(dead_code)] // first provenance slice; production migration follows
+struct LiveTargetHalf {
+    epoch: PairBranchEpoch,
+    cache: AnyCache,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // first provenance slice; production migration follows
+struct LiveDFlashHalf {
+    epoch: PairBranchEpoch,
+    cache: DFlashCache,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // first provenance slice; production migration follows
+pub(crate) struct LivePair {
+    epoch: PairBranchEpoch,
+    revision: u64,
+    target: LiveTargetHalf,
+    dflash: LiveDFlashHalf,
+    tokens: Vec<u32>,
+}
+
+/// Move-only in-flight transition for one exact live pair.
+///
+/// Both mutable cache halves retain their private pair epoch while model work
+/// happens. Reuniting a target half from branch A with a dFlash half from
+/// same-length branch B therefore fails before either can be stamped.
+#[derive(Debug)]
+#[allow(dead_code)] // first provenance slice; production migration follows
+pub(crate) struct LivePairAdvance {
+    epoch: PairBranchEpoch,
+    base_revision: u64,
+    target: LiveTargetHalf,
+    dflash: LiveDFlashHalf,
+    prefix_tokens: Vec<u32>,
+    forwarded_tokens: Box<[u32]>,
+}
+
+#[allow(dead_code)] // first provenance slice; production migration follows
+impl LivePair {
+    pub(crate) fn cold(target: AnyCache, dflash: DFlashCache) -> Result<Self, PairedCacheError> {
+        SealedPair::validate_boundaries(&target, dflash.position(), 0)?;
+        let epoch = next_pair_branch_epoch();
+        Ok(Self {
+            epoch,
+            revision: 0,
+            target: LiveTargetHalf {
+                epoch,
+                cache: target,
+            },
+            dflash: LiveDFlashHalf {
+                epoch,
+                cache: dflash,
+            },
+            tokens: Vec::new(),
+        })
+    }
+
+    /// Begin an aligned transition through one exact target-token slice.
+    ///
+    /// The exact tokens are captured before either cache becomes mutable. The
+    /// returned transition is move-only; dropping it after a partial failure
+    /// drops both halves and cannot mint a publication stamp.
+    pub(crate) fn begin_aligned_advance(
+        self,
+        forwarded_tokens: &[u32],
+    ) -> Result<LivePairAdvance, PairedCacheError> {
+        let new_len = self
+            .tokens
+            .len()
+            .checked_add(forwarded_tokens.len())
+            .ok_or(PairedCacheError::PrefixLengthOverflow { len: usize::MAX })?;
+        i32::try_from(new_len)
+            .map_err(|_| PairedCacheError::PrefixLengthOverflow { len: new_len })?;
+        Ok(LivePairAdvance {
+            epoch: self.epoch,
+            base_revision: self.revision,
+            target: self.target,
+            dflash: self.dflash,
+            prefix_tokens: self.tokens,
+            forwarded_tokens: forwarded_tokens.into(),
+        })
+    }
+
+    /// Consume this exact live branch into one publishable retained pair.
+    ///
+    /// The sealing callback receives the only owned live drafter cache. The
+    /// returned snapshot carries model-level source-branch provenance, so a
+    /// callback cannot substitute a same-position snapshot from another branch.
+    pub(crate) fn seal<E, F>(self, seal: F) -> Result<PairedCache, PairedCacheError>
+    where
+        E: std::fmt::Display,
+        F: FnOnce(DFlashCache, i32) -> Result<DFlashSnapshot, E>,
+    {
+        let Self {
+            epoch,
+            revision: _,
+            target,
+            dflash,
+            tokens,
+        } = self;
+        if target.epoch != epoch {
+            return Err(PairedCacheError::ForeignTargetBranch);
+        }
+        if dflash.epoch != epoch {
+            return Err(PairedCacheError::ForeignDFlashPairBranch);
+        }
+        let expected = i32::try_from(tokens.len())
+            .map_err(|_| PairedCacheError::PrefixLengthOverflow { len: tokens.len() })?;
+        SealedPair::validate_boundaries(&target.cache, dflash.cache.position(), expected)?;
+        let source_branch = dflash.cache.branch_id();
+        let snapshot =
+            seal(dflash.cache, expected).map_err(|error| PairedCacheError::DFlashSeal {
+                details: error.to_string(),
+            })?;
+        if snapshot.source_branch_id() != source_branch {
+            return Err(PairedCacheError::ForeignDFlashBranch);
+        }
+        let sealed = SealedPair::from_live_branch(target.cache, snapshot, epoch, tokens)?;
+        Ok(PairedCache { sealed })
+    }
+}
+
+#[allow(dead_code)] // first provenance slice; production migration follows
+impl LivePairAdvance {
+    /// Test seam for exercising the staged provenance transition before the
+    /// production prefill coordinator migrates into this module.
+    ///
+    /// Production deliberately receives no raw `&mut AnyCache` escape hatch:
+    /// the migration must add target-forward methods that consume the ticket's
+    /// own token slice.
+    #[cfg(test)]
+    fn target_cache_mut(&mut self) -> &mut AnyCache {
+        &mut self.target.cache
+    }
+
+    /// Test seam paired with [`Self::target_cache_mut`].
+    #[cfg(test)]
+    fn dflash_cache_mut(&mut self) -> &mut DFlashCache {
+        &mut self.dflash.cache
+    }
+
+    /// Reunite the exact two halves after successful model work.
+    pub(crate) fn commit(mut self) -> Result<LivePair, PairedCacheError> {
+        if self.target.epoch != self.epoch {
+            return Err(PairedCacheError::ForeignTargetBranch);
+        }
+        if self.dflash.epoch != self.epoch {
+            return Err(PairedCacheError::ForeignDFlashPairBranch);
+        }
+        let new_len = self
+            .prefix_tokens
+            .len()
+            .checked_add(self.forwarded_tokens.len())
+            .ok_or(PairedCacheError::PrefixLengthOverflow { len: usize::MAX })?;
+        let expected = i32::try_from(new_len)
+            .map_err(|_| PairedCacheError::PrefixLengthOverflow { len: new_len })?;
+        SealedPair::validate_boundaries(
+            &self.target.cache,
+            self.dflash.cache.position(),
+            expected,
+        )?;
+        let revision = self
+            .base_revision
+            .checked_add(1)
+            .ok_or(PairedCacheError::BranchRevisionOverflow)?;
+        self.prefix_tokens.extend_from_slice(&self.forwarded_tokens);
+        Ok(LivePair {
+            epoch: self.epoch,
+            revision,
+            target: self.target,
+            dflash: self.dflash,
+            tokens: self.prefix_tokens,
+        })
+    }
+}
+
 /// One immutable retained target/dFlash boundary.
 ///
 /// Both halves are private and the type is not `Clone`, so callers cannot
@@ -208,6 +472,13 @@ impl PairedCache {
     /// The caller must have evaluated `target` while holding the process MLX
     /// execution gate before transferring it here. `DFlashSnapshot` is already
     /// evaluated by `DFlashDrafter::seal_after_taps`.
+    ///
+    /// # Temporary compatibility layer
+    ///
+    /// This constructor accepts independently supplied halves and therefore
+    /// proves boundary/key equality but not shared prefill provenance. New code
+    /// must use [`LivePair::seal`]. Delete this after `simple.rs` and radix
+    /// publication migrate to the move-owned coordinator.
     pub(crate) fn new(
         target: AnyCache,
         dflash: DFlashSnapshot,
@@ -462,12 +733,12 @@ impl RetainedState {
 mod tests {
     use higgs_models::{
         AnyCache,
-        cache::SteppingKeyValueCache,
+        cache::{KeyValueCache, SteppingKeyValueCache},
         dflash::{DFlashConfig, DFlashDrafter, DFlashSnapshot},
     };
     use mlx_rs::Array;
 
-    use super::{PairedCache, PairedCacheError, PrefixStamp, RetainedState};
+    use super::{LivePair, PairedCache, PairedCacheError, PrefixStamp, RetainedState};
 
     fn target_cache(boundary: i32) -> AnyCache {
         let layer = if boundary == 0 {
@@ -509,18 +780,139 @@ mod tests {
         drafter.seal_after_taps(cache, &taps, boundary).unwrap()
     }
 
+    fn advance_target_one(cache: &mut AnyCache, token: u32) {
+        let AnyCache::KV(layers) = cache else {
+            panic!("test target must use a KV cache");
+        };
+        let layer = layers
+            .first_mut()
+            .and_then(Option::as_mut)
+            .expect("test target layer");
+        let value = token as f32;
+        let keys = Array::from_slice(&[value], &[1, 1, 1, 1]);
+        let values = Array::from_slice(&[-value], &[1, 1, 1, 1]);
+        layer.update_and_fetch(keys, values).unwrap();
+    }
+
+    fn pending_live_pair_at_one(token: u32) -> (super::LivePairAdvance, DFlashDrafter) {
+        let config: DFlashConfig = serde_json::from_str(
+            r#"{
+                "hidden_size": 4,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "intermediate_size": 8,
+                "vocab_size": 8,
+                "dflash_config": {
+                    "target_layer_ids": [0]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut drafter = DFlashDrafter::new(config).unwrap();
+        let mut advance = LivePair::cold(target_cache(0), drafter.make_cache())
+            .unwrap()
+            .begin_aligned_advance(&[token])
+            .unwrap();
+        let _exec = higgs_models::mlx_exec::acquire();
+        advance_target_one(advance.target_cache_mut(), token);
+        advance.target_cache_mut().eval().unwrap();
+        let taps = [Array::from_slice(
+            &[token as f32, 1.0, 2.0, 3.0],
+            &[1, 1, 4],
+        )];
+        drafter
+            .prime_taps(&taps, advance.dflash_cache_mut())
+            .unwrap();
+        (advance, drafter)
+    }
+
+    fn live_pair_at_one(token: u32) -> (LivePair, DFlashDrafter) {
+        let (advance, drafter) = pending_live_pair_at_one(token);
+        (advance.commit().unwrap(), drafter)
+    }
+
+    #[test]
+    fn live_pair_seal_uses_its_forwarded_prefix_without_a_publication_label() {
+        let (pair, mut drafter) = live_pair_at_one(11);
+        let _exec = higgs_models::mlx_exec::acquire();
+
+        let sealed = pair
+            .seal(|dflash, boundary| drafter.seal_after_taps(dflash, &[], boundary))
+            .unwrap();
+
+        assert!(sealed.matches_prefix(&[11]));
+        assert!(!sealed.matches_prefix(&[12]));
+        assert!(
+            sealed.sealed.metadata.stamp.branch_epoch.is_some(),
+            "the correct-by-construction path must retain its live branch epoch"
+        );
+    }
+
+    #[test]
+    fn live_pair_rejects_a_same_length_snapshot_from_another_branch() {
+        let (left, mut left_drafter) = live_pair_at_one(11);
+        let (right, mut right_drafter) = live_pair_at_one(12);
+        let right_boundary = i32::try_from(right.tokens.len()).unwrap();
+        let _exec = higgs_models::mlx_exec::acquire();
+        let wrong_snapshot = right_drafter
+            .seal_after_taps(right.dflash.cache, &[], right_boundary)
+            .unwrap();
+
+        let error = left
+            .seal(|owned_dflash, _boundary| {
+                drop(owned_dflash);
+                Ok::<_, &'static str>(wrong_snapshot)
+            })
+            .unwrap_err();
+
+        assert_eq!(error, PairedCacheError::ForeignDFlashBranch);
+
+        // Keep the intended drafter alive through the adversarial seal attempt:
+        // the rejection is provenance-based, not caused by dropping model state.
+        let _ = &mut left_drafter;
+    }
+
+    #[test]
+    fn live_pair_rejects_a_same_length_target_half_from_another_branch() {
+        let (mut left, _left_drafter) = pending_live_pair_at_one(11);
+        let (mut right, _right_drafter) = pending_live_pair_at_one(12);
+        std::mem::swap(&mut left.target, &mut right.target);
+
+        let error = left.commit().unwrap_err();
+
+        assert_eq!(error, PairedCacheError::ForeignTargetBranch);
+    }
+
+    #[test]
+    fn live_pair_rejects_a_same_length_dflash_half_from_another_branch() {
+        let (mut left, _left_drafter) = pending_live_pair_at_one(11);
+        let (mut right, _right_drafter) = pending_live_pair_at_one(12);
+        std::mem::swap(&mut left.dflash, &mut right.dflash);
+
+        let error = left.commit().unwrap_err();
+
+        assert_eq!(error, PairedCacheError::ForeignDFlashPairBranch);
+    }
+
     #[test]
     fn paired_cache_accepts_one_exact_shared_boundary() {
         let pair = PairedCache::new(target_cache(0), dflash_snapshot(0), &[]).unwrap();
 
         assert_eq!(pair.prefix_len(), 0);
         assert!(pair.matches_prefix(&[]));
+        assert!(
+            pair.sealed.metadata.stamp.branch_epoch.is_none(),
+            "legacy compatibility construction must remain visibly unproven"
+        );
     }
 
     #[test]
     fn prefix_length_must_fit_the_model_boundary_type() {
         let len = usize::try_from(i32::MAX).unwrap() + 1;
         let stamp = PrefixStamp {
+            branch_epoch: None,
             hash: 0,
             len,
             tokens: Vec::new().into_boxed_slice(),
