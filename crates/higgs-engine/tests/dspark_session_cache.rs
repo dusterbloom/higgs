@@ -80,7 +80,9 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
         .prepare_chat_prompt_with_thinking(
             &[ChatMessage {
                 role: "user".to_owned(),
-                content: "Count upward from 1. Print only comma-separated integers.".to_owned(),
+                content: "Print the integers from 1 upward as comma-separated values. \
+                          Output only the sequence and continue for many terms."
+                    .to_owned(),
                 tool_calls: None,
             }],
             None,
@@ -93,6 +95,27 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
     );
 
     const SID: u64 = 0xD5A4_0001;
+    const COLD_SID: u64 = SID + 1;
+    const WARMUP_SID: u64 = SID + 2;
+    let warmup = engine
+        .generate_continued_with_thinking(
+            WARMUP_SID,
+            &prompt,
+            8,
+            &greedy(Speculation::DFlash),
+            false,
+        )
+        .expect("session dSpark kernel warmup");
+    assert_eq!(
+        warmup.completion_tokens, 8,
+        "the session performance warmup must enter dSpark decode"
+    );
+    assert!(
+        !engine.last_dflash_accepts().is_empty(),
+        "the session performance warmup must execute speculative rounds"
+    );
+    engine.drop_retained_session(WARMUP_SID);
+
     let first = engine
         .generate_continued_with_thinking(SID, &prompt, 1, &greedy(Speculation::DFlash), false)
         .expect("one-token paired turn");
@@ -130,6 +153,10 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
             false,
         )
         .expect("resume paired dSpark session");
+    assert_eq!(
+        second.completion_tokens, 32,
+        "the session decode gate requires the complete tg32 workload"
+    );
     let second_accepts = engine.last_dflash_accepts();
     let second_acceptance = dflash_acceptance(&engine, "warm paired session");
     let second_decode_tps = dflash_decode_tps(&engine, "warm paired session");
@@ -159,7 +186,6 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
     // Decode-only release gate against the identical session decoder with no
     // retained pair. `drop_retained_session` makes the comparator cold while
     // preserving the same prompt, sampling domain, and dSpark implementation.
-    const COLD_SID: u64 = SID + 1;
     engine.drop_retained_session(COLD_SID);
     let cold = engine
         .generate_continued_with_thinking(
@@ -185,8 +211,6 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
         "paired session reuse must preserve the cold greedy output"
     );
     assert_eq!(second.completion_tokens, cold.completion_tokens);
-    assert_acceptance_within("warm paired session", second_acceptance, cold_acceptance);
-    assert_decode_tps_within("warm paired session", second_decode_tps, cold_decode_tps);
     eprintln!(
         "dspark-session release gate: warm_decode={second_decode_tps:.2} \
          uncached_decode={cold_decode_tps:.2} tok/s warm_acceptance={:.2}% ({}/{}) \
@@ -198,6 +222,8 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
         cold_acceptance.matched,
         cold_acceptance.drafted,
     );
+    assert_acceptance_within("warm paired session", second_acceptance, cold_acceptance);
+    assert_decode_tps_within("warm paired session", second_decode_tps, cold_decode_tps);
     engine.drop_retained_session(COLD_SID);
 
     let paired_tokens = engine
