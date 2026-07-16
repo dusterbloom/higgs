@@ -343,6 +343,21 @@ pub(crate) struct PairedPrepareTicket {
     revision: CachePublicationRevision,
 }
 
+impl PairedPrepareTicket {
+    /// Boundary representable by this ticket's captured target-radix layout.
+    ///
+    /// Dense targets publish only complete paged blocks. Hybrid targets use
+    /// the existing exact cloned-endpoint path.
+    #[must_use]
+    pub(crate) const fn store_boundary(self, requested: usize, is_hybrid: bool) -> usize {
+        if is_hybrid {
+            requested
+        } else {
+            requested / self.block_size * self.block_size
+        }
+    }
+}
+
 /// Opaque token for refreshing paired LRU only after a successful fork.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PairedTouchToken {
@@ -1084,20 +1099,6 @@ impl PagedPrefixCache {
         }
     }
 
-    /// Boundary representable by the existing target radix storage path.
-    ///
-    /// Dense targets reuse block-paged storage and therefore publish only a
-    /// complete block boundary. Hybrid targets use the existing exact cloned
-    /// endpoint path.
-    #[must_use]
-    pub(crate) const fn paired_store_boundary(requested: usize, is_hybrid: bool) -> usize {
-        if is_hybrid {
-            requested
-        } else {
-            requested / DEFAULT_BLOCK_SIZE * DEFAULT_BLOCK_SIZE
-        }
-    }
-
     #[must_use]
     pub(crate) const fn paired_prepare_ticket(&self) -> PairedPrepareTicket {
         PairedPrepareTicket {
@@ -1152,6 +1153,10 @@ impl PagedPrefixCache {
         &self,
         tokens: &[u32],
     ) -> Result<Option<PagedPairedLookupPlan>, PairedCacheError> {
+        debug_assert!(
+            !higgs_models::mlx_exec::held(),
+            "paired prefix selection must happen before acquiring the MLX execution gate"
+        );
         let mut scratch: Vec<&EdgeBlocks> = Vec::new();
         let Some(matched) = self.root.find_deepest_match(
             tokens,
@@ -3262,6 +3267,22 @@ mod tests {
         assert_eq!(matched.dflash_cache.position(), 8);
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "paired prefix selection must happen before")]
+    fn paired_lookup_selection_rejects_the_mlx_execution_gate() {
+        let mut cache = PagedPrefixCache::new(10, 4);
+        let stored: Vec<u32> = (0..8).collect();
+        cache
+            .store_paired(&stored, &make_kv_cache(1, 8), dflash_snapshot(8))
+            .unwrap();
+        let mut query = stored;
+        query.push(99);
+
+        let _exec = higgs_models::mlx_exec::acquire();
+        let _ = cache.plan_longest_paired_prefix(&query);
+    }
+
     #[test]
     fn paired_prepare_and_commit_separate_mlx_from_trie_mutation() {
         let mut cache = PagedPrefixCache::new(10, 4);
@@ -3288,6 +3309,19 @@ mod tests {
             cache.plan_longest_paired_prefix(&query).unwrap().is_some(),
             "CPU-only commit must publish the complete pair"
         );
+    }
+
+    #[test]
+    fn paired_prepare_ticket_uses_its_captured_block_layout_for_dense_boundaries() {
+        let block_four = PagedPrefixCache::new(10, 4).paired_prepare_ticket();
+        let block_six = PagedPrefixCache::new(10, 6).paired_prepare_ticket();
+
+        assert_eq!(block_four.store_boundary(13, false), 12);
+        assert_eq!(block_six.store_boundary(13, false), 12);
+        assert_eq!(block_four.store_boundary(11, false), 8);
+        assert_eq!(block_six.store_boundary(11, false), 6);
+        assert_eq!(block_four.store_boundary(11, true), 11);
+        assert_eq!(block_six.store_boundary(11, true), 11);
     }
 
     #[test]

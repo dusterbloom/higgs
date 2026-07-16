@@ -35,7 +35,9 @@ use crate::{
     error::EngineError,
     mlx_tuning::MlxRuntimeTuning,
     model_loader,
-    paged_prefix_cache::{DEFAULT_BLOCK_SIZE, PagedPairedLookupPlan, PairedPrepareTicket},
+    paged_prefix_cache::{
+        DEFAULT_BLOCK_SIZE, PagedPairedLookupPlan, PairedPrepareTicket, PairedTouchToken,
+    },
     scheduler::RoundRobinScheduler,
 };
 
@@ -1284,6 +1286,62 @@ struct DflashPrefillOutcome {
 struct DflashPairedPrefixPlan {
     lookup: Option<PagedPairedLookupPlan>,
     publication_ticket: PairedPrepareTicket,
+}
+
+/// Defers paired-radix LRU mutation until every model/MLX guard has dropped.
+///
+/// The lookup plan owns immutable target/dSpark handles, so cache eviction
+/// after selection cannot invalidate the in-flight request. The one-shot touch
+/// is only an LRU refresh and may safely fail closed if the endpoint was
+/// cleared or replaced while the request ran.
+struct DeferredPairedTouch<'a> {
+    prefix_cache: &'a Mutex<DiskPrefixCache>,
+    token: Option<PairedTouchToken>,
+}
+
+impl<'a> DeferredPairedTouch<'a> {
+    const fn new(prefix_cache: &'a Mutex<DiskPrefixCache>) -> Self {
+        Self {
+            prefix_cache,
+            token: None,
+        }
+    }
+
+    fn arm(&mut self, token: PairedTouchToken) {
+        debug_assert!(
+            self.token.is_none(),
+            "one dSpark request may arm at most one paired-radix touch"
+        );
+        self.token = Some(token);
+    }
+}
+
+impl Drop for DeferredPairedTouch<'_> {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        if higgs_models::mlx_exec::held() {
+            debug_assert!(
+                false,
+                "paired-radix LRU touch must run after releasing the MLX execution gate"
+            );
+            return;
+        }
+        let touched = match self.prefix_cache.try_lock() {
+            Ok(mut cache) => Some(cache.touch_memory_paired(token)),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                Some(error.into_inner().touch_memory_paired(token))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::debug!("Skipping contended paired dSpark radix LRU touch");
+                None
+            }
+        };
+        if touched == Some(false) {
+            tracing::debug!("Skipping stale paired dSpark radix LRU touch");
+        }
+    }
 }
 
 impl DflashPrefillOutcome {
@@ -5276,11 +5334,6 @@ impl SimpleEngine {
         Ok((logits, taps))
     }
 
-    #[must_use]
-    const fn dflash_pair_boundary(body_end: usize, is_hybrid: bool) -> usize {
-        DiskPrefixCache::paired_store_boundary(body_end, is_hybrid)
-    }
-
     fn dflash_cold_prefill(
         &self,
         model: &mut AnyModel,
@@ -5329,6 +5382,7 @@ impl SimpleEngine {
         prompt_tokens: &[u32],
         partition: Option<DflashPromptPartition<'_>>,
         paired_plan: Option<DflashPairedPrefixPlan>,
+        deferred_touch: &mut DeferredPairedTouch<'_>,
         dflash: &DFlashState,
     ) -> Result<DflashPrefillOutcome, EngineError> {
         let (Some(partition), Some(paired_plan)) = (partition, paired_plan) else {
@@ -5342,15 +5396,8 @@ impl SimpleEngine {
         let reusable = lookup.and_then(|plan| match plan.materialize() {
             Ok(matched) => {
                 let (matched, touch) = matched.into_materialized_and_touch();
-                if lock_or_recover(&self.prefix_cache).touch_memory_paired(touch) {
-                    Some((matched.cache, matched.dflash_cache, matched.prefix_len))
-                } else {
-                    tracing::debug!(
-                        prefix_len = matched.prefix_len,
-                        "Discarding stale paired dSpark radix materialization"
-                    );
-                    None
-                }
+                deferred_touch.arm(touch);
+                Some((matched.cache, matched.dflash_cache, matched.prefix_len))
             }
             Err(error) => {
                 tracing::warn!(
@@ -5373,8 +5420,8 @@ impl SimpleEngine {
                 )
             };
 
-        let publish_boundary =
-            Self::dflash_pair_boundary(partition.body_end, matches!(&cache, AnyCache::Hybrid(_)));
+        let publish_boundary = publication_ticket
+            .store_boundary(partition.body_end, matches!(&cache, AnyCache::Hybrid(_)));
         if publish_boundary == 0 || reused_prefix_len > publish_boundary {
             drop(cache);
             drop(draft_cache);
@@ -5676,6 +5723,43 @@ impl SimpleEngine {
         })
     }
 
+    /// Select owned paired-radix handles under a short, isolated prefix lock.
+    fn select_dflash_paired_prefix(
+        &self,
+        partition: DflashPromptPartition<'_>,
+    ) -> DflashPairedPrefixPlan {
+        debug_assert!(
+            !higgs_models::mlx_exec::held(),
+            "paired dSpark radix selection must precede the MLX execution gate"
+        );
+        self.cache_metrics
+            .radix_lookups
+            .fetch_add(1, Ordering::Relaxed);
+        self.cache_metrics
+            .paired_radix_lookups
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Keeping the mutex guard local to this helper makes it structurally
+        // impossible for dflash_decode to retain the prefix lock while it
+        // later acquires the model lock or process-wide MLX gate.
+        let prefix_cache = lock_or_recover(&self.prefix_cache);
+        let publication_ticket = prefix_cache.paired_prepare_ticket();
+        let lookup = match prefix_cache.plan_memory_paired_prefix(partition.body()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Paired dSpark radix selection failed; cold-prefilling"
+                );
+                None
+            }
+        };
+        DflashPairedPrefixPlan {
+            lookup,
+            publication_ticket,
+        }
+    }
+
     /// `DFlash` block-diffusion speculative decode loop.
     ///
     /// Each round: drafter proposes a `block_size` block from the target's tap
@@ -5734,6 +5818,13 @@ impl SimpleEngine {
             })
             .flatten();
 
+        // Selection returns only owned handles. The helper's local prefix guard
+        // is gone before this function can acquire model/MLX state.
+        let paired_plan = partition.map(|partition| self.select_dflash_paired_prefix(partition));
+        // Declared before model/MLX/drafter guards so Drop runs after them on
+        // every success and error path.
+        let mut deferred_touch = DeferredPairedTouch::new(&self.prefix_cache);
+
         let mut model = lock_or_recover(&self.model);
         // `generate_inner` dispatches DFlash before `prepare_generation`, whose
         // `PreparedGeneration` normally owns this token for plain AR. Acquire
@@ -5743,32 +5834,6 @@ impl SimpleEngine {
         // requests can race MLX's process-global Metal command buffer.
         let _mlx_gate = higgs_models::mlx_exec::acquire();
         debug_assert!(higgs_models::mlx_exec::held());
-        let paired_plan = if let Some(partition) = partition {
-            self.cache_metrics
-                .radix_lookups
-                .fetch_add(1, Ordering::Relaxed);
-            self.cache_metrics
-                .paired_radix_lookups
-                .fetch_add(1, Ordering::Relaxed);
-            let prefix_cache = lock_or_recover(&self.prefix_cache);
-            let publication_ticket = prefix_cache.paired_prepare_ticket();
-            let lookup = match prefix_cache.plan_memory_paired_prefix(partition.body()) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Paired dSpark radix selection failed; cold-prefilling"
-                    );
-                    None
-                }
-            };
-            Some(DflashPairedPrefixPlan {
-                lookup,
-                publication_ticket,
-            })
-        } else {
-            None
-        };
         let mut drafter = lock_or_recover(&dflash.drafter);
         let is_dspark = drafter.config.is_dspark();
 
@@ -5778,6 +5843,7 @@ impl SimpleEngine {
             prompt_tokens,
             partition,
             paired_plan,
+            &mut deferred_touch,
             dflash,
         )?;
         let DflashPrefillOutcome {
@@ -8847,13 +8913,6 @@ mod tests {
         assert!(DflashPromptPartition::new(&prompt, &prompt).is_none());
         assert!(DflashPromptPartition::new(&prompt, &[0, 2, 3]).is_none());
         assert!(DflashPromptPartition::new(&prompt, &[2, 3, 4]).is_none());
-    }
-
-    #[test]
-    fn dspark_radix_publish_boundary_uses_each_existing_target_storage_path() {
-        assert_eq!(SimpleEngine::dflash_pair_boundary(37, true), 37);
-        assert_eq!(SimpleEngine::dflash_pair_boundary(37, false), 32);
-        assert_eq!(SimpleEngine::dflash_pair_boundary(15, false), 0);
     }
 
     #[test]

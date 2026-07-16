@@ -126,11 +126,6 @@ impl DiskPrefixCache {
     }
 
     #[must_use]
-    pub(crate) const fn paired_store_boundary(requested: usize, is_hybrid: bool) -> usize {
-        PagedPrefixCache::paired_store_boundary(requested, is_hybrid)
-    }
-
-    #[must_use]
     pub(crate) const fn paired_prepare_ticket(&self) -> PairedPrepareTicket {
         self.memory.paired_prepare_ticket()
     }
