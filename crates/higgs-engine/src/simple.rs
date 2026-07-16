@@ -111,9 +111,9 @@ fn continuation_prior_len(prior_tokens: &[u32], full: &[u32]) -> Option<usize> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionDecodeMode {
+enum SpeculationRoute {
     DFlash,
-    Mtp,
+    MtpFamily,
     Autoregressive,
 }
 
@@ -126,38 +126,46 @@ fn paired_dflash_exact_domain(params: &SamplingParams, thinking_enabled: bool) -
         && !params.has_penalties()
 }
 
-fn session_decode_mode(
-    params: &SamplingParams,
-    has_dflash: bool,
-    has_mtp: bool,
-    thinking_enabled: bool,
-) -> SessionDecodeMode {
-    match params.speculation {
-        Speculation::None => SessionDecodeMode::Autoregressive,
+fn resolve_speculation_route(
+    selector: Speculation,
+    dflash_eligible: bool,
+    mtp_family_eligible: bool,
+) -> SpeculationRoute {
+    match selector {
+        Speculation::None => SpeculationRoute::Autoregressive,
         Speculation::Mtp => {
-            if has_mtp {
-                SessionDecodeMode::Mtp
+            if mtp_family_eligible {
+                SpeculationRoute::MtpFamily
             } else {
-                SessionDecodeMode::Autoregressive
+                SpeculationRoute::Autoregressive
             }
         }
         Speculation::DFlash => {
-            if has_dflash && paired_dflash_exact_domain(params, thinking_enabled) {
-                SessionDecodeMode::DFlash
+            if dflash_eligible {
+                SpeculationRoute::DFlash
             } else {
-                SessionDecodeMode::Autoregressive
+                SpeculationRoute::Autoregressive
             }
         }
         Speculation::Auto => {
-            if has_dflash && paired_dflash_exact_domain(params, thinking_enabled) {
-                SessionDecodeMode::DFlash
-            } else if has_mtp {
-                SessionDecodeMode::Mtp
+            if dflash_eligible {
+                SpeculationRoute::DFlash
+            } else if mtp_family_eligible {
+                SpeculationRoute::MtpFamily
             } else {
-                SessionDecodeMode::Autoregressive
+                SpeculationRoute::Autoregressive
             }
         }
     }
+}
+
+#[allow(clippy::float_cmp)]
+fn stateless_mtp_family_eligible(
+    params: &SamplingParams,
+    constraint_active: bool,
+    logprobs: bool,
+) -> bool {
+    !constraint_active && !logprobs && params.temperature == 0.0 && !params.has_penalties()
 }
 
 fn session_ledger_error(error: LedgerError) -> EngineError {
@@ -3600,9 +3608,12 @@ impl SimpleEngine {
                 .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
             model.has_mtp()
         };
-        let decode_mode =
-            session_decode_mode(params, self.dflash.is_some(), has_mtp, enable_thinking);
-        if decode_mode == SessionDecodeMode::DFlash {
+        let speculation_route = resolve_speculation_route(
+            params.speculation,
+            self.dflash.is_some() && paired_dflash_exact_domain(params, enable_thinking),
+            has_mtp,
+        );
+        if speculation_route == SpeculationRoute::DFlash {
             return self.generate_continued_dflash_locked(
                 session_id,
                 prompt_tokens,
@@ -3664,8 +3675,9 @@ impl SimpleEngine {
         // capture_hidden: the MTP head primes from the prefilled tokens'
         // hidden states (unprimed acceptance measured ~75% vs 85-97% primed).
         // Chunked long prefills return no hidden — priming is then skipped.
-        let want_mtp =
-            decode_mode == SessionDecodeMode::Mtp && prepared.model.has_mtp() && max_tokens > 1;
+        let want_mtp = speculation_route == SpeculationRoute::MtpFamily
+            && prepared.model.has_mtp()
+            && max_tokens > 1;
         // dSpark sessions returned through the paired-cache path above. The
         // remaining selectors are deliberately sidecar-free MTP or AR.
         let (current_token, _, prefill_hidden) = self.run_prefill(
@@ -4906,13 +4918,16 @@ impl SimpleEngine {
                 "sampled dSpark request uses ordinary AR to preserve the shared RNG transition"
             );
         }
-        if self.dflash.is_some()
-            && !sampled_dspark
-            && params.speculation.allows_dflash()
-            && constraint.is_none()
-            && pixel_values.is_none()
-            && !logprobs
-        {
+        let speculation_route = resolve_speculation_route(
+            params.speculation,
+            self.dflash.is_some()
+                && !sampled_dspark
+                && constraint.is_none()
+                && pixel_values.is_none()
+                && !logprobs,
+            stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
+        );
+        if speculation_route == SpeculationRoute::DFlash {
             return self.generate_dflash_inner(
                 prompt_tokens,
                 max_tokens,
@@ -5026,7 +5041,7 @@ impl SimpleEngine {
         // collected because the normal path has a pipelined single-token loop.
         #[allow(clippy::float_cmp)]
         if prompt_lookup_enabled()
-            && params.speculation.allows_mtp()
+            && speculation_route == SpeculationRoute::MtpFamily
             && constraint.is_none()
             && !logprobs
             && params.temperature == 0.0
@@ -5048,7 +5063,7 @@ impl SimpleEngine {
         // Only for greedy (temperature == 0), no constraints, no logprobs.
         #[allow(clippy::float_cmp)]
         if self.tuning.enable_mtp()
-            && params.speculation.allows_mtp()
+            && speculation_route == SpeculationRoute::MtpFamily
             && prepared.model.has_mtp()
             && constraint.is_none()
             && !logprobs
@@ -7959,13 +7974,16 @@ impl SimpleEngine {
                 "sampled streaming dSpark request uses ordinary AR to preserve the shared RNG transition"
             );
         }
-        if self.dflash.is_some()
-            && !sampled_dspark
-            && params.speculation.allows_dflash()
-            && constraint.is_none()
-            && pixel_values.is_none()
-            && !logprobs
-        {
+        let speculation_route = resolve_speculation_route(
+            params.speculation,
+            self.dflash.is_some()
+                && !sampled_dspark
+                && constraint.is_none()
+                && pixel_values.is_none()
+                && !logprobs,
+            stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
+        );
+        if speculation_route == SpeculationRoute::DFlash {
             return self.generate_dflash_streaming(
                 prompt_tokens,
                 max_tokens,
@@ -8115,7 +8133,7 @@ impl SimpleEngine {
         // MTP speculative decode (streaming): greedy, no constraints, no logprobs.
         #[allow(clippy::float_cmp)]
         if self.tuning.enable_mtp()
-            && params.speculation.allows_mtp()
+            && speculation_route == SpeculationRoute::MtpFamily
             && prepared.model.has_mtp()
             && constraint.is_none()
             && !logprobs
@@ -8940,14 +8958,15 @@ mod tests {
     use super::{
         CanonicalDflashRound, DFlashVerifyMode, DFlashVerifyRound, DflashPromptPartition,
         DflashSealDemotion, DflashTapFrontier, EngineError, GenerationPromptSuffixes,
-        IncrementalDetok, SessionDecodeMode, SessionDsparkRetention, SessionDsparkRetentionError,
-        SessionGeneration, SimpleEngine, Tokenizer, ValidatedSessionTarget,
+        IncrementalDetok, SessionDsparkRetention, SessionDsparkRetentionError, SessionGeneration,
+        SimpleEngine, SpeculationRoute, Tokenizer, ValidatedSessionTarget,
         adaptive_draft_depth_for_cap, check_stop_sequences, complete_session_dflash_tail_forward,
         continuation_prior_len, derive_model_name, detect_thinking_support,
         dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
         dflash_resolve_target_then_draft, dflash_tail_draft_cap, estimate_paged_kv_blocks,
-        extract_eos_tokens, find_stop_in_tail, lock_or_recover, parse_enabled_flag,
-        resolve_session_dspark_retention, session_decode_mode, with_chat_terminator,
+        extract_eos_tokens, find_stop_in_tail, lock_or_recover, paired_dflash_exact_domain,
+        parse_enabled_flag, resolve_session_dspark_retention, resolve_speculation_route,
+        stateless_mtp_family_eligible, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
@@ -9204,15 +9223,76 @@ mod tests {
     }
 
     #[test]
-    fn session_decode_mode_honors_selector_and_dflash_without_mtp() {
+    fn speculation_route_truth_table_is_exhaustive() {
+        use SpeculationRoute::{Autoregressive, DFlash, MtpFamily};
+
+        let cases = [
+            (Speculation::None, false, false, Autoregressive),
+            (Speculation::None, false, true, Autoregressive),
+            (Speculation::None, true, false, Autoregressive),
+            (Speculation::None, true, true, Autoregressive),
+            (Speculation::Mtp, false, false, Autoregressive),
+            (Speculation::Mtp, false, true, MtpFamily),
+            (Speculation::Mtp, true, false, Autoregressive),
+            (Speculation::Mtp, true, true, MtpFamily),
+            (Speculation::DFlash, false, false, Autoregressive),
+            (Speculation::DFlash, false, true, Autoregressive),
+            (Speculation::DFlash, true, false, DFlash),
+            (Speculation::DFlash, true, true, DFlash),
+            (Speculation::Auto, false, false, Autoregressive),
+            (Speculation::Auto, false, true, MtpFamily),
+            (Speculation::Auto, true, false, DFlash),
+            (Speculation::Auto, true, true, DFlash),
+        ];
+
+        for (selector, dflash_eligible, mtp_family_eligible, expected) in cases {
+            assert_eq!(
+                resolve_speculation_route(selector, dflash_eligible, mtp_family_eligible),
+                expected,
+                "selector={selector:?} dflash_eligible={dflash_eligible} mtp_family_eligible={mtp_family_eligible}"
+            );
+        }
+    }
+
+    #[test]
+    fn penalties_disable_stateless_mtp_family_but_not_session_mtp() {
+        let penalized = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: Some(1.1),
+            speculation: Speculation::Mtp,
+            ..SamplingParams::default()
+        };
+
+        assert_eq!(
+            resolve_speculation_route(
+                penalized.speculation,
+                false,
+                stateless_mtp_family_eligible(&penalized, false, false),
+            ),
+            SpeculationRoute::Autoregressive,
+            "stateless prompt-lookup/native-MTP loops do not apply penalty history"
+        );
+        assert_eq!(
+            resolve_speculation_route(penalized.speculation, false, true),
+            SpeculationRoute::MtpFamily,
+            "session MTP remains eligible because its loop receives params/history"
+        );
+    }
+
+    #[test]
+    fn session_speculation_eligibility_keeps_dspark_independent_of_mtp() {
         let greedy = SamplingParams {
             temperature: 0.0,
             ..SamplingParams::default()
         };
 
         assert_eq!(
-            session_decode_mode(&greedy, true, false, false),
-            SessionDecodeMode::DFlash,
+            resolve_speculation_route(
+                greedy.speculation,
+                paired_dflash_exact_domain(&greedy, false),
+                false,
+            ),
+            SpeculationRoute::DFlash,
             "Bonsai dSpark must not be nested behind an MTP head"
         );
 
@@ -9221,8 +9301,12 @@ mod tests {
             ..greedy.clone()
         };
         assert_eq!(
-            session_decode_mode(&none, true, true, false),
-            SessionDecodeMode::Autoregressive
+            resolve_speculation_route(
+                none.speculation,
+                paired_dflash_exact_domain(&none, false),
+                true,
+            ),
+            SpeculationRoute::Autoregressive
         );
 
         let mtp = SamplingParams {
@@ -9230,12 +9314,20 @@ mod tests {
             ..greedy.clone()
         };
         assert_eq!(
-            session_decode_mode(&mtp, true, true, false),
-            SessionDecodeMode::Mtp
+            resolve_speculation_route(
+                mtp.speculation,
+                paired_dflash_exact_domain(&mtp, false),
+                true,
+            ),
+            SpeculationRoute::MtpFamily
         );
         assert_eq!(
-            session_decode_mode(&mtp, true, false, false),
-            SessionDecodeMode::Autoregressive
+            resolve_speculation_route(
+                mtp.speculation,
+                paired_dflash_exact_domain(&mtp, false),
+                false,
+            ),
+            SpeculationRoute::Autoregressive
         );
 
         let forced_dflash = SamplingParams {
@@ -9243,12 +9335,16 @@ mod tests {
             ..greedy.clone()
         };
         assert_eq!(
-            session_decode_mode(&forced_dflash, true, true, false),
-            SessionDecodeMode::DFlash
+            resolve_speculation_route(
+                forced_dflash.speculation,
+                paired_dflash_exact_domain(&forced_dflash, false),
+                true,
+            ),
+            SpeculationRoute::DFlash
         );
         assert_eq!(
-            session_decode_mode(&forced_dflash, false, true, false),
-            SessionDecodeMode::Autoregressive,
+            resolve_speculation_route(forced_dflash.speculation, false, true),
+            SpeculationRoute::Autoregressive,
             "forced dFlash must not silently become MTP"
         );
 
@@ -9257,8 +9353,12 @@ mod tests {
             ..greedy.clone()
         };
         assert_eq!(
-            session_decode_mode(&sampled, true, true, false),
-            SessionDecodeMode::Mtp,
+            resolve_speculation_route(
+                sampled.speculation,
+                paired_dflash_exact_domain(&sampled, false),
+                true,
+            ),
+            SpeculationRoute::MtpFamily,
             "auto may use MTP when paired dSpark is outside its exact domain"
         );
         let forced_sampled = SamplingParams {
@@ -9266,12 +9366,20 @@ mod tests {
             ..sampled
         };
         assert_eq!(
-            session_decode_mode(&forced_sampled, true, true, false),
-            SessionDecodeMode::Autoregressive
+            resolve_speculation_route(
+                forced_sampled.speculation,
+                paired_dflash_exact_domain(&forced_sampled, false),
+                true,
+            ),
+            SpeculationRoute::Autoregressive
         );
         assert_eq!(
-            session_decode_mode(&greedy, true, true, true),
-            SessionDecodeMode::Mtp,
+            resolve_speculation_route(
+                greedy.speculation,
+                paired_dflash_exact_domain(&greedy, true),
+                true,
+            ),
+            SpeculationRoute::MtpFamily,
             "paired dSpark initially requires no-thinking mode"
         );
     }
