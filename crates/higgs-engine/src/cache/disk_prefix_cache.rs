@@ -17,7 +17,8 @@ use crate::cache::disk_storage::{
 };
 use crate::cache::paired::PairedCacheError;
 use crate::paged_prefix_cache::{
-    PagedPairedLookupPlan, PagedPrefixCache, PagedPrefixMatch, PreparedPairedPrefix,
+    PagedPairedLookupPlan, PagedPrefixCache, PagedPrefixMatch, PairedPrefixCacheStats,
+    PreparedPairedPrefix,
 };
 
 pub const DEFAULT_MIN_TOKENS_TO_PERSIST: usize = 512;
@@ -282,6 +283,14 @@ impl DiskPrefixCache {
 
     pub const fn is_empty(&self) -> bool {
         self.memory.is_empty()
+    }
+
+    pub const fn paired_entry_count(&self) -> usize {
+        self.memory.paired_entry_count()
+    }
+
+    pub fn paired_stats(&self) -> PairedPrefixCacheStats {
+        self.memory.paired_stats()
     }
 
     pub fn clear(&mut self) {
@@ -698,6 +707,25 @@ mod tests {
         let matched = plan.materialize().unwrap();
         assert_eq!(matched.prefix_len, 1);
         assert_eq!(matched.dflash_cache.position(), 1);
+    }
+
+    #[test]
+    fn disk_wrapper_exposes_and_clears_paired_memory_stats() {
+        let mut cache = DiskPrefixCache::memory_only(4, 1);
+        let tokens = vec![7];
+        cache
+            .store_paired(&tokens, &make_kv_cache(1, 1), dflash_snapshot(1), None)
+            .unwrap();
+
+        let stats = cache.paired_stats();
+        assert_eq!(cache.paired_entry_count(), 1);
+        assert_eq!(stats.entries, 1);
+        assert!(stats.target_bytes > 0);
+        assert!(stats.dflash_bytes > 0);
+
+        cache.clear();
+        assert_eq!(cache.paired_entry_count(), 0);
+        assert_eq!(cache.paired_stats(), PairedPrefixCacheStats::default());
     }
 
     #[test]

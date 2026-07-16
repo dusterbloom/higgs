@@ -736,6 +736,24 @@ impl DFlashSnapshot {
         self.position
     }
 
+    /// Estimated device bytes retained by this immutable snapshot.
+    ///
+    /// MLX reports each array's logical buffer size. The estimate deliberately
+    /// excludes small Rust-side vector/enum metadata.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        let layer_bytes = self.layers.iter().fold(0usize, |total, layer| {
+            layer.as_ref().map_or(total, |(keys, values)| {
+                total
+                    .saturating_add(keys.nbytes())
+                    .saturating_add(values.nbytes())
+            })
+        });
+        self.pending_taps.as_ref().map_or(layer_bytes, |pending| {
+            layer_bytes.saturating_add(pending.nbytes())
+        })
+    }
+
     /// Move this uniquely-owned snapshot into a new live branch without copying
     /// its evaluated arrays.
     #[must_use]
@@ -2479,6 +2497,24 @@ mod tests {
             &stable_after,
             "immutable snapshot after fork advance",
         );
+    }
+
+    #[test]
+    fn snapshot_estimated_bytes_sums_retained_arrays() {
+        let keys = mlx_rs::Array::zeros::<f32>(&[1, 1, 2, 4]).unwrap();
+        let values = mlx_rs::Array::zeros::<f32>(&[1, 1, 2, 4]).unwrap();
+        let pending = mlx_rs::Array::zeros::<f32>(&[1, 3, 4]).unwrap();
+        let expected = keys
+            .nbytes()
+            .saturating_add(values.nbytes())
+            .saturating_add(pending.nbytes());
+        let snapshot = super::DFlashSnapshot {
+            layers: vec![Some((keys, values)), None],
+            pending_taps: Some(pending),
+            position: 5,
+        };
+
+        assert_eq!(snapshot.estimated_bytes(), expected);
     }
 
     #[test]

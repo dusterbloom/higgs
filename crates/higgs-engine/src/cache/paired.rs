@@ -174,6 +174,7 @@ pub(crate) struct RadixDFlashSnapshot {
     // plans; it is never acquired while the radix/prefix mutex is held.
     dflash: Mutex<DFlashSnapshot>,
     stamp: PrefixStamp,
+    estimated_bytes: usize,
 }
 
 impl RadixDFlashSnapshot {
@@ -184,9 +185,11 @@ impl RadixDFlashSnapshot {
         if actual != expected {
             return Err(PairedCacheError::DFlashBoundary { expected, actual });
         }
+        let estimated_bytes = dflash.estimated_bytes();
         Ok(Self {
             dflash: Mutex::new(dflash),
             stamp,
+            estimated_bytes,
         })
     }
 
@@ -198,6 +201,11 @@ impl RadixDFlashSnapshot {
     #[must_use]
     pub(crate) fn matches_prefix(&self, tokens: &[u32]) -> bool {
         self.stamp.matches(tokens)
+    }
+
+    #[must_use]
+    pub(crate) const fn estimated_bytes(&self) -> usize {
+        self.estimated_bytes
     }
 
     /// Select an exact immutable snapshot without doing any MLX work.
