@@ -203,12 +203,10 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     let second_prompt = engine
         .prepare_chat_prompt_with_thinking(&second_messages, None, false)
         .expect("render related second no-thinking prompt");
-    assert!(
-        second_prompt
-            .strip_suffix(generation_suffix.as_slice())
-            .is_some(),
-        "turn two must end in the exact no-thinking generation suffix"
-    );
+    let second_body_len = second_prompt
+        .strip_suffix(generation_suffix.as_slice())
+        .expect("turn two must end in the exact no-thinking generation suffix")
+        .len();
     assert_eq!(
         second_prompt.get(..first_body_len),
         first_prompt.get(..first_body_len),
@@ -335,11 +333,13 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     );
     assert_eq!(
         after_concurrent.prefill_saved_tokens - before_concurrent.prefill_saved_tokens,
-        u64::try_from(first_body_len * 2).expect("concurrent saved-token count fits u64")
+        u64::try_from(second_body_len * 2).expect("concurrent saved-token count fits u64"),
+        "the warm request has already published the longer second-turn body, \
+         so both concurrent forks must reuse that exact endpoint"
     );
     assert_eq!(
-        after_concurrent.paired_radix_entries, 1,
-        "concurrent same-key publication must leave one paired endpoint"
+        after_concurrent.paired_radix_entries, before_concurrent.paired_radix_entries,
+        "concurrent same-key publication must not duplicate either exact endpoint"
     );
 
     engine.clear_prefix_cache();
