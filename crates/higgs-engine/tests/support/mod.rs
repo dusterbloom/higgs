@@ -1,8 +1,9 @@
 use std::ffi::OsString;
+use std::path::Path;
 
 use higgs_engine::simple::SimpleEngine;
 
-pub(crate) const MAX_DSPARK_RELATIVE_REGRESSION: f64 = 0.03;
+pub(crate) const MAX_DSPARK_REFERENCE_TOLERANCE: f64 = 0.03;
 
 pub(crate) struct ScopedEnvVar {
     key: &'static str,
@@ -60,6 +61,77 @@ impl ReferenceDsparkEnv {
     }
 }
 
+pub(crate) fn assert_bonsai_27b_full_q4(target: &Path, drafter: &Path) {
+    let target_config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(target.join("config.json")).expect("read Bonsai target config"),
+    )
+    .expect("parse Bonsai target config");
+    let text = target_config
+        .get("text_config")
+        .expect("Bonsai target text_config");
+    assert_eq!(
+        target_config.get("model_type").and_then(|v| v.as_str()),
+        Some("qwen3_5")
+    );
+    assert_eq!(text.get("hidden_size").and_then(|v| v.as_u64()), Some(5120));
+    assert_eq!(
+        text.get("num_hidden_layers").and_then(|v| v.as_u64()),
+        Some(64)
+    );
+    assert_eq!(
+        text.pointer("/quantization/bits").and_then(|v| v.as_u64()),
+        Some(1),
+        "release gates require the Bonsai-27B 1-bit target"
+    );
+
+    let drafter_config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(drafter.join("config.json")).expect("read dSpark config"),
+    )
+    .expect("parse dSpark config");
+    assert_eq!(
+        drafter_config.get("model_type").and_then(|v| v.as_str()),
+        Some("dspark")
+    );
+    assert_eq!(
+        drafter_config
+            .pointer("/dflash_config/dspark")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_ne!(
+        drafter_config
+            .get("reuse_target_head")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "release gates require Prism's frozen full-Q4 proposal head"
+    );
+    assert_eq!(
+        drafter_config
+            .pointer("/quantization/bits")
+            .and_then(|v| v.as_u64()),
+        Some(4)
+    );
+    assert_eq!(
+        drafter_config
+            .pointer("/quantization/group_size")
+            .and_then(|v| v.as_u64()),
+        Some(32)
+    );
+    assert_eq!(
+        drafter_config
+            .pointer("/quantization/mode")
+            .and_then(|v| v.as_str()),
+        Some("affine")
+    );
+    assert_eq!(
+        drafter_config
+            .pointer("/dflash_config/target_binding/format")
+            .and_then(|v| v.as_str()),
+        Some("higgs-target-artifact-v1"),
+        "release gates require an exact target-bound dSpark artifact"
+    );
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DflashAcceptance {
     pub(crate) matched: u64,
@@ -106,8 +178,19 @@ pub(crate) fn dflash_decode_tps(engine: &SimpleEngine, label: &str) -> f64 {
     rate
 }
 
-fn relative_floor(baseline: f64, max_regression: f64) -> f64 {
-    baseline * (1.0 - max_regression)
+pub(crate) fn dflash_prefill_seconds(engine: &SimpleEngine, label: &str) -> f64 {
+    let seconds = engine
+        .last_dflash_prefill_seconds()
+        .unwrap_or_else(|| panic!("{label}: dSpark request must publish prefill timing"));
+    assert!(
+        seconds.is_finite() && seconds > 0.0,
+        "{label}: dSpark prefill time must be finite and positive, got {seconds}"
+    );
+    seconds
+}
+
+fn relative_floor(baseline: f64, tolerance: f64) -> f64 {
+    baseline * (1.0 - tolerance)
 }
 
 pub(crate) fn assert_acceptance_within(
@@ -115,7 +198,7 @@ pub(crate) fn assert_acceptance_within(
     candidate: DflashAcceptance,
     baseline: DflashAcceptance,
 ) {
-    let floor = relative_floor(baseline.rate(), MAX_DSPARK_RELATIVE_REGRESSION);
+    let floor = relative_floor(baseline.rate(), MAX_DSPARK_REFERENCE_TOLERANCE);
     assert!(
         candidate.rate() >= floor,
         "{candidate_label} aggregate dSpark acceptance is more than 3% below the uncached \
@@ -135,7 +218,7 @@ pub(crate) fn assert_decode_tps_within(
     candidate_tps: f64,
     baseline_tps: f64,
 ) {
-    let floor = relative_floor(baseline_tps, MAX_DSPARK_RELATIVE_REGRESSION);
+    let floor = relative_floor(baseline_tps, MAX_DSPARK_REFERENCE_TOLERANCE);
     assert!(
         candidate_tps >= floor,
         "{candidate_label} decode throughput is more than 3% below the uncached dSpark \

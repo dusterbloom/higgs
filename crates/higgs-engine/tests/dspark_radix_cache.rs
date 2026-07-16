@@ -26,12 +26,13 @@ use std::path::Path;
 use higgs_engine::{
     chat_template::{ChatMessage, ChatTemplateRenderer},
     mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile},
+    paged_prefix_cache::MAX_PAIRED_RADIX_ENTRIES,
     simple::SimpleEngine,
 };
 use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
 use support::{
-    ReferenceDsparkEnv, ScopedEnvVar, assert_acceptance_within, assert_decode_tps_within,
-    dflash_acceptance, dflash_decode_tps,
+    ReferenceDsparkEnv, ScopedEnvVar, assert_acceptance_within, assert_bonsai_27b_full_q4,
+    assert_decode_tps_within, dflash_acceptance, dflash_decode_tps, dflash_prefill_seconds,
 };
 
 fn user(content: &str) -> ChatMessage {
@@ -104,6 +105,7 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     let drafter = std::env::var("HIGGS_DFLASH_DRAFTER_DIR")
         .expect("set HIGGS_DFLASH_DRAFTER_DIR to the MLX dSpark drafter");
     let target_path = Path::new(&target);
+    assert_bonsai_27b_full_q4(target_path, Path::new(&drafter));
     let renderer =
         ChatTemplateRenderer::from_model_dir(target_path).expect("load target chat template");
     let tuning = MlxRuntimeTuning::from_model_dir(target_path, RequestedMlxProfile::Auto);
@@ -237,6 +239,7 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     let warm_accepts = engine.last_dflash_accepts();
     let warm_acceptance = dflash_acceptance(&engine, "warm paired radix");
     let warm_decode_tps = dflash_decode_tps(&engine, "warm paired radix");
+    let warm_prefill_seconds = dflash_prefill_seconds(&engine, "warm paired radix");
     let after_warm = engine.cache_stats();
     let saved = after_warm.prefill_saved_tokens - before_warm.prefill_saved_tokens;
     eprintln!(
@@ -275,6 +278,70 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
         "the reused dSpark branch must enter speculative rounds"
     );
 
+    // Both callers select the already-published immutable endpoint before
+    // model execution is serialized. Each must own an independent live fork;
+    // a stale publication ticket may lose, but neither decode branch may
+    // cross-commit or corrupt the other.
+    let before_concurrent = engine.cache_stats();
+    let start = std::sync::Barrier::new(3);
+    let concurrent = std::thread::scope(|scope| {
+        let left = scope.spawn(|| {
+            start.wait();
+            engine.generate_with_thinking(
+                &second_prompt,
+                4,
+                &params,
+                &[],
+                false,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+        });
+        let right = scope.spawn(|| {
+            start.wait();
+            engine.generate_with_thinking(
+                &second_prompt,
+                4,
+                &params,
+                &[],
+                false,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+        });
+        start.wait();
+        [left, right].map(|worker| {
+            worker
+                .join()
+                .expect("paired radix worker must not panic")
+                .expect("paired radix worker generation")
+        })
+    });
+    let [left, right] = concurrent;
+    assert_eq!(left.text, right.text);
+    assert_eq!(left.completion_tokens, 4);
+    assert_eq!(right.completion_tokens, 4);
+    let after_concurrent = engine.cache_stats();
+    assert_eq!(
+        after_concurrent.paired_radix_hits - before_concurrent.paired_radix_hits,
+        2,
+        "both concurrent requests must fork the same proven paired endpoint"
+    );
+    assert_eq!(
+        after_concurrent.prefill_saved_tokens - before_concurrent.prefill_saved_tokens,
+        u64::try_from(first_body_len * 2).expect("concurrent saved-token count fits u64")
+    );
+    assert_eq!(
+        after_concurrent.paired_radix_entries, 1,
+        "concurrent same-key publication must leave one paired endpoint"
+    );
+
     engine.clear_prefix_cache();
     assert_eq!(
         engine.prefix_cache_len(),
@@ -305,6 +372,7 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     let cold_accepts = engine.last_dflash_accepts();
     let cold_acceptance = dflash_acceptance(&engine, "cold paired split");
     let cold_decode_tps = dflash_decode_tps(&engine, "cold paired split");
+    let cold_prefill_seconds = dflash_prefill_seconds(&engine, "cold paired split");
     let after_cold = engine.cache_stats();
     assert_eq!(
         after_cold.radix_hits, before_cold.radix_hits,
@@ -386,6 +454,16 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     assert_acceptance_within("cold paired split", cold_acceptance, legacy_acceptance);
     assert_decode_tps_within("warm paired radix", warm_decode_tps, legacy_decode_tps);
     assert_decode_tps_within("cold paired split", cold_decode_tps, legacy_decode_tps);
+    assert!(
+        warm_prefill_seconds < cold_prefill_seconds,
+        "paired radix reuse must remove target+dSpark prefill work: \
+         warm={warm_prefill_seconds:.3}s cold={cold_prefill_seconds:.3}s"
+    );
+    assert!(
+        warm_wall.as_secs_f64() <= cold_wall.as_secs_f64() * 1.03,
+        "paired radix wall time may vary within 3% but must not erase the saved prefill: \
+         warm={warm_wall:.2?} cold={cold_wall:.2?}"
+    );
     eprintln!(
         "dspark-radix decode: warm={warm_decode_tps:.2} cold={cold_decode_tps:.2} \
          legacy={legacy_decode_tps:.2} tok/s; acceptance: warm={:.2}% ({}/{}) \
@@ -427,5 +505,161 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     eprintln!(
         "dspark-radix wall: initial={first_wall:.2?} warm={warm_wall:.2?} \
          cold_after_clear={cold_wall:.2?} legacy_one_shot={legacy_wall:.2?} ar={ar_wall:.2?}"
+    );
+
+    // One loaded engine, three unrelated equal-length conversation bodies:
+    // the third publication is the cap+1 event. Repeated one-token ASCII words
+    // keep the no-thinking body lengths identical while diverging well before
+    // the block-aligned publication boundary.
+    engine.clear_prefix_cache();
+    assert_eq!(engine.prefix_cache_len(), 0);
+    assert_eq!(
+        MAX_PAIRED_RADIX_ENTRIES, 2,
+        "the real-model release gate pins the first-release paired radix cap"
+    );
+    let cap_prompts: Vec<Vec<u32>> = ["A", "B", "C"]
+        .into_iter()
+        .map(|word| {
+            let messages = [user(&vec![word; 96].join(" "))];
+            engine
+                .prepare_chat_prompt_with_thinking(&messages, None, false)
+                .expect("render cap+1 no-thinking prompt")
+        })
+        .collect();
+    let cap_bodies: Vec<&[u32]> = cap_prompts
+        .iter()
+        .map(|prompt| {
+            prompt
+                .strip_suffix(generation_suffix.as_slice())
+                .expect("cap+1 prompt must end in the proven generation suffix")
+        })
+        .collect();
+    let [body_a, body_b, body_c] = cap_bodies.as_slice() else {
+        panic!("the cap+1 fixture must contain exactly three bodies");
+    };
+    let cap_body_len = body_a.len();
+    assert!(cap_body_len > 0);
+    assert!(
+        cap_bodies.iter().all(|body| body.len() == cap_body_len),
+        "cap+1 bodies must have identical target/dSpark boundaries"
+    );
+    assert!(
+        body_a != body_b && body_a != body_c && body_b != body_c,
+        "cap+1 conversations must name unrelated radix endpoints"
+    );
+
+    let mut cap_snapshots = Vec::with_capacity(cap_prompts.len());
+    for (index, prompt) in cap_prompts.iter().enumerate() {
+        let before = engine.cache_stats();
+        engine
+            .generate_with_thinking(
+                prompt,
+                1,
+                &params,
+                &[],
+                false,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("cold cap+1 body {} failed: {error}", index + 1));
+        let after = engine.cache_stats();
+        assert_eq!(
+            after.paired_radix_lookups - before.paired_radix_lookups,
+            1,
+            "each unrelated body must perform one paired lookup"
+        );
+        assert_eq!(
+            after.paired_radix_hits, before.paired_radix_hits,
+            "each first-seen unrelated body must miss"
+        );
+        assert_eq!(
+            after.prefill_saved_tokens, before.prefill_saved_tokens,
+            "each first-seen unrelated body must prefill cold"
+        );
+        cap_snapshots.push(after);
+    }
+
+    let [after_cap_first, after_cap_second, after_cap_third] = cap_snapshots.as_slice() else {
+        panic!("the cap+1 fixture must produce exactly three cache snapshots");
+    };
+    assert_eq!(after_cap_first.paired_radix_entries, 1);
+    assert!(
+        after_cap_first.paired_radix_target_bytes > 0
+            && after_cap_first.paired_radix_dflash_bytes > 0,
+        "cap+1 accounting must start from one resident whole pair"
+    );
+    assert_eq!(
+        after_cap_second.paired_radix_entries,
+        MAX_PAIRED_RADIX_ENTRIES
+    );
+    assert_eq!(
+        after_cap_third.paired_radix_entries, MAX_PAIRED_RADIX_ENTRIES,
+        "cap+1 must evict one whole pair before resident count can grow"
+    );
+    assert_eq!(
+        after_cap_second.paired_radix_target_bytes,
+        after_cap_first
+            .paired_radix_target_bytes
+            .checked_mul(MAX_PAIRED_RADIX_ENTRIES)
+            .expect("paired target accounting fits usize"),
+        "two equal-length bodies must account for two complete target halves"
+    );
+    assert_eq!(
+        after_cap_second.paired_radix_dflash_bytes,
+        after_cap_first
+            .paired_radix_dflash_bytes
+            .checked_mul(MAX_PAIRED_RADIX_ENTRIES)
+            .expect("paired dSpark accounting fits usize"),
+        "two equal-length bodies must account for two complete dSpark halves"
+    );
+    assert_eq!(
+        after_cap_third.paired_radix_target_bytes, after_cap_second.paired_radix_target_bytes,
+        "target resident bytes must plateau at cap+1"
+    );
+    assert_eq!(
+        after_cap_third.paired_radix_dflash_bytes, after_cap_second.paired_radix_dflash_bytes,
+        "dSpark resident bytes must plateau at cap+1"
+    );
+
+    let before_evicted_probe = engine.cache_stats();
+    engine
+        .generate_with_thinking(
+            cap_prompts
+                .first()
+                .expect("cap+1 fixture contains the first prompt"),
+            1,
+            &params,
+            &[],
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("re-probe the first cap+1 body");
+    let after_evicted_probe = engine.cache_stats();
+    assert_eq!(
+        after_evicted_probe.paired_radix_hits, before_evicted_probe.paired_radix_hits,
+        "the first endpoint must be the deterministic cap+1 eviction victim"
+    );
+    assert_eq!(
+        after_evicted_probe.prefill_saved_tokens, before_evicted_probe.prefill_saved_tokens,
+        "re-probing the evicted first body must prefill cold"
+    );
+    assert_eq!(
+        after_evicted_probe.paired_radix_entries,
+        MAX_PAIRED_RADIX_ENTRIES
+    );
+    assert_eq!(
+        after_evicted_probe.paired_radix_target_bytes,
+        after_cap_third.paired_radix_target_bytes
+    );
+    assert_eq!(
+        after_evicted_probe.paired_radix_dflash_bytes,
+        after_cap_third.paired_radix_dflash_bytes
     );
 }
