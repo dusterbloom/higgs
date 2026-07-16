@@ -2,7 +2,26 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::cache::paired::PairLedgerKey;
+
 static NEXT_LEDGER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn try_next_ledger_id(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+}
+
+fn next_ledger_id() -> u64 {
+    let Some(ledger_id) = try_next_ledger_id(&NEXT_LEDGER_ID) else {
+        // Wrapping could let a stale move-only ticket alias a future ledger.
+        // Exhausting u64 identities is unrecoverable, so fail closed.
+        std::process::abort();
+    };
+    ledger_id
+}
 
 /// The action required before this ledger can label a retained cache boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +59,10 @@ pub(crate) enum LedgerError {
     BoundaryOverflow,
     #[error("cache-only forward ticket counter overflow")]
     ForwardTicketOverflow,
+    #[error("token ledger is not bound to a live target/dSpark pair")]
+    MissingPairBinding,
+    #[error("pair-bound ledgers require a cache-only or speculative forward ticket")]
+    UnverifiedPairedForwardClaim,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +103,27 @@ impl SpeculativeTicket {
     }
 }
 
+/// Move-only proof that one pair-bound ledger reached an exact forwarded
+/// completion suffix.
+///
+/// The proof owns both the opaque pair identity and the ledger's forwarded
+/// prefix. A pending or in-flight token can never enter this value.
+#[derive(Debug)]
+pub(crate) struct PairedLedgerProof {
+    key: PairLedgerKey,
+    forwarded_suffix: Box<[u32]>,
+}
+
+impl PairedLedgerProof {
+    /// Consume this proof only when it belongs to the expected pair identity.
+    ///
+    /// The owned key is never returned, even on mismatch, so it cannot be
+    /// recycled into a second pair-bound token ledger.
+    pub(crate) fn into_forwarded_suffix_for(self, expected: &PairLedgerKey) -> Option<Box<[u32]>> {
+        (self.key == *expected).then_some(self.forwarded_suffix)
+    }
+}
+
 /// Completion-token accounting for a cache-resident turn.
 ///
 /// `emitted` is the response-visible sequence. `forwarded_len` is always a
@@ -94,6 +138,7 @@ pub(crate) struct TokenLedger {
     tail: TailState,
     ledger_id: u64,
     next_ticket_id: u64,
+    pair_key: Option<PairLedgerKey>,
 }
 
 impl TokenLedger {
@@ -104,8 +149,26 @@ impl TokenLedger {
             emitted: Vec::new(),
             forwarded_len: 0,
             tail: TailState::Aligned,
-            ledger_id: NEXT_LEDGER_ID.fetch_add(1, Ordering::Relaxed),
+            ledger_id: next_ledger_id(),
             next_ticket_id: 1,
+            pair_key: None,
+        }
+    }
+
+    /// Start completion accounting for one exact move-owned live pair.
+    ///
+    /// The base boundary is derived from the opaque key; callers cannot supply
+    /// an independent same-length label.
+    #[must_use]
+    pub(crate) fn new_paired(key: PairLedgerKey) -> Self {
+        Self {
+            base_boundary: key.base_boundary(),
+            emitted: Vec::new(),
+            forwarded_len: 0,
+            tail: TailState::Aligned,
+            ledger_id: next_ledger_id(),
+            next_ticket_id: 1,
+            pair_key: Some(key),
         }
     }
 
@@ -120,6 +183,9 @@ impl TokenLedger {
     where
         I: IntoIterator<Item = u32>,
     {
+        if self.pair_key.is_some() {
+            return Err(LedgerError::UnverifiedPairedForwardClaim);
+        }
         self.ensure_aligned_for_append()?;
         let incoming: Vec<u32> = tokens.into_iter().collect();
         let new_forwarded = self
@@ -310,6 +376,33 @@ impl TokenLedger {
         }
     }
 
+    /// Consume this ledger into a proof for its originating live pair.
+    ///
+    /// `emitted` is moved rather than copied. Truncating it to
+    /// `forwarded_len` excludes a terminal EOS and is only reachable after
+    /// pending/in-flight states have failed closed.
+    pub(crate) fn into_paired_proof(mut self) -> Result<PairedLedgerProof, LedgerError> {
+        match self.tail {
+            TailState::Pending { token } => return Err(LedgerError::PendingToken { token }),
+            TailState::Forwarding { token, .. } => {
+                return Err(LedgerError::ForwardInFlight { token });
+            }
+            TailState::Aligned | TailState::ExcludedEos { .. } => {}
+        }
+        if self.forwarded_len > self.emitted.len() {
+            return Err(LedgerError::BoundaryOverflow);
+        }
+        let key = self
+            .pair_key
+            .take()
+            .ok_or(LedgerError::MissingPairBinding)?;
+        self.emitted.truncate(self.forwarded_len);
+        Ok(PairedLedgerProof {
+            key,
+            forwarded_suffix: self.emitted.into_boxed_slice(),
+        })
+    }
+
     fn ensure_aligned_for_append(&self) -> Result<(), LedgerError> {
         match self.tail {
             TailState::Aligned => Ok(()),
@@ -332,6 +425,8 @@ impl TokenLedger {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::cache::paired::PairLedgerKey;
+
     use super::{LedgerError, RetentionAction, TokenLedger};
 
     #[test]
@@ -527,5 +622,126 @@ mod tests {
         ledger.complete_speculative_round(ticket, &[18]).unwrap();
         assert_eq!(ledger.emitted_tokens(), &[17, 18]);
         assert_eq!(ledger.pending_token(), Some(18));
+    }
+
+    #[test]
+    fn ordinary_ledger_cannot_mint_a_paired_proof() {
+        assert_eq!(
+            TokenLedger::new(0).into_paired_proof().unwrap_err(),
+            LedgerError::MissingPairBinding
+        );
+    }
+
+    #[test]
+    fn paired_proof_rejects_a_pending_tail() {
+        let mut ledger = TokenLedger::new_paired(PairLedgerKey::for_test(10));
+        ledger.emit_pending(7).unwrap();
+
+        assert_eq!(
+            ledger.into_paired_proof().unwrap_err(),
+            LedgerError::PendingToken { token: 7 }
+        );
+    }
+
+    #[test]
+    fn paired_proof_rejects_an_in_flight_tail() {
+        let mut ledger = TokenLedger::new_paired(PairLedgerKey::for_test(10));
+        ledger.emit_pending(7).unwrap();
+        let _ticket = ledger.begin_cache_only_forward().unwrap();
+
+        assert_eq!(
+            ledger.into_paired_proof().unwrap_err(),
+            LedgerError::ForwardInFlight { token: 7 }
+        );
+    }
+
+    #[test]
+    fn cache_only_token_enters_paired_proof_only_after_ticket_completion() {
+        let mut pending = TokenLedger::new_paired(PairLedgerKey::for_test(10));
+        pending.emit_pending(7).unwrap();
+        assert_eq!(
+            pending.into_paired_proof().unwrap_err(),
+            LedgerError::PendingToken { token: 7 }
+        );
+
+        let mut forwarded = TokenLedger::new_paired(PairLedgerKey::for_test(10));
+        forwarded.emit_pending(7).unwrap();
+        let ticket = forwarded.begin_cache_only_forward().unwrap();
+        forwarded.complete_cache_only_forward(ticket).unwrap();
+        let proof = forwarded.into_paired_proof().unwrap();
+        let suffix = proof
+            .into_forwarded_suffix_for(&PairLedgerKey::for_test(10))
+            .unwrap();
+
+        assert_eq!(suffix.as_ref(), [7]);
+    }
+
+    #[test]
+    fn paired_proof_excludes_a_terminal_eos() {
+        let mut ledger = TokenLedger::new_paired(PairLedgerKey::for_test(10));
+        ledger.emit_pending(3).unwrap();
+        let ticket = ledger.begin_cache_only_forward().unwrap();
+        ledger.complete_cache_only_forward(ticket).unwrap();
+        ledger.emit_pending(99).unwrap();
+        ledger.exclude_pending_eos(&[99]).unwrap();
+
+        let proof = ledger.into_paired_proof().unwrap();
+        let suffix = proof
+            .into_forwarded_suffix_for(&PairLedgerKey::for_test(10))
+            .unwrap();
+
+        assert_eq!(suffix.as_ref(), [3]);
+    }
+
+    #[test]
+    fn paired_proof_contains_only_the_forwarded_speculative_prefix() {
+        let mut ledger = TokenLedger::new_paired(PairLedgerKey::for_test(10));
+        ledger.emit_pending(11).unwrap();
+        let ticket = ledger.begin_speculative_round().unwrap();
+        ledger
+            .complete_speculative_round(ticket, &[12, 13, 99])
+            .unwrap();
+        ledger.exclude_pending_eos(&[99]).unwrap();
+
+        let proof = ledger.into_paired_proof().unwrap();
+        let suffix = proof
+            .into_forwarded_suffix_for(&PairLedgerKey::for_test(10))
+            .unwrap();
+
+        assert_eq!(suffix.as_ref(), [11, 12, 13]);
+    }
+
+    #[test]
+    fn paired_proof_mismatch_consumes_identity_without_returning_a_key() {
+        let proof = TokenLedger::new_paired(PairLedgerKey::for_test(10))
+            .into_paired_proof()
+            .unwrap();
+
+        let suffix = proof.into_forwarded_suffix_for(&PairLedgerKey::for_test(11));
+
+        assert!(suffix.is_none());
+    }
+
+    #[test]
+    fn paired_ledger_rejects_unverified_direct_forward_claims() {
+        let mut ledger = TokenLedger::new_paired(PairLedgerKey::for_test(10));
+
+        assert_eq!(
+            ledger.record_forwarded(7).unwrap_err(),
+            LedgerError::UnverifiedPairedForwardClaim
+        );
+        assert_eq!(
+            ledger.extend_forwarded([7, 8]).unwrap_err(),
+            LedgerError::UnverifiedPairedForwardClaim
+        );
+        assert!(ledger.emitted_tokens().is_empty());
+    }
+
+    #[test]
+    fn ledger_identity_counter_rejects_wraparound() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+        assert!(super::try_next_ledger_id(&counter).is_none());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), u64::MAX);
     }
 }
