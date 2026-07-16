@@ -34,6 +34,8 @@ pub(crate) enum LedgerError {
     TerminalTokenExcluded { token: u32 },
     #[error("cache-only forward ticket belongs to another ledger or transition")]
     ForeignForwardTicket,
+    #[error("a speculative round must produce one pending successor")]
+    EmptySpeculativeRound,
     #[error("token boundary overflow")]
     BoundaryOverflow,
     #[error("cache-only forward ticket counter overflow")]
@@ -53,10 +55,29 @@ enum TailState {
 /// The ticket is intentionally neither `Clone` nor `Copy`: a successful model
 /// forward consumes it exactly once when the ledger commits the token.
 #[derive(Debug)]
-pub(crate) struct ForwardTicket {
+struct TicketIdentity {
     ledger_id: u64,
     ticket_id: u64,
     token: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct ForwardTicket(TicketIdentity);
+
+/// Opaque proof that one exact pending token anchors a speculative round.
+///
+/// The drafter/target round takes ownership of this ticket and derives its
+/// anchor token from it. The successful round then returns the same ticket to
+/// the ledger transition, so a different same-length token sequence cannot be
+/// published under the original cache boundary.
+#[derive(Debug)]
+pub(crate) struct SpeculativeTicket(TicketIdentity);
+
+impl SpeculativeTicket {
+    #[must_use]
+    pub(crate) const fn token(&self) -> u32 {
+        self.0.token
+    }
 }
 
 /// Completion-token accounting for a cache-resident turn.
@@ -143,6 +164,15 @@ impl TokenLedger {
 
     /// Start the cache-only forward required for a visible non-EOS tail.
     pub(crate) fn begin_cache_only_forward(&mut self) -> Result<ForwardTicket, LedgerError> {
+        self.begin_forward().map(ForwardTicket)
+    }
+
+    /// Bind the current visible pending token to one speculative target round.
+    pub(crate) fn begin_speculative_round(&mut self) -> Result<SpeculativeTicket, LedgerError> {
+        self.begin_forward().map(SpeculativeTicket)
+    }
+
+    fn begin_forward(&mut self) -> Result<TicketIdentity, LedgerError> {
         let TailState::Pending { token } = self.tail else {
             return Err(self.tail_error());
         };
@@ -152,7 +182,7 @@ impl TokenLedger {
             .checked_add(1)
             .ok_or(LedgerError::ForwardTicketOverflow)?;
         self.tail = TailState::Forwarding { token, ticket_id };
-        Ok(ForwardTicket {
+        Ok(TicketIdentity {
             ledger_id: self.ledger_id,
             ticket_id,
             token,
@@ -164,6 +194,7 @@ impl TokenLedger {
         &mut self,
         ticket: ForwardTicket,
     ) -> Result<(), LedgerError> {
+        let ticket = ticket.0;
         let TailState::Forwarding { token, ticket_id } = self.tail else {
             return Err(self.tail_error());
         };
@@ -185,6 +216,51 @@ impl TokenLedger {
         }
         self.forwarded_len = new_forwarded;
         self.tail = TailState::Aligned;
+        Ok(())
+    }
+
+    /// Commit one target-authoritative speculative round as a single ledger
+    /// transition.
+    ///
+    /// The in-flight ticket proves that the previously pending anchor entered
+    /// the target cache. `successors[..len - 1]` were subsequently used as
+    /// verified target inputs and are therefore cache-resident too; the final
+    /// successor remains response-visible but unforwarded. All validation and
+    /// boundary arithmetic happen before mutation, so callers can never expose
+    /// a partially-accounted round.
+    pub(crate) fn complete_speculative_round(
+        &mut self,
+        ticket: SpeculativeTicket,
+        successors: &[u32],
+    ) -> Result<(), LedgerError> {
+        let ticket = ticket.0;
+        let Some((&pending, forwarded_successors)) = successors.split_last() else {
+            return Err(LedgerError::EmptySpeculativeRound);
+        };
+        let TailState::Forwarding { token, ticket_id } = self.tail else {
+            return Err(self.tail_error());
+        };
+        if ticket.ledger_id != self.ledger_id
+            || ticket.ticket_id != ticket_id
+            || ticket.token != token
+            || self.emitted.get(self.forwarded_len).copied() != Some(token)
+        {
+            return Err(LedgerError::ForeignForwardTicket);
+        }
+        let newly_forwarded = 1usize
+            .checked_add(forwarded_successors.len())
+            .ok_or(LedgerError::BoundaryOverflow)?;
+        let new_forwarded = self
+            .forwarded_len
+            .checked_add(newly_forwarded)
+            .ok_or(LedgerError::BoundaryOverflow)?;
+        self.base_boundary
+            .checked_add(new_forwarded)
+            .ok_or(LedgerError::BoundaryOverflow)?;
+
+        self.emitted.extend_from_slice(successors);
+        self.forwarded_len = new_forwarded;
+        self.tail = TailState::Pending { token: pending };
         Ok(())
     }
 
@@ -400,5 +476,56 @@ mod tests {
             LedgerError::BoundaryOverflow
         );
         assert!(ledger.emitted_tokens().is_empty());
+    }
+
+    #[test]
+    fn speculative_round_atomically_forwards_anchor_and_leaves_one_pending_successor() {
+        let mut ledger = TokenLedger::new(40);
+        ledger.emit_pending(11).unwrap();
+        let ticket = ledger.begin_speculative_round().unwrap();
+
+        ledger
+            .complete_speculative_round(ticket, &[12, 13, 14])
+            .unwrap();
+
+        assert_eq!(ledger.emitted_tokens(), &[11, 12, 13, 14]);
+        assert_eq!(ledger.pending_token(), Some(14));
+        assert_eq!(
+            ledger.retention_action(&[99]),
+            RetentionAction::CacheOnlyForward { token: 14 }
+        );
+        assert_eq!(
+            ledger.retainable_tokens().unwrap_err(),
+            LedgerError::PendingToken { token: 14 }
+        );
+    }
+
+    #[test]
+    fn speculative_round_rejects_an_empty_successor_set_without_publishing_a_boundary() {
+        let mut ledger = TokenLedger::new(40);
+        ledger.emit_pending(11).unwrap();
+        let ticket = ledger.begin_speculative_round().unwrap();
+
+        assert_eq!(
+            ledger.complete_speculative_round(ticket, &[]).unwrap_err(),
+            LedgerError::EmptySpeculativeRound
+        );
+        assert_eq!(
+            ledger.retention_action(&[99]),
+            RetentionAction::ForwardInFlight { token: 11 }
+        );
+    }
+
+    #[test]
+    fn speculative_ticket_is_bound_to_the_exact_pending_anchor() {
+        let mut ledger = TokenLedger::new(0);
+        ledger.emit_pending(17).unwrap();
+
+        let ticket = ledger.begin_speculative_round().unwrap();
+
+        assert_eq!(ticket.token(), 17);
+        ledger.complete_speculative_round(ticket, &[18]).unwrap();
+        assert_eq!(ledger.emitted_tokens(), &[17, 18]);
+        assert_eq!(ledger.pending_token(), Some(18));
     }
 }

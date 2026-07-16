@@ -27,7 +27,7 @@ use tokenizers::Tokenizer;
 use crate::{
     cache::{DiskPrefixCache, DiskPrefixCacheConfig, PagedKvCache, paired::RetainedState},
     chat_template::{ChatMessage, ChatTemplateRenderer},
-    decode::token_ledger::{LedgerError, RetentionAction, TokenLedger},
+    decode::token_ledger::{LedgerError, RetentionAction, SpeculativeTicket, TokenLedger},
     engine::{GenerationOutput, StreamingOutput},
     error::EngineError,
     mlx_tuning::MlxRuntimeTuning,
@@ -740,6 +740,228 @@ enum DFlashVerifyRound {
         pending_replaced: bool,
         expected_taps: usize,
     },
+}
+
+/// Move-only target taps spanning one exact drafter-to-target boundary gap.
+///
+/// `draft_boundary` is already represented by the live drafter cache;
+/// `target_boundary` is already represented by target KV. The arrays cover
+/// exactly the intervening target rows and may be consumed only by the next
+/// drafter round, a cache-only extension, or final sealing.
+#[derive(Debug)]
+struct DflashTapFrontier {
+    draft_boundary: i32,
+    target_boundary: i32,
+    taps: Vec<Array>,
+    expected_taps: usize,
+}
+
+impl DflashTapFrontier {
+    fn new(
+        draft_boundary: i32,
+        target_boundary: i32,
+        taps: Vec<Array>,
+        expected_taps: usize,
+    ) -> Result<Self, EngineError> {
+        if draft_boundary < 0 || target_boundary < draft_boundary {
+            return Err(EngineError::Generation(format!(
+                "invalid dSpark tap frontier: draft={draft_boundary} target={target_boundary}"
+            )));
+        }
+        let rows = target_boundary
+            .checked_sub(draft_boundary)
+            .ok_or_else(|| EngineError::Generation("dSpark tap frontier overflow".to_owned()))?;
+        if rows == 0 {
+            if !taps.is_empty() {
+                return Err(EngineError::Generation(format!(
+                    "empty dSpark tap frontier carries {} arrays",
+                    taps.len()
+                )));
+            }
+        } else {
+            if taps.len() != expected_taps {
+                return Err(EngineError::Generation(format!(
+                    "dSpark tap frontier has {} layers for {expected_taps} configured taps",
+                    taps.len()
+                )));
+            }
+            for (index, tap) in taps.iter().enumerate() {
+                let shape = tap.shape();
+                if shape.len() != 3 || shape[0] <= 0 || shape[1] != rows || shape[2] <= 0 {
+                    return Err(EngineError::Generation(format!(
+                        "dSpark tap frontier layer {index} must be [B, {rows}, H], got {shape:?}"
+                    )));
+                }
+            }
+        }
+        Ok(Self {
+            draft_boundary,
+            target_boundary,
+            taps,
+            expected_taps,
+        })
+    }
+
+    #[must_use]
+    const fn target_boundary(&self) -> i32 {
+        self.target_boundary
+    }
+
+    fn rows(&self) -> Result<i32, EngineError> {
+        self.target_boundary
+            .checked_sub(self.draft_boundary)
+            .ok_or_else(|| EngineError::Generation("dSpark tap frontier overflow".to_owned()))
+    }
+
+    fn validate_live_draft(&self, draft_cache: &DFlashCache) -> Result<(), EngineError> {
+        let actual = draft_cache.position();
+        if actual != self.draft_boundary {
+            return Err(EngineError::Generation(format!(
+                "dSpark tap frontier starts at {0}, but live drafter is at {actual}",
+                self.draft_boundary
+            )));
+        }
+        Ok(())
+    }
+
+    fn append(self, next_target_boundary: i32, next_taps: Vec<Array>) -> Result<Self, EngineError> {
+        let next = Self::new(
+            self.target_boundary,
+            next_target_boundary,
+            next_taps,
+            self.expected_taps,
+        )?;
+        if next.taps.is_empty() {
+            return Ok(self);
+        }
+        if self.taps.is_empty() {
+            return Self::new(
+                self.draft_boundary,
+                next.target_boundary,
+                next.taps,
+                self.expected_taps,
+            );
+        }
+        let taps = self
+            .taps
+            .into_iter()
+            .zip(next.taps)
+            .map(|(current, added)| {
+                mlx_rs::ops::concatenate_axis(&[&current, &added], 1).map_err(EngineError::Mlx)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(
+            self.draft_boundary,
+            next.target_boundary,
+            taps,
+            self.expected_taps,
+        )
+    }
+
+    fn into_seal_taps(
+        self,
+        draft_cache: &DFlashCache,
+        expected_target_boundary: i32,
+    ) -> Result<Vec<Array>, EngineError> {
+        self.validate_live_draft(draft_cache)?;
+        if self.target_boundary != expected_target_boundary {
+            return Err(EngineError::Generation(format!(
+                "dSpark tap frontier ends at {}, expected retained boundary {expected_target_boundary}",
+                self.target_boundary
+            )));
+        }
+        Ok(self.taps)
+    }
+}
+
+struct CanonicalDflashRound {
+    anchor_ticket: SpeculativeTicket,
+    successors: Vec<u32>,
+    tap_frontier: DflashTapFrontier,
+    draft_tokens: Vec<u32>,
+    draft_matches: usize,
+}
+
+struct CanonicalCommittedRound {
+    tap_frontier: DflashTapFrontier,
+    successors: Vec<u32>,
+    draft_tokens: Vec<u32>,
+    draft_matches: usize,
+}
+
+impl CanonicalDflashRound {
+    /// Replace only the sole successor that remains absent from target KV.
+    ///
+    /// Canonical verification has already forwarded every earlier successor
+    /// as the next S=1 input. Replacing any of those would make the published
+    /// token sequence disagree with target state; the final successor is safe
+    /// because it is deliberately pending.
+    fn replace_pending_successor(&mut self, token: u32) -> Result<(), EngineError> {
+        let pending = self.successors.last_mut().ok_or_else(|| {
+            EngineError::Generation(
+                "canonical DFlash round has no pending successor to replace".to_owned(),
+            )
+        })?;
+        *pending = token;
+        Ok(())
+    }
+
+    /// Publish a canonical round into any output path backed by a token ledger.
+    ///
+    /// Both buffered/streaming stateless generation and retained sessions use
+    /// this adapter. The move-only ticket binds the target transition to the
+    /// exact visible anchor; the typed frontier binds its successors to the
+    /// exact target rows advanced by that transition.
+    fn commit_output(
+        self,
+        ledger: &mut TokenLedger,
+        generated: &mut Vec<u32>,
+    ) -> Result<CanonicalCommittedRound, EngineError> {
+        let Self {
+            anchor_ticket,
+            successors,
+            tap_frontier,
+            draft_tokens,
+            draft_matches,
+        } = self;
+        if ledger.emitted_tokens() != generated.as_slice() {
+            return Err(EngineError::Generation(
+                "session dSpark ledger/output sequence diverged before round commit".to_owned(),
+            ));
+        }
+        let anchor = anchor_ticket.token();
+        if generated.last().copied() != Some(anchor) {
+            return Err(EngineError::Generation(format!(
+                "session dSpark anchor mismatch: ledger={anchor} output={:?}",
+                generated.last()
+            )));
+        }
+        let accepted_tokens = successors.len();
+        let accepted_rows = i32::try_from(accepted_tokens).map_err(|_| {
+            EngineError::Generation("session dSpark accepted row count overflow".to_owned())
+        })?;
+        let frontier_rows = tap_frontier.rows()?;
+        if frontier_rows != accepted_rows {
+            return Err(EngineError::Generation(format!(
+                "session dSpark tap/token mismatch: taps={frontier_rows} tokens={accepted_rows}"
+            )));
+        }
+        ledger
+            .complete_speculative_round(anchor_ticket, &successors)
+            .map_err(session_ledger_error)?;
+        generated.extend_from_slice(&successors);
+        if ledger.emitted_tokens() != generated.as_slice() {
+            return Err(EngineError::Generation(
+                "session dSpark ledger/output sequence diverged after round commit".to_owned(),
+            ));
+        }
+        Ok(CanonicalCommittedRound {
+            tap_frontier,
+            successors,
+            draft_tokens,
+            draft_matches,
+        })
+    }
 }
 
 impl DFlashVerifyRound {
@@ -2936,6 +3158,29 @@ impl SimpleEngine {
         max_tokens: u32,
         params: &SamplingParams,
     ) -> Result<SessionGeneration, EngineError> {
+        self.generate_continued_with_thinking(
+            session_id,
+            prompt_tokens,
+            max_tokens,
+            params,
+            self.enable_thinking,
+        )
+    }
+
+    /// Cache-resident generation with request-scoped thinking control.
+    ///
+    /// The same flag must be used to render `prompt_tokens` and to select the
+    /// decode path. In particular, an explicit no-thinking request may enter
+    /// the exact paired dSpark domain even when the engine's legacy default is
+    /// thinking-enabled.
+    pub fn generate_continued_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+    ) -> Result<SessionGeneration, EngineError> {
         let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
         let total_start = std::time::Instant::now();
         // Serialize all work for this conversation: hold the per-session lock for
@@ -2965,6 +3210,25 @@ impl SimpleEngine {
 
         let total = u32::try_from(prompt_tokens.len())
             .map_err(|_| EngineError::Generation("prompt too long".to_owned()))?;
+        let has_mtp = {
+            let model = self
+                .model
+                .lock()
+                .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+            model.has_mtp()
+        };
+        let decode_mode =
+            session_decode_mode(params, self.dflash.is_some(), has_mtp, enable_thinking);
+        if decode_mode == SessionDecodeMode::DFlash {
+            return self.generate_continued_dflash_locked(
+                session_id,
+                prompt_tokens,
+                max_tokens,
+                params,
+                timing,
+                total_start,
+            );
+        }
 
         let (mut prepared, prefilled, continued) = if let Some((state, prior)) =
             self.take_continuable(session_id, prompt_tokens)
@@ -3017,25 +3281,10 @@ impl SimpleEngine {
         // capture_hidden: the MTP head primes from the prefilled tokens'
         // hidden states (unprimed acceptance measured ~75% vs 85-97% primed).
         // Chunked long prefills return no hidden — priming is then skipped.
-        let want_mtp = prepared.model.has_mtp() && max_tokens > 1;
-        // Delta-prefill taps seed the session drafter's context with the new
-        // messages (tool results / user turn) — without them the drafter
-        // drafts blind to the instruction it is continuing (measured: short
-        // under-confident blocks that never beat the MTP floor).
-        let session_block_dflash = self.dflash.as_ref().is_some_and(|d| {
-            d.verify_mode.for_request(d.is_dspark, params, false) == DFlashVerifyMode::BatchedTape
-        });
-        if want_mtp && self.dflash.as_ref().is_some_and(|_| !session_block_dflash) {
-            tracing::debug!(
-                "canonical dSpark has no retained-session transaction; using the exact MTP/AR session path"
-            );
-        }
-        let session_tap_layers: Option<Vec<usize>> = self
-            .dflash
-            .as_ref()
-            .filter(|_| want_mtp && session_block_dflash)
-            .map(|d| d.tap_layers.clone());
-        let mut delta_taps: Vec<Array> = Vec::new();
+        let want_mtp =
+            decode_mode == SessionDecodeMode::Mtp && prepared.model.has_mtp() && max_tokens > 1;
+        // dSpark sessions returned through the paired-cache path above. The
+        // remaining selectors are deliberately sidecar-free MTP or AR.
         let (current_token, _, prefill_hidden) = self.run_prefill(
             prompt_tokens,
             &mut prepared,
@@ -3045,8 +3294,8 @@ impl SimpleEngine {
             want_mtp,
             false,
             None,
-            session_tap_layers.as_deref(),
-            Some(&mut delta_taps),
+            None,
+            None,
         )?;
         let prefill_elapsed = prefill_start.elapsed();
         let first_id: u32 = current_token.item();
@@ -3081,26 +3330,6 @@ impl SimpleEngine {
                     hidden,
                 )?;
             }
-            // Session DFlash state (declared before the bootstrap so the
-            // bootstrap's tap joins the backlog — the drafter's context stream
-            // must start at the generation's position 0, or every draft is
-            // conditioned one token behind and acceptance collapses).
-            let mut drafter_guard = self
-                .dflash
-                .as_ref()
-                // The session implementation currently has only the S>1 tape
-                // transaction. Fail closed for canonical dSpark rather than
-                // reintroducing the numerically divergent verifier on resumed
-                // conversations; the regular MTP/AR floor remains available.
-                .filter(|_| session_block_dflash)
-                .map(|d| (d, lock_or_recover(&d.drafter)));
-            let mut draft_cache = drafter_guard
-                .as_mut()
-                .map(|(_, g)| g.make_cache())
-                .unwrap_or_default();
-            let mut tap_backlog: Vec<Array> = std::mem::take(&mut delta_taps);
-            let mut drafter_pos: i32 = 0;
-
             // Bootstrap identical to `mtp_generate`: forward the already-
             // emitted first token, keep its hidden, sample the next confirmed
             // token (pending, NOT emitted — the first cycle emits it).
@@ -3112,24 +3341,10 @@ impl SimpleEngine {
             let first_forward = token_ledger
                 .begin_cache_only_forward()
                 .map_err(session_ledger_error)?;
-            let (hidden, logits) = if let Some((dflash_state, _)) = drafter_guard.as_ref() {
-                let (hidden, logits, boot_taps) = prepared
-                    .model
-                    .forward_with_hidden_taps(
-                        &first_input,
-                        None,
-                        &mut prepared.cache,
-                        &dflash_state.tap_layers,
-                    )
-                    .map_err(EngineError::Mlx)?;
-                Self::append_taps(&mut tap_backlog, &boot_taps).map_err(EngineError::Mlx)?;
-                (hidden, logits)
-            } else {
-                prepared
-                    .model
-                    .forward_with_hidden(&first_input, None, &mut prepared.cache)
-                    .map_err(EngineError::Mlx)?
-            };
+            let (hidden, logits) = prepared
+                .model
+                .forward_with_hidden(&first_input, None, &mut prepared.cache)
+                .map_err(EngineError::Mlx)?;
             token_ledger
                 .complete_cache_only_forward(first_forward)
                 .map_err(session_ledger_error)?;
@@ -3153,23 +3368,9 @@ impl SimpleEngine {
             let next_arr = sample(&boot_logits, params).map_err(EngineError::Mlx)?;
             let h = hidden.index((.., -1.., ..));
             eval([&next_arr, &h]).map_err(EngineError::Mlx)?;
-            let mut current_hidden: Option<Array> = Some(h);
+            let mut current_hidden = h;
             let mut confirmed: u32 = next_arr.item();
 
-            // Session DFlash: gated spec rounds on top of the MTP floor when a
-            // drafter is loaded. The drafter's context backlog is built from
-            // this request only (bootstrap + tapped floor cycles + accepted
-            // rounds) — after a resume it drafts on thin context, so the gate
-            // starts floored and a round must beat the measured MTP rate to
-            // stay engaged.
-            const SPEC_PROBE_BASE: u32 = 48;
-            const SPEC_PROBE_MAX: u32 = 512;
-            let mut probe_every = SPEC_PROBE_BASE;
-            let mut tokens_since_probe: u32 = 0;
-            let mut spec_active = false;
-            let mut spec_ratio_ema = 1.3_f64;
-            let mut t_mtp: Option<f64> = None;
-            let mut mtp_cycles_seen: u32 = 0;
             loop {
                 let completion = u32::try_from(generated.len()).unwrap_or(u32::MAX);
                 if completion >= max_tokens {
@@ -3185,184 +3386,31 @@ impl SimpleEngine {
                     break;
                 }
 
-                // DFlash spec round: while engaged, or as a probe once enough
-                // floor tokens have accumulated context and an MTP rate exists.
-                let probe_due = tokens_since_probe >= probe_every;
-                if let Some((dflash_state, guard)) = drafter_guard.as_mut() {
-                    if (spec_active || probe_due)
-                        && t_mtp.is_some()
-                        && (!tap_backlog.is_empty() || drafter_pos > 0)
-                    {
-                        let round_t0 = std::time::Instant::now();
-                        let max_emitted =
-                            usize::try_from(max_tokens - completion).map_err(|_| {
-                                EngineError::Generation(
-                                    "remaining session tokens overflow".to_owned(),
-                                )
-                            })?;
-                        let (emitted, next_pending, round_taps) = self.session_dflash_round(
-                            &mut prepared.model,
-                            &mut prepared.cache,
-                            guard,
-                            &mut draft_cache,
-                            &mut tap_backlog,
-                            &mut drafter_pos,
-                            confirmed,
-                            params,
-                            &generated,
-                            max_emitted,
-                            dflash_state,
-                        )?;
-                        let wall = round_t0.elapsed().as_secs_f64().max(1e-9);
-                        let n = emitted.len();
-                        token_ledger
-                            .extend_forwarded(emitted.iter().copied())
-                            .map_err(session_ledger_error)?;
-                        generated.extend_from_slice(&emitted);
-                        confirmed = next_pending;
-                        // Verify taps of the emitted positions feed the backlog.
-                        Self::append_taps(&mut tap_backlog, &round_taps)
-                            .map_err(EngineError::Mlx)?;
-                        // Head hidden is stale after a spec round; the reseed
-                        // branch below rebuilds it on the next floor step.
-                        current_hidden = None;
-                        let ratio = t_mtp.map_or(1.0, |t| {
-                            f64::from(u32::try_from(n).unwrap_or(u32::MAX)) * t / wall
-                        });
-                        spec_ratio_ema = 0.6f64.mul_add(spec_ratio_ema, 0.4 * ratio);
-                        tracing::info!(
-                            session_id,
-                            emitted = n,
-                            wall_ms = format!("{:.1}", wall * 1e3),
-                            ratio = format!("{ratio:.2}"),
-                            ratio_ema = format!("{spec_ratio_ema:.2}"),
-                            engaged = spec_ratio_ema >= 1.0,
-                            "session DFlash round"
-                        );
-                        if spec_ratio_ema >= 1.0 {
-                            spec_active = true;
-                            probe_every = SPEC_PROBE_BASE;
-                        } else {
-                            spec_active = false;
-                            spec_ratio_ema = 1.3;
-                            probe_every = probe_every.saturating_mul(2).min(SPEC_PROBE_MAX);
-                        }
-                        tokens_since_probe = 0;
-                        continue;
-                    }
-                }
-
-                if current_hidden.is_none() {
-                    // Reseed after a spec round: flush the pending token (emit),
-                    // forward it with hidden+taps, sample the next pending.
-                    generated.push(confirmed);
-                    token_ledger
-                        .emit_pending(confirmed)
-                        .map_err(session_ledger_error)?;
-                    if self.eos_token_ids.contains(&confirmed) {
-                        break;
-                    }
-                    let single = Array::from_slice(
-                        &[i32::try_from(confirmed).map_err(|_| {
-                            EngineError::Generation("pending overflow i32".to_owned())
-                        })?],
-                        &[1, 1],
-                    );
-                    let reseed_forward = token_ledger
-                        .begin_cache_only_forward()
-                        .map_err(session_ledger_error)?;
-                    let (reseed_hidden, reseed_logits, step_taps) = prepared
-                        .model
-                        .forward_with_hidden_taps(
-                            &single,
-                            None,
-                            &mut prepared.cache,
-                            drafter_guard
-                                .as_ref()
-                                .map_or::<&[usize], _>(&[], |(d, _)| &d.tap_layers),
-                        )
-                        .map_err(EngineError::Mlx)?;
-                    token_ledger
-                        .complete_cache_only_forward(reseed_forward)
-                        .map_err(session_ledger_error)?;
-                    if drafter_guard.is_some() {
-                        Self::append_taps(&mut tap_backlog, &step_taps)
-                            .map_err(EngineError::Mlx)?;
-                    }
-                    let reseed_pen =
-                        apply_penalties(&reseed_logits.index((.., -1, ..)), &generated, params)
-                            .map_err(EngineError::Mlx)?;
-                    let reseed_next = sample(&reseed_pen, params).map_err(EngineError::Mlx)?;
-                    let reseed_h = reseed_hidden.index((.., -1.., ..));
-                    eval([&reseed_next, &reseed_h]).map_err(EngineError::Mlx)?;
-                    tokens_since_probe = tokens_since_probe.saturating_add(1);
-                    current_hidden = Some(reseed_h);
-                    confirmed = reseed_next.item();
-                    continue;
-                }
-                let hidden_ref = current_hidden.as_ref().ok_or_else(|| {
-                    EngineError::Generation("session hidden missing after reseed".to_owned())
-                })?;
-
-                // MTP floor cycle (tapped when a drafter needs the backlog).
+                // The session selector is already resolved before prefill, so
+                // this is the ordinary MTP cycle with no hidden dSpark sidecar.
                 let remaining = usize::try_from(max_tokens.saturating_sub(completion))
                     .map_err(|_| EngineError::Generation("max_tokens overflow".to_owned()))?;
                 let draft_depth = self
                     .tuning
                     .mtp_draft_n_max()
                     .min(remaining.saturating_sub(1).max(1));
-                let cycle_t0 = std::time::Instant::now();
-                let (result, cycle_taps) = if drafter_guard.is_some() {
-                    let (r, t) = crate::mtp::mtp_cycle_session(
-                        &mut prepared.model,
-                        &mut prepared.cache,
-                        &mut session_mtp_cache,
-                        hidden_ref,
-                        confirmed,
-                        draft_depth,
-                        &self.eos_token_ids,
-                        Some(params),
-                        drafter_guard
-                            .as_ref()
-                            .map_or::<&[usize], _>(&[], |(d, _)| &d.tap_layers),
-                        &generated,
-                    )?;
-                    (r, Some(t))
-                } else {
-                    (
-                        crate::mtp::mtp_cycle_bounded(
-                            &mut prepared.model,
-                            &mut prepared.cache,
-                            &mut session_mtp_cache,
-                            hidden_ref,
-                            confirmed,
-                            draft_depth,
-                            &self.eos_token_ids,
-                            Some(params),
-                            &generated,
-                        )?,
-                        None,
-                    )
-                };
-                let dt = cycle_t0.elapsed().as_secs_f64();
-                let n = result.tokens.len().max(1);
-                let dt_tok = dt / f64::from(u32::try_from(n).unwrap_or(u32::MAX));
-                // Skip the first (kernel-cold) cycle when seeding the floor rate.
-                if mtp_cycles_seen > 0 {
-                    t_mtp = Some(t_mtp.map_or(dt_tok, |e| 0.7f64.mul_add(e, 0.3 * dt_tok)));
-                }
-                mtp_cycles_seen += 1;
-                if let Some(taps) = cycle_taps {
-                    Self::append_taps(&mut tap_backlog, &taps).map_err(EngineError::Mlx)?;
-                }
+                let result = crate::mtp::mtp_cycle_bounded(
+                    &mut prepared.model,
+                    &mut prepared.cache,
+                    &mut session_mtp_cache,
+                    &current_hidden,
+                    confirmed,
+                    draft_depth,
+                    &self.eos_token_ids,
+                    Some(params),
+                    &generated,
+                )?;
                 mtp_stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
-                tokens_since_probe = tokens_since_probe
-                    .saturating_add(u32::try_from(result.tokens.len()).unwrap_or(0));
                 token_ledger
                     .extend_forwarded(result.tokens.iter().copied())
                     .map_err(session_ledger_error)?;
                 generated.extend_from_slice(&result.tokens);
-                current_hidden = Some(result.hidden);
+                current_hidden = result.hidden;
                 confirmed = result.next_token_id;
             }
         } else if !self.eos_token_ids.contains(&first_id) && max_tokens > 1 {
@@ -3565,6 +3613,411 @@ impl SimpleEngine {
             prefilled_tokens = prefilled,
             prefill_saved = total.saturating_sub(prefilled),
             "cache-resident turn"
+        );
+
+        Ok(SessionGeneration {
+            text: self.decode_tokens(&generated)?,
+            completion_tokens: u32::try_from(generated.len()).unwrap_or(u32::MAX),
+            prompt_tokens: total,
+            prefilled_tokens: prefilled,
+            continued,
+        })
+    }
+
+    /// Exact greedy/no-thinking dSpark session path.
+    ///
+    /// The caller owns the per-session lock for this entire method. A retained
+    /// pair is move-reused only when both private halves match the exact prior
+    /// token prefix; target-only state is intentionally discarded because its
+    /// historical tap stream cannot reconstruct drafter continuity. Every
+    /// successful turn publishes either one sealed pair or one explicit
+    /// target-only downgrade after drafter sealing fails.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn generate_continued_dflash_locked(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        timing: bool,
+        total_start: std::time::Instant,
+    ) -> Result<SessionGeneration, EngineError> {
+        let dflash = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| EngineError::Generation("DFlash state missing".to_owned()))?;
+        if prompt_tokens.is_empty() {
+            return Err(EngineError::Generation(
+                "session DFlash requires a non-empty prompt".to_owned(),
+            ));
+        }
+        let total = Self::prompt_len(prompt_tokens)?;
+        let prompt_boundary = i32::try_from(prompt_tokens.len())
+            .map_err(|_| EngineError::Generation("prompt boundary overflow i32".to_owned()))?;
+
+        if let Ok(mut values) = self.last_dflash_accepts.lock() {
+            values.clear();
+        }
+        if let Ok(mut values) = self.last_dflash_draft_matches.lock() {
+            values.clear();
+        }
+        if let Ok(mut values) = self.last_dflash_draft_counts.lock() {
+            values.clear();
+        }
+        if let Ok(mut value) = self.last_dflash_timing.lock() {
+            *value = None;
+        }
+
+        // Move a retained pair out of the session map before taking the model
+        // lock. A target-only hit is not sufficient for dSpark because no
+        // independent lookup may supply the missing historical tap frontier.
+        let reusable =
+            self.take_continuable(session_id, prompt_tokens)
+                .and_then(|(state, prior)| {
+                    let prefix = prompt_tokens.get(..prior)?;
+                    state
+                        .into_paired(prefix)
+                        .ok()
+                        .map(|(target, draft)| (target, draft, prior))
+                });
+
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let mut drafter = lock_or_recover(&dflash.drafter);
+
+        let reusable = reusable.and_then(|(target, draft, prior)| {
+            let Ok(expected) = i32::try_from(prior) else {
+                tracing::warn!(
+                    session_id,
+                    prior,
+                    "Retained paired session boundary exceeds i32; cold-prefilling"
+                );
+                return None;
+            };
+            if let Err(error) = target.validate_absolute_boundary(expected) {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    expected,
+                    "Retained paired target boundary is invalid; cold-prefilling"
+                );
+                return None;
+            }
+            if draft.position() != expected {
+                tracing::warn!(
+                    session_id,
+                    expected,
+                    actual = draft.position(),
+                    "Retained paired drafter boundary is invalid; cold-prefilling"
+                );
+                return None;
+            }
+            Some((target, draft, prior))
+        });
+
+        let (mut cache, mut draft_cache, prefill_from, continued) =
+            if let Some((target, draft, prior)) = reusable {
+                (target, draft, prior, true)
+            } else {
+                (
+                    model
+                        .make_cache_with_config(self.kv_cache_config)
+                        .map_err(EngineError::Mlx)?,
+                    drafter.make_cache(),
+                    0,
+                    false,
+                )
+            };
+        let prefill_tokens = prompt_tokens.get(prefill_from..).ok_or_else(|| {
+            EngineError::Generation("session DFlash prefill boundary exceeds prompt".to_owned())
+        })?;
+        if prefill_tokens.is_empty() {
+            return Err(EngineError::Generation(
+                "session DFlash continuation requires a non-empty suffix".to_owned(),
+            ));
+        }
+        let prefilled = u32::try_from(prefill_tokens.len()).unwrap_or(u32::MAX);
+
+        if continued {
+            self.cache_metrics
+                .continuations
+                .fetch_add(1, Ordering::Relaxed);
+            self.cache_metrics.prefill_saved_tokens.fetch_add(
+                u64::from(total.saturating_sub(prefilled)),
+                Ordering::Relaxed,
+            );
+        }
+
+        let prefill_start = std::time::Instant::now();
+        let (prefill_logits, prefill_taps) = self.dflash_prefill_with_taps(
+            &mut model,
+            &mut cache,
+            &mut drafter,
+            &mut draft_cache,
+            prefill_tokens,
+            &dflash.tap_layers,
+        )?;
+        cache
+            .validate_absolute_boundary(prompt_boundary)
+            .map_err(EngineError::Mlx)?;
+        let mut tap_frontier = DflashTapFrontier::new(
+            draft_cache.position(),
+            prompt_boundary,
+            prefill_taps,
+            dflash.tap_layers.len(),
+        )?;
+        let first_token =
+            sample(&prefill_logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
+        eval([&first_token]).map_err(EngineError::Mlx)?;
+        let prefill_elapsed = prefill_start.elapsed();
+
+        let first_id: u32 = first_token.item();
+        let mut generated = vec![first_id];
+        let mut token_ledger = TokenLedger::new(prompt_tokens.len());
+        token_ledger
+            .emit_pending(first_id)
+            .map_err(session_ledger_error)?;
+        let max_tokens = usize::try_from(max_tokens)
+            .map_err(|_| EngineError::Generation("max_tokens overflow usize".to_owned()))?;
+
+        let decode_start = std::time::Instant::now();
+        while generated.len() < max_tokens {
+            let pending_anchor = token_ledger.pending_token().ok_or_else(|| {
+                EngineError::Generation("session DFlash ledger lost its pending token".to_owned())
+            })?;
+            if generated.last().copied() != Some(pending_anchor) {
+                return Err(EngineError::Generation(
+                    "session DFlash output tail does not match its pending ledger anchor"
+                        .to_owned(),
+                ));
+            }
+            if self.eos_token_ids.contains(&pending_anchor) {
+                break;
+            }
+            let remaining = max_tokens.saturating_sub(generated.len());
+            if remaining == 0 {
+                break;
+            }
+            let history_before_anchor = generated
+                .get(..generated.len().saturating_sub(1))
+                .unwrap_or_default();
+            let anchor_ticket = token_ledger
+                .begin_speculative_round()
+                .map_err(session_ledger_error)?;
+            let round = self.canonical_dflash_round(
+                &mut model,
+                &mut cache,
+                &mut drafter,
+                &mut draft_cache,
+                tap_frontier,
+                anchor_ticket,
+                history_before_anchor,
+                remaining,
+                remaining,
+                params,
+                &[],
+                None,
+                dflash,
+            )?;
+            let committed = round.commit_output(&mut token_ledger, &mut generated)?;
+            tap_frontier = committed.tap_frontier;
+
+            if let Ok(mut values) = self.last_dflash_accepts.lock() {
+                values.push(u32::try_from(committed.successors.len()).unwrap_or(0));
+            }
+            if let Ok(mut values) = self.last_dflash_draft_matches.lock() {
+                values.push(u32::try_from(committed.draft_matches).unwrap_or(0));
+            }
+            if let Ok(mut values) = self.last_dflash_draft_counts.lock() {
+                values.push(u32::try_from(committed.draft_tokens.len()).unwrap_or(0));
+            }
+        }
+        let decode_elapsed = decode_start.elapsed();
+        let retain_start = std::time::Instant::now();
+
+        // Align the final visible token with both caches. EOS remains visible
+        // but is intentionally absent from the retained key; a non-EOS length
+        // tail receives one target-only forward whose taps are consumed while
+        // sealing the drafter snapshot.
+        match token_ledger.retention_action(&self.eos_token_ids) {
+            RetentionAction::Ready { .. } => {}
+            RetentionAction::ExcludeEos { .. } => {
+                token_ledger
+                    .exclude_pending_eos(&self.eos_token_ids)
+                    .map_err(session_ledger_error)?;
+            }
+            RetentionAction::CacheOnlyForward { token } => {
+                let ticket = token_ledger
+                    .begin_cache_only_forward()
+                    .map_err(session_ledger_error)?;
+                let input_token = i32::try_from(token).map_err(|_| {
+                    EngineError::Generation("session DFlash retained token overflow i32".to_owned())
+                })?;
+                let input = Array::from_slice(&[input_token], &[1, 1]);
+                let (_hidden, final_taps) = model
+                    .forward_raw_with_taps(&input, None, &mut cache, &dflash.tap_layers)
+                    .map_err(EngineError::Mlx)?;
+                let next_target_boundary = tap_frontier
+                    .target_boundary()
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        EngineError::Generation("session target boundary overflow".to_owned())
+                    })?;
+                tap_frontier = tap_frontier.append(next_target_boundary, final_taps)?;
+                token_ledger
+                    .complete_cache_only_forward(ticket)
+                    .map_err(session_ledger_error)?;
+            }
+            RetentionAction::ForwardInFlight { token } => {
+                return Err(EngineError::Generation(format!(
+                    "session token {token} still has a cache-only forward in flight"
+                )));
+            }
+        }
+
+        debug_assert_eq!(token_ledger.emitted_tokens(), generated);
+        let retained_generated = token_ledger
+            .retainable_tokens()
+            .map_err(session_ledger_error)?
+            .to_vec();
+        let expected_boundary = prompt_tokens
+            .len()
+            .checked_add(retained_generated.len())
+            .ok_or_else(|| EngineError::Generation("session boundary overflow".to_owned()))?;
+        let expected_boundary_i32 = i32::try_from(expected_boundary).map_err(|_| {
+            EngineError::Generation("session retained boundary overflow i32".to_owned())
+        })?;
+        if tap_frontier.target_boundary() != expected_boundary_i32 {
+            return Err(EngineError::Generation(format!(
+                "session ledger/target boundary mismatch: ledger={expected_boundary_i32} target={}",
+                tap_frontier.target_boundary()
+            )));
+        }
+
+        let target_valid = cache
+            .validate_absolute_boundary(expected_boundary_i32)
+            .map_or_else(
+                |error| {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        expected = expected_boundary_i32,
+                        "Retained dSpark target cache is misaligned; dropping session retention"
+                    );
+                    false
+                },
+                |()| true,
+            );
+        let sealed_dflash = if target_valid {
+            let seal_taps = tap_frontier.into_seal_taps(&draft_cache, expected_boundary_i32)?;
+            match drafter.seal_after_taps(draft_cache, &seal_taps, expected_boundary_i32) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        expected = expected_boundary_i32,
+                        "Failed to seal retained dSpark cache; downgrading to target-only"
+                    );
+                    None
+                }
+            }
+        } else {
+            drop(tap_frontier);
+            drop(draft_cache);
+            None
+        };
+
+        let cap = self.kv_cache_config.max_session_tokens;
+        let over_dense_cap = cap > 0 && expected_boundary > cap;
+        let mut cap_exempt = false;
+        if target_valid && (self.kv_cache_config.is_turboquant() || over_dense_cap) {
+            match cache.quantize_for_retention(self.kv_cache_config) {
+                Ok(layers) if layers > 0 => {
+                    cap_exempt = over_dense_cap;
+                    tracing::debug!(
+                        session_id,
+                        compressed_layers = layers,
+                        over_dense_cap,
+                        "Compressed paired target KV for between-turn retention"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "Failed to TurboQuant-compress paired target KV; retaining dense"
+                ),
+            }
+        }
+        let target_evaluated = target_valid
+            && match cache.eval() {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "Failed to eval retained dSpark target cache; dropping session retention"
+                    );
+                    false
+                }
+            };
+
+        let mut full = prompt_tokens.to_vec();
+        full.extend_from_slice(&retained_generated);
+        let retained_state = if target_evaluated {
+            match sealed_dflash {
+                Some(snapshot) => match RetainedState::paired(cache, snapshot, &full) {
+                    Ok(state) => Some(state),
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id,
+                            error = %error,
+                            "Failed to publish an exact retained dSpark pair"
+                        );
+                        None
+                    }
+                },
+                None => Some(RetainedState::TargetOnly(cache)),
+            }
+        } else {
+            None
+        };
+        let retain_elapsed = retain_start.elapsed();
+
+        drop(drafter);
+        drop(model);
+        drop(mlx_gate);
+        if let Some(state) = retained_state {
+            self.stash_retained(session_id, state, full, cap_exempt);
+        }
+
+        let total_elapsed = total_start.elapsed();
+        if let Ok(mut value) = self.last_dflash_timing.lock() {
+            *value = Some(GenerationPhaseTiming {
+                prefill: prefill_elapsed,
+                decode: decode_elapsed,
+                request: total_elapsed,
+                decode_tokens: u32::try_from(generated.len().saturating_sub(1)).unwrap_or(u32::MAX),
+            });
+        }
+        #[allow(clippy::print_stderr)]
+        if timing {
+            eprintln!(
+                "DIAG session-dspark-timing: continued={continued} prompt={total} prefilled={prefilled} generated={} prefill={prefill_elapsed:.2?} decode={decode_elapsed:.2?} retain_eval={retain_elapsed:.2?} total={total_elapsed:.2?}",
+                generated.len()
+            );
+        }
+        tracing::info!(
+            session_id,
+            continued,
+            prompt_tokens = total,
+            prefilled_tokens = prefilled,
+            prefill_saved = total.saturating_sub(prefilled),
+            "paired dSpark cache-resident turn"
         );
 
         Ok(SessionGeneration {
@@ -4611,57 +5064,56 @@ impl SimpleEngine {
         })
     }
 
-    /// One lean DFlash speculative round for the SESSION path.
+    /// One target-authoritative S=1 DFlash/dSpark round shared by stateless and
+    /// retained-session decoding.
     ///
-    /// Same core as `dflash_decode`'s spec branch (block draft off tap
-    /// hiddens, confidence truncation, tape-recording verify, GDN tape
-    /// rollback on partial accept) with the session path's three extra
-    /// contracts:
-    ///
-    /// - Pending-token convention: `confirmed` is sampled-but-unemitted (the
-    ///   MTP loop's convention). The round emits it as the anchor (verify
-    ///   forwards it), and the round's correction token becomes the NEXT
-    ///   pending confirmed — returned, never emitted or forwarded here.
-    /// - Stop-exact: acceptance is capped BEFORE any stop token, so a stop can
-    ///   only surface as the returned pending token and the retained cache
-    ///   stays 1:1 with the stashed token list.
-    /// - Distribution-preserving: verify targets are sampled at the request
-    ///   temperature when nonzero; emitted tokens are always the targets.
-    ///
-    /// The drafter sees only this request's tap backlog (bootstrap + floor
-    /// cycles + prior rounds), not the retained history — early rounds after a
-    /// resume draft on thin context and the caller's gate keeps them off
-    /// until they pay. Returns `(emitted_tokens, next_pending_confirmed,
-    /// verify_taps_for_emitted)`.
+    /// The move-only anchor ticket identifies the visible token absent from
+    /// target KV. This method forwards it, then forwards each matching draft one
+    /// at a time. The returned final successor is therefore the sole
+    /// unforwarded token. The old tap frontier is consumed into the drafter and
+    /// replaced with a new boundary-tagged frontier for exactly the target rows
+    /// advanced here.
     #[allow(clippy::too_many_arguments)]
-    fn session_dflash_round(
+    fn canonical_dflash_round(
         &self,
-        model: &mut higgs_models::AnyModel,
-        cache: &mut higgs_models::AnyCache,
-        drafter: &mut higgs_models::dflash::DFlashDrafter,
+        model: &mut AnyModel,
+        target_cache: &mut AnyCache,
+        drafter: &mut DFlashDrafter,
         draft_cache: &mut DFlashCache,
-        current_taps: &mut Vec<Array>,
-        drafter_pos: &mut i32,
-        confirmed: u32,
+        tap_frontier: DflashTapFrontier,
+        anchor_ticket: SpeculativeTicket,
+        history_before_anchor: &[u32],
+        hard_output_limit: usize,
+        canonical_step_limit: usize,
         params: &SamplingParams,
-        history: &[u32],
-        max_emitted: usize,
+        stop_sequences: &[String],
+        terminal_token: Option<u32>,
         dflash: &DFlashState,
-    ) -> Result<(Vec<u32>, u32, Vec<Array>), EngineError> {
-        if max_emitted == 0 {
+    ) -> Result<CanonicalDflashRound, EngineError> {
+        if hard_output_limit == 0 || canonical_step_limit == 0 {
             return Err(EngineError::Generation(
-                "session DFlash round requires remaining output capacity".to_owned(),
+                "canonical DFlash round requires output capacity".to_owned(),
             ));
         }
+        tap_frontier.validate_live_draft(draft_cache)?;
+        let expected_target_boundary = tap_frontier.target_boundary();
+        target_cache
+            .validate_absolute_boundary(expected_target_boundary)
+            .map_err(EngineError::Mlx)?;
+
+        let pending_anchor = anchor_ticket.token();
+        if self.eos_token_ids.contains(&pending_anchor) {
+            return Err(EngineError::Generation(
+                "canonical DFlash round cannot forward a pending EOS token".to_owned(),
+            ));
+        }
+        let anchor = i32::try_from(pending_anchor)
+            .map_err(|_| EngineError::Generation("DFlash anchor overflow i32".to_owned()))?;
         let block_size = dflash.block_size;
         let block_size_us = usize::try_from(block_size)
-            .map_err(|_| EngineError::Generation("block_size overflow".to_owned()))?;
-        let anchor = i32::try_from(confirmed)
-            .map_err(|_| EngineError::Generation("anchor overflow i32".to_owned()))?;
-
-        // a. Block: [anchor, mask, ...] → embed → drafter forward on backlog.
+            .map_err(|_| EngineError::Generation("block_size overflow for usize".to_owned()))?;
         let mut block_tokens = vec![dflash.mask_token_id; block_size_us];
-        if let Some(slot) = block_tokens.get_mut(0) {
+        if let Some(slot) = block_tokens.first_mut() {
             *slot = anchor;
         }
         let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
@@ -4669,112 +5121,116 @@ impl SimpleEngine {
             .embed_token_ids(&block_ids)
             .map_err(EngineError::Mlx)?;
         let draft_transaction = drafter
-            .stage_forward(&noise_embedding, current_taps, draft_cache)
+            .stage_forward(&noise_embedding, &tap_frontier.taps, draft_cache)
             .map_err(EngineError::Mlx)?;
+        let staged_position = draft_transaction.position().map_err(EngineError::Mlx)?;
+        if staged_position != expected_target_boundary {
+            return Err(EngineError::Generation(format!(
+                "dSpark context transaction diverged: drafter={staged_position} target={expected_target_boundary}"
+            )));
+        }
 
-        // b. Draft tokens: target-head DFlash or trained-head Prism dSpark.
+        let round_draft_cap =
+            dflash_tail_draft_cap(dflash.draft_cap, hard_output_limit, dflash.is_dspark);
         let proposal = dflash_propose_tokens(
             model,
             drafter,
             draft_transaction.hidden(),
             anchor,
-            dflash.draft_cap,
+            round_draft_cap,
             dflash.dspark_target_head,
         )?;
+        let draft_tokens = proposal.host_tokens()?;
+        let draft_inputs = draft_tokens
+            .iter()
+            .map(|&token| i32::try_from(token))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                EngineError::Generation("draft token overflow for sequential verify".to_owned())
+            })?;
 
-        // c. Tape-recording verify over [anchor, drafts...].
-        let verify_input = dflash_verify_input(anchor, &proposal)?;
-        let verify_len = *verify_input
-            .shape()
-            .get(1)
-            .ok_or_else(|| EngineError::Generation("verify input missing T axis".to_owned()))?;
-        let row_schedule = if dflash.is_dspark {
-            higgs_models::qwen3_next::DFlashRowSchedule::CanonicalS1
-        } else {
-            higgs_models::qwen3_next::DFlashRowSchedule::NativeBatch
-        };
-        let (verify_logits, verify_taps, layer_tapes) = model
-            .forward_with_taps_tape_scheduled(
-                &verify_input,
-                None,
-                cache,
-                &dflash.tap_layers,
-                None,
-                row_schedule,
-            )
-            .map_err(EngineError::Mlx)?;
+        let step_limit = hard_output_limit.min(canonical_step_limit);
+        let mut target_tokens = Vec::with_capacity(step_limit);
+        let mut committed_taps: Vec<Array> = Vec::new();
+        let mut chain_history =
+            Vec::with_capacity(history_before_anchor.len().saturating_add(step_limit + 1));
+        chain_history.extend_from_slice(history_before_anchor);
+        chain_history.push(pending_anchor);
+        let stop_context = chain_history.clone();
 
-        // d. Targets (sampled at temperature when nonzero) + greedy-match
-        //    acceptance, capped BEFORE any stop token.
-        let chain_history: Vec<u32> = {
-            let mut v = Vec::with_capacity(history.len() + 1);
-            v.extend_from_slice(history);
-            v.push(confirmed);
-            v
-        };
-        let (targets, draft_u32) = dflash_resolve_target_then_draft(
-            || crate::mtp::verify_targets(&verify_logits, Some(params), Some(&chain_history)),
-            || proposal.host_tokens(),
-        )?;
-        let target_rows = i32::try_from(targets.len())
-            .map_err(|_| EngineError::Generation("session target count overflow".to_owned()))?;
-        if target_rows != verify_len || verify_taps.len() != dflash.tap_layers.len() {
-            return Err(EngineError::Generation(format!(
-                "session verifier transaction mismatch: rows={verify_len} targets={target_rows} taps={} expected_taps={}",
-                verify_taps.len(),
-                dflash.tap_layers.len()
-            )));
-        }
-        for (tap_index, tap) in verify_taps.iter().enumerate() {
-            if tap.shape().get(1).copied() != Some(verify_len) {
-                return Err(EngineError::Generation(format!(
-                    "session verifier tap {tap_index} does not cover {verify_len} rows"
-                )));
+        for (position, input_token) in std::iter::once(anchor).chain(draft_inputs).enumerate() {
+            if target_tokens.len() >= step_limit {
+                break;
+            }
+            let single = Array::from_slice(&[input_token], &[1, 1]);
+            let (step_logits, step_taps) = model
+                .forward_with_taps(&single, None, target_cache, &dflash.tap_layers)
+                .map_err(EngineError::Mlx)?;
+            let target =
+                *crate::mtp::verify_targets(&step_logits, Some(params), Some(&chain_history))?
+                    .first()
+                    .ok_or_else(|| {
+                        EngineError::Generation(
+                            "canonical DFlash verifier produced no target".to_owned(),
+                        )
+                    })?;
+            Self::append_taps(&mut committed_taps, &step_taps).map_err(EngineError::Mlx)?;
+            target_tokens.push(target);
+            chain_history.push(target);
+
+            let textual_stop = self
+                .dflash_stop_prefix_len(&stop_context, &target_tokens, stop_sequences)?
+                .is_some();
+            if dflash_canonical_target_is_terminal(
+                position,
+                target,
+                &draft_tokens,
+                &self.eos_token_ids,
+                textual_stop,
+                terminal_token,
+            ) {
+                break;
             }
         }
+
+        let draft_matches = draft_tokens
+            .iter()
+            .zip(&target_tokens)
+            .take_while(|(draft, target)| *draft == *target)
+            .count();
+        let verify =
+            DFlashVerifyRound::committed(target_tokens, committed_taps, dflash.tap_layers.len());
+        let advanced_rows = verify.validate_output_boundary()?;
+        let expected_after = expected_target_boundary
+            .checked_add(advanced_rows)
+            .ok_or_else(|| EngineError::Generation("target boundary overflow".to_owned()))?;
+        target_cache
+            .validate_absolute_boundary(expected_after)
+            .map_err(EngineError::Mlx)?;
+        let (successors, round_taps) = verify.commit_target_state(model, target_cache)?;
+        let next_frontier = DflashTapFrontier::new(
+            expected_target_boundary,
+            expected_after,
+            round_taps,
+            dflash.tap_layers.len(),
+        )?;
         draft_transaction
             .commit(draft_cache)
             .map_err(EngineError::Mlx)?;
-        *drafter_pos = draft_cache.position();
-        current_taps.clear();
-        let mut n_match = draft_u32
-            .iter()
-            .zip(&targets)
-            .take_while(|(d, t)| *d == *t)
-            .count();
-        // `confirmed` itself is always emitted, so at most `max_emitted - 1`
-        // matching drafts may join it in this round.
-        n_match = n_match.min(max_emitted.saturating_sub(1));
-        if let Some(stop_at) = targets
-            .get(..n_match)
-            .unwrap_or(&[])
-            .iter()
-            .position(|t| self.eos_token_ids.contains(t))
-        {
-            n_match = stop_at;
+        if draft_cache.position() != expected_target_boundary {
+            return Err(EngineError::Generation(format!(
+                "canonical DFlash committed drafter boundary {}, expected {expected_target_boundary}",
+                draft_cache.position()
+            )));
         }
-        // Emitted: anchor + matched drafts. Next pending: target at n_match
-        // (the correction — or the stop token — never forwarded here).
-        let next_pending = *targets.get(n_match).ok_or_else(|| {
-            EngineError::Generation("verify targets missing correction".to_owned())
-        })?;
-        let mut emitted = Vec::with_capacity(n_match + 1);
-        emitted.push(confirmed);
-        emitted.extend_from_slice(draft_u32.get(..n_match).unwrap_or(&[]));
 
-        // e. Roll back unaccepted positions (cache advance == emitted count).
-        let n_accepted = i32::try_from(n_match + 1)
-            .map_err(|_| EngineError::Generation("n_accepted overflow".to_owned()))?;
-        if n_accepted < verify_len {
-            model
-                .replay_tape_rollback(&layer_tapes, cache, n_accepted, verify_len - n_accepted)
-                .map_err(EngineError::Mlx)?;
-        }
-        let kept_taps: Vec<Array> = verify_taps
-            .into_iter()
-            .map(|tap| tap.index((.., ..n_accepted, ..)))
-            .collect();
-        Ok((emitted, next_pending, kept_taps))
+        Ok(CanonicalDflashRound {
+            anchor_ticket,
+            successors,
+            tap_frontier: next_frontier,
+            draft_tokens,
+            draft_matches,
+        })
     }
 
     /// `DFlash` block-diffusion speculative decode loop.
@@ -4836,6 +5292,7 @@ impl SimpleEngine {
         let _mlx_gate = higgs_models::mlx_exec::acquire();
         debug_assert!(higgs_models::mlx_exec::held());
         let mut drafter = lock_or_recover(&dflash.drafter);
+        let is_dspark = drafter.config.is_dspark();
 
         let mut cache = model
             .make_cache_with_config(self.kv_cache_config)
@@ -4906,11 +5363,34 @@ impl SimpleEngine {
             );
         }
 
-        let mut current_taps = taps;
         let mut last_token = i32::try_from(first_token_id)
             .map_err(|_| EngineError::Generation("first_token_id overflow for i32".to_owned()))?;
         let mut start = i32::try_from(prompt_len)
             .map_err(|_| EngineError::Generation("prompt_len overflow for i32".to_owned()))?;
+        let (mut current_taps, mut dspark_frontier) = if is_dspark {
+            (
+                Vec::new(),
+                Some(DflashTapFrontier::new(
+                    draft_cache.position(),
+                    start,
+                    taps,
+                    dflash.tap_layers.len(),
+                )?),
+            )
+        } else {
+            (taps, None)
+        };
+        let mut dspark_ledger = if is_dspark {
+            let prompt_boundary = usize::try_from(prompt_len)
+                .map_err(|_| EngineError::Generation("prompt boundary overflow".to_owned()))?;
+            let mut ledger = TokenLedger::new(prompt_boundary);
+            ledger
+                .emit_pending(first_token_id)
+                .map_err(session_ledger_error)?;
+            Some(ledger)
+        } else {
+            None
+        };
         // Adaptive (entropy-gated) block size. Acceptance length is the entropy
         // proxy: predictable/low-entropy regions accept long blocks (big win,
         // byte-exact), uncertain/high-entropy regions reject them. So grow the
@@ -4929,7 +5409,6 @@ impl SimpleEngine {
         // fixed block. Its output/verify work may be capped independently, but
         // resizing the trunk changes the trained distribution and shape-fails
         // the fixed conditioning tensor.
-        let is_dspark = drafter.config.is_dspark();
         // Batched dSpark currently has a greedy, no-thinking proof boundary.
         // Sampling would consume RNG for discarded verifier rows, penalties
         // would need a transactional history, and forced thinking tokens would
@@ -5189,6 +5668,14 @@ impl SimpleEngine {
                     if pending_was_eos {
                         floor_tokens = 1;
                     } else {
+                        let dspark_forward = dspark_ledger
+                            .as_mut()
+                            .map(|ledger| {
+                                ledger
+                                    .begin_cache_only_forward()
+                                    .map_err(session_ledger_error)
+                            })
+                            .transpose()?;
                         let single = Array::from_slice(&[last_token], &[1, 1]);
                         let ar_logits = if need_taps && mtp_floor {
                             // MTP-floor leaving step: APPEND this position's taps to
@@ -5212,8 +5699,17 @@ impl SimpleEngine {
                                 // the pending verify taps and consumed together
                                 // on the next probe, so cache length and `start`
                                 // remain contiguous across AR↔spec transitions.
-                                Self::append_taps(&mut current_taps, &ar_taps)
-                                    .map_err(EngineError::Mlx)?;
+                                let next_boundary = start.checked_add(1).ok_or_else(|| {
+                                    EngineError::Generation(
+                                        "dSpark AR target boundary overflow".to_owned(),
+                                    )
+                                })?;
+                                let frontier = dspark_frontier.take().ok_or_else(|| {
+                                    EngineError::Generation(
+                                        "dSpark AR floor lost its tap frontier".to_owned(),
+                                    )
+                                })?;
+                                dspark_frontier = Some(frontier.append(next_boundary, ar_taps)?);
                             } else {
                                 current_taps = ar_taps;
                             }
@@ -5240,6 +5736,17 @@ impl SimpleEngine {
                                 .forward(&single, None, &mut cache)
                                 .map_err(EngineError::Mlx)?
                         };
+                        if let Some(ticket) = dspark_forward {
+                            dspark_ledger
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    EngineError::Generation(
+                                        "dSpark AR floor lost its token ledger".to_owned(),
+                                    )
+                                })?
+                                .complete_cache_only_forward(ticket)
+                                .map_err(session_ledger_error)?;
+                        }
                         let ar_row =
                             apply_penalties(&ar_logits.index((.., -1, ..)), &tokens, params)
                                 .map_err(EngineError::Mlx)?;
@@ -5258,6 +5765,9 @@ impl SimpleEngine {
                             floor_tokens = 0;
                         } else {
                             tokens.push(ar_id);
+                            if let Some(ledger) = dspark_ledger.as_mut() {
+                                ledger.emit_pending(ar_id).map_err(session_ledger_error)?;
+                            }
                             last_token = i32::try_from(ar_id).map_err(|_| {
                                 EngineError::Generation("ar token overflow".to_owned())
                             })?;
@@ -5337,77 +5847,11 @@ impl SimpleEngine {
                     }
                 }
             } else {
-                // a. Build block: [anchor, mask, mask, ...]
-                let block_size_us = usize::try_from(block_size).map_err(|_| {
-                    EngineError::Generation("block_size overflow for usize".to_owned())
-                })?;
-                let mut block_tokens = vec![mask_id; block_size_us];
-                if let Some(slot) = block_tokens.get_mut(0) {
-                    *slot = last_token;
-                }
-                let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
-
-                // b. Embed through target's embedding layer.
-                let noise_embedding = model
-                    .embed_token_ids(&block_ids)
-                    .map_err(EngineError::Mlx)?;
-
-                // c. Drafter forward.
-                let draft_transaction = drafter
-                    .stage_forward(&noise_embedding, &current_taps, &draft_cache)
-                    .map_err(EngineError::Mlx)?;
-                let staged_position = draft_transaction.position().map_err(EngineError::Mlx)?;
-                if staged_position != start {
-                    return Err(EngineError::Generation(format!(
-                        "dSpark context transaction diverged: drafter={staged_position} target={start}"
-                    )));
-                }
-
                 let completion_len = Self::completion_len(&tokens)?;
                 let remaining = usize::try_from(max_tokens.saturating_sub(completion_len))
                     .map_err(|_| EngineError::Generation("remaining tokens overflow".to_owned()))?;
-                // A length-bounded final round cannot emit more than
-                // `remaining` tokens, including its correction/bonus. Avoid
-                // generating and verifying dSpark rows that will be truncated
-                // unconditionally. The fixed four-position trunk still runs in
-                // its trained domain; only the sequential head and verifier
-                // prefix narrow. Keep one proposal for the remaining==1 case so
-                // the existing S1 branch can own the final target transition.
-                let round_draft_cap = dflash_tail_draft_cap(dflash.draft_cap, remaining, is_dspark);
-
-                // d. Target-head Modal DFlash or trained-head Prism dSpark.
-                let proposal = dflash_propose_tokens(
-                    &model,
-                    &drafter,
-                    draft_transaction.hidden(),
-                    last_token,
-                    round_draft_cap,
-                    dflash.dspark_target_head,
-                )?;
-
                 let exact_sequential = canonical_verify || (is_dspark && remaining == 1);
-
-                // The correctness reference advances the target through the
-                // exact same S=1 transition as ordinary autoregressive decode.
-                // It stops at the first rejected draft (or the bonus token), so
-                // every cache position it creates is committed and rollback is
-                // impossible by construction. This is the default for dSpark
-                // until the S>1 Metal verifier is proven bit-identical to this
-                // transition. `HIGGS_DFLASH_VERIFY_MODE=block` opts into the
-                // experimental batched verifier for profiling.
-                let (mut verify_round, draft_u32, draft_matches) = if exact_sequential {
-                    // The S=1 oracle needs each draft token on the host to
-                    // decide whether to execute the next committed transition.
-                    let draft_u32 = proposal.host_tokens()?;
-                    let mut verify_targets = Vec::with_capacity(draft_u32.len() + 1);
-                    let mut committed = Vec::with_capacity(draft_u32.len() + 1);
-                    let mut committed_taps: Vec<Array> = Vec::new();
-                    let mut chain_history = tokens.clone();
-                    // If the thinking budget will force-replace a target,
-                    // do not speculatively advance any later input. The
-                    // forced token itself is still pending (not forwarded),
-                    // so stopping on that row preserves the S=1 cache
-                    // convention without rollback.
+                let n_accepted = if exact_sequential {
                     let sequential_limit = think_close_token.map_or(remaining, |_| {
                         if seen_think_close {
                             remaining
@@ -5417,76 +5861,157 @@ impl SimpleEngine {
                             remaining.min(usize::try_from(until_forced).unwrap_or(usize::MAX))
                         }
                     });
-                    let draft_inputs = draft_u32
-                        .iter()
-                        .map(|&token| i32::try_from(token))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|_| {
-                            EngineError::Generation(
-                                "draft token overflow for sequential verify".to_owned(),
-                            )
-                        })?;
-                    let verify_inputs = std::iter::once(last_token).chain(draft_inputs);
+                    let ledger = dspark_ledger.as_mut().ok_or_else(|| {
+                        EngineError::Generation(
+                            "canonical dSpark decode lost its token ledger".to_owned(),
+                        )
+                    })?;
+                    let anchor_ticket = ledger
+                        .begin_speculative_round()
+                        .map_err(session_ledger_error)?;
+                    let frontier = dspark_frontier.take().ok_or_else(|| {
+                        EngineError::Generation(
+                            "canonical dSpark decode lost its tap frontier".to_owned(),
+                        )
+                    })?;
+                    let history_before_anchor = tokens
+                        .get(..tokens.len().saturating_sub(1))
+                        .unwrap_or_default();
+                    let mut round = self.canonical_dflash_round(
+                        &mut model,
+                        &mut cache,
+                        &mut drafter,
+                        &mut draft_cache,
+                        frontier,
+                        anchor_ticket,
+                        history_before_anchor,
+                        remaining,
+                        sequential_limit,
+                        params,
+                        stop_sequences,
+                        think_close_token,
+                        dflash,
+                    )?;
 
-                    for (position, input_token) in verify_inputs.enumerate() {
-                        if committed.len() >= sequential_limit {
-                            break;
+                    if let Some(close_id) = think_close_token
+                        && !seen_think_close
+                    {
+                        let mut force_pending_at = None;
+                        for (index, &token) in round.successors.iter().enumerate() {
+                            if token == close_id {
+                                seen_think_close = true;
+                                break;
+                            }
+                            thinking_tokens = thinking_tokens.saturating_add(1);
+                            if thinking_tokens >= thinking_budget {
+                                seen_think_close = true;
+                                force_pending_at = Some(index);
+                                tracing::info!(
+                                    budget = thinking_budget,
+                                    "Thinking budget reached, forcing </think>"
+                                );
+                                break;
+                            }
                         }
-                        let single = Array::from_slice(&[input_token], &[1, 1]);
-                        let (step_logits, step_taps) = model
-                            .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
-                            .map_err(EngineError::Mlx)?;
-                        let target = *crate::mtp::verify_targets(
-                            &step_logits,
-                            Some(params),
-                            Some(&chain_history),
-                        )?
-                        .first()
-                        .ok_or_else(|| {
-                            EngineError::Generation(
-                                "sequential verifier produced no target".to_owned(),
-                            )
-                        })?;
-                        Self::append_taps(&mut committed_taps, &step_taps)
-                            .map_err(EngineError::Mlx)?;
-                        verify_targets.push(target);
-                        committed.push(target);
-                        chain_history.push(target);
-
-                        let textual_stop = self
-                            .dflash_stop_prefix_len(&tokens, &committed, stop_sequences)?
-                            .is_some();
-                        if dflash_canonical_target_is_terminal(
-                            position,
-                            target,
-                            &draft_u32,
-                            &self.eos_token_ids,
-                            textual_stop,
-                            think_close_token,
-                        ) {
-                            break;
+                        if let Some(index) = force_pending_at {
+                            if index + 1 != round.successors.len() {
+                                return Err(EngineError::Generation(format!(
+                                    "thinking policy selected canonical successor {index}, but {} successors were committed",
+                                    round.successors.len()
+                                )));
+                            }
+                            round.replace_pending_successor(close_id)?;
                         }
                     }
 
-                    let draft_matches = draft_u32
-                        .iter()
-                        .zip(&verify_targets)
-                        .take_while(|(draft, target)| draft == target)
-                        .count();
-                    debug_assert_eq!(verify_targets, committed);
-                    (
-                        DFlashVerifyRound::committed(
-                            verify_targets,
-                            committed_taps,
-                            dflash.tap_layers.len(),
-                        ),
-                        draft_u32,
-                        draft_matches,
-                    )
+                    let committed = round.commit_output(ledger, &mut tokens)?;
+                    let accepted_count = committed.successors.len();
+                    let accepted_rows = i32::try_from(accepted_count).map_err(|_| {
+                        EngineError::Generation(
+                            "canonical dSpark accepted count overflow".to_owned(),
+                        )
+                    })?;
+                    if let Ok(mut values) = self.last_dflash_accepts.lock() {
+                        values.push(u32::try_from(accepted_count).unwrap_or(0));
+                    }
+                    if let Ok(mut values) = self.last_dflash_draft_matches.lock() {
+                        values.push(u32::try_from(committed.draft_matches).unwrap_or(0));
+                    }
+                    if let Ok(mut values) = self.last_dflash_draft_counts.lock() {
+                        values.push(u32::try_from(committed.draft_tokens.len()).unwrap_or(0));
+                    }
+                    rounds += 1;
+                    total_accepted += accepted_count as u64;
+                    if std::env::var("HIGGS_DFLASH_TRACE").is_ok()
+                        && (tokens.len() <= 32 || std::env::var("HIGGS_DFLASH_TRACE_ALL").is_ok())
+                    {
+                        tracing::info!(
+                            drafts = ?committed.draft_tokens,
+                            verify_argmax = ?committed.successors,
+                            n_accepted = accepted_rows,
+                            accepted = ?committed.successors,
+                            "canonical DFlash iter trace"
+                        );
+                    }
+                    last_token = i32::try_from(*committed.successors.last().ok_or_else(|| {
+                        EngineError::Generation(
+                            "canonical dSpark round returned no successor".to_owned(),
+                        )
+                    })?)
+                    .map_err(|_| {
+                        EngineError::Generation("accepted token overflow i32".to_owned())
+                    })?;
+                    start = committed.tap_frontier.target_boundary();
+                    dspark_frontier = Some(committed.tap_frontier);
+                    accepted_rows
                 } else {
-                    // Experimental throughput path: verify
-                    // [anchor, draft_0, ...] in one target forward and use
-                    // the GDN tape to select the committed prefix.
+                    // Experimental S>1 throughput path. It remains isolated
+                    // behind the explicit block verifier policy; the default
+                    // dSpark path above is the shared S=1 transaction.
+                    let block_size_us = usize::try_from(block_size).map_err(|_| {
+                        EngineError::Generation("block_size overflow for usize".to_owned())
+                    })?;
+                    let mut block_tokens = vec![mask_id; block_size_us];
+                    if let Some(slot) = block_tokens.get_mut(0) {
+                        *slot = last_token;
+                    }
+                    let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
+                    let noise_embedding = model
+                        .embed_token_ids(&block_ids)
+                        .map_err(EngineError::Mlx)?;
+                    let draft_transaction = if let Some(frontier) = dspark_frontier.as_ref() {
+                        frontier.validate_live_draft(&draft_cache)?;
+                        drafter.stage_forward(&noise_embedding, &frontier.taps, &draft_cache)
+                    } else {
+                        drafter.stage_forward(&noise_embedding, &current_taps, &draft_cache)
+                    }
+                    .map_err(EngineError::Mlx)?;
+                    let staged_position = draft_transaction.position().map_err(EngineError::Mlx)?;
+                    if staged_position != start {
+                        return Err(EngineError::Generation(format!(
+                            "DFlash context transaction diverged: drafter={staged_position} target={start}"
+                        )));
+                    }
+                    let round_draft_cap =
+                        dflash_tail_draft_cap(dflash.draft_cap, remaining, is_dspark);
+                    let proposal = dflash_propose_tokens(
+                        &model,
+                        &drafter,
+                        draft_transaction.hidden(),
+                        last_token,
+                        round_draft_cap,
+                        dflash.dspark_target_head,
+                    )?;
+                    let dspark_anchor_ticket = dspark_ledger
+                        .as_mut()
+                        .map(|ledger| {
+                            ledger
+                                .begin_speculative_round()
+                                .map_err(session_ledger_error)
+                        })
+                        .transpose()?;
+                    // Verify [anchor, draft_0, ...] in one target forward and
+                    // use the GDN tape to select the committed prefix.
                     let verify_input = dflash_verify_input(last_token, &proposal)?;
                     let verify_len = *verify_input.shape().get(1).ok_or_else(|| {
                         EngineError::Generation("verify input missing T axis".to_owned())
@@ -5536,7 +6061,7 @@ impl SimpleEngine {
                     {
                         accepted.truncate(stop_len);
                     }
-                    (
+                    let (mut verify_round, draft_u32, draft_matches) = (
                         DFlashVerifyRound::TentativeTape {
                             target_rows: verify_len,
                             target_tokens: verify_flat,
@@ -5548,90 +6073,140 @@ impl SimpleEngine {
                         },
                         draft_u32,
                         draft_matches,
-                    )
-                };
+                    );
 
-                draft_transaction
-                    .commit(&mut draft_cache)
-                    .map_err(EngineError::Mlx)?;
+                    draft_transaction
+                        .commit(&mut draft_cache)
+                        .map_err(EngineError::Mlx)?;
+                    if is_dspark && draft_cache.position() != start {
+                        return Err(EngineError::Generation(format!(
+                            "batched dSpark committed drafter boundary {}, expected {start}",
+                            draft_cache.position()
+                        )));
+                    }
 
-                if let Some(close_id) = think_close_token {
-                    let mut forced_index = None;
-                    if !seen_think_close {
-                        for (index, &token) in verify_round.output_tokens().iter().enumerate() {
-                            if token == close_id {
-                                seen_think_close = true;
-                                break;
-                            }
-                            thinking_tokens = thinking_tokens.saturating_add(1);
-                            if thinking_tokens >= thinking_budget {
-                                seen_think_close = true;
-                                forced_index = Some(index);
-                                tracing::info!(
-                                    budget = thinking_budget,
-                                    "Thinking budget reached, forcing </think>"
-                                );
-                                break;
+                    if let Some(close_id) = think_close_token {
+                        let mut forced_index = None;
+                        if !seen_think_close {
+                            for (index, &token) in verify_round.output_tokens().iter().enumerate() {
+                                if token == close_id {
+                                    seen_think_close = true;
+                                    break;
+                                }
+                                thinking_tokens = thinking_tokens.saturating_add(1);
+                                if thinking_tokens >= thinking_budget {
+                                    seen_think_close = true;
+                                    forced_index = Some(index);
+                                    tracing::info!(
+                                        budget = thinking_budget,
+                                        "Thinking budget reached, forcing </think>"
+                                    );
+                                    break;
+                                }
                             }
                         }
+                        if let Some(index) = forced_index {
+                            // The forced close becomes the pending token. Later
+                            // verifier rows were conditioned on the replaced target
+                            // and must not be committed.
+                            verify_round.replace_pending_output(index, close_id)?;
+                        }
                     }
-                    if let Some(index) = forced_index {
-                        // The forced close becomes the pending token. Later
-                        // verifier rows were conditioned on the replaced target
-                        // and must not be committed.
-                        verify_round.replace_pending_output(index, close_id)?;
+                    if let Ok(mut v) = self.last_dflash_accepts.lock() {
+                        v.push(u32::try_from(verify_round.output_tokens().len()).unwrap_or(0));
                     }
-                }
-                if let Ok(mut v) = self.last_dflash_accepts.lock() {
-                    v.push(u32::try_from(verify_round.output_tokens().len()).unwrap_or(0));
-                }
-                if let Ok(mut v) = self.last_dflash_draft_matches.lock() {
-                    v.push(u32::try_from(draft_matches).unwrap_or(0));
-                }
-                if let Ok(mut v) = self.last_dflash_draft_counts.lock() {
-                    v.push(u32::try_from(draft_u32.len()).unwrap_or(0));
-                }
-                let n_accepted = verify_round.validate_output_boundary()?;
-                rounds += 1;
-                total_accepted += verify_round.output_tokens().len() as u64;
+                    if let Ok(mut v) = self.last_dflash_draft_matches.lock() {
+                        v.push(u32::try_from(draft_matches).unwrap_or(0));
+                    }
+                    if let Ok(mut v) = self.last_dflash_draft_counts.lock() {
+                        v.push(u32::try_from(draft_u32.len()).unwrap_or(0));
+                    }
+                    let n_accepted = verify_round.validate_output_boundary()?;
+                    rounds += 1;
+                    total_accepted += verify_round.output_tokens().len() as u64;
 
-                if std::env::var("HIGGS_DFLASH_TRACE").is_ok()
-                    && (tokens.len() <= 32 || std::env::var("HIGGS_DFLASH_TRACE_ALL").is_ok())
-                {
-                    tracing::info!(
-                        drafts = ?draft_u32,
-                        verify_argmax = ?verify_round.target_tokens(),
-                        n_accepted,
-                        accepted = ?verify_round.output_tokens(),
-                        "DFlash iter trace"
-                    );
-                }
+                    if std::env::var("HIGGS_DFLASH_TRACE").is_ok()
+                        && (tokens.len() <= 32 || std::env::var("HIGGS_DFLASH_TRACE_ALL").is_ok())
+                    {
+                        tracing::info!(
+                            drafts = ?draft_u32,
+                            verify_argmax = ?verify_round.target_tokens(),
+                            n_accepted,
+                            accepted = ?verify_round.output_tokens(),
+                            "DFlash iter trace"
+                        );
+                    }
 
-                // h. Partial accept — GDN-only replay from tape. The verify
-                //    advanced state for ALL positions; on partial rejection we
-                //    restore each GDN layer's snapshot, replay the SSM kernel for
-                //    the n_accepted positions, and trim KV layers by the rejected
-                //    count. Issued lazily (no eval) so it folds into the next
-                //    verify's host barrier.
-                // `verify_len`, not `block_size`: with confidence truncation the
-                // chain can be shorter than the block, and a fully-accepted
-                // truncated chain needs no rollback.
-                let (accepted, verify_taps) =
-                    verify_round.commit_target_state(&model, &mut cache)?;
-                current_taps = verify_taps
-                    .into_iter()
-                    .map(|tap| tap.index((.., ..n_accepted, ..)))
-                    .collect();
+                    // h. Partial accept — GDN-only replay from tape. The verify
+                    //    advanced state for ALL positions; on partial rejection we
+                    //    restore each GDN layer's snapshot, replay the SSM kernel for
+                    //    the n_accepted positions, and trim KV layers by the rejected
+                    //    count. Issued lazily (no eval) so it folds into the next
+                    //    verify's host barrier.
+                    // `verify_len`, not `block_size`: with confidence truncation the
+                    // chain can be shorter than the block, and a fully-accepted
+                    // truncated chain needs no rollback.
+                    let (accepted, verify_taps) =
+                        verify_round.commit_target_state(&model, &mut cache)?;
+                    let kept_taps: Vec<Array> = verify_taps
+                        .into_iter()
+                        .map(|tap| tap.index((.., ..n_accepted, ..)))
+                        .collect();
 
-                // i. Update state.
-                for &tok in &accepted {
-                    tokens.push(tok);
-                }
-                last_token = i32::try_from(*accepted.last().ok_or_else(|| {
-                    EngineError::Generation("accept_prefix returned empty vec".to_owned())
-                })?)
-                .map_err(|_| EngineError::Generation("accepted token overflow i32".to_owned()))?;
-                start += n_accepted;
+                    // i. Update state.
+                    if let Some(ticket) = dspark_anchor_ticket {
+                        let expected_after = start.checked_add(n_accepted).ok_or_else(|| {
+                            EngineError::Generation(
+                                "batched dSpark target boundary overflow".to_owned(),
+                            )
+                        })?;
+                        let old_frontier = dspark_frontier.take().ok_or_else(|| {
+                            EngineError::Generation(
+                                "batched dSpark lost its tap frontier".to_owned(),
+                            )
+                        })?;
+                        if old_frontier.target_boundary() != start {
+                            return Err(EngineError::Generation(format!(
+                                "batched dSpark frontier ends at {}, target starts at {start}",
+                                old_frontier.target_boundary()
+                            )));
+                        }
+                        let next_frontier = DflashTapFrontier::new(
+                            start,
+                            expected_after,
+                            kept_taps,
+                            dflash.tap_layers.len(),
+                        )?;
+                        let ledger = dspark_ledger.as_mut().ok_or_else(|| {
+                            EngineError::Generation(
+                                "batched dSpark lost its token ledger".to_owned(),
+                            )
+                        })?;
+                        ledger
+                            .complete_speculative_round(ticket, &accepted)
+                            .map_err(session_ledger_error)?;
+                        tokens.extend_from_slice(&accepted);
+                        if ledger.emitted_tokens() != tokens.as_slice() {
+                            return Err(EngineError::Generation(
+                                "batched dSpark ledger/output sequence diverged".to_owned(),
+                            ));
+                        }
+                        dspark_frontier = Some(next_frontier);
+                    } else {
+                        current_taps = kept_taps;
+                        tokens.extend_from_slice(&accepted);
+                    }
+                    last_token = i32::try_from(*accepted.last().ok_or_else(|| {
+                        EngineError::Generation("accept_prefix returned empty vec".to_owned())
+                    })?)
+                    .map_err(|_| {
+                        EngineError::Generation("accepted token overflow i32".to_owned())
+                    })?;
+                    start = start.checked_add(n_accepted).ok_or_else(|| {
+                        EngineError::Generation("DFlash target boundary overflow".to_owned())
+                    })?;
+                    n_accepted
+                };
 
                 // Adapt the next round's block size by block UTILIZATION
                 // (n_accepted / block_size) — the entropy proxy. On low-entropy text
@@ -7667,14 +8242,16 @@ impl SimpleEngine {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        DFlashVerifyMode, DFlashVerifyRound, IncrementalDetok, SessionDecodeMode, SimpleEngine,
-        Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences, continuation_prior_len,
+        CanonicalDflashRound, DFlashVerifyMode, DFlashVerifyRound, DflashTapFrontier, EngineError,
+        IncrementalDetok, SessionDecodeMode, SessionGeneration, SimpleEngine, Tokenizer,
+        adaptive_draft_depth_for_cap, check_stop_sequences, continuation_prior_len,
         derive_model_name, detect_thinking_support, dflash_canonical_target_is_terminal,
         dflash_new_stop_prefix_len, dflash_resolve_target_then_draft, dflash_tail_draft_cap,
         estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail, lock_or_recover,
         parse_enabled_flag, session_decode_mode, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
+    use crate::decode::token_ledger::TokenLedger;
     use higgs_models::{SamplingParams, Speculation};
     use mlx_rs::{
         Array, Dtype,
@@ -7682,6 +8259,88 @@ mod tests {
         transforms::eval,
     };
     use std::path::Path;
+
+    #[test]
+    fn continued_generation_exposes_request_scoped_thinking_control() {
+        let _: fn(
+            &SimpleEngine,
+            u64,
+            &[u32],
+            u32,
+            &SamplingParams,
+            bool,
+        ) -> Result<SessionGeneration, EngineError> =
+            SimpleEngine::generate_continued_with_thinking;
+    }
+
+    #[test]
+    fn canonical_round_commit_is_shared_by_stateless_and_session_outputs() {
+        let mut ledger = TokenLedger::new(10);
+        ledger.emit_pending(41).unwrap();
+        let anchor_ticket = ledger.begin_speculative_round().unwrap();
+        let round = CanonicalDflashRound {
+            anchor_ticket,
+            successors: vec![42, 43],
+            tap_frontier: DflashTapFrontier::new(10, 12, vec![], 0).unwrap(),
+            draft_tokens: vec![42],
+            draft_matches: 1,
+        };
+        let mut output = vec![41];
+
+        let committed = round.commit_output(&mut ledger, &mut output).unwrap();
+
+        assert_eq!(output, [41, 42, 43]);
+        assert_eq!(ledger.emitted_tokens(), output);
+        assert_eq!(ledger.pending_token(), Some(43));
+        assert_eq!(committed.successors, [42, 43]);
+        assert_eq!(committed.draft_tokens, [42]);
+        assert_eq!(committed.tap_frontier.target_boundary(), 12);
+    }
+
+    #[test]
+    fn canonical_round_can_only_replace_its_final_pending_successor() {
+        let mut ledger = TokenLedger::new(10);
+        ledger.emit_pending(41).unwrap();
+        let anchor_ticket = ledger.begin_speculative_round().unwrap();
+        let mut round = CanonicalDflashRound {
+            anchor_ticket,
+            successors: vec![42, 43],
+            tap_frontier: DflashTapFrontier::new(10, 12, vec![], 0).unwrap(),
+            draft_tokens: vec![42],
+            draft_matches: 1,
+        };
+
+        round.replace_pending_successor(99).unwrap();
+        let mut output = vec![41];
+        round.commit_output(&mut ledger, &mut output).unwrap();
+
+        assert_eq!(output, [41, 42, 99]);
+        assert_eq!(ledger.pending_token(), Some(99));
+    }
+
+    #[test]
+    fn canonical_round_rejects_boundary_divergence_before_output_publication() {
+        let mut ledger = TokenLedger::new(10);
+        ledger.emit_pending(41).unwrap();
+        let anchor_ticket = ledger.begin_speculative_round().unwrap();
+        let round = CanonicalDflashRound {
+            anchor_ticket,
+            successors: vec![42, 43],
+            tap_frontier: DflashTapFrontier::new(10, 11, vec![], 0).unwrap(),
+            draft_tokens: vec![42],
+            draft_matches: 1,
+        };
+        let mut output = vec![41];
+
+        assert!(round.commit_output(&mut ledger, &mut output).is_err());
+
+        assert_eq!(output, [41]);
+        assert_eq!(ledger.emitted_tokens(), [41]);
+        assert_eq!(
+            ledger.retention_action(&[]),
+            super::RetentionAction::ForwardInFlight { token: 41 }
+        );
+    }
 
     #[test]
     fn session_decode_mode_honors_selector_and_dflash_without_mtp() {

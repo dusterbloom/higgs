@@ -337,7 +337,13 @@ async fn chat_completions_non_streaming(
         let sampling_c = sampling.clone();
         let engine_c = Arc::clone(&engine);
         let session_output = tokio::task::spawn_blocking(move || {
-            engine_c.generate_continued(sid, &continued_prompt, max_tokens, &sampling_c)
+            engine_c.generate_continued_with_thinking(
+                sid,
+                &continued_prompt,
+                max_tokens,
+                &sampling_c,
+                thinking_enabled,
+            )
         })
         .await
         .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
@@ -897,7 +903,13 @@ fn chat_completions_stream(
             emit_delta!(&role_delta, None, None);
 
             let session_result = tokio::task::spawn_blocking(move || {
-                engine_c.generate_continued(sid, &continued_prompt, max_tokens, &sampling_c)
+                engine_c.generate_continued_with_thinking(
+                    sid,
+                    &continued_prompt,
+                    max_tokens,
+                    &sampling_c,
+                    thinking_enabled_stream,
+                )
             })
             .await;
 

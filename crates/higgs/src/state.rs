@@ -243,8 +243,33 @@ impl Engine {
         max_tokens: u32,
         params: &SamplingParams,
     ) -> Result<SessionGeneration, EngineError> {
+        self.generate_continued_with_thinking(
+            session_id,
+            prompt_tokens,
+            max_tokens,
+            params,
+            self.enable_thinking(),
+        )
+    }
+
+    /// Cache-resident generation using the thinking mode already resolved for
+    /// this request's chat template.
+    pub fn generate_continued_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+    ) -> Result<SessionGeneration, EngineError> {
         match self {
-            Self::Simple(e) => e.generate_continued(session_id, prompt_tokens, max_tokens, params),
+            Self::Simple(e) => e.generate_continued_with_thinking(
+                session_id,
+                prompt_tokens,
+                max_tokens,
+                params,
+                enable_thinking,
+            ),
             Self::Batch(_) => Err(EngineError::Generation(
                 "session_id (continued generation) is only supported by the Simple engine"
                     .to_owned(),
