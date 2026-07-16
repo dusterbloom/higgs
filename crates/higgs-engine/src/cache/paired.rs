@@ -177,6 +177,9 @@ struct PairBranchEpoch(u64);
 
 static NEXT_PAIR_BRANCH_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+static FAIL_NEXT_RADIX_CHECKPOINT_FORK: AtomicBool = AtomicBool::new(false);
+
 fn next_pair_branch_epoch_from(counter: &AtomicU64) -> Result<PairBranchEpoch, PairedCacheError> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -232,8 +235,9 @@ struct PrefixStamp {
 }
 
 impl PrefixStamp {
-    /// Temporary compatibility stamp. This proves exact lookup identity, but
-    /// cannot prove that independently supplied cache halves came from it.
+    /// Legacy test-fixture stamp. This proves exact lookup identity, but cannot
+    /// prove that independently supplied cache halves came from it.
+    #[cfg(test)]
     fn new(tokens: &[u32]) -> Self {
         Self::from_tokens(tokens.to_vec())
     }
@@ -509,6 +513,18 @@ pub(crate) struct LivePair {
     tokens: Vec<u32>,
 }
 
+/// One-way handoff into the legacy stateless decode loop.
+///
+/// The authoritative token ledger and branch publication capability are
+/// intentionally discarded. These parts may drive the current request, but
+/// cannot be relabelled or sealed back into a retained pair.
+#[derive(Debug)]
+pub(crate) struct LivePairParts {
+    pub(crate) target: AnyCache,
+    pub(crate) dflash: DFlashCache,
+    pub(crate) frontier: DflashTapFrontier,
+}
+
 /// Move-only decode transaction for one exact live target/dSpark branch.
 #[derive(Debug)]
 pub(crate) struct LivePairDecodeLease {
@@ -544,6 +560,42 @@ impl LivePair {
             },
             frontier: LiveFrontierHalf { epoch, frontier },
             tokens: Vec::new(),
+        };
+        pair.validate_stable()?;
+        Ok(pair)
+    }
+
+    /// Construct one fresh live branch from an already aligned immutable
+    /// boundary.
+    ///
+    /// The token ledger is authoritative: callers supply owned tokens, not an
+    /// independent length label. Every retained/radix fork enters through this
+    /// helper so target, drafter, frontier, and branch identity are branded
+    /// together.
+    fn from_clean_boundary(
+        target: AnyCache,
+        dflash: DFlashCache,
+        tokens: Vec<u32>,
+        expected_taps: usize,
+    ) -> Result<Self, PairedCacheError> {
+        let expected = Self::token_boundary(tokens.len())?;
+        SealedPair::validate_boundaries(&target, dflash.position(), expected)?;
+        let epoch = next_pair_branch_epoch()?;
+        let frontier = DflashTapFrontier::new(expected, expected, Vec::new(), expected_taps)
+            .map_err(Self::frontier_error)?;
+        let pair = Self {
+            epoch,
+            revision: 0,
+            target: LiveTargetHalf {
+                epoch,
+                cache: target,
+            },
+            dflash: LiveDFlashHalf {
+                epoch,
+                cache: dflash,
+            },
+            frontier: LiveFrontierHalf { epoch, frontier },
+            tokens,
         };
         pair.validate_stable()?;
         Ok(pair)
@@ -648,6 +700,28 @@ impl LivePair {
     #[must_use]
     pub(crate) fn token_len(&self) -> usize {
         self.tokens.len()
+    }
+
+    #[must_use]
+    pub(crate) const fn target_is_hybrid(&self) -> bool {
+        matches!(&self.target.cache, AnyCache::Hybrid(_))
+    }
+
+    /// Consume a validated pair into non-publishable stateless decode state.
+    pub(crate) fn into_stateless_parts(self) -> Result<LivePairParts, PairedCacheError> {
+        self.validate_stable()?;
+        let Self {
+            target,
+            dflash,
+            frontier,
+            tokens: _,
+            ..
+        } = self;
+        Ok(LivePairParts {
+            target: target.cache,
+            dflash: dflash.cache,
+            frontier: frontier.frontier,
+        })
     }
 
     /// Best-effort target-only retention compression without exposing either
@@ -795,6 +869,81 @@ impl LivePair {
             })?;
         let sealed = SealedPair::from_live_branch(target.cache, snapshot, epoch, tokens)?;
         Ok(PairedCache { sealed })
+    }
+
+    /// Seal one exact radix checkpoint and continue from an independent live
+    /// fork.
+    ///
+    /// The preparation callback runs synchronously while its opaque checkpoint
+    /// borrows this branch's exact target cache. Its result may fail without
+    /// invalidating the independently forked continuation. Sealing or snapshot
+    /// forking failures occur before the callback receives any publishable
+    /// checkpoint and therefore fail closed.
+    pub(crate) fn checkpoint_for_radix<R, E, F>(
+        self,
+        drafter: &mut DFlashDrafter,
+        _exec: &MlxExecToken,
+        prepare: F,
+    ) -> Result<(Self, Result<R, E>), PairedCacheError>
+    where
+        F: for<'a> FnOnce(RadixPairCheckpoint<'a>) -> Result<R, E>,
+    {
+        self.validate_stable()?;
+        let Self {
+            epoch,
+            revision: _,
+            target,
+            dflash,
+            frontier,
+            tokens,
+        } = self;
+        let configured_taps = drafter.config.num_taps();
+        let expected_taps = frontier.frontier.expected_taps();
+        if configured_taps != expected_taps {
+            return Err(PairedCacheError::DFlashTapCount {
+                expected: expected_taps,
+                actual: configured_taps,
+            });
+        }
+
+        let expected = Self::token_boundary(tokens.len())?;
+        target
+            .cache
+            .eval()
+            .map_err(|error| PairedCacheError::TargetMaterialization {
+                details: error.to_string(),
+            })?;
+        target
+            .cache
+            .validate_absolute_boundary(expected)
+            .map_err(|error| PairedCacheError::TargetBoundary {
+                expected,
+                details: error.to_string(),
+            })?;
+        let snapshot = drafter
+            .seal_after_taps(dflash.cache, &frontier.frontier.taps, expected)
+            .map_err(|error| PairedCacheError::DFlashSeal {
+                details: error.to_string(),
+            })?;
+
+        #[cfg(test)]
+        if FAIL_NEXT_RADIX_CHECKPOINT_FORK.swap(false, Ordering::SeqCst) {
+            return Err(PairedCacheError::DFlashFork {
+                details: "injected radix checkpoint fork failure".to_owned(),
+            });
+        }
+        let live_dflash = snapshot
+            .fork_live()
+            .map_err(|error| PairedCacheError::DFlashFork {
+                details: error.to_string(),
+            })?;
+        let stamp = PrefixStamp::from_live_branch(epoch, tokens.clone());
+        let continued =
+            Self::from_clean_boundary(target.cache, live_dflash, tokens, expected_taps)?;
+        let checkpoint = RadixPairCheckpoint::new(&continued.target.cache, snapshot, stamp)?;
+        let prepared = prepare(checkpoint);
+        continued.validate_stable()?;
+        Ok((continued, prepared))
     }
 
     fn validate_stable(&self) -> Result<(), PairedCacheError> {
@@ -1031,29 +1180,9 @@ impl PairedCache {
         }
         let PairMetadata { stamp, .. } =
             Arc::try_unwrap(metadata).map_err(|_| PairedCacheError::SharedPairMetadata)?;
-        let expected = stamp.boundary()?;
-        SealedPair::validate_boundaries(&target, dflash.position(), expected)?;
         let tokens = stamp.tokens.into_vec();
-        let epoch = next_pair_branch_epoch()?;
         let live_dflash = dflash.into_live();
-        let frontier = DflashTapFrontier::new(expected, expected, Vec::new(), expected_taps)
-            .map_err(LivePair::frontier_error)?;
-        let pair = LivePair {
-            epoch,
-            revision: 0,
-            target: LiveTargetHalf {
-                epoch,
-                cache: target,
-            },
-            dflash: LiveDFlashHalf {
-                epoch,
-                cache: live_dflash,
-            },
-            frontier: LiveFrontierHalf { epoch, frontier },
-            tokens,
-        };
-        pair.validate_stable()?;
-        Ok(pair)
+        LivePair::from_clean_boundary(target, live_dflash, tokens, expected_taps)
     }
 
     #[must_use]
@@ -1101,6 +1230,58 @@ impl PairedCache {
     }
 }
 
+/// Synchronous, non-escapable proof for one radix publication attempt.
+///
+/// The target is borrowed from the exact continued [`LivePair`], while the
+/// sealed drafter snapshot and authoritative prefix stamp came from that same
+/// branch transition. Private fields prevent callers from substituting any of
+/// the three pieces. The lifetime prevents the checkpoint itself from escaping
+/// [`LivePair::checkpoint_for_radix`].
+#[derive(Debug)]
+pub(crate) struct RadixPairCheckpoint<'a> {
+    target: &'a AnyCache,
+    dflash: DFlashSnapshot,
+    stamp: PrefixStamp,
+}
+
+impl<'a> RadixPairCheckpoint<'a> {
+    fn new(
+        target: &'a AnyCache,
+        dflash: DFlashSnapshot,
+        stamp: PrefixStamp,
+    ) -> Result<Self, PairedCacheError> {
+        if stamp.branch_epoch.is_none() {
+            return Err(PairedCacheError::UnprovenPair);
+        }
+        let expected = stamp.boundary()?;
+        SealedPair::validate_boundaries(target, dflash.position(), expected)?;
+        Ok(Self {
+            target,
+            dflash,
+            stamp,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> &AnyCache {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) fn tokens(&self) -> &[u32] {
+        &self.stamp.tokens
+    }
+
+    /// Finish target byte accounting and consume this checkpoint into the only
+    /// production radix sidecar constructor.
+    pub(crate) fn into_radix_snapshot(
+        self,
+        target_bytes: usize,
+    ) -> Result<RadixDFlashSnapshot, PairedCacheError> {
+        RadixDFlashSnapshot::from_checkpoint(self, target_bytes)
+    }
+}
+
 /// Immutable dFlash sidecar attached to one exact radix endpoint.
 ///
 /// The target half remains represented by the radix endpoint's existing
@@ -1118,6 +1299,37 @@ pub(crate) struct RadixDFlashSnapshot {
 }
 
 impl RadixDFlashSnapshot {
+    fn from_checkpoint(
+        checkpoint: RadixPairCheckpoint<'_>,
+        target_bytes: usize,
+    ) -> Result<Self, PairedCacheError> {
+        let RadixPairCheckpoint {
+            target,
+            dflash,
+            stamp,
+        } = checkpoint;
+        if stamp.branch_epoch.is_none() {
+            return Err(PairedCacheError::UnprovenPair);
+        }
+        let expected = stamp.boundary()?;
+        SealedPair::validate_boundaries(target, dflash.position(), expected)?;
+        let metadata = Arc::new(PairMetadata {
+            target_bytes,
+            dflash_bytes: dflash.estimated_bytes(),
+            stamp,
+        });
+        Ok(Self {
+            dflash: Mutex::new(dflash),
+            metadata,
+            #[cfg(test)]
+            fail_next_fork: AtomicBool::new(false),
+        })
+    }
+
+    /// Legacy independently-labelled fixture constructor.
+    ///
+    /// Production radix publication must consume [`RadixPairCheckpoint`].
+    #[cfg(test)]
     pub(crate) fn new(
         dflash: DFlashSnapshot,
         tokens: &[u32],
@@ -1229,6 +1441,26 @@ impl RadixDFlashForkPlan {
         self.snapshot.prefix_len()
     }
 
+    /// Fork both endpoint halves into one freshly branded live pair.
+    ///
+    /// The target was selected from the same radix endpoint as this plan. Its
+    /// exact boundary is checked against the private proven stamp; no external
+    /// token label participates in construction.
+    pub(crate) fn materialize_pair(
+        self,
+        target: AnyCache,
+        expected_taps: usize,
+    ) -> Result<LivePair, PairedCacheError> {
+        if self.snapshot.metadata.stamp.branch_epoch.is_none() {
+            return Err(PairedCacheError::UnprovenPair);
+        }
+        let tokens = self.snapshot.metadata.stamp.tokens.to_vec();
+        let dflash = self.snapshot.fork_live()?;
+        LivePair::from_clean_boundary(target, dflash, tokens, expected_taps)
+    }
+
+    /// Legacy raw-drafter materialization for pre-migration unit fixtures.
+    #[cfg(test)]
     pub(crate) fn materialize(self) -> Result<DFlashCache, PairedCacheError> {
         self.snapshot.fork_live()
     }
@@ -1698,6 +1930,152 @@ mod tests {
         assert!(
             sealed.sealed.metadata.stamp.branch_epoch.is_some(),
             "the correct-by-construction path must retain its live branch epoch"
+        );
+    }
+
+    fn checkpoint_snapshot(
+        pair: LivePair,
+        drafter: &mut DFlashDrafter,
+    ) -> (LivePair, std::sync::Arc<super::RadixDFlashSnapshot>) {
+        let exec = higgs_models::mlx_exec::acquire();
+        let (continued, prepared) = pair
+            .checkpoint_for_radix(drafter, &exec, |checkpoint| {
+                let target_bytes = checkpoint.target().estimated_bytes();
+                Ok::<_, ()>(
+                    checkpoint
+                        .into_radix_snapshot(target_bytes)
+                        .expect("valid proven checkpoint"),
+                )
+            })
+            .unwrap();
+        (
+            continued,
+            std::sync::Arc::new(prepared.expect("checkpoint preparation")),
+        )
+    }
+
+    #[test]
+    fn radix_checkpoint_owns_the_live_pairs_authoritative_tokens() {
+        let mut caller_tokens = vec![11];
+        let (pair, mut drafter) = target_ahead_live_pair(&caller_tokens);
+
+        let (continued, snapshot) = checkpoint_snapshot(pair, &mut drafter);
+        caller_tokens[0] = 99;
+
+        assert_eq!(continued.tokens, [11]);
+        assert!(snapshot.matches_prefix(&[11]));
+        assert!(!snapshot.matches_prefix(&caller_tokens));
+        assert!(
+            snapshot.metadata.stamp.branch_epoch.is_some(),
+            "production radix checkpoints must retain proven live provenance"
+        );
+    }
+
+    #[test]
+    fn radix_checkpoint_rejects_a_same_length_relabel() {
+        let (pair, mut drafter) = target_ahead_live_pair(&[11]);
+        let (_continued, snapshot) = checkpoint_snapshot(pair, &mut drafter);
+
+        assert!(matches!(
+            snapshot.plan_fork(&[12]).unwrap_err(),
+            PairedCacheError::PrefixMismatch {
+                stored_len: 1,
+                requested_len: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn radix_snapshot_forks_independent_proven_live_pairs() {
+        let (pair, mut drafter) = target_ahead_live_pair(&[11]);
+        let (_continued, snapshot) = checkpoint_snapshot(pair, &mut drafter);
+        let left_plan = snapshot.plan_fork(&[11]).unwrap();
+        let right_plan = snapshot.plan_fork(&[11]).unwrap();
+        let left_target = target_cache(1);
+        let right_target = target_cache(1);
+        let exec = higgs_models::mlx_exec::acquire();
+
+        let left = left_plan.materialize_pair(left_target, 1).unwrap();
+        let right = right_plan.materialize_pair(right_target, 1).unwrap();
+        assert_ne!(left.epoch, right.epoch);
+        drop(exec);
+        let left = finish_one_forwarded_token(left, 12).unwrap();
+
+        assert_eq!(left.tokens, [11, 12]);
+        assert_eq!(right.tokens, [11]);
+        right.validate_stable().unwrap();
+        let third_target = target_cache(1);
+        let _exec = higgs_models::mlx_exec::acquire();
+        let third = snapshot
+            .plan_fork(&[11])
+            .unwrap()
+            .materialize_pair(third_target, 1)
+            .unwrap();
+        assert_eq!(third.tokens, [11]);
+    }
+
+    #[test]
+    fn radix_checkpoint_preparation_failure_preserves_the_continued_pair() {
+        let (pair, mut drafter) = target_ahead_live_pair(&[11]);
+        let exec = higgs_models::mlx_exec::acquire();
+
+        let (continued, prepared) = pair
+            .checkpoint_for_radix(&mut drafter, &exec, |_checkpoint| {
+                Err::<(), _>("injected radix preparation failure")
+            })
+            .unwrap();
+
+        assert_eq!(prepared, Err("injected radix preparation failure"));
+        assert_eq!(continued.tokens, [11]);
+        continued.validate_stable().unwrap();
+        drop(exec);
+        let continued = finish_one_forwarded_token(continued, 12).unwrap();
+        assert_eq!(continued.tokens, [11, 12]);
+    }
+
+    #[test]
+    fn radix_checkpoint_seal_and_fork_failures_expose_no_checkpoint() {
+        let (seal_pair, mut broken_drafter) = target_ahead_live_pair(&[11]);
+        broken_drafter.config.hidden_size = 5;
+        let seal_called = std::cell::Cell::new(false);
+        let exec = higgs_models::mlx_exec::acquire();
+
+        let seal_error = seal_pair
+            .checkpoint_for_radix(&mut broken_drafter, &exec, |_checkpoint| {
+                seal_called.set(true);
+                Ok::<(), ()>(())
+            })
+            .unwrap_err();
+        assert!(matches!(seal_error, PairedCacheError::DFlashSeal { .. }));
+        assert!(!seal_called.get());
+        drop(exec);
+
+        let (fork_pair, mut drafter) = target_ahead_live_pair(&[11]);
+        let fork_called = std::cell::Cell::new(false);
+        super::FAIL_NEXT_RADIX_CHECKPOINT_FORK.store(true, std::sync::atomic::Ordering::SeqCst);
+        let exec = higgs_models::mlx_exec::acquire();
+        let fork_error = fork_pair
+            .checkpoint_for_radix(&mut drafter, &exec, |_checkpoint| {
+                fork_called.set(true);
+                Ok::<(), ()>(())
+            })
+            .unwrap_err();
+        assert!(matches!(fork_error, PairedCacheError::DFlashFork { .. }));
+        assert!(!fork_called.get());
+    }
+
+    #[test]
+    fn legacy_radix_snapshot_cannot_materialize_a_proven_live_pair() {
+        let snapshot = std::sync::Arc::new(
+            super::RadixDFlashSnapshot::new(dflash_snapshot(1), &[11], 1).unwrap(),
+        );
+        let plan = snapshot.plan_fork(&[11]).unwrap();
+        let target = target_cache(1);
+        let _exec = higgs_models::mlx_exec::acquire();
+
+        assert_eq!(
+            plan.materialize_pair(target, 1).unwrap_err(),
+            PairedCacheError::UnprovenPair
         );
     }
 

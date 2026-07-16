@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis1, slice_axis2};
+#[cfg(test)]
 use higgs_models::dflash::{DFlashCache, DFlashSnapshot};
 use higgs_models::qwen3_next::ArraysCache;
 use higgs_models::turboquant::TurboQuantContext;
@@ -12,7 +13,9 @@ use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::concatenate_axis;
 
-use crate::cache::paired::{PairedCacheError, RadixDFlashForkPlan, RadixDFlashSnapshot};
+use crate::cache::paired::{
+    LivePair, PairedCacheError, RadixDFlashForkPlan, RadixDFlashSnapshot, RadixPairCheckpoint,
+};
 
 /// Default block size in tokens for paged caching.
 pub const DEFAULT_BLOCK_SIZE: usize = 32;
@@ -194,7 +197,7 @@ enum CachedData {
 ///
 /// The existing target payload and optional immutable dFlash sidecar move and
 /// evict together. Arbitrary target replacement demotes the endpoint; a
-/// trusted exact-key disk refresh may retain the sidecar.
+/// trusted exact-key disk refresh leaves an existing whole pair untouched.
 enum CachedEndpoint {
     TargetOnly(CachedData),
     TargetAndDflash {
@@ -219,15 +222,6 @@ impl CachedEndpoint {
 
     const fn is_paired(&self) -> bool {
         matches!(self, Self::TargetAndDflash { .. })
-    }
-
-    fn replace_preserving_dflash(self, previous: Option<Self>) -> Self {
-        match (self, previous) {
-            (Self::TargetOnly(target), Some(Self::TargetAndDflash { target: _, dflash })) => {
-                Self::TargetAndDflash { target, dflash }
-            }
-            (replacement, _) => replacement,
-        }
     }
 }
 
@@ -299,24 +293,23 @@ pub struct PagedPrefixMatch {
     pub cache: AnyCache,
 }
 
-/// Independently materialized target state plus a forked live dFlash branch.
+/// Legacy raw paired materialization retained only for unit fixtures.
+#[cfg(test)]
 pub(crate) struct MaterializedPairedPrefix {
     pub(crate) prefix_len: usize,
     pub(crate) cache: AnyCache,
     pub(crate) dflash_cache: DFlashCache,
 }
 
-/// Successful paired fork plus its one-shot retained-LRU authority.
+/// Successful proven pair fork plus its one-shot retained-LRU authority.
 pub(crate) struct PagedPairedPrefixMatch {
-    materialized: MaterializedPairedPrefix,
+    pair: LivePair,
     touch: PairedTouchToken,
 }
 
 impl PagedPairedPrefixMatch {
-    pub(crate) fn into_materialized_and_touch(
-        self,
-    ) -> (MaterializedPairedPrefix, PairedTouchToken) {
-        (self.materialized, self.touch)
+    pub(crate) fn into_pair_and_touch(self) -> (LivePair, PairedTouchToken) {
+        (self.pair, self.touch)
     }
 }
 
@@ -422,7 +415,49 @@ impl PagedPairedLookupPlan {
         self.prefix_len
     }
 
-    pub(crate) fn materialize(self) -> Result<PagedPairedPrefixMatch, PairedCacheError> {
+    pub(crate) fn materialize(
+        self,
+        expected_taps: usize,
+    ) -> Result<PagedPairedPrefixMatch, PairedCacheError> {
+        debug_assert!(
+            higgs_models::mlx_exec::held(),
+            "paired radix materialization requires the process MLX execution gate"
+        );
+        let cache =
+            self.target
+                .materialize()
+                .map_err(|error| PairedCacheError::TargetMaterialization {
+                    details: error.to_string(),
+                })?;
+        let expected =
+            i32::try_from(self.prefix_len).map_err(|_| PairedCacheError::PrefixLengthOverflow {
+                len: self.prefix_len,
+            })?;
+        cache
+            .validate_absolute_boundary(expected)
+            .map_err(|error| PairedCacheError::TargetBoundary {
+                expected,
+                details: error.to_string(),
+            })?;
+        if self.dflash.prefix_len() != self.prefix_len {
+            return Err(PairedCacheError::DFlashBoundary {
+                expected,
+                actual: i32::try_from(self.dflash.prefix_len()).unwrap_or(i32::MAX),
+            });
+        }
+        let pair = self.dflash.materialize_pair(cache, expected_taps)?;
+        Ok(PagedPairedPrefixMatch {
+            pair,
+            touch: self.touch,
+        })
+    }
+
+    /// Legacy raw-half materialization for independently-labelled unit
+    /// fixtures. Production callers can receive only [`LivePair`].
+    #[cfg(test)]
+    pub(crate) fn materialize_unproven_for_test(
+        self,
+    ) -> Result<(MaterializedPairedPrefix, PairedTouchToken), PairedCacheError> {
         debug_assert!(
             higgs_models::mlx_exec::held(),
             "paired radix materialization requires the process MLX execution gate"
@@ -450,14 +485,14 @@ impl PagedPairedLookupPlan {
             });
         }
         let dflash_cache = self.dflash.materialize()?;
-        Ok(PagedPairedPrefixMatch {
-            materialized: MaterializedPairedPrefix {
+        Ok((
+            MaterializedPairedPrefix {
                 prefix_len: self.prefix_len,
                 cache,
                 dflash_cache,
             },
-            touch: self.touch,
-        })
+            self.touch,
+        ))
     }
 
     #[cfg(test)]
@@ -828,6 +863,25 @@ impl RadixNode {
         child.remove_exact_paired_endpoint(remaining)
     }
 
+    /// Whether `tokens` names one exact stored paired endpoint.
+    fn has_exact_paired_endpoint(&self, tokens: &[u32]) -> bool {
+        if tokens.is_empty() {
+            return self
+                .cached
+                .as_ref()
+                .is_some_and(|cached| cached.endpoint.is_paired());
+        }
+
+        let Some(child) = tokens.first().and_then(|first| self.children.get(first)) else {
+            return false;
+        };
+        if !tokens.starts_with(&child.edge) {
+            return false;
+        }
+        let remaining = tokens.get(child.edge.len()..).unwrap_or_default();
+        child.has_exact_paired_endpoint(remaining)
+    }
+
     fn touch_entry(&self, entry_id: u64, access: u64, paired_only: bool) -> bool {
         if let Some(cached) = self.cached.as_ref().filter(|cached| {
             cached.entry_id == entry_id && (!paired_only || cached.endpoint.is_paired())
@@ -971,7 +1025,6 @@ struct Ctx {
     context: Option<Arc<TurboQuantContext>>,
     entry_id: u64,
     last_accessed: u64,
-    preserve_existing_dflash: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1227,18 +1280,18 @@ impl PagedPrefixCache {
             prepared.blocks,
             prepared.context,
             target,
-            false,
         );
     }
 
-    /// Refresh target state loaded from the trusted disk cache while retaining
-    /// an exact same-key in-memory dFlash sidecar.
+    /// Refresh target state loaded from the trusted disk cache unless the exact
+    /// endpoint already owns a proven target/dFlash pair.
     ///
     /// This is intentionally narrower than [`Self::store`]: arbitrary live
     /// target replacement still demotes speculative continuity. Disk snapshots
-    /// are keyed by the same exact token fingerprint and checkpoint identity,
-    /// so refreshing only the target representation must not erase the paired
-    /// endpoint capability.
+    /// may serve the current target-only request, but they cannot replace one
+    /// half of an existing pair. At an exact paired endpoint the complete
+    /// original target representation, dFlash sidecar, identity, LRU age, and
+    /// publication revision therefore remain untouched.
     pub(crate) fn store_disk_refresh_preserving_pair(
         &mut self,
         prefix_tokens: &[u32],
@@ -1251,6 +1304,12 @@ impl PagedPrefixCache {
             return;
         };
         let stored_len = prepared.total_tokens;
+        let Some(tokens_to_store) = prefix_tokens.get(..stored_len) else {
+            return;
+        };
+        if self.root.has_exact_paired_endpoint(tokens_to_store) {
+            return;
+        }
         let target = CachedEndpoint::TargetOnly(prepared.endpoint);
         self.publish_prepared(
             prefix_tokens,
@@ -1258,7 +1317,6 @@ impl PagedPrefixCache {
             prepared.blocks,
             prepared.context,
             target,
-            true,
         );
     }
 
@@ -1268,8 +1326,33 @@ impl PagedPrefixCache {
     /// Slicing/evaluation happens here under the process MLX gate. Because this
     /// is an associated function rather than a method, callers do not need (and
     /// should not hold) the prefix-cache mutex. The opaque result can only be
-    /// published through [`Self::commit_prepared_pair`].
+    /// published through [`Self::commit_prepared_pair`]. The checkpoint must
+    /// already name an exactly representable target boundary; preparation never
+    /// relabels it to a shorter paged floor.
     pub(crate) fn prepare_paired_prefix(
+        ticket: PairedPrepareTicket,
+        checkpoint: RadixPairCheckpoint<'_>,
+    ) -> Result<PreparedPairedPrefix, PairedCacheError> {
+        debug_assert!(
+            higgs_models::mlx_exec::held(),
+            "paired radix preparation requires the process MLX execution gate"
+        );
+        let checkpoint_len = checkpoint.tokens().len();
+        let prepared = Self::prepare_pair_target(ticket, checkpoint.tokens(), checkpoint.target())?;
+        if prepared.tokens.len() != checkpoint_len {
+            return Err(PairedCacheError::PrefixMismatch {
+                stored_len: prepared.tokens.len(),
+                requested_len: checkpoint_len,
+            });
+        }
+        let dflash = checkpoint.into_radix_snapshot(prepared.target_bytes)?;
+        Ok(prepared.attach_dflash(dflash))
+    }
+
+    /// Legacy independently-labelled preparation retained only for unit
+    /// fixtures. Production publication must consume [`RadixPairCheckpoint`].
+    #[cfg(test)]
+    pub(crate) fn prepare_paired_prefix_from_parts(
         ticket: PairedPrepareTicket,
         prefix_tokens: &[u32],
         cache: &AnyCache,
@@ -1279,6 +1362,16 @@ impl PagedPrefixCache {
             higgs_models::mlx_exec::held(),
             "paired radix preparation requires the process MLX execution gate"
         );
+        let prepared = Self::prepare_pair_target(ticket, prefix_tokens, cache)?;
+        let dflash = RadixDFlashSnapshot::new(dflash, &prepared.tokens, prepared.target_bytes)?;
+        Ok(prepared.attach_dflash(dflash))
+    }
+
+    fn prepare_pair_target(
+        ticket: PairedPrepareTicket,
+        prefix_tokens: &[u32],
+        cache: &AnyCache,
+    ) -> Result<PreparedPairTarget, PairedCacheError> {
         let mut prepared =
             Self::prepare_store_with_block_size(ticket.block_size, prefix_tokens, cache)
                 .ok_or_else(|| PairedCacheError::TargetMaterialization {
@@ -1286,13 +1379,12 @@ impl PagedPrefixCache {
                 })?;
         validate_prepared_pair_boundary(&prepared)?;
         let stored_len = prepared.total_tokens;
-        let tokens_to_store =
-            prefix_tokens
-                .get(..stored_len)
-                .ok_or(PairedCacheError::PrefixMismatch {
-                    stored_len,
-                    requested_len: prefix_tokens.len(),
-                })?;
+        let tokens = prefix_tokens
+            .get(..stored_len)
+            .ok_or(PairedCacheError::PrefixMismatch {
+                stored_len,
+                requested_len: prefix_tokens.len(),
+            })?;
 
         // A cloned endpoint is the existing target path for hybrid / fallback
         // caches. Freeze that one stored target before the live cache advances;
@@ -1316,21 +1408,13 @@ impl PagedPrefixCache {
         }
 
         let target_bytes = prepared_target_bytes(&prepared);
-        let dflash = Arc::new(RadixDFlashSnapshot::new(
-            dflash,
-            tokens_to_store,
-            target_bytes,
-        )?);
-        let endpoint = CachedEndpoint::TargetAndDflash {
-            target: prepared.endpoint,
-            dflash,
-        };
-        Ok(PreparedPairedPrefix {
+        Ok(PreparedPairTarget {
             ticket,
-            tokens: tokens_to_store.into(),
+            tokens: tokens.into(),
             blocks: prepared.blocks,
             context: prepared.context,
-            endpoint,
+            target: prepared.endpoint,
+            target_bytes,
         })
     }
 
@@ -1377,7 +1461,7 @@ impl PagedPrefixCache {
             endpoint,
         } = prepared;
         let stored_len = tokens.len();
-        self.publish_prepared(&tokens, stored_len, blocks, context, endpoint, false);
+        self.publish_prepared(&tokens, stored_len, blocks, context, endpoint);
         Ok(())
     }
 
@@ -1390,7 +1474,8 @@ impl PagedPrefixCache {
     ) -> Result<(), PairedCacheError> {
         let ticket = self.paired_prepare_ticket();
         let _exec = higgs_models::mlx_exec::acquire();
-        let prepared = Self::prepare_paired_prefix(ticket, prefix_tokens, cache, dflash)?;
+        let prepared =
+            Self::prepare_paired_prefix_from_parts(ticket, prefix_tokens, cache, dflash)?;
         self.commit_prepared_pair(prepared)
     }
 
@@ -1475,7 +1560,6 @@ impl PagedPrefixCache {
         blocks: Option<Vec<CachedLayerData>>,
         context: Option<Arc<TurboQuantContext>>,
         endpoint: CachedEndpoint,
-        preserve_existing_dflash: bool,
     ) {
         let Some(tokens_to_store) = prefix_tokens.get(..stored_len) else {
             return;
@@ -1487,7 +1571,6 @@ impl PagedPrefixCache {
             context,
             entry_id,
             last_accessed,
-            preserve_existing_dflash,
         };
         let outcome = Self::insert(
             &mut self.root,
@@ -1560,11 +1643,6 @@ impl PagedPrefixCache {
             let was_paired = previous
                 .as_ref()
                 .is_some_and(|cached| cached.endpoint.is_paired());
-            let endpoint = if ctx.preserve_existing_dflash {
-                endpoint.replace_preserving_dflash(previous.map(|cached| cached.endpoint))
-            } else {
-                endpoint
-            };
             let is_paired = endpoint.is_paired();
             node.cached = Some(CachedState {
                 endpoint,
@@ -1861,6 +1939,32 @@ struct PreparedStore {
     context: Option<Arc<TurboQuantContext>>,
     total_tokens: usize,
     endpoint: CachedData,
+}
+
+/// Prepared target representation waiting for the exact checkpoint-owned
+/// dFlash sidecar. This intermediate cannot be committed to the radix.
+struct PreparedPairTarget {
+    ticket: PairedPrepareTicket,
+    tokens: Box<[u32]>,
+    blocks: Option<Vec<CachedLayerData>>,
+    context: Option<Arc<TurboQuantContext>>,
+    target: CachedData,
+    target_bytes: usize,
+}
+
+impl PreparedPairTarget {
+    fn attach_dflash(self, dflash: RadixDFlashSnapshot) -> PreparedPairedPrefix {
+        PreparedPairedPrefix {
+            ticket: self.ticket,
+            tokens: self.tokens,
+            blocks: self.blocks,
+            context: self.context,
+            endpoint: CachedEndpoint::TargetAndDflash {
+                target: self.target,
+                dflash: Arc::new(dflash),
+            },
+        }
+    }
 }
 
 /// Opaque, fully evaluated paired endpoint ready for a CPU-only radix commit.
@@ -2381,6 +2485,7 @@ fn gather_tq_blocks(
 )]
 mod tests {
     use super::*;
+    use crate::cache::paired::DflashTapFrontier;
     use higgs_models::cache::KeyValueCache;
     use higgs_models::dflash::{DFlashConfig, DFlashDrafter, DFlashSnapshot};
 
@@ -2520,6 +2625,66 @@ mod tests {
         drafter.seal_after_taps(cache, &taps, boundary).unwrap()
     }
 
+    fn cold_live_pair_with_tokens(tokens: &[u32]) -> (LivePair, DFlashDrafter) {
+        assert!(!tokens.is_empty());
+        let _exec = higgs_models::mlx_exec::acquire();
+        let drafter = tiny_dflash_drafter();
+        let target = AnyCache::KV(vec![Some(SteppingKeyValueCache::new())]);
+        let pair = LivePair::cold(target, drafter.make_cache(), 1).unwrap();
+        let (pair, ()) = pair
+            .advance_known(tokens, |exact, target, _dflash, _frontier| {
+                let rows = i32::try_from(exact.len()).unwrap();
+                let AnyCache::KV(layers) = target else {
+                    panic!("test checkpoint target must be dense KV");
+                };
+                let kv = layers[0].as_mut().unwrap();
+                let keys = Array::zeros::<f32>(&[1, 2, rows, 8]).unwrap();
+                let values = Array::zeros::<f32>(&[1, 2, rows, 8]).unwrap();
+                let (keys, values) = kv.update_and_fetch(keys, values).unwrap();
+                mlx_rs::transforms::eval([&keys, &values]).unwrap();
+                let taps = Array::zeros::<f32>(&[1, rows, 4]).unwrap();
+                let frontier = DflashTapFrontier::new(0, rows, vec![taps], 1).unwrap();
+                Ok::<_, String>((frontier, ()))
+            })
+            .unwrap();
+        (pair, drafter)
+    }
+
+    fn prepare_proven_checkpoint(
+        ticket: PairedPrepareTicket,
+        tokens: &[u32],
+    ) -> (LivePair, Result<PreparedPairedPrefix, PairedCacheError>) {
+        let (pair, mut drafter) = cold_live_pair_with_tokens(tokens);
+        let exec = higgs_models::mlx_exec::acquire();
+        pair.checkpoint_for_radix(&mut drafter, &exec, |checkpoint| {
+            PagedPrefixCache::prepare_paired_prefix(ticket, checkpoint)
+        })
+        .unwrap()
+    }
+
+    fn advance_proven_pair(pair: LivePair, suffix: &[u32]) -> LivePair {
+        let _exec = higgs_models::mlx_exec::acquire();
+        pair.advance_known(suffix, |exact, target, _dflash, frontier| {
+            let rows = i32::try_from(exact.len()).unwrap();
+            let AnyCache::KV(layers) = target else {
+                panic!("test checkpoint target must be dense KV");
+            };
+            let kv = layers[0].as_mut().unwrap();
+            let keys = Array::ones::<f32>(&[1, 2, rows, 8]).unwrap();
+            let values = Array::ones::<f32>(&[1, 2, rows, 8]).unwrap();
+            let (keys, values) = kv.update_and_fetch(keys, values).unwrap();
+            mlx_rs::transforms::eval([&keys, &values]).unwrap();
+            let taps = Array::ones::<f32>(&[1, rows, 4]).unwrap();
+            let target_boundary = frontier.target_boundary().checked_add(rows).unwrap();
+            let frontier =
+                DflashTapFrontier::new(frontier.draft_boundary(), target_boundary, vec![taps], 1)
+                    .unwrap();
+            Ok::<_, String>((frontier, ()))
+        })
+        .unwrap()
+        .0
+    }
+
     fn find_paired(
         cache: &mut PagedPrefixCache,
         tokens: &[u32],
@@ -2527,7 +2692,7 @@ mod tests {
         let plan = cache.plan_longest_paired_prefix(tokens).unwrap()?;
         let (matched, touch) = {
             let _exec = higgs_models::mlx_exec::acquire();
-            plan.materialize().unwrap().into_materialized_and_touch()
+            plan.materialize_unproven_for_test().unwrap()
         };
         assert!(
             cache.touch_paired(touch),
@@ -3097,6 +3262,87 @@ mod tests {
     }
 
     #[test]
+    fn production_checkpoint_derives_identity_and_returns_one_proven_live_pair() {
+        let mut cache = PagedPrefixCache::new(10, 1);
+        let tokens = vec![7];
+        let ticket = cache.paired_prepare_ticket();
+        let (continued, prepared) = prepare_proven_checkpoint(ticket, &tokens);
+        assert_eq!(continued.token_len(), 1);
+        cache.commit_prepared_pair(prepared.unwrap()).unwrap();
+
+        assert!(
+            cache.plan_longest_paired_prefix(&[8]).unwrap().is_none(),
+            "production publication exposes no external token label that could relabel an equal-length checkpoint"
+        );
+
+        let plan = cache
+            .plan_longest_paired_prefix(&[7, 99])
+            .unwrap()
+            .expect("the checkpoint-owned key must select its exact endpoint");
+        let (pair, touch) = {
+            let _exec = higgs_models::mlx_exec::acquire();
+            plan.materialize(1).unwrap().into_pair_and_touch()
+        };
+        assert_eq!(pair.token_len(), 1);
+        assert!(cache.touch_paired(touch));
+    }
+
+    #[test]
+    fn production_checkpoint_rejects_paged_floor_relabelling() {
+        let cache = PagedPrefixCache::new(10, 4);
+        let tokens: Vec<u32> = (0..10).collect();
+        let ticket = cache.paired_prepare_ticket();
+        let (continued, prepared) = prepare_proven_checkpoint(ticket, &tokens);
+
+        assert_eq!(
+            continued.token_len(),
+            10,
+            "a rejected publication must not invalidate its independent live continuation"
+        );
+        let Err(error) = prepared else {
+            panic!("an exact checkpoint must not be relabelled to its paged floor");
+        };
+        assert!(matches!(
+            error,
+            PairedCacheError::PrefixMismatch {
+                stored_len: 8,
+                requested_len: 10
+            }
+        ));
+    }
+
+    #[test]
+    fn proven_radix_snapshot_forks_independent_live_pairs() {
+        let mut cache = PagedPrefixCache::new(10, 1);
+        let tokens = vec![7];
+        let ticket = cache.paired_prepare_ticket();
+        let (_continued, prepared) = prepare_proven_checkpoint(ticket, &tokens);
+        cache.commit_prepared_pair(prepared.unwrap()).unwrap();
+
+        let left_plan = cache.plan_longest_paired_prefix(&[7, 99]).unwrap().unwrap();
+        let right_plan = cache
+            .plan_longest_paired_prefix(&[7, 100])
+            .unwrap()
+            .unwrap();
+        let (left, _left_touch) = {
+            let _exec = higgs_models::mlx_exec::acquire();
+            left_plan.materialize(1).unwrap().into_pair_and_touch()
+        };
+        let (right, _right_touch) = {
+            let _exec = higgs_models::mlx_exec::acquire();
+            right_plan.materialize(1).unwrap().into_pair_and_touch()
+        };
+
+        let left = advance_proven_pair(left, &[8]);
+        assert_eq!(left.token_len(), 2);
+        assert_eq!(
+            right.token_len(),
+            1,
+            "advancing one proven fork must not mutate another fork or the retained snapshot"
+        );
+    }
+
+    #[test]
     fn paired_store_rejects_snapshot_boundary_different_from_prepared_boundary() {
         let mut cache = PagedPrefixCache::new(10, 4);
         let tokens: Vec<u32> = (0..10).collect();
@@ -3119,9 +3365,9 @@ mod tests {
     #[test]
     fn dense_paired_store_uses_the_existing_block_aligned_target_path() {
         let mut cache = PagedPrefixCache::new(10, 4);
-        let tokens: Vec<u32> = (0..10).collect();
+        let tokens: Vec<u32> = (0..8).collect();
         cache
-            .store_paired(&tokens, &make_kv_cache(1, 10), dflash_snapshot(8))
+            .store_paired(&tokens, &make_kv_cache(1, 8), dflash_snapshot(8))
             .unwrap();
 
         let mut query = tokens;
@@ -3170,7 +3416,7 @@ mod tests {
         let ticket = cache.paired_prepare_ticket();
         let result = {
             let _exec = higgs_models::mlx_exec::acquire();
-            PagedPrefixCache::prepare_paired_prefix(
+            PagedPrefixCache::prepare_paired_prefix_from_parts(
                 ticket,
                 &rejected_tokens,
                 &rejected_target,
@@ -3262,7 +3508,7 @@ mod tests {
         );
 
         let _exec = higgs_models::mlx_exec::acquire();
-        let (matched, _touch) = plan.materialize().unwrap().into_materialized_and_touch();
+        let (matched, _touch) = plan.materialize_unproven_for_test().unwrap();
         assert_eq!(kv_cache_offset(&matched.cache), 8);
         assert_eq!(matched.dflash_cache.position(), 8);
     }
@@ -3293,7 +3539,8 @@ mod tests {
 
         let prepared = {
             let _exec = higgs_models::mlx_exec::acquire();
-            PagedPrefixCache::prepare_paired_prefix(ticket, &tokens, &target, snapshot).unwrap()
+            PagedPrefixCache::prepare_paired_prefix_from_parts(ticket, &tokens, &target, snapshot)
+                .unwrap()
         };
         assert!(
             cache.is_empty(),
@@ -3334,7 +3581,8 @@ mod tests {
         let snapshot = dflash_snapshot(8);
         let prepared = {
             let _exec = higgs_models::mlx_exec::acquire();
-            PagedPrefixCache::prepare_paired_prefix(ticket, &tokens, &target, snapshot).unwrap()
+            PagedPrefixCache::prepare_paired_prefix_from_parts(ticket, &tokens, &target, snapshot)
+                .unwrap()
         };
 
         let error = destination.commit_prepared_pair(prepared).unwrap_err();
@@ -3362,7 +3610,7 @@ mod tests {
         let prepared_snapshot = dflash_snapshot(8);
         let prepared = {
             let _exec = higgs_models::mlx_exec::acquire();
-            PagedPrefixCache::prepare_paired_prefix(
+            PagedPrefixCache::prepare_paired_prefix_from_parts(
                 ticket,
                 &tokens,
                 &prepared_target,
@@ -3404,14 +3652,14 @@ mod tests {
         let (first, second) = {
             let _exec = higgs_models::mlx_exec::acquire();
             (
-                PagedPrefixCache::prepare_paired_prefix(
+                PagedPrefixCache::prepare_paired_prefix_from_parts(
                     ticket,
                     &first_tokens,
                     &first_target,
                     first_snapshot,
                 )
                 .unwrap(),
-                PagedPrefixCache::prepare_paired_prefix(
+                PagedPrefixCache::prepare_paired_prefix_from_parts(
                     ticket,
                     &second_tokens,
                     &second_target,
@@ -3454,7 +3702,8 @@ mod tests {
         let ticket = cache.paired_prepare_ticket();
         let prepared = {
             let _exec = higgs_models::mlx_exec::acquire();
-            PagedPrefixCache::prepare_paired_prefix(ticket, &tokens, &target, snapshot).unwrap()
+            PagedPrefixCache::prepare_paired_prefix_from_parts(ticket, &tokens, &target, snapshot)
+                .unwrap()
         };
 
         cache.clear();
@@ -3475,7 +3724,7 @@ mod tests {
         cache.clear();
         let (_matched, touch) = {
             let _exec = higgs_models::mlx_exec::acquire();
-            plan.materialize().unwrap().into_materialized_and_touch()
+            plan.materialize_unproven_for_test().unwrap()
         };
         assert!(
             !cache.touch_paired(touch),
@@ -3501,14 +3750,14 @@ mod tests {
         let plan = source.plan_longest_paired_prefix(&query).unwrap().unwrap();
         let (_matched, foreign_touch) = {
             let _exec = higgs_models::mlx_exec::acquire();
-            plan.materialize().unwrap().into_materialized_and_touch()
+            plan.materialize_unproven_for_test().unwrap()
         };
         assert!(!destination.touch_paired(foreign_touch));
 
         let plan = source.plan_longest_paired_prefix(&query).unwrap().unwrap();
         let (_matched, local_touch) = {
             let _exec = higgs_models::mlx_exec::acquire();
-            plan.materialize().unwrap().into_materialized_and_touch()
+            plan.materialize_unproven_for_test().unwrap()
         };
         assert!(source.touch_paired(local_touch));
     }
@@ -3525,7 +3774,7 @@ mod tests {
         let plan = cache.plan_longest_paired_prefix(&query).unwrap().unwrap();
         let (_matched, touch) = {
             let _exec = higgs_models::mlx_exec::acquire();
-            plan.materialize().unwrap().into_materialized_and_touch()
+            plan.materialize_unproven_for_test().unwrap()
         };
 
         let unrelated_tokens: Vec<u32> = (100..108).collect();
@@ -3626,8 +3875,7 @@ mod tests {
                 std::thread::spawn(move || {
                     start.wait();
                     let _exec = higgs_models::mlx_exec::acquire();
-                    let (mut matched, _touch) =
-                        plan.materialize().unwrap().into_materialized_and_touch();
+                    let (mut matched, _touch) = plan.materialize_unproven_for_test().unwrap();
                     let mut drafter = tiny_dflash_drafter();
                     let taps = Array::zeros::<f32>(&[1, advance, 4]).unwrap();
                     drafter
@@ -3673,7 +3921,7 @@ mod tests {
         plan.fail_materialization_for_test();
         let failed = {
             let _exec = higgs_models::mlx_exec::acquire();
-            plan.materialize()
+            plan.materialize_unproven_for_test()
         };
         assert!(failed.is_err());
 

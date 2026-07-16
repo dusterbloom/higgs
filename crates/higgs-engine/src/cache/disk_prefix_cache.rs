@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use half::f16;
 use higgs_models::AnyCache;
 use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis2};
+#[cfg(test)]
 use higgs_models::dflash::DFlashSnapshot;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::concatenate_axis;
@@ -15,7 +16,7 @@ use crate::cache::disk_storage::{
     DiskCacheBlock, DiskCacheEntryMetadata, DiskCacheError, DiskCacheFileHeader, DiskCacheLayer,
     DiskCacheSnapshot, DiskStorage,
 };
-use crate::cache::paired::PairedCacheError;
+use crate::cache::paired::{PairedCacheError, RadixPairCheckpoint};
 use crate::paged_prefix_cache::{
     PagedPairedLookupPlan, PagedPrefixCache, PagedPrefixMatch, PairedPrefixCacheStats,
     PairedPrepareTicket, PairedTouchToken, PreparedPairedPrefix,
@@ -202,11 +203,9 @@ impl DiskPrefixCache {
     /// retain their existing disk behavior through [`Self::store`].
     pub(crate) fn prepare_memory_paired_prefix(
         ticket: PairedPrepareTicket,
-        prefix_tokens: &[u32],
-        cache: &AnyCache,
-        snapshot: DFlashSnapshot,
+        checkpoint: RadixPairCheckpoint<'_>,
     ) -> Result<PreparedPairedPrefix, PairedCacheError> {
-        PagedPrefixCache::prepare_paired_prefix(ticket, prefix_tokens, cache, snapshot)
+        PagedPrefixCache::prepare_paired_prefix(ticket, checkpoint)
     }
 
     /// Commit a fully prepared memory pair using only ownership/trie mutation.
@@ -227,7 +226,12 @@ impl DiskPrefixCache {
     ) -> Result<(), PairedCacheError> {
         let ticket = self.paired_prepare_ticket();
         let _exec = higgs_models::mlx_exec::acquire();
-        let prepared = Self::prepare_memory_paired_prefix(ticket, prefix_tokens, cache, snapshot)?;
+        let prepared = PagedPrefixCache::prepare_paired_prefix_from_parts(
+            ticket,
+            prefix_tokens,
+            cache,
+            snapshot,
+        )?;
         self.commit_memory_paired_prefix(prepared)
     }
 
@@ -589,17 +593,39 @@ mod tests {
     use higgs_models::cache::KeyValueCache;
     use higgs_models::dflash::{DFlashConfig, DFlashDrafter, DFlashSnapshot};
 
-    fn make_kv_cache(num_layers: usize, seq_len: i32) -> AnyCache {
+    fn make_kv_cache_with_value(num_layers: usize, seq_len: i32, value: f32) -> AnyCache {
         let layers: Vec<Option<SteppingKeyValueCache>> = (0..num_layers)
             .map(|_| {
                 let elem_count = usize::try_from(2 * seq_len * 4).unwrap();
-                let values = vec![1.0_f32; elem_count];
+                let values = vec![value; elem_count];
                 let keys = Array::from_slice(&values, &[1, 2, seq_len, 4]);
                 let vals = Array::from_slice(&values, &[1, 2, seq_len, 4]);
                 Some(SteppingKeyValueCache::from_arrays(keys, vals).unwrap())
             })
             .collect();
         AnyCache::KV(layers)
+    }
+
+    fn make_kv_cache(num_layers: usize, seq_len: i32) -> AnyCache {
+        make_kv_cache_with_value(num_layers, seq_len, 1.0)
+    }
+
+    fn kv_cache_has_value(cache: &AnyCache, value: f32) -> bool {
+        let AnyCache::KV(layers) = cache else {
+            return false;
+        };
+        let keys = layers[0].as_ref().unwrap().keys().unwrap();
+        let element_count = keys
+            .shape()
+            .iter()
+            .map(|dim| usize::try_from(*dim).unwrap())
+            .product();
+        let expected = Array::from_slice(&vec![value; element_count], keys.shape());
+        keys.array_eq(&expected, None)
+            .unwrap()
+            .all(None)
+            .unwrap()
+            .item::<bool>()
     }
 
     fn dflash_snapshot(boundary: i32) -> DFlashSnapshot {
@@ -635,7 +661,7 @@ mod tests {
         let plan = cache.plan_memory_paired_prefix(tokens).unwrap()?;
         let (matched, touch) = {
             let _exec = higgs_models::mlx_exec::acquire();
-            plan.materialize().unwrap().into_materialized_and_touch()
+            plan.materialize_unproven_for_test().unwrap()
         };
         assert!(
             cache.touch_memory_paired(touch),
@@ -707,7 +733,7 @@ mod tests {
         let ticket = cache.paired_prepare_ticket();
         let prepared = {
             let _exec = higgs_models::mlx_exec::acquire();
-            DiskPrefixCache::prepare_memory_paired_prefix(ticket, &tokens, &target, snapshot)
+            PagedPrefixCache::prepare_paired_prefix_from_parts(ticket, &tokens, &target, snapshot)
                 .unwrap()
         };
         assert!(!higgs_models::mlx_exec::held());
@@ -723,7 +749,7 @@ mod tests {
 
         cache.memory.clear();
         let _exec = higgs_models::mlx_exec::acquire();
-        let (matched, _touch) = plan.materialize().unwrap().into_materialized_and_touch();
+        let (matched, _touch) = plan.materialize_unproven_for_test().unwrap();
         assert_eq!(matched.prefix_len, 1);
         assert_eq!(matched.dflash_cache.position(), 1);
     }
@@ -814,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn same_key_disk_refresh_preserves_the_memory_paired_sidecar() {
+    fn same_key_disk_refresh_preserves_the_original_whole_memory_pair() {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
@@ -822,24 +848,32 @@ mod tests {
             min_tokens_to_persist: 1,
         };
         let tokens = vec![7];
-        let cache = make_kv_cache(1, 1);
+        let disk_target = make_kv_cache_with_value(1, 1, 2.0);
+        let paired_target = make_kv_cache_with_value(1, 1, 7.0);
         let mut prefix_cache = DiskPrefixCache::new(8, 1, config, 2, 4).unwrap();
-        prefix_cache.store(&tokens, &cache, Some("paired"));
+        prefix_cache.store(&tokens, &disk_target, Some("paired"));
         prefix_cache
-            .store_paired(&tokens, &cache, dflash_snapshot(1), Some("paired"))
+            .store_paired(&tokens, &paired_target, dflash_snapshot(1), Some("paired"))
             .unwrap();
 
         let candidate = prefix_cache
             .find_disk_prefix_candidate(&tokens, Some("paired"), 0)
             .expect("ordinary target store should persist its target state");
-        prefix_cache
+        let loaded = prefix_cache
             .load_disk_prefix_candidate(&tokens, candidate)
             .expect("forced target-only refresh should load");
-
         assert!(
-            find_memory_pair(&mut prefix_cache, &tokens).is_some(),
-            "a trusted same-key disk refresh must not erase paired endpoint metadata"
+            kv_cache_has_value(&loaded.cache, 2.0),
+            "the current ordinary request should receive the materialized disk target"
         );
+
+        let retained = find_memory_pair(&mut prefix_cache, &tokens)
+            .expect("a trusted exact-key disk refresh must leave the pair selectable");
+        assert!(
+            kv_cache_has_value(&retained.cache, 7.0),
+            "disk refresh must leave the original paired target half untouched"
+        );
+        assert_eq!(retained.dflash_cache.position(), 1);
     }
 
     #[test]

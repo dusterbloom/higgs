@@ -181,6 +181,10 @@ fn session_pair_error(error: PairedCacheError) -> EngineError {
     EngineError::Generation(format!("session live dSpark pair: {error}"))
 }
 
+fn radix_pair_error(error: PairedCacheError) -> EngineError {
+    EngineError::Generation(format!("radix live dSpark pair: {error}"))
+}
+
 /// Insert a retained KV cache for `session_id`, enforcing the resident-memory
 /// bounds: a per-session token cap (drop instead of retain once the
 /// conversation's KV exceeds `max_session_tokens`; `0` = unlimited) and a count
@@ -5267,6 +5271,7 @@ impl SimpleEngine {
         &self,
         model: &mut AnyModel,
         drafter: &mut DFlashDrafter,
+        mlx_gate: &higgs_models::mlx_exec::MlxExecToken,
         prompt_tokens: &[u32],
         partition: Option<DflashPromptPartition<'_>>,
         paired_plan: Option<DflashPairedPrefixPlan>,
@@ -5281,11 +5286,13 @@ impl SimpleEngine {
             lookup,
             publication_ticket,
         } = paired_plan;
-        let reusable = lookup.and_then(|plan| match plan.materialize() {
+        let expected_taps = dflash.tap_layers.len();
+        let reusable = lookup.and_then(|plan| match plan.materialize(expected_taps) {
             Ok(matched) => {
-                let (matched, touch) = matched.into_materialized_and_touch();
+                let (pair, touch) = matched.into_pair_and_touch();
+                let prefix_len = pair.token_len();
                 deferred_touch.arm(touch);
-                Some((matched.cache, matched.dflash_cache, matched.prefix_len))
+                Some((pair, prefix_len))
             }
             Err(error) => {
                 tracing::warn!(
@@ -5295,24 +5302,21 @@ impl SimpleEngine {
                 None
             }
         });
-        let (mut cache, mut draft_cache, reused_prefix_len) =
-            if let Some((cache, draft_cache, prefix_len)) = reusable {
-                (cache, draft_cache, prefix_len)
-            } else {
-                (
-                    model
-                        .make_cache_with_config(self.kv_cache_config)
-                        .map_err(EngineError::Mlx)?,
-                    drafter.make_cache(),
-                    0,
-                )
-            };
+        let (mut pair, reused_prefix_len) = if let Some((pair, prefix_len)) = reusable {
+            (pair, prefix_len)
+        } else {
+            let target = model
+                .make_cache_with_config(self.kv_cache_config)
+                .map_err(EngineError::Mlx)?;
+            let pair = LivePair::cold(target, drafter.make_cache(), expected_taps)
+                .map_err(radix_pair_error)?;
+            (pair, 0)
+        };
 
-        let publish_boundary = publication_ticket
-            .store_boundary(partition.body_end, matches!(&cache, AnyCache::Hybrid(_)));
+        let publish_boundary =
+            publication_ticket.store_boundary(partition.body_end, pair.target_is_hybrid());
         if publish_boundary == 0 || reused_prefix_len > publish_boundary {
-            drop(cache);
-            drop(draft_cache);
+            drop(pair);
             return self.dflash_cold_prefill(model, drafter, prompt_tokens, dflash);
         }
 
@@ -5323,74 +5327,70 @@ impl SimpleEngine {
                 .ok_or_else(|| {
                     EngineError::Generation("paired dSpark body boundary exceeds prompt".to_owned())
                 })?;
-            let body_taps = self.dflash_advance_with_taps(
-                model,
-                &mut cache,
-                drafter,
-                &mut draft_cache,
-                body_delta,
-                &dflash.tap_layers,
-            )?;
             let expected = i32::try_from(publish_boundary).map_err(|_| {
                 EngineError::Generation("paired dSpark boundary overflow i32".to_owned())
             })?;
-            cache
-                .validate_absolute_boundary(expected)
-                .map_err(EngineError::Mlx)?;
-            let snapshot = match drafter.seal_after_taps(draft_cache, &body_taps, expected) {
-                Ok(snapshot) => snapshot,
+            pair = pair
+                .advance_known(
+                    body_delta,
+                    |exact_suffix, target_cache, draft_cache, frontier| {
+                        if frontier.rows()? != 0 {
+                            return Err(EngineError::Generation(
+                                "paired radix body extension requires an aligned frontier"
+                                    .to_owned(),
+                            ));
+                        }
+                        let body_taps = self.dflash_advance_with_taps(
+                            model,
+                            target_cache,
+                            drafter,
+                            draft_cache,
+                            exact_suffix,
+                            &dflash.tap_layers,
+                        )?;
+                        let next_frontier = DflashTapFrontier::new(
+                            draft_cache.position(),
+                            expected,
+                            body_taps,
+                            expected_taps,
+                        )?;
+                        Ok::<_, EngineError>((next_frontier, ()))
+                    },
+                )
+                .map_err(radix_pair_error)?
+                .0;
+
+            let checkpoint = pair.checkpoint_for_radix(drafter, mlx_gate, |checkpoint| {
+                DiskPrefixCache::prepare_memory_paired_prefix(publication_ticket, checkpoint)
+            });
+            let (continued, prepared) = match checkpoint {
+                Ok(result) => result,
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
                         expected,
-                        "Failed to seal a paired radix dSpark boundary; cold-prefilling"
+                        "Failed to checkpoint a paired radix dSpark boundary; cold-prefilling"
                     );
-                    drop(cache);
-                    drop(body_taps);
                     return self.dflash_cold_prefill(model, drafter, prompt_tokens, dflash);
                 }
             };
-            let (live_draft, snapshot_to_publish) = match snapshot.fork_live() {
-                Ok(cache) => (cache, Some(snapshot)),
+            pair = continued;
+            match prepared {
+                Ok(prepared) => {
+                    let publish =
+                        lock_or_recover(&self.prefix_cache).commit_memory_paired_prefix(prepared);
+                    if let Err(error) = publish {
+                        tracing::warn!(
+                            error = %error,
+                            "Failed to publish prepared paired dSpark radix state"
+                        );
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
-                        expected,
-                        "Failed to fork a newly sealed radix dSpark snapshot; continuing live without publication"
+                        "Failed to freeze paired dSpark radix state; continuing with the validated live pair"
                     );
-                    (snapshot.into_live(), None)
-                }
-            };
-            let prefix_tokens = partition.prompt.get(..publish_boundary).ok_or_else(|| {
-                EngineError::Generation(
-                    "paired dSpark publication boundary exceeds prompt".to_owned(),
-                )
-            })?;
-            draft_cache = live_draft;
-            if let Some(snapshot) = snapshot_to_publish {
-                let prepared = DiskPrefixCache::prepare_memory_paired_prefix(
-                    publication_ticket,
-                    prefix_tokens,
-                    &cache,
-                    snapshot,
-                );
-                match prepared {
-                    Ok(prepared) => {
-                        let publish = lock_or_recover(&self.prefix_cache)
-                            .commit_memory_paired_prefix(prepared);
-                        if let Err(error) = publish {
-                            tracing::warn!(
-                                error = %error,
-                                "Failed to publish prepared paired dSpark radix state"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            "Failed to freeze paired dSpark radix state; continuing with the validated live pair"
-                        );
-                    }
                 }
             }
         }
@@ -5403,25 +5403,38 @@ impl SimpleEngine {
                     "paired dSpark full hit has no cached logits or generation suffix".to_owned(),
                 )
             })?;
-        let (logits, taps) = self.dflash_prefill_with_taps(
-            model,
-            &mut cache,
-            drafter,
-            &mut draft_cache,
-            tail,
-            &dflash.tap_layers,
-        )?;
         let expected = i32::try_from(prompt_tokens.len()).map_err(|_| {
             EngineError::Generation("DFlash prompt boundary overflow i32".to_owned())
         })?;
+        let (pair, logits) = pair
+            .advance_known(tail, |exact_suffix, target_cache, draft_cache, frontier| {
+                if frontier.rows()? != 0 {
+                    return Err(EngineError::Generation(
+                        "paired radix generation tail requires an aligned frontier".to_owned(),
+                    ));
+                }
+                let (logits, taps) = self.dflash_prefill_with_taps(
+                    model,
+                    target_cache,
+                    drafter,
+                    draft_cache,
+                    exact_suffix,
+                    &dflash.tap_layers,
+                )?;
+                let next_frontier =
+                    DflashTapFrontier::new(draft_cache.position(), expected, taps, expected_taps)?;
+                Ok::<_, EngineError>((next_frontier, logits))
+            })
+            .map_err(radix_pair_error)?;
+        let parts = pair.into_stateless_parts().map_err(radix_pair_error)?;
         DflashPrefillOutcome::validated(
-            cache,
-            draft_cache,
+            parts.target,
+            parts.dflash,
             logits,
-            taps,
+            parts.frontier.taps,
             reused_prefix_len,
             expected,
-            dflash.tap_layers.len(),
+            expected_taps,
         )
     }
 
@@ -5720,7 +5733,7 @@ impl SimpleEngine {
         // prefill, draft, verify, rollback, and sink finalization. Without it,
         // the first sanctioned eval panics in debug and concurrent release
         // requests can race MLX's process-global Metal command buffer.
-        let _mlx_gate = higgs_models::mlx_exec::acquire();
+        let mlx_gate = higgs_models::mlx_exec::acquire();
         debug_assert!(higgs_models::mlx_exec::held());
         let mut drafter = lock_or_recover(&dflash.drafter);
         let is_dspark = drafter.config.is_dspark();
@@ -5728,6 +5741,7 @@ impl SimpleEngine {
         let prefill = self.dflash_prepare_prefill(
             &mut model,
             &mut drafter,
+            &mlx_gate,
             prompt_tokens,
             partition,
             paired_plan,
