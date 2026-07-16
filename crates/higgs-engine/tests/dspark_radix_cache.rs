@@ -29,61 +29,10 @@ use higgs_engine::{
     simple::SimpleEngine,
 };
 use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
-use support::{ReferenceDsparkEnv, ScopedEnvVar};
-
-#[derive(Clone, Copy)]
-struct DflashAcceptance {
-    matched: u64,
-    drafted: u64,
-}
-
-impl DflashAcceptance {
-    fn rate(self) -> f64 {
-        self.matched as f64 / self.drafted as f64
-    }
-}
-
-fn dflash_acceptance(engine: &SimpleEngine, label: &str) -> DflashAcceptance {
-    let matches = engine.last_dflash_draft_matches();
-    let draft_counts = engine.last_dflash_draft_counts();
-    assert_eq!(
-        matches.len(),
-        draft_counts.len(),
-        "{label}: every speculative round must report both matched and drafted counts"
-    );
-    let acceptance = DflashAcceptance {
-        matched: matches.into_iter().map(u64::from).sum(),
-        drafted: draft_counts.into_iter().map(u64::from).sum(),
-    };
-    assert!(
-        acceptance.drafted > 0,
-        "{label}: the acceptance gate requires at least one drafted token"
-    );
-    assert!(
-        acceptance.matched <= acceptance.drafted,
-        "{label}: matched tokens cannot exceed drafted tokens"
-    );
-    acceptance
-}
-
-fn assert_acceptance_within(
-    candidate_label: &str,
-    candidate: DflashAcceptance,
-    baseline: DflashAcceptance,
-) {
-    const MAX_REGRESSION: f64 = 0.03;
-    assert!(
-        candidate.rate() + MAX_REGRESSION >= baseline.rate(),
-        "{candidate_label} aggregate dFlash acceptance regressed by more than \
-         3 percentage points: candidate={:.2}% ({}/{}) baseline={:.2}% ({}/{})",
-        candidate.rate() * 100.0,
-        candidate.matched,
-        candidate.drafted,
-        baseline.rate() * 100.0,
-        baseline.matched,
-        baseline.drafted
-    );
-}
+use support::{
+    ReferenceDsparkEnv, ScopedEnvVar, assert_acceptance_within, assert_decode_tps_within,
+    dflash_acceptance, dflash_decode_tps,
+};
 
 fn user(content: &str) -> ChatMessage {
     ChatMessage {
@@ -287,6 +236,7 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     let warm_wall = warm_started.elapsed();
     let warm_accepts = engine.last_dflash_accepts();
     let warm_acceptance = dflash_acceptance(&engine, "warm paired radix");
+    let warm_decode_tps = dflash_decode_tps(&engine, "warm paired radix");
     let after_warm = engine.cache_stats();
     let saved = after_warm.prefill_saved_tokens - before_warm.prefill_saved_tokens;
     eprintln!(
@@ -354,6 +304,7 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     let cold_wall = cold_started.elapsed();
     let cold_accepts = engine.last_dflash_accepts();
     let cold_acceptance = dflash_acceptance(&engine, "cold paired split");
+    let cold_decode_tps = dflash_decode_tps(&engine, "cold paired split");
     let after_cold = engine.cache_stats();
     assert_eq!(
         after_cold.radix_hits, before_cold.radix_hits,
@@ -389,7 +340,7 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     engine.clear_prefix_cache();
     assert_eq!(engine.prefix_cache_len(), 0);
     let before_legacy = engine.cache_stats();
-    let (legacy, legacy_wall, legacy_acceptance) = {
+    let (legacy, legacy_wall, legacy_acceptance, legacy_decode_tps) = {
         let _prefix_cache_disabled = ScopedEnvVar::set("HIGGS_PREFIX_CACHE", "0");
         let legacy_started = std::time::Instant::now();
         let legacy = engine
@@ -408,7 +359,8 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
             .expect("legacy one-shot dSpark request with paired cache disabled");
         let legacy_wall = legacy_started.elapsed();
         let legacy_acceptance = dflash_acceptance(&engine, "legacy one-shot dSpark");
-        (legacy, legacy_wall, legacy_acceptance)
+        let legacy_decode_tps = dflash_decode_tps(&engine, "legacy one-shot dSpark");
+        (legacy, legacy_wall, legacy_acceptance, legacy_decode_tps)
     };
     let after_legacy = engine.cache_stats();
     assert_eq!(
@@ -432,8 +384,12 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     assert_eq!(cold.finish_reason, legacy.finish_reason);
     assert_acceptance_within("warm paired radix", warm_acceptance, legacy_acceptance);
     assert_acceptance_within("cold paired split", cold_acceptance, legacy_acceptance);
+    assert_decode_tps_within("warm paired radix", warm_decode_tps, legacy_decode_tps);
+    assert_decode_tps_within("cold paired split", cold_decode_tps, legacy_decode_tps);
     eprintln!(
-        "dspark-radix acceptance: warm={:.2}% ({}/{}) cold={:.2}% ({}/{}) legacy={:.2}% ({}/{})",
+        "dspark-radix decode: warm={warm_decode_tps:.2} cold={cold_decode_tps:.2} \
+         legacy={legacy_decode_tps:.2} tok/s; acceptance: warm={:.2}% ({}/{}) \
+         cold={:.2}% ({}/{}) legacy={:.2}% ({}/{})",
         warm_acceptance.rate() * 100.0,
         warm_acceptance.matched,
         warm_acceptance.drafted,

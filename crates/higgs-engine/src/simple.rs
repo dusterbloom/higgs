@@ -2051,6 +2051,20 @@ impl SimpleEngine {
             .unwrap_or_default()
     }
 
+    /// Decode-only throughput from the most recent dSpark request.
+    ///
+    /// This deliberately excludes model load, prefill, cache publication, and
+    /// request framing. It is a narrow observability seam for real-model release
+    /// gates that compare cached and uncached execution of the same decoder.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_dflash_decode_tokens_per_second(&self) -> Option<f64> {
+        let timing = self.last_dflash_timing.lock().ok()?.as_ref().copied()?;
+        let seconds = timing.decode.as_secs_f64();
+        (timing.decode_tokens > 0 && seconds > 0.0)
+            .then(|| f64::from(timing.decode_tokens) / seconds)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     fn last_ar_timing(&self) -> Option<GenerationPhaseTiming> {
         self.last_ar_timing.lock().map_or(None, |timing| *timing)
@@ -9753,6 +9767,8 @@ mod tests {
         let mut df_wall_secs = Vec::with_capacity(2);
         let mut ar_phase_timings = Vec::with_capacity(2);
         let mut df_phase_timings = Vec::with_capacity(2);
+        let mut df_matched_drafts = 0_u64;
+        let mut df_drafted_tokens = 0_u64;
         // AR, DFlash, DFlash, AR cancels a first-order thermal trend while
         // keeping one model load and fresh request-local caches for every run.
         for (index, speculation) in [
@@ -9813,6 +9829,8 @@ mod tests {
                     );
                     let rounds = u32::try_from(accepts.len()).expect("round count fits u32");
                     let drafted: u32 = draft_counts.iter().copied().sum();
+                    df_matched_drafts += u64::from(matched);
+                    df_drafted_tokens += u64::from(drafted);
                     println!("DFlash accepts: {accepts:?}");
                     println!("DFlash draft matches: {matches:?}");
                     println!("DFlash draft counts: {draft_counts:?}");
@@ -9903,6 +9921,38 @@ mod tests {
         println!(
             "decode speedup vs AR: {:.3}x",
             df_decode_tps / ar_decode_tps
+        );
+
+        // The established Bonsai battery result is 1.435x decode throughput
+        // versus AR (20.42 -> 29.31 tok/s). Preserve that demonstrated speedup
+        // with a 3% relative tolerance, rather than pinning machine-specific
+        // absolute rates. Acceptance uses the Prism-style matched/drafted ratio.
+        const REFERENCE_DECODE_SPEEDUP: f64 = 1.435;
+        const MAX_RELATIVE_REGRESSION: f64 = 0.03;
+        const MIN_ACCEPTANCE_RATE: f64 = 0.87;
+        const MIN_DECODE_SPEEDUP: f64 = REFERENCE_DECODE_SPEEDUP * (1.0 - MAX_RELATIVE_REGRESSION);
+        assert!(
+            df_drafted_tokens > 0,
+            "the dSpark acceptance gate requires drafted tokens"
+        );
+        let aggregate_acceptance = df_matched_drafts as f64 / df_drafted_tokens as f64;
+        let decode_speedup = df_decode_tps / ar_decode_tps;
+        println!(
+            "dSpark release gates: acceptance={:.2}% floor={:.2}% decode_speedup={decode_speedup:.5}x floor={MIN_DECODE_SPEEDUP:.5}x",
+            aggregate_acceptance * 100.0,
+            MIN_ACCEPTANCE_RATE * 100.0,
+        );
+        assert!(
+            aggregate_acceptance >= MIN_ACCEPTANCE_RATE,
+            "aggregate dSpark acceptance {:.2}% is below the {:.2}% release floor",
+            aggregate_acceptance * 100.0,
+            MIN_ACCEPTANCE_RATE * 100.0
+        );
+        assert!(
+            decode_speedup >= MIN_DECODE_SPEEDUP,
+            "dSpark decode speedup {decode_speedup:.5}x is below the \
+             {MIN_DECODE_SPEEDUP:.5}x release floor derived from the demonstrated \
+             {REFERENCE_DECODE_SPEEDUP:.3}x battery result"
         );
 
         // Correctness gate: speculative decode must obey the same output bound

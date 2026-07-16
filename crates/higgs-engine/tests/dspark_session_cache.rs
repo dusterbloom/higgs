@@ -25,7 +25,10 @@ use higgs_engine::{
     simple::SimpleEngine,
 };
 use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
-use support::ReferenceDsparkEnv;
+use support::{
+    ReferenceDsparkEnv, assert_acceptance_within, assert_decode_tps_within, dflash_acceptance,
+    dflash_decode_tps,
+};
 
 fn greedy(speculation: Speculation) -> SamplingParams {
     SamplingParams {
@@ -128,9 +131,12 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
         )
         .expect("resume paired dSpark session");
     let second_accepts = engine.last_dflash_accepts();
+    let second_acceptance = dflash_acceptance(&engine, "warm paired session");
+    let second_decode_tps = dflash_decode_tps(&engine, "warm paired session");
     eprintln!(
-        "dspark-session checkpoint: turn2 generated={} accepts={second_accepts:?}",
-        second.completion_tokens
+        "dspark-session checkpoint: turn2 generated={} decode={second_decode_tps:.2} tok/s \
+         accepts={second_accepts:?}",
+        second.completion_tokens,
     );
     assert!(
         second.continued,
@@ -149,6 +155,50 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
         1,
         "a resumed dSpark turn must replace the session with one sealed pair"
     );
+
+    // Decode-only release gate against the identical session decoder with no
+    // retained pair. `drop_retained_session` makes the comparator cold while
+    // preserving the same prompt, sampling domain, and dSpark implementation.
+    const COLD_SID: u64 = SID + 1;
+    engine.drop_retained_session(COLD_SID);
+    let cold = engine
+        .generate_continued_with_thinking(
+            COLD_SID,
+            &second_prompt,
+            32,
+            &greedy(Speculation::DFlash),
+            false,
+        )
+        .expect("cold session dSpark reference");
+    let cold_acceptance = dflash_acceptance(&engine, "uncached session baseline");
+    let cold_decode_tps = dflash_decode_tps(&engine, "uncached session baseline");
+    assert!(
+        !cold.continued,
+        "the session performance baseline must begin without retained state"
+    );
+    assert_eq!(
+        cold.prefilled_tokens, cold.prompt_tokens,
+        "the session performance baseline must prefill its complete prompt"
+    );
+    assert_eq!(
+        second.text, cold.text,
+        "paired session reuse must preserve the cold greedy output"
+    );
+    assert_eq!(second.completion_tokens, cold.completion_tokens);
+    assert_acceptance_within("warm paired session", second_acceptance, cold_acceptance);
+    assert_decode_tps_within("warm paired session", second_decode_tps, cold_decode_tps);
+    eprintln!(
+        "dspark-session release gate: warm_decode={second_decode_tps:.2} \
+         uncached_decode={cold_decode_tps:.2} tok/s warm_acceptance={:.2}% ({}/{}) \
+         uncached_acceptance={:.2}% ({}/{})",
+        second_acceptance.rate() * 100.0,
+        second_acceptance.matched,
+        second_acceptance.drafted,
+        cold_acceptance.rate() * 100.0,
+        cold_acceptance.matched,
+        cold_acceptance.drafted,
+    );
+    engine.drop_retained_session(COLD_SID);
 
     let paired_tokens = engine
         .retained_session_tokens(SID)
