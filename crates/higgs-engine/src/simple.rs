@@ -27,6 +27,7 @@ use tokenizers::Tokenizer;
 use crate::{
     cache::{DiskPrefixCache, DiskPrefixCacheConfig, PagedKvCache, paired::RetainedState},
     chat_template::{ChatMessage, ChatTemplateRenderer},
+    decode::token_ledger::{LedgerError, RetentionAction, TokenLedger},
     engine::{GenerationOutput, StreamingOutput},
     error::EngineError,
     mlx_tuning::MlxRuntimeTuning,
@@ -109,6 +110,10 @@ fn session_decode_mode(
             }
         }
     }
+}
+
+fn session_ledger_error(error: LedgerError) -> EngineError {
+    EngineError::Generation(format!("session token ledger: {error}"))
 }
 
 /// Insert a retained KV cache for `session_id`, enforcing the resident-memory
@@ -3046,6 +3051,10 @@ impl SimpleEngine {
         let prefill_elapsed = prefill_start.elapsed();
         let first_id: u32 = current_token.item();
         let mut generated: Vec<u32> = vec![first_id];
+        let mut token_ledger = TokenLedger::new(prompt_tokens.len());
+        token_ledger
+            .emit_pending(first_id)
+            .map_err(session_ledger_error)?;
 
         let decode_start = std::time::Instant::now();
         // MTP speculative decode for the session path when the model ships a
@@ -3100,6 +3109,9 @@ impl SimpleEngine {
                     .map_err(|_| EngineError::Generation("first token overflow i32".to_owned()))?],
                 &[1, 1],
             );
+            let first_forward = token_ledger
+                .begin_cache_only_forward()
+                .map_err(session_ledger_error)?;
             let (hidden, logits) = if let Some((dflash_state, _)) = drafter_guard.as_ref() {
                 let (hidden, logits, boot_taps) = prepared
                     .model
@@ -3118,6 +3130,9 @@ impl SimpleEngine {
                     .forward_with_hidden(&first_input, None, &mut prepared.cache)
                     .map_err(EngineError::Mlx)?
             };
+            token_ledger
+                .complete_cache_only_forward(first_forward)
+                .map_err(session_ledger_error)?;
             if let Some(prev_hidden) = prefill_hidden
                 .as_ref()
                 .filter(|_| !prepared.actual_prompt_tokens.is_empty())
@@ -3161,9 +3176,12 @@ impl SimpleEngine {
                     break; // pending token dropped, unforwarded — aligned.
                 }
                 if self.eos_token_ids.contains(&confirmed) {
-                    // Pending stop token: emit without forwarding — the stash
-                    // pops it, matching the cache exactly.
+                    // Pending stop token: emit without forwarding. The token
+                    // ledger excludes it from the retained key below.
                     generated.push(confirmed);
+                    token_ledger
+                        .emit_pending(confirmed)
+                        .map_err(session_ledger_error)?;
                     break;
                 }
 
@@ -3197,6 +3215,9 @@ impl SimpleEngine {
                         )?;
                         let wall = round_t0.elapsed().as_secs_f64().max(1e-9);
                         let n = emitted.len();
+                        token_ledger
+                            .extend_forwarded(emitted.iter().copied())
+                            .map_err(session_ledger_error)?;
                         generated.extend_from_slice(&emitted);
                         confirmed = next_pending;
                         // Verify taps of the emitted positions feed the backlog.
@@ -3235,6 +3256,9 @@ impl SimpleEngine {
                     // Reseed after a spec round: flush the pending token (emit),
                     // forward it with hidden+taps, sample the next pending.
                     generated.push(confirmed);
+                    token_ledger
+                        .emit_pending(confirmed)
+                        .map_err(session_ledger_error)?;
                     if self.eos_token_ids.contains(&confirmed) {
                         break;
                     }
@@ -3244,6 +3268,9 @@ impl SimpleEngine {
                         })?],
                         &[1, 1],
                     );
+                    let reseed_forward = token_ledger
+                        .begin_cache_only_forward()
+                        .map_err(session_ledger_error)?;
                     let (reseed_hidden, reseed_logits, step_taps) = prepared
                         .model
                         .forward_with_hidden_taps(
@@ -3255,6 +3282,9 @@ impl SimpleEngine {
                                 .map_or::<&[usize], _>(&[], |(d, _)| &d.tap_layers),
                         )
                         .map_err(EngineError::Mlx)?;
+                    token_ledger
+                        .complete_cache_only_forward(reseed_forward)
+                        .map_err(session_ledger_error)?;
                     if drafter_guard.is_some() {
                         Self::append_taps(&mut tap_backlog, &step_taps)
                             .map_err(EngineError::Mlx)?;
@@ -3328,6 +3358,9 @@ impl SimpleEngine {
                 mtp_stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
                 tokens_since_probe = tokens_since_probe
                     .saturating_add(u32::try_from(result.tokens.len()).unwrap_or(0));
+                token_ledger
+                    .extend_forwarded(result.tokens.iter().copied())
+                    .map_err(session_ledger_error)?;
                 generated.extend_from_slice(&result.tokens);
                 current_hidden = Some(result.hidden);
                 confirmed = result.next_token_id;
@@ -3335,6 +3368,9 @@ impl SimpleEngine {
         } else if !self.eos_token_ids.contains(&first_id) && max_tokens > 1 {
             let mut cur = current_token;
             while u32::try_from(generated.len()).unwrap_or(u32::MAX) < max_tokens {
+                let forwarded = token_ledger
+                    .begin_cache_only_forward()
+                    .map_err(session_ledger_error)?;
                 let (next, _) = Self::decode_step(
                     &cur,
                     &mut prepared.model,
@@ -3344,8 +3380,14 @@ impl SimpleEngine {
                     None,
                     None,
                 )?;
+                token_ledger
+                    .complete_cache_only_forward(forwarded)
+                    .map_err(session_ledger_error)?;
                 let next_id: u32 = next.item();
                 generated.push(next_id);
+                token_ledger
+                    .emit_pending(next_id)
+                    .map_err(session_ledger_error)?;
                 if self.eos_token_ids.contains(&next_id) {
                     break;
                 }
@@ -3364,6 +3406,41 @@ impl SimpleEngine {
                 "session MTP decode"
             );
         }
+
+        match token_ledger.retention_action(&self.eos_token_ids) {
+            RetentionAction::Ready { .. } => {}
+            RetentionAction::ExcludeEos { .. } => {
+                token_ledger
+                    .exclude_pending_eos(&self.eos_token_ids)
+                    .map_err(session_ledger_error)?;
+            }
+            RetentionAction::CacheOnlyForward { token } => {
+                let ticket = token_ledger
+                    .begin_cache_only_forward()
+                    .map_err(session_ledger_error)?;
+                let token = i32::try_from(token).map_err(|_| {
+                    EngineError::Generation("retained pending token overflow i32".to_owned())
+                })?;
+                let input = Array::from_slice(&[token], &[1, 1]);
+                let _ = prepared
+                    .model
+                    .forward(&input, None, &mut prepared.cache)
+                    .map_err(EngineError::Mlx)?;
+                token_ledger
+                    .complete_cache_only_forward(ticket)
+                    .map_err(session_ledger_error)?;
+            }
+            RetentionAction::ForwardInFlight { token } => {
+                return Err(EngineError::Generation(format!(
+                    "session token {token} still has a cache-only forward in flight"
+                )));
+            }
+        }
+        debug_assert_eq!(token_ledger.emitted_tokens(), generated);
+        let retained_generated = token_ledger
+            .retainable_tokens()
+            .map_err(session_ledger_error)?
+            .to_vec();
 
         // Retain the live cache + the exact tokens it now holds (prompt +
         // generated) so the next hop continues from here.
@@ -3398,10 +3475,34 @@ impl SimpleEngine {
         // and GPU dequant work is in flight). Exactness was already
         // best-effort on this path.
         let cap = self.kv_cache_config.max_session_tokens;
-        let total_turn_tokens = prompt_tokens.len().saturating_add(generated.len());
+        let total_turn_tokens = prompt_tokens.len().saturating_add(retained_generated.len());
+        let boundary_valid = i32::try_from(total_turn_tokens).map_or_else(
+            |_| {
+                tracing::warn!(
+                    session_id,
+                    retained_tokens = total_turn_tokens,
+                    "Retained session boundary exceeds i32; dropping session retention"
+                );
+                false
+            },
+            |expected| {
+                cache.validate_absolute_boundary(expected).map_or_else(
+                    |error| {
+                        tracing::warn!(
+                            session_id,
+                            error = %error,
+                            expected,
+                            "Retained target cache is misaligned; dropping session retention"
+                        );
+                        false
+                    },
+                    |()| true,
+                )
+            },
+        );
         let over_dense_cap = cap > 0 && total_turn_tokens > cap;
         let mut cap_exempt = false;
-        if self.kv_cache_config.is_turboquant() || over_dense_cap {
+        if boundary_valid && (self.kv_cache_config.is_turboquant() || over_dense_cap) {
             match cache.quantize_for_retention(self.kv_cache_config) {
                 Ok(layers) if layers > 0 => {
                     cap_exempt = over_dense_cap;
@@ -3421,30 +3522,32 @@ impl SimpleEngine {
                 ),
             }
         }
-        if let Err(e) = cache.eval() {
-            tracing::warn!(session_id, error = %e, "Failed to eval retained cache before stash");
-        }
+        let retention_evaluated = boundary_valid
+            && match cache.eval() {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %e,
+                        "Failed to eval retained cache; dropping session retention"
+                    );
+                    false
+                }
+            };
         let retain_elapsed = retain_start.elapsed();
         // Release model lock and MLX gate together, only after the last eval.
         drop(model);
         drop(mlx_gate);
         let mut full = prompt_tokens.to_vec();
-        full.extend_from_slice(&generated);
-        // The predicted stop token has no KV in the cache — it was the final
-        // prediction and was never fed back through `decode_step` — and it is not
-        // part of the conversation. Drop it so the retained tokens align 1:1 with
-        // the cache and end at the turn boundary; a continuation then resumes with
-        // the next turn's framing instead of after a mid-sequence EOS (which never
-        // matches the freshly-rendered conversation, forcing a full re-prefill).
-        if full.last().is_some_and(|t| self.eos_token_ids.contains(t)) {
-            full.pop();
+        full.extend_from_slice(&retained_generated);
+        if retention_evaluated {
+            self.stash_retained(
+                session_id,
+                RetainedState::TargetOnly(cache),
+                full,
+                cap_exempt,
+            );
         }
-        self.stash_retained(
-            session_id,
-            RetainedState::TargetOnly(cache),
-            full,
-            cap_exempt,
-        );
         let total_elapsed = total_start.elapsed();
 
         #[allow(clippy::print_stderr)] // env-gated diagnostic
