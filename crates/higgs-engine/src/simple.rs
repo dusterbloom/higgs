@@ -25,7 +25,10 @@ use mlx_rs::{
 use tokenizers::Tokenizer;
 
 use crate::{
-    cache::{DiskPrefixCache, DiskPrefixCacheConfig, PagedKvCache, paired::RetainedState},
+    cache::{
+        DiskPrefixCache, DiskPrefixCacheConfig, PagedKvCache,
+        paired::{DflashSealDemotion, DflashSealEligibility, DflashTapFrontier, RetainedState},
+    },
     chat_template::{ChatMessage, ChatTemplateRenderer},
     decode::token_ledger::{LedgerError, RetentionAction, SpeculativeTicket, TokenLedger},
     engine::{GenerationOutput, StreamingOutput},
@@ -820,66 +823,6 @@ enum DFlashVerifyRound {
     },
 }
 
-/// Move-only target taps spanning one exact drafter-to-target boundary gap.
-///
-/// `draft_boundary` is already represented by the live drafter cache;
-/// `target_boundary` is already represented by target KV. The arrays cover
-/// exactly the intervening target rows and may be consumed only by the next
-/// drafter round, a cache-only extension, or final sealing.
-#[derive(Debug)]
-struct DflashTapFrontier {
-    draft_boundary: i32,
-    target_boundary: i32,
-    taps: Vec<Array>,
-    expected_taps: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum DflashSealDemotion {
-    MissingOrUnsupportedTaps {
-        rows: i32,
-        collected: usize,
-        required: usize,
-    },
-    DraftBoundaryMismatch {
-        expected: i32,
-        actual: i32,
-    },
-    TargetBoundaryMismatch {
-        expected: i32,
-        actual: i32,
-    },
-}
-
-#[derive(Debug)]
-struct DflashSealInput {
-    draft_cache: DFlashCache,
-    taps: Vec<Array>,
-    expected_target_boundary: i32,
-}
-
-#[derive(Debug)]
-enum DflashSealEligibility {
-    Eligible(DflashSealInput),
-    Ineligible {
-        expected_target_boundary: i32,
-        reason: DflashSealDemotion,
-    },
-}
-
-impl DflashSealEligibility {
-    #[must_use]
-    const fn expected_target_boundary(&self) -> i32 {
-        match self {
-            Self::Eligible(input) => input.expected_target_boundary,
-            Self::Ineligible {
-                expected_target_boundary,
-                ..
-            } => *expected_target_boundary,
-        }
-    }
-}
-
 /// Target state that has independently proved its exact absolute boundary and
 /// completed all lazy MLX work needed for cross-turn publication.
 ///
@@ -976,164 +919,6 @@ where
                 .map_err(|error| SessionDsparkRetentionError::PairPublication(error.to_string()))?;
             Ok(SessionDsparkRetention::Paired(state))
         }
-    }
-}
-
-impl DflashTapFrontier {
-    fn validate_parts(
-        draft_boundary: i32,
-        target_boundary: i32,
-        taps: &[Array],
-        expected_taps: usize,
-    ) -> Result<(), EngineError> {
-        if draft_boundary < 0 || target_boundary < draft_boundary {
-            return Err(EngineError::Generation(format!(
-                "invalid dSpark tap frontier: draft={draft_boundary} target={target_boundary}"
-            )));
-        }
-        let rows = target_boundary
-            .checked_sub(draft_boundary)
-            .ok_or_else(|| EngineError::Generation("dSpark tap frontier overflow".to_owned()))?;
-        if rows == 0 {
-            if !taps.is_empty() {
-                return Err(EngineError::Generation(format!(
-                    "empty dSpark tap frontier carries {} arrays",
-                    taps.len()
-                )));
-            }
-        } else {
-            if taps.len() != expected_taps {
-                return Err(EngineError::Generation(format!(
-                    "dSpark tap frontier has {} layers for {expected_taps} configured taps",
-                    taps.len()
-                )));
-            }
-            for (index, tap) in taps.iter().enumerate() {
-                let shape = tap.shape();
-                if shape.len() != 3 || shape[0] <= 0 || shape[1] != rows || shape[2] <= 0 {
-                    return Err(EngineError::Generation(format!(
-                        "dSpark tap frontier layer {index} must be [B, {rows}, H], got {shape:?}"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn new(
-        draft_boundary: i32,
-        target_boundary: i32,
-        taps: Vec<Array>,
-        expected_taps: usize,
-    ) -> Result<Self, EngineError> {
-        Self::validate_parts(draft_boundary, target_boundary, &taps, expected_taps)?;
-        Ok(Self {
-            draft_boundary,
-            target_boundary,
-            taps,
-            expected_taps,
-        })
-    }
-
-    #[must_use]
-    const fn target_boundary(&self) -> i32 {
-        self.target_boundary
-    }
-
-    fn rows(&self) -> Result<i32, EngineError> {
-        self.target_boundary
-            .checked_sub(self.draft_boundary)
-            .ok_or_else(|| EngineError::Generation("dSpark tap frontier overflow".to_owned()))
-    }
-
-    fn validate_live_draft(&self, draft_cache: &DFlashCache) -> Result<(), EngineError> {
-        let actual = draft_cache.position();
-        if actual != self.draft_boundary {
-            return Err(EngineError::Generation(format!(
-                "dSpark tap frontier starts at {0}, but live drafter is at {actual}",
-                self.draft_boundary
-            )));
-        }
-        Ok(())
-    }
-
-    fn append(self, next_target_boundary: i32, next_taps: Vec<Array>) -> Result<Self, EngineError> {
-        let next = Self::new(
-            self.target_boundary,
-            next_target_boundary,
-            next_taps,
-            self.expected_taps,
-        )?;
-        if next.taps.is_empty() {
-            return Ok(self);
-        }
-        if self.taps.is_empty() {
-            return Self::new(
-                self.draft_boundary,
-                next.target_boundary,
-                next.taps,
-                self.expected_taps,
-            );
-        }
-        let taps = self
-            .taps
-            .into_iter()
-            .zip(next.taps)
-            .map(|(current, added)| {
-                mlx_rs::ops::concatenate_axis(&[&current, &added], 1).map_err(EngineError::Mlx)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::new(
-            self.draft_boundary,
-            next.target_boundary,
-            taps,
-            self.expected_taps,
-        )
-    }
-
-    fn into_seal_eligibility(
-        self,
-        draft_cache: DFlashCache,
-        expected_target_boundary: i32,
-        required_seal_taps: usize,
-    ) -> DflashSealEligibility {
-        let actual_draft_boundary = draft_cache.position();
-        if actual_draft_boundary != self.draft_boundary {
-            return DflashSealEligibility::Ineligible {
-                expected_target_boundary,
-                reason: DflashSealDemotion::DraftBoundaryMismatch {
-                    expected: self.draft_boundary,
-                    actual: actual_draft_boundary,
-                },
-            };
-        }
-        if self.target_boundary != expected_target_boundary {
-            return DflashSealEligibility::Ineligible {
-                expected_target_boundary,
-                reason: DflashSealDemotion::TargetBoundaryMismatch {
-                    expected: expected_target_boundary,
-                    actual: self.target_boundary,
-                },
-            };
-        }
-        let rows = self.target_boundary - self.draft_boundary;
-        if rows > 0
-            && (self.expected_taps != required_seal_taps || self.taps.len() != required_seal_taps)
-        {
-            return DflashSealEligibility::Ineligible {
-                expected_target_boundary,
-                reason: DflashSealDemotion::MissingOrUnsupportedTaps {
-                    rows,
-                    collected: self.taps.len(),
-                    required: required_seal_taps,
-                },
-            };
-        }
-        DflashSealEligibility::Eligible(DflashSealInput {
-            draft_cache,
-            taps: self.taps,
-            expected_target_boundary,
-        })
     }
 }
 
