@@ -73,8 +73,9 @@ pub struct KvCacheConfig {
     /// next turn then full-prefills. Default 0.
     #[serde(default)]
     pub max_session_tokens: usize,
-    /// Evict a retained KV cache idle longer than this many seconds (`0` =
-    /// never). Frees memory from abandoned conversations. Default 1800 (30 min).
+    /// Evict retained session KV and memory-only paired target+dSpark radix
+    /// endpoints idle longer than this many seconds (`0` = never). Frees memory
+    /// from abandoned conversations. Default 1800 (30 min).
     #[serde(default = "default_retained_idle_secs")]
     pub retained_idle_secs: u64,
 }

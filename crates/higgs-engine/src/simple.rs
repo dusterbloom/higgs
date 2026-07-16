@@ -27,7 +27,9 @@ use tokenizers::Tokenizer;
 use crate::{
     cache::{
         DiskPrefixCache, DiskPrefixCacheConfig, PagedKvCache,
-        paired::{DflashTapFrontier, LivePair, PairedCacheError, RetainedState},
+        paired::{
+            DflashTapFrontier, LivePair, LivePairDecodeLease, PairedCacheError, RetainedState,
+        },
     },
     chat_template::{ChatMessage, ChatTemplateRenderer},
     decode::token_ledger::{LedgerError, RetentionAction, SpeculativeTicket, TokenLedger},
@@ -859,6 +861,151 @@ struct CanonicalCommittedRound {
     draft_matches: usize,
 }
 
+/// Correct-by-construction retained-session decode ownership.
+///
+/// The live pair lease and its pair-bound token ledger move together through
+/// every speculative round and the final cache-only transition. Response
+/// tokens are read from the ledger rather than mirrored in a second mutable
+/// vector, so the publication boundary has exactly one authority.
+struct SessionDsparkDecodeState {
+    lease: LivePairDecodeLease,
+    ledger: TokenLedger,
+}
+
+impl SessionDsparkDecodeState {
+    fn begin(pair: LivePair, first_token: u32) -> Result<Self, EngineError> {
+        let (lease, pair_key) = pair.begin_decode().map_err(session_pair_error)?;
+        let mut ledger = TokenLedger::new_paired(pair_key);
+        ledger
+            .emit_pending(first_token)
+            .map_err(session_ledger_error)?;
+        Ok(Self { lease, ledger })
+    }
+
+    #[must_use]
+    fn tokens(&self) -> &[u32] {
+        self.ledger.emitted_tokens()
+    }
+
+    #[must_use]
+    fn len(&self) -> usize {
+        self.tokens().len()
+    }
+
+    #[must_use]
+    fn pending_token(&self) -> Option<u32> {
+        self.ledger.pending_token()
+    }
+
+    /// Advance one canonical target-authoritative round.
+    ///
+    /// The model transition runs inside the move-only pair lease. Only after the
+    /// lease validates the replacement frontier may the canonical commit update
+    /// the token ledger.
+    fn run_round<F>(self, advance: F) -> Result<(Self, CanonicalCommittedPayload), EngineError>
+    where
+        F: FnOnce(
+            &mut AnyCache,
+            &mut DFlashCache,
+            DflashTapFrontier,
+            SpeculativeTicket,
+            &[u32],
+        ) -> Result<(DflashTapFrontier, CanonicalDflashCommit), EngineError>,
+    {
+        let Self { lease, mut ledger } = self;
+        let pending_anchor = ledger.pending_token().ok_or_else(|| {
+            EngineError::Generation("session DFlash ledger lost its pending token".to_owned())
+        })?;
+        if ledger.emitted_tokens().last().copied() != Some(pending_anchor) {
+            return Err(EngineError::Generation(
+                "session DFlash output tail does not match its pending ledger anchor".to_owned(),
+            ));
+        }
+        let history_end = ledger
+            .emitted_tokens()
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| {
+                EngineError::Generation("session DFlash ledger has no pending anchor".to_owned())
+            })?;
+        let anchor_ticket = ledger
+            .begin_speculative_round()
+            .map_err(session_ledger_error)?;
+        let history_before_anchor =
+            ledger.emitted_tokens().get(..history_end).ok_or_else(|| {
+                EngineError::Generation(
+                    "session DFlash history boundary exceeds emitted tokens".to_owned(),
+                )
+            })?;
+        let (lease, commit) = lease
+            .run(|target_cache, draft_cache, tap_frontier| {
+                advance(
+                    target_cache,
+                    draft_cache,
+                    tap_frontier,
+                    anchor_ticket,
+                    history_before_anchor,
+                )
+            })
+            .map_err(session_pair_error)?;
+        let committed = commit.commit_ledger(&mut ledger)?;
+        Ok((Self { lease, ledger }, committed))
+    }
+
+    /// Align the response-visible tail, reunite the exact pair-bound ledger
+    /// proof with its lease, and return the sole publishable live pair.
+    fn finish<F>(
+        self,
+        eos_token_ids: &[u32],
+        cache_only_forward: F,
+    ) -> Result<(LivePair, Vec<u32>), EngineError>
+    where
+        F: FnOnce(
+            &mut AnyCache,
+            &mut DFlashCache,
+            DflashTapFrontier,
+            u32,
+        ) -> Result<DflashTapFrontier, EngineError>,
+    {
+        let Self { lease, mut ledger } = self;
+        let lease = match ledger.retention_action(eos_token_ids) {
+            RetentionAction::Ready { .. } => lease,
+            RetentionAction::ExcludeEos { .. } => {
+                ledger
+                    .exclude_pending_eos(eos_token_ids)
+                    .map_err(session_ledger_error)?;
+                lease
+            }
+            RetentionAction::CacheOnlyForward { token } => {
+                let ticket = ledger
+                    .begin_cache_only_forward()
+                    .map_err(session_ledger_error)?;
+                let (lease, ()) = lease
+                    .run(|target_cache, draft_cache, tap_frontier| {
+                        let next_frontier =
+                            cache_only_forward(target_cache, draft_cache, tap_frontier, token)?;
+                        Ok::<_, EngineError>((next_frontier, ()))
+                    })
+                    .map_err(session_pair_error)?;
+                ledger
+                    .complete_cache_only_forward(ticket)
+                    .map_err(session_ledger_error)?;
+                lease
+            }
+            RetentionAction::ForwardInFlight { token } => {
+                return Err(EngineError::Generation(format!(
+                    "session token {token} still has a cache-only forward in flight"
+                )));
+            }
+        };
+
+        let visible_tokens = ledger.emitted_tokens().to_vec();
+        let proof = ledger.into_paired_proof().map_err(session_ledger_error)?;
+        let pair = lease.finish(proof).map_err(session_pair_error)?;
+        Ok((pair, visible_tokens))
+    }
+}
+
 impl CanonicalDflashRound {
     /// Replace only the sole successor that remains absent from target KV.
     ///
@@ -931,10 +1078,9 @@ impl CanonicalDflashRound {
 }
 
 impl CanonicalDflashCommit {
-    fn commit_output(
+    fn commit_ledger(
         self,
         ledger: &mut TokenLedger,
-        generated: &mut Vec<u32>,
     ) -> Result<CanonicalCommittedPayload, EngineError> {
         let Self {
             anchor_ticket,
@@ -942,32 +1088,41 @@ impl CanonicalDflashCommit {
             draft_tokens,
             draft_matches,
         } = self;
-        if ledger.emitted_tokens() != generated.as_slice() {
-            return Err(EngineError::Generation(
-                "session dSpark ledger/output sequence diverged before round commit".to_owned(),
-            ));
-        }
         let anchor = anchor_ticket.token();
-        if generated.last().copied() != Some(anchor) {
+        if ledger.emitted_tokens().last().copied() != Some(anchor) {
             return Err(EngineError::Generation(format!(
-                "session dSpark anchor mismatch: ledger={anchor} output={:?}",
-                generated.last()
+                "canonical dSpark anchor mismatch: ledger={anchor} emitted={:?}",
+                ledger.emitted_tokens().last()
             )));
         }
         ledger
             .complete_speculative_round(anchor_ticket, &successors)
             .map_err(session_ledger_error)?;
-        generated.extend_from_slice(&successors);
-        if ledger.emitted_tokens() != generated.as_slice() {
-            return Err(EngineError::Generation(
-                "session dSpark ledger/output sequence diverged after round commit".to_owned(),
-            ));
-        }
         Ok(CanonicalCommittedPayload {
             successors,
             draft_tokens,
             draft_matches,
         })
+    }
+
+    fn commit_output(
+        self,
+        ledger: &mut TokenLedger,
+        generated: &mut Vec<u32>,
+    ) -> Result<CanonicalCommittedPayload, EngineError> {
+        if ledger.emitted_tokens() != generated.as_slice() {
+            return Err(EngineError::Generation(
+                "session dSpark ledger/output sequence diverged before round commit".to_owned(),
+            ));
+        }
+        let committed = self.commit_ledger(ledger)?;
+        generated.extend_from_slice(&committed.successors);
+        if ledger.emitted_tokens() != generated.as_slice() {
+            return Err(EngineError::Generation(
+                "session dSpark ledger/output sequence diverged after round commit".to_owned(),
+            ));
+        }
+        Ok(committed)
     }
 }
 
@@ -1794,7 +1949,7 @@ impl SimpleEngine {
             })
             .transpose()?;
 
-        let prefix_cache = disk_cache_config.map_or_else(
+        let mut prefix_cache = disk_cache_config.map_or_else(
             || DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE),
             |config| match DiskPrefixCache::new(
                 DEFAULT_PREFIX_CACHE_SIZE,
@@ -1812,6 +1967,10 @@ impl SimpleEngine {
                     DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE)
                 }
             },
+        );
+        prefix_cache.set_paired_idle_ttl(
+            (kv_cache_config.retained_idle_secs > 0)
+                .then(|| std::time::Duration::from_secs(kv_cache_config.retained_idle_secs)),
         );
 
         Ok(Self {
@@ -1860,7 +2019,8 @@ impl SimpleEngine {
             (retained.len(), retained_paired_stats(&retained))
         };
         let (radix_entries, paired_radix) = {
-            let prefix_cache = lock_or_recover(&self.prefix_cache);
+            let mut prefix_cache = lock_or_recover(&self.prefix_cache);
+            prefix_cache.evict_idle_paired();
             (prefix_cache.len(), prefix_cache.paired_stats())
         };
         CacheStats {
@@ -2063,6 +2223,17 @@ impl SimpleEngine {
         let seconds = timing.decode.as_secs_f64();
         (timing.decode_tokens > 0 && seconds > 0.0)
             .then(|| f64::from(timing.decode_tokens) / seconds)
+    }
+
+    /// Prefill-phase wall time from the most recent dSpark request.
+    ///
+    /// This narrow observability seam lets real-model release gates distinguish
+    /// saved paired prefill work from steady-state dSpark decode throughput.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_dflash_prefill_seconds(&self) -> Option<f64> {
+        let timing = self.last_dflash_timing.lock().ok()?.as_ref().copied()?;
+        Some(timing.prefill.as_secs_f64())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3944,45 +4115,24 @@ impl SimpleEngine {
         let prefill_elapsed = prefill_start.elapsed();
 
         let first_id: u32 = first_token.item();
-        let mut generated = vec![first_id];
-        let (decode_lease, pair_key) = pair.begin_decode().map_err(session_pair_error)?;
-        let mut decode_lease = Some(decode_lease);
-        let mut token_ledger = TokenLedger::new_paired(pair_key);
-        token_ledger
-            .emit_pending(first_id)
-            .map_err(session_ledger_error)?;
+        let mut decode = SessionDsparkDecodeState::begin(pair, first_id)?;
         let max_tokens = usize::try_from(max_tokens)
             .map_err(|_| EngineError::Generation("max_tokens overflow usize".to_owned()))?;
 
         let decode_start = std::time::Instant::now();
-        while generated.len() < max_tokens {
-            let pending_anchor = token_ledger.pending_token().ok_or_else(|| {
+        while decode.len() < max_tokens {
+            let pending_anchor = decode.pending_token().ok_or_else(|| {
                 EngineError::Generation("session DFlash ledger lost its pending token".to_owned())
             })?;
-            if generated.last().copied() != Some(pending_anchor) {
-                return Err(EngineError::Generation(
-                    "session DFlash output tail does not match its pending ledger anchor"
-                        .to_owned(),
-                ));
-            }
             if self.eos_token_ids.contains(&pending_anchor) {
                 break;
             }
-            let remaining = max_tokens.saturating_sub(generated.len());
+            let remaining = max_tokens.saturating_sub(decode.len());
             if remaining == 0 {
                 break;
             }
-            let history_before_anchor = generated
-                .get(..generated.len().saturating_sub(1))
-                .unwrap_or_default();
-            let anchor_ticket = token_ledger
-                .begin_speculative_round()
-                .map_err(session_ledger_error)?;
-            let lease = decode_lease.take().ok_or_else(|| {
-                EngineError::Generation("session dSpark decode lease is unavailable".to_owned())
-            })?;
-            let (next_lease, commit) = lease
-                .run(|target_cache, draft_cache, tap_frontier| {
+            let (next_decode, committed) = decode.run_round(
+                |target_cache, draft_cache, tap_frontier, anchor_ticket, history_before_anchor| {
                     let round = self.canonical_dflash_round(
                         &mut model,
                         target_cache,
@@ -3999,10 +4149,9 @@ impl SimpleEngine {
                         dflash,
                     )?;
                     round.into_lease_parts()
-                })
-                .map_err(session_pair_error)?;
-            let committed = commit.commit_output(&mut token_ledger, &mut generated)?;
-            decode_lease = Some(next_lease);
+                },
+            )?;
+            decode = next_decode;
 
             if let Ok(mut values) = self.last_dflash_accepts.lock() {
                 values.push(u32::try_from(committed.successors.len()).unwrap_or(0));
@@ -4021,65 +4170,29 @@ impl SimpleEngine {
         // but is intentionally absent from the retained key; a non-EOS length
         // tail receives one target-only forward whose taps are consumed while
         // sealing the drafter snapshot.
-        match token_ledger.retention_action(&self.eos_token_ids) {
-            RetentionAction::Ready { .. } => {}
-            RetentionAction::ExcludeEos { .. } => {
-                token_ledger
-                    .exclude_pending_eos(&self.eos_token_ids)
-                    .map_err(session_ledger_error)?;
-            }
-            RetentionAction::CacheOnlyForward { token } => {
-                let ticket = token_ledger
-                    .begin_cache_only_forward()
-                    .map_err(session_ledger_error)?;
+        let (mut pair, generated) = decode.finish(
+            &self.eos_token_ids,
+            |target_cache, _draft_cache, tap_frontier, token| {
                 let input_token = i32::try_from(token).map_err(|_| {
                     EngineError::Generation("session DFlash retained token overflow i32".to_owned())
                 })?;
-                let lease = decode_lease.take().ok_or_else(|| {
-                    EngineError::Generation("session dSpark decode lease is unavailable".to_owned())
-                })?;
-                let (next_lease, ()) = lease
-                    .run(|target_cache, _draft_cache, tap_frontier| {
-                        let input = Array::from_slice(&[input_token], &[1, 1]);
-                        let (_hidden, taps) = model
-                            .forward_raw_with_taps(&input, None, target_cache, &dflash.tap_layers)
-                            .map_err(EngineError::Mlx)?;
-                        let next_target_boundary = tap_frontier
-                            .target_boundary()
-                            .checked_add(1)
-                            .ok_or_else(|| {
-                                EngineError::Generation(
-                                    "session target boundary overflow".to_owned(),
-                                )
-                            })?;
-                        let next_frontier = tap_frontier.append(next_target_boundary, taps)?;
-                        Ok::<_, EngineError>((next_frontier, ()))
-                    })
-                    .map_err(session_pair_error)?;
-                token_ledger
-                    .complete_cache_only_forward(ticket)
-                    .map_err(session_ledger_error)?;
-                decode_lease = Some(next_lease);
-            }
-            RetentionAction::ForwardInFlight { token } => {
-                return Err(EngineError::Generation(format!(
-                    "session token {token} still has a cache-only forward in flight"
-                )));
-            }
-        }
-
-        debug_assert_eq!(token_ledger.emitted_tokens(), generated);
-        let proof = token_ledger
-            .into_paired_proof()
-            .map_err(session_ledger_error)?;
-        let lease = decode_lease.take().ok_or_else(|| {
-            EngineError::Generation("session dSpark decode lease is unavailable".to_owned())
-        })?;
-        let mut pair = lease.finish(proof).map_err(session_pair_error)?;
-        let expected_boundary = pair.token_len();
+                let input = Array::from_slice(&[input_token], &[1, 1]);
+                let (_hidden, taps) = model
+                    .forward_raw_with_taps(&input, None, target_cache, &dflash.tap_layers)
+                    .map_err(EngineError::Mlx)?;
+                let next_target_boundary = tap_frontier
+                    .target_boundary()
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        EngineError::Generation("session target boundary overflow".to_owned())
+                    })?;
+                tap_frontier.append(next_target_boundary, taps)
+            },
+        )?;
+        let retained_boundary = pair.token_len();
 
         let cap = self.kv_cache_config.max_session_tokens;
-        let over_dense_cap = cap > 0 && expected_boundary > cap;
+        let over_dense_cap = cap > 0 && retained_boundary > cap;
         let mut cap_exempt = false;
         if self.kv_cache_config.is_turboquant() || over_dense_cap {
             match pair.quantize_target_for_retention(self.kv_cache_config, &mlx_gate) {
@@ -4107,7 +4220,7 @@ impl SimpleEngine {
                     tracing::warn!(
                         session_id,
                         ?reason,
-                        expected = expected_boundary,
+                        expected = retained_boundary,
                         "dSpark retention is ineligible; publishing validated target only"
                     );
                 }
@@ -4117,7 +4230,7 @@ impl SimpleEngine {
                 tracing::warn!(
                     session_id,
                     error = %error,
-                    expected = expected_boundary,
+                    expected = retained_boundary,
                     "Failed to retain exact session dSpark state; publishing nothing"
                 );
                 None
@@ -5657,8 +5770,7 @@ impl SimpleEngine {
         // Keeping the mutex guard local to this helper makes it structurally
         // impossible for dflash_decode to retain the prefix lock while it
         // later acquires the model lock or process-wide MLX gate.
-        let prefix_cache = lock_or_recover(&self.prefix_cache);
-        let publication_ticket = prefix_cache.paired_prepare_ticket();
+        let mut prefix_cache = lock_or_recover(&self.prefix_cache);
         let lookup = match prefix_cache.plan_memory_paired_prefix(partition.body()) {
             Ok(plan) => plan,
             Err(error) => {
@@ -5669,6 +5781,7 @@ impl SimpleEngine {
                 None
             }
         };
+        let publication_ticket = prefix_cache.paired_prepare_ticket();
         DflashPairedPrefixPlan {
             lookup,
             publication_ticket,
@@ -8724,14 +8837,14 @@ impl SimpleEngine {
 mod tests {
     use super::{
         CanonicalDflashRound, DFlashVerifyMode, DFlashVerifyRound, DflashPromptPartition,
-        DflashTapFrontier, EngineError, GenerationPromptSuffixes, IncrementalDetok,
-        SessionGeneration, SimpleEngine, SpeculationRoute, Tokenizer, adaptive_draft_depth_for_cap,
-        check_stop_sequences, continuation_prior_len, derive_model_name, detect_thinking_support,
-        dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
-        dflash_resolve_target_then_draft, dflash_tail_draft_cap, estimate_paged_kv_blocks,
-        extract_eos_tokens, find_stop_in_tail, lock_or_recover, paired_dflash_exact_domain,
-        parse_enabled_flag, resolve_speculation_route, stateless_mtp_family_eligible,
-        with_chat_terminator,
+        DflashTapFrontier, EngineError, GenerationPromptSuffixes, IncrementalDetok, LivePair,
+        SessionDsparkDecodeState, SessionGeneration, SimpleEngine, SpeculationRoute, Tokenizer,
+        adaptive_draft_depth_for_cap, check_stop_sequences, continuation_prior_len,
+        derive_model_name, detect_thinking_support, dflash_canonical_target_is_terminal,
+        dflash_new_stop_prefix_len, dflash_resolve_target_then_draft, dflash_tail_draft_cap,
+        estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail, lock_or_recover,
+        paired_dflash_exact_domain, parse_enabled_flag, resolve_speculation_route,
+        stateless_mtp_family_eligible, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
@@ -8762,8 +8875,7 @@ mod tests {
         cache
     }
 
-    fn paired_retained_state(boundary: i32) -> crate::cache::paired::RetainedState {
-        let target = validated_session_target(boundary);
+    fn session_test_drafter() -> DFlashDrafter {
         let config: DFlashConfig = serde_json::from_str(
             r#"{
                 "hidden_size": 4,
@@ -8779,7 +8891,12 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let mut drafter = DFlashDrafter::new(config).unwrap();
+        DFlashDrafter::new(config).unwrap()
+    }
+
+    fn paired_retained_state(boundary: i32) -> crate::cache::paired::RetainedState {
+        let target = validated_session_target(boundary);
+        let mut drafter = session_test_drafter();
         let cache = drafter.make_cache();
         let taps = (boundary > 0)
             .then(|| Array::zeros::<f32>(&[1, boundary, 4]).unwrap())
@@ -8802,6 +8919,33 @@ mod tests {
             bool,
         ) -> Result<SessionGeneration, EngineError> =
             SimpleEngine::generate_continued_with_thinking;
+    }
+
+    #[test]
+    fn session_dspark_decode_state_keeps_visible_eos_out_of_the_pair_boundary() {
+        let drafter = session_test_drafter();
+        let pair = LivePair::cold(validated_session_target(0), drafter.make_cache(), 1).unwrap();
+        let decode = SessionDsparkDecodeState::begin(pair, 99).unwrap();
+
+        assert_eq!(decode.tokens(), [99]);
+        assert_eq!(decode.pending_token(), Some(99));
+        let (pair, visible) = decode
+            .finish(
+                &[99],
+                |_target, _draft, _frontier, _token| -> Result<_, EngineError> {
+                    Err(EngineError::Generation(
+                        "EOS must not enter the cache-only forward".to_owned(),
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(visible, [99]);
+        assert_eq!(
+            pair.token_len(),
+            0,
+            "the visible terminal token must not become publication identity"
+        );
     }
 
     #[test]
@@ -9378,6 +9522,44 @@ mod tests {
     }
 
     #[test]
+    fn paired_session_ttl_evicts_the_whole_pair() {
+        use super::{RetainedKv, evict_idle_from, retained_paired_stats};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let mut retained: HashMap<u64, RetainedKv> = HashMap::new();
+        retained.insert(
+            100,
+            RetainedKv {
+                state: paired_retained_state(1),
+                last_used: Instant::now(),
+            },
+        );
+
+        let before = retained_paired_stats(&retained);
+        assert_eq!(before.entries, 1);
+        assert!(before.target_bytes > 0);
+        assert!(before.dflash_bytes > 0);
+        assert_eq!(
+            evict_idle_from(&mut retained, Duration::from_secs(999)),
+            0,
+            "a fresh retained pair must survive its TTL"
+        );
+
+        assert_eq!(
+            evict_idle_from(&mut retained, Duration::ZERO),
+            1,
+            "TTL expiry must remove the one ownership entry containing both halves"
+        );
+        assert!(retained.is_empty());
+        assert_eq!(
+            retained_paired_stats(&retained),
+            super::RetainedPairedStats::default(),
+            "no target or dSpark byte accounting may survive whole-pair eviction"
+        );
+    }
+
+    #[test]
     fn paired_session_bytes_plateau_at_count_cap_plus_one() {
         use super::{RetainedKv, retained_paired_stats, stash_into};
         use std::collections::HashMap;
@@ -9928,9 +10110,9 @@ mod tests {
         // with a 3% relative tolerance, rather than pinning machine-specific
         // absolute rates. Acceptance uses the Prism-style matched/drafted ratio.
         const REFERENCE_DECODE_SPEEDUP: f64 = 1.435;
-        const MAX_RELATIVE_REGRESSION: f64 = 0.03;
+        const MAX_REFERENCE_TOLERANCE: f64 = 0.03;
         const MIN_ACCEPTANCE_RATE: f64 = 0.87;
-        const MIN_DECODE_SPEEDUP: f64 = REFERENCE_DECODE_SPEEDUP * (1.0 - MAX_RELATIVE_REGRESSION);
+        const MIN_DECODE_SPEEDUP: f64 = REFERENCE_DECODE_SPEEDUP * (1.0 - MAX_REFERENCE_TOLERANCE);
         assert!(
             df_drafted_tokens > 0,
             "the dSpark acceptance gate requires drafted tokens"

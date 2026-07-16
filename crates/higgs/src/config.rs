@@ -449,8 +449,8 @@ pub struct ModelConfig {
     /// (`0` = unlimited). Bounds a single conversation's resident KV.
     #[serde(default)]
     pub kv_max_session_tokens: usize,
-    /// Evict a retained KV cache idle longer than this many seconds
-    /// (`0` = never).
+    /// Evict retained session KV and memory-only paired target+dSpark radix
+    /// endpoints idle longer than this many seconds (`0` = never).
     #[serde(default = "default_kv_retained_idle_secs")]
     pub kv_retained_idle_secs: u64,
 }

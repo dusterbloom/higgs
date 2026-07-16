@@ -2160,6 +2160,11 @@ mod tests {
         let resumed = sealed.resume(&tokens, 1).unwrap();
 
         assert_eq!(resumed.tokens, tokens);
+        assert_eq!(
+            resumed.dflash.cache.position(),
+            i32::try_from(resumed.tokens.len()).unwrap(),
+            "resumed dSpark state must start at the retained nonzero token boundary"
+        );
         assert_ne!(resumed.epoch, sealed_epoch);
         resumed.validate_stable().unwrap();
     }

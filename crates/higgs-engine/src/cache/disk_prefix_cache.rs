@@ -2,6 +2,7 @@
 //! Disk-backed wrapper around the in-memory paged prefix cache.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use half::f16;
 use higgs_models::AnyCache;
@@ -120,10 +121,22 @@ impl DiskPrefixCache {
     /// dFlash snapshots are deliberately never persisted, so this method must
     /// not fall back to the target-only disk index.
     pub(crate) fn plan_memory_paired_prefix(
-        &self,
+        &mut self,
         tokens: &[u32],
     ) -> Result<Option<PagedPairedLookupPlan>, PairedCacheError> {
         self.memory.plan_longest_paired_prefix(tokens)
+    }
+
+    /// Configure whole-endpoint idle expiry for memory-only target+dSpark
+    /// pairs. Target-only memory and disk snapshots retain their existing
+    /// policies.
+    pub(crate) const fn set_paired_idle_ttl(&mut self, ttl: Option<Duration>) {
+        self.memory.set_paired_idle_ttl(ttl);
+    }
+
+    /// Remove expired memory-only target+dSpark endpoints atomically.
+    pub(crate) fn evict_idle_paired(&mut self) -> usize {
+        self.memory.evict_idle_paired()
     }
 
     #[must_use]
@@ -774,6 +787,34 @@ mod tests {
     }
 
     #[test]
+    fn disk_wrapper_ttl_evicts_only_whole_memory_pairs() {
+        let mut cache = DiskPrefixCache::memory_only(4, 1);
+        let paired = vec![7];
+        let target_only = vec![9];
+        cache
+            .store_paired(&paired, &make_kv_cache(1, 1), dflash_snapshot(1), None)
+            .unwrap();
+        cache.store(&target_only, &make_kv_cache(1, 1), None);
+        cache.set_paired_idle_ttl(Some(Duration::ZERO));
+
+        assert_eq!(cache.evict_idle_paired(), 1);
+        assert_eq!(cache.paired_entry_count(), 0);
+        assert_eq!(cache.paired_stats(), PairedPrefixCacheStats::default());
+        assert!(
+            find_memory_pair(&mut cache, &[7, 99]).is_none(),
+            "TTL must remove the dSpark half"
+        );
+        assert!(
+            cache.find_memory_prefix(&[7, 99]).is_none(),
+            "TTL must remove the paired target half too"
+        );
+        assert!(
+            cache.find_memory_prefix(&[9, 99]).is_some(),
+            "unrelated target-only memory must retain its existing policy"
+        );
+    }
+
+    #[test]
     fn paired_state_is_memory_only_while_ordinary_target_store_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
@@ -807,6 +848,54 @@ mod tests {
         assert!(
             find_memory_pair(&mut reader, &query).is_none(),
             "loading target state from disk must remain explicitly target-only"
+        );
+    }
+
+    #[test]
+    fn deeper_disk_target_never_replaces_or_combines_with_shorter_memory_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskPrefixCacheConfig {
+            disk_path: dir.path().join("prefix.bin"),
+            max_disk_blocks: 16,
+            min_tokens_to_persist: 1,
+        };
+        let paired_tokens = vec![7];
+        let disk_tokens = vec![7, 8];
+        let disk_target = make_kv_cache_with_value(1, 2, 2.0);
+
+        let mut writer = DiskPrefixCache::new(8, 1, config.clone(), 2, 4).unwrap();
+        writer.store(&disk_tokens, &disk_target, Some("deeper-target"));
+        drop(writer);
+
+        let paired_target = make_kv_cache_with_value(1, 1, 7.0);
+        let mut reader = DiskPrefixCache::new(8, 1, config, 2, 4).unwrap();
+        reader
+            .store_paired(&paired_tokens, &paired_target, dflash_snapshot(1), None)
+            .unwrap();
+        let paired_before = reader.paired_stats();
+        let query = vec![7, 8, 9];
+
+        let paired = find_memory_pair(&mut reader, &query)
+            .expect("paired lookup must select the exact in-memory capability");
+        assert_eq!(paired.prefix_len, 1);
+        assert!(kv_cache_has_value(&paired.cache, 7.0));
+        assert_eq!(paired.dflash_cache.position(), 1);
+
+        let target = reader
+            .find_longest_prefix(&query, Some("deeper-target"))
+            .expect("ordinary target lookup may select the deeper disk snapshot");
+        assert_eq!(target.prefix_len, 2);
+        assert!(kv_cache_has_value(&target.cache, 2.0));
+
+        let paired_after = find_memory_pair(&mut reader, &query)
+            .expect("loading a deeper target-only disk endpoint must preserve the shorter pair");
+        assert_eq!(paired_after.prefix_len, 1);
+        assert!(kv_cache_has_value(&paired_after.cache, 7.0));
+        assert_eq!(paired_after.dflash_cache.position(), 1);
+        assert_eq!(
+            reader.paired_stats(),
+            paired_before,
+            "a deeper disk refresh must not mutate paired endpoint accounting"
         );
     }
 

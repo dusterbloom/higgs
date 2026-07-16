@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis1, slice_axis2};
 #[cfg(test)]
@@ -229,6 +230,7 @@ struct CachedState {
     endpoint: CachedEndpoint,
     entry_id: u64,
     last_accessed: Cell<u64>,
+    last_accessed_at: Cell<Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +548,7 @@ pub struct PagedPrefixCache {
     revision: CachePublicationRevision,
     next_entry_id: u64,
     access_clock: u64,
+    paired_idle_ttl: Option<Duration>,
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +571,7 @@ impl RadixNode {
         endpoint: CachedEndpoint,
         entry_id: u64,
         last_accessed: u64,
+        last_accessed_at: Instant,
     ) -> Self {
         Self {
             edge,
@@ -576,6 +580,7 @@ impl RadixNode {
                 endpoint,
                 entry_id,
                 last_accessed: Cell::new(last_accessed),
+                last_accessed_at: Cell::new(last_accessed_at),
             }),
             children: HashMap::new(),
         }
@@ -882,17 +887,43 @@ impl RadixNode {
         child.has_exact_paired_endpoint(remaining)
     }
 
-    fn touch_entry(&self, entry_id: u64, access: u64, paired_only: bool) -> bool {
+    fn touch_entry(
+        &self,
+        entry_id: u64,
+        access: u64,
+        accessed_at: Instant,
+        paired_only: bool,
+    ) -> bool {
         if let Some(cached) = self.cached.as_ref().filter(|cached| {
             cached.entry_id == entry_id && (!paired_only || cached.endpoint.is_paired())
         }) {
             cached.last_accessed.set(access);
+            cached.last_accessed_at.set(accessed_at);
             return true;
         }
 
         self.children
             .values()
-            .any(|child| child.touch_entry(entry_id, access, paired_only))
+            .any(|child| child.touch_entry(entry_id, access, accessed_at, paired_only))
+    }
+
+    /// Remove paired endpoints last touched at or before `cutoff`.
+    ///
+    /// The endpoint owns both target and dSpark capabilities, so taking the
+    /// single `CachedState` is the atomic eviction operation. Target-only
+    /// endpoints and shared path blocks needed by surviving descendants remain.
+    fn remove_expired_paired(&mut self, cutoff: Instant) -> usize {
+        let mut removed = 0;
+        if self.cached.as_ref().is_some_and(|cached| {
+            cached.endpoint.is_paired() && cached.last_accessed_at.get() <= cutoff
+        }) {
+            self.cached = None;
+            removed += 1;
+        }
+        for child in self.children.values_mut() {
+            removed += child.remove_expired_paired(cutoff);
+        }
+        removed
     }
 
     fn accumulate_paired_stats(&self, stats: &mut PairedPrefixCacheStats) {
@@ -1025,6 +1056,7 @@ struct Ctx {
     context: Option<Arc<TurboQuantContext>>,
     entry_id: u64,
     last_accessed: u64,
+    last_accessed_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1149,7 +1181,17 @@ impl PagedPrefixCache {
             revision: CachePublicationRevision(0),
             next_entry_id: 1,
             access_clock: 1,
+            paired_idle_ttl: None,
         }
+    }
+
+    /// Apply one idle TTL to paired target+dSpark radix endpoints.
+    ///
+    /// `None` disables expiry. The target-only radix remains governed by its
+    /// existing entry cap; the TTL is intentionally scoped to the larger paired
+    /// capability whose dSpark full-attention state grows with context.
+    pub(crate) const fn set_paired_idle_ttl(&mut self, ttl: Option<Duration>) {
+        self.paired_idle_ttl = ttl;
     }
 
     #[must_use]
@@ -1168,6 +1210,7 @@ impl PagedPrefixCache {
     /// block. On hit, blocks along the matched path are gathered into a
     /// contiguous `AnyCache`.
     pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<PagedPrefixMatch> {
+        self.evict_idle_paired();
         let (prefix_len, entry_id, result) = {
             let mut scratch: Vec<&EdgeBlocks> = Vec::new();
             let matched = self.root.find_deepest_match(
@@ -1185,7 +1228,9 @@ impl PagedPrefixCache {
                 tracing::debug!(prefix_len, "Prefix cache hit");
                 if let Some(entry_id) = entry_id {
                     let access = self.next_access();
-                    let _ = self.root.touch_entry(entry_id, access, false);
+                    let _ = self
+                        .root
+                        .touch_entry(entry_id, access, Instant::now(), false);
                 }
                 Some(PagedPrefixMatch { prefix_len, cache })
             }
@@ -1203,13 +1248,14 @@ impl PagedPrefixCache {
     /// owns immutable handles for the target endpoint and the exact dFlash
     /// sidecar selected under the same lock. Selection does not refresh LRU.
     pub(crate) fn plan_longest_paired_prefix(
-        &self,
+        &mut self,
         tokens: &[u32],
     ) -> Result<Option<PagedPairedLookupPlan>, PairedCacheError> {
         debug_assert!(
             !higgs_models::mlx_exec::held(),
             "paired prefix selection must happen before acquiring the MLX execution gate"
         );
+        self.evict_idle_paired();
         let mut scratch: Vec<&EdgeBlocks> = Vec::new();
         let Some(matched) = self.root.find_deepest_match(
             tokens,
@@ -1571,6 +1617,7 @@ impl PagedPrefixCache {
             context,
             entry_id,
             last_accessed,
+            last_accessed_at: Instant::now(),
         };
         let outcome = Self::insert(
             &mut self.root,
@@ -1648,6 +1695,7 @@ impl PagedPrefixCache {
                 endpoint,
                 entry_id: ctx.entry_id,
                 last_accessed: Cell::new(ctx.last_accessed),
+                last_accessed_at: Cell::new(ctx.last_accessed_at),
             });
             return InsertOutcome {
                 added: is_new,
@@ -1730,6 +1778,7 @@ impl PagedPrefixCache {
                     endpoint,
                     entry_id: ctx.entry_id,
                     last_accessed: Cell::new(ctx.last_accessed),
+                    last_accessed_at: Cell::new(ctx.last_accessed_at),
                 });
                 node.children.insert(next_token, split);
                 return InsertOutcome {
@@ -1751,6 +1800,7 @@ impl PagedPrefixCache {
                 endpoint,
                 ctx.entry_id,
                 ctx.last_accessed,
+                ctx.last_accessed_at,
             );
             split.children.insert(new_key, new_leaf);
 
@@ -1771,6 +1821,7 @@ impl PagedPrefixCache {
             endpoint,
             ctx.entry_id,
             ctx.last_accessed,
+            ctx.last_accessed_at,
         );
         node.children.insert(next_token, new_leaf);
         InsertOutcome {
@@ -1830,11 +1881,15 @@ impl PagedPrefixCache {
     /// Epoch and entry identity make stale tokens harmless: clearing or
     /// replacing an endpoint invalidates every previously selected touch.
     pub(crate) fn touch_paired(&mut self, token: PairedTouchToken) -> bool {
+        self.evict_idle_paired();
         if token.instance_id != self.instance_id || token.epoch != self.epoch {
             return false;
         }
         let access = self.access_clock;
-        if !self.root.touch_entry(token.entry_id, access, true) {
+        if !self
+            .root
+            .touch_entry(token.entry_id, access, Instant::now(), true)
+        {
             return false;
         }
         self.access_clock = self
@@ -1842,6 +1897,35 @@ impl PagedPrefixCache {
             .checked_add(1)
             .expect("paired radix access clock exhausted");
         true
+    }
+
+    /// Evict every expired paired endpoint as one target+dSpark ownership unit.
+    ///
+    /// The publication revision advances once when anything is removed, so a
+    /// pair prepared against the pre-expiry trie cannot later commit through a
+    /// stale ticket.
+    pub(crate) fn evict_idle_paired(&mut self) -> usize {
+        self.evict_idle_paired_at(Instant::now())
+    }
+
+    fn evict_idle_paired_at(&mut self, now: Instant) -> usize {
+        let Some(ttl) = self.paired_idle_ttl else {
+            return 0;
+        };
+        let Some(cutoff) = now.checked_sub(ttl) else {
+            return 0;
+        };
+        let removed = self.root.remove_expired_paired(cutoff);
+        if removed == 0 {
+            return 0;
+        }
+        debug_assert!(removed <= self.num_paired);
+        debug_assert!(removed <= self.num_cached);
+        self.num_paired = self.num_paired.saturating_sub(removed);
+        self.num_cached = self.num_cached.saturating_sub(removed);
+        self.root.prune();
+        self.advance_revision();
+        removed
     }
 
     pub fn paired_stats(&self) -> PairedPrefixCacheStats {
@@ -4082,10 +4166,21 @@ mod tests {
         let mut query_a = pair_a;
         query_a.push(999);
         assert!(find_paired(&mut cache, &query_a).is_none());
+        assert!(
+            cache.find_longest_prefix(&query_a).is_none(),
+            "LRU eviction must remove the paired target half with its dSpark sidecar"
+        );
         assert!(find_paired(&mut cache, &query_b).is_some());
+        let after_lru = cache.paired_stats();
+        assert_eq!(cache.paired_entry_count(), 1);
+        assert_eq!(after_lru.entries, 1);
+        assert!(after_lru.target_bytes > 0);
+        assert!(after_lru.dflash_bytes > 0);
 
         cache.clear();
         assert!(cache.is_empty());
+        assert_eq!(cache.paired_entry_count(), 0);
+        assert_eq!(cache.paired_stats(), PairedPrefixCacheStats::default());
         assert!(find_paired(&mut cache, &query_b).is_none());
     }
 
@@ -4106,6 +4201,8 @@ mod tests {
 
         let before = cache.paired_stats();
         assert_eq!(before.entries, MAX_PAIRED_RADIX_ENTRIES);
+        assert_eq!(cache.paired_entry_count(), MAX_PAIRED_RADIX_ENTRIES);
+        assert_eq!(cache.len(), MAX_PAIRED_RADIX_ENTRIES + 1);
         assert!(before.target_bytes > 0);
         assert!(before.dflash_bytes > 0);
 
@@ -4121,6 +4218,8 @@ mod tests {
 
         let after = cache.paired_stats();
         assert_eq!(after.entries, MAX_PAIRED_RADIX_ENTRIES);
+        assert_eq!(cache.paired_entry_count(), MAX_PAIRED_RADIX_ENTRIES);
+        assert_eq!(cache.len(), MAX_PAIRED_RADIX_ENTRIES + 1);
         assert_eq!(after.target_bytes, before.target_bytes);
         assert_eq!(after.dflash_bytes, before.dflash_bytes);
 
@@ -4141,6 +4240,10 @@ mod tests {
                 .is_none()
         );
         assert!(
+            cache.find_longest_prefix(&query_b).is_none(),
+            "the cap must evict the complete target+dSpark endpoint, not demote it"
+        );
+        assert!(
             cache
                 .plan_longest_paired_prefix(&query_c)
                 .unwrap()
@@ -4150,6 +4253,177 @@ mod tests {
             cache.find_longest_prefix(&target_only).is_some(),
             "paired pressure must not evict an ordinary target-only endpoint"
         );
+    }
+
+    #[test]
+    fn paired_radix_ttl_evicts_whole_endpoint_and_invalidates_prepared_publication() {
+        let mut cache = PagedPrefixCache::new(8, 4);
+        let paired: Vec<u32> = (0..4).collect();
+        let target_only: Vec<u32> = (100..104).collect();
+        let replacement: Vec<u32> = (200..204).collect();
+        cache.store(&target_only, &make_kv_cache(1, 4));
+        cache
+            .store_paired(&paired, &make_kv_cache(1, 4), dflash_snapshot(4))
+            .unwrap();
+        cache.set_paired_idle_ttl(Some(Duration::from_secs(999)));
+
+        assert_eq!(cache.evict_idle_paired(), 0);
+        assert_eq!(cache.paired_entry_count(), 1);
+
+        let ticket = cache.paired_prepare_ticket();
+        let replacement_target = make_kv_cache(1, 4);
+        let replacement_dflash = dflash_snapshot(4);
+        let _exec = higgs_models::mlx_exec::acquire();
+        let prepared = PagedPrefixCache::prepare_paired_prefix_from_parts(
+            ticket,
+            &replacement,
+            &replacement_target,
+            replacement_dflash,
+        )
+        .unwrap();
+        drop(_exec);
+
+        cache.set_paired_idle_ttl(Some(Duration::ZERO));
+        assert_eq!(
+            cache.evict_idle_paired(),
+            1,
+            "expiry must take the one endpoint that owns both cache halves"
+        );
+        assert_eq!(cache.paired_entry_count(), 0);
+        assert_eq!(cache.paired_stats(), PairedPrefixCacheStats::default());
+        assert_eq!(
+            cache.len(),
+            1,
+            "paired expiry must leave unrelated target-only endpoints intact"
+        );
+        assert!(cache.find_longest_prefix(&target_only).is_some());
+        let mut paired_query = paired;
+        paired_query.push(999);
+        assert!(
+            cache
+                .plan_longest_paired_prefix(&paired_query)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache.find_longest_prefix(&paired_query).is_none(),
+            "TTL expiry must remove the target half with the dSpark sidecar"
+        );
+        assert!(matches!(
+            cache.commit_prepared_pair(prepared).unwrap_err(),
+            PairedCacheError::StaleRevision { .. }
+        ));
+    }
+
+    #[test]
+    fn paired_ttl_prunes_exact_endpoint_without_damaging_shared_target_descendant() {
+        let mut cache = PagedPrefixCache::new(8, 4);
+        let paired: Vec<u32> = (0..4).collect();
+        let target_descendant: Vec<u32> = (0..8).collect();
+        let expected_target = make_kv_cache_content(1, 8, 23.0);
+        let expected_keys = cache_keys(&expected_target, 0);
+        cache
+            .store_paired(
+                &paired,
+                &make_kv_cache_content(1, 4, 23.0),
+                dflash_snapshot(4),
+            )
+            .unwrap();
+        cache.store(&target_descendant, &expected_target);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.paired_entry_count(), 1);
+
+        cache.set_paired_idle_ttl(Some(Duration::ZERO));
+        assert_eq!(cache.evict_idle_paired(), 1);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.paired_entry_count(), 0);
+        assert_eq!(cache.paired_stats(), PairedPrefixCacheStats::default());
+
+        let mut query = target_descendant;
+        query.push(999);
+        assert!(
+            cache.plan_longest_paired_prefix(&query).unwrap().is_none(),
+            "expiry must remove the exact paired capability"
+        );
+        let retained = cache
+            .find_longest_prefix(&query)
+            .expect("shared descendant target must survive paired endpoint pruning");
+        assert_eq!(retained.prefix_len, 8);
+        assert_keys_eq_first_n(&cache_keys(&retained.cache, 0), &expected_keys, 8);
+    }
+
+    #[test]
+    fn successful_paired_touch_renews_ttl_without_reviving_an_idle_peer() {
+        fn set_last_accessed_at(node: &RadixNode, entry_id: u64, accessed_at: Instant) -> bool {
+            if let Some(cached) = node
+                .cached
+                .as_ref()
+                .filter(|cached| cached.entry_id == entry_id)
+            {
+                cached.last_accessed_at.set(accessed_at);
+                return true;
+            }
+            node.children
+                .values()
+                .any(|child| set_last_accessed_at(child, entry_id, accessed_at))
+        }
+
+        let mut cache = PagedPrefixCache::new(8, 4);
+        let pair_a: Vec<u32> = (0..4).collect();
+        let pair_b: Vec<u32> = (100..104).collect();
+        cache
+            .store_paired(&pair_a, &make_kv_cache(1, 4), dflash_snapshot(4))
+            .unwrap();
+        cache
+            .store_paired(&pair_b, &make_kv_cache(1, 4), dflash_snapshot(4))
+            .unwrap();
+        cache.set_paired_idle_ttl(Some(Duration::from_secs(10)));
+
+        let mut query_a = pair_a;
+        query_a.push(999);
+        let plan_a = cache.plan_longest_paired_prefix(&query_a).unwrap().unwrap();
+        let entry_a = plan_a.touch.entry_id;
+        drop(plan_a);
+
+        let mut query_b = pair_b;
+        query_b.push(999);
+        let plan_b = cache.plan_longest_paired_prefix(&query_b).unwrap().unwrap();
+        let (_matched_b, touch_b) = {
+            let _exec = higgs_models::mlx_exec::acquire();
+            plan_b.materialize_unproven_for_test().unwrap()
+        };
+        let entry_b = touch_b.entry_id;
+
+        let baseline = Instant::now();
+        let five_seconds_old = baseline.checked_sub(Duration::from_secs(5)).unwrap();
+        assert!(set_last_accessed_at(&cache.root, entry_a, five_seconds_old));
+        assert!(set_last_accessed_at(&cache.root, entry_b, five_seconds_old));
+        assert!(
+            cache.touch_paired(touch_b),
+            "a successful materialized fork must renew the retained pair"
+        );
+
+        let six_seconds_later = baseline.checked_add(Duration::from_secs(6)).unwrap();
+        assert_eq!(cache.evict_idle_paired_at(six_seconds_later), 1);
+        assert!(
+            cache
+                .plan_longest_paired_prefix(&query_a)
+                .unwrap()
+                .is_none(),
+            "the untouched peer must expire"
+        );
+        assert!(
+            cache
+                .plan_longest_paired_prefix(&query_b)
+                .unwrap()
+                .is_some(),
+            "the successfully touched pair must retain both cache halves"
+        );
+        assert_eq!(cache.paired_entry_count(), 1);
+        let stats = cache.paired_stats();
+        assert_eq!(stats.entries, 1);
+        assert!(stats.target_bytes > 0);
+        assert!(stats.dflash_bytes > 0);
     }
 
     #[test]

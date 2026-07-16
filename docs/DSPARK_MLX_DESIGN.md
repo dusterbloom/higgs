@@ -62,6 +62,14 @@ not support enabling gate/up fusion. The run ended at 61% on a discharging
 battery with no external source, so a powered primary-row4 result is still
 required for promotion.
 
+The later full-Q4 ABBA battery gate measured 19.95 tok/s AR decode and 29.14
+tok/s dSpark decode (1.461x), with 90% matched-draft acceptance. Its end-to-end
+wall throughput was 16.14 versus 21.80 tok/s (1.35x); the lower wall figure
+includes prefill and request orchestration and is not a dSpark decode
+regression. A separate paired-radix run measured 16.8 tok/s AR versus 25.59
+tok/s dSpark decode (1.52x) at 87.8% acceptance. These remain machine-local
+battery measurements pending the final stable-power rerun.
+
 ## Pinned sidecar contract
 
 A dSpark sidecar is not a generic drafter that may be paired with any
@@ -160,6 +168,43 @@ similarly owns lazy proposal output plus candidate layer state. Commit checks
 that its base position still matches the live cache, preventing stale or
 partially evaluated work from becoming visible. Dropping a failed transaction
 leaves the committed cache unchanged.
+
+## Paired cache lifecycle
+
+Reusable dSpark state is one capability, never two independently discoverable
+caches:
+
+```text
+Cold -> LivePair -> SealedPair -> session move / radix fork -> LivePair
+                    |
+                    +-> deterministic capability loss -> TargetOnly
+                    +-> effectful seal/fork failure     -> publish nothing
+```
+
+`LivePair` move-owns the target state, dSpark state, exact token ledger, tap
+frontier, and branch epoch. A decode lease prevents either cache half from
+being published until target advancement, tap advancement, and the token
+ledger have all committed the same boundary. `SealedPair` validates every
+target KV layer, every recurrent-cache absolute offset, the dSpark position,
+and the exact token identity. The dSpark fixed-tile remainder is preserved; it
+is valid internal state and is not projected merely to make a cache entry.
+
+Retained sessions move the whole pair out of the session map and mint a fresh
+live branch epoch. The radix cache stores an immutable dSpark sidecar only at
+an exact endpoint in the existing target trie; each hit materializes the
+deduplicated target path and independently forks the endpoint's dSpark
+snapshot. Paired radix lookup is memory-only and never combines a target from
+disk with a separately selected sidecar.
+
+Session and radix pairs report target and dSpark bytes independently. Session
+TTL/count/token limits and radix TTL/LRU/cap eviction remove the complete
+ownership unit. The initial paired-radix cap is two entries.
+
+The first release intentionally excludes disk-persisted dSpark snapshots,
+partial/interior drafter radix hits, batch/paged-engine integration,
+sampled-history transactions, and cached logits for a full prompt hit. A full
+paired hit without a generation suffix therefore fails closed to fresh
+prefill.
 
 ### Fixed 32-row context tiling
 
