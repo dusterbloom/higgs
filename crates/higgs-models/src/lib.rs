@@ -207,6 +207,67 @@ impl AnyCache {
         }
     }
 
+    /// Validate that every target-cache layer represents one exact absolute
+    /// token boundary.
+    ///
+    /// Unlike [`Self::resident_len`], this checks every KV layer and every
+    /// recurrent `ArraysCache` offset. Missing layers are rejected because a
+    /// paired target/drafter snapshot must never publish partially-advanced
+    /// target state.
+    pub fn validate_absolute_boundary(&self, expected: i32) -> Result<(), Exception> {
+        if expected < 0 {
+            return Err(Exception::custom(format!(
+                "cache absolute boundary must be non-negative, got {expected}"
+            )));
+        }
+        match self {
+            Self::KV(layers) => {
+                if layers.is_empty() {
+                    return Err(Exception::custom(
+                        "cache has no KV layers to validate at an absolute boundary",
+                    ));
+                }
+                for (index, layer) in layers.iter().enumerate() {
+                    let Some(layer) = layer else {
+                        return Err(Exception::custom(format!(
+                            "cache missing layer {index} at absolute boundary {expected}"
+                        )));
+                    };
+                    let actual = cache::KeyValueCache::offset(layer);
+                    if actual != expected {
+                        return Err(Exception::custom(format!(
+                            "cache layer {index} KV offset {actual} does not match absolute boundary {expected}"
+                        )));
+                    }
+                }
+            }
+            Self::Hybrid(layers) => {
+                if layers.is_empty() {
+                    return Err(Exception::custom(
+                        "cache has no hybrid layers to validate at an absolute boundary",
+                    ));
+                }
+                for (index, layer) in layers.iter().enumerate() {
+                    let Some(layer) = layer else {
+                        return Err(Exception::custom(format!(
+                            "cache missing layer {index} at absolute boundary {expected}"
+                        )));
+                    };
+                    let (kind, actual) = match layer {
+                        LayerCache::KV(kv) => ("KV", cache::KeyValueCache::offset(kv)),
+                        LayerCache::Arrays(arrays) => ("GDN", arrays.offset),
+                    };
+                    if actual != expected {
+                        return Err(Exception::custom(format!(
+                            "cache layer {index} {kind} offset {actual} does not match absolute boundary {expected}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Force-evaluate every array this cache holds. Required before the cache is
     /// shared across threads — e.g. stashed for a later turn that resumes on a
     /// different blocking-pool thread, or after a lazy `quantize_for_retention`.
@@ -2258,6 +2319,56 @@ mod tests {
     fn any_cache_hybrid_variant() {
         let cache = AnyCache::Hybrid(Vec::new());
         assert!(matches!(cache, AnyCache::Hybrid(_)));
+    }
+
+    fn kv_cache_at(offset: i32) -> cache::SteppingKeyValueCache {
+        let mut kv = cache::SteppingKeyValueCache::new();
+        if offset > 0 {
+            let keys = Array::zeros::<f32>(&[1, 1, offset, 4]).unwrap();
+            let values = Array::zeros::<f32>(&[1, 1, offset, 4]).unwrap();
+            kv.update_and_fetch(keys, values).unwrap();
+        }
+        kv
+    }
+
+    #[test]
+    fn any_cache_absolute_boundary_checks_every_hybrid_layer() {
+        let mut aligned_arrays = qwen3_next::ArraysCache::new();
+        aligned_arrays.offset = 3;
+        let aligned = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv_cache_at(3))),
+            Some(LayerCache::Arrays(aligned_arrays)),
+        ]);
+        aligned.validate_absolute_boundary(3).unwrap();
+
+        let mut stale_arrays = qwen3_next::ArraysCache::new();
+        stale_arrays.offset = 2;
+        let stale_gdn = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv_cache_at(3))),
+            Some(LayerCache::Arrays(stale_arrays)),
+        ]);
+        let error = stale_gdn.validate_absolute_boundary(3).unwrap_err();
+        assert!(error.to_string().contains("layer 1"));
+
+        let mut aligned_arrays = qwen3_next::ArraysCache::new();
+        aligned_arrays.offset = 3;
+        let stale_kv = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv_cache_at(2))),
+            Some(LayerCache::Arrays(aligned_arrays)),
+        ]);
+        let error = stale_kv.validate_absolute_boundary(3).unwrap_err();
+        assert!(error.to_string().contains("layer 0"));
+    }
+
+    #[test]
+    fn any_cache_absolute_boundary_rejects_missing_or_negative_state() {
+        let missing = AnyCache::Hybrid(vec![Some(LayerCache::KV(kv_cache_at(0))), None]);
+        let error = missing.validate_absolute_boundary(0).unwrap_err();
+        assert!(error.to_string().contains("missing layer 1"));
+
+        let populated = AnyCache::KV(vec![Some(kv_cache_at(0))]);
+        let error = populated.validate_absolute_boundary(-1).unwrap_err();
+        assert!(error.to_string().contains("non-negative"));
     }
 
     #[test]

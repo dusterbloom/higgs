@@ -15,6 +15,7 @@ use std::{
     fs::File,
     io::{BufReader, Read},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use mlx_rs::{
@@ -681,7 +682,7 @@ pub struct DFlashDrafter {
 /// `position` is the absolute number of target-context rows consumed.  It is
 /// deliberately independent of retained KV length: sliding-attention layers
 /// evict old rows, so their tensor length is not a valid RoPE position.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct DFlashCache {
     layers: Vec<Option<(Array, Array)>>,
     /// Raw concatenated target taps not yet projected into a complete fixed
@@ -689,6 +690,117 @@ pub struct DFlashCache {
     pending_taps: Option<Array>,
     /// Total target rows ingested, including `pending_taps`.
     position: i32,
+    /// Unique identity for this live branch. A staged transaction may commit
+    /// only to the exact branch it was created from.
+    branch: DFlashBranchId,
+    /// Monotonic mutation counter within one live branch.
+    revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DFlashBranchId(u64);
+
+static NEXT_DFLASH_BRANCH_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_dflash_branch_id() -> DFlashBranchId {
+    DFlashBranchId(NEXT_DFLASH_BRANCH_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+impl Default for DFlashCache {
+    fn default() -> Self {
+        Self {
+            layers: Vec::new(),
+            pending_taps: None,
+            position: 0,
+            branch: next_dflash_branch_id(),
+            revision: 0,
+        }
+    }
+}
+
+/// Immutable, evaluated drafter context at one exact target-token boundary.
+///
+/// Snapshots expose no forward or mutation API. A session may move the stored
+/// arrays into a fresh live branch with [`Self::into_live`]; radix reuse calls
+/// [`Self::fork_live`] to obtain an independent device-side copy.
+#[derive(Debug)]
+pub struct DFlashSnapshot {
+    layers: Vec<Option<(Array, Array)>>,
+    pending_taps: Option<Array>,
+    position: i32,
+}
+
+impl DFlashSnapshot {
+    #[must_use]
+    pub const fn position(&self) -> i32 {
+        self.position
+    }
+
+    /// Move this uniquely-owned snapshot into a new live branch without copying
+    /// its evaluated arrays.
+    #[must_use]
+    pub fn into_live(self) -> DFlashCache {
+        DFlashCache {
+            layers: self.layers,
+            pending_taps: self.pending_taps,
+            position: self.position,
+            branch: next_dflash_branch_id(),
+            revision: 0,
+        }
+    }
+
+    /// Deep-copy this immutable snapshot into an independent live branch.
+    ///
+    /// Every MLX array is copied and evaluated before publication so later
+    /// mutation or buffer donation in the live branch cannot affect the stored
+    /// snapshot.
+    pub fn fork_live(&self) -> Result<DFlashCache, Exception> {
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| {
+                layer.as_ref().map_or(Ok(None), |(keys, values)| {
+                    Ok(Some((
+                        try_eval_device_copy(keys)?,
+                        try_eval_device_copy(values)?,
+                    )))
+                })
+            })
+            .collect::<Result<Vec<_>, Exception>>()?;
+        let pending_taps = self
+            .pending_taps
+            .as_ref()
+            .map(try_eval_device_copy)
+            .transpose()?;
+        Ok(DFlashCache {
+            layers,
+            pending_taps,
+            position: self.position,
+            branch: next_dflash_branch_id(),
+            revision: 0,
+        })
+    }
+}
+
+#[allow(unsafe_code)]
+fn try_eval_device_copy(array: &Array) -> Result<Array, Exception> {
+    let mut result = unsafe { mlx_sys::mlx_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_copy(
+            &raw mut result,
+            array.as_ptr(),
+            mlx_rs::Stream::task_local_or_default().as_ptr(),
+        )
+    };
+    if status != 0 {
+        unsafe { mlx_sys::mlx_array_free(result) };
+        return Err(Exception::custom(format!(
+            "failed to copy drafter snapshot array: MLX status {status}"
+        )));
+    }
+    let copy = unsafe { Array::from_ptr(result) };
+    copy.eval()?;
+    Ok(copy)
 }
 
 /// A lazy drafter forward whose cache update has not been published yet.
@@ -700,6 +812,8 @@ pub struct DFlashCache {
 pub struct DFlashForwardTransaction {
     hidden: Array,
     layers: Vec<Option<(Array, Array)>>,
+    base_branch: DFlashBranchId,
+    base_revision: u64,
     base_position: i32,
     appended_rows: i32,
 }
@@ -717,6 +831,18 @@ impl DFlashForwardTransaction {
     }
 
     pub fn commit(self, cache: &mut DFlashCache) -> Result<(), Exception> {
+        if cache.branch != self.base_branch {
+            return Err(Exception::custom(format!(
+                "stale drafter transaction branch: staged={} live={}",
+                self.base_branch.0, cache.branch.0
+            )));
+        }
+        if cache.revision != self.base_revision {
+            return Err(Exception::custom(format!(
+                "stale drafter transaction revision: staged={} live={}",
+                self.base_revision, cache.revision
+            )));
+        }
         if cache.position != self.base_position {
             return Err(Exception::custom(format!(
                 "stale drafter transaction: base={} live={}",
@@ -769,9 +895,65 @@ impl DFlashCache {
             .position
             .checked_add(appended_rows)
             .ok_or_else(|| Exception::custom("drafter absolute context position overflow"))?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Exception::custom("drafter cache revision overflow"))?;
         self.layers = layers;
         self.pending_taps = pending_taps;
         self.position = position;
+        self.revision = revision;
+        Ok(())
+    }
+
+    fn validate_at_boundary(
+        &self,
+        expected_position: i32,
+        expected_layers: usize,
+        expected_pending_width: i32,
+    ) -> Result<(), Exception> {
+        if expected_position < 0 {
+            return Err(Exception::custom(format!(
+                "drafter boundary must be non-negative, got {expected_position}"
+            )));
+        }
+        if self.position != expected_position {
+            return Err(Exception::custom(format!(
+                "drafter boundary mismatch: cache={} expected={expected_position}",
+                self.position
+            )));
+        }
+        if self.layers.len() != expected_layers {
+            return Err(Exception::custom(format!(
+                "drafter cache has {} layers, expected {expected_layers}",
+                self.layers.len()
+            )));
+        }
+        let pending_rows = self.pending_rows()?;
+        if !(0..DFLASH_CONTEXT_TILE_ROWS).contains(&pending_rows) {
+            return Err(Exception::custom(format!(
+                "drafter pending tail has {pending_rows} rows, expected 0..{}",
+                DFLASH_CONTEXT_TILE_ROWS - 1
+            )));
+        }
+        let projected_position = self.projected_position()?;
+        if projected_position > 0 && self.layers.iter().any(Option::is_none) {
+            return Err(Exception::custom(
+                "drafter projected context is missing one or more layer caches",
+            ));
+        }
+        if let Some(pending) = self.pending_taps.as_ref() {
+            let shape = pending.shape();
+            if shape.len() != 3
+                || shape[0] <= 0
+                || shape[1] != pending_rows
+                || shape[2] != expected_pending_width
+            {
+                return Err(Exception::custom(format!(
+                    "drafter pending tail shape mismatch: expected [B, {pending_rows}, {expected_pending_width}], got {shape:?}"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -822,6 +1004,8 @@ impl DFlashDrafter {
             layers: vec![None; self.layers.len()],
             pending_taps: None,
             position: 0,
+            branch: next_dflash_branch_id(),
+            revision: 0,
         }
     }
 
@@ -871,6 +1055,68 @@ impl DFlashDrafter {
                 "drafter noise must be [B, block_size, hidden] = {expected:?}, got {:?}",
                 noise.shape()
             )));
+        }
+        Ok(())
+    }
+
+    fn validate_cache_layer_shapes(&self, cache: &DFlashCache) -> Result<(), Exception> {
+        let projected_position = cache.projected_position()?;
+        let mut expected_batch = cache
+            .pending_taps
+            .as_ref()
+            .and_then(|pending| pending.shape().first().copied());
+
+        for (index, (state, layer)) in cache.layers.iter().zip(&self.layers).enumerate() {
+            let Some((keys, values)) = state else {
+                continue;
+            };
+            let key_shape = keys.shape();
+            let value_shape = values.shape();
+            if key_shape.len() != 4 || value_shape.len() != 4 {
+                return Err(Exception::custom(format!(
+                    "drafter layer {index} cache must be rank 4 [B, Hkv, T, D], got keys={key_shape:?} values={value_shape:?}"
+                )));
+            }
+            if key_shape[0] <= 0 || value_shape[0] <= 0 {
+                return Err(Exception::custom(format!(
+                    "drafter layer {index} cache batch must be positive, got keys={} values={}",
+                    key_shape[0], value_shape[0]
+                )));
+            }
+            if key_shape[0] != value_shape[0] {
+                return Err(Exception::custom(format!(
+                    "drafter layer {index} key/value batch mismatch: {} vs {}",
+                    key_shape[0], value_shape[0]
+                )));
+            }
+            match expected_batch {
+                Some(batch) if key_shape[0] != batch => {
+                    return Err(Exception::custom(format!(
+                        "drafter layer {index} cache batch mismatch: expected {batch}, got {}",
+                        key_shape[0]
+                    )));
+                }
+                None => expected_batch = Some(key_shape[0]),
+                Some(_) => {}
+            }
+
+            let attention = &layer.self_attn;
+            let retained = if attention.is_sliding && attention.sliding_window > 1 {
+                projected_position.min(attention.sliding_window - 1)
+            } else {
+                projected_position
+            };
+            let expected_shape = [
+                key_shape[0],
+                attention.num_key_value_heads,
+                retained,
+                attention.head_dim,
+            ];
+            if key_shape != expected_shape || value_shape != expected_shape {
+                return Err(Exception::custom(format!(
+                    "drafter layer {index} cache shape mismatch: expected {expected_shape:?}, got keys={key_shape:?} values={value_shape:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -956,6 +1202,40 @@ impl DFlashDrafter {
         Self::eval_parts(&cache.layers, cache.pending_taps.as_ref())
     }
 
+    /// Consume a live drafter cache and publish one immutable boundary snapshot.
+    ///
+    /// `external_taps` is the engine-owned tap frontier not yet represented in
+    /// `cache`. It is appended through [`Self::prime_taps`], which projects only
+    /// complete 32-row tiles and intentionally retains the final sub-tile tail.
+    /// Empty `external_taps` means the cache is already caught up.
+    pub fn seal_after_taps(
+        &mut self,
+        mut cache: DFlashCache,
+        external_taps: &[Array],
+        expected_position: i32,
+    ) -> Result<DFlashSnapshot, Exception> {
+        if expected_position < 0 {
+            return Err(Exception::custom(format!(
+                "drafter boundary must be non-negative, got {expected_position}"
+            )));
+        }
+        if !external_taps.is_empty() {
+            self.prime_taps(external_taps, &mut cache)?;
+        }
+        let pending_width = i32::try_from(self.config.num_taps())
+            .map_err(|_| Exception::custom("drafter tap count exceeds i32"))?
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| Exception::custom("drafter pending tap width overflow"))?;
+        cache.validate_at_boundary(expected_position, self.layers.len(), pending_width)?;
+        self.validate_cache_layer_shapes(&cache)?;
+        Self::eval_cache(&cache)?;
+        Ok(DFlashSnapshot {
+            layers: cache.layers,
+            pending_taps: cache.pending_taps,
+            position: cache.position,
+        })
+    }
+
     /// Initialize all `QLinear` weights to zero at the correct shapes.
     /// Only for tests — `QLinear` (unlike `nn::Linear`) starts with [1] placeholders.
     #[cfg(test)]
@@ -1029,6 +1309,8 @@ impl DFlashDrafter {
         Ok(DFlashForwardTransaction {
             hidden,
             layers: staged,
+            base_branch: cache.branch,
+            base_revision: cache.revision,
             base_position: cache.position,
             appended_rows: rows,
         })
@@ -2109,6 +2391,184 @@ mod tests {
     }
 
     #[test]
+    fn sealed_snapshot_preserves_fixed_tile_tail_and_next_round_exactness() {
+        use mlx_rs::ops::indexing::IndexOp;
+
+        for boundary in [31_i32, 32, 33, 63, 64, 65] {
+            let config = tiny_dense_config(Some(16));
+            let mut reference = super::DFlashDrafter::new(config.clone()).unwrap();
+            let mut sealing = super::DFlashDrafter::new(config).unwrap();
+            init_patterned_weights(&mut reference);
+            init_patterned_weights(&mut sealing);
+
+            let all_taps = input(boundary, 4, usize::try_from(boundary).unwrap() + 1);
+            let split = boundary - 1;
+            let prefix = all_taps.index((.., ..split, ..));
+            let external = all_taps.index((.., split.., ..));
+
+            let mut reference_cache = reference.make_cache();
+            reference
+                .prime_taps(&[all_taps], &mut reference_cache)
+                .unwrap();
+
+            let mut live = sealing.make_cache();
+            sealing.prime_taps(&[prefix], &mut live).unwrap();
+            let snapshot = sealing
+                .seal_after_taps(live, &[external], boundary)
+                .unwrap();
+
+            assert_eq!(snapshot.position(), boundary);
+            let pending_rows = snapshot
+                .pending_taps
+                .as_ref()
+                .map_or(0, |pending| pending.shape()[1]);
+            assert_eq!(
+                pending_rows,
+                boundary.rem_euclid(super::DFLASH_CONTEXT_TILE_ROWS),
+                "boundary {boundary} must retain its raw fixed-tile tail"
+            );
+
+            let mut resumed = snapshot.into_live();
+            assert_cache_exact(
+                &reference_cache,
+                &resumed,
+                &format!("sealed boundary {boundary}"),
+            );
+
+            let next_taps = input(2, 4, usize::try_from(boundary).unwrap() + 19);
+            let next_noise = input(2, 4, usize::try_from(boundary).unwrap() + 37);
+            let reference_hidden = reference
+                .forward(&next_noise, &[next_taps.clone()], &mut reference_cache)
+                .unwrap();
+            let resumed_hidden = sealing
+                .forward(&next_noise, &[next_taps], &mut resumed)
+                .unwrap();
+            mlx_rs::transforms::eval([&reference_hidden, &resumed_hidden]).unwrap();
+            assert_f32_bits_equal(
+                &reference_hidden,
+                &resumed_hidden,
+                &format!("sealed boundary {boundary} next hidden"),
+            );
+            assert_cache_exact(
+                &reference_cache,
+                &resumed,
+                &format!("sealed boundary {boundary} next cache"),
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_forks_remain_independent_after_one_live_branch_advances() {
+        let mut drafter = super::DFlashDrafter::new(tiny_dense_config(Some(16))).unwrap();
+        init_patterned_weights(&mut drafter);
+        let mut live = drafter.make_cache();
+        drafter.prime_taps(&[input(33, 4, 5)], &mut live).unwrap();
+        let snapshot = drafter.seal_after_taps(live, &[], 33).unwrap();
+
+        let stable_before = snapshot.fork_live().unwrap();
+        let mut advanced = snapshot.fork_live().unwrap();
+        drafter
+            .prime_taps(&[input(2, 4, 17)], &mut advanced)
+            .unwrap();
+        let stable_after = snapshot.fork_live().unwrap();
+
+        assert_eq!(advanced.position(), 35);
+        assert_eq!(stable_after.position(), 33);
+        assert_cache_exact(
+            &stable_before,
+            &stable_after,
+            "immutable snapshot after fork advance",
+        );
+    }
+
+    #[test]
+    fn staged_transaction_rejects_a_different_same_position_branch() {
+        let mut drafter = super::DFlashDrafter::new(tiny_dense_config(None)).unwrap();
+        init_patterned_weights(&mut drafter);
+        let snapshot = drafter
+            .seal_after_taps(drafter.make_cache(), &[], 0)
+            .unwrap();
+        let left = snapshot.fork_live().unwrap();
+        let mut right = snapshot.fork_live().unwrap();
+        let taps = input(2, 4, 23);
+        let noise = input(2, 4, 29);
+
+        let transaction = drafter.stage_forward(&noise, &[taps], &left).unwrap();
+        let error = transaction.commit(&mut right).unwrap_err();
+
+        assert!(error.to_string().contains("branch"));
+        assert_eq!(right.position(), 0);
+    }
+
+    #[test]
+    fn staged_transaction_rejects_a_same_position_revision_change() {
+        let mut drafter = super::DFlashDrafter::new(tiny_dense_config(None)).unwrap();
+        init_patterned_weights(&mut drafter);
+        let mut cache = drafter.make_cache();
+        let taps = input(2, 4, 31);
+        let noise = input(2, 4, 41);
+        let transaction = drafter.stage_forward(&noise, &[taps], &cache).unwrap();
+        cache.revision += 1;
+
+        let error = transaction.commit(&mut cache).unwrap_err();
+
+        assert!(error.to_string().contains("revision"));
+        assert_eq!(cache.position(), 0);
+    }
+
+    #[test]
+    fn seal_rejects_an_incorrect_absolute_boundary() {
+        let mut drafter = super::DFlashDrafter::new(tiny_dense_config(None)).unwrap();
+        init_patterned_weights(&mut drafter);
+
+        let error = drafter
+            .seal_after_taps(drafter.make_cache(), &[], 1)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("boundary"));
+    }
+
+    #[test]
+    fn seal_accepts_empty_and_single_pending_boundaries() {
+        let mut drafter = super::DFlashDrafter::new(tiny_dense_config(None)).unwrap();
+        init_patterned_weights(&mut drafter);
+
+        let empty = drafter
+            .seal_after_taps(drafter.make_cache(), &[], 0)
+            .unwrap();
+        assert_eq!(empty.position(), 0);
+        assert!(empty.layers.iter().all(Option::is_none));
+        assert!(empty.pending_taps.is_none());
+
+        let one = drafter
+            .seal_after_taps(drafter.make_cache(), &[input(1, 4, 47)], 1)
+            .unwrap();
+        assert_eq!(one.position(), 1);
+        assert!(one.layers.iter().all(Option::is_none));
+        assert_eq!(one.pending_taps.as_ref().unwrap().shape(), &[1, 1, 4]);
+    }
+
+    #[test]
+    fn seal_rejects_wrong_full_and_sliding_retained_lengths() {
+        for (sliding_window, expected_retained) in [(None, 32_i32), (Some(16), 15)] {
+            let mut drafter = super::DFlashDrafter::new(tiny_dense_config(sliding_window)).unwrap();
+            init_patterned_weights(&mut drafter);
+            let mut cache = drafter.make_cache();
+            drafter.prime_taps(&[input(32, 4, 53)], &mut cache).unwrap();
+            let wrong_retained = expected_retained - 1;
+            let wrong = mlx_rs::Array::zeros::<f32>(&[1, 1, wrong_retained, 4]).unwrap();
+            cache.layers[0] = Some((wrong.clone(), wrong));
+
+            let error = drafter.seal_after_taps(cache, &[], 32).unwrap_err();
+
+            assert!(
+                error.to_string().contains("cache shape mismatch"),
+                "unexpected error for sliding_window={sliding_window:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_tap_batch_leaves_cache_transaction_unchanged() {
         let mut config = tiny_dense_config(None);
         config.dflash_config.target_layer_ids = vec![0, 1];
@@ -2119,8 +2579,9 @@ mod tests {
         drafter
             .prime_taps(&[good.clone(), good], &mut cache)
             .unwrap();
-        let before = cache.clone();
-        super::DFlashDrafter::eval_cache(&cache).unwrap();
+        let snapshot = drafter.seal_after_taps(cache, &[], 2).unwrap();
+        let before = snapshot.fork_live().unwrap();
+        let mut cache = snapshot.into_live();
 
         let first = input(1, 4, 2);
         let bad_batch = mlx_rs::Array::zeros::<f32>(&[2, 1, 4]).unwrap();
@@ -2138,7 +2599,9 @@ mod tests {
         let mut cache = drafter.make_cache();
         let taps = input(2, 4, 1);
         drafter.prime_taps(&[taps.clone()], &mut cache).unwrap();
-        let before = cache.clone();
+        let snapshot = drafter.seal_after_taps(cache, &[], 2).unwrap();
+        let before = snapshot.fork_live().unwrap();
+        let mut cache = snapshot.into_live();
         let wrong_block = input(1, 4, 7);
 
         let error = drafter
@@ -2153,8 +2616,10 @@ mod tests {
     fn staged_forward_publishes_cache_only_after_successful_commit() {
         let mut drafter = super::DFlashDrafter::new(tiny_dense_config(None)).unwrap();
         init_patterned_weights(&mut drafter);
-        let mut cache = drafter.make_cache();
-        let before = cache.clone();
+        let empty = drafter.make_cache();
+        let snapshot = drafter.seal_after_taps(empty, &[], 0).unwrap();
+        let before = snapshot.fork_live().unwrap();
+        let mut cache = snapshot.into_live();
         let taps = input(2, 4, 3);
         let noise = input(2, 4, 11);
 
