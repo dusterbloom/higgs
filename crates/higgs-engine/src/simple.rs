@@ -4082,199 +4082,264 @@ impl SimpleEngine {
             }
         });
 
-        let (pair, prefill_from, continued) = if let Some((pair, prior)) = resumed {
-            (pair, prior, true)
-        } else {
-            let target = model
-                .make_cache_with_config(self.kv_cache_config)
-                .map_err(EngineError::Mlx)?;
-            let pair = LivePair::cold(target, drafter.make_cache(), expected_taps)
-                .map_err(session_pair_error)?;
-            (pair, 0, false)
-        };
-        let prefill_tokens = prompt_tokens.get(prefill_from..).ok_or_else(|| {
-            EngineError::Generation("session DFlash prefill boundary exceeds prompt".to_owned())
-        })?;
-        if prefill_tokens.is_empty() {
-            return Err(EngineError::Generation(
-                "session DFlash continuation requires a non-empty suffix".to_owned(),
-            ));
-        }
-        let prefilled = u32::try_from(prefill_tokens.len()).unwrap_or(u32::MAX);
-
-        if continued {
-            self.cache_metrics
-                .continuations
-                .fetch_add(1, Ordering::Relaxed);
-            self.cache_metrics.prefill_saved_tokens.fetch_add(
-                u64::from(total.saturating_sub(prefilled)),
-                Ordering::Relaxed,
-            );
-        }
-
-        let prefill_start = std::time::Instant::now();
-        let (pair, prefill_logits) = pair
-            .prefill_known(prefill_tokens, |exact_suffix, target_cache, draft_cache| {
-                self.dflash_prefill_with_taps(
-                    &mut model,
-                    target_cache,
-                    &mut drafter,
-                    draft_cache,
-                    exact_suffix,
-                    &dflash.tap_layers,
-                )
-            })
-            .map_err(session_pair_error)?;
-        let first_token =
-            sample(&prefill_logits.index((.., -1, ..)), params).map_err(EngineError::Mlx)?;
-        eval([&first_token]).map_err(EngineError::Mlx)?;
-        let prefill_elapsed = prefill_start.elapsed();
-
-        let first_id: u32 = first_token.item();
-        let mut decode = SessionDsparkDecodeState::begin(pair, first_id)?;
-        let max_tokens = usize::try_from(max_tokens)
-            .map_err(|_| EngineError::Generation("max_tokens overflow usize".to_owned()))?;
-
-        let decode_start = std::time::Instant::now();
-        // This loop owns only session delivery/termination. Ticket creation,
-        // exact history, target+dSpark advancement, lease validation, and
-        // ledger commit all run through the same canonical transaction driver
-        // used by stateless decoding.
-        while decode.len() < max_tokens {
-            let pending_anchor = decode.pending_token().ok_or_else(|| {
-                EngineError::Generation("session DFlash ledger lost its pending token".to_owned())
-            })?;
-            if self.eos_token_ids.contains(&pending_anchor) {
-                break;
-            }
-            let remaining = max_tokens.saturating_sub(decode.len());
-            if remaining == 0 {
-                break;
-            }
-            let (next_decode, committed) = decode.run_round(
-                |target_cache, draft_cache, tap_frontier, anchor_ticket, history_before_anchor| {
-                    let round = self.canonical_dflash_round(
-                        &mut model,
-                        target_cache,
-                        &mut drafter,
-                        draft_cache,
-                        tap_frontier,
-                        anchor_ticket,
-                        history_before_anchor,
-                        remaining,
-                        remaining,
-                        params,
-                        &[],
-                        None,
-                        dflash,
-                    )?;
-                    round.into_lease_parts()
-                },
-            )?;
-            decode = next_decode;
-
-            if let Ok(mut values) = self.last_dflash_accepts.lock() {
-                values.push(u32::try_from(committed.successors.len()).unwrap_or(0));
-            }
-            if let Ok(mut values) = self.last_dflash_draft_matches.lock() {
-                values.push(u32::try_from(committed.draft_matches).unwrap_or(0));
-            }
-            if let Ok(mut values) = self.last_dflash_draft_counts.lock() {
-                values.push(u32::try_from(committed.draft_tokens.len()).unwrap_or(0));
-            }
-        }
-        let decode_elapsed = decode_start.elapsed();
-        let retain_start = std::time::Instant::now();
-
-        // Align the final visible token with both caches. EOS remains visible
-        // but is intentionally absent from the retained key; a non-EOS length
-        // tail receives one target-only forward whose taps are consumed while
-        // sealing the drafter snapshot.
-        let (mut pair, generated) = decode.finish(
-            &self.eos_token_ids,
-            |target_cache, _draft_cache, tap_frontier, token| {
-                let input_token = i32::try_from(token).map_err(|_| {
-                    EngineError::Generation("session DFlash retained token overflow i32".to_owned())
-                })?;
-                let input = Array::from_slice(&[input_token], &[1, 1]);
-                let (_hidden, taps) = model
-                    .forward_raw_with_taps(&input, None, target_cache, &dflash.tap_layers)
+        // Cache-state divergence must never fail the request outright: if the
+        // resumed (continued) attempt errors, retry ONCE from a cold prefill
+        // within the same request. The retained pair was already moved out of
+        // the session map, so nothing poisoned survives in either outcome —
+        // this only converts a residual 500 into a slower successful turn.
+        let mut resumed = resumed;
+        let mut retried_cold = false;
+        let (generation, publication, cap_exempt) = loop {
+            let (pair, prefill_from, continued) = if let Some((pair, prior)) = resumed.take() {
+                (pair, prior, true)
+            } else {
+                let target = model
+                    .make_cache_with_config(self.kv_cache_config)
                     .map_err(EngineError::Mlx)?;
-                let next_target_boundary = tap_frontier
-                    .target_boundary()
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        EngineError::Generation("session target boundary overflow".to_owned())
+                let pair = LivePair::cold(target, drafter.make_cache(), expected_taps)
+                    .map_err(session_pair_error)?;
+                (pair, 0, false)
+            };
+            if retried_cold {
+                // The failed continued attempt may have recorded partial per-round
+                // stats; the retry must report only its own rounds.
+                if let Ok(mut values) = self.last_dflash_accepts.lock() {
+                    values.clear();
+                }
+                if let Ok(mut values) = self.last_dflash_draft_matches.lock() {
+                    values.clear();
+                }
+                if let Ok(mut values) = self.last_dflash_draft_counts.lock() {
+                    values.clear();
+                }
+            }
+            let attempt =
+                (|| -> Result<(SessionGeneration, Option<SessionDsparkPublication>, bool), EngineError> {
+                    let prefill_tokens = prompt_tokens.get(prefill_from..).ok_or_else(|| {
+                        EngineError::Generation(
+                            "session DFlash prefill boundary exceeds prompt".to_owned(),
+                        )
                     })?;
-                tap_frontier.append(next_target_boundary, taps)
-            },
-        )?;
-        let retained_boundary = pair.token_len();
+                    if prefill_tokens.is_empty() {
+                        return Err(EngineError::Generation(
+                            "session DFlash continuation requires a non-empty suffix".to_owned(),
+                        ));
+                    }
+                    let prefilled = u32::try_from(prefill_tokens.len()).unwrap_or(u32::MAX);
 
-        let cap = self.kv_cache_config.max_session_tokens;
-        let over_dense_cap = cap > 0 && retained_boundary > cap;
-        let mut cap_exempt = false;
-        if self.kv_cache_config.is_turboquant() || over_dense_cap {
-            match pair.quantize_target_for_retention(self.kv_cache_config, &mlx_gate) {
-                Ok(layers) if layers > 0 => {
-                    cap_exempt = over_dense_cap;
-                    tracing::debug!(
+                    if continued {
+                        self.cache_metrics
+                            .continuations
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.cache_metrics.prefill_saved_tokens.fetch_add(
+                            u64::from(total.saturating_sub(prefilled)),
+                            Ordering::Relaxed,
+                        );
+                    }
+
+                    let prefill_start = std::time::Instant::now();
+                    let (pair, prefill_logits) = pair
+                        .prefill_known(prefill_tokens, |exact_suffix, target_cache, draft_cache| {
+                            self.dflash_prefill_with_taps(
+                                &mut model,
+                                target_cache,
+                                &mut drafter,
+                                draft_cache,
+                                exact_suffix,
+                                &dflash.tap_layers,
+                            )
+                        })
+                        .map_err(session_pair_error)?;
+                    let first_token = sample(&prefill_logits.index((.., -1, ..)), params)
+                        .map_err(EngineError::Mlx)?;
+                    eval([&first_token]).map_err(EngineError::Mlx)?;
+                    let prefill_elapsed = prefill_start.elapsed();
+
+                    let first_id: u32 = first_token.item();
+                    let mut decode = SessionDsparkDecodeState::begin(pair, first_id)?;
+                    let max_tokens = usize::try_from(max_tokens).map_err(|_| {
+                        EngineError::Generation("max_tokens overflow usize".to_owned())
+                    })?;
+
+                    let decode_start = std::time::Instant::now();
+                    // This loop owns only session delivery/termination. Ticket creation,
+                    // exact history, target+dSpark advancement, lease validation, and
+                    // ledger commit all run through the same canonical transaction driver
+                    // used by stateless decoding.
+                    while decode.len() < max_tokens {
+                        let pending_anchor = decode.pending_token().ok_or_else(|| {
+                            EngineError::Generation(
+                                "session DFlash ledger lost its pending token".to_owned(),
+                            )
+                        })?;
+                        if self.eos_token_ids.contains(&pending_anchor) {
+                            break;
+                        }
+                        let remaining = max_tokens.saturating_sub(decode.len());
+                        if remaining == 0 {
+                            break;
+                        }
+                        let (next_decode, committed) = decode.run_round(
+                            |target_cache,
+                             draft_cache,
+                             tap_frontier,
+                             anchor_ticket,
+                             history_before_anchor| {
+                                let round = self.canonical_dflash_round(
+                                    &mut model,
+                                    target_cache,
+                                    &mut drafter,
+                                    draft_cache,
+                                    tap_frontier,
+                                    anchor_ticket,
+                                    history_before_anchor,
+                                    remaining,
+                                    remaining,
+                                    params,
+                                    &[],
+                                    None,
+                                    dflash,
+                                )?;
+                                round.into_lease_parts()
+                            },
+                        )?;
+                        decode = next_decode;
+
+                        if let Ok(mut values) = self.last_dflash_accepts.lock() {
+                            values.push(u32::try_from(committed.successors.len()).unwrap_or(0));
+                        }
+                        if let Ok(mut values) = self.last_dflash_draft_matches.lock() {
+                            values.push(u32::try_from(committed.draft_matches).unwrap_or(0));
+                        }
+                        if let Ok(mut values) = self.last_dflash_draft_counts.lock() {
+                            values.push(u32::try_from(committed.draft_tokens.len()).unwrap_or(0));
+                        }
+                    }
+                    let decode_elapsed = decode_start.elapsed();
+                    let retain_start = std::time::Instant::now();
+
+                    // Align the final visible token with both caches. EOS remains visible
+                    // but is intentionally absent from the retained key; a non-EOS length
+                    // tail receives one target-only forward whose taps are consumed while
+                    // sealing the drafter snapshot.
+                    let (mut pair, generated) = decode.finish(
+                        &self.eos_token_ids,
+                        |target_cache, _draft_cache, tap_frontier, token| {
+                            let input_token = i32::try_from(token).map_err(|_| {
+                                EngineError::Generation(
+                                    "session DFlash retained token overflow i32".to_owned(),
+                                )
+                            })?;
+                            let input = Array::from_slice(&[input_token], &[1, 1]);
+                            let (_hidden, taps) = model
+                                .forward_raw_with_taps(
+                                    &input,
+                                    None,
+                                    target_cache,
+                                    &dflash.tap_layers,
+                                )
+                                .map_err(EngineError::Mlx)?;
+                            let next_target_boundary = tap_frontier
+                                .target_boundary()
+                                .checked_add(1)
+                                .ok_or_else(|| {
+                                    EngineError::Generation(
+                                        "session target boundary overflow".to_owned(),
+                                    )
+                                })?;
+                            tap_frontier.append(next_target_boundary, taps)
+                        },
+                    )?;
+                    let retained_boundary = pair.token_len();
+
+                    let cap = self.kv_cache_config.max_session_tokens;
+                    let over_dense_cap = cap > 0 && retained_boundary > cap;
+                    let mut cap_exempt = false;
+                    if self.kv_cache_config.is_turboquant() || over_dense_cap {
+                        match pair.quantize_target_for_retention(self.kv_cache_config, &mlx_gate) {
+                            Ok(layers) if layers > 0 => {
+                                cap_exempt = over_dense_cap;
+                                tracing::debug!(
+                                    session_id,
+                                    compressed_layers = layers,
+                                    over_dense_cap,
+                                    "Compressed paired target KV for between-turn retention"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(
+                                session_id,
+                                error = %error,
+                                "Failed to TurboQuant-compress paired target KV; retaining dense"
+                            ),
+                        }
+                    }
+
+                    let publication = self.seal_session_dspark_publication(
                         session_id,
-                        compressed_layers = layers,
-                        over_dense_cap,
-                        "Compressed paired target KV for between-turn retention"
+                        pair,
+                        &mut drafter,
+                        &mlx_gate,
+                    );
+                    let retain_elapsed = retain_start.elapsed();
+
+                    let total_elapsed = total_start.elapsed();
+                    if let Ok(mut value) = self.last_dflash_timing.lock() {
+                        *value = Some(GenerationPhaseTiming {
+                            prefill: prefill_elapsed,
+                            decode: decode_elapsed,
+                            request: total_elapsed,
+                            decode_tokens: u32::try_from(generated.len().saturating_sub(1))
+                                .unwrap_or(u32::MAX),
+                        });
+                    }
+                    #[allow(clippy::print_stderr)]
+                    if timing {
+                        eprintln!(
+                            "DIAG session-dspark-timing: continued={continued} prompt={total} prefilled={prefilled} generated={} prefill={prefill_elapsed:.2?} decode={decode_elapsed:.2?} retain_eval={retain_elapsed:.2?} total={total_elapsed:.2?}",
+                            generated.len()
+                        );
+                    }
+                    tracing::info!(
+                        session_id,
+                        continued,
+                        prompt_tokens = total,
+                        prefilled_tokens = prefilled,
+                        prefill_saved = total.saturating_sub(prefilled),
+                        "paired dSpark cache-resident turn"
+                    );
+
+                    Ok((
+                        SessionGeneration {
+                            text: self.decode_tokens(&generated)?,
+                            completion_tokens: u32::try_from(generated.len()).unwrap_or(u32::MAX),
+                            prompt_tokens: total,
+                            prefilled_tokens: prefilled,
+                            continued,
+                        },
+                        publication,
+                        cap_exempt,
+                    ))
+                })();
+            match attempt {
+                Ok(parts) => break parts,
+                Err(error) if continued && !retried_cold => {
+                    retried_cold = true;
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "continued dSpark turn failed; retrying this request from a cold prefill"
                     );
                 }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    session_id,
-                    error = %error,
-                    "Failed to TurboQuant-compress paired target KV; retaining dense"
-                ),
+                Err(error) => return Err(error),
             }
-        }
-
-        let publication =
-            self.seal_session_dspark_publication(session_id, pair, &mut drafter, &mlx_gate);
-        let retain_elapsed = retain_start.elapsed();
+        };
 
         drop(drafter);
         drop(model);
         drop(mlx_gate);
         self.publish_session_dspark_publication(session_id, publication, cap_exempt);
-
-        let total_elapsed = total_start.elapsed();
-        if let Ok(mut value) = self.last_dflash_timing.lock() {
-            *value = Some(GenerationPhaseTiming {
-                prefill: prefill_elapsed,
-                decode: decode_elapsed,
-                request: total_elapsed,
-                decode_tokens: u32::try_from(generated.len().saturating_sub(1)).unwrap_or(u32::MAX),
-            });
-        }
-        #[allow(clippy::print_stderr)]
-        if timing {
-            eprintln!(
-                "DIAG session-dspark-timing: continued={continued} prompt={total} prefilled={prefilled} generated={} prefill={prefill_elapsed:.2?} decode={decode_elapsed:.2?} retain_eval={retain_elapsed:.2?} total={total_elapsed:.2?}",
-                generated.len()
-            );
-        }
-        tracing::info!(
-            session_id,
-            continued,
-            prompt_tokens = total,
-            prefilled_tokens = prefilled,
-            prefill_saved = total.saturating_sub(prefilled),
-            "paired dSpark cache-resident turn"
-        );
-
-        Ok(SessionGeneration {
-            text: self.decode_tokens(&generated)?,
-            completion_tokens: u32::try_from(generated.len()).unwrap_or(u32::MAX),
-            prompt_tokens: total,
-            prefilled_tokens: prefilled,
-            continued,
-        })
+        Ok(generation)
     }
 
     /// Greedy decode with a token-age KV-prune policy applied after every step.
