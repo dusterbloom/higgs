@@ -6366,7 +6366,16 @@ impl SimpleEngine {
                                 })?;
                                 dspark_frontier = Some(frontier.append(next_boundary, ar_taps)?);
                             } else {
-                                current_taps = ar_taps;
+                                // Append, never replace: the backlog may still
+                                // hold un-consumed taps (the chunked-prefill
+                                // tail plus every floored AR step below). A
+                                // replace here pinned the drafter cache at the
+                                // last chunk boundary and every sampled request
+                                // with a >1-chunk prompt died at its first spec
+                                // probe with "DFlash context transaction
+                                // diverged: drafter=<chunk+1>".
+                                Self::append_taps(&mut current_taps, &ar_taps)
+                                    .map_err(EngineError::Mlx)?;
                             }
                             logits
                         } else if mtp_floor {
@@ -6387,9 +6396,18 @@ impl SimpleEngine {
                                 .map_err(EngineError::Mlx)?;
                             logits
                         } else {
-                            model
-                                .forward(&single, None, &mut cache)
-                                .map_err(EngineError::Mlx)?
+                            // Plain-AR floor step: collect this position's tap
+                            // like the MTP floor does. A context hole blinds
+                            // the drafter at the next probe and breaks the
+                            // `drafter position + backlog == start` transaction
+                            // invariant. The cost is one lazy tap clone per
+                            // floored step.
+                            let (logits, ar_taps) = model
+                                .forward_with_taps(&single, None, &mut cache, &dflash.tap_layers)
+                                .map_err(EngineError::Mlx)?;
+                            Self::append_taps(&mut current_taps, &ar_taps)
+                                .map_err(EngineError::Mlx)?;
+                            logits
                         };
                         if let Some(ticket) = dspark_forward {
                             dspark_ledger
@@ -6644,14 +6662,20 @@ impl SimpleEngine {
                     // Experimental S>1 throughput path. It remains isolated
                     // behind the explicit block verifier policy; the default
                     // dSpark path above is the shared S=1 transaction.
-                    let block_size_us = usize::try_from(block_size).map_err(|_| {
+                    // The noise block is FIXED at the drafter's trained block
+                    // size — validate_noise rejects any other shape (observed
+                    // 500: "drafter noise must be [1, 16, ...], got [1, 8, ...]"
+                    // after the adaptive gate shrank the block). Adaptivity is
+                    // applied to the PROPOSAL cap below instead, which is where
+                    // the target-verify savings actually come from.
+                    let block_size_us = usize::try_from(dflash.block_size).map_err(|_| {
                         EngineError::Generation("block_size overflow for usize".to_owned())
                     })?;
                     let mut block_tokens = vec![mask_id; block_size_us];
                     if let Some(slot) = block_tokens.get_mut(0) {
                         *slot = last_token;
                     }
-                    let block_ids = Array::from_slice(&block_tokens, &[1, block_size]);
+                    let block_ids = Array::from_slice(&block_tokens, &[1, dflash.block_size]);
                     let noise_embedding = model
                         .embed_token_ids(&block_ids)
                         .map_err(EngineError::Mlx)?;
@@ -6669,7 +6693,8 @@ impl SimpleEngine {
                         )));
                     }
                     let round_draft_cap =
-                        dflash_tail_draft_cap(dflash.draft_cap, remaining, is_dspark);
+                        dflash_tail_draft_cap(dflash.draft_cap, remaining, is_dspark)
+                            .min(block_size.max(1));
                     let proposal = dflash_propose_tokens(
                         &model,
                         &drafter,
