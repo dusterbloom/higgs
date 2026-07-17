@@ -226,8 +226,8 @@ impl PairLedgerKey {
 struct PrefixStamp {
     /// `Some` only for the correct-by-construction [`LivePair`] path.
     ///
-    /// `None` identifies the temporary compatibility constructor used by call
-    /// sites that have not yet migrated to the shared paired coordinator.
+    /// `None` identifies the legacy `#[cfg(test)]` fixture constructor, which
+    /// deliberately cannot claim shared live-branch provenance.
     branch_epoch: Option<PairBranchEpoch>,
     hash: u64,
     len: usize,
@@ -482,9 +482,10 @@ impl SealedPair {
 /// - dFlash position = frontier draft boundary;
 /// - frontier target boundary = `tokens.len()`.
 ///
-/// Session prefill/decode uses this coordinator directly. The radix path still
-/// has a temporary snapshot-sidecar compatibility layer until Phase 2 moves
-/// endpoint publication and fork reuse onto the same ownership flow.
+/// Session prefill/decode and exact-endpoint radix publication both use this
+/// coordinator directly. Radix entries retain only an immutable dSpark
+/// sidecar beside the existing deduplicated target path and fork back into a
+/// fresh `LivePair`.
 #[derive(Debug)]
 struct LiveTargetHalf {
     epoch: PairBranchEpoch,
@@ -523,6 +524,19 @@ pub(crate) struct LivePairParts {
     pub(crate) target: AnyCache,
     pub(crate) dflash: DFlashCache,
     pub(crate) frontier: DflashTapFrontier,
+}
+
+/// Evaluated exact-boundary artifacts produced by the sole live-pair sealing
+/// primitive.
+///
+/// Session publication consumes these into a `SealedPair`; radix publication
+/// forks the dSpark snapshot and continues from the same evaluated target.
+struct PreparedLiveSeal {
+    epoch: PairBranchEpoch,
+    target: AnyCache,
+    snapshot: DFlashSnapshot,
+    tokens: Vec<u32>,
+    expected_taps: usize,
 }
 
 /// Move-only decode transaction for one exact live target/dSpark branch.
@@ -672,6 +686,56 @@ impl LivePair {
         };
         pair.validate_stable()?;
         Ok((pair, result))
+    }
+
+    /// Consume this pair through one exact target-plus-taps prefill suffix.
+    ///
+    /// Unlike [`Self::advance_known`], the caller cannot choose either frontier
+    /// boundary or tap count. Prefill must start from an aligned pair; this
+    /// coordinator derives the new target boundary from the pair-owned token
+    /// ledger and the new draft boundary from the live dFlash cache after the
+    /// callback has projected any completed chunks. The callback supplies only
+    /// the target operation's result and final unconsumed taps.
+    pub(crate) fn prefill_known<R, F>(
+        self,
+        suffix: &[u32],
+        prefill: F,
+    ) -> Result<(Self, R), PairedCacheError>
+    where
+        F: FnOnce(&[u32], &mut AnyCache, &mut DFlashCache) -> Result<(R, Vec<Array>), EngineError>,
+    {
+        if suffix.is_empty() {
+            return Err(PairedCacheError::Advance {
+                details: "known dSpark prefill requires a non-empty suffix".to_owned(),
+            });
+        }
+        self.advance_known(suffix, |exact_suffix, target, draft, frontier| {
+            let pending_rows = frontier.rows()?;
+            if pending_rows != 0 {
+                return Err(EngineError::Generation(format!(
+                    "known dSpark prefill requires an aligned frontier, found {pending_rows} pending target rows"
+                )));
+            }
+            let suffix_rows = i32::try_from(exact_suffix.len()).map_err(|_| {
+                EngineError::Generation(format!(
+                    "known dSpark prefill suffix length {} exceeds i32",
+                    exact_suffix.len()
+                ))
+            })?;
+            let target_boundary = frontier
+                .target_boundary()
+                .checked_add(suffix_rows)
+                .ok_or_else(|| {
+                    EngineError::Generation(
+                        "known dSpark prefill target boundary overflow".to_owned(),
+                    )
+                })?;
+            let expected_taps = frontier.expected_taps();
+            let (result, taps) = prefill(exact_suffix, target, draft)?;
+            let next_frontier =
+                DflashTapFrontier::new(draft.position(), target_boundary, taps, expected_taps)?;
+            Ok((next_frontier, result))
+        })
     }
 
     /// Move this exact pair into a decode lease and independently move its
@@ -829,45 +893,16 @@ impl LivePair {
     pub(crate) fn seal(
         self,
         drafter: &mut DFlashDrafter,
-        _exec: &MlxExecToken,
+        exec: &MlxExecToken,
     ) -> Result<PairedCache, PairedCacheError> {
-        self.validate_stable()?;
-        let Self {
+        let PreparedLiveSeal {
             epoch,
-            revision: _,
             target,
-            dflash,
-            frontier,
+            snapshot,
             tokens,
-        } = self;
-        let configured_taps = drafter.config.num_taps();
-        let expected_taps = frontier.frontier.expected_taps();
-        if configured_taps != expected_taps {
-            return Err(PairedCacheError::DFlashTapCount {
-                expected: expected_taps,
-                actual: configured_taps,
-            });
-        }
-        let expected = Self::token_boundary(tokens.len())?;
-        target
-            .cache
-            .eval()
-            .map_err(|error| PairedCacheError::TargetMaterialization {
-                details: error.to_string(),
-            })?;
-        target
-            .cache
-            .validate_absolute_boundary(expected)
-            .map_err(|error| PairedCacheError::TargetBoundary {
-                expected,
-                details: error.to_string(),
-            })?;
-        let snapshot = drafter
-            .seal_after_taps(dflash.cache, &frontier.frontier.taps, expected)
-            .map_err(|error| PairedCacheError::DFlashSeal {
-                details: error.to_string(),
-            })?;
-        let sealed = SealedPair::from_live_branch(target.cache, snapshot, epoch, tokens)?;
+            expected_taps: _,
+        } = self.prepare_live_seal(drafter, exec)?;
+        let sealed = SealedPair::from_live_branch(target, snapshot, epoch, tokens)?;
         Ok(PairedCache { sealed })
     }
 
@@ -882,12 +917,46 @@ impl LivePair {
     pub(crate) fn checkpoint_for_radix<R, E, F>(
         self,
         drafter: &mut DFlashDrafter,
-        _exec: &MlxExecToken,
+        exec: &MlxExecToken,
         prepare: F,
     ) -> Result<(Self, Result<R, E>), PairedCacheError>
     where
         F: for<'a> FnOnce(RadixPairCheckpoint<'a>) -> Result<R, E>,
     {
+        let PreparedLiveSeal {
+            epoch,
+            target,
+            snapshot,
+            tokens,
+            expected_taps,
+        } = self.prepare_live_seal(drafter, exec)?;
+
+        #[cfg(test)]
+        if FAIL_NEXT_RADIX_CHECKPOINT_FORK.swap(false, Ordering::SeqCst) {
+            return Err(PairedCacheError::DFlashFork {
+                details: "injected radix checkpoint fork failure".to_owned(),
+            });
+        }
+        let live_dflash = snapshot
+            .fork_live()
+            .map_err(|error| PairedCacheError::DFlashFork {
+                details: error.to_string(),
+            })?;
+        let stamp = PrefixStamp::from_live_branch(epoch, tokens.clone());
+        let continued = Self::from_clean_boundary(target, live_dflash, tokens, expected_taps)?;
+        let checkpoint = RadixPairCheckpoint::new(&continued.target.cache, snapshot, stamp)?;
+        let prepared = prepare(checkpoint);
+        continued.validate_stable()?;
+        Ok((continued, prepared))
+    }
+
+    /// Evaluate and seal one exact live branch through the only target+dSpark
+    /// boundary-validation implementation.
+    fn prepare_live_seal(
+        self,
+        drafter: &mut DFlashDrafter,
+        _exec: &MlxExecToken,
+    ) -> Result<PreparedLiveSeal, PairedCacheError> {
         self.validate_stable()?;
         let Self {
             epoch,
@@ -905,7 +974,6 @@ impl LivePair {
                 actual: configured_taps,
             });
         }
-
         let expected = Self::token_boundary(tokens.len())?;
         target
             .cache
@@ -925,25 +993,13 @@ impl LivePair {
             .map_err(|error| PairedCacheError::DFlashSeal {
                 details: error.to_string(),
             })?;
-
-        #[cfg(test)]
-        if FAIL_NEXT_RADIX_CHECKPOINT_FORK.swap(false, Ordering::SeqCst) {
-            return Err(PairedCacheError::DFlashFork {
-                details: "injected radix checkpoint fork failure".to_owned(),
-            });
-        }
-        let live_dflash = snapshot
-            .fork_live()
-            .map_err(|error| PairedCacheError::DFlashFork {
-                details: error.to_string(),
-            })?;
-        let stamp = PrefixStamp::from_live_branch(epoch, tokens.clone());
-        let continued =
-            Self::from_clean_boundary(target.cache, live_dflash, tokens, expected_taps)?;
-        let checkpoint = RadixPairCheckpoint::new(&continued.target.cache, snapshot, stamp)?;
-        let prepared = prepare(checkpoint);
-        continued.validate_stable()?;
-        Ok((continued, prepared))
+        Ok(PreparedLiveSeal {
+            epoch,
+            target: target.cache,
+            snapshot,
+            tokens,
+            expected_taps,
+        })
     }
 
     fn validate_stable(&self) -> Result<(), PairedCacheError> {
@@ -1137,12 +1193,11 @@ impl PairedCache {
     /// execution gate before transferring it here. `DFlashSnapshot` is already
     /// evaluated by `DFlashDrafter::seal_after_taps`.
     ///
-    /// # Temporary compatibility layer
+    /// # Legacy test fixture
     ///
     /// This constructor accepts independently supplied halves and therefore
-    /// proves boundary/key equality but not shared prefill provenance. New code
-    /// must use [`LivePair::seal`]. Delete this after `simple.rs` and radix
-    /// publication migrate to the move-owned coordinator.
+    /// proves boundary/key equality but not shared prefill provenance.
+    /// Production code must use [`LivePair::seal`].
     #[cfg(test)]
     pub(crate) fn new(
         target: AnyCache,
@@ -1156,8 +1211,8 @@ impl PairedCache {
     ///
     /// `expected_tokens` is only a comparison key. The live token ledger is
     /// moved out of the private retained stamp, so a caller cannot relabel the
-    /// cache with an equal-length slice. Legacy pairs created by [`Self::new`]
-    /// remain usable by existing compatibility paths but cannot enter this
+    /// cache with an equal-length slice. Legacy test pairs created by
+    /// [`Self::new`] remain intentionally unproven and cannot enter this
     /// correct-by-construction coordinator.
     pub(crate) fn resume(
         self,
@@ -1711,7 +1766,7 @@ mod tests {
         let pair = LivePair::cold(target_cache(0), drafter.make_cache(), 1).unwrap();
         let _exec = higgs_models::mlx_exec::acquire();
         let pair = pair
-            .advance_known(tokens, |exact, target, draft, frontier| {
+            .prefill_known(tokens, |exact, target, draft| {
                 assert_eq!(exact, tokens);
                 assert_eq!(draft.position(), 0);
                 for &token in exact {
@@ -1722,8 +1777,7 @@ mod tests {
                     .then(|| Array::zeros::<f32>(&[1, rows, 4]).unwrap())
                     .into_iter()
                     .collect();
-                let frontier = frontier.append(rows, taps)?;
-                Ok::<_, EngineError>((frontier, ()))
+                Ok::<_, EngineError>(((), taps))
             })
             .unwrap()
             .0;
@@ -1789,6 +1843,91 @@ mod tests {
 
         assert_ne!(captured_ptr, caller_ptr);
         assert_eq!(pair.tokens, [11, 12]);
+    }
+
+    #[test]
+    fn known_prefill_derives_nonzero_boundaries_from_pair_owned_tokens() {
+        let retained_tokens = vec![11];
+        let (pair, mut drafter) = target_ahead_live_pair(&retained_tokens);
+        let exec = higgs_models::mlx_exec::acquire();
+        let sealed = pair.seal(&mut drafter, &exec).unwrap();
+        let pair = sealed.resume(&retained_tokens, 1).unwrap();
+        let mut caller_suffix = vec![12, 13];
+        let caller_ptr = caller_suffix.as_ptr();
+
+        let (pair, captured_ptr) = pair
+            .prefill_known(&caller_suffix, |exact, target, draft| {
+                assert_eq!(exact, [12, 13]);
+                assert_eq!(
+                    draft.position(),
+                    1,
+                    "the resumed drafter must begin at the retained boundary"
+                );
+                for &token in exact {
+                    advance_target_one(target, token);
+                }
+                let taps = vec![Array::zeros::<f32>(&[1, 2, 4]).unwrap()];
+                Ok::<_, EngineError>((exact.as_ptr(), taps))
+            })
+            .unwrap();
+        caller_suffix[0] = 99;
+
+        assert_ne!(
+            captured_ptr, caller_ptr,
+            "the callback must observe the pair-owned suffix"
+        );
+        assert_eq!(pair.tokens, [11, 12, 13]);
+        assert_eq!(pair.dflash.cache.position(), 1);
+        assert_eq!(pair.frontier.frontier.draft_boundary(), 1);
+        assert_eq!(pair.frontier.frontier.target_boundary(), 3);
+        assert_eq!(pair.frontier.frontier.rows().unwrap(), 2);
+        pair.target.cache.validate_absolute_boundary(3).unwrap();
+        pair.validate_stable().unwrap();
+    }
+
+    #[test]
+    fn known_prefill_rejects_a_target_ahead_frontier_before_model_work() {
+        let (pair, _drafter) = target_ahead_live_pair(&[11]);
+        let callback_called = std::cell::Cell::new(false);
+
+        let error = pair
+            .prefill_known(&[12], |_exact, _target, _draft| {
+                callback_called.set(true);
+                Ok::<_, EngineError>(((), vec![Array::zeros::<f32>(&[1, 1, 4]).unwrap()]))
+            })
+            .unwrap_err();
+
+        assert!(!callback_called.get());
+        assert_eq!(
+            error,
+            PairedCacheError::Advance {
+                details:
+                    "Generation error: known dSpark prefill requires an aligned frontier, found 1 pending target rows"
+                        .to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn known_prefill_rejects_an_empty_suffix_before_model_work() {
+        let drafter = test_drafter();
+        let pair = LivePair::cold(target_cache(0), drafter.make_cache(), 1).unwrap();
+        let callback_called = std::cell::Cell::new(false);
+
+        let error = pair
+            .prefill_known(&[], |_exact, _target, _draft| {
+                callback_called.set(true);
+                Ok::<_, EngineError>(((), Vec::new()))
+            })
+            .unwrap_err();
+
+        assert!(!callback_called.get());
+        assert_eq!(
+            error,
+            PairedCacheError::Advance {
+                details: "known dSpark prefill requires a non-empty suffix".to_owned()
+            }
+        );
     }
 
     #[test]

@@ -50,12 +50,14 @@ impl ReferenceDsparkEnv {
             _guards: vec![
                 ScopedEnvVar::set("HIGGS_DFLASH_VERIFY_MODE", "block"),
                 ScopedEnvVar::set("HIGGS_DFLASH_GATE", "0"),
-                ScopedEnvVar::set("HIGGS_DFLASH_ADAPTIVE", "0"),
                 ScopedEnvVar::set("HIGGS_DSPARK_DRAFT_CAP", "4"),
                 ScopedEnvVar::set("HIGGS_DSPARK_TARGET_HEAD", "0"),
                 ScopedEnvVar::set("HIGGS_BONSAI_TG_LUT4", "1"),
                 ScopedEnvVar::set("HIGGS_BONSAI_TG_LUT4_FUSED_MLP", "0"),
                 ScopedEnvVar::set("HIGGS_BONSAI_TG_LUT4_M5_WG", "256"),
+                ScopedEnvVar::set("HIGGS_DFLASH_FUSED_CONV", "0"),
+                ScopedEnvVar::set("HIGGS_DFLASH_GDN_CONFIG_CACHE", "0"),
+                ScopedEnvVar::set("HIGGS_BONSAI_ALIGNED_FAST_QMV", "0"),
             ],
         }
     }

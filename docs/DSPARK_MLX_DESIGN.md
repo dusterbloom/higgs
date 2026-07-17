@@ -189,6 +189,15 @@ target KV layer, every recurrent-cache absolute offset, the dSpark position,
 and the exact token identity. The dSpark fixed-tile remainder is preserved; it
 is valid internal state and is not projected merely to make a cache entry.
 
+All known target-plus-taps prefill enters through the same `LivePair`
+coordinator, whether the branch is cold, session-resumed, or radix-forked. It
+derives both boundaries from pair-owned state and accepts only the final
+unconsumed tap rows from model execution. Canonical stateless and session
+decode likewise share one transaction driver for anchor-ticket creation,
+history derivation, and ledger commit; the session backend adds lease
+validation before that commit, while streaming/termination policy remains an
+outer delivery concern.
+
 Retained sessions move the whole pair out of the session map and mint a fresh
 live branch epoch. The radix cache stores an immutable dSpark sidecar only at
 an exact endpoint in the existing target trie; each hit materializes the
