@@ -7995,17 +7995,6 @@ impl Qwen3NextCausalLM {
             promoted.projections = promoted.projections.saturating_add(layer.projections);
             promoted.bytes = promoted.bytes.saturating_add(layer.bytes);
         }
-        // Also promote the LM head if eligible (huge N=vocab benefits most).
-        if let Some(lm_head) = self.lm_head.as_mut() {
-            let (_shape, eligible) = lm_head.bonsai_row2_promotion_candidate("lm_head")?;
-            if eligible {
-                let packed = lm_head.prepare_bonsai_row2("lm_head")?;
-                let bytes = packed.cached_bytes();
-                lm_head.install_bonsai_row2(packed);
-                promoted.projections = promoted.projections.saturating_add(1);
-                promoted.bytes = promoted.bytes.saturating_add(bytes);
-            }
-        }
         Ok(promoted)
     }
 
