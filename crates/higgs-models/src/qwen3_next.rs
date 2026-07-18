@@ -820,6 +820,11 @@ impl QLinear {
     }
 
     /// Return whether this canonical Q2 projection can be promoted to row2.
+    /// Eligibility: Affine mode, bits=2, group_size=128, N>=8192, N%2==0,
+    /// K%128==0, nonempty fp16/bf16 bias (Phase 0.3 decision: retain biases
+    /// for Q2 v1). The N>=8192 floor reflects microbench evidence that the
+    /// row2 kernel's one-thread-per-output-row design starves GPU occupancy
+    /// for small N (down_proj at N=5120 measured 0.90x slower than MLX stock).
     fn bonsai_row2_promotion_candidate(&self, _path: &str) -> Result<((i32, i32), bool), Exception> {
         match &self.weight_layout {
             QLinearWeightLayout::BonsaiRow2 { n_rows, k_dim } => Ok(((*n_rows, *k_dim), false)),
@@ -840,6 +845,7 @@ impl QLinear {
                 };
                 let eligible = !has_symmetric_q1_biases(&self.biases)
                     && matches!(self.scales.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+                    && n_rows >= 8192
                     && n_rows % 2 == 0
                     && k_dim % 128 == 0;
                 Ok(((n_rows, k_dim), eligible))
@@ -896,10 +902,12 @@ impl QLinear {
             return x.matmul(&dense.transpose()?);
         }
 
-        // Q2 row2 promotion: M=5 verifier tile uses the native spec kernel
-        // (1.73-1.79x vs z-batched QMM per microbench). M=1 AR decode uses a
-        // direct row2 M=1 kernel that reads the row2 layout without dequant
-        // round-trip. Wider inputs fall through to dequant + MLX matmul.
+        // Q2 row2 promotion: M=6 verifier tile uses the native spec kernel
+        // (1.46x faster than MLX stock on large-N gate/up at M=6 per direct
+        // microbench). M=1 AR decode uses a direct row2 M=1 kernel. Small-N
+        // projections are NOT promoted (down_proj stays Canonical for MLX stock
+        // because the row2 kernel's one-thread-per-output-row design starves
+        // GPU occupancy below ~8K output rows).
         if let Some(packed) = self.bonsai_row2()? {
             let row_count: i32 = x.shape().iter().take(x.ndim().saturating_sub(1)).product();
             if row_count == 6 && x.shape().last().copied() == Some(packed.k_dim) {
@@ -917,13 +925,6 @@ impl QLinear {
                 }
             }
             // Wide prefill: dequant row2 -> canonical, then MLX stock matmul.
-            tracing::debug!(
-                row_count,
-                k_dim = packed.k_dim,
-                input_last = ?x.shape().last(),
-                bits = self.bits,
-                "row2 fallback to dequant+stock"
-            );
             let (w_canon, s_canon) = crate::metal_kernel::bonsai_q2_row2_to_canonical(packed)?;
             return ops::quantized_matmul(
                 x,
