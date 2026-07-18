@@ -1686,6 +1686,7 @@ impl BonsaiQ2Row2 {
 const Q2_ROW2_M5_KERNEL_SOURCE: &str = r"
 constexpr int WG = 256;           // threads per threadgroup
 constexpr int ROWS_PER_TG = 256;  // output rows handled by one threadgroup
+constexpr int MROWS = 6;          // anchor + 4 drafts + 1 bonus
 
 uint tid = thread_index_in_threadgroup;
 uint tgx = threadgroup_position_in_grid.x;
@@ -1696,6 +1697,7 @@ float acc1 = 0.0f;
 float acc2 = 0.0f;
 float acc3 = 0.0f;
 float acc4 = 0.0f;
+float acc5 = 0.0f;
 
 if (n < NRows) {
     int row_tile = n / 2;
@@ -1704,9 +1706,9 @@ if (n < NRows) {
     for (int g = 0; g < NumGroups; ++g) {
         // Per-verifier-row partials for this group.
         float qacc0 = 0.0f; float qacc1 = 0.0f; float qacc2 = 0.0f;
-        float qacc3 = 0.0f; float qacc4 = 0.0f;
+        float qacc3 = 0.0f; float qacc4 = 0.0f; float qacc5 = 0.0f;
         float sx0 = 0.0f;   float sx1 = 0.0f;   float sx2 = 0.0f;
-        float sx3 = 0.0f;   float sx4 = 0.0f;
+        float sx3 = 0.0f;   float sx4 = 0.0f;   float sx5 = 0.0f;
 
         int group_base = (row_tile * NumGroups + g) * 8;  // 8 packed words per group
         int x_base = g * 128;
@@ -1715,8 +1717,6 @@ if (n < NRows) {
         for (int word = 0; word < 8; ++word) {
             uint packed = w[(group_base + word) * 2 + row_lane];
             int xo = x_base + word * 16;
-            // Unrolled 16-way 2-bit unpack + fma into 5 verifier rows.
-            // Direct q*x fma; bias*sum_x combined at the group tail.
             #pragma clang loop unroll(full)
             for (int i = 0; i < 16; ++i) {
                 uint q = (packed >> (uint(i) * 2u)) & 0x3u;
@@ -1726,16 +1726,16 @@ if (n < NRows) {
                 float xv2 = float(x[2 * K + xo + i]);
                 float xv3 = float(x[3 * K + xo + i]);
                 float xv4 = float(x[4 * K + xo + i]);
+                float xv5 = float(x[5 * K + xo + i]);
                 qacc0 += qf * xv0; sx0 += xv0;
                 qacc1 += qf * xv1; sx1 += xv1;
                 qacc2 += qf * xv2; sx2 += xv2;
                 qacc3 += qf * xv3; sx3 += xv3;
                 qacc4 += qf * xv4; sx4 += xv4;
+                qacc5 += qf * xv5; sx5 += xv5;
             }
         }
 
-        // Scales are in row2 layout: sc_transposed[t, g, l] = scales[t*2+l, g].
-        // Biases are in canonical [N, NumGroups] layout: bi[n, g] = biases[n*NumGroups+g].
         int sb_row2_idx = (row_tile * NumGroups + g) * 2 + row_lane;
         int b_canon_idx = (row_tile * 2 + row_lane) * NumGroups + g;
         float s_val = float(sc[sb_row2_idx]);
@@ -1745,16 +1745,17 @@ if (n < NRows) {
         acc2 += s_val * qacc2 + b_val * sx2;
         acc3 += s_val * qacc3 + b_val * sx3;
         acc4 += s_val * qacc4 + b_val * sx4;
+        acc5 += s_val * qacc5 + b_val * sx5;
     }
 }
 
-// Output layout: [M, NRows] row-major (matches Q1 TG-LUT4 M=5 kernel).
 if (n < NRows) {
     y[0 * NRows + n] = OutT(acc0);
     y[1 * NRows + n] = OutT(acc1);
     y[2 * NRows + n] = OutT(acc2);
     y[3 * NRows + n] = OutT(acc3);
     y[4 * NRows + n] = OutT(acc4);
+    y[5 * NRows + n] = OutT(acc5);
 }
 ";
 
@@ -1819,8 +1820,8 @@ fn configure_q2_row2_m5_kernel(
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, grid_x, 1, 1);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, WG, 1, 1);
 
-        // Output: [M=5, NRows] row-major.
-        let y_shape = [5, n_rows];
+        // Output: [M=6, NRows] row-major.
+        let y_shape = [6, n_rows];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
             y_shape.as_ptr(),
@@ -1856,12 +1857,12 @@ pub fn bonsai_q2_row2_m5_contract(
         .iter()
         .take(x_shape.len().saturating_sub(1))
         .product();
-    if m_rows != 5 {
+    if m_rows != 6 {
         return Err(Exception::custom(format!(
-            "bonsai_q2_row2_m5: expected M=5 verifier tile, got M={m_rows}"
+            "bonsai_q2_row2_m5: expected M=6 verifier tile (anchor + 4 drafts + 1 bonus), got M={m_rows}"
         )));
     }
-    let x_flat = x.reshape(&[5, packed.k_dim])?;
+    let x_flat = x.reshape(&[6, packed.k_dim])?;
     let w_flat = packed.weights.reshape(&[-1])?;
     let s_flat = packed.scales.flatten(None, None)?;
     let b_flat = biases.flatten(None, None)?;
@@ -1896,7 +1897,14 @@ pub fn bonsai_q2_row2_m5_contract(
     } else {
         let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
         unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
-        Ok(unsafe { Array::from_ptr(y_ptr) })
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        // Restore caller's leading batch dims (e.g. [1, 6, K] input -> [1, 6, N] output).
+        // The kernel always produces [6, N]; prepend the input's leading dims.
+        let trim_to = x_shape.len().saturating_sub(2).max(0);
+        let mut out_shape: Vec<i32> = x_shape.get(..trim_to).unwrap_or(&[]).to_vec();
+        out_shape.push(6);
+        out_shape.push(packed.n_rows);
+        y.reshape(&out_shape)
     };
 
     unsafe {
