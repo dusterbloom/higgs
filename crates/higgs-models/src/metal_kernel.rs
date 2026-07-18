@@ -900,6 +900,373 @@ pub fn bonsai_q1_qmm(
 }
 
 // ---------------------------------------------------------------------------
+// `qmv_fast`-class 2-bit narrow matrix multiply (decode / verify hot path).
+//
+// Direct port of the 1-bit `qmv_fast` tiling for Q2 affine packed weights:
+// each simdgroup computes RESULTS_PER_SIMDGROUP (4) output rows for one input
+// row; the grid's z dimension covers narrow M > 1 verifier batches without
+// materializing the dense weight matrix. Each lane holds VPT (16) input
+// values in registers (= one packed u32 word, which holds 16 Q2 weights) and
+// reuses them across all 4 output rows.
+//
+// Q2 math: per weight, `w = scale*q + bias` where `q = (word >> 2*col) & 0b11`.
+// Per 16-weight tile per row: `result = scale * sum(q_i * x_i) + bias * sum(x_i)`.
+// Biases are always retained (no symmetric compaction for Q2 v1).
+//
+// No LUT identity here -- at M=1, direct `q*x` fma is faster than building a
+// LUT. The LUT identity becomes useful at M=5 in the TG-LUT4 M=5 kernel
+// (Phase 3D), where one packed-word load is shared across 5 verifier rows.
+// ---------------------------------------------------------------------------
+
+const FAST_Q2_QMV_KERNEL_SOURCE: &str = r"
+constexpr int VPT = 16;          // values_per_thread (one packed u32 word per lane)
+constexpr int RPS = 4;           // results_per_simdgroup
+constexpr int WPT = VPT / 16;    // packed uint32 words per thread (1)
+constexpr int BLK = VPT * 32;    // block_size = 512
+
+uint tgx = threadgroup_position_in_grid.x;
+uint sg  = simdgroup_index_in_threadgroup;
+uint lid = thread_index_in_simdgroup;
+uint nsg = simdgroups_per_threadgroup;
+uint batch = threadgroup_position_in_grid.z;
+
+int out_row = int(tgx) * (int(nsg) * RPS) + int(sg) * RPS;
+auto x_row = x + int(batch) * K;
+
+float xt[VPT];
+float result[RPS];
+for (int r = 0; r < RPS; ++r) { result[r] = 0.0f; }
+
+int aligned_end = (K / BLK) * BLK;
+
+// Main loop: full 512-element blocks.
+for (int k = 0; k < aligned_end; k += BLK) {
+    int xbase = k + int(lid) * VPT;
+    float sum = 0.0f;
+    for (int i = 0; i < VPT; ++i) { float v = float(x_row[xbase + i]); xt[i] = v; sum += v; }
+
+    int wcol = (k / 16) + int(lid) * WPT;
+    int g = xbase / GroupSize;   // all VPT values fall in one 128-wide group
+
+    for (int r = 0; r < RPS; ++r) {
+        int row = out_row + r;
+        if constexpr (!AlignedN) {
+            if (row >= n_param) { continue; }
+        }
+        float accum = 0.0f;
+        for (int wp = 0; wp < WPT; ++wp) {
+            uint packed = w[row * KPacked + wcol + wp];
+            int xo = wp * 16;
+            // Unrolled 16-way 2-bit unpack + fma. Metal compiler unrolls fully.
+            accum += float((packed >>  0u) & 0x3u) * xt[xo +  0];
+            accum += float((packed >>  2u) & 0x3u) * xt[xo +  1];
+            accum += float((packed >>  4u) & 0x3u) * xt[xo +  2];
+            accum += float((packed >>  6u) & 0x3u) * xt[xo +  3];
+            accum += float((packed >>  8u) & 0x3u) * xt[xo +  4];
+            accum += float((packed >> 10u) & 0x3u) * xt[xo +  5];
+            accum += float((packed >> 12u) & 0x3u) * xt[xo +  6];
+            accum += float((packed >> 14u) & 0x3u) * xt[xo +  7];
+            accum += float((packed >> 16u) & 0x3u) * xt[xo +  8];
+            accum += float((packed >> 18u) & 0x3u) * xt[xo +  9];
+            accum += float((packed >> 20u) & 0x3u) * xt[xo + 10];
+            accum += float((packed >> 22u) & 0x3u) * xt[xo + 11];
+            accum += float((packed >> 24u) & 0x3u) * xt[xo + 12];
+            accum += float((packed >> 26u) & 0x3u) * xt[xo + 13];
+            accum += float((packed >> 28u) & 0x3u) * xt[xo + 14];
+            accum += float((packed >> 30u) & 0x3u) * xt[xo + 15];
+        }
+        float s_val = float(sc[row * NumGroups + g]);
+        float b_val = float(bi[row * NumGroups + g]);
+        result[r] += s_val * accum + b_val * sum;
+    }
+}
+
+// Tail: only exercised by tests with K < 512 or K % 512 != 0.
+if (aligned_end < K) {
+    int xbase = aligned_end + int(lid) * VPT;
+    bool in_bounds = xbase < K;
+    float sum = 0.0f;
+    for (int i = 0; i < VPT; ++i) {
+        float v = (in_bounds && (xbase + i) < K) ? float(x_row[xbase + i]) : 0.0f;
+        xt[i] = v;
+        sum += v;
+    }
+    int wcol = (aligned_end / 16) + int(lid) * WPT;
+    int g = in_bounds ? (xbase / GroupSize) : 0;
+    for (int r = 0; r < RPS; ++r) {
+        int row = out_row + r;
+        if constexpr (AlignedN) {
+            if (!in_bounds) { continue; }
+        } else {
+            if (row >= n_param || !in_bounds) { continue; }
+        }
+        float accum = 0.0f;
+        for (int wp = 0; wp < WPT; ++wp) {
+            int widx = wcol + wp;
+            if (widx >= KPacked) { continue; }
+            uint packed = w[row * KPacked + widx];
+            int xo = wp * 16;
+            // Bounds-checked tail: each code may be the last in K.
+            accum += float((packed >>  0u) & 0x3u) * xt[xo +  0];
+            accum += float((packed >>  2u) & 0x3u) * xt[xo +  1];
+            accum += float((packed >>  4u) & 0x3u) * xt[xo +  2];
+            accum += float((packed >>  6u) & 0x3u) * xt[xo +  3];
+            accum += float((packed >>  8u) & 0x3u) * xt[xo +  4];
+            accum += float((packed >> 10u) & 0x3u) * xt[xo +  5];
+            accum += float((packed >> 12u) & 0x3u) * xt[xo +  6];
+            accum += float((packed >> 14u) & 0x3u) * xt[xo +  7];
+            accum += float((packed >> 16u) & 0x3u) * xt[xo +  8];
+            accum += float((packed >> 18u) & 0x3u) * xt[xo +  9];
+            accum += float((packed >> 20u) & 0x3u) * xt[xo + 10];
+            accum += float((packed >> 22u) & 0x3u) * xt[xo + 11];
+            accum += float((packed >> 24u) & 0x3u) * xt[xo + 12];
+            accum += float((packed >> 26u) & 0x3u) * xt[xo + 13];
+            accum += float((packed >> 28u) & 0x3u) * xt[xo + 14];
+            accum += float((packed >> 30u) & 0x3u) * xt[xo + 15];
+        }
+        float s_val = float(sc[row * NumGroups + g]);
+        float b_val = float(bi[row * NumGroups + g]);
+        result[r] += s_val * accum + b_val * sum;
+    }
+}
+
+for (int r = 0; r < RPS; ++r) {
+    int row = out_row + r;
+    float v = simd_sum(result[r]);
+    if (lid == 0u) {
+        if constexpr (AlignedN) {
+            y[int(batch) * n_param + row] = OutT(v);
+        } else if (row < n_param) {
+            y[int(batch) * n_param + row] = OutT(v);
+        }
+    }
+}
+";
+
+static FAST_Q2_QMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_fast_q2_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"bi", c"x", c"n_param"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(FAST_Q2_QMV_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_qmv_fast".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,  // raw pointer arithmetic requires row-contiguous inputs
+            false, // atomic_outputs
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_fast_q2_qmv_kernel(
+    out_dtype: mlx_sys::mlx_dtype,
+    n_rows: i32,
+    m_rows: i32,
+    k_dim: i32,
+    group_size: i32,
+    prefer_aligned: bool,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OutT".as_ptr(),
+            out_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"GroupSize".as_ptr(),
+            group_size,
+        );
+        // Q2 packs 16 weights per u32 (vs Q1's 32).
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"KPacked".as_ptr(),
+            k_dim / 16,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NumGroups".as_ptr(),
+            k_dim / group_size,
+        );
+
+        // Each simdgroup computes 4 rows; nsg simdgroups per threadgroup.
+        let nsg = fast_qmv_nsg();
+        let rows_per_tg = nsg * 4;
+        let aligned_n = fast_qmv_has_aligned_rows(n_rows, nsg, prefer_aligned);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"AlignedN".as_ptr(),
+            i32::from(aligned_n),
+        );
+        let n_tgs = (n_rows + rows_per_tg - 1) / rows_per_tg;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tgs * 32, nsg, m_rows);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, nsg, 1);
+
+        let y_shape = [m_rows, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            out_dtype,
+        );
+        config
+    }
+}
+
+/// Fused 2-bit quantized matvec: `y = x @ dequant(weight).T` for narrow M.
+///
+/// `weight` is the packed `[out_features, in_features/16]` uint32 matrix (each
+/// u32 word holds 16 Q2 codes). `scales`/`biases` are
+/// `[out_features, in_features/group_size]` fp16/bf16/fp32. Output dtype
+/// matches `x`.
+///
+/// Dispatches one grid slice per flattened input row (M can be 1 for decode
+/// or up to `bonsai_q2_qmm_max_rows()` for verifier batches). The kernel
+/// computes `result = scale * sum(q_i * x_i) + bias * sum(x_i)` per 16-weight
+/// tile per row, with biases always retained (Q2 v1 has no symmetric
+/// compaction).
+pub fn bonsai_q2_qmv(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    bonsai_q2_qmv_fast_impl(x, weight, scales, biases, group_size, use_aligned_fast_qmv())
+}
+
+/// Packed affine Q2 matrix multiply for narrow verifier batches. Wraps
+/// [`bonsai_q2_qmv`] (same dispatch pattern as Q1's `bonsai_q1_qmm`).
+pub fn bonsai_q2_qmm(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    bonsai_q2_qmv(x, weight, scales, biases, group_size)
+}
+
+#[allow(unsafe_code)]
+fn bonsai_q2_qmv_fast_impl(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+    prefer_aligned: bool,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    let n_rows = weight_shape
+        .first()
+        .copied()
+        .ok_or_else(|| Exception::custom("bonsai_q2_qmv_fast: weight has no rows"))?;
+    let k_packed = weight_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| Exception::custom("bonsai_q2_qmv_fast: weight has no columns"))?;
+    // Q2 packs 16 weights per u32.
+    let k_dim = k_packed * 16;
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+
+    let x_flat = x.reshape(&[m_rows, k_dim])?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.flatten(None, None)?;
+    // Q2 v1 always retains biases; empty biases array is a caller bug.
+    if biases.size() == 0 {
+        return Err(Exception::custom(
+            "bonsai_q2_qmv_fast: Q2 v1 requires a nonempty affine bias (no symmetric compaction)",
+        ));
+    }
+    let b_flat = biases.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    let cached = FAST_Q2_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_q2_qmv_kernel()));
+    let config = configure_fast_q2_qmv_kernel(
+        out_dtype,
+        n_rows,
+        m_rows,
+        k_dim,
+        group_size,
+        prefer_aligned,
+    );
+
+    let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
+    let input_ptrs = [
+        w_flat.as_ptr(),
+        s_flat.as_ptr(),
+        b_flat.as_ptr(),
+        x_flat.as_ptr(),
+        n_scalar,
+    ];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q2_qmv_fast failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        let trim_to = x_shape.len().saturating_sub(1);
+        let mut out_shape = x_shape
+            .get(..trim_to)
+            .ok_or_else(|| Exception::custom("bonsai_q2_qmv_fast: x_shape too small"))?
+            .to_vec();
+        out_shape.push(n_rows);
+        y.reshape(&out_shape)
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(n_scalar);
+    }
+    result
+}
+
+/// Upper bound on M for the narrow Q2 verifier path. Same knob as Q1
+/// (`HIGGS_BONSAI_QMM_MAX_ROWS`, default 8) since both share the z-batched
+/// dispatch shape. Wider M goes through `bonsai_q2_wide_qmm` (Phase 3E).
+pub fn bonsai_q2_qmm_max_rows() -> i32 {
+    crate::qwen3_next::bonsai_q1_qmm_max_rows()
+}
+
+// ---------------------------------------------------------------------------
 // Experimental symmetric-Q1 threadgroup-local LUT4 path.
 //
 // This is deliberately exposed through a typed row4 container instead of raw

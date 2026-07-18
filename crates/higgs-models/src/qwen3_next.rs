@@ -452,7 +452,7 @@ fn validate_dflash_affine_lowbit_linear(
     Ok(())
 }
 
-fn bonsai_q1_qmm_max_rows() -> i32 {
+pub(crate) fn bonsai_q1_qmm_max_rows() -> i32 {
     static MAX_ROWS: OnceLock<i32> = OnceLock::new();
     *MAX_ROWS.get_or_init(|| {
         std::env::var("HIGGS_BONSAI_QMM_MAX_ROWS")

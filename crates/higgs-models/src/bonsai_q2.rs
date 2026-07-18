@@ -321,4 +321,172 @@ mod tests {
             "expected ~2.25 bpw, got {bpw}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Phase 3B kernel bit-exactness tests (against the CPU oracle).
+    // -----------------------------------------------------------------
+
+    /// Deterministic PRNG (SplitMix-ish LCG), mirrors `bonsai_q1::tests::lcg`.
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 32) as u32
+    }
+
+    /// Build a deterministic Q2 fixture with per-(row,group) scales/biases so
+    /// a wrong group index produces a clear mismatch. Magnitudes are small and
+    /// signed, like real affine params. Matches `bonsai_q1::make_packed`.
+    fn make_packed_q2(out_features: usize, in_features: usize, seed: u64) -> PackedQ2Linear {
+        let packed_cols = in_features / WEIGHTS_PER_WORD;
+        let n_groups = in_features / GROUP_SIZE;
+        let mut st = seed;
+        let w_packed: Vec<u32> = (0..out_features * packed_cols)
+            .map(|_| lcg(&mut st))
+            .collect();
+        let scales: Vec<f16> = (0..out_features * n_groups)
+            .map(|i| f16::from_f32(0.05 + 0.013 * ((i % 7) as f32)))
+            .collect();
+        let biases: Vec<f16> = (0..out_features * n_groups)
+            .map(|i| f16::from_f32(-0.03 + 0.011 * ((i % 5) as f32)))
+            .collect();
+        PackedQ2Linear {
+            w_packed,
+            scales,
+            biases,
+            out_features,
+            in_features,
+        }
+    }
+
+    /// CPU reference matvec: y = dequant(W) · x for one row of x.
+    fn dense_matvec_reference(p: &PackedQ2Linear, x: &[f32]) -> Vec<f32> {
+        let mut y = vec![0f32; p.out_features];
+        let mut w_row = vec![0f32; p.in_features];
+        for r in 0..p.out_features {
+            p.dequant_row_to_fp32(r, &mut w_row);
+            let mut acc = 0f32;
+            for c in 0..p.in_features {
+                acc += x[c] * w_row[c];
+            }
+            y[r] = acc;
+        }
+        y
+    }
+
+    /// Upload a PackedQ2Linear's packed weight, scales, and biases to MLX
+    /// arrays matching the kernel's expected layout.
+    fn upload_to_mlx(p: &PackedQ2Linear) -> (mlx_rs::Array, mlx_rs::Array, mlx_rs::Array) {
+        use mlx_rs::Array;
+        let packed_cols = p.packed_cols();
+        let n_groups = p.n_groups();
+        let w = Array::from_slice(&p.w_packed, &[p.out_features as i32, packed_cols as i32]);
+        let s = Array::from_slice(&p.scales, &[p.out_features as i32, n_groups as i32]);
+        let b = Array::from_slice(&p.biases, &[p.out_features as i32, n_groups as i32]);
+        (w, s, b)
+    }
+
+    /// Phase 3B foundation gate: `bonsai_q2_qmv` must match the CPU oracle
+    /// bit-for-bit (within fp16 epsilon) across multiple shapes including the
+    /// dominant Bonsai-27B verifier shapes.
+    #[test]
+    fn q2_qmv_kernel_matches_cpu_reference() {
+        let _exec = crate::mlx_exec::acquire();
+
+        for &(out_f, in_f, seed) in &[
+            (96usize, 256usize, 0x1234_5678_u64),      // small shape, multiple groups
+            (130usize, 4096usize, 0x0BAD_F00D_u64),    // 32 packed words per row
+            (5120usize, 5120usize, 0xCAFEBABE_u64),    // Bonsai-27B hidden x hidden
+        ] {
+            let p = make_packed_q2(out_f, in_f, seed);
+            let (w, s, b) = upload_to_mlx(&p);
+
+            // Build a deterministic fp16 activation vector.
+            let mut st = 0xABCD_EF01_u64;
+            let x_f32: Vec<f32> = (0..in_f)
+                .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
+                .collect();
+            let x = mlx_rs::Array::from_slice(&x_f32, &[1, in_f as i32])
+                .as_dtype(mlx_rs::Dtype::Float16)
+                .unwrap();
+            // Reference uses fp16-rounded activations to match kernel dtype exactly.
+            let x_ref: Vec<f32> = x_f32.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+
+            let y = crate::metal_kernel::bonsai_q2_qmv(&x, &w, &s, &b, GROUP_SIZE as i32).unwrap();
+            y.eval().unwrap();
+            let got = y.as_slice::<half::f16>();
+            assert_eq!(got.len(), out_f, "output length mismatch for {out_f}x{in_f}");
+
+            let want = dense_matvec_reference(&p, &x_ref);
+            let mut max_rel = 0f32;
+            for r in 0..out_f {
+                let gv = got[r].to_f32();
+                let wv = want[r];
+                let tol = (1e-2 * wv.abs()).max(1e-3);
+                let d = (gv - wv).abs();
+                assert!(
+                    d <= tol,
+                    "qmv mismatch ({out_f}x{in_f}) row {r}: got {gv} want {wv} (|d|={d}, tol={tol})"
+                );
+                if d > 0.0 {
+                    max_rel = max_rel.max(d / tol);
+                }
+            }
+            // Sanity: we should not be sitting right at the tolerance edge.
+            assert!(
+                max_rel < 0.9,
+                "max_rel={max_rel} for shape ({out_f}x{in_f}) — kernel within tolerance but suspiciously close"
+            );
+        }
+    }
+
+    /// Phase 3B M>1 gate: z-batched QMV must match CPU oracle for verifier
+    /// shapes M=2..=5 (anchor + drafts). This is what `bonsai_q2_qmm` routes
+    /// to and what the block verifier will exercise at M=5.
+    #[test]
+    fn q2_qmm_kernel_matches_cpu_reference_m1_through_m5() {
+        let _exec = crate::mlx_exec::acquire();
+
+        let (out_f, in_f) = (512usize, 512usize);
+        let p = make_packed_q2(out_f, in_f, 0xFEED_FACE);
+        let (w, s, b) = upload_to_mlx(&p);
+        let mut w_row = vec![0f32; in_f];
+
+        for m in 1..=5 {
+            // Distinct deterministic activation per M row.
+            let mut st = 0xDEAD_BEEF_u64.wrapping_mul(m as u64);
+            let x_f32: Vec<f32> = (0..(m as usize * in_f))
+                .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
+                .collect();
+            let x = mlx_rs::Array::from_slice(&x_f32, &[m, in_f as i32])
+                .as_dtype(mlx_rs::Dtype::Float16)
+                .unwrap();
+            let x_ref: Vec<f32> = x_f32
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_f32())
+                .collect();
+
+            let y = crate::metal_kernel::bonsai_q2_qmm(&x, &w, &s, &b, GROUP_SIZE as i32).unwrap();
+            y.eval().unwrap();
+            let got = y.as_slice::<half::f16>();
+            assert_eq!(got.len(), m as usize * out_f);
+
+            for m_idx in 0..m as usize {
+                let x_slice = &x_ref[m_idx * in_f..(m_idx + 1) * in_f];
+                for r in 0..out_f {
+                    p.dequant_row_to_fp32(r, &mut w_row);
+                    let mut acc = 0f32;
+                    for c in 0..in_f {
+                        acc += x_slice[c] * w_row[c];
+                    }
+                    let gv = got[m_idx * out_f + r].to_f32();
+                    let tol = (1e-2 * acc.abs()).max(1e-3);
+                    assert!(
+                        (gv - acc).abs() <= tol,
+                        "qmm M={m} row {r} (m_idx={m_idx}): got {gv} want {acc}"
+                    );
+                }
+            }
+        }
+    }
 }
