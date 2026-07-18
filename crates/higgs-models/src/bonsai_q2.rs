@@ -557,4 +557,75 @@ mod tests {
             }
         }
     }
+
+    /// Phase 3D.4 kill-gate microbench: compare bonsai_q2_row2_m5_contract
+    /// against the z-batched bonsai_q2_qmm baseline on the dominant Bonsai-27B
+    /// verifier shapes. Promotion gate: >=1.30x speedup. Ignored by default
+    /// because it requires real GPU time; run with `--ignored microbench`.
+    #[test]
+    #[ignore = "microbench: run with --ignored q2_row2_m5_microbench_kill_gate"]
+    fn q2_row2_m5_microbench_kill_gate() {
+        let _exec = crate::mlx_exec::acquire();
+
+        // Dominant Bonsai-27B MLP verifier shapes:
+        // - gate/up_proj: in=hidden=5120, out=inter=17408
+        // - down_proj:    in=inter=17408, out=hidden=5120
+        let shapes: &[(usize, usize, &str)] = &[
+            (17408, 5120, "gate_up (N=inter, K=hidden)"),
+            (5120, 17408, "down (N=hidden, K=inter)"),
+        ];
+
+        for &(out_f, in_f, label) in shapes {
+            let p = make_packed_q2(out_f, in_f, 0xBEEF_BEEF);
+            let (w_canon, s_canon, b_canon) = upload_to_mlx(&p);
+            let packed =
+                crate::metal_kernel::BonsaiQ2Row2::from_row_major(&w_canon, &s_canon).unwrap();
+            let packed_ref = packed.as_ref();
+
+            // 5-row activation tile matching the dSpark verifier (anchor + 4 drafts).
+            let x_f32: Vec<f32> = (0..(5 * in_f))
+                .map(|i| ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / 16777216.0 - 0.5)
+                .collect();
+            let x = mlx_rs::Array::from_slice(&x_f32, &[5, in_f as i32])
+                .as_dtype(mlx_rs::Dtype::Float16)
+                .unwrap();
+
+            // Warmup
+            for _ in 0..3 {
+                let _ = crate::metal_kernel::bonsai_q2_qmm(&x, &w_canon, &s_canon, &b_canon, 128)
+                    .unwrap()
+                    .eval()
+                    .unwrap();
+                let _ = crate::metal_kernel::bonsai_q2_row2_m5_contract(&x, packed_ref, &b_canon)
+                    .unwrap()
+                    .eval()
+                    .unwrap();
+            }
+
+            // Measure z-batched QMM baseline.
+            let n_iters = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n_iters {
+                let y = crate::metal_kernel::bonsai_q2_qmm(&x, &w_canon, &s_canon, &b_canon, 128)
+                    .unwrap();
+                y.eval().unwrap();
+            }
+            let qmm_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+            // Measure row2 M=5 kernel.
+            let t0 = std::time::Instant::now();
+            for _ in 0..n_iters {
+                let y =
+                    crate::metal_kernel::bonsai_q2_row2_m5_contract(&x, packed_ref, &b_canon)
+                        .unwrap();
+                y.eval().unwrap();
+            }
+            let row2_m5_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+            let ratio = qmm_us / row2_m5_us;
+            eprintln!(
+                "MICROBENCH {label} ({out_f}x{in_f}, M=5): qmm={qmm_us:.1}us row2_m5={row2_m5_us:.1}us ratio={ratio:.3}x"
+            );
+        }
+    }
 }
