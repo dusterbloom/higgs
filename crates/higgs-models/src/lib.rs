@@ -1,4 +1,5 @@
 pub mod bonsai_q1;
+pub mod bonsai_q2;
 pub mod cache;
 pub mod deepseek_v2;
 pub mod dflash;
