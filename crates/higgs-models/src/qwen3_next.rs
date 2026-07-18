@@ -473,8 +473,62 @@ pub(crate) fn quantized_forward(
 ) -> Result<Array, Exception> {
     if bits == 1 {
         affine_q1_forward(x, weight, scales, biases, group_size)
+    } else if bits == 2 {
+        affine_q2_forward(x, weight, scales, biases, group_size)
     } else {
         ops::quantized_matmul(x, weight, scales, biases, true, group_size, bits)
+    }
+}
+
+/// Affine 2-bit matrix multiplication using Higgs' runtime Metal kernels.
+///
+/// Mirror of [`affine_q1_forward`] for Q2 affine packed weights (16 weights
+/// per u32). Decode uses the fused packed matvec; narrow verifier batches use
+/// the same kernel z-batched over M; wider inputs fall back to MLX stock
+/// `quantized_matmul` until `bonsai_q2_wide_qmm` (Phase 3E) lands.
+fn affine_q2_forward(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    let x_shape = x.shape();
+    let input_dim = x_shape
+        .last()
+        .copied()
+        .ok_or_else(|| Exception::custom("2-bit affine input has no dimensions"))?;
+    let weight_shape = weight.shape();
+    let packed_dim = weight_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| Exception::custom("2-bit affine weight must be a matrix"))?;
+    let expected_input_dim = packed_dim
+        .checked_mul(16)
+        .ok_or_else(|| Exception::custom("2-bit affine input dimension overflow"))?;
+    if input_dim != expected_input_dim {
+        return Err(Exception::custom(format!(
+            "2-bit affine input dim {input_dim} does not match packed weight dim {expected_input_dim}"
+        )));
+    }
+    if group_size <= 0 || expected_input_dim % group_size != 0 {
+        return Err(Exception::custom(format!(
+            "invalid 2-bit affine group size {group_size} for input dim {expected_input_dim}"
+        )));
+    }
+
+    let row_count: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    if row_count == 1 {
+        crate::metal_kernel::bonsai_q2_qmv(x, weight, scales, biases, group_size)
+    } else if row_count > 0 && row_count <= bonsai_q1_qmm_max_rows() {
+        crate::metal_kernel::bonsai_q2_qmm(x, weight, scales, biases, group_size)
+    } else {
+        // Phase 3E will insert bonsai_q2_wide_qmm here. For now, route to MLX
+        // stock affine quantized_matmul which dequantizes internally.
+        ops::quantized_matmul(x, weight, scales, biases, true, group_size, 2)
     }
 }
 

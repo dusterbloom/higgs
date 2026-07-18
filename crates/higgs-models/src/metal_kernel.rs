@@ -1259,9 +1259,10 @@ fn bonsai_q2_qmv_fast_impl(
     result
 }
 
-/// Upper bound on M for the narrow Q2 verifier path. Same knob as Q1
+/// Upper bound on M for the narrow Q2 verifier path. Same value as Q1
 /// (`HIGGS_BONSAI_QMM_MAX_ROWS`, default 8) since both share the z-batched
 /// dispatch shape. Wider M goes through `bonsai_q2_wide_qmm` (Phase 3E).
+#[allow(dead_code)]
 pub fn bonsai_q2_qmm_max_rows() -> i32 {
     crate::qwen3_next::bonsai_q1_qmm_max_rows()
 }
