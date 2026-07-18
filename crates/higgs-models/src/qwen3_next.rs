@@ -614,6 +614,7 @@ fn affine_q1_forward(
 enum QLinearWeightLayout {
     Canonical,
     BonsaiRow4 { n_rows: i32, k_dim: i32 },
+    BonsaiRow2 { n_rows: i32, k_dim: i32 },
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -724,6 +725,7 @@ impl QLinear {
                 validate_dflash_qlinear(path, self)?;
                 Ok(((*n_rows, *k_dim), false))
             }
+            QLinearWeightLayout::BonsaiRow2 { .. } => Ok(((0, 0), false)),
             QLinearWeightLayout::Canonical => {
                 // TG-LUT4 row4 promotion is a Q1-only optimization. A canonical
                 // tensor that is not Q1 affine (e.g. an 8-bit group-64 model
@@ -803,6 +805,70 @@ impl QLinear {
         self.weight_layout = QLinearWeightLayout::BonsaiRow4 { n_rows, k_dim };
     }
 
+    /// Borrow the validated row2 view if this QLinear was promoted to BonsaiRow2.
+    fn bonsai_row2(&self) -> Result<Option<crate::metal_kernel::BonsaiQ2Row2Ref<'_>>, Exception> {
+        let QLinearWeightLayout::BonsaiRow2 { n_rows, k_dim } = &self.weight_layout else {
+            return Ok(None);
+        };
+        crate::metal_kernel::BonsaiQ2Row2Ref::from_primary_parts(
+            &self.weight,
+            &self.scales,
+            *n_rows,
+            *k_dim,
+        )
+        .map(Some)
+    }
+
+    /// Return whether this canonical Q2 projection can be promoted to row2.
+    fn bonsai_row2_promotion_candidate(&self, _path: &str) -> Result<((i32, i32), bool), Exception> {
+        match &self.weight_layout {
+            QLinearWeightLayout::BonsaiRow2 { n_rows, k_dim } => Ok(((*n_rows, *k_dim), false)),
+            QLinearWeightLayout::BonsaiRow4 { .. } => Ok(((0, 0), false)),
+            QLinearWeightLayout::Canonical => {
+                let is_q2_affine = self.mode == crate::quant_mode::QuantMode::Affine
+                    && self.bits == 2
+                    && self.group_size == 128;
+                if !is_q2_affine {
+                    return Ok(((0, 0), false));
+                }
+                let [n_rows, k_packed] = *self.weight.shape() else {
+                    return Ok(((0, 0), false));
+                };
+                let k_dim = match k_packed.checked_mul(16) {
+                    Some(v) => v,
+                    None => return Ok(((0, 0), false)),
+                };
+                let eligible = !has_symmetric_q1_biases(&self.biases)
+                    && matches!(self.scales.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+                    && n_rows % 2 == 0
+                    && k_dim % 128 == 0;
+                Ok(((n_rows, k_dim), eligible))
+            }
+        }
+    }
+
+    fn prepare_bonsai_row2(
+        &self,
+        path: &str,
+    ) -> Result<crate::metal_kernel::BonsaiQ2Row2, Exception> {
+        let (shape, eligible) = self.bonsai_row2_promotion_candidate(path)?;
+        if !matches!(self.weight_layout, QLinearWeightLayout::Canonical) || !eligible {
+            return Err(Exception::custom(format!(
+                "{path} is outside the Q2 row2 promotion domain: mode={:?} bits={} group_size={}",
+                self.mode, self.bits, self.group_size
+            )));
+        }
+        let _ = shape;
+        crate::metal_kernel::BonsaiQ2Row2::from_row_major(&self.weight, &self.scales)
+    }
+
+    fn install_bonsai_row2(&mut self, packed: crate::metal_kernel::BonsaiQ2Row2) {
+        let (weights, scales, n_rows, k_dim) = packed.into_primary_parts();
+        self.weight = Param::new(weights);
+        self.scales = Param::new(scales);
+        self.weight_layout = QLinearWeightLayout::BonsaiRow2 { n_rows, k_dim };
+    }
+
     pub(crate) fn forward(&self, x: &Array) -> Result<Array, Exception> {
         if let Some(packed) = self.bonsai_row4()? {
             if packed.accepts_input(x) {
@@ -830,6 +896,38 @@ impl QLinear {
             return x.matmul(&dense.transpose()?);
         }
 
+        // Q2 row2 promotion: M=5 verifier tile uses the native spec kernel
+        // (1.73-1.79x vs z-batched QMM per microbench). M=1 AR decode uses a
+        // direct row2 M=1 kernel that reads the row2 layout without dequant
+        // round-trip. Wider inputs fall through to dequant + MLX matmul.
+        if let Some(packed) = self.bonsai_row2()? {
+            let row_count: i32 = x.shape().iter().take(x.ndim().saturating_sub(1)).product();
+            if row_count == 5 && x.shape().last().copied() == Some(packed.k_dim) {
+                if let Ok(y) = crate::metal_kernel::bonsai_q2_row2_m5_contract(
+                    x, packed, &*self.biases,
+                ) {
+                    return Ok(y);
+                }
+            }
+            if row_count == 1 && x.shape().last().copied() == Some(packed.k_dim) {
+                if let Ok(y) =
+                    crate::metal_kernel::bonsai_q2_row2_qmv(x, packed, &*self.biases)
+                {
+                    return Ok(y);
+                }
+            }
+            // Wide prefill: dequant row2 -> canonical, then MLX stock matmul.
+            let (w_canon, s_canon) = crate::metal_kernel::bonsai_q2_row2_to_canonical(packed)?;
+            return ops::quantized_matmul(
+                x,
+                &w_canon,
+                &s_canon,
+                &*self.biases,
+                true,
+                self.group_size,
+                self.bits,
+            );
+        }
         // Fast path: batched quantized GEMM for verify (T>1, T<=16).
         // Fuses T matmuls into one Metal kernel dispatch — eliminates
         // pipeline bubbles. Gated by env var until validated.
@@ -1008,6 +1106,24 @@ fn validate_dflash_qlinear(path: &str, linear: &QLinear) -> Result<(), Exception
             // cannot silently leave forward using an older cloned handle.
             linear.bonsai_row4()?.ok_or_else(|| {
                 Exception::custom(format!("{path} lost its Bonsai row4 layout metadata"))
+            })?;
+            Ok(())
+        }
+        QLinearWeightLayout::BonsaiRow2 { .. } => {
+            // Q2 row2 contract: Affine bits=2 group=128. Revalidate the typed
+            // view from current parameters so a same-shaped parameter-tree
+            // update cannot leave forward using an older cloned handle.
+            if linear.mode != crate::quant_mode::QuantMode::Affine
+                || linear.bits != 2
+                || linear.group_size != 128
+            {
+                return Err(Exception::custom(format!(
+                    "{path} has an invalid installed Bonsai row2 contract mode={:?} bits={} group_size={}",
+                    linear.mode, linear.bits, linear.group_size
+                )));
+            }
+            linear.bonsai_row2()?.ok_or_else(|| {
+                Exception::custom(format!("{path} lost its Bonsai row2 layout metadata"))
             })?;
             Ok(())
         }
@@ -6617,6 +6733,15 @@ impl FfnBlock {
             .get_or_init(|| std::env::var("HIGGS_BONSAI_TG_LUT4").is_ok_and(|value| value == "1"))
     }
 
+    /// Opt-in gate for Q2 row2 promotion. Disabled by default until powered
+    /// ABBA benchmark confirms end-to-end speedup; enabled with
+    /// `HIGGS_BONSAI_Q2_ROW2=1`.
+    fn q2_row2_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED
+            .get_or_init(|| std::env::var("HIGGS_BONSAI_Q2_ROW2").is_ok_and(|value| value == "1"))
+    }
+
     fn tg_lut4_fused_mlp_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
@@ -6713,6 +6838,96 @@ impl FfnBlock {
         }
         if let Some(packed) = down_packed {
             down.install_bonsai_row4(packed);
+        }
+        Ok(BonsaiRow4Promotion {
+            layers: usize::from(projections != 0),
+            projections,
+            bytes,
+        })
+    }
+
+    /// Promote dense-MLP Q2 affine projections to the row2 layout.
+    fn promote_bonsai_row2(
+        &mut self,
+        layer_index: usize,
+    ) -> Result<BonsaiRow4Promotion, Exception> {
+        if self.is_moe {
+            return Err(Exception::custom(format!(
+                "layer {layer_index} uses MoE and cannot be promoted to dense Bonsai row2"
+            )));
+        }
+        let gate = self
+            .gate_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom(format!("layer {layer_index} gate_proj missing")))?;
+        let up = self
+            .up_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom(format!("layer {layer_index} up_proj missing")))?;
+        let down = self
+            .down_proj
+            .as_ref()
+            .ok_or_else(|| Exception::custom(format!("layer {layer_index} down_proj missing")))?;
+
+        let gate_path = format!("layers.{layer_index}.mlp.gate_proj");
+        let up_path = format!("layers.{layer_index}.mlp.up_proj");
+        let down_path = format!("layers.{layer_index}.mlp.down_proj");
+        let (gate_shape, promote_gate) = gate.bonsai_row2_promotion_candidate(&gate_path)?;
+        let (up_shape, promote_up) = up.bonsai_row2_promotion_candidate(&up_path)?;
+        let (down_shape, promote_down) = down.bonsai_row2_promotion_candidate(&down_path)?;
+        if !promote_gate && !promote_up && !promote_down {
+            return Ok(BonsaiRow4Promotion::default());
+        }
+        if gate_shape != up_shape || down_shape != (gate_shape.1, gate_shape.0) {
+            return Err(Exception::custom(format!(
+                "layer {layer_index} dense MLP logical shapes are inconsistent: gate={gate_shape:?} up={up_shape:?} down={down_shape:?}"
+            )));
+        }
+
+        let gate_packed = promote_gate
+            .then(|| gate.prepare_bonsai_row2(&gate_path))
+            .transpose()?;
+        let up_packed = promote_up
+            .then(|| up.prepare_bonsai_row2(&up_path))
+            .transpose()?;
+        let down_packed = promote_down
+            .then(|| down.prepare_bonsai_row2(&down_path))
+            .transpose()?;
+        let projections = [gate_packed.is_some(), up_packed.is_some(), down_packed.is_some()]
+            .into_iter()
+            .filter(|promoted| *promoted)
+            .count();
+        let bytes = gate_packed
+            .as_ref()
+            .map_or(0, crate::metal_kernel::BonsaiQ2Row2::cached_bytes)
+            .saturating_add(
+                up_packed
+                    .as_ref()
+                    .map_or(0, crate::metal_kernel::BonsaiQ2Row2::cached_bytes),
+            )
+            .saturating_add(
+                down_packed
+                    .as_ref()
+                    .map_or(0, crate::metal_kernel::BonsaiQ2Row2::cached_bytes),
+            );
+
+        let (Some(gate), Some(up), Some(down)) = (
+            self.gate_proj.as_mut(),
+            self.up_proj.as_mut(),
+            self.down_proj.as_mut(),
+        ) else {
+            return Err(Exception::custom(
+                "dense MLP projections disappeared during row2 promotion",
+            ));
+        };
+        if let Some(packed) = gate_packed {
+            gate.install_bonsai_row2(packed);
+        }
+        if let Some(packed) = up_packed {
+            up.install_bonsai_row2(packed);
+        }
+        if let Some(packed) = down_packed {
+            down.install_bonsai_row2(packed);
         }
         Ok(BonsaiRow4Promotion {
             layers: usize::from(projections != 0),
@@ -7753,6 +7968,21 @@ impl Qwen3NextCausalLM {
         let mut promoted = BonsaiRow4Promotion::default();
         for (layer_index, layer) in self.model.layers.iter_mut().enumerate() {
             let layer = layer.mlp.promote_bonsai_row4(layer_index)?;
+            promoted.layers = promoted.layers.saturating_add(layer.layers);
+            promoted.projections = promoted.projections.saturating_add(layer.projections);
+            promoted.bytes = promoted.bytes.saturating_add(layer.bytes);
+        }
+        Ok(promoted)
+    }
+
+    /// Promote every dense-MLP Q2 affine projection to the row2 layout. The
+    /// verifier M=5 forward then routes through `bonsai_q2_row2_m5_contract`
+    /// (~1.79x faster than z-batched QMM per microbench); AR decode M=1 routes
+    /// through `bonsai_q2_row2_qmv` to avoid the dequant round-trip.
+    fn promote_bonsai_dense_mlps_to_row2(&mut self) -> Result<BonsaiRow4Promotion, Exception> {
+        let mut promoted = BonsaiRow4Promotion::default();
+        for (layer_index, layer) in self.model.layers.iter_mut().enumerate() {
+            let layer = layer.mlp.promote_bonsai_row2(layer_index)?;
             promoted.layers = promoted.layers.saturating_add(layer.layers);
             promoted.projections = promoted.projections.saturating_add(layer.projections);
             promoted.bytes = promoted.bytes.saturating_add(layer.bytes);
@@ -10449,6 +10679,26 @@ pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausa
             projections = promoted.projections,
             resident_bytes = promoted.bytes,
             "Promoted dense Bonsai MLP parameters to primary row4 storage"
+        );
+    }
+    if FfnBlock::q2_row2_enabled()
+        && model
+            .args
+            .quantization
+            .as_ref()
+            .is_some_and(|q| q.bits == 2)
+    {
+        // Q2 row2 promotion: engages the M=5 native spec verifier kernel
+        // (1.73-1.79x faster than z-batched QMM per microbench). M=1 AR decode
+        // uses bonsai_q2_row2_qmv to avoid the dequant round-trip. Off by
+        // default until powered ABBA benchmark confirms end-to-end win.
+        let _promotion_exec = (!crate::mlx_exec::held()).then(crate::mlx_exec::acquire);
+        let promoted = model.promote_bonsai_dense_mlps_to_row2()?;
+        tracing::info!(
+            layers = promoted.layers,
+            projections = promoted.projections,
+            resident_bytes = promoted.bytes,
+            "Promoted dense Bonsai Q2 MLP parameters to primary row2 storage"
         );
     }
     tracing::info!("Qwen3.5 dense model loaded successfully");

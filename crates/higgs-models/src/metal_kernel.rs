@@ -1504,10 +1504,10 @@ pub(super) struct BonsaiQ2Row2 {
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub(super) struct BonsaiQ2Row2Ref<'a> {
-    weights: &'a Array,
-    scales: &'a Array,
-    n_rows: i32,
-    k_dim: i32,
+    pub weights: &'a Array,
+    pub scales: &'a Array,
+    pub n_rows: i32,
+    pub k_dim: i32,
 }
 
 impl<'a> BonsaiQ2Row2Ref<'a> {
@@ -1905,6 +1905,225 @@ pub fn bonsai_q2_row2_m5_contract(
         mlx_sys::mlx_vector_array_free(outputs_vec);
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Q2 row2 M=1 decode kernel.
+//
+// Companion to bonsai_q2_row2_m5_contract for the M=1 AR decode path. Same
+// row2 layout, but one verifier row instead of five. Without this kernel,
+// M=1 would need to dequant row2 back to canonical before MLX stock could
+// touch it (~120 ms per AR token -- catastrophic). This kernel reads row2
+// directly with no intermediate materialization.
+//
+// Per-thread: one output row n. row_tile = n/2, row_lane = n%2. For each
+// group: read 8 packed words, extract 16 codes per word, fma into one
+// accumulator + one sum-x. Combine: acc += scale * qacc + bias * sum_x.
+// ---------------------------------------------------------------------------
+
+const Q2_ROW2_QMV_KERNEL_SOURCE: &str = r"
+constexpr int WG = 256;
+constexpr int ROWS_PER_TG = 256;
+
+uint tid = thread_index_in_threadgroup;
+uint tgx = threadgroup_position_in_grid.x;
+int n = int(tgx) * ROWS_PER_TG + int(tid);
+
+float acc0 = 0.0f;
+
+if (n < NRows) {
+    int row_tile = n / 2;
+    int row_lane = n & 1;
+
+    for (int g = 0; g < NumGroups; ++g) {
+        float qacc0 = 0.0f;
+        float sx0 = 0.0f;
+
+        int group_base = (row_tile * NumGroups + g) * 8;
+        int x_base = g * 128;
+
+        #pragma clang loop unroll(full)
+        for (int word = 0; word < 8; ++word) {
+            uint packed = w[(group_base + word) * 2 + row_lane];
+            int xo = x_base + word * 16;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 16; ++i) {
+                uint q = (packed >> (uint(i) * 2u)) & 0x3u;
+                float qf = float(q);
+                float xv0 = float(x[xo + i]);
+                qacc0 += qf * xv0;
+                sx0 += xv0;
+            }
+        }
+
+        int sb_row2_idx = (row_tile * NumGroups + g) * 2 + row_lane;
+        int b_canon_idx = (row_tile * 2 + row_lane) * NumGroups + g;
+        float s_val = float(sc[sb_row2_idx]);
+        float b_val = float(bi[b_canon_idx]);
+        acc0 += s_val * qacc0 + b_val * sx0;
+    }
+}
+
+if (n < NRows) {
+    y[0 * NRows + n] = OutT(acc0);
+}
+";
+
+static Q2_ROW2_QMV_KERNEL_V3: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_q2_row2_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"bi", c"x"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(Q2_ROW2_QMV_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_row2_qmv_v2".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_q2_row2_qmv_kernel(
+    out_dtype: mlx_sys::mlx_dtype,
+    n_rows: i32,
+    k_dim: i32,
+    group_size: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    const WG: i32 = 256;
+    const ROWS_PER_TG: i32 = 256;
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OutT".as_ptr(),
+            out_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"GroupSize".as_ptr(),
+            group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NumGroups".as_ptr(),
+            k_dim / group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NRows".as_ptr(),
+            n_rows,
+        );
+
+        let n_tgs = (n_rows + ROWS_PER_TG - 1) / ROWS_PER_TG;
+        let grid_x = n_tgs * ROWS_PER_TG;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, grid_x, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, WG, 1, 1);
+
+        let y_shape = [1, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            out_dtype,
+        );
+        let _ = (WG, ROWS_PER_TG);
+        config
+    }
+}
+
+/// Phase 3D M=1 row2 decode kernel. Reads row2 layout directly (no dequant
+/// round-trip). Used as the AR decode fast path when QLinear is in
+/// BonsaiRow2 layout. Slower than MLX stock canonical, but vastly faster
+/// than dequant+stock.
+#[allow(dead_code, unsafe_code)]
+pub fn bonsai_q2_row2_qmv(
+    x: &Array,
+    packed: BonsaiQ2Row2Ref<'_>,
+    biases: &Array,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let x_shape = x.shape();
+    let x_flat = x.reshape(&[1, packed.k_dim])?;
+    let w_flat = packed.weights.reshape(&[-1])?;
+    let s_flat = packed.scales.flatten(None, None)?;
+    let b_flat = biases.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    let cached = Q2_ROW2_QMV_KERNEL_V3.get_or_init(|| CachedMetalKernel(create_q2_row2_qmv_kernel()));
+    let config = configure_q2_row2_qmv_kernel(out_dtype, packed.n_rows, packed.k_dim, 128);
+
+    let input_ptrs = [w_flat.as_ptr(), s_flat.as_ptr(), b_flat.as_ptr(), x_flat.as_ptr()];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q2_row2_qmv failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        // Restore caller's leading batch dims (e.g. [1, K] input -> [1, N] output).
+        let trim_to = x_shape.len().saturating_sub(1);
+        let mut out_shape = x_shape
+            .get(..trim_to)
+            .ok_or_else(|| Exception::custom("bonsai_q2_row2_qmv: x_shape too small"))?
+            .to_vec();
+        out_shape.push(packed.n_rows);
+        y.reshape(&out_shape)
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+    }
+    result
+}
+
+/// Reverse the row2 layout back to canonical `[N, K/16]` packed weights and
+/// `[N, NumGroups]` scales. Used as a fallback for paths that don't have a
+/// row2-specialized kernel (e.g. wide prefill).
+#[allow(dead_code)]
+pub fn bonsai_q2_row2_to_canonical(
+    packed: BonsaiQ2Row2Ref<'_>,
+) -> Result<(Array, Array), Exception> {
+    // weight: [N/2, NumGroups, 8, 2] -> [N/2, 2, NumGroups, 8] -> [N, K/16]
+    let weight_view = packed.weights.transpose_axes(&[0, 3, 1, 2])?;
+    let scale_view = packed.scales.transpose_axes(&[0, 2, 1])?;
+    let weight_storage = row_contiguous_copy(&weight_view)?;
+    let scale_storage = row_contiguous_copy(&scale_view)?;
+    crate::mlx_exec::eval([&weight_storage, &scale_storage])?;
+    let weights = weight_storage.reshape(&[packed.n_rows, packed.k_dim / 16])?;
+    let scales = scale_storage.reshape(&[packed.n_rows, packed.k_dim / 128])?;
+    Ok((weights, scales))
 }
 
 #[allow(unsafe_code)]
