@@ -628,4 +628,35 @@ mod tests {
             );
         }
     }
+
+    /// Simdgroup Q2 kernel vs MLX stock — the real comparison.
+    #[test]
+    #[ignore = "microbench: --ignored q2_simd_vs_mlx_stock"]
+    fn q2_simd_vs_mlx_stock() {
+        let _exec = crate::mlx_exec::acquire();
+        for &(out_f, in_f, label) in &[
+            (17408usize, 5120usize, "gate_up"),
+            (5120usize, 17408usize, "down"),
+            (248320usize, 5120usize, "lm_head"),
+        ] {
+            let p = make_packed_q2(out_f, in_f, 0xCAFE);
+            let (w, s, b) = upload_to_mlx(&p);
+            let x_f32: Vec<f32> = (0..in_f).map(|i| i as f32 / in_f as f32 * 2.0 - 1.0).collect();
+            let x = mlx_rs::Array::from_slice(&x_f32, &[1, in_f as i32])
+                .as_dtype(mlx_rs::Dtype::Float16).unwrap();
+            for _ in 0..5 {
+                let _ = mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, 128, 2).unwrap().eval().unwrap();
+                let _ = crate::metal_kernel::bonsai_q2_qmv_simd(&x, &w, &s, &b, GROUP_SIZE as i32).unwrap().eval().unwrap();
+            }
+            let n_iters = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n_iters { let y = mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, 128, 2).unwrap(); y.eval().unwrap(); }
+            let mlx_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n_iters { let y = crate::metal_kernel::bonsai_q2_qmv_simd(&x, &w, &s, &b, GROUP_SIZE as i32).unwrap(); y.eval().unwrap(); }
+            let simd_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+            let ratio = mlx_us / simd_us;
+            eprintln!("SIMD_VS_MLX {label} ({out_f}x{in_f}): mlx={mlx_us:.0}us simd={simd_us:.0}us ratio={ratio:.3}x");
+        }
+    }
 }

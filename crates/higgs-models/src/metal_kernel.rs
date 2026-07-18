@@ -1260,6 +1260,236 @@ fn bonsai_q2_qmv_fast_impl(
     result
 }
 
+// ---------------------------------------------------------------------------
+// Q2 simdgroup-cooperating decode kernel (ports MLX qmv_fast for bits=2).
+//
+// Unlike the scalar FAST_Q2_QMV_KERNEL (one thread per row), this kernel
+// distributes the K dimension across 32 threads in a simdgroup. Each thread
+// handles VPT=16 Q2 values (one packed u32 word); 32 threads cooperatively
+// cover 512 K values per block. Partial results are simd_sum-reduced.
+//
+// This is the pattern MLX's own qmv_fast uses (quantized.h:844) and is the
+// only way to match MLX stock performance — scalar per-row dispatch starves
+// GPU occupancy.
+// ---------------------------------------------------------------------------
+
+const FAST_Q2_QMV_SIMD_SOURCE: &str = r"
+constexpr int VPT = 16;          // values per thread (one packed u32 = 16 Q2 codes)
+constexpr int RPS = 4;           // results per simdgroup
+constexpr int BLK = VPT * 32;    // block size = 512
+
+uint tgx = threadgroup_position_in_grid.x;
+uint sg  = simdgroup_index_in_threadgroup;
+uint lid = thread_index_in_simdgroup;
+uint nsg = simdgroups_per_threadgroup;
+uint batch = threadgroup_position_in_grid.z;
+
+int out_row = int(tgx) * (int(nsg) * RPS) + int(sg) * RPS;
+auto x_row = x + int(batch) * K;
+
+float xt[VPT];
+float result[RPS];
+for (int r = 0; r < RPS; ++r) { result[r] = 0.0f; }
+
+int aligned_end = (K / BLK) * BLK;
+
+for (int k = 0; k < aligned_end; k += BLK) {
+    int xbase = k + int(lid) * VPT;
+    float sum = 0.0f;
+    for (int i = 0; i < VPT; ++i) { float v = float(x_row[xbase + i]); xt[i] = v; sum += v; }
+
+    int wcol = (k / 16) + int(lid);
+    int g = xbase / GroupSize;
+
+    for (int r = 0; r < RPS; ++r) {
+        int row = out_row + r;
+        if constexpr (!AlignedN) {
+            if (row >= n_param) { continue; }
+        }
+        float accum = 0.0f;
+        uint packed = w[row * KPacked + wcol];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < VPT; ++i) {
+            float q = float((packed >> (uint(i) * 2u)) & 0x3u);
+            accum += q * xt[i];
+        }
+        float s_val = float(sc[row * NumGroups + g]);
+        float b_val = float(bi[row * NumGroups + g]);
+        result[r] += s_val * accum + b_val * sum;
+    }
+}
+
+// Tail
+if (aligned_end < K) {
+    int xbase = aligned_end + int(lid) * VPT;
+    bool in_bounds = xbase < K;
+    float sum = 0.0f;
+    for (int i = 0; i < VPT; ++i) {
+        float v = (in_bounds && (xbase + i) < K) ? float(x_row[xbase + i]) : 0.0f;
+        xt[i] = v;
+        sum += v;
+    }
+    int wcol = (aligned_end / 16) + int(lid);
+    int g = in_bounds ? (xbase / GroupSize) : 0;
+    for (int r = 0; r < RPS; ++r) {
+        int row = out_row + r;
+        if constexpr (AlignedN) {
+            if (!in_bounds) { continue; }
+        } else {
+            if (row >= n_param || !in_bounds) { continue; }
+        }
+        float accum = 0.0f;
+        int widx = wcol;
+        if (widx >= KPacked) { continue; }
+        uint packed = w[row * KPacked + widx];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < VPT; ++i) {
+            if (xbase + i >= K) { break; }
+            float q = float((packed >> (uint(i) * 2u)) & 0x3u);
+            accum += q * xt[i];
+        }
+        float s_val = float(sc[row * NumGroups + g]);
+        float b_val = float(bi[row * NumGroups + g]);
+        result[r] += s_val * accum + b_val * sum;
+    }
+}
+
+for (int r = 0; r < RPS; ++r) {
+    int row = out_row + r;
+    float v = simd_sum(result[r]);
+    if (lid == 0u) {
+        if constexpr (AlignedN) {
+            y[int(batch) * n_param + row] = OutT(v);
+        } else if (row < n_param) {
+            y[int(batch) * n_param + row] = OutT(v);
+        }
+    }
+}
+";
+
+static FAST_Q2_QMV_SIMD_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_fast_q2_qmv_simd() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"bi", c"x", c"n_param"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(FAST_Q2_QMV_SIMD_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_qmv_simd".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_fast_q2_qmv_simd(
+    out_dtype: mlx_sys::mlx_dtype,
+    n_rows: i32,
+    m_rows: i32,
+    k_dim: i32,
+    group_size: i32,
+    prefer_aligned: bool,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, c"OutT".as_ptr(), out_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, c"GroupSize".as_ptr(), group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, c"KPacked".as_ptr(), k_dim / 16,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, c"NumGroups".as_ptr(), k_dim / group_size,
+        );
+        let nsg = fast_qmv_nsg();
+        let rows_per_tg = nsg * 4;
+        let aligned_n = fast_qmv_has_aligned_rows(n_rows, nsg, prefer_aligned);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, c"AlignedN".as_ptr(), i32::from(aligned_n),
+        );
+        let n_tgs = (n_rows + rows_per_tg - 1) / rows_per_tg;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tgs * 32, nsg, m_rows);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, nsg, 1);
+        let y_shape = [m_rows, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, y_shape.as_ptr(), y_shape.len(), out_dtype,
+        );
+        config
+    }
+}
+
+/// Q2 simdgroup-cooperating decode kernel. Ports MLX's qmv_fast for bits=2:
+/// 32 threads per simdgroup, 4 output rows per simdgroup, simd_sum reduction.
+/// This is the only pattern that matches MLX stock performance.
+#[allow(unsafe_code, dead_code)]
+pub fn bonsai_q2_qmv_simd(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    let n_rows = weight_shape.first().copied()
+        .ok_or_else(|| Exception::custom("bonsai_q2_qmv_simd: weight has no rows"))?;
+    let k_packed = weight_shape.get(1).copied()
+        .ok_or_else(|| Exception::custom("bonsai_q2_qmv_simd: weight has no columns"))?;
+    let k_dim = k_packed * 16;
+    let m_rows: i32 = x_shape.iter().take(x_shape.len().saturating_sub(1)).product();
+
+    let x_flat = x.reshape(&[m_rows, k_dim])?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.flatten(None, None)?;
+    let b_flat = biases.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+    let cached = FAST_Q2_QMV_SIMD_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_q2_qmv_simd()));
+    let config = configure_fast_q2_qmv_simd(out_dtype, n_rows, m_rows, k_dim, group_size, use_aligned_fast_qmv());
+
+    let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
+    let input_ptrs = [w_flat.as_ptr(), s_flat.as_ptr(), b_flat.as_ptr(), x_flat.as_ptr(), n_scalar];
+    let inputs_vec = unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(&raw mut outputs_vec, cached.0, inputs_vec, config, stream.as_ptr())
+    };
+    let result = if status != 0 {
+        Err(Exception::custom(format!("bonsai_q2_qmv_simd failed: {}", take_last_error())))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        let trim_to = x_shape.len().saturating_sub(1);
+        let mut out_shape = x_shape.get(..trim_to)
+            .ok_or_else(|| Exception::custom("bonsai_q2_qmv_simd: x_shape too small"))?.to_vec();
+        out_shape.push(n_rows);
+        y.reshape(&out_shape)
+    };
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(n_scalar);
+    }
+    result
+}
+
 /// Upper bound on M for the narrow Q2 verifier path. Same value as Q1
 /// (`HIGGS_BONSAI_QMM_MAX_ROWS`, default 8) since both share the z-batched
 /// dispatch shape. Wider M goes through `bonsai_q2_wide_qmm` (Phase 3E).
