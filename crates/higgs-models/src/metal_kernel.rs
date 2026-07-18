@@ -919,10 +919,10 @@ pub fn bonsai_q1_qmm(
 // ---------------------------------------------------------------------------
 
 const FAST_Q2_QMV_KERNEL_SOURCE: &str = r"
-constexpr int VPT = 16;          // values_per_thread (one packed u32 word per lane)
+constexpr int VPT = 32;          // values_per_thread (TWO packed u32 words per lane, matches Q1's register footprint)
 constexpr int RPS = 4;           // results_per_simdgroup
-constexpr int WPT = VPT / 16;    // packed uint32 words per thread (1)
-constexpr int BLK = VPT * 32;    // block_size = 512
+constexpr int WPT = VPT / 16;    // packed uint32 words per thread (2)
+constexpr int BLK = VPT * 32;    // block_size = 1024 (same iteration count as Q1)
 
 uint tgx = threadgroup_position_in_grid.x;
 uint sg  = simdgroup_index_in_threadgroup;
@@ -939,14 +939,14 @@ for (int r = 0; r < RPS; ++r) { result[r] = 0.0f; }
 
 int aligned_end = (K / BLK) * BLK;
 
-// Main loop: full 512-element blocks.
+// Main loop: full 1024-element blocks (same iteration count as Q1).
 for (int k = 0; k < aligned_end; k += BLK) {
     int xbase = k + int(lid) * VPT;
     float sum = 0.0f;
     for (int i = 0; i < VPT; ++i) { float v = float(x_row[xbase + i]); xt[i] = v; sum += v; }
 
     int wcol = (k / 16) + int(lid) * WPT;
-    int g = xbase / GroupSize;   // all VPT values fall in one 128-wide group
+    int g = xbase / GroupSize;   // all VPT=32 values still fall in one 128-wide group
 
     for (int r = 0; r < RPS; ++r) {
         int row = out_row + r;
@@ -957,7 +957,7 @@ for (int k = 0; k < aligned_end; k += BLK) {
         for (int wp = 0; wp < WPT; ++wp) {
             uint packed = w[row * KPacked + wcol + wp];
             int xo = wp * 16;
-            // Unrolled 16-way 2-bit unpack + fma. Metal compiler unrolls fully.
+            // Unrolled 16-way 2-bit unpack + fma per word. Metal compiler unrolls fully.
             accum += float((packed >>  0u) & 0x3u) * xt[xo +  0];
             accum += float((packed >>  2u) & 0x3u) * xt[xo +  1];
             accum += float((packed >>  4u) & 0x3u) * xt[xo +  2];
@@ -981,7 +981,7 @@ for (int k = 0; k < aligned_end; k += BLK) {
     }
 }
 
-// Tail: only exercised by tests with K < 512 or K % 512 != 0.
+// Tail: only exercised by tests with K < 1024 or K % 1024 != 0.
 if (aligned_end < K) {
     int xbase = aligned_end + int(lid) * VPT;
     bool in_bounds = xbase < K;
@@ -1006,23 +1006,24 @@ if (aligned_end < K) {
             if (widx >= KPacked) { continue; }
             uint packed = w[row * KPacked + widx];
             int xo = wp * 16;
-            // Bounds-checked tail: each code may be the last in K.
-            accum += float((packed >>  0u) & 0x3u) * xt[xo +  0];
-            accum += float((packed >>  2u) & 0x3u) * xt[xo +  1];
-            accum += float((packed >>  4u) & 0x3u) * xt[xo +  2];
-            accum += float((packed >>  6u) & 0x3u) * xt[xo +  3];
-            accum += float((packed >>  8u) & 0x3u) * xt[xo +  4];
-            accum += float((packed >> 10u) & 0x3u) * xt[xo +  5];
-            accum += float((packed >> 12u) & 0x3u) * xt[xo +  6];
-            accum += float((packed >> 14u) & 0x3u) * xt[xo +  7];
-            accum += float((packed >> 16u) & 0x3u) * xt[xo +  8];
-            accum += float((packed >> 18u) & 0x3u) * xt[xo +  9];
-            accum += float((packed >> 20u) & 0x3u) * xt[xo + 10];
-            accum += float((packed >> 22u) & 0x3u) * xt[xo + 11];
-            accum += float((packed >> 24u) & 0x3u) * xt[xo + 12];
-            accum += float((packed >> 26u) & 0x3u) * xt[xo + 13];
-            accum += float((packed >> 28u) & 0x3u) * xt[xo + 14];
-            accum += float((packed >> 30u) & 0x3u) * xt[xo + 15];
+            // Tail bounds-check: each code may be past K.
+            int codes_in_bounds = (xo + 16 <= K - xbase) ? 16 : max(0, K - xbase - xo);
+            if (codes_in_bounds >  0) { accum += float((packed >>  0u) & 0x3u) * xt[xo +  0]; }
+            if (codes_in_bounds >  1) { accum += float((packed >>  2u) & 0x3u) * xt[xo +  1]; }
+            if (codes_in_bounds >  2) { accum += float((packed >>  4u) & 0x3u) * xt[xo +  2]; }
+            if (codes_in_bounds >  3) { accum += float((packed >>  6u) & 0x3u) * xt[xo +  3]; }
+            if (codes_in_bounds >  4) { accum += float((packed >>  8u) & 0x3u) * xt[xo +  4]; }
+            if (codes_in_bounds >  5) { accum += float((packed >> 10u) & 0x3u) * xt[xo +  5]; }
+            if (codes_in_bounds >  6) { accum += float((packed >> 12u) & 0x3u) * xt[xo +  6]; }
+            if (codes_in_bounds >  7) { accum += float((packed >> 14u) & 0x3u) * xt[xo +  7]; }
+            if (codes_in_bounds >  8) { accum += float((packed >> 16u) & 0x3u) * xt[xo +  8]; }
+            if (codes_in_bounds >  9) { accum += float((packed >> 18u) & 0x3u) * xt[xo +  9]; }
+            if (codes_in_bounds > 10) { accum += float((packed >> 20u) & 0x3u) * xt[xo + 10]; }
+            if (codes_in_bounds > 11) { accum += float((packed >> 22u) & 0x3u) * xt[xo + 11]; }
+            if (codes_in_bounds > 12) { accum += float((packed >> 24u) & 0x3u) * xt[xo + 12]; }
+            if (codes_in_bounds > 13) { accum += float((packed >> 26u) & 0x3u) * xt[xo + 13]; }
+            if (codes_in_bounds > 14) { accum += float((packed >> 28u) & 0x3u) * xt[xo + 14]; }
+            if (codes_in_bounds > 15) { accum += float((packed >> 30u) & 0x3u) * xt[xo + 15]; }
         }
         float s_val = float(sc[row * NumGroups + g]);
         float b_val = float(bi[row * NumGroups + g]);

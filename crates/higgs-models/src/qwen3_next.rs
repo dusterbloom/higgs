@@ -473,8 +473,6 @@ pub(crate) fn quantized_forward(
 ) -> Result<Array, Exception> {
     if bits == 1 {
         affine_q1_forward(x, weight, scales, biases, group_size)
-    } else if bits == 2 {
-        affine_q2_forward(x, weight, scales, biases, group_size)
     } else {
         ops::quantized_matmul(x, weight, scales, biases, true, group_size, bits)
     }
@@ -482,10 +480,18 @@ pub(crate) fn quantized_forward(
 
 /// Affine 2-bit matrix multiplication using Higgs' runtime Metal kernels.
 ///
-/// Mirror of [`affine_q1_forward`] for Q2 affine packed weights (16 weights
-/// per u32). Decode uses the fused packed matvec; narrow verifier batches use
-/// the same kernel z-batched over M; wider inputs fall back to MLX stock
-/// `quantized_matmul` until `bonsai_q2_wide_qmm` (Phase 3E) lands.
+/// Currently NOT wired into `quantized_forward` because the direct-port Q2
+/// qmv_fast kernel measures ~17% slower than MLX stock `quantized_matmul` for
+/// M=1 on Bonsai-27B-2bit (7.7 tok/s vs 9.2 tok/s baseline). MLX's stock
+/// affine bits=2 kernel is well-tuned for the M=1 AR path; the Q2 win lives in
+/// the Phase 3D TG-LUT4 M=5 specialization, where one packed-word load is
+/// shared across 5 verifier rows via the 2-LUT identity.
+///
+/// Kept here as `#[allow(dead_code)]` so Phase 3D can wire it in for verifier
+/// M=5+ only without re-implementing the dispatch logic. The narrow Q2 kernels
+/// (`bonsai_q2_qmv`, `bonsai_q2_qmm`) remain bit-exact-validated against the
+/// CPU oracle in `bonsai_q2::tests`.
+#[allow(dead_code)]
 fn affine_q2_forward(
     x: &Array,
     weight: &Array,
