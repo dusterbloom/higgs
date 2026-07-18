@@ -13,8 +13,10 @@ use std::sync::{Mutex, MutexGuard};
 use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, Speculation, apply_penalties,
+    cache::SteppingKeyValueCache,
     dflash::{DFlashCache, DFlashConfig, DFlashDrafter, accept_prefix},
     sample,
+    spec_prefill::{PrefillScoreConfig, select_survivors},
     turboquant::KvCacheConfig,
 };
 use mlx_rs::{
@@ -54,6 +56,19 @@ const DEFAULT_THINKING_BUDGET: u32 = 256;
 struct GenerationPromptSuffixes {
     no_thinking: Box<[u32]>,
     thinking: Box<[u32]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillCompressionMode {
+    Off,
+    Auto,
+    Always,
+}
+
+impl Default for PrefillCompressionMode {
+    fn default() -> Self {
+        Self::Off
+    }
 }
 
 impl GenerationPromptSuffixes {
@@ -96,6 +111,37 @@ fn exact_generation_body<'a>(prompt: &'a [u32], generation_suffix: &[u32]) -> Op
         return None;
     }
     prompt.strip_suffix(generation_suffix)
+}
+
+fn prefill_min_free_memory_mb() -> usize {
+    std::env::var("HIGGS_PREFLASH_MIN_FREE_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2048)
+}
+
+#[allow(unsafe_code)]
+fn pflash_free_memory_mb() -> Result<usize, EngineError> {
+    let mut active_memory: usize = 0;
+    let mut memory_limit: usize = 0;
+    unsafe {
+        if mlx_sys::mlx_get_active_memory(&raw mut active_memory as *mut _) != 0 {
+            return Err(EngineError::Generation(
+                "failed to query MLX active memory for PFlash guard".to_owned(),
+            ));
+        }
+        if mlx_sys::mlx_get_memory_limit(&raw mut memory_limit as *mut _) != 0 {
+            return Err(EngineError::Generation(
+                "failed to query MLX memory limit for PFlash guard".to_owned(),
+            ));
+        }
+    }
+    if memory_limit == 0 {
+        return Ok(usize::MAX);
+    }
+    let free_bytes = memory_limit.saturating_sub(active_memory);
+    Ok(free_bytes / (1024 * 1024))
 }
 
 /// Acquire a `Mutex` lock, recovering from poison by reusing the inner data.
@@ -1490,6 +1536,13 @@ pub struct SimpleEngine {
     /// Optional `DFlash` block-diffusion speculative decoding state, enabled
     /// when `HIGGS_DFLASH_PATH` points at a drafter checkpoint.
     dflash: Option<DFlashState>,
+    prefill_drafter: Option<std::sync::Arc<std::sync::Mutex<AnyModel>>>,
+    prefill_compression: PrefillCompressionMode,
+    prefill_keep_ratio: f32,
+    prefill_threshold: usize,
+    prefill_chunk: usize,
+    prefill_avgpool: usize,
+    prefill_lookahead: usize,
     last_dflash_accepts: std::sync::Mutex<Vec<u32>>,
     /// Proposed draft tokens that matched the target before output truncation,
     /// recorded once per DFlash round for exact acceptance telemetry.
@@ -1644,7 +1697,21 @@ impl SimpleEngine {
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
     ) -> Result<Self, EngineError> {
-        Self::load_with_dflash(dir, kv_cache_config, tuning, raise_wired_limit, None, None)
+        Self::load_with_dflash(
+            dir,
+            kv_cache_config,
+            tuning,
+            raise_wired_limit,
+            None,
+            None,
+            None,
+            PrefillCompressionMode::Off,
+            0.10,
+            4096,
+            32,
+            13,
+            8,
+        )
     }
 
     /// Load a model and tokenizer from a directory with an optional disk prefix
@@ -1663,6 +1730,13 @@ impl SimpleEngine {
             raise_wired_limit,
             None,
             disk_cache_config,
+            None,
+            PrefillCompressionMode::Off,
+            0.10,
+            4096,
+            32,
+            13,
+            8,
         )
     }
 
@@ -1682,6 +1756,13 @@ impl SimpleEngine {
         raise_wired_limit: bool,
         dflash_path: Option<&Path>,
         disk_cache_config: Option<DiskPrefixCacheConfig>,
+        prefill_drafter_path: Option<&Path>,
+        prefill_compression: PrefillCompressionMode,
+        prefill_keep_ratio: f32,
+        prefill_threshold: usize,
+        prefill_chunk: usize,
+        prefill_avgpool: usize,
+        prefill_lookahead: usize,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
@@ -1932,6 +2013,41 @@ impl SimpleEngine {
             })
             .transpose()?;
 
+        let mut prefill_mode = prefill_compression;
+        let prefill_drafter = if prefill_mode == PrefillCompressionMode::Off {
+            None
+        } else if let Some(path) = prefill_drafter_path {
+            match model_loader::load_model(path) {
+                Ok(drafter) => {
+                    tracing::info!(
+                        drafter = %path.display(),
+                        mode = ?prefill_mode,
+                        keep_ratio = prefill_keep_ratio,
+                        "Prefill drafter loaded — compressive prefill armed"
+                    );
+                    Some(std::sync::Arc::new(Mutex::new(drafter)))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        drafter = %path.display(),
+                        error = %error,
+                        "Failed to load prefill drafter; falling back to uncompressed prefill"
+                    );
+                    prefill_mode = PrefillCompressionMode::Off;
+                    None
+                }
+            }
+        } else {
+            if prefill_mode != PrefillCompressionMode::Off {
+                tracing::warn!(
+                    mode = ?prefill_mode,
+                    "Prefill compression requested but prefill_drafter is not set; disabling prefill compression"
+                );
+            }
+            prefill_mode = PrefillCompressionMode::Off;
+            None
+        };
+
         let mut prefix_cache = disk_cache_config.map_or_else(
             || DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE),
             |config| match DiskPrefixCache::new(
@@ -1976,6 +2092,13 @@ impl SimpleEngine {
             kv_cache_config,
             tuning,
             dflash,
+            prefill_drafter,
+            prefill_compression: prefill_mode,
+            prefill_keep_ratio,
+            prefill_threshold,
+            prefill_chunk,
+            prefill_avgpool,
+            prefill_lookahead,
             last_dflash_accepts: Mutex::new(Vec::new()),
             last_dflash_draft_matches: Mutex::new(Vec::new()),
             last_dflash_draft_counts: Mutex::new(Vec::new()),
@@ -3498,6 +3621,58 @@ impl SimpleEngine {
         params: &SamplingParams,
         enable_thinking: bool,
     ) -> Result<SessionGeneration, EngineError> {
+        self.generate_continued_impl(
+            session_id,
+            prompt_tokens,
+            max_tokens,
+            params,
+            enable_thinking,
+            None,
+        )
+    }
+
+    /// Cache-resident generation that streams each decoded token to `sender`
+    /// as it is produced, instead of buffering the whole completion and
+    /// returning it in one shot at the end.
+    ///
+    /// This is the session-continuation counterpart of
+    /// [`Self::generate_streaming_with_thinking`]: same wire contract
+    /// (`StreamingOutput` per step, `finish_reason` set on the terminal
+    /// chunk), but decoding from the retained per-session KV cache. The
+    /// DFlash speculation route has no incremental decode loop today, so it
+    /// falls back to the existing buffered path internally and emits the
+    /// whole completion as a single chunk — every other route (MTP-family
+    /// and plain autoregressive, which cover the overwhelming majority of
+    /// cache-resident turns) streams token-by-token.
+    pub fn generate_continued_streaming_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+    ) -> Result<(), EngineError> {
+        self.generate_continued_impl(
+            session_id,
+            prompt_tokens,
+            max_tokens,
+            params,
+            enable_thinking,
+            Some(sender),
+        )?;
+        Ok(())
+    }
+
+    fn generate_continued_impl(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+        sender: Option<&tokio::sync::mpsc::Sender<StreamingOutput>>,
+    ) -> Result<SessionGeneration, EngineError> {
         let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
         let total_start = std::time::Instant::now();
         // Serialize all work for this conversation: hold the per-session lock for
@@ -3540,14 +3715,48 @@ impl SimpleEngine {
             has_mtp,
         );
         if speculation_route == SpeculationRoute::DFlash {
-            return self.generate_continued_dflash_locked(
+            let output = self.generate_continued_dflash_locked(
                 session_id,
                 prompt_tokens,
                 max_tokens,
                 params,
                 timing,
                 total_start,
-            );
+            )?;
+            // No incremental decode loop for DFlash sessions yet: emit the
+            // already-materialized completion as a single terminal chunk so
+            // the SSE contract still holds, at the cost of this one route
+            // staying non-incremental.
+            if let Some(sender) = sender {
+                let cached = if output.continued {
+                    output.prompt_tokens.saturating_sub(output.prefilled_tokens)
+                } else {
+                    0
+                };
+                let _ = sender.blocking_send(StreamingOutput {
+                    new_text: String::new(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: output.prompt_tokens,
+                    completion_tokens: 0,
+                    token_logprob: None,
+                    prefill_progress: Some(crate::engine::PrefillProgress {
+                        processed: cached,
+                        cached,
+                        total: output.prompt_tokens,
+                    }),
+                });
+                let _ = sender.blocking_send(StreamingOutput {
+                    new_text: output.text.clone(),
+                    finished: true,
+                    finish_reason: Some("stop".to_owned()),
+                    prompt_tokens: output.prompt_tokens,
+                    completion_tokens: output.completion_tokens,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+            }
+            return Ok(output);
         }
 
         let (mut prepared, prefilled, continued) = if let Some((state, prior)) =
@@ -3597,6 +3806,31 @@ impl SimpleEngine {
             );
         }
 
+        // Surface the reused prefix to the streaming route before prefill runs:
+        // the route folds `prefill_progress.cached` into the final usage block's
+        // `prompt_tokens_details.cached_tokens` (and forwards it as a
+        // `prompt_progress` chunk when the client opted in).
+        if let Some(sender) = sender {
+            let cached = if continued {
+                total.saturating_sub(prefilled)
+            } else {
+                0
+            };
+            let _ = sender.blocking_send(StreamingOutput {
+                new_text: String::new(),
+                finished: false,
+                finish_reason: None,
+                prompt_tokens: total,
+                completion_tokens: 0,
+                token_logprob: None,
+                prefill_progress: Some(crate::engine::PrefillProgress {
+                    processed: cached,
+                    cached,
+                    total,
+                }),
+            });
+        }
+
         let prefill_start = std::time::Instant::now();
         // capture_hidden: the MTP head primes from the prefilled tokens'
         // hidden states (unprimed acceptance measured ~75% vs 85-97% primed).
@@ -3614,6 +3848,14 @@ impl SimpleEngine {
             None,
             None,
             want_mtp,
+            // NOTE: `store_prefix_cache` is deliberately `false` on the
+            // session-resident path. Enabling radix consult/store here crashes
+            // the hybrid (GDN+FA) target with a Metal command-buffer assertion
+            // during KV reconstruction — confirmed empirically (2026-07-17).
+            // The cross-session radix hit on the system+tools prefix must be
+            // achieved a different way (e.g. a non-session first-turn path, or
+            // making the hybrid radix reconstruction safe), not by flipping
+            // this flag.
             false,
             None,
             None,
@@ -3626,6 +3868,43 @@ impl SimpleEngine {
         token_ledger
             .emit_pending(first_id)
             .map_err(session_ledger_error)?;
+
+        // Incremental detokenizer for the streaming path only (`None` when
+        // this is the buffered `generate_continued_with_thinking` caller) —
+        // mirrors `generate_streaming_inner`'s `IncrementalDetok` usage so
+        // streamed text matches a full `decode_tokens` byte-for-byte.
+        let mut detok = sender.map(|_| {
+            IncrementalDetok::new(
+                String::new(),
+                0,
+                std::sync::Arc::clone(&self.decode_skip_ids),
+            )
+        });
+        if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+            let is_eos = self.eos_token_ids.contains(&first_id);
+            let is_max = 1 >= max_tokens;
+            let mut new_text = detok.append(&self.tokenizer, &generated)?;
+            let step_finished = is_eos || is_max;
+            if step_finished {
+                new_text.push_str(&detok.flush(&self.tokenizer, &generated)?);
+            }
+            let finish_reason = if is_eos {
+                Some("stop".to_owned())
+            } else if is_max {
+                Some("length".to_owned())
+            } else {
+                None
+            };
+            let _ = sender.blocking_send(StreamingOutput {
+                new_text,
+                finished: step_finished,
+                finish_reason,
+                prompt_tokens: total,
+                completion_tokens: 1,
+                token_logprob: None,
+                prefill_progress: None,
+            });
+        }
 
         let decode_start = std::time::Instant::now();
         // MTP speculative decode for the session path when the model ships a
@@ -3705,6 +3984,20 @@ impl SimpleEngine {
                     token_ledger
                         .emit_pending(confirmed)
                         .map_err(session_ledger_error)?;
+                    if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+                        let completion_len = u32::try_from(generated.len()).unwrap_or(u32::MAX);
+                        let mut new_text = detok.append(&self.tokenizer, &generated)?;
+                        new_text.push_str(&detok.flush(&self.tokenizer, &generated)?);
+                        let _ = sender.blocking_send(StreamingOutput {
+                            new_text,
+                            finished: true,
+                            finish_reason: Some("stop".to_owned()),
+                            prompt_tokens: total,
+                            completion_tokens: completion_len,
+                            token_logprob: None,
+                            prefill_progress: None,
+                        });
+                    }
                     break;
                 }
 
@@ -3731,7 +4024,43 @@ impl SimpleEngine {
                 token_ledger
                     .extend_forwarded(result.tokens.iter().copied())
                     .map_err(session_ledger_error)?;
+                let batch_base = generated.len();
                 generated.extend_from_slice(&result.tokens);
+                if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+                    for (i, tok) in result.tokens.iter().enumerate() {
+                        let upto = batch_base + i + 1;
+                        let window = &generated[..upto];
+                        let is_eos = self.eos_token_ids.contains(tok);
+                        let completion_len = u32::try_from(upto).unwrap_or(u32::MAX);
+                        let is_max = completion_len >= max_tokens;
+                        let mut new_text = detok.append(&self.tokenizer, window)?;
+                        let step_finished = is_eos || is_max;
+                        if step_finished {
+                            new_text.push_str(&detok.flush(&self.tokenizer, window)?);
+                        }
+                        let finish_reason = if is_eos {
+                            Some("stop".to_owned())
+                        } else if is_max {
+                            Some("length".to_owned())
+                        } else {
+                            None
+                        };
+                        let send_failed = sender
+                            .blocking_send(StreamingOutput {
+                                new_text,
+                                finished: step_finished,
+                                finish_reason,
+                                prompt_tokens: total,
+                                completion_tokens: completion_len,
+                                token_logprob: None,
+                                prefill_progress: None,
+                            })
+                            .is_err();
+                        if step_finished || send_failed {
+                            break;
+                        }
+                    }
+                }
                 current_hidden = result.hidden;
                 confirmed = result.next_token_id;
             }
@@ -3758,7 +4087,33 @@ impl SimpleEngine {
                 token_ledger
                     .emit_pending(next_id)
                     .map_err(session_ledger_error)?;
-                if self.eos_token_ids.contains(&next_id) {
+                let is_eos = self.eos_token_ids.contains(&next_id);
+                if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+                    let completion_len = u32::try_from(generated.len()).unwrap_or(u32::MAX);
+                    let is_max = completion_len >= max_tokens;
+                    let mut new_text = detok.append(&self.tokenizer, &generated)?;
+                    let step_finished = is_eos || is_max;
+                    if step_finished {
+                        new_text.push_str(&detok.flush(&self.tokenizer, &generated)?);
+                    }
+                    let finish_reason = if is_eos {
+                        Some("stop".to_owned())
+                    } else if is_max {
+                        Some("length".to_owned())
+                    } else {
+                        None
+                    };
+                    let _ = sender.blocking_send(StreamingOutput {
+                        new_text,
+                        finished: step_finished,
+                        finish_reason,
+                        prompt_tokens: total,
+                        completion_tokens: completion_len,
+                        token_logprob: None,
+                        prefill_progress: None,
+                    });
+                }
+                if is_eos {
                     break;
                 }
                 cur = next;
@@ -4818,8 +5173,113 @@ impl SimpleEngine {
         clippy::significant_drop_tightening,
         clippy::too_many_lines,
         clippy::too_many_arguments,
+        clippy::unnecessary_wraps,
         clippy::float_cmp
     )]
+    fn pflash_compress_if_eligible(
+        &self,
+        prompt_tokens: &[u32],
+        _params: &SamplingParams,
+        pixel_values: Option<&Array>,
+        constraint: Option<&crate::constrained::ConstrainedGenerator>,
+        logprobs: bool,
+        session_id: Option<&u64>,
+    ) -> Result<Option<Vec<u32>>, EngineError> {
+        if self.prefill_compression == PrefillCompressionMode::Off {
+            return Ok(None);
+        }
+        if self.prefill_drafter.is_none() {
+            return Ok(None);
+        }
+        if self.prefill_compression == PrefillCompressionMode::Auto
+            && prompt_tokens.len() < self.prefill_threshold
+        {
+            return Ok(None);
+        }
+        if pixel_values.is_some() || constraint.is_some() || logprobs || session_id.is_some() {
+            return Ok(None);
+        }
+        // Simple engine is single-request only; no batch mode call-path reaches here.
+
+        let min_free_mb = prefill_min_free_memory_mb();
+        let free_mb = match pflash_free_memory_mb() {
+            Ok(free_mb) => free_mb,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    min_free_mb,
+                    "PFlash memory guard unavailable; falling back to uncompressed prefill"
+                );
+                return Ok(None);
+            }
+        };
+        if free_mb < min_free_mb {
+            tracing::warn!(
+                free_mb,
+                min_free_mb,
+                "Insufficient free memory for PFlash; falling back to uncompressed prefill"
+            );
+            return Ok(None);
+        }
+
+        let plan = match (|| -> Result<Vec<u32>, EngineError> {
+            let prefill_lock = self
+                .prefill_drafter
+                .as_ref()
+                .ok_or_else(|| EngineError::Generation("prefill drafter missing".to_owned()))?;
+            let mut drafter = lock_or_recover(prefill_lock);
+
+            let prompt_len = i32::try_from(prompt_tokens.len()).map_err(|_| {
+                EngineError::Generation("prompt too long for prefill compression".to_owned())
+            })?;
+            let inputs = Array::from_slice(prompt_tokens, &[1, prompt_len]);
+            let num_layers = drafter.num_layers();
+            let score_layers_start = num_layers.saturating_sub(8);
+            let score_layers: Vec<usize> = (score_layers_start..num_layers).collect();
+            let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+            let raw_importance_scores = drafter.pflash_importance(
+                &inputs,
+                &score_layers,
+                self.prefill_lookahead,
+                &mut cache,
+            )?;
+            eval([&raw_importance_scores]).map_err(EngineError::Mlx)?;
+            let importance_scores_f32 = raw_importance_scores
+                .as_dtype(Dtype::Float32)
+                .map_err(EngineError::Mlx)?;
+            let importance_scores = importance_scores_f32.as_slice::<f32>().to_vec();
+            let cfg = PrefillScoreConfig {
+                keep_ratio: self.prefill_keep_ratio,
+                chunk: self.prefill_chunk,
+                avgpool: self.prefill_avgpool,
+                lookahead: self.prefill_lookahead,
+            };
+            let plan =
+                select_survivors(prompt_tokens, &importance_scores, &cfg).map_err(|error| {
+                    EngineError::Generation(format!("PFlash survivor selection failed: {error}"))
+                })?;
+            Ok(plan.token_ids)
+        })() {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "PFlash compression failed; falling back to uncompressed prefill"
+                );
+                return Ok(None);
+            }
+        };
+        let original_len = prompt_tokens.len();
+        let kept_len = plan.len();
+        tracing::debug!(
+            original = original_len,
+            kept = kept_len,
+            ratio = format_args!("{kept_len}/{original_len}"),
+            "PFlash compressed prefill prompt"
+        );
+        Ok(Some(plan))
+    }
+
     fn generate_inner(
         &self,
         prompt_tokens: &[u32],
@@ -4834,6 +5294,18 @@ impl SimpleEngine {
         checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
         let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
+        let compressed = self.pflash_compress_if_eligible(
+            prompt_tokens,
+            params,
+            pixel_values.as_ref(),
+            constraint.as_ref(),
+            logprobs,
+            None,
+        )?;
+        let prepared_prompt_tokens: &[u32] = match &compressed {
+            Some(tokens) => tokens.as_slice(),
+            None => prompt_tokens,
+        };
         // DFlash speculative decoding: use the draft-verify loop when a drafter
         // is loaded, the request allows it (`speculation` = auto/dflash), no
         // constraints active, and no multimodal input.
@@ -4854,7 +5326,7 @@ impl SimpleEngine {
         );
         if speculation_route == SpeculationRoute::DFlash {
             return self.generate_dflash_inner(
-                prompt_tokens,
+                prepared_prompt_tokens,
                 max_tokens,
                 params,
                 stop_sequences,
@@ -4869,7 +5341,8 @@ impl SimpleEngine {
         }
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
-        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values, checkpoint_id)?;
+        let mut prepared =
+            self.prepare_generation(prepared_prompt_tokens, pixel_values, checkpoint_id)?;
         let prompt_len = prepared.prompt_len;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
@@ -4881,7 +5354,7 @@ impl SimpleEngine {
             && params.temperature == 0.0;
 
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
-            prompt_tokens,
+            prepared_prompt_tokens,
             self.gen_prompt_suffixes.for_request(enable_thinking),
             &mut prepared,
             params,
@@ -7955,10 +8428,23 @@ impl SimpleEngine {
         checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
         let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
+        let compressed = self.pflash_compress_if_eligible(
+            prompt_tokens,
+            params,
+            pixel_values.as_ref(),
+            constraint.as_ref(),
+            logprobs,
+            None,
+        )?;
+        let prepared_prompt_tokens: &[u32] = match &compressed {
+            Some(tokens) => tokens.as_slice(),
+            None => prompt_tokens,
+        };
         // DFlash streaming: branch BEFORE the normal prefill — the DFlash loop
         // runs its own tap-prefill, so dispatching here (mirroring the
         // non-streaming site) avoids a double prefill. Logprobs requests fall
         // through to the MTP/AR path, which produces per-token logprobs.
+        // PFlash: compressive prefill is applied above (single compression point); the compressed slice feeds both the DFlash-streaming and AR paths.
         let sampled_dspark = self.sampled_dspark_requires_ar(params);
         if sampled_dspark {
             tracing::debug!(
@@ -7976,7 +8462,7 @@ impl SimpleEngine {
         );
         if speculation_route == SpeculationRoute::DFlash {
             return self.generate_dflash_streaming(
-                prompt_tokens,
+                prepared_prompt_tokens,
                 max_tokens,
                 params,
                 stop_sequences,
@@ -7988,7 +8474,8 @@ impl SimpleEngine {
 
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
-        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values, checkpoint_id)?;
+        let mut prepared =
+            self.prepare_generation(prepared_prompt_tokens, pixel_values, checkpoint_id)?;
         let prompt_len = prepared.prompt_len;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
@@ -8038,7 +8525,7 @@ impl SimpleEngine {
         });
 
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
-            prompt_tokens,
+            prepared_prompt_tokens,
             self.gen_prompt_suffixes.for_request(enable_thinking),
             &mut prepared,
             params,
@@ -8949,13 +9436,14 @@ mod tests {
     use super::{
         CanonicalDflashRound, DFlashVerifyMode, DFlashVerifyRound, DflashPromptPartition,
         DflashTapFrontier, EngineError, GenerationPromptSuffixes, IncrementalDetok, LivePair,
-        SessionDsparkDecodeState, SessionGeneration, SimpleEngine, SpeculationRoute, Tokenizer,
-        adaptive_draft_depth_for_cap, check_stop_sequences, continuation_prior_len,
-        derive_model_name, detect_thinking_support, dflash_canonical_target_is_terminal,
-        dflash_new_stop_prefix_len, dflash_resolve_target_then_draft, dflash_tail_draft_cap,
-        drive_canonical_dspark_round, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, lock_or_recover, paired_dflash_exact_domain, parse_enabled_flag,
-        resolve_speculation_route, stateless_mtp_family_eligible, with_chat_terminator,
+        PrefillCompressionMode, SessionDsparkDecodeState, SessionGeneration, SimpleEngine,
+        SpeculationRoute, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
+        continuation_prior_len, derive_model_name, detect_thinking_support,
+        dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
+        dflash_resolve_target_then_draft, dflash_tail_draft_cap, drive_canonical_dspark_round,
+        estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail, lock_or_recover,
+        paired_dflash_exact_domain, parse_enabled_flag, resolve_speculation_route,
+        stateless_mtp_family_eligible, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
@@ -9100,6 +9588,13 @@ mod tests {
                 RequestedMlxProfile::Baseline,
             ),
             dflash: None,
+            prefill_drafter: None,
+            prefill_compression: PrefillCompressionMode::Off,
+            prefill_keep_ratio: 0.10,
+            prefill_threshold: 4096,
+            prefill_chunk: 32,
+            prefill_avgpool: 13,
+            prefill_lookahead: 8,
             last_dflash_accepts: std::sync::Mutex::new(Vec::new()),
             last_dflash_draft_matches: std::sync::Mutex::new(Vec::new()),
             last_dflash_draft_counts: std::sync::Mutex::new(Vec::new()),
@@ -9911,6 +10406,13 @@ mod tests {
             false,
             Some(Path::new(&drafter)),
             None,
+            None,
+            PrefillCompressionMode::Off,
+            0.10,
+            4096,
+            32,
+            13,
+            8,
         )
         .expect("load DFlash engine");
 
@@ -10124,6 +10626,13 @@ mod tests {
             false,
             Some(Path::new(&drafter)),
             None,
+            None,
+            PrefillCompressionMode::Off,
+            0.10,
+            4096,
+            32,
+            13,
+            8,
         )
         .expect("load paired target + drafter");
         let dflash = engine.dflash.as_ref().expect("DFlash state");
@@ -10869,6 +11378,13 @@ mod tests {
                 false,
                 Some(Path::new(&drafter)),
                 None,
+                None,
+                PrefillCompressionMode::Off,
+                0.10,
+                4096,
+                32,
+                13,
+                8,
             )
             .expect("load DFlash engine")
         };

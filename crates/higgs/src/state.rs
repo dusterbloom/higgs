@@ -7,13 +7,18 @@ use higgs_engine::chat_template::ChatMessage;
 use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::{MlxRuntimeTuning, resolve_runtime_tuning};
-use higgs_engine::simple::{CacheStats, SessionGeneration, SimpleEngine};
+use higgs_engine::simple::{
+    CacheStats, PrefillCompressionMode as EnginePrefillCompressionMode, SessionGeneration,
+    SimpleEngine,
+};
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
 use higgs_models::turboquant::KvCacheConfig;
 use mlx_rs::Array;
 
-use crate::config::{HiggsConfig, LocalConfig, ModelConfig, resolved_model_supports_batch};
+use crate::config::{
+    HiggsConfig, LocalConfig, ModelConfig, PrefillCompressionMode, resolved_model_supports_batch,
+};
 use crate::metrics::MetricsStore;
 use crate::router::Router;
 
@@ -59,8 +64,20 @@ impl Engine {
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
         draft_model: Option<&Path>,
+        prefill_drafter: Option<&Path>,
+        prefill_compression: PrefillCompressionMode,
+        prefill_keep_ratio: f32,
+        prefill_threshold: usize,
+        prefill_chunk: usize,
+        prefill_avgpool: usize,
+        prefill_lookahead: usize,
         disk_cache_config: Option<DiskPrefixCacheConfig>,
     ) -> Result<Self, EngineError> {
+        let prefill_compression = match prefill_compression {
+            PrefillCompressionMode::Off => EnginePrefillCompressionMode::Off,
+            PrefillCompressionMode::Auto => EnginePrefillCompressionMode::Auto,
+            PrefillCompressionMode::Always => EnginePrefillCompressionMode::Always,
+        };
         SimpleEngine::load_with_dflash(
             dir,
             kv_cache_config,
@@ -68,6 +85,13 @@ impl Engine {
             raise_wired_limit,
             draft_model,
             disk_cache_config,
+            prefill_drafter,
+            prefill_compression,
+            prefill_keep_ratio,
+            prefill_threshold,
+            prefill_chunk,
+            prefill_avgpool,
+            prefill_lookahead,
         )
         .map(|e| Self::Simple(Box::new(e)))
     }
@@ -279,6 +303,36 @@ impl Engine {
         }
     }
 
+    /// Streaming counterpart of [`Self::generate_continued_with_thinking`]:
+    /// emits each decoded token via `sender` instead of buffering the whole
+    /// completion.
+    pub fn generate_continued_streaming_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+    ) -> Result<(), EngineError> {
+        match self {
+            Self::Simple(e) => e.generate_continued_streaming_with_thinking(
+                session_id,
+                prompt_tokens,
+                max_tokens,
+                params,
+                sender,
+                enable_thinking,
+            ),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "session_id (continued generation) is only supported by the Simple engine"
+                    .to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -471,6 +525,13 @@ pub fn build_engine(
             tuning,
             local.raise_wired_limit,
             model_cfg.draft_model.as_deref().map(Path::new),
+            model_cfg.prefill_drafter.as_deref().map(Path::new),
+            model_cfg.prefill_compression,
+            model_cfg.prefill_keep_ratio,
+            model_cfg.prefill_threshold,
+            model_cfg.prefill_chunk,
+            model_cfg.prefill_avgpool,
+            model_cfg.prefill_lookahead,
             model_cfg.disk_prefix_cache_config(resolved),
         )
         .map_err(|e| e.to_string())?

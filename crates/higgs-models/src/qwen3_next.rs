@@ -524,6 +524,15 @@ fn affine_q1_forward(
     } else if row_count > 0 && row_count <= bonsai_q1_qmm_max_rows() {
         crate::metal_kernel::bonsai_q1_qmm(x, weight, scales, biases, group_size)
     } else {
+        // Native packed-Q1 wide QMM (gated by HIGGS_BONSAI_QMM_WIDE). Reads each
+        // packed weight roughly once per m-tile instead of materializing a full
+        // fp16 dequant projection. Falls through to the dense dequant path when
+        // disabled or outside the validated shape domain.
+        if let Some(y) =
+            crate::metal_kernel::bonsai_q1_wide_qmm(x, weight, scales, biases, group_size)?
+        {
+            return Ok(y);
+        }
         let dense = crate::metal_kernel::bonsai_q1_dequant(weight, scales, biases, group_size)?
             .as_dtype(x.dtype())?;
         x.matmul(&dense.transpose()?)
@@ -655,6 +664,27 @@ impl QLinear {
                 Ok(((*n_rows, *k_dim), false))
             }
             QLinearWeightLayout::Canonical => {
+                // TG-LUT4 row4 promotion is a Q1-only optimization. A canonical
+                // tensor that is not Q1 affine (e.g. an 8-bit group-64 model
+                // loaded while HIGGS_BONSAI_TG_LUT4=1 is set globally) is simply
+                // not a promotion candidate — decline silently so it falls
+                // through to the standard forward path. Derive [N,K] from the
+                // scales (group_count * group_size), which is packing-independent,
+                // so the caller's gate/up/down shape-consistency check still holds.
+                let is_q1_affine = self.mode == crate::quant_mode::QuantMode::Affine
+                    && self.bits == 1
+                    && self.group_size == 128;
+                if !is_q1_affine {
+                    let [n_rows, n_groups] = *self.scales.shape() else {
+                        return Err(Exception::custom(format!(
+                            "{path} canonical scales must have shape [N, K/group]"
+                        )));
+                    };
+                    let k_dim = n_groups
+                        .checked_mul(self.group_size)
+                        .ok_or_else(|| Exception::custom(format!("{path} canonical K overflow")))?;
+                    return Ok(((n_rows, k_dim), false));
+                }
                 validate_dflash_q1_linear(
                     path,
                     &self.weight,
@@ -724,6 +754,13 @@ impl QLinear {
                     x.shape(),
                     x.dtype()
                 )));
+            }
+            // Native packed-Q1 wide QMM against the authoritative row4 buffers
+            // (gated by HIGGS_BONSAI_QMM_WIDE). Falls through to the row4
+            // dequant + dense matmul path when disabled or outside the validated
+            // shape domain.
+            if let Some(y) = crate::metal_kernel::bonsai_q1_row4_wide_qmm_view(x, packed)? {
+                return Ok(y);
             }
             // Wide prefill dequantizes directly from the authoritative row4
             // buffers. No transient canonical packed copy is materialized.

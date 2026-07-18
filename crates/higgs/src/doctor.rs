@@ -340,6 +340,101 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 continue;
             }
         }
+        // PFlash compressive prefill (docs/RESEARCH-pflash-prior-art.md).
+        if let Some(ref pd) = model.prefill_drafter {
+            if !std::path::Path::new(pd).exists() {
+                fail(
+                    &format!("model {label} prefill_drafter path does not exist: {pd}"),
+                    result,
+                );
+                continue;
+            }
+            if model.batch {
+                fail(
+                    &format!(
+                        "model {label} sets prefill_drafter but PFlash is simple-engine only (batch=true)"
+                    ),
+                    result,
+                );
+                continue;
+            }
+        }
+        if model.prefill_compression != crate::config::PrefillCompressionMode::Off
+            && model.prefill_drafter.is_none()
+        {
+            fail(
+                &format!(
+                    "model {label} sets prefill_compression={:?} but no prefill_drafter is configured",
+                    model.prefill_compression
+                ),
+                result,
+            );
+            continue;
+        }
+        if model.prefill_drafter.is_some()
+            && model.prefill_compression != crate::config::PrefillCompressionMode::Off
+        {
+            warn(
+                &format!(
+                    "model {label} enables PFlash (mode={:?}, keep_ratio={}, threshold={}): \
+                     compressed output is NOT byte-identical to uncompressed. \
+                     Validate on your workload before relying on it.",
+                    model.prefill_compression, model.prefill_keep_ratio, model.prefill_threshold
+                ),
+                result,
+            );
+        }
+        if !(0.02..=0.50).contains(&model.prefill_keep_ratio) {
+            fail(
+                &format!(
+                    "model {label} prefill_keep_ratio={} out of range [0.02, 0.50]",
+                    model.prefill_keep_ratio
+                ),
+                result,
+            );
+            continue;
+        }
+        if model.prefill_drafter.is_some() {
+            if model.prefill_chunk == 0 {
+                fail(
+                    &format!(
+                        "model {label} prefill_chunk must be >= 1, got {}",
+                        model.prefill_chunk
+                    ),
+                    result,
+                );
+                continue;
+            }
+            if model.prefill_avgpool == 0 || model.prefill_avgpool % 2 == 0 {
+                fail(
+                    &format!(
+                        "model {label} prefill_avgpool must be odd and >= 1 (symmetric smoothing window), got {}",
+                        model.prefill_avgpool
+                    ),
+                    result,
+                );
+                continue;
+            }
+            if model.prefill_lookahead == 0 {
+                fail(
+                    &format!(
+                        "model {label} prefill_lookahead must be >= 1, got {}",
+                        model.prefill_lookahead
+                    ),
+                    result,
+                );
+                continue;
+            }
+            if model.prefill_threshold < 1024 {
+                warn(
+                    &format!(
+                        "model {label} prefill_threshold={} is very low; compressing short prompts costs more than it saves",
+                        model.prefill_threshold
+                    ),
+                    result,
+                );
+            }
+        }
         match model_resolver::resolve(&model.path) {
             Ok(resolved) => {
                 if model.batch {

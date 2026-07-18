@@ -22,7 +22,7 @@ use std::path::Path;
 use higgs_engine::{
     chat_template::ChatMessage,
     mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile},
-    simple::SimpleEngine,
+    simple::{PrefillCompressionMode, SimpleEngine},
 };
 use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
 use support::{
@@ -76,6 +76,13 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
         false,
         Some(Path::new(&drafter)),
         None,
+        None,
+        PrefillCompressionMode::Off,
+        0.10,
+        4096,
+        32,
+        13,
+        8,
     )
     .expect("load paired dSpark engine");
     eprintln!("dspark-session checkpoint: engine loaded");

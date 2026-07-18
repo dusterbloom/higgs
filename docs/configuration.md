@@ -196,6 +196,28 @@ That means Higgs supports:
 - Source builds on macOS require `mlx.metallib`. Higgs restores it from Cargo build output when possible and fails startup if it still cannot be resolved.
 - The `session_id` chat-request field opts a conversation into cache-resident multi-turn reuse (prefill only the new turn instead of the whole history). It is a **best-effort latency optimization, not exact replay** — the retained KV is TurboQuant-compressed, so a continued turn's output may differ slightly from a stateless full prefill. Omit `session_id` for bit-identical output; the radix prefix cache on the normal path reuses dense KV exactly. Per-conversation KV is bounded by the `kv_max_sessions` / `kv_max_session_tokens` / `kv_retained_idle_secs` model settings above.
 
+### Compressive prefill (PFlash) — experimental
+
+A second, optional `prefill_drafter` (distinct from the decode-speculation `draft_model`) scores the prompt with a small dense model and the target then prefills only the kept fraction. This is the SpecPrefill algorithm (arXiv:2502.02789); see `.planning/DESIGN-pflash-higgs.md` and `docs/RESEARCH-pflash-prior-art.md`.
+
+```toml
+# [[models]]
+# path = "..."
+# draft_model     = "/path/to/dspark-drafter"        # decode speculation (dFlash/dSpark)
+# prefill_drafter = "mlx-community/Qwen3-0.6B-4bit"  # compressive prefill (PFlash)
+# prefill_compression = "off"                        # off | auto | always
+# prefill_threshold   = 4096                         # auto: enable above this many prompt tokens
+# prefill_keep_ratio  = 0.10                         # fraction kept (~10x prefill at 0.10)
+# prefill_chunk = 32                                 # survivor block size (SpecPrefill default)
+# prefill_avgpool = 13                               # importance smoothing kernel
+# prefill_lookahead = 8                              # lookahead decoded tokens for scoring
+```
+
+- **Off by default.** When `off` (or no `prefill_drafter` is set) behavior is byte-identical to today.
+- **Output is NOT byte-identical to uncompressed** when active — the target sees a subset of tokens. `higgs doctor` warns when PFlash is enabled.
+- **Quality vs keep_ratio** (from published evidence): retrieval stays intact down to ~5%; multi-doc QA and code-debug are flat to ~10–20% then degrade. `0.10` is the default "highest tradable point"; raise it to `0.20` for coding-heavy workloads. Agent/multi-step loops have thin published evidence below 10% — validate on your traffic.
+- **Simple engine only** (`batch=true` rejects it), and v1 excludes multimodal, grammar-constrained, `logprobs`, and `session_id` requests (fail-closed to the uncompressed path).
+
 ## Shell Integration
 
 Export Higgs as the local OpenAI and Anthropic base URL:

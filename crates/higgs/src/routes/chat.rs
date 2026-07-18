@@ -470,11 +470,10 @@ async fn chat_completions_non_streaming(
             finish_reason,
             logprobs: logprobs_response,
         }],
-        usage: CompletionUsage {
-            prompt_tokens: output.prompt_tokens,
-            completion_tokens: output.completion_tokens,
-            total_tokens: output.prompt_tokens + output.completion_tokens,
-        },
+        // Stateless (no session_id) path: reuse is via the radix prefix cache,
+        // which is not surfaced per-request through `GenerationOutput`, so
+        // report no cached tokens rather than a fabricated value.
+        usage: CompletionUsage::new(output.prompt_tokens, output.completion_tokens, 0),
     })
 }
 
@@ -674,6 +673,7 @@ fn build_session_response(
     has_tools: bool,
     thinking_enabled: bool,
 ) -> ChatCompletionResponse {
+    let usage = session_usage(&output);
     let output_text = output.text;
     // Same reasoning-tag handling as the normal path: the template opens
     // `<think>` in the prompt, so generated text starts inside the think block.
@@ -749,12 +749,20 @@ fn build_session_response(
             finish_reason,
             logprobs: None,
         }],
-        usage: CompletionUsage {
-            prompt_tokens: output.prompt_tokens,
-            completion_tokens: output.completion_tokens,
-            total_tokens: output.prompt_tokens + output.completion_tokens,
-        },
+        usage,
     }
+}
+
+/// Usage for a session-continuation turn. `cached_tokens` = the prompt tokens
+/// served from the retained KV cache (everything not re-prefilled this turn).
+/// Only a truly continued turn reused a prefix; a cold prefill reports 0.
+fn session_usage(output: &higgs_engine::simple::SessionGeneration) -> CompletionUsage {
+    let cached = if output.continued {
+        output.prompt_tokens.saturating_sub(output.prefilled_tokens)
+    } else {
+        0
+    };
+    CompletionUsage::new(output.prompt_tokens, output.completion_tokens, cached)
 }
 
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
@@ -843,7 +851,6 @@ fn chat_completions_stream(
         .is_some_and(|opts| opts.include_usage.unwrap_or(false));
     let return_progress = req.return_progress.unwrap_or(false);
     let created = current_unix_timestamp();
-    let tools_for_session = req.tools.clone();
     let request_session_id = req.session_id;
     let model = req.model;
     let checkpoint_id = req.checkpoint_id;
@@ -869,6 +876,19 @@ fn chat_completions_stream(
     let stream_session_id = request_session_id
         .filter(|_| pixel_values.is_none() && constraint.is_none() && !want_logprobs)
         .filter(|_| checkpoint_id.is_none());
+
+    let tokenizer = engine.tokenizer().clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+
+    // Cache-resident (session-continued) turns stream from the retained KV
+    // cache; everything else does a fresh prefill. Both feed the same
+    // `StreamingOutput` channel and the same delta/tool-call-tracking loop
+    // below — the session path used to buffer the *entire* completion behind
+    // a `spawn_blocking().await` before emitting a single burst of deltas
+    // (the browser/client would see time-to-first-delta == total elapsed
+    // time on every cache-resident turn). Streaming the retained-cache decode
+    // loop itself (see `generate_continued_streaming_with_thinking`) fixes
+    // that without changing the non-session path at all.
     if let Some(sid) = stream_session_id {
         let continued_prompt = continued_prompt_tokens(
             &engine,
@@ -878,146 +898,40 @@ fn chat_completions_stream(
             prompt_tools,
             thinking_enabled_stream,
         );
-        let engine_c = Arc::clone(&engine);
-        let sampling_c = sampling.clone();
-        let request_id_c = request_id.clone();
-        let model_c = model.clone();
-        let stream = async_stream::stream! {
-            let mut writer = crate::sse::ChatChunkWriter::new(&request_id_c, created, &model_c);
-
-            macro_rules! emit_delta {
-                ($delta:expr, $finish:expr, $logprobs:expr) => {
-                    match writer.write_delta($delta, $finish, $logprobs) {
-                        Ok(json) => yield Ok(Event::default().data(json)),
-                        Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
-                    }
-                };
+        tokio::task::spawn_blocking(move || {
+            let result = engine.generate_continued_streaming_with_thinking(
+                sid,
+                &continued_prompt,
+                max_tokens,
+                &sampling,
+                &tx,
+                thinking_enabled_stream,
+            );
+            if let Err(e) = result {
+                tracing::error!(error = %e, "Session generation error during streaming");
             }
-
-            let role_delta = ChatCompletionDelta {
-                role: Some("assistant".to_owned()),
-                content: None,
-                reasoning_content: None,
-                tool_calls: None,
-            };
-            emit_delta!(&role_delta, None, None);
-
-            let session_result = tokio::task::spawn_blocking(move || {
-                engine_c.generate_continued_with_thinking(
-                    sid,
-                    &continued_prompt,
-                    max_tokens,
-                    &sampling_c,
-                    thinking_enabled_stream,
-                )
-            })
-            .await;
-
-            match session_result {
-                Ok(Ok(output)) => {
-                    let tools = tools_for_session.as_deref().filter(|t| !t.is_empty());
-                    let response = build_session_response(
-                        &model_c,
-                        &request_id_c,
-                        output,
-                        tools,
-                        stream_includes_tools,
-                        thinking_enabled_stream,
-                    );
-                    if let Some(choice) = response.choices.first() {
-                        if let Some(reasoning) = choice.message.reasoning_content.clone() {
-                            let d = ChatCompletionDelta {
-                                role: None,
-                                content: None,
-                                reasoning_content: Some(reasoning),
-                                tool_calls: None,
-                            };
-                            emit_delta!(&d, None, None);
-                        }
-                        if let Some(content) = choice.message.content.as_ref() {
-                            let text = content.text();
-                            if !text.is_empty() {
-                                let d = ChatCompletionDelta {
-                                    role: None,
-                                    content: Some(text),
-                                    reasoning_content: None,
-                                    tool_calls: None,
-                                };
-                                emit_delta!(&d, None, None);
-                            }
-                        }
-                        if let Some(tool_calls) = choice.message.tool_calls.as_ref() {
-                            for (index, tool_call) in tool_calls.iter().enumerate() {
-                                let d = ChatCompletionDelta {
-                                    role: None,
-                                    content: None,
-                                    reasoning_content: None,
-                                    tool_calls: Some(vec![ToolCallDelta {
-                                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                                        id: Some(tool_call.id.clone()),
-                                        r#type: Some(tool_call.r#type.clone()),
-                                        function: Some(ToolCallFunctionDelta {
-                                            name: Some(tool_call.function.name.clone()),
-                                            arguments: Some(tool_call.function.arguments.clone()),
-                                        }),
-                                    }]),
-                                };
-                                emit_delta!(&d, None, None);
-                            }
-                        }
-                        let final_delta = ChatCompletionDelta {
-                            role: None,
-                            content: None,
-                            reasoning_content: None,
-                            tool_calls: None,
-                        };
-                        emit_delta!(&final_delta, Some(choice.finish_reason.as_str()), None);
-                    }
-
-                    if include_usage {
-                        match writer.write_usage(&response.usage) {
-                            Ok(json) => yield Ok(Event::default().data(json)),
-                            Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
-                        }
-                    }
-                    if let Some(ref m) = metrics {
-                        if let Some(id) = metrics_id {
-                            m.finalize_stream(id, u64::from(response.usage.completion_tokens), start.elapsed());
-                        }
-                    }
-                }
-                Ok(Err(e)) => tracing::error!(error = %e, "Session generation error during streaming"),
-                Err(e) => tracing::error!(error = %e, "Session generation task join error during streaming"),
+        });
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let result = engine.generate_streaming_with_thinking(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                want_logprobs,
+                top_logprobs,
+                &tx,
+                thinking_enabled_stream,
+                return_progress,
+                constraint,
+                pixel_values,
+                checkpoint_id.as_deref(),
+            );
+            if let Err(e) = result {
+                tracing::error!(error = %e, "Generation error during streaming");
             }
-
-            yield Ok(Event::default().data("[DONE]"));
-        };
-
-        return Ok(Box::pin(stream));
+        });
     }
-
-    let tokenizer = engine.tokenizer().clone();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-
-    tokio::task::spawn_blocking(move || {
-        let result = engine.generate_streaming_with_thinking(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
-            &tx,
-            thinking_enabled_stream,
-            return_progress,
-            constraint,
-            pixel_values,
-            checkpoint_id.as_deref(),
-        );
-        if let Err(e) = result {
-            tracing::error!(error = %e, "Generation error during streaming");
-        }
-    });
 
     let stream = async_stream::stream! {
         let mut writer = crate::sse::ChatChunkWriter::new(&request_id, created, &model);
@@ -1070,6 +984,9 @@ fn chat_completions_stream(
         };
 
         let mut output_token_count: u32 = 0;
+        // Radix prefix-cache tokens reused this turn, taken from the prefill
+        // progress events (`p.cached`). Reported as `prompt_tokens_details`.
+        let mut cached_prompt_tokens: u32 = 0;
         let mut pending_finish_reason: Option<String> = None;
         let mut pending_finish_logprobs: Option<ChoiceLogprobs> = None;
 
@@ -1078,6 +995,7 @@ fn chat_completions_stream(
             // `prompt_progress` chunks when the client opted in, and keep
             // them away from the delta/tool trackers either way.
             if let Some(p) = output.prefill_progress {
+                cached_prompt_tokens = cached_prompt_tokens.max(p.cached);
                 if return_progress {
                     let time_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let json = writer.write_prompt_progress(p.total, p.cached, p.processed, time_ms);
@@ -1212,11 +1130,8 @@ fn chat_completions_stream(
 
         // Emit final chunk with usage only when explicitly requested.
         if include_usage {
-            let usage = CompletionUsage {
-                prompt_tokens: prompt_token_count,
-                completion_tokens: output_token_count,
-                total_tokens: prompt_token_count + output_token_count,
-            };
+            let usage =
+                CompletionUsage::new(prompt_token_count, output_token_count, cached_prompt_tokens);
             match writer.write_usage(&usage) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
@@ -1439,6 +1354,38 @@ fn current_unix_timestamp() -> i64 {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_usage_reports_reused_prefix_as_cached() {
+        // A continued turn: 1000-token prompt, only the 120-token suffix was
+        // prefilled, so 880 tokens came from the retained KV cache.
+        let continued = higgs_engine::simple::SessionGeneration {
+            text: String::new(),
+            completion_tokens: 30,
+            prompt_tokens: 1000,
+            prefilled_tokens: 120,
+            continued: true,
+        };
+        let usage = session_usage(&continued);
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            Some(880)
+        );
+
+        // A cold prefill re-ran the whole prompt: no cached tokens reported.
+        let cold = higgs_engine::simple::SessionGeneration {
+            text: String::new(),
+            completion_tokens: 30,
+            prompt_tokens: 1000,
+            prefilled_tokens: 1000,
+            continued: false,
+        };
+        assert!(session_usage(&cold).prompt_tokens_details.is_none());
+    }
 
     #[test]
     fn boundary_delta_splices_after_covered_messages() {

@@ -194,11 +194,7 @@ async fn completions_non_streaming(
             finish_reason: output.finish_reason,
             logprobs: logprobs_response,
         }],
-        usage: CompletionUsage {
-            prompt_tokens: output.prompt_tokens,
-            completion_tokens: output.completion_tokens,
-            total_tokens: output.prompt_tokens + output.completion_tokens,
-        },
+        usage: CompletionUsage::new(output.prompt_tokens, output.completion_tokens, 0),
     })
 }
 

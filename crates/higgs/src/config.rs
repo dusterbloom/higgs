@@ -429,6 +429,34 @@ pub struct ModelConfig {
     /// Optional path to a `DFlash` drafter (simple engine); overrides `HIGGS_DFLASH_PATH`.
     #[serde(default)]
     pub draft_model: Option<String>,
+    /// Optional path to a small dense MLX model (e.g. Qwen3-0.6B) used to score
+    /// the prompt for compressive (PFlash) prefill. Distinct from `draft_model`,
+    /// which is decode speculation. See `.planning/DESIGN-pflash-higgs.md`.
+    #[serde(default)]
+    pub prefill_drafter: Option<String>,
+    /// When to invoke compressive prefill. `off` (default) never; `auto`
+    /// enables above `prefill_threshold` prompt tokens; `always` for every
+    /// request. Output is NOT byte-identical to uncompressed when active.
+    #[serde(default)]
+    pub prefill_compression: PrefillCompressionMode,
+    /// Auto-enable compressive prefill above this many prompt tokens. Lower
+    /// than Lucebox PFlash's 32K because typical agent prompts are 4-16K.
+    #[serde(default = "default_prefill_threshold")]
+    pub prefill_threshold: usize,
+    /// Fraction of source tokens kept after compression. 0.10 is the
+    /// "highest tradable point" with published NIAH + multi-doc-QA evidence
+    /// (docs/RESEARCH-pflash-prior-art.md §3.5). Tunable per workload.
+    #[serde(default = "default_prefill_keep_ratio")]
+    pub prefill_keep_ratio: f32,
+    /// Prompt-token block size for survivor selection (SpecPrefill default 32).
+    #[serde(default = "default_prefill_chunk")]
+    pub prefill_chunk: usize,
+    /// 1D avgpool smoothing kernel width (Cross-Family Appendix A.1: 13).
+    #[serde(default = "default_prefill_avgpool")]
+    pub prefill_avgpool: usize,
+    /// Lookahead decoded tokens used for importance aggregation (SpecPrefill: 8).
+    #[serde(default = "default_prefill_lookahead")]
+    pub prefill_lookahead: usize,
     /// Persist simple-engine prefix KV snapshots to disk.
     #[serde(default)]
     pub disk_cache_enabled: bool,
@@ -457,6 +485,36 @@ pub struct ModelConfig {
 
 const fn default_norm_correction() -> bool {
     true
+}
+
+fn default_prefill_threshold() -> usize {
+    4096
+}
+
+fn default_prefill_keep_ratio() -> f32 {
+    0.10
+}
+
+fn default_prefill_chunk() -> usize {
+    32
+}
+
+fn default_prefill_avgpool() -> usize {
+    13
+}
+
+fn default_prefill_lookahead() -> usize {
+    8
+}
+
+/// When the PFlash compressive-prefill drafter is invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefillCompressionMode {
+    #[default]
+    Off,
+    Auto,
+    Always,
 }
 
 const fn default_kv_bits() -> u8 {
@@ -533,6 +591,13 @@ impl Default for ModelConfig {
             kv_adaptive_dense_layers: 0,
             kv_seed: 0,
             draft_model: None,
+            prefill_drafter: None,
+            prefill_compression: PrefillCompressionMode::Off,
+            prefill_threshold: default_prefill_threshold(),
+            prefill_keep_ratio: default_prefill_keep_ratio(),
+            prefill_chunk: default_prefill_chunk(),
+            prefill_avgpool: default_prefill_avgpool(),
+            prefill_lookahead: default_prefill_lookahead(),
             disk_cache_enabled: false,
             disk_cache_path: None,
             max_disk_blocks: default_max_disk_blocks(),
@@ -766,6 +831,13 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_adaptive_dense_layers: args.kv_adaptive_dense_layers.unwrap_or(0),
             kv_seed: args.kv_seed.unwrap_or_default(),
             draft_model: None,
+            prefill_drafter: None,
+            prefill_compression: PrefillCompressionMode::Off,
+            prefill_threshold: default_prefill_threshold(),
+            prefill_keep_ratio: default_prefill_keep_ratio(),
+            prefill_chunk: default_prefill_chunk(),
+            prefill_avgpool: default_prefill_avgpool(),
+            prefill_lookahead: default_prefill_lookahead(),
             disk_cache_enabled: false,
             disk_cache_path: None,
             max_disk_blocks: default_max_disk_blocks(),
@@ -861,6 +933,13 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_adaptive_dense_layers: serve_args.kv_adaptive_dense_layers.unwrap_or(0),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
                     draft_model: None,
+                    prefill_drafter: None,
+                    prefill_compression: PrefillCompressionMode::Off,
+                    prefill_threshold: default_prefill_threshold(),
+                    prefill_keep_ratio: default_prefill_keep_ratio(),
+                    prefill_chunk: default_prefill_chunk(),
+                    prefill_avgpool: default_prefill_avgpool(),
+                    prefill_lookahead: default_prefill_lookahead(),
                     disk_cache_enabled: false,
                     disk_cache_path: None,
                     max_disk_blocks: default_max_disk_blocks(),
@@ -1062,6 +1141,13 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_adaptive_dense_layers: 0,
         kv_seed: 0,
         draft_model: None,
+        prefill_drafter: None,
+        prefill_compression: PrefillCompressionMode::Off,
+        prefill_threshold: default_prefill_threshold(),
+        prefill_keep_ratio: default_prefill_keep_ratio(),
+        prefill_chunk: default_prefill_chunk(),
+        prefill_avgpool: default_prefill_avgpool(),
+        prefill_lookahead: default_prefill_lookahead(),
         disk_cache_enabled: false,
         disk_cache_path: None,
         max_disk_blocks: default_max_disk_blocks(),

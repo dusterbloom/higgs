@@ -1235,6 +1235,33 @@ impl AnyModel {
         }
     }
 
+    /// PFlash compressive-prefill scorer (SpecPrefill). Computes per-token
+    /// prompt importance via lookahead attention. Only the dense `Transformer`
+    /// variant is supported — the drafter must be a vanilla Qwen3-class model.
+    /// See `transformer::Model::pflash_importance` and `.planning/DESIGN-pflash-higgs.md`.
+    pub fn pflash_importance(
+        &mut self,
+        inputs: &Array,
+        score_layers: &[usize],
+        lookahead: usize,
+        kv_cache: &mut Vec<Option<cache::SteppingKeyValueCache>>,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Transformer(m) => m.pflash_importance(inputs, score_layers, lookahead, kv_cache),
+            _ => Err(Exception::custom(
+                "pflash_importance requires a dense Transformer drafter (got non-Transformer model)",
+            )),
+        }
+    }
+
+    /// Number of transformer layers (PFlash scorer uses the last few).
+    pub fn num_layers(&self) -> usize {
+        match self {
+            Self::Transformer(m) => m.num_layers() as usize,
+            _ => 0,
+        }
+    }
+
     /// `DFlash` verify: forward returning logits + tap hiddens + per-layer GDN tape (for cheap rollback).
     pub fn forward_with_taps_tape(
         &mut self,

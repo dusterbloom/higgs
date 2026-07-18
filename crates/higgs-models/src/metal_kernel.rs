@@ -2264,6 +2264,447 @@ pub(crate) fn bonsai_q1_row4_dequant(packed: &BonsaiQ1Row4) -> Result<Array, Exc
 
 static DEQUANT_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static ROW4_DEQUANT_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static WIDE_QMM_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// Wide packed-Q1 matrix multiply (`bonsai_q1_wide_qmm`).
+//
+// Replaces the fp16 dequant + dense matmul fallback used by wide prefill
+// (M > `bonsai_q1_qmm_max_rows`). The dequant path materializes a ~170 MiB
+// fp16 projection per layer and pays ~352 MiB of weight traffic; this kernel
+// keeps weights packed and reads each packed word roughly once per m-tile.
+//
+// Tiling: grid `(ceil(N/BN)*BM, ceil(M/BM), 1)` with `thread_group (BM,1,1)`.
+// Each thread owns one input row `m_local = tid` and accumulates `BN` output
+// columns. The `BN` packed words and scales for the current group are loaded
+// cooperatively into threadgroup shared memory, so a single weight read feeds
+// all `BM` input rows of the tile. The affine contract is identical to
+// [`bonsai_q1_qmv_fast`]: per group of `GroupSize` (128),
+//   `acc += scale * sum(bit * x) + bias * sum(x)`,
+// with `bias = -scale/2` for the symmetric case. The narrow verify path
+// (`bonsai_q1_qmm`, M <= 8) is deliberately untouched.
+//
+// `Row4` reuses the authoritative primary row4 buffers (`[N/4,K/128,4,4]`
+// weights, `[N/4,K/128,4]` scales) without reconstructing canonical packing.
+// ---------------------------------------------------------------------------
+
+const WIDE_QMM_BN: i32 = 8;
+const WIDE_QMM_BM: i32 = 32;
+
+const WIDE_QMM_KERNEL_SOURCE: &str = r"
+constexpr int WORDS_PER_GROUP = GroupSize / 32;
+constexpr int BK = 128;                         // one affine group per K-tile
+constexpr int VPT = 32;
+constexpr int CELLS = BM * BN;                  // threadgroup size (one cell per thread)
+
+uint tgx = threadgroup_position_in_grid.x;
+uint tgy = threadgroup_position_in_grid.y;
+uint tid = thread_index_in_threadgroup;
+int n_local = int(tid) % BN;
+int m_local = int(tid) / BN;
+int n_global = int(tgx) * BN + n_local;
+int m_global = int(tgy) * BM + m_local;
+
+threadgroup float x_tile[BM * BK];
+threadgroup uint w_tile[BN * WORDS_PER_GROUP];
+threadgroup float sc_tile[BN];
+threadgroup float bi_tile[BN];
+
+float acc = 0.0f;
+
+for (int g = 0; g < NumGroups; ++g) {
+    // Cooperative coalesced load of x_tile[BM, BK]. Consecutive threads map to
+    // consecutive K within a row, so each wave of BK threads loads one m-row
+    // contiguously from global memory. Widened to float so the tile dtype is
+    // independent of whether the input is fp16 or bf16.
+    int x_row_base = int(tgy) * BM * K + g * BK;
+    for (uint i = tid; i < uint(BM * BK); i += uint(CELLS)) {
+        int xm = int(i) / BK;
+        int xk = int(i) % BK;
+        int xm_global = int(tgy) * BM + xm;
+        // Tail m-tiles must not read past the input's row count. Out-of-range
+        // rows are zeroed; their results are discarded by the `active` guard.
+        x_tile[i] = (xm_global < m_param) ? float(x[x_row_base + xm * K + xk]) : 0.0f;
+    }
+    // Cooperative load of this group's packed words + scales (+ biases) for the
+    // BN output rows of the tile. Out-of-range rows are zeroed so the compute
+    // path reads deterministic values it will discard.
+    for (uint i = tid; i < uint(BN * WORDS_PER_GROUP); i += uint(CELLS)) {
+        int wn = int(i) / WORDS_PER_GROUP;
+        int ww = int(i) % WORDS_PER_GROUP;
+        int wn_global = int(tgx) * BN + wn;
+        uint packed = 0u;
+        if (wn_global < n_param) {
+            uint tile = uint(wn_global) / 4u;
+            uint lane = uint(wn_global) & 3u;
+            if constexpr (Row4) {
+                uint row4_group = tile * uint(NumGroups) + uint(g);
+                packed = w[(row4_group * 4u + uint(ww)) * 4u + lane];
+            } else {
+                packed = w[uint(wn_global) * uint(KPacked) + uint(g) * uint(WORDS_PER_GROUP) + uint(ww)];
+            }
+        }
+        w_tile[wn * WORDS_PER_GROUP + ww] = packed;
+    }
+    for (uint i = tid; i < uint(BN); i += uint(CELLS)) {
+        int sn_global = int(tgx) * BN + int(i);
+        float s_val = 0.0f;
+        float b_val = 0.0f;
+        if (sn_global < n_param) {
+            uint tile = uint(sn_global) / 4u;
+            uint lane = uint(sn_global) & 3u;
+            if constexpr (Row4) {
+                s_val = float(sc[(tile * uint(NumGroups) + uint(g)) * 4u + lane]);
+            } else {
+                s_val = float(sc[uint(sn_global) * uint(NumGroups) + uint(g)]);
+                if constexpr (!Symmetric) {
+                    b_val = float(bi[uint(sn_global) * uint(NumGroups) + uint(g)]);
+                }
+            }
+        }
+        sc_tile[i] = s_val;
+        bi_tile[i] = b_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (m_global < m_param && n_global < n_param) {
+        float sum_x = 0.0f;
+        float dot = 0.0f;
+        for (int word = 0; word < WORDS_PER_GROUP; ++word) {
+            uint packed = w_tile[n_local * WORDS_PER_GROUP + word];
+            int xb = word * VPT;
+            float d = 0.0f;
+            for (int bk = 0; bk < 4; ++bk) {
+                uint wb = (packed >> (uint(bk) * 8u)) & 0xFFu;
+                int b = xb + bk * 8;
+                d += select(0.0f, float(x_tile[m_local * BK + b + 0]), (wb & 0x01u) != 0u);
+                d += select(0.0f, float(x_tile[m_local * BK + b + 1]), (wb & 0x02u) != 0u);
+                d += select(0.0f, float(x_tile[m_local * BK + b + 2]), (wb & 0x04u) != 0u);
+                d += select(0.0f, float(x_tile[m_local * BK + b + 3]), (wb & 0x08u) != 0u);
+                d += select(0.0f, float(x_tile[m_local * BK + b + 4]), (wb & 0x10u) != 0u);
+                d += select(0.0f, float(x_tile[m_local * BK + b + 5]), (wb & 0x20u) != 0u);
+                d += select(0.0f, float(x_tile[m_local * BK + b + 6]), (wb & 0x40u) != 0u);
+                d += select(0.0f, float(x_tile[m_local * BK + b + 7]), (wb & 0x80u) != 0u);
+            }
+            dot += d;
+            for (int i = 0; i < VPT; ++i) {
+                sum_x += float(x_tile[m_local * BK + xb + i]);
+            }
+        }
+        float s_val = float(sc_tile[n_local]);
+        float b_val;
+        if constexpr (Symmetric) {
+            b_val = -0.5f * s_val;
+        } else {
+            b_val = float(bi_tile[n_local]);
+        }
+        acc += s_val * dot + b_val * sum_x;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (m_global < m_param && n_global < n_param) {
+    y[m_global * n_param + n_global] = OutT(acc);
+}
+";
+
+#[allow(unsafe_code)]
+fn create_wide_qmm_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"bi", c"x", c"n_param", c"m_param"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(WIDE_QMM_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q1_wide_qmm".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_wide_qmm_kernel(
+    out_dtype: mlx_sys::mlx_dtype,
+    n_rows: i32,
+    m_rows: i32,
+    k_dim: i32,
+    group_size: i32,
+    symmetric: bool,
+    row4: bool,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    let k_packed = k_dim / 32;
+    let num_groups = k_dim / group_size;
+    let bn = WIDE_QMM_BN;
+    let bm = WIDE_QMM_BM;
+    let cells = bm * bn;
+    let n_tiles = (n_rows + bn - 1) / bn;
+    let m_tiles = (m_rows + bm - 1) / bm;
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OutT".as_ptr(),
+            out_dtype,
+        );
+        for (name, value) in [
+            (c"K", k_dim),
+            (c"GroupSize", group_size),
+            (c"KPacked", k_packed),
+            (c"NumGroups", num_groups),
+            (c"Symmetric", i32::from(symmetric)),
+            (c"Row4", i32::from(row4)),
+            (c"BN", bn),
+            (c"BM", bm),
+        ] {
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config,
+                name.as_ptr(),
+                value,
+            );
+        }
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tiles * cells, m_tiles, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, cells, 1, 1);
+        let output_shape = [m_rows, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            output_shape.as_ptr(),
+            output_shape.len(),
+            out_dtype,
+        );
+        config
+    }
+}
+
+/// Whether the wide packed-Q1 QMM may replace the fp16-dequant prefill path.
+/// Off by default until benchmarked on the real Bonsai-27B checkpoint; the
+/// dequant fallback remains exact and is always available.
+fn wide_qmm_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("HIGGS_BONSAI_QMM_WIDE").is_ok_and(|v| v == "1"))
+}
+
+/// Wide packed-Q1 multiply against canonical `[N, K/32]` packed weights.
+/// Falls back to `Ok(None)` when the wide path is disabled or outside its
+/// validated shape domain, leaving the caller on the existing dequant path.
+#[allow(unsafe_code)]
+pub(super) fn bonsai_q1_wide_qmm(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Option<Array>, Exception> {
+    if !wide_qmm_enabled() {
+        return Ok(None);
+    }
+    ensure_ffi_error_handler();
+    let x_shape = x.shape();
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    if m_rows <= bonsai_q1_narrow_qmm_cap() {
+        return Ok(None);
+    }
+    let weight_shape = weight.shape();
+    let n_rows = weight_shape
+        .first()
+        .copied()
+        .ok_or_else(|| Exception::custom("bonsai_q1_wide_qmm: weight has no rows"))?;
+    let k_packed = weight_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| Exception::custom("bonsai_q1_wide_qmm: weight has no columns"))?;
+    let k_dim = k_packed * 32;
+    // The wide kernel hardcodes BK = 128 (one affine group per K-tile) and
+    // WORDS_PER_GROUP = GroupSize/32. Only group_size = 128 is sound here;
+    // any other valid group size would overrun x_tile. Fall back to dequant.
+    if group_size != 128 || k_dim % group_size != 0 || k_dim % 32 != 0 {
+        return Ok(None);
+    }
+
+    let x_flat = row_contiguous_copy(&x.reshape(&[m_rows, k_dim])?)?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.flatten(None, None)?;
+    let symmetric = biases.size() == 0;
+    let b_flat = if symmetric {
+        s_flat.clone()
+    } else {
+        biases.flatten(None, None)?
+    };
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+    let cached = WIDE_QMM_KERNEL.get_or_init(|| CachedMetalKernel(create_wide_qmm_kernel()));
+    let config = configure_wide_qmm_kernel(
+        out_dtype, n_rows, m_rows, k_dim, group_size, symmetric, false,
+    );
+
+    let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
+    let m_scalar = unsafe { mlx_sys::mlx_array_new_int(m_rows) };
+    let input_ptrs = [
+        w_flat.as_ptr(),
+        s_flat.as_ptr(),
+        b_flat.as_ptr(),
+        x_flat.as_ptr(),
+        n_scalar,
+        m_scalar,
+    ];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q1_wide_qmm failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        let trim_to = x_shape.len().saturating_sub(1);
+        let mut out_shape = x_shape
+            .get(..trim_to)
+            .ok_or_else(|| Exception::custom("bonsai_q1_wide_qmm: x_shape too small"))?
+            .to_vec();
+        out_shape.push(n_rows);
+        y.reshape(&out_shape).map(Some)
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(n_scalar);
+        mlx_sys::mlx_array_free(m_scalar);
+    }
+    result
+}
+
+/// Wide packed-Q1 multiply against authoritative primary row4 buffers.
+/// Symmetric affine only (the row4 promotion domain). Returns `Ok(None)` when
+/// the wide path is disabled or the input is inside the narrow TG-LUT4 range.
+#[allow(unsafe_code)]
+pub(super) fn bonsai_q1_row4_wide_qmm_view(
+    x: &Array,
+    packed: BonsaiQ1Row4Ref<'_>,
+) -> Result<Option<Array>, Exception> {
+    if !wide_qmm_enabled() {
+        return Ok(None);
+    }
+    ensure_ffi_error_handler();
+    if !matches!(x.dtype(), Dtype::Float16 | Dtype::Bfloat16) {
+        return Ok(None);
+    }
+    let x_shape = x.shape();
+    if x_shape.last().copied() != Some(packed.k_dim) {
+        return Ok(None);
+    }
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    if m_rows <= bonsai_q1_narrow_qmm_cap() {
+        return Ok(None);
+    }
+
+    let x_flat = row_contiguous_copy(&x.reshape(&[m_rows, packed.k_dim])?)?;
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+    let cached = WIDE_QMM_KERNEL.get_or_init(|| CachedMetalKernel(create_wide_qmm_kernel()));
+    let config = configure_wide_qmm_kernel(
+        out_dtype,
+        packed.n_rows,
+        m_rows,
+        packed.k_dim,
+        128,
+        true,
+        true,
+    );
+
+    let n_scalar = unsafe { mlx_sys::mlx_array_new_int(packed.n_rows) };
+    let m_scalar = unsafe { mlx_sys::mlx_array_new_int(m_rows) };
+    // Row4 promotion is symmetric-Q1 only; the kernel never indexes `bi` under
+    // `Symmetric`, so the scales buffer stands in as a valid placeholder input.
+    let input_ptrs = [
+        packed.weights.as_ptr(),
+        packed.scales.as_ptr(),
+        packed.scales.as_ptr(),
+        x_flat.as_ptr(),
+        n_scalar,
+        m_scalar,
+    ];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q1_row4_wide_qmm failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        let trim_to = x_shape.len().saturating_sub(1);
+        let mut out_shape = x_shape
+            .get(..trim_to)
+            .ok_or_else(|| Exception::custom("bonsai_q1_row4_wide_qmm: x_shape too small"))?
+            .to_vec();
+        out_shape.push(packed.n_rows);
+        y.reshape(&out_shape).map(Some)
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(n_scalar);
+        mlx_sys::mlx_array_free(m_scalar);
+    }
+    result
+}
+
+/// Upper bound on M for which the narrow packed path (`bonsai_q1_qmm`,
+/// [`bonsai_q1_tg_lut4_qmm_view`]) is authoritative. The wide kernel only
+/// engages above this to avoid duplicating the proven narrow domain.
+fn bonsai_q1_narrow_qmm_cap() -> i32 {
+    static CAP: OnceLock<i32> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("HIGGS_BONSAI_QMM_MAX_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|n| (0..=64).contains(n))
+            .unwrap_or(8)
+    })
+}
 
 #[cfg(test)]
 #[allow(
@@ -2823,6 +3264,184 @@ mod tests {
                 aligned_median_norm = aligned_median / aligned_m1_median,
                 aligned_mean_norm = aligned_mean / aligned_m1_mean,
                 speedup = guarded_median / aligned_median,
+            );
+        }
+    }
+
+    // CPU reference for the affine 1-bit contract: per group of `GroupSize`,
+    //   acc += scale * sum(bit * x) + bias * sum(x),
+    // with `bias = -scale / 2` when biases are empty (symmetric). Scales and
+    // x are read back at their stored dtype so the reference matches what the
+    // kernel observes after its `float(...)` widening.
+    fn cpu_wide_qmm_reference(
+        weight: &Array,
+        scales: &Array,
+        biases: &Array,
+        x: &Array,
+        m: i32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+    ) -> Vec<f32> {
+        let k_packed = (k / 32) as usize;
+        let num_groups = (k / group_size) as usize;
+        let group_size = group_size as usize;
+        let k = k as usize;
+        let m = m as usize;
+        let n = n as usize;
+
+        let w = weight.as_slice::<u32>().to_vec();
+        let sc_f32 = scales.as_dtype(Dtype::Float32).unwrap();
+        eval([&sc_f32]).unwrap();
+        let sc = sc_f32.as_slice::<f32>().to_vec();
+        let symmetric = biases.size() == 0;
+        let bi = if symmetric {
+            Vec::new()
+        } else {
+            let bi_f32 = biases.as_dtype(Dtype::Float32).unwrap();
+            eval([&bi_f32]).unwrap();
+            bi_f32.as_slice::<f32>().to_vec()
+        };
+        let x_f32_arr = x.as_dtype(Dtype::Float32).unwrap();
+        eval([&x_f32_arr]).unwrap();
+        let x_f32 = x_f32_arr.as_slice::<f32>().to_vec();
+
+        let mut y = vec![0.0f32; m * n];
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut acc = 0.0f32;
+                for g in 0..num_groups {
+                    let mut dot = 0.0f32;
+                    let mut sum_x = 0.0f32;
+                    for kk in 0..group_size {
+                        let k_abs = g * group_size + kk;
+                        let word = w[ni * k_packed + k_abs / 32];
+                        let bit = ((word >> (k_abs % 32)) & 1) as f32;
+                        let x_val = x_f32[mi * k + k_abs];
+                        dot += bit * x_val;
+                        sum_x += x_val;
+                    }
+                    let s_val = sc[ni * num_groups + g];
+                    let b_val = if symmetric {
+                        -0.5 * s_val
+                    } else {
+                        bi[ni * num_groups + g]
+                    };
+                    acc += s_val * dot + b_val * sum_x;
+                }
+                y[mi * n + ni] = acc;
+            }
+        }
+        y
+    }
+
+    fn assert_wide_qmm_matches_reference(
+        label: &str,
+        got: &Array,
+        reference: &[f32],
+        m: i32,
+        n: i32,
+    ) {
+        let got_f32 = got.as_dtype(Dtype::Float32).unwrap();
+        eval([&got_f32]).unwrap();
+        let got_slice = got_f32.as_slice::<f32>();
+        assert_eq!(
+            got_slice.len(),
+            (m * n) as usize,
+            "{label}: output length {} expected {}",
+            got_slice.len(),
+            m * n
+        );
+        let mut worst = 0.0f32;
+        for (index, (g, w)) in got_slice.iter().zip(reference.iter()).enumerate() {
+            let tol = 1e-2 * w.abs().max(1.0);
+            let err = (g - w).abs();
+            worst = worst.max(err / w.abs().max(1.0).max(1e-6));
+            assert!(
+                err <= tol,
+                "{label}[{index}] (m={},n={}): got {g} want {w} err {err} > tol {tol}",
+                index / n as usize,
+                index % n as usize
+            );
+        }
+        println!(
+            "{label}: worst relative error = {worst:.4e} over {} cells",
+            m * n
+        );
+    }
+
+    /// The wide packed-Q1 QMM must reproduce the affine contract for canonical
+    /// `[N, K/32]` weights, across M values that exercise a single tile, an
+    /// m-tail, and the asymmetric-bias path. Bit-comparable to the CPU oracle
+    /// within the same tolerance the narrow QMV kernel uses.
+    #[test]
+    #[allow(unsafe_code)]
+    fn wide_qmm_canonical_matches_cpu_reference() {
+        unsafe {
+            std::env::set_var("HIGGS_BONSAI_QMM_WIDE", "1");
+        }
+        let _exec = crate::mlx_exec::acquire();
+
+        // (N, K, M, symmetric): N=64 fills BN=8 tiles exactly; N=50 exercises
+        // the N%BN != 0 tail; K=256 spans two groups; K=512 spans four.
+        for &(n, k, m, symmetric) in &[
+            (64_i32, 256_i32, 16_i32, true),
+            (64, 256, 600, true),
+            (50, 512, 300, false),
+            (64, 512, 1024, true),
+        ] {
+            let (weight, scales, biases) = patterned_weights(n, k, Dtype::Bfloat16, symmetric);
+            let x = patterned_input(m, k, Dtype::Bfloat16);
+
+            let got = bonsai_q1_wide_qmm(&x, &weight, &scales, &biases, GROUP_SIZE)
+                .unwrap()
+                .unwrap_or_else(|| panic!("wide QMM did not engage for n={n} k={k} m={m}"));
+            eval([&got]).unwrap();
+
+            let reference =
+                cpu_wide_qmm_reference(&weight, &scales, &biases, &x, m, n, k, GROUP_SIZE);
+            assert_wide_qmm_matches_reference(
+                &format!("canonical wide QMM (n={n},k={k},m={m},sym={symmetric})"),
+                &got,
+                &reference,
+                m,
+                n,
+            );
+        }
+    }
+
+    /// The row4 wide QMM must match the same affine contract while reading the
+    /// authoritative primary row4 buffers. Covers N divisible by 4 (the row4
+    /// promotion domain) and m-tail tiling.
+    #[test]
+    #[allow(unsafe_code)]
+    fn wide_qmm_row4_matches_cpu_reference() {
+        unsafe {
+            std::env::set_var("HIGGS_BONSAI_QMM_WIDE", "1");
+        }
+        let _exec = crate::mlx_exec::acquire();
+
+        for &(n, k, m) in &[(64_i32, 256_i32, 16_i32), (48, 256, 300), (64, 512, 600)] {
+            let (weight, scales, _biases) = patterned_weights(n, k, Dtype::Bfloat16, true);
+            let packed = BonsaiQ1Row4::from_row_major(&weight, &scales).unwrap();
+            eval([&packed.weights, &packed.scales]).unwrap();
+            let x = patterned_input(m, k, Dtype::Bfloat16);
+
+            let got = bonsai_q1_row4_wide_qmm_view(&x, packed.as_ref())
+                .unwrap()
+                .unwrap_or_else(|| panic!("row4 wide QMM did not engage for n={n} k={k} m={m}"));
+            eval([&got]).unwrap();
+
+            // The reference uses the canonical packed arrays that produced the
+            // row4 transform; row4 promotion preserves bits and scales exactly.
+            let reference =
+                cpu_wide_qmm_reference(&weight, &scales, &_biases, &x, m, n, k, GROUP_SIZE);
+            assert_wide_qmm_matches_reference(
+                &format!("row4 wide QMM (n={n},k={k},m={m})"),
+                &got,
+                &reference,
+                m,
+                n,
             );
         }
     }

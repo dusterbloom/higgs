@@ -401,12 +401,43 @@ pub struct CompletionChunkChoice {
     pub finish_reason: Option<String>,
 }
 
+/// Breakdown of the prompt token count (OpenAI `prompt_tokens_details`).
+///
+/// Only `cached_tokens` is populated: the number of prompt tokens served from
+/// reused KV state (session continuation or radix prefix cache) instead of being
+/// re-prefilled this turn. Clients read this as `usage.prompt_tokens_details.cached_tokens`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
 /// Token usage statistics.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompletionUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// OpenAI-shape prompt breakdown. Omitted from the wire when no prompt
+    /// tokens were served from cache, so `cached_tokens: 0` never masquerades as
+    /// a measured zero for paths that don't track reuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+impl CompletionUsage {
+    /// Build a usage block. `cached_tokens` is the count of prompt tokens
+    /// served from reused KV; when it is 0 the `prompt_tokens_details` field is
+    /// omitted entirely (OpenAI clients treat a missing block as "no reuse").
+    #[must_use]
+    pub fn new(prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: (cached_tokens > 0)
+                .then_some(PromptTokensDetails { cached_tokens }),
+        }
+    }
 }
 
 /// GET /v1/models response.
@@ -477,6 +508,20 @@ pub struct EmbeddingUsage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn usage_reports_cached_tokens_only_when_nonzero() {
+        // Reuse happened: OpenAI-shape `prompt_tokens_details.cached_tokens`.
+        let reused = serde_json::to_value(CompletionUsage::new(100, 20, 80)).unwrap();
+        assert_eq!(reused["prompt_tokens"], 100);
+        assert_eq!(reused["total_tokens"], 120);
+        assert_eq!(reused["prompt_tokens_details"]["cached_tokens"], 80);
+
+        // Cold prefill: the block is omitted so a client never reads a
+        // fabricated `cached_tokens: 0`.
+        let cold = serde_json::to_value(CompletionUsage::new(100, 20, 0)).unwrap();
+        assert!(cold.get("prompt_tokens_details").is_none());
+    }
+
     /// Deserialize a chat completion request from JSON with a single user message
     /// and one extra field merged in (e.g., `"max_tokens": 0`).
     fn chat_request_with(extra_field: &str) -> ChatCompletionRequest {
@@ -520,11 +565,7 @@ mod tests {
     }
 
     fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
-        CompletionUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: prompt + completion,
-        }
+        CompletionUsage::new(prompt, completion, 0)
     }
 
     #[test]

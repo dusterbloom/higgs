@@ -203,6 +203,11 @@ Measured on DeepSeek-V2-Lite-4bit with global batch sorting before `gather_qmm`.
   (`auto` | `dflash` | `mtp` | `none`) to pick the speculative-decode method per
   request. `auto` (default) uses the DFlash drafter when one is loaded — including
   while streaming — otherwise the MTP head; `none` disables speculation.
+- Compressive prefill (PFlash, experimental): an optional `prefill_drafter`
+  (e.g. `mlx-community/Qwen3-0.6B-4bit`) scores the prompt so the target
+  prefills only a fraction of it (`prefill_compression`, `prefill_keep_ratio`).
+  Off by default; see `docs/configuration.md` and
+  `.planning/DESIGN-pflash-higgs.md`.
 - Runtime model management (opt-in): `POST /v1/models`, `DELETE /v1/models/{name}`
 - Metrics: `/metrics`
 - Health: `/health`

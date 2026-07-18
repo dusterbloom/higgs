@@ -162,6 +162,12 @@ port = 8000
 # kv_max_sessions = 8           # max retained conversations, LRU-evicted (>= 1)
 # kv_max_session_tokens = 0     # drop a conversation's KV past N tokens (0 = unlimited)
 # kv_retained_idle_secs = 1800  # evict KV idle longer than N seconds (0 = never)
+# # Speculative decoding (decode) + compressive prefill (PFlash) drafters:
+# # draft_model      = "/path/to/dspark-drafter"      # decode speculation (DFlash/dSpark)
+# # prefill_drafter  = "mlx-community/Qwen3-0.6B-4bit" # compressive prefill (PFlash)
+# # prefill_compression = "off"                       # off | auto | always
+# # prefill_threshold   = 4096                        # auto: enable above this many prompt tokens
+# # prefill_keep_ratio  = 0.10                        # fraction kept (~10x prefill at 0.10)
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.

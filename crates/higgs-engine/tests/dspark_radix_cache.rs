@@ -27,7 +27,7 @@ use higgs_engine::{
     chat_template::{ChatMessage, ChatTemplateRenderer},
     mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile},
     paged_prefix_cache::MAX_PAIRED_RADIX_ENTRIES,
-    simple::SimpleEngine,
+    simple::{PrefillCompressionMode, SimpleEngine},
 };
 use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
 use support::{
@@ -118,6 +118,13 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
         false,
         Some(Path::new(&drafter)),
         None,
+        None,
+        PrefillCompressionMode::Off,
+        0.10,
+        4096,
+        32,
+        13,
+        8,
     )
     .expect("load paired dSpark engine");
     let params = greedy_dflash();
