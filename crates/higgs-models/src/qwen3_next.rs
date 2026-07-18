@@ -384,7 +384,7 @@ fn has_loaded_affine_q1_biases(scales: &Array, biases: &Array) -> bool {
         )
 }
 
-fn validate_dflash_q1_linear(
+fn validate_dflash_affine_lowbit_linear(
     path: &str,
     weight: &Array,
     scales: &Array,
@@ -393,19 +393,19 @@ fn validate_dflash_q1_linear(
     bits: i32,
     mode: crate::quant_mode::QuantMode,
 ) -> Result<(), Exception> {
-    if mode != crate::quant_mode::QuantMode::Affine || bits != 1 || group_size != 128 {
+    if mode != crate::quant_mode::QuantMode::Affine || !matches!(bits, 1 | 2) || group_size != 128 {
         return Err(Exception::custom(format!(
-            "{path} is outside the proven dSpark Q1 domain: mode={mode:?} bits={bits} group_size={group_size}"
+            "{path} is outside the proven low-bit affine domain: mode={mode:?} bits={bits} group_size={group_size}"
         )));
     }
     let [rows, packed_columns] = *weight.shape() else {
         return Err(Exception::custom(format!(
-            "{path} must have a loaded two-dimensional packed Q1 weight"
+            "{path} must have a loaded two-dimensional packed low-bit affine weight"
         )));
     };
     let [scale_rows, scale_columns] = *scales.shape() else {
         return Err(Exception::custom(format!(
-            "{path} must have two-dimensional Q1 scales"
+            "{path} must have two-dimensional low-bit affine scales"
         )));
     };
     if weight.dtype() != Dtype::Uint32
@@ -415,17 +415,18 @@ fn validate_dflash_q1_linear(
         )
     {
         return Err(Exception::custom(format!(
-            "{path} has invalid Q1 dtypes weight={:?} scales={:?}",
+            "{path} has invalid low-bit affine dtypes weight={:?} scales={:?}",
             weight.dtype(),
             scales.dtype()
         )));
     }
+    let cols_per_word = 32 / bits;
     let logical_columns = packed_columns
-        .checked_mul(32)
-        .ok_or_else(|| Exception::custom(format!("{path} Q1 shape overflow")))?;
+        .checked_mul(cols_per_word)
+        .ok_or_else(|| Exception::custom(format!("{path} low-bit affine shape overflow")))?;
     if logical_columns % group_size != 0 {
         return Err(Exception::custom(format!(
-            "{path} logical Q1 width {logical_columns} is not divisible by group size {group_size}"
+            "{path} logical low-bit affine width {logical_columns} is not divisible by group size {group_size}"
         )));
     }
     let expected_scale_columns = logical_columns / group_size;
@@ -435,14 +436,14 @@ fn validate_dflash_q1_linear(
         || scale_columns != expected_scale_columns
     {
         return Err(Exception::custom(format!(
-            "{path} has inconsistent packed Q1 weight/scales shapes {:?}/{:?}",
+            "{path} has inconsistent packed low-bit affine weight/scales shapes {:?}/{:?}",
             weight.shape(),
             scales.shape()
         )));
     }
     if !has_symmetric_q1_biases(biases) && !has_loaded_affine_q1_biases(scales, biases) {
         return Err(Exception::custom(format!(
-            "{path} must use the validated symmetric-Q1 bias sentinel or a nonempty floating-point affine bias matching scales shape {:?}; got shape {:?} dtype {:?}",
+            "{path} must use the validated low-bit-affine bias sentinel or a nonempty floating-point affine bias matching scales shape {:?}; got shape {:?} dtype {:?}",
             scales.shape(),
             biases.shape(),
             biases.dtype()
@@ -685,7 +686,7 @@ impl QLinear {
                         .ok_or_else(|| Exception::custom(format!("{path} canonical K overflow")))?;
                     return Ok(((n_rows, k_dim), false));
                 }
-                validate_dflash_q1_linear(
+                validate_dflash_affine_lowbit_linear(
                     path,
                     &self.weight,
                     &self.scales,
@@ -912,7 +913,7 @@ impl QLinear {
 
 fn validate_dflash_qlinear(path: &str, linear: &QLinear) -> Result<(), Exception> {
     match &linear.weight_layout {
-        QLinearWeightLayout::Canonical => validate_dflash_q1_linear(
+        QLinearWeightLayout::Canonical => validate_dflash_affine_lowbit_linear(
             path,
             &linear.weight,
             &linear.scales,
@@ -939,6 +940,8 @@ fn validate_dflash_qlinear(path: &str, linear: &QLinear) -> Result<(), Exception
                     has_symmetric_q1_biases(&linear.biases)
                 )));
             }
+            // BonsaiRow4 is intentionally Q1-only; Q2 low-bit-affine layout
+            // remains Canonical.
             // Rebuild the typed view from the current parameter handles. This
             // validates shape, dtype, contiguity, and the logical dimensions
             // recorded in metadata, so a same-shaped parameter-tree update
@@ -7736,12 +7739,12 @@ impl Qwen3NextCausalLM {
             || self.args.dense_attention_outputs
         {
             return Err(Exception::custom(
-                "dSpark block verification is proven only for the dense all-Q1 Bonsai target",
+                "dSpark block verification is proven only for the dense low-bit-affine Bonsai target",
             ));
         }
 
         let validate_linear = |path: &str, linear: &QLinear| validate_dflash_qlinear(path, linear);
-        validate_dflash_q1_linear(
+        validate_dflash_affine_lowbit_linear(
             "model.embed_tokens",
             &self.model.embed_tokens.weight,
             &self.model.embed_tokens.scales,
@@ -12084,7 +12087,7 @@ mod tests {
         let weight = Array::from_slice(&[0_u32; 8], &[2, 4]);
         let scales = Array::from_slice(&[0.25_f32, 0.5], &[2, 1]);
         let validate = |biases: &Array| {
-            validate_dflash_q1_linear(
+            validate_dflash_affine_lowbit_linear(
                 "fixture",
                 &weight,
                 &scales,
@@ -14546,10 +14549,19 @@ mod tests {
         );
     }
 
-    fn deterministic_q1_params(rows: i32, columns: i32, salt: u32) -> (Array, Array, Array) {
+    fn deterministic_affine_lowbit_params(
+        bits: i32,
+        rows: i32,
+        columns: i32,
+        salt: u32,
+    ) -> (Array, Array, Array) {
         const GROUP_SIZE: i32 = 128;
+        assert!(matches!(bits, 1 | 2));
+        assert_eq!(32 % bits, 0);
         assert_eq!(columns % GROUP_SIZE, 0);
-        let words_per_row = columns / 32;
+        let cols_per_word = 32 / bits;
+        assert_eq!(columns % cols_per_word, 0);
+        let words_per_row = columns / cols_per_word;
         let patterns = [
             0xA5A5_5A5A_u32,
             0x3C3C_C3C3_u32,
@@ -14575,6 +14587,14 @@ mod tests {
         (weight, scales, symmetric_q1_bias_sentinel())
     }
 
+    fn deterministic_q1_params(rows: i32, columns: i32, salt: u32) -> (Array, Array, Array) {
+        deterministic_affine_lowbit_params(1, rows, columns, salt)
+    }
+
+    fn deterministic_q2_params(rows: i32, columns: i32, salt: u32) -> (Array, Array, Array) {
+        deterministic_affine_lowbit_params(2, rows, columns, salt)
+    }
+
     fn install_deterministic_q1(linear: &mut QLinear, rows: i32, columns: i32, salt: u32) {
         let (weight, scales, biases) = deterministic_q1_params(rows, columns, salt);
         linear.weight = Param::new(weight);
@@ -14582,6 +14602,16 @@ mod tests {
         linear.biases = Param::new(biases);
         linear.group_size = 128;
         linear.bits = 1;
+        linear.mode = crate::quant_mode::QuantMode::Affine;
+    }
+
+    fn install_deterministic_q2(linear: &mut QLinear, rows: i32, columns: i32, salt: u32) {
+        let (weight, scales, biases) = deterministic_q2_params(rows, columns, salt);
+        linear.weight = Param::new(weight);
+        linear.scales = Param::new(scales);
+        linear.biases = Param::new(biases);
+        linear.group_size = 128;
+        linear.bits = 2;
         linear.mode = crate::quant_mode::QuantMode::Affine;
     }
 
@@ -14600,12 +14630,27 @@ mod tests {
         embedding.mode = crate::quant_mode::QuantMode::Affine;
     }
 
-    fn deterministic_hybrid_q1_model() -> Qwen3NextCausalLM {
+    fn install_deterministic_q2_embedding(
+        embedding: &mut QEmbedding,
+        rows: i32,
+        columns: i32,
+        salt: u32,
+    ) {
+        let (weight, scales, biases) = deterministic_q2_params(rows, columns, salt);
+        embedding.weight = Param::new(weight);
+        embedding.scales = Param::new(scales);
+        embedding.biases = Param::new(biases);
+        embedding.group_size = 128;
+        embedding.bits = 2;
+        embedding.mode = crate::quant_mode::QuantMode::Affine;
+    }
+
+    fn deterministic_hybrid_affine_lowbit_model(bits: i32, num_layers: i32) -> Qwen3NextCausalLM {
         let mut args = valid_causal_lm_args();
         args.hidden_size = 128;
         args.intermediate_size = 128;
         args.vocab_size = 128;
-        args.num_hidden_layers = 2;
+        args.num_hidden_layers = num_layers;
         args.full_attention_interval = 2;
         args.num_attention_heads = 2;
         args.num_key_value_heads = 1;
@@ -14619,7 +14664,7 @@ mod tests {
         args.decoder_sparse_step = 0;
         args.quantization = Some(QuantizationConfig {
             group_size: 128,
-            bits: 1,
+            bits,
             mode: crate::quant_mode::QuantMode::Affine,
         });
         args.quant_overrides.clear();
@@ -14628,13 +14673,23 @@ mod tests {
         let intermediate = args.intermediate_size;
         let vocab = args.vocab_size;
         let mut model = Qwen3NextCausalLM::new(args).unwrap();
-        install_deterministic_q1_embedding(&mut model.model.embed_tokens, vocab, hidden, 1);
-        install_deterministic_q1(
-            model.lm_head.as_mut().expect("untied LM head"),
-            vocab,
-            hidden,
-            3,
-        );
+        if bits == 1 {
+            install_deterministic_q1_embedding(&mut model.model.embed_tokens, vocab, hidden, 1);
+            install_deterministic_q1(
+                model.lm_head.as_mut().expect("untied LM head"),
+                vocab,
+                hidden,
+                3,
+            );
+        } else {
+            install_deterministic_q2_embedding(&mut model.model.embed_tokens, vocab, hidden, 1);
+            install_deterministic_q2(
+                model.lm_head.as_mut().expect("untied LM head"),
+                vocab,
+                hidden,
+                3,
+            );
+        }
         model.model.norm.weight = Param::new(Array::ones::<f32>(&[hidden]).unwrap());
 
         for (layer_index, layer) in model.model.layers.iter_mut().enumerate() {
@@ -14642,40 +14697,77 @@ mod tests {
             layer.input_layernorm.weight = Param::new(Array::ones::<f32>(&[hidden]).unwrap());
             layer.post_attention_layernorm.weight =
                 Param::new(Array::ones::<f32>(&[hidden]).unwrap());
-            install_deterministic_q1(
-                layer.mlp.gate_proj.as_mut().expect("dense gate projection"),
-                intermediate,
-                hidden,
-                salt,
-            );
-            install_deterministic_q1(
-                layer.mlp.up_proj.as_mut().expect("dense up projection"),
-                intermediate,
-                hidden,
-                salt + 1,
-            );
-            install_deterministic_q1(
-                layer.mlp.down_proj.as_mut().expect("dense down projection"),
-                hidden,
-                intermediate,
-                salt + 2,
-            );
+            if bits == 1 {
+                install_deterministic_q1(
+                    layer.mlp.gate_proj.as_mut().expect("dense gate projection"),
+                    intermediate,
+                    hidden,
+                    salt,
+                );
+                install_deterministic_q1(
+                    layer.mlp.up_proj.as_mut().expect("dense up projection"),
+                    intermediate,
+                    hidden,
+                    salt + 1,
+                );
+                install_deterministic_q1(
+                    layer.mlp.down_proj.as_mut().expect("dense down projection"),
+                    hidden,
+                    intermediate,
+                    salt + 2,
+                );
+            } else {
+                install_deterministic_q2(
+                    layer.mlp.gate_proj.as_mut().expect("dense gate projection"),
+                    intermediate,
+                    hidden,
+                    salt,
+                );
+                install_deterministic_q2(
+                    layer.mlp.up_proj.as_mut().expect("dense up projection"),
+                    intermediate,
+                    hidden,
+                    salt + 1,
+                );
+                install_deterministic_q2(
+                    layer.mlp.down_proj.as_mut().expect("dense down projection"),
+                    hidden,
+                    intermediate,
+                    salt + 2,
+                );
+            }
 
             if let Some(gdn) = layer.linear_attn.as_mut() {
                 let value_dim = gdn.num_v_heads * gdn.head_v_dim;
-                install_deterministic_q1(
-                    &mut gdn.in_proj_qkvz,
-                    2 * (gdn.key_dim + value_dim),
-                    hidden,
-                    salt + 3,
-                );
-                install_deterministic_q1(
-                    &mut gdn.in_proj_ba,
-                    2 * gdn.num_v_heads,
-                    hidden,
-                    salt + 4,
-                );
-                install_deterministic_q1(&mut gdn.out_proj, hidden, value_dim, salt + 5);
+                if bits == 1 {
+                    install_deterministic_q1(
+                        &mut gdn.in_proj_qkvz,
+                        2 * (gdn.key_dim + value_dim),
+                        hidden,
+                        salt + 3,
+                    );
+                    install_deterministic_q1(
+                        &mut gdn.in_proj_ba,
+                        2 * gdn.num_v_heads,
+                        hidden,
+                        salt + 4,
+                    );
+                    install_deterministic_q1(&mut gdn.out_proj, hidden, value_dim, salt + 5);
+                } else {
+                    install_deterministic_q2(
+                        &mut gdn.in_proj_qkvz,
+                        2 * (gdn.key_dim + value_dim),
+                        hidden,
+                        salt + 3,
+                    );
+                    install_deterministic_q2(
+                        &mut gdn.in_proj_ba,
+                        2 * gdn.num_v_heads,
+                        hidden,
+                        salt + 4,
+                    );
+                    install_deterministic_q2(&mut gdn.out_proj, hidden, value_dim, salt + 5);
+                }
                 let conv_values = (0..gdn.conv_dim * gdn.conv_kernel_size)
                     .map(|index| {
                         const TAPS: [f32; 4] = [0.125, -0.0625, 0.03125, 0.25];
@@ -14694,15 +14786,27 @@ mod tests {
                 let attention = layer.self_attn.as_mut().expect("full attention layer");
                 let q_rows = 2 * attention.num_attention_heads * model.args.head_dim;
                 let kv_rows = attention.num_key_value_heads * model.args.head_dim;
-                install_deterministic_q1(&mut attention.q_proj, q_rows, hidden, salt + 3);
-                install_deterministic_q1(&mut attention.k_proj, kv_rows, hidden, salt + 4);
-                install_deterministic_q1(&mut attention.v_proj, kv_rows, hidden, salt + 5);
-                install_deterministic_q1(
-                    &mut attention.o_proj,
-                    hidden,
-                    attention.num_attention_heads * model.args.head_dim,
-                    salt + 6,
-                );
+                if bits == 1 {
+                    install_deterministic_q1(&mut attention.q_proj, q_rows, hidden, salt + 3);
+                    install_deterministic_q1(&mut attention.k_proj, kv_rows, hidden, salt + 4);
+                    install_deterministic_q1(&mut attention.v_proj, kv_rows, hidden, salt + 5);
+                    install_deterministic_q1(
+                        &mut attention.o_proj,
+                        hidden,
+                        attention.num_attention_heads * model.args.head_dim,
+                        salt + 6,
+                    );
+                } else {
+                    install_deterministic_q2(&mut attention.q_proj, q_rows, hidden, salt + 3);
+                    install_deterministic_q2(&mut attention.k_proj, kv_rows, hidden, salt + 4);
+                    install_deterministic_q2(&mut attention.v_proj, kv_rows, hidden, salt + 5);
+                    install_deterministic_q2(
+                        &mut attention.o_proj,
+                        hidden,
+                        attention.num_attention_heads * model.args.head_dim,
+                        salt + 6,
+                    );
+                }
                 attention.q_norm.weight =
                     Param::new(Array::ones::<f32>(&[model.args.head_dim]).unwrap());
                 attention.k_norm.weight =
@@ -14710,6 +14814,14 @@ mod tests {
             }
         }
         model
+    }
+
+    fn deterministic_hybrid_q1_model() -> Qwen3NextCausalLM {
+        deterministic_hybrid_affine_lowbit_model(1, 2)
+    }
+
+    fn deterministic_hybrid_q2_model() -> Qwen3NextCausalLM {
+        deterministic_hybrid_affine_lowbit_model(2, 4)
     }
 
     fn retain_loaded_affine_q1_bias(linear: &mut QLinear) {
@@ -14780,6 +14892,25 @@ mod tests {
         assert_eq!(retained, 15, "fixture must retain every active affine bias");
         assert!(!has_symmetric_q1_biases(&model.model.embed_tokens.biases));
         model.validate_dflash_block_domain(5).unwrap();
+    }
+
+    #[test]
+    fn test_qwen3_5_q2_target_passes_dflash_block_domain() {
+        deterministic_hybrid_q2_model().validate_dflash_block_domain(5).unwrap();
+    }
+
+    #[test]
+    fn test_qwen3_5_q2_target_rejects_for_invalid_group_size() {
+        let mut model = deterministic_hybrid_q2_model();
+        model.model.embed_tokens.group_size = 64;
+        assert!(model.validate_dflash_block_domain(5).is_err());
+    }
+
+    #[test]
+    fn test_qwen3_5_q3_target_rejects() {
+        let mut model = deterministic_hybrid_q2_model();
+        model.model.embed_tokens.bits = 3;
+        assert!(model.validate_dflash_block_domain(5).is_err());
     }
 
     fn eval_hybrid_cache(cache: &[Option<LayerCache>]) {
