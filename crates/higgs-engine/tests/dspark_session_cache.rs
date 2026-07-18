@@ -26,8 +26,9 @@ use higgs_engine::{
 };
 use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
 use support::{
-    ReferenceDsparkEnv, assert_acceptance_within, assert_bonsai_27b_full_q4,
-    assert_decode_tps_within, dflash_acceptance, dflash_decode_tps, dflash_prefill_seconds,
+    ReferenceDsparkEnv, assert_acceptance_within,
+    assert_bonsai_27b_full_lowbit, assert_decode_tps_within, dflash_acceptance,
+    dflash_decode_tps, dflash_prefill_seconds,
 };
 
 fn greedy(speculation: Speculation) -> SamplingParams {
@@ -51,9 +52,7 @@ fn append_suffix(engine: &SimpleEngine, prefix: &[u32], text: &str) -> (Vec<u32>
     (extended, suffix_len)
 }
 
-#[test]
-#[ignore = "loads real Bonsai target + dSpark drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
-fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
+fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically_impl(target_bits: u64) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_test_writer()
@@ -63,7 +62,7 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
         .expect("set HIGGS_DFLASH_TARGET_DIR to the Bonsai target model");
     let drafter = std::env::var("HIGGS_DFLASH_DRAFTER_DIR")
         .expect("set HIGGS_DFLASH_DRAFTER_DIR to the MLX dSpark drafter");
-    assert_bonsai_27b_full_q4(Path::new(&target), Path::new(&drafter));
+    assert_bonsai_27b_full_lowbit(Path::new(&target), Path::new(&drafter), target_bits);
     eprintln!("dspark-session checkpoint: loading target + drafter");
     let tuning = MlxRuntimeTuning::from_model_dir(Path::new(&target), RequestedMlxProfile::Auto);
     let engine = SimpleEngine::load_with_dflash(
@@ -547,4 +546,16 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
     assert_eq!(after_ttl.retained_paired_sessions, 0);
     assert_eq!(after_ttl.retained_paired_target_bytes, 0);
     assert_eq!(after_ttl.retained_paired_dflash_bytes, 0);
+}
+
+#[test]
+#[ignore = "loads real Bonsai target + dSpark drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically() {
+    bonsai_session_pair_resumes_suffix_only_and_demotes_atomically_impl(1)
+}
+
+#[test]
+#[ignore = "loads real Bonsai target + dSpark drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically_q2() {
+    bonsai_session_pair_resumes_suffix_only_and_demotes_atomically_impl(2)
 }

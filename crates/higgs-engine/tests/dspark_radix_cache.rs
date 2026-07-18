@@ -31,8 +31,9 @@ use higgs_engine::{
 };
 use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
 use support::{
-    ReferenceDsparkEnv, ScopedEnvVar, assert_acceptance_within, assert_bonsai_27b_full_q4,
-    assert_decode_tps_within, dflash_acceptance, dflash_decode_tps, dflash_prefill_seconds,
+    ReferenceDsparkEnv, ScopedEnvVar, assert_acceptance_within,
+    assert_bonsai_27b_full_lowbit, assert_decode_tps_within, dflash_acceptance,
+    dflash_decode_tps, dflash_prefill_seconds,
 };
 
 fn user(content: &str) -> ChatMessage {
@@ -91,9 +92,9 @@ fn generation_suffix(engine: &SimpleEngine, renderer: &ChatTemplateRenderer) -> 
         .to_vec()
 }
 
-#[test]
-#[ignore = "loads real Bonsai target + dSpark drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
-fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
+fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_impl(
+    target_bits: u64,
+) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_test_writer()
@@ -105,7 +106,7 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     let drafter = std::env::var("HIGGS_DFLASH_DRAFTER_DIR")
         .expect("set HIGGS_DFLASH_DRAFTER_DIR to the MLX dSpark drafter");
     let target_path = Path::new(&target);
-    assert_bonsai_27b_full_q4(target_path, Path::new(&drafter));
+    assert_bonsai_27b_full_lowbit(target_path, Path::new(&drafter), target_bits);
     let renderer =
         ChatTemplateRenderer::from_model_dir(target_path).expect("load target chat template");
     let tuning = MlxRuntimeTuning::from_model_dir(target_path, RequestedMlxProfile::Auto);
@@ -669,4 +670,16 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
         after_evicted_probe.paired_radix_dflash_bytes,
         after_cap_third.paired_radix_dflash_bytes
     );
+}
+
+#[test]
+#[ignore = "loads real Bonsai target + dSpark drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
+    bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_impl(1)
+}
+
+#[test]
+#[ignore = "loads real Bonsai target + dSpark drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_q2() {
+    bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_impl(2)
 }
