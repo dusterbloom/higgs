@@ -1273,64 +1273,133 @@ fn bonsai_q2_qmv_fast_impl(
 // GPU occupancy.
 // ---------------------------------------------------------------------------
 
+const FAST_Q2_QMV_SIMD_HEADER: &str = r"
+template <int bits, int wsize = 8>
+inline constexpr short get_pack_factor() {
+  return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
+}
+template <int bits, int wsize = 8>
+inline constexpr short get_bytes_per_pack() {
+  constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
+  return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
+}
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_vector(const device T* x, thread U* x_thread) {
+  U sum = 0;
+  if (bits == 1) {
+    for (int i = 0; i < values_per_thread; i += 8) {
+      sum += x[i]+x[i+1]+x[i+2]+x[i+3]+x[i+4]+x[i+5]+x[i+6]+x[i+7];
+      x_thread[i]=x[i];x_thread[i+1]=x[i+1];x_thread[i+2]=x[i+2];x_thread[i+3]=x[i+3];
+      x_thread[i+4]=x[i+4];x_thread[i+5]=x[i+5];x_thread[i+6]=x[i+6];x_thread[i+7]=x[i+7];
+    }
+  } else if (bits == 2) {
+    for (int i = 0; i < values_per_thread; i += 4) {
+      sum += x[i]+x[i+1]+x[i+2]+x[i+3];
+      x_thread[i]=x[i]; x_thread[i+1]=x[i+1]/4.0f; x_thread[i+2]=x[i+2]/16.0f; x_thread[i+3]=x[i+3]/64.0f;
+    }
+  } else if (bits == 4) {
+    const device uint16_t* ws = (const device uint16_t*)x;
+    for (int i = 0; i < values_per_thread; i += 4) {
+      sum += x[i]+x[i+1]+x[i+2]+x[i+3];
+      x_thread[i]=x[i]; x_thread[i+1]=x[i+1]/16.0f; x_thread[i+2]=x[i+2]/256.0f; x_thread[i+3]=x[i+3]/4096.0f;
+    }
+  } else { for (int i = 0; i < values_per_thread; i++) { sum += x[i]; x_thread[i] = x[i]; } }
+  return sum;
+}
+template <typename U, int values_per_thread, int bits>
+inline U qdot(const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum) {
+  U accum = 0;
+  if (bits == 1) {
+    for (int i = 0; i < (values_per_thread / 8); i++) {
+      uint8_t wb = w[i];
+      accum += select(U(0), x_thread[8*i], bool(wb&0x01));
+      accum += select(U(0), x_thread[8*i+1], bool(wb&0x02));
+      accum += select(U(0), x_thread[8*i+2], bool(wb&0x04));
+      accum += select(U(0), x_thread[8*i+3], bool(wb&0x08));
+      accum += select(U(0), x_thread[8*i+4], bool(wb&0x10));
+      accum += select(U(0), x_thread[8*i+5], bool(wb&0x20));
+      accum += select(U(0), x_thread[8*i+6], bool(wb&0x40));
+      accum += select(U(0), x_thread[8*i+7], bool(wb&0x80));
+    }
+  } else if (bits == 2) {
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum += (x_thread[4*i]*(w[i]&0x03) + x_thread[4*i+1]*(w[i]&0x0c) + x_thread[4*i+2]*(w[i]&0x30) + x_thread[4*i+3]*(w[i]&0xc0));
+    }
+  } else if (bits == 4) {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum += (x_thread[4*i]*(ws[i]&0x000f) + x_thread[4*i+1]*(ws[i]&0x00f0) + x_thread[4*i+2]*(ws[i]&0x0f00) + x_thread[4*i+3]*(ws[i]&0xf000));
+    }
+  } else { for (int i = 0; i < values_per_thread; i++) { accum += x_thread[i] * w[i]; } }
+  return scale * accum + bias * sum;
+}
+";
+
 const FAST_Q2_QMV_SIMD_SOURCE: &str = r"
-constexpr int VPT = 16;          // values per thread (one packed u32 = 16 Q2 codes)
-constexpr int RPS = 4;           // results per simdgroup
-constexpr int BLK = VPT * 32;    // block size = 512
+typedef half T;
+typedef float U;
+
+constexpr int bits = 2;
+constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+constexpr int RPS = 4;                             // results per simdgroup
+constexpr int pack_factor = get_pack_factor<bits, 32>(); // values packed per byte-slice
+constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+constexpr int VPT = pack_factor * packs_per_thread; // values-per-thread
+constexpr int BLK = VPT * 32;                      // block size
+constexpr int scale_step_per_thread = GroupSize / VPT;
 
 uint tgx = threadgroup_position_in_grid.x;
-uint sg  = simdgroup_index_in_threadgroup;
+uint sg = simdgroup_index_in_threadgroup;
 uint lid = thread_index_in_simdgroup;
 uint nsg = simdgroups_per_threadgroup;
 uint batch = threadgroup_position_in_grid.z;
 
+const device uint8_t* ws = (const device uint8_t*)w;
 int out_row = int(tgx) * (int(nsg) * RPS) + int(sg) * RPS;
+
 auto x_row = x + int(batch) * K;
+int in_vec_size_w = K * bytes_per_pack / pack_factor;
+int in_vec_size_g = K / GroupSize;
 
 float xt[VPT];
 float result[RPS];
 for (int r = 0; r < RPS; ++r) { result[r] = 0.0f; }
 
+ws += out_row * in_vec_size_w + int(lid) * packs_per_thread * bytes_per_pack;
+sc += out_row * in_vec_size_g + int(lid) / scale_step_per_thread;
+bi += out_row * in_vec_size_g + int(lid) / scale_step_per_thread;
+x_row += int(lid) * VPT;
+
 int aligned_end = (K / BLK) * BLK;
 
 for (int k = 0; k < aligned_end; k += BLK) {
-    int xbase = k + int(lid) * VPT;
-    float sum = 0.0f;
-    for (int i = 0; i < VPT; ++i) { float v = float(x_row[xbase + i]); xt[i] = v; sum += v; }
-
-    int wcol = (k / 16) + int(lid);
-    int g = xbase / GroupSize;
-
+    U sum = load_vector<T, U, VPT, bits>(x_row, xt);
     for (int r = 0; r < RPS; ++r) {
         int row = out_row + r;
         if constexpr (!AlignedN) {
             if (row >= n_param) { continue; }
         }
-        float accum = 0.0f;
-        uint packed = w[row * KPacked + wcol];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < VPT; ++i) {
-            float q = float((packed >> (uint(i) * 2u)) & 0x3u);
-            accum += q * xt[i];
-        }
-        float s_val = float(sc[row * NumGroups + g]);
-        float b_val = float(bi[row * NumGroups + g]);
-        result[r] += s_val * accum + b_val * sum;
+        auto wl = ws + r * in_vec_size_w;
+        U s_val = U(sc[r * in_vec_size_g]);
+        U b_val = U(bi[r * in_vec_size_g]);
+        result[r] += qdot<U, VPT, bits>(wl, xt, s_val, b_val, sum);
     }
+
+    ws += BLK * bytes_per_pack / pack_factor;
+    sc += BLK / GroupSize;
+    bi += BLK / GroupSize;
+    x_row += BLK;
 }
 
-// Tail
 if (aligned_end < K) {
-    int xbase = aligned_end + int(lid) * VPT;
-    bool in_bounds = xbase < K;
-    float sum = 0.0f;
-    for (int i = 0; i < VPT; ++i) {
-        float v = (in_bounds && (xbase + i) < K) ? float(x_row[xbase + i]) : 0.0f;
-        xt[i] = v;
-        sum += v;
+    bool in_bounds = (aligned_end + int(lid) * VPT) < K;
+    U sum = 0;
+    if (in_bounds) {
+        sum = load_vector<T, U, VPT, bits>(x_row, xt);
+    } else {
+        for (int i = 0; i < VPT; ++i) { xt[i] = 0.0f; }
     }
-    int wcol = (aligned_end / 16) + int(lid);
-    int g = in_bounds ? (xbase / GroupSize) : 0;
+
     for (int r = 0; r < RPS; ++r) {
         int row = out_row + r;
         if constexpr (AlignedN) {
@@ -1338,26 +1407,17 @@ if (aligned_end < K) {
         } else {
             if (row >= n_param || !in_bounds) { continue; }
         }
-        float accum = 0.0f;
-        int widx = wcol;
-        if (widx >= KPacked) { continue; }
-        uint packed = w[row * KPacked + widx];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < VPT; ++i) {
-            if (xbase + i >= K) { break; }
-            float q = float((packed >> (uint(i) * 2u)) & 0x3u);
-            accum += q * xt[i];
-        }
-        float s_val = float(sc[row * NumGroups + g]);
-        float b_val = float(bi[row * NumGroups + g]);
-        result[r] += s_val * accum + b_val * sum;
+        U s_val = in_bounds ? U(sc[r * in_vec_size_g]) : U(0);
+        U b_val = in_bounds ? U(bi[r * in_vec_size_g]) : U(0);
+        auto wl = ws + r * in_vec_size_w;
+        result[r] += qdot<U, VPT, bits>(wl, xt, s_val, b_val, sum);
     }
 }
 
 for (int r = 0; r < RPS; ++r) {
-    int row = out_row + r;
     float v = simd_sum(result[r]);
     if (lid == 0u) {
+        int row = out_row + r;
         if constexpr (AlignedN) {
             y[int(batch) * n_param + row] = OutT(v);
         } else if (row < n_param) {
@@ -1373,14 +1433,16 @@ static FAST_Q2_QMV_SIMD_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 fn create_fast_q2_qmv_simd() -> mlx_sys::mlx_fast_metal_kernel {
     let in_vec = cstr_vec(&[c"w", c"sc", c"bi", c"x", c"n_param"]);
     let out_vec = cstr_vec(&[c"y"]);
+    // Split: helper functions go in the header (file scope), kernel body in source.
+    let header = CString::new(FAST_Q2_QMV_SIMD_HEADER).unwrap_or_default();
     let source = CString::new(FAST_Q2_QMV_SIMD_SOURCE).unwrap_or_default();
     unsafe {
         let kernel = mlx_sys::mlx_fast_metal_kernel_new(
-            c"higgs_bonsai_q2_qmv_simd".as_ptr(),
+            c"higgs_bonsai_q2_qmv_simd_v3".as_ptr(),
             in_vec,
             out_vec,
             source.as_ptr(),
-            c"".as_ptr(),
+            header.as_ptr(),
             true,
             false,
         );
@@ -1895,11 +1957,9 @@ impl BonsaiQ2Row2 {
 // ---------------------------------------------------------------------------
 // Q2 M=5 native spec verifier kernel.
 //
-// Direct port of the Q1 TG-LUT4 M=5 design without the LUT identity: at Q2
-// the per-2-bit-code branching cost is low enough that direct `q*x` fma is
-// competitive with the LUT, and skipping the LUT avoids 5 KiB of threadgroup
-// memory and the cooperative build phase. The dominant win is the same as
-// Q1's M=5 path -- one packed-word read serves all 5 verifier rows.
+// Decomposes Q2 2-bit code as q=2*q_h + q_l and applies the 16-entry TG-LUT4
+// identity on both bit-planes. This keeps one packed-word read shared across all
+// five verifier rows per group.
 //
 // Layout contract: BonsaiQ2Row2 (`[N/2, NumGroups, 8 words, 2 lanes]` packed
 // bits, `[N/2, NumGroups, 2 lanes]` scales). Adjacent output rows read
@@ -1907,10 +1967,10 @@ impl BonsaiQ2Row2 {
 //
 // Per-thread work: one output row n. row_tile = n/2, row_lane = n%2.
 //   For each group g:
-//     1) Read 8 packed u32 words covering this group's 128 cols for this row.
-//     2) For each of 16 codes per word, extract q and fma into 5 verifier-row
-//        accumulators (qacc0..qacc4) plus 5 sum-x accumulators (sum_x0..sum_x4).
-//     3) Combine: acc_m += scale * qacc_m + bias * sum_x_m.
+//     1) Build the row-local LUT (cooperative once per tile, one barrier).
+//     2) Read each 2-bit nibble, decompose into q_h/q_l bit-planes.
+//     3) sum(qa_h), sum(qa_l), sum(x) and combine:
+//        acc_m += scale * (2*sum(qa_h) + sum(qa_l)) + bias * sum_x.
 // ---------------------------------------------------------------------------
 
 const Q2_ROW2_M5_KERNEL_SOURCE: &str = r"
@@ -1927,14 +1987,50 @@ float acc2 = 0.0f;
 float acc3 = 0.0f;
 float acc4 = 0.0f;
 
+for (uint build = tid; build < 160u; build += uint(WG)) {
+    int mlocal = int(build) / 32;
+    int nibble = int(build) & 31;
+    if (mlocal < 5) {
+        int kbase = mlocal * K + nibble * 4;
+        float x0 = float(x[kbase + 0]);
+        float x1 = float(x[kbase + 1]);
+        float x2 = float(x[kbase + 2]);
+        float x3 = float(x[kbase + 3]);
+        float xy = x0 + x1;
+        float xz = x0 + x2;
+        float yz = x1 + x2;
+        float xyz = xy + x2;
+        float c = 0.5f * (x0 + x1 + x2 + x3);
+        int base = (mlocal * 32 + nibble) * 16;
+        lut[base + 0] = half(-c);
+        lut[base + 1] = half(x0 - c);
+        lut[base + 2] = half(x1 - c);
+        lut[base + 3] = half(xy - c);
+        lut[base + 4] = half(x2 - c);
+        lut[base + 5] = half(xz - c);
+        lut[base + 6] = half(yz - c);
+        lut[base + 7] = half(xyz - c);
+        lut[base + 8] = half(x3 - c);
+        lut[base + 9] = half(x0 + x3 - c);
+        lut[base + 10] = half(x1 + x3 - c);
+        lut[base + 11] = half(xy + x3 - c);
+        lut[base + 12] = half(x2 + x3 - c);
+        lut[base + 13] = half(xz + x3 - c);
+        lut[base + 14] = half(yz + x3 - c);
+        lut[base + 15] = half(xyz + x3 - c);
+    }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
 if (n < NRows) {
     int row_tile = n / 2;
     int row_lane = n & 1;
 
     for (int g = 0; g < NumGroups; ++g) {
-        // Per-verifier-row partials for this group.
-        float qacc0 = 0.0f; float qacc1 = 0.0f; float qacc2 = 0.0f;
-        float qacc3 = 0.0f; float qacc4 = 0.0f;
+        float qa0h = 0.0f; float qa1h = 0.0f; float qa2h = 0.0f;
+        float qa3h = 0.0f; float qa4h = 0.0f;
+        float qa0l = 0.0f; float qa1l = 0.0f; float qa2l = 0.0f;
+        float qa3l = 0.0f; float qa4l = 0.0f;
         float sx0 = 0.0f;   float sx1 = 0.0f;   float sx2 = 0.0f;
         float sx3 = 0.0f;   float sx4 = 0.0f;
 
@@ -1945,22 +2041,52 @@ if (n < NRows) {
         for (int word = 0; word < 8; ++word) {
             uint packed = w[(group_base + word) * 2 + row_lane];
             int xo = x_base + word * 16;
-            // Unrolled 16-way 2-bit unpack + fma into 5 verifier rows.
-            // Direct q*x fma; bias*sum_x combined at the group tail.
             #pragma clang loop unroll(full)
-            for (int i = 0; i < 16; ++i) {
-                uint q = (packed >> (uint(i) * 2u)) & 0x3u;
-                float qf = float(q);
-                float xv0 = float(x[0 * K + xo + i]);
-                float xv1 = float(x[1 * K + xo + i]);
-                float xv2 = float(x[2 * K + xo + i]);
-                float xv3 = float(x[3 * K + xo + i]);
-                float xv4 = float(x[4 * K + xo + i]);
-                qacc0 += qf * xv0; sx0 += xv0;
-                qacc1 += qf * xv1; sx1 += xv1;
-                qacc2 += qf * xv2; sx2 += xv2;
-                qacc3 += qf * xv3; sx3 += xv3;
-                qacc4 += qf * xv4; sx4 += xv4;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                uint block = (packed >> (uint(chunk) * 8u)) & 0xFFu;
+                uint q_hi = ((block & 0x02u) >> 1u) | ((block & 0x08u) >> 2u) |
+                            ((block & 0x20u) >> 3u) | ((block & 0x80u) >> 4u);
+                uint q_lo = (block & 0x01u) | ((block & 0x04u) >> 1u) |
+                            ((block & 0x10u) >> 2u) | ((block & 0x40u) >> 3u);
+                int li = (word * 4 + chunk) * 16 + int(q_lo);
+                int hi = (word * 4 + chunk) * 16 + int(q_hi);
+                qa0l += float(lut[li]);
+                qa1l += float(lut[512 + li]);
+                qa2l += float(lut[1024 + li]);
+                qa3l += float(lut[1536 + li]);
+                qa4l += float(lut[2048 + li]);
+                qa0h += float(lut[hi]);
+                qa1h += float(lut[512 + hi]);
+                qa2h += float(lut[1024 + hi]);
+                qa3h += float(lut[1536 + hi]);
+                qa4h += float(lut[2048 + hi]);
+
+                int xchunk = xo + chunk * 4;
+                float xv00 = float(x[0 * K + xchunk + 0]);
+                float xv01 = float(x[0 * K + xchunk + 1]);
+                float xv02 = float(x[0 * K + xchunk + 2]);
+                float xv03 = float(x[0 * K + xchunk + 3]);
+                float xv10 = float(x[1 * K + xchunk + 0]);
+                float xv11 = float(x[1 * K + xchunk + 1]);
+                float xv12 = float(x[1 * K + xchunk + 2]);
+                float xv13 = float(x[1 * K + xchunk + 3]);
+                float xv20 = float(x[2 * K + xchunk + 0]);
+                float xv21 = float(x[2 * K + xchunk + 1]);
+                float xv22 = float(x[2 * K + xchunk + 2]);
+                float xv23 = float(x[2 * K + xchunk + 3]);
+                float xv30 = float(x[3 * K + xchunk + 0]);
+                float xv31 = float(x[3 * K + xchunk + 1]);
+                float xv32 = float(x[3 * K + xchunk + 2]);
+                float xv33 = float(x[3 * K + xchunk + 3]);
+                float xv40 = float(x[4 * K + xchunk + 0]);
+                float xv41 = float(x[4 * K + xchunk + 1]);
+                float xv42 = float(x[4 * K + xchunk + 2]);
+                float xv43 = float(x[4 * K + xchunk + 3]);
+                sx0 += xv00 + xv01 + xv02 + xv03;
+                sx1 += xv10 + xv11 + xv12 + xv13;
+                sx2 += xv20 + xv21 + xv22 + xv23;
+                sx3 += xv30 + xv31 + xv32 + xv33;
+                sx4 += xv40 + xv41 + xv42 + xv43;
             }
         }
 
@@ -1970,13 +2096,14 @@ if (n < NRows) {
         int b_canon_idx = (row_tile * 2 + row_lane) * NumGroups + g;
         float s_val = float(sc[sb_row2_idx]);
         float b_val = float(bi[b_canon_idx]);
-        acc0 += s_val * qacc0 + b_val * sx0;
-        acc1 += s_val * qacc1 + b_val * sx1;
-        acc2 += s_val * qacc2 + b_val * sx2;
-        acc3 += s_val * qacc3 + b_val * sx3;
-        acc4 += s_val * qacc4 + b_val * sx4;
+        acc0 += s_val * (2.0f * qa0h + qa0l) + b_val * sx0;
+        acc1 += s_val * (2.0f * qa1h + qa1l) + b_val * sx1;
+        acc2 += s_val * (2.0f * qa2h + qa2l) + b_val * sx2;
+        acc3 += s_val * (2.0f * qa3h + qa3l) + b_val * sx3;
+        acc4 += s_val * (2.0f * qa4h + qa4l) + b_val * sx4;
     }
 }
+threadgroup_barrier(mem_flags::mem_threadgroup);
 
 // Output layout: [M, NRows] row-major (matches Q1 TG-LUT4 M=5 kernel).
 if (n < NRows) {
@@ -1997,7 +2124,7 @@ fn create_q2_row2_m5_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let source = CString::new(Q2_ROW2_M5_KERNEL_SOURCE).unwrap_or_default();
     unsafe {
         let kernel = mlx_sys::mlx_fast_metal_kernel_new(
-            c"higgs_bonsai_q2_row2_m5_contract_v2".as_ptr(),
+            c"higgs_bonsai_q2_row2_m5_contract_v3".as_ptr(),
             in_vec,
             out_vec,
             source.as_ptr(),
