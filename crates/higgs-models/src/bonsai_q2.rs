@@ -441,7 +441,7 @@ mod tests {
     }
 
     /// Phase 3B M>1 gate: z-batched QMV must match CPU oracle for verifier
-    /// shapes M=2..=5 (anchor + drafts). This is what `bonsai_q2_qmm` routes
+    /// shapes M=1..=5 (anchor + drafts). This is what `bonsai_q2_qmm` routes
     /// to and what the block verifier will exercise at M=5.
     #[test]
     fn q2_qmm_kernel_matches_cpu_reference_m1_through_m5() {
@@ -484,6 +484,74 @@ mod tests {
                     assert!(
                         (gv - acc).abs() <= tol,
                         "qmm M={m} row {r} (m_idx={m_idx}): got {gv} want {acc}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Phase 3D M=5 kernel gate: bonsai_q2_row2_m5_contract must match the
+    /// CPU oracle across all 5 verifier rows for representative Bonsai-27B
+    /// shapes. This is the make-or-break gate for the 1.45x target.
+    #[test]
+    fn q2_row2_m5_kernel_matches_cpu_reference() {
+        let _exec = crate::mlx_exec::acquire();
+
+        for &(out_f, in_f, seed) in &[
+            (256usize, 256usize, 0x1111_2222_u64),    // small smoke
+            (512usize, 512usize, 0x3333_4444_u64),    // 4 groups
+            (5120usize, 5120usize, 0x5555_6666_u64),  // Bonsai-27B hidden x hidden
+        ] {
+            let p = make_packed_q2(out_f, in_f, seed);
+            let (w_canon, s_canon, b_canon) = upload_to_mlx(&p);
+            let packed =
+                crate::metal_kernel::BonsaiQ2Row2::from_row_major(&w_canon, &s_canon).unwrap();
+
+            // Round-trip first -- if this fails, the layout transform itself is broken.
+            let (w_rt, s_rt) = packed.to_row_major().unwrap();
+            w_rt.eval().unwrap();
+            s_rt.eval().unwrap();
+            let w_got: Vec<u32> = w_rt.as_slice::<u32>().iter().copied().collect();
+            let s_got: Vec<half::f16> = s_rt.as_slice::<half::f16>().iter().copied().collect();
+            assert_eq!(w_got, p.w_packed, "row2 weights did not round-trip ({out_f}x{in_f})");
+            assert_eq!(s_got, p.scales, "row2 scales did not round-trip ({out_f}x{in_f})");
+
+            let packed_ref = packed.as_ref();
+
+            // Build 5 distinct activation rows (anchor + 4 drafts).
+            let mut st = 0x9876_5432_u64;
+            let x_f32: Vec<f32> = (0..(5 * in_f))
+                .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
+                .collect();
+            let x = mlx_rs::Array::from_slice(&x_f32, &[5, in_f as i32])
+                .as_dtype(mlx_rs::Dtype::Float16)
+                .unwrap();
+            let x_ref: Vec<f32> = x_f32
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_f32())
+                .collect();
+
+            let y = crate::metal_kernel::bonsai_q2_row2_m5_contract(&x, packed_ref, &b_canon)
+                .unwrap();
+            y.eval().unwrap();
+            let got = y.as_slice::<half::f16>();
+            assert_eq!(got.len(), 5 * out_f);
+
+            // CPU reference: full dequant then matvec per (verifier_row, output_row).
+            let mut w_row = vec![0f32; in_f];
+            for m_idx in 0..5 {
+                let x_slice = &x_ref[m_idx * in_f..(m_idx + 1) * in_f];
+                for r in 0..out_f {
+                    p.dequant_row_to_fp32(r, &mut w_row);
+                    let mut acc = 0f32;
+                    for c in 0..in_f {
+                        acc += x_slice[c] * w_row[c];
+                    }
+                    let gv = got[m_idx * out_f + r].to_f32();
+                    let tol = (1e-2 * acc.abs()).max(1e-3);
+                    assert!(
+                        (gv - acc).abs() <= tol,
+                        "row2_m5 ({out_f}x{in_f}) verifier_row={m_idx} output_row={r}: got {gv} want {acc}"
                     );
                 }
             }

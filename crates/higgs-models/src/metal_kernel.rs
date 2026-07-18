@@ -1478,6 +1478,435 @@ impl BonsaiQ1Row4 {
     }
 }
 
+/// One-time row2 materialization consumed by the Q2 M=5 verifier kernels.
+///
+/// Mirror of [`BonsaiQ1Row4`] for 2-bit affine packed weights. Physical shapes
+/// are `[N/2, K/128, 8 words, 2 output lanes]` for packed Q2 bits and
+/// `[N/2, K/128, 2 output lanes]` for scales. The 8-words-per-group dimension
+/// reflects Q2's packing: 128 cols / 16 cols-per-word = 8 packed u32s per
+/// affine group, vs Q1's 4 (128 cols / 32 cols-per-word).
+///
+/// Two adjacent output rows share contiguous memory (coalesced loads) but
+/// each output row still reads its own packed words. The dominant weight-reuse
+/// benefit comes from sharing each packed-word read across 5 verifier rows
+/// in the M=5 native spec kernel (`bonsai_q2_row2_m5_contract`).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Phase 3D integration lands in a follow-up commit
+pub(super) struct BonsaiQ2Row2 {
+    weights: Array,
+    scales: Array,
+    n_rows: i32,
+    k_dim: i32,
+    cached_bytes: usize,
+}
+
+/// Borrowed, validated view of primary row2 model parameters.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(super) struct BonsaiQ2Row2Ref<'a> {
+    weights: &'a Array,
+    scales: &'a Array,
+    n_rows: i32,
+    k_dim: i32,
+}
+
+impl<'a> BonsaiQ2Row2Ref<'a> {
+    pub(crate) fn from_primary_parts(
+        weights: &'a Array,
+        scales: &'a Array,
+        n_rows: i32,
+        k_dim: i32,
+    ) -> Result<Self, Exception> {
+        let expected_weights = [n_rows / 2, k_dim / 128, 8, 2];
+        let expected_scales = [n_rows / 2, k_dim / 128, 2];
+        if n_rows <= 0
+            || k_dim <= 0
+            || n_rows % 2 != 0
+            || k_dim % 128 != 0
+            || weights.shape() != expected_weights
+            || scales.shape() != expected_scales
+            || weights.dtype() != Dtype::Uint32
+            || !matches!(scales.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+        {
+            return Err(Exception::custom(format!(
+                "BonsaiQ2Row2: invalid packed contract bits={:?}/{:?} scales={:?}/{:?}; expected {:?} Uint32 and {:?} Float16/Bfloat16",
+                weights.shape(),
+                weights.dtype(),
+                scales.shape(),
+                scales.dtype(),
+                expected_weights,
+                expected_scales
+            )));
+        }
+        if !array_is_row_contiguous(weights)? || !array_is_row_contiguous(scales)? {
+            return Err(Exception::custom(
+                "BonsaiQ2Row2: packed arrays must be physically row-contiguous",
+            ));
+        }
+        Ok(Self {
+            weights,
+            scales,
+            n_rows,
+            k_dim,
+        })
+    }
+}
+
+#[allow(dead_code)]
+impl BonsaiQ2Row2 {
+    /// Transform canonical checkpoint arrays `[N,K/16]` and `[N,K/128]` into
+    /// the row2 layout entirely through MLX.
+    pub(crate) fn from_row_major(weight: &Array, scales: &Array) -> Result<Self, Exception> {
+        let [n_rows, k_packed] = *weight.shape() else {
+            return Err(Exception::custom(
+                "BonsaiQ2Row2: canonical weight must have shape [N,K/16]",
+            ));
+        };
+        let [scale_rows, groups] = *scales.shape() else {
+            return Err(Exception::custom(
+                "BonsaiQ2Row2: canonical scales must have shape [N,K/128]",
+            ));
+        };
+        if weight.dtype() != Dtype::Uint32
+            || !matches!(scales.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+        {
+            return Err(Exception::custom(format!(
+                "BonsaiQ2Row2: expected Uint32 bits and Float16/Bfloat16 scales, got {:?}/{:?}",
+                weight.dtype(),
+                scales.dtype()
+            )));
+        }
+        let k_dim = k_packed
+            .checked_mul(16)
+            .ok_or_else(|| Exception::custom("BonsaiQ2Row2: K overflow"))?;
+        // 8 packed words per group (128 cols / 16 cols per word).
+        let words_per_group = k_dim / 128 * 8;
+        if k_packed != words_per_group {
+            return Err(Exception::custom(format!(
+                "BonsaiQ2Row2: k_packed={k_packed} does not match expected {words_per_group} (8 per group * {} groups)",
+                k_dim / 128
+            )));
+        }
+        if n_rows <= 0
+            || k_dim <= 0
+            || n_rows % 2 != 0
+            || k_dim % 128 != 0
+            || scale_rows != n_rows
+            || groups != k_dim / 128
+        {
+            return Err(Exception::custom(format!(
+                "BonsaiQ2Row2: incompatible canonical shapes {:?}/{:?}; require N%2=0 and K%128=0",
+                weight.shape(),
+                scales.shape()
+            )));
+        }
+
+        // weight: [N, K/16] -> [N/2, 2, NumGroups, 8] -> [N/2, NumGroups, 8, 2]
+        let weights_reshaped = weight.reshape(&[n_rows / 2, 2, groups, 8])?;
+        let weights_view = weights_reshaped.transpose_axes(&[0, 2, 3, 1])?;
+        // scales: [N, NumGroups] -> [N/2, 2, NumGroups] -> [N/2, NumGroups, 2]
+        let scales_reshaped = scales.reshape(&[n_rows / 2, 2, groups])?;
+        let scales_view = scales_reshaped.transpose_axes(&[0, 2, 1])?;
+        let weights = row_contiguous_copy(&weights_view)?;
+        let packed_scales = row_contiguous_copy(&scales_view)?;
+        crate::mlx_exec::eval([&weights, &packed_scales])?;
+        Self::from_packed_parts(weights, packed_scales, n_rows, k_dim)
+    }
+
+    /// Reconstruct canonical checkpoint arrays `[N,K/16]` and `[N,K/128]`.
+    #[cfg(test)]
+    pub(crate) fn to_row_major(&self) -> Result<(Array, Array), Exception> {
+        let weight_view = self.weights.transpose_axes(&[0, 3, 1, 2])?;
+        let scale_view = self.scales.transpose_axes(&[0, 2, 1])?;
+        let weight_storage = row_contiguous_copy(&weight_view)?;
+        let scale_storage = row_contiguous_copy(&scale_view)?;
+        crate::mlx_exec::eval([&weight_storage, &scale_storage])?;
+        let weights = weight_storage.reshape(&[self.n_rows, self.k_dim / 16])?;
+        let scales = scale_storage.reshape(&[self.n_rows, self.k_dim / 128])?;
+        Ok((weights, scales))
+    }
+
+    fn from_packed_parts(
+        weights: Array,
+        scales: Array,
+        n_rows: i32,
+        k_dim: i32,
+    ) -> Result<Self, Exception> {
+        BonsaiQ2Row2Ref::from_primary_parts(&weights, &scales, n_rows, k_dim)?;
+        let cached_bytes = weights.nbytes().saturating_add(scales.nbytes());
+        Ok(Self {
+            weights,
+            scales,
+            n_rows,
+            k_dim,
+            cached_bytes,
+        })
+    }
+
+    pub(crate) const fn cached_bytes(&self) -> usize {
+        self.cached_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn as_ref(&self) -> BonsaiQ2Row2Ref<'_> {
+        BonsaiQ2Row2Ref {
+            weights: &self.weights,
+            scales: &self.scales,
+            n_rows: self.n_rows,
+            k_dim: self.k_dim,
+        }
+    }
+
+    pub(crate) fn into_primary_parts(self) -> (Array, Array, i32, i32) {
+        (self.weights, self.scales, self.n_rows, self.k_dim)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q2 M=5 native spec verifier kernel.
+//
+// Direct port of the Q1 TG-LUT4 M=5 design without the LUT identity: at Q2
+// the per-2-bit-code branching cost is low enough that direct `q*x` fma is
+// competitive with the LUT, and skipping the LUT avoids 5 KiB of threadgroup
+// memory and the cooperative build phase. The dominant win is the same as
+// Q1's M=5 path -- one packed-word read serves all 5 verifier rows.
+//
+// Layout contract: BonsaiQ2Row2 (`[N/2, NumGroups, 8 words, 2 lanes]` packed
+// bits, `[N/2, NumGroups, 2 lanes]` scales). Adjacent output rows read
+// contiguous memory (coalesced loads).
+//
+// Per-thread work: one output row n. row_tile = n/2, row_lane = n%2.
+//   For each group g:
+//     1) Read 8 packed u32 words covering this group's 128 cols for this row.
+//     2) For each of 16 codes per word, extract q and fma into 5 verifier-row
+//        accumulators (qacc0..qacc4) plus 5 sum-x accumulators (sum_x0..sum_x4).
+//     3) Combine: acc_m += scale * qacc_m + bias * sum_x_m.
+// ---------------------------------------------------------------------------
+
+const Q2_ROW2_M5_KERNEL_SOURCE: &str = r"
+constexpr int WG = 256;           // threads per threadgroup
+constexpr int ROWS_PER_TG = 256;  // output rows handled by one threadgroup
+
+uint tid = thread_index_in_threadgroup;
+uint tgx = threadgroup_position_in_grid.x;
+int n = int(tgx) * ROWS_PER_TG + int(tid);
+
+float acc0 = 0.0f;
+float acc1 = 0.0f;
+float acc2 = 0.0f;
+float acc3 = 0.0f;
+float acc4 = 0.0f;
+
+if (n < NRows) {
+    int row_tile = n / 2;
+    int row_lane = n & 1;
+
+    for (int g = 0; g < NumGroups; ++g) {
+        // Per-verifier-row partials for this group.
+        float qacc0 = 0.0f; float qacc1 = 0.0f; float qacc2 = 0.0f;
+        float qacc3 = 0.0f; float qacc4 = 0.0f;
+        float sx0 = 0.0f;   float sx1 = 0.0f;   float sx2 = 0.0f;
+        float sx3 = 0.0f;   float sx4 = 0.0f;
+
+        int group_base = (row_tile * NumGroups + g) * 8;  // 8 packed words per group
+        int x_base = g * 128;
+
+        #pragma clang loop unroll(full)
+        for (int word = 0; word < 8; ++word) {
+            uint packed = w[(group_base + word) * 2 + row_lane];
+            int xo = x_base + word * 16;
+            // Unrolled 16-way 2-bit unpack + fma into 5 verifier rows.
+            // Direct q*x fma; bias*sum_x combined at the group tail.
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 16; ++i) {
+                uint q = (packed >> (uint(i) * 2u)) & 0x3u;
+                float qf = float(q);
+                float xv0 = float(x[0 * K + xo + i]);
+                float xv1 = float(x[1 * K + xo + i]);
+                float xv2 = float(x[2 * K + xo + i]);
+                float xv3 = float(x[3 * K + xo + i]);
+                float xv4 = float(x[4 * K + xo + i]);
+                qacc0 += qf * xv0; sx0 += xv0;
+                qacc1 += qf * xv1; sx1 += xv1;
+                qacc2 += qf * xv2; sx2 += xv2;
+                qacc3 += qf * xv3; sx3 += xv3;
+                qacc4 += qf * xv4; sx4 += xv4;
+            }
+        }
+
+        // Scales are in row2 layout: sc_transposed[t, g, l] = scales[t*2+l, g].
+        // Biases are in canonical [N, NumGroups] layout: bi[n, g] = biases[n*NumGroups+g].
+        int sb_row2_idx = (row_tile * NumGroups + g) * 2 + row_lane;
+        int b_canon_idx = (row_tile * 2 + row_lane) * NumGroups + g;
+        float s_val = float(sc[sb_row2_idx]);
+        float b_val = float(bi[b_canon_idx]);
+        acc0 += s_val * qacc0 + b_val * sx0;
+        acc1 += s_val * qacc1 + b_val * sx1;
+        acc2 += s_val * qacc2 + b_val * sx2;
+        acc3 += s_val * qacc3 + b_val * sx3;
+        acc4 += s_val * qacc4 + b_val * sx4;
+    }
+}
+
+// Output layout: [M, NRows] row-major (matches Q1 TG-LUT4 M=5 kernel).
+if (n < NRows) {
+    y[0 * NRows + n] = OutT(acc0);
+    y[1 * NRows + n] = OutT(acc1);
+    y[2 * NRows + n] = OutT(acc2);
+    y[3 * NRows + n] = OutT(acc3);
+    y[4 * NRows + n] = OutT(acc4);
+}
+";
+
+static Q2_ROW2_M5_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_q2_row2_m5_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"bi", c"x"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(Q2_ROW2_M5_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_row2_m5_contract_v2".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,  // raw pointer arithmetic requires row-contiguous inputs
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_q2_row2_m5_kernel(
+    out_dtype: mlx_sys::mlx_dtype,
+    n_rows: i32,
+    k_dim: i32,
+    group_size: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    const WG: i32 = 256;
+    const ROWS_PER_TG: i32 = 256;
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OutT".as_ptr(),
+            out_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"GroupSize".as_ptr(),
+            group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NumGroups".as_ptr(),
+            k_dim / group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NRows".as_ptr(),
+            n_rows,
+        );
+
+        let n_tgs = (n_rows + ROWS_PER_TG - 1) / ROWS_PER_TG;
+        let grid_x = n_tgs * ROWS_PER_TG;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, grid_x, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, WG, 1, 1);
+
+        // Output: [M=5, NRows] row-major.
+        let y_shape = [5, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            out_dtype,
+        );
+        let _ = (WG, ROWS_PER_TG); // suppress unused-constant warning if any
+        config
+    }
+}
+
+/// Phase 3D Q2 M=5 native spec verifier kernel.
+///
+/// Computes `y[m, n] = sum_k dequant(w[n,k]) * x[m,k]` for m=0..4 and all
+/// output rows n, where `w` is in [`BonsaiQ2Row2`] layout and `x` is the
+/// `[5, K]` activation tile (anchor + 4 draft rows). Each thread handles one
+/// output row across all 5 verifier rows, sharing the 8 packed-word reads per
+/// group across all 5 verifier-row accumulators.
+///
+/// Bit-exact vs CPU oracle (verified in `bonsai_q2::tests`). Performance:
+/// microbench vs z-batched `bonsai_q2_qmm` is the kill gate for the 1.45×
+/// end-to-end target.
+#[allow(dead_code, unsafe_code)]
+pub fn bonsai_q2_row2_m5_contract(
+    x: &Array,
+    packed: BonsaiQ2Row2Ref<'_>,
+    biases: &Array,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let x_shape = x.shape();
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    if m_rows != 5 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_row2_m5: expected M=5 verifier tile, got M={m_rows}"
+        )));
+    }
+    let x_flat = x.reshape(&[5, packed.k_dim])?;
+    let w_flat = packed.weights.reshape(&[-1])?;
+    let s_flat = packed.scales.flatten(None, None)?;
+    let b_flat = biases.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    let cached = Q2_ROW2_M5_KERNEL.get_or_init(|| CachedMetalKernel(create_q2_row2_m5_kernel()));
+    let config =
+        configure_q2_row2_m5_kernel(out_dtype, packed.n_rows, packed.k_dim, 128);
+
+    let input_ptrs = [w_flat.as_ptr(), s_flat.as_ptr(), b_flat.as_ptr(), x_flat.as_ptr()];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q2_row2_m5 failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
+        Ok(unsafe { Array::from_ptr(y_ptr) })
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+    }
+    result
+}
+
 #[allow(unsafe_code)]
 fn row_contiguous_copy(array: &Array) -> Result<Array, Exception> {
     ensure_ffi_error_handler();
