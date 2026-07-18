@@ -902,7 +902,7 @@ impl QLinear {
         // round-trip. Wider inputs fall through to dequant + MLX matmul.
         if let Some(packed) = self.bonsai_row2()? {
             let row_count: i32 = x.shape().iter().take(x.ndim().saturating_sub(1)).product();
-            if row_count == 6 && x.shape().last().copied() == Some(packed.k_dim) {
+            if row_count == 5 && x.shape().last().copied() == Some(packed.k_dim) {
                 if let Ok(y) = crate::metal_kernel::bonsai_q2_row2_m5_contract(
                     x, packed, &*self.biases,
                 ) {
@@ -917,13 +917,6 @@ impl QLinear {
                 }
             }
             // Wide prefill: dequant row2 -> canonical, then MLX stock matmul.
-            tracing::debug!(
-                row_count,
-                k_dim = packed.k_dim,
-                input_last = ?x.shape().last(),
-                bits = self.bits,
-                "row2 fallback to dequant+stock"
-            );
             let (w_canon, s_canon) = crate::metal_kernel::bonsai_q2_row2_to_canonical(packed)?;
             return ops::quantized_matmul(
                 x,

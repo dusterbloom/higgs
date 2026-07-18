@@ -490,10 +490,9 @@ mod tests {
         }
     }
 
-    /// Phase 3D M=5 (actually M=6 in production: anchor + 4 drafts + 1 bonus)
-    /// kernel gate: bonsai_q2_row2_m5_contract must match the CPU oracle
-    /// across all 6 verifier rows for representative Bonsai-27B shapes. This
-    /// is the make-or-break gate for the 1.45x target.
+    /// Phase 3D M=5 kernel gate: bonsai_q2_row2_m5_contract must match the
+    /// CPU oracle across all 5 verifier rows for representative Bonsai-27B
+    /// shapes. This is the make-or-break gate for the 1.45x target.
     #[test]
     fn q2_row2_m5_kernel_matches_cpu_reference() {
         let _exec = crate::mlx_exec::acquire();
@@ -521,12 +520,12 @@ mod tests {
 
             let packed_ref = packed.as_ref();
 
-            // Build 6 distinct activation rows (anchor + 4 drafts + 1 bonus).
+            // Build 5 distinct activation rows (anchor + 4 drafts).
             let mut st = 0x9876_5432_u64;
-            let x_f32: Vec<f32> = (0..(6 * in_f))
+            let x_f32: Vec<f32> = (0..(5 * in_f))
                 .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
                 .collect();
-            let x = mlx_rs::Array::from_slice(&x_f32, &[6, in_f as i32])
+            let x = mlx_rs::Array::from_slice(&x_f32, &[5, in_f as i32])
                 .as_dtype(mlx_rs::Dtype::Float16)
                 .unwrap();
             let x_ref: Vec<f32> = x_f32
@@ -538,11 +537,11 @@ mod tests {
                 .unwrap();
             y.eval().unwrap();
             let got = y.as_slice::<half::f16>();
-            assert_eq!(got.len(), 6 * out_f);
+            assert_eq!(got.len(), 5 * out_f);
 
             // CPU reference: full dequant then matvec per (verifier_row, output_row).
             let mut w_row = vec![0f32; in_f];
-            for m_idx in 0..6 {
+            for m_idx in 0..5 {
                 let x_slice = &x_ref[m_idx * in_f..(m_idx + 1) * in_f];
                 for r in 0..out_f {
                     p.dequant_row_to_fp32(r, &mut w_row);
@@ -636,11 +635,11 @@ mod tests {
                 crate::metal_kernel::BonsaiQ2Row2::from_row_major(&w_canon, &s_canon).unwrap();
             let packed_ref = packed.as_ref();
 
-            // 6-row activation tile matching the dSpark verifier (anchor + 4 drafts + 1 bonus).
-            let x_f32: Vec<f32> = (0..(6 * in_f))
+            // 5-row activation tile matching the dSpark verifier (anchor + 4 drafts).
+            let x_f32: Vec<f32> = (0..(5 * in_f))
                 .map(|i| ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / 16777216.0 - 0.5)
                 .collect();
-            let x = mlx_rs::Array::from_slice(&x_f32, &[6, in_f as i32])
+            let x = mlx_rs::Array::from_slice(&x_f32, &[5, in_f as i32])
                 .as_dtype(mlx_rs::Dtype::Float16)
                 .unwrap();
 
