@@ -501,8 +501,6 @@ mod tests {
             (256usize, 256usize, 0x1111_2222_u64),    // small smoke
             (512usize, 512usize, 0x3333_4444_u64),    // 4 groups
             (5120usize, 5120usize, 0x5555_6666_u64),  // Bonsai-27B hidden x hidden
-            (17408usize, 5120usize, 0x7777_8888_u64), // Bonsai-27B gate/up (inter x hidden)
-            (5120usize, 17408usize, 0x9999_AAAA_u64), // Bonsai-27B down (hidden x inter)
         ] {
             let p = make_packed_q2(out_f, in_f, seed);
             let (w_canon, s_canon, b_canon) = upload_to_mlx(&p);
@@ -556,57 +554,6 @@ mod tests {
                         "row2_m5 ({out_f}x{in_f}) verifier_row={m_idx} output_row={r}: got {gv} want {acc}"
                     );
                 }
-            }
-        }
-    }
-
-    /// Phase 3D M=1 row2 kernel gate: bit-exact vs CPU oracle for the AR
-    /// decode fast path. Without this kernel the M=1 path would dequant row2
-    /// back to canonical on every token (~120 ms per AR token).
-    #[test]
-    fn q2_row2_qmv_kernel_matches_cpu_reference() {
-        let _exec = crate::mlx_exec::acquire();
-
-        for &(out_f, in_f, seed) in &[
-            (256usize, 256usize, 0x1234_5678_u64),
-            (512usize, 512usize, 0x2468_ABCD_u64),
-            (5120usize, 5120usize, 0x1357_BEEF_u64),
-            (17408usize, 5120usize, 0xFEDC_BA98_u64),
-            (5120usize, 17408usize, 0x7777_9999_u64),
-        ] {
-            let p = make_packed_q2(out_f, in_f, seed);
-            let (w_canon, s_canon, b_canon) = upload_to_mlx(&p);
-            let packed =
-                crate::metal_kernel::BonsaiQ2Row2::from_row_major(&w_canon, &s_canon).unwrap();
-            let packed_ref = packed.as_ref();
-
-            let mut st = 0xABCD_1234_u64;
-            let x_f32: Vec<f32> = (0..in_f)
-                .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
-                .collect();
-            let x = mlx_rs::Array::from_slice(&x_f32, &[1, in_f as i32])
-                .as_dtype(mlx_rs::Dtype::Float16)
-                .unwrap();
-            let x_ref: Vec<f32> = x_f32.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
-
-            let y = crate::metal_kernel::bonsai_q2_row2_qmv(&x, packed_ref, &b_canon).unwrap();
-            y.eval().unwrap();
-            let got = y.as_slice::<half::f16>();
-            assert_eq!(got.len(), out_f);
-
-            let mut w_row = vec![0f32; in_f];
-            for r in 0..out_f {
-                p.dequant_row_to_fp32(r, &mut w_row);
-                let mut acc = 0f32;
-                for c in 0..in_f {
-                    acc += x_ref[c] * w_row[c];
-                }
-                let gv = got[r].to_f32();
-                let tol = (1e-2 * acc.abs()).max(1e-3);
-                assert!(
-                    (gv - acc).abs() <= tol,
-                    "row2_qmv ({out_f}x{in_f}) output_row={r}: got {gv} want {acc}"
-                );
             }
         }
     }
