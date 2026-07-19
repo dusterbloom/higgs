@@ -203,6 +203,10 @@ Measured on DeepSeek-V2-Lite-4bit with global batch sorting before `gather_qmm`.
   (`auto` | `dflash` | `mtp` | `none`) to pick the speculative-decode method per
   request. `auto` (default) uses the DFlash drafter when one is loaded — including
   while streaming — otherwise the MTP head; `none` disables speculation.
+- The dSpark (DFlash) verifier defaults to the block (`BatchedTape`) schedule for
+  the 2-bit Bonsai target (validated end-to-end) and to canonical S=1 for the
+  1-bit Bonsai target. Override per-process with `HIGGS_DFLASH_VERIFY_MODE`
+  (`block` | `canonical`).
 - Compressive prefill (PFlash, experimental): an optional `prefill_drafter`
   (e.g. `mlx-community/Qwen3-0.6B-4bit`) scores the prompt so the target
   prefills only a fraction of it (`prefill_compression`, `prefill_keep_ratio`).

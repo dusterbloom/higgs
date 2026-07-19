@@ -164,6 +164,9 @@ port = 8000
 # kv_retained_idle_secs = 1800  # evict KV idle longer than N seconds (0 = never)
 # # Speculative decoding (decode) + compressive prefill (PFlash) drafters:
 # # draft_model      = "/path/to/dspark-drafter"      # decode speculation (DFlash/dSpark)
+# # For the 2-bit Bonsai target the block (BatchedTape) verifier is the default
+# # verify schedule; the 1-bit Bonsai keeps the conservative canonical default.
+# # Set HIGGS_DFLASH_VERIFY_MODE=canonical to opt any model back to S=1.
 # # prefill_drafter  = "mlx-community/Qwen3-0.6B-4bit" # compressive prefill (PFlash)
 # # prefill_compression = "off"                       # off | auto | always
 # # prefill_threshold   = 4096                        # auto: enable above this many prompt tokens

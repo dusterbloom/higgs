@@ -826,6 +826,18 @@ impl AnyModel {
         }
     }
 
+    /// Whether the target is the 2-bit Bonsai variant (affine quantization at
+    /// 2 bits). The 2-bit target is the only model with the block
+    /// (`BatchedTape`) verifier validated end-to-end, so the engine uses it as
+    /// that model's default verify schedule while the 1-bit Bonsai keeps the
+    /// conservative `CanonicalS1` contract.
+    pub fn is_target_2bit(&self) -> bool {
+        match self {
+            Self::Qwen3Next(m) => m.args.default_quant_spec().bits == 2,
+            _ => false,
+        }
+    }
+
     /// Run the MTP head to produce draft logits for position t+2.
     ///
     /// Returns draft logits `[B, 1, vocab]`, or an error if no MTP head.
