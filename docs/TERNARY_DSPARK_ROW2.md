@@ -295,6 +295,23 @@ steady concat:                    ~0.1-0.2 ms
 
 Conclusion: the sidecar Q4 output projection is the dominant proposal cost. A fused `base logits + Markov bias -> argmax` kernel can only attack roughly `4-5 ms` per round; the larger lever is the sidecar output head projection itself.
 
+Stage-detail tracing (`HIGGS_DSPARK_STAGE_TRACE=1`) split the dSpark trunk:
+
+```text
+steady context append/project: ~1.5-2.3 ms
+steady log-SNR add:           ~0.1-0.2 ms
+steady layer 0:               ~2.1 ms
+steady layer 1:               ~2.1 ms
+steady layer 2:               ~2.1 ms
+steady layer 3:               ~2.1 ms
+steady layer 4:               ~2.1 ms
+steady layer 5:               ~2.1 ms
+steady final norm:            ~0.2 ms
+steady stage total:           ~15 ms with trace barriers
+```
+
+Conclusion: the trunk is evenly distributed across six layers; no single stage subcomponent is an obvious quick win. The output head remains the most concentrated target.
+
 Runtime result with:
 
 ```bash
@@ -347,7 +364,7 @@ The remaining gap is likely in the dSpark drafter proposal/stage path and smalle
 Recommended next moves:
 
 1. Probe a faster sidecar Q4 output head path for `[1,4,5120] -> [1,4,vocab]`, ideally argmax-oriented so it avoids materializing all logits if Markov bias can be folded later.
-2. Profile `stage_forward` inside the six-layer dSpark trunk to find whether attention, MLP, or context-tile append dominates the steady ~13 ms.
-3. Keep fused Markov `base logits + low-rank bias -> argmax` as a secondary probe; it can save at most the measured ~4-5 ms per round unless paired with output-head changes.
+2. Keep fused Markov `base logits + low-rank bias -> argmax` as a secondary probe; it can save at most the measured ~4-5 ms per round unless paired with output-head changes.
+3. If the output-head path stalls, inspect one dSpark trunk layer internally; stage-level tracing shows each layer costs about the same.
 4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
 5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.
