@@ -612,6 +612,14 @@ mod tests {
                     .unwrap()
                     .eval()
                     .unwrap();
+                let _ = crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(&x, packed_ref, 2)
+                    .unwrap()
+                    .eval()
+                    .unwrap();
+                let _ = crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(&x, packed_ref, 4)
+                    .unwrap()
+                    .eval()
+                    .unwrap();
             }
 
             // Measure z-batched QMM baseline.
@@ -642,6 +650,25 @@ mod tests {
             }
             let ternary_row2_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
 
+            // Measure strict-ternary row2 split-K variants.
+            let t0 = std::time::Instant::now();
+            for _ in 0..n_iters {
+                let y =
+                    crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(&x, packed_ref, 2)
+                        .unwrap();
+                y.eval().unwrap();
+            }
+            let ternary_splitk2_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..n_iters {
+                let y =
+                    crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(&x, packed_ref, 4)
+                        .unwrap();
+                y.eval().unwrap();
+            }
+            let ternary_splitk4_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
             // Measure MLX stock affine Q2.
             let t0 = std::time::Instant::now();
             for _ in 0..n_iters {
@@ -653,8 +680,10 @@ mod tests {
             let mlx_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
 
             eprintln!(
-                "MICROBENCH {label} ({out_f}x{in_f}, M=5): mlx={mlx_us:.1}us qmm={qmm_us:.1}us row2_m5={row2_m5_us:.1}us ternary_row2={ternary_row2_us:.1}us mlx/ternary_row2={:.3}x qmm/ternary_row2={:.3}x",
+                "MICROBENCH {label} ({out_f}x{in_f}, M=5): mlx={mlx_us:.1}us qmm={qmm_us:.1}us row2_m5={row2_m5_us:.1}us ternary_row2={ternary_row2_us:.1}us splitk2={ternary_splitk2_us:.1}us splitk4={ternary_splitk4_us:.1}us mlx/ternary_row2={:.3}x mlx/splitk2={:.3}x mlx/splitk4={:.3}x qmm/ternary_row2={:.3}x",
                 mlx_us / ternary_row2_us,
+                mlx_us / ternary_splitk2_us,
+                mlx_us / ternary_splitk4_us,
                 qmm_us / ternary_row2_us
             );
         }

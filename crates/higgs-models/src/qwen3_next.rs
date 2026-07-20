@@ -769,6 +769,9 @@ impl QLinear {
             .get()
             .ok_or_else(|| Exception::custom("Q2 row2 cache was not initialized"))?
             .as_ref();
+        if packed.n_rows() == 5120 && packed.k_dim() == 17408 {
+            return crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(x, packed, 4).map(Some);
+        }
         crate::metal_kernel::bonsai_q2_row2_m5_ternary_direct(x, packed).map(Some)
     }
 

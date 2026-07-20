@@ -99,8 +99,9 @@ argmax parity:          matched
 End-to-end runtime did improve because the verifier no longer syncs/copies the candidate arrays to CPU:
 
 ```text
-row2 MLP + CPU head reduce: 17.49 tok/s
-row2 MLP + GPU head reduce: 18.55 tok/s
+row2 MLP + CPU head reduce:         17.49 tok/s
+row2 MLP + GPU head reduce:         18.55 tok/s
+row2 MLP + GPU head + split-K down: 19.29 tok/s
 ```
 
 Server telemetry stayed behavior-identical:
@@ -108,7 +109,8 @@ Server telemetry stayed behavior-identical:
 ```text
 accept_len: 4.23
 spec_rounds: 30
-server decode after warmup: ~16.0 tok/s
+server decode after warmup before split-K: ~16.0 tok/s
+server decode after warmup with split-K:   ~16.5-16.8 tok/s
 ```
 
 The head path is available behind:
@@ -144,6 +146,24 @@ down M=5:
   ternary row2: 1308.7 us
   speedup:      1.04x
 ```
+
+Split-K was tested for `down_proj`, where `K=17408` and the direct row2 kernel exposes less row parallelism:
+
+```text
+gate/up M=5:
+  MLX stock:     1356.9 us
+  ternary row2:   929.0 us
+  split-K2:       941.1 us
+  split-K4:       935.0 us
+
+down M=5:
+  MLX stock:     1366.0 us
+  ternary row2:  1295.6 us
+  split-K2:      1164.8 us
+  split-K4:      1144.8 us
+```
+
+Conclusion: split-K hurts or is neutral for gate/up, but wins for down. Runtime dispatch now uses split-K4 only for the Bonsai ternary `down_proj` shape (`N=5120`, `K=17408`) under the row2 MLP flag.
 
 Full MLP microbench:
 
@@ -207,7 +227,7 @@ Long Fibonacci, 128 tokens:
 
 ```text
 previous long Fibonacci: 13.87 tok/s
-row2 MLP + head argmax:  18.55 tok/s
+row2 MLP + head argmax:  19.29 tok/s
 ```
 
 Server telemetry:
@@ -216,10 +236,10 @@ Server telemetry:
 accept_len: 4.23
 spec_rounds: 30
 server decode before: ~12.0-12.1 tok/s
-server decode after:  ~16.0 tok/s
+server decode after:  ~16.5-16.8 tok/s
 ```
 
-This is about `1.37x` versus the AR Fibonacci baseline, still short of the `1.5x` target but now materially close.
+This is about `1.43x` versus the AR Fibonacci baseline, still short of the `1.5x` target but now within roughly another five percent.
 
 ## Runtime controls
 
@@ -247,8 +267,8 @@ The remaining gap is likely in `down_proj`, `lm_head`, and verifier overhead out
 
 Recommended next moves:
 
-1. Improve `down_proj` row2 M=5, where current isolated speedup is only `1.04x`, without falling back to stock MLX.
-2. Explore a direct row2/radix-3 head argmax kernel to recover more of the remaining `lm_head` cost.
+1. Explore a direct row2/radix-3 head argmax kernel to recover more of the remaining `lm_head` cost.
+2. Probe split-K variants for the head candidate kernel, since the head has `N=248320`, `K=5120`, and still dominates isolated head time.
 3. Explore radix-3 prepack only after proving it beats direct row2 on gate/up, down, or head in isolation.
 4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
 5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.

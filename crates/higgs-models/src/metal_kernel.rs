@@ -2417,6 +2417,14 @@ pub(crate) struct BonsaiQ2Row2Ref<'a> {
 }
 
 impl<'a> BonsaiQ2Row2Ref<'a> {
+    pub(crate) fn n_rows(&self) -> i32 {
+        self.n_rows
+    }
+
+    pub(crate) fn k_dim(&self) -> i32 {
+        self.k_dim
+    }
+
     pub(crate) fn from_primary_parts(
         weights: &'a Array,
         scales: &'a Array,
@@ -2731,6 +2739,8 @@ if (n < NRows) {
 static Q2_ROW2_M5_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static Q2_ROW2_M5_TERNARY_DIRECT_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static Q2_ROW2_M5_TERNARY_FUSED_GATE_UP_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static Q2_ROW2_M5_TERNARY_SPLITK_PARTIAL_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static Q2_ROW2_M5_TERNARY_SPLITK_REDUCE_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 #[allow(unsafe_code)]
 fn create_q2_row2_m5_kernel() -> mlx_sys::mlx_fast_metal_kernel {
@@ -2997,6 +3007,90 @@ if (n < NRows) {
 }
 ";
 
+const Q2_ROW2_M5_TERNARY_SPLITK_PARTIAL_SOURCE: &str = r"
+constexpr int WG = 256;
+constexpr int ROWS_PER_TG = 256;
+
+uint tid = thread_index_in_threadgroup;
+uint tgx = threadgroup_position_in_grid.x;
+uint chunk = threadgroup_position_in_grid.y;
+int n = int(tgx) * ROWS_PER_TG + int(tid);
+
+float acc0 = 0.0f;
+float acc1 = 0.0f;
+float acc2 = 0.0f;
+float acc3 = 0.0f;
+float acc4 = 0.0f;
+
+if (n < NRows) {
+    int row_tile = n / 2;
+    int row_lane = n & 1;
+    int g_start = (NumGroups * int(chunk)) / Chunks;
+    int g_end = (NumGroups * (int(chunk) + 1)) / Chunks;
+
+    for (int g = g_start; g < g_end; ++g) {
+        float a0 = 0.0f; float a1 = 0.0f; float a2 = 0.0f; float a3 = 0.0f; float a4 = 0.0f;
+        int group_base = (row_tile * NumGroups + g) * 8;
+        int x_base = g * GroupSize;
+        #pragma clang loop unroll(full)
+        for (int word = 0; word < 8; ++word) {
+            uint packed = w[(group_base + word) * 2 + row_lane];
+            int xb = x_base + word * 16;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 16; ++j) {
+                float t = float((packed >> uint(2 * j)) & 0x3u) - 1.0f;
+                a0 += t * float(x[0 * K + xb + j]);
+                a1 += t * float(x[1 * K + xb + j]);
+                a2 += t * float(x[2 * K + xb + j]);
+                a3 += t * float(x[3 * K + xb + j]);
+                a4 += t * float(x[4 * K + xb + j]);
+            }
+        }
+        float s = float(sc[(row_tile * NumGroups + g) * 2 + row_lane]);
+        acc0 += s * a0;
+        acc1 += s * a1;
+        acc2 += s * a2;
+        acc3 += s * a3;
+        acc4 += s * a4;
+    }
+}
+
+if (n < NRows) {
+    int base = int(chunk) * 5 * NRows;
+    partial[base + 0 * NRows + n] = acc0;
+    partial[base + 1 * NRows + n] = acc1;
+    partial[base + 2 * NRows + n] = acc2;
+    partial[base + 3 * NRows + n] = acc3;
+    partial[base + 4 * NRows + n] = acc4;
+}
+";
+
+const Q2_ROW2_M5_TERNARY_SPLITK_REDUCE_SOURCE: &str = r"
+constexpr int WG = 256;
+constexpr int ROWS_PER_TG = 256;
+
+uint tid = thread_index_in_threadgroup;
+uint tgx = threadgroup_position_in_grid.x;
+int n = int(tgx) * ROWS_PER_TG + int(tid);
+
+if (n < NRows) {
+    float acc0 = 0.0f; float acc1 = 0.0f; float acc2 = 0.0f; float acc3 = 0.0f; float acc4 = 0.0f;
+    for (int c = 0; c < Chunks; ++c) {
+        int base = c * 5 * NRows;
+        acc0 += partial[base + 0 * NRows + n];
+        acc1 += partial[base + 1 * NRows + n];
+        acc2 += partial[base + 2 * NRows + n];
+        acc3 += partial[base + 3 * NRows + n];
+        acc4 += partial[base + 4 * NRows + n];
+    }
+    y[0 * NRows + n] = OutT(acc0);
+    y[1 * NRows + n] = OutT(acc1);
+    y[2 * NRows + n] = OutT(acc2);
+    y[3 * NRows + n] = OutT(acc3);
+    y[4 * NRows + n] = OutT(acc4);
+}
+";
+
 #[allow(unsafe_code)]
 fn create_q2_row2_m5_ternary_direct_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let in_vec = cstr_vec(&[c"w", c"sc", c"x"]);
@@ -3078,6 +3172,133 @@ fn configure_q2_row2_m5_fused_gate_up_kernel(
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, WG, 1, 1);
 
         let y_shape = [5, n_rows * 2];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            out_dtype,
+        );
+        config
+    }
+}
+
+#[allow(unsafe_code)]
+fn create_q2_row2_m5_ternary_splitk_partial_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"x"]);
+    let out_vec = cstr_vec(&[c"partial"]);
+    let source = CString::new(Q2_ROW2_M5_TERNARY_SPLITK_PARTIAL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_row2_m5_ternary_splitk_partial_v1".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn create_q2_row2_m5_ternary_splitk_reduce_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"partial"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(Q2_ROW2_M5_TERNARY_SPLITK_REDUCE_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_row2_m5_ternary_splitk_reduce_v1".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_q2_row2_m5_splitk_partial_kernel(
+    n_rows: i32,
+    k_dim: i32,
+    group_size: i32,
+    chunks: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    const WG: i32 = 256;
+    const ROWS_PER_TG: i32 = 256;
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"GroupSize".as_ptr(),
+            group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NumGroups".as_ptr(),
+            k_dim / group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NRows".as_ptr(),
+            n_rows,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Chunks".as_ptr(),
+            chunks,
+        );
+        let n_tgs = (n_rows + ROWS_PER_TG - 1) / ROWS_PER_TG;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tgs * ROWS_PER_TG, chunks, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, WG, 1, 1);
+        let partial_shape = [chunks, 5, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            partial_shape.as_ptr(),
+            partial_shape.len(),
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
+        config
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_q2_row2_m5_splitk_reduce_kernel(
+    out_dtype: mlx_sys::mlx_dtype,
+    n_rows: i32,
+    chunks: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    const WG: i32 = 256;
+    const ROWS_PER_TG: i32 = 256;
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OutT".as_ptr(),
+            out_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NRows".as_ptr(),
+            n_rows,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Chunks".as_ptr(),
+            chunks,
+        );
+        let n_tgs = (n_rows + ROWS_PER_TG - 1) / ROWS_PER_TG;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_tgs * ROWS_PER_TG, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, WG, 1, 1);
+        let y_shape = [5, n_rows];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
             y_shape.as_ptr(),
@@ -3221,6 +3442,110 @@ pub fn bonsai_q2_row2_m5_ternary_fused_gate_up(
         mlx_sys::mlx_fast_metal_kernel_config_free(config);
         mlx_sys::mlx_vector_array_free(inputs_vec);
         mlx_sys::mlx_vector_array_free(outputs_vec);
+    }
+    result
+}
+
+#[allow(dead_code, unsafe_code)]
+pub fn bonsai_q2_row2_m5_ternary_splitk(
+    x: &Array,
+    packed: BonsaiQ2Row2Ref<'_>,
+    chunks: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    if chunks < 2 || chunks > 8 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_row2_m5_ternary_splitk: expected chunks in 2..=8, got {chunks}"
+        )));
+    }
+    let x_shape = x.shape();
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    if m_rows != 5 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_row2_m5_ternary_splitk: expected M=5 verifier tile, got M={m_rows}"
+        )));
+    }
+
+    let x_flat = x.reshape(&[5, packed.k_dim])?;
+    let w_flat = packed.weights.reshape(&[-1])?;
+    let s_flat = packed.scales.flatten(None, None)?;
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    let partial_cached = Q2_ROW2_M5_TERNARY_SPLITK_PARTIAL_KERNEL
+        .get_or_init(|| CachedMetalKernel(create_q2_row2_m5_ternary_splitk_partial_kernel()));
+    let partial_config =
+        configure_q2_row2_m5_splitk_partial_kernel(packed.n_rows, packed.k_dim, 128, chunks);
+    let partial_inputs = [w_flat.as_ptr(), s_flat.as_ptr(), x_flat.as_ptr()];
+    let partial_inputs_vec = unsafe {
+        mlx_sys::mlx_vector_array_new_data(partial_inputs.as_ptr(), partial_inputs.len())
+    };
+    let mut partial_outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let partial_status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut partial_outputs_vec,
+            partial_cached.0,
+            partial_inputs_vec,
+            partial_config,
+            stream.as_ptr(),
+        )
+    };
+    let partial = if partial_status != 0 {
+        let err = take_last_error();
+        unsafe {
+            mlx_sys::mlx_fast_metal_kernel_config_free(partial_config);
+            mlx_sys::mlx_vector_array_free(partial_inputs_vec);
+            mlx_sys::mlx_vector_array_free(partial_outputs_vec);
+        }
+        return Err(Exception::custom(format!(
+            "bonsai_q2_row2_m5_ternary_splitk partial failed: {err}"
+        )));
+    } else {
+        let mut partial_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut partial_ptr, partial_outputs_vec, 0) };
+        unsafe { Array::from_ptr(partial_ptr) }
+    };
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(partial_config);
+        mlx_sys::mlx_vector_array_free(partial_inputs_vec);
+        mlx_sys::mlx_vector_array_free(partial_outputs_vec);
+    }
+
+    let reduce_cached = Q2_ROW2_M5_TERNARY_SPLITK_REDUCE_KERNEL
+        .get_or_init(|| CachedMetalKernel(create_q2_row2_m5_ternary_splitk_reduce_kernel()));
+    let reduce_config = configure_q2_row2_m5_splitk_reduce_kernel(out_dtype, packed.n_rows, chunks);
+    let reduce_inputs = [partial.as_ptr()];
+    let reduce_inputs_vec = unsafe {
+        mlx_sys::mlx_vector_array_new_data(reduce_inputs.as_ptr(), reduce_inputs.len())
+    };
+    let mut reduce_outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let reduce_status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut reduce_outputs_vec,
+            reduce_cached.0,
+            reduce_inputs_vec,
+            reduce_config,
+            stream.as_ptr(),
+        )
+    };
+    let result = if reduce_status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q2_row2_m5_ternary_splitk reduce failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, reduce_outputs_vec, 0) };
+        Ok(unsafe { Array::from_ptr(y_ptr) })
+    };
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(reduce_config);
+        mlx_sys::mlx_vector_array_free(reduce_inputs_vec);
+        mlx_sys::mlx_vector_array_free(reduce_outputs_vec);
     }
     result
 }
