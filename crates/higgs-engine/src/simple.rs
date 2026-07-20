@@ -2062,25 +2062,27 @@ impl SimpleEngine {
             None
         };
 
-        let mut prefix_cache = disk_cache_config.map_or_else(
-            || DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE),
-            |config| match DiskPrefixCache::new(
-                DEFAULT_PREFIX_CACHE_SIZE,
-                DEFAULT_BLOCK_SIZE,
-                config,
-                num_kv_heads,
-                head_dim,
-            ) {
-                Ok(cache) => cache,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Failed to initialize disk prefix cache; falling back to memory-only cache"
-                    );
-                    DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE)
-                }
-            },
-        );
+        let mut prefix_cache = disk_cache_config
+            .map_or_else(
+                || DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE),
+                |config| match DiskPrefixCache::new(
+                    DEFAULT_PREFIX_CACHE_SIZE,
+                    DEFAULT_BLOCK_SIZE,
+                    config,
+                    num_kv_heads,
+                    head_dim,
+                ) {
+                    Ok(cache) => cache,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Failed to initialize disk prefix cache; falling back to memory-only cache"
+                        );
+                        DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE)
+                    }
+                },
+            )
+            .with_max_bytes(kv_cache_config.kv_cache_bytes);
         prefix_cache.set_paired_idle_ttl(
             (kv_cache_config.retained_idle_secs > 0)
                 .then(|| std::time::Duration::from_secs(kv_cache_config.retained_idle_secs)),
@@ -4961,6 +4963,39 @@ impl SimpleEngine {
         decode(&filtered)
     }
 
+    /// Split a completed token sequence into `(content, reasoning)` at the
+    /// `</think>` boundary, excluding the boundary token from both ranges.
+    ///
+    /// This is the token-level analogue of the streaming reasoning tracker and
+    /// the source of truth for the buffered (non-streaming) path: it guarantees
+    /// the `</think>` delimiter never surfaces in either field, unlike the
+    /// string-based `reasoning_parser::parse_reasoning` which can leak it when
+    /// the model (or the thinking-budget fallback) emits the boundary token.
+    fn split_thinking_output(
+        &self,
+        tokens: &[u32],
+        enable_thinking: bool,
+        think_close_token: Option<u32>,
+        think_close_index: Option<usize>,
+    ) -> Result<(String, Option<String>), EngineError> {
+        Ok(match think_close_index {
+            Some(idx) => (
+                self.decode_tokens(&tokens[idx + 1..])?,
+                Some(self.decode_tokens(&tokens[..idx])?),
+            ),
+            None => {
+                if enable_thinking && think_close_token.is_some() {
+                    // Thinking enabled, but the model never closed its think
+                    // block within this turn: the whole sequence is reasoning
+                    // and there is no visible answer yet.
+                    (String::new(), Some(self.decode_tokens(tokens)?))
+                } else {
+                    (self.decode_tokens(tokens)?, None)
+                }
+            }
+        })
+    }
+
     /// The model's hidden dimension (embedding output size).
     pub fn hidden_size(&self) -> i32 {
         let model = self
@@ -5162,6 +5197,7 @@ impl SimpleEngine {
                 prompt_tokens: Self::prompt_len(prompt_tokens)?,
                 completion_tokens: 0,
                 token_logprobs: None,
+                reasoning_content: None,
             });
         }
 
@@ -5410,6 +5446,7 @@ impl SimpleEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
+                reasoning_content: None,
             });
         }
         if has_stop_sequences {
@@ -5428,6 +5465,7 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: 1,
                     token_logprobs: all_logprobs,
+                    reasoning_content: None,
                 });
             }
         }
@@ -5445,6 +5483,7 @@ impl SimpleEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
+                reasoning_content: None,
             });
         }
 
@@ -5539,6 +5578,11 @@ impl SimpleEngine {
         let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
         let mut seen_think_close =
             think_close_token.is_some_and(|close_id| first_token_id == close_id);
+        // Index of the `</think>` boundary token in `tokens` once seen, so the
+        // reasoning/answer split can be done at the token level (the boundary
+        // token is then excluded from both decoded ranges). `None` means the
+        // model never closed its think block within this turn.
+        let mut think_close_index: Option<usize> = None;
 
         loop {
             let t0 = std::time::Instant::now();
@@ -5601,11 +5645,13 @@ impl SimpleEngine {
             if let Some(close_id) = think_close_token {
                 if !seen_think_close {
                     if token_id == close_id {
+                        think_close_index = Some(tokens.len());
                         seen_think_close = true;
                     } else {
                         thinking_tokens += 1;
                         if thinking_tokens >= thinking_budget {
                             token_id = close_id;
+                            think_close_index = Some(tokens.len());
                             seen_think_close = true;
                             tracing::info!(
                                 budget = thinking_budget,
@@ -5657,12 +5703,19 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
+                let (split_text, reasoning_content) = self.split_thinking_output(
+                    &tokens,
+                    enable_thinking,
+                    think_close_token,
+                    think_close_index,
+                )?;
                 return Ok(GenerationOutput {
-                    text: self.decode_tokens(&tokens)?,
+                    text: split_text,
                     finish_reason: "stop".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    reasoning_content,
                 });
             }
 
@@ -5675,12 +5728,19 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
+                let (split_text, reasoning_content) = self.split_thinking_output(
+                    &tokens,
+                    enable_thinking,
+                    think_close_token,
+                    think_close_index,
+                )?;
                 return Ok(GenerationOutput {
-                    text: self.decode_tokens(&tokens)?,
+                    text: split_text,
                     finish_reason: "stop".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    reasoning_content,
                 });
             }
 
@@ -5695,12 +5755,19 @@ impl SimpleEngine {
                         total_item_ns,
                         total_other_ns,
                     );
+                    let (_, reasoning_content) = self.split_thinking_output(
+                        &tokens,
+                        enable_thinking,
+                        think_close_token,
+                        think_close_index,
+                    )?;
                     return Ok(GenerationOutput {
                         text: truncated,
                         finish_reason: "stop".to_owned(),
                         prompt_tokens: prompt_len,
                         completion_tokens: completion_len,
                         token_logprobs: all_logprobs,
+                        reasoning_content,
                     });
                 }
             }
@@ -5714,12 +5781,19 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
+                let (split_text, reasoning_content) = self.split_thinking_output(
+                    &tokens,
+                    enable_thinking,
+                    think_close_token,
+                    think_close_index,
+                )?;
                 return Ok(GenerationOutput {
-                    text: self.decode_tokens(&tokens)?,
+                    text: split_text,
                     finish_reason: "length".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    reasoning_content,
                 });
             }
 
@@ -7166,6 +7240,15 @@ impl SimpleEngine {
                     let noise_embedding = model
                         .embed_token_ids(&block_ids)
                         .map_err(EngineError::Mlx)?;
+                    let dspark_phase_trace =
+                        std::env::var("HIGGS_DSPARK_PHASE_TRACE").is_ok_and(|v| v == "1");
+                    let mut dspark_phase_ckpt = if dspark_phase_trace {
+                        higgs_models::mlx_exec::eval([&noise_embedding])
+                            .map_err(EngineError::Mlx)?;
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let draft_transaction = if let Some(frontier) = dspark_frontier.as_ref() {
                         frontier.validate_live_draft(&draft_cache)?;
                         drafter.stage_forward(&noise_embedding, &frontier.taps, &draft_cache)
@@ -7173,6 +7256,19 @@ impl SimpleEngine {
                         drafter.stage_forward(&noise_embedding, &current_taps, &draft_cache)
                     }
                     .map_err(EngineError::Mlx)?;
+                    let mut dspark_stage_ms = 0.0;
+                    let mut dspark_propose_ms = 0.0;
+                    let mut dspark_verify_ms = 0.0;
+                    let mut dspark_resolve_ms = 0.0;
+                    let mut dspark_commit_ms = 0.0;
+                    let mut dspark_target_commit_ms = 0.0;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        higgs_models::mlx_exec::eval([draft_transaction.hidden()])
+                            .map_err(EngineError::Mlx)?;
+                        let now = std::time::Instant::now();
+                        dspark_stage_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        *ckpt = now;
+                    }
                     let staged_position = draft_transaction.position().map_err(EngineError::Mlx)?;
                     if staged_position != start {
                         return Err(EngineError::Generation(format!(
@@ -7190,6 +7286,12 @@ impl SimpleEngine {
                         round_draft_cap,
                         dflash.dspark_target_head,
                     )?;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        proposal.host_tokens()?;
+                        let now = std::time::Instant::now();
+                        dspark_propose_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        *ckpt = now;
+                    }
                     let dspark_anchor_ticket = dspark_ledger
                         .as_mut()
                         .map(|ledger| {
@@ -7209,7 +7311,10 @@ impl SimpleEngine {
                     // skipped attention layer from an advanced layer with no
                     // GDN tape, so partial commit could trim retained history.
                     let early_exit = None;
-                    let row_schedule = if is_dspark {
+                    let dspark_native_verify = is_dspark
+                        && std::env::var("HIGGS_DSPARK_NATIVE_VERIFY")
+                            .is_ok_and(|v| v == "1");
+                    let row_schedule = if is_dspark && !dspark_native_verify {
                         higgs_models::qwen3_next::DFlashRowSchedule::CanonicalS1
                     } else {
                         higgs_models::qwen3_next::DFlashRowSchedule::NativeBatch
@@ -7224,14 +7329,41 @@ impl SimpleEngine {
                             row_schedule,
                         )
                         .map_err(EngineError::Mlx)?;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        higgs_models::mlx_exec::eval([&verify_logits])
+                            .map_err(EngineError::Mlx)?;
+                        let now = std::time::Instant::now();
+                        dspark_verify_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        *ckpt = now;
+                    }
                     // Keep draft tokens device-resident until the target verify
                     // graph reaches its single logits barrier. Pulling them
                     // earlier serializes proposal and verification and can add
                     // a full GPU/host synchronization to every round.
                     let (verify_flat, draft_u32) = dflash_resolve_target_then_draft(
-                        || crate::mtp::verify_targets(&verify_logits, Some(params), Some(&tokens)),
+                        || {
+                            if verify_logits.ndim() == 2
+                                && std::env::var("HIGGS_DSPARK_Q2_HEAD_ARGMAX")
+                                    .is_ok_and(|v| v == "1")
+                            {
+                                higgs_models::mlx_exec::eval([&verify_logits])
+                                    .map_err(EngineError::Mlx)?;
+                                Ok(verify_logits.as_slice::<u32>().to_vec())
+                            } else {
+                                crate::mtp::verify_targets(
+                                    &verify_logits,
+                                    Some(params),
+                                    Some(&tokens),
+                                )
+                            }
+                        },
                         || proposal.host_tokens(),
                     )?;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        let now = std::time::Instant::now();
+                        dspark_resolve_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        *ckpt = now;
+                    }
                     let mut accepted = accept_prefix(&draft_u32, &verify_flat);
                     let draft_matches = accepted.len().saturating_sub(1);
                     // The cache convention retains one verify-input token
@@ -7266,6 +7398,11 @@ impl SimpleEngine {
                     draft_transaction
                         .commit(&mut draft_cache)
                         .map_err(EngineError::Mlx)?;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        let now = std::time::Instant::now();
+                        dspark_commit_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        *ckpt = now;
+                    }
                     if is_dspark && draft_cache.position() != start {
                         return Err(EngineError::Generation(format!(
                             "batched dSpark committed drafter boundary {}, expected {start}",
@@ -7336,6 +7473,11 @@ impl SimpleEngine {
                     // truncated chain needs no rollback.
                     let (accepted, verify_taps) =
                         verify_round.commit_target_state(&model, &mut cache)?;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        let now = std::time::Instant::now();
+                        dspark_target_commit_ms =
+                            now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                    }
                     let kept_taps: Vec<Array> = verify_taps
                         .into_iter()
                         .map(|tap| tap.index((.., ..n_accepted, ..)))
@@ -7393,6 +7535,22 @@ impl SimpleEngine {
                     start = start.checked_add(n_accepted).ok_or_else(|| {
                         EngineError::Generation("DFlash target boundary overflow".to_owned())
                     })?;
+                    if dspark_phase_trace {
+                        tracing::info!(
+                            round = rounds,
+                            accepted = n_accepted,
+                            draft_cap = round_draft_cap,
+                            verify_len,
+                            stage_ms = format!("{dspark_stage_ms:.1}"),
+                            propose_ms = format!("{dspark_propose_ms:.1}"),
+                            verify_ms = format!("{dspark_verify_ms:.1}"),
+                            resolve_ms = format!("{dspark_resolve_ms:.1}"),
+                            draft_commit_ms = format!("{dspark_commit_ms:.1}"),
+                            target_commit_ms = format!("{dspark_target_commit_ms:.1}"),
+                            total_ms = format!("{:.1}", round_t0.elapsed().as_secs_f64() * 1000.0),
+                            "dSpark phase timing"
+                        );
+                    }
                     n_accepted
                 };
 
@@ -7684,6 +7842,7 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: None,
+                    reasoning_content: None,
                 });
             }
 
@@ -7730,6 +7889,7 @@ impl SimpleEngine {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: Self::completion_len(tokens)?,
                                         token_logprobs: None,
+                                        reasoning_content: None,
                                     });
                                 }
 
@@ -7748,6 +7908,7 @@ impl SimpleEngine {
                                             prompt_tokens: prompt_len,
                                             completion_tokens: Self::completion_len(tokens)?,
                                             token_logprobs: None,
+                                            reasoning_content: None,
                                         });
                                     }
                                 }
@@ -7762,6 +7923,7 @@ impl SimpleEngine {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: forced_completion_len,
                                         token_logprobs: None,
+                                        reasoning_content: None,
                                     });
                                 }
                                 break;
@@ -7781,6 +7943,7 @@ impl SimpleEngine {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        reasoning_content: None,
                     });
                 }
             }
@@ -7796,6 +7959,7 @@ impl SimpleEngine {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        reasoning_content: None,
                     });
                 }
             }
@@ -7810,6 +7974,7 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: final_completion_len,
                     token_logprobs: None,
+                    reasoning_content: None,
                 });
             }
 
@@ -7966,6 +8131,7 @@ impl SimpleEngine {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: Self::completion_len(tokens)?,
                                         token_logprobs: None,
+                                        reasoning_content: None,
                                     });
                                 }
 
@@ -7982,6 +8148,7 @@ impl SimpleEngine {
                                             prompt_tokens: prompt_len,
                                             completion_tokens: Self::completion_len(tokens)?,
                                             token_logprobs: None,
+                                            reasoning_content: None,
                                         });
                                     }
                                 }
@@ -7996,6 +8163,7 @@ impl SimpleEngine {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: completion_len,
                                         token_logprobs: None,
+                                        reasoning_content: None,
                                     });
                                 }
 
@@ -8017,6 +8185,7 @@ impl SimpleEngine {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        reasoning_content: None,
                     });
                 }
             }
@@ -8032,6 +8201,7 @@ impl SimpleEngine {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        reasoning_content: None,
                     });
                 }
             }
@@ -8046,6 +8216,7 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: None,
+                    reasoning_content: None,
                 });
             }
 
@@ -9126,9 +9297,84 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
     }
 
     if ids.is_empty() {
-        tracing::warn!("No eos_token_id found in config.json, generation will rely on max_tokens");
+        ids = eos_from_tokenizer_config(model_dir);
+    }
+    if ids.is_empty() {
+        tracing::warn!(
+            "No eos_token_id found in config.json or tokenizer_config.json, generation will rely on max_tokens"
+        );
     }
     ids
+}
+
+/// Harvest EOS token IDs from `tokenizer_config.json` when model configs omit
+/// `eos_token_id`. A model that never signals EOS forces generation to run to
+/// `max_tokens` (a very large default), pegging the GPU indefinitely. We read
+/// the standard `eos_token` field first, then fall back to scanning the added
+/// special tokens for a known end-of-sequence signature.
+///
+/// Returns empty if nothing is found, preserving the caller's warn-and-rely-on
+/// `max_tokens` path. Callers only invoke this when config-derived ids are empty,
+/// so a real `eos_token_id` is never overridden.
+fn eos_from_tokenizer_config(model_dir: &Path) -> Vec<u32> {
+    let Ok(text) = std::fs::read_to_string(model_dir.join("tokenizer_config.json")) else {
+        return vec![];
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return vec![];
+    };
+
+    // Primary: the standard `eos_token` field (string or {"content": ...}),
+    // resolved via the existing decoder lookup.
+    if let Some(content) = eos_token_field_content(&config) {
+        if let Some(id) = special_token_id(model_dir, &content) {
+            return vec![id];
+        }
+    }
+
+    // Fallback: scan added special tokens for an end-of-sequence signature.
+    config
+        .get("added_tokens_decoder")
+        .and_then(serde_json::Value::as_object)
+        .map(|decoder| {
+            decoder
+                .iter()
+                .filter_map(|(id, info)| {
+                    let content = info.get("content").and_then(serde_json::Value::as_str)?;
+                    is_eos_signature(content)
+                        .then(|| id.parse::<u32>().ok())
+                        .flatten()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract the token-content string named by `tokenizer_config.json`'s
+/// `eos_token` field, which may be a bare string or an object with `content`.
+fn eos_token_field_content(config: &serde_json::Value) -> Option<String> {
+    match config.get("eos_token")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(o) => o
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// A special-token content string is an end-of-sequence marker if it carries a
+/// known EOS signature and is not a begin/pad/unknown/mask marker (which would
+/// otherwise be mistaken for a stop).
+fn is_eos_signature(content: &str) -> bool {
+    let c = content.to_ascii_lowercase();
+    (c.contains("end_of_text")
+        || c.contains("eot")
+        || c.contains("end_of_turn")
+        || c.contains("im_end")
+        || c == "</s>"
+        || c.contains("eos"))
+        && !(c.contains("bos") || c.contains("pad") || c.contains("unk") || c.contains("mask"))
 }
 
 /// Parse an `eos_token_id` JSON value (a single number or an array of numbers).
@@ -9312,6 +9558,7 @@ impl DflashSink for DflashBufferedSink {
             prompt_tokens: prompt_len,
             completion_tokens: completion_len,
             token_logprobs: None,
+            reasoning_content: None,
         })
     }
 }
@@ -11527,6 +11774,42 @@ mod tests {
         .unwrap();
         let ids = extract_eos_tokens(dir.path());
         assert_eq!(ids, vec![2], "non-gemma must not add end_of_turn: {ids:?}");
+    }
+
+    /// When config.json omits `eos_token_id`, harvest the EOS from
+    /// `tokenizer_config.json`'s standard `eos_token` field. Without this,
+    /// generation can only stop at `max_tokens`, pegging the GPU indefinitely.
+    #[test]
+    fn extract_eos_tokens_harvests_eos_token_field() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type":"llama"}"#); // no eos_token_id
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"eos_token":"<|end_of_text|>","added_tokens_decoder":{"2":{"content":"<|end_of_text|>"}}}"#,
+        )
+        .unwrap();
+        let ids = extract_eos_tokens(dir.path());
+        assert!(
+            ids.contains(&2),
+            "harvested eos_token from tokenizer_config: {ids:?}"
+        );
+    }
+
+    /// When there is no explicit `eos_token` field, fall back to scanning the
+    /// added special tokens for a known end-of-sequence signature, and never
+    /// mistake a begin-of-sequence token for EOS.
+    #[test]
+    fn extract_eos_tokens_scans_added_tokens_for_eos_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type":"llama"}"#); // no eos_token_id
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"2":{"content":"<|end_of_text|>"},"1":{"content":"<s>"}}}"#,
+        )
+        .unwrap();
+        let ids = extract_eos_tokens(dir.path());
+        assert!(ids.contains(&2), "scanned EOS signature added: {ids:?}");
+        assert!(!ids.contains(&1), "BOS must not be treated as EOS: {ids:?}");
     }
 
     // --- detect_thinking_support tests ---

@@ -482,9 +482,11 @@ pub(crate) fn quantized_forward(
 
 /// Affine 2-bit matrix multiply using the MLX-qdot simdgroup kernel.
 ///
-/// Microbench: 1.15-1.51x faster than MLX stock at M=1 on Bonsai-27B-Q2
-/// shapes. Routes M=1 through `bonsai_q2_qmv_simd`, M<=8 through z-batched
-/// dispatch, wider inputs through MLX stock (no custom wide QMM yet).
+/// Affine 2-bit matrix multiply defaults to MLX stock for full-model AR.
+///
+/// The custom simdgroup Q2 kernel can win isolated microbench shapes, but the
+/// full Ternary-Bonsai-27B decode path is faster with MLX stock by default.
+/// Keep the custom route opt-in for future sweeps.
 fn affine_q2_simd_forward(
     x: &Array,
     weight: &Array,
@@ -497,10 +499,17 @@ fn affine_q2_simd_forward(
         .iter()
         .take(x_shape.len().saturating_sub(1))
         .product();
-    // Use the simdgroup kernel for M=1 (AR decode) where it's 1.15-1.51x
-    // faster than MLX stock. For M>1, MLX's quantized_matmul does proper
-    // M-dimension weight sharing that our z-batched dispatch can't match.
-    if row_count == 1 {
+    let use_simd = std::env::var("HIGGS_BONSAI_Q2_SIMD")
+        .ok()
+        .is_some_and(|value| value == "1")
+        && if let [n_rows, k_packed] = *weight.shape() {
+        let k_dim = k_packed.saturating_mul(16);
+        row_count == 1 && n_rows == 17408 && k_dim == 5120
+    } else {
+        false
+    };
+
+    if use_simd {
         crate::metal_kernel::bonsai_q2_qmv_simd(x, weight, scales, biases, group_size)
     } else {
         ops::quantized_matmul(x, weight, scales, biases, true, group_size, 2)
@@ -670,6 +679,7 @@ pub(crate) struct QLinear {
     /// path; `MxFp4` routes through the FFI bypass in [`crate::quant_mode`].
     pub(crate) mode: crate::quant_mode::QuantMode,
     weight_layout: QLinearWeightLayout,
+    q2_row2: OnceLock<crate::metal_kernel::BonsaiQ2Row2>,
 }
 
 impl QLinear {
@@ -723,11 +733,43 @@ impl QLinear {
             bits,
             mode,
             weight_layout: QLinearWeightLayout::Canonical,
+            q2_row2: OnceLock::new(),
         })
     }
 
     fn reset_weight_layout(&mut self) {
         self.weight_layout = QLinearWeightLayout::Canonical;
+        self.q2_row2 = OnceLock::new();
+    }
+
+    fn q2_row2_m5_ternary_forward(&self, x: &Array) -> Result<Option<Array>, Exception> {
+        if !std::env::var("HIGGS_DSPARK_Q2_ROW2_MLP").is_ok_and(|v| v == "1")
+            || self.mode != crate::quant_mode::QuantMode::Affine
+            || self.bits != 2
+            || self.group_size != 128
+            || !matches!(self.weight_layout, QLinearWeightLayout::Canonical)
+        {
+            return Ok(None);
+        }
+        let x_shape = x.shape();
+        let m_rows: i32 = x_shape
+            .iter()
+            .take(x_shape.len().saturating_sub(1))
+            .product();
+        if m_rows != 5 {
+            return Ok(None);
+        }
+        if self.q2_row2.get().is_none() {
+            let packed =
+                crate::metal_kernel::BonsaiQ2Row2::from_row_major(&self.weight, &self.scales)?;
+            let _ = self.q2_row2.set(packed);
+        }
+        let packed = self
+            .q2_row2
+            .get()
+            .ok_or_else(|| Exception::custom("Q2 row2 cache was not initialized"))?
+            .as_ref();
+        crate::metal_kernel::bonsai_q2_row2_m5_ternary_direct(x, packed).map(Some)
     }
 
     fn bonsai_row4(&self) -> Result<Option<crate::metal_kernel::BonsaiQ1Row4Ref<'_>>, Exception> {
@@ -862,6 +904,9 @@ impl QLinear {
         // Fast path: batched quantized GEMM for verify (T>1, T<=16).
         // Fuses T matmuls into one Metal kernel dispatch — eliminates
         // pipeline bubbles. Gated by env var until validated.
+        if let Some(y) = self.q2_row2_m5_ternary_forward(x)? {
+            return Ok(y);
+        }
         if let Some(t) = self.qgemm_verify_shape(x) {
             let fast = if self.mode == crate::quant_mode::QuantMode::MxFp4 {
                 qgemm_mxfp4_4bit(x, &self.weight, &self.scales, self.group_size, t)
@@ -1281,12 +1326,12 @@ fn compiled_gdn_decode_enabled() -> bool {
 
 fn async_layer_state_eval_enabled() -> bool {
     *ASYNC_LAYER_STATE_EVAL_ENABLED.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("HIGGS_ASYNC_LAYER_STATE_EVAL")
                 .ok()
                 .map(|s| s.trim().to_ascii_lowercase())
                 .as_deref(),
-            Some("1" | "true" | "on" | "yes")
+            Some("0" | "false" | "off" | "no")
         )
     })
 }
@@ -9136,7 +9181,17 @@ impl Qwen3NextCausalLM {
             detail.final_norm_ms += now.duration_since(*ckpt).as_secs_f64() * 1000.0;
             *ckpt = now;
         }
-        let logits = self.project_logits(&normed)?;
+        let logits = if std::env::var("HIGGS_DSPARK_Q2_HEAD_ARGMAX").is_ok_and(|v| v == "1")
+            && T == 5
+            && !layer_detail_timing
+        {
+            match self.project_q2_m5_argmax_ids(&normed)? {
+                Some(ids) => ids,
+                None => self.project_logits(&normed)?,
+            }
+        } else {
+            self.project_logits(&normed)?
+        };
         if let Some(ckpt) = tail_detail_ckpt.as_mut() {
             mlx_rs::transforms::eval([&logits])?;
             let now = std::time::Instant::now();
@@ -9503,6 +9558,46 @@ impl Qwen3NextCausalLM {
     /// Input: `[B, T, hidden_size]`. Returns: `[B, T, vocab_size]`.
     pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
         self.project_logits(hidden)
+    }
+
+    fn project_q2_m5_argmax_ids(&self, hidden: &Array) -> Result<Option<Array>, Exception> {
+        let Some(head) = self.lm_head.as_ref() else {
+            return Ok(None);
+        };
+        if head.mode != crate::quant_mode::QuantMode::Affine
+            || head.bits != 2
+            || head.group_size != 128
+            || !matches!(hidden.shape(), [1, 5, _])
+        {
+            return Ok(None);
+        }
+        let (maxv, maxid) = crate::metal_kernel::bonsai_q2_m5_argmax_candidates(
+            hidden,
+            &head.weight,
+            &head.scales,
+            &head.biases,
+            head.group_size,
+        )?;
+        crate::mlx_exec::eval([&maxv, &maxid].into_iter())?;
+        let values = maxv.as_slice::<f32>();
+        let ids = maxid.as_slice::<f32>();
+        let blocks = values.len() / 5;
+        let mut out = Vec::with_capacity(5);
+        for row in 0..5 {
+            let mut best_v = f32::NEG_INFINITY;
+            let mut best_id = 0u32;
+            for block in 0..blocks {
+                let idx = row * blocks + block;
+                let v = values[idx];
+                let id = ids[idx] as u32;
+                if v > best_v || (v == best_v && id < best_id) {
+                    best_v = v;
+                    best_id = id;
+                }
+            }
+            out.push(best_id);
+        }
+        Ok(Some(Array::from_slice(&out, &[1, 5])))
     }
 
     fn project_logits(&self, hidden: &Array) -> Result<Array, Exception> {
@@ -14985,7 +15080,9 @@ mod tests {
 
     #[test]
     fn test_qwen3_5_q2_target_passes_dflash_block_domain() {
-        deterministic_hybrid_q2_model().validate_dflash_block_domain(5).unwrap();
+        deterministic_hybrid_q2_model()
+            .validate_dflash_block_domain(5)
+            .unwrap();
     }
 
     #[test]
