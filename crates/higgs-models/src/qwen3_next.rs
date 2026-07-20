@@ -9574,11 +9574,10 @@ impl Qwen3NextCausalLM {
         {
             return Ok(None);
         }
-        let (maxv, maxid) = crate::metal_kernel::bonsai_q2_m5_argmax_candidates(
+        let (maxv, maxid) = crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates(
             hidden,
             &head.weight,
             &head.scales,
-            &head.biases,
             head.group_size,
         )?;
         crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid).map(Some)

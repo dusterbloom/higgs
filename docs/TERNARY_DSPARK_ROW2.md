@@ -104,6 +104,23 @@ row2 MLP + GPU head reduce:         18.55 tok/s
 row2 MLP + GPU head + split-K down: 19.29 tok/s
 ```
 
+The next head probe specialized the candidate kernel to the checkpoint's strict ternary affine structure (`bias = -scale`, `weight = scale * (q - 1)`). The generic synthetic benchmark initially failed parity with arbitrary affine biases, then matched once the benchmark used strict ternary biases:
+
+```text
+MLX qmm + argmax:            15494.7 us
+affine candidate + GPU reduce: 11218.7 us
+ternary candidate + GPU reduce: 8369.6 us
+ternary vs affine candidate: 1.340x
+ternary vs MLX qmm+argmax:  1.851x
+argmax parity:              matched under strict ternary affine
+```
+
+Runtime with strict ternary head:
+
+```text
+row2 MLP + GPU head + split-K down + ternary head: 19.68 tok/s
+```
+
 Server telemetry stayed behavior-identical:
 
 ```text
@@ -111,6 +128,7 @@ accept_len: 4.23
 spec_rounds: 30
 server decode after warmup before split-K: ~16.0 tok/s
 server decode after warmup with split-K:   ~16.5-16.8 tok/s
+server decode with ternary head:           ~17.0 tok/s
 ```
 
 The head path is available behind:
@@ -227,7 +245,7 @@ Long Fibonacci, 128 tokens:
 
 ```text
 previous long Fibonacci: 13.87 tok/s
-row2 MLP + head argmax:  19.29 tok/s
+row2 MLP + head argmax:  19.68 tok/s
 ```
 
 Server telemetry:
@@ -236,10 +254,10 @@ Server telemetry:
 accept_len: 4.23
 spec_rounds: 30
 server decode before: ~12.0-12.1 tok/s
-server decode after:  ~16.5-16.8 tok/s
+server decode after:  ~17.0 tok/s
 ```
 
-This is about `1.43x` versus the AR Fibonacci baseline, still short of the `1.5x` target but now within roughly another five percent.
+This is about `1.46x` versus the AR Fibonacci baseline, still short of the `1.5x` target but now within roughly another three percent.
 
 ## Runtime controls
 
@@ -267,8 +285,8 @@ The remaining gap is likely in `down_proj`, `lm_head`, and verifier overhead out
 
 Recommended next moves:
 
-1. Explore a direct row2/radix-3 head argmax kernel to recover more of the remaining `lm_head` cost.
-2. Probe split-K variants for the head candidate kernel, since the head has `N=248320`, `K=5120`, and still dominates isolated head time.
-3. Explore radix-3 prepack only after proving it beats direct row2 on gate/up, down, or head in isolation.
+1. Probe split-K variants for the strict ternary head candidate kernel, since the head has `N=248320`, `K=5120`, and still dominates isolated head time.
+2. Explore radix-3 prepack only after proving it beats direct ternary on gate/up, down, or head in isolation.
+3. Look for verifier scheduling overhead outside target forward now that arithmetic-only wins are smaller.
 4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
 5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.

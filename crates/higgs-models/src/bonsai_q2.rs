@@ -1202,7 +1202,8 @@ mod tests {
         let out_f = 248320usize;
         let in_f = 5120usize;
         let p = make_packed_q2(out_f, in_f, 0x6865_6164);
-        let (w, s, b) = upload_to_mlx(&p);
+        let (w, s, _b) = upload_to_mlx(&p);
+        let b = s.negative().unwrap();
         let x_f32: Vec<f32> = (0..(5 * in_f))
             .map(|i| ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / 16777216.0 - 0.5)
             .collect();
@@ -1217,6 +1218,13 @@ mod tests {
                 crate::metal_kernel::bonsai_q2_m5_argmax_candidates(&x, &w, &s, &b, 128)
                     .unwrap();
             crate::mlx_exec::eval([&maxv, &maxid].into_iter()).unwrap();
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
+                .unwrap()
+                .eval()
+                .unwrap();
+            let (maxv, maxid) =
+                crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates(&x, &w, &s, 128)
+                    .unwrap();
             crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
                 .unwrap()
                 .eval()
@@ -1254,6 +1262,13 @@ mod tests {
         gpu_ids_arr.eval().unwrap();
         let gpu_ids: Vec<u32> = gpu_ids_arr.as_slice::<u32>().to_vec();
         eprintln!("Q2_M5_HEAD_ARGMAX_GPU_REDUCE gpu={gpu_ids:?}");
+        let (tmaxv, tmaxid) =
+            crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates(&x, &w, &s, 128).unwrap();
+        let ternary_gpu_ids_arr =
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&tmaxv, &tmaxid).unwrap();
+        ternary_gpu_ids_arr.eval().unwrap();
+        let ternary_gpu_ids: Vec<u32> = ternary_gpu_ids_arr.as_slice::<u32>().to_vec();
+        eprintln!("Q2_M5_HEAD_ARGMAX_TERNARY_GPU_REDUCE gpu={ternary_gpu_ids:?}");
 
         let n_iters = 10;
         let t0 = std::time::Instant::now();
@@ -1303,11 +1318,25 @@ mod tests {
         }
         let gpu_reduce_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
 
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            let (maxv, maxid) =
+                crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates(&x, &w, &s, 128)
+                    .unwrap();
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
+                .unwrap()
+                .eval()
+                .unwrap();
+        }
+        let ternary_gpu_reduce_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
         eprintln!(
-            "Q2_M5_HEAD_ARGMAX lm_head ({out_f}x{in_f}) M=5: mlx_qmm_argmax={mlx_argmax_us:.1}us candidate_cpu_reduce={candidate_us:.1}us candidate_gpu_reduce={gpu_reduce_us:.1}us cpu_speedup={:.3}x gpu_speedup={:.3}x gpu_vs_cpu={:.3}x",
+            "Q2_M5_HEAD_ARGMAX lm_head ({out_f}x{in_f}) M=5: mlx_qmm_argmax={mlx_argmax_us:.1}us candidate_cpu_reduce={candidate_us:.1}us candidate_gpu_reduce={gpu_reduce_us:.1}us ternary_gpu_reduce={ternary_gpu_reduce_us:.1}us cpu_speedup={:.3}x gpu_speedup={:.3}x ternary_speedup={:.3}x gpu_vs_cpu={:.3}x ternary_vs_affine_gpu={:.3}x",
             mlx_argmax_us / candidate_us,
             mlx_argmax_us / gpu_reduce_us,
-            candidate_us / gpu_reduce_us
+            mlx_argmax_us / ternary_gpu_reduce_us,
+            candidate_us / gpu_reduce_us,
+            gpu_reduce_us / ternary_gpu_reduce_us
         );
     }
 }
