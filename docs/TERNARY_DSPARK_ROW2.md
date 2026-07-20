@@ -282,6 +282,19 @@ target-head proposal:        19.61 tok/s
 
 Conclusion: `HIGGS_DSPARK_TARGET_HEAD=1` reduces proposal timing in traces, but it is not a net throughput win on the apples-to-apples run. The next useful work should target the dSpark proposal implementation itself, especially the sequential Markov resampler and sidecar Q4 output path.
 
+Proposal-detail tracing (`HIGGS_DSPARK_PROPOSE_TRACE=1`) then split the sidecar proposal:
+
+```text
+steady sidecar output projection: ~16-17 ms
+steady Markov step 0:             ~1.1 ms
+steady Markov step 1:             ~1.1 ms
+steady Markov step 2:             ~1.1 ms
+steady Markov step 3:             ~1.1 ms
+steady concat:                    ~0.1-0.2 ms
+```
+
+Conclusion: the sidecar Q4 output projection is the dominant proposal cost. A fused `base logits + Markov bias -> argmax` kernel can only attack roughly `4-5 ms` per round; the larger lever is the sidecar output head projection itself.
+
 Runtime result with:
 
 ```bash
@@ -333,8 +346,8 @@ The remaining gap is likely in the dSpark drafter proposal/stage path and smalle
 
 Recommended next moves:
 
-1. Probe a fused dSpark proposal kernel for `base logits + Markov low-rank bias -> argmax`, avoiding four separate full-vocab add/argmax passes.
+1. Probe a faster sidecar Q4 output head path for `[1,4,5120] -> [1,4,vocab]`, ideally argmax-oriented so it avoids materializing all logits if Markov bias can be folded later.
 2. Profile `stage_forward` inside the six-layer dSpark trunk to find whether attention, MLP, or context-tile append dominates the steady ~13 ms.
-3. Explore radix-3 prepack only after proving it beats direct ternary on gate/up, down, or head in isolation.
+3. Keep fused Markov `base logits + low-rank bias -> argmax` as a secondary probe; it can save at most the measured ~4-5 ms per round unless paired with output-head changes.
 4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
 5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.
