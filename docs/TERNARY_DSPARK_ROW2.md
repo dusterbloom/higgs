@@ -368,6 +368,7 @@ Recommended next moves:
 3. If the output-head path stalls, inspect one dSpark trunk layer internally; stage-level tracing shows each layer costs about the same.
 4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
 5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.
+<<<<<<< HEAD
 
 ## Default runtime policy
 
@@ -600,6 +601,39 @@ spec_rounds:          30
 The exact verifier path is the upstreamable default. Top-K/proposal probes remain local because the best measured top-K variant did not beat the exact path.
 =======
 >>>>>>> parent of 6019d1d1 (bench ternary dspark markov argmax fusion)
+## Default runtime policy
+
+The ternary path now defaults the winning exact verifier setup for affine 2-bit Qwen3Next/Bonsai targets:
+
+```bash
+HIGGS_DFLASH_VERIFY_MODE=block
+HIGGS_DFLASH_GATE=0
+HIGGS_DSPARK_DRAFT_CAP=4
+HIGGS_DSPARK_TARGET_HEAD=0
+```
+
+Additional ternary defaults:
+
+```bash
+HIGGS_DSPARK_Q2_ROW2_MLP=1
+HIGGS_DSPARK_Q2_HEAD_ARGMAX=1
+```
+
+Set either variable to `0` to force the older MLX stock path for that component.
+
+Current best apples-to-apples Fibonacci result on AC power:
+
+```text
+AR decode:            13.51 tok/s
+exact dSpark decode:  19.68 tok/s
+speedup:              1.46x
+accept_len:           4.23
+spec_rounds:          30
+```
+
+The exact verifier path is the upstreamable default. Top-K/proposal probes remain local because the best measured top-K variant did not beat the exact path.
+=======
+>>>>>>> parent of 3835f051 (bench ternary dspark q4 output head)
 ## Default runtime policy
 
 The ternary path now defaults the winning exact verifier setup for affine 2-bit Qwen3Next/Bonsai targets:
