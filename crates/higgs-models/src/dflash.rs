@@ -164,16 +164,6 @@ const fn default_block_size() -> i32 {
     16
 }
 
-static DSPARK_TOPK_TOTAL: AtomicU64 = AtomicU64::new(0);
-static DSPARK_TOPK_HIT16: AtomicU64 = AtomicU64::new(0);
-static DSPARK_TOPK_HIT32: AtomicU64 = AtomicU64::new(0);
-static DSPARK_TOPK_HIT64: AtomicU64 = AtomicU64::new(0);
-static DSPARK_TOPK_HIT128: AtomicU64 = AtomicU64::new(0);
-static DSPARK_TOPK_HIT256: AtomicU64 = AtomicU64::new(0);
-static DSPARK_TOPK_HIT512: AtomicU64 = AtomicU64::new(0);
-static DSPARK_TOPK_RANK_SUM: AtomicU64 = AtomicU64::new(0);
-static DSPARK_TOPK_RANK_MAX: AtomicU64 = AtomicU64::new(0);
-
 // ---------------------------------------------------------------------------
 // SwiGLU MLP (non-quantized)
 // ---------------------------------------------------------------------------
@@ -586,7 +576,6 @@ impl DsparkExtras {
         use mlx_rs::ops::indexing::IndexOp;
 
         let trace = std::env::var("HIGGS_DSPARK_PROPOSE_TRACE").is_ok_and(|v| v == "1");
-        let topk_trace = std::env::var("HIGGS_DSPARK_TOPK_TRACE").is_ok_and(|v| v == "1");
         let mut ckpt = trace.then(std::time::Instant::now);
         let mut output_ms = 0.0;
         let mut markov_ms = Vec::new();
@@ -635,64 +624,6 @@ impl DsparkExtras {
             let markov_bias = self.markov_head_b.forward(&markov_embedding)?;
             let logits = base.add(&markov_bias)?;
             previous = mlx_rs::argmax_axis!(&logits, -1)?;
-            if topk_trace {
-                let base_f32 = base.as_dtype(mlx_rs::Dtype::Float32)?;
-                crate::mlx_exec::eval([&base_f32, &previous])?;
-                let chosen = usize::try_from(previous.as_slice::<u32>()[0]).unwrap_or(usize::MAX);
-                let base_scores = base_f32.as_slice::<f32>();
-                if let Some(&chosen_score) = base_scores.get(chosen) {
-                    let mut rank = 1usize;
-                    for (idx, &score) in base_scores.iter().enumerate() {
-                        if score > chosen_score || (score == chosen_score && idx < chosen) {
-                            rank += 1;
-                        }
-                    }
-                    let rank_u64 = u64::try_from(rank).unwrap_or(u64::MAX);
-                    let total = DSPARK_TOPK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-                    let sum = DSPARK_TOPK_RANK_SUM.fetch_add(rank_u64, Ordering::Relaxed) + rank_u64;
-                    DSPARK_TOPK_RANK_MAX.fetch_max(rank_u64, Ordering::Relaxed);
-                    let hit16_count = DSPARK_TOPK_HIT16
-                        .fetch_add(u64::from(rank <= 16), Ordering::Relaxed)
-                        + u64::from(rank <= 16);
-                    let hit32_count = DSPARK_TOPK_HIT32
-                        .fetch_add(u64::from(rank <= 32), Ordering::Relaxed)
-                        + u64::from(rank <= 32);
-                    let hit64_count = DSPARK_TOPK_HIT64
-                        .fetch_add(u64::from(rank <= 64), Ordering::Relaxed)
-                        + u64::from(rank <= 64);
-                    let hit128_count = DSPARK_TOPK_HIT128
-                        .fetch_add(u64::from(rank <= 128), Ordering::Relaxed)
-                        + u64::from(rank <= 128);
-                    let hit256_count = DSPARK_TOPK_HIT256
-                        .fetch_add(u64::from(rank <= 256), Ordering::Relaxed)
-                        + u64::from(rank <= 256);
-                    let hit512_count = DSPARK_TOPK_HIT512
-                        .fetch_add(u64::from(rank <= 512), Ordering::Relaxed)
-                        + u64::from(rank <= 512);
-                    let max_rank = DSPARK_TOPK_RANK_MAX.load(Ordering::Relaxed).max(rank_u64);
-                    tracing::info!(
-                        position,
-                        chosen,
-                        base_rank = rank,
-                        samples = total,
-                        mean_rank = format!("{:.2}", sum as f64 / total as f64),
-                        max_rank,
-                        hit16 = rank <= 16,
-                        hit32 = rank <= 32,
-                        hit64 = rank <= 64,
-                        hit128 = rank <= 128,
-                        hit256 = rank <= 256,
-                        hit512 = rank <= 512,
-                        hit16_rate = format!("{:.3}", hit16_count as f64 / total as f64),
-                        hit32_rate = format!("{:.3}", hit32_count as f64 / total as f64),
-                        hit64_rate = format!("{:.3}", hit64_count as f64 / total as f64),
-                        hit128_rate = format!("{:.3}", hit128_count as f64 / total as f64),
-                        hit256_rate = format!("{:.3}", hit256_count as f64 / total as f64),
-                        hit512_rate = format!("{:.3}", hit512_count as f64 / total as f64),
-                        "dSpark base-topK containment"
-                    );
-                }
-            }
             if let Some(ckpt_ref) = ckpt.as_mut() {
                 crate::mlx_exec::eval([&previous])?;
                 let now = std::time::Instant::now();
