@@ -537,3 +537,78 @@ server decode:      ~16.1-16.8 tok/s after warmup
 ```
 
 This improves over the contaminated `18.77 tok/s` run but remains below the current best `19.68 tok/s`. The top-K scaffold should be kept: correctness evidence is strong, but the stock-MLX implementation is overhead-limited. The next move is not deletion; it is replacing `argpartition + gather + tiny qmm` with a custom base top-16 extraction kernel, then a fused topK Markov scorer if needed.
+
+## Custom base top-16 extraction probe
+
+A custom Metal base-top16 extractor was added behind:
+
+```bash
+HIGGS_DSPARK_TOPK_BASE_KERNEL=1
+```
+
+It scans each 256-token block of the base logits, emits the top 16 ids/scores per block, then uses MLX `argpartition` only over the reduced candidate set before the existing top-K Markov shortlist scoring. The intent was to remove the full-vocab MLX `argpartition` cost while preserving the top-K scaffold.
+
+Compare mode stayed exact on Fibonacci:
+
+```text
+HIGGS_DSPARK_TOPK_COMPARE=16 HIGGS_DSPARK_TOPK_BASE_KERNEL=1
+matches: 234 / 234
+hit rate: 100.0%
+```
+
+The first fast run was contaminated by another Higgs 35B server on the GPU and showed high variance. After killing that server and rerunning cleanly:
+
+```text
+HIGGS_DSPARK_TOPK_FAST=16 HIGGS_DSPARK_TOPK_BASE_KERNEL=1
+client decode mean: 19.28 tok/s
+trials:             19.30, 19.32, 19.21 tok/s
+accept_len:         4.23
+spec_rounds:        30
+server decode:      ~16.6-16.7 tok/s after warmup
+```
+
+Current best remains:
+
+```text
+client decode mean: 19.68 tok/s
+```
+
+Conclusion: custom base top-16 extraction fixes the variance and beats the stock top-K implementation, but it still does not beat the best exact full-Markov path. It should not become the ternary default. The remaining top-K overhead is likely the `forward_rows` gather plus tiny quantized matmul path. A future top-K attempt needs fused candidate Markov scoring that reads the 16 selected Q4 rows directly and returns the winning id without MLX row gathers or materialized top-K Markov tensors.
+
+## Fused top-16 Markov scorer probe
+
+The custom top-K path was extended behind:
+
+```bash
+HIGGS_DSPARK_TOPK_MARKOV_KERNEL=1
+```
+
+This kernel scores the 16 selected base-logit candidates directly as `base + Markov-B(candidate)` and returns the winning id. It removes the remaining `forward_rows + tiny quantized_matmul + shortlist argmax` sequence from the top-K fast path.
+
+Correctness audit on long Fibonacci with compare mode:
+
+```text
+HIGGS_DSPARK_TOPK_COMPARE=16 HIGGS_DSPARK_TOPK_BASE_KERNEL=1 HIGGS_DSPARK_TOPK_MARKOV_KERNEL=1
+hit rate: 1.000 through the audited run
+client decode: 19.05 tok/s, compare-only and not a throughput result
+server: accept_len=4.23, spec_rounds=30
+```
+
+Fast-path throughput with one warmup and three measured trials:
+
+```text
+HIGGS_DSPARK_TOPK_FAST=16 HIGGS_DSPARK_TOPK_BASE_KERNEL=1 HIGGS_DSPARK_TOPK_MARKOV_KERNEL=1
+client decode mean: 19.61 tok/s
+trials:             19.66, 19.64, 19.54 tok/s
+accept_len:         4.23
+spec_rounds:        30
+server decode:      ~16.9-17.0 tok/s after warmup
+```
+
+Current best exact full-Markov ternary dSpark result remains:
+
+```text
+client decode mean: 19.68 tok/s
+```
+
+Conclusion: fused candidate Markov scoring recovers most of the top-K overhead and is the best top-K variant so far, but it does not beat the existing exact full-Markov path on the apples-to-apples Fibonacci run. It should remain an opt-in probe and should not become the default ternary Bonsai path.
