@@ -121,6 +121,21 @@ Runtime with strict ternary head:
 row2 MLP + GPU head + split-K down + ternary head: 19.68 tok/s
 ```
 
+Split-K variants for the strict ternary head were then tested. They were parity-correct but did not materially beat the direct strict ternary candidate:
+
+```text
+MLX qmm + argmax:              15594.7 us
+affine candidate + GPU reduce: 11307.1 us
+ternary direct + GPU reduce:    8495.6 us
+ternary split-K2 + GPU reduce:  8476.4 us
+ternary split-K4 + GPU reduce:  8655.0 us
+split-K2 vs direct:             1.002x
+split-K4 vs direct:             0.982x
+argmax parity:                  matched
+```
+
+Conclusion: split-K head is below the wiring threshold. The extra partial-sum traffic cancels the small parallelism gain, unlike `down_proj`.
+
 Server telemetry stayed behavior-identical:
 
 ```text
@@ -285,8 +300,8 @@ The remaining gap is likely in `down_proj`, `lm_head`, and verifier overhead out
 
 Recommended next moves:
 
-1. Probe split-K variants for the strict ternary head candidate kernel, since the head has `N=248320`, `K=5120`, and still dominates isolated head time.
-2. Explore radix-3 prepack only after proving it beats direct ternary on gate/up, down, or head in isolation.
-3. Look for verifier scheduling overhead outside target forward now that arithmetic-only wins are smaller.
+1. Explore radix-3 prepack only after proving it beats direct ternary on gate/up, down, or head in isolation.
+2. Look for verifier scheduling overhead outside target forward now that arithmetic-only wins are smaller.
+3. Probe a lower-overhead final verifier path that avoids extra array construction/casts around the `[1,5]` accepted-token ids.
 4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
 5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.

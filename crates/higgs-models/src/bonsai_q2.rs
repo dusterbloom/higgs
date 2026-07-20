@@ -1229,6 +1229,24 @@ mod tests {
                 .unwrap()
                 .eval()
                 .unwrap();
+            let (maxv, maxid) =
+                crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
+                    &x, &w, &s, 128, 2,
+                )
+                .unwrap();
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
+                .unwrap()
+                .eval()
+                .unwrap();
+            let (maxv, maxid) =
+                crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
+                    &x, &w, &s, 128, 4,
+                )
+                .unwrap();
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
+                .unwrap()
+                .eval()
+                .unwrap();
         }
 
         let logits = mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, 128, 2).unwrap();
@@ -1269,6 +1287,25 @@ mod tests {
         ternary_gpu_ids_arr.eval().unwrap();
         let ternary_gpu_ids: Vec<u32> = ternary_gpu_ids_arr.as_slice::<u32>().to_vec();
         eprintln!("Q2_M5_HEAD_ARGMAX_TERNARY_GPU_REDUCE gpu={ternary_gpu_ids:?}");
+        let (s2maxv, s2maxid) =
+            crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
+                &x, &w, &s, 128, 2,
+            )
+            .unwrap();
+        let splitk2_ids_arr =
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&s2maxv, &s2maxid).unwrap();
+        splitk2_ids_arr.eval().unwrap();
+        let splitk2_ids: Vec<u32> = splitk2_ids_arr.as_slice::<u32>().to_vec();
+        let (s4maxv, s4maxid) =
+            crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
+                &x, &w, &s, 128, 4,
+            )
+            .unwrap();
+        let splitk4_ids_arr =
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&s4maxv, &s4maxid).unwrap();
+        splitk4_ids_arr.eval().unwrap();
+        let splitk4_ids: Vec<u32> = splitk4_ids_arr.as_slice::<u32>().to_vec();
+        eprintln!("Q2_M5_HEAD_ARGMAX_TERNARY_SPLITK splitk2={splitk2_ids:?} splitk4={splitk4_ids:?}");
 
         let n_iters = 10;
         let t0 = std::time::Instant::now();
@@ -1330,13 +1367,45 @@ mod tests {
         }
         let ternary_gpu_reduce_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
 
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            let (maxv, maxid) =
+                crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
+                    &x, &w, &s, 128, 2,
+                )
+                .unwrap();
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
+                .unwrap()
+                .eval()
+                .unwrap();
+        }
+        let ternary_splitk2_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            let (maxv, maxid) =
+                crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
+                    &x, &w, &s, 128, 4,
+                )
+                .unwrap();
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
+                .unwrap()
+                .eval()
+                .unwrap();
+        }
+        let ternary_splitk4_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
         eprintln!(
-            "Q2_M5_HEAD_ARGMAX lm_head ({out_f}x{in_f}) M=5: mlx_qmm_argmax={mlx_argmax_us:.1}us candidate_cpu_reduce={candidate_us:.1}us candidate_gpu_reduce={gpu_reduce_us:.1}us ternary_gpu_reduce={ternary_gpu_reduce_us:.1}us cpu_speedup={:.3}x gpu_speedup={:.3}x ternary_speedup={:.3}x gpu_vs_cpu={:.3}x ternary_vs_affine_gpu={:.3}x",
+            "Q2_M5_HEAD_ARGMAX lm_head ({out_f}x{in_f}) M=5: mlx_qmm_argmax={mlx_argmax_us:.1}us candidate_cpu_reduce={candidate_us:.1}us candidate_gpu_reduce={gpu_reduce_us:.1}us ternary_gpu_reduce={ternary_gpu_reduce_us:.1}us ternary_splitk2={ternary_splitk2_us:.1}us ternary_splitk4={ternary_splitk4_us:.1}us cpu_speedup={:.3}x gpu_speedup={:.3}x ternary_speedup={:.3}x splitk2_speedup={:.3}x splitk4_speedup={:.3}x gpu_vs_cpu={:.3}x ternary_vs_affine_gpu={:.3}x splitk2_vs_direct={:.3}x splitk4_vs_direct={:.3}x",
             mlx_argmax_us / candidate_us,
             mlx_argmax_us / gpu_reduce_us,
             mlx_argmax_us / ternary_gpu_reduce_us,
+            mlx_argmax_us / ternary_splitk2_us,
+            mlx_argmax_us / ternary_splitk4_us,
             candidate_us / gpu_reduce_us,
-            gpu_reduce_us / ternary_gpu_reduce_us
+            gpu_reduce_us / ternary_gpu_reduce_us,
+            ternary_gpu_reduce_us / ternary_splitk2_us,
+            ternary_gpu_reduce_us / ternary_splitk4_us
         );
     }
 }
