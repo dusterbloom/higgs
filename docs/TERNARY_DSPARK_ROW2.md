@@ -368,3 +368,25 @@ Recommended next moves:
 3. If the output-head path stalls, inspect one dSpark trunk layer internally; stage-level tracing shows each layer costs about the same.
 4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
 5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.
+
+## Sidecar Q4 output-head argmax probe
+
+The next bottleneck after the verifier target-head and row2 MLP work is the dSpark sidecar proposal path. Proposal tracing showed the frozen sidecar Q4 output projection dominates steady-state draft generation:
+
+```text
+sidecar Q4 output projection/eval: ~16-17 ms
+four Markov steps total:           ~4-5 ms
+concat:                            ~0.1-0.2 ms
+```
+
+A Q4 M=4 output-head argmax candidate kernel was tested against MLX `qmm + argmax` for the sidecar output-head shape (`248320 x 5120`). This is an argmax-only kill gate, not yet a drop-in runtime path, because the dSpark Markov resampler needs exact `base_logits + markov_bias` argmax per sequential token.
+
+```text
+Q4_M4_OUTPUT_HEAD_ARGMAX_PARITY ref=[139620, 13434, 93037, 51939] cand=[139620, 13434, 93037, 51939]
+MLX qmm + argmax:            11249.7 us
+candidate + GPU reduction:    9453.0 us
+speedup:                       1.190x
+argmax parity:                 matched
+```
+
+Conclusion: the sidecar Q4 output head still has measurable room. The current custom argmax path is not directly wireable because it only finds `argmax(base_logits)`, while dSpark needs Markov-biased argmax. The next scientifically useful probe is an exact fused one-step kernel for `output_q4(hidden) + markov_q4(A(prev_token)) -> argmax`, then benchmark four sequential fused steps against the current `output_q4(M=4) + Markov` path.

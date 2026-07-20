@@ -381,6 +381,35 @@ mod tests {
         (w, s, b)
     }
 
+    fn make_q4_arrays(
+        out_features: usize,
+        in_features: usize,
+        group_size: usize,
+        seed: u64,
+    ) -> (mlx_rs::Array, mlx_rs::Array, mlx_rs::Array) {
+        let packed_cols = in_features / 8;
+        let n_groups = in_features / group_size;
+        let mut st = seed;
+        let w_packed: Vec<u32> = (0..out_features * packed_cols)
+            .map(|_| lcg(&mut st))
+            .collect();
+        let scales: Vec<f16> = (0..out_features * n_groups)
+            .map(|i| f16::from_f32(0.015 + 0.004 * ((i % 11) as f32)))
+            .collect();
+        let biases: Vec<f16> = (0..out_features * n_groups)
+            .map(|i| f16::from_f32(-0.02 + 0.003 * ((i % 13) as f32)))
+            .collect();
+        let w = mlx_rs::Array::from_slice(
+            &w_packed,
+            &[out_features as i32, packed_cols as i32],
+        );
+        let s =
+            mlx_rs::Array::from_slice(&scales, &[out_features as i32, n_groups as i32]);
+        let b =
+            mlx_rs::Array::from_slice(&biases, &[out_features as i32, n_groups as i32]);
+        (w, s, b)
+    }
+
     /// Phase 3B foundation gate: `bonsai_q2_qmv` must match the CPU oracle
     /// bit-for-bit (within fp16 epsilon) across multiple shapes including the
     /// dominant Bonsai-27B verifier shapes.
@@ -1406,6 +1435,75 @@ mod tests {
             gpu_reduce_us / ternary_gpu_reduce_us,
             ternary_gpu_reduce_us / ternary_splitk2_us,
             ternary_gpu_reduce_us / ternary_splitk4_us
+        );
+    }
+
+    #[test]
+    #[ignore = "microbench: --ignored q4_m4_output_head_argmax_candidate_sweep"]
+    fn q4_m4_output_head_argmax_candidate_sweep() {
+        let _exec = crate::mlx_exec::acquire();
+        let out_f = 248320usize;
+        let in_f = 5120usize;
+        let group_size = 32i32;
+        let (w, s, b) = make_q4_arrays(out_f, in_f, group_size as usize, 0x6473_706b);
+        let x_f32: Vec<f32> = (0..(4 * in_f))
+            .map(|i| ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / 16777216.0 - 0.5)
+            .collect();
+        let x = mlx_rs::Array::from_slice(&x_f32, &[4, in_f as i32])
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+
+        for _ in 0..3 {
+            let logits =
+                mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
+            mlx_rs::argmax_axis!(&logits, -1).unwrap().eval().unwrap();
+            let (maxv, maxid) =
+                crate::metal_kernel::bonsai_q4_m4_argmax_candidates(&x, &w, &s, &b, group_size)
+                    .unwrap();
+            crate::metal_kernel::bonsai_q4_m4_argmax_reduce_ids(&maxv, &maxid)
+                .unwrap()
+                .eval()
+                .unwrap();
+        }
+
+        let logits =
+            mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
+        let ref_ids_arr = mlx_rs::argmax_axis!(&logits, -1).unwrap();
+        ref_ids_arr.eval().unwrap();
+        let ref_ids: Vec<u32> = ref_ids_arr.as_slice::<u32>().to_vec();
+        let (maxv, maxid) =
+            crate::metal_kernel::bonsai_q4_m4_argmax_candidates(&x, &w, &s, &b, group_size)
+                .unwrap();
+        let gpu_ids_arr =
+            crate::metal_kernel::bonsai_q4_m4_argmax_reduce_ids(&maxv, &maxid).unwrap();
+        gpu_ids_arr.eval().unwrap();
+        let gpu_ids: Vec<u32> = gpu_ids_arr.as_slice::<u32>().to_vec();
+        eprintln!("Q4_M4_OUTPUT_HEAD_ARGMAX_PARITY ref={ref_ids:?} cand={gpu_ids:?}");
+
+        let n_iters = 10;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            let logits =
+                mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
+            mlx_rs::argmax_axis!(&logits, -1).unwrap().eval().unwrap();
+        }
+        let mlx_argmax_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            let (maxv, maxid) =
+                crate::metal_kernel::bonsai_q4_m4_argmax_candidates(&x, &w, &s, &b, group_size)
+                    .unwrap();
+            crate::metal_kernel::bonsai_q4_m4_argmax_reduce_ids(&maxv, &maxid)
+                .unwrap()
+                .eval()
+                .unwrap();
+        }
+        let candidate_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+        eprintln!(
+            "Q4_M4_OUTPUT_HEAD_ARGMAX output_head ({out_f}x{in_f}) M=4: mlx_qmm_argmax={mlx_argmax_us:.1}us candidate_gpu_reduce={candidate_us:.1}us speedup={:.3}x",
+            mlx_argmax_us / candidate_us
         );
     }
 }
