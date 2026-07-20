@@ -383,6 +383,7 @@ HIGGS_DSPARK_Q2_HEAD_ARGMAX=1
 
 AR decode remains on MLX stock affine Q2 because the custom M=1 Q2 SIMD path lost full-model throughput. The exact dSpark path reached 19.68 tok/s on the long Fibonacci benchmark versus the 13.51 tok/s AR reference, about 1.46x, with `accept_len=4.23` and `spec_rounds=30`.
 
+<<<<<<< HEAD
 Escape hatches:
 
 ```bash
@@ -404,11 +405,28 @@ matches:       234 / 234
 hit rate:      100.0%
 accept_len:    4.23
 spec_rounds:   30
+=======
+Long Fibonacci, 128 tokens, one warmup and one traced trial:
+
+```text
+samples:        234 proposal positions
+mean base rank: 1.20
+max base rank:  13
+hit@16:         100.0%
+hit@32:         100.0%
+hit@64:         100.0%
+hit@128:        100.0%
+hit@256:        100.0%
+hit@512:        100.0%
+accept_len:     4.23
+spec_rounds:    30
+>>>>>>> parent of bb3456ad (probe ternary dspark topk markov shortlist)
 ```
 
 Representative final cumulative line:
 
 ```text
+<<<<<<< HEAD
 position=0 k=16 exact=18 shortlist=18 matched=true samples=234 hit_rate="1.000"
 ```
 
@@ -442,6 +460,43 @@ exact dSpark decode: 19.68 tok/s
 speedup:             1.46x
 accept_len:          4.23
 spec_rounds:         30
+```
+
+The exact verifier path is the upstreamable default. Top-K/proposal probes remain local because the best measured top-K variant did not beat the exact path.
+=======
+samples=234 mean_rank="1.20" max_rank=13 hit16_rate="1.000" hit32_rate="1.000" hit64_rate="1.000" hit128_rate="1.000" hit256_rate="1.000" hit512_rate="1.000"
+```
+
+Conclusion: for the Fibonacci workload, the Markov bias almost never changes the candidate outside the base head's tiny shortlist. This is the first evidence with enough upside for a larger proposal-path speedup. The next implementation probe should test a top-16 or top-32 candidate path with exact fallback: compute base topK, evaluate Markov-B only for those candidate rows, and fall back to the full current Markov path whenever the exactness guard cannot prove the shortlist winner.
+>>>>>>> parent of bb3456ad (probe ternary dspark topk markov shortlist)
+## Default runtime policy
+
+The ternary path now defaults the winning exact verifier setup for affine 2-bit Qwen3Next/Bonsai targets:
+
+```bash
+HIGGS_DFLASH_VERIFY_MODE=block
+HIGGS_DFLASH_GATE=0
+HIGGS_DSPARK_DRAFT_CAP=4
+HIGGS_DSPARK_TARGET_HEAD=0
+```
+
+Additional ternary defaults:
+
+```bash
+HIGGS_DSPARK_Q2_ROW2_MLP=1
+HIGGS_DSPARK_Q2_HEAD_ARGMAX=1
+```
+
+Set either variable to `0` to force the older MLX stock path for that component.
+
+Current best apples-to-apples Fibonacci result on AC power:
+
+```text
+AR decode:            13.51 tok/s
+exact dSpark decode:  19.68 tok/s
+speedup:              1.46x
+accept_len:           4.23
+spec_rounds:          30
 ```
 
 The exact verifier path is the upstreamable default. Top-K/proposal probes remain local because the best measured top-K variant did not beat the exact path.
