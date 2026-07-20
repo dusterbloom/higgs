@@ -162,11 +162,12 @@ port = 8000
 # kv_max_sessions = 8           # max retained conversations, LRU-evicted (>= 1)
 # kv_max_session_tokens = 0     # drop a conversation's KV past N tokens (0 = unlimited)
 # kv_retained_idle_secs = 1800  # evict KV idle longer than N seconds (0 = never)
+# kv_cache_bytes = 0            # prefix KV cache byte budget (0 = disabled; evicts LRU over budget)
 # # Speculative decoding (decode) + compressive prefill (PFlash) drafters:
 # # draft_model      = "/path/to/dspark-drafter"      # decode speculation (DFlash/dSpark)
-# # For the 2-bit Bonsai target the block (BatchedTape) verifier is the default
-# # verify schedule; the 1-bit Bonsai keeps the conservative canonical default.
-# # Set HIGGS_DFLASH_VERIFY_MODE=canonical to opt any model back to S=1.
+# # Validated low-bit Bonsai targets default to the block (BatchedTape) verifier.
+# # Unsupported domains fail closed to canonical S=1; set HIGGS_DFLASH_VERIFY_MODE=canonical
+# # to opt any model back to S=1.
 # # prefill_drafter  = "mlx-community/Qwen3-0.6B-4bit" # compressive prefill (PFlash)
 # # prefill_compression = "off"                       # off | auto | always
 # # prefill_threshold   = 4096                        # auto: enable above this many prompt tokens

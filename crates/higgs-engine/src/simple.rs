@@ -1517,6 +1517,8 @@ pub struct SimpleEngine {
     tokenizer: Tokenizer,
     template: Option<ChatTemplateRenderer>,
     model_name: String,
+    is_vlm: bool,
+    vlm_image_size: Option<i32>,
     eos_token_ids: Vec<u32>,
     /// Control tokens stripped from decoded output (EOS + `<|…|>` chat
     /// delimiters + classic sentinels), while content-bearing special tokens
@@ -2088,6 +2090,9 @@ impl SimpleEngine {
                 .then(|| std::time::Duration::from_secs(kv_cache_config.retained_idle_secs)),
         );
 
+        let is_vlm = model.is_vlm();
+        let vlm_image_size = model.image_size();
+
         Ok(Self {
             model: Mutex::new(model),
             prefix_cache: Mutex::new(prefix_cache),
@@ -2100,6 +2105,8 @@ impl SimpleEngine {
             tokenizer,
             template,
             model_name,
+            is_vlm,
+            vlm_image_size,
             eos_token_ids,
             decode_skip_ids,
             enable_thinking,
@@ -2418,21 +2425,13 @@ impl SimpleEngine {
     }
 
     /// Whether the loaded model is a vision-language model.
-    pub fn is_vlm(&self) -> bool {
-        let model = self
-            .model
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        model.is_vlm()
+    pub const fn is_vlm(&self) -> bool {
+        self.is_vlm
     }
 
     /// The expected image size for the VLM's vision encoder, or `None`.
-    pub fn vlm_image_size(&self) -> Option<i32> {
-        let model = self
-            .model
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        model.image_size()
+    pub const fn vlm_image_size(&self) -> Option<i32> {
+        self.vlm_image_size
     }
 
     /// Replace image placeholder tokens with `IMAGE_TOKEN_INDEX` in the token
@@ -9837,6 +9836,8 @@ mod tests {
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             template: None,
             model_name: "synthetic-session-cache".to_owned(),
+            is_vlm: false,
+            vlm_image_size: None,
             eos_token_ids: Vec::new(),
             decode_skip_ids: std::sync::Arc::new(std::collections::HashSet::new()),
             enable_thinking: false,
