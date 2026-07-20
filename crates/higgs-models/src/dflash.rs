@@ -579,7 +579,6 @@ impl DsparkExtras {
         let mut ckpt = trace.then(std::time::Instant::now);
         let mut output_ms = 0.0;
         let mut markov_ms = Vec::new();
-        let mut concat_ms = 0.0;
 
         let owned_logits = if base_logits.is_none() {
             Some(
@@ -639,7 +638,7 @@ impl DsparkExtras {
         if let Some(ckpt_ref) = ckpt.as_mut() {
             crate::mlx_exec::eval([&out])?;
             let now = std::time::Instant::now();
-            concat_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
+                let concat_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
             tracing::info!(
                 output_ms = format!("{output_ms:.2}"),
                 markov_ms = ?markov_ms.iter().map(|ms| format!("{ms:.2}")).collect::<Vec<_>>(),
@@ -1348,7 +1347,6 @@ impl DFlashDrafter {
         let mut context_ms = 0.0;
         let mut log_snr_ms = 0.0;
         let mut layer_ms = Vec::new();
-        let mut norm_ms = 0.0;
 
         let rows = self.validate_context_taps(taps, "forward")?;
         self.validate_noise(noise, taps)?;
@@ -1405,7 +1403,7 @@ impl DFlashDrafter {
         if let Some(ckpt_ref) = ckpt.as_mut() {
             crate::mlx_exec::eval([&hidden])?;
             let now = std::time::Instant::now();
-            norm_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
+                let norm_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
             tracing::info!(
                 context_ms = format!("{context_ms:.2}"),
                 log_snr_ms = format!("{log_snr_ms:.2}"),

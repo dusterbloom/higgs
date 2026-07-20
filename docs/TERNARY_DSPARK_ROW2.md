@@ -390,3 +390,47 @@ argmax parity:                 matched
 ```
 
 Conclusion: the sidecar Q4 output head still has measurable room. The current custom argmax path is not directly wireable because it only finds `argmax(base_logits)`, while dSpark needs Markov-biased argmax. The next scientifically useful probe is an exact fused one-step kernel for `output_q4(hidden) + markov_q4(A(prev_token)) -> argmax`, then benchmark four sequential fused steps against the current `output_q4(M=4) + Markov` path.
+
+## Exact fused Markov-biased Q4 argmax probe
+
+The direct follow-up was an exact one-step kernel for the actual sidecar shape:
+
+```text
+output_head: 248320 x 5120, Q4 group size 32
+markov_b:    248320 x 256,  Q4 group size 32
+```
+
+The kernel computes `argmax(output_q4(hidden_row) + markov_q4(markov_embedding_row))` without materializing either logits vector. Four sequential M=1 calls were compared against the current proposal math: one MLX M=4 output-head projection plus four Markov-bias projections/adds/argmaxes.
+
+```text
+Q4_M1_MARKOV_ARGMAX_PARITY ref=[51939, 76445, 93037, 20293] fused=[51939, 76445, 93037, 20293]
+current MLX M=4 output + Markov: 14218.7 us
+fused exact M=1 x4:              40718.0 us
+speedup:                         0.349x
+argmax parity:                   matched
+```
+
+Conclusion: exact four-step M=1 fusion is a dead end. It repeats the 5120-wide output dot four times and loses the M=4 batching advantage by more than the materialization savings can recover. The output-head path needs either an M=4 fused Markov-aware kernel that preserves output batching, or a different strategy that avoids recomputing the output dot per proposed token.
+
+## Markov-only fused Q4 argmax probe
+
+The safer exact variant preserved MLX's batched M=4 sidecar output projection and fused only the sequential Markov tail:
+
+```text
+base_logits = output_q4(hidden[4])
+argmax(base_logits[row] + markov_q4(markov_embedding[row]))
+```
+
+This avoids recomputing the expensive `5120 -> vocab` output dot four times. It only streams the `256 -> vocab` Markov-B projection and reduces against the already materialized base row.
+
+```text
+Q4_M1_MARKOV_ARGMAX_PARITY ref=[51939, 76445, 93037, 20293] fused=[51939, 76445, 93037, 20293] markov_only=[51939, 76445, 93037, 20293]
+current MLX M=4 output + Markov: 14062.9 us
+full fused M=1 x4:               41893.7 us
+Markov-only fused:               13696.9 us
+full fused speedup:              0.336x
+Markov-only speedup:             1.027x
+argmax parity:                   matched
+```
+
+Conclusion: preserving M=4 output batching was the right direction, but the exact Markov-only fusion only trims about `2.7%` in this benchmark. It is not enough by itself to explain a path from `19.68 tok/s` to a robust `1.5x`. The next higher-upside question is whether full-vocab Markov-biased argmax is necessary at all: measure base-topK containment of `argmax(base + markov_bias)` on real proposal states, then consider topK plus exact fallback only if containment is high.
