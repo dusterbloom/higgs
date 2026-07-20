@@ -630,6 +630,11 @@ impl DsparkExtras {
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|&k| k > 0 && k < vocab_size);
+        let topk_fast = std::env::var("HIGGS_DSPARK_TOPK_FAST")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&k| k > 0 && k < vocab_size);
+        let topk_shortlist = topk_fast.or(topk_compare);
         let mut previous = Array::from_slice(&[anchor], &[1]);
         let mut sampled = Vec::with_capacity(usize::try_from(block_size).unwrap_or(0));
 
@@ -637,7 +642,7 @@ impl DsparkExtras {
             let base = resolved_logits
                 .index((.., position..position + 1, ..))
                 .reshape(&[-1, vocab_size])?;
-            let topk_indices = if let Some(k) = topk_compare {
+            let topk_indices = if let Some(k) = topk_shortlist {
                 let neg_base = base.negative()?;
                 let partition = ops::argpartition_axis(&neg_base, k - 1, -1)?;
                 Some(partition.index((.., 0..k)))
@@ -645,36 +650,84 @@ impl DsparkExtras {
                 None
             };
             let markov_embedding = (*self.markov_head_a).take_axis(&previous, 0)?;
-            let markov_bias = self.markov_head_b.forward(&markov_embedding)?;
-            let logits = base.add(&markov_bias)?;
-            previous = mlx_rs::argmax_axis!(&logits, -1)?;
-            if let Some(indices) = topk_indices.as_ref() {
+            let shortlist = if let Some(indices) = topk_indices.as_ref() {
                 let flat_indices = indices.reshape(&[-1])?;
                 let base_topk = base.take_along_axis(indices, -1)?;
                 let markov_topk = self.markov_head_b.forward_rows(&markov_embedding, &flat_indices)?;
                 let shortlist_logits = base_topk.add(&markov_topk)?;
                 let shortlist_pos = mlx_rs::argmax_axis!(&shortlist_logits, -1)?;
-                let shortlist = indices
-                    .take_along_axis(&shortlist_pos.reshape(&[-1, 1])?, -1)?
-                    .reshape(&[-1])?;
-                crate::mlx_exec::eval([&shortlist, &previous])?;
-                let shortlist_id = shortlist.as_slice::<u32>()[0];
-                let exact_id = previous.as_slice::<u32>()[0];
-                let matched = shortlist_id == exact_id;
-                let total = DSPARK_TOPK_COMPARE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-                let hits = DSPARK_TOPK_COMPARE_HIT
-                    .fetch_add(u64::from(matched), Ordering::Relaxed)
-                    + u64::from(matched);
-                tracing::info!(
-                    position,
-                    k = topk_compare.unwrap_or_default(),
-                    exact = exact_id,
-                    shortlist = shortlist_id,
-                    matched,
-                    samples = total,
-                    hit_rate = format!("{:.3}", hits as f64 / total as f64),
-                    "dSpark topK Markov shortlist compare"
-                );
+                Some(
+                    indices
+                        .take_along_axis(&shortlist_pos.reshape(&[-1, 1])?, -1)?
+                        .reshape(&[-1])?,
+                )
+            } else {
+                None
+            };
+            if topk_fast.is_some() {
+                previous = shortlist
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("dSpark topK fast shortlist missing"))?
+                    .clone();
+            } else {
+                let markov_bias = self.markov_head_b.forward(&markov_embedding)?;
+                let logits = base.add(&markov_bias)?;
+                previous = mlx_rs::argmax_axis!(&logits, -1)?;
+            }
+            if topk_indices.is_some() {
+                let Some(shortlist) = shortlist.as_ref() else {
+                    return Err(Exception::custom("dSpark topK compare shortlist missing"));
+                };
+                if topk_compare.is_none() {
+                    crate::mlx_exec::eval([shortlist])?;
+                    tracing::debug!(
+                        position,
+                        k = topk_fast.unwrap_or_default(),
+                        shortlist = shortlist.as_slice::<u32>()[0],
+                        "dSpark topK Markov shortlist fast"
+                    );
+                } else if topk_fast.is_some() {
+                    let markov_bias = self.markov_head_b.forward(&markov_embedding)?;
+                    let logits = base.add(&markov_bias)?;
+                    let exact = mlx_rs::argmax_axis!(&logits, -1)?;
+                    crate::mlx_exec::eval([shortlist, &exact])?;
+                    let shortlist_id = shortlist.as_slice::<u32>()[0];
+                    let exact_id = exact.as_slice::<u32>()[0];
+                    let matched = shortlist_id == exact_id;
+                    let total = DSPARK_TOPK_COMPARE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+                    let hits = DSPARK_TOPK_COMPARE_HIT
+                        .fetch_add(u64::from(matched), Ordering::Relaxed)
+                        + u64::from(matched);
+                    tracing::info!(
+                        position,
+                        k = topk_fast.unwrap_or_default(),
+                        exact = exact_id,
+                        shortlist = shortlist_id,
+                        matched,
+                        samples = total,
+                        hit_rate = format!("{:.3}", hits as f64 / total as f64),
+                        "dSpark topK Markov shortlist compare"
+                    );
+                } else {
+                    crate::mlx_exec::eval([shortlist, &previous])?;
+                    let shortlist_id = shortlist.as_slice::<u32>()[0];
+                    let exact_id = previous.as_slice::<u32>()[0];
+                    let matched = shortlist_id == exact_id;
+                    let total = DSPARK_TOPK_COMPARE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+                    let hits = DSPARK_TOPK_COMPARE_HIT
+                        .fetch_add(u64::from(matched), Ordering::Relaxed)
+                        + u64::from(matched);
+                    tracing::info!(
+                        position,
+                        k = topk_compare.unwrap_or_default(),
+                        exact = exact_id,
+                        shortlist = shortlist_id,
+                        matched,
+                        samples = total,
+                        hit_rate = format!("{:.3}", hits as f64 / total as f64),
+                        "dSpark topK Markov shortlist compare"
+                    );
+                }
             }
             if topk_trace {
                 let base_f32 = base.as_dtype(mlx_rs::Dtype::Float32)?;

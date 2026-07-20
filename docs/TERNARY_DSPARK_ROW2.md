@@ -497,3 +497,43 @@ position=0 k=16 exact=18 shortlist=18 matched=true samples=234 hit_rate="1.000"
 ```
 
 Conclusion: the top-16 shortlist is exact on this Fibonacci run in compare mode. The current compare path is not a throughput result because it deliberately runs both shortlist and full exact computation. The next probe should add a runtime fast-path flag that uses the shortlist token directly, with a separate compare flag retained for correctness audits on prose.
+
+## Top-16 Markov shortlist fast-path probe
+
+The compare-only shortlist was then promoted behind:
+
+```bash
+HIGGS_DSPARK_TOPK_FAST=16
+```
+
+This mode uses the top-16 shortlist token directly and skips the full-vocab Markov-biased argmax. The exact full path remains available, and `HIGGS_DSPARK_TOPK_COMPARE=16` can still be used for audits.
+
+Long Fibonacci, 128 tokens, one warmup and three measured trials:
+
+```text
+client decode mean: 18.77 tok/s
+trials:             18.69, 18.49, 19.12 tok/s
+accept_len:         4.23
+spec_rounds:        30
+server decode:      ~16.0-16.5 tok/s after warmup
+```
+
+Current best without the shortlist fast path remains:
+
+```text
+client decode mean: 19.68 tok/s
+```
+
+Conclusion: the top-16 shortlist is behavior-correct on Fibonacci but slower in this implementation. The likely culprit is MLX `argpartition + gather + tiny quantized_matmul` overhead: selecting and gathering 16 rows costs more than the full Markov tail it replaces. This kills the stock-MLX shortlist fast path. If shortlist acceleration is revisited, it needs a custom streaming top-K/Markov kernel or a cheaper candidate source than MLX argpartition.
+
+Clean rerun after closing LM Studio and with no cargo build running:
+
+```text
+client decode mean: 18.96 tok/s
+trials:             19.36, 18.90, 18.61 tok/s
+accept_len:         4.23
+spec_rounds:        30
+server decode:      ~16.1-16.8 tok/s after warmup
+```
+
+This improves over the contaminated `18.77 tok/s` run but remains below the current best `19.68 tok/s`. The top-K scaffold should be kept: correctness evidence is strong, but the stock-MLX implementation is overhead-limited. The next move is not deletion; it is replacing `argpartition + gather + tiny qmm` with a custom base top-16 extraction kernel, then a fused topK Markov scorer if needed.
