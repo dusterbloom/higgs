@@ -16898,6 +16898,7 @@ mod tests {
                 bits,
                 mode: crate::quant_mode::QuantMode::Affine,
                 weight_layout: QLinearWeightLayout::Canonical,
+                q2_row2: std::sync::OnceLock::new(),
             }
         };
 
@@ -16915,6 +16916,7 @@ mod tests {
                 bits,
                 mode: crate::quant_mode::QuantMode::Affine,
                 weight_layout: QLinearWeightLayout::Canonical,
+                q2_row2: std::sync::OnceLock::new(),
             }
         };
 

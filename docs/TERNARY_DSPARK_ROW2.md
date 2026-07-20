@@ -128,6 +128,49 @@ ternary row2 full MLP: 2557.2 us
 speedup:              1.391x
 ```
 
+Hybrid row2 plus stock MLX down was tested after the row2 win:
+
+```text
+MLX stock full MLP:                 3518.8 us
+ternary row2 full MLP:              2542.8 us
+row2 gate/up + MLX stock down:      2642.2 us
+row2 full MLP speedup:              1.384x
+hybrid row2/MLX-down speedup:       1.332x
+```
+
+Conclusion: keeping `down_proj` on stock MLX does not recover throughput. The all-row2 MLP remains faster, so the remaining gap is not explained by a bad row2 down-projection dispatch alone.
+
+Fusing row2 gate/up into a single Metal launch was also tested:
+
+```text
+MLX stock full MLP:                 3500.9 us
+ternary row2 full MLP:              2525.7 us
+fused row2 gate/up + row2 down:     2594.8 us
+row2 full MLP speedup:              1.386x
+fused row2 gate/up speedup:         1.349x
+```
+
+Conclusion: one fewer launch is not enough to win here. The fused gate/up kernel increases per-thread register/weight work enough that it loses to two independent row2 projection launches.
+
+Power-of-two M-scaling was tested with the legal dSpark cap:
+
+```bash
+HIGGS_DSPARK_DRAFT_CAP=3
+```
+
+This gives verifier `M=4` (`anchor + 3 draft`) because the published dSpark artifact has `block_size=4`; attempts to set `HIGGS_DSPARK_DRAFT_CAP=7` were clamped back to `draft_cap=4`.
+
+Long Fibonacci, 128 tokens:
+
+```text
+client decode mean: 13.68 tok/s
+accept_len:         3.63
+spec_rounds:        35
+server decode:      ~12.0-12.4 tok/s
+```
+
+Conclusion: the feasible power-of-two verifier tile loses. The lower draft cap increases rounds and drops acceptance enough that any M=4 scaling benefit is erased. Testing M=8 would require a dSpark artifact or verifier schedule that can actually propose seven draft positions.
+
 Runtime result with:
 
 ```bash
@@ -179,7 +222,8 @@ The remaining gap is likely in `down_proj`, `lm_head`, and verifier overhead out
 
 Recommended next moves:
 
-1. Improve `down_proj` row2 M=5, where current speedup is only `1.04x`.
+1. Improve `down_proj` row2 M=5, where current isolated speedup is only `1.04x`, without falling back to stock MLX.
 2. Replace the head candidate path with a row2/radix-3 head argmax kernel to recover more of the `lm_head` cost.
 3. Explore radix-3 prepack only after proving it beats direct row2 on gate/up and down in isolation.
-4. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.
+4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
+5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.

@@ -934,6 +934,26 @@ mod tests {
                 .unwrap()
                 .eval()
                 .unwrap();
+            mlx_rs::ops::quantized_matmul(&act, &dw, &ds, &db, true, 128, 2)
+                .unwrap()
+                .eval()
+                .unwrap();
+
+            let fused_gu =
+                crate::metal_kernel::bonsai_q2_row2_m5_ternary_fused_gate_up(&x, gate_row2, up_row2)
+                    .unwrap();
+            let parts = fused_gu.split_axis(&[intermediate_f as i32], Some(-1)).unwrap();
+            let gate_out = parts.first().unwrap();
+            let up_out = parts.get(1).unwrap();
+            let act = gate_out
+                .multiply(mlx_rs::nn::sigmoid(gate_out).unwrap())
+                .unwrap()
+                .multiply(up_out)
+                .unwrap();
+            crate::metal_kernel::bonsai_q2_row2_m5_ternary_direct(&act, down_row2)
+                .unwrap()
+                .eval()
+                .unwrap();
         }
 
         let n_iters = 20;
@@ -990,10 +1010,50 @@ mod tests {
         }
         let ternary_row2_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
 
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            let gate_out =
+                crate::metal_kernel::bonsai_q2_row2_m5_ternary_direct(&x, gate_row2).unwrap();
+            let up_out =
+                crate::metal_kernel::bonsai_q2_row2_m5_ternary_direct(&x, up_row2).unwrap();
+            let act = gate_out
+                .multiply(mlx_rs::nn::sigmoid(&gate_out).unwrap())
+                .unwrap()
+                .multiply(&up_out)
+                .unwrap();
+            mlx_rs::ops::quantized_matmul(&act, &dw, &ds, &db, true, 128, 2)
+                .unwrap()
+                .eval()
+                .unwrap();
+        }
+        let hybrid_row2_mlx_down_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            let fused_gu =
+                crate::metal_kernel::bonsai_q2_row2_m5_ternary_fused_gate_up(&x, gate_row2, up_row2)
+                    .unwrap();
+            let parts = fused_gu.split_axis(&[intermediate_f as i32], Some(-1)).unwrap();
+            let gate_out = parts.first().unwrap();
+            let up_out = parts.get(1).unwrap();
+            let act = gate_out
+                .multiply(mlx_rs::nn::sigmoid(gate_out).unwrap())
+                .unwrap()
+                .multiply(up_out)
+                .unwrap();
+            crate::metal_kernel::bonsai_q2_row2_m5_ternary_direct(&act, down_row2)
+                .unwrap()
+                .eval()
+                .unwrap();
+        }
+        let fused_row2_gate_up_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
         eprintln!(
-            "Q2_M5_MLP_FUSED_GATE_UP hidden={hidden_f} intermediate={intermediate_f} M=5: separate={separate_us:.1}us fused={fused_us:.1}us ternary_row2={ternary_row2_us:.1}us fused_speedup={:.3}x row2_speedup={:.3}x",
+            "Q2_M5_MLP_FUSED_GATE_UP hidden={hidden_f} intermediate={intermediate_f} M=5: separate={separate_us:.1}us fused={fused_us:.1}us ternary_row2={ternary_row2_us:.1}us hybrid_row2_mlx_down={hybrid_row2_mlx_down_us:.1}us fused_row2_gate_up={fused_row2_gate_up_us:.1}us fused_speedup={:.3}x row2_speedup={:.3}x hybrid_speedup={:.3}x fused_row2_gate_up_speedup={:.3}x",
             separate_us / fused_us,
-            separate_us / ternary_row2_us
+            separate_us / ternary_row2_us,
+            separate_us / hybrid_row2_mlx_down_us,
+            separate_us / fused_row2_gate_up_us
         );
     }
 

@@ -2600,6 +2600,7 @@ if (n < NRows) {
 
 static Q2_ROW2_M5_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static Q2_ROW2_M5_TERNARY_DIRECT_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static Q2_ROW2_M5_TERNARY_FUSED_GATE_UP_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 #[allow(unsafe_code)]
 fn create_q2_row2_m5_kernel() -> mlx_sys::mlx_fast_metal_kernel {
@@ -2806,6 +2807,66 @@ if (n < NRows) {
 }
 ";
 
+const Q2_ROW2_M5_TERNARY_FUSED_GATE_UP_SOURCE: &str = r"
+constexpr int WG = 256;
+constexpr int ROWS_PER_TG = 256;
+
+uint tid = thread_index_in_threadgroup;
+uint tgx = threadgroup_position_in_grid.x;
+int n = int(tgx) * ROWS_PER_TG + int(tid);
+
+float g0 = 0.0f; float g1 = 0.0f; float g2 = 0.0f; float g3 = 0.0f; float g4 = 0.0f;
+float u0 = 0.0f; float u1 = 0.0f; float u2 = 0.0f; float u3 = 0.0f; float u4 = 0.0f;
+
+if (n < NRows) {
+    int row_tile = n / 2;
+    int row_lane = n & 1;
+
+    for (int g = 0; g < NumGroups; ++g) {
+        float ga0 = 0.0f; float ga1 = 0.0f; float ga2 = 0.0f; float ga3 = 0.0f; float ga4 = 0.0f;
+        float ua0 = 0.0f; float ua1 = 0.0f; float ua2 = 0.0f; float ua3 = 0.0f; float ua4 = 0.0f;
+        int group_base = (row_tile * NumGroups + g) * 8;
+        int x_base = g * GroupSize;
+        #pragma clang loop unroll(full)
+        for (int word = 0; word < 8; ++word) {
+            uint gpacked = wg[(group_base + word) * 2 + row_lane];
+            uint upacked = wu[(group_base + word) * 2 + row_lane];
+            int xb = x_base + word * 16;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 16; ++j) {
+                float gt = float((gpacked >> uint(2 * j)) & 0x3u) - 1.0f;
+                float ut = float((upacked >> uint(2 * j)) & 0x3u) - 1.0f;
+                float x0 = float(x[0 * K + xb + j]);
+                float x1 = float(x[1 * K + xb + j]);
+                float x2 = float(x[2 * K + xb + j]);
+                float x3 = float(x[3 * K + xb + j]);
+                float x4 = float(x[4 * K + xb + j]);
+                ga0 += gt * x0; ga1 += gt * x1; ga2 += gt * x2; ga3 += gt * x3; ga4 += gt * x4;
+                ua0 += ut * x0; ua1 += ut * x1; ua2 += ut * x2; ua3 += ut * x3; ua4 += ut * x4;
+            }
+        }
+        float gs = float(scg[(row_tile * NumGroups + g) * 2 + row_lane]);
+        float us = float(scu[(row_tile * NumGroups + g) * 2 + row_lane]);
+        g0 += gs * ga0; g1 += gs * ga1; g2 += gs * ga2; g3 += gs * ga3; g4 += gs * ga4;
+        u0 += us * ua0; u1 += us * ua1; u2 += us * ua2; u3 += us * ua3; u4 += us * ua4;
+    }
+}
+
+if (n < NRows) {
+    constexpr int OutRows = 2 * NRows;
+    y[0 * OutRows + n] = OutT(g0);
+    y[1 * OutRows + n] = OutT(g1);
+    y[2 * OutRows + n] = OutT(g2);
+    y[3 * OutRows + n] = OutT(g3);
+    y[4 * OutRows + n] = OutT(g4);
+    y[0 * OutRows + NRows + n] = OutT(u0);
+    y[1 * OutRows + NRows + n] = OutT(u1);
+    y[2 * OutRows + NRows + n] = OutT(u2);
+    y[3 * OutRows + NRows + n] = OutT(u3);
+    y[4 * OutRows + NRows + n] = OutT(u4);
+}
+";
+
 #[allow(unsafe_code)]
 fn create_q2_row2_m5_ternary_direct_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let in_vec = cstr_vec(&[c"w", c"sc", c"x"]);
@@ -2824,6 +2885,76 @@ fn create_q2_row2_m5_ternary_direct_kernel() -> mlx_sys::mlx_fast_metal_kernel {
         mlx_sys::mlx_vector_string_free(in_vec);
         mlx_sys::mlx_vector_string_free(out_vec);
         kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn create_q2_row2_m5_ternary_fused_gate_up_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"wg", c"wu", c"scg", c"scu", c"x"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(Q2_ROW2_M5_TERNARY_FUSED_GATE_UP_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_row2_m5_ternary_fused_gate_up_v1".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_q2_row2_m5_fused_gate_up_kernel(
+    out_dtype: mlx_sys::mlx_dtype,
+    n_rows: i32,
+    k_dim: i32,
+    group_size: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    const WG: i32 = 256;
+    const ROWS_PER_TG: i32 = 256;
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OutT".as_ptr(),
+            out_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"GroupSize".as_ptr(),
+            group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NumGroups".as_ptr(),
+            k_dim / group_size,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NRows".as_ptr(),
+            n_rows,
+        );
+
+        let n_tgs = (n_rows + ROWS_PER_TG - 1) / ROWS_PER_TG;
+        let grid_x = n_tgs * ROWS_PER_TG;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, grid_x, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, WG, 1, 1);
+
+        let y_shape = [5, n_rows * 2];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            out_dtype,
+        );
+        config
     }
 }
 
@@ -2872,6 +3003,82 @@ pub fn bonsai_q2_row2_m5_ternary_direct(
     let result = if status != 0 {
         Err(Exception::custom(format!(
             "bonsai_q2_row2_m5_ternary_direct failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
+        Ok(unsafe { Array::from_ptr(y_ptr) })
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+    }
+    result
+}
+
+#[allow(dead_code, unsafe_code)]
+pub fn bonsai_q2_row2_m5_ternary_fused_gate_up(
+    x: &Array,
+    gate: BonsaiQ2Row2Ref<'_>,
+    up: BonsaiQ2Row2Ref<'_>,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    if gate.n_rows != up.n_rows || gate.k_dim != up.k_dim {
+        return Err(Exception::custom(
+            "bonsai_q2_row2_m5_ternary_fused_gate_up: gate/up shape mismatch",
+        ));
+    }
+
+    let x_shape = x.shape();
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    if m_rows != 5 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_row2_m5_ternary_fused_gate_up: expected M=5 verifier tile, got M={m_rows}"
+        )));
+    }
+    let x_flat = x.reshape(&[5, gate.k_dim])?;
+    let wg_flat = gate.weights.reshape(&[-1])?;
+    let wu_flat = up.weights.reshape(&[-1])?;
+    let sg_flat = gate.scales.flatten(None, None)?;
+    let su_flat = up.scales.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+    let cached = Q2_ROW2_M5_TERNARY_FUSED_GATE_UP_KERNEL
+        .get_or_init(|| CachedMetalKernel(create_q2_row2_m5_ternary_fused_gate_up_kernel()));
+    let config = configure_q2_row2_m5_fused_gate_up_kernel(out_dtype, gate.n_rows, gate.k_dim, 128);
+
+    let input_ptrs = [
+        wg_flat.as_ptr(),
+        wu_flat.as_ptr(),
+        sg_flat.as_ptr(),
+        su_flat.as_ptr(),
+        x_flat.as_ptr(),
+    ];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q2_row2_m5_ternary_fused_gate_up failed: {}",
             take_last_error()
         )))
     } else {
