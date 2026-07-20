@@ -588,6 +588,17 @@ fn make_turboquant_kv_cache(
 pub type TapsTapeOutput = (Array, Vec<Array>, Vec<Option<qwen3_next::GdnLayerTape>>);
 
 impl AnyModel {
+    /// Whether the target is the PrismML Bonsai-27B style Qwen3Next checkpoint
+    /// using affine 1-bit weights. Standalone legacy `BonsaiQ1` is excluded:
+    /// the row4/dSpark defaults below are validated on the Qwen3.5 text
+    /// backbone path.
+    pub fn is_qwen3next_affine_1bit(&self) -> bool {
+        match self {
+            Self::Qwen3Next(m) => m.args.default_quant_spec().bits == 1,
+            _ => false,
+        }
+    }
+
     pub fn forward(
         &mut self,
         inputs: &Array,

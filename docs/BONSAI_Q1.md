@@ -220,3 +220,17 @@ ABBA result above, this provides no basis to enable fusion by default; it
 remains an explicit experiment. A powered confirmation is still pending. See
 `docs/DSPARK_MLX_DESIGN.md` for the complete state contract, rejected paths,
 and promotion gates.
+
+## Default runtime policy
+
+For Qwen3Next affine 1-bit Bonsai checkpoints, Higgs now enables the validated row4/TG-LUT path by default. A paired Prism dSpark sidecar defaults to block verification when the model-domain validator accepts the request shape. This removes the benchmark-only flag bundle from ordinary Bonsai-27B use.
+
+The AC-gated release benchmark on 2026-07-20 measured 19.55 tok/s AR decode and 28.67 tok/s dSpark decode, a 1.466x decode speedup. Wall throughput was 15.85 versus 21.29 tok/s, a 1.343x wall speedup. Acceptance remained `tau = 4.536` with 90.00% exact draft matches; AR endpoint drift was under the 3% gate.
+
+Escape hatches:
+
+```bash
+HIGGS_BONSAI_TG_LUT4=0              # disable Q1 row4 promotion
+HIGGS_DFLASH_VERIFY_MODE=canonical  # force S=1 dSpark verification
+HIGGS_BONSAI_TG_LUT4_FUSED_MLP=1    # experimental; not default
+```

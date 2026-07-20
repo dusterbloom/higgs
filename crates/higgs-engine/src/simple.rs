@@ -1878,7 +1878,15 @@ impl SimpleEngine {
                 let dspark_target_head = drafter.config.is_dspark()
                     && (drafter.config.reuse_target_head()
                         || std::env::var("HIGGS_DSPARK_TARGET_HEAD").is_ok_and(|v| v != "0"));
+                let target_is_bonsai_q1 = model.is_qwen3next_affine_1bit();
                 let verify_mode_raw = std::env::var("HIGGS_DFLASH_VERIFY_MODE").ok();
+                let verify_mode_raw = verify_mode_raw.or_else(|| {
+                    if drafter.config.is_dspark() && target_is_bonsai_q1 {
+                        Some("block".to_owned())
+                    } else {
+                        None
+                    }
+                });
                 let requested_verify_mode = DFlashVerifyMode::for_drafter(
                     drafter.config.is_dspark(),
                     verify_mode_raw.as_deref(),

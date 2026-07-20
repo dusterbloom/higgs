@@ -6513,8 +6513,7 @@ impl FfnBlock {
 
     fn tg_lut4_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED
-            .get_or_init(|| std::env::var("HIGGS_BONSAI_TG_LUT4").is_ok_and(|value| value == "1"))
+        *ENABLED.get_or_init(|| std::env::var("HIGGS_BONSAI_TG_LUT4").map_or(true, |v| v != "0"))
     }
 
     fn tg_lut4_fused_mlp_enabled() -> bool {
