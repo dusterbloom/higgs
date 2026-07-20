@@ -121,21 +121,6 @@ Runtime with strict ternary head:
 row2 MLP + GPU head + split-K down + ternary head: 19.68 tok/s
 ```
 
-Split-K variants for the strict ternary head were then tested. They were parity-correct but did not materially beat the direct strict ternary candidate:
-
-```text
-MLX qmm + argmax:              15594.7 us
-affine candidate + GPU reduce: 11307.1 us
-ternary direct + GPU reduce:    8495.6 us
-ternary split-K2 + GPU reduce:  8476.4 us
-ternary split-K4 + GPU reduce:  8655.0 us
-split-K2 vs direct:             1.002x
-split-K4 vs direct:             0.982x
-argmax parity:                  matched
-```
-
-Conclusion: split-K head is below the wiring threshold. The extra partial-sum traffic cancels the small parallelism gain, unlike `down_proj`.
-
 Server telemetry stayed behavior-identical:
 
 ```text
@@ -249,69 +234,6 @@ server decode:      ~12.0-12.4 tok/s
 
 Conclusion: the feasible power-of-two verifier tile loses. The lower draft cap increases rounds and drops acceptance enough that any M=4 scaling benefit is erased. Testing M=8 would require a dSpark artifact or verifier schedule that can actually propose seven draft positions.
 
-## Verifier overhead outside target forward
-
-Phase tracing showed that accepted-id resolution and commit bookkeeping are not the remaining bottleneck:
-
-```text
-steady resolve_ms:       ~0.1 ms
-steady draft_commit_ms:  ~0.0 ms
-steady target_commit_ms: ~0.1 ms
-```
-
-The measurable non-target overhead is drafter-side:
-
-```text
-sidecar output proposal:
-  steady stage_ms:   ~13 ms
-  steady propose_ms: ~20 ms
-  steady total_ms:   ~251-253 ms
-
-target-head proposal:
-  steady stage_ms:   ~13 ms
-  steady propose_ms: ~17 ms
-  steady total_ms:   ~246-248 ms
-```
-
-However, full 128-token Fibonacci throughput with target-head proposal did not beat the sidecar-output best:
-
-```text
-sidecar output proposal best: 19.68 tok/s
-target-head proposal:        19.61 tok/s
-```
-
-Conclusion: `HIGGS_DSPARK_TARGET_HEAD=1` reduces proposal timing in traces, but it is not a net throughput win on the apples-to-apples run. The next useful work should target the dSpark proposal implementation itself, especially the sequential Markov resampler and sidecar Q4 output path.
-
-Proposal-detail tracing (`HIGGS_DSPARK_PROPOSE_TRACE=1`) then split the sidecar proposal:
-
-```text
-steady sidecar output projection: ~16-17 ms
-steady Markov step 0:             ~1.1 ms
-steady Markov step 1:             ~1.1 ms
-steady Markov step 2:             ~1.1 ms
-steady Markov step 3:             ~1.1 ms
-steady concat:                    ~0.1-0.2 ms
-```
-
-Conclusion: the sidecar Q4 output projection is the dominant proposal cost. A fused `base logits + Markov bias -> argmax` kernel can only attack roughly `4-5 ms` per round; the larger lever is the sidecar output head projection itself.
-
-Stage-detail tracing (`HIGGS_DSPARK_STAGE_TRACE=1`) split the dSpark trunk:
-
-```text
-steady context append/project: ~1.5-2.3 ms
-steady log-SNR add:           ~0.1-0.2 ms
-steady layer 0:               ~2.1 ms
-steady layer 1:               ~2.1 ms
-steady layer 2:               ~2.1 ms
-steady layer 3:               ~2.1 ms
-steady layer 4:               ~2.1 ms
-steady layer 5:               ~2.1 ms
-steady final norm:            ~0.2 ms
-steady stage total:           ~15 ms with trace barriers
-```
-
-Conclusion: the trunk is evenly distributed across six layers; no single stage subcomponent is an obvious quick win. The output head remains the most concentrated target.
-
 Runtime result with:
 
 ```bash
@@ -359,13 +281,13 @@ HIGGS_DSPARK_NATIVE_VERIFY=1
 
 ## Next targets
 
-The remaining gap is likely in the dSpark drafter proposal/stage path and smaller verifier scheduling overheads.
+The remaining gap is likely in `down_proj`, `lm_head`, and verifier overhead outside the MLP.
 
 Recommended next moves:
 
-1. Probe a faster sidecar Q4 output head path for `[1,4,5120] -> [1,4,vocab]`, ideally argmax-oriented so it avoids materializing all logits if Markov bias can be folded later.
-2. Keep fused Markov `base logits + low-rank bias -> argmax` as a secondary probe; it can save at most the measured ~4-5 ms per round unless paired with output-head changes.
-3. If the output-head path stalls, inspect one dSpark trunk layer internally; stage-level tracing shows each layer costs about the same.
+1. Probe split-K variants for the strict ternary head candidate kernel, since the head has `N=248320`, `K=5120`, and still dominates isolated head time.
+2. Explore radix-3 prepack only after proving it beats direct ternary on gate/up, down, or head in isolation.
+3. Look for verifier scheduling overhead outside target forward now that arithmetic-only wins are smaller.
 4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
 5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.
 <<<<<<< HEAD

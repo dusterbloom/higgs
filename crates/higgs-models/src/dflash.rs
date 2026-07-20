@@ -575,12 +575,6 @@ impl DsparkExtras {
     ) -> Result<Array, Exception> {
         use mlx_rs::ops::indexing::IndexOp;
 
-        let trace = std::env::var("HIGGS_DSPARK_PROPOSE_TRACE").is_ok_and(|v| v == "1");
-        let mut ckpt = trace.then(std::time::Instant::now);
-        let mut output_ms = 0.0;
-        let mut markov_ms = Vec::new();
-        let mut concat_ms = 0.0;
-
         let owned_logits = if base_logits.is_none() {
             Some(
                 self.output
@@ -595,14 +589,6 @@ impl DsparkExtras {
         } else {
             None
         };
-        if let Some(ckpt_ref) = ckpt.as_mut() {
-            if let Some(logits) = owned_logits.as_ref() {
-                crate::mlx_exec::eval([logits])?;
-            }
-            let now = std::time::Instant::now();
-            output_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
-            *ckpt_ref = now;
-        }
         let resolved_logits = base_logits
             .or(owned_logits.as_ref())
             .ok_or_else(|| Exception::custom("dSpark base logits missing"))?;
@@ -625,30 +611,11 @@ impl DsparkExtras {
             let markov_bias = self.markov_head_b.forward(&markov_embedding)?;
             let logits = base.add(&markov_bias)?;
             previous = mlx_rs::argmax_axis!(&logits, -1)?;
-            if let Some(ckpt_ref) = ckpt.as_mut() {
-                crate::mlx_exec::eval([&previous])?;
-                let now = std::time::Instant::now();
-                markov_ms.push(now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0);
-                *ckpt_ref = now;
-            }
             sampled.push(previous.clone());
         }
 
         let refs: Vec<&Array> = sampled.iter().collect();
-        let out = ops::concatenate_axis(&refs, 0)?.reshape(&[1, block_size])?;
-        if let Some(ckpt_ref) = ckpt.as_mut() {
-            crate::mlx_exec::eval([&out])?;
-            let now = std::time::Instant::now();
-            concat_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
-            tracing::info!(
-                output_ms = format!("{output_ms:.2}"),
-                markov_ms = ?markov_ms.iter().map(|ms| format!("{ms:.2}")).collect::<Vec<_>>(),
-                concat_ms = format!("{concat_ms:.2}"),
-                total_ms = format!("{:.2}", output_ms + markov_ms.iter().sum::<f64>() + concat_ms),
-                "dSpark proposal detail"
-            );
-        }
-        Ok(out)
+        ops::concatenate_axis(&refs, 0)?.reshape(&[1, block_size])
     }
 }
 
@@ -1343,13 +1310,6 @@ impl DFlashDrafter {
         taps: &[Array],
         cache: &DFlashCache,
     ) -> Result<DFlashForwardTransaction, Exception> {
-        let trace = std::env::var("HIGGS_DSPARK_STAGE_TRACE").is_ok_and(|v| v == "1");
-        let mut ckpt = trace.then(std::time::Instant::now);
-        let mut context_ms = 0.0;
-        let mut log_snr_ms = 0.0;
-        let mut layer_ms = Vec::new();
-        let mut norm_ms = 0.0;
-
         let rows = self.validate_context_taps(taps, "forward")?;
         self.validate_noise(noise, taps)?;
         let projected_position = cache.projected_position()?;
@@ -1365,18 +1325,6 @@ impl DFlashDrafter {
                 "drafter forward failed to flush its context-tile remainder",
             ));
         }
-        if let Some(ckpt_ref) = ckpt.as_mut() {
-            let mut targets = staged
-                .iter()
-                .flatten()
-                .flat_map(|(keys, values)| [keys, values])
-                .collect::<Vec<_>>();
-            targets.push(&combined);
-            crate::mlx_exec::eval(targets)?;
-            let now = std::time::Instant::now();
-            context_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
-            *ckpt_ref = now;
-        }
         let noise_position = cache
             .position
             .checked_add(rows)
@@ -1386,41 +1334,10 @@ impl DFlashDrafter {
             Some(dspark) => dspark.add_log_snr(noise)?,
             None => noise.clone(),
         };
-        if let Some(ckpt_ref) = ckpt.as_mut() {
-            crate::mlx_exec::eval([&h])?;
-            let now = std::time::Instant::now();
-            log_snr_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
-            *ckpt_ref = now;
-        }
-        for (index, (layer, lc)) in self.layers.iter_mut().zip(staged.iter_mut()).enumerate() {
+        for (layer, lc) in self.layers.iter_mut().zip(staged.iter_mut()) {
             h = layer.forward_noise(&h, lc, noise_position)?;
-            if let Some(ckpt_ref) = ckpt.as_mut() {
-                crate::mlx_exec::eval([&h])?;
-                let now = std::time::Instant::now();
-                layer_ms.push((index, now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0));
-                *ckpt_ref = now;
-            }
         }
         let hidden = self.norm.forward(&h)?;
-        if let Some(ckpt_ref) = ckpt.as_mut() {
-            crate::mlx_exec::eval([&hidden])?;
-            let now = std::time::Instant::now();
-            norm_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
-            tracing::info!(
-                context_ms = format!("{context_ms:.2}"),
-                log_snr_ms = format!("{log_snr_ms:.2}"),
-                layer_ms = ?layer_ms
-                    .iter()
-                    .map(|(index, ms)| format!("{index}:{ms:.2}"))
-                    .collect::<Vec<_>>(),
-                norm_ms = format!("{norm_ms:.2}"),
-                total_ms = format!(
-                    "{:.2}",
-                    context_ms + log_snr_ms + layer_ms.iter().map(|(_, ms)| *ms).sum::<f64>() + norm_ms
-                ),
-                "dSpark stage detail"
-            );
-        }
         Ok(DFlashForwardTransaction {
             hidden,
             layers: staged,
