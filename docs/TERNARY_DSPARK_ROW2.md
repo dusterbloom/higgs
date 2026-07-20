@@ -80,10 +80,35 @@ speedup: 1.388x
 argmax parity: matched
 ```
 
-Runtime impact was real but small:
+The first runtime impact was real but small:
 
 ```text
 head argmax only: 14.03 tok/s
+```
+
+The follow-up moved the final candidate reduction from CPU to a tiny GPU kernel returning `[1,5]` `uint32` ids directly. Isolated head timing was neutral because the projection dominates:
+
+```text
+MLX qmm + argmax:       15724.8 us
+candidate + CPU reduce: 11284.3 us
+candidate + GPU reduce: 11285.1 us
+GPU vs CPU:             1.000x
+argmax parity:          matched
+```
+
+End-to-end runtime did improve because the verifier no longer syncs/copies the candidate arrays to CPU:
+
+```text
+row2 MLP + CPU head reduce: 17.49 tok/s
+row2 MLP + GPU head reduce: 18.55 tok/s
+```
+
+Server telemetry stayed behavior-identical:
+
+```text
+accept_len: 4.23
+spec_rounds: 30
+server decode after warmup: ~16.0 tok/s
 ```
 
 The head path is available behind:
@@ -182,7 +207,7 @@ Long Fibonacci, 128 tokens:
 
 ```text
 previous long Fibonacci: 13.87 tok/s
-row2 MLP + head argmax:  17.49 tok/s
+row2 MLP + head argmax:  18.55 tok/s
 ```
 
 Server telemetry:
@@ -191,10 +216,10 @@ Server telemetry:
 accept_len: 4.23
 spec_rounds: 30
 server decode before: ~12.0-12.1 tok/s
-server decode after:  14.9-15.5 tok/s
+server decode after:  ~16.0 tok/s
 ```
 
-This is about `1.29x` versus the AR Fibonacci baseline, still short of the `1.5x` target but now materially close.
+This is about `1.37x` versus the AR Fibonacci baseline, still short of the `1.5x` target but now materially close.
 
 ## Runtime controls
 
@@ -223,7 +248,7 @@ The remaining gap is likely in `down_proj`, `lm_head`, and verifier overhead out
 Recommended next moves:
 
 1. Improve `down_proj` row2 M=5, where current isolated speedup is only `1.04x`, without falling back to stock MLX.
-2. Replace the head candidate path with a row2/radix-3 head argmax kernel to recover more of the `lm_head` cost.
-3. Explore radix-3 prepack only after proving it beats direct row2 on gate/up and down in isolation.
+2. Explore a direct row2/radix-3 head argmax kernel to recover more of the remaining `lm_head` cost.
+3. Explore radix-3 prepack only after proving it beats direct row2 on gate/up, down, or head in isolation.
 4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
 5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.

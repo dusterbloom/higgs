@@ -1188,6 +1188,10 @@ mod tests {
                 crate::metal_kernel::bonsai_q2_m5_argmax_candidates(&x, &w, &s, &b, 128)
                     .unwrap();
             crate::mlx_exec::eval([&maxv, &maxid].into_iter()).unwrap();
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
+                .unwrap()
+                .eval()
+                .unwrap();
         }
 
         let logits = mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, 128, 2).unwrap();
@@ -1216,6 +1220,11 @@ mod tests {
             cand_ids.push(best_id);
         }
         eprintln!("Q2_M5_HEAD_ARGMAX_PARITY ref={ref_ids:?} cand={cand_ids:?}");
+        let gpu_ids_arr = crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
+            .unwrap();
+        gpu_ids_arr.eval().unwrap();
+        let gpu_ids: Vec<u32> = gpu_ids_arr.as_slice::<u32>().to_vec();
+        eprintln!("Q2_M5_HEAD_ARGMAX_GPU_REDUCE gpu={gpu_ids:?}");
 
         let n_iters = 10;
         let t0 = std::time::Instant::now();
@@ -1253,9 +1262,23 @@ mod tests {
         }
         let candidate_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
 
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            let (maxv, maxid) =
+                crate::metal_kernel::bonsai_q2_m5_argmax_candidates(&x, &w, &s, &b, 128)
+                    .unwrap();
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
+                .unwrap()
+                .eval()
+                .unwrap();
+        }
+        let gpu_reduce_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
         eprintln!(
-            "Q2_M5_HEAD_ARGMAX lm_head ({out_f}x{in_f}) M=5: mlx_qmm_argmax={mlx_argmax_us:.1}us candidate_kernel={candidate_us:.1}us speedup={:.3}x",
-            mlx_argmax_us / candidate_us
+            "Q2_M5_HEAD_ARGMAX lm_head ({out_f}x{in_f}) M=5: mlx_qmm_argmax={mlx_argmax_us:.1}us candidate_cpu_reduce={candidate_us:.1}us candidate_gpu_reduce={gpu_reduce_us:.1}us cpu_speedup={:.3}x gpu_speedup={:.3}x gpu_vs_cpu={:.3}x",
+            mlx_argmax_us / candidate_us,
+            mlx_argmax_us / gpu_reduce_us,
+            candidate_us / gpu_reduce_us
         );
     }
 }

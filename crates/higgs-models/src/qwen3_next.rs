@@ -9578,26 +9578,7 @@ impl Qwen3NextCausalLM {
             &head.biases,
             head.group_size,
         )?;
-        crate::mlx_exec::eval([&maxv, &maxid].into_iter())?;
-        let values = maxv.as_slice::<f32>();
-        let ids = maxid.as_slice::<f32>();
-        let blocks = values.len() / 5;
-        let mut out = Vec::with_capacity(5);
-        for row in 0..5 {
-            let mut best_v = f32::NEG_INFINITY;
-            let mut best_id = 0u32;
-            for block in 0..blocks {
-                let idx = row * blocks + block;
-                let v = values[idx];
-                let id = ids[idx] as u32;
-                if v > best_v || (v == best_v && id < best_id) {
-                    best_v = v;
-                    best_id = id;
-                }
-            }
-            out.push(best_id);
-        }
-        Ok(Some(Array::from_slice(&out, &[1, 5])))
+        crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid).map(Some)
     }
 
     fn project_logits(&self, hidden: &Array) -> Result<Array, Exception> {

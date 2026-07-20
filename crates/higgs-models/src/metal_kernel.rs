@@ -1442,6 +1442,7 @@ for (int r = 0; r < RPS; ++r) {
 static FAST_Q2_QMV_SIMD_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static FAST_Q2_TERNARY_QMV_SIMD_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static Q2_M5_ARGMAX_CANDIDATES_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+static Q2_M5_ARGMAX_REDUCE_IDS_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 #[allow(unsafe_code)]
 fn create_fast_q2_qmv_simd() -> mlx_sys::mlx_fast_metal_kernel {
@@ -1910,6 +1911,135 @@ fn create_q2_m5_argmax_candidates_kernel() -> mlx_sys::mlx_fast_metal_kernel {
         mlx_sys::mlx_vector_string_free(out_vec);
         kernel
     }
+}
+
+const Q2_M5_ARGMAX_REDUCE_IDS_SOURCE: &str = r"
+constexpr int WG = 1024;
+threadgroup float vals[WG];
+threadgroup uint ids_tg[WG];
+
+uint tid = thread_index_in_threadgroup;
+uint row = threadgroup_position_in_grid.x;
+int idx = int(row) * Blocks + int(tid);
+
+if (tid < uint(Blocks)) {
+    vals[tid] = maxv[idx];
+    ids_tg[tid] = uint(maxid[idx]);
+} else {
+    vals[tid] = -INFINITY;
+    ids_tg[tid] = 0u;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+        uint rhs = tid + stride;
+        if (vals[rhs] > vals[tid] || (vals[rhs] == vals[tid] && ids_tg[rhs] < ids_tg[tid])) {
+            vals[tid] = vals[rhs];
+            ids_tg[tid] = ids_tg[rhs];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (tid == 0u) {
+    ids[row] = ids_tg[0];
+}
+";
+
+#[allow(unsafe_code)]
+fn create_q2_m5_argmax_reduce_ids_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"maxv", c"maxid"]);
+    let out_vec = cstr_vec(&[c"ids"]);
+    let source = CString::new(Q2_M5_ARGMAX_REDUCE_IDS_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_m5_argmax_reduce_ids_v1".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code, dead_code)]
+pub fn bonsai_q2_m5_argmax_reduce_ids(maxv: &Array, maxid: &Array) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+    let shape = maxv.shape();
+    if shape.len() != 2 || shape[0] != 5 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_m5_argmax_reduce_ids: expected [5, blocks], got {shape:?}"
+        )));
+    }
+    if maxid.shape() != shape {
+        return Err(Exception::custom(
+            "bonsai_q2_m5_argmax_reduce_ids: maxv/maxid shape mismatch",
+        ));
+    }
+    let blocks = shape[1];
+    if blocks > 1024 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_m5_argmax_reduce_ids: blocks={blocks} exceeds WG=1024"
+        )));
+    }
+
+    let stream = Stream::task_local_or_default();
+    let cached = Q2_M5_ARGMAX_REDUCE_IDS_KERNEL
+        .get_or_init(|| CachedMetalKernel(create_q2_m5_argmax_reduce_ids_kernel()));
+    let config = unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Blocks".as_ptr(),
+            blocks,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 5 * 1024, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 1024, 1, 1);
+        let out_shape = [1, 5];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            mlx_sys::mlx_dtype__MLX_UINT32,
+        );
+        config
+    };
+
+    let input_ptrs = [maxv.as_ptr(), maxid.as_ptr()];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q2_m5_argmax_reduce_ids failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut ids_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut ids_ptr, outputs_vec, 0) };
+        Ok(unsafe { Array::from_ptr(ids_ptr) })
+    };
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+    }
+    result
 }
 
 #[allow(unsafe_code, dead_code)]
