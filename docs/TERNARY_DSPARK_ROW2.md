@@ -468,3 +468,32 @@ samples=234 mean_rank="1.20" max_rank=13 hit16_rate="1.000" hit32_rate="1.000" h
 ```
 
 Conclusion: for the Fibonacci workload, the Markov bias almost never changes the candidate outside the base head's tiny shortlist. This is the first evidence with enough upside for a larger proposal-path speedup. The next implementation probe should test a top-16 or top-32 candidate path with exact fallback: compute base topK, evaluate Markov-B only for those candidate rows, and fall back to the full current Markov path whenever the exactness guard cannot prove the shortlist winner.
+
+## Top-16 Markov shortlist compare probe
+
+A first implementation probe was added behind:
+
+```bash
+HIGGS_DSPARK_TOPK_COMPARE=16
+```
+
+This mode is still exact-generation: it computes a shortlist candidate, then computes the existing full-vocab Markov-biased argmax and logs whether they match. The shortlist path uses MLX base top-K selection, gathers only those Markov-B output rows, evaluates `markov_q4(A(prev))` only for the shortlist, adds the base top-K scores, and picks the best candidate.
+
+Long Fibonacci, 128 tokens, one warmup and one traced trial:
+
+```text
+samples:       234 proposal positions
+K:             16
+matches:       234 / 234
+hit rate:      100.0%
+accept_len:    4.23
+spec_rounds:   30
+```
+
+Representative final cumulative line:
+
+```text
+position=0 k=16 exact=18 shortlist=18 matched=true samples=234 hit_rate="1.000"
+```
+
+Conclusion: the top-16 shortlist is exact on this Fibonacci run in compare mode. The current compare path is not a throughput result because it deliberately runs both shortlist and full exact computation. The next probe should add a runtime fast-path flag that uses the shortlist token directly, with a separate compare flag retained for correctness audits on prose.

@@ -980,6 +980,20 @@ impl QLinear {
         }
     }
 
+    pub(crate) fn forward_rows(&self, x: &Array, rows: &Array) -> Result<Array, Exception> {
+        use mlx_rs::ops::indexing::take_axis;
+
+        if self.mode != crate::quant_mode::QuantMode::Affine || self.bits == 1 {
+            return Err(Exception::custom(
+                "QLinear::forward_rows currently supports affine bits>=2 only",
+            ));
+        }
+        let weight = take_axis(&self.weight, rows, 0)?;
+        let scales = take_axis(&self.scales, rows, 0)?;
+        let biases = take_axis(&self.biases, rows, 0)?;
+        quantized_forward(x, &weight, &scales, &biases, self.group_size, self.bits)
+    }
+
     fn qgemm_verify_shape(&self, x: &Array) -> Option<i32> {
         if !qgemm_verify_enabled()
             || self.bits != 4
