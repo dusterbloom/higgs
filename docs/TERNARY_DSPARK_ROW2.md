@@ -249,6 +249,39 @@ server decode:      ~12.0-12.4 tok/s
 
 Conclusion: the feasible power-of-two verifier tile loses. The lower draft cap increases rounds and drops acceptance enough that any M=4 scaling benefit is erased. Testing M=8 would require a dSpark artifact or verifier schedule that can actually propose seven draft positions.
 
+## Verifier overhead outside target forward
+
+Phase tracing showed that accepted-id resolution and commit bookkeeping are not the remaining bottleneck:
+
+```text
+steady resolve_ms:       ~0.1 ms
+steady draft_commit_ms:  ~0.0 ms
+steady target_commit_ms: ~0.1 ms
+```
+
+The measurable non-target overhead is drafter-side:
+
+```text
+sidecar output proposal:
+  steady stage_ms:   ~13 ms
+  steady propose_ms: ~20 ms
+  steady total_ms:   ~251-253 ms
+
+target-head proposal:
+  steady stage_ms:   ~13 ms
+  steady propose_ms: ~17 ms
+  steady total_ms:   ~246-248 ms
+```
+
+However, full 128-token Fibonacci throughput with target-head proposal did not beat the sidecar-output best:
+
+```text
+sidecar output proposal best: 19.68 tok/s
+target-head proposal:        19.61 tok/s
+```
+
+Conclusion: `HIGGS_DSPARK_TARGET_HEAD=1` reduces proposal timing in traces, but it is not a net throughput win on the apples-to-apples run. The next useful work should target the dSpark proposal implementation itself, especially the sequential Markov resampler and sidecar Q4 output path.
+
 Runtime result with:
 
 ```bash
@@ -296,12 +329,12 @@ HIGGS_DSPARK_NATIVE_VERIFY=1
 
 ## Next targets
 
-The remaining gap is likely in `down_proj`, `lm_head`, and verifier overhead outside the MLP.
+The remaining gap is likely in the dSpark drafter proposal/stage path and smaller verifier scheduling overheads.
 
 Recommended next moves:
 
-1. Explore radix-3 prepack only after proving it beats direct ternary on gate/up, down, or head in isolation.
-2. Look for verifier scheduling overhead outside target forward now that arithmetic-only wins are smaller.
-3. Probe a lower-overhead final verifier path that avoids extra array construction/casts around the `[1,5]` accepted-token ids.
+1. Probe a fused dSpark proposal kernel for `base logits + Markov low-rank bias -> argmax`, avoiding four separate full-vocab add/argmax passes.
+2. Profile `stage_forward` inside the six-layer dSpark trunk to find whether attention, MLP, or context-tile append dominates the steady ~13 ms.
+3. Explore radix-3 prepack only after proving it beats direct ternary on gate/up, down, or head in isolation.
 4. Test M=8 only if a dSpark artifact or schedule can produce seven draft positions; the current artifact clamps at four.
 5. Keep native verifier scheduling as an explicit probe/flag until exactness and acceptance are understood across prose.
