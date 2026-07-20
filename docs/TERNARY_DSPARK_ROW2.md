@@ -434,3 +434,37 @@ argmax parity:                   matched
 ```
 
 Conclusion: preserving M=4 output batching was the right direction, but the exact Markov-only fusion only trims about `2.7%` in this benchmark. It is not enough by itself to explain a path from `19.68 tok/s` to a robust `1.5x`. The next higher-upside question is whether full-vocab Markov-biased argmax is necessary at all: measure base-topK containment of `argmax(base + markov_bias)` on real proposal states, then consider topK plus exact fallback only if containment is high.
+
+## Base-topK containment probe
+
+The next probe measured whether the exact dSpark token from `argmax(base_logits + markov_bias)` was already present in the base-output head's top-K candidates. This was instrumented behind:
+
+```bash
+HIGGS_DSPARK_TOPK_TRACE=1
+```
+
+The trace is non-invasive: it computes the current exact Markov-biased argmax, then ranks that chosen token under the base logits alone. It is intentionally not a throughput benchmark because it copies the base row to CPU for rank measurement.
+
+Long Fibonacci, 128 tokens, one warmup and one traced trial:
+
+```text
+samples:        234 proposal positions
+mean base rank: 1.20
+max base rank:  13
+hit@16:         100.0%
+hit@32:         100.0%
+hit@64:         100.0%
+hit@128:        100.0%
+hit@256:        100.0%
+hit@512:        100.0%
+accept_len:     4.23
+spec_rounds:    30
+```
+
+Representative final cumulative line:
+
+```text
+samples=234 mean_rank="1.20" max_rank=13 hit16_rate="1.000" hit32_rate="1.000" hit64_rate="1.000" hit128_rate="1.000" hit256_rate="1.000" hit512_rate="1.000"
+```
+
+Conclusion: for the Fibonacci workload, the Markov bias almost never changes the candidate outside the base head's tiny shortlist. This is the first evidence with enough upside for a larger proposal-path speedup. The next implementation probe should test a top-16 or top-32 candidate path with exact fallback: compute base topK, evaluate Markov-B only for those candidate rows, and fall back to the full current Markov path whenever the exactness guard cannot prove the shortlist winner.
