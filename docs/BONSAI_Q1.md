@@ -167,6 +167,8 @@ endpoint drift was 0.27%, and external power remained connected and charging.
 A cap-three trial was also near parity but performed worse than cap four, so
 four remains the default.
 
+A fresh AC-gated row4/TG-LUT release benchmark was run on 2026-07-20 with the full frozen Q4 dSpark head, greedy/no-thinking decoding, block size and draft cap four, warmup eight, and the same 128-token paired ABBA workload. It passed the preflight and postflight AC checks, the 3% AR endpoint-drift gate, byte-exact speculative-vs-AR output, and the release acceptance floor. The aggregate result was 19.55 tok/s AR decode and 28.67 tok/s dSpark decode, or 1.466x. Wall throughput was 15.85 tok/s AR and 21.29 tok/s dSpark, or 1.343x. Acceptance stayed at `tau = 4.536` with 90.00% exact draft matches, and AR endpoint drift was 0.85% decode / 0.56% wall. This supersedes the earlier powered pre-TG-LUT result as the promotable 1-bit row4/TG-LUT baseline.
+
 The experimental row4 TG-LUT path later measured 19.51 tok/s AR decode and
 29.01 tok/s speculative decode (1.487x) in the ABBA harness, while wall
 throughput rose from 15.72 to 21.63 tok/s (1.376x). Its best speculative sample
@@ -194,7 +196,7 @@ absolute endpoint. Interpolating the two off controls in latency space estimates
 that fusion improved AR decode by 2.23% but reduced speculative decode by 2.40%;
 the adjacent on-to-final-off comparison observed a larger 7.40% speculative
 difference whose magnitude remains order-confounded. This remained a
-discharging-battery diagnostic, ending at 61% with no external source connected.
+discharging-battery diagnostic, ending at 61% with no external source connected. It is retained as historical evidence because its absolute dSpark decode rate was slightly higher than the later AC gate, but the AC-gated 28.67 tok/s result is the publishable row4/TG-LUT claim.
 
 [The Bonsai-27B paper](https://www.alphaxiv.org/abs/2607.bonsai-27b) reports its
 dSpark throughput gains on H100 CUDA. It explicitly leaves net-positive Apple
@@ -220,3 +222,17 @@ ABBA result above, this provides no basis to enable fusion by default; it
 remains an explicit experiment. A powered confirmation is still pending. See
 `docs/DSPARK_MLX_DESIGN.md` for the complete state contract, rejected paths,
 and promotion gates.
+
+## Default runtime policy
+
+As of the July 20 AC-gated row4 release benchmark, Bonsai-27B 1-bit no longer requires the benchmark flag bundle for the proven path. When a Qwen3.5 affine 1-bit group-128 target is loaded, Higgs enables primary row4/TG-LUT promotion by default and keeps the rejected fused gate/up schedule off by default. A paired dSpark sidecar defaults to block verification when the model-domain validator accepts the request shape.
+
+Escape hatches remain explicit:
+
+```bash
+HIGGS_BONSAI_TG_LUT4=0              # disable Q1 row4 promotion
+HIGGS_DFLASH_VERIFY_MODE=canonical  # force S=1 dSpark verification
+HIGGS_BONSAI_TG_LUT4_FUSED_MLP=1    # experimental; not default
+```
+
+The default dSpark schedule keeps Prism's full frozen Q4 proposal head (`HIGGS_DSPARK_TARGET_HEAD=0` behavior) and draft cap four. This is the AC-backed path that produced 19.55 tok/s AR decode, 28.67 tok/s dSpark decode, 1.466x decode speedup, 15.85 versus 21.29 tok/s wall throughput, and 90.00% exact draft matches.

@@ -36,6 +36,8 @@ round, byte-exact output, and only 0.27% AR endpoint drift. Power remained
 connected and charging throughout. Cap three was also near parity but worse
 than cap four, so it is not the default.
 
+A fresh AC-gated row4/TG-LUT release benchmark on 2026-07-20 used the full frozen Q4 head, greedy/no-thinking sampling, block size and draft cap four, warmup eight, and the same 128-token paired ABBA workload. It passed AC preflight/postflight, byte-exact speculative-vs-AR output, the 3% AR endpoint-drift gate, and the release acceptance floor. The aggregate was 19.55 tok/s AR decode and 28.67 tok/s dSpark decode, or 1.466x. Wall throughput was 15.85 tok/s AR and 21.29 tok/s dSpark, or 1.343x. Acceptance remained `tau = 4.536` with 90.00% exact draft matches. AR endpoint drift was 0.85% decode and 0.56% wall.
+
 The experimental row4 TG-LUT integration subsequently produced 19.51 tok/s AR
 decode and 29.01 tok/s speculative decode in the same ABBA harness, or 1.487x,
 with wall throughput increasing from 15.72 to 21.63 tok/s (1.376x). The best
@@ -59,8 +61,7 @@ The off result therefore reached 1.435x decode and 1.325x wall speedup, and its
 best speculative sample reached 29.47 tok/s. Acceptance and byte parity were
 unchanged. This validates the primary-layout path under real decoding but does
 not support enabling gate/up fusion. The run ended at 61% on a discharging
-battery with no external source, so a powered primary-row4 result is still
-required for promotion.
+battery with no external source, so it is retained as diagnostic evidence; the later AC-gated row4/TG-LUT run supplies the promotable result.
 
 The later full-Q4 ABBA battery gate measured 19.95 tok/s AR decode and 29.14
 tok/s dSpark decode (1.461x), with 90% matched-draft acceptance. Its end-to-end
@@ -68,7 +69,9 @@ wall throughput was 16.14 versus 21.80 tok/s (1.35x); the lower wall figure
 includes prefill and request orchestration and is not a dSpark decode
 regression. A separate paired-radix run measured 16.8 tok/s AR versus 25.59
 tok/s dSpark decode (1.52x) at 87.8% acceptance. These remain machine-local
-battery measurements pending the final stable-power rerun.
+battery measurements; the stable-power row4/TG-LUT gate is now 19.55 tok/s AR
+versus 28.67 tok/s dSpark decode (1.466x), with 15.85 versus 21.29 tok/s wall
+throughput (1.343x) and 90.00% acceptance.
 
 ## Pinned sidecar contract
 

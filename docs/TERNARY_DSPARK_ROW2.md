@@ -612,3 +612,26 @@ client decode mean: 19.68 tok/s
 ```
 
 Conclusion: fused candidate Markov scoring recovers most of the top-K overhead and is the best top-K variant so far, but it does not beat the existing exact full-Markov path on the apples-to-apples Fibonacci run. It should remain an opt-in probe and should not become the default ternary Bonsai path.
+
+## Default runtime policy
+
+The exact ternary dSpark path is now the default for recognized 2-bit Bonsai targets. Users no longer need to set the successful benchmark flags manually:
+
+```bash
+HIGGS_DFLASH_VERIFY_MODE=block
+HIGGS_DSPARK_DRAFT_CAP=4
+HIGGS_DSPARK_TARGET_HEAD=0
+HIGGS_DSPARK_Q2_ROW2_MLP=1
+HIGGS_DSPARK_Q2_HEAD_ARGMAX=1
+```
+
+Higgs now defaults to the equivalent policy when a paired dSpark sidecar is loaded against an affine 2-bit Qwen3.5 target and the block verifier domain check passes. AR decode remains on MLX stock affine Q2 because the custom M=1 Q2 SIMD path lost full-model throughput. The top-K proposal experiments also remain opt-in because the best fused top-K scorer reached 19.61 tok/s, below the exact full-Markov 19.68 tok/s result.
+
+Escape hatches:
+
+```bash
+HIGGS_DFLASH_VERIFY_MODE=canonical  # force S=1 verification
+HIGGS_DSPARK_Q2_ROW2_MLP=0          # disable ternary row2 verifier MLP
+HIGGS_DSPARK_Q2_HEAD_ARGMAX=0       # disable verifier head argmax ids
+HIGGS_DSPARK_TOPK_FAST=16           # still experimental; not default
+```

@@ -826,11 +826,19 @@ impl AnyModel {
         }
     }
 
+    /// Whether the target is the 1-bit Bonsai variant (affine quantization at
+    /// 1 bit). This enables the validated Bonsai row4/dSpark defaults while
+    /// leaving unrelated models on their generic policy.
+    pub fn is_target_1bit(&self) -> bool {
+        match self {
+            Self::Qwen3Next(m) => m.args.default_quant_spec().bits == 1,
+            _ => false,
+        }
+    }
+
     /// Whether the target is the 2-bit Bonsai variant (affine quantization at
-    /// 2 bits). The 2-bit target is the only model with the block
-    /// (`BatchedTape`) verifier validated end-to-end, so the engine uses it as
-    /// that model's default verify schedule while the 1-bit Bonsai keeps the
-    /// conservative `CanonicalS1` contract.
+    /// 2 bits). The 2-bit target defaults to the validated exact dSpark block
+    /// verifier plus row2/head verifier kernels; AR decode still uses MLX stock.
     pub fn is_target_2bit(&self) -> bool {
         match self {
             Self::Qwen3Next(m) => m.args.default_quant_spec().bits == 2,

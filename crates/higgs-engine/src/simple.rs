@@ -809,9 +809,9 @@ pub struct CacheStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DFlashVerifyMode {
     /// Fold the target's ordinary one-token transition until first rejection.
-    /// This is the fail-closed default for the 1-bit Bonsai target and any
-    /// dSpark model without an explicit `HIGGS_DFLASH_VERIFY_MODE`; the 2-bit
-    /// Bonsai target defaults to `BatchedTape` instead (see `for_drafter`).
+    /// This is the fail-closed fallback for dSpark models outside the validated
+    /// block-verifier domain or when explicitly requested via
+    /// `HIGGS_DFLASH_VERIFY_MODE=canonical`.
     CanonicalS1,
     /// Experimental S>1 target forward plus GDN innovation-tape commit.
     BatchedTape,
@@ -1961,14 +1961,14 @@ impl SimpleEngine {
                 let dspark_target_head = drafter.config.is_dspark()
                     && (drafter.config.reuse_target_head()
                         || std::env::var("HIGGS_DSPARK_TARGET_HEAD").is_ok_and(|v| v != "0"));
-                let target_is_2bit = model.is_target_2bit();
+                let target_is_bonsai_lowbit = model.is_target_1bit() || model.is_target_2bit();
                 let verify_mode_raw = std::env::var("HIGGS_DFLASH_VERIFY_MODE").ok();
-                // The 2-bit Bonsai target has the block (BatchedTape) verifier
-                // validated end-to-end; default to it there. The 1-bit Bonsai
-                // keeps the conservative CanonicalS1 default (its contract)
-                // unless explicitly opted in via HIGGS_DFLASH_VERIFY_MODE.
+                // Bonsai low-bit targets have validated block-verifier defaults:
+                // Q1 through the AC-gated row4 release benchmark and Q2 through
+                // the exact ternary row2/head path. Non-Bonsai dSpark sidecars
+                // still fail closed to CanonicalS1 unless explicitly opted in.
                 let verify_mode_raw = verify_mode_raw.or_else(|| {
-                    if drafter.config.is_dspark() && target_is_2bit {
+                    if drafter.config.is_dspark() && target_is_bonsai_lowbit {
                         Some("block".to_owned())
                     } else {
                         None
@@ -7343,8 +7343,7 @@ impl SimpleEngine {
                     let (verify_flat, draft_u32) = dflash_resolve_target_then_draft(
                         || {
                             if verify_logits.ndim() == 2
-                                && std::env::var("HIGGS_DSPARK_Q2_HEAD_ARGMAX")
-                                    .is_ok_and(|v| v == "1")
+                                && verify_logits.dtype() == Dtype::Uint32
                             {
                                 higgs_models::mlx_exec::eval([&verify_logits])
                                     .map_err(EngineError::Mlx)?;

@@ -743,7 +743,9 @@ impl QLinear {
     }
 
     fn q2_row2_m5_ternary_forward(&self, x: &Array) -> Result<Option<Array>, Exception> {
-        if !std::env::var("HIGGS_DSPARK_Q2_ROW2_MLP").is_ok_and(|v| v == "1")
+        let row2_enabled = std::env::var("HIGGS_DSPARK_Q2_ROW2_MLP")
+            .map_or(true, |v| v != "0");
+        if !row2_enabled
             || self.mode != crate::quant_mode::QuantMode::Affine
             || self.bits != 2
             || self.group_size != 128
@@ -6704,8 +6706,7 @@ impl FfnBlock {
 
     fn tg_lut4_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED
-            .get_or_init(|| std::env::var("HIGGS_BONSAI_TG_LUT4").is_ok_and(|value| value == "1"))
+        *ENABLED.get_or_init(|| std::env::var("HIGGS_BONSAI_TG_LUT4").map_or(true, |v| v != "0"))
     }
 
     fn tg_lut4_fused_mlp_enabled() -> bool {
@@ -9198,7 +9199,9 @@ impl Qwen3NextCausalLM {
             detail.final_norm_ms += now.duration_since(*ckpt).as_secs_f64() * 1000.0;
             *ckpt = now;
         }
-        let logits = if std::env::var("HIGGS_DSPARK_Q2_HEAD_ARGMAX").is_ok_and(|v| v == "1")
+        let q2_head_argmax_enabled = self.args.default_quant_spec().bits == 2
+            && std::env::var("HIGGS_DSPARK_Q2_HEAD_ARGMAX").map_or(true, |v| v != "0");
+        let logits = if q2_head_argmax_enabled
             && T == 5
             && !layer_detail_timing
         {
