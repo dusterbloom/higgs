@@ -635,10 +635,6 @@ impl DsparkExtras {
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|&k| k > 0 && k < vocab_size);
         let topk_shortlist = topk_fast.or(topk_compare);
-        let topk_base_kernel = std::env::var("HIGGS_DSPARK_TOPK_BASE_KERNEL")
-            .is_ok_and(|v| v == "1");
-        let topk_markov_kernel = std::env::var("HIGGS_DSPARK_TOPK_MARKOV_KERNEL")
-            .is_ok_and(|v| v == "1");
         let mut previous = Array::from_slice(&[anchor], &[1]);
         let mut sampled = Vec::with_capacity(usize::try_from(block_size).unwrap_or(0));
 
@@ -646,49 +642,25 @@ impl DsparkExtras {
             let base = resolved_logits
                 .index((.., position..position + 1, ..))
                 .reshape(&[-1, vocab_size])?;
-            let topk = if let Some(k) = topk_shortlist {
-                if topk_base_kernel && k == 16 {
-                    let (candidate_vals, candidate_ids) = crate::metal_kernel::base_top16_blocks(&base)?;
-                    let neg_candidates = candidate_vals.negative()?;
-                    let partition = ops::argpartition_axis(&neg_candidates, k - 1, -1)?;
-                    let candidate_pos = partition.index((.., 0..k));
-                    Some((
-                        candidate_ids.take_along_axis(&candidate_pos, -1)?,
-                        candidate_vals.take_along_axis(&candidate_pos, -1)?,
-                    ))
-                } else {
-                    let neg_base = base.negative()?;
-                    let partition = ops::argpartition_axis(&neg_base, k - 1, -1)?;
-                    let indices = partition.index((.., 0..k));
-                    let values = base.take_along_axis(&indices, -1)?;
-                    Some((indices, values))
-                }
+            let topk_indices = if let Some(k) = topk_shortlist {
+                let neg_base = base.negative()?;
+                let partition = ops::argpartition_axis(&neg_base, k - 1, -1)?;
+                Some(partition.index((.., 0..k)))
             } else {
                 None
             };
             let markov_embedding = (*self.markov_head_a).take_axis(&previous, 0)?;
-            let shortlist = if let Some((indices, base_topk)) = topk.as_ref() {
-                if topk_markov_kernel && indices.size() == 16 && base_topk.size() == 16 {
-                    Some(crate::metal_kernel::bonsai_q4_markov_top16_argmax(
-                        indices,
-                        base_topk,
-                        &markov_embedding,
-                        &self.markov_head_b.weight,
-                        &self.markov_head_b.scales,
-                        &self.markov_head_b.biases,
-                        self.markov_head_b.group_size,
-                    )?)
-                } else {
-                    let flat_indices = indices.reshape(&[-1])?;
-                    let markov_topk = self.markov_head_b.forward_rows(&markov_embedding, &flat_indices)?;
-                    let shortlist_logits = base_topk.add(&markov_topk)?;
-                    let shortlist_pos = mlx_rs::argmax_axis!(&shortlist_logits, -1)?;
-                    Some(
-                        indices
-                            .take_along_axis(&shortlist_pos.reshape(&[-1, 1])?, -1)?
-                            .reshape(&[-1])?,
-                    )
-                }
+            let shortlist = if let Some(indices) = topk_indices.as_ref() {
+                let flat_indices = indices.reshape(&[-1])?;
+                let base_topk = base.take_along_axis(indices, -1)?;
+                let markov_topk = self.markov_head_b.forward_rows(&markov_embedding, &flat_indices)?;
+                let shortlist_logits = base_topk.add(&markov_topk)?;
+                let shortlist_pos = mlx_rs::argmax_axis!(&shortlist_logits, -1)?;
+                Some(
+                    indices
+                        .take_along_axis(&shortlist_pos.reshape(&[-1, 1])?, -1)?
+                        .reshape(&[-1])?,
+                )
             } else {
                 None
             };
@@ -702,7 +674,7 @@ impl DsparkExtras {
                 let logits = base.add(&markov_bias)?;
                 previous = mlx_rs::argmax_axis!(&logits, -1)?;
             }
-            if topk.is_some() {
+            if topk_indices.is_some() {
                 let Some(shortlist) = shortlist.as_ref() else {
                     return Err(Exception::custom("dSpark topK compare shortlist missing"));
                 };
