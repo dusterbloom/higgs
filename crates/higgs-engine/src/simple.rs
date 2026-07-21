@@ -132,6 +132,25 @@ fn pflash_cache_source_and_request_tail<'a>(
     (body, tail)
 }
 
+fn pflash_cache_source_and_request_tail_with_boundary<'a>(
+    prompt: &'a [u32],
+    generation_suffix: &[u32],
+    body_token_count: Option<usize>,
+) -> (&'a [u32], &'a [u32]) {
+    if let Some(body_token_count) = body_token_count
+        && body_token_count <= prompt.len()
+    {
+        let body = prompt.get(..body_token_count).unwrap_or_default();
+        let tail = prompt.get(body_token_count..).unwrap_or_default();
+        return (body, tail);
+    }
+    pflash_cache_source_and_request_tail(prompt, generation_suffix)
+}
+
+fn dflash_accepts_pflash_plan(compressed: Option<&SurvivalPlan>) -> bool {
+    compressed.is_none_or(SurvivalPlan::is_contiguous_identity)
+}
+
 fn prefill_min_free_memory_mb() -> usize {
     std::env::var("HIGGS_PREFLASH_MIN_FREE_MB")
         .ok()
@@ -181,6 +200,7 @@ struct PFlashScoreOutcome {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PFlashPromptPolicy {
     pub hard_keep_ranges: Vec<Range<usize>>,
+    pub body_token_count: Option<usize>,
 }
 
 #[derive(Default)]
@@ -359,6 +379,39 @@ fn contains_real_user_query(messages: &[ChatMessage]) -> bool {
         let content = message.content.trim();
         !(content.starts_with("<tool_response>") && content.ends_with("</tool_response>"))
     })
+}
+
+fn pflash_current_user_start_token(
+    renderer: &ChatTemplateRenderer,
+    tokenizer: &Tokenizer,
+    messages: &[ChatMessage],
+    tail_start_message: usize,
+    tools: Option<&[serde_json::Value]>,
+    enable_thinking: bool,
+) -> Result<usize, EngineError> {
+    if tail_start_message == 0 {
+        return Ok(0);
+    }
+
+    let before_tail_messages = &messages[..tail_start_message];
+    if contains_real_user_query(before_tail_messages) {
+        let before_tail =
+            renderer.apply_with_thinking(before_tail_messages, tools, false, enable_thinking)?;
+        return token_len_for_text(tokenizer, &before_tail);
+    }
+
+    const SENTINEL: &str = "__HIGGS_PFLASH_CURRENT_USER_START__";
+    let mut probe_messages = before_tail_messages.to_vec();
+    probe_messages.push(ChatMessage {
+        role: "user".to_owned(),
+        content: SENTINEL.to_owned(),
+        tool_calls: None,
+    });
+    let rendered = renderer.apply_with_thinking(&probe_messages, tools, false, enable_thinking)?;
+    let Some(marker_start) = rendered.rfind(SENTINEL) else {
+        return Ok(0);
+    };
+    token_len_for_text(tokenizer, &rendered[..marker_start])
 }
 
 fn token_range_for_byte_span(
@@ -2819,6 +2872,9 @@ impl SimpleEngine {
             .map_err(|e| EngineError::Tokenization(e.to_string()))?;
         let prompt_tokens = encoding.get_ids().to_vec();
         let mut hard_keep_ranges = Vec::new();
+        let without_generation_prompt =
+            renderer.apply_with_thinking(messages, tools, false, enable_thinking)?;
+        let body_token_count = token_len_for_text(&self.tokenizer, &without_generation_prompt)?;
 
         if tools.is_some() {
             let without_tools =
@@ -2834,34 +2890,35 @@ impl SimpleEngine {
         if let Some(tail_start_message) =
             messages.iter().rposition(|message| message.role == "user")
         {
-            let before_tail_messages = &messages[..tail_start_message];
-            let start = if contains_real_user_query(before_tail_messages) {
-                let before_tail = match renderer.apply_with_thinking(
-                    before_tail_messages,
-                    tools,
-                    false,
-                    enable_thinking,
-                ) {
-                    Ok(rendered) => rendered,
-                    Err(error) => {
-                        tracing::debug!(
-                            error = %error,
-                            "PFlash hard-keep prefix render failed; keeping current-tail range from prompt start"
-                        );
-                        String::new()
-                    }
-                };
-                token_len_for_text(&self.tokenizer, &before_tail)?
-            } else {
-                0
+            let start = match pflash_current_user_start_token(
+                renderer,
+                &self.tokenizer,
+                messages,
+                tail_start_message,
+                tools,
+                enable_thinking,
+            ) {
+                Ok(start) => start,
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "PFlash hard-keep prefix boundary probe failed; keeping current-tail range from prompt start"
+                    );
+                    0
+                }
             };
-            let without_generation_prompt =
-                renderer.apply_with_thinking(messages, tools, false, enable_thinking)?;
-            let end = token_len_for_text(&self.tokenizer, &without_generation_prompt)?;
+            let end = body_token_count;
             push_merged_token_range(&mut hard_keep_ranges, prompt_tokens.len(), start..end);
         }
 
-        Ok((prompt_tokens, PFlashPromptPolicy { hard_keep_ranges }))
+        let body_token_count = body_token_count.min(prompt_tokens.len());
+        Ok((
+            prompt_tokens,
+            PFlashPromptPolicy {
+                hard_keep_ranges,
+                body_token_count: Some(body_token_count),
+            },
+        ))
     }
 
     /// Apply chat template and tokenize messages with explicit thinking control.
@@ -3109,11 +3166,17 @@ impl SimpleEngine {
             let resident_len = output.state.resident_len();
             let logical_next_pos = output.state.next_position();
             prepared.cache = AnyCache::Hybrid(output.state.into_cache());
+            let actual_keep_ratio = if plan.source_token_count == 0 {
+                1.0
+            } else {
+                resident_len as f64 / plan.source_token_count as f64
+            };
             tracing::info!(
                 source_tokens = plan.source_token_count,
                 resident_tokens = resident_len,
                 logical_next_pos,
-                keep_ratio = plan.metadata.keep_ratio,
+                actual_keep_ratio,
+                metadata_keep_ratio = plan.metadata.keep_ratio,
                 score_mode = ?plan.metadata.score_mode,
                 "PFlash sparse prefill executed"
             );
@@ -6007,7 +6070,11 @@ impl SimpleEngine {
         let total_start = std::time::Instant::now();
         let cache_config = self.pflash_plan_cache_config();
         let (body_tokens, generation_tail_tokens) =
-            pflash_cache_source_and_request_tail(prompt_tokens, generation_suffix);
+            pflash_cache_source_and_request_tail_with_boundary(
+                prompt_tokens,
+                generation_suffix,
+                pflash_policy.body_token_count,
+            );
         let exact_body_tail_start = pflash_policy
             .hard_keep_ranges
             .iter()
@@ -6198,10 +6265,17 @@ impl SimpleEngine {
                 "sampled dSpark request uses ordinary AR to preserve the shared RNG transition"
             );
         }
+        let dflash_accepts_prefill_plan = dflash_accepts_pflash_plan(compressed.as_ref());
+        if compressed.is_some() && !dflash_accepts_prefill_plan && self.dflash.is_some() {
+            tracing::info!(
+                "PFlash non-contiguous plan requires sparse target prefill; using AR decode until DFlash sparse taps are wired"
+            );
+        }
         let speculation_route = resolve_speculation_route(
             params.speculation,
             self.dflash.is_some()
                 && !sampled_dspark
+                && dflash_accepts_prefill_plan
                 && constraint.is_none()
                 && pixel_values.is_none()
                 && !logprobs,
@@ -9512,10 +9586,17 @@ impl SimpleEngine {
                 "sampled streaming dSpark request uses ordinary AR to preserve the shared RNG transition"
             );
         }
+        let dflash_accepts_prefill_plan = dflash_accepts_pflash_plan(compressed.as_ref());
+        if compressed.is_some() && !dflash_accepts_prefill_plan && self.dflash.is_some() {
+            tracing::info!(
+                "PFlash non-contiguous plan requires sparse target prefill; using AR streaming decode until DFlash sparse taps are wired"
+            );
+        }
         let speculation_route = resolve_speculation_route(
             params.speculation,
             self.dflash.is_some()
                 && !sampled_dspark
+                && dflash_accepts_prefill_plan
                 && constraint.is_none()
                 && pixel_values.is_none()
                 && !logprobs,
@@ -10590,7 +10671,8 @@ mod tests {
         dflash_resolve_target_then_draft, dflash_tail_draft_cap, drive_canonical_dspark_round,
         estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail, lock_or_recover,
         paired_dflash_exact_domain, parse_enabled_flag, pflash_cache_source_and_request_tail,
-        resolve_speculation_route, stateless_mtp_family_eligible, with_chat_terminator,
+        pflash_cache_source_and_request_tail_with_boundary, resolve_speculation_route,
+        stateless_mtp_family_eligible, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
@@ -10693,6 +10775,30 @@ mod tests {
         assert_eq!(next_tail, &suffix);
         assert!(next_body.starts_with(previous_body));
         assert!(!next_prompt.starts_with(&previous_prompt));
+    }
+
+    #[test]
+    fn pflash_cache_source_prefers_rendered_body_boundary() {
+        let suffix = [90, 91];
+        let prompt = [1, 2, 3, 4, 5, 77, 78];
+
+        let (body, tail) =
+            pflash_cache_source_and_request_tail_with_boundary(&prompt, &suffix, Some(5));
+
+        assert_eq!(body, &[1, 2, 3, 4, 5]);
+        assert_eq!(tail, &[77, 78]);
+    }
+
+    #[test]
+    fn pflash_cache_source_boundary_accepts_empty_tail() {
+        let suffix = [90, 91];
+        let prompt = [1, 2, 3, 4, 5];
+
+        let (body, tail) =
+            pflash_cache_source_and_request_tail_with_boundary(&prompt, &suffix, Some(5));
+
+        assert_eq!(body, &[1, 2, 3, 4, 5]);
+        assert!(tail.is_empty());
     }
 
     #[test]
