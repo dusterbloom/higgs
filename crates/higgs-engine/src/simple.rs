@@ -54,6 +54,7 @@ use crate::{
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 const DEFAULT_PAGED_KV_BLOCK_SIZE: usize = 64;
 pub const DEFAULT_PFLASH_KEEP_RATIO_MAX: f32 = 0.75;
+pub const DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO: f32 = 0.60;
 pub const DEFAULT_PFLASH_PLAN_CACHE: bool = true;
 pub const DEFAULT_PFLASH_PLAN_CACHE_ENTRIES: usize = 64;
 pub const DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD: usize = 128;
@@ -149,6 +150,17 @@ fn pflash_cache_source_and_request_tail_with_boundary<'a>(
 
 fn dflash_accepts_pflash_plan(compressed: Option<&SurvivalPlan>) -> bool {
     compressed.is_none_or(SurvivalPlan::is_contiguous_identity)
+}
+
+fn pflash_actual_keep_ratio(source_tokens: usize, kept_tokens: usize) -> f32 {
+    if source_tokens == 0 {
+        return 0.0;
+    }
+    kept_tokens as f32 / source_tokens as f32
+}
+
+fn pflash_auto_plan_worth_executing(source_tokens: usize, kept_tokens: usize) -> bool {
+    pflash_actual_keep_ratio(source_tokens, kept_tokens) <= DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO
 }
 
 fn prefill_min_free_memory_mb() -> usize {
@@ -1084,6 +1096,7 @@ struct CacheMetrics {
     pflash_attempts: AtomicU64,
     pflash_used: AtomicU64,
     pflash_fallbacks: AtomicU64,
+    pflash_skipped_unprofitable: AtomicU64,
     pflash_plan_cache_hits: AtomicU64,
     pflash_last_source_tokens: AtomicU64,
     pflash_last_kept_tokens: AtomicU64,
@@ -1117,6 +1130,8 @@ pub struct CacheStats {
     pub pflash_used: u64,
     /// PFlash attempts that fell back or errored before target execution.
     pub pflash_fallbacks: u64,
+    /// Auto PFlash plans skipped because survivor prefill would cost more than exact cache reuse.
+    pub pflash_skipped_unprofitable: u64,
     /// In-memory PFlash stable-body plan-cache hits.
     pub pflash_plan_cache_hits: u64,
     /// Source prompt tokens for the most recent accepted PFlash plan.
@@ -2573,6 +2588,10 @@ impl SimpleEngine {
             pflash_attempts: self.cache_metrics.pflash_attempts.load(Ordering::Relaxed),
             pflash_used: self.cache_metrics.pflash_used.load(Ordering::Relaxed),
             pflash_fallbacks: self.cache_metrics.pflash_fallbacks.load(Ordering::Relaxed),
+            pflash_skipped_unprofitable: self
+                .cache_metrics
+                .pflash_skipped_unprofitable
+                .load(Ordering::Relaxed),
             pflash_plan_cache_hits: self
                 .cache_metrics
                 .pflash_plan_cache_hits
@@ -6175,6 +6194,36 @@ impl SimpleEngine {
         let original_len = prompt_tokens.len();
         let kept_len = plan.len();
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        let actual_keep_ratio = pflash_actual_keep_ratio(original_len, kept_len);
+        if self.prefill_compression == PrefillCompressionMode::Auto
+            && !pflash_auto_plan_worth_executing(original_len, kept_len)
+        {
+            self.cache_metrics
+                .pflash_skipped_unprofitable
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                original = original_len,
+                kept = kept_len,
+                ratio = format_args!("{kept_len}/{original_len}"),
+                actual_keep_ratio,
+                max_auto_prefill_ratio = DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+                mode = ?plan.metadata.score_mode,
+                cache_prefix_tokens,
+                suffix_tokens,
+                suffix_identity,
+                request_tail_tokens = request_tail_tokens.len(),
+                exact_body_tail_tokens = body_tokens.len().saturating_sub(cache_source_tokens.len()),
+                hard_keep_ranges = pflash_policy.hard_keep_ranges.len(),
+                score_ms,
+                select_ms,
+                total_ms,
+                keep_floor = self.prefill_keep_ratio,
+                keep_ceiling = self.prefill_keep_ratio_max,
+                effective_keep_ratio,
+                "PFlash high-retention plan skipped; using exact prefill/cache path"
+            );
+            return Ok(None);
+        }
         let target_plan = match plan.target_sparse_prefill_plan() {
             Ok(target_plan) => target_plan,
             Err(error) => {
@@ -6197,6 +6246,7 @@ impl SimpleEngine {
             original = original_len,
             kept = kept_len,
             ratio = format_args!("{kept_len}/{original_len}"),
+            actual_keep_ratio,
             positions = plan.original_positions.len(),
             source = plan.source_token_count,
             mode = ?plan.metadata.score_mode,
@@ -10660,17 +10710,19 @@ impl SimpleEngine {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        CanonicalDflashRound, DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_PLAN_CACHE,
-        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
-        DFlashVerifyMode, DFlashVerifyRound, DflashPromptPartition, DflashTapFrontier, EngineError,
-        GenerationPromptSuffixes, IncrementalDetok, LivePair, PFlashPlanCache,
-        PFlashPlanCacheConfig, PrefillCompressionMode, SessionDsparkDecodeState, SessionGeneration,
-        SimpleEngine, SpeculationRoute, Tokenizer, adaptive_draft_depth_for_cap,
-        check_stop_sequences, contains_real_user_query, continuation_prior_len, derive_model_name,
-        detect_thinking_support, dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
+        CanonicalDflashRound, DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+        DEFAULT_PFLASH_PLAN_CACHE, DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+        DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD, DFlashVerifyMode, DFlashVerifyRound,
+        DflashPromptPartition, DflashTapFrontier, EngineError, GenerationPromptSuffixes,
+        IncrementalDetok, LivePair, PFlashPlanCache, PFlashPlanCacheConfig, PrefillCompressionMode,
+        SessionDsparkDecodeState, SessionGeneration, SimpleEngine, SpeculationRoute, Tokenizer,
+        adaptive_draft_depth_for_cap, check_stop_sequences, contains_real_user_query,
+        continuation_prior_len, derive_model_name, detect_thinking_support,
+        dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
         dflash_resolve_target_then_draft, dflash_tail_draft_cap, drive_canonical_dspark_round,
         estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail, lock_or_recover,
-        paired_dflash_exact_domain, parse_enabled_flag, pflash_cache_source_and_request_tail,
+        paired_dflash_exact_domain, parse_enabled_flag, pflash_actual_keep_ratio,
+        pflash_auto_plan_worth_executing, pflash_cache_source_and_request_tail,
         pflash_cache_source_and_request_tail_with_boundary, resolve_speculation_route,
         stateless_mtp_family_eligible, with_chat_terminator,
     };
@@ -10712,6 +10764,27 @@ mod tests {
             PrefillPlanMetadata::from_config(&PrefillScoreConfig::default()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn pflash_auto_executes_only_when_survivor_ratio_is_low() {
+        let source_tokens = 1_000;
+        let profitable_kept =
+            (source_tokens as f32 * DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO).round() as usize;
+        assert!(pflash_auto_plan_worth_executing(
+            source_tokens,
+            profitable_kept
+        ));
+        assert!(!pflash_auto_plan_worth_executing(
+            source_tokens,
+            profitable_kept + 1
+        ));
+    }
+
+    #[test]
+    fn pflash_actual_keep_ratio_handles_empty_sources() {
+        assert_eq!(pflash_actual_keep_ratio(0, 0), 0.0);
+        assert!(pflash_auto_plan_worth_executing(0, 0));
     }
 
     #[test]

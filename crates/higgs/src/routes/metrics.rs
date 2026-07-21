@@ -37,6 +37,8 @@ pub struct CacheMetricsView {
     pub pflash_used: u64,
     /// PFlash attempts that fell back or errored before target execution.
     pub pflash_fallbacks: u64,
+    /// Auto PFlash plans skipped because survivor prefill would cost more than exact cache reuse.
+    pub pflash_skipped_unprofitable: u64,
     /// In-memory PFlash stable-body plan-cache hits.
     pub pflash_plan_cache_hits: u64,
     /// Source prompt tokens for the most recent accepted PFlash plan.
@@ -95,6 +97,9 @@ impl CacheMetricsView {
         self.pflash_attempts = self.pflash_attempts.saturating_add(stats.pflash_attempts);
         self.pflash_used = self.pflash_used.saturating_add(stats.pflash_used);
         self.pflash_fallbacks = self.pflash_fallbacks.saturating_add(stats.pflash_fallbacks);
+        self.pflash_skipped_unprofitable = self
+            .pflash_skipped_unprofitable
+            .saturating_add(stats.pflash_skipped_unprofitable);
         self.pflash_plan_cache_hits = self
             .pflash_plan_cache_hits
             .saturating_add(stats.pflash_plan_cache_hits);
@@ -265,26 +270,27 @@ mod tests {
             pflash_attempts: 6,
             pflash_used: 7,
             pflash_fallbacks: 8,
-            pflash_plan_cache_hits: 9,
-            pflash_last_source_tokens: 10,
-            pflash_last_kept_tokens: 11,
-            pflash_last_cache_prefix_tokens: 12,
-            pflash_last_suffix_tokens: 13,
-            pflash_last_request_tail_tokens: 14,
-            pflash_last_score_ms: 15,
-            pflash_last_select_ms: 16,
-            pflash_last_total_ms: 17,
+            pflash_skipped_unprofitable: 9,
+            pflash_plan_cache_hits: 10,
+            pflash_last_source_tokens: 11,
+            pflash_last_kept_tokens: 12,
+            pflash_last_cache_prefix_tokens: 13,
+            pflash_last_suffix_tokens: 14,
+            pflash_last_request_tail_tokens: 15,
+            pflash_last_score_ms: 16,
+            pflash_last_select_ms: 17,
+            pflash_last_total_ms: 18,
             pflash_last_effective_keep_ratio_ppm: 180_000,
-            continuations: 19,
-            sessions_evicted: 20,
-            retained_sessions: 21,
-            retained_paired_sessions: 22,
-            retained_paired_target_bytes: 23,
-            retained_paired_dflash_bytes: 24,
-            radix_entries: 25,
-            paired_radix_entries: 26,
-            paired_radix_target_bytes: 27,
-            paired_radix_dflash_bytes: 28,
+            continuations: 20,
+            sessions_evicted: 21,
+            retained_sessions: 22,
+            retained_paired_sessions: 23,
+            retained_paired_target_bytes: 24,
+            retained_paired_dflash_bytes: 25,
+            radix_entries: 26,
+            paired_radix_entries: 27,
+            paired_radix_target_bytes: 28,
+            paired_radix_dflash_bytes: 29,
         }
     }
 
@@ -334,13 +340,14 @@ mod tests {
         assert_eq!(view.pflash_attempts, 12);
         assert_eq!(view.pflash_used, 14);
         assert_eq!(view.pflash_fallbacks, 16);
-        assert_eq!(view.pflash_plan_cache_hits, 18);
-        assert_eq!(view.retained_paired_sessions, 44);
-        assert_eq!(view.retained_paired_target_bytes, 46);
-        assert_eq!(view.retained_paired_dflash_bytes, 48);
-        assert_eq!(view.paired_radix_entries, 52);
-        assert_eq!(view.paired_radix_target_bytes, 54);
-        assert_eq!(view.paired_radix_dflash_bytes, 56);
+        assert_eq!(view.pflash_skipped_unprofitable, 18);
+        assert_eq!(view.pflash_plan_cache_hits, 20);
+        assert_eq!(view.retained_paired_sessions, 46);
+        assert_eq!(view.retained_paired_target_bytes, 48);
+        assert_eq!(view.retained_paired_dflash_bytes, 50);
+        assert_eq!(view.paired_radix_entries, 54);
+        assert_eq!(view.paired_radix_target_bytes, 56);
+        assert_eq!(view.paired_radix_dflash_bytes, 58);
     }
 
     #[test]
@@ -355,22 +362,23 @@ mod tests {
             ("pflash_attempts", 6),
             ("pflash_used", 7),
             ("pflash_fallbacks", 8),
-            ("pflash_plan_cache_hits", 9),
-            ("pflash_last_source_tokens", 10),
-            ("pflash_last_kept_tokens", 11),
-            ("pflash_last_cache_prefix_tokens", 12),
-            ("pflash_last_suffix_tokens", 13),
-            ("pflash_last_request_tail_tokens", 14),
-            ("pflash_last_score_ms", 15),
-            ("pflash_last_select_ms", 16),
-            ("pflash_last_total_ms", 17),
+            ("pflash_skipped_unprofitable", 9),
+            ("pflash_plan_cache_hits", 10),
+            ("pflash_last_source_tokens", 11),
+            ("pflash_last_kept_tokens", 12),
+            ("pflash_last_cache_prefix_tokens", 13),
+            ("pflash_last_suffix_tokens", 14),
+            ("pflash_last_request_tail_tokens", 15),
+            ("pflash_last_score_ms", 16),
+            ("pflash_last_select_ms", 17),
+            ("pflash_last_total_ms", 18),
             ("pflash_last_effective_keep_ratio_ppm", 180_000),
-            ("retained_paired_sessions", 22),
-            ("retained_paired_target_bytes", 23),
-            ("retained_paired_dflash_bytes", 24),
-            ("paired_radix_entries", 26),
-            ("paired_radix_target_bytes", 27),
-            ("paired_radix_dflash_bytes", 28),
+            ("retained_paired_sessions", 23),
+            ("retained_paired_target_bytes", 24),
+            ("retained_paired_dflash_bytes", 25),
+            ("paired_radix_entries", 27),
+            ("paired_radix_target_bytes", 28),
+            ("paired_radix_dflash_bytes", 29),
         ] {
             assert_eq!(
                 rendered.get(name).and_then(serde_json::Value::as_u64),
