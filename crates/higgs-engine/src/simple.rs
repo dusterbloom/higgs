@@ -6,6 +6,7 @@
     clippy::manual_let_else
 )]
 
+use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -16,7 +17,10 @@ use higgs_models::{
     cache::SteppingKeyValueCache,
     dflash::{DFlashCache, DFlashConfig, DFlashDrafter, accept_prefix},
     sample,
-    spec_prefill::{PrefillScoreConfig, select_survivors},
+    spec_prefill::{
+        HardKeepSpan, PrefillPlanMetadata, PrefillScoreConfig, PrefillScoreMode, SurvivalPlan,
+        adaptive_keep_ratio_from_importance, select_survivors_with_hard_keep,
+    },
     turboquant::KvCacheConfig,
 };
 use mlx_rs::{
@@ -49,6 +53,10 @@ use crate::{
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 const DEFAULT_PAGED_KV_BLOCK_SIZE: usize = 64;
+pub const DEFAULT_PFLASH_KEEP_RATIO_MAX: f32 = 0.75;
+pub const DEFAULT_PFLASH_PLAN_CACHE: bool = true;
+pub const DEFAULT_PFLASH_PLAN_CACHE_ENTRIES: usize = 64;
+pub const DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD: usize = 128;
 /// Default `<think>` budget (tokens) when a request omits `reasoning_budget`.
 const DEFAULT_THINKING_BUDGET: u32 = 256;
 
@@ -113,12 +121,165 @@ fn exact_generation_body<'a>(prompt: &'a [u32], generation_suffix: &[u32]) -> Op
     prompt.strip_suffix(generation_suffix)
 }
 
+fn pflash_cache_source_and_request_tail<'a>(
+    prompt: &'a [u32],
+    generation_suffix: &[u32],
+) -> (&'a [u32], &'a [u32]) {
+    let Some(body) = exact_generation_body(prompt, generation_suffix) else {
+        return (prompt, &[]);
+    };
+    let tail = prompt.get(body.len()..).unwrap_or_default();
+    (body, tail)
+}
+
 fn prefill_min_free_memory_mb() -> usize {
     std::env::var("HIGGS_PREFLASH_MIN_FREE_MB")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2048)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PFlashPlanCacheConfig {
+    version: u32,
+    score_mode: PrefillScoreMode,
+    exit_layer: usize,
+    keep_floor_bits: u32,
+    keep_ceiling_bits: u32,
+    chunk: usize,
+    avgpool: usize,
+    lookahead: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PFlashPlanCacheEntry {
+    source_tokens: Vec<u32>,
+    plan: SurvivalPlan,
+    config: PFlashPlanCacheConfig,
+    last_used: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PFlashPlanCacheHit {
+    source_len: usize,
+    plan: SurvivalPlan,
+}
+
+#[derive(Clone, Debug)]
+struct PFlashScoreOutcome {
+    plan: SurvivalPlan,
+    score_ms: f64,
+    select_ms: f64,
+    effective_keep_ratio: f32,
+}
+
+/// Request-local prompt policy for lossy PFlash compression.
+///
+/// Ranges are half-open token offsets in the full rendered prompt. They are
+/// interpreted before the generation suffix is split off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PFlashPromptPolicy {
+    pub hard_keep_ranges: Vec<Range<usize>>,
+}
+
+#[derive(Default)]
+struct PFlashPlanCache {
+    entries: Vec<PFlashPlanCacheEntry>,
+    tick: u64,
+}
+
+impl PFlashPlanCache {
+    fn find_longest_prefix(
+        &mut self,
+        tokens: &[u32],
+        config: PFlashPlanCacheConfig,
+    ) -> Option<PFlashPlanCacheHit> {
+        self.tick = self.tick.wrapping_add(1);
+        let mut best_index = None;
+        let mut best_len = 0usize;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let len = entry.source_tokens.len();
+            if entry.config == config
+                && len > best_len
+                && len <= tokens.len()
+                && tokens.starts_with(&entry.source_tokens)
+                && entry.plan.source_token_count == len
+            {
+                best_index = Some(index);
+                best_len = len;
+            }
+        }
+        let index = best_index?;
+        let entry = self.entries.get_mut(index)?;
+        entry.last_used = self.tick;
+        Some(PFlashPlanCacheHit {
+            source_len: entry.source_tokens.len(),
+            plan: entry.plan.clone(),
+        })
+    }
+
+    fn store(
+        &mut self,
+        tokens: &[u32],
+        plan: SurvivalPlan,
+        config: PFlashPlanCacheConfig,
+        max_entries: usize,
+    ) {
+        if tokens.is_empty() || plan.source_token_count != tokens.len() {
+            return;
+        }
+        if plan.target_sparse_prefill_plan().is_err() {
+            return;
+        }
+        self.tick = self.tick.wrapping_add(1);
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.config == config && entry.source_tokens == tokens)
+        {
+            entry.plan = plan;
+            entry.last_used = self.tick;
+            return;
+        }
+        self.entries.retain(|entry| {
+            !(entry.config == config
+                && entry.source_tokens.len() < tokens.len()
+                && tokens.starts_with(&entry.source_tokens))
+        });
+        self.entries.push(PFlashPlanCacheEntry {
+            source_tokens: tokens.to_vec(),
+            plan,
+            config,
+            last_used: self.tick,
+        });
+        while self.entries.len() > max_entries {
+            let evict_index = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            self.entries.remove(evict_index);
+        }
+    }
+}
+
+fn any_model_variant_name(model: &AnyModel) -> &'static str {
+    match model {
+        AnyModel::Transformer(_) => "Transformer",
+        AnyModel::Qwen3Next(_) => "Qwen3Next",
+        AnyModel::Qwen3Moe(_) => "Qwen3Moe",
+        AnyModel::Gemma2(_) => "Gemma2",
+        AnyModel::Gemma3(_) => "Gemma3",
+        AnyModel::Gemma4(_) => "Gemma4",
+        AnyModel::Phi3(_) => "Phi3",
+        AnyModel::Starcoder2(_) => "Starcoder2",
+        AnyModel::LlavaQwen2(_) => "LlavaQwen2",
+        AnyModel::DeepSeekV2(_) => "DeepSeekV2",
+        AnyModel::BonsaiQ1(_) => "BonsaiQ1",
+    }
 }
 
 #[allow(unsafe_code)]
@@ -142,6 +303,113 @@ fn pflash_free_memory_mb() -> Result<usize, EngineError> {
     }
     let free_bytes = memory_limit.saturating_sub(active_memory);
     Ok(free_bytes / (1024 * 1024))
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn inserted_byte_span(with_insert: &str, without_insert: &str) -> Option<Range<usize>> {
+    if with_insert == without_insert {
+        return None;
+    }
+    let with = with_insert.as_bytes();
+    let without = without_insert.as_bytes();
+    let mut prefix = 0usize;
+    while prefix < with.len() && prefix < without.len() && with.get(prefix) == without.get(prefix) {
+        prefix += 1;
+    }
+    prefix = floor_char_boundary(with_insert, prefix);
+
+    let mut suffix = 0usize;
+    while suffix < with.len().saturating_sub(prefix)
+        && suffix < without.len().saturating_sub(prefix)
+        && with.get(with.len() - 1 - suffix) == without.get(without.len() - 1 - suffix)
+    {
+        suffix += 1;
+    }
+    let end = ceil_char_boundary(with_insert, with_insert.len().saturating_sub(suffix));
+    (prefix < end).then_some(prefix..end)
+}
+
+fn token_len_for_text(tokenizer: &Tokenizer, text: &str) -> Result<usize, EngineError> {
+    tokenizer
+        .encode(text, false)
+        .map(|encoding| encoding.get_ids().len())
+        .map_err(|e| EngineError::Tokenization(e.to_string()))
+}
+
+fn contains_real_user_query(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        if message.role != "user" {
+            return false;
+        }
+        let content = message.content.trim();
+        !(content.starts_with("<tool_response>") && content.ends_with("</tool_response>"))
+    })
+}
+
+fn token_range_for_byte_span(
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    byte_span: Range<usize>,
+) -> Result<Option<Range<usize>>, EngineError> {
+    let start = floor_char_boundary(prompt, byte_span.start);
+    let end = ceil_char_boundary(prompt, byte_span.end);
+    if start >= end {
+        return Ok(None);
+    }
+    let token_start = token_len_for_text(tokenizer, &prompt[..start])?;
+    let token_end = token_len_for_text(tokenizer, &prompt[..end])?;
+    Ok((token_start < token_end).then_some(token_start..token_end))
+}
+
+fn push_merged_token_range(
+    ranges: &mut Vec<Range<usize>>,
+    total_tokens: usize,
+    range: Range<usize>,
+) {
+    let start = range.start.min(total_tokens);
+    let end = range.end.min(total_tokens);
+    if start >= end {
+        return;
+    }
+    ranges.push(start..end);
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && range.start < last.end
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    *ranges = merged;
+}
+
+fn clipped_hard_keep_spans(ranges: &[Range<usize>], start: usize, end: usize) -> Vec<HardKeepSpan> {
+    ranges
+        .iter()
+        .filter_map(|range| {
+            let lo = range.start.max(start);
+            let hi = range.end.min(end);
+            (lo < hi).then(|| HardKeepSpan::new(lo - start, hi - start))
+        })
+        .collect()
 }
 
 /// Acquire a `Mutex` lock, recovering from poison by reusing the inner data.
@@ -760,6 +1028,19 @@ struct CacheMetrics {
     paired_radix_lookups: AtomicU64,
     paired_radix_hits: AtomicU64,
     prefill_saved_tokens: AtomicU64,
+    pflash_attempts: AtomicU64,
+    pflash_used: AtomicU64,
+    pflash_fallbacks: AtomicU64,
+    pflash_plan_cache_hits: AtomicU64,
+    pflash_last_source_tokens: AtomicU64,
+    pflash_last_kept_tokens: AtomicU64,
+    pflash_last_cache_prefix_tokens: AtomicU64,
+    pflash_last_suffix_tokens: AtomicU64,
+    pflash_last_request_tail_tokens: AtomicU64,
+    pflash_last_score_ms: AtomicU64,
+    pflash_last_select_ms: AtomicU64,
+    pflash_last_total_ms: AtomicU64,
+    pflash_last_effective_keep_ratio_ppm: AtomicU64,
     continuations: AtomicU64,
     sessions_evicted: AtomicU64,
 }
@@ -777,6 +1058,32 @@ pub struct CacheStats {
     pub paired_radix_hits: u64,
     /// Prompt tokens NOT re-prefilled thanks to reuse (radix + continuation).
     pub prefill_saved_tokens: u64,
+    /// PFlash scoring/planning attempts after config/request eligibility checks.
+    pub pflash_attempts: u64,
+    /// PFlash plans accepted for target execution.
+    pub pflash_used: u64,
+    /// PFlash attempts that fell back or errored before target execution.
+    pub pflash_fallbacks: u64,
+    /// In-memory PFlash stable-body plan-cache hits.
+    pub pflash_plan_cache_hits: u64,
+    /// Source prompt tokens for the most recent accepted PFlash plan.
+    pub pflash_last_source_tokens: u64,
+    /// Survivor tokens for the most recent accepted PFlash plan.
+    pub pflash_last_kept_tokens: u64,
+    /// Stable-body prefix tokens reused from the PFlash plan cache.
+    pub pflash_last_cache_prefix_tokens: u64,
+    /// Stable-body suffix tokens scored or identity-appended this turn.
+    pub pflash_last_suffix_tokens: u64,
+    /// Request-specific generation-suffix tokens identity-appended after body planning.
+    pub pflash_last_request_tail_tokens: u64,
+    /// Scorer wall time for the most recent accepted PFlash plan.
+    pub pflash_last_score_ms: u64,
+    /// Survivor-selection wall time for the most recent accepted PFlash plan.
+    pub pflash_last_select_ms: u64,
+    /// End-to-end PFlash planning wall time for the most recent accepted plan.
+    pub pflash_last_total_ms: u64,
+    /// Effective adaptive keep ratio for the most recent accepted plan, parts per million.
+    pub pflash_last_effective_keep_ratio_ppm: u64,
     /// Per-session continuations (a retained cache was reused).
     pub continuations: u64,
     /// Retained sessions evicted (count cap + idle TTL).
@@ -1547,6 +1854,13 @@ pub struct SimpleEngine {
     prefill_chunk: usize,
     prefill_avgpool: usize,
     prefill_lookahead: usize,
+    prefill_score_mode: PrefillScoreMode,
+    prefill_exit_layer: usize,
+    prefill_keep_ratio_max: f32,
+    prefill_plan_cache: bool,
+    prefill_plan_cache_entries: usize,
+    prefill_suffix_identity_threshold: usize,
+    pflash_plan_cache: Mutex<PFlashPlanCache>,
     last_dflash_accepts: std::sync::Mutex<Vec<u32>>,
     /// Proposed draft tokens that matched the target before output truncation,
     /// recorded once per DFlash round for exact acceptance telemetry.
@@ -1715,6 +2029,12 @@ impl SimpleEngine {
             32,
             13,
             8,
+            PrefillScoreMode::Full,
+            7,
+            DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            DEFAULT_PFLASH_PLAN_CACHE,
+            DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+            DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
         )
     }
 
@@ -1741,6 +2061,12 @@ impl SimpleEngine {
             32,
             13,
             8,
+            PrefillScoreMode::Full,
+            7,
+            DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            DEFAULT_PFLASH_PLAN_CACHE,
+            DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+            DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
         )
     }
 
@@ -1767,9 +2093,17 @@ impl SimpleEngine {
         prefill_chunk: usize,
         prefill_avgpool: usize,
         prefill_lookahead: usize,
+        prefill_score_mode: PrefillScoreMode,
+        prefill_exit_layer: usize,
+        prefill_keep_ratio_max: f32,
+        prefill_plan_cache: bool,
+        prefill_plan_cache_entries: usize,
+        prefill_suffix_identity_threshold: usize,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
+        let prefill_keep_ratio_max = prefill_keep_ratio_max.clamp(prefill_keep_ratio, 0.95);
+        let prefill_plan_cache_entries = prefill_plan_cache_entries.max(1);
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model");
 
@@ -2035,13 +2369,25 @@ impl SimpleEngine {
         } else if let Some(path) = prefill_drafter_path {
             match model_loader::load_model(path) {
                 Ok(drafter) => {
-                    tracing::info!(
-                        drafter = %path.display(),
-                        mode = ?prefill_mode,
-                        keep_ratio = prefill_keep_ratio,
-                        "Prefill drafter loaded — compressive prefill armed"
-                    );
-                    Some(std::sync::Arc::new(Mutex::new(drafter)))
+                    if let AnyModel::Transformer(ref transformer) = drafter {
+                        tracing::info!(
+                            drafter = %path.display(),
+                            scorer_model_type = transformer.model_type(),
+                            mode = ?prefill_mode,
+                            score_mode = ?prefill_score_mode,
+                            keep_ratio = prefill_keep_ratio,
+                            "PFlash prefill drafter loaded — compressive-prefill scorer armed"
+                        );
+                        Some(std::sync::Arc::new(Mutex::new(drafter)))
+                    } else {
+                        tracing::warn!(
+                            drafter = %path.display(),
+                            loaded_model = any_model_variant_name(&drafter),
+                            "PFlash prefill_drafter must be a dense Transformer scorer; disabling prefill compression"
+                        );
+                        prefill_mode = PrefillCompressionMode::Off;
+                        None
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -2122,6 +2468,13 @@ impl SimpleEngine {
             prefill_chunk,
             prefill_avgpool,
             prefill_lookahead,
+            prefill_score_mode,
+            prefill_exit_layer,
+            prefill_keep_ratio_max,
+            prefill_plan_cache,
+            prefill_plan_cache_entries,
+            prefill_suffix_identity_threshold,
+            pflash_plan_cache: Mutex::new(PFlashPlanCache::default()),
             last_dflash_accepts: Mutex::new(Vec::new()),
             last_dflash_draft_matches: Mutex::new(Vec::new()),
             last_dflash_draft_counts: Mutex::new(Vec::new()),
@@ -2163,6 +2516,49 @@ impl SimpleEngine {
             prefill_saved_tokens: self
                 .cache_metrics
                 .prefill_saved_tokens
+                .load(Ordering::Relaxed),
+            pflash_attempts: self.cache_metrics.pflash_attempts.load(Ordering::Relaxed),
+            pflash_used: self.cache_metrics.pflash_used.load(Ordering::Relaxed),
+            pflash_fallbacks: self.cache_metrics.pflash_fallbacks.load(Ordering::Relaxed),
+            pflash_plan_cache_hits: self
+                .cache_metrics
+                .pflash_plan_cache_hits
+                .load(Ordering::Relaxed),
+            pflash_last_source_tokens: self
+                .cache_metrics
+                .pflash_last_source_tokens
+                .load(Ordering::Relaxed),
+            pflash_last_kept_tokens: self
+                .cache_metrics
+                .pflash_last_kept_tokens
+                .load(Ordering::Relaxed),
+            pflash_last_cache_prefix_tokens: self
+                .cache_metrics
+                .pflash_last_cache_prefix_tokens
+                .load(Ordering::Relaxed),
+            pflash_last_suffix_tokens: self
+                .cache_metrics
+                .pflash_last_suffix_tokens
+                .load(Ordering::Relaxed),
+            pflash_last_request_tail_tokens: self
+                .cache_metrics
+                .pflash_last_request_tail_tokens
+                .load(Ordering::Relaxed),
+            pflash_last_score_ms: self
+                .cache_metrics
+                .pflash_last_score_ms
+                .load(Ordering::Relaxed),
+            pflash_last_select_ms: self
+                .cache_metrics
+                .pflash_last_select_ms
+                .load(Ordering::Relaxed),
+            pflash_last_total_ms: self
+                .cache_metrics
+                .pflash_last_total_ms
+                .load(Ordering::Relaxed),
+            pflash_last_effective_keep_ratio_ppm: self
+                .cache_metrics
+                .pflash_last_effective_keep_ratio_ppm
                 .load(Ordering::Relaxed),
             continuations: self.cache_metrics.continuations.load(Ordering::Relaxed),
             sessions_evicted: self.cache_metrics.sessions_evicted.load(Ordering::Relaxed),
@@ -2400,6 +2796,74 @@ impl SimpleEngine {
         renderer.apply_with_thinking(messages, tools, true, enable_thinking)
     }
 
+    /// Apply chat template, tokenize it, and compute request-local PFlash spans.
+    ///
+    /// The spans are conservative: tool-template insertions and the active
+    /// action tail are kept exact, while older conversation body can still be
+    /// compressed and plan-cached.
+    pub fn prepare_chat_prompt_with_pflash_policy(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+    ) -> Result<(Vec<u32>, PFlashPromptPolicy), EngineError> {
+        let renderer = self.template.as_ref().ok_or_else(|| {
+            EngineError::Template(
+                "This model has no chat template; use /v1/completions instead".to_owned(),
+            )
+        })?;
+        let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
+        let encoding = self
+            .tokenizer
+            .encode(prompt.as_str(), false)
+            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
+        let prompt_tokens = encoding.get_ids().to_vec();
+        let mut hard_keep_ranges = Vec::new();
+
+        if tools.is_some() {
+            let without_tools =
+                renderer.apply_with_thinking(messages, None, true, enable_thinking)?;
+            if let Some(byte_span) = inserted_byte_span(&prompt, &without_tools)
+                && let Some(token_span) =
+                    token_range_for_byte_span(&self.tokenizer, &prompt, byte_span)?
+            {
+                push_merged_token_range(&mut hard_keep_ranges, prompt_tokens.len(), token_span);
+            }
+        }
+
+        if let Some(tail_start_message) =
+            messages.iter().rposition(|message| message.role == "user")
+        {
+            let before_tail_messages = &messages[..tail_start_message];
+            let start = if contains_real_user_query(before_tail_messages) {
+                let before_tail = match renderer.apply_with_thinking(
+                    before_tail_messages,
+                    tools,
+                    false,
+                    enable_thinking,
+                ) {
+                    Ok(rendered) => rendered,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "PFlash hard-keep prefix render failed; keeping current-tail range from prompt start"
+                        );
+                        String::new()
+                    }
+                };
+                token_len_for_text(&self.tokenizer, &before_tail)?
+            } else {
+                0
+            };
+            let without_generation_prompt =
+                renderer.apply_with_thinking(messages, tools, false, enable_thinking)?;
+            let end = token_len_for_text(&self.tokenizer, &without_generation_prompt)?;
+            push_merged_token_range(&mut hard_keep_ranges, prompt_tokens.len(), start..end);
+        }
+
+        Ok((prompt_tokens, PFlashPromptPolicy { hard_keep_ranges }))
+    }
+
     /// Apply chat template and tokenize messages with explicit thinking control.
     pub fn prepare_chat_prompt_with_thinking(
         &self,
@@ -2464,6 +2928,7 @@ impl SimpleEngine {
         prompt_tokens: &[u32],
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
+        allow_prefix_cache: bool,
     ) -> Result<PreparedGeneration<'_>, EngineError> {
         let prompt_len = Self::prompt_len(prompt_tokens)?;
         let has_images = pixel_values.is_some();
@@ -2472,7 +2937,7 @@ impl SimpleEngine {
         // Keep that CPU-only candidate selection outside the model lock / MLX
         // execution gate; the later materialization step still runs under the
         // gate because it rebuilds MLX arrays.
-        let disk_prefix_candidate = if has_images {
+        let disk_prefix_candidate = if has_images || !allow_prefix_cache {
             None
         } else {
             let pc = self
@@ -2504,7 +2969,7 @@ impl SimpleEngine {
         // `-[_MTLCommandBuffer addCompletedHandler:]` / `IOGPUMetalCommandBuffer
         // validate` failed assertions during a session-continuation fallback
         // prefill racing a concurrent request's prefix lookup).
-        let use_prefix_cache = !has_images && prefix_cache_enabled();
+        let use_prefix_cache = allow_prefix_cache && !has_images && prefix_cache_enabled();
         let prefix_match = if !use_prefix_cache {
             None
         } else {
@@ -2605,6 +3070,7 @@ impl SimpleEngine {
         capture_hidden: bool,
         store_prefix_cache: bool,
         checkpoint_id: Option<&str>,
+        compressed_prefill: Option<&SurvivalPlan>,
         // When Some, the single-pass capture_hidden prefill ALSO collects tap
         // hiddens for these layers (session DFlash drafter context). Chunked
         // and two-phase prefills skip taps — callers must tolerate None.
@@ -2619,8 +3085,41 @@ impl SimpleEngine {
         if Self::probe_warm_drift_enabled(prompt_tokens, prepared.cache.resident_len()) {
             self.probe_warm_drift(prompt_tokens, prepared);
         }
+        let sparse_compressed_prefill =
+            compressed_prefill.filter(|_| prepared.model.supports_pflash_sparse_prefill());
+        if let Some(plan) =
+            compressed_prefill.filter(|_| !prepared.model.supports_pflash_sparse_prefill())
+        {
+            tracing::warn!(
+                source_tokens = plan.source_token_count,
+                kept_tokens = plan.token_ids.len(),
+                target_model = any_model_variant_name(&prepared.model),
+                "PFlash target sparse prefill unsupported; using compressed survivor-domain prefill"
+            );
+        }
         let mut prefill_hidden = None;
-        let logits = if let Some(ref pixel_values) = prepared.pixel_values {
+        let logits = if let Some(plan) = sparse_compressed_prefill {
+            let target_plan = plan.target_sparse_prefill_plan().map_err(|error| {
+                EngineError::Generation(format!("PFlash sparse prefill plan invalid: {error}"))
+            })?;
+            let output = prepared
+                .model
+                .pflash_prefill_sparse(target_plan)
+                .map_err(EngineError::Mlx)?;
+            let resident_len = output.state.resident_len();
+            let logical_next_pos = output.state.next_position();
+            prepared.cache = AnyCache::Hybrid(output.state.into_cache());
+            tracing::info!(
+                source_tokens = plan.source_token_count,
+                resident_tokens = resident_len,
+                logical_next_pos,
+                keep_ratio = plan.metadata.keep_ratio,
+                score_mode = ?plan.metadata.score_mode,
+                "PFlash sparse prefill executed"
+            );
+            higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+            output.logits
+        } else if let Some(ref pixel_values) = prepared.pixel_values {
             // Multimodal path: full forward (VLMs need all tokens for vision)
             prepared
                 .model
@@ -3806,7 +4305,7 @@ impl SimpleEngine {
             };
             (prepared, prefilled, true)
         } else {
-            let prepared = self.prepare_generation(prompt_tokens, None, None)?;
+            let prepared = self.prepare_generation(prompt_tokens, None, None, true)?;
             let prefilled = u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
             (prepared, prefilled, false)
         };
@@ -3872,6 +4371,7 @@ impl SimpleEngine {
             // making the hybrid radix reconstruction safe), not by flipping
             // this flag.
             false,
+            None,
             None,
             None,
             None,
@@ -4733,7 +5233,7 @@ impl SimpleEngine {
         policy: &crate::prune::PrunePolicy,
         rope: higgs_models::cache::RopeShift,
     ) -> Result<PrunedGeneration, EngineError> {
-        let mut prepared = self.prepare_generation(prompt_tokens, None, None)?;
+        let mut prepared = self.prepare_generation(prompt_tokens, None, None, true)?;
         let prompt_len = usize::try_from(prepared.prompt_len)
             .map_err(|_| EngineError::Generation("prompt_len overflow".to_owned()))?;
         let (current_token, _, _) = self.run_prefill(
@@ -4745,6 +5245,7 @@ impl SimpleEngine {
             None,
             false,
             prefix_cache_enabled(),
+            None,
             None,
             None,
             None,
@@ -5186,6 +5687,36 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
+        self.generate_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            enable_thinking,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            &PFlashPromptPolicy::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_thinking_and_pflash_policy(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        enable_thinking: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<GenerationOutput, EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -5214,6 +5745,7 @@ impl SimpleEngine {
                 constraint,
                 pixel_values,
                 checkpoint_id,
+                pflash_policy,
             )
         })
     }
@@ -5225,20 +5757,215 @@ impl SimpleEngine {
         clippy::unnecessary_wraps,
         clippy::float_cmp
     )]
+    fn pflash_plan_cache_config(&self) -> PFlashPlanCacheConfig {
+        PFlashPlanCacheConfig {
+            version: PrefillPlanMetadata::VERSION,
+            score_mode: self.prefill_score_mode,
+            exit_layer: self.prefill_exit_layer,
+            keep_floor_bits: self.prefill_keep_ratio.to_bits(),
+            keep_ceiling_bits: self.prefill_keep_ratio_max.to_bits(),
+            chunk: self.prefill_chunk,
+            avgpool: self.prefill_avgpool,
+            lookahead: self.prefill_lookahead,
+        }
+    }
+
+    fn pflash_cached_prefix(
+        &self,
+        prompt_tokens: &[u32],
+        config: PFlashPlanCacheConfig,
+    ) -> Option<PFlashPlanCacheHit> {
+        if !self.prefill_plan_cache {
+            return None;
+        }
+        self.pflash_plan_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.find_longest_prefix(prompt_tokens, config))
+    }
+
+    fn pflash_store_plan(
+        &self,
+        prompt_tokens: &[u32],
+        plan: &SurvivalPlan,
+        config: PFlashPlanCacheConfig,
+    ) {
+        if !self.prefill_plan_cache {
+            return;
+        }
+        if let Ok(mut cache) = self.pflash_plan_cache.lock() {
+            cache.store(
+                prompt_tokens,
+                plan.clone(),
+                config,
+                self.prefill_plan_cache_entries,
+            );
+        }
+    }
+
+    fn pflash_score_tokens(
+        &self,
+        tokens: &[u32],
+        hard_keep_spans: &[HardKeepSpan],
+    ) -> Result<PFlashScoreOutcome, EngineError> {
+        let prefill_lock = self
+            .prefill_drafter
+            .as_ref()
+            .ok_or_else(|| EngineError::Generation("prefill drafter missing".to_owned()))?;
+        let mut drafter = lock_or_recover(prefill_lock);
+
+        let prompt_len = i32::try_from(tokens.len()).map_err(|_| {
+            EngineError::Generation("prompt too long for prefill compression".to_owned())
+        })?;
+        let inputs = Array::from_slice(tokens, &[1, prompt_len]);
+        let num_layers = drafter.num_layers();
+        let score_layers_start = num_layers.saturating_sub(8);
+        let score_layers: Vec<usize> = match self.prefill_score_mode {
+            PrefillScoreMode::Full => (score_layers_start..num_layers).collect(),
+            PrefillScoreMode::L7 => unreachable!("L7 mode returned before scoring"),
+        };
+        let score_start = std::time::Instant::now();
+        let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+        let raw_importance_scores = drafter.pflash_importance(
+            &inputs,
+            &score_layers,
+            self.prefill_lookahead,
+            &mut cache,
+        )?;
+        eval([&raw_importance_scores]).map_err(EngineError::Mlx)?;
+        let score_ms = score_start.elapsed().as_secs_f64() * 1000.0;
+
+        let select_start = std::time::Instant::now();
+        let importance_scores_f32 = raw_importance_scores
+            .as_dtype(Dtype::Float32)
+            .map_err(EngineError::Mlx)?;
+        let importance_scores = importance_scores_f32.as_slice::<f32>().to_vec();
+        let keep_ceiling = self.prefill_keep_ratio_max;
+        let effective_keep_ratio = adaptive_keep_ratio_from_importance(
+            &importance_scores,
+            self.prefill_keep_ratio,
+            keep_ceiling,
+        );
+        let cfg = PrefillScoreConfig {
+            keep_ratio: effective_keep_ratio,
+            chunk: self.prefill_chunk,
+            avgpool: self.prefill_avgpool,
+            lookahead: self.prefill_lookahead,
+        };
+        let plan =
+            select_survivors_with_hard_keep(tokens, &importance_scores, &cfg, hard_keep_spans)
+                .map_err(|error| {
+                    EngineError::Generation(format!("PFlash survivor selection failed: {error}"))
+                })?;
+        let select_ms = select_start.elapsed().as_secs_f64() * 1000.0;
+        Ok(PFlashScoreOutcome {
+            plan: plan.with_scorer(self.prefill_score_mode, None),
+            score_ms,
+            select_ms,
+            effective_keep_ratio,
+        })
+    }
+
+    fn pflash_identity_plan(&self, tokens: &[u32]) -> Result<SurvivalPlan, EngineError> {
+        let cfg = PrefillScoreConfig {
+            keep_ratio: 0.95,
+            chunk: self.prefill_chunk,
+            avgpool: self.prefill_avgpool,
+            lookahead: self.prefill_lookahead,
+        };
+        let metadata = PrefillPlanMetadata::from_config(&cfg);
+        SurvivalPlan::identity(tokens, metadata)
+            .map(|plan| plan.with_scorer(self.prefill_score_mode, None))
+            .map_err(|error| {
+                EngineError::Generation(format!("PFlash identity plan failed: {error}"))
+            })
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn pflash_record_used(
+        &self,
+        source_tokens: usize,
+        kept_tokens: usize,
+        cache_prefix_tokens: usize,
+        suffix_tokens: usize,
+        request_tail_tokens: usize,
+        score_ms: f64,
+        select_ms: f64,
+        total_ms: f64,
+        effective_keep_ratio: f32,
+    ) {
+        self.cache_metrics
+            .pflash_used
+            .fetch_add(1, Ordering::Relaxed);
+        self.cache_metrics.pflash_last_source_tokens.store(
+            u64::try_from(source_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.pflash_last_kept_tokens.store(
+            u64::try_from(kept_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.pflash_last_cache_prefix_tokens.store(
+            u64::try_from(cache_prefix_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.pflash_last_suffix_tokens.store(
+            u64::try_from(suffix_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.pflash_last_request_tail_tokens.store(
+            u64::try_from(request_tail_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics
+            .pflash_last_score_ms
+            .store(score_ms.round().max(0.0) as u64, Ordering::Relaxed);
+        self.cache_metrics
+            .pflash_last_select_ms
+            .store(select_ms.round().max(0.0) as u64, Ordering::Relaxed);
+        self.cache_metrics
+            .pflash_last_total_ms
+            .store(total_ms.round().max(0.0) as u64, Ordering::Relaxed);
+        let keep_ppm = (effective_keep_ratio.clamp(0.0, 1.0) * 1_000_000.0).round() as u64;
+        self.cache_metrics
+            .pflash_last_effective_keep_ratio_ppm
+            .store(keep_ppm, Ordering::Relaxed);
+    }
+
+    fn pflash_unavailable(
+        &self,
+        reason: &'static str,
+        required: bool,
+    ) -> Result<Option<SurvivalPlan>, EngineError> {
+        self.cache_metrics
+            .pflash_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+        if required {
+            return Err(EngineError::Generation(format!(
+                "PFlash required but unavailable: {reason}"
+            )));
+        }
+        tracing::warn!(reason, "PFlash unavailable; using uncompressed prefill");
+        Ok(None)
+    }
+
     fn pflash_compress_if_eligible(
         &self,
         prompt_tokens: &[u32],
+        generation_suffix: &[u32],
+        pflash_policy: &PFlashPromptPolicy,
         _params: &SamplingParams,
         pixel_values: Option<&Array>,
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
         logprobs: bool,
         session_id: Option<&u64>,
-    ) -> Result<Option<Vec<u32>>, EngineError> {
+    ) -> Result<Option<SurvivalPlan>, EngineError> {
         if self.prefill_compression == PrefillCompressionMode::Off {
             return Ok(None);
         }
+        let pflash_required = self.prefill_compression == PrefillCompressionMode::Always;
         if self.prefill_drafter.is_none() {
-            return Ok(None);
+            return self.pflash_unavailable("prefill drafter missing", pflash_required);
         }
         if self.prefill_compression == PrefillCompressionMode::Auto
             && prompt_tokens.len() < self.prefill_threshold
@@ -5246,9 +5973,19 @@ impl SimpleEngine {
             return Ok(None);
         }
         if pixel_values.is_some() || constraint.is_some() || logprobs || session_id.is_some() {
-            return Ok(None);
+            return self.pflash_unavailable("request is incompatible", pflash_required);
+        }
+        if self.prefill_score_mode == PrefillScoreMode::L7 {
+            tracing::warn!(
+                exit_layer = self.prefill_exit_layer,
+                "PFlash-L7 requested, but no true early-exit scorer is wired yet"
+            );
+            return self.pflash_unavailable("l7 scorer is not wired", pflash_required);
         }
         // Simple engine is single-request only; no batch mode call-path reaches here.
+        self.cache_metrics
+            .pflash_attempts
+            .fetch_add(1, Ordering::Relaxed);
 
         let min_free_mb = prefill_min_free_memory_mb();
         let free_mb = match pflash_free_memory_mb() {
@@ -5257,74 +5994,167 @@ impl SimpleEngine {
                 tracing::warn!(
                     error = %error,
                     min_free_mb,
-                    "PFlash memory guard unavailable; falling back to uncompressed prefill"
+                    "PFlash memory guard unavailable"
                 );
-                return Ok(None);
+                return self.pflash_unavailable("memory guard unavailable", pflash_required);
             }
         };
         if free_mb < min_free_mb {
-            tracing::warn!(
-                free_mb,
-                min_free_mb,
-                "Insufficient free memory for PFlash; falling back to uncompressed prefill"
-            );
-            return Ok(None);
+            tracing::warn!(free_mb, min_free_mb, "Insufficient free memory for PFlash");
+            return self.pflash_unavailable("insufficient free memory", pflash_required);
         }
 
-        let plan = match (|| -> Result<Vec<u32>, EngineError> {
-            let prefill_lock = self
-                .prefill_drafter
-                .as_ref()
-                .ok_or_else(|| EngineError::Generation("prefill drafter missing".to_owned()))?;
-            let mut drafter = lock_or_recover(prefill_lock);
+        let total_start = std::time::Instant::now();
+        let cache_config = self.pflash_plan_cache_config();
+        let (body_tokens, generation_tail_tokens) =
+            pflash_cache_source_and_request_tail(prompt_tokens, generation_suffix);
+        let exact_body_tail_start = pflash_policy
+            .hard_keep_ranges
+            .iter()
+            .filter(|range| range.start < body_tokens.len() && range.end >= body_tokens.len())
+            .map(|range| range.start)
+            .min()
+            .unwrap_or(body_tokens.len());
+        let cache_source_tokens = body_tokens
+            .get(..exact_body_tail_start)
+            .unwrap_or(body_tokens);
+        let request_tail_tokens = prompt_tokens
+            .get(exact_body_tail_start..)
+            .unwrap_or(generation_tail_tokens);
+        let cache_hard_keep_spans = clipped_hard_keep_spans(
+            &pflash_policy.hard_keep_ranges,
+            0,
+            cache_source_tokens.len(),
+        );
+        let cached_prefix = self.pflash_cached_prefix(cache_source_tokens, cache_config);
+        let suffix_identity_threshold = self.prefill_suffix_identity_threshold;
+        let mut cache_prefix_tokens = 0usize;
+        let mut suffix_tokens = cache_source_tokens.len();
+        let mut suffix_identity = false;
+        let mut score_ms = 0.0_f64;
+        let mut select_ms = 0.0_f64;
+        let mut effective_keep_ratio = self.prefill_keep_ratio;
 
-            let prompt_len = i32::try_from(prompt_tokens.len()).map_err(|_| {
-                EngineError::Generation("prompt too long for prefill compression".to_owned())
-            })?;
-            let inputs = Array::from_slice(prompt_tokens, &[1, prompt_len]);
-            let num_layers = drafter.num_layers();
-            let score_layers_start = num_layers.saturating_sub(8);
-            let score_layers: Vec<usize> = (score_layers_start..num_layers).collect();
-            let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
-            let raw_importance_scores = drafter.pflash_importance(
-                &inputs,
-                &score_layers,
-                self.prefill_lookahead,
-                &mut cache,
-            )?;
-            eval([&raw_importance_scores]).map_err(EngineError::Mlx)?;
-            let importance_scores_f32 = raw_importance_scores
-                .as_dtype(Dtype::Float32)
-                .map_err(EngineError::Mlx)?;
-            let importance_scores = importance_scores_f32.as_slice::<f32>().to_vec();
-            let cfg = PrefillScoreConfig {
-                keep_ratio: self.prefill_keep_ratio,
-                chunk: self.prefill_chunk,
-                avgpool: self.prefill_avgpool,
-                lookahead: self.prefill_lookahead,
-            };
-            let plan =
-                select_survivors(prompt_tokens, &importance_scores, &cfg).map_err(|error| {
-                    EngineError::Generation(format!("PFlash survivor selection failed: {error}"))
-                })?;
-            Ok(plan.token_ids)
+        let body_plan = match (|| -> Result<SurvivalPlan, EngineError> {
+            if let Some(hit) = cached_prefix {
+                self.cache_metrics
+                    .pflash_plan_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                cache_prefix_tokens = hit.source_len;
+                suffix_tokens = cache_source_tokens.len().saturating_sub(hit.source_len);
+                if suffix_tokens == 0 {
+                    return Ok(hit.plan);
+                }
+                let suffix = cache_source_tokens
+                    .get(hit.source_len..)
+                    .unwrap_or_default();
+                let suffix_hard_keep_spans = clipped_hard_keep_spans(
+                    &pflash_policy.hard_keep_ranges,
+                    hit.source_len,
+                    cache_source_tokens.len(),
+                );
+                let suffix_plan = if suffix.len() <= suffix_identity_threshold {
+                    suffix_identity = true;
+                    self.pflash_identity_plan(suffix)?
+                } else {
+                    let outcome = self.pflash_score_tokens(suffix, &suffix_hard_keep_spans)?;
+                    score_ms = outcome.score_ms;
+                    select_ms = outcome.select_ms;
+                    effective_keep_ratio = outcome.effective_keep_ratio;
+                    outcome.plan
+                };
+                return hit
+                    .plan
+                    .append_suffix(&suffix_plan, suffix_plan.metadata.clone())
+                    .map_err(|error| {
+                        EngineError::Generation(format!(
+                            "PFlash cached-prefix append failed: {error}"
+                        ))
+                    });
+            }
+
+            if cache_source_tokens.is_empty() {
+                return self.pflash_identity_plan(cache_source_tokens);
+            }
+
+            let outcome = self.pflash_score_tokens(cache_source_tokens, &cache_hard_keep_spans)?;
+            score_ms = outcome.score_ms;
+            select_ms = outcome.select_ms;
+            effective_keep_ratio = outcome.effective_keep_ratio;
+            Ok(outcome.plan)
         })() {
-            Ok(plan) => plan,
+            Ok(plan) => {
+                self.pflash_store_plan(cache_source_tokens, &plan, cache_config);
+                plan
+            }
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    "PFlash compression failed; falling back to uncompressed prefill"
+                    "PFlash compression failed"
                 );
-                return Ok(None);
+                return self.pflash_unavailable("compression failed", pflash_required);
             }
+        };
+        let plan = if request_tail_tokens.is_empty() {
+            body_plan
+        } else {
+            let tail_plan = self.pflash_identity_plan(request_tail_tokens)?;
+            body_plan
+                .append_suffix(&tail_plan, tail_plan.metadata.clone())
+                .map_err(|error| {
+                    EngineError::Generation(format!("PFlash request-tail append failed: {error}"))
+                })?
         };
         let original_len = prompt_tokens.len();
         let kept_len = plan.len();
-        tracing::debug!(
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        let target_plan = match plan.target_sparse_prefill_plan() {
+            Ok(target_plan) => target_plan,
+            Err(error) => {
+                tracing::warn!(error, "PFlash built invalid sparse prefill plan");
+                return self.pflash_unavailable("invalid sparse plan", pflash_required);
+            }
+        };
+        self.pflash_record_used(
+            original_len,
+            kept_len,
+            cache_prefix_tokens,
+            suffix_tokens,
+            request_tail_tokens.len(),
+            score_ms,
+            select_ms,
+            total_ms,
+            effective_keep_ratio,
+        );
+        tracing::info!(
             original = original_len,
             kept = kept_len,
             ratio = format_args!("{kept_len}/{original_len}"),
-            "PFlash compressed prefill prompt"
+            positions = plan.original_positions.len(),
+            source = plan.source_token_count,
+            mode = ?plan.metadata.score_mode,
+            cache_prefix_tokens,
+            suffix_tokens,
+            suffix_identity,
+            request_tail_tokens = request_tail_tokens.len(),
+            exact_body_tail_tokens = body_tokens.len().saturating_sub(cache_source_tokens.len()),
+            hard_keep_ranges = pflash_policy.hard_keep_ranges.len(),
+            cache_hard_keep_tokens = cache_hard_keep_spans
+                .iter()
+                .map(|span| span.end.saturating_sub(span.start))
+                .sum::<usize>(),
+            score_ms,
+            select_ms,
+            total_ms,
+            keep_floor = self.prefill_keep_ratio,
+            keep_ceiling = self.prefill_keep_ratio_max,
+            effective_keep_ratio,
+            "PFlash built compressed prefill plan"
+        );
+        tracing::info!(
+            logical_next_pos = target_plan.logical_next_pos,
+            contiguous_identity = plan.is_contiguous_identity(),
+            "PFlash sparse prefill plan accepted"
         );
         Ok(Some(plan))
     }
@@ -5341,10 +6171,14 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
     ) -> Result<GenerationOutput, EngineError> {
         let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
+        let generation_suffix = self.gen_prompt_suffixes.for_request(enable_thinking);
         let compressed = self.pflash_compress_if_eligible(
             prompt_tokens,
+            generation_suffix,
+            pflash_policy,
             params,
             pixel_values.as_ref(),
             constraint.as_ref(),
@@ -5352,7 +6186,7 @@ impl SimpleEngine {
             None,
         )?;
         let prepared_prompt_tokens: &[u32] = match &compressed {
-            Some(tokens) => tokens.as_slice(),
+            Some(plan) => plan.token_ids.as_slice(),
             None => prompt_tokens,
         };
         // DFlash speculative decoding: use the draft-verify loop when a drafter
@@ -5390,8 +6224,15 @@ impl SimpleEngine {
         }
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
-        let mut prepared =
-            self.prepare_generation(prepared_prompt_tokens, pixel_values, checkpoint_id)?;
+        let mut prepared = self.prepare_generation(
+            prepared_prompt_tokens,
+            pixel_values,
+            checkpoint_id,
+            compressed.is_none(),
+        )?;
+        if compressed.is_some() {
+            prepared.prompt_len = Self::prompt_len(prompt_tokens)?;
+        }
         let prompt_len = prepared.prompt_len;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
@@ -5410,8 +6251,9 @@ impl SimpleEngine {
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
-            prefix_cache_enabled(),
+            prefix_cache_enabled() && compressed.is_none(),
             checkpoint_id,
+            compressed.as_ref(),
             None,
             None,
         )?;
@@ -7311,8 +8153,7 @@ impl SimpleEngine {
                     // GDN tape, so partial commit could trim retained history.
                     let early_exit = None;
                     let dspark_native_verify = is_dspark
-                        && std::env::var("HIGGS_DSPARK_NATIVE_VERIFY")
-                            .is_ok_and(|v| v == "1");
+                        && std::env::var("HIGGS_DSPARK_NATIVE_VERIFY").is_ok_and(|v| v == "1");
                     let row_schedule = if is_dspark && !dspark_native_verify {
                         higgs_models::qwen3_next::DFlashRowSchedule::CanonicalS1
                     } else {
@@ -7329,8 +8170,7 @@ impl SimpleEngine {
                         )
                         .map_err(EngineError::Mlx)?;
                     if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
-                        higgs_models::mlx_exec::eval([&verify_logits])
-                            .map_err(EngineError::Mlx)?;
+                        higgs_models::mlx_exec::eval([&verify_logits]).map_err(EngineError::Mlx)?;
                         let now = std::time::Instant::now();
                         dspark_verify_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
                         *ckpt = now;
@@ -7341,9 +8181,7 @@ impl SimpleEngine {
                     // a full GPU/host synchronization to every round.
                     let (verify_flat, draft_u32) = dflash_resolve_target_then_draft(
                         || {
-                            if verify_logits.ndim() == 2
-                                && verify_logits.dtype() == Dtype::Uint32
-                            {
+                            if verify_logits.ndim() == 2 && verify_logits.dtype() == Dtype::Uint32 {
                                 higgs_models::mlx_exec::eval([&verify_logits])
                                     .map_err(EngineError::Mlx)?;
                                 Ok(verify_logits.as_slice::<u32>().to_vec())
@@ -7473,8 +8311,7 @@ impl SimpleEngine {
                         verify_round.commit_target_state(&model, &mut cache)?;
                     if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
                         let now = std::time::Instant::now();
-                        dspark_target_commit_ms =
-                            now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        dspark_target_commit_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
                     }
                     let kept_taps: Vec<Array> = verify_taps
                         .into_iter()
@@ -8555,6 +9392,40 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
+        self.generate_streaming_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            sender,
+            enable_thinking,
+            return_progress,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            &PFlashPromptPolicy::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_thinking_and_pflash_policy(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        return_progress: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<(), EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -8586,6 +9457,7 @@ impl SimpleEngine {
                 constraint,
                 pixel_values,
                 checkpoint_id,
+                pflash_policy,
             )
         })
     }
@@ -8609,10 +9481,14 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
     ) -> Result<(), EngineError> {
         let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
+        let generation_suffix = self.gen_prompt_suffixes.for_request(enable_thinking);
         let compressed = self.pflash_compress_if_eligible(
             prompt_tokens,
+            generation_suffix,
+            pflash_policy,
             params,
             pixel_values.as_ref(),
             constraint.as_ref(),
@@ -8620,14 +9496,16 @@ impl SimpleEngine {
             None,
         )?;
         let prepared_prompt_tokens: &[u32] = match &compressed {
-            Some(tokens) => tokens.as_slice(),
+            Some(plan) => plan.token_ids.as_slice(),
             None => prompt_tokens,
         };
         // DFlash streaming: branch BEFORE the normal prefill — the DFlash loop
         // runs its own tap-prefill, so dispatching here (mirroring the
         // non-streaming site) avoids a double prefill. Logprobs requests fall
         // through to the MTP/AR path, which produces per-token logprobs.
-        // PFlash: compressive prefill is applied above (single compression point); the compressed slice feeds both the DFlash-streaming and AR paths.
+        // PFlash: plan construction is centralized above. dSpark/DFlash sees
+        // the compressed survivor sequence and can use its existing paired
+        // prefix cache; the AR path below uses target sparse prefill.
         let sampled_dspark = self.sampled_dspark_requires_ar(params);
         if sampled_dspark {
             tracing::debug!(
@@ -8657,8 +9535,15 @@ impl SimpleEngine {
 
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
-        let mut prepared =
-            self.prepare_generation(prepared_prompt_tokens, pixel_values, checkpoint_id)?;
+        let mut prepared = self.prepare_generation(
+            prepared_prompt_tokens,
+            pixel_values,
+            checkpoint_id,
+            compressed.is_none(),
+        )?;
+        if compressed.is_some() {
+            prepared.prompt_len = Self::prompt_len(prompt_tokens)?;
+        }
         let prompt_len = prepared.prompt_len;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
@@ -8715,8 +9600,9 @@ impl SimpleEngine {
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
-            prefix_cache_enabled(),
+            prefix_cache_enabled() && compressed.is_none(),
             checkpoint_id,
+            compressed.as_ref(),
             None,
             None,
         )?;
@@ -9693,16 +10579,18 @@ impl SimpleEngine {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        CanonicalDflashRound, DFlashVerifyMode, DFlashVerifyRound, DflashPromptPartition,
-        DflashTapFrontier, EngineError, GenerationPromptSuffixes, IncrementalDetok, LivePair,
-        PrefillCompressionMode, SessionDsparkDecodeState, SessionGeneration, SimpleEngine,
-        SpeculationRoute, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
-        continuation_prior_len, derive_model_name, detect_thinking_support,
-        dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
+        CanonicalDflashRound, DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_PLAN_CACHE,
+        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+        DFlashVerifyMode, DFlashVerifyRound, DflashPromptPartition, DflashTapFrontier, EngineError,
+        GenerationPromptSuffixes, IncrementalDetok, LivePair, PFlashPlanCache,
+        PFlashPlanCacheConfig, PrefillCompressionMode, SessionDsparkDecodeState, SessionGeneration,
+        SimpleEngine, SpeculationRoute, Tokenizer, adaptive_draft_depth_for_cap,
+        check_stop_sequences, contains_real_user_query, continuation_prior_len, derive_model_name,
+        detect_thinking_support, dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
         dflash_resolve_target_then_draft, dflash_tail_draft_cap, drive_canonical_dspark_round,
         estimate_paged_kv_blocks, extract_eos_tokens, find_stop_in_tail, lock_or_recover,
-        paired_dflash_exact_domain, parse_enabled_flag, resolve_speculation_route,
-        stateless_mtp_family_eligible, with_chat_terminator,
+        paired_dflash_exact_domain, parse_enabled_flag, pflash_cache_source_and_request_tail,
+        resolve_speculation_route, stateless_mtp_family_eligible, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
@@ -9712,6 +10600,7 @@ mod tests {
         AnyCache, AnyModel, SamplingParams, Speculation,
         cache::{KeyValueCache, SteppingKeyValueCache},
         dflash::{DFlashConfig, DFlashDrafter},
+        spec_prefill::{PrefillPlanMetadata, PrefillScoreConfig, PrefillScoreMode, SurvivalPlan},
         transformer::{Model as TransformerModel, ModelArgs as TransformerModelArgs},
         turboquant::KvCacheConfig,
     };
@@ -9721,6 +10610,113 @@ mod tests {
         transforms::eval,
     };
     use std::path::Path;
+
+    fn pflash_test_config(chunk: usize) -> PFlashPlanCacheConfig {
+        PFlashPlanCacheConfig {
+            version: PrefillPlanMetadata::VERSION,
+            score_mode: PrefillScoreMode::Full,
+            exit_layer: 7,
+            keep_floor_bits: 0.10_f32.to_bits(),
+            keep_ceiling_bits: 0.75_f32.to_bits(),
+            chunk,
+            avgpool: 13,
+            lookahead: 8,
+        }
+    }
+
+    fn pflash_identity(tokens: &[u32]) -> SurvivalPlan {
+        SurvivalPlan::identity(
+            tokens,
+            PrefillPlanMetadata::from_config(&PrefillScoreConfig::default()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pflash_plan_cache_returns_longest_matching_prefix() {
+        let mut cache = PFlashPlanCache::default();
+        let config = pflash_test_config(32);
+        cache.store(&[1, 2, 3], pflash_identity(&[1, 2, 3]), config, 64);
+        cache.store(
+            &[1, 2, 3, 4, 5],
+            pflash_identity(&[1, 2, 3, 4, 5]),
+            config,
+            64,
+        );
+
+        let hit = cache
+            .find_longest_prefix(&[1, 2, 3, 4, 5, 6, 7], config)
+            .unwrap();
+        assert_eq!(hit.source_len, 5);
+        assert_eq!(hit.plan.token_ids, &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn pflash_plan_cache_rejects_config_mismatch() {
+        let mut cache = PFlashPlanCache::default();
+        let config = pflash_test_config(32);
+        cache.store(&[1, 2, 3], pflash_identity(&[1, 2, 3]), config, 64);
+
+        assert!(
+            cache
+                .find_longest_prefix(&[1, 2, 3, 4], pflash_test_config(64))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pflash_plan_cache_prunes_superseded_linear_prefix() {
+        let mut cache = PFlashPlanCache::default();
+        let config = pflash_test_config(32);
+        cache.store(&[1, 2, 3], pflash_identity(&[1, 2, 3]), config, 64);
+        cache.store(&[1, 2, 3, 4], pflash_identity(&[1, 2, 3, 4]), config, 64);
+
+        assert_eq!(cache.entries.len(), 1);
+        let hit = cache.find_longest_prefix(&[1, 2, 3, 4, 5], config).unwrap();
+        assert_eq!(hit.source_len, 4);
+        assert_eq!(hit.plan.token_ids, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn pflash_cache_source_strips_request_generation_suffix() {
+        let suffix = [90, 91];
+        let previous_prompt = [1, 2, 3, 90, 91];
+        let next_prompt = [1, 2, 3, 4, 5, 90, 91];
+
+        let (previous_body, previous_tail) =
+            pflash_cache_source_and_request_tail(&previous_prompt, &suffix);
+        let (next_body, next_tail) = pflash_cache_source_and_request_tail(&next_prompt, &suffix);
+
+        assert_eq!(previous_body, &[1, 2, 3]);
+        assert_eq!(previous_tail, &suffix);
+        assert_eq!(next_body, &[1, 2, 3, 4, 5]);
+        assert_eq!(next_tail, &suffix);
+        assert!(next_body.starts_with(previous_body));
+        assert!(!next_prompt.starts_with(&previous_prompt));
+    }
+
+    #[test]
+    fn pflash_real_user_query_ignores_wrapped_tool_responses() {
+        let no_query = [ChatMessage {
+            role: "user".to_owned(),
+            content: "<tool_response>{\"ok\":true}</tool_response>".to_owned(),
+            tool_calls: None,
+        }];
+        let system_only = [ChatMessage {
+            role: "system".to_owned(),
+            content: "policy".to_owned(),
+            tool_calls: None,
+        }];
+        let real_query = [ChatMessage {
+            role: "user".to_owned(),
+            content: "what next?".to_owned(),
+            tool_calls: None,
+        }];
+
+        assert!(!contains_real_user_query(&no_query));
+        assert!(!contains_real_user_query(&system_only));
+        assert!(contains_real_user_query(&real_query));
+    }
 
     fn validated_session_target(boundary: i32) -> AnyCache {
         let layer = if boundary == 0 {
@@ -9856,6 +10852,13 @@ mod tests {
             prefill_chunk: 32,
             prefill_avgpool: 13,
             prefill_lookahead: 8,
+            prefill_score_mode: PrefillScoreMode::Full,
+            prefill_exit_layer: 7,
+            prefill_keep_ratio_max: DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            prefill_plan_cache: DEFAULT_PFLASH_PLAN_CACHE,
+            prefill_plan_cache_entries: DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+            prefill_suffix_identity_threshold: DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+            pflash_plan_cache: std::sync::Mutex::new(PFlashPlanCache::default()),
             last_dflash_accepts: std::sync::Mutex::new(Vec::new()),
             last_dflash_draft_matches: std::sync::Mutex::new(Vec::new()),
             last_dflash_draft_counts: std::sync::Mutex::new(Vec::new()),
@@ -10674,6 +11677,12 @@ mod tests {
             32,
             13,
             8,
+            PrefillScoreMode::Full,
+            7,
+            DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            DEFAULT_PFLASH_PLAN_CACHE,
+            DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+            DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
         )
         .expect("load DFlash engine");
 
@@ -10894,6 +11903,12 @@ mod tests {
             32,
             13,
             8,
+            PrefillScoreMode::Full,
+            7,
+            DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            DEFAULT_PFLASH_PLAN_CACHE,
+            DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+            DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
         )
         .expect("load paired target + drafter");
         let dflash = engine.dflash.as_ref().expect("DFlash state");
@@ -11646,6 +12661,12 @@ mod tests {
                 32,
                 13,
                 8,
+                PrefillScoreMode::Full,
+                7,
+                DEFAULT_PFLASH_KEEP_RATIO_MAX,
+                DEFAULT_PFLASH_PLAN_CACHE,
+                DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+                DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
             )
             .expect("load DFlash engine")
         };

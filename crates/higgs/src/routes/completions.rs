@@ -23,6 +23,7 @@ use crate::{
     types::openai::{
         ChoiceLogprobs, CompletionChoice, CompletionChunkChoice, CompletionRequest,
         CompletionResponse, CompletionUsage, StopSequence, TokenLogprob, TopLogprob,
+        merge_repetition_penalty,
     },
 };
 use higgs_models::SamplingParams;
@@ -53,6 +54,7 @@ pub async fn completions(
             engine,
             model_name,
             routing_method,
+            ..
         } => {
             if req.stream == Some(true) {
                 let metrics = state.metrics.clone();
@@ -292,11 +294,11 @@ fn completions_stream(
 
 fn build_sampling_params(req: &CompletionRequest) -> SamplingParams {
     SamplingParams {
-        temperature: req.temperature.unwrap_or(1.0),
+        temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k,
         min_p: req.min_p,
-        repetition_penalty: req.repetition_penalty,
+        repetition_penalty: merge_repetition_penalty(req.repetition_penalty, req.repeat_penalty),
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
         // Legacy text-completion endpoint: speculation method stays at the

@@ -22,17 +22,18 @@
 //! the Bonsai target was resident. At S=32K that is ~32 GB; the allocator OOM'd
 //! and crashed the server.
 //!
-//! The scorer half (steps 1-3, NOT yet implemented here) MUST compute attention
-//! block-pair by block-pair: one K-block of 128 at a time, producing a transient
+//! The scorer half (steps 1-3) MUST compute attention block-pair by block-pair:
+//! one K-block of 128 at a time, producing a transient
 //! `[lookahead, n_kv_heads, 128]` (~16 KB) and accumulating into a per-layer
 //! `[lookahead, n_heads, S]` (~75 MB at S=128K), streamed to a running max so
 //! peak is **~75 MB regardless of S**. S grows the accumulator linearly, never
-//! quadratically. The regression test `scorer_never_materializes_full_attention`
-//! in the design (§5.4) asserts this bound once the scorer lands.
+//! quadratically.
 //!
-//! This module currently ships the model-free selection half (steps 4-6), which
-//! is pure arithmetic over `Vec<f32>` and cannot OOM. The scorer half is
-//! scaffolded below as `score_prompt` and is the next implementation step.
+//! This module ships the model-free selection half (steps 4-6) plus the
+//! S-linear per-layer attention primitive used by the dense drafter scorer.
+//! Drafter orchestration lives in `transformer::Model::pflash_importance`.
+//! Target-side sparse execution is implemented for Qwen3Next/Bonsai-hybrid
+//! targets; dSpark/DFlash uses the compressed survivor sequence directly.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::float_cmp)]
@@ -41,7 +42,7 @@ mod tests;
 /// Knobs for SpecPrefill selection. Defaults mirror the published recipe
 /// (Cross-Family Appendix A.1: chunk=32, avgpool=13, lookahead=8) and the
 /// "highest tradable point" keep_ratio=0.10 (RESEARCH §3.5).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PrefillScoreConfig {
     /// Fraction of source tokens kept after compression.
     pub keep_ratio: f32,
@@ -64,13 +65,156 @@ impl Default for PrefillScoreConfig {
     }
 }
 
+/// Map scorer uncertainty to an effective keep ratio.
+///
+/// The scorer produces a non-negative importance distribution over source
+/// tokens. When that distribution is sharp, the prompt has a small number of
+/// clear anchors and PFlash can compress aggressively. When it is diffuse, the
+/// prompt is harder to summarize safely, so keep more of it.
+#[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+#[must_use]
+pub fn adaptive_keep_ratio_from_importance(
+    importance: &[f32],
+    keep_floor: f32,
+    keep_ceiling: f32,
+) -> f32 {
+    let floor = keep_floor.clamp(0.02, 0.95);
+    let ceiling = keep_ceiling.clamp(floor, 0.95);
+    if importance.len() < 2 || (ceiling - floor).abs() <= f32::EPSILON {
+        return floor;
+    }
+
+    let finite_positive: Vec<f64> = importance
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(f64::from)
+        .collect();
+    let total: f64 = finite_positive.iter().sum();
+    if total <= f64::EPSILON {
+        return ceiling;
+    }
+
+    let entropy_nats = finite_positive.iter().fold(0.0_f64, |acc, score| {
+        let p = *score / total;
+        if p <= 0.0 { acc } else { acc - p * p.ln() }
+    });
+    let max_entropy = (importance.len() as f64).ln().max(f64::EPSILON);
+    let normalized_entropy = (entropy_nats / max_entropy).clamp(0.0, 1.0) as f32;
+    // Long real prompts naturally have high entropy even when the scorer still
+    // provides usable anchors. A linear map therefore collapses the policy into
+    // "mostly keep the ceiling" and erases the prefill win. Treat entropy below
+    // 0.80 as compressible, then ramp quadratically only for truly diffuse
+    // scorer output.
+    let diffuse_pressure = ((normalized_entropy - 0.80) / 0.20).clamp(0.0, 1.0);
+    floor + (ceiling - floor) * diffuse_pressure * diffuse_pressure
+}
+
+impl Default for PrefillScoreMode {
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
+/// Scorer variant used to produce a survivor plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefillScoreMode {
+    /// Full drafter scorer: prompt forward plus lookahead through the whole drafter.
+    Full,
+    /// Early-exit scorer at an intermediate drafter layer.
+    L7,
+}
+
+/// Metadata that makes a compressed prefill plan safe to cache or reject.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefillPlanMetadata {
+    pub version: u32,
+    pub score_mode: PrefillScoreMode,
+    pub exit_layer: Option<usize>,
+    pub keep_ratio: f32,
+    pub chunk: usize,
+    pub avgpool: usize,
+    pub lookahead: usize,
+}
+
+impl PrefillPlanMetadata {
+    pub const VERSION: u32 = 1;
+
+    #[must_use]
+    pub fn from_config(cfg: &PrefillScoreConfig) -> Self {
+        Self {
+            version: Self::VERSION,
+            score_mode: PrefillScoreMode::Full,
+            exit_layer: None,
+            keep_ratio: cfg.keep_ratio,
+            chunk: cfg.chunk,
+            avgpool: cfg.avgpool,
+            lookahead: cfg.lookahead,
+        }
+    }
+}
+
 /// A survivor plan: the kept token ids in their original order, plus the
 /// **original prompt position** of each survivor (for RoPE position-id restore —
 /// SpecPrefill §3.2.4; critical for NIAH and counting tasks).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SurvivalPlan {
     pub token_ids: Vec<u32>,
     pub original_positions: Vec<i32>,
+    pub source_token_count: usize,
+    pub metadata: PrefillPlanMetadata,
+}
+
+/// Borrowed, validated target-prefill view of a [`SurvivalPlan`].
+///
+/// `logical_next_pos` is the absolute prompt position the next decoded token
+/// must use. For lossy compression this is the source prompt length, not the
+/// number of retained survivor rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetSparsePrefillPlan<'a> {
+    pub token_ids: &'a [u32],
+    pub original_positions: &'a [i32],
+    pub logical_next_pos: i32,
+}
+
+/// Half-open source-token span that must survive PFlash selection exactly.
+///
+/// These spans carry executable prompt contracts (tool schemas, current action
+/// tail) that are cheap enough to keep verbatim and expensive to corrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardKeepSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl HardKeepSpan {
+    #[must_use]
+    pub const fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+}
+
+impl TargetSparsePrefillPlan<'_> {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.token_ids.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.token_ids.is_empty()
+    }
+
+    #[must_use]
+    pub fn is_contiguous_identity(&self) -> bool {
+        self.len() == usize::try_from(self.logical_next_pos).unwrap_or(usize::MAX)
+            && self
+                .original_positions
+                .iter()
+                .enumerate()
+                .all(|(index, position)| *position == index as i32)
+    }
 }
 
 impl SurvivalPlan {
@@ -81,6 +225,181 @@ impl SurvivalPlan {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.token_ids.is_empty()
+    }
+
+    #[must_use]
+    pub fn with_scorer(mut self, score_mode: PrefillScoreMode, exit_layer: Option<usize>) -> Self {
+        self.metadata.score_mode = score_mode;
+        self.metadata.exit_layer = exit_layer;
+        self
+    }
+
+    /// Build an identity/no-compression survivor plan. Useful when appending a
+    /// small new turn to a cached compressed prefix: the old prefix stays
+    /// compressed, while the new suffix remains exact.
+    pub fn identity(tokens: &[u32], metadata: PrefillPlanMetadata) -> Result<Self, String> {
+        let mut original_positions = Vec::with_capacity(tokens.len());
+        for index in 0..tokens.len() {
+            let position = i32::try_from(index).map_err(|_| {
+                format!("SurvivalPlan::identity: token index {index} exceeds i32::MAX")
+            })?;
+            original_positions.push(position);
+        }
+        let plan = Self {
+            token_ids: tokens.to_vec(),
+            original_positions,
+            source_token_count: tokens.len(),
+            metadata,
+        };
+        plan.target_sparse_prefill_plan()?;
+        Ok(plan)
+    }
+
+    /// Append a suffix plan whose original positions are relative to the suffix
+    /// source. The returned plan's positions are relative to the concatenated
+    /// source, preserving the frozen prefix survivor mapping across turns.
+    pub fn append_suffix(
+        &self,
+        suffix: &Self,
+        metadata: PrefillPlanMetadata,
+    ) -> Result<Self, String> {
+        let suffix_offset = self.source_token_count;
+        let mut token_ids = Vec::with_capacity(self.token_ids.len() + suffix.token_ids.len());
+        token_ids.extend_from_slice(&self.token_ids);
+        token_ids.extend_from_slice(&suffix.token_ids);
+
+        let mut original_positions =
+            Vec::with_capacity(self.original_positions.len() + suffix.original_positions.len());
+        original_positions.extend_from_slice(&self.original_positions);
+        for &position in &suffix.original_positions {
+            if position < 0 {
+                return Err(format!(
+                    "SurvivalPlan::append_suffix: negative suffix position {position}"
+                ));
+            }
+            let suffix_position = usize::try_from(position).map_err(|_| {
+                format!("SurvivalPlan::append_suffix: invalid suffix position {position}")
+            })?;
+            if suffix_position >= suffix.source_token_count {
+                return Err(format!(
+                    "SurvivalPlan::append_suffix: suffix position {position} outside source length {}",
+                    suffix.source_token_count
+                ));
+            }
+            let combined = suffix_offset
+                .checked_add(suffix_position)
+                .ok_or_else(|| "SurvivalPlan::append_suffix: position overflow".to_owned())?;
+            let combined_i32 = i32::try_from(combined).map_err(|_| {
+                format!(
+                    "SurvivalPlan::append_suffix: combined position {combined} exceeds i32::MAX"
+                )
+            })?;
+            original_positions.push(combined_i32);
+        }
+
+        let source_token_count = self
+            .source_token_count
+            .checked_add(suffix.source_token_count)
+            .ok_or_else(|| "SurvivalPlan::append_suffix: source length overflow".to_owned())?;
+        let plan = Self {
+            token_ids,
+            original_positions,
+            source_token_count,
+            metadata,
+        };
+        plan.target_sparse_prefill_plan()?;
+        Ok(plan)
+    }
+
+    /// True only when the plan is a no-op contiguous prefill. Any lossy plan
+    /// must go through a sparse-prefill path that applies RoPE at
+    /// `original_positions` and advances decode from `source_token_count`.
+    #[must_use]
+    pub fn is_contiguous_identity(&self) -> bool {
+        self.token_ids.len() == self.source_token_count
+            && self.original_positions.len() == self.source_token_count
+            && self
+                .original_positions
+                .iter()
+                .enumerate()
+                .all(|(index, position)| *position == index as i32)
+    }
+
+    pub fn target_sparse_prefill_plan(&self) -> Result<TargetSparsePrefillPlan<'_>, String> {
+        if self.token_ids.len() != self.original_positions.len() {
+            return Err(format!(
+                "target_sparse_prefill_plan: token_ids ({}) and original_positions ({}) length mismatch",
+                self.token_ids.len(),
+                self.original_positions.len()
+            ));
+        }
+        let logical_next_pos = i32::try_from(self.source_token_count).map_err(|_| {
+            format!(
+                "target_sparse_prefill_plan: source_token_count {} exceeds i32::MAX",
+                self.source_token_count
+            )
+        })?;
+        if self.source_token_count == 0 {
+            if self.token_ids.is_empty() {
+                return Ok(TargetSparsePrefillPlan {
+                    token_ids: &self.token_ids,
+                    original_positions: &self.original_positions,
+                    logical_next_pos,
+                });
+            }
+            return Err(
+                "target_sparse_prefill_plan: non-empty survivors for empty source".to_owned(),
+            );
+        }
+        if self.token_ids.is_empty() {
+            return Err(
+                "target_sparse_prefill_plan: non-empty source must retain at least one token"
+                    .to_owned(),
+            );
+        }
+        let mut previous = None;
+        for &position in &self.original_positions {
+            if position < 0 {
+                return Err(format!(
+                    "target_sparse_prefill_plan: negative original position {position}"
+                ));
+            }
+            if usize::try_from(position).unwrap_or(usize::MAX) >= self.source_token_count {
+                return Err(format!(
+                    "target_sparse_prefill_plan: original position {position} outside source length {}",
+                    self.source_token_count
+                ));
+            }
+            if previous.is_some_and(|prev| position <= prev) {
+                return Err(
+                    "target_sparse_prefill_plan: original positions must be strictly increasing"
+                        .to_owned(),
+                );
+            }
+            previous = Some(position);
+        }
+        if self.original_positions.first().copied() != Some(0) {
+            return Err(
+                "target_sparse_prefill_plan: first source token at position 0 must be retained"
+                    .to_owned(),
+            );
+        }
+        let final_source_pos = i32::try_from(self.source_token_count - 1).map_err(|_| {
+            format!(
+                "target_sparse_prefill_plan: source_token_count {} exceeds i32::MAX",
+                self.source_token_count
+            )
+        })?;
+        if self.original_positions.last().copied() != Some(final_source_pos) {
+            return Err(format!(
+                "target_sparse_prefill_plan: final source token at position {final_source_pos} must be retained"
+            ));
+        }
+        Ok(TargetSparsePrefillPlan {
+            token_ids: &self.token_ids,
+            original_positions: &self.original_positions,
+            logical_next_pos,
+        })
     }
 }
 
@@ -145,6 +464,27 @@ pub fn select_survivors(
     importance: &[f32],
     cfg: &PrefillScoreConfig,
 ) -> Result<SurvivalPlan, String> {
+    select_survivors_with_hard_keep(tokens, importance, cfg, &[])
+}
+
+/// Select survivors while forcing exact retention of caller-provided spans.
+///
+/// Block selection still controls the lossy budget for ordinary context. Hard
+/// spans are applied at token granularity so preserving a tool name or the
+/// current user turn does not force an entire neighboring chunk to survive.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+pub fn select_survivors_with_hard_keep(
+    tokens: &[u32],
+    importance: &[f32],
+    cfg: &PrefillScoreConfig,
+    hard_keep_spans: &[HardKeepSpan],
+) -> Result<SurvivalPlan, String> {
     if tokens.len() != importance.len() {
         return Err(format!(
             "select_survivors: tokens ({}) and importance ({}) length mismatch",
@@ -156,16 +496,28 @@ pub fn select_survivors(
         return Ok(SurvivalPlan {
             token_ids: Vec::new(),
             original_positions: Vec::new(),
+            source_token_count: 0,
+            metadata: PrefillPlanMetadata::from_config(cfg),
         });
     }
-    if !(0.02..=0.50).contains(&cfg.keep_ratio) {
+    if !(0.02..=0.95).contains(&cfg.keep_ratio) {
         return Err(format!(
-            "select_survivors: keep_ratio {} out of range [0.02, 0.50]",
+            "select_survivors: keep_ratio {} out of range [0.02, 0.95]",
             cfg.keep_ratio
         ));
     }
     if cfg.chunk == 0 {
         return Err("select_survivors: chunk must be >= 1".to_string());
+    }
+    for span in hard_keep_spans {
+        if span.start > span.end || span.end > tokens.len() {
+            return Err(format!(
+                "select_survivors: hard keep span {}..{} outside source length {}",
+                span.start,
+                span.end,
+                tokens.len()
+            ));
+        }
     }
     let smoothed = smooth_importance(importance, cfg.avgpool)?;
 
@@ -197,22 +549,28 @@ pub fn select_survivors(
     kept[0] = true;
     kept[last_block] = true;
 
+    let mut hard_keep = vec![false; s];
+    for span in hard_keep_spans {
+        for keep in &mut hard_keep[span.start..span.end] {
+            *keep = true;
+        }
+    }
+
     let mut token_ids = Vec::new();
     let mut original_positions = Vec::new();
-    for b in 0..n_blocks {
-        if !kept[b] {
+    for (i, &token) in tokens.iter().enumerate() {
+        let b = i / cfg.chunk;
+        if !kept[b] && !hard_keep[i] {
             continue;
         }
-        let lo = b * cfg.chunk;
-        let hi = lo + cfg.chunk.min(s - lo);
-        for i in lo..hi {
-            token_ids.push(tokens[i]);
-            original_positions.push(i as i32);
-        }
+        token_ids.push(token);
+        original_positions.push(i as i32);
     }
     Ok(SurvivalPlan {
         token_ids,
         original_positions,
+        source_token_count: tokens.len(),
+        metadata: PrefillPlanMetadata::from_config(cfg),
     })
 }
 

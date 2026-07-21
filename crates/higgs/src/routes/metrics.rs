@@ -31,6 +31,32 @@ pub struct CacheMetricsView {
     pub paired_radix_hits: u64,
     /// Prompt tokens NOT re-prefilled thanks to reuse (radix + continuation).
     pub prefill_saved_tokens: u64,
+    /// PFlash scoring/planning attempts after config/request eligibility checks.
+    pub pflash_attempts: u64,
+    /// PFlash plans accepted for target execution.
+    pub pflash_used: u64,
+    /// PFlash attempts that fell back or errored before target execution.
+    pub pflash_fallbacks: u64,
+    /// In-memory PFlash stable-body plan-cache hits.
+    pub pflash_plan_cache_hits: u64,
+    /// Source prompt tokens for the most recent accepted PFlash plan.
+    pub pflash_last_source_tokens: u64,
+    /// Survivor tokens for the most recent accepted PFlash plan.
+    pub pflash_last_kept_tokens: u64,
+    /// Stable-body prefix tokens reused from the PFlash plan cache.
+    pub pflash_last_cache_prefix_tokens: u64,
+    /// Stable-body suffix tokens scored or identity-appended this turn.
+    pub pflash_last_suffix_tokens: u64,
+    /// Request-specific generation-suffix tokens identity-appended after body planning.
+    pub pflash_last_request_tail_tokens: u64,
+    /// Scorer wall time for the most recent accepted PFlash plan.
+    pub pflash_last_score_ms: u64,
+    /// Survivor-selection wall time for the most recent accepted PFlash plan.
+    pub pflash_last_select_ms: u64,
+    /// End-to-end PFlash planning wall time for the most recent accepted plan.
+    pub pflash_last_total_ms: u64,
+    /// Effective adaptive keep ratio for the most recent accepted plan, parts per million.
+    pub pflash_last_effective_keep_ratio_ppm: u64,
     /// Per-session continuations (best-effort retained-cache reuse).
     pub continuations: u64,
     /// Retained sessions evicted (count cap + idle TTL).
@@ -66,6 +92,33 @@ impl CacheMetricsView {
         self.prefill_saved_tokens = self
             .prefill_saved_tokens
             .saturating_add(stats.prefill_saved_tokens);
+        self.pflash_attempts = self.pflash_attempts.saturating_add(stats.pflash_attempts);
+        self.pflash_used = self.pflash_used.saturating_add(stats.pflash_used);
+        self.pflash_fallbacks = self.pflash_fallbacks.saturating_add(stats.pflash_fallbacks);
+        self.pflash_plan_cache_hits = self
+            .pflash_plan_cache_hits
+            .saturating_add(stats.pflash_plan_cache_hits);
+        self.pflash_last_source_tokens = self
+            .pflash_last_source_tokens
+            .max(stats.pflash_last_source_tokens);
+        self.pflash_last_kept_tokens = self
+            .pflash_last_kept_tokens
+            .max(stats.pflash_last_kept_tokens);
+        self.pflash_last_cache_prefix_tokens = self
+            .pflash_last_cache_prefix_tokens
+            .max(stats.pflash_last_cache_prefix_tokens);
+        self.pflash_last_suffix_tokens = self
+            .pflash_last_suffix_tokens
+            .max(stats.pflash_last_suffix_tokens);
+        self.pflash_last_request_tail_tokens = self
+            .pflash_last_request_tail_tokens
+            .max(stats.pflash_last_request_tail_tokens);
+        self.pflash_last_score_ms = self.pflash_last_score_ms.max(stats.pflash_last_score_ms);
+        self.pflash_last_select_ms = self.pflash_last_select_ms.max(stats.pflash_last_select_ms);
+        self.pflash_last_total_ms = self.pflash_last_total_ms.max(stats.pflash_last_total_ms);
+        self.pflash_last_effective_keep_ratio_ppm = self
+            .pflash_last_effective_keep_ratio_ppm
+            .max(stats.pflash_last_effective_keep_ratio_ppm);
         self.continuations = self.continuations.saturating_add(stats.continuations);
         self.sessions_evicted = self.sessions_evicted.saturating_add(stats.sessions_evicted);
         self.retained_sessions = self
@@ -209,16 +262,29 @@ mod tests {
             paired_radix_lookups: 3,
             paired_radix_hits: 4,
             prefill_saved_tokens: 5,
-            continuations: 6,
-            sessions_evicted: 7,
-            retained_sessions: 8,
-            retained_paired_sessions: 9,
-            retained_paired_target_bytes: 10,
-            retained_paired_dflash_bytes: 11,
-            radix_entries: 12,
-            paired_radix_entries: 13,
-            paired_radix_target_bytes: 14,
-            paired_radix_dflash_bytes: 15,
+            pflash_attempts: 6,
+            pflash_used: 7,
+            pflash_fallbacks: 8,
+            pflash_plan_cache_hits: 9,
+            pflash_last_source_tokens: 10,
+            pflash_last_kept_tokens: 11,
+            pflash_last_cache_prefix_tokens: 12,
+            pflash_last_suffix_tokens: 13,
+            pflash_last_request_tail_tokens: 14,
+            pflash_last_score_ms: 15,
+            pflash_last_select_ms: 16,
+            pflash_last_total_ms: 17,
+            pflash_last_effective_keep_ratio_ppm: 180_000,
+            continuations: 19,
+            sessions_evicted: 20,
+            retained_sessions: 21,
+            retained_paired_sessions: 22,
+            retained_paired_target_bytes: 23,
+            retained_paired_dflash_bytes: 24,
+            radix_entries: 25,
+            paired_radix_entries: 26,
+            paired_radix_target_bytes: 27,
+            paired_radix_dflash_bytes: 28,
         }
     }
 
@@ -265,12 +331,16 @@ mod tests {
 
         assert_eq!(view.paired_radix_lookups, 6);
         assert_eq!(view.paired_radix_hits, 8);
-        assert_eq!(view.retained_paired_sessions, 18);
-        assert_eq!(view.retained_paired_target_bytes, 20);
-        assert_eq!(view.retained_paired_dflash_bytes, 22);
-        assert_eq!(view.paired_radix_entries, 26);
-        assert_eq!(view.paired_radix_target_bytes, 28);
-        assert_eq!(view.paired_radix_dflash_bytes, 30);
+        assert_eq!(view.pflash_attempts, 12);
+        assert_eq!(view.pflash_used, 14);
+        assert_eq!(view.pflash_fallbacks, 16);
+        assert_eq!(view.pflash_plan_cache_hits, 18);
+        assert_eq!(view.retained_paired_sessions, 44);
+        assert_eq!(view.retained_paired_target_bytes, 46);
+        assert_eq!(view.retained_paired_dflash_bytes, 48);
+        assert_eq!(view.paired_radix_entries, 52);
+        assert_eq!(view.paired_radix_target_bytes, 54);
+        assert_eq!(view.paired_radix_dflash_bytes, 56);
     }
 
     #[test]
@@ -282,12 +352,25 @@ mod tests {
         for (name, expected) in [
             ("paired_radix_lookups", 3),
             ("paired_radix_hits", 4),
-            ("retained_paired_sessions", 9),
-            ("retained_paired_target_bytes", 10),
-            ("retained_paired_dflash_bytes", 11),
-            ("paired_radix_entries", 13),
-            ("paired_radix_target_bytes", 14),
-            ("paired_radix_dflash_bytes", 15),
+            ("pflash_attempts", 6),
+            ("pflash_used", 7),
+            ("pflash_fallbacks", 8),
+            ("pflash_plan_cache_hits", 9),
+            ("pflash_last_source_tokens", 10),
+            ("pflash_last_kept_tokens", 11),
+            ("pflash_last_cache_prefix_tokens", 12),
+            ("pflash_last_suffix_tokens", 13),
+            ("pflash_last_request_tail_tokens", 14),
+            ("pflash_last_score_ms", 15),
+            ("pflash_last_select_ms", 16),
+            ("pflash_last_total_ms", 17),
+            ("pflash_last_effective_keep_ratio_ppm", 180_000),
+            ("retained_paired_sessions", 22),
+            ("retained_paired_target_bytes", 23),
+            ("retained_paired_dflash_bytes", 24),
+            ("paired_radix_entries", 26),
+            ("paired_radix_target_bytes", 27),
+            ("paired_radix_dflash_bytes", 28),
         ] {
             assert_eq!(
                 rendered.get(name).and_then(serde_json::Value::as_u64),

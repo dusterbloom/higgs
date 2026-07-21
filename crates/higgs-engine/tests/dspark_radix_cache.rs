@@ -27,13 +27,18 @@ use higgs_engine::{
     chat_template::{ChatMessage, ChatTemplateRenderer},
     mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile},
     paged_prefix_cache::MAX_PAIRED_RADIX_ENTRIES,
-    simple::{PrefillCompressionMode, SimpleEngine},
+    simple::{
+        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_PLAN_CACHE,
+        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+        PrefillCompressionMode, SimpleEngine,
+    },
 };
-use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
+use higgs_models::{
+    SamplingParams, Speculation, spec_prefill::PrefillScoreMode, turboquant::KvCacheConfig,
+};
 use support::{
-    ReferenceDsparkEnv, ScopedEnvVar, assert_acceptance_within,
-    assert_bonsai_27b_full_lowbit, assert_decode_tps_within, dflash_acceptance,
-    dflash_decode_tps, dflash_prefill_seconds,
+    ReferenceDsparkEnv, ScopedEnvVar, assert_acceptance_within, assert_bonsai_27b_full_lowbit,
+    assert_decode_tps_within, dflash_acceptance, dflash_decode_tps, dflash_prefill_seconds,
 };
 
 fn user(content: &str) -> ChatMessage {
@@ -92,9 +97,7 @@ fn generation_suffix(engine: &SimpleEngine, renderer: &ChatTemplateRenderer) -> 
         .to_vec()
 }
 
-fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_impl(
-    target_bits: u64,
-) {
+fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_impl(target_bits: u64) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_test_writer()
@@ -126,6 +129,12 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_impl(
         32,
         13,
         8,
+        PrefillScoreMode::Full,
+        7,
+        DEFAULT_PFLASH_KEEP_RATIO_MAX,
+        DEFAULT_PFLASH_PLAN_CACHE,
+        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+        DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
     )
     .expect("load paired dSpark engine");
     let params = greedy_dflash();

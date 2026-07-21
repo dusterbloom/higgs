@@ -114,6 +114,7 @@ static CANONICAL_CONV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
+    spec_prefill::TargetSparsePrefillPlan,
     utils::{AttentionMask, apply_rope, create_causal_mask},
     yarn::{compute_yarn_freqs, yarn_get_mscale},
 };
@@ -503,11 +504,11 @@ fn affine_q2_simd_forward(
         .ok()
         .is_some_and(|value| value == "1")
         && if let [n_rows, k_packed] = *weight.shape() {
-        let k_dim = k_packed.saturating_mul(16);
-        row_count == 1 && n_rows == 17408 && k_dim == 5120
-    } else {
-        false
-    };
+            let k_dim = k_packed.saturating_mul(16);
+            row_count == 1 && n_rows == 17408 && k_dim == 5120
+        } else {
+            false
+        };
 
     if use_simd {
         crate::metal_kernel::bonsai_q2_qmv_simd(x, weight, scales, biases, group_size)
@@ -743,8 +744,7 @@ impl QLinear {
     }
 
     fn q2_row2_m5_ternary_forward(&self, x: &Array) -> Result<Option<Array>, Exception> {
-        let row2_enabled = std::env::var("HIGGS_DSPARK_Q2_ROW2_MLP")
-            .map_or(true, |v| v != "0");
+        let row2_enabled = std::env::var("HIGGS_DSPARK_Q2_ROW2_MLP").map_or(true, |v| v != "0");
         if !row2_enabled
             || self.mode != crate::quant_mode::QuantMode::Affine
             || self.bits != 2
@@ -4261,6 +4261,7 @@ impl Qwen3NextAttention {
         // (L=1 is always length-independent, and the fused kernel is faster on
         // the per-token hot path).
         let offset = cache.offset();
+        let rope_offset = cache.position_offset();
         let rope_dim = self.rope.dimensions;
         let rope_base = self.rope.base;
         let rope_scale = self.rope.scale;
@@ -4312,14 +4313,14 @@ impl Qwen3NextAttention {
         queries = apply_qwen3_next_rope_scheduled(
             queries,
             &self.rope,
-            offset,
+            rope_offset,
             self.yarn.as_ref(),
             row_schedule,
         )?;
         keys = apply_qwen3_next_rope_scheduled(
             keys,
             &self.rope,
-            offset,
+            rope_offset,
             self.yarn.as_ref(),
             row_schedule,
         )?;
@@ -4576,9 +4577,9 @@ impl DenseQwen3NextAttention {
             .reshape(&[B, L, self.num_key_value_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let offset = cache.offset();
-        queries = apply_qwen3_next_rope(queries, &self.rope, offset, self.yarn.as_ref())?;
-        keys = apply_qwen3_next_rope(keys, &self.rope, offset, self.yarn.as_ref())?;
+        let rope_offset = cache.position_offset();
+        queries = apply_qwen3_next_rope(queries, &self.rope, rope_offset, self.yarn.as_ref())?;
+        keys = apply_qwen3_next_rope(keys, &self.rope, rope_offset, self.yarn.as_ref())?;
 
         let view = cache.update_and_view(keys, values)?;
         let try_tq_decode = mask.is_none() && L == 1;
@@ -7232,6 +7233,125 @@ pub enum LayerCache {
     Arrays(ArraysCache),
 }
 
+/// Opaque state produced by checked Qwen3Next sparse prefill.
+///
+/// The cache stores only resident survivor rows (`resident_len`), while
+/// `next_position` is the absolute logical token position decode must use
+/// next. Until ordinary decode is taught this split, this state is deliberately
+/// not exposed as a normal `AnyCache`.
+#[derive(Debug, Clone)]
+pub struct Qwen3NextSparsePrefillState {
+    cache: Vec<Option<LayerCache>>,
+    resident_len: i32,
+    next_position: i32,
+}
+
+impl Qwen3NextSparsePrefillState {
+    #[must_use]
+    pub const fn resident_len(&self) -> i32 {
+        self.resident_len
+    }
+
+    #[must_use]
+    pub const fn next_position(&self) -> i32 {
+        self.next_position
+    }
+
+    #[must_use]
+    pub fn layer_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    #[must_use]
+    pub fn into_cache(self) -> Vec<Option<LayerCache>> {
+        self.cache
+    }
+}
+
+/// Last-token logits and private sparse-prefill state.
+#[derive(Debug, Clone)]
+pub struct Qwen3NextSparsePrefillOutput {
+    pub logits: Array,
+    pub state: Qwen3NextSparsePrefillState,
+}
+
+fn validate_target_sparse_prefill_plan(plan: TargetSparsePrefillPlan<'_>) -> Result<(), Exception> {
+    if plan.token_ids.len() != plan.original_positions.len() {
+        return Err(Exception::custom(format!(
+            "Qwen3Next sparse prefill token_ids ({}) and original_positions ({}) length mismatch",
+            plan.token_ids.len(),
+            plan.original_positions.len()
+        )));
+    }
+    if plan.token_ids.is_empty() {
+        return Err(Exception::custom(
+            "Qwen3Next sparse prefill requires at least one survivor token",
+        ));
+    }
+    let source_len = usize::try_from(plan.logical_next_pos).map_err(|_| {
+        Exception::custom(format!(
+            "Qwen3Next sparse prefill logical_next_pos {} must be non-negative",
+            plan.logical_next_pos
+        ))
+    })?;
+    if source_len == 0 {
+        return Err(Exception::custom(
+            "Qwen3Next sparse prefill source length must be positive",
+        ));
+    }
+    let mut previous = None;
+    for &position in plan.original_positions {
+        if position < 0 {
+            return Err(Exception::custom(format!(
+                "Qwen3Next sparse prefill original position {position} must be non-negative"
+            )));
+        }
+        if usize::try_from(position).unwrap_or(usize::MAX) >= source_len {
+            return Err(Exception::custom(format!(
+                "Qwen3Next sparse prefill original position {position} outside source length {source_len}"
+            )));
+        }
+        if previous.is_some_and(|prev| position <= prev) {
+            return Err(Exception::custom(
+                "Qwen3Next sparse prefill original positions must be strictly increasing",
+            ));
+        }
+        previous = Some(position);
+    }
+    if plan.original_positions.first().copied() != Some(0) {
+        return Err(Exception::custom(
+            "Qwen3Next sparse prefill requires survivor position 0",
+        ));
+    }
+    let final_pos = plan
+        .logical_next_pos
+        .checked_sub(1)
+        .ok_or_else(|| Exception::custom("Qwen3Next sparse prefill source length underflow"))?;
+    if plan.original_positions.last().copied() != Some(final_pos) {
+        return Err(Exception::custom(format!(
+            "Qwen3Next sparse prefill requires final source position {final_pos}"
+        )));
+    }
+    Ok(())
+}
+
+fn set_sparse_cache_logical_positions(
+    cache: &mut [Option<LayerCache>],
+    logical_next_pos: i32,
+) -> Result<(), Exception> {
+    for (index, layer_cache) in cache.iter_mut().enumerate() {
+        let Some(layer_cache) = layer_cache else {
+            return Err(Exception::custom(format!(
+                "Qwen3Next sparse prefill missing layer cache {index}"
+            )));
+        };
+        if let LayerCache::KV(kv) = layer_cache {
+            kv.set_position_offset(logical_next_pos)?;
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Qwen3NextInner (embed + layers + norm)
 // ---------------------------------------------------------------------------
@@ -8025,6 +8145,39 @@ impl Qwen3NextCausalLM {
                 }
             })
             .collect()
+    }
+
+    /// Experimental sparse-prefill boundary for PFlash survivor plans.
+    ///
+    /// The cache keeps only resident survivor rows, while full-attention layers
+    /// use each survivor's original source position for RoPE. Decode then
+    /// continues from `logical_next_pos`, not from the compact resident length.
+    pub fn prefill_sparse(
+        &mut self,
+        plan: TargetSparsePrefillPlan<'_>,
+    ) -> Result<Qwen3NextSparsePrefillOutput, Exception> {
+        validate_target_sparse_prefill_plan(plan)?;
+        let len = i32::try_from(plan.len()).map_err(|_| {
+            Exception::custom(format!(
+                "Qwen3Next sparse prefill length {} exceeds i32::MAX",
+                plan.len()
+            ))
+        })?;
+        let inputs = Array::from_slice(plan.token_ids, &[1, len]);
+        let positions = Array::from_slice(plan.original_positions, &[len]);
+        let mut cache = self.make_cache();
+        let hidden = self.forward_hidden_sparse(&inputs, &positions, &mut cache)?;
+        let h_last = hidden.index((.., -1.., ..));
+        let logits = self.compute_logits(&h_last)?;
+        set_sparse_cache_logical_positions(&mut cache, plan.logical_next_pos)?;
+        Ok(Qwen3NextSparsePrefillOutput {
+            logits,
+            state: Qwen3NextSparsePrefillState {
+                cache,
+                resident_len: len,
+                next_position: plan.logical_next_pos,
+            },
+        })
     }
 
     /// Forward pass returning raw hidden states (before final `RMSNorm`).
@@ -9201,10 +9354,7 @@ impl Qwen3NextCausalLM {
         }
         let q2_head_argmax_enabled = self.args.default_quant_spec().bits == 2
             && std::env::var("HIGGS_DSPARK_Q2_HEAD_ARGMAX").map_or(true, |v| v != "0");
-        let logits = if q2_head_argmax_enabled
-            && T == 5
-            && !layer_detail_timing
-        {
+        let logits = if q2_head_argmax_enabled && T == 5 && !layer_detail_timing {
             match self.project_q2_m5_argmax_ids(&normed)? {
                 Some(ids) => ids,
                 None => self.project_logits(&normed)?,
@@ -12527,6 +12677,78 @@ mod tests {
             LayerCache::Arrays(c) => assert_eq!(c.offset, 0),
             LayerCache::KV(_) => panic!("Expected Arrays variant"),
         }
+    }
+
+    #[test]
+    fn target_sparse_prefill_validation_accepts_identity_boundary() {
+        let tokens = [1_u32, 2, 3, 4];
+        let positions = [0_i32, 1, 2, 3];
+        let plan = TargetSparsePrefillPlan {
+            token_ids: &tokens,
+            original_positions: &positions,
+            logical_next_pos: 4,
+        };
+
+        validate_target_sparse_prefill_plan(plan).unwrap();
+        assert!(plan.is_contiguous_identity());
+    }
+
+    #[test]
+    fn target_sparse_prefill_validation_rejects_malformed_boundaries() {
+        let tokens = [1_u32, 2, 3];
+        let positions = [0_i32, 2];
+        assert!(
+            validate_target_sparse_prefill_plan(TargetSparsePrefillPlan {
+                token_ids: &tokens,
+                original_positions: &positions,
+                logical_next_pos: 4,
+            })
+            .is_err()
+        );
+
+        let positions = [0_i32, 3, 2];
+        assert!(
+            validate_target_sparse_prefill_plan(TargetSparsePrefillPlan {
+                token_ids: &tokens,
+                original_positions: &positions,
+                logical_next_pos: 4,
+            })
+            .is_err()
+        );
+
+        let positions = [1_i32, 2, 3];
+        assert!(
+            validate_target_sparse_prefill_plan(TargetSparsePrefillPlan {
+                token_ids: &tokens,
+                original_positions: &positions,
+                logical_next_pos: 4,
+            })
+            .is_err()
+        );
+
+        let positions = [0_i32, 2, 4];
+        assert!(
+            validate_target_sparse_prefill_plan(TargetSparsePrefillPlan {
+                token_ids: &tokens,
+                original_positions: &positions,
+                logical_next_pos: 4,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn target_sparse_prefill_validation_accepts_lossy_boundary() {
+        let tokens = [1_u32, 2, 3];
+        let positions = [0_i32, 8, 15];
+        let plan = TargetSparsePrefillPlan {
+            token_ids: &tokens,
+            original_positions: &positions,
+            logical_next_pos: 16,
+        };
+
+        validate_target_sparse_prefill_plan(plan).unwrap();
+        assert!(!plan.is_contiguous_identity());
     }
 
     #[test]
@@ -25439,7 +25661,7 @@ fn forward_attention_sparse(
         .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
 
     // Q is projected to 2 * num_heads * head_dim (doubled for gating)
-    let q_proj_output = attn.q_proj.forward(x)?;
+    let q_proj_output = attn.q_proj.forward_decode_fast(x)?;
     let q_reshaped = q_proj_output.reshape(&[b, l, attn.num_attention_heads, -1])?;
     let q_halves = q_reshaped.split(2, Some(-1))?;
     let queries_pre = q_halves
@@ -25450,8 +25672,8 @@ fn forward_attention_sparse(
         .ok_or_else(|| Exception::custom("split produced empty result"))?
         .reshape(&[b, l, -1])?;
 
-    let keys_raw = attn.k_proj.forward(x)?;
-    let values_raw = attn.v_proj.forward(x)?;
+    let keys_raw = attn.k_proj.forward_decode_fast(x)?;
+    let values_raw = attn.v_proj.forward_decode_fast(x)?;
 
     // Per-head RmsNorm then transpose to [B, H, L, D]
     let mut queries = attn
@@ -25466,52 +25688,35 @@ fn forward_attention_sparse(
         .reshape(&[b, l, attn.num_key_value_heads, -1])?
         .transpose_axes(&[0, 2, 1, 3])?;
 
-    // Apply RoPE at CUSTOM positions using rope_dynamic
-    tracing::debug!(
-        "forward_attention_sparse: queries.shape={:?}, keys.shape={:?}, positions.shape={:?}",
-        queries.shape(),
-        keys.shape(),
-        positions.shape()
-    );
     let (queries_with_rope, keys_with_rope) =
-        match attn.apply_rope_at_positions(&queries, &keys, positions) {
-            Ok(result) => {
-                tracing::debug!("rope_dynamic succeeded");
-                result
-            }
-            Err(e) => {
-                tracing::error!("rope_dynamic failed: {:?}", e);
-                return Err(e);
-            }
-        };
+        attn.apply_rope_at_positions(&queries, &keys, positions)?;
     queries = queries_with_rope;
     keys = keys_with_rope;
 
     // Update cache with custom-positioned keys/values
-    let (cached_keys, cached_values) = cache.update_and_fetch(keys, values)?;
-    let final_keys = cached_keys;
-    let final_values = cached_values;
+    let (final_keys, final_values) = cache.update_and_fetch(keys, values)?;
 
-    // Compute attention
-    let output = crate::utils::scaled_dot_product_attention(
+    let output = fast::scaled_dot_product_attention(
         queries,
         final_keys,
         final_values,
         attn.scale,
-        None, // No mask needed for sparse prefill
+        Some(fast::ScaledDotProductAttentionMask::Causal),
+        None::<&Array>,
     )?
     .transpose_axes(&[0, 2, 1, 3])?
     .reshape(&[b, l, -1])?;
 
-    let gated = output.multiply(nn::sigmoid(&gate)?)?;
-    attn.o_proj.forward(&gated)
+    let gated = sigmoid_mul(&gate, &output)?;
+    attn.o_proj.forward_decode_fast(&gated)
 }
 
 impl Qwen3NextCausalLM {
     /// Forward pass with custom `RoPE` positions for sparse prefill.
     ///
-    /// This method applies `RoPE` at arbitrary (non-contiguous) positions using
-    /// `rope_dynamic`, enabling sparse prefill where only selected tokens are processed.
+    /// Full-attention layers apply `RoPE` at arbitrary, non-contiguous source
+    /// positions. Linear-attention/GDN layers run over the compact survivor
+    /// sequence, which is intentionally lossy.
     ///
     /// # Arguments
     /// * `inputs` - Selected tokens [B, N] where N = number of selected tokens

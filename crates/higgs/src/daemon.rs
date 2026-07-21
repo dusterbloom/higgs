@@ -168,10 +168,18 @@ port = 8000
 # # Validated low-bit Bonsai targets default to the block (BatchedTape) verifier.
 # # Unsupported domains fail closed to canonical S=1; set HIGGS_DFLASH_VERIFY_MODE=canonical
 # # to opt any model back to S=1.
-# # prefill_drafter  = "mlx-community/Qwen3-0.6B-4bit" # compressive prefill (PFlash)
+# # PFlash scorer/compressor: must load as a dense Transformer (for example
+# # Qwen3-0.6B). Bonsai Ternary/Q2 remains the target, not the prefill drafter.
+# # prefill_drafter  = "mlx-community/Qwen3-0.6B-4bit"
 # # prefill_compression = "off"                       # off | auto | always
 # # prefill_threshold   = 4096                        # auto: enable above this many prompt tokens
-# # prefill_keep_ratio  = 0.10                        # fraction kept (~10x prefill at 0.10)
+# # prefill_keep_ratio  = 0.10                        # adaptive floor
+# # prefill_keep_ratio_max = 0.75                     # adaptive ceiling
+# # prefill_plan_cache = true                         # reuse frozen plans across turns
+# # prefill_plan_cache_entries = 64                   # branch/frontier cap
+# # prefill_suffix_identity_threshold = 128           # small suffixes stay exact
+# # prefill_score_mode  = "full"                      # full | l7 (l7 requires true early-exit support)
+# # prefill_exit_layer  = 7
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.

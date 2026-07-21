@@ -63,6 +63,14 @@ impl DiskPrefixCache {
         }
     }
 
+    /// Set the resident-byte budget for the in-memory paged radix. `0` (the
+    /// default) disables the budget.
+    #[must_use]
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.memory = self.memory.with_max_bytes(max_bytes);
+        self
+    }
+
     pub fn new(
         max_entries: usize,
         block_size: usize,

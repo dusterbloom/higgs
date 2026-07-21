@@ -10,8 +10,15 @@ use higgs_engine::{
     cache::{DEFAULT_MAX_DISK_BLOCKS, DEFAULT_MIN_TOKENS_TO_PERSIST, DiskPrefixCacheConfig},
     mlx_tuning::RequestedMlxProfile,
     model_loader,
+    simple::{
+        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_PLAN_CACHE,
+        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+    },
 };
-use higgs_models::turboquant::{KvCacheConfig, KvCacheMode};
+use higgs_models::{
+    spec_prefill::PrefillScoreMode,
+    turboquant::{KvCacheConfig, KvCacheMode},
+};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -399,6 +406,12 @@ pub struct ModelConfig {
     /// Optional external name exposed to API clients.
     #[serde(default)]
     pub name: Option<String>,
+    /// Per-model request defaults for omitted chat-completion fields.
+    ///
+    /// Explicit request values still win. This is the config-level home for
+    /// model policy such as Bonsai+dSpark's greedy/non-thinking default.
+    #[serde(default)]
+    pub generation_defaults: GenerationDefaults,
     /// Optional per-model MLX tuning override for the simple engine.
     #[serde(default)]
     pub mlx_profile: Option<MlxProfile>,
@@ -430,8 +443,10 @@ pub struct ModelConfig {
     #[serde(default)]
     pub draft_model: Option<String>,
     /// Optional path to a small dense MLX model (e.g. Qwen3-0.6B) used to score
-    /// the prompt for compressive (PFlash) prefill. Distinct from `draft_model`,
-    /// which is decode speculation. See `.planning/DESIGN-pflash-higgs.md`.
+    /// the prompt for compressive (PFlash) prefill. This is not the served
+    /// target model: Bonsai Ternary/Q2 can be the target, but `prefill_drafter`
+    /// must load as a dense `Transformer`. Distinct from `draft_model`, which
+    /// is decode speculation. See `.planning/DESIGN-pflash-higgs.md`.
     #[serde(default)]
     pub prefill_drafter: Option<String>,
     /// When to invoke compressive prefill. `off` (default) never; `auto`
@@ -443,9 +458,9 @@ pub struct ModelConfig {
     /// than Lucebox PFlash's 32K because typical agent prompts are 4-16K.
     #[serde(default = "default_prefill_threshold")]
     pub prefill_threshold: usize,
-    /// Fraction of source tokens kept after compression. 0.10 is the
-    /// "highest tradable point" with published NIAH + multi-doc-QA evidence
-    /// (docs/RESEARCH-pflash-prior-art.md §3.5). Tunable per workload.
+    /// Floor fraction of source tokens kept after compression. The engine
+    /// adaptively raises this toward `prefill_keep_ratio_max` when scorer
+    /// entropy/surprise is high.
     #[serde(default = "default_prefill_keep_ratio")]
     pub prefill_keep_ratio: f32,
     /// Prompt-token block size for survivor selection (SpecPrefill default 32).
@@ -457,6 +472,27 @@ pub struct ModelConfig {
     /// Lookahead decoded tokens used for importance aggregation (SpecPrefill: 8).
     #[serde(default = "default_prefill_lookahead")]
     pub prefill_lookahead: usize,
+    /// PFlash scorer variant. `full` runs the baseline full drafter scorer;
+    /// `l7` is reserved for a true layer-7 early-exit scorer.
+    #[serde(default)]
+    pub prefill_score_mode: PrefillScoreMode,
+    /// Early-exit layer for `prefill_score_mode = "l7"`.
+    #[serde(default = "default_prefill_exit_layer")]
+    pub prefill_exit_layer: usize,
+    /// Adaptive keep-ratio ceiling used when scorer entropy/surprise is high.
+    #[serde(default = "default_prefill_keep_ratio_max")]
+    pub prefill_keep_ratio_max: f32,
+    /// Reuse frozen PFlash survivor plans for exact source-token prefixes
+    /// across turns.
+    #[serde(default = "default_prefill_plan_cache")]
+    pub prefill_plan_cache: bool,
+    /// Maximum frozen PFlash branch frontiers retained per model.
+    #[serde(default = "default_prefill_plan_cache_entries")]
+    pub prefill_plan_cache_entries: usize,
+    /// New suffixes at or below this size are appended exact instead of running
+    /// the PFlash scorer again. Set to 0 to score every non-empty suffix.
+    #[serde(default = "default_prefill_suffix_identity_threshold")]
+    pub prefill_suffix_identity_threshold: usize,
     /// Persist simple-engine prefix KV snapshots to disk.
     #[serde(default)]
     pub disk_cache_enabled: bool,
@@ -481,6 +517,35 @@ pub struct ModelConfig {
     /// endpoints idle longer than this many seconds (`0` = never).
     #[serde(default = "default_kv_retained_idle_secs")]
     pub kv_retained_idle_secs: u64,
+    /// Resident-byte budget for the prefix KV cache. When exceeded, the
+    /// least-recently-used prefix is evicted (in addition to the count cap).
+    /// `0` (default) disables the budget.
+    #[serde(default)]
+    pub kv_cache_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GenerationDefaults {
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub speculation: Option<String>,
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
 }
 
 const fn default_norm_correction() -> bool {
@@ -495,6 +560,22 @@ fn default_prefill_keep_ratio() -> f32 {
     0.10
 }
 
+fn default_prefill_keep_ratio_max() -> f32 {
+    DEFAULT_PFLASH_KEEP_RATIO_MAX
+}
+
+fn default_prefill_plan_cache() -> bool {
+    DEFAULT_PFLASH_PLAN_CACHE
+}
+
+fn default_prefill_plan_cache_entries() -> usize {
+    DEFAULT_PFLASH_PLAN_CACHE_ENTRIES
+}
+
+fn default_prefill_suffix_identity_threshold() -> usize {
+    DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD
+}
+
 fn default_prefill_chunk() -> usize {
     32
 }
@@ -505,6 +586,10 @@ fn default_prefill_avgpool() -> usize {
 
 fn default_prefill_lookahead() -> usize {
     8
+}
+
+const fn default_prefill_exit_layer() -> usize {
+    7
 }
 
 /// When the PFlash compressive-prefill drafter is invoked.
@@ -550,6 +635,7 @@ impl ModelConfig {
             max_retained_sessions: self.kv_max_sessions,
             max_session_tokens: self.kv_max_session_tokens,
             retained_idle_secs: self.kv_retained_idle_secs,
+            kv_cache_bytes: self.kv_cache_bytes,
         }
     }
 
@@ -581,6 +667,7 @@ impl Default for ModelConfig {
         Self {
             path: String::new(),
             name: None,
+            generation_defaults: GenerationDefaults::default(),
             mlx_profile: None,
             batch: false,
             kv_cache: KvCacheMode::Off,
@@ -598,6 +685,12 @@ impl Default for ModelConfig {
             prefill_chunk: default_prefill_chunk(),
             prefill_avgpool: default_prefill_avgpool(),
             prefill_lookahead: default_prefill_lookahead(),
+            prefill_score_mode: PrefillScoreMode::Full,
+            prefill_exit_layer: default_prefill_exit_layer(),
+            prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+            prefill_plan_cache: default_prefill_plan_cache(),
+            prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
+            prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
             disk_cache_enabled: false,
             disk_cache_path: None,
             max_disk_blocks: default_max_disk_blocks(),
@@ -605,6 +698,7 @@ impl Default for ModelConfig {
             kv_max_sessions: default_kv_max_sessions(),
             kv_max_session_tokens: 0,
             kv_retained_idle_secs: default_kv_retained_idle_secs(),
+            kv_cache_bytes: 0,
         }
     }
 }
@@ -821,6 +915,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
         .map(|p| ModelConfig {
             path: p.clone(),
             name: None,
+            generation_defaults: GenerationDefaults::default(),
             mlx_profile: None,
             batch: args.batch,
             kv_cache,
@@ -838,6 +933,12 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             prefill_chunk: default_prefill_chunk(),
             prefill_avgpool: default_prefill_avgpool(),
             prefill_lookahead: default_prefill_lookahead(),
+            prefill_score_mode: PrefillScoreMode::Full,
+            prefill_exit_layer: default_prefill_exit_layer(),
+            prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+            prefill_plan_cache: default_prefill_plan_cache(),
+            prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
+            prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
             disk_cache_enabled: false,
             disk_cache_path: None,
             max_disk_blocks: default_max_disk_blocks(),
@@ -845,6 +946,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_max_sessions: default_kv_max_sessions(),
             kv_max_session_tokens: 0,
             kv_retained_idle_secs: default_kv_retained_idle_secs(),
+            kv_cache_bytes: 0,
         })
         .collect();
 
@@ -923,6 +1025,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                 .map(|p| ModelConfig {
                     path: p.clone(),
                     name: None,
+                    generation_defaults: GenerationDefaults::default(),
                     mlx_profile: None,
                     batch: serve_args.batch,
                     kv_cache,
@@ -940,6 +1043,12 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     prefill_chunk: default_prefill_chunk(),
                     prefill_avgpool: default_prefill_avgpool(),
                     prefill_lookahead: default_prefill_lookahead(),
+                    prefill_score_mode: PrefillScoreMode::Full,
+                    prefill_exit_layer: default_prefill_exit_layer(),
+                    prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+                    prefill_plan_cache: default_prefill_plan_cache(),
+                    prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
+                    prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
                     disk_cache_enabled: false,
                     disk_cache_path: None,
                     max_disk_blocks: default_max_disk_blocks(),
@@ -947,6 +1056,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_max_sessions: default_kv_max_sessions(),
                     kv_max_session_tokens: 0,
                     kv_retained_idle_secs: default_kv_retained_idle_secs(),
+                    kv_cache_bytes: 0,
                 })
                 .collect();
             let mut existing = figment
@@ -1131,6 +1241,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
     config.models.push(ModelConfig {
         path,
         name: Some(name.clone()),
+        generation_defaults: GenerationDefaults::default(),
         mlx_profile: None,
         batch: false,
         kv_cache: KvCacheMode::Off,
@@ -1148,6 +1259,12 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         prefill_chunk: default_prefill_chunk(),
         prefill_avgpool: default_prefill_avgpool(),
         prefill_lookahead: default_prefill_lookahead(),
+        prefill_score_mode: PrefillScoreMode::Full,
+        prefill_exit_layer: default_prefill_exit_layer(),
+        prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+        prefill_plan_cache: default_prefill_plan_cache(),
+        prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
+        prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
         disk_cache_enabled: false,
         disk_cache_path: None,
         max_disk_blocks: default_max_disk_blocks(),
@@ -1155,6 +1272,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_max_sessions: default_kv_max_sessions(),
         kv_max_session_tokens: 0,
         kv_retained_idle_secs: default_kv_retained_idle_secs(),
+        kv_cache_bytes: 0,
     });
     config.auto_router.model = name;
 }
@@ -2213,6 +2331,35 @@ mod tests {
         .unwrap();
         let config = load_config_file(&path, None).unwrap();
         assert!(config.models.first().unwrap().name.is_none());
+    }
+
+    #[test]
+    fn test_model_generation_defaults_deserialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "org/bonsai"
+            name = "bonsai-27b-q2"
+
+            [models.generation_defaults]
+            max_tokens = 4096
+            temperature = 0.0
+            top_p = 1.0
+            speculation = "auto"
+            enable_thinking = false
+            "#,
+        )
+        .unwrap();
+        let config = load_config_file(&path, None).unwrap();
+        let defaults = &config.models.first().unwrap().generation_defaults;
+        assert_eq!(defaults.max_tokens, Some(4096));
+        assert_eq!(defaults.temperature, Some(0.0));
+        assert_eq!(defaults.top_p, Some(1.0));
+        assert_eq!(defaults.speculation.as_deref(), Some("auto"));
+        assert_eq!(defaults.enable_thinking, Some(false));
     }
 
     #[test]

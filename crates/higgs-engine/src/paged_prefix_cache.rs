@@ -542,6 +542,13 @@ pub struct PagedPrefixCache {
     num_paired: usize,
     max_cached: usize,
     max_paired: usize,
+    /// Resident-byte budget for the cached KV state. `0` disables the budget
+    /// (pure count-based LRU, the historical behaviour).
+    max_bytes: usize,
+    /// Conservative tracked bytes of all cached endpoints. Each endpoint's path
+    /// (root to terminal node) is summed, so blocks shared between overlapping
+    /// prefixes are over-counted -- a safe upper bound that never under-evicts.
+    total_bytes: usize,
     block_size: usize,
     instance_id: CacheInstanceId,
     epoch: PairedCacheEpoch,
@@ -975,6 +982,14 @@ impl EdgeData {
         }
     }
 
+    /// Approximate resident bytes of this edge's block payload.
+    fn total_bytes(&self) -> usize {
+        match self {
+            Self::Paged(blocks) => estimated_cached_layers_bytes(&blocks.layers),
+            Self::None => 0,
+        }
+    }
+
     /// Concatenate two consecutive edges' block payloads into one. Used when
     /// `prune` collapses a node into its sole child after eviction.
     fn merge(parent: Self, child: Self) -> Self {
@@ -1175,6 +1190,8 @@ impl PagedPrefixCache {
             num_paired: 0,
             max_cached: max_entries,
             max_paired: MAX_PAIRED_RADIX_ENTRIES,
+            max_bytes: 0,
+            total_bytes: 0,
             block_size,
             instance_id: Self::next_instance_id(),
             epoch: PairedCacheEpoch(0),
@@ -1183,6 +1200,20 @@ impl PagedPrefixCache {
             access_clock: 1,
             paired_idle_ttl: None,
         }
+    }
+
+    /// Set the resident-byte budget for cached KV state. `0` (the default)
+    /// disables the budget and falls back to pure count-based LRU.
+    #[must_use]
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// Conservative tracked bytes of all cached KV endpoints.
+    #[must_use]
+    pub const fn total_bytes(&self) -> usize {
+        self.total_bytes
     }
 
     /// Apply one idle TTL to paired target+dSpark radix endpoints.
@@ -1640,11 +1671,19 @@ impl PagedPrefixCache {
             }
             (false, false) | (true, true) => {}
         }
+        self.total_bytes = total_endpoint_path_bytes(&self.root);
         while self.num_paired > self.max_paired {
             self.evict_oldest_paired();
         }
         while self.num_cached > self.max_cached {
             self.evict_lru();
+        }
+        if self.max_bytes > 0 {
+            while self.total_bytes > self.max_bytes {
+                if !self.evict_lru() {
+                    break;
+                }
+            }
         }
         self.advance_revision();
     }
@@ -1838,18 +1877,24 @@ impl PagedPrefixCache {
             self.num_cached -= 1;
             self.num_paired -= 1;
             self.root.prune();
+            self.total_bytes = total_endpoint_path_bytes(&self.root);
         }
     }
 
-    fn evict_lru(&mut self) {
-        if let Some((_, entry_id)) = self.root.oldest_cached() {
-            if let Some(was_paired) = self.root.remove_cached_by_id(entry_id) {
-                self.num_cached -= 1;
-                if was_paired {
-                    self.num_paired -= 1;
-                }
-                self.root.prune();
+    fn evict_lru(&mut self) -> bool {
+        let Some((_, entry_id)) = self.root.oldest_cached() else {
+            return false;
+        };
+        if let Some(was_paired) = self.root.remove_cached_by_id(entry_id) {
+            self.num_cached -= 1;
+            if was_paired {
+                self.num_paired -= 1;
             }
+            self.root.prune();
+            self.total_bytes = total_endpoint_path_bytes(&self.root);
+            true
+        } else {
+            false
         }
     }
 
@@ -1861,6 +1906,7 @@ impl PagedPrefixCache {
             self.num_cached -= 1;
             self.num_paired -= 1;
             self.root.prune();
+            self.total_bytes = total_endpoint_path_bytes(&self.root);
         }
     }
 
@@ -1924,6 +1970,7 @@ impl PagedPrefixCache {
         self.num_paired = self.num_paired.saturating_sub(removed);
         self.num_cached = self.num_cached.saturating_sub(removed);
         self.root.prune();
+        self.total_bytes = total_endpoint_path_bytes(&self.root);
         self.advance_revision();
         removed
     }
@@ -1948,6 +1995,7 @@ impl PagedPrefixCache {
         self.root = RadixNode::empty();
         self.num_cached = 0;
         self.num_paired = 0;
+        self.total_bytes = 0;
     }
 
     /// Test-only: collect, per layer-0 dense block, its `Arc` pointer identity
@@ -2167,6 +2215,21 @@ fn estimated_cached_layers_bytes(layers: &[CachedLayerData]) -> usize {
             CachedLayerData::Empty => 0,
         })
     })
+}
+
+/// Sum every stored endpoint's root-to-endpoint path bytes. Shared blocks are
+/// counted once per endpoint that can reuse them, so the result is a deliberate
+/// over-estimate suitable for a conservative byte budget.
+fn total_endpoint_path_bytes(node: &RadixNode) -> usize {
+    fn visit(node: &RadixNode, parent_bytes: usize) -> usize {
+        let path_bytes = parent_bytes.saturating_add(node.edge_blocks.total_bytes());
+        let self_bytes = if node.cached.is_some() { path_bytes } else { 0 };
+        node.children.values().fold(self_bytes, |total, child| {
+            total.saturating_add(visit(child, path_bytes))
+        })
+    }
+
+    visit(node, 0)
 }
 
 /// Slice a cache into block-aligned paged data.
@@ -2584,6 +2647,53 @@ mod tests {
             })
             .collect();
         AnyCache::KV(layers)
+    }
+
+    fn assert_byte_ledger_coherent(cache: &PagedPrefixCache) {
+        assert_eq!(
+            cache.total_bytes(),
+            total_endpoint_path_bytes(&cache.root),
+            "tracked byte ledger must match the trie endpoint path total"
+        );
+    }
+
+    /// Size-aware eviction: with a tight byte budget, storing more distinct
+    /// prefixes than the budget allows drops the LRU endpoint so the tracked
+    /// total stays at or below budget.
+    #[test]
+    fn test_size_aware_eviction_under_budget() {
+        // One layer, 8-token dense KV (block_size 4 => 2 blocks). Each distinct
+        // prefix becomes its own endpoint; its path bytes exceed a tiny budget.
+        let mut cache = PagedPrefixCache::new(100, 4).with_max_bytes(1500);
+
+        let a: Vec<u32> = (0..8).collect();
+        let b: Vec<u32> = (100..108).collect();
+        let c: Vec<u32> = (200..208).collect();
+
+        cache.store(&a, &make_kv_cache(1, 8));
+        let one_entry = cache.total_bytes();
+        assert!(one_entry > 0, "an 8-token entry must report non-zero bytes");
+        assert_eq!(cache.len(), 1);
+
+        cache.store(&b, &make_kv_cache(1, 8));
+        cache.store(&c, &make_kv_cache(1, 8));
+
+        // Two stores pushed the total over the 1500-byte budget, so the LRU
+        // entry was evicted and only the most recent prefix remains cached.
+        assert_eq!(cache.len(), 1);
+        assert!(cache.total_bytes() <= 1500 + one_entry);
+        assert!(cache.total_bytes() >= one_entry);
+    }
+
+    #[test]
+    fn test_size_aware_eviction_disabled_by_default() {
+        let mut cache = PagedPrefixCache::new(100, 4);
+        for base in 0..5u32 {
+            let tokens: Vec<u32> = (base..base + 8).collect();
+            cache.store(&tokens, &make_kv_cache(1, 8));
+        }
+        assert_eq!(cache.len(), 5);
+        assert!(cache.total_bytes() > 0);
     }
 
     /// Create a Hybrid cache with interleaved KV and GDN layers.
@@ -3117,9 +3227,16 @@ mod tests {
 
         cache.store(&prefix, &make_kv_cache(2, 64));
         assert_eq!(cache.len(), 1);
+        let first_bytes = cache.total_bytes();
+        assert!(first_bytes > 0);
 
         cache.store(&prefix, &make_kv_cache(8, 64));
         assert_eq!(cache.len(), 1);
+        assert_byte_ledger_coherent(&cache);
+        assert!(
+            cache.total_bytes() > first_bytes,
+            "overwrite must replace the old endpoint byte charge"
+        );
 
         let mut query = prefix;
         query.push(999);
@@ -4080,6 +4197,7 @@ mod tests {
         let refreshed_keys = cache_keys(&refreshed, 0);
 
         cache.store(&tokens, &refreshed);
+        assert_byte_ledger_coherent(&cache);
 
         let mut query = tokens;
         query.push(99);
@@ -4102,6 +4220,7 @@ mod tests {
             .unwrap();
 
         cache.store(&tokens, &make_kv_cache(1, 10));
+        assert_byte_ledger_coherent(&cache);
 
         let mut query = tokens;
         query.push(99);
@@ -4162,6 +4281,7 @@ mod tests {
         assert!(find_paired(&mut cache, &query_b).is_some());
 
         cache.store(&target_c, &make_kv_cache(1, 8));
+        assert_byte_ledger_coherent(&cache);
 
         let mut query_a = pair_a;
         query_a.push(999);
@@ -4179,6 +4299,7 @@ mod tests {
 
         cache.clear();
         assert!(cache.is_empty());
+        assert_eq!(cache.total_bytes(), 0);
         assert_eq!(cache.paired_entry_count(), 0);
         assert_eq!(cache.paired_stats(), PairedPrefixCacheStats::default());
         assert!(find_paired(&mut cache, &query_b).is_none());
@@ -4289,6 +4410,7 @@ mod tests {
             1,
             "expiry must take the one endpoint that owns both cache halves"
         );
+        assert_byte_ledger_coherent(&cache);
         assert_eq!(cache.paired_entry_count(), 0);
         assert_eq!(cache.paired_stats(), PairedPrefixCacheStats::default());
         assert_eq!(
@@ -4335,6 +4457,7 @@ mod tests {
 
         cache.set_paired_idle_ttl(Some(Duration::ZERO));
         assert_eq!(cache.evict_idle_paired(), 1);
+        assert_byte_ledger_coherent(&cache);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.paired_entry_count(), 0);
         assert_eq!(cache.paired_stats(), PairedPrefixCacheStats::default());

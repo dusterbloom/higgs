@@ -25,6 +25,12 @@ struct RadixNode {
     children: HashMap<u32, Self>,
 }
 
+#[derive(Default)]
+struct InsertOutcome {
+    added: bool,
+    replaced_bytes: usize,
+}
+
 /// Result of a prefix cache lookup.
 pub struct PrefixMatch {
     /// Number of tokens from the beginning that matched the cached prefix.
@@ -42,6 +48,12 @@ pub struct PrefixCache {
     root: RadixNode,
     num_cached: usize,
     max_cached: usize,
+    /// Byte budget for the cached KV state. `0` disables the budget (pure
+    /// count-based LRU, the historical behaviour).
+    max_bytes: usize,
+    /// Approximate resident bytes of all cached `AnyCache` entries, tracked
+    /// incrementally on store/evict so enforcement is `O(evictions)`.
+    total_bytes: usize,
 }
 
 impl RadixNode {
@@ -112,24 +124,24 @@ impl RadixNode {
         oldest
     }
 
-    /// Remove the first cached entry matching `target` time. Returns `true` if removed.
-    fn remove_cached_with_time(&mut self, target: Instant) -> bool {
+    /// Remove the first cached entry matching `target` time. Returns the evicted
+    /// `AnyCache` if one was removed.
+    fn remove_cached_with_time(&mut self, target: Instant) -> Option<AnyCache> {
         if self
             .cached
             .as_ref()
             .is_some_and(|cs| cs.last_accessed.get() == target)
         {
-            self.cached = None;
-            return true;
+            return self.cached.take().map(|cs| cs.cache);
         }
 
         for child in self.children.values_mut() {
-            if child.remove_cached_with_time(target) {
-                return true;
+            if let Some(evicted) = child.remove_cached_with_time(target) {
+                return Some(evicted);
             }
         }
 
-        false
+        None
     }
 
     /// Remove empty leaf nodes and compress single-child routing nodes.
@@ -163,7 +175,23 @@ impl PrefixCache {
             root: RadixNode::empty(),
             num_cached: 0,
             max_cached: max_entries,
+            max_bytes: 0,
+            total_bytes: 0,
         }
+    }
+
+    /// Set the resident-byte budget for cached KV state. `0` (the default)
+    /// disables the budget and falls back to pure count-based LRU.
+    #[must_use]
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// Approximate resident bytes of all cached KV entries.
+    #[must_use]
+    pub const fn total_bytes(&self) -> usize {
+        self.total_bytes
     }
 
     /// Find the longest cached prefix that matches the beginning of `tokens`.
@@ -188,36 +216,52 @@ impl PrefixCache {
             return;
         }
 
-        let added = Self::insert(&mut self.root, prefix_tokens, 0, cache);
+        let bytes = cache.approx_bytes();
+        let outcome = Self::insert(&mut self.root, prefix_tokens, 0, cache);
 
-        if added {
+        if outcome.added {
             self.num_cached += 1;
+        }
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(outcome.replaced_bytes)
+            .saturating_add(bytes);
 
+        if outcome.added {
             while self.num_cached > self.max_cached {
                 self.evict_lru();
+            }
+        }
+
+        while self.max_bytes > 0 && self.total_bytes > self.max_bytes {
+            if !self.evict_lru() {
+                break;
             }
         }
     }
 
     /// Insert a prefix into the radix tree. Returns `true` if a new cache slot
     /// was created (as opposed to overwriting an existing one).
-    fn insert(node: &mut RadixNode, tokens: &[u32], pos: usize, cache: AnyCache) -> bool {
+    fn insert(node: &mut RadixNode, tokens: &[u32], pos: usize, cache: AnyCache) -> InsertOutcome {
         if pos >= tokens.len() {
             let is_new = node.cached.is_none();
-            node.cached = Some(CachedState {
+            let previous = node.cached.replace(CachedState {
                 cache,
                 last_accessed: Cell::new(Instant::now()),
             });
-            return is_new;
+            return InsertOutcome {
+                added: is_new,
+                replaced_bytes: previous.map_or(0, |state| state.cache.approx_bytes()),
+            };
         }
 
         let Some(&next_token) = tokens.get(pos) else {
-            return false;
+            return InsertOutcome::default();
         };
 
         if node.children.contains_key(&next_token) {
             let Some(child) = node.children.get(&next_token) else {
-                return false;
+                return InsertOutcome::default();
             };
 
             let remaining = tokens.get(pos..).unwrap_or_default();
@@ -230,21 +274,21 @@ impl PrefixCache {
 
             if common == child.edge.len() {
                 let Some(child_mut) = node.children.get_mut(&next_token) else {
-                    return false;
+                    return InsertOutcome::default();
                 };
                 return Self::insert(child_mut, tokens, pos + common, cache);
             }
 
             // Partial match -- split the edge at `common`
             let Some(mut old_child) = node.children.remove(&next_token) else {
-                return false;
+                return InsertOutcome::default();
             };
 
             let common_edge = old_child.edge.get(..common).unwrap_or_default().to_vec();
             let leftover_edge = old_child.edge.get(common..).unwrap_or_default().to_vec();
 
             let Some(&leftover_key) = leftover_edge.first() else {
-                return false;
+                return InsertOutcome::default();
             };
             old_child.edge = leftover_edge;
 
@@ -261,35 +305,50 @@ impl PrefixCache {
                     last_accessed: Cell::new(Instant::now()),
                 });
                 node.children.insert(next_token, split);
-                return true;
+                return InsertOutcome {
+                    added: true,
+                    replaced_bytes: 0,
+                };
             }
 
             let new_edge = tokens.get(pos + common..).unwrap_or_default().to_vec();
             let Some(&new_key) = new_edge.first() else {
                 node.children.insert(next_token, split);
-                return false;
+                return InsertOutcome::default();
             };
             let new_leaf = RadixNode::leaf(new_edge, cache);
             split.children.insert(new_key, new_leaf);
 
             node.children.insert(next_token, split);
-            return true;
+            return InsertOutcome {
+                added: true,
+                replaced_bytes: 0,
+            };
         }
 
         // No matching child -- create a new leaf
         let new_edge = tokens.get(pos..).unwrap_or_default().to_vec();
         let new_leaf = RadixNode::leaf(new_edge, cache);
         node.children.insert(next_token, new_leaf);
-        true
+        InsertOutcome {
+            added: true,
+            replaced_bytes: 0,
+        }
     }
 
-    /// Evict the least recently used cached entry.
-    fn evict_lru(&mut self) {
-        if let Some(oldest) = self.root.oldest_cached_time() {
-            if self.root.remove_cached_with_time(oldest) {
-                self.num_cached -= 1;
-                self.root.prune();
-            }
+    /// Evict the least recently used cached entry. Returns `true` if an entry
+    /// was removed (and its bytes subtracted from the ledger).
+    fn evict_lru(&mut self) -> bool {
+        let Some(oldest) = self.root.oldest_cached_time() else {
+            return false;
+        };
+        if let Some(evicted) = self.root.remove_cached_with_time(oldest) {
+            self.num_cached -= 1;
+            self.total_bytes = self.total_bytes.saturating_sub(evicted.approx_bytes());
+            self.root.prune();
+            true
+        } else {
+            false
         }
     }
 
@@ -307,6 +366,7 @@ impl PrefixCache {
     pub fn clear(&mut self) {
         self.root = RadixNode::empty();
         self.num_cached = 0;
+        self.total_bytes = 0;
     }
 }
 
@@ -316,12 +376,72 @@ mod tests {
     use super::*;
     use higgs_models::AnyCache;
     use higgs_models::cache::SteppingKeyValueCache;
+    use mlx_rs::Array;
 
     fn make_dummy_cache(num_layers: usize) -> AnyCache {
         let kv: Vec<Option<SteppingKeyValueCache>> = (0..num_layers)
             .map(|_| Some(SteppingKeyValueCache::new()))
             .collect();
         AnyCache::KV(kv)
+    }
+
+    /// Build a one-layer KV cache whose key+value arrays occupy `bytes_per_entry`
+    /// bytes total (f32, so 4 bytes/element).
+    fn make_sized_cache(bytes_per_entry: usize) -> AnyCache {
+        let elements = (bytes_per_entry / 2 / 4) as i32; // split across key + value, f32
+        let shape = &[elements, 1, 1, 1];
+        let keys = Array::zeros::<f32>(shape).unwrap();
+        let values = Array::zeros::<f32>(shape).unwrap();
+        AnyCache::KV(vec![Some(
+            SteppingKeyValueCache::from_arrays(keys, values).unwrap(),
+        )])
+    }
+
+    #[test]
+    fn test_size_aware_eviction_drops_lru_over_budget() {
+        // Each entry is ~2048 bytes; a 3000-byte budget holds only one entry.
+        let entry = make_sized_cache(2048);
+        let per_entry = entry.approx_bytes();
+        assert!(per_entry > 0, "sized cache must report non-zero bytes");
+
+        let mut cache = PrefixCache::new(100).with_max_bytes(3000);
+        cache.store(&[1, 2, 3], entry.clone());
+        assert_eq!(cache.len(), 1);
+
+        cache.store(&[4, 5, 6], entry.clone());
+        // Second store pushed the total over budget, so the LRU (first) entry
+        // is evicted and only the most recent entry remains.
+        assert_eq!(cache.len(), 1);
+        assert!(cache.total_bytes() <= 3000 + per_entry);
+        assert!(cache.total_bytes() >= per_entry);
+    }
+
+    #[test]
+    fn test_no_budget_keeps_all_entries() {
+        let entry = make_sized_cache(2048);
+        let mut cache = PrefixCache::new(100);
+        cache.store(&[1, 2, 3], entry.clone());
+        cache.store(&[4, 5, 6], entry.clone());
+        assert_eq!(cache.len(), 2);
+        assert!(cache.total_bytes() > 0);
+    }
+
+    #[test]
+    fn test_overwrite_and_clear_keep_byte_ledger_coherent() {
+        let small = make_sized_cache(1024);
+        let large = make_sized_cache(4096);
+        let large_bytes = large.approx_bytes();
+        let mut cache = PrefixCache::new(100);
+
+        cache.store(&[1, 2, 3], small);
+        cache.store(&[1, 2, 3], large);
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.total_bytes(), large_bytes);
+
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.total_bytes(), 0);
     }
 
     fn cache_layer_count(cache: &AnyCache) -> usize {

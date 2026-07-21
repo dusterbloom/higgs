@@ -2637,7 +2637,9 @@ fn create_q4_m4_argmax_reduce_ids_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 
 #[allow(unsafe_code)]
 fn create_q4_m1_plus_q4_m1_argmax_candidates_kernel() -> mlx_sys::mlx_fast_metal_kernel {
-    let in_vec = cstr_vec(&[c"w", c"sc", c"bi", c"x", c"mw", c"ms", c"mb", c"mx", c"n_param"]);
+    let in_vec = cstr_vec(&[
+        c"w", c"sc", c"bi", c"x", c"mw", c"ms", c"mb", c"mx", c"n_param",
+    ]);
     let out_vec = cstr_vec(&[c"maxv", c"maxid"]);
     let source = CString::new(Q4_M1_PLUS_Q4_M1_ARGMAX_CANDIDATES_SOURCE).unwrap_or_default();
     unsafe {
@@ -2986,10 +2988,9 @@ pub fn bonsai_q2_m5_argmax_candidates(
         .first()
         .copied()
         .ok_or_else(|| Exception::custom("bonsai_q2_m5_argmax_candidates: weight has no rows"))?;
-    let k_packed = weight_shape
-        .get(1)
-        .copied()
-        .ok_or_else(|| Exception::custom("bonsai_q2_m5_argmax_candidates: weight has no columns"))?;
+    let k_packed = weight_shape.get(1).copied().ok_or_else(|| {
+        Exception::custom("bonsai_q2_m5_argmax_candidates: weight has no columns")
+    })?;
     let k_dim = k_packed * 16;
     let blocks = (n_rows + 255) / 256;
     let x_flat = x.reshape(&[5, k_dim])?;
@@ -3353,9 +3354,8 @@ pub fn bonsai_q2_m5_ternary_argmax_candidates_splitk(
         config
     };
     let reduce_inputs = [partial.as_ptr(), n_scalar];
-    let reduce_inputs_vec = unsafe {
-        mlx_sys::mlx_vector_array_new_data(reduce_inputs.as_ptr(), reduce_inputs.len())
-    };
+    let reduce_inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(reduce_inputs.as_ptr(), reduce_inputs.len()) };
     let mut reduce_outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
     let reduce_status = unsafe {
         mlx_sys::mlx_fast_metal_kernel_apply(
@@ -3420,10 +3420,9 @@ pub fn bonsai_q4_m4_argmax_candidates(
         .first()
         .copied()
         .ok_or_else(|| Exception::custom("bonsai_q4_m4_argmax_candidates: weight has no rows"))?;
-    let k_packed = weight_shape
-        .get(1)
-        .copied()
-        .ok_or_else(|| Exception::custom("bonsai_q4_m4_argmax_candidates: weight has no columns"))?;
+    let k_packed = weight_shape.get(1).copied().ok_or_else(|| {
+        Exception::custom("bonsai_q4_m4_argmax_candidates: weight has no columns")
+    })?;
     let k_dim = k_packed * 8;
     let blocks = (n_rows + 255) / 256;
     let x_flat = x.reshape(&[4, k_dim])?;
@@ -3808,10 +3807,7 @@ pub fn bonsai_q4_markov_m1_argmax_candidates(
 pub fn base_top16_blocks(base: &Array) -> Result<(Array, Array), Exception> {
     ensure_ffi_error_handler();
     let shape = base.shape();
-    let n_rows: i32 = shape
-        .iter()
-        .take(shape.len().saturating_sub(1))
-        .product();
+    let n_rows: i32 = shape.iter().take(shape.len().saturating_sub(1)).product();
     if n_rows != 1 {
         return Err(Exception::custom(format!(
             "base_top16_blocks: expected one row, got shape {shape:?}"
@@ -3915,9 +3911,10 @@ pub fn bonsai_q4_markov_top16_argmax(
         )));
     }
     let weight_shape = markov_weight.shape();
-    let k_packed = weight_shape.get(1).copied().ok_or_else(|| {
-        Exception::custom("bonsai_q4_markov_top16_argmax: weight has no columns")
-    })?;
+    let k_packed = weight_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| Exception::custom("bonsai_q4_markov_top16_argmax: weight has no columns"))?;
     let k_dim = k_packed * 8;
     let ids_flat = ids.reshape(&[16])?;
     let base_flat = base_values.reshape(&[16])?;
@@ -5352,9 +5349,8 @@ pub fn bonsai_q2_row2_m5_ternary_splitk(
         .get_or_init(|| CachedMetalKernel(create_q2_row2_m5_ternary_splitk_reduce_kernel()));
     let reduce_config = configure_q2_row2_m5_splitk_reduce_kernel(out_dtype, packed.n_rows, chunks);
     let reduce_inputs = [partial.as_ptr()];
-    let reduce_inputs_vec = unsafe {
-        mlx_sys::mlx_vector_array_new_data(reduce_inputs.as_ptr(), reduce_inputs.len())
-    };
+    let reduce_inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(reduce_inputs.as_ptr(), reduce_inputs.len()) };
     let mut reduce_outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
     let reduce_status = unsafe {
         mlx_sys::mlx_fast_metal_kernel_apply(

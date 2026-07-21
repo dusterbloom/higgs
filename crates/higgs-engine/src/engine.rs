@@ -8,6 +8,13 @@ pub struct GenerationOutput {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub token_logprobs: Option<Vec<TokenLogprobInfo>>,
+    /// Reasoning content, split from `text` at the `</think>` token boundary
+    /// when thinking mode is enabled. `None` when thinking is off or the split
+    /// was not performed by the engine (callers may fall back to string parsing).
+    ///
+    /// The boundary token is excluded from both fields so it never surfaces in
+    /// streamed/returned text. See `SimpleEngine::generate_inner`.
+    pub reasoning_content: Option<String>,
 }
 
 /// Prefill progress for one streaming request, in absolute prompt tokens.
@@ -50,6 +57,7 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             token_logprobs: None,
+            reasoning_content: None,
         };
         assert_eq!(output.text, "Hello world");
         assert_eq!(output.finish_reason, "stop");
@@ -65,6 +73,7 @@ mod tests {
             prompt_tokens: 0,
             completion_tokens: 0,
             token_logprobs: None,
+            reasoning_content: None,
         };
         assert!(output.text.is_empty());
         assert_eq!(output.prompt_tokens, 0);
@@ -126,6 +135,7 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 3,
             token_logprobs: None,
+            reasoning_content: None,
         };
         let cloned = output.clone();
         assert_eq!(cloned.text, output.text);
@@ -157,6 +167,7 @@ mod tests {
             prompt_tokens: 1,
             completion_tokens: 1,
             token_logprobs: None,
+            reasoning_content: None,
         };
         let debug_str = format!("{output:?}");
         assert!(debug_str.contains("GenerationOutput"));
@@ -200,6 +211,7 @@ mod tests {
                     },
                 ],
             }]),
+            reasoning_content: None,
         };
         let lps = output.token_logprobs.unwrap();
         assert_eq!(lps.len(), 1);

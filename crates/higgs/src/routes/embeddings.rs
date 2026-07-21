@@ -39,6 +39,7 @@ pub async fn embeddings(
             engine,
             model_name,
             routing_method,
+            ..
         } => {
             let inputs = match &req.input {
                 EmbeddingInput::Single(s) => vec![s.clone()],

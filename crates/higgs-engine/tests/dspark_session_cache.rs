@@ -22,13 +22,18 @@ use std::path::Path;
 use higgs_engine::{
     chat_template::ChatMessage,
     mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile},
-    simple::{PrefillCompressionMode, SimpleEngine},
+    simple::{
+        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_PLAN_CACHE,
+        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+        PrefillCompressionMode, SimpleEngine,
+    },
 };
-use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
+use higgs_models::{
+    SamplingParams, Speculation, spec_prefill::PrefillScoreMode, turboquant::KvCacheConfig,
+};
 use support::{
-    ReferenceDsparkEnv, assert_acceptance_within,
-    assert_bonsai_27b_full_lowbit, assert_decode_tps_within, dflash_acceptance,
-    dflash_decode_tps, dflash_prefill_seconds,
+    ReferenceDsparkEnv, assert_acceptance_within, assert_bonsai_27b_full_lowbit,
+    assert_decode_tps_within, dflash_acceptance, dflash_decode_tps, dflash_prefill_seconds,
 };
 
 fn greedy(speculation: Speculation) -> SamplingParams {
@@ -82,6 +87,12 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically_impl(target_bi
         32,
         13,
         8,
+        PrefillScoreMode::Full,
+        7,
+        DEFAULT_PFLASH_KEEP_RATIO_MAX,
+        DEFAULT_PFLASH_PLAN_CACHE,
+        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+        DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
     )
     .expect("load paired dSpark engine");
     eprintln!("dspark-session checkpoint: engine loaded");

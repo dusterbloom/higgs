@@ -8,8 +8,8 @@ use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::{MlxRuntimeTuning, resolve_runtime_tuning};
 use higgs_engine::simple::{
-    CacheStats, PrefillCompressionMode as EnginePrefillCompressionMode, SessionGeneration,
-    SimpleEngine,
+    CacheStats, PFlashPromptPolicy, PrefillCompressionMode as EnginePrefillCompressionMode,
+    SessionGeneration, SimpleEngine,
 };
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
@@ -71,6 +71,12 @@ impl Engine {
         prefill_chunk: usize,
         prefill_avgpool: usize,
         prefill_lookahead: usize,
+        prefill_score_mode: higgs_models::spec_prefill::PrefillScoreMode,
+        prefill_exit_layer: usize,
+        prefill_keep_ratio_max: f32,
+        prefill_plan_cache: bool,
+        prefill_plan_cache_entries: usize,
+        prefill_suffix_identity_threshold: usize,
         disk_cache_config: Option<DiskPrefixCacheConfig>,
     ) -> Result<Self, EngineError> {
         let prefill_compression = match prefill_compression {
@@ -92,6 +98,12 @@ impl Engine {
             prefill_chunk,
             prefill_avgpool,
             prefill_lookahead,
+            prefill_score_mode,
+            prefill_exit_layer,
+            prefill_keep_ratio_max,
+            prefill_plan_cache,
+            prefill_plan_cache_entries,
+            prefill_suffix_identity_threshold,
         )
         .map(|e| Self::Simple(Box::new(e)))
     }
@@ -208,6 +220,24 @@ impl Engine {
             Self::Batch(e) => e.prepare_chat_prompt_with_thinking(messages, tools, enable_thinking),
             #[cfg(test)]
             Self::Stub(_) => Ok(Vec::new()),
+        }
+    }
+
+    pub fn prepare_chat_prompt_with_pflash_policy(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+    ) -> Result<(Vec<u32>, PFlashPromptPolicy), EngineError> {
+        match self {
+            Self::Simple(e) => {
+                e.prepare_chat_prompt_with_pflash_policy(messages, tools, enable_thinking)
+            }
+            Self::Batch(e) => e
+                .prepare_chat_prompt_with_thinking(messages, tools, enable_thinking)
+                .map(|tokens| (tokens, PFlashPromptPolicy::default())),
+            #[cfg(test)]
+            Self::Stub(_) => Ok((Vec::new(), PFlashPromptPolicy::default())),
         }
     }
 
@@ -374,9 +404,39 @@ impl Engine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
+        self.generate_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            enable_thinking,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            &PFlashPromptPolicy::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_thinking_and_pflash_policy(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        enable_thinking: bool,
+        constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<GenerationOutput, EngineError> {
         let _gpu = gpu_gate();
         match self {
-            Self::Simple(e) => e.generate_with_thinking(
+            Self::Simple(e) => e.generate_with_thinking_and_pflash_policy(
                 prompt_tokens,
                 max_tokens,
                 params,
@@ -387,6 +447,7 @@ impl Engine {
                 constraint,
                 pixel_values,
                 checkpoint_id,
+                pflash_policy,
             ),
             Self::Batch(e) => e.generate_with_thinking(
                 prompt_tokens,
@@ -451,9 +512,43 @@ impl Engine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
+        self.generate_streaming_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            sender,
+            enable_thinking,
+            return_progress,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            &PFlashPromptPolicy::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_thinking_and_pflash_policy(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        return_progress: bool,
+        constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<(), EngineError> {
         let _gpu = gpu_gate();
         match self {
-            Self::Simple(e) => e.generate_streaming_with_thinking(
+            Self::Simple(e) => e.generate_streaming_with_thinking_and_pflash_policy(
                 prompt_tokens,
                 max_tokens,
                 params,
@@ -466,6 +561,7 @@ impl Engine {
                 constraint,
                 pixel_values,
                 checkpoint_id,
+                pflash_policy,
             ),
             Self::Batch(e) => e.generate_streaming_with_thinking(
                 prompt_tokens,
@@ -532,6 +628,12 @@ pub fn build_engine(
             model_cfg.prefill_chunk,
             model_cfg.prefill_avgpool,
             model_cfg.prefill_lookahead,
+            model_cfg.prefill_score_mode,
+            model_cfg.prefill_exit_layer,
+            model_cfg.prefill_keep_ratio_max,
+            model_cfg.prefill_plan_cache,
+            model_cfg.prefill_plan_cache_entries,
+            model_cfg.prefill_suffix_identity_threshold,
             model_cfg.disk_prefix_cache_config(resolved),
         )
         .map_err(|e| e.to_string())?

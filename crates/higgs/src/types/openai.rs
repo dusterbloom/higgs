@@ -20,6 +20,13 @@ pub struct ChatCompletionRequest {
     pub min_p: Option<f32>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    /// llama.cpp/Ollama alias for [`Self::repetition_penalty`]. Accepted as a
+    /// separate field (never an `alias`) so clients that send both names — e.g.
+    /// some local backends emit `repeat_penalty` alongside a vLLM-style
+    /// `repetition_penalty` — don't get a "duplicate field" 400. Merged at
+    /// sampling-param build time, with `repetition_penalty` taking precedence.
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
@@ -345,6 +352,13 @@ pub struct CompletionRequest {
     pub min_p: Option<f32>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    /// llama.cpp/Ollama alias for [`Self::repetition_penalty`]. Accepted as a
+    /// separate field (never an `alias`) so clients that send both names don't
+    /// get a "duplicate field" 400. Merged at sampling-param build time via
+    /// [`merge_repetition_penalty`], taking the stronger (higher) control so a
+    /// weaker default can't defeat a repetition-loop safeguard.
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
@@ -360,6 +374,20 @@ pub struct CompletionRequest {
     /// Optional Higgs extension naming a disk prefix-cache checkpoint to load/store.
     #[serde(default)]
     pub checkpoint_id: Option<String>,
+}
+
+/// Merge an OpenAI/vLLM `repetition_penalty` with the llama.cpp/Ollama
+/// `repeat_penalty` alias. Some clients (e.g. nanobot) send both on the same
+/// request — `repetition_penalty` from a model-config default and
+/// `repeat_penalty` as a per-model-class loop safeguard. We must accept both
+/// without a "duplicate field" 400, and we take the stronger control (higher
+/// value, since repetition penalties above 1.0 suppress loops) so a weaker
+/// default can never silently disable the safeguard.
+pub fn merge_repetition_penalty(repetition: Option<f32>, repeat: Option<f32>) -> Option<f32> {
+    match (repetition, repeat) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// POST /v1/completions response (non-streaming).
@@ -927,6 +955,64 @@ mod tests {
         }"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.max_tokens, Some(100));
+    }
+
+    #[test]
+    fn test_completion_request_accepts_repeat_penalty_field() {
+        // llama.cpp/Ollama clients send `repeat_penalty`; higgs reads it as a
+        // dedicated field and merges it into `repetition_penalty` at sampling
+        // build time, so local repetition guards are not silently dropped.
+        let json = r#"{
+            "model": "m",
+            "prompt": "test",
+            "repeat_penalty": 1.1
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.repeat_penalty, Some(1.1));
+    }
+
+    #[test]
+    fn test_chat_request_accepts_repeat_penalty_field() {
+        let json = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "repeat_penalty": 1.15
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.repeat_penalty, Some(1.15));
+    }
+
+    #[test]
+    fn test_chat_request_accepts_both_repetition_and_repeat_penalty() {
+        // Some clients emit both names in one body. With `repeat_penalty` as a
+        // serde alias this 400s with "duplicate field repetition_penalty"; as a
+        // dedicated field it must parse cleanly, and `merge_repetition_penalty`
+        // must take the stronger (higher) control so a weaker default can't
+        // defeat a loop safeguard.
+        let json = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "repetition_penalty": 1.0,
+            "repeat_penalty": 1.15
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.repetition_penalty, Some(1.0));
+        assert_eq!(req.repeat_penalty, Some(1.15));
+        assert_eq!(
+            merge_repetition_penalty(req.repetition_penalty, req.repeat_penalty),
+            Some(1.15)
+        );
+    }
+
+    #[test]
+    fn test_merge_repetition_penalty_takes_max() {
+        // repetition_penalty is the weaker config default; repeat_penalty is the
+        // per-model-class safeguard. The safeguard (higher) must win.
+        assert_eq!(merge_repetition_penalty(Some(1.0), Some(1.1)), Some(1.1));
+        assert_eq!(merge_repetition_penalty(Some(1.3), Some(1.1)), Some(1.3));
+        assert_eq!(merge_repetition_penalty(Some(1.1), None), Some(1.1));
+        assert_eq!(merge_repetition_penalty(None, Some(1.1)), Some(1.1));
+        assert_eq!(merge_repetition_penalty(None, None), None);
     }
 
     #[test]

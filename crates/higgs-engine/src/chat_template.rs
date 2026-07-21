@@ -30,14 +30,16 @@ impl ChatTemplateRenderer {
     /// Create a renderer from a Jinja2 template string.
     pub fn new<S: Into<String>>(template_source: S) -> Result<Self, EngineError> {
         let mut env = Environment::new();
+        let template_source = normalize_hf_chat_template(template_source.into());
         // Templates come from model directories (tokenizer_config.json /
         // chat_template.jinja), which are third-party content; bound execution
         // so a hostile template cannot loop forever.
         env.set_fuel(Some(TEMPLATE_FUEL));
         env.add_filter("tojson", tojson_filter);
+        env.add_function("raise_exception", raise_exception);
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_template_owned("chat".to_owned(), template_source.into())
+        env.add_template_owned("chat".to_owned(), template_source)
             .map_err(|e| EngineError::Template(e.to_string()))?;
         Ok(Self {
             env,
@@ -292,6 +294,23 @@ fn tojson_filter(value: Value, _kwargs: Kwargs) -> Result<String, minijinja::Err
     Ok(serialized)
 }
 
+/// HuggingFace chat templates use `raise_exception(...)` for explicit
+/// validation failures. MiniJinja does not provide it by default.
+fn raise_exception(message: Value) -> Result<String, minijinja::Error> {
+    Err(minijinja::Error::new(
+        minijinja::ErrorKind::InvalidOperation,
+        message.to_string(),
+    ))
+}
+
+fn normalize_hf_chat_template(template_source: String) -> String {
+    // Some HF/Qwen templates use Python's extended slice syntax to scan
+    // messages backwards. MiniJinja accepts `messages[::-1]` but does not
+    // iterate it like Python/Jinja2, which trips templates that validate the
+    // presence of a real user query. Use MiniJinja's reverse filter instead.
+    template_source.replace("messages[::-1]", "messages|reverse")
+}
+
 #[cfg(test)]
 #[allow(
     clippy::panic,
@@ -366,6 +385,80 @@ mod tests {
             .unwrap();
         // UTF-8 preserved (not \u-escaped), and the call did not error.
         assert_eq!(result, "\"café\"");
+    }
+
+    #[test]
+    fn test_raise_exception_function_is_available_but_lazy() {
+        let renderer = ChatTemplateRenderer::new(
+            r"{%- if should_raise %}{{ raise_exception('bad chat') }}{%- else %}ok{%- endif %}",
+        )
+        .unwrap();
+        let result = renderer.apply(&[msg("user", "hi")], None, false).unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn test_raise_exception_function_returns_template_error() {
+        let renderer = ChatTemplateRenderer::new(r"{{ raise_exception('bad chat') }}").unwrap();
+        let err = renderer
+            .apply(&[msg("user", "hi")], None, false)
+            .unwrap_err();
+        assert!(err.to_string().contains("bad chat"));
+    }
+
+    #[test]
+    fn test_hf_reverse_message_slice_finds_real_user_query() {
+        let template = r#"
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = message.content|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if ns.multi_step_tool %}
+    {{- raise_exception('No user query found in messages.') }}
+{%- endif %}
+last={{ ns.last_query_index }}"#;
+        let renderer = ChatTemplateRenderer::new(template).unwrap();
+        let messages = vec![
+            msg("system", "You are helpful."),
+            msg("user", "real query"),
+            msg("assistant", "calling tool"),
+            msg("user", "<tool_response>{\"ok\":true}</tool_response>"),
+        ];
+
+        let result = renderer.apply(&messages, None, false).unwrap();
+
+        assert_eq!(result.trim(), "last=1");
+    }
+
+    #[test]
+    fn test_hf_reverse_message_slice_still_rejects_missing_user_query() {
+        let template = r#"
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = message.content|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if ns.multi_step_tool %}
+    {{- raise_exception('No user query found in messages.') }}
+{%- endif %}
+ok"#;
+        let renderer = ChatTemplateRenderer::new(template).unwrap();
+        let messages = vec![msg("user", "<tool_response>{\"ok\":true}</tool_response>")];
+
+        let err = renderer.apply(&messages, None, false).unwrap_err();
+
+        assert!(err.to_string().contains("No user query found"));
     }
 
     #[test]

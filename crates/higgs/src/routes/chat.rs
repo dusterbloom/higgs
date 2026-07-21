@@ -16,7 +16,7 @@ use bytes::Bytes;
 use tokio_stream::Stream;
 
 use crate::{
-    config::ApiFormat,
+    config::{ApiFormat, GenerationDefaults},
     error::ServerError,
     metrics::{MetricsStore, RequestRecord},
     router::ResolvedRoute,
@@ -25,6 +25,7 @@ use crate::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
         ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent, StopSequence,
         TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
+        merge_repetition_penalty,
     },
 };
 use higgs_models::SamplingParams;
@@ -61,6 +62,7 @@ pub async fn chat_completions(
         ResolvedRoute::Higgs {
             engine,
             model_name,
+            generation_defaults,
             routing_method,
         } => {
             req.model = model_name;
@@ -69,6 +71,7 @@ pub async fn chat_completions(
                     Arc::clone(&state),
                     req,
                     engine,
+                    generation_defaults,
                     state.metrics.clone(),
                     routing_method,
                 )?;
@@ -76,8 +79,13 @@ pub async fn chat_completions(
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
-                let response =
-                    chat_completions_non_streaming(Arc::clone(&state), req, engine).await?;
+                let response = chat_completions_non_streaming(
+                    Arc::clone(&state),
+                    req,
+                    engine,
+                    generation_defaults,
+                )
+                .await?;
                 if let Some(ref metrics) = state.metrics {
                     metrics.record(RequestRecord {
                         id: 0,
@@ -252,9 +260,11 @@ async fn chat_completions_non_streaming(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: Arc<Engine>,
+    generation_defaults: GenerationDefaults,
 ) -> Result<ChatCompletionResponse, ServerError> {
-    let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
-    let sampling = build_sampling_params(&req)?;
+    let max_tokens =
+        resolved_max_tokens(&req, &generation_defaults, state.config.server.max_tokens);
+    let sampling = build_sampling_params(&req, &generation_defaults)?;
     let stop_sequences = StopSequence::extract(req.stop);
     let want_logprobs = req.logprobs.unwrap_or(false);
     let top_logprobs = req.top_logprobs;
@@ -278,11 +288,12 @@ async fn chat_completions_non_streaming(
         req.chat_template_kwargs
             .as_ref()
             .and_then(|k| k.enable_thinking)
-            .or(req.enable_thinking),
+            .or(req.enable_thinking)
+            .or(generation_defaults.enable_thinking),
     );
 
-    let mut prompt_tokens = engine
-        .prepare_chat_prompt_with_thinking(&messages, tools, thinking_enabled)
+    let (mut prompt_tokens, pflash_policy) = engine
+        .prepare_chat_prompt_with_pflash_policy(&messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
 
     // Preprocess images for VLM
@@ -315,12 +326,14 @@ async fn chat_completions_non_streaming(
     // turn may differ slightly from a stateless full prefill. Clients needing
     // bit-identical output should omit `session_id` — the radix prefix cache on
     // the normal path is exact. See `SimpleEngine::generate_continued`.
-    let session_id = req
-        .session_id
-        .filter(|_| pixel_values.is_none() && constraint.is_none());
-
     let tokenizer = engine.tokenizer().clone();
     let checkpoint_id = req.checkpoint_id.clone();
+    let session_id = session_continuation_id(
+        req.session_id,
+        pixel_values.is_some(),
+        constraint.is_some(),
+        checkpoint_id.as_deref(),
+    );
     let request_id = generate_request_id();
     let has_tools = tools.is_some();
 
@@ -360,7 +373,7 @@ async fn chat_completions_non_streaming(
     }
 
     let output = tokio::task::spawn_blocking(move || {
-        engine.generate_with_thinking(
+        engine.generate_with_thinking_and_pflash_policy(
             &prompt_tokens,
             max_tokens,
             &sampling,
@@ -371,6 +384,7 @@ async fn chat_completions_non_streaming(
             constraint,
             pixel_values,
             checkpoint_id.as_deref(),
+            &pflash_policy,
         )
     })
     .await
@@ -384,24 +398,32 @@ async fn chat_completions_non_streaming(
 
     let output_text = output.text;
     // Parse reasoning (think tags) from the output.
-    // When thinking mode is enabled, the template already opened `<think>` in the prompt,
-    // so the generated text starts inside the think block. Prepend `<think>` so the parser
-    // can find the matching `</think>` and split reasoning from visible content.
+    // When thinking mode is enabled, prefer the token-level split the engine
+    // already performed (`output.reasoning_content` / `output.text`), which is
+    // exact and never surfaces the `</think>` delimiter. Fall back to the
+    // string parser only when the engine did not split (e.g. a model that
+    // self-emits `<think>` tags, or thinking disabled at the engine layer).
     let (raw_text, reasoning_content) = if thinking_enabled {
-        let parse_input = if output_text.contains("</think>") {
-            format!("<think>{output_text}")
-        } else {
-            // Model was length-stopped mid-thinking — close the tag so the
-            // parser can extract reasoning instead of leaking raw `<think>`.
-            format!("<think>{output_text}</think>")
-        };
-        let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
-        let raw_text = if reasoning_result.reasoning.is_some() {
-            reasoning_result.text
-        } else {
-            output_text
-        };
-        (raw_text, reasoning_result.reasoning)
+        match output.reasoning_content {
+            Some(r) => (output_text, Some(r)),
+            None => {
+                let parse_input = if output_text.contains("</think>") {
+                    format!("<think>{output_text}")
+                } else {
+                    // Model was length-stopped mid-thinking — close the tag so the
+                    // parser can extract reasoning instead of leaking raw `<think>`.
+                    format!("<think>{output_text}</think>")
+                };
+                let reasoning_result =
+                    higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
+                let raw_text = if reasoning_result.reasoning.is_some() {
+                    reasoning_result.text
+                } else {
+                    output_text.clone()
+                };
+                (raw_text, reasoning_result.reasoning)
+            }
+        }
     } else {
         // Model-emitted reasoning (e.g. VibeThinker writes its own
         // `<think>...</think>`): parse it out without the prompt-injection
@@ -770,6 +792,7 @@ fn chat_completions_stream(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: Arc<Engine>,
+    generation_defaults: GenerationDefaults,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, ServerError> {
@@ -787,8 +810,9 @@ fn chat_completions_stream(
         );
     }
 
-    let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
-    let sampling = build_sampling_params(&req)?;
+    let max_tokens =
+        resolved_max_tokens(&req, &generation_defaults, state.config.server.max_tokens);
+    let sampling = build_sampling_params(&req, &generation_defaults)?;
     let stop_sequences = StopSequence::extract(req.stop);
     let want_logprobs = req.logprobs.unwrap_or(false);
     let top_logprobs = req.top_logprobs;
@@ -809,7 +833,8 @@ fn chat_completions_stream(
         req.chat_template_kwargs
             .as_ref()
             .and_then(|k| k.enable_thinking)
-            .or(req.enable_thinking),
+            .or(req.enable_thinking)
+            .or(generation_defaults.enable_thinking),
     );
 
     // Pass tools into prompt rendering so the chat template emits the
@@ -821,8 +846,8 @@ fn chat_completions_stream(
         .tools
         .as_deref()
         .and_then(|t| if t.is_empty() { None } else { Some(t) });
-    let mut prompt_tokens = engine
-        .prepare_chat_prompt_with_thinking(&messages, prompt_tools, thinking_enabled_stream)
+    let (mut prompt_tokens, pflash_policy) = engine
+        .prepare_chat_prompt_with_pflash_policy(&messages, prompt_tools, thinking_enabled_stream)
         .map_err(ServerError::Engine)?;
 
     // Preprocess images for VLM
@@ -850,6 +875,7 @@ fn chat_completions_stream(
         .as_ref()
         .is_some_and(|opts| opts.include_usage.unwrap_or(false));
     let return_progress = req.return_progress.unwrap_or(false);
+    let collect_prefill_progress = return_progress || include_usage;
     let created = current_unix_timestamp();
     let request_session_id = req.session_id;
     let model = req.model;
@@ -873,9 +899,13 @@ fn chat_completions_stream(
         })
     });
 
-    let stream_session_id = request_session_id
-        .filter(|_| pixel_values.is_none() && constraint.is_none() && !want_logprobs)
-        .filter(|_| checkpoint_id.is_none());
+    let stream_session_id = session_continuation_id(
+        request_session_id,
+        pixel_values.is_some(),
+        constraint.is_some(),
+        checkpoint_id.as_deref(),
+    )
+    .filter(|_| !want_logprobs);
 
     let tokenizer = engine.tokenizer().clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -913,7 +943,7 @@ fn chat_completions_stream(
         });
     } else {
         tokio::task::spawn_blocking(move || {
-            let result = engine.generate_streaming_with_thinking(
+            let result = engine.generate_streaming_with_thinking_and_pflash_policy(
                 &prompt_tokens,
                 max_tokens,
                 &sampling,
@@ -922,10 +952,11 @@ fn chat_completions_stream(
                 top_logprobs,
                 &tx,
                 thinking_enabled_stream,
-                return_progress,
+                collect_prefill_progress,
                 constraint,
                 pixel_values,
                 checkpoint_id.as_deref(),
+                &pflash_policy,
             );
             if let Err(e) = result {
                 tracing::error!(error = %e, "Generation error during streaming");
@@ -1242,24 +1273,46 @@ fn inject_image_placeholders(messages: &[ChatCompletionMessage]) -> Vec<ChatComp
         .collect()
 }
 
-fn build_sampling_params(req: &ChatCompletionRequest) -> Result<SamplingParams, ServerError> {
-    let speculation =
-        higgs_models::Speculation::parse(req.speculation.as_deref()).map_err(|v| {
-            ServerError::BadRequest(format!(
-                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
-            ))
-        })?;
+fn build_sampling_params(
+    req: &ChatCompletionRequest,
+    defaults: &GenerationDefaults,
+) -> Result<SamplingParams, ServerError> {
+    let speculation = higgs_models::Speculation::parse(
+        req.speculation
+            .as_deref()
+            .or(defaults.speculation.as_deref()),
+    )
+    .map_err(|v| {
+        ServerError::BadRequest(format!(
+            "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
+        ))
+    })?;
+    let repetition_penalty = if req.repetition_penalty.is_some() || req.repeat_penalty.is_some() {
+        merge_repetition_penalty(req.repetition_penalty, req.repeat_penalty)
+    } else {
+        defaults.repetition_penalty
+    };
     Ok(SamplingParams {
-        temperature: req.temperature.unwrap_or(1.0),
-        top_p: req.top_p.unwrap_or(1.0),
-        top_k: req.top_k,
-        min_p: req.min_p,
-        repetition_penalty: req.repetition_penalty,
-        frequency_penalty: req.frequency_penalty,
-        presence_penalty: req.presence_penalty,
+        temperature: req.temperature.or(defaults.temperature).unwrap_or(0.0),
+        top_p: req.top_p.or(defaults.top_p).unwrap_or(1.0),
+        top_k: req.top_k.or(defaults.top_k),
+        min_p: req.min_p.or(defaults.min_p),
+        repetition_penalty,
+        frequency_penalty: req.frequency_penalty.or(defaults.frequency_penalty),
+        presence_penalty: req.presence_penalty.or(defaults.presence_penalty),
         speculation,
         thinking_budget: req.reasoning_budget,
     })
+}
+
+fn resolved_max_tokens(
+    req: &ChatCompletionRequest,
+    defaults: &GenerationDefaults,
+    server_max_tokens: u32,
+) -> u32 {
+    req.max_tokens
+        .or(defaults.max_tokens)
+        .unwrap_or(server_max_tokens)
 }
 
 /// Build a constrained generator from the request's `response_format`.
@@ -1346,6 +1399,18 @@ fn generate_request_id() -> String {
     format!("chatcmpl-{}", uuid::Uuid::new_v4())
 }
 
+fn session_continuation_id(
+    session_id: Option<u64>,
+    has_pixel_values: bool,
+    has_constraint: bool,
+    checkpoint_id: Option<&str>,
+) -> Option<u64> {
+    session_id
+        .filter(|_| !has_pixel_values)
+        .filter(|_| !has_constraint)
+        .filter(|_| checkpoint_id.is_none())
+}
+
 fn current_unix_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -1354,6 +1419,74 @@ fn current_unix_timestamp() -> i64 {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn chat_request(extra: serde_json::Value) -> ChatCompletionRequest {
+        let mut request = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        if let (Some(dst), Some(src)) = (request.as_object_mut(), extra.as_object()) {
+            dst.extend(src.clone());
+        }
+        serde_json::from_value(request).unwrap()
+    }
+
+    #[test]
+    fn generation_defaults_fill_omitted_sampling_fields() {
+        let req = chat_request(serde_json::json!({}));
+        let defaults = GenerationDefaults {
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            min_p: Some(0.0),
+            repetition_penalty: Some(1.1),
+            frequency_penalty: Some(0.2),
+            presence_penalty: Some(0.3),
+            speculation: Some("none".to_owned()),
+            enable_thinking: Some(false),
+        };
+
+        assert_eq!(resolved_max_tokens(&req, &defaults, 1024), 4096);
+        let sampling = build_sampling_params(&req, &defaults).unwrap();
+        assert!((sampling.temperature - 0.7).abs() < f32::EPSILON);
+        assert!((sampling.top_p - 0.95).abs() < f32::EPSILON);
+        assert_eq!(sampling.top_k, Some(20));
+        assert_eq!(sampling.min_p, Some(0.0));
+        assert_eq!(sampling.repetition_penalty, Some(1.1));
+        assert_eq!(sampling.frequency_penalty, Some(0.2));
+        assert_eq!(sampling.presence_penalty, Some(0.3));
+        assert_eq!(sampling.speculation, higgs_models::Speculation::None);
+    }
+
+    #[test]
+    fn request_sampling_fields_override_generation_defaults() {
+        let req = chat_request(serde_json::json!({
+            "max_tokens": 64,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 5,
+            "repeat_penalty": 1.2,
+            "speculation": "auto"
+        }));
+        let defaults = GenerationDefaults {
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            repetition_penalty: Some(1.1),
+            speculation: Some("none".to_owned()),
+            ..GenerationDefaults::default()
+        };
+
+        assert_eq!(resolved_max_tokens(&req, &defaults, 1024), 64);
+        let sampling = build_sampling_params(&req, &defaults).unwrap();
+        assert!(sampling.temperature.abs() < f32::EPSILON);
+        assert!((sampling.top_p - 1.0).abs() < f32::EPSILON);
+        assert_eq!(sampling.top_k, Some(5));
+        assert_eq!(sampling.repetition_penalty, Some(1.2));
+        assert_eq!(sampling.speculation, higgs_models::Speculation::Auto);
+    }
 
     #[test]
     fn session_usage_reports_reused_prefix_as_cached() {
@@ -1385,6 +1518,29 @@ mod tests {
             continued: false,
         };
         assert!(session_usage(&cold).prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn session_continuation_allows_plain_session_id() {
+        assert_eq!(
+            session_continuation_id(Some(42), false, false, None),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn session_continuation_rejects_unsupported_request_shapes() {
+        assert_eq!(session_continuation_id(Some(42), true, false, None), None);
+        assert_eq!(session_continuation_id(Some(42), false, true, None), None);
+        assert_eq!(session_continuation_id(None, false, false, None), None);
+    }
+
+    #[test]
+    fn session_continuation_checkpoint_id_takes_precedence() {
+        assert_eq!(
+            session_continuation_id(Some(42), false, false, Some("checkpoint-a")),
+            None
+        );
     }
 
     #[test]

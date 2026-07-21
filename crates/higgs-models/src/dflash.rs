@@ -635,10 +635,10 @@ impl DsparkExtras {
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|&k| k > 0 && k < vocab_size);
         let topk_shortlist = topk_fast.or(topk_compare);
-        let topk_base_kernel = std::env::var("HIGGS_DSPARK_TOPK_BASE_KERNEL")
-            .is_ok_and(|v| v == "1");
-        let topk_markov_kernel = std::env::var("HIGGS_DSPARK_TOPK_MARKOV_KERNEL")
-            .is_ok_and(|v| v == "1");
+        let topk_base_kernel =
+            std::env::var("HIGGS_DSPARK_TOPK_BASE_KERNEL").is_ok_and(|v| v == "1");
+        let topk_markov_kernel =
+            std::env::var("HIGGS_DSPARK_TOPK_MARKOV_KERNEL").is_ok_and(|v| v == "1");
         let mut previous = Array::from_slice(&[anchor], &[1]);
         let mut sampled = Vec::with_capacity(usize::try_from(block_size).unwrap_or(0));
 
@@ -648,7 +648,8 @@ impl DsparkExtras {
                 .reshape(&[-1, vocab_size])?;
             let topk = if let Some(k) = topk_shortlist {
                 if topk_base_kernel && k == 16 {
-                    let (candidate_vals, candidate_ids) = crate::metal_kernel::base_top16_blocks(&base)?;
+                    let (candidate_vals, candidate_ids) =
+                        crate::metal_kernel::base_top16_blocks(&base)?;
                     let neg_candidates = candidate_vals.negative()?;
                     let partition = ops::argpartition_axis(&neg_candidates, k - 1, -1)?;
                     let candidate_pos = partition.index((.., 0..k));
@@ -680,7 +681,9 @@ impl DsparkExtras {
                     )?)
                 } else {
                     let flat_indices = indices.reshape(&[-1])?;
-                    let markov_topk = self.markov_head_b.forward_rows(&markov_embedding, &flat_indices)?;
+                    let markov_topk = self
+                        .markov_head_b
+                        .forward_rows(&markov_embedding, &flat_indices)?;
                     let shortlist_logits = base_topk.add(&markov_topk)?;
                     let shortlist_pos = mlx_rs::argmax_axis!(&shortlist_logits, -1)?;
                     Some(
@@ -771,7 +774,8 @@ impl DsparkExtras {
                     }
                     let rank_u64 = u64::try_from(rank).unwrap_or(u64::MAX);
                     let total = DSPARK_TOPK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-                    let sum = DSPARK_TOPK_RANK_SUM.fetch_add(rank_u64, Ordering::Relaxed) + rank_u64;
+                    let sum =
+                        DSPARK_TOPK_RANK_SUM.fetch_add(rank_u64, Ordering::Relaxed) + rank_u64;
                     DSPARK_TOPK_RANK_MAX.fetch_max(rank_u64, Ordering::Relaxed);
                     let hit16_count = DSPARK_TOPK_HIT16
                         .fetch_add(u64::from(rank <= 16), Ordering::Relaxed)
@@ -829,7 +833,7 @@ impl DsparkExtras {
         if let Some(ckpt_ref) = ckpt.as_mut() {
             crate::mlx_exec::eval([&out])?;
             let now = std::time::Instant::now();
-                let concat_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
+            let concat_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
             tracing::info!(
                 output_ms = format!("{output_ms:.2}"),
                 markov_ms = ?markov_ms.iter().map(|ms| format!("{ms:.2}")).collect::<Vec<_>>(),
@@ -1594,7 +1598,7 @@ impl DFlashDrafter {
         if let Some(ckpt_ref) = ckpt.as_mut() {
             crate::mlx_exec::eval([&hidden])?;
             let now = std::time::Instant::now();
-                let norm_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
+            let norm_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
             tracing::info!(
                 context_ms = format!("{context_ms:.2}"),
                 log_snr_ms = format!("{log_snr_ms:.2}"),

@@ -399,14 +399,9 @@ mod tests {
         let biases: Vec<f16> = (0..out_features * n_groups)
             .map(|i| f16::from_f32(-0.02 + 0.003 * ((i % 13) as f32)))
             .collect();
-        let w = mlx_rs::Array::from_slice(
-            &w_packed,
-            &[out_features as i32, packed_cols as i32],
-        );
-        let s =
-            mlx_rs::Array::from_slice(&scales, &[out_features as i32, n_groups as i32]);
-        let b =
-            mlx_rs::Array::from_slice(&biases, &[out_features as i32, n_groups as i32]);
+        let w = mlx_rs::Array::from_slice(&w_packed, &[out_features as i32, packed_cols as i32]);
+        let s = mlx_rs::Array::from_slice(&scales, &[out_features as i32, n_groups as i32]);
+        let b = mlx_rs::Array::from_slice(&biases, &[out_features as i32, n_groups as i32]);
         (w, s, b)
     }
 
@@ -682,18 +677,16 @@ mod tests {
             // Measure strict-ternary row2 split-K variants.
             let t0 = std::time::Instant::now();
             for _ in 0..n_iters {
-                let y =
-                    crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(&x, packed_ref, 2)
-                        .unwrap();
+                let y = crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(&x, packed_ref, 2)
+                    .unwrap();
                 y.eval().unwrap();
             }
             let ternary_splitk2_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
 
             let t0 = std::time::Instant::now();
             for _ in 0..n_iters {
-                let y =
-                    crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(&x, packed_ref, 4)
-                        .unwrap();
+                let y = crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(&x, packed_ref, 4)
+                    .unwrap();
                 y.eval().unwrap();
             }
             let ternary_splitk4_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
@@ -842,15 +835,10 @@ mod tests {
 
             let t0 = std::time::Instant::now();
             for _ in 0..n_iters {
-                crate::metal_kernel::bonsai_q2_ternary_qmv_simd(
-                    &x,
-                    &w,
-                    &s,
-                    GROUP_SIZE as i32,
-                )
-                .unwrap()
-                .eval()
-                .unwrap();
+                crate::metal_kernel::bonsai_q2_ternary_qmv_simd(&x, &w, &s, GROUP_SIZE as i32)
+                    .unwrap()
+                    .eval()
+                    .unwrap();
             }
             let ternary_simd_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
 
@@ -952,8 +940,7 @@ mod tests {
             .unwrap();
 
         for _ in 0..3 {
-            let gate_out =
-                mlx_rs::ops::quantized_matmul(&x, &gw, &gs, &gb, true, 128, 2).unwrap();
+            let gate_out = mlx_rs::ops::quantized_matmul(&x, &gw, &gs, &gb, true, 128, 2).unwrap();
             let up_out = mlx_rs::ops::quantized_matmul(&x, &uw, &us, &ub, true, 128, 2).unwrap();
             let act = gate_out
                 .multiply(mlx_rs::nn::sigmoid(&gate_out).unwrap())
@@ -966,7 +953,9 @@ mod tests {
                 .unwrap();
 
             let fused = mlx_rs::ops::quantized_matmul(&x, &fw, &fs, &fb, true, 128, 2).unwrap();
-            let parts = fused.split_axis(&[intermediate_f as i32], Some(-1)).unwrap();
+            let parts = fused
+                .split_axis(&[intermediate_f as i32], Some(-1))
+                .unwrap();
             let gate_out = parts.first().unwrap();
             let up_out = parts.get(1).unwrap();
             let act = gate_out
@@ -997,10 +986,13 @@ mod tests {
                 .eval()
                 .unwrap();
 
-            let fused_gu =
-                crate::metal_kernel::bonsai_q2_row2_m5_ternary_fused_gate_up(&x, gate_row2, up_row2)
-                    .unwrap();
-            let parts = fused_gu.split_axis(&[intermediate_f as i32], Some(-1)).unwrap();
+            let fused_gu = crate::metal_kernel::bonsai_q2_row2_m5_ternary_fused_gate_up(
+                &x, gate_row2, up_row2,
+            )
+            .unwrap();
+            let parts = fused_gu
+                .split_axis(&[intermediate_f as i32], Some(-1))
+                .unwrap();
             let gate_out = parts.first().unwrap();
             let up_out = parts.get(1).unwrap();
             let act = gate_out
@@ -1017,8 +1009,7 @@ mod tests {
         let n_iters = 20;
         let t0 = std::time::Instant::now();
         for _ in 0..n_iters {
-            let gate_out =
-                mlx_rs::ops::quantized_matmul(&x, &gw, &gs, &gb, true, 128, 2).unwrap();
+            let gate_out = mlx_rs::ops::quantized_matmul(&x, &gw, &gs, &gb, true, 128, 2).unwrap();
             let up_out = mlx_rs::ops::quantized_matmul(&x, &uw, &us, &ub, true, 128, 2).unwrap();
             let act = gate_out
                 .multiply(mlx_rs::nn::sigmoid(&gate_out).unwrap())
@@ -1035,7 +1026,9 @@ mod tests {
         let t0 = std::time::Instant::now();
         for _ in 0..n_iters {
             let fused = mlx_rs::ops::quantized_matmul(&x, &fw, &fs, &fb, true, 128, 2).unwrap();
-            let parts = fused.split_axis(&[intermediate_f as i32], Some(-1)).unwrap();
+            let parts = fused
+                .split_axis(&[intermediate_f as i32], Some(-1))
+                .unwrap();
             let gate_out = parts.first().unwrap();
             let up_out = parts.get(1).unwrap();
             let act = gate_out
@@ -1088,10 +1081,13 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         for _ in 0..n_iters {
-            let fused_gu =
-                crate::metal_kernel::bonsai_q2_row2_m5_ternary_fused_gate_up(&x, gate_row2, up_row2)
-                    .unwrap();
-            let parts = fused_gu.split_axis(&[intermediate_f as i32], Some(-1)).unwrap();
+            let fused_gu = crate::metal_kernel::bonsai_q2_row2_m5_ternary_fused_gate_up(
+                &x, gate_row2, up_row2,
+            )
+            .unwrap();
+            let parts = fused_gu
+                .split_axis(&[intermediate_f as i32], Some(-1))
+                .unwrap();
             let gate_out = parts.first().unwrap();
             let up_out = parts.get(1).unwrap();
             let act = gate_out
@@ -1192,9 +1188,7 @@ mod tests {
             let mut baseline_m1_us = None;
             for &m_rows in &[1usize, 2, 4, 5, 8] {
                 let x_f32: Vec<f32> = (0..(m_rows * in_f))
-                    .map(|i| {
-                        ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / 16777216.0 - 0.5
-                    })
+                    .map(|i| ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / 16777216.0 - 0.5)
                     .collect();
                 let x = mlx_rs::Array::from_slice(&x_f32, &[m_rows as i32, in_f as i32])
                     .as_dtype(mlx_rs::Dtype::Float16)
@@ -1244,8 +1238,7 @@ mod tests {
             let logits = mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, 128, 2).unwrap();
             mlx_rs::argmax_axis!(&logits, -1).unwrap().eval().unwrap();
             let (maxv, maxid) =
-                crate::metal_kernel::bonsai_q2_m5_argmax_candidates(&x, &w, &s, &b, 128)
-                    .unwrap();
+                crate::metal_kernel::bonsai_q2_m5_argmax_candidates(&x, &w, &s, &b, 128).unwrap();
             crate::mlx_exec::eval([&maxv, &maxid].into_iter()).unwrap();
             crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
                 .unwrap()
@@ -1258,20 +1251,18 @@ mod tests {
                 .unwrap()
                 .eval()
                 .unwrap();
-            let (maxv, maxid) =
-                crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
-                    &x, &w, &s, 128, 2,
-                )
-                .unwrap();
+            let (maxv, maxid) = crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
+                &x, &w, &s, 128, 2,
+            )
+            .unwrap();
             crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
                 .unwrap()
                 .eval()
                 .unwrap();
-            let (maxv, maxid) =
-                crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
-                    &x, &w, &s, 128, 4,
-                )
-                .unwrap();
+            let (maxv, maxid) = crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
+                &x, &w, &s, 128, 4,
+            )
+            .unwrap();
             crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
                 .unwrap()
                 .eval()
@@ -1304,8 +1295,8 @@ mod tests {
             cand_ids.push(best_id);
         }
         eprintln!("Q2_M5_HEAD_ARGMAX_PARITY ref={ref_ids:?} cand={cand_ids:?}");
-        let gpu_ids_arr = crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
-            .unwrap();
+        let gpu_ids_arr =
+            crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid).unwrap();
         gpu_ids_arr.eval().unwrap();
         let gpu_ids: Vec<u32> = gpu_ids_arr.as_slice::<u32>().to_vec();
         eprintln!("Q2_M5_HEAD_ARGMAX_GPU_REDUCE gpu={gpu_ids:?}");
@@ -1317,24 +1308,22 @@ mod tests {
         let ternary_gpu_ids: Vec<u32> = ternary_gpu_ids_arr.as_slice::<u32>().to_vec();
         eprintln!("Q2_M5_HEAD_ARGMAX_TERNARY_GPU_REDUCE gpu={ternary_gpu_ids:?}");
         let (s2maxv, s2maxid) =
-            crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
-                &x, &w, &s, 128, 2,
-            )
-            .unwrap();
+            crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(&x, &w, &s, 128, 2)
+                .unwrap();
         let splitk2_ids_arr =
             crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&s2maxv, &s2maxid).unwrap();
         splitk2_ids_arr.eval().unwrap();
         let splitk2_ids: Vec<u32> = splitk2_ids_arr.as_slice::<u32>().to_vec();
         let (s4maxv, s4maxid) =
-            crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
-                &x, &w, &s, 128, 4,
-            )
-            .unwrap();
+            crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(&x, &w, &s, 128, 4)
+                .unwrap();
         let splitk4_ids_arr =
             crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&s4maxv, &s4maxid).unwrap();
         splitk4_ids_arr.eval().unwrap();
         let splitk4_ids: Vec<u32> = splitk4_ids_arr.as_slice::<u32>().to_vec();
-        eprintln!("Q2_M5_HEAD_ARGMAX_TERNARY_SPLITK splitk2={splitk2_ids:?} splitk4={splitk4_ids:?}");
+        eprintln!(
+            "Q2_M5_HEAD_ARGMAX_TERNARY_SPLITK splitk2={splitk2_ids:?} splitk4={splitk4_ids:?}"
+        );
 
         let n_iters = 10;
         let t0 = std::time::Instant::now();
@@ -1347,8 +1336,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         for _ in 0..n_iters {
             let (maxv, maxid) =
-                crate::metal_kernel::bonsai_q2_m5_argmax_candidates(&x, &w, &s, &b, 128)
-                    .unwrap();
+                crate::metal_kernel::bonsai_q2_m5_argmax_candidates(&x, &w, &s, &b, 128).unwrap();
             crate::mlx_exec::eval([&maxv, &maxid].into_iter()).unwrap();
             let values = maxv.as_slice::<f32>();
             let ids = maxid.as_slice::<f32>();
@@ -1375,8 +1363,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         for _ in 0..n_iters {
             let (maxv, maxid) =
-                crate::metal_kernel::bonsai_q2_m5_argmax_candidates(&x, &w, &s, &b, 128)
-                    .unwrap();
+                crate::metal_kernel::bonsai_q2_m5_argmax_candidates(&x, &w, &s, &b, 128).unwrap();
             crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
                 .unwrap()
                 .eval()
@@ -1398,11 +1385,10 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         for _ in 0..n_iters {
-            let (maxv, maxid) =
-                crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
-                    &x, &w, &s, 128, 2,
-                )
-                .unwrap();
+            let (maxv, maxid) = crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
+                &x, &w, &s, 128, 2,
+            )
+            .unwrap();
             crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
                 .unwrap()
                 .eval()
@@ -1412,11 +1398,10 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         for _ in 0..n_iters {
-            let (maxv, maxid) =
-                crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
-                    &x, &w, &s, 128, 4,
-                )
-                .unwrap();
+            let (maxv, maxid) = crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates_splitk(
+                &x, &w, &s, 128, 4,
+            )
+            .unwrap();
             crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid)
                 .unwrap()
                 .eval()
@@ -1466,8 +1451,7 @@ mod tests {
                 .unwrap();
         }
 
-        let logits =
-            mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
+        let logits = mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
         let ref_ids_arr = mlx_rs::argmax_axis!(&logits, -1).unwrap();
         ref_ids_arr.eval().unwrap();
         let ref_ids: Vec<u32> = ref_ids_arr.as_slice::<u32>().to_vec();
@@ -1516,8 +1500,7 @@ mod tests {
         let markov_rank = 256usize;
         let group_size = 32i32;
         let (w, s, b) = make_q4_arrays(out_f, in_f, group_size as usize, 0x6473_706b);
-        let (mw, ms, mb) =
-            make_q4_arrays(out_f, markov_rank, group_size as usize, 0x6d61_726b);
+        let (mw, ms, mb) = make_q4_arrays(out_f, markov_rank, group_size as usize, 0x6d61_726b);
         let x_f32: Vec<f32> = (0..(4 * in_f))
             .map(|i| ((i as u32).wrapping_mul(2654435761) >> 8) as f32 / 16777216.0 - 0.5)
             .collect();
@@ -1532,11 +1515,13 @@ mod tests {
             .unwrap();
 
         for _ in 0..3 {
-            let base =
-                mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
+            let base = mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
             for step in 0..4 {
                 let base_row = base.index(step).reshape(&[1, out_f as i32]).unwrap();
-                let markov_row = markov.index(step).reshape(&[1, markov_rank as i32]).unwrap();
+                let markov_row = markov
+                    .index(step)
+                    .reshape(&[1, markov_rank as i32])
+                    .unwrap();
                 let bias =
                     mlx_rs::ops::quantized_matmul(&markov_row, &mw, &ms, &mb, true, group_size, 4)
                         .unwrap();
@@ -1546,11 +1531,19 @@ mod tests {
                     .unwrap();
 
                 let x_row = x.index(step);
-                let (maxv, maxid) =
-                    crate::metal_kernel::bonsai_q4_m1_plus_q4_m1_argmax_candidates(
-                        &x_row, &w, &s, &b, &markov_row, &mw, &ms, &mb, group_size, group_size,
-                    )
-                    .unwrap();
+                let (maxv, maxid) = crate::metal_kernel::bonsai_q4_m1_plus_q4_m1_argmax_candidates(
+                    &x_row,
+                    &w,
+                    &s,
+                    &b,
+                    &markov_row,
+                    &mw,
+                    &ms,
+                    &mb,
+                    group_size,
+                    group_size,
+                )
+                .unwrap();
                 crate::metal_kernel::bonsai_q4_m1_argmax_reduce_ids(&maxv, &maxid)
                     .unwrap()
                     .eval()
@@ -1578,7 +1571,10 @@ mod tests {
         let mut markov_only_ids = Vec::new();
         for step in 0..4 {
             let base_row = base.index(step).reshape(&[1, out_f as i32]).unwrap();
-            let markov_row = markov.index(step).reshape(&[1, markov_rank as i32]).unwrap();
+            let markov_row = markov
+                .index(step)
+                .reshape(&[1, markov_rank as i32])
+                .unwrap();
             let bias =
                 mlx_rs::ops::quantized_matmul(&markov_row, &mw, &ms, &mb, true, group_size, 4)
                     .unwrap();
@@ -1588,7 +1584,16 @@ mod tests {
 
             let x_row = x.index(step);
             let (maxv, maxid) = crate::metal_kernel::bonsai_q4_m1_plus_q4_m1_argmax_candidates(
-                &x_row, &w, &s, &b, &markov_row, &mw, &ms, &mb, group_size, group_size,
+                &x_row,
+                &w,
+                &s,
+                &b,
+                &markov_row,
+                &mw,
+                &ms,
+                &mb,
+                group_size,
+                group_size,
             )
             .unwrap();
             let fused_id_arr =
@@ -1617,11 +1622,13 @@ mod tests {
         let n_iters = 10;
         let t0 = std::time::Instant::now();
         for _ in 0..n_iters {
-            let base =
-                mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
+            let base = mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
             for step in 0..4 {
                 let base_row = base.index(step).reshape(&[1, out_f as i32]).unwrap();
-                let markov_row = markov.index(step).reshape(&[1, markov_rank as i32]).unwrap();
+                let markov_row = markov
+                    .index(step)
+                    .reshape(&[1, markov_rank as i32])
+                    .unwrap();
                 let bias =
                     mlx_rs::ops::quantized_matmul(&markov_row, &mw, &ms, &mb, true, group_size, 4)
                         .unwrap();
@@ -1637,12 +1644,23 @@ mod tests {
         for _ in 0..n_iters {
             for step in 0..4 {
                 let x_row = x.index(step);
-                let markov_row = markov.index(step).reshape(&[1, markov_rank as i32]).unwrap();
-                let (maxv, maxid) =
-                    crate::metal_kernel::bonsai_q4_m1_plus_q4_m1_argmax_candidates(
-                        &x_row, &w, &s, &b, &markov_row, &mw, &ms, &mb, group_size, group_size,
-                    )
+                let markov_row = markov
+                    .index(step)
+                    .reshape(&[1, markov_rank as i32])
                     .unwrap();
+                let (maxv, maxid) = crate::metal_kernel::bonsai_q4_m1_plus_q4_m1_argmax_candidates(
+                    &x_row,
+                    &w,
+                    &s,
+                    &b,
+                    &markov_row,
+                    &mw,
+                    &ms,
+                    &mb,
+                    group_size,
+                    group_size,
+                )
+                .unwrap();
                 crate::metal_kernel::bonsai_q4_m1_argmax_reduce_ids(&maxv, &maxid)
                     .unwrap()
                     .eval()
@@ -1653,21 +1671,22 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         for _ in 0..n_iters {
-            let base =
-                mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
+            let base = mlx_rs::ops::quantized_matmul(&x, &w, &s, &b, true, group_size, 4).unwrap();
             for step in 0..4 {
                 let base_row = base.index(step).reshape(&[1, out_f as i32]).unwrap();
-                let markov_row = markov.index(step).reshape(&[1, markov_rank as i32]).unwrap();
-                let (maxv, maxid) =
-                    crate::metal_kernel::bonsai_q4_markov_m1_argmax_candidates(
-                        &base_row,
-                        &markov_row,
-                        &mw,
-                        &ms,
-                        &mb,
-                        group_size,
-                    )
+                let markov_row = markov
+                    .index(step)
+                    .reshape(&[1, markov_rank as i32])
                     .unwrap();
+                let (maxv, maxid) = crate::metal_kernel::bonsai_q4_markov_m1_argmax_candidates(
+                    &base_row,
+                    &markov_row,
+                    &mw,
+                    &ms,
+                    &mb,
+                    group_size,
+                )
+                .unwrap();
                 crate::metal_kernel::bonsai_q4_m1_argmax_reduce_ids(&maxv, &maxid)
                     .unwrap()
                     .eval()
