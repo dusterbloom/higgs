@@ -519,6 +519,23 @@ fn continuation_prior_len(prior_tokens: &[u32], full: &[u32]) -> Option<usize> {
     }
 }
 
+fn common_prefix_token_len(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn continuation_reject_reason(prior_tokens: &[u32], full: &[u32]) -> &'static str {
+    if prior_tokens.is_empty() {
+        "empty_retained"
+    } else if prior_tokens.len() >= full.len() {
+        "not_growing"
+    } else {
+        "token_mismatch"
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpeculationRoute {
     DFlash,
@@ -1130,7 +1147,51 @@ struct CacheMetrics {
     pflash_last_total_ms: AtomicU64,
     pflash_last_effective_keep_ratio_ppm: AtomicU64,
     continuations: AtomicU64,
+    session_prompt_traces: AtomicU64,
+    session_prompt_prefix_misses: AtomicU64,
+    session_prompt_boundary_splices: AtomicU64,
+    session_bootstrap_exact: AtomicU64,
+    session_bootstrap_pflash: AtomicU64,
+    session_stateless_prefills: AtomicU64,
+    session_last_prompt_tokens: AtomicU64,
+    session_last_retained_tokens: AtomicU64,
+    session_last_candidate_tokens: AtomicU64,
+    session_last_suffix_tokens: AtomicU64,
+    session_last_common_prefix_tokens: AtomicU64,
+    session_last_divergence_token_plus_one: AtomicU64,
+    session_last_tool_result_messages: AtomicU64,
+    session_last_tool_result_bytes: AtomicU64,
+    session_last_tool_result_largest_bytes: AtomicU64,
     sessions_evicted: AtomicU64,
+}
+
+/// Route-level outcome for a session prompt/cache trace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionPromptTraceOutcome {
+    #[default]
+    Continued,
+    ExactBootstrap,
+    StatelessPflashBootstrap,
+    StatelessPrefill,
+}
+
+/// Content-safe session prompt/cache trace surfaced through [`CacheStats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionPromptTraceMetrics {
+    pub prompt_tokens: usize,
+    pub retained_tokens: usize,
+    pub candidate_tokens: usize,
+    pub suffix_tokens: usize,
+    pub common_prefix_tokens: usize,
+    /// `None` means the retained token list is a strict prefix of the candidate.
+    pub divergence_token: Option<usize>,
+    /// True when the canonical chat render was not an exact token extension,
+    /// but route-level message-boundary splicing rebuilt `retained ++ delta`.
+    pub boundary_splice: bool,
+    pub tool_result_messages: usize,
+    pub tool_result_bytes: usize,
+    pub tool_result_largest_bytes: usize,
+    pub outcome: SessionPromptTraceOutcome,
 }
 
 /// Snapshot of cache effectiveness for the `/metrics` endpoint.
@@ -1176,6 +1237,36 @@ pub struct CacheStats {
     pub pflash_last_effective_keep_ratio_ppm: u64,
     /// Per-session continuations (a retained cache was reused).
     pub continuations: u64,
+    /// Session prompt/cache observations recorded by the route.
+    pub session_prompt_traces: u64,
+    /// Observed retained-token prefix mismatches after route reconciliation.
+    pub session_prompt_prefix_misses: u64,
+    /// Canonical render mismatches repaired by message-boundary splicing.
+    pub session_prompt_boundary_splices: u64,
+    /// Diverged/cold sessions routed through exact retained prefill.
+    pub session_bootstrap_exact: u64,
+    /// Diverged/cold sessions routed through stateless PFlash/cache.
+    pub session_bootstrap_pflash: u64,
+    /// Session requests that skipped retained continuation and used stateless prefill.
+    pub session_stateless_prefills: u64,
+    /// Prompt tokens for the most recent session prompt/cache trace.
+    pub session_last_prompt_tokens: u64,
+    /// Retained tokens for the most recent session prompt/cache trace.
+    pub session_last_retained_tokens: u64,
+    /// Candidate tokens passed to the exact retained-cache guard most recently.
+    pub session_last_candidate_tokens: u64,
+    /// Candidate suffix tokens beyond the retained prefix for the most recent trace.
+    pub session_last_suffix_tokens: u64,
+    /// Common retained/candidate token prefix length for the most recent trace.
+    pub session_last_common_prefix_tokens: u64,
+    /// First divergence token plus one for the most recent trace; 0 means none.
+    pub session_last_divergence_token_plus_one: u64,
+    /// Tool-result messages present in the most recent session request.
+    pub session_last_tool_result_messages: u64,
+    /// Tool-result payload bytes present in the most recent session request.
+    pub session_last_tool_result_bytes: u64,
+    /// Largest single tool-result payload in the most recent session request.
+    pub session_last_tool_result_largest_bytes: u64,
     /// Retained sessions evicted (count cap + idle TTL).
     pub sessions_evicted: u64,
     /// Currently retained per-session caches.
@@ -2697,6 +2788,66 @@ impl SimpleEngine {
                 .pflash_last_effective_keep_ratio_ppm
                 .load(Ordering::Relaxed),
             continuations: self.cache_metrics.continuations.load(Ordering::Relaxed),
+            session_prompt_traces: self
+                .cache_metrics
+                .session_prompt_traces
+                .load(Ordering::Relaxed),
+            session_prompt_prefix_misses: self
+                .cache_metrics
+                .session_prompt_prefix_misses
+                .load(Ordering::Relaxed),
+            session_prompt_boundary_splices: self
+                .cache_metrics
+                .session_prompt_boundary_splices
+                .load(Ordering::Relaxed),
+            session_bootstrap_exact: self
+                .cache_metrics
+                .session_bootstrap_exact
+                .load(Ordering::Relaxed),
+            session_bootstrap_pflash: self
+                .cache_metrics
+                .session_bootstrap_pflash
+                .load(Ordering::Relaxed),
+            session_stateless_prefills: self
+                .cache_metrics
+                .session_stateless_prefills
+                .load(Ordering::Relaxed),
+            session_last_prompt_tokens: self
+                .cache_metrics
+                .session_last_prompt_tokens
+                .load(Ordering::Relaxed),
+            session_last_retained_tokens: self
+                .cache_metrics
+                .session_last_retained_tokens
+                .load(Ordering::Relaxed),
+            session_last_candidate_tokens: self
+                .cache_metrics
+                .session_last_candidate_tokens
+                .load(Ordering::Relaxed),
+            session_last_suffix_tokens: self
+                .cache_metrics
+                .session_last_suffix_tokens
+                .load(Ordering::Relaxed),
+            session_last_common_prefix_tokens: self
+                .cache_metrics
+                .session_last_common_prefix_tokens
+                .load(Ordering::Relaxed),
+            session_last_divergence_token_plus_one: self
+                .cache_metrics
+                .session_last_divergence_token_plus_one
+                .load(Ordering::Relaxed),
+            session_last_tool_result_messages: self
+                .cache_metrics
+                .session_last_tool_result_messages
+                .load(Ordering::Relaxed),
+            session_last_tool_result_bytes: self
+                .cache_metrics
+                .session_last_tool_result_bytes
+                .load(Ordering::Relaxed),
+            session_last_tool_result_largest_bytes: self
+                .cache_metrics
+                .session_last_tool_result_largest_bytes
+                .load(Ordering::Relaxed),
             sessions_evicted: self.cache_metrics.sessions_evicted.load(Ordering::Relaxed),
             retained_sessions,
             retained_paired_sessions: retained_paired.entries,
@@ -2707,6 +2858,86 @@ impl SimpleEngine {
             paired_radix_target_bytes: paired_radix.target_bytes,
             paired_radix_dflash_bytes: paired_radix.dflash_bytes,
         }
+    }
+
+    /// Record route-level prompt/cache reconciliation diagnostics.
+    pub fn record_session_prompt_trace(&self, trace: SessionPromptTraceMetrics) {
+        self.cache_metrics
+            .session_prompt_traces
+            .fetch_add(1, Ordering::Relaxed);
+        if trace.divergence_token.is_some() {
+            self.cache_metrics
+                .session_prompt_prefix_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if trace.boundary_splice {
+            self.cache_metrics
+                .session_prompt_boundary_splices
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        match trace.outcome {
+            SessionPromptTraceOutcome::Continued => {}
+            SessionPromptTraceOutcome::ExactBootstrap => {
+                self.cache_metrics
+                    .session_bootstrap_exact
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SessionPromptTraceOutcome::StatelessPflashBootstrap => {
+                self.cache_metrics
+                    .session_bootstrap_pflash
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SessionPromptTraceOutcome::StatelessPrefill => {
+                self.cache_metrics
+                    .session_stateless_prefills
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        self.cache_metrics.session_last_prompt_tokens.store(
+            u64::try_from(trace.prompt_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.session_last_retained_tokens.store(
+            u64::try_from(trace.retained_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.session_last_candidate_tokens.store(
+            u64::try_from(trace.candidate_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.session_last_suffix_tokens.store(
+            u64::try_from(trace.suffix_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.session_last_common_prefix_tokens.store(
+            u64::try_from(trace.common_prefix_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics
+            .session_last_divergence_token_plus_one
+            .store(
+                trace
+                    .divergence_token
+                    .and_then(|idx| idx.checked_add(1))
+                    .and_then(|idx| u64::try_from(idx).ok())
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+        self.cache_metrics.session_last_tool_result_messages.store(
+            u64::try_from(trace.tool_result_messages).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.session_last_tool_result_bytes.store(
+            u64::try_from(trace.tool_result_bytes).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics
+            .session_last_tool_result_largest_bytes
+            .store(
+                u64::try_from(trace.tool_result_largest_bytes).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
     }
 
     /// Number of stored prefixes in the radix prefix cache. Observability hook
@@ -2793,7 +3024,22 @@ impl SimpleEngine {
     ) -> Option<(RetainedState, usize)> {
         let mut map = lock_or_recover(&self.retained);
         let prior = match map.get(&session_id) {
-            Some(entry) => continuation_prior_len(entry.state.tokens(), full_tokens),
+            Some(entry) => {
+                let retained_tokens = entry.state.tokens();
+                let prior = continuation_prior_len(retained_tokens, full_tokens);
+                if prior.is_none() {
+                    tracing::info!(
+                        session_id,
+                        retained_tokens = retained_tokens.len(),
+                        prompt_tokens = full_tokens.len(),
+                        common_prefix_tokens =
+                            common_prefix_token_len(retained_tokens, full_tokens),
+                        reason = continuation_reject_reason(retained_tokens, full_tokens),
+                        "retained session exact-token guard rejected prompt"
+                    );
+                }
+                prior
+            }
             None => return None,
         };
         if let Some(p) = prior {
@@ -10984,7 +11230,8 @@ mod tests {
         GenerationPromptSuffixes, IncrementalDetok, LivePair, PFlashPlanCache,
         PFlashPlanCacheConfig, PrefillCompressionMode, SessionDsparkDecodeState, SessionGeneration,
         SimpleEngine, SpeculationRoute, Tokenizer, adaptive_draft_depth_for_cap,
-        check_stop_sequences, contains_real_user_query, continuation_prior_len, derive_model_name,
+        check_stop_sequences, common_prefix_token_len, contains_real_user_query,
+        continuation_prior_len, continuation_reject_reason, derive_model_name,
         detect_thinking_support, dflash_accepts_pflash_plan, dflash_canonical_target_is_terminal,
         dflash_new_stop_prefix_len, dflash_resolve_target_then_draft,
         dflash_sparse_taps_available_for_pflash_plan, dflash_tail_draft_cap,
@@ -12056,6 +12303,16 @@ mod tests {
         assert_eq!(continuation_prior_len(&[1, 2, 3], &[7, 8, 9, 10]), None);
         // History edited at the very first token → fallback.
         assert_eq!(continuation_prior_len(&[1, 2, 3], &[9, 2, 3, 4]), None);
+        assert_eq!(common_prefix_token_len(&[1, 2, 3], &[1, 2, 9, 4]), 2);
+        assert_eq!(
+            continuation_reject_reason(&[1, 2, 3], &[1, 2, 9, 4]),
+            "token_mismatch"
+        );
+        assert_eq!(
+            continuation_reject_reason(&[1, 2, 3], &[1, 2, 3]),
+            "not_growing"
+        );
+        assert_eq!(continuation_reject_reason(&[], &[1, 2]), "empty_retained");
         // A genuine prefix is accepted even across a collision — and that is
         // SOUND: a retained cache is always paired with its exact tokens, so
         // reuse is only ever offered when those tokens really do lead the new

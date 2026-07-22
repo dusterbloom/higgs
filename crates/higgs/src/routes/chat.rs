@@ -13,6 +13,7 @@ use axum::{
     },
 };
 use bytes::Bytes;
+use higgs_engine::simple::{SessionPromptTraceMetrics, SessionPromptTraceOutcome};
 use tokio_stream::Stream;
 
 use crate::{
@@ -29,6 +30,8 @@ use crate::{
     },
 };
 use higgs_models::SamplingParams;
+
+const TOOL_RESULT_PROMPT_WARN_BYTES: usize = 16 * 1024;
 
 #[allow(clippy::too_many_lines)]
 pub async fn chat_completions(
@@ -344,6 +347,8 @@ async fn chat_completions_non_streaming(
     );
     let request_id = generate_request_id();
     let has_tools = tools.is_some();
+    let tool_payload = tool_payload_stats(&effective_messages);
+    warn_large_tool_payload(tool_payload);
 
     if let Some(sid) = session_id {
         let max_session_prefill_tokens = engine.session_max_suffix_prefill_tokens();
@@ -361,13 +366,23 @@ async fn chat_completions_non_streaming(
             prompt_tokens.clone()
         };
 
-        match session_prefill_strategy(
+        let strategy = session_prefill_strategy(
             Some(sid),
             retained_tokens.as_deref(),
             &continued_prompt,
             max_session_prefill_tokens,
-        ) {
+        );
+        match strategy {
             SessionPrefillStrategy::Continue { session_id: sid } => {
+                record_session_prompt_trace(
+                    &engine,
+                    sid,
+                    retained_tokens.as_deref(),
+                    &prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::Continued,
+                );
                 let sampling_c = sampling.clone();
                 let engine_c = Arc::clone(&engine);
                 let session_output = tokio::task::spawn_blocking(move || {
@@ -396,11 +411,21 @@ async fn chat_completions_non_streaming(
                 session_id: sid,
                 reason,
             } => {
-                match session_bootstrap_route(
+                let bootstrap_route = session_bootstrap_route(
                     reason,
                     engine.pflash_can_run_stateless_for_prompt(&prompt_tokens),
-                ) {
+                );
+                match bootstrap_route {
                     SessionBootstrapRoute::ExactRetained => {
+                        record_session_prompt_trace(
+                            &engine,
+                            sid,
+                            retained_tokens.as_deref(),
+                            &prompt_tokens,
+                            &continued_prompt,
+                            tool_payload,
+                            SessionPromptTraceOutcome::ExactBootstrap,
+                        );
                         handle_session_exact_bootstrap(sid, reason);
                         let sampling_c = sampling.clone();
                         let engine_c = Arc::clone(&engine);
@@ -427,11 +452,29 @@ async fn chat_completions_non_streaming(
                         ));
                     }
                     SessionBootstrapRoute::StatelessPflash => {
+                        record_session_prompt_trace(
+                            &engine,
+                            sid,
+                            retained_tokens.as_deref(),
+                            &prompt_tokens,
+                            &continued_prompt,
+                            tool_payload,
+                            SessionPromptTraceOutcome::StatelessPflashBootstrap,
+                        );
                         handle_session_stateless_pflash_bootstrap(sid, reason);
                     }
                 }
             }
             SessionPrefillStrategy::Stateless(reason) => {
+                record_session_prompt_trace(
+                    &engine,
+                    sid,
+                    retained_tokens.as_deref(),
+                    &prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::StatelessPrefill,
+                );
                 handle_session_stateless_prefill(sid, reason);
             }
         }
@@ -775,6 +818,139 @@ fn handle_session_stateless_pflash_bootstrap(session_id: u64, reason: SessionBoo
     );
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ToolPayloadStats {
+    messages: usize,
+    bytes: usize,
+    largest_bytes: usize,
+}
+
+fn tool_payload_stats(messages: &[ChatCompletionMessage]) -> ToolPayloadStats {
+    let mut stats = ToolPayloadStats::default();
+    for message in messages {
+        if !message.role.eq_ignore_ascii_case("tool") {
+            continue;
+        }
+        let bytes = message
+            .content
+            .as_ref()
+            .map_or(0, |content| content.text().len());
+        stats.messages += 1;
+        stats.bytes = stats.bytes.saturating_add(bytes);
+        stats.largest_bytes = stats.largest_bytes.max(bytes);
+    }
+    stats
+}
+
+fn warn_large_tool_payload(stats: ToolPayloadStats) {
+    if stats.bytes >= TOOL_RESULT_PROMPT_WARN_BYTES {
+        tracing::warn!(
+            tool_result_messages = stats.messages,
+            tool_result_bytes = stats.bytes,
+            tool_result_largest_bytes = stats.largest_bytes,
+            warn_threshold_bytes = TOOL_RESULT_PROMPT_WARN_BYTES,
+            "large raw tool-result replay present in live prompt; compact to handles and recall exact output on demand"
+        );
+    }
+}
+
+fn record_session_prompt_trace(
+    engine: &Arc<Engine>,
+    session_id: u64,
+    retained_tokens: Option<&[u32]>,
+    prompt_tokens: &[u32],
+    candidate_tokens: &[u32],
+    tool_payload: ToolPayloadStats,
+    outcome: SessionPromptTraceOutcome,
+) {
+    let trace = session_prompt_trace_metrics(
+        retained_tokens,
+        prompt_tokens,
+        candidate_tokens,
+        tool_payload,
+        outcome,
+    );
+    tracing::info!(
+        session_id,
+        prompt_tokens = trace.prompt_tokens,
+        retained_tokens = trace.retained_tokens,
+        candidate_tokens = trace.candidate_tokens,
+        suffix_tokens = trace.suffix_tokens,
+        common_prefix_tokens = trace.common_prefix_tokens,
+        divergence_token = ?trace.divergence_token,
+        boundary_splice = trace.boundary_splice,
+        tool_result_messages = trace.tool_result_messages,
+        tool_result_bytes = trace.tool_result_bytes,
+        tool_result_largest_bytes = trace.tool_result_largest_bytes,
+        ?outcome,
+        "session prompt/cache trace"
+    );
+    engine.record_session_prompt_trace(trace);
+}
+
+fn session_prompt_trace_metrics(
+    retained_tokens: Option<&[u32]>,
+    prompt_tokens: &[u32],
+    candidate_tokens: &[u32],
+    tool_payload: ToolPayloadStats,
+    outcome: SessionPromptTraceOutcome,
+) -> SessionPromptTraceMetrics {
+    let Some(retained) = retained_tokens else {
+        return SessionPromptTraceMetrics {
+            prompt_tokens: prompt_tokens.len(),
+            retained_tokens: 0,
+            candidate_tokens: candidate_tokens.len(),
+            suffix_tokens: candidate_tokens.len(),
+            common_prefix_tokens: 0,
+            divergence_token: None,
+            boundary_splice: false,
+            tool_result_messages: tool_payload.messages,
+            tool_result_bytes: tool_payload.bytes,
+            tool_result_largest_bytes: tool_payload.largest_bytes,
+            outcome,
+        };
+    };
+
+    let common_prefix_tokens = common_prefix_tokens(retained, candidate_tokens);
+    let retained_prefix_of_candidate = !retained.is_empty()
+        && retained.len() < candidate_tokens.len()
+        && common_prefix_tokens == retained.len();
+    let retained_prefix_of_prompt = !retained.is_empty()
+        && retained.len() < prompt_tokens.len()
+        && prompt_tokens.get(..retained.len()) == Some(retained);
+    let divergence_token = if retained_prefix_of_candidate {
+        None
+    } else {
+        Some(common_prefix_tokens)
+    };
+    let suffix_tokens = if retained_prefix_of_candidate {
+        candidate_tokens.len().saturating_sub(retained.len())
+    } else {
+        candidate_tokens.len()
+    };
+
+    SessionPromptTraceMetrics {
+        prompt_tokens: prompt_tokens.len(),
+        retained_tokens: retained.len(),
+        candidate_tokens: candidate_tokens.len(),
+        suffix_tokens,
+        common_prefix_tokens,
+        divergence_token,
+        boundary_splice: !retained_prefix_of_prompt && retained_prefix_of_candidate,
+        tool_result_messages: tool_payload.messages,
+        tool_result_bytes: tool_payload.bytes,
+        tool_result_largest_bytes: tool_payload.largest_bytes,
+        outcome,
+    }
+}
+
+fn common_prefix_tokens(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 fn common_prefix_bytes(left: &str, right: &str) -> usize {
     left.as_bytes()
         .iter()
@@ -835,8 +1011,10 @@ struct RenderedMessageSegment<'a> {
 /// messages' final `<|im_end|>`; when the retained text does end with it, the
 /// delta starts right after instead. Returns `None` (caller falls back to a
 /// full prefill) when the render has fewer messages than the retained text,
-/// any covered message changed, or literal chat-template markers make the text
-/// ambiguous to splice safely.
+/// any covered complete message changed, or literal chat-template markers make
+/// the text ambiguous to splice safely. The final retained message is commonly
+/// the previously generated assistant turn without `<|im_end|>`; for that one,
+/// the retained KV is the source of truth and only the role boundary must match.
 fn message_boundary_delta<'a>(retained_text: &str, full_text: &'a str) -> Option<&'a str> {
     let retained_segments = rendered_message_segments(retained_text)?;
     let full_segments = rendered_message_segments(full_text)?;
@@ -845,11 +1023,15 @@ fn message_boundary_delta<'a>(retained_text: &str, full_text: &'a str) -> Option
         return None;
     }
 
-    for (retained, fresh) in retained_segments
+    for (idx, (retained, fresh)) in retained_segments
         .iter()
         .zip(full_segments.iter())
+        .enumerate()
         .take(covered)
     {
+        if idx + 1 == covered && generated_assistant_boundary(retained, fresh) {
+            continue;
+        }
         if normalized_segment(retained.text_without_end)
             != normalized_segment(fresh.text_without_end)
         {
@@ -918,10 +1100,72 @@ fn rendered_message_segments(text: &str) -> Option<Vec<RenderedMessageSegment<'_
     Some(segments)
 }
 
+fn generated_assistant_boundary(
+    retained: &RenderedMessageSegment<'_>,
+    fresh: &RenderedMessageSegment<'_>,
+) -> bool {
+    retained.end_start.is_none()
+        && fresh.end_start.is_some()
+        && segment_role(retained.text_without_end) == Some("assistant")
+        && segment_role(fresh.text_without_end) == Some("assistant")
+}
+
+fn segment_role(segment: &str) -> Option<&str> {
+    segment
+        .strip_prefix(IM_START)?
+        .split_once('\n')
+        .map(|(role, _)| role)
+}
+
 fn normalized_segment(segment: &str) -> String {
-    strip_think_blocks(segment)
+    let without_think = strip_think_blocks(segment);
+    canonicalize_tool_calls(&without_think)
         .trim_end_matches('\n')
         .to_owned()
+}
+
+fn canonicalize_tool_calls(text: &str) -> String {
+    let parsed = higgs_engine::tool_parser::parse_tool_calls(text, None);
+    if parsed.tool_calls.is_empty() {
+        return text.to_owned();
+    }
+
+    let mut out = parsed.text.trim_end_matches('\n').to_owned();
+    for call in parsed.tool_calls {
+        out.push_str("\n<tool_call:");
+        out.push_str(&call.name);
+        out.push(':');
+        out.push_str(&canonical_json_value(&call.arguments));
+        out.push('>');
+    }
+    out
+}
+
+fn canonical_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(values) => {
+            let body = values
+                .iter()
+                .map(canonical_json_value)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{body}]")
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let body = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let key = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
+                    format!("{key}:{}", canonical_json_value(value))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        }
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
+    }
 }
 
 fn strip_think_blocks(text: &str) -> String {
@@ -1151,6 +1395,8 @@ async fn chat_completions_stream(
     let model = req.model;
     let checkpoint_id = req.checkpoint_id;
     let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(0);
+    let tool_payload = tool_payload_stats(&effective_messages);
+    warn_large_tool_payload(tool_payload);
 
     let start = Instant::now();
     let metrics_id = metrics.as_ref().map(|m| {
@@ -1206,13 +1452,23 @@ async fn chat_completions_stream(
             prompt_tokens.clone()
         };
 
-        match session_prefill_strategy(
+        let strategy = session_prefill_strategy(
             Some(sid),
             retained_tokens.as_deref(),
             &continued_prompt,
             max_session_prefill_tokens,
-        ) {
+        );
+        match strategy {
             SessionPrefillStrategy::Continue { session_id: sid } => {
+                record_session_prompt_trace(
+                    &engine,
+                    sid,
+                    retained_tokens.as_deref(),
+                    &prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::Continued,
+                );
                 tokio::task::spawn_blocking(move || {
                     let result = engine.generate_continued_streaming_with_thinking(
                         sid,
@@ -1231,11 +1487,21 @@ async fn chat_completions_stream(
                 session_id: sid,
                 reason,
             } => {
-                match session_bootstrap_route(
+                let bootstrap_route = session_bootstrap_route(
                     reason,
                     engine.pflash_can_run_stateless_for_prompt(&prompt_tokens),
-                ) {
+                );
+                match bootstrap_route {
                     SessionBootstrapRoute::ExactRetained => {
+                        record_session_prompt_trace(
+                            &engine,
+                            sid,
+                            retained_tokens.as_deref(),
+                            &prompt_tokens,
+                            &continued_prompt,
+                            tool_payload,
+                            SessionPromptTraceOutcome::ExactBootstrap,
+                        );
                         handle_session_exact_bootstrap(sid, reason);
                         tokio::task::spawn_blocking(move || {
                             let result = engine.generate_continued_streaming_with_thinking(
@@ -1252,6 +1518,15 @@ async fn chat_completions_stream(
                         });
                     }
                     SessionBootstrapRoute::StatelessPflash => {
+                        record_session_prompt_trace(
+                            &engine,
+                            sid,
+                            retained_tokens.as_deref(),
+                            &prompt_tokens,
+                            &continued_prompt,
+                            tool_payload,
+                            SessionPromptTraceOutcome::StatelessPflashBootstrap,
+                        );
                         handle_session_stateless_pflash_bootstrap(sid, reason);
                         tokio::task::spawn_blocking(move || {
                             let result = engine.generate_streaming_with_thinking_and_pflash_policy(
@@ -1277,6 +1552,15 @@ async fn chat_completions_stream(
                 }
             }
             SessionPrefillStrategy::Stateless(reason) => {
+                record_session_prompt_trace(
+                    &engine,
+                    sid,
+                    retained_tokens.as_deref(),
+                    &prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::StatelessPrefill,
+                );
                 handle_session_stateless_prefill(sid, reason);
                 tokio::task::spawn_blocking(move || {
                     let result = engine.generate_streaming_with_thinking_and_pflash_policy(
@@ -2119,6 +2403,27 @@ mod tests {
     }
 
     #[test]
+    fn boundary_delta_treats_generated_assistant_as_retained_source_of_truth() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nI'm **NanoBot** - compact and direct.";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nI'm **NanoBot** (surname: Bonsai) - compact, direct, and local.<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+        let delta = message_boundary_delta(retained, full).unwrap();
+
+        assert_eq!(
+            delta,
+            "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn boundary_delta_rejects_partial_non_assistant_boundary() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\npartial";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\npartial edited<|im_end|>\n<|im_start|>assistant\n";
+
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
     fn boundary_delta_rejects_mutated_first_message() {
         // Client rewrote the system prompt between turns: no splice.
         let retained = "<|im_start|>system\noriginal<|im_end|>\n<|im_start|>user\nq<|im_end|>";
@@ -2158,6 +2463,65 @@ mod tests {
         let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans";
         let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>";
         assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_accepts_equivalent_tool_call_replay() {
+        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nread it<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=read_file>\n<parameter=path>\nCargo.toml\n</parameter>\n</function>\n</tool_call>";
+        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nread it<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"arguments\":{\"path\":\"Cargo.toml\"},\"name\":\"read_file\"}\n</tool_call><|im_end|>\n<|im_start|>tool\n[workspace]\n<|im_end|>\n<|im_start|>assistant\n<think>";
+
+        let delta = message_boundary_delta(retained, full).unwrap();
+
+        assert_eq!(
+            delta,
+            "<|im_end|>\n<|im_start|>tool\n[workspace]\n<|im_end|>\n<|im_start|>assistant\n<think>"
+        );
+    }
+
+    #[test]
+    fn session_prompt_trace_reports_boundary_splice_and_tool_payload() {
+        let retained = [1, 2, 3];
+        let canonical = [9, 9, 9, 4, 5, 6];
+        let candidate = [1, 2, 3, 4, 5, 6];
+        let tool_payload = ToolPayloadStats {
+            messages: 2,
+            bytes: 100,
+            largest_bytes: 80,
+        };
+
+        let trace = session_prompt_trace_metrics(
+            Some(&retained),
+            &canonical,
+            &candidate,
+            tool_payload,
+            SessionPromptTraceOutcome::Continued,
+        );
+
+        assert_eq!(trace.common_prefix_tokens, retained.len());
+        assert_eq!(trace.divergence_token, None);
+        assert_eq!(trace.suffix_tokens, 3);
+        assert!(trace.boundary_splice);
+        assert_eq!(trace.tool_result_messages, 2);
+        assert_eq!(trace.tool_result_bytes, 100);
+        assert_eq!(trace.tool_result_largest_bytes, 80);
+    }
+
+    #[test]
+    fn session_prompt_trace_reports_prefix_mismatch() {
+        let retained = [1, 2, 3];
+        let candidate = [1, 2, 4, 5];
+        let trace = session_prompt_trace_metrics(
+            Some(&retained),
+            &candidate,
+            &candidate,
+            ToolPayloadStats::default(),
+            SessionPromptTraceOutcome::StatelessPflashBootstrap,
+        );
+
+        assert_eq!(trace.common_prefix_tokens, 2);
+        assert_eq!(trace.divergence_token, Some(2));
+        assert_eq!(trace.suffix_tokens, candidate.len());
+        assert!(!trace.boundary_splice);
     }
 
     fn simple_message(role: &str, content: Option<&str>) -> ChatCompletionMessage {

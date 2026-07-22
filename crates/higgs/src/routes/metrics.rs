@@ -61,6 +61,36 @@ pub struct CacheMetricsView {
     pub pflash_last_effective_keep_ratio_ppm: u64,
     /// Per-session continuations (best-effort retained-cache reuse).
     pub continuations: u64,
+    /// Session prompt/cache observations recorded by the route.
+    pub session_prompt_traces: u64,
+    /// Observed retained-token prefix mismatches after route reconciliation.
+    pub session_prompt_prefix_misses: u64,
+    /// Canonical render mismatches repaired by message-boundary splicing.
+    pub session_prompt_boundary_splices: u64,
+    /// Diverged/cold sessions routed through exact retained prefill.
+    pub session_bootstrap_exact: u64,
+    /// Diverged/cold sessions routed through stateless PFlash/cache.
+    pub session_bootstrap_pflash: u64,
+    /// Session requests that skipped retained continuation and used stateless prefill.
+    pub session_stateless_prefills: u64,
+    /// Prompt tokens for the most recent session prompt/cache trace.
+    pub session_last_prompt_tokens: u64,
+    /// Retained tokens for the most recent session prompt/cache trace.
+    pub session_last_retained_tokens: u64,
+    /// Candidate tokens passed to the exact retained-cache guard most recently.
+    pub session_last_candidate_tokens: u64,
+    /// Candidate suffix tokens beyond the retained prefix for the most recent trace.
+    pub session_last_suffix_tokens: u64,
+    /// Common retained/candidate token prefix length for the most recent trace.
+    pub session_last_common_prefix_tokens: u64,
+    /// First divergence token plus one for the most recent trace; 0 means none.
+    pub session_last_divergence_token_plus_one: u64,
+    /// Tool-result messages present in the most recent session request.
+    pub session_last_tool_result_messages: u64,
+    /// Tool-result payload bytes present in the most recent session request.
+    pub session_last_tool_result_bytes: u64,
+    /// Largest single tool-result payload in the most recent session request.
+    pub session_last_tool_result_largest_bytes: u64,
     /// Retained sessions evicted (count cap + idle TTL).
     pub sessions_evicted: u64,
     /// Currently retained per-session caches.
@@ -125,6 +155,51 @@ impl CacheMetricsView {
             .pflash_last_effective_keep_ratio_ppm
             .max(stats.pflash_last_effective_keep_ratio_ppm);
         self.continuations = self.continuations.saturating_add(stats.continuations);
+        self.session_prompt_traces = self
+            .session_prompt_traces
+            .saturating_add(stats.session_prompt_traces);
+        self.session_prompt_prefix_misses = self
+            .session_prompt_prefix_misses
+            .saturating_add(stats.session_prompt_prefix_misses);
+        self.session_prompt_boundary_splices = self
+            .session_prompt_boundary_splices
+            .saturating_add(stats.session_prompt_boundary_splices);
+        self.session_bootstrap_exact = self
+            .session_bootstrap_exact
+            .saturating_add(stats.session_bootstrap_exact);
+        self.session_bootstrap_pflash = self
+            .session_bootstrap_pflash
+            .saturating_add(stats.session_bootstrap_pflash);
+        self.session_stateless_prefills = self
+            .session_stateless_prefills
+            .saturating_add(stats.session_stateless_prefills);
+        self.session_last_prompt_tokens = self
+            .session_last_prompt_tokens
+            .max(stats.session_last_prompt_tokens);
+        self.session_last_retained_tokens = self
+            .session_last_retained_tokens
+            .max(stats.session_last_retained_tokens);
+        self.session_last_candidate_tokens = self
+            .session_last_candidate_tokens
+            .max(stats.session_last_candidate_tokens);
+        self.session_last_suffix_tokens = self
+            .session_last_suffix_tokens
+            .max(stats.session_last_suffix_tokens);
+        self.session_last_common_prefix_tokens = self
+            .session_last_common_prefix_tokens
+            .max(stats.session_last_common_prefix_tokens);
+        self.session_last_divergence_token_plus_one = self
+            .session_last_divergence_token_plus_one
+            .max(stats.session_last_divergence_token_plus_one);
+        self.session_last_tool_result_messages = self
+            .session_last_tool_result_messages
+            .max(stats.session_last_tool_result_messages);
+        self.session_last_tool_result_bytes = self
+            .session_last_tool_result_bytes
+            .max(stats.session_last_tool_result_bytes);
+        self.session_last_tool_result_largest_bytes = self
+            .session_last_tool_result_largest_bytes
+            .max(stats.session_last_tool_result_largest_bytes);
         self.sessions_evicted = self.sessions_evicted.saturating_add(stats.sessions_evicted);
         self.retained_sessions = self
             .retained_sessions
@@ -282,15 +357,30 @@ mod tests {
             pflash_last_total_ms: 18,
             pflash_last_effective_keep_ratio_ppm: 180_000,
             continuations: 20,
-            sessions_evicted: 21,
-            retained_sessions: 22,
-            retained_paired_sessions: 23,
-            retained_paired_target_bytes: 24,
-            retained_paired_dflash_bytes: 25,
-            radix_entries: 26,
-            paired_radix_entries: 27,
-            paired_radix_target_bytes: 28,
-            paired_radix_dflash_bytes: 29,
+            session_prompt_traces: 21,
+            session_prompt_prefix_misses: 22,
+            session_prompt_boundary_splices: 23,
+            session_bootstrap_exact: 24,
+            session_bootstrap_pflash: 25,
+            session_stateless_prefills: 26,
+            session_last_prompt_tokens: 27,
+            session_last_retained_tokens: 28,
+            session_last_candidate_tokens: 29,
+            session_last_suffix_tokens: 30,
+            session_last_common_prefix_tokens: 31,
+            session_last_divergence_token_plus_one: 32,
+            session_last_tool_result_messages: 33,
+            session_last_tool_result_bytes: 34,
+            session_last_tool_result_largest_bytes: 35,
+            sessions_evicted: 36,
+            retained_sessions: 37,
+            retained_paired_sessions: 38,
+            retained_paired_target_bytes: 39,
+            retained_paired_dflash_bytes: 40,
+            radix_entries: 41,
+            paired_radix_entries: 42,
+            paired_radix_target_bytes: 43,
+            paired_radix_dflash_bytes: 44,
         }
     }
 
@@ -342,12 +432,18 @@ mod tests {
         assert_eq!(view.pflash_fallbacks, 16);
         assert_eq!(view.pflash_skipped_unprofitable, 18);
         assert_eq!(view.pflash_plan_cache_hits, 20);
-        assert_eq!(view.retained_paired_sessions, 46);
-        assert_eq!(view.retained_paired_target_bytes, 48);
-        assert_eq!(view.retained_paired_dflash_bytes, 50);
-        assert_eq!(view.paired_radix_entries, 54);
-        assert_eq!(view.paired_radix_target_bytes, 56);
-        assert_eq!(view.paired_radix_dflash_bytes, 58);
+        assert_eq!(view.session_prompt_traces, 42);
+        assert_eq!(view.session_prompt_prefix_misses, 44);
+        assert_eq!(view.session_prompt_boundary_splices, 46);
+        assert_eq!(view.session_bootstrap_exact, 48);
+        assert_eq!(view.session_bootstrap_pflash, 50);
+        assert_eq!(view.session_stateless_prefills, 52);
+        assert_eq!(view.retained_paired_sessions, 76);
+        assert_eq!(view.retained_paired_target_bytes, 78);
+        assert_eq!(view.retained_paired_dflash_bytes, 80);
+        assert_eq!(view.paired_radix_entries, 84);
+        assert_eq!(view.paired_radix_target_bytes, 86);
+        assert_eq!(view.paired_radix_dflash_bytes, 88);
     }
 
     #[test]
@@ -373,12 +469,27 @@ mod tests {
             ("pflash_last_select_ms", 17),
             ("pflash_last_total_ms", 18),
             ("pflash_last_effective_keep_ratio_ppm", 180_000),
-            ("retained_paired_sessions", 23),
-            ("retained_paired_target_bytes", 24),
-            ("retained_paired_dflash_bytes", 25),
-            ("paired_radix_entries", 27),
-            ("paired_radix_target_bytes", 28),
-            ("paired_radix_dflash_bytes", 29),
+            ("session_prompt_traces", 21),
+            ("session_prompt_prefix_misses", 22),
+            ("session_prompt_boundary_splices", 23),
+            ("session_bootstrap_exact", 24),
+            ("session_bootstrap_pflash", 25),
+            ("session_stateless_prefills", 26),
+            ("session_last_prompt_tokens", 27),
+            ("session_last_retained_tokens", 28),
+            ("session_last_candidate_tokens", 29),
+            ("session_last_suffix_tokens", 30),
+            ("session_last_common_prefix_tokens", 31),
+            ("session_last_divergence_token_plus_one", 32),
+            ("session_last_tool_result_messages", 33),
+            ("session_last_tool_result_bytes", 34),
+            ("session_last_tool_result_largest_bytes", 35),
+            ("retained_paired_sessions", 38),
+            ("retained_paired_target_bytes", 39),
+            ("retained_paired_dflash_bytes", 40),
+            ("paired_radix_entries", 42),
+            ("paired_radix_target_bytes", 43),
+            ("paired_radix_dflash_bytes", 44),
         ] {
             assert_eq!(
                 rendered.get(name).and_then(serde_json::Value::as_u64),

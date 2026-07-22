@@ -10,6 +10,24 @@ pub mod gemma4;
 pub mod llava_qwen2;
 /// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
 mod metal_kernel;
+#[doc(hidden)]
+pub mod q2_row2_bench {
+    use mlx_rs::{Array, error::Exception};
+
+    /// Opaque handle for release-build microbenchmarks that need the internal
+    /// Bonsai Q2 row2 layout without exposing `metal_kernel` as public API.
+    pub struct BonsaiQ2Row2Bench(crate::metal_kernel::BonsaiQ2Row2);
+
+    impl BonsaiQ2Row2Bench {
+        pub fn from_row_major(weight: &Array, scales: &Array) -> Result<Self, Exception> {
+            crate::metal_kernel::BonsaiQ2Row2::from_row_major(weight, scales).map(Self)
+        }
+
+        pub fn m5_contract(&self, x: &Array, bias: &Array) -> Result<Array, Exception> {
+            crate::metal_kernel::bonsai_q2_row2_m5_contract(x, self.0.as_ref(), bias)
+        }
+    }
+}
 pub mod mlx_exec;
 pub mod phi3;
 pub mod progress;

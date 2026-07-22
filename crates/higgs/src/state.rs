@@ -9,7 +9,7 @@ use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::{MlxRuntimeTuning, resolve_runtime_tuning};
 use higgs_engine::simple::{
     CacheStats, PFlashPromptPolicy, PrefillCompressionMode as EnginePrefillCompressionMode,
-    SessionGeneration, SimpleEngine,
+    SessionGeneration, SessionPromptTraceMetrics, SimpleEngine,
 };
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
@@ -319,6 +319,15 @@ impl Engine {
             Self::Batch(_) => None,
             #[cfg(test)]
             Self::Stub(_) => None,
+        }
+    }
+
+    pub fn record_session_prompt_trace(&self, trace: SessionPromptTraceMetrics) {
+        match self {
+            Self::Simple(e) => e.record_session_prompt_trace(trace),
+            Self::Batch(_) => {}
+            #[cfg(test)]
+            Self::Stub(_) => {}
         }
     }
 
