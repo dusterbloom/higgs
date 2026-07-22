@@ -74,9 +74,11 @@ impl Engine {
         prefill_score_mode: higgs_models::spec_prefill::PrefillScoreMode,
         prefill_exit_layer: usize,
         prefill_keep_ratio_max: f32,
+        prefill_max_auto_prefill_ratio: f32,
         prefill_plan_cache: bool,
         prefill_plan_cache_entries: usize,
         prefill_suffix_identity_threshold: usize,
+        session_max_suffix_prefill_tokens: usize,
         disk_cache_config: Option<DiskPrefixCacheConfig>,
     ) -> Result<Self, EngineError> {
         let prefill_compression = match prefill_compression {
@@ -101,9 +103,11 @@ impl Engine {
             prefill_score_mode,
             prefill_exit_layer,
             prefill_keep_ratio_max,
+            prefill_max_auto_prefill_ratio,
             prefill_plan_cache,
             prefill_plan_cache_entries,
             prefill_suffix_identity_threshold,
+            session_max_suffix_prefill_tokens,
         )
         .map(|e| Self::Simple(Box::new(e)))
     }
@@ -272,6 +276,38 @@ impl Engine {
             Self::Batch(_) => None,
             #[cfg(test)]
             Self::Stub(_) => None,
+        }
+    }
+
+    pub fn session_max_suffix_prefill_tokens(&self) -> usize {
+        match self {
+            Self::Simple(e) => e.session_max_suffix_prefill_tokens(),
+            Self::Batch(_) => usize::MAX,
+            #[cfg(test)]
+            Self::Stub(_) => 8192,
+        }
+    }
+
+    /// Whether this prompt can use the stateless PFlash path. Route handlers
+    /// use this only to choose a fallback path; the Simple engine still decides
+    /// whether compression is actually safe and worthwhile.
+    pub fn pflash_can_run_stateless_for_prompt(&self, prompt_tokens: &[u32]) -> bool {
+        match self {
+            Self::Simple(e) => e.pflash_can_run_stateless_for_prompt(prompt_tokens),
+            Self::Batch(_) => false,
+            #[cfg(test)]
+            Self::Stub(_) => false,
+        }
+    }
+
+    /// Drop a retained per-session KV cache. Exact radix/disk prefix caches are
+    /// independent and are intentionally left intact.
+    pub fn drop_retained_session(&self, session_id: u64) -> bool {
+        match self {
+            Self::Simple(e) => e.drop_retained_session(session_id),
+            Self::Batch(_) => false,
+            #[cfg(test)]
+            Self::Stub(_) => false,
         }
     }
 
@@ -631,9 +667,11 @@ pub fn build_engine(
             model_cfg.prefill_score_mode,
             model_cfg.prefill_exit_layer,
             model_cfg.prefill_keep_ratio_max,
+            model_cfg.prefill_max_auto_prefill_ratio,
             model_cfg.prefill_plan_cache,
             model_cfg.prefill_plan_cache_entries,
             model_cfg.prefill_suffix_identity_threshold,
+            model_cfg.kv_max_suffix_prefill_tokens,
             model_cfg.disk_prefix_cache_config(resolved),
         )
         .map_err(|e| e.to_string())?

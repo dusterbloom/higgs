@@ -175,6 +175,7 @@ port = 8000
 # # prefill_threshold   = 4096                        # auto: enable above this many prompt tokens
 # # prefill_keep_ratio  = 0.10                        # adaptive floor
 # # prefill_keep_ratio_max = 0.75                     # adaptive ceiling
+# # prefill_max_auto_prefill_ratio = 0.60             # auto skip ceiling for high-retention plans
 # # prefill_plan_cache = true                         # reuse frozen plans across turns
 # # prefill_plan_cache_entries = 64                   # branch/frontier cap
 # # prefill_suffix_identity_threshold = 128           # small suffixes stay exact

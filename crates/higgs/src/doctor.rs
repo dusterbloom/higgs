@@ -389,9 +389,13 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             warn(
                 &format!(
                     "model {label} enables PFlash (mode={:?}, keep_ratio={}, threshold={}): \
+                     max_auto_prefill_ratio={}; \
                      compressed output is NOT byte-identical to uncompressed. \
                      Validate on your workload before relying on it.",
-                    model.prefill_compression, model.prefill_keep_ratio, model.prefill_threshold
+                    model.prefill_compression,
+                    model.prefill_keep_ratio,
+                    model.prefill_threshold,
+                    model.prefill_max_auto_prefill_ratio
                 ),
                 result,
             );
@@ -411,6 +415,16 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 &format!(
                     "model {label} prefill_keep_ratio_max={} must be in [{}, 0.95]",
                     model.prefill_keep_ratio_max, model.prefill_keep_ratio
+                ),
+                result,
+            );
+            continue;
+        }
+        if !(0.0..=1.0).contains(&model.prefill_max_auto_prefill_ratio) {
+            fail(
+                &format!(
+                    "model {label} prefill_max_auto_prefill_ratio={} out of range [0.0, 1.0]",
+                    model.prefill_max_auto_prefill_ratio
                 ),
                 result,
             );

@@ -28,9 +28,9 @@ use higgs_engine::{
     mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile},
     paged_prefix_cache::MAX_PAIRED_RADIX_ENTRIES,
     simple::{
-        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_PLAN_CACHE,
-        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
-        PrefillCompressionMode, SimpleEngine,
+        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+        DEFAULT_PFLASH_PLAN_CACHE, DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+        DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD, PrefillCompressionMode, SimpleEngine,
     },
 };
 use higgs_models::{
@@ -132,9 +132,11 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_impl(
         PrefillScoreMode::Full,
         7,
         DEFAULT_PFLASH_KEEP_RATIO_MAX,
+        DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
         DEFAULT_PFLASH_PLAN_CACHE,
         DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
         DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+        8192,
     )
     .expect("load paired dSpark engine");
     let params = greedy_dflash();

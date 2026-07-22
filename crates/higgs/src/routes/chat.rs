@@ -74,7 +74,8 @@ pub async fn chat_completions(
                     generation_defaults,
                     state.metrics.clone(),
                     routing_method,
-                )?;
+                )
+                .await?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
                 Ok(sse.into_response())
             } else {
@@ -262,6 +263,13 @@ async fn chat_completions_non_streaming(
     engine: Arc<Engine>,
     generation_defaults: GenerationDefaults,
 ) -> Result<ChatCompletionResponse, ServerError> {
+    drop_requested_retained_sessions(
+        Arc::clone(&engine),
+        req.drop_session_id,
+        req.drop_session_ids.as_deref(),
+    )
+    .await?;
+
     let max_tokens =
         resolved_max_tokens(&req, &generation_defaults, state.config.server.max_tokens);
     let sampling = build_sampling_params(&req, &generation_defaults)?;
@@ -315,11 +323,9 @@ async fn chat_completions_non_streaming(
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
-    // Opt-in multi-turn KV-cache reuse. Only honored on the non-streaming path
-    // for the Simple engine; `generate_continued` errors for other variants and
-    // we never reach this branch for them because `retained`/`generate_continued`
-    // degrade cleanly. Images and constrained decoding are not supported by the
-    // continued path, so fall back to the normal generation when present.
+    // Opt-in multi-turn KV-cache reuse. Only honored for request shapes the
+    // continued path can preserve; unsupported features fall back to normal
+    // generation, where radix/PFlash stay available.
     //
     // BEST-EFFORT, not exact replay: the retained KV is TurboQuant-compressed
     // (lossy) and the prompt is reconciled in text space below, so a continued
@@ -333,43 +339,102 @@ async fn chat_completions_non_streaming(
         pixel_values.is_some(),
         constraint.is_some(),
         checkpoint_id.as_deref(),
+        want_logprobs,
+        !stop_sequences.is_empty(),
     );
     let request_id = generate_request_id();
     let has_tools = tools.is_some();
 
     if let Some(sid) = session_id {
-        let continued_prompt = continued_prompt_tokens(
-            &engine,
-            sid,
-            &prompt_tokens,
-            &messages,
-            tools,
-            thinking_enabled,
-        );
-
-        let sampling_c = sampling.clone();
-        let engine_c = Arc::clone(&engine);
-        let session_output = tokio::task::spawn_blocking(move || {
-            engine_c.generate_continued_with_thinking(
+        let max_session_prefill_tokens = engine.session_max_suffix_prefill_tokens();
+        let retained_tokens = engine.retained_session_tokens(sid);
+        let continued_prompt = if retained_tokens.is_some() {
+            continued_prompt_tokens(
+                &engine,
                 sid,
-                &continued_prompt,
-                max_tokens,
-                &sampling_c,
+                &prompt_tokens,
+                &messages,
+                tools,
                 thinking_enabled,
             )
-        })
-        .await
-        .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-        .map_err(ServerError::Engine)?;
+        } else {
+            prompt_tokens.clone()
+        };
 
-        return Ok(build_session_response(
-            &req.model,
-            &request_id,
-            session_output,
-            tools,
-            has_tools,
-            thinking_enabled,
-        ));
+        match session_prefill_strategy(
+            Some(sid),
+            retained_tokens.as_deref(),
+            &continued_prompt,
+            max_session_prefill_tokens,
+        ) {
+            SessionPrefillStrategy::Continue { session_id: sid } => {
+                let sampling_c = sampling.clone();
+                let engine_c = Arc::clone(&engine);
+                let session_output = tokio::task::spawn_blocking(move || {
+                    engine_c.generate_continued_with_thinking(
+                        sid,
+                        &continued_prompt,
+                        max_tokens,
+                        &sampling_c,
+                        thinking_enabled,
+                    )
+                })
+                .await
+                .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
+                .map_err(ServerError::Engine)?;
+
+                return Ok(build_session_response(
+                    &req.model,
+                    &request_id,
+                    session_output,
+                    tools,
+                    has_tools,
+                    thinking_enabled,
+                ));
+            }
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: sid,
+                reason,
+            } => {
+                match session_bootstrap_route(
+                    reason,
+                    engine.pflash_can_run_stateless_for_prompt(&prompt_tokens),
+                ) {
+                    SessionBootstrapRoute::ExactRetained => {
+                        handle_session_exact_bootstrap(sid, reason);
+                        let sampling_c = sampling.clone();
+                        let engine_c = Arc::clone(&engine);
+                        let session_output = tokio::task::spawn_blocking(move || {
+                            engine_c.generate_continued_with_thinking(
+                                sid,
+                                &continued_prompt,
+                                max_tokens,
+                                &sampling_c,
+                                thinking_enabled,
+                            )
+                        })
+                        .await
+                        .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
+                        .map_err(ServerError::Engine)?;
+
+                        return Ok(build_session_response(
+                            &req.model,
+                            &request_id,
+                            session_output,
+                            tools,
+                            has_tools,
+                            thinking_enabled,
+                        ));
+                    }
+                    SessionBootstrapRoute::StatelessPflash => {
+                        handle_session_stateless_pflash_bootstrap(sid, reason);
+                    }
+                }
+            }
+            SessionPrefillStrategy::Stateless(reason) => {
+                handle_session_stateless_prefill(sid, reason);
+            }
+        }
     }
 
     let output = tokio::task::spawn_blocking(move || {
@@ -594,6 +659,122 @@ fn continued_prompt_tokens(
     combined
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPrefillStrategy {
+    Continue {
+        session_id: u64,
+    },
+    BootstrapExact {
+        session_id: u64,
+        reason: SessionBootstrapReason,
+    },
+    Stateless(SessionPrefillFallback),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBootstrapReason {
+    ColdPromptTooLarge {
+        prompt_tokens: usize,
+        max_prefill_tokens: usize,
+    },
+    DivergedOrNotGrowing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBootstrapRoute {
+    ExactRetained,
+    StatelessPflash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPrefillFallback {
+    NoSessionId,
+    LargeSuffix {
+        suffix_tokens: usize,
+        max_prefill_tokens: usize,
+    },
+}
+
+fn session_prefill_strategy(
+    session_id: Option<u64>,
+    retained_tokens: Option<&[u32]>,
+    continuation_candidate: &[u32],
+    max_prefill_tokens: usize,
+) -> SessionPrefillStrategy {
+    let Some(session_id) = session_id else {
+        return SessionPrefillStrategy::Stateless(SessionPrefillFallback::NoSessionId);
+    };
+
+    let Some(retained_tokens) = retained_tokens else {
+        if continuation_candidate.len() <= max_prefill_tokens {
+            return SessionPrefillStrategy::Continue { session_id };
+        }
+        return SessionPrefillStrategy::BootstrapExact {
+            session_id,
+            reason: SessionBootstrapReason::ColdPromptTooLarge {
+                prompt_tokens: continuation_candidate.len(),
+                max_prefill_tokens,
+            },
+        };
+    };
+
+    let prior = retained_tokens.len();
+    if prior == 0
+        || prior >= continuation_candidate.len()
+        || continuation_candidate.get(..prior) != Some(retained_tokens)
+    {
+        return SessionPrefillStrategy::BootstrapExact {
+            session_id,
+            reason: SessionBootstrapReason::DivergedOrNotGrowing,
+        };
+    }
+
+    let suffix_tokens = continuation_candidate.len() - prior;
+    if suffix_tokens <= max_prefill_tokens {
+        SessionPrefillStrategy::Continue { session_id }
+    } else {
+        SessionPrefillStrategy::Stateless(SessionPrefillFallback::LargeSuffix {
+            suffix_tokens,
+            max_prefill_tokens,
+        })
+    }
+}
+
+fn session_bootstrap_route(
+    _reason: SessionBootstrapReason,
+    pflash_can_run_stateless: bool,
+) -> SessionBootstrapRoute {
+    if pflash_can_run_stateless {
+        SessionBootstrapRoute::StatelessPflash
+    } else {
+        SessionBootstrapRoute::ExactRetained
+    }
+}
+
+fn handle_session_stateless_prefill(session_id: u64, reason: SessionPrefillFallback) {
+    tracing::info!(
+        session_id,
+        ?reason,
+        "session continuation skipped; using stateless prefill path"
+    );
+}
+
+fn handle_session_exact_bootstrap(session_id: u64, reason: SessionBootstrapReason) {
+    tracing::info!(
+        session_id,
+        ?reason,
+        "session continuation bootstrapping exact retained prefill path"
+    );
+}
+
+fn handle_session_stateless_pflash_bootstrap(session_id: u64, reason: SessionBootstrapReason) {
+    tracing::info!(
+        session_id,
+        ?reason,
+        "session continuation cannot reuse retained KV; using stateless PFlash/cache path"
+    );
+}
+
 fn common_prefix_bytes(left: &str, right: &str) -> usize {
     left.as_bytes()
         .iter()
@@ -623,13 +804,17 @@ fn char_boundary_at_or_after(text: &str, byte_pos: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-/// Remove `<think>...</think>` blocks — and the single `\n\n` the chat template
-/// emits after each — from a rendered prompt string. Used by the cache-resident
-/// continuation path to reconcile a retained KV's detokenization (which carries
-/// the per-turn think injection) with the canonical multi-turn render (which
-/// strips think from historical turns), so the retained prefix can be matched.
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
+const THINK_START: &str = "<think>";
+const THINK_END: &str = "</think>";
+
+#[derive(Debug)]
+struct RenderedMessageSegment<'a> {
+    text_without_end: &'a str,
+    end_start: Option<usize>,
+    end_after: Option<usize>,
+}
 
 /// Splice point for a continued turn: the suffix of the canonical render that
 /// covers the messages the retained KV does NOT yet cover.
@@ -649,37 +834,115 @@ const IM_END: &str = "<|im_end|>";
 /// pops the EOS token before stashing), so the delta starts AT the covered
 /// messages' final `<|im_end|>`; when the retained text does end with it, the
 /// delta starts right after instead. Returns `None` (caller falls back to a
-/// full prefill) when the render has fewer messages than the retained text or
-/// the shared first message diverges (client mutated history).
+/// full prefill) when the render has fewer messages than the retained text,
+/// any covered message changed, or literal chat-template markers make the text
+/// ambiguous to splice safely.
 fn message_boundary_delta<'a>(retained_text: &str, full_text: &'a str) -> Option<&'a str> {
-    let covered = retained_text.matches(IM_START).count();
-    if covered == 0 {
+    let retained_segments = rendered_message_segments(retained_text)?;
+    let full_segments = rendered_message_segments(full_text)?;
+    let covered = retained_segments.len();
+    if covered == 0 || full_segments.len() < covered {
         return None;
     }
-    // Mutation guard: the first message (system/user opener) must agree
-    // byte-for-byte between the retained text and the fresh render.
-    let first_end = retained_text
-        .find(IM_END)
-        .map_or_else(|| retained_text.len().min(256), |p| p.min(256));
-    if full_text.get(..first_end) != retained_text.get(..first_end) {
-        return None;
+
+    for (retained, fresh) in retained_segments
+        .iter()
+        .zip(full_segments.iter())
+        .take(covered)
+    {
+        if normalized_segment(retained.text_without_end)
+            != normalized_segment(fresh.text_without_end)
+        {
+            return None;
+        }
     }
-    // Offset of the `covered`-th message's closing <|im_end|> in the render:
-    // each covered message renders exactly one.
-    let mut pos = 0usize;
-    for _ in 0..covered {
-        let found = full_text.get(pos..)?.find(IM_END)?;
-        pos = pos + found + IM_END.len();
-    }
-    // pos is just past the covered messages' final <|im_end|>. The retained
-    // text usually lacks that closer (EOS popped at stash time) — include it
-    // in the delta; skip it when the retained text already ends with it.
+
+    let covered_segment = &full_segments[covered - 1];
+    let end_start = covered_segment.end_start?;
+    let end_after = covered_segment.end_after?;
+
+    // `end_after` is just past the covered messages' final <|im_end|>. The
+    // retained text usually lacks that closer (EOS popped at stash time), so
+    // include it in the delta; skip it when the retained text already ends with
+    // it.
     let trimmed = retained_text.trim_end_matches('\n');
     if trimmed.ends_with(IM_END) {
-        full_text.get(pos..)
+        full_text.get(end_after..)
     } else {
-        full_text.get(pos - IM_END.len()..)
+        full_text.get(end_start..)
     }
+}
+
+fn rendered_message_segments(text: &str) -> Option<Vec<RenderedMessageSegment<'_>>> {
+    let mut segments = Vec::new();
+    let mut pos = 0usize;
+
+    while let Some(relative_start) = text.get(pos..)?.find(IM_START) {
+        let start = pos + relative_start;
+        if !text.get(pos..start)?.trim().is_empty() {
+            return None;
+        }
+
+        let body_start = start + IM_START.len();
+        let Some(relative_end) = text.get(body_start..)?.find(IM_END) else {
+            let partial = text.get(start..)?;
+            if partial.get(IM_START.len()..)?.contains(IM_START) {
+                return None;
+            }
+            segments.push(RenderedMessageSegment {
+                text_without_end: partial,
+                end_start: None,
+                end_after: None,
+            });
+            return Some(segments);
+        };
+
+        let end_start = body_start + relative_end;
+        let end_after = end_start + IM_END.len();
+        let body = text.get(body_start..end_start)?;
+        if body.contains(IM_START) {
+            return None;
+        }
+
+        segments.push(RenderedMessageSegment {
+            text_without_end: text.get(start..end_start)?,
+            end_start: Some(end_start),
+            end_after: Some(end_after),
+        });
+        pos = end_after;
+    }
+
+    if !text.get(pos..)?.trim().is_empty() {
+        return None;
+    }
+    Some(segments)
+}
+
+fn normalized_segment(segment: &str) -> String {
+    strip_think_blocks(segment)
+        .trim_end_matches('\n')
+        .to_owned()
+}
+
+fn strip_think_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(start) = rest.find(THINK_START) {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + THINK_START.len()..];
+        let Some(end) = after_start.find(THINK_END) else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        rest = &after_start[end + THINK_END.len()..];
+        if let Some(after_blank) = rest.strip_prefix("\n\n") {
+            rest = after_blank;
+        }
+    }
+
+    out.push_str(rest);
+    out
 }
 
 /// Map a [`SessionGeneration`] (cache-resident continued turn) onto the same
@@ -788,7 +1051,7 @@ fn session_usage(output: &higgs_engine::simple::SessionGeneration) -> Completion
 }
 
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
-fn chat_completions_stream(
+async fn chat_completions_stream(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: Arc<Engine>,
@@ -796,6 +1059,13 @@ fn chat_completions_stream(
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, ServerError> {
+    drop_requested_retained_sessions(
+        Arc::clone(&engine),
+        req.drop_session_id,
+        req.drop_session_ids.as_deref(),
+    )
+    .await?;
+
     let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     // Built here (before the `async_stream::stream!` block, which captures by
     // move) so the tracker can coerce XML-format tool-call values to their
@@ -904,8 +1174,9 @@ fn chat_completions_stream(
         pixel_values.is_some(),
         constraint.is_some(),
         checkpoint_id.as_deref(),
-    )
-    .filter(|_| !want_logprobs);
+        want_logprobs,
+        !stop_sequences.is_empty(),
+    );
 
     let tokenizer = engine.tokenizer().clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -920,27 +1191,115 @@ fn chat_completions_stream(
     // loop itself (see `generate_continued_streaming_with_thinking`) fixes
     // that without changing the non-session path at all.
     if let Some(sid) = stream_session_id {
-        let continued_prompt = continued_prompt_tokens(
-            &engine,
-            sid,
-            &prompt_tokens,
-            &messages,
-            prompt_tools,
-            thinking_enabled_stream,
-        );
-        tokio::task::spawn_blocking(move || {
-            let result = engine.generate_continued_streaming_with_thinking(
+        let max_session_prefill_tokens = engine.session_max_suffix_prefill_tokens();
+        let retained_tokens = engine.retained_session_tokens(sid);
+        let continued_prompt = if retained_tokens.is_some() {
+            continued_prompt_tokens(
+                &engine,
                 sid,
-                &continued_prompt,
-                max_tokens,
-                &sampling,
-                &tx,
+                &prompt_tokens,
+                &messages,
+                prompt_tools,
                 thinking_enabled_stream,
-            );
-            if let Err(e) = result {
-                tracing::error!(error = %e, "Session generation error during streaming");
+            )
+        } else {
+            prompt_tokens.clone()
+        };
+
+        match session_prefill_strategy(
+            Some(sid),
+            retained_tokens.as_deref(),
+            &continued_prompt,
+            max_session_prefill_tokens,
+        ) {
+            SessionPrefillStrategy::Continue { session_id: sid } => {
+                tokio::task::spawn_blocking(move || {
+                    let result = engine.generate_continued_streaming_with_thinking(
+                        sid,
+                        &continued_prompt,
+                        max_tokens,
+                        &sampling,
+                        &tx,
+                        thinking_enabled_stream,
+                    );
+                    if let Err(e) = result {
+                        tracing::error!(error = %e, "Session generation error during streaming");
+                    }
+                });
             }
-        });
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: sid,
+                reason,
+            } => {
+                match session_bootstrap_route(
+                    reason,
+                    engine.pflash_can_run_stateless_for_prompt(&prompt_tokens),
+                ) {
+                    SessionBootstrapRoute::ExactRetained => {
+                        handle_session_exact_bootstrap(sid, reason);
+                        tokio::task::spawn_blocking(move || {
+                            let result = engine.generate_continued_streaming_with_thinking(
+                                sid,
+                                &continued_prompt,
+                                max_tokens,
+                                &sampling,
+                                &tx,
+                                thinking_enabled_stream,
+                            );
+                            if let Err(e) = result {
+                                tracing::error!(error = %e, "Session generation error during streaming");
+                            }
+                        });
+                    }
+                    SessionBootstrapRoute::StatelessPflash => {
+                        handle_session_stateless_pflash_bootstrap(sid, reason);
+                        tokio::task::spawn_blocking(move || {
+                            let result = engine.generate_streaming_with_thinking_and_pflash_policy(
+                                &prompt_tokens,
+                                max_tokens,
+                                &sampling,
+                                &stop_sequences,
+                                want_logprobs,
+                                top_logprobs,
+                                &tx,
+                                thinking_enabled_stream,
+                                collect_prefill_progress,
+                                constraint,
+                                pixel_values,
+                                checkpoint_id.as_deref(),
+                                &pflash_policy,
+                            );
+                            if let Err(e) = result {
+                                tracing::error!(error = %e, "Generation error during streaming");
+                            }
+                        });
+                    }
+                }
+            }
+            SessionPrefillStrategy::Stateless(reason) => {
+                handle_session_stateless_prefill(sid, reason);
+                tokio::task::spawn_blocking(move || {
+                    let result = engine.generate_streaming_with_thinking_and_pflash_policy(
+                        &prompt_tokens,
+                        max_tokens,
+                        &sampling,
+                        &stop_sequences,
+                        want_logprobs,
+                        top_logprobs,
+                        &tx,
+                        thinking_enabled_stream,
+                        collect_prefill_progress,
+                        constraint,
+                        pixel_values,
+                        checkpoint_id.as_deref(),
+                        &pflash_policy,
+                    );
+                    if let Err(e) = result {
+                        tracing::error!(error = %e, "Generation error during streaming");
+                    }
+                });
+            }
+        }
     } else {
         tokio::task::spawn_blocking(move || {
             let result = engine.generate_streaming_with_thinking_and_pflash_policy(
@@ -1404,11 +1763,54 @@ fn session_continuation_id(
     has_pixel_values: bool,
     has_constraint: bool,
     checkpoint_id: Option<&str>,
+    want_logprobs: bool,
+    has_stop_sequences: bool,
 ) -> Option<u64> {
     session_id
         .filter(|_| !has_pixel_values)
         .filter(|_| !has_constraint)
         .filter(|_| checkpoint_id.is_none())
+        .filter(|_| !want_logprobs)
+        .filter(|_| !has_stop_sequences)
+}
+
+async fn drop_requested_retained_sessions(
+    engine: Arc<Engine>,
+    session_id: Option<u64>,
+    session_ids: Option<&[u64]>,
+) -> Result<(), ServerError> {
+    let ids = retained_session_drop_ids(session_id, session_ids);
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    tokio::task::spawn_blocking(move || {
+        for session_id in ids {
+            let dropped = engine.drop_retained_session(session_id);
+            tracing::info!(
+                session_id,
+                dropped,
+                "retained session drop requested by client"
+            );
+        }
+    })
+    .await
+    .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?;
+
+    Ok(())
+}
+
+fn retained_session_drop_ids(session_id: Option<u64>, session_ids: Option<&[u64]>) -> Vec<u64> {
+    let mut ids = Vec::new();
+    if let Some(session_id) = session_id {
+        ids.push(session_id);
+    }
+    if let Some(session_ids) = session_ids {
+        ids.extend_from_slice(session_ids);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 fn current_unix_timestamp() -> i64 {
@@ -1523,23 +1925,171 @@ mod tests {
     #[test]
     fn session_continuation_allows_plain_session_id() {
         assert_eq!(
-            session_continuation_id(Some(42), false, false, None),
+            session_continuation_id(Some(42), false, false, None, false, false),
             Some(42)
         );
     }
 
     #[test]
     fn session_continuation_rejects_unsupported_request_shapes() {
-        assert_eq!(session_continuation_id(Some(42), true, false, None), None);
-        assert_eq!(session_continuation_id(Some(42), false, true, None), None);
-        assert_eq!(session_continuation_id(None, false, false, None), None);
+        assert_eq!(
+            session_continuation_id(Some(42), true, false, None, false, false),
+            None
+        );
+        assert_eq!(
+            session_continuation_id(Some(42), false, true, None, false, false),
+            None
+        );
+        assert_eq!(
+            session_continuation_id(None, false, false, None, false, false),
+            None
+        );
+        assert_eq!(
+            session_continuation_id(Some(42), false, false, None, true, false),
+            None
+        );
+        assert_eq!(
+            session_continuation_id(Some(42), false, false, None, false, true),
+            None
+        );
     }
 
     #[test]
     fn session_continuation_checkpoint_id_takes_precedence() {
         assert_eq!(
-            session_continuation_id(Some(42), false, false, Some("checkpoint-a")),
+            session_continuation_id(Some(42), false, false, Some("checkpoint-a"), false, false),
             None
+        );
+    }
+
+    #[test]
+    fn retained_session_drop_ids_are_deduplicated_and_sorted() {
+        assert_eq!(retained_session_drop_ids(None, None), Vec::<u64>::new());
+        assert_eq!(
+            retained_session_drop_ids(Some(9), Some(&[3, 9, 1, 3])),
+            vec![1, 3, 9]
+        );
+    }
+
+    #[test]
+    fn cold_long_session_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let prompt = vec![7; MAX_PREFILL_TOKENS + 1];
+
+        assert_eq!(
+            session_prefill_strategy(Some(42), None, &prompt, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::ColdPromptTooLarge {
+                    prompt_tokens: prompt.len(),
+                    max_prefill_tokens: MAX_PREFILL_TOKENS,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn cold_short_session_still_seeds_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let prompt = vec![7; MAX_PREFILL_TOKENS];
+
+        assert_eq!(
+            session_prefill_strategy(Some(42), None, &prompt, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::Continue { session_id: 42 }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_small_exact_suffix_continues() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+        let mut candidate = retained.clone();
+        candidate.extend(std::iter::repeat_n(9, MAX_PREFILL_TOKENS));
+
+        assert_eq!(
+            session_prefill_strategy(Some(42), Some(&retained), &candidate, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::Continue { session_id: 42 }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_large_suffix_routes_to_stateless_pflash_path() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+        let mut candidate = retained.clone();
+        candidate.extend(std::iter::repeat_n(9, MAX_PREFILL_TOKENS + 1));
+
+        assert_eq!(
+            session_prefill_strategy(Some(42), Some(&retained), &candidate, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::Stateless(SessionPrefillFallback::LargeSuffix {
+                suffix_tokens: MAX_PREFILL_TOKENS + 1,
+                max_prefill_tokens: MAX_PREFILL_TOKENS,
+            })
+        );
+    }
+
+    #[test]
+    fn warm_session_with_diverged_candidate_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+        let candidate = vec![1, 2, 4, 9];
+
+        assert_eq!(
+            session_prefill_strategy(Some(42), Some(&retained), &candidate, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::DivergedOrNotGrowing,
+            }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_not_growing_candidate_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+
+        assert_eq!(
+            session_prefill_strategy(Some(42), Some(&retained), &retained, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::DivergedOrNotGrowing,
+            }
+        );
+    }
+
+    #[test]
+    fn session_bootstrap_uses_exact_retained_route_without_pflash() {
+        assert_eq!(
+            session_bootstrap_route(SessionBootstrapReason::DivergedOrNotGrowing, false),
+            SessionBootstrapRoute::ExactRetained
+        );
+        assert_eq!(
+            session_bootstrap_route(
+                SessionBootstrapReason::ColdPromptTooLarge {
+                    prompt_tokens: 129,
+                    max_prefill_tokens: 128,
+                },
+                false,
+            ),
+            SessionBootstrapRoute::ExactRetained
+        );
+    }
+
+    #[test]
+    fn session_bootstrap_uses_stateless_pflash_route_when_available() {
+        assert_eq!(
+            session_bootstrap_route(SessionBootstrapReason::DivergedOrNotGrowing, true),
+            SessionBootstrapRoute::StatelessPflash
+        );
+        assert_eq!(
+            session_bootstrap_route(
+                SessionBootstrapReason::ColdPromptTooLarge {
+                    prompt_tokens: 129,
+                    max_prefill_tokens: 128,
+                },
+                true,
+            ),
+            SessionBootstrapRoute::StatelessPflash
         );
     }
 
@@ -1573,6 +2123,31 @@ mod tests {
         // Client rewrote the system prompt between turns: no splice.
         let retained = "<|im_start|>system\noriginal<|im_end|>\n<|im_start|>user\nq<|im_end|>";
         let full = "<|im_start|>system\nMUTATED!<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_mutated_middle_message() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nold context<|im_end|>\n<|im_start|>assistant\nanswer";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nNEW context<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_late_system_prompt_mutation() {
+        let original_tail = "a".repeat(300);
+        let mutated_tail = format!("{}b", "a".repeat(299));
+        let retained =
+            format!("<|im_start|>system\n{original_tail}<|im_end|>\n<|im_start|>user\nq");
+        let full =
+            format!("<|im_start|>system\n{mutated_tail}<|im_end|>\n<|im_start|>user\nq<|im_end|>");
+        assert!(message_boundary_delta(&retained, &full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_template_marker_inside_message_content() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_start|>user\nnot a boundary<|im_end|>";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_start|>user\nnot a boundary<|im_end|>\n<|im_start|>assistant\n";
         assert!(message_boundary_delta(retained, full).is_none());
     }
 

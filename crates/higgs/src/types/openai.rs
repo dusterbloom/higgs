@@ -86,6 +86,17 @@ pub struct ChatCompletionRequest {
     /// Omitted by default — behavior is unchanged when absent.
     #[serde(default)]
     pub session_id: Option<u64>,
+    /// Optional Higgs extension: drop a retained per-session KV cache before
+    /// serving this request. This is for logical session resets; it does not
+    /// clear exact radix/disk prefix caches.
+    #[serde(default)]
+    pub drop_session_id: Option<u64>,
+    /// Optional Higgs extension: drop multiple retained per-session KV caches
+    /// before serving this request. This is the batched form of
+    /// `drop_session_id`; both fields may be supplied and are de-duplicated by
+    /// the route.
+    #[serde(default)]
+    pub drop_session_ids: Option<Vec<u64>>,
 }
 
 /// Subset of `chat_template_kwargs` that Higgs acts on.
@@ -636,6 +647,21 @@ mod tests {
             req.reasoning.and_then(|reasoning| reasoning.effort),
             Some("none".to_owned())
         );
+    }
+
+    #[test]
+    fn test_chat_request_drop_session_id_deserialization() {
+        let json = r#"{
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "session_id": 9,
+            "drop_session_id": 8,
+            "drop_session_ids": [7, 8]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.session_id, Some(9));
+        assert_eq!(req.drop_session_id, Some(8));
+        assert_eq!(req.drop_session_ids, Some(vec![7, 8]));
     }
 
     #[test]

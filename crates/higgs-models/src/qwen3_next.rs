@@ -7273,6 +7273,12 @@ impl Qwen3NextSparsePrefillState {
 pub struct Qwen3NextSparsePrefillOutput {
     pub logits: Array,
     pub state: Qwen3NextSparsePrefillState,
+    /// Tap hidden states captured at the requested layers during sparse
+    /// prefill, in tap-layer order. Each row count equals `state.resident_len`
+    /// (the survivor count), NOT the source prompt length — dSpark's drafter
+    /// context frontier tracks residents, while RoPE/logical positions track
+    /// the source. Empty when no tap layers were requested.
+    pub taps: Vec<Array>,
 }
 
 fn validate_target_sparse_prefill_plan(plan: TargetSparsePrefillPlan<'_>) -> Result<(), Exception> {
@@ -7331,6 +7337,27 @@ fn validate_target_sparse_prefill_plan(plan: TargetSparsePrefillPlan<'_>) -> Res
         return Err(Exception::custom(format!(
             "Qwen3Next sparse prefill requires final source position {final_pos}"
         )));
+    }
+    Ok(())
+}
+
+/// Validate tap-layer selection for sparse prefill. Tap layers must be unique,
+/// strictly increasing, and (when a model is in scope) `< num_layers`. The
+/// plan-only check rejects unsorted/duplicate ids; the per-model check adds
+/// the upper-bound range. This mirrors `forward_raw_hidden_with_taps`'s
+/// contract so the sparse boundary raises the same error shape before any
+/// forward work begins.
+fn validate_target_sparse_prefill_tap_layers(
+    plan: TargetSparsePrefillPlan<'_>,
+    tap_layers: &[usize],
+) -> Result<(), Exception> {
+    // Plan validity is the caller's responsibility — re-running it here would
+    // mask whether a tap-layer error came from the plan or the tap list.
+    let _ = plan;
+    if tap_layers.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Exception::custom(
+            "Qwen3Next sparse prefill tap layers must be unique, strictly increasing, and in range",
+        ));
     }
     Ok(())
 }
@@ -8177,6 +8204,56 @@ impl Qwen3NextCausalLM {
                 resident_len: len,
                 next_position: plan.logical_next_pos,
             },
+            taps: Vec::new(),
+        })
+    }
+
+    /// Sparse-prefill boundary that also captures tap hidden states at the
+    /// requested layers, for dSpark drafter context priming.
+    ///
+    /// Tap rows are indexed by **resident survivor position** (the compact
+    /// domain the GDN/SSM and drafter context frontier operate on), NOT by
+    /// source prompt position. RoPE and `logical_next_pos` still track the
+    /// source domain. dSpark is eligible after this call returns because the
+    /// drafter can prime its per-layer context from the captured tap rows.
+    pub fn prefill_sparse_with_taps(
+        &mut self,
+        plan: TargetSparsePrefillPlan<'_>,
+        tap_layers: &[usize],
+    ) -> Result<Qwen3NextSparsePrefillOutput, Exception> {
+        validate_target_sparse_prefill_plan(plan)?;
+        validate_target_sparse_prefill_tap_layers(plan, tap_layers)?;
+        if tap_layers
+            .iter()
+            .any(|&index| index >= self.model.layers.len())
+        {
+            return Err(Exception::custom(format!(
+                "Qwen3Next sparse prefill tap layer out of range: model has {} layers",
+                self.model.layers.len()
+            )));
+        }
+        let len = i32::try_from(plan.len()).map_err(|_| {
+            Exception::custom(format!(
+                "Qwen3Next sparse prefill length {} exceeds i32::MAX",
+                plan.len()
+            ))
+        })?;
+        let inputs = Array::from_slice(plan.token_ids, &[1, len]);
+        let positions = Array::from_slice(plan.original_positions, &[len]);
+        let mut cache = self.make_cache();
+        let (hidden, taps) =
+            self.forward_hidden_sparse_with_taps(&inputs, &positions, &mut cache, tap_layers)?;
+        let h_last = hidden.index((.., -1.., ..));
+        let logits = self.compute_logits(&h_last)?;
+        set_sparse_cache_logical_positions(&mut cache, plan.logical_next_pos)?;
+        Ok(Qwen3NextSparsePrefillOutput {
+            logits,
+            state: Qwen3NextSparsePrefillState {
+                cache,
+                resident_len: len,
+                next_position: plan.logical_next_pos,
+            },
+            taps,
         })
     }
 
@@ -12749,6 +12826,127 @@ mod tests {
 
         validate_target_sparse_prefill_plan(plan).unwrap();
         assert!(!plan.is_contiguous_identity());
+    }
+
+    #[test]
+    fn sparse_prefill_with_taps_rejects_unsorted_tap_layers() {
+        // Coordinate-system smoke test (no checkpoint): the tap-layer validator
+        // must reject out-of-range or non strictly-increasing layer ids before
+        // any forward work begins. Mirrors `forward_raw_with_taps`'s contract.
+        let tokens = [1_u32, 2, 3, 4];
+        let positions = [0_i32, 1, 2, 3];
+        let plan = TargetSparsePrefillPlan {
+            token_ids: &tokens,
+            original_positions: &positions,
+            logical_next_pos: 4,
+        };
+        validate_target_sparse_prefill_plan(plan).unwrap();
+
+        fn check(plan: TargetSparsePrefillPlan<'_>, tap_layers: &[usize]) -> Result<(), Exception> {
+            validate_target_sparse_prefill_tap_layers(plan, tap_layers)
+        }
+
+        // Strictly increasing in-range layers are accepted.
+        assert!(check(plan, &[0_usize, 1, 2]).is_ok());
+        // Empty tap set is always valid (identity-dispatch fast path).
+        assert!(check(plan, &[]).is_ok());
+        // Out-of-range (>= num layers is unknown at plan level, so the validator
+        // only rejects strictly-decreasing pairs and duplicates here; the model
+        // boundary re-checks against its own layer count).
+        assert!(check(plan, &[1_usize, 0]).is_err());
+        assert!(check(plan, &[0_usize, 0]).is_err());
+        assert!(check(plan, &[2_usize, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn sparse_prefill_output_carries_resident_and_logical_coordinates() {
+        // Static contract: the sparse output preserves the two coordinate
+        // systems even when taps are attached. `resident_len` counts survivors
+        // (tap rows / GDN-SSM offset), `next_position` is the absolute source
+        // position (RoPE / logical decode cursor).
+        let tokens = [10_u32, 11, 99];
+        let positions = [0_i32, 8, 15];
+        let plan = TargetSparsePrefillPlan {
+            token_ids: &tokens,
+            original_positions: &positions,
+            logical_next_pos: 16,
+        };
+        validate_target_sparse_prefill_plan(plan).unwrap();
+
+        // Mirror the constructor's coordinate invariants without running a
+        // real backbone: taps default to empty until captured, resident_len
+        // equals the survivor count, and next_position equals logical_next_pos.
+        let state = Qwen3NextSparsePrefillState {
+            cache: Vec::new(),
+            resident_len: i32::try_from(tokens.len()).unwrap(),
+            next_position: plan.logical_next_pos,
+        };
+        let output = Qwen3NextSparsePrefillOutput {
+            logits: Array::zeros::<f32>(&[1, 1]).unwrap(),
+            state: state.clone(),
+            taps: Vec::new(),
+        };
+        assert_eq!(output.state.resident_len(), 3);
+        assert_eq!(output.state.next_position(), 16);
+        assert!(output.taps.is_empty());
+        // Each captured tap row count MUST equal the resident survivor count,
+        // not the source length — that is the contract dSpark relies on.
+        let resident_rows = output.state.resident_len();
+        let fake_tap = Array::zeros::<f32>(&[1, resident_rows, 1]).unwrap();
+        let output_with_tap = Qwen3NextSparsePrefillOutput {
+            logits: Array::zeros::<f32>(&[1, 1]).unwrap(),
+            state,
+            taps: vec![fake_tap],
+        };
+        assert_eq!(output_with_tap.taps.len(), 1);
+        let tap_rows = output_with_tap.taps[0].shape().get(1).copied().unwrap_or(0);
+        assert_eq!(
+            tap_rows, resident_rows,
+            "tap row count must track resident survivors, not source length"
+        );
+    }
+
+    #[test]
+    fn sparse_prefill_cache_keeps_resident_boundary_and_logical_rope_cursor() {
+        let resident_len = 3;
+        let logical_next_pos = 16;
+        let mut kv = SteppingKeyValueCache::new();
+        let keys = Array::zeros::<f32>(&[1, 1, resident_len, 4]).unwrap();
+        let values = Array::zeros::<f32>(&[1, 1, resident_len, 4]).unwrap();
+        kv.update_and_view(keys, values).unwrap();
+        assert_eq!(kv.offset(), resident_len);
+        assert_eq!(kv.position_offset(), resident_len);
+
+        let mut arrays = ArraysCache::new();
+        arrays.offset = resident_len;
+        let mut cache = vec![Some(LayerCache::KV(kv)), Some(LayerCache::Arrays(arrays))];
+
+        set_sparse_cache_logical_positions(&mut cache, logical_next_pos).unwrap();
+        match cache.first().and_then(Option::as_ref).unwrap() {
+            LayerCache::KV(kv) => {
+                assert_eq!(
+                    kv.offset(),
+                    resident_len,
+                    "resident KV rows remain compact survivors"
+                );
+                assert_eq!(
+                    kv.position_offset(),
+                    logical_next_pos,
+                    "next decode RoPE position resumes at the source length"
+                );
+            }
+            LayerCache::Arrays(_) => panic!("first layer should be KV"),
+        }
+        match cache.get(1).and_then(Option::as_ref).unwrap() {
+            LayerCache::Arrays(arrays) => assert_eq!(
+                arrays.offset, resident_len,
+                "GDN/SSM state remains resident-boundary based"
+            ),
+            LayerCache::KV(_) => panic!("second layer should be Arrays"),
+        }
+        crate::AnyCache::Hybrid(cache)
+            .validate_absolute_boundary(resident_len)
+            .unwrap();
     }
 
     #[test]
@@ -25783,6 +25981,81 @@ impl Qwen3NextCausalLM {
         }
 
         self.model.norm.forward(&h)
+    }
+
+    /// Same as [`Self::forward_hidden_sparse`] but also captures post-residual
+    /// hidden states at the requested tap layers.
+    ///
+    /// Tap row count equals the survivor count (`inputs` seq dim), not the
+    /// source prompt length — dSpark's drafter context frontier counts
+    /// residents. Returned taps are in ascending tap-layer order.
+    pub fn forward_hidden_sparse_with_taps(
+        &mut self,
+        inputs: &Array,
+        positions: &Array,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        if kv_cache.is_empty() {
+            *kv_cache = self.make_cache();
+        }
+
+        if kv_cache.len() != self.model.layers.len() {
+            return Err(Exception::custom(format!(
+                "cache length ({}) must match num layers ({})",
+                kv_cache.len(),
+                self.model.layers.len()
+            )));
+        }
+
+        let mut taps = Vec::with_capacity(tap_layers.len());
+
+        for (layer_idx, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(kv_cache.iter_mut())
+            .enumerate()
+        {
+            let cache = layer_cache
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Layer cache is None"))?;
+
+            let normed = layer.input_layernorm.forward(&h)?;
+            let r = if layer.is_linear {
+                let attn = layer
+                    .linear_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing"))?;
+                let LayerCache::Arrays(ssm_cache) = cache else {
+                    return Err(Exception::custom("Expected ArraysCache"));
+                };
+                attn.forward(&normed, None, ssm_cache)?
+            } else {
+                let attn = layer
+                    .self_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing"))?;
+                let LayerCache::KV(layer_kv) = cache else {
+                    return Err(Exception::custom("Expected KVCache"));
+                };
+                forward_attention_sparse(attn, &normed, positions, layer_kv)?
+            };
+
+            let h2 = h.add(r)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            h = h2.add(mlp_out)?;
+
+            if tap_layers.binary_search(&layer_idx).is_ok() {
+                taps.push(h.clone());
+            }
+        }
+
+        let hidden = self.model.norm.forward(&h)?;
+        Ok((hidden, taps))
     }
 }
 

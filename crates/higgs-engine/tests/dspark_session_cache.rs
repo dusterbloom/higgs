@@ -23,9 +23,9 @@ use higgs_engine::{
     chat_template::ChatMessage,
     mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile},
     simple::{
-        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_PLAN_CACHE,
-        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
-        PrefillCompressionMode, SimpleEngine,
+        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+        DEFAULT_PFLASH_PLAN_CACHE, DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+        DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD, PrefillCompressionMode, SimpleEngine,
     },
 };
 use higgs_models::{
@@ -90,9 +90,11 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically_impl(target_bi
         PrefillScoreMode::Full,
         7,
         DEFAULT_PFLASH_KEEP_RATIO_MAX,
+        DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
         DEFAULT_PFLASH_PLAN_CACHE,
         DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
         DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+        8192,
     )
     .expect("load paired dSpark engine");
     eprintln!("dspark-session checkpoint: engine loaded");

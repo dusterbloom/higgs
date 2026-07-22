@@ -1335,6 +1335,28 @@ impl AnyModel {
         }
     }
 
+    /// Sparse-prefill boundary that also captures dSpark drafter taps at the
+    /// requested layers. Tap rows are indexed by resident survivor position;
+    /// RoPE and `logical_next_pos` still track the source prompt domain.
+    ///
+    /// Same dispatch surface as [`Self::pflash_prefill_sparse`]: only
+    /// Qwen3Next/Bonsai hybrid targets implement it.
+    pub fn pflash_prefill_sparse_with_taps(
+        &mut self,
+        plan: spec_prefill::TargetSparsePrefillPlan<'_>,
+        tap_layers: &[usize],
+    ) -> Result<qwen3_next::Qwen3NextSparsePrefillOutput, Exception> {
+        match self {
+            Self::Qwen3Next(model) => model.prefill_sparse_with_taps(plan, tap_layers),
+            Self::BonsaiQ1(_) => Err(Exception::custom(
+                "PFlash sparse prefill with taps is unsupported for packed BonsaiQ1 models",
+            )),
+            _ => Err(Exception::custom(
+                "PFlash sparse prefill with taps requires a Qwen3Next/Bonsai hybrid target",
+            )),
+        }
+    }
+
     /// Number of transformer layers (PFlash scorer uses the last few).
     pub fn num_layers(&self) -> usize {
         match self {

@@ -11,8 +11,9 @@ use higgs_engine::{
     mlx_tuning::RequestedMlxProfile,
     model_loader,
     simple::{
-        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_PLAN_CACHE,
-        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+        DEFAULT_PFLASH_PLAN_CACHE, DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+        DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
     },
 };
 use higgs_models::{
@@ -482,6 +483,11 @@ pub struct ModelConfig {
     /// Adaptive keep-ratio ceiling used when scorer entropy/surprise is high.
     #[serde(default = "default_prefill_keep_ratio_max")]
     pub prefill_keep_ratio_max: f32,
+    /// Auto-mode execution ceiling: skip lossy sparse prefill when survivor
+    /// retention is above this ratio and exact prefix/session cache is likely
+    /// cheaper.
+    #[serde(default = "default_prefill_max_auto_prefill_ratio")]
+    pub prefill_max_auto_prefill_ratio: f32,
     /// Reuse frozen PFlash survivor plans for exact source-token prefixes
     /// across turns.
     #[serde(default = "default_prefill_plan_cache")]
@@ -517,6 +523,11 @@ pub struct ModelConfig {
     /// endpoints idle longer than this many seconds (`0` = never).
     #[serde(default = "default_kv_retained_idle_secs")]
     pub kv_retained_idle_secs: u64,
+    /// Maximum exact suffix tokens to append to a retained session before
+    /// falling back to the stateless radix/PFlash path. Cold session bootstraps
+    /// are still executed exactly so the retained KV can seed later turns.
+    #[serde(default = "default_kv_max_suffix_prefill_tokens")]
+    pub kv_max_suffix_prefill_tokens: usize,
     /// Resident-byte budget for the prefix KV cache. When exceeded, the
     /// least-recently-used prefix is evicted (in addition to the count cap).
     /// `0` (default) disables the budget.
@@ -562,6 +573,10 @@ fn default_prefill_keep_ratio() -> f32 {
 
 fn default_prefill_keep_ratio_max() -> f32 {
     DEFAULT_PFLASH_KEEP_RATIO_MAX
+}
+
+fn default_prefill_max_auto_prefill_ratio() -> f32 {
+    DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO
 }
 
 fn default_prefill_plan_cache() -> bool {
@@ -620,6 +635,10 @@ const fn default_kv_max_sessions() -> usize {
 
 const fn default_kv_retained_idle_secs() -> u64 {
     1800
+}
+
+const fn default_kv_max_suffix_prefill_tokens() -> usize {
+    8192
 }
 
 impl ModelConfig {
@@ -688,6 +707,7 @@ impl Default for ModelConfig {
             prefill_score_mode: PrefillScoreMode::Full,
             prefill_exit_layer: default_prefill_exit_layer(),
             prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+            prefill_max_auto_prefill_ratio: default_prefill_max_auto_prefill_ratio(),
             prefill_plan_cache: default_prefill_plan_cache(),
             prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
             prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
@@ -698,6 +718,7 @@ impl Default for ModelConfig {
             kv_max_sessions: default_kv_max_sessions(),
             kv_max_session_tokens: 0,
             kv_retained_idle_secs: default_kv_retained_idle_secs(),
+            kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
             kv_cache_bytes: 0,
         }
     }
@@ -936,6 +957,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             prefill_score_mode: PrefillScoreMode::Full,
             prefill_exit_layer: default_prefill_exit_layer(),
             prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+            prefill_max_auto_prefill_ratio: default_prefill_max_auto_prefill_ratio(),
             prefill_plan_cache: default_prefill_plan_cache(),
             prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
             prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
@@ -946,6 +968,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_max_sessions: default_kv_max_sessions(),
             kv_max_session_tokens: 0,
             kv_retained_idle_secs: default_kv_retained_idle_secs(),
+            kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
             kv_cache_bytes: 0,
         })
         .collect();
@@ -1046,6 +1069,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     prefill_score_mode: PrefillScoreMode::Full,
                     prefill_exit_layer: default_prefill_exit_layer(),
                     prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+                    prefill_max_auto_prefill_ratio: default_prefill_max_auto_prefill_ratio(),
                     prefill_plan_cache: default_prefill_plan_cache(),
                     prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
                     prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
@@ -1056,6 +1080,7 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_max_sessions: default_kv_max_sessions(),
                     kv_max_session_tokens: 0,
                     kv_retained_idle_secs: default_kv_retained_idle_secs(),
+                    kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
                     kv_cache_bytes: 0,
                 })
                 .collect();
@@ -1115,6 +1140,14 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
                 model.path
             ));
         }
+        if !model.prefill_max_auto_prefill_ratio.is_finite()
+            || !(0.0..=1.0).contains(&model.prefill_max_auto_prefill_ratio)
+        {
+            return Err(format!(
+                "prefill_max_auto_prefill_ratio must be a finite ratio between 0.0 and 1.0 for model {}",
+                model.path
+            ));
+        }
         if model.disk_cache_enabled && model.max_disk_blocks == 0 {
             return Err(format!(
                 "max_disk_blocks must be greater than zero for model {}",
@@ -1128,6 +1161,12 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
         {
             return Err(format!(
                 "disk_cache_path must not be empty for model {}",
+                model.path
+            ));
+        }
+        if model.kv_max_suffix_prefill_tokens == 0 {
+            return Err(format!(
+                "kv_max_suffix_prefill_tokens must be greater than zero for model {}",
                 model.path
             ));
         }
@@ -1262,6 +1301,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         prefill_score_mode: PrefillScoreMode::Full,
         prefill_exit_layer: default_prefill_exit_layer(),
         prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+        prefill_max_auto_prefill_ratio: default_prefill_max_auto_prefill_ratio(),
         prefill_plan_cache: default_prefill_plan_cache(),
         prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
         prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
@@ -1272,6 +1312,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_max_sessions: default_kv_max_sessions(),
         kv_max_session_tokens: 0,
         kv_retained_idle_secs: default_kv_retained_idle_secs(),
+        kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
         kv_cache_bytes: 0,
     });
     config.auto_router.model = name;
@@ -1815,6 +1856,7 @@ mod tests {
         assert_eq!(model.kv_max_sessions, 8);
         assert_eq!(model.kv_max_session_tokens, 0);
         assert_eq!(model.kv_retained_idle_secs, 1800);
+        assert_eq!(model.kv_max_suffix_prefill_tokens, 8192);
         let kv = model.kv_cache_config();
         assert_eq!(kv.max_retained_sessions, 8);
         assert_eq!(kv.max_session_tokens, 0);
@@ -1824,19 +1866,20 @@ mod tests {
         let path2 = dir.path().join("explicit.toml");
         std::fs::write(
             &path2,
-            "[[models]]\npath = \"some/model\"\nkv_max_sessions = 4\nkv_max_session_tokens = 4096\nkv_retained_idle_secs = 300\n",
+            "[[models]]\npath = \"some/model\"\nkv_max_sessions = 4\nkv_max_session_tokens = 4096\nkv_retained_idle_secs = 300\nkv_max_suffix_prefill_tokens = 2048\n",
         )
         .unwrap();
-        let kv2 = load_config_file(&path2, None)
+        let model2 = load_config_file(&path2, None)
             .unwrap()
             .models
             .into_iter()
             .next()
-            .unwrap()
-            .kv_cache_config();
+            .unwrap();
+        let kv2 = model2.kv_cache_config();
         assert_eq!(kv2.max_retained_sessions, 4);
         assert_eq!(kv2.max_session_tokens, 4096);
         assert_eq!(kv2.retained_idle_secs, 300);
+        assert_eq!(model2.kv_max_suffix_prefill_tokens, 2048);
 
         // kv_max_sessions = 0 is rejected at load (validate catches it).
         let path3 = dir.path().join("bad.toml");
@@ -1849,6 +1892,57 @@ mod tests {
             load_config_file(&path3, None).is_err(),
             "kv_max_sessions = 0 must be rejected"
         );
+
+        let path4 = dir.path().join("bad-suffix.toml");
+        std::fs::write(
+            &path4,
+            "[[models]]\npath = \"some/model\"\nkv_max_suffix_prefill_tokens = 0\n",
+        )
+        .unwrap();
+        assert!(
+            load_config_file(&path4, None).is_err(),
+            "kv_max_suffix_prefill_tokens = 0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_pflash_auto_prefill_ratio_defaults_and_parses() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let default_path = dir.path().join("default-pflash.toml");
+        std::fs::write(&default_path, "[[models]]\npath = \"some/model\"\n").unwrap();
+        let model = load_config_file(&default_path, None)
+            .unwrap()
+            .models
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            model.prefill_max_auto_prefill_ratio,
+            DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO
+        );
+
+        let explicit_path = dir.path().join("explicit-pflash.toml");
+        std::fs::write(
+            &explicit_path,
+            "[[models]]\npath = \"some/model\"\nprefill_max_auto_prefill_ratio = 0.8\n",
+        )
+        .unwrap();
+        let model = load_config_file(&explicit_path, None)
+            .unwrap()
+            .models
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(model.prefill_max_auto_prefill_ratio, 0.8);
+
+        let invalid_path = dir.path().join("invalid-pflash.toml");
+        std::fs::write(
+            &invalid_path,
+            "[[models]]\npath = \"some/model\"\nprefill_max_auto_prefill_ratio = 1.2\n",
+        )
+        .unwrap();
+        assert!(load_config_file(&invalid_path, None).is_err());
     }
 
     #[test]

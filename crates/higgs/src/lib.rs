@@ -68,6 +68,10 @@ pub fn build_router(
     let mut api_routes = Router::new()
         .route("/metrics", get(routes::metrics::metrics))
         .route(
+            "/v1/cache/sessions/{session_id}",
+            delete(routes::cache::drop_retained_session),
+        )
+        .route(
             "/v1/models",
             get(routes::models::list_models).post(routes::models::load_model),
         )
