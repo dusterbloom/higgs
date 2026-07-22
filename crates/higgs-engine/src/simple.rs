@@ -537,6 +537,341 @@ fn continuation_reject_reason(prior_tokens: &[u32], full: &[u32]) -> &'static st
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPrefillStrategy {
+    Continue {
+        session_id: u64,
+    },
+    BootstrapExact {
+        session_id: u64,
+        reason: SessionBootstrapReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBootstrapReason {
+    ColdPromptTooLarge {
+        prompt_tokens: usize,
+        max_prefill_tokens: usize,
+    },
+    LargeSuffix {
+        suffix_tokens: usize,
+        max_prefill_tokens: usize,
+    },
+    DivergedOrNotGrowing,
+}
+
+fn session_prefill_strategy(
+    session_id: u64,
+    retained_tokens: Option<&[u32]>,
+    continuation_candidate: &[u32],
+    max_prefill_tokens: usize,
+) -> SessionPrefillStrategy {
+    let Some(retained_tokens) = retained_tokens else {
+        if continuation_candidate.len() <= max_prefill_tokens {
+            return SessionPrefillStrategy::Continue { session_id };
+        }
+        return SessionPrefillStrategy::BootstrapExact {
+            session_id,
+            reason: SessionBootstrapReason::ColdPromptTooLarge {
+                prompt_tokens: continuation_candidate.len(),
+                max_prefill_tokens,
+            },
+        };
+    };
+
+    let prior = retained_tokens.len();
+    if prior == 0
+        || prior >= continuation_candidate.len()
+        || continuation_candidate.get(..prior) != Some(retained_tokens)
+    {
+        return SessionPrefillStrategy::BootstrapExact {
+            session_id,
+            reason: SessionBootstrapReason::DivergedOrNotGrowing,
+        };
+    }
+
+    let suffix_tokens = continuation_candidate.len() - prior;
+    if suffix_tokens <= max_prefill_tokens {
+        SessionPrefillStrategy::Continue { session_id }
+    } else {
+        SessionPrefillStrategy::BootstrapExact {
+            session_id,
+            reason: SessionBootstrapReason::LargeSuffix {
+                suffix_tokens,
+                max_prefill_tokens,
+            },
+        }
+    }
+}
+
+fn session_prompt_trace_metrics(
+    retained_tokens: Option<&[u32]>,
+    prompt_tokens: &[u32],
+    candidate_tokens: &[u32],
+    tool_payload: SessionPromptTracePayloadStats,
+    outcome: SessionPromptTraceOutcome,
+) -> SessionPromptTraceMetrics {
+    let Some(retained) = retained_tokens else {
+        return SessionPromptTraceMetrics {
+            prompt_tokens: prompt_tokens.len(),
+            retained_tokens: 0,
+            candidate_tokens: candidate_tokens.len(),
+            suffix_tokens: candidate_tokens.len(),
+            common_prefix_tokens: 0,
+            divergence_token: None,
+            boundary_splice: false,
+            tool_result_messages: tool_payload.messages,
+            tool_result_bytes: tool_payload.bytes,
+            tool_result_largest_bytes: tool_payload.largest_bytes,
+            outcome,
+        };
+    };
+
+    let common_prefix_tokens = common_prefix_token_len(retained, candidate_tokens);
+    let retained_prefix_of_candidate = !retained.is_empty()
+        && retained.len() < candidate_tokens.len()
+        && common_prefix_tokens == retained.len();
+    let retained_prefix_of_prompt = !retained.is_empty()
+        && retained.len() < prompt_tokens.len()
+        && prompt_tokens.get(..retained.len()) == Some(retained);
+    let divergence_token = if retained_prefix_of_candidate {
+        None
+    } else {
+        Some(common_prefix_tokens)
+    };
+    let suffix_tokens = if retained_prefix_of_candidate {
+        candidate_tokens.len().saturating_sub(retained.len())
+    } else {
+        candidate_tokens.len()
+    };
+
+    SessionPromptTraceMetrics {
+        prompt_tokens: prompt_tokens.len(),
+        retained_tokens: retained.len(),
+        candidate_tokens: candidate_tokens.len(),
+        suffix_tokens,
+        common_prefix_tokens,
+        divergence_token,
+        boundary_splice: !retained_prefix_of_prompt && retained_prefix_of_candidate,
+        tool_result_messages: tool_payload.messages,
+        tool_result_bytes: tool_payload.bytes,
+        tool_result_largest_bytes: tool_payload.largest_bytes,
+        outcome,
+    }
+}
+
+fn common_prefix_bytes(left: &str, right: &str) -> usize {
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .take_while(|(l, r)| l == r)
+        .count()
+}
+
+fn preview_around(text: &str, byte_pos: usize) -> String {
+    let start = char_boundary_at_or_before(text, byte_pos.saturating_sub(80));
+    let end = char_boundary_at_or_after(text, byte_pos.saturating_add(80));
+    text.get(start..end).unwrap_or_default().to_owned()
+}
+
+fn char_boundary_at_or_before(text: &str, byte_pos: usize) -> usize {
+    let pos = byte_pos.min(text.len());
+    (0..=pos)
+        .rev()
+        .find(|idx| text.is_char_boundary(*idx))
+        .unwrap_or(0)
+}
+
+fn char_boundary_at_or_after(text: &str, byte_pos: usize) -> usize {
+    let pos = byte_pos.min(text.len());
+    (pos..=text.len())
+        .find(|idx| text.is_char_boundary(*idx))
+        .unwrap_or(text.len())
+}
+
+const IM_START: &str = "<|im_start|>";
+const IM_END: &str = "<|im_end|>";
+const THINK_START: &str = "<think>";
+const THINK_END: &str = "</think>";
+
+#[derive(Debug)]
+struct RenderedMessageSegment<'a> {
+    text_without_end: &'a str,
+    end_start: Option<usize>,
+    end_after: Option<usize>,
+}
+
+fn message_boundary_delta<'a>(retained_text: &str, full_text: &'a str) -> Option<&'a str> {
+    let retained_segments = rendered_message_segments(retained_text)?;
+    let full_segments = rendered_message_segments(full_text)?;
+    let covered = retained_segments.len();
+    if covered == 0 || full_segments.len() < covered {
+        return None;
+    }
+
+    for (retained, fresh) in retained_segments
+        .iter()
+        .zip(full_segments.iter())
+        .take(covered)
+    {
+        if !segments_compatible(retained, fresh) {
+            return None;
+        }
+    }
+
+    let covered_segment = &full_segments[covered - 1];
+    let end_start = covered_segment.end_start?;
+    let end_after = covered_segment.end_after?;
+
+    let trimmed = retained_text.trim_end_matches('\n');
+    if trimmed.ends_with(IM_END) {
+        full_text.get(end_after..)
+    } else {
+        full_text.get(end_start..)
+    }
+}
+
+fn rendered_message_segments(text: &str) -> Option<Vec<RenderedMessageSegment<'_>>> {
+    let mut segments = Vec::new();
+    let mut pos = 0usize;
+
+    while let Some(relative_start) = text.get(pos..)?.find(IM_START) {
+        let start = pos + relative_start;
+        if !text.get(pos..start)?.trim().is_empty() {
+            return None;
+        }
+
+        let body_start = start + IM_START.len();
+        let Some(relative_end) = text.get(body_start..)?.find(IM_END) else {
+            let partial = text.get(start..)?;
+            if partial.get(IM_START.len()..)?.contains(IM_START) {
+                return None;
+            }
+            segments.push(RenderedMessageSegment {
+                text_without_end: partial,
+                end_start: None,
+                end_after: None,
+            });
+            return Some(segments);
+        };
+
+        let end_start = body_start + relative_end;
+        let end_after = end_start + IM_END.len();
+        let body = text.get(body_start..end_start)?;
+        if body.contains(IM_START) {
+            return None;
+        }
+
+        segments.push(RenderedMessageSegment {
+            text_without_end: text.get(start..end_start)?,
+            end_start: Some(end_start),
+            end_after: Some(end_after),
+        });
+        pos = end_after;
+    }
+
+    if !text.get(pos..)?.trim().is_empty() {
+        return None;
+    }
+    Some(segments)
+}
+
+fn segments_compatible(
+    retained: &RenderedMessageSegment<'_>,
+    fresh: &RenderedMessageSegment<'_>,
+) -> bool {
+    let Some(role) = segment_role(retained.text_without_end) else {
+        return false;
+    };
+    if segment_role(fresh.text_without_end) != Some(role) {
+        return false;
+    }
+    if role == "assistant" {
+        return true;
+    }
+    normalized_segment(retained.text_without_end) == normalized_segment(fresh.text_without_end)
+}
+
+fn segment_role(segment: &str) -> Option<&str> {
+    segment
+        .strip_prefix(IM_START)?
+        .split_once('\n')
+        .map(|(role, _)| role)
+}
+
+fn normalized_segment(segment: &str) -> String {
+    let without_think = strip_think_blocks(segment);
+    canonicalize_tool_calls(&without_think)
+        .trim_end_matches('\n')
+        .to_owned()
+}
+
+fn canonicalize_tool_calls(text: &str) -> String {
+    let parsed = crate::tool_parser::parse_tool_calls(text, None);
+    if parsed.tool_calls.is_empty() {
+        return text.to_owned();
+    }
+
+    let mut out = parsed.text.trim_end_matches('\n').to_owned();
+    for call in parsed.tool_calls {
+        out.push_str("\n<tool_call:");
+        out.push_str(&call.name);
+        out.push(':');
+        out.push_str(&canonical_json_value(&call.arguments));
+        out.push('>');
+    }
+    out
+}
+
+fn canonical_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(values) => {
+            let body = values
+                .iter()
+                .map(canonical_json_value)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{body}]")
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let body = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let key = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
+                    format!("{key}:{}", canonical_json_value(value))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        }
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
+    }
+}
+
+fn strip_think_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(start) = rest.find(THINK_START) {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + THINK_START.len()..];
+        let Some(end) = after_start.find(THINK_END) else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        rest = &after_start[end + THINK_END.len()..];
+        if let Some(after_blank) = rest.strip_prefix("\n\n") {
+            rest = after_blank;
+        }
+    }
+
+    out.push_str(rest);
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpeculationRoute {
     DFlash,
     MtpFamily,
@@ -604,6 +939,15 @@ fn session_pair_error(error: PairedCacheError) -> EngineError {
 
 fn radix_pair_error(error: PairedCacheError) -> EngineError {
     EngineError::Generation(format!("radix live dSpark pair: {error}"))
+}
+
+fn send_session_stream_output(
+    sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+    output: StreamingOutput,
+) -> Result<(), EngineError> {
+    sender
+        .blocking_send(output)
+        .map_err(|_| EngineError::Cancelled)
 }
 
 /// Insert a retained KV cache for `session_id`, enforcing the resident-memory
@@ -1151,8 +1495,6 @@ struct CacheMetrics {
     session_prompt_prefix_misses: AtomicU64,
     session_prompt_boundary_splices: AtomicU64,
     session_bootstrap_exact: AtomicU64,
-    session_bootstrap_pflash: AtomicU64,
-    session_stateless_prefills: AtomicU64,
     session_last_prompt_tokens: AtomicU64,
     session_last_retained_tokens: AtomicU64,
     session_last_candidate_tokens: AtomicU64,
@@ -1171,8 +1513,6 @@ pub enum SessionPromptTraceOutcome {
     #[default]
     Continued,
     ExactBootstrap,
-    StatelessPflashBootstrap,
-    StatelessPrefill,
 }
 
 /// Content-safe session prompt/cache trace surfaced through [`CacheStats`].
@@ -1245,10 +1585,6 @@ pub struct CacheStats {
     pub session_prompt_boundary_splices: u64,
     /// Diverged/cold sessions routed through exact retained prefill.
     pub session_bootstrap_exact: u64,
-    /// Diverged/cold sessions routed through stateless PFlash/cache.
-    pub session_bootstrap_pflash: u64,
-    /// Session requests that skipped retained continuation and used stateless prefill.
-    pub session_stateless_prefills: u64,
     /// Prompt tokens for the most recent session prompt/cache trace.
     pub session_last_prompt_tokens: u64,
     /// Retained tokens for the most recent session prompt/cache trace.
@@ -2183,6 +2519,14 @@ pub struct SessionGeneration {
     pub continued: bool,
 }
 
+/// Content-free prompt payload counters carried into session trace metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionPromptTracePayloadStats {
+    pub messages: usize,
+    pub bytes: usize,
+    pub largest_bytes: usize,
+}
+
 impl SimpleEngine {
     #[allow(clippy::float_cmp)]
     fn sampled_dspark_requires_ar(&self, params: &SamplingParams) -> bool {
@@ -2804,14 +3148,6 @@ impl SimpleEngine {
                 .cache_metrics
                 .session_bootstrap_exact
                 .load(Ordering::Relaxed),
-            session_bootstrap_pflash: self
-                .cache_metrics
-                .session_bootstrap_pflash
-                .load(Ordering::Relaxed),
-            session_stateless_prefills: self
-                .cache_metrics
-                .session_stateless_prefills
-                .load(Ordering::Relaxed),
             session_last_prompt_tokens: self
                 .cache_metrics
                 .session_last_prompt_tokens
@@ -2860,8 +3196,8 @@ impl SimpleEngine {
         }
     }
 
-    /// Record route-level prompt/cache reconciliation diagnostics.
-    pub fn record_session_prompt_trace(&self, trace: SessionPromptTraceMetrics) {
+    /// Record session prompt/cache reconciliation diagnostics.
+    fn record_session_prompt_trace(&self, trace: SessionPromptTraceMetrics) {
         self.cache_metrics
             .session_prompt_traces
             .fetch_add(1, Ordering::Relaxed);
@@ -2880,16 +3216,6 @@ impl SimpleEngine {
             SessionPromptTraceOutcome::ExactBootstrap => {
                 self.cache_metrics
                     .session_bootstrap_exact
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SessionPromptTraceOutcome::StatelessPflashBootstrap => {
-                self.cache_metrics
-                    .session_bootstrap_pflash
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SessionPromptTraceOutcome::StatelessPrefill => {
-                self.cache_metrics
-                    .session_stateless_prefills
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -2970,13 +3296,17 @@ impl SimpleEngine {
         self.session_max_suffix_prefill_tokens
     }
 
-    /// Drop a conversation's retained KV cache, freeing its KV memory.
-    pub fn drop_retained_session(&self, session_id: u64) -> bool {
-        let session_lock = std::sync::Arc::clone(
+    fn session_lock_for(&self, session_id: u64) -> std::sync::Arc<Mutex<()>> {
+        std::sync::Arc::clone(
             lock_or_recover(&self.session_locks)
                 .entry(session_id)
                 .or_default(),
-        );
+        )
+    }
+
+    /// Drop a conversation's retained KV cache, freeing its KV memory.
+    pub fn drop_retained_session(&self, session_id: u64) -> bool {
+        let session_lock = self.session_lock_for(session_id);
         let _session_guard = session_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4593,6 +4923,300 @@ impl SimpleEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_session_routed_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+        tool_payload: SessionPromptTracePayloadStats,
+    ) -> Result<SessionGeneration, EngineError> {
+        let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
+        let total_start = std::time::Instant::now();
+        let session_lock = self.session_lock_for(session_id);
+        let _session_guard = session_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let retained_tokens = self.retained_session_tokens(session_id);
+        let continued_prompt = self.continued_prompt_tokens_from_retained(
+            session_id,
+            retained_tokens.as_deref(),
+            prompt_tokens,
+            messages,
+            tools,
+            enable_thinking,
+        );
+        let strategy = session_prefill_strategy(
+            session_id,
+            retained_tokens.as_deref(),
+            &continued_prompt,
+            self.session_max_suffix_prefill_tokens,
+        );
+
+        match strategy {
+            SessionPrefillStrategy::Continue { session_id } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::Continued,
+                );
+                self.generate_continued_impl_locked(
+                    session_id,
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    enable_thinking,
+                    None,
+                    timing,
+                    total_start,
+                )
+            }
+            SessionPrefillStrategy::BootstrapExact { session_id, reason } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::ExactBootstrap,
+                );
+                self.handle_session_exact_bootstrap(session_id, reason);
+                self.generate_continued_impl_locked(
+                    session_id,
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    enable_thinking,
+                    None,
+                    timing,
+                    total_start,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_session_routed_streaming_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        max_tokens: u32,
+        params: &SamplingParams,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        tool_payload: SessionPromptTracePayloadStats,
+    ) -> Result<(), EngineError> {
+        let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
+        let total_start = std::time::Instant::now();
+        let session_lock = self.session_lock_for(session_id);
+        let _session_guard = session_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let retained_tokens = self.retained_session_tokens(session_id);
+        let continued_prompt = self.continued_prompt_tokens_from_retained(
+            session_id,
+            retained_tokens.as_deref(),
+            prompt_tokens,
+            messages,
+            tools,
+            enable_thinking,
+        );
+        let strategy = session_prefill_strategy(
+            session_id,
+            retained_tokens.as_deref(),
+            &continued_prompt,
+            self.session_max_suffix_prefill_tokens,
+        );
+
+        match strategy {
+            SessionPrefillStrategy::Continue { session_id } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::Continued,
+                );
+                self.generate_continued_impl_locked(
+                    session_id,
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    enable_thinking,
+                    Some(sender),
+                    timing,
+                    total_start,
+                )?;
+                Ok(())
+            }
+            SessionPrefillStrategy::BootstrapExact { session_id, reason } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::ExactBootstrap,
+                );
+                self.handle_session_exact_bootstrap(session_id, reason);
+                self.generate_continued_impl_locked(
+                    session_id,
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    enable_thinking,
+                    Some(sender),
+                    timing,
+                    total_start,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(clippy::print_stderr)]
+    fn continued_prompt_tokens_from_retained(
+        &self,
+        session_id: u64,
+        retained_tokens: Option<&[u32]>,
+        prompt_tokens: &[u32],
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        thinking_enabled: bool,
+    ) -> Vec<u32> {
+        let diag = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
+        let Some(retained) = retained_tokens else {
+            if diag {
+                eprintln!(
+                    "DIAG session-continue-fallback: reason=no_retained_cache session_id={session_id} prompt_tokens={}",
+                    prompt_tokens.len()
+                );
+            }
+            return prompt_tokens.to_vec();
+        };
+        let retained_text = match self.tokenizer.decode(retained, false) {
+            Ok(text) => text,
+            Err(error) => {
+                if diag {
+                    eprintln!(
+                        "DIAG session-continue-fallback: reason=decode_retained_failed session_id={session_id} retained_tokens={} error={error}",
+                        retained.len()
+                    );
+                }
+                return prompt_tokens.to_vec();
+            }
+        };
+        let full_text = match self.render_chat_prompt_with_thinking(
+            messages,
+            tools,
+            thinking_enabled,
+        ) {
+            Ok(text) => text,
+            Err(error) => {
+                if diag {
+                    eprintln!(
+                        "DIAG session-continue-fallback: reason=render_full_failed session_id={session_id} retained_tokens={} prompt_tokens={} error={error}",
+                        retained.len(),
+                        prompt_tokens.len()
+                    );
+                }
+                return prompt_tokens.to_vec();
+            }
+        };
+        let Some(delta_text) = message_boundary_delta(&retained_text, &full_text) else {
+            if diag {
+                let common = common_prefix_bytes(&retained_text, &full_text);
+                eprintln!(
+                    "DIAG session-continue-fallback: reason=boundary_splice_failed session_id={session_id} retained_tokens={} prompt_tokens={} retained_bytes={} full_bytes={} retained_msgs={} full_msgs={} common_bytes={} retained_tail={:?} full_at_mismatch={:?}",
+                    retained.len(),
+                    prompt_tokens.len(),
+                    retained_text.len(),
+                    full_text.len(),
+                    retained_text.matches(IM_START).count(),
+                    full_text.matches(IM_START).count(),
+                    common,
+                    preview_around(&retained_text, common),
+                    preview_around(&full_text, common)
+                );
+            }
+            return prompt_tokens.to_vec();
+        };
+        let Ok(delta_enc) = self.tokenizer.encode(delta_text, false) else {
+            if diag {
+                eprintln!(
+                    "DIAG session-continue-fallback: reason=encode_delta_failed session_id={session_id} delta_bytes={}",
+                    delta_text.len()
+                );
+            }
+            return prompt_tokens.to_vec();
+        };
+        if diag {
+            eprintln!(
+                "DIAG session-continue: matched session_id={session_id} retained_tokens={} delta_tokens={} full_prompt_tokens={}",
+                retained.len(),
+                delta_enc.get_ids().len(),
+                prompt_tokens.len()
+            );
+        }
+        let mut combined = retained.to_vec();
+        combined.extend_from_slice(delta_enc.get_ids());
+        combined
+    }
+
+    fn record_and_log_session_prompt_trace(
+        &self,
+        session_id: u64,
+        retained_tokens: Option<&[u32]>,
+        prompt_tokens: &[u32],
+        candidate_tokens: &[u32],
+        tool_payload: SessionPromptTracePayloadStats,
+        outcome: SessionPromptTraceOutcome,
+    ) {
+        let trace = session_prompt_trace_metrics(
+            retained_tokens,
+            prompt_tokens,
+            candidate_tokens,
+            tool_payload,
+            outcome,
+        );
+        tracing::info!(
+            session_id,
+            prompt_tokens = trace.prompt_tokens,
+            retained_tokens = trace.retained_tokens,
+            candidate_tokens = trace.candidate_tokens,
+            suffix_tokens = trace.suffix_tokens,
+            common_prefix_tokens = trace.common_prefix_tokens,
+            divergence_token = ?trace.divergence_token,
+            boundary_splice = trace.boundary_splice,
+            tool_result_messages = trace.tool_result_messages,
+            tool_result_bytes = trace.tool_result_bytes,
+            tool_result_largest_bytes = trace.tool_result_largest_bytes,
+            ?outcome,
+            "session prompt/cache trace"
+        );
+        self.record_session_prompt_trace(trace);
+    }
+
+    fn handle_session_exact_bootstrap(&self, session_id: u64, reason: SessionBootstrapReason) {
+        tracing::info!(
+            session_id,
+            ?reason,
+            "session continuation bootstrapping exact retained prefill path"
+        );
+    }
+
     fn generate_continued_impl(
         &self,
         session_id: u64,
@@ -4611,15 +5235,34 @@ impl SimpleEngine {
         // Acquired BEFORE the model lock — the global order is session -> model,
         // so this can never deadlock. The map lock itself is released immediately;
         // only the per-session lock is held across the body.
-        let session_lock = std::sync::Arc::clone(
-            lock_or_recover(&self.session_locks)
-                .entry(session_id)
-                .or_default(),
-        );
+        let session_lock = self.session_lock_for(session_id);
         let _session_guard = session_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.generate_continued_impl_locked(
+            session_id,
+            prompt_tokens,
+            max_tokens,
+            params,
+            enable_thinking,
+            sender,
+            timing,
+            total_start,
+        )
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn generate_continued_impl_locked(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+        sender: Option<&tokio::sync::mpsc::Sender<StreamingOutput>>,
+        timing: bool,
+        total_start: std::time::Instant,
+    ) -> Result<SessionGeneration, EngineError> {
         // Opportunistic idle eviction: free retained caches abandoned longer than
         // the configured TTL. Cheap (bounded by max_retained_sessions) and runs
         // on each cache-resident request, so memory is reclaimed without a
@@ -4659,19 +5302,22 @@ impl SimpleEngine {
                 } else {
                     0
                 };
-                let _ = sender.blocking_send(StreamingOutput {
-                    new_text: String::new(),
-                    finished: false,
-                    finish_reason: None,
-                    prompt_tokens: output.prompt_tokens,
-                    completion_tokens: 0,
-                    token_logprob: None,
-                    prefill_progress: Some(crate::engine::PrefillProgress {
-                        processed: cached,
-                        cached,
-                        total: output.prompt_tokens,
-                    }),
-                });
+                send_session_stream_output(
+                    sender,
+                    StreamingOutput {
+                        new_text: String::new(),
+                        finished: false,
+                        finish_reason: None,
+                        prompt_tokens: output.prompt_tokens,
+                        completion_tokens: 0,
+                        token_logprob: None,
+                        prefill_progress: Some(crate::engine::PrefillProgress {
+                            processed: cached,
+                            cached,
+                            total: output.prompt_tokens,
+                        }),
+                    },
+                )?;
             }
             return Ok(output);
         }
@@ -4733,19 +5379,22 @@ impl SimpleEngine {
             } else {
                 0
             };
-            let _ = sender.blocking_send(StreamingOutput {
-                new_text: String::new(),
-                finished: false,
-                finish_reason: None,
-                prompt_tokens: total,
-                completion_tokens: 0,
-                token_logprob: None,
-                prefill_progress: Some(crate::engine::PrefillProgress {
-                    processed: cached,
-                    cached,
-                    total,
-                }),
-            });
+            send_session_stream_output(
+                sender,
+                StreamingOutput {
+                    new_text: String::new(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: total,
+                    completion_tokens: 0,
+                    token_logprob: None,
+                    prefill_progress: Some(crate::engine::PrefillProgress {
+                        processed: cached,
+                        cached,
+                        total,
+                    }),
+                },
+            )?;
         }
 
         let prefill_start = std::time::Instant::now();
@@ -4813,15 +5462,18 @@ impl SimpleEngine {
             } else {
                 None
             };
-            let _ = sender.blocking_send(StreamingOutput {
-                new_text,
-                finished: step_finished,
-                finish_reason,
-                prompt_tokens: total,
-                completion_tokens: 1,
-                token_logprob: None,
-                prefill_progress: None,
-            });
+            send_session_stream_output(
+                sender,
+                StreamingOutput {
+                    new_text,
+                    finished: step_finished,
+                    finish_reason,
+                    prompt_tokens: total,
+                    completion_tokens: 1,
+                    token_logprob: None,
+                    prefill_progress: None,
+                },
+            )?;
         }
 
         let decode_start = std::time::Instant::now();
@@ -4906,15 +5558,18 @@ impl SimpleEngine {
                         let completion_len = u32::try_from(generated.len()).unwrap_or(u32::MAX);
                         let mut new_text = detok.append(&self.tokenizer, &generated)?;
                         new_text.push_str(&detok.flush(&self.tokenizer, &generated)?);
-                        let _ = sender.blocking_send(StreamingOutput {
-                            new_text,
-                            finished: true,
-                            finish_reason: Some("stop".to_owned()),
-                            prompt_tokens: total,
-                            completion_tokens: completion_len,
-                            token_logprob: None,
-                            prefill_progress: None,
-                        });
+                        send_session_stream_output(
+                            sender,
+                            StreamingOutput {
+                                new_text,
+                                finished: true,
+                                finish_reason: Some("stop".to_owned()),
+                                prompt_tokens: total,
+                                completion_tokens: completion_len,
+                                token_logprob: None,
+                                prefill_progress: None,
+                            },
+                        )?;
                     }
                     break;
                 }
@@ -4945,6 +5600,7 @@ impl SimpleEngine {
                 let batch_base = generated.len();
                 generated.extend_from_slice(&result.tokens);
                 if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+                    let mut stop_after_batch = false;
                     for (i, tok) in result.tokens.iter().enumerate() {
                         let upto = batch_base + i + 1;
                         let window = &generated[..upto];
@@ -4963,8 +5619,9 @@ impl SimpleEngine {
                         } else {
                             None
                         };
-                        let send_failed = sender
-                            .blocking_send(StreamingOutput {
+                        send_session_stream_output(
+                            sender,
+                            StreamingOutput {
                                 new_text,
                                 finished: step_finished,
                                 finish_reason,
@@ -4972,11 +5629,15 @@ impl SimpleEngine {
                                 completion_tokens: completion_len,
                                 token_logprob: None,
                                 prefill_progress: None,
-                            })
-                            .is_err();
-                        if step_finished || send_failed {
+                            },
+                        )?;
+                        if step_finished {
+                            stop_after_batch = true;
                             break;
                         }
+                    }
+                    if stop_after_batch {
+                        break;
                     }
                 }
                 current_hidden = result.hidden;
@@ -5021,15 +5682,18 @@ impl SimpleEngine {
                     } else {
                         None
                     };
-                    let _ = sender.blocking_send(StreamingOutput {
-                        new_text,
-                        finished: step_finished,
-                        finish_reason,
-                        prompt_tokens: total,
-                        completion_tokens: completion_len,
-                        token_logprob: None,
-                        prefill_progress: None,
-                    });
+                    send_session_stream_output(
+                        sender,
+                        StreamingOutput {
+                            new_text,
+                            finished: step_finished,
+                            finish_reason,
+                            prompt_tokens: total,
+                            completion_tokens: completion_len,
+                            token_logprob: None,
+                            prefill_progress: None,
+                        },
+                    )?;
                 }
                 if is_eos {
                     break;
@@ -5457,7 +6121,7 @@ impl SimpleEngine {
                         } else {
                             None
                         };
-                        let _ = sender.blocking_send(StreamingOutput {
+                        send_session_stream_output(sender, StreamingOutput {
                             new_text,
                             finished,
                             finish_reason,
@@ -5465,7 +6129,7 @@ impl SimpleEngine {
                             completion_tokens: u32::try_from(decode.len()).unwrap_or(u32::MAX),
                             token_logprob: None,
                             prefill_progress: None,
-                        });
+                        })?;
                     }
 
                     let decode_start = std::time::Instant::now();
@@ -5538,7 +6202,7 @@ impl SimpleEngine {
                             } else {
                                 None
                             };
-                            let _ = sender.blocking_send(StreamingOutput {
+                            send_session_stream_output(sender, StreamingOutput {
                                 new_text,
                                 finished,
                                 finish_reason,
@@ -5546,7 +6210,7 @@ impl SimpleEngine {
                                 completion_tokens: u32::try_from(decode.len()).unwrap_or(u32::MAX),
                                 token_logprob: None,
                                 prefill_progress: None,
-                            });
+                            })?;
                         }
                     }
                     let decode_elapsed = decode_start.elapsed();
@@ -5657,6 +6321,7 @@ impl SimpleEngine {
                 })();
             match attempt {
                 Ok(parts) => break parts,
+                Err(EngineError::Cancelled) => return Err(EngineError::Cancelled),
                 Err(error) if continued && !retried_cold => {
                     retried_cold = true;
                     tracing::warn!(
@@ -6272,6 +6937,7 @@ impl SimpleEngine {
         tokens: &[u32],
         hard_keep_spans: &[HardKeepSpan],
     ) -> Result<PFlashScoreOutcome, EngineError> {
+        let _mlx_gate = (!higgs_models::mlx_exec::held()).then(higgs_models::mlx_exec::acquire);
         let prefill_lock = self
             .prefill_drafter
             .as_ref()
@@ -11228,18 +11894,21 @@ mod tests {
         DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD, DFlashVerifyMode, DFlashVerifyRound,
         DflashPrefillOutcome, DflashPromptPartition, DflashTapFrontier, EngineError,
         GenerationPromptSuffixes, IncrementalDetok, LivePair, PFlashPlanCache,
-        PFlashPlanCacheConfig, PrefillCompressionMode, SessionDsparkDecodeState, SessionGeneration,
-        SimpleEngine, SpeculationRoute, Tokenizer, adaptive_draft_depth_for_cap,
-        check_stop_sequences, common_prefix_token_len, contains_real_user_query,
-        continuation_prior_len, continuation_reject_reason, derive_model_name,
-        detect_thinking_support, dflash_accepts_pflash_plan, dflash_canonical_target_is_terminal,
-        dflash_new_stop_prefix_len, dflash_resolve_target_then_draft,
-        dflash_sparse_taps_available_for_pflash_plan, dflash_tail_draft_cap,
-        drive_canonical_dspark_round, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, lock_or_recover, paired_dflash_exact_domain, parse_enabled_flag,
-        pflash_actual_keep_ratio, pflash_auto_plan_worth_executing,
-        pflash_cache_source_and_request_tail, pflash_cache_source_and_request_tail_with_boundary,
-        resolve_speculation_route, stateless_mtp_family_eligible, with_chat_terminator,
+        PFlashPlanCacheConfig, PrefillCompressionMode, SessionBootstrapReason,
+        SessionDsparkDecodeState, SessionGeneration, SessionPrefillStrategy,
+        SessionPromptTraceOutcome, SessionPromptTracePayloadStats, SimpleEngine, SpeculationRoute,
+        Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences, common_prefix_token_len,
+        contains_real_user_query, continuation_prior_len, continuation_reject_reason,
+        derive_model_name, detect_thinking_support, dflash_accepts_pflash_plan,
+        dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
+        dflash_resolve_target_then_draft, dflash_sparse_taps_available_for_pflash_plan,
+        dflash_tail_draft_cap, drive_canonical_dspark_round, estimate_paged_kv_blocks,
+        extract_eos_tokens, find_stop_in_tail, lock_or_recover, message_boundary_delta,
+        paired_dflash_exact_domain, parse_enabled_flag, pflash_actual_keep_ratio,
+        pflash_auto_plan_worth_executing, pflash_cache_source_and_request_tail,
+        pflash_cache_source_and_request_tail_with_boundary, resolve_speculation_route,
+        session_prefill_strategy, session_prompt_trace_metrics, stateless_mtp_family_eligible,
+        with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
@@ -11523,6 +12192,255 @@ mod tests {
         assert!(!contains_real_user_query(&no_query));
         assert!(!contains_real_user_query(&system_only));
         assert!(contains_real_user_query(&real_query));
+    }
+
+    #[test]
+    fn cold_long_session_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let prompt = vec![7; MAX_PREFILL_TOKENS + 1];
+
+        assert_eq!(
+            session_prefill_strategy(42, None, &prompt, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::ColdPromptTooLarge {
+                    prompt_tokens: prompt.len(),
+                    max_prefill_tokens: MAX_PREFILL_TOKENS,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn cold_short_session_still_seeds_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let prompt = vec![7; MAX_PREFILL_TOKENS];
+
+        assert_eq!(
+            session_prefill_strategy(42, None, &prompt, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::Continue { session_id: 42 }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_small_exact_suffix_continues() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+        let mut candidate = retained.clone();
+        candidate.extend(std::iter::repeat_n(9, MAX_PREFILL_TOKENS));
+
+        assert_eq!(
+            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::Continue { session_id: 42 }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_large_suffix_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+        let mut candidate = retained.clone();
+        candidate.extend(std::iter::repeat_n(9, MAX_PREFILL_TOKENS + 1));
+
+        assert_eq!(
+            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::LargeSuffix {
+                    suffix_tokens: MAX_PREFILL_TOKENS + 1,
+                    max_prefill_tokens: MAX_PREFILL_TOKENS,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_diverged_candidate_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+        let candidate = vec![1, 2, 4, 9];
+
+        assert_eq!(
+            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::DivergedOrNotGrowing,
+            }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_not_growing_candidate_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+
+        assert_eq!(
+            session_prefill_strategy(42, Some(&retained), &retained, MAX_PREFILL_TOKENS),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::DivergedOrNotGrowing,
+            }
+        );
+    }
+
+    #[test]
+    fn boundary_delta_splices_after_covered_messages() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nanswer1";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nanswer1<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>";
+        let delta = message_boundary_delta(retained, full).unwrap();
+
+        assert_eq!(
+            delta,
+            "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>"
+        );
+    }
+
+    #[test]
+    fn boundary_delta_skips_closer_when_retained_has_it() {
+        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>";
+        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+        let delta = message_boundary_delta(retained, full).unwrap();
+        assert_eq!(delta, "\n<|im_start|>user\nq2<|im_end|>");
+    }
+
+    #[test]
+    fn boundary_delta_treats_generated_assistant_as_retained_source_of_truth() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nI'm **NanoBot** - compact and direct.";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nI'm **NanoBot** (surname: Bonsai) - compact, direct, and local.<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+        let delta = message_boundary_delta(retained, full).unwrap();
+
+        assert_eq!(
+            delta,
+            "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn boundary_delta_treats_closed_assistant_segments_as_retained_truth() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nactual generated answer<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\nsecond generated answer";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nnormalized stored answer<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\nsecond stored answer<|im_end|>\n<|im_start|>user\nq3<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+        let delta = message_boundary_delta(retained, full).unwrap();
+
+        assert_eq!(
+            delta,
+            "<|im_end|>\n<|im_start|>user\nq3<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn boundary_delta_rejects_non_assistant_role_mismatch() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>assistant\nq1<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_partial_non_assistant_boundary() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\npartial";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\npartial edited<|im_end|>\n<|im_start|>assistant\n";
+
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_mutated_first_message() {
+        let retained = "<|im_start|>system\noriginal<|im_end|>\n<|im_start|>user\nq<|im_end|>";
+        let full = "<|im_start|>system\nMUTATED!<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_mutated_middle_message() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nold context<|im_end|>\n<|im_start|>assistant\nanswer";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nNEW context<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_late_system_prompt_mutation() {
+        let original_tail = "a".repeat(300);
+        let mutated_tail = format!("{}b", "a".repeat(299));
+        let retained =
+            format!("<|im_start|>system\n{original_tail}<|im_end|>\n<|im_start|>user\nq");
+        let full =
+            format!("<|im_start|>system\n{mutated_tail}<|im_end|>\n<|im_start|>user\nq<|im_end|>");
+        assert!(message_boundary_delta(&retained, &full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_template_marker_inside_message_content() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_start|>user\nnot a boundary<|im_end|>";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_start|>user\nnot a boundary<|im_end|>\n<|im_start|>assistant\n";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_render_with_fewer_messages() {
+        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans";
+        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_accepts_equivalent_tool_call_replay() {
+        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nread it<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=read_file>\n<parameter=path>\nCargo.toml\n</parameter>\n</function>\n</tool_call>";
+        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nread it<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"arguments\":{\"path\":\"Cargo.toml\"},\"name\":\"read_file\"}\n</tool_call><|im_end|>\n<|im_start|>tool\n[workspace]\n<|im_end|>\n<|im_start|>assistant\n<think>";
+
+        let delta = message_boundary_delta(retained, full).unwrap();
+
+        assert_eq!(
+            delta,
+            "<|im_end|>\n<|im_start|>tool\n[workspace]\n<|im_end|>\n<|im_start|>assistant\n<think>"
+        );
+    }
+
+    #[test]
+    fn session_prompt_trace_reports_boundary_splice_and_tool_payload() {
+        let retained = [1, 2, 3];
+        let canonical = [9, 9, 9, 4, 5, 6];
+        let candidate = [1, 2, 3, 4, 5, 6];
+        let tool_payload = SessionPromptTracePayloadStats {
+            messages: 2,
+            bytes: 100,
+            largest_bytes: 80,
+        };
+
+        let trace = session_prompt_trace_metrics(
+            Some(&retained),
+            &canonical,
+            &candidate,
+            tool_payload,
+            SessionPromptTraceOutcome::Continued,
+        );
+
+        assert_eq!(trace.common_prefix_tokens, retained.len());
+        assert_eq!(trace.divergence_token, None);
+        assert_eq!(trace.suffix_tokens, 3);
+        assert!(trace.boundary_splice);
+        assert_eq!(trace.tool_result_messages, 2);
+        assert_eq!(trace.tool_result_bytes, 100);
+        assert_eq!(trace.tool_result_largest_bytes, 80);
+    }
+
+    #[test]
+    fn session_prompt_trace_reports_prefix_mismatch() {
+        let retained = [1, 2, 3];
+        let candidate = [1, 2, 4, 5];
+        let trace = session_prompt_trace_metrics(
+            Some(&retained),
+            &candidate,
+            &candidate,
+            SessionPromptTracePayloadStats::default(),
+            SessionPromptTraceOutcome::ExactBootstrap,
+        );
+
+        assert_eq!(trace.common_prefix_tokens, 2);
+        assert_eq!(trace.divergence_token, Some(2));
+        assert_eq!(trace.suffix_tokens, candidate.len());
+        assert!(!trace.boundary_splice);
     }
 
     fn validated_session_target(boundary: i32) -> AnyCache {

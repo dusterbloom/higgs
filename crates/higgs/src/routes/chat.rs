@@ -13,7 +13,7 @@ use axum::{
     },
 };
 use bytes::Bytes;
-use higgs_engine::simple::{SessionPromptTraceMetrics, SessionPromptTraceOutcome};
+use higgs_engine::simple::SessionPromptTracePayloadStats;
 use tokio_stream::Stream;
 
 use crate::{
@@ -350,154 +350,56 @@ async fn chat_completions_non_streaming(
     let tool_payload = tool_payload_stats(&effective_messages);
     warn_large_tool_payload(tool_payload);
 
-    if let Some(sid) = session_id {
-        let max_session_prefill_tokens = engine.session_max_suffix_prefill_tokens();
-        let retained_tokens = engine.retained_session_tokens(sid);
-        let continued_prompt = if retained_tokens.is_some() {
-            continued_prompt_tokens(
-                &engine,
+    let output = if let Some(sid) = session_id {
+        let engine_c = Arc::clone(&engine);
+        let prompt_tokens_c = prompt_tokens.clone();
+        let messages_c = messages.clone();
+        let tools_c = tools.map(<[serde_json::Value]>::to_vec);
+        let sampling_c = sampling.clone();
+        let session_output = tokio::task::spawn_blocking(move || {
+            engine_c.generate_session_routed_with_thinking(
                 sid,
-                &prompt_tokens,
-                &messages,
-                tools,
+                &prompt_tokens_c,
+                &messages_c,
+                tools_c.as_deref(),
+                max_tokens,
+                &sampling_c,
                 thinking_enabled,
+                tool_payload,
             )
-        } else {
-            prompt_tokens.clone()
-        };
+        })
+        .await
+        .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
+        .map_err(ServerError::Engine)?;
 
-        let strategy = session_prefill_strategy(
-            Some(sid),
-            retained_tokens.as_deref(),
-            &continued_prompt,
-            max_session_prefill_tokens,
-        );
-        match strategy {
-            SessionPrefillStrategy::Continue { session_id: sid } => {
-                record_session_prompt_trace(
-                    &engine,
-                    sid,
-                    retained_tokens.as_deref(),
-                    &prompt_tokens,
-                    &continued_prompt,
-                    tool_payload,
-                    SessionPromptTraceOutcome::Continued,
-                );
-                let sampling_c = sampling.clone();
-                let engine_c = Arc::clone(&engine);
-                let session_output = tokio::task::spawn_blocking(move || {
-                    engine_c.generate_continued_with_thinking(
-                        sid,
-                        &continued_prompt,
-                        max_tokens,
-                        &sampling_c,
-                        thinking_enabled,
-                    )
-                })
-                .await
-                .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-                .map_err(ServerError::Engine)?;
-
-                return Ok(build_session_response(
-                    &req.model,
-                    &request_id,
-                    session_output,
-                    tools,
-                    has_tools,
-                    thinking_enabled,
-                ));
-            }
-            SessionPrefillStrategy::BootstrapExact {
-                session_id: sid,
-                reason,
-            } => {
-                let bootstrap_route = session_bootstrap_route(
-                    reason,
-                    engine.pflash_can_run_stateless_for_prompt(&prompt_tokens),
-                );
-                match bootstrap_route {
-                    SessionBootstrapRoute::ExactRetained => {
-                        record_session_prompt_trace(
-                            &engine,
-                            sid,
-                            retained_tokens.as_deref(),
-                            &prompt_tokens,
-                            &continued_prompt,
-                            tool_payload,
-                            SessionPromptTraceOutcome::ExactBootstrap,
-                        );
-                        handle_session_exact_bootstrap(sid, reason);
-                        let sampling_c = sampling.clone();
-                        let engine_c = Arc::clone(&engine);
-                        let session_output = tokio::task::spawn_blocking(move || {
-                            engine_c.generate_continued_with_thinking(
-                                sid,
-                                &continued_prompt,
-                                max_tokens,
-                                &sampling_c,
-                                thinking_enabled,
-                            )
-                        })
-                        .await
-                        .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-                        .map_err(ServerError::Engine)?;
-
-                        return Ok(build_session_response(
-                            &req.model,
-                            &request_id,
-                            session_output,
-                            tools,
-                            has_tools,
-                            thinking_enabled,
-                        ));
-                    }
-                    SessionBootstrapRoute::StatelessPflash => {
-                        record_session_prompt_trace(
-                            &engine,
-                            sid,
-                            retained_tokens.as_deref(),
-                            &prompt_tokens,
-                            &continued_prompt,
-                            tool_payload,
-                            SessionPromptTraceOutcome::StatelessPflashBootstrap,
-                        );
-                        handle_session_stateless_pflash_bootstrap(sid, reason);
-                    }
-                }
-            }
-            SessionPrefillStrategy::Stateless(reason) => {
-                record_session_prompt_trace(
-                    &engine,
-                    sid,
-                    retained_tokens.as_deref(),
-                    &prompt_tokens,
-                    &continued_prompt,
-                    tool_payload,
-                    SessionPromptTraceOutcome::StatelessPrefill,
-                );
-                handle_session_stateless_prefill(sid, reason);
-            }
-        }
-    }
-
-    let output = tokio::task::spawn_blocking(move || {
-        engine.generate_with_thinking_and_pflash_policy(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
+        return Ok(build_session_response(
+            &req.model,
+            &request_id,
+            session_output,
+            tools,
+            has_tools,
             thinking_enabled,
-            constraint,
-            pixel_values,
-            checkpoint_id.as_deref(),
-            &pflash_policy,
-        )
-    })
-    .await
-    .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-    .map_err(ServerError::Engine)?;
+        ));
+    } else {
+        tokio::task::spawn_blocking(move || {
+            engine.generate_with_thinking_and_pflash_policy(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                want_logprobs,
+                top_logprobs,
+                thinking_enabled,
+                constraint,
+                pixel_values,
+                checkpoint_id.as_deref(),
+                &pflash_policy,
+            )
+        })
+        .await
+        .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
+        .map_err(ServerError::Engine)?
+    };
 
     let logprobs_response = output
         .token_logprobs
@@ -607,226 +509,8 @@ async fn chat_completions_non_streaming(
     })
 }
 
-/// Build the token sequence fed to `generate_continued`. The engine guard
-/// prefills only the suffix IFF the retained tokens are a strict token-prefix of
-/// what we pass, so we hand it `retained ++ delta`.
-///
-/// `retained` carries the `<think>...</think>` block the chat template injected
-/// for the prior assistant turn. The canonical multi-turn render strips
-/// `<think>` from historical assistant turns, so match a think-stripped copy of
-/// `retained` against the full render to find the new-turn delta, then append
-/// that delta to the original retained tokens.
-// `print_stderr`: env-gated (HIGGS_DIAG_SESSION_TIMING) diagnostics only.
-#[allow(clippy::print_stderr)]
-fn continued_prompt_tokens(
-    engine: &Arc<Engine>,
-    session_id: u64,
-    prompt_tokens: &[u32],
-    messages: &[higgs_engine::chat_template::ChatMessage],
-    tools: Option<&[serde_json::Value]>,
-    thinking_enabled: bool,
-) -> Vec<u32> {
-    let diag = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
-    let Some(retained) = engine.retained_session_tokens(session_id) else {
-        if diag {
-            eprintln!(
-                "DIAG session-continue-fallback: reason=no_retained_cache session_id={session_id} prompt_tokens={}",
-                prompt_tokens.len()
-            );
-        }
-        return prompt_tokens.to_vec();
-    };
-    let retained_text = match engine.tokenizer().decode(&retained, false) {
-        Ok(text) => text,
-        Err(error) => {
-            if diag {
-                eprintln!(
-                    "DIAG session-continue-fallback: reason=decode_retained_failed session_id={session_id} retained_tokens={} error={error}",
-                    retained.len()
-                );
-            }
-            return prompt_tokens.to_vec();
-        }
-    };
-    let full_text = match engine.render_chat_prompt_with_thinking(messages, tools, thinking_enabled)
-    {
-        Ok(text) => text,
-        Err(error) => {
-            if diag {
-                eprintln!(
-                    "DIAG session-continue-fallback: reason=render_full_failed session_id={session_id} retained_tokens={} prompt_tokens={} error={error}",
-                    retained.len(),
-                    prompt_tokens.len()
-                );
-            }
-            return prompt_tokens.to_vec();
-        }
-    };
-    let Some(delta_text) = message_boundary_delta(&retained_text, &full_text) else {
-        if diag {
-            let common = common_prefix_bytes(&retained_text, &full_text);
-            eprintln!(
-                "DIAG session-continue-fallback: reason=boundary_splice_failed session_id={session_id} retained_tokens={} prompt_tokens={} retained_bytes={} full_bytes={} retained_msgs={} full_msgs={} common_bytes={} retained_tail={:?} full_at_mismatch={:?}",
-                retained.len(),
-                prompt_tokens.len(),
-                retained_text.len(),
-                full_text.len(),
-                retained_text.matches(IM_START).count(),
-                full_text.matches(IM_START).count(),
-                common,
-                preview_around(&retained_text, common),
-                preview_around(&full_text, common)
-            );
-        }
-        return prompt_tokens.to_vec();
-    };
-    let Ok(delta_enc) = engine.tokenizer().encode(delta_text, false) else {
-        if diag {
-            eprintln!(
-                "DIAG session-continue-fallback: reason=encode_delta_failed session_id={session_id} delta_bytes={}",
-                delta_text.len()
-            );
-        }
-        return prompt_tokens.to_vec();
-    };
-    if diag {
-        eprintln!(
-            "DIAG session-continue: matched session_id={session_id} retained_tokens={} delta_tokens={} full_prompt_tokens={}",
-            retained.len(),
-            delta_enc.get_ids().len(),
-            prompt_tokens.len()
-        );
-    }
-    let mut combined = retained;
-    combined.extend_from_slice(delta_enc.get_ids());
-    combined
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionPrefillStrategy {
-    Continue {
-        session_id: u64,
-    },
-    BootstrapExact {
-        session_id: u64,
-        reason: SessionBootstrapReason,
-    },
-    Stateless(SessionPrefillFallback),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionBootstrapReason {
-    ColdPromptTooLarge {
-        prompt_tokens: usize,
-        max_prefill_tokens: usize,
-    },
-    DivergedOrNotGrowing,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionBootstrapRoute {
-    ExactRetained,
-    StatelessPflash,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionPrefillFallback {
-    NoSessionId,
-    LargeSuffix {
-        suffix_tokens: usize,
-        max_prefill_tokens: usize,
-    },
-}
-
-fn session_prefill_strategy(
-    session_id: Option<u64>,
-    retained_tokens: Option<&[u32]>,
-    continuation_candidate: &[u32],
-    max_prefill_tokens: usize,
-) -> SessionPrefillStrategy {
-    let Some(session_id) = session_id else {
-        return SessionPrefillStrategy::Stateless(SessionPrefillFallback::NoSessionId);
-    };
-
-    let Some(retained_tokens) = retained_tokens else {
-        if continuation_candidate.len() <= max_prefill_tokens {
-            return SessionPrefillStrategy::Continue { session_id };
-        }
-        return SessionPrefillStrategy::BootstrapExact {
-            session_id,
-            reason: SessionBootstrapReason::ColdPromptTooLarge {
-                prompt_tokens: continuation_candidate.len(),
-                max_prefill_tokens,
-            },
-        };
-    };
-
-    let prior = retained_tokens.len();
-    if prior == 0
-        || prior >= continuation_candidate.len()
-        || continuation_candidate.get(..prior) != Some(retained_tokens)
-    {
-        return SessionPrefillStrategy::BootstrapExact {
-            session_id,
-            reason: SessionBootstrapReason::DivergedOrNotGrowing,
-        };
-    }
-
-    let suffix_tokens = continuation_candidate.len() - prior;
-    if suffix_tokens <= max_prefill_tokens {
-        SessionPrefillStrategy::Continue { session_id }
-    } else {
-        SessionPrefillStrategy::Stateless(SessionPrefillFallback::LargeSuffix {
-            suffix_tokens,
-            max_prefill_tokens,
-        })
-    }
-}
-
-fn session_bootstrap_route(
-    _reason: SessionBootstrapReason,
-    pflash_can_run_stateless: bool,
-) -> SessionBootstrapRoute {
-    if pflash_can_run_stateless {
-        SessionBootstrapRoute::StatelessPflash
-    } else {
-        SessionBootstrapRoute::ExactRetained
-    }
-}
-
-fn handle_session_stateless_prefill(session_id: u64, reason: SessionPrefillFallback) {
-    tracing::info!(
-        session_id,
-        ?reason,
-        "session continuation skipped; using stateless prefill path"
-    );
-}
-
-fn handle_session_exact_bootstrap(session_id: u64, reason: SessionBootstrapReason) {
-    tracing::info!(
-        session_id,
-        ?reason,
-        "session continuation bootstrapping exact retained prefill path"
-    );
-}
-
-fn handle_session_stateless_pflash_bootstrap(session_id: u64, reason: SessionBootstrapReason) {
-    tracing::info!(
-        session_id,
-        ?reason,
-        "session continuation cannot reuse retained KV; using stateless PFlash/cache path"
-    );
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ToolPayloadStats {
-    messages: usize,
-    bytes: usize,
-    largest_bytes: usize,
-}
-
-fn tool_payload_stats(messages: &[ChatCompletionMessage]) -> ToolPayloadStats {
-    let mut stats = ToolPayloadStats::default();
+fn tool_payload_stats(messages: &[ChatCompletionMessage]) -> SessionPromptTracePayloadStats {
+    let mut stats = SessionPromptTracePayloadStats::default();
     for message in messages {
         if !message.role.eq_ignore_ascii_case("tool") {
             continue;
@@ -842,7 +526,7 @@ fn tool_payload_stats(messages: &[ChatCompletionMessage]) -> ToolPayloadStats {
     stats
 }
 
-fn warn_large_tool_payload(stats: ToolPayloadStats) {
+fn warn_large_tool_payload(stats: SessionPromptTracePayloadStats) {
     if stats.bytes >= TOOL_RESULT_PROMPT_WARN_BYTES {
         tracing::warn!(
             tool_result_messages = stats.messages,
@@ -852,341 +536,6 @@ fn warn_large_tool_payload(stats: ToolPayloadStats) {
             "large raw tool-result replay present in live prompt; compact to handles and recall exact output on demand"
         );
     }
-}
-
-fn record_session_prompt_trace(
-    engine: &Arc<Engine>,
-    session_id: u64,
-    retained_tokens: Option<&[u32]>,
-    prompt_tokens: &[u32],
-    candidate_tokens: &[u32],
-    tool_payload: ToolPayloadStats,
-    outcome: SessionPromptTraceOutcome,
-) {
-    let trace = session_prompt_trace_metrics(
-        retained_tokens,
-        prompt_tokens,
-        candidate_tokens,
-        tool_payload,
-        outcome,
-    );
-    tracing::info!(
-        session_id,
-        prompt_tokens = trace.prompt_tokens,
-        retained_tokens = trace.retained_tokens,
-        candidate_tokens = trace.candidate_tokens,
-        suffix_tokens = trace.suffix_tokens,
-        common_prefix_tokens = trace.common_prefix_tokens,
-        divergence_token = ?trace.divergence_token,
-        boundary_splice = trace.boundary_splice,
-        tool_result_messages = trace.tool_result_messages,
-        tool_result_bytes = trace.tool_result_bytes,
-        tool_result_largest_bytes = trace.tool_result_largest_bytes,
-        ?outcome,
-        "session prompt/cache trace"
-    );
-    engine.record_session_prompt_trace(trace);
-}
-
-fn session_prompt_trace_metrics(
-    retained_tokens: Option<&[u32]>,
-    prompt_tokens: &[u32],
-    candidate_tokens: &[u32],
-    tool_payload: ToolPayloadStats,
-    outcome: SessionPromptTraceOutcome,
-) -> SessionPromptTraceMetrics {
-    let Some(retained) = retained_tokens else {
-        return SessionPromptTraceMetrics {
-            prompt_tokens: prompt_tokens.len(),
-            retained_tokens: 0,
-            candidate_tokens: candidate_tokens.len(),
-            suffix_tokens: candidate_tokens.len(),
-            common_prefix_tokens: 0,
-            divergence_token: None,
-            boundary_splice: false,
-            tool_result_messages: tool_payload.messages,
-            tool_result_bytes: tool_payload.bytes,
-            tool_result_largest_bytes: tool_payload.largest_bytes,
-            outcome,
-        };
-    };
-
-    let common_prefix_tokens = common_prefix_tokens(retained, candidate_tokens);
-    let retained_prefix_of_candidate = !retained.is_empty()
-        && retained.len() < candidate_tokens.len()
-        && common_prefix_tokens == retained.len();
-    let retained_prefix_of_prompt = !retained.is_empty()
-        && retained.len() < prompt_tokens.len()
-        && prompt_tokens.get(..retained.len()) == Some(retained);
-    let divergence_token = if retained_prefix_of_candidate {
-        None
-    } else {
-        Some(common_prefix_tokens)
-    };
-    let suffix_tokens = if retained_prefix_of_candidate {
-        candidate_tokens.len().saturating_sub(retained.len())
-    } else {
-        candidate_tokens.len()
-    };
-
-    SessionPromptTraceMetrics {
-        prompt_tokens: prompt_tokens.len(),
-        retained_tokens: retained.len(),
-        candidate_tokens: candidate_tokens.len(),
-        suffix_tokens,
-        common_prefix_tokens,
-        divergence_token,
-        boundary_splice: !retained_prefix_of_prompt && retained_prefix_of_candidate,
-        tool_result_messages: tool_payload.messages,
-        tool_result_bytes: tool_payload.bytes,
-        tool_result_largest_bytes: tool_payload.largest_bytes,
-        outcome,
-    }
-}
-
-fn common_prefix_tokens(left: &[u32], right: &[u32]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
-fn common_prefix_bytes(left: &str, right: &str) -> usize {
-    left.as_bytes()
-        .iter()
-        .zip(right.as_bytes())
-        .take_while(|(l, r)| l == r)
-        .count()
-}
-
-fn preview_around(text: &str, byte_pos: usize) -> String {
-    let start = char_boundary_at_or_before(text, byte_pos.saturating_sub(80));
-    let end = char_boundary_at_or_after(text, byte_pos.saturating_add(80));
-    text.get(start..end).unwrap_or_default().to_owned()
-}
-
-fn char_boundary_at_or_before(text: &str, byte_pos: usize) -> usize {
-    let pos = byte_pos.min(text.len());
-    (0..=pos)
-        .rev()
-        .find(|idx| text.is_char_boundary(*idx))
-        .unwrap_or(0)
-}
-
-fn char_boundary_at_or_after(text: &str, byte_pos: usize) -> usize {
-    let pos = byte_pos.min(text.len());
-    (pos..=text.len())
-        .find(|idx| text.is_char_boundary(*idx))
-        .unwrap_or(text.len())
-}
-
-const IM_START: &str = "<|im_start|>";
-const IM_END: &str = "<|im_end|>";
-const THINK_START: &str = "<think>";
-const THINK_END: &str = "</think>";
-
-#[derive(Debug)]
-struct RenderedMessageSegment<'a> {
-    text_without_end: &'a str,
-    end_start: Option<usize>,
-    end_after: Option<usize>,
-}
-
-/// Splice point for a continued turn: the suffix of the canonical render that
-/// covers the messages the retained KV does NOT yet cover.
-///
-/// The retained detokenization can never byte-match the canonical re-render of
-/// the same messages — think blocks are stripped or replaced by a placeholder
-/// depending on the turn's position relative to the conversation's last user
-/// message, and content/tool-call join whitespace differs from what the model
-/// generated. Instead of canonicalizing (template lore, position-dependent),
-/// splice at message boundaries: the retained text covers as many messages as
-/// it has `<|im_start|>` markers; everything from that boundary onward in the
-/// fresh render is the delta to prefill. The retained prefix keeps the model's
-/// original per-turn text (real thinking, original whitespace) — a known,
-/// accepted divergence source of the best-effort continuation path.
-///
-/// The last retained message usually ends without `<|im_end|>` (the engine
-/// pops the EOS token before stashing), so the delta starts AT the covered
-/// messages' final `<|im_end|>`; when the retained text does end with it, the
-/// delta starts right after instead. Returns `None` (caller falls back to a
-/// full prefill) when the render has fewer messages than the retained text,
-/// any covered complete message changed, or literal chat-template markers make
-/// the text ambiguous to splice safely. The final retained message is commonly
-/// the previously generated assistant turn without `<|im_end|>`; for that one,
-/// the retained KV is the source of truth and only the role boundary must match.
-fn message_boundary_delta<'a>(retained_text: &str, full_text: &'a str) -> Option<&'a str> {
-    let retained_segments = rendered_message_segments(retained_text)?;
-    let full_segments = rendered_message_segments(full_text)?;
-    let covered = retained_segments.len();
-    if covered == 0 || full_segments.len() < covered {
-        return None;
-    }
-
-    for (idx, (retained, fresh)) in retained_segments
-        .iter()
-        .zip(full_segments.iter())
-        .enumerate()
-        .take(covered)
-    {
-        if idx + 1 == covered && generated_assistant_boundary(retained, fresh) {
-            continue;
-        }
-        if normalized_segment(retained.text_without_end)
-            != normalized_segment(fresh.text_without_end)
-        {
-            return None;
-        }
-    }
-
-    let covered_segment = &full_segments[covered - 1];
-    let end_start = covered_segment.end_start?;
-    let end_after = covered_segment.end_after?;
-
-    // `end_after` is just past the covered messages' final <|im_end|>. The
-    // retained text usually lacks that closer (EOS popped at stash time), so
-    // include it in the delta; skip it when the retained text already ends with
-    // it.
-    let trimmed = retained_text.trim_end_matches('\n');
-    if trimmed.ends_with(IM_END) {
-        full_text.get(end_after..)
-    } else {
-        full_text.get(end_start..)
-    }
-}
-
-fn rendered_message_segments(text: &str) -> Option<Vec<RenderedMessageSegment<'_>>> {
-    let mut segments = Vec::new();
-    let mut pos = 0usize;
-
-    while let Some(relative_start) = text.get(pos..)?.find(IM_START) {
-        let start = pos + relative_start;
-        if !text.get(pos..start)?.trim().is_empty() {
-            return None;
-        }
-
-        let body_start = start + IM_START.len();
-        let Some(relative_end) = text.get(body_start..)?.find(IM_END) else {
-            let partial = text.get(start..)?;
-            if partial.get(IM_START.len()..)?.contains(IM_START) {
-                return None;
-            }
-            segments.push(RenderedMessageSegment {
-                text_without_end: partial,
-                end_start: None,
-                end_after: None,
-            });
-            return Some(segments);
-        };
-
-        let end_start = body_start + relative_end;
-        let end_after = end_start + IM_END.len();
-        let body = text.get(body_start..end_start)?;
-        if body.contains(IM_START) {
-            return None;
-        }
-
-        segments.push(RenderedMessageSegment {
-            text_without_end: text.get(start..end_start)?,
-            end_start: Some(end_start),
-            end_after: Some(end_after),
-        });
-        pos = end_after;
-    }
-
-    if !text.get(pos..)?.trim().is_empty() {
-        return None;
-    }
-    Some(segments)
-}
-
-fn generated_assistant_boundary(
-    retained: &RenderedMessageSegment<'_>,
-    fresh: &RenderedMessageSegment<'_>,
-) -> bool {
-    retained.end_start.is_none()
-        && fresh.end_start.is_some()
-        && segment_role(retained.text_without_end) == Some("assistant")
-        && segment_role(fresh.text_without_end) == Some("assistant")
-}
-
-fn segment_role(segment: &str) -> Option<&str> {
-    segment
-        .strip_prefix(IM_START)?
-        .split_once('\n')
-        .map(|(role, _)| role)
-}
-
-fn normalized_segment(segment: &str) -> String {
-    let without_think = strip_think_blocks(segment);
-    canonicalize_tool_calls(&without_think)
-        .trim_end_matches('\n')
-        .to_owned()
-}
-
-fn canonicalize_tool_calls(text: &str) -> String {
-    let parsed = higgs_engine::tool_parser::parse_tool_calls(text, None);
-    if parsed.tool_calls.is_empty() {
-        return text.to_owned();
-    }
-
-    let mut out = parsed.text.trim_end_matches('\n').to_owned();
-    for call in parsed.tool_calls {
-        out.push_str("\n<tool_call:");
-        out.push_str(&call.name);
-        out.push(':');
-        out.push_str(&canonical_json_value(&call.arguments));
-        out.push('>');
-    }
-    out
-}
-
-fn canonical_json_value(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Array(values) => {
-            let body = values
-                .iter()
-                .map(canonical_json_value)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("[{body}]")
-        }
-        serde_json::Value::Object(map) => {
-            let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-            let body = entries
-                .into_iter()
-                .map(|(key, value)| {
-                    let key = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
-                    format!("{key}:{}", canonical_json_value(value))
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{body}}}")
-        }
-        _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
-    }
-}
-
-fn strip_think_blocks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-
-    while let Some(start) = rest.find(THINK_START) {
-        out.push_str(&rest[..start]);
-        let after_start = &rest[start + THINK_START.len()..];
-        let Some(end) = after_start.find(THINK_END) else {
-            out.push_str(&rest[start..]);
-            return out;
-        };
-        rest = &after_start[end + THINK_END.len()..];
-        if let Some(after_blank) = rest.strip_prefix("\n\n") {
-            rest = after_blank;
-        }
-    }
-
-    out.push_str(rest);
-    out
 }
 
 /// Map a [`SessionGeneration`] (cache-resident continued turn) onto the same
@@ -1437,153 +786,30 @@ async fn chat_completions_stream(
     // loop itself (see `generate_continued_streaming_with_thinking`) fixes
     // that without changing the non-session path at all.
     if let Some(sid) = stream_session_id {
-        let max_session_prefill_tokens = engine.session_max_suffix_prefill_tokens();
-        let retained_tokens = engine.retained_session_tokens(sid);
-        let continued_prompt = if retained_tokens.is_some() {
-            continued_prompt_tokens(
-                &engine,
+        let prompt_tools_c = prompt_tools.map(<[serde_json::Value]>::to_vec);
+        let messages_c = messages.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = engine.generate_session_routed_streaming_with_thinking(
                 sid,
                 &prompt_tokens,
-                &messages,
-                prompt_tools,
+                &messages_c,
+                prompt_tools_c.as_deref(),
+                max_tokens,
+                &sampling,
+                &tx,
                 thinking_enabled_stream,
-            )
-        } else {
-            prompt_tokens.clone()
-        };
-
-        let strategy = session_prefill_strategy(
-            Some(sid),
-            retained_tokens.as_deref(),
-            &continued_prompt,
-            max_session_prefill_tokens,
-        );
-        match strategy {
-            SessionPrefillStrategy::Continue { session_id: sid } => {
-                record_session_prompt_trace(
-                    &engine,
-                    sid,
-                    retained_tokens.as_deref(),
-                    &prompt_tokens,
-                    &continued_prompt,
-                    tool_payload,
-                    SessionPromptTraceOutcome::Continued,
-                );
-                tokio::task::spawn_blocking(move || {
-                    let result = engine.generate_continued_streaming_with_thinking(
-                        sid,
-                        &continued_prompt,
-                        max_tokens,
-                        &sampling,
-                        &tx,
-                        thinking_enabled_stream,
-                    );
-                    if let Err(e) = result {
-                        tracing::error!(error = %e, "Session generation error during streaming");
-                    }
-                });
-            }
-            SessionPrefillStrategy::BootstrapExact {
-                session_id: sid,
-                reason,
-            } => {
-                let bootstrap_route = session_bootstrap_route(
-                    reason,
-                    engine.pflash_can_run_stateless_for_prompt(&prompt_tokens),
-                );
-                match bootstrap_route {
-                    SessionBootstrapRoute::ExactRetained => {
-                        record_session_prompt_trace(
-                            &engine,
-                            sid,
-                            retained_tokens.as_deref(),
-                            &prompt_tokens,
-                            &continued_prompt,
-                            tool_payload,
-                            SessionPromptTraceOutcome::ExactBootstrap,
-                        );
-                        handle_session_exact_bootstrap(sid, reason);
-                        tokio::task::spawn_blocking(move || {
-                            let result = engine.generate_continued_streaming_with_thinking(
-                                sid,
-                                &continued_prompt,
-                                max_tokens,
-                                &sampling,
-                                &tx,
-                                thinking_enabled_stream,
-                            );
-                            if let Err(e) = result {
-                                tracing::error!(error = %e, "Session generation error during streaming");
-                            }
-                        });
-                    }
-                    SessionBootstrapRoute::StatelessPflash => {
-                        record_session_prompt_trace(
-                            &engine,
-                            sid,
-                            retained_tokens.as_deref(),
-                            &prompt_tokens,
-                            &continued_prompt,
-                            tool_payload,
-                            SessionPromptTraceOutcome::StatelessPflashBootstrap,
-                        );
-                        handle_session_stateless_pflash_bootstrap(sid, reason);
-                        tokio::task::spawn_blocking(move || {
-                            let result = engine.generate_streaming_with_thinking_and_pflash_policy(
-                                &prompt_tokens,
-                                max_tokens,
-                                &sampling,
-                                &stop_sequences,
-                                want_logprobs,
-                                top_logprobs,
-                                &tx,
-                                thinking_enabled_stream,
-                                collect_prefill_progress,
-                                constraint,
-                                pixel_values,
-                                checkpoint_id.as_deref(),
-                                &pflash_policy,
-                            );
-                            if let Err(e) = result {
-                                tracing::error!(error = %e, "Generation error during streaming");
-                            }
-                        });
-                    }
+                tool_payload,
+            );
+            match result {
+                Ok(()) => {}
+                Err(higgs_engine::error::EngineError::Cancelled) => {
+                    tracing::debug!(sid, "Session-routed streaming cancelled by client");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Session-routed generation error during streaming");
                 }
             }
-            SessionPrefillStrategy::Stateless(reason) => {
-                record_session_prompt_trace(
-                    &engine,
-                    sid,
-                    retained_tokens.as_deref(),
-                    &prompt_tokens,
-                    &continued_prompt,
-                    tool_payload,
-                    SessionPromptTraceOutcome::StatelessPrefill,
-                );
-                handle_session_stateless_prefill(sid, reason);
-                tokio::task::spawn_blocking(move || {
-                    let result = engine.generate_streaming_with_thinking_and_pflash_policy(
-                        &prompt_tokens,
-                        max_tokens,
-                        &sampling,
-                        &stop_sequences,
-                        want_logprobs,
-                        top_logprobs,
-                        &tx,
-                        thinking_enabled_stream,
-                        collect_prefill_progress,
-                        constraint,
-                        pixel_values,
-                        checkpoint_id.as_deref(),
-                        &pflash_policy,
-                    );
-                    if let Err(e) = result {
-                        tracing::error!(error = %e, "Generation error during streaming");
-                    }
-                });
-            }
-        }
+        });
     } else {
         tokio::task::spawn_blocking(move || {
             let result = engine.generate_streaming_with_thinking_and_pflash_policy(
@@ -2253,275 +1479,6 @@ mod tests {
             retained_session_drop_ids(Some(9), Some(&[3, 9, 1, 3])),
             vec![1, 3, 9]
         );
-    }
-
-    #[test]
-    fn cold_long_session_bootstraps_exact_retained_cache() {
-        const MAX_PREFILL_TOKENS: usize = 128;
-        let prompt = vec![7; MAX_PREFILL_TOKENS + 1];
-
-        assert_eq!(
-            session_prefill_strategy(Some(42), None, &prompt, MAX_PREFILL_TOKENS),
-            SessionPrefillStrategy::BootstrapExact {
-                session_id: 42,
-                reason: SessionBootstrapReason::ColdPromptTooLarge {
-                    prompt_tokens: prompt.len(),
-                    max_prefill_tokens: MAX_PREFILL_TOKENS,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn cold_short_session_still_seeds_retained_cache() {
-        const MAX_PREFILL_TOKENS: usize = 128;
-        let prompt = vec![7; MAX_PREFILL_TOKENS];
-
-        assert_eq!(
-            session_prefill_strategy(Some(42), None, &prompt, MAX_PREFILL_TOKENS),
-            SessionPrefillStrategy::Continue { session_id: 42 }
-        );
-    }
-
-    #[test]
-    fn warm_session_with_small_exact_suffix_continues() {
-        const MAX_PREFILL_TOKENS: usize = 128;
-        let retained = vec![1, 2, 3];
-        let mut candidate = retained.clone();
-        candidate.extend(std::iter::repeat_n(9, MAX_PREFILL_TOKENS));
-
-        assert_eq!(
-            session_prefill_strategy(Some(42), Some(&retained), &candidate, MAX_PREFILL_TOKENS),
-            SessionPrefillStrategy::Continue { session_id: 42 }
-        );
-    }
-
-    #[test]
-    fn warm_session_with_large_suffix_routes_to_stateless_pflash_path() {
-        const MAX_PREFILL_TOKENS: usize = 128;
-        let retained = vec![1, 2, 3];
-        let mut candidate = retained.clone();
-        candidate.extend(std::iter::repeat_n(9, MAX_PREFILL_TOKENS + 1));
-
-        assert_eq!(
-            session_prefill_strategy(Some(42), Some(&retained), &candidate, MAX_PREFILL_TOKENS),
-            SessionPrefillStrategy::Stateless(SessionPrefillFallback::LargeSuffix {
-                suffix_tokens: MAX_PREFILL_TOKENS + 1,
-                max_prefill_tokens: MAX_PREFILL_TOKENS,
-            })
-        );
-    }
-
-    #[test]
-    fn warm_session_with_diverged_candidate_bootstraps_exact_retained_cache() {
-        const MAX_PREFILL_TOKENS: usize = 128;
-        let retained = vec![1, 2, 3];
-        let candidate = vec![1, 2, 4, 9];
-
-        assert_eq!(
-            session_prefill_strategy(Some(42), Some(&retained), &candidate, MAX_PREFILL_TOKENS),
-            SessionPrefillStrategy::BootstrapExact {
-                session_id: 42,
-                reason: SessionBootstrapReason::DivergedOrNotGrowing,
-            }
-        );
-    }
-
-    #[test]
-    fn warm_session_with_not_growing_candidate_bootstraps_exact_retained_cache() {
-        const MAX_PREFILL_TOKENS: usize = 128;
-        let retained = vec![1, 2, 3];
-
-        assert_eq!(
-            session_prefill_strategy(Some(42), Some(&retained), &retained, MAX_PREFILL_TOKENS),
-            SessionPrefillStrategy::BootstrapExact {
-                session_id: 42,
-                reason: SessionBootstrapReason::DivergedOrNotGrowing,
-            }
-        );
-    }
-
-    #[test]
-    fn session_bootstrap_uses_exact_retained_route_without_pflash() {
-        assert_eq!(
-            session_bootstrap_route(SessionBootstrapReason::DivergedOrNotGrowing, false),
-            SessionBootstrapRoute::ExactRetained
-        );
-        assert_eq!(
-            session_bootstrap_route(
-                SessionBootstrapReason::ColdPromptTooLarge {
-                    prompt_tokens: 129,
-                    max_prefill_tokens: 128,
-                },
-                false,
-            ),
-            SessionBootstrapRoute::ExactRetained
-        );
-    }
-
-    #[test]
-    fn session_bootstrap_uses_stateless_pflash_route_when_available() {
-        assert_eq!(
-            session_bootstrap_route(SessionBootstrapReason::DivergedOrNotGrowing, true),
-            SessionBootstrapRoute::StatelessPflash
-        );
-        assert_eq!(
-            session_bootstrap_route(
-                SessionBootstrapReason::ColdPromptTooLarge {
-                    prompt_tokens: 129,
-                    max_prefill_tokens: 128,
-                },
-                true,
-            ),
-            SessionBootstrapRoute::StatelessPflash
-        );
-    }
-
-    #[test]
-    fn boundary_delta_splices_after_covered_messages() {
-        // Retained: system + user + generated assistant reply (EOS popped, so
-        // no trailing <|im_end|>), with real thinking the render won't have.
-        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nanswer1";
-        // Fresh render: same three messages canonically rendered (thinking
-        // stripped, whitespace differs) plus a new user turn + gen suffix.
-        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nanswer1<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>";
-        let delta = message_boundary_delta(retained, full).unwrap();
-        // Delta starts at the covered messages' closing <|im_end|> (retained
-        // lacks it) and carries everything new.
-        assert_eq!(
-            delta,
-            "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>"
-        );
-    }
-
-    #[test]
-    fn boundary_delta_skips_closer_when_retained_has_it() {
-        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>";
-        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
-        let delta = message_boundary_delta(retained, full).unwrap();
-        assert_eq!(delta, "\n<|im_start|>user\nq2<|im_end|>");
-    }
-
-    #[test]
-    fn boundary_delta_treats_generated_assistant_as_retained_source_of_truth() {
-        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nI'm **NanoBot** - compact and direct.";
-        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nI'm **NanoBot** (surname: Bonsai) - compact, direct, and local.<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
-
-        let delta = message_boundary_delta(retained, full).unwrap();
-
-        assert_eq!(
-            delta,
-            "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        );
-    }
-
-    #[test]
-    fn boundary_delta_rejects_partial_non_assistant_boundary() {
-        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\npartial";
-        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\npartial edited<|im_end|>\n<|im_start|>assistant\n";
-
-        assert!(message_boundary_delta(retained, full).is_none());
-    }
-
-    #[test]
-    fn boundary_delta_rejects_mutated_first_message() {
-        // Client rewrote the system prompt between turns: no splice.
-        let retained = "<|im_start|>system\noriginal<|im_end|>\n<|im_start|>user\nq<|im_end|>";
-        let full = "<|im_start|>system\nMUTATED!<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
-        assert!(message_boundary_delta(retained, full).is_none());
-    }
-
-    #[test]
-    fn boundary_delta_rejects_mutated_middle_message() {
-        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nold context<|im_end|>\n<|im_start|>assistant\nanswer";
-        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nNEW context<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
-        assert!(message_boundary_delta(retained, full).is_none());
-    }
-
-    #[test]
-    fn boundary_delta_rejects_late_system_prompt_mutation() {
-        let original_tail = "a".repeat(300);
-        let mutated_tail = format!("{}b", "a".repeat(299));
-        let retained =
-            format!("<|im_start|>system\n{original_tail}<|im_end|>\n<|im_start|>user\nq");
-        let full =
-            format!("<|im_start|>system\n{mutated_tail}<|im_end|>\n<|im_start|>user\nq<|im_end|>");
-        assert!(message_boundary_delta(&retained, &full).is_none());
-    }
-
-    #[test]
-    fn boundary_delta_rejects_template_marker_inside_message_content() {
-        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_start|>user\nnot a boundary<|im_end|>";
-        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_start|>user\nnot a boundary<|im_end|>\n<|im_start|>assistant\n";
-        assert!(message_boundary_delta(retained, full).is_none());
-    }
-
-    #[test]
-    fn boundary_delta_rejects_render_with_fewer_messages() {
-        // Render has fewer message closers than retained covers (history
-        // shrank): no splice.
-        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans";
-        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>";
-        assert!(message_boundary_delta(retained, full).is_none());
-    }
-
-    #[test]
-    fn boundary_delta_accepts_equivalent_tool_call_replay() {
-        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nread it<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=read_file>\n<parameter=path>\nCargo.toml\n</parameter>\n</function>\n</tool_call>";
-        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nread it<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"arguments\":{\"path\":\"Cargo.toml\"},\"name\":\"read_file\"}\n</tool_call><|im_end|>\n<|im_start|>tool\n[workspace]\n<|im_end|>\n<|im_start|>assistant\n<think>";
-
-        let delta = message_boundary_delta(retained, full).unwrap();
-
-        assert_eq!(
-            delta,
-            "<|im_end|>\n<|im_start|>tool\n[workspace]\n<|im_end|>\n<|im_start|>assistant\n<think>"
-        );
-    }
-
-    #[test]
-    fn session_prompt_trace_reports_boundary_splice_and_tool_payload() {
-        let retained = [1, 2, 3];
-        let canonical = [9, 9, 9, 4, 5, 6];
-        let candidate = [1, 2, 3, 4, 5, 6];
-        let tool_payload = ToolPayloadStats {
-            messages: 2,
-            bytes: 100,
-            largest_bytes: 80,
-        };
-
-        let trace = session_prompt_trace_metrics(
-            Some(&retained),
-            &canonical,
-            &candidate,
-            tool_payload,
-            SessionPromptTraceOutcome::Continued,
-        );
-
-        assert_eq!(trace.common_prefix_tokens, retained.len());
-        assert_eq!(trace.divergence_token, None);
-        assert_eq!(trace.suffix_tokens, 3);
-        assert!(trace.boundary_splice);
-        assert_eq!(trace.tool_result_messages, 2);
-        assert_eq!(trace.tool_result_bytes, 100);
-        assert_eq!(trace.tool_result_largest_bytes, 80);
-    }
-
-    #[test]
-    fn session_prompt_trace_reports_prefix_mismatch() {
-        let retained = [1, 2, 3];
-        let candidate = [1, 2, 4, 5];
-        let trace = session_prompt_trace_metrics(
-            Some(&retained),
-            &candidate,
-            &candidate,
-            ToolPayloadStats::default(),
-            SessionPromptTraceOutcome::StatelessPflashBootstrap,
-        );
-
-        assert_eq!(trace.common_prefix_tokens, 2);
-        assert_eq!(trace.divergence_token, Some(2));
-        assert_eq!(trace.suffix_tokens, candidate.len());
-        assert!(!trace.boundary_splice);
     }
 
     fn simple_message(role: &str, content: Option<&str>) -> ChatCompletionMessage {

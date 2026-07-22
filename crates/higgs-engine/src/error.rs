@@ -16,6 +16,9 @@ pub enum EngineError {
 
     #[error("Generation error: {0}")]
     Generation(String),
+
+    #[error("Generation cancelled")]
+    Cancelled,
 }
 
 #[cfg(test)]
@@ -39,6 +42,12 @@ mod tests {
     fn test_engine_error_display_generation() {
         let err = EngineError::Generation("out of memory".to_owned());
         assert!(err.to_string().contains("out of memory"));
+    }
+
+    #[test]
+    fn test_engine_error_display_cancelled() {
+        let err = EngineError::Cancelled;
+        assert_eq!(err.to_string(), "Generation cancelled");
     }
 
     #[test]

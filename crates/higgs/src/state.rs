@@ -9,7 +9,7 @@ use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::{MlxRuntimeTuning, resolve_runtime_tuning};
 use higgs_engine::simple::{
     CacheStats, PFlashPromptPolicy, PrefillCompressionMode as EnginePrefillCompressionMode,
-    SessionGeneration, SessionPromptTraceMetrics, SimpleEngine,
+    SessionGeneration, SessionPromptTracePayloadStats, SimpleEngine,
 };
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
@@ -245,61 +245,6 @@ impl Engine {
         }
     }
 
-    /// Render the chat template to its prompt STRING (the exact text
-    /// [`Self::prepare_chat_prompt_with_thinking`] tokenizes). Only the Simple
-    /// engine, which owns retained session caches, needs this — it lets the
-    /// continuation path compute a text-anchored delta against the retained
-    /// tokens' own detokenization. Other variants have no retained cache, so
-    /// this is unreachable for them.
-    pub fn render_chat_prompt_with_thinking(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[serde_json::Value]>,
-        enable_thinking: bool,
-    ) -> Result<String, EngineError> {
-        match self {
-            Self::Simple(e) => e.render_chat_prompt_with_thinking(messages, tools, enable_thinking),
-            Self::Batch(_) => Err(EngineError::Generation(
-                "render_chat_prompt_with_thinking is only used by the Simple engine".to_owned(),
-            )),
-            #[cfg(test)]
-            Self::Stub(_) => Ok(String::new()),
-        }
-    }
-
-    /// The exact token sequence a retained session cache currently holds
-    /// (prompt + previously generated tokens), or `None` when no live cache
-    /// exists for this `session_id`. Only the Simple engine retains caches.
-    pub fn retained_session_tokens(&self, session_id: u64) -> Option<Vec<u32>> {
-        match self {
-            Self::Simple(e) => e.retained_session_tokens(session_id),
-            Self::Batch(_) => None,
-            #[cfg(test)]
-            Self::Stub(_) => None,
-        }
-    }
-
-    pub fn session_max_suffix_prefill_tokens(&self) -> usize {
-        match self {
-            Self::Simple(e) => e.session_max_suffix_prefill_tokens(),
-            Self::Batch(_) => usize::MAX,
-            #[cfg(test)]
-            Self::Stub(_) => 8192,
-        }
-    }
-
-    /// Whether this prompt can use the stateless PFlash path. Route handlers
-    /// use this only to choose a fallback path; the Simple engine still decides
-    /// whether compression is actually safe and worthwhile.
-    pub fn pflash_can_run_stateless_for_prompt(&self, prompt_tokens: &[u32]) -> bool {
-        match self {
-            Self::Simple(e) => e.pflash_can_run_stateless_for_prompt(prompt_tokens),
-            Self::Batch(_) => false,
-            #[cfg(test)]
-            Self::Stub(_) => false,
-        }
-    }
-
     /// Drop a retained per-session KV cache. Exact radix/disk prefix caches are
     /// independent and are intentionally left intact.
     pub fn drop_retained_session(&self, session_id: u64) -> bool {
@@ -319,15 +264,6 @@ impl Engine {
             Self::Batch(_) => None,
             #[cfg(test)]
             Self::Stub(_) => None,
-        }
-    }
-
-    pub fn record_session_prompt_trace(&self, trace: SessionPromptTraceMetrics) {
-        match self {
-            Self::Simple(e) => e.record_session_prompt_trace(trace),
-            Self::Batch(_) => {}
-            #[cfg(test)]
-            Self::Stub(_) => {}
         }
     }
 
@@ -361,6 +297,7 @@ impl Engine {
         params: &SamplingParams,
         enable_thinking: bool,
     ) -> Result<SessionGeneration, EngineError> {
+        let _gpu = gpu_gate();
         match self {
             Self::Simple(e) => e.generate_continued_with_thinking(
                 session_id,
@@ -390,6 +327,7 @@ impl Engine {
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         enable_thinking: bool,
     ) -> Result<(), EngineError> {
+        let _gpu = gpu_gate();
         match self {
             Self::Simple(e) => e.generate_continued_streaming_with_thinking(
                 session_id,
@@ -401,6 +339,74 @@ impl Engine {
             ),
             Self::Batch(_) => Err(EngineError::Generation(
                 "session_id (continued generation) is only supported by the Simple engine"
+                    .to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_session_routed_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+        tool_payload: SessionPromptTracePayloadStats,
+    ) -> Result<SessionGeneration, EngineError> {
+        let _gpu = gpu_gate();
+        match self {
+            Self::Simple(e) => e.generate_session_routed_with_thinking(
+                session_id,
+                prompt_tokens,
+                messages,
+                tools,
+                max_tokens,
+                params,
+                enable_thinking,
+                tool_payload,
+            ),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "session_id (session-routed generation) is only supported by the Simple engine"
+                    .to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_session_routed_streaming_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        max_tokens: u32,
+        params: &SamplingParams,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        tool_payload: SessionPromptTracePayloadStats,
+    ) -> Result<(), EngineError> {
+        let _gpu = gpu_gate();
+        match self {
+            Self::Simple(e) => e.generate_session_routed_streaming_with_thinking(
+                session_id,
+                prompt_tokens,
+                messages,
+                tools,
+                max_tokens,
+                params,
+                sender,
+                enable_thinking,
+                tool_payload,
+            ),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "session_id (session-routed streaming) is only supported by the Simple engine"
                     .to_owned(),
             )),
             #[cfg(test)]
