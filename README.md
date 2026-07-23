@@ -94,7 +94,7 @@ curl http://localhost:8000/v1/chat/completions \
 ### Run open-weight models locally on Apple Silicon
 
 - Serve MLX models from Hugging Face IDs or local paths.
-- Support current model families including Qwen 3.6, Qwen 3.x, Llama, Mistral, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, and LLaVA-Qwen2.
+- Support current model families including Qwen 3.6, Qwen 3.x, Nanbeige, Llama, Mistral, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, and LLaVA-Qwen2.
 - Expose local serving through OpenAI and Anthropic-compatible endpoints.
 
 ### Use one endpoint for local and remote models
@@ -126,7 +126,7 @@ curl http://localhost:8000/v1/chat/completions \
 - Release artifacts bundle `mlx.metallib`.
 - Source builds also require `mlx.metallib` next to the executable. Higgs now restores it automatically from Cargo build output when possible, then fails loudly if it still cannot be found.
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
-- `batch=true` is only supported for transformer families with true batched decode support.
+- `batch=true` is only supported for standard transformer families with true batched decode support.
 
 ## Performance
 

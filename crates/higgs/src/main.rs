@@ -278,7 +278,7 @@ fn load_engines(
         tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
         if model_cfg.batch && !config::resolved_model_supports_batch(&resolved)? {
             return Err(format!(
-                "batch=true is only supported for transformer models (llama, mistral, qwen2, qwen3); {model_path} is not supported"
+                "batch=true is only supported for standard transformer models (llama, mistral, qwen2, qwen3); {model_path} is not supported"
             )
             .into());
         }

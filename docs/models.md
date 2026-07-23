@@ -14,6 +14,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Qwen3.5 / Qwen3.6 MoE | `qwen3_5_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints |
 | Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B |
+| Nanbeige | `nanbeige` | Nanbeige4.2 |
 | Gemma 2 | `gemma2` | Gemma 2 2B, 9B, and 27B |
 | Gemma 3 | `gemma3`, `gemma3_text` | Gemma 3 1B, 4B, 12B, and 27B |
 | Gemma 4 | `gemma4`, `gemma4_text`, `gemma4_unified` | Gemma 4 E2B, E4B (edge); 12B, 31B; 26B-A4B (MoE) |
@@ -45,6 +46,8 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 
 Other supported architectures still serve normally in simple mode, but Higgs now rejects `batch=true` during config load, `doctor`, and server startup.
 
+Nanbeige uses repeated shared-weight decoder loops with loop-aware KV cache slots, so it is not included in true batched decode support.
+
 ## Representative Working MLX Model IDs
 
 | Family | Example model IDs |
@@ -56,6 +59,7 @@ Other supported architectures still serve normally in simple mode, but Higgs now
 | Qwen3.5 dense | `mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` |
 | Qwen3.5 MoE | `NexVeridian/Qwen3.5-35B-A3B-3bit` |
 | Qwen3.6 MoE | `mlx-community/Qwen3.6-35B-A3B-4bit` |
+| Nanbeige | `MercuriusDream/Nanbeige4.2-3B-mlx-6bit` |
 | DeepSeek-V2 | `mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx` |
 
 ## Qwen 3.6 Notes

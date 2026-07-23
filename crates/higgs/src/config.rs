@@ -810,7 +810,7 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
             && !supported
         {
             return Err(format!(
-                "batch=true is only supported for transformer models (llama, mistral, qwen2, qwen3); {} is not supported",
+                "batch=true is only supported for standard transformer models (llama, mistral, qwen2, qwen3); {} is not supported",
                 model.path
             ));
         }
@@ -1283,6 +1283,12 @@ mod tests {
         };
         let error = build_simple_config(&args).unwrap_err();
         assert!(error.contains("TurboQuant"));
+    }
+
+    #[test]
+    fn test_batch_support_model_types_excludes_nanbeige() {
+        assert!(supports_batch_model_type("qwen3"));
+        assert!(!supports_batch_model_type("nanbeige"));
     }
 
     #[test]

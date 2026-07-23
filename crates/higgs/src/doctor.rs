@@ -292,7 +292,7 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                         Ok(false) => {
                             fail(
                                 &format!(
-                                    "model {label} enables unsupported batch=true; only transformer models (llama, mistral, qwen2, qwen3) support true batched decode"
+                                    "model {label} enables unsupported batch=true; only standard transformer models (llama, mistral, qwen2, qwen3) support true batched decode"
                                 ),
                                 result,
                             );
