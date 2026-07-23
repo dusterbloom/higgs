@@ -36,6 +36,7 @@ pub fn is_supported(model_type: &str) -> bool {
             | "qwen3_moe"
             | "qwen3_5"
             | "qwen3_5_moe"
+            | "nanbeige"
             | "gemma2"
             | "gemma3"
             | "gemma3_text"
@@ -159,6 +160,11 @@ mod tests {
     #[test]
     fn test_is_supported_qwen3_moe() {
         assert!(is_supported("qwen3_moe"));
+    }
+
+    #[test]
+    fn test_is_supported_nanbeige() {
+        assert!(is_supported("nanbeige"));
     }
 
     #[test]

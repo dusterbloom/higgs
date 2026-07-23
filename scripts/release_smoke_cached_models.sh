@@ -17,9 +17,15 @@ OPTIONAL_MODELS=(
   "mlx-community/Qwen3.6-35B-A3B-4bit"
 )
 
+NANBEIGE_MODEL="${HIGGS_SMOKE_NANBEIGE_MODEL:-MercuriusDream/Nanbeige4.2-3B-mlx-6bit}"
+NANBEIGE_EXPECTED_NAME="${HIGGS_SMOKE_NANBEIGE_NAME:-MercuriusDream/Nanbeige4.2-3B-mlx-6bit}"
+
 MODELS=("${DEFAULT_MODELS[@]}")
 if [[ "${HIGGS_SMOKE_INCLUDE_OPTIONAL_MODELS:-0}" == "1" ]]; then
   MODELS+=("${OPTIONAL_MODELS[@]}")
+fi
+if [[ "${HIGGS_SMOKE_INCLUDE_NANBEIGE:-0}" == "1" ]]; then
+  MODELS+=("$NANBEIGE_MODEL")
 fi
 
 cleanup_pid=""
@@ -44,7 +50,22 @@ require_cmd() {
 
 require_cached_model() {
   local model_id="$1"
-  local cache_dir="$HOME/.cache/huggingface/hub/models--${model_id//\//--}"
+  if [[ -d "$model_id" ]]; then
+    return 0
+  fi
+  if [[ "$model_id" == ~/* ]]; then
+    local expanded="$HOME/${model_id#~/}"
+    if [[ -d "$expanded" ]]; then
+      return 0
+    fi
+  fi
+
+  local cache_root="${HF_HUB_CACHE:-${HUGGINGFACE_HUB_CACHE:-}}"
+  if [[ -z "$cache_root" && -n "${HF_HOME:-}" ]]; then
+    cache_root="$HF_HOME/hub"
+  fi
+  cache_root="${cache_root:-$HOME/.cache/huggingface/hub}"
+  local cache_dir="$cache_root/models--${model_id//\//--}"
   if [[ ! -d "$cache_dir" ]]; then
     echo "missing cached model: $model_id ($cache_dir)" >&2
     exit 1
@@ -106,14 +127,16 @@ stop_server() {
 single_model_smoke() {
   local model="$1"
   local port="$2"
-  local log_path="$TMP_DIR/$(basename "$model").log"
+  local expected_name="${3:-$model}"
+  local log_path
+  log_path="$TMP_DIR/$(basename "$model").log"
 
   echo "single-model smoke: $model"
   start_server "$log_path" serve --host 127.0.0.1 --port "$port" --model "$model"
   local pid="$cleanup_pid"
   wait_for_health "$port"
-  assert_models_contains "$port" "$model"
-  run_chat_checks "$port" "$model"
+  assert_models_contains "$port" "$expected_name"
+  run_chat_checks "$port" "$expected_name"
   stop_server "$pid"
 }
 
@@ -175,7 +198,7 @@ EOF
     echo "expected doctor to reject unsupported batch=true for Qwen3-Next" >&2
     exit 1
   fi
-  grep -F 'batch=true is only supported for transformer models' \
+  grep -F 'batch=true is only supported for standard transformer models' \
     "$TMP_DIR/qwen3-next-batch.out" >/dev/null
 }
 
@@ -233,6 +256,9 @@ main() {
   if [[ "${HIGGS_SMOKE_INCLUDE_OPTIONAL_MODELS:-0}" == "1" ]]; then
     echo "including optional cached models in smoke matrix"
   fi
+  if [[ "${HIGGS_SMOKE_INCLUDE_NANBEIGE:-0}" == "1" ]]; then
+    echo "including Nanbeige cached model in smoke matrix"
+  fi
 
   for model in "${MODELS[@]}"; do
     require_cached_model "$model"
@@ -247,6 +273,9 @@ main() {
   single_model_smoke "mlx-community/Qwen3-Coder-Next-4bit" 8104
   if [[ "${HIGGS_SMOKE_INCLUDE_OPTIONAL_MODELS:-0}" == "1" ]]; then
     single_model_smoke "mlx-community/Qwen3.6-35B-A3B-4bit" 8105
+  fi
+  if [[ "${HIGGS_SMOKE_INCLUDE_NANBEIGE:-0}" == "1" ]]; then
+    single_model_smoke "$NANBEIGE_MODEL" 8106 "$NANBEIGE_EXPECTED_NAME"
   fi
   multi_model_smoke 8110
   unsupported_batch_smoke

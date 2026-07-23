@@ -38,7 +38,7 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
     let config = ModelConfig::from_dir(&model_dir)?;
 
     match config.model_type.as_str() {
-        "qwen2" | "qwen3" | "llama" | "mistral" => {
+        "qwen2" | "qwen3" | "llama" | "mistral" | "nanbeige" => {
             // Packed 1.25-bpw Bonsai-Q1 checkpoints declare model_type="qwen3"
             // but the weights are quantized to bits=1. Route them to the
             // dedicated packed engine, whose bits=1 matvec/dequant run through
@@ -215,6 +215,12 @@ mod tests {
     fn model_config_from_dir_mistral() {
         let (_dir, result) = config_for_model("mistral");
         assert_eq!(result.unwrap().model_type, "mistral");
+    }
+
+    #[test]
+    fn model_config_from_dir_nanbeige() {
+        let (_dir, result) = config_for_model("nanbeige");
+        assert_eq!(result.unwrap().model_type, "nanbeige");
     }
 
     #[test]

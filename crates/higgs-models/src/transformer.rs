@@ -1,19 +1,21 @@
 //! Unified transformer model implementation.
 //!
-//! Supports Qwen2, Llama, and Mistral architectures. Architecture-specific
-//! behavior (e.g., Q/K/V bias) is parameterized through `ModelArgs`.
+//! Supports Qwen2, Qwen3, Llama, Mistral, and Nanbeige architectures.
+//! Architecture-specific behavior (for example Q/K/V bias and Nanbeige's
+//! repeated shared-weight decoder loops) is parameterized through `ModelArgs`.
 
 use std::path::Path;
 
 use mlx_rs::{
-    Array,
+    Array, Dtype,
     builder::Builder,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
-    module::Module,
+    module::{Module, Param},
     nn, ops,
     ops::indexing::IndexOp,
     quantization::MaybeQuantized,
+    random,
 };
 use serde::Deserialize;
 
@@ -28,6 +30,10 @@ use crate::{
 
 const fn default_rope_theta() -> f32 {
     10000.0
+}
+
+const fn default_num_loops() -> i32 {
+    1
 }
 
 /// Deserialize an `Option<i32>` that may appear as the string `"None"` in
@@ -70,6 +76,10 @@ pub struct ModelArgs {
     pub model_type: String,
     pub hidden_size: i32,
     pub num_hidden_layers: i32,
+    #[serde(default = "default_num_loops")]
+    pub num_loops: i32,
+    #[serde(default)]
+    pub skip_loop_final_norm: bool,
     pub intermediate_size: i32,
     pub num_attention_heads: i32,
     pub rms_norm_eps: f32,
@@ -156,6 +166,149 @@ impl ModelArgs {
         }
         Ok(self.hidden_size / self.num_attention_heads)
     }
+
+    /// Number of logical KV-cache layers required by this model.
+    ///
+    /// Nanbeige shares physical layer weights across loop passes, but upstream
+    /// generation stores separate KV entries for each loop/layer pass.
+    pub fn num_cache_layers(&self) -> Result<i32, ModelError> {
+        if self.num_loops <= 0 {
+            return Err(ModelError::ShapeMismatch(
+                "num_loops must be positive".to_owned(),
+            ));
+        }
+        self.num_hidden_layers
+            .checked_mul(self.num_loops)
+            .ok_or_else(|| {
+                ModelError::ShapeMismatch(format!(
+                    "num_hidden_layers ({}) * num_loops ({}) overflows i32",
+                    self.num_hidden_layers, self.num_loops
+                ))
+            })
+    }
+
+    pub fn supports_batched_decode(&self) -> bool {
+        self.num_loops == 1
+            && matches!(
+                self.model_type.as_str(),
+                "qwen2" | "qwen3" | "llama" | "mistral"
+            )
+    }
+
+    fn direct_quantization(&self) -> Option<&QuantizationConfig> {
+        if matches!(self.model_type.as_str(), "nanbeige") {
+            self.quantization.as_ref()
+        } else {
+            None
+        }
+    }
+
+    fn uses_direct_quantization(&self) -> bool {
+        self.direct_quantization().is_some()
+    }
+}
+
+fn quantized_cols(input_dims: i32, group_size: i32, bits: i32) -> Result<(i32, i32), Exception> {
+    if input_dims <= 0 {
+        return Err(Exception::custom("quantized input_dims must be positive"));
+    }
+    if group_size <= 0 {
+        return Err(Exception::custom(
+            "quantization group_size must be positive",
+        ));
+    }
+    if bits <= 0 {
+        return Err(Exception::custom("quantization bits must be positive"));
+    }
+    if input_dims % group_size != 0 {
+        return Err(Exception::custom(format!(
+            "input_dims ({input_dims}) must be divisible by quantization group_size ({group_size})"
+        )));
+    }
+    let packed_bits = group_size
+        .checked_mul(bits)
+        .ok_or_else(|| Exception::custom("quantization group_size * bits overflow"))?;
+    if packed_bits % 32 != 0 {
+        return Err(Exception::custom(format!(
+            "quantization group_size ({group_size}) * bits ({bits}) must be divisible by 32"
+        )));
+    }
+    let groups = input_dims / group_size;
+    let words_per_group = packed_bits / 32;
+    let cols = groups
+        .checked_mul(words_per_group)
+        .ok_or_else(|| Exception::custom("quantized packed column count overflow"))?;
+    Ok((groups, cols))
+}
+
+fn quantized_placeholder(
+    input_dims: i32,
+    qc: &QuantizationConfig,
+) -> Result<(Array, Array, Array), Exception> {
+    let (_groups, _packed_cols) = quantized_cols(input_dims, qc.group_size, qc.bits)?;
+
+    let weight = random::uniform::<_, f32>(-1.0e-7, 1.0e-7, &[1, 1], None)?;
+    let scales = random::uniform::<_, f32>(-1.0e-7, 1.0e-7, &[1, 1], None)?;
+    let dequant_biases = random::uniform::<_, f32>(-1.0e-7, 1.0e-7, &[1, 1], None)?;
+    Ok((weight, scales, dequant_biases))
+}
+
+fn maybe_quantized_linear(
+    input_dims: i32,
+    output_dims: i32,
+    bias: bool,
+    quantization: Option<&QuantizationConfig>,
+) -> Result<MaybeQuantized<nn::Linear>, Exception> {
+    let Some(qc) = quantization else {
+        return Ok(MaybeQuantized::Original(
+            nn::LinearBuilder::new(input_dims, output_dims)
+                .bias(bias)
+                .build()?,
+        ));
+    };
+
+    let (weight, scales, dequant_biases) = quantized_placeholder(input_dims, qc)?;
+    let bias_param = if bias {
+        Some(ops::zeros_dtype(&[1], Dtype::Float32)?)
+    } else {
+        None
+    };
+
+    Ok(MaybeQuantized::Quantized(nn::QuantizedLinear {
+        group_size: qc.group_size,
+        bits: qc.bits,
+        scales: Param::new(scales),
+        biases: Param::new(dequant_biases),
+        inner: nn::Linear {
+            weight: Param::new(weight),
+            bias: Param::new(bias_param),
+        },
+    }))
+}
+
+fn maybe_quantized_embedding(
+    embedding_count: i32,
+    dimensions: i32,
+    quantization: Option<&QuantizationConfig>,
+) -> Result<MaybeQuantized<nn::Embedding>, Exception> {
+    let Some(qc) = quantization else {
+        return Ok(MaybeQuantized::Original(nn::Embedding::new(
+            embedding_count,
+            dimensions,
+        )?));
+    };
+
+    let (weight, scales, dequant_biases) = quantized_placeholder(dimensions, qc)?;
+
+    Ok(MaybeQuantized::Quantized(nn::QuantizedEmbedding {
+        group_size: qc.group_size,
+        bits: qc.bits,
+        scales: Param::new(scales),
+        biases: Param::new(dequant_biases),
+        inner: nn::Embedding {
+            weight: Param::new(weight),
+        },
+    }))
 }
 
 /// Multi-head attention module.
@@ -199,18 +352,11 @@ impl Attention {
         let scale = head_dim_f32.sqrt().recip();
 
         let qkv_bias = args.qkv_bias();
-        let q_proj = nn::LinearBuilder::new(dim, n_heads * head_dim)
-            .bias(qkv_bias)
-            .build()?;
-        let k_proj = nn::LinearBuilder::new(dim, n_kv_heads * head_dim)
-            .bias(qkv_bias)
-            .build()?;
-        let v_proj = nn::LinearBuilder::new(dim, n_kv_heads * head_dim)
-            .bias(qkv_bias)
-            .build()?;
-        let o_proj = nn::LinearBuilder::new(n_heads * head_dim, dim)
-            .bias(false)
-            .build()?;
+        let quantization = args.direct_quantization();
+        let q_proj = maybe_quantized_linear(dim, n_heads * head_dim, qkv_bias, quantization)?;
+        let k_proj = maybe_quantized_linear(dim, n_kv_heads * head_dim, qkv_bias, quantization)?;
+        let v_proj = maybe_quantized_linear(dim, n_kv_heads * head_dim, qkv_bias, quantization)?;
+        let o_proj = maybe_quantized_linear(n_heads * head_dim, dim, false, quantization)?;
 
         let qk_norm = matches!(args.model_type.as_str(), "qwen3");
         let q_norm = qk_norm
@@ -239,10 +385,10 @@ impl Attention {
             n_heads,
             n_kv_heads,
             scale,
-            q_proj: MaybeQuantized::Original(q_proj),
-            k_proj: MaybeQuantized::Original(k_proj),
-            v_proj: MaybeQuantized::Original(v_proj),
-            o_proj: MaybeQuantized::Original(o_proj),
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
             q_norm,
             k_norm,
             rope,
@@ -348,21 +494,18 @@ pub struct Mlp {
 }
 
 impl Mlp {
-    pub fn new(dim: i32, hidden_dim: i32) -> Result<Self, Exception> {
-        let gate_proj = nn::LinearBuilder::new(dim, hidden_dim)
-            .bias(false)
-            .build()?;
-        let down_proj = nn::LinearBuilder::new(hidden_dim, dim)
-            .bias(false)
-            .build()?;
-        let up_proj = nn::LinearBuilder::new(dim, hidden_dim)
-            .bias(false)
-            .build()?;
-
+    pub fn new(
+        dim: i32,
+        hidden_dim: i32,
+        quantization: Option<&QuantizationConfig>,
+    ) -> Result<Self, Exception> {
+        let gate_proj = maybe_quantized_linear(dim, hidden_dim, false, quantization)?;
+        let down_proj = maybe_quantized_linear(hidden_dim, dim, false, quantization)?;
+        let up_proj = maybe_quantized_linear(dim, hidden_dim, false, quantization)?;
         Ok(Self {
-            gate_proj: MaybeQuantized::Original(gate_proj),
-            down_proj: MaybeQuantized::Original(down_proj),
-            up_proj: MaybeQuantized::Original(up_proj),
+            gate_proj,
+            down_proj,
+            up_proj,
         })
     }
 }
@@ -404,17 +547,25 @@ pub struct TransformerBlock {
 
 impl TransformerBlock {
     pub fn new(args: &ModelArgs) -> Result<Self, Exception> {
+        let self_attn = Attention::new(args)?;
+        let mlp = Mlp::new(
+            args.hidden_size,
+            args.intermediate_size,
+            args.direct_quantization(),
+        )?;
+        let input_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
+            .eps(args.rms_norm_eps)
+            .build()?;
+        let post_attention_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
+            .eps(args.rms_norm_eps)
+            .build()?;
         Ok(Self {
             num_attention_heads: args.num_attention_heads,
             hidden_size: args.hidden_size,
-            self_attn: Attention::new(args)?,
-            mlp: Mlp::new(args.hidden_size, args.intermediate_size)?,
-            input_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
-                .eps(args.rms_norm_eps)
-                .build()?,
-            post_attention_layernorm: nn::RmsNormBuilder::new(args.hidden_size)
-                .eps(args.rms_norm_eps)
-                .build()?,
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
         })
     }
 }
@@ -455,6 +606,8 @@ where
 struct TransformerModel {
     pub vocab_size: i32,
     pub num_hidden_layers: i32,
+    pub num_loops: i32,
+    pub skip_loop_final_norm: bool,
 
     #[quantizable]
     #[param]
@@ -477,21 +630,104 @@ impl TransformerModel {
         if !args.num_key_value_heads.is_positive() {
             return Err(Exception::custom("num_key_value_heads must be positive"));
         }
+        args.num_cache_layers()
+            .map_err(|e| Exception::custom(e.to_string()))?;
+
+        let embed_tokens = maybe_quantized_embedding(
+            args.vocab_size,
+            args.hidden_size,
+            args.direct_quantization(),
+        )?;
+        let layers = (0..args.num_hidden_layers)
+            .map(|_| TransformerBlock::new(args))
+            .collect::<Result<Vec<_>, _>>()?;
+        let norm = nn::RmsNormBuilder::new(args.hidden_size)
+            .eps(args.rms_norm_eps)
+            .build()?;
 
         Ok(Self {
             vocab_size: args.vocab_size,
             num_hidden_layers: args.num_hidden_layers,
-            embed_tokens: MaybeQuantized::Original(nn::Embedding::new(
-                args.vocab_size,
-                args.hidden_size,
-            )?),
-            layers: (0..args.num_hidden_layers)
-                .map(|_| TransformerBlock::new(args))
-                .collect::<Result<Vec<_>, _>>()?,
-            norm: nn::RmsNormBuilder::new(args.hidden_size)
-                .eps(args.rms_norm_eps)
-                .build()?,
+            num_loops: args.num_loops,
+            skip_loop_final_norm: args.skip_loop_final_norm,
+            embed_tokens,
+            layers,
+            norm,
         })
+    }
+
+    fn cache_layer_count(&self) -> Result<usize, Exception> {
+        let loops =
+            usize::try_from(self.num_loops).map_err(|_| Exception::custom("num_loops overflow"))?;
+        self.layers
+            .len()
+            .checked_mul(loops)
+            .ok_or_else(|| Exception::custom("logical KV cache layer count overflow"))
+    }
+
+    fn forward_embeddings<C>(
+        &mut self,
+        embeddings: Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+    {
+        let computed_mask = match mask {
+            Some(m) => Some(m.clone()),
+            None => match create_attention_mask(&embeddings, cache, Some(true))? {
+                Some(AttentionMask::Array(a)) => Some(a),
+                Some(AttentionMask::Causal) => {
+                    return Err(Exception::custom("Only Array mask is supported"));
+                }
+                None => None,
+            },
+        };
+
+        let cache_layers = self.cache_layer_count()?;
+        if cache.is_empty() {
+            *cache = (0..cache_layers).map(|_| None).collect();
+        } else if cache.len() != cache_layers {
+            return Err(Exception::custom(format!(
+                "kv_cache length ({}) must match logical num layers ({cache_layers})",
+                cache.len()
+            )));
+        }
+
+        let loops =
+            usize::try_from(self.num_loops).map_err(|_| Exception::custom("num_loops overflow"))?;
+        let physical_layers = self.layers.len();
+        let mut h = embeddings;
+
+        for loop_idx in 0..loops {
+            let cache_base = loop_idx
+                .checked_mul(physical_layers)
+                .ok_or_else(|| Exception::custom("loop cache index overflow"))?;
+            for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+                let cache_idx = cache_base
+                    .checked_add(layer_idx)
+                    .ok_or_else(|| Exception::custom("layer cache index overflow"))?;
+                let layer_cache = cache
+                    .get_mut(cache_idx)
+                    .ok_or_else(|| Exception::custom("layer cache index out of bounds"))?;
+                h = layer.forward(AttentionInput {
+                    x: &h,
+                    mask: computed_mask.as_ref(),
+                    cache: layer_cache.as_mut(),
+                })?;
+            }
+
+            if !self.skip_loop_final_norm {
+                h = self.norm.forward(&h)?;
+            }
+        }
+
+        if self.skip_loop_final_norm {
+            h = self.norm.forward(&h)?;
+        }
+
+        Ok(h)
     }
 }
 
@@ -516,38 +752,8 @@ where
             cache,
         } = input;
 
-        let mut h = self.embed_tokens.forward(inputs)?;
-
-        let computed_mask = match mask {
-            Some(m) => Some(m.clone()),
-            None => match create_attention_mask(&h, cache, Some(true))? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("Only Array mask is supported"));
-                }
-                None => None,
-            },
-        };
-
-        if cache.is_empty() {
-            *cache = (0..self.layers.len()).map(|_| None).collect();
-        } else if cache.len() != self.layers.len() {
-            return Err(Exception::custom(format!(
-                "kv_cache length ({}) must match num layers ({})",
-                cache.len(),
-                self.layers.len()
-            )));
-        }
-
-        for (layer, layer_cache) in self.layers.iter_mut().zip(cache.iter_mut()) {
-            h = layer.forward(AttentionInput {
-                x: &h,
-                mask: computed_mask.as_ref(),
-                cache: layer_cache.as_mut(),
-            })?;
-        }
-
-        self.norm.forward(&h)
+        let h = self.embed_tokens.forward(inputs)?;
+        self.forward_embeddings(h, mask, cache)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -579,11 +785,12 @@ impl Model {
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(MaybeQuantized::Original(
-                nn::LinearBuilder::new(args.hidden_size, args.vocab_size)
-                    .bias(false)
-                    .build()?,
-            ))
+            Some(maybe_quantized_linear(
+                args.hidden_size,
+                args.vocab_size,
+                false,
+                args.direct_quantization(),
+            )?)
         };
 
         Ok(Self {
@@ -644,6 +851,14 @@ impl Model {
         self.args.num_hidden_layers
     }
 
+    pub fn num_cache_layers(&self) -> Result<i32, ModelError> {
+        self.args.num_cache_layers()
+    }
+
+    pub fn supports_batched_decode(&self) -> bool {
+        self.args.supports_batched_decode()
+    }
+
     /// Look up token embeddings without running the transformer.
     pub fn embed_tokens(&mut self, input_ids: &Array) -> Result<Array, Exception> {
         self.model.embed_tokens.forward(input_ids)
@@ -657,37 +872,9 @@ impl Model {
         mask: Option<&Array>,
         kv_cache: &mut Vec<Option<C>>,
     ) -> Result<Array, Exception> {
-        let computed_mask = match mask {
-            Some(m) => Some(m.clone()),
-            None => match create_attention_mask(embeddings, kv_cache, Some(true))? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("Only Array mask is supported"));
-                }
-                None => None,
-            },
-        };
-
-        if kv_cache.is_empty() {
-            *kv_cache = (0..self.model.layers.len()).map(|_| None).collect();
-        } else if kv_cache.len() != self.model.layers.len() {
-            return Err(Exception::custom(format!(
-                "kv_cache length ({}) must match num layers ({})",
-                kv_cache.len(),
-                self.model.layers.len()
-            )));
-        }
-
-        let mut h = embeddings.clone();
-        for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache.iter_mut()) {
-            h = layer.forward(AttentionInput {
-                x: &h,
-                mask: computed_mask.as_ref(),
-                cache: layer_cache.as_mut(),
-            })?;
-        }
-
-        let out = self.model.norm.forward(&h)?;
+        let out = self
+            .model
+            .forward_embeddings(embeddings.clone(), mask, kv_cache)?;
         self.apply_lm_head(&out)
     }
 
@@ -702,6 +889,12 @@ impl Model {
         inputs: &Array,
         kv_caches: &mut [&mut Vec<Option<SteppingKeyValueCache>>],
     ) -> Result<Array, Exception> {
+        if !self.supports_batched_decode() {
+            return Err(Exception::custom(
+                "Batched forward only supported for llama, mistral, qwen2, and qwen3 transformer models",
+            ));
+        }
+
         let n = *inputs
             .shape()
             .first()
@@ -898,7 +1091,127 @@ impl Model {
 pub fn load_model_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, ModelError> {
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
-    Ok(serde_json::from_reader(file)?)
+    let config: serde_json::Value = serde_json::from_reader(file)?;
+    validate_nanbeige_config(&config)?;
+    Ok(serde_json::from_value(config)?)
+}
+
+fn reject_nanbeige_true_option(config: &serde_json::Value, key: &str) -> Result<(), ModelError> {
+    if config
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(ModelError::UnsupportedModel(format!(
+            "nanbeige config option '{key}=true' is not supported"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_nanbeige_present_non_null(
+    config: &serde_json::Value,
+    key: &str,
+) -> Result<(), ModelError> {
+    if config.get(key).is_some_and(|value| !value.is_null()) {
+        return Err(ModelError::UnsupportedModel(format!(
+            "nanbeige config option '{key}' is not supported"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_nanbeige_config(config: &serde_json::Value) -> Result<(), ModelError> {
+    if config.get("model_type").and_then(serde_json::Value::as_str) != Some("nanbeige") {
+        return Ok(());
+    }
+    for key in [
+        "attention_bias",
+        "mlp_bias",
+        "qk_layernorm",
+        "enable_double_loop_split",
+        "loop_share_kv",
+        "mhc_diff_for_loop",
+        "enable_hyper_connection",
+        "enable_mhc",
+        "enable_h_res_identity",
+        "mhc_identity_nohresparam",
+        "enable_depth_attention",
+        "ngram_mod_force_prime",
+        "ngram_compressed_tokenizer",
+        "skip_ngram_for_input",
+        "ngram_insert_all_layers",
+    ] {
+        reject_nanbeige_true_option(config, key)?;
+    }
+
+    for key in [
+        "rope_scaling",
+        "emb_neighbor_num",
+        "emb_split_num",
+        "ngram_vocab_size_ratio",
+        "ngram_embedding_hidden_size",
+        "emb_tp_num",
+        "ngram_layer_downproject_size",
+        "loop_middle_layers",
+        "mhc_double_stream_position_for_loop",
+        "depth_attention_stride",
+    ] {
+        reject_nanbeige_present_non_null(config, key)?;
+    }
+
+    if config
+        .get("insert_ngram_layer_idx")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
+        return Err(ModelError::UnsupportedModel(
+            "nanbeige config option 'insert_ngram_layer_idx' is not supported".to_owned(),
+        ));
+    }
+
+    if config
+        .get("loop_loss_weights")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
+        return Err(ModelError::UnsupportedModel(
+            "nanbeige config option 'loop_loss_weights' is not supported".to_owned(),
+        ));
+    }
+
+    if config
+        .get("pretraining_tp")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1)
+        > 1
+    {
+        return Err(ModelError::UnsupportedModel(
+            "nanbeige pretraining_tp > 1 is not supported".to_owned(),
+        ));
+    }
+
+    if config
+        .get("hidden_act")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|hidden_act| hidden_act != "silu")
+    {
+        return Err(ModelError::UnsupportedModel(
+            "nanbeige hidden_act must be 'silu'".to_owned(),
+        ));
+    }
+
+    if config
+        .get("ngram_fused_mode")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|mode| mode != "average")
+    {
+        return Err(ModelError::UnsupportedModel(
+            "nanbeige ngram_fused_mode values other than 'average' are not supported".to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Load model args from the `text_config` section of config.json (used by VLMs).
@@ -946,17 +1259,22 @@ pub fn load_vlm_language_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, Mo
     );
 
     let quantization = args.quantization.clone();
+    let uses_direct_quantization = args.uses_direct_quantization();
     let raw_model = Model::new(args)?;
-
     let mut model = if let Some(ref qc) = quantization {
         tracing::info!(
             group_size = qc.group_size,
             bits = qc.bits,
+            direct = uses_direct_quantization,
             "Applying quantization structure"
         );
-        mlx_rs::nn::quantize(raw_model, qc.group_size, qc.bits).map_err(|e| {
-            ModelError::ShapeMismatch(format!("Failed to quantize model structure: {e}"))
-        })?
+        if uses_direct_quantization {
+            raw_model
+        } else {
+            mlx_rs::nn::quantize(raw_model, qc.group_size, qc.bits).map_err(|e| {
+                ModelError::ShapeMismatch(format!("Failed to quantize model structure: {e}"))
+            })?
+        }
     } else {
         raw_model
     };
@@ -989,20 +1307,23 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
     );
 
     let quantization = args.quantization.clone();
+    let uses_direct_quantization = args.uses_direct_quantization();
     let raw_model = Model::new(args)?;
 
-    // Pre-quantized models need the MaybeQuantized fields converted to
-    // Quantized variants before loading weights, so that the parameter
-    // names (inner.weight, scales, biases) match the safetensors keys.
     let mut model = if let Some(ref qc) = quantization {
         tracing::info!(
             group_size = qc.group_size,
             bits = qc.bits,
+            direct = uses_direct_quantization,
             "Applying quantization structure"
         );
-        mlx_rs::nn::quantize(raw_model, qc.group_size, qc.bits).map_err(|e| {
-            ModelError::ShapeMismatch(format!("Failed to quantize model structure: {e}"))
-        })?
+        if uses_direct_quantization {
+            raw_model
+        } else {
+            mlx_rs::nn::quantize(raw_model, qc.group_size, qc.bits).map_err(|e| {
+                ModelError::ShapeMismatch(format!("Failed to quantize model structure: {e}"))
+            })?
+        }
     } else {
         raw_model
     };
@@ -1025,6 +1346,8 @@ mod tests {
             model_type: "llama".to_owned(),
             hidden_size: 256,
             num_hidden_layers: 2,
+            num_loops: 1,
+            skip_loop_final_norm: false,
             intermediate_size: 512,
             num_attention_heads: 4,
             rms_norm_eps: 1e-6,
@@ -1237,6 +1560,8 @@ mod tests {
         let args = default_model_args();
         assert!((args.rope_theta - 10000.0).abs() < f32::EPSILON);
         assert!(!args.tie_word_embeddings);
+        assert_eq!(args.num_loops, 1);
+        assert!(!args.skip_loop_final_norm);
         assert!(!args.use_sliding_window);
         assert!(args.sliding_window.is_none());
         assert!(args.rope_scaling.is_none());
@@ -1263,6 +1588,214 @@ mod tests {
         let args = assert_model_config(json, "llama", 1536, 128, false);
         assert_eq!(args.head_dim_override, Some(128));
         assert_eq!(args.checked_head_dim().unwrap(), 128);
+    }
+
+    #[test]
+    fn test_nanbeige_config_deserialization() {
+        let json = r#"{
+            "architectures": ["NanbeigeForCausalLM"],
+            "attention_bias": false,
+            "head_dim": 128,
+            "hidden_act": "silu",
+            "hidden_size": 3072,
+            "intermediate_size": 10752,
+            "loop_loss_weights": [],
+            "max_position_embeddings": 262144,
+            "model_type": "nanbeige",
+            "num_attention_heads": 48,
+            "num_hidden_layers": 22,
+            "num_key_value_heads": 8,
+            "num_loops": 2,
+            "pretraining_tp": 1,
+            "quantization": {"group_size": 64, "bits": 6, "mode": "affine"},
+            "rms_norm_eps": 1e-05,
+            "rope_scaling": null,
+            "rope_theta": 70000000,
+            "skip_loop_final_norm": false,
+            "tie_word_embeddings": false,
+            "vocab_size": 166144
+        }"#;
+        let args = assert_model_config(json, "nanbeige", 3072, 128, false);
+        assert_eq!(args.num_hidden_layers, 22);
+        assert_eq!(args.num_loops, 2);
+        assert_eq!(args.num_cache_layers().unwrap(), 44);
+        assert!(!args.supports_batched_decode());
+        let qc = args.quantization.unwrap();
+        assert_eq!(qc.group_size, 64);
+        assert_eq!(qc.bits, 6);
+    }
+
+    #[test]
+    fn test_nanbeige_load_model_args_rejects_unsupported_features() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "model_type": "nanbeige",
+                "hidden_size": 256,
+                "num_hidden_layers": 2,
+                "intermediate_size": 512,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-05,
+                "vocab_size": 1000,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 512,
+                "num_loops": 2,
+                "loop_share_kv": true
+            }"#,
+        )
+        .unwrap();
+
+        let err = load_model_args(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("loop_share_kv"));
+    }
+
+    #[test]
+    fn test_nanbeige_num_cache_layers_uses_loop_count() {
+        let mut args = make_model_args("nanbeige", 256, 4, 2, 1000, 2);
+        args.num_loops = 2;
+        let model = Model::new(args).unwrap();
+        assert_eq!(model.num_cache_layers().unwrap(), 4);
+        assert!(!model.supports_batched_decode());
+    }
+
+    fn make_initialized_kv_cache(layers: i32) -> Vec<Option<crate::cache::SteppingKeyValueCache>> {
+        (0..layers)
+            .map(|_| Some(crate::cache::SteppingKeyValueCache::new()))
+            .collect()
+    }
+
+    fn assert_cache_offsets(
+        cache: &[Option<crate::cache::SteppingKeyValueCache>],
+        expected_offset: i32,
+    ) {
+        for (idx, layer_cache) in cache.iter().enumerate() {
+            let layer_cache = layer_cache
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing cache slot {idx}"));
+            assert_eq!(
+                crate::cache::KeyValueCache::offset(layer_cache),
+                expected_offset,
+                "cache slot {idx} offset"
+            );
+        }
+    }
+
+    fn assert_finite_logits(logits: &Array, message: &str) {
+        let logits = logits.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&logits]).unwrap();
+        let vals: Vec<f32> = logits.as_slice().to_vec();
+        assert!(vals.iter().all(|v| v.is_finite()), "{message}");
+    }
+
+    #[test]
+    fn test_nanbeige_two_loop_forward_advances_logical_cache_layers() {
+        let mut args = make_model_args("nanbeige", 32, 4, 2, 64, 2);
+        args.num_loops = 2;
+        args.intermediate_size = 64;
+        args.tie_word_embeddings = false;
+
+        let expected_layers = args.num_cache_layers().unwrap();
+        let mut model = Model::new(args).unwrap();
+        let mut cache = make_initialized_kv_cache(expected_layers);
+
+        let input = Array::from_slice(&[1_i32, 2, 3], &[1, 3]);
+        let logits = model.forward(&input, None, &mut cache).unwrap();
+        assert_eq!(logits.shape(), &[1, 1, 64]);
+        assert_finite_logits(&logits, "prefill logits contain non-finite values");
+        assert_cache_offsets(&cache, 3);
+
+        let decode = Array::from_slice(&[4_i32], &[1, 1]);
+        let decode_logits = model.forward(&decode, None, &mut cache).unwrap();
+        assert_eq!(decode_logits.shape(), &[1, 1, 64]);
+        assert_finite_logits(&decode_logits, "decode logits contain non-finite values");
+        assert_cache_offsets(&cache, 4);
+    }
+
+    #[test]
+    fn test_nanbeige_quantized_constructor_supports_6bit() {
+        let mut args = make_model_args("nanbeige", 128, 4, 2, 256, 1);
+        args.num_loops = 2;
+        args.intermediate_size = 256;
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 6,
+        });
+
+        let model = Model::new(args).unwrap();
+        assert_eq!(model.num_cache_layers().unwrap(), 2);
+        assert!(!model.supports_batched_decode());
+        assert!(matches!(
+            &model.model.embed_tokens,
+            MaybeQuantized::Quantized(_)
+        ));
+        let first_layer = model.model.layers.first().unwrap();
+        assert!(matches!(
+            &first_layer.self_attn.q_proj,
+            MaybeQuantized::Quantized(_)
+        ));
+    }
+
+    #[test]
+    fn test_nanbeige_quantized_constructor_real_dimensions_supports_6bit() {
+        let mut args = make_model_args("nanbeige", 3072, 48, 8, 166144, 1);
+        args.num_loops = 2;
+        args.intermediate_size = 10752;
+        args.rms_norm_eps = 1e-5;
+        args.rope_theta = 70_000_000.0;
+        args.head_dim_override = Some(128);
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 6,
+        });
+
+        let model = Model::new(args).unwrap();
+        assert_eq!(model.num_cache_layers().unwrap(), 2);
+        assert!(!model.supports_batched_decode());
+    }
+
+    #[test]
+    fn test_non_nanbeige_quantized_constructor_defers_to_mlx_quantize() {
+        let mut args = make_model_args("qwen3", 128, 4, 2, 256, 1);
+        args.intermediate_size = 256;
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 4,
+        });
+
+        let model = Model::new(args).unwrap();
+        assert!(matches!(
+            &model.model.embed_tokens,
+            MaybeQuantized::Original(_)
+        ));
+        let first_layer = model.model.layers.first().unwrap();
+        assert!(matches!(
+            &first_layer.self_attn.q_proj,
+            MaybeQuantized::Original(_)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires HIGGS_NANBEIGE_SMOKE_MODEL_PATH pointing to a local MLX checkpoint"]
+    fn test_nanbeige_real_checkpoint_forward_smoke() {
+        let Some(model_dir) = std::env::var_os("HIGGS_NANBEIGE_SMOKE_MODEL_PATH") else {
+            eprintln!("set HIGGS_NANBEIGE_SMOKE_MODEL_PATH to run this smoke test");
+            return;
+        };
+
+        let mut model = load_model(std::path::PathBuf::from(model_dir)).unwrap();
+        assert_eq!(model.model_type(), "nanbeige");
+
+        let logical_layers = model.num_cache_layers().unwrap();
+        let mut cache = make_initialized_kv_cache(logical_layers);
+        let input = Array::from_slice(&[1_i32], &[1, 1]);
+        let logits = model.forward(&input, None, &mut cache).unwrap();
+        assert_eq!(logits.shape(), &[1, 1, model.args.vocab_size]);
+        assert_finite_logits(
+            &logits,
+            "real Nanbeige checkpoint logits contain non-finite values",
+        );
+        assert_cache_offsets(&cache, 1);
     }
 
     #[test]

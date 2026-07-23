@@ -782,7 +782,12 @@ impl AnyModel {
         }
 
         match self {
-            Self::Transformer(m) => m.forward_batched(inputs, &mut kv_refs),
+            Self::Transformer(m) if m.supports_batched_decode() => {
+                m.forward_batched(inputs, &mut kv_refs)
+            }
+            Self::Transformer(_) => Err(Exception::custom(
+                "Batched forward only supported for llama, mistral, qwen2, and qwen3 transformer models",
+            )),
             Self::Qwen3Moe(_)
             | Self::Qwen3Next(_)
             | Self::Gemma2(_)
@@ -798,9 +803,9 @@ impl AnyModel {
         }
     }
 
-    /// Whether this model supports batched decode.
-    pub const fn supports_batched_decode(&self) -> bool {
-        matches!(self, Self::Transformer(_))
+    /// Whether this model supports true batched decode.
+    pub fn supports_batched_decode(&self) -> bool {
+        matches!(self, Self::Transformer(m) if m.supports_batched_decode())
     }
 
     /// Whether this model has a loaded MTP head for speculative decode.
@@ -1005,9 +1010,12 @@ impl AnyModel {
     ) -> Result<AnyCache, Exception> {
         match self {
             Self::Transformer(m) => {
+                let num_cache_layers = m
+                    .num_cache_layers()
+                    .map_err(|err| Exception::custom(err.to_string()))?;
                 if kv_cache_config.is_turboquant() {
                     make_turboquant_kv_cache(
-                        m.args.num_hidden_layers,
+                        num_cache_layers,
                         m.args.num_key_value_heads,
                         m.args
                             .checked_head_dim()
@@ -1015,7 +1023,7 @@ impl AnyModel {
                         kv_cache_config,
                     )
                 } else {
-                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                    Ok(make_kv_cache(num_cache_layers))
                 }
             }
             Self::Qwen3Moe(m) => {
@@ -2491,6 +2499,44 @@ mod tests {
             AnyCache::KV(layers) => assert!(layers.is_empty()),
             AnyCache::Hybrid(_) => panic!("Expected KV variant"),
         }
+    }
+
+    fn small_transformer_args(model_type: &str) -> transformer::ModelArgs {
+        transformer::ModelArgs {
+            model_type: model_type.to_owned(),
+            hidden_size: 32,
+            num_hidden_layers: 2,
+            num_loops: 1,
+            skip_loop_final_norm: false,
+            intermediate_size: 64,
+            num_attention_heads: 4,
+            rms_norm_eps: 1e-6,
+            vocab_size: 64,
+            num_key_value_heads: 2,
+            max_position_embeddings: 128,
+            rope_theta: 10000.0,
+            tie_word_embeddings: true,
+            attention_bias: None,
+            use_sliding_window: false,
+            sliding_window: None,
+            rope_scaling: None,
+            head_dim_override: None,
+            quantization: None,
+        }
+    }
+
+    #[test]
+    fn any_model_nanbeige_make_cache_uses_logical_loop_layers() {
+        let mut args = small_transformer_args("nanbeige");
+        args.num_loops = 2;
+        let model = transformer::Model::new(args).unwrap();
+        let any = AnyModel::Transformer(model);
+        let cache = any.make_cache().unwrap();
+        match &cache {
+            AnyCache::KV(layers) => assert_eq!(layers.len(), 4),
+            AnyCache::Hybrid(_) => panic!("Expected KV cache for Nanbeige"),
+        }
+        assert!(!any.supports_batched_decode());
     }
 
     fn small_qwen3_moe_args() -> qwen3_moe::Qwen3MoeModelArgs {
