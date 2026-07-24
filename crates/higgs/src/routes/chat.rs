@@ -356,6 +356,7 @@ async fn chat_completions_non_streaming(
         let messages_c = messages.clone();
         let tools_c = tools.map(<[serde_json::Value]>::to_vec);
         let sampling_c = sampling.clone();
+        let pflash_policy_c = pflash_policy.clone();
         let session_output = tokio::task::spawn_blocking(move || {
             engine_c.generate_session_routed_with_thinking(
                 sid,
@@ -366,6 +367,7 @@ async fn chat_completions_non_streaming(
                 &sampling_c,
                 thinking_enabled,
                 tool_payload,
+                &pflash_policy_c,
             )
         })
         .await
@@ -788,6 +790,7 @@ async fn chat_completions_stream(
     if let Some(sid) = stream_session_id {
         let prompt_tools_c = prompt_tools.map(<[serde_json::Value]>::to_vec);
         let messages_c = messages.clone();
+        let pflash_policy_c = pflash_policy.clone();
         tokio::task::spawn_blocking(move || {
             let result = engine.generate_session_routed_streaming_with_thinking(
                 sid,
@@ -799,6 +802,7 @@ async fn chat_completions_stream(
                 &tx,
                 thinking_enabled_stream,
                 tool_payload,
+                &pflash_policy_c,
             );
             match result {
                 Ok(()) => {}
@@ -1410,6 +1414,7 @@ mod tests {
             prompt_tokens: 1000,
             prefilled_tokens: 120,
             continued: true,
+            outcome: higgs_engine::simple::SessionOutcome::Continued,
         };
         let usage = session_usage(&continued);
         assert_eq!(usage.prompt_tokens, 1000);
@@ -1428,8 +1433,15 @@ mod tests {
             prompt_tokens: 1000,
             prefilled_tokens: 1000,
             continued: false,
+            outcome: higgs_engine::simple::SessionOutcome::ExactBootstrap,
         };
         assert!(session_usage(&cold).prompt_tokens_details.is_none());
+
+        let pflash = higgs_engine::simple::SessionGeneration {
+            outcome: higgs_engine::simple::SessionOutcome::PFlashBootstrap,
+            ..cold
+        };
+        assert!(session_usage(&pflash).prompt_tokens_details.is_none());
     }
 
     #[test]

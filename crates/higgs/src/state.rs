@@ -357,6 +357,7 @@ impl Engine {
         params: &SamplingParams,
         enable_thinking: bool,
         tool_payload: SessionPromptTracePayloadStats,
+        pflash_policy: &PFlashPromptPolicy,
     ) -> Result<SessionGeneration, EngineError> {
         let _gpu = gpu_gate();
         match self {
@@ -369,6 +370,7 @@ impl Engine {
                 params,
                 enable_thinking,
                 tool_payload,
+                pflash_policy,
             ),
             Self::Batch(_) => Err(EngineError::Generation(
                 "session_id (session-routed generation) is only supported by the Simple engine"
@@ -391,6 +393,7 @@ impl Engine {
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         enable_thinking: bool,
         tool_payload: SessionPromptTracePayloadStats,
+        pflash_policy: &PFlashPromptPolicy,
     ) -> Result<(), EngineError> {
         let _gpu = gpu_gate();
         match self {
@@ -404,6 +407,7 @@ impl Engine {
                 sender,
                 enable_thinking,
                 tool_payload,
+                pflash_policy,
             ),
             Self::Batch(_) => Err(EngineError::Generation(
                 "session_id (session-routed streaming) is only supported by the Simple engine"

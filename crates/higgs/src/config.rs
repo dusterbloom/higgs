@@ -474,7 +474,7 @@ pub struct ModelConfig {
     #[serde(default = "default_prefill_lookahead")]
     pub prefill_lookahead: usize,
     /// PFlash scorer variant. `full` runs the baseline full drafter scorer;
-    /// `l7` is reserved for a true layer-7 early-exit scorer.
+    /// `l7` exits the dense drafter at `prefill_exit_layer`.
     #[serde(default)]
     pub prefill_score_mode: PrefillScoreMode,
     /// Early-exit layer for `prefill_score_mode = "l7"`.

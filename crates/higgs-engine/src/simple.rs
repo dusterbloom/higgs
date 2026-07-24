@@ -185,6 +185,24 @@ fn pflash_auto_plan_worth_executing(
     pflash_actual_keep_ratio(source_tokens, kept_tokens) <= max_auto_prefill_ratio
 }
 
+const DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS: usize = 8192;
+
+fn pflash_full_score_max_tokens() -> usize {
+    std::env::var("HIGGS_PREFLASH_FULL_SCORE_MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS)
+}
+
+fn pflash_full_score_budget_exceeded(
+    score_mode: PrefillScoreMode,
+    source_tokens: usize,
+    max_score_tokens: usize,
+) -> bool {
+    score_mode == PrefillScoreMode::Full && source_tokens > max_score_tokens
+}
+
 fn prefill_min_free_memory_mb() -> usize {
     std::env::var("HIGGS_PREFLASH_MIN_FREE_MB")
         .ok()
@@ -225,6 +243,7 @@ struct PFlashScoreOutcome {
     score_ms: f64,
     select_ms: f64,
     effective_keep_ratio: f32,
+    score_budget_fallback: bool,
 }
 
 /// Request-local prompt policy for lossy PFlash compression.
@@ -545,6 +564,9 @@ enum SessionPrefillStrategy {
         session_id: u64,
         reason: SessionBootstrapReason,
     },
+    BootstrapPFlash {
+        session_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,10 +587,14 @@ fn session_prefill_strategy(
     retained_tokens: Option<&[u32]>,
     continuation_candidate: &[u32],
     max_prefill_tokens: usize,
+    pflash_bootstrap_eligible: bool,
 ) -> SessionPrefillStrategy {
     let Some(retained_tokens) = retained_tokens else {
         if continuation_candidate.len() <= max_prefill_tokens {
             return SessionPrefillStrategy::Continue { session_id };
+        }
+        if pflash_bootstrap_eligible {
+            return SessionPrefillStrategy::BootstrapPFlash { session_id };
         }
         return SessionPrefillStrategy::BootstrapExact {
             session_id,
@@ -1495,6 +1521,7 @@ struct CacheMetrics {
     session_prompt_prefix_misses: AtomicU64,
     session_prompt_boundary_splices: AtomicU64,
     session_bootstrap_exact: AtomicU64,
+    session_bootstrap_pflash: AtomicU64,
     session_last_prompt_tokens: AtomicU64,
     session_last_retained_tokens: AtomicU64,
     session_last_candidate_tokens: AtomicU64,
@@ -1507,13 +1534,16 @@ struct CacheMetrics {
     sessions_evicted: AtomicU64,
 }
 
-/// Route-level outcome for a session prompt/cache trace.
+/// Route-level outcome for a session generation and prompt/cache trace.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SessionPromptTraceOutcome {
+pub enum SessionOutcome {
     #[default]
     Continued,
     ExactBootstrap,
+    PFlashBootstrap,
 }
+
+pub type SessionPromptTraceOutcome = SessionOutcome;
 
 /// Content-safe session prompt/cache trace surfaced through [`CacheStats`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1585,6 +1615,8 @@ pub struct CacheStats {
     pub session_prompt_boundary_splices: u64,
     /// Diverged/cold sessions routed through exact retained prefill.
     pub session_bootstrap_exact: u64,
+    /// Cold oversized sessions routed through degraded stateless PFlash prefill.
+    pub session_bootstrap_pflash: u64,
     /// Prompt tokens for the most recent session prompt/cache trace.
     pub session_last_prompt_tokens: u64,
     /// Retained tokens for the most recent session prompt/cache trace.
@@ -2512,6 +2544,8 @@ pub struct SessionGeneration {
     /// turn this is just the new suffix (tool result + generation prompt), not
     /// `prompt_tokens`.
     pub prefilled_tokens: u32,
+    /// Explicit admission/execution outcome for this session turn.
+    pub outcome: SessionOutcome,
     /// Whether a retained cache was reused (true) or a clean prefill ran (false).
     /// A `true` is a best-effort latency win, NOT an exact-replay guarantee: the
     /// reused KV is TurboQuant-compressed, so the turn's output may differ
@@ -3148,6 +3182,10 @@ impl SimpleEngine {
                 .cache_metrics
                 .session_bootstrap_exact
                 .load(Ordering::Relaxed),
+            session_bootstrap_pflash: self
+                .cache_metrics
+                .session_bootstrap_pflash
+                .load(Ordering::Relaxed),
             session_last_prompt_tokens: self
                 .cache_metrics
                 .session_last_prompt_tokens
@@ -3216,6 +3254,11 @@ impl SimpleEngine {
             SessionPromptTraceOutcome::ExactBootstrap => {
                 self.cache_metrics
                     .session_bootstrap_exact
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SessionPromptTraceOutcome::PFlashBootstrap => {
+                self.cache_metrics
+                    .session_bootstrap_pflash
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -3342,16 +3385,16 @@ impl SimpleEngine {
         self.evict_idle_retained(std::time::Duration::from_secs(idle_secs))
     }
 
-    /// Look up the retained cache for `session_id` whose tokens are a prefix of
-    /// `full_tokens`, returning the cache and the suffix that still needs
-    /// prefilling. Returns `None` (and drops any stale entry) when there is no
-    /// retained cache or the conversation diverged from it — the caller then
-    /// falls back to a clean full prefill. This is the cache-poisoning guard.
-    fn take_continuable(
+    /// Non-destructive target-cache continuation lookup. The retained entry
+    /// remains in the map until this request publishes a successor, so
+    /// cancellation or stream disconnect falls back to the previous valid
+    /// retained boundary instead of leaving the session empty.
+    fn fork_target_continuable(
         &self,
         session_id: u64,
         full_tokens: &[u32],
-    ) -> Option<(RetainedState, usize)> {
+        mlx_gate: &higgs_models::mlx_exec::MlxExecToken,
+    ) -> Result<Option<(AnyCache, usize)>, EngineError> {
         let mut map = lock_or_recover(&self.retained);
         let prior = match map.get(&session_id) {
             Some(entry) => {
@@ -3370,14 +3413,74 @@ impl SimpleEngine {
                 }
                 prior
             }
-            None => return None,
+            None => return Ok(None),
         };
-        if let Some(p) = prior {
-            map.remove(&session_id).map(|kept| (kept.state, p))
-        } else {
+        let Some(p) = prior else {
             map.remove(&session_id); // drop the diverged/stale entry
-            None
-        }
+            return Ok(None);
+        };
+        let Some(entry) = map.get_mut(&session_id) else {
+            return Ok(None);
+        };
+        let cache = entry
+            .state
+            .fork_target_cache_for_session(mlx_gate)
+            .map_err(session_pair_error)?;
+        entry.last_used = std::time::Instant::now();
+        Ok(Some((cache, p)))
+    }
+
+    /// Non-destructive paired-cache continuation lookup for exact dSpark
+    /// sessions. Target-only retained state is left intact and the caller cold
+    /// prefills; successful generation will publish a paired successor.
+    fn fork_paired_continuable(
+        &self,
+        session_id: u64,
+        full_tokens: &[u32],
+        expected_taps: usize,
+        mlx_gate: &higgs_models::mlx_exec::MlxExecToken,
+    ) -> Result<Option<(LivePair, usize)>, EngineError> {
+        let mut map = lock_or_recover(&self.retained);
+        let prior = match map.get(&session_id) {
+            Some(entry) => {
+                let retained_tokens = entry.state.tokens();
+                let prior = continuation_prior_len(retained_tokens, full_tokens);
+                if prior.is_none() {
+                    tracing::info!(
+                        session_id,
+                        retained_tokens = retained_tokens.len(),
+                        prompt_tokens = full_tokens.len(),
+                        common_prefix_tokens =
+                            common_prefix_token_len(retained_tokens, full_tokens),
+                        reason = continuation_reject_reason(retained_tokens, full_tokens),
+                        "retained session exact-token guard rejected prompt"
+                    );
+                }
+                prior
+            }
+            None => return Ok(None),
+        };
+        let Some(p) = prior else {
+            map.remove(&session_id); // drop the diverged/stale entry
+            return Ok(None);
+        };
+        let Some(prefix) = full_tokens.get(..p) else {
+            return Err(EngineError::Generation(
+                "retained paired session boundary exceeds prompt".to_owned(),
+            ));
+        };
+        let Some(entry) = map.get_mut(&session_id) else {
+            return Ok(None);
+        };
+        let forked = entry
+            .state
+            .fork_paired_live_for_session(prefix, expected_taps, mlx_gate)
+            .map_err(session_pair_error)?;
+        entry.last_used = std::time::Instant::now();
+        let Some(pair) = forked else {
+            return Ok(None);
+        };
+        Ok(Some((pair, p)))
     }
 
     /// Stash a live cache and the exact tokens it now represents for `session_id`,
@@ -3429,6 +3532,25 @@ impl SimpleEngine {
                 .sessions_evicted
                 .fetch_add(u64::try_from(evicted).unwrap_or(0), Ordering::Relaxed);
         }
+    }
+
+    /// Best-effort pre-decode checkpoint publication. Unlike final session
+    /// publication, an oversized checkpoint must not delete an older usable
+    /// boundary: cancellation should fall back to whatever was retained before
+    /// this attempt rather than converting a cap miss into retained=0.
+    fn stash_retained_checkpoint(&self, session_id: u64, state: RetainedState) {
+        let effective_cap = retention_token_cap(self.kv_cache_config, false, &state);
+        let token_len = state.tokens().len();
+        if effective_cap > 0 && token_len > effective_cap {
+            tracing::warn!(
+                session_id,
+                tokens = token_len,
+                cap = effective_cap,
+                "Skipped oversized session prompt checkpoint; preserving prior retained boundary"
+            );
+            return;
+        }
+        self.stash_retained(session_id, state, false);
     }
 
     /// Get a reference to the tokenizer.
@@ -4078,7 +4200,18 @@ impl SimpleEngine {
             let stripped =
                 exact_generation_body(prompt_tokens, generation_suffix).unwrap_or(prompt_tokens);
             let cache_to_store = prepared.stored_clone.as_ref().unwrap_or(&prepared.cache);
-            pc.store(stripped, cache_to_store, checkpoint_id);
+            // Correct by construction: hybrid (GDN+KV) caches are whole-clone
+            // snapshots whose KV offset cannot be trimmed after prefill. Only
+            // store when the two-phase snapshot (stored_clone) exists — its
+            // offset matches the stripped key exactly. Without it, the fallback
+            // (prepared.cache) includes generation-suffix tokens and the
+            // boundary guard in prepare_store would correctly reject the
+            // mismatch (with a WARN). Skipping silently here is better: the
+            // store is intentionally omitted, not attempted and rejected.
+            let is_hybrid = matches!(cache_to_store, AnyCache::Hybrid(_));
+            if !is_hybrid || prepared.stored_clone.is_some() {
+                pc.store(stripped, cache_to_store, checkpoint_id);
+            }
         }
         maybe_clear_mlx_cache(
             self.tuning.clear_cache_after_prefill(),
@@ -4825,8 +4958,10 @@ impl SimpleEngine {
     /// alive across tool hops and prefill ONLY the new suffix on the next turn
     /// (no re-prefill of history). Opt-in per conversation via `session_id`. On
     /// the first turn — or a conversation that diverged from the retained cache —
-    /// it falls back to a clean full prefill (the [`take_continuable`] guard) and
-    /// retains the resulting cache; on a continuation it reuses the live cache.
+    /// it falls back to a clean full prefill (the non-destructive continuation
+    /// fork guard) and retains the resulting cache; on a continuation it forks
+    /// the retained cache and keeps the prior boundary published until a valid
+    /// successor replaces it.
     /// Greedy decode with MTP speculation when the model ships a head (the
     /// stop-aware cycle keeps the retained cache 1:1 with the stashed tokens);
     /// plain sequential decode otherwise.
@@ -4849,7 +4984,6 @@ impl SimpleEngine {
     /// one-shot full prefill; the session path is the right option when the user
     /// experience depends on avoiding repeated long-context prefill.
     ///
-    /// [`take_continuable`]: Self::take_continuable
     pub fn generate_continued(
         &self,
         session_id: u64,
@@ -4934,6 +5068,7 @@ impl SimpleEngine {
         params: &SamplingParams,
         enable_thinking: bool,
         tool_payload: SessionPromptTracePayloadStats,
+        pflash_policy: &PFlashPromptPolicy,
     ) -> Result<SessionGeneration, EngineError> {
         let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
         let total_start = std::time::Instant::now();
@@ -4956,6 +5091,7 @@ impl SimpleEngine {
             retained_tokens.as_deref(),
             &continued_prompt,
             self.session_max_suffix_prefill_tokens,
+            self.pflash_can_run_stateless_for_prompt(&continued_prompt),
         );
 
         match strategy {
@@ -5000,6 +5136,24 @@ impl SimpleEngine {
                     total_start,
                 )
             }
+            SessionPrefillStrategy::BootstrapPFlash { session_id } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::PFlashBootstrap,
+                );
+                self.handle_session_pflash_bootstrap(session_id);
+                self.generate_session_pflash_bootstrap(
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    enable_thinking,
+                    pflash_policy,
+                )
+            }
         }
     }
 
@@ -5015,6 +5169,7 @@ impl SimpleEngine {
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         enable_thinking: bool,
         tool_payload: SessionPromptTracePayloadStats,
+        pflash_policy: &PFlashPromptPolicy,
     ) -> Result<(), EngineError> {
         let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
         let total_start = std::time::Instant::now();
@@ -5037,6 +5192,7 @@ impl SimpleEngine {
             retained_tokens.as_deref(),
             &continued_prompt,
             self.session_max_suffix_prefill_tokens,
+            self.pflash_can_run_stateless_for_prompt(&continued_prompt),
         );
 
         match strategy {
@@ -5082,6 +5238,25 @@ impl SimpleEngine {
                     total_start,
                 )?;
                 Ok(())
+            }
+            SessionPrefillStrategy::BootstrapPFlash { session_id } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::PFlashBootstrap,
+                );
+                self.handle_session_pflash_bootstrap(session_id);
+                self.generate_session_pflash_bootstrap_streaming(
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    sender,
+                    enable_thinking,
+                    pflash_policy,
+                )
             }
         }
     }
@@ -5217,6 +5392,70 @@ impl SimpleEngine {
         );
     }
 
+    fn handle_session_pflash_bootstrap(&self, session_id: u64) {
+        tracing::info!(
+            session_id,
+            "session continuation bootstrapping degraded stateless PFlash prefill path"
+        );
+    }
+
+    fn generate_session_pflash_bootstrap(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<SessionGeneration, EngineError> {
+        let output = self.generate_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            &[],
+            false,
+            None,
+            enable_thinking,
+            None,
+            None,
+            None,
+            pflash_policy,
+        )?;
+        Ok(SessionGeneration {
+            text: output.text,
+            completion_tokens: output.completion_tokens,
+            prompt_tokens: output.prompt_tokens,
+            prefilled_tokens: output.prompt_tokens,
+            outcome: SessionOutcome::PFlashBootstrap,
+            continued: false,
+        })
+    }
+
+    fn generate_session_pflash_bootstrap_streaming(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<(), EngineError> {
+        self.generate_streaming_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            &[],
+            false,
+            None,
+            sender,
+            enable_thinking,
+            false,
+            None,
+            None,
+            None,
+            pflash_policy,
+        )
+    }
+
     fn generate_continued_impl(
         &self,
         session_id: u64,
@@ -5322,41 +5561,56 @@ impl SimpleEngine {
             return Ok(output);
         }
 
-        let (mut prepared, prefilled, continued) = if let Some((state, prior)) =
-            self.take_continuable(session_id, prompt_tokens)
-        {
-            let cache = state.demote();
-            debug_assert!(
-                prior <= prompt_tokens.len(),
-                "continuation prior {prior} exceeds prompt length {}",
-                prompt_tokens.len()
-            );
-            let suffix: Vec<u32> = prompt_tokens.get(prior..).unwrap_or_default().to_vec();
-            let prefilled = u32::try_from(suffix.len()).unwrap_or(u32::MAX);
-            let prompt_array = Array::from(suffix.as_slice()).index(NewAxis);
+        let (mut prepared, prefilled, continued) = {
             let model = self
                 .model
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
-            // Same single sanctioned MLX-gate acquisition as prepare_generation —
-            // the continuation path builds PreparedGeneration by hand, so it must
-            // take the gate too or its eval would fire the off-gate assert.
             let mlx_gate = higgs_models::mlx_exec::acquire();
-            let prepared = PreparedGeneration {
-                model,
-                cache,
-                actual_prompt_tokens: suffix,
-                prompt_array,
-                prompt_len: total,
-                pixel_values: None,
-                stored_clone: None,
-                _mlx_gate: mlx_gate,
+
+            let forked = match self.fork_target_continuable(session_id, prompt_tokens, &mlx_gate) {
+                Ok(forked) => forked,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "retained target session could not be forked; cold-prefilling"
+                    );
+                    None
+                }
             };
-            (prepared, prefilled, true)
-        } else {
-            let prepared = self.prepare_generation(prompt_tokens, None, None, true)?;
-            let prefilled = u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
-            (prepared, prefilled, false)
+
+            if let Some((cache, prior)) = forked {
+                debug_assert!(
+                    prior <= prompt_tokens.len(),
+                    "continuation prior {prior} exceeds prompt length {}",
+                    prompt_tokens.len()
+                );
+                let suffix: Vec<u32> = prompt_tokens.get(prior..).unwrap_or_default().to_vec();
+                let prefilled = u32::try_from(suffix.len()).unwrap_or(u32::MAX);
+                let prompt_array = Array::from(suffix.as_slice()).index(NewAxis);
+                // Same single sanctioned MLX-gate acquisition as prepare_generation —
+                // the continuation path builds PreparedGeneration by hand, so it must
+                // take the gate too or its eval would fire the off-gate assert.
+                let prepared = PreparedGeneration {
+                    model,
+                    cache,
+                    actual_prompt_tokens: suffix,
+                    prompt_array,
+                    prompt_len: total,
+                    pixel_values: None,
+                    stored_clone: None,
+                    _mlx_gate: mlx_gate,
+                };
+                (prepared, prefilled, true)
+            } else {
+                drop(model);
+                drop(mlx_gate);
+                let prepared = self.prepare_generation(prompt_tokens, None, None, true)?;
+                let prefilled =
+                    u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
+                (prepared, prefilled, false)
+            }
         };
 
         if continued {
@@ -5429,6 +5683,40 @@ impl SimpleEngine {
             None,
         )?;
         let prefill_elapsed = prefill_start.elapsed();
+
+        // A cold/bootstrap streaming turn can disconnect after prefill but
+        // before a valid response/tool payload is delivered. Publish that exact
+        // prompt boundary before decode mutates the live cache. Exact
+        // continuations already left the prior retained entry published, so
+        // skip this clone there and let cancellation fall back to that boundary.
+        // A successful turn replaces any checkpoint with prompt+completion
+        // retention at the normal publication point below.
+        if sender.is_some() && !continued {
+            match prepared.cache.try_deep_clone().map_err(|error| {
+                PairedCacheError::TargetMaterialization {
+                    details: error.to_string(),
+                }
+            }) {
+                Ok(prompt_cache) => match RetainedState::target_only(
+                    prompt_cache,
+                    prompt_tokens.to_vec(),
+                    &prepared._mlx_gate,
+                ) {
+                    Ok(state) => self.stash_retained_checkpoint(session_id, state),
+                    Err(error) => tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "Failed to publish prompt checkpoint for cancellable session turn"
+                    ),
+                },
+                Err(error) => tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "Failed to clone prompt cache for cancellable session checkpoint"
+                ),
+            }
+        }
+
         let first_id: u32 = current_token.item();
         let mut generated: Vec<u32> = vec![first_id];
         let mut token_ledger = TokenLedger::new(prompt_tokens.len());
@@ -5878,6 +6166,11 @@ impl SimpleEngine {
             completion_tokens: u32::try_from(generated.len()).unwrap_or(u32::MAX),
             prompt_tokens: total,
             prefilled_tokens: prefilled,
+            outcome: if continued {
+                SessionOutcome::Continued
+            } else {
+                SessionOutcome::ExactBootstrap
+            },
             continued,
         })
     }
@@ -5935,12 +6228,13 @@ impl SimpleEngine {
     /// Exact greedy/no-thinking dSpark session path.
     ///
     /// The caller owns the per-session lock for this entire method. A retained
-    /// pair is move-reused only when both private halves match the exact prior
-    /// token prefix; target-only state is intentionally discarded because its
-    /// historical tap stream cannot reconstruct drafter continuity. Every
+    /// pair is fork-reused only when both private halves match the exact prior
+    /// token prefix; target-only state stays published while this request cold
+    /// prefills because it cannot reconstruct drafter continuity. Every
     /// successful turn publishes one sealed pair, or one explicit target-only
     /// downgrade when a deterministic tap precondition is unavailable. Once
-    /// effectful sealing begins, any error publishes neither half.
+    /// effectful sealing begins, any error publishes neither half, leaving the
+    /// prior retained boundary intact unless the exact-token guard rejected it.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn generate_continued_dflash_locked(
         &self,
@@ -5976,19 +6270,6 @@ impl SimpleEngine {
             *value = None;
         }
 
-        // Move a retained pair out of the session map before taking the model
-        // lock. A target-only hit is not sufficient for dSpark because no
-        // independent lookup may supply the missing historical tap frontier.
-        let reusable = self.take_continuable(session_id, prompt_tokens).and_then(
-            |(state, prior)| match state {
-                RetainedState::Paired(pair) => Some((pair, prior)),
-                RetainedState::TargetOnly(target) => {
-                    drop(target);
-                    None
-                }
-            },
-        );
-
         let mut model = self
             .model
             .lock()
@@ -5997,34 +6278,29 @@ impl SimpleEngine {
         let mut drafter = lock_or_recover(&dflash.drafter);
 
         let expected_taps = dflash.tap_layers.len();
-        let resumed = reusable.and_then(|(pair, prior)| {
-            let Some(prefix) = prompt_tokens.get(..prior) else {
+        let resumed = match self.fork_paired_continuable(
+            session_id,
+            prompt_tokens,
+            expected_taps,
+            &mlx_gate,
+        ) {
+            Ok(resumed) => resumed,
+            Err(error) => {
                 tracing::warn!(
                     session_id,
-                    prior,
-                    "Retained paired session boundary exceeds prompt; cold-prefilling"
+                    error = %error,
+                    "Retained paired session could not fork as one proven branch; cold-prefilling"
                 );
-                return None;
-            };
-            match pair.resume(prefix, expected_taps) {
-                Ok(pair) => Some((pair, prior)),
-                Err(error) => {
-                    tracing::warn!(
-                        session_id,
-                        error = %error,
-                        prior,
-                        "Retained paired session could not resume as one proven branch; cold-prefilling"
-                    );
-                    None
-                }
+                None
             }
-        });
+        };
 
         // Cache-state divergence must never fail the request outright: if the
         // resumed (continued) attempt errors, retry ONCE from a cold prefill
-        // within the same request. The retained pair was already moved out of
-        // the session map, so nothing poisoned survives in either outcome —
-        // this only converts a residual 500 into a slower successful turn.
+        // within the same request. The retained pair remains published through
+        // the resumed attempt; a cold retry may replace it with a target-only
+        // prompt checkpoint at the newer boundary, and final success replaces
+        // either with the sealed publication.
         let mut resumed = resumed;
         let mut retried_cold = false;
         let (generation, publication, cap_exempt) = loop {
@@ -6088,6 +6364,16 @@ impl SimpleEngine {
                             )
                         })
                         .map_err(session_pair_error)?;
+                    if sender.is_some() && !continued {
+                        match pair.target_only_checkpoint_for_session(&mlx_gate) {
+                            Ok(state) => self.stash_retained_checkpoint(session_id, state),
+                            Err(error) => tracing::warn!(
+                                session_id,
+                                error = %error,
+                                "Failed to publish dSpark prompt checkpoint for cancellable session turn"
+                            ),
+                        }
+                    }
                     let first_token = sample(&prefill_logits.index((.., -1, ..)), params)
                         .map_err(EngineError::Mlx)?;
                     eval([&first_token]).map_err(EngineError::Mlx)?;
@@ -6313,6 +6599,11 @@ impl SimpleEngine {
                             completion_tokens: u32::try_from(generated.len()).unwrap_or(u32::MAX),
                             prompt_tokens: total,
                             prefilled_tokens: prefilled,
+                            outcome: if continued {
+                                SessionOutcome::Continued
+                            } else {
+                                SessionOutcome::ExactBootstrap
+                            },
                             continued,
                         },
                         publication,
@@ -6937,6 +7228,21 @@ impl SimpleEngine {
         tokens: &[u32],
         hard_keep_spans: &[HardKeepSpan],
     ) -> Result<PFlashScoreOutcome, EngineError> {
+        let max_full_score_tokens = pflash_full_score_max_tokens();
+        if pflash_full_score_budget_exceeded(
+            self.prefill_score_mode,
+            tokens.len(),
+            max_full_score_tokens,
+        ) {
+            tracing::warn!(
+                source_tokens = tokens.len(),
+                max_score_tokens = max_full_score_tokens,
+                score_mode = ?self.prefill_score_mode,
+                "PFlash Full scorer budget exceeded; using bounded recency survivor plan"
+            );
+            return self.pflash_recency_fallback_plan(tokens, hard_keep_spans);
+        }
+
         let _mlx_gate = (!higgs_models::mlx_exec::held()).then(higgs_models::mlx_exec::acquire);
         let prefill_lock = self
             .prefill_drafter
@@ -6950,10 +7256,19 @@ impl SimpleEngine {
         let inputs = Array::from_slice(tokens, &[1, prompt_len]);
         let num_layers = drafter.num_layers();
         let score_layers_start = num_layers.saturating_sub(8);
-        let score_layers: Vec<usize> = match self.prefill_score_mode {
-            PrefillScoreMode::Full => (score_layers_start..num_layers).collect(),
-            PrefillScoreMode::L7 => unreachable!("L7 mode returned before scoring"),
-        };
+        let (score_layers, scorer_exit_layer): (Vec<usize>, Option<usize>) =
+            match self.prefill_score_mode {
+                PrefillScoreMode::Full => ((score_layers_start..num_layers).collect(), None),
+                PrefillScoreMode::L7 => {
+                    if self.prefill_exit_layer == 0 {
+                        return Err(EngineError::Generation(
+                            "PFlash-L7 requires prefill_exit_layer >= 1".to_owned(),
+                        ));
+                    }
+                    let exit_layer = self.prefill_exit_layer.min(num_layers.saturating_sub(1));
+                    (vec![exit_layer], Some(exit_layer))
+                }
+            };
         let score_start = std::time::Instant::now();
         let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
         let raw_importance_scores = drafter.pflash_importance(
@@ -6989,10 +7304,54 @@ impl SimpleEngine {
                 })?;
         let select_ms = select_start.elapsed().as_secs_f64() * 1000.0;
         Ok(PFlashScoreOutcome {
-            plan: plan.with_scorer(self.prefill_score_mode, None),
+            plan: plan.with_scorer(self.prefill_score_mode, scorer_exit_layer),
             score_ms,
             select_ms,
             effective_keep_ratio,
+            score_budget_fallback: false,
+        })
+    }
+
+    fn pflash_recency_fallback_plan(
+        &self,
+        tokens: &[u32],
+        hard_keep_spans: &[HardKeepSpan],
+    ) -> Result<PFlashScoreOutcome, EngineError> {
+        let select_start = std::time::Instant::now();
+        let source_len = tokens.len();
+        let importance_scores: Vec<f32> = if source_len == 0 {
+            Vec::new()
+        } else {
+            let denom = source_len.max(1) as f32;
+            (0..source_len)
+                .map(|index| (index + 1) as f32 / denom)
+                .collect()
+        };
+        let effective_keep_ratio = self.prefill_keep_ratio;
+        let cfg = PrefillScoreConfig {
+            keep_ratio: effective_keep_ratio,
+            chunk: self.prefill_chunk,
+            avgpool: self.prefill_avgpool,
+            lookahead: 0,
+        };
+        let plan =
+            select_survivors_with_hard_keep(tokens, &importance_scores, &cfg, hard_keep_spans)
+                .map_err(|error| {
+                    EngineError::Generation(format!(
+                        "PFlash recency survivor selection failed: {error}"
+                    ))
+                })?;
+        let select_ms = select_start.elapsed().as_secs_f64() * 1000.0;
+        let scorer_exit_layer = match self.prefill_score_mode {
+            PrefillScoreMode::Full => None,
+            PrefillScoreMode::L7 => Some(self.prefill_exit_layer),
+        };
+        Ok(PFlashScoreOutcome {
+            plan: plan.with_scorer(self.prefill_score_mode, scorer_exit_layer),
+            score_ms: 0.0,
+            select_ms,
+            effective_keep_ratio,
+            score_budget_fallback: true,
         })
     }
 
@@ -7004,8 +7363,12 @@ impl SimpleEngine {
             lookahead: self.prefill_lookahead,
         };
         let metadata = PrefillPlanMetadata::from_config(&cfg);
+        let exit_layer = match self.prefill_score_mode {
+            PrefillScoreMode::Full => None,
+            PrefillScoreMode::L7 => Some(self.prefill_exit_layer),
+        };
         SurvivalPlan::identity(tokens, metadata)
-            .map(|plan| plan.with_scorer(self.prefill_score_mode, None))
+            .map(|plan| plan.with_scorer(self.prefill_score_mode, exit_layer))
             .map_err(|error| {
                 EngineError::Generation(format!("PFlash identity plan failed: {error}"))
             })
@@ -7105,13 +7468,6 @@ impl SimpleEngine {
         if pixel_values.is_some() || constraint.is_some() || logprobs || session_id.is_some() {
             return self.pflash_unavailable("request is incompatible", pflash_required);
         }
-        if self.prefill_score_mode == PrefillScoreMode::L7 {
-            tracing::warn!(
-                exit_layer = self.prefill_exit_layer,
-                "PFlash-L7 requested, but no true early-exit scorer is wired yet"
-            );
-            return self.pflash_unavailable("l7 scorer is not wired", pflash_required);
-        }
         // Simple engine is single-request only; no batch mode call-path reaches here.
         self.cache_metrics
             .pflash_attempts
@@ -7168,6 +7524,7 @@ impl SimpleEngine {
         let mut score_ms = 0.0_f64;
         let mut select_ms = 0.0_f64;
         let mut effective_keep_ratio = self.prefill_keep_ratio;
+        let mut score_budget_fallback = false;
 
         let body_plan = match (|| -> Result<SurvivalPlan, EngineError> {
             if let Some(hit) = cached_prefix {
@@ -7195,6 +7552,7 @@ impl SimpleEngine {
                     score_ms = outcome.score_ms;
                     select_ms = outcome.select_ms;
                     effective_keep_ratio = outcome.effective_keep_ratio;
+                    score_budget_fallback = outcome.score_budget_fallback;
                     outcome.plan
                 };
                 return hit
@@ -7215,6 +7573,7 @@ impl SimpleEngine {
             score_ms = outcome.score_ms;
             select_ms = outcome.select_ms;
             effective_keep_ratio = outcome.effective_keep_ratio;
+            score_budget_fallback = outcome.score_budget_fallback;
             Ok(outcome.plan)
         })() {
             Ok(plan) => {
@@ -7276,6 +7635,8 @@ impl SimpleEngine {
                 keep_floor = self.prefill_keep_ratio,
                 keep_ceiling = self.prefill_keep_ratio_max,
                 effective_keep_ratio,
+                exit_layer = ?plan.metadata.exit_layer,
+                score_budget_fallback,
                 "PFlash high-retention plan skipped; using exact prefill/cache path"
             );
             return Ok(None);
@@ -7322,6 +7683,8 @@ impl SimpleEngine {
             keep_floor = self.prefill_keep_ratio,
             keep_ceiling = self.prefill_keep_ratio_max,
             effective_keep_ratio,
+            exit_layer = ?plan.metadata.exit_layer,
+            score_budget_fallback,
             "PFlash built compressed prefill plan"
         );
         tracing::info!(
@@ -11889,12 +12252,12 @@ impl SimpleEngine {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        CanonicalDflashRound, DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
-        DEFAULT_PFLASH_PLAN_CACHE, DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
-        DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD, DFlashVerifyMode, DFlashVerifyRound,
-        DflashPrefillOutcome, DflashPromptPartition, DflashTapFrontier, EngineError,
-        GenerationPromptSuffixes, IncrementalDetok, LivePair, PFlashPlanCache,
-        PFlashPlanCacheConfig, PrefillCompressionMode, SessionBootstrapReason,
+        CanonicalDflashRound, DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS, DEFAULT_PFLASH_KEEP_RATIO_MAX,
+        DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO, DEFAULT_PFLASH_PLAN_CACHE,
+        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+        DFlashVerifyMode, DFlashVerifyRound, DflashPrefillOutcome, DflashPromptPartition,
+        DflashTapFrontier, EngineError, GenerationPromptSuffixes, IncrementalDetok, LivePair,
+        PFlashPlanCache, PFlashPlanCacheConfig, PrefillCompressionMode, SessionBootstrapReason,
         SessionDsparkDecodeState, SessionGeneration, SessionPrefillStrategy,
         SessionPromptTraceOutcome, SessionPromptTracePayloadStats, SimpleEngine, SpeculationRoute,
         Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences, common_prefix_token_len,
@@ -11906,9 +12269,9 @@ mod tests {
         extract_eos_tokens, find_stop_in_tail, lock_or_recover, message_boundary_delta,
         paired_dflash_exact_domain, parse_enabled_flag, pflash_actual_keep_ratio,
         pflash_auto_plan_worth_executing, pflash_cache_source_and_request_tail,
-        pflash_cache_source_and_request_tail_with_boundary, resolve_speculation_route,
-        session_prefill_strategy, session_prompt_trace_metrics, stateless_mtp_family_eligible,
-        with_chat_terminator,
+        pflash_cache_source_and_request_tail_with_boundary, pflash_full_score_budget_exceeded,
+        resolve_speculation_route, session_prefill_strategy, session_prompt_trace_metrics,
+        stateless_mtp_family_eligible, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
@@ -11918,7 +12281,9 @@ mod tests {
         AnyCache, AnyModel, SamplingParams, Speculation,
         cache::{KeyValueCache, SteppingKeyValueCache},
         dflash::{DFlashConfig, DFlashDrafter},
-        spec_prefill::{PrefillPlanMetadata, PrefillScoreConfig, PrefillScoreMode, SurvivalPlan},
+        spec_prefill::{
+            HardKeepSpan, PrefillPlanMetadata, PrefillScoreConfig, PrefillScoreMode, SurvivalPlan,
+        },
         transformer::{Model as TransformerModel, ModelArgs as TransformerModelArgs},
         turboquant::KvCacheConfig,
     };
@@ -11976,6 +12341,51 @@ mod tests {
             0,
             DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
         ));
+    }
+
+    #[test]
+    fn pflash_full_score_budget_only_limits_full_scorer() {
+        assert!(!pflash_full_score_budget_exceeded(
+            PrefillScoreMode::Full,
+            8192,
+            8192,
+        ));
+        assert!(pflash_full_score_budget_exceeded(
+            PrefillScoreMode::Full,
+            8193,
+            8192,
+        ));
+        assert!(!pflash_full_score_budget_exceeded(
+            PrefillScoreMode::L7,
+            65_536,
+            8192,
+        ));
+    }
+
+    #[test]
+    fn pflash_large_full_prompt_uses_scoreless_recency_fallback() {
+        let engine = session_cache_test_engine();
+        let source_len = DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS + 1024;
+        let tokens: Vec<u32> = (0..source_len as u32).collect();
+        let hard_keep = [HardKeepSpan::new(4000, 4010)];
+
+        let outcome = engine.pflash_score_tokens(&tokens, &hard_keep).unwrap();
+
+        assert!(outcome.score_budget_fallback);
+        assert_eq!(outcome.score_ms, 0.0);
+        assert_eq!(outcome.effective_keep_ratio, 0.10);
+        assert!(outcome.plan.len() < tokens.len());
+        assert_eq!(outcome.plan.original_positions.first().copied(), Some(0));
+        assert_eq!(
+            outcome.plan.original_positions.last().copied(),
+            Some((source_len - 1) as i32)
+        );
+        for position in 4000..4010 {
+            assert!(
+                outcome.plan.original_positions.contains(&(position as i32)),
+                "hard-keep position {position} must survive"
+            );
+        }
     }
 
     #[test]
@@ -12195,12 +12605,12 @@ mod tests {
     }
 
     #[test]
-    fn cold_long_session_bootstraps_exact_retained_cache() {
+    fn cold_long_session_without_pflash_bootstraps_exact_retained_cache() {
         const MAX_PREFILL_TOKENS: usize = 128;
         let prompt = vec![7; MAX_PREFILL_TOKENS + 1];
 
         assert_eq!(
-            session_prefill_strategy(42, None, &prompt, MAX_PREFILL_TOKENS),
+            session_prefill_strategy(42, None, &prompt, MAX_PREFILL_TOKENS, false),
             SessionPrefillStrategy::BootstrapExact {
                 session_id: 42,
                 reason: SessionBootstrapReason::ColdPromptTooLarge {
@@ -12212,12 +12622,23 @@ mod tests {
     }
 
     #[test]
+    fn cold_long_session_with_pflash_uses_degraded_bootstrap() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let prompt = vec![7; MAX_PREFILL_TOKENS + 1];
+
+        assert_eq!(
+            session_prefill_strategy(42, None, &prompt, MAX_PREFILL_TOKENS, true),
+            SessionPrefillStrategy::BootstrapPFlash { session_id: 42 }
+        );
+    }
+
+    #[test]
     fn cold_short_session_still_seeds_retained_cache() {
         const MAX_PREFILL_TOKENS: usize = 128;
         let prompt = vec![7; MAX_PREFILL_TOKENS];
 
         assert_eq!(
-            session_prefill_strategy(42, None, &prompt, MAX_PREFILL_TOKENS),
+            session_prefill_strategy(42, None, &prompt, MAX_PREFILL_TOKENS, true),
             SessionPrefillStrategy::Continue { session_id: 42 }
         );
     }
@@ -12230,7 +12651,7 @@ mod tests {
         candidate.extend(std::iter::repeat_n(9, MAX_PREFILL_TOKENS));
 
         assert_eq!(
-            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS),
+            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS, true,),
             SessionPrefillStrategy::Continue { session_id: 42 }
         );
     }
@@ -12243,7 +12664,7 @@ mod tests {
         candidate.extend(std::iter::repeat_n(9, MAX_PREFILL_TOKENS + 1));
 
         assert_eq!(
-            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS),
+            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS, true,),
             SessionPrefillStrategy::BootstrapExact {
                 session_id: 42,
                 reason: SessionBootstrapReason::LargeSuffix {
@@ -12261,7 +12682,7 @@ mod tests {
         let candidate = vec![1, 2, 4, 9];
 
         assert_eq!(
-            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS),
+            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS, true,),
             SessionPrefillStrategy::BootstrapExact {
                 session_id: 42,
                 reason: SessionBootstrapReason::DivergedOrNotGrowing,
@@ -12275,7 +12696,7 @@ mod tests {
         let retained = vec![1, 2, 3];
 
         assert_eq!(
-            session_prefill_strategy(42, Some(&retained), &retained, MAX_PREFILL_TOKENS),
+            session_prefill_strategy(42, Some(&retained), &retained, MAX_PREFILL_TOKENS, true,),
             SessionPrefillStrategy::BootstrapExact {
                 session_id: 42,
                 reason: SessionBootstrapReason::DivergedOrNotGrowing,
@@ -12441,6 +12862,24 @@ mod tests {
         assert_eq!(trace.divergence_token, Some(2));
         assert_eq!(trace.suffix_tokens, candidate.len());
         assert!(!trace.boundary_splice);
+    }
+
+    #[test]
+    fn session_prompt_metrics_distinguish_pflash_from_exact_bootstrap() {
+        let engine = session_cache_test_engine();
+        let prompt = [1, 2, 3, 4];
+
+        engine.record_session_prompt_trace(session_prompt_trace_metrics(
+            None,
+            &prompt,
+            &prompt,
+            SessionPromptTracePayloadStats::default(),
+            SessionPromptTraceOutcome::PFlashBootstrap,
+        ));
+
+        let stats = engine.cache_stats();
+        assert_eq!(stats.session_bootstrap_exact, 0);
+        assert_eq!(stats.session_bootstrap_pflash, 1);
     }
 
     fn validated_session_target(boundary: i32) -> AnyCache {
@@ -12629,6 +13068,27 @@ mod tests {
     }
 
     #[test]
+    fn oversized_prompt_checkpoint_preserves_prior_retained_boundary() {
+        const SESSION_ID: u64 = 0xCACE_C4A9;
+        let mut engine = session_cache_test_engine();
+        engine.kv_cache_config.max_session_tokens = 2;
+        let prior = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![1],
+        );
+        engine.stash_retained(SESSION_ID, prior, false);
+
+        let oversized_checkpoint =
+            crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+                AnyCache::KV(Vec::new()),
+                vec![1, 2, 3],
+            );
+        engine.stash_retained_checkpoint(SESSION_ID, oversized_checkpoint);
+
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), Some(vec![1]));
+    }
+
+    #[test]
     fn simple_engine_drop_retained_session_waits_for_session_lock() {
         const SESSION_ID: u64 = 0xD202_5E55;
         let engine = std::sync::Arc::new(session_cache_test_engine());
@@ -12679,7 +13139,108 @@ mod tests {
     }
 
     #[test]
-    fn simple_engine_session_effectful_seal_failure_republishes_neither_half() {
+    fn simple_engine_fork_target_continuable_preserves_retained_session() {
+        const SESSION_ID: u64 = 0xCACE_11ED;
+        let engine = session_cache_test_engine();
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![1, 2, 3],
+        );
+        engine.stash_retained(SESSION_ID, state, false);
+
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let forked = engine
+            .fork_target_continuable(SESSION_ID, &[1, 2, 3, 4], &mlx_gate)
+            .unwrap()
+            .expect("target retention must fork for an exact continuation");
+        drop(mlx_gate);
+
+        let (cache, prior) = forked;
+        drop(cache);
+        assert_eq!(prior, 3);
+        assert_eq!(
+            engine.retained_session_tokens(SESSION_ID),
+            Some(vec![1, 2, 3]),
+            "stream cancellation before successor publication must leave the prior retained cache"
+        );
+    }
+
+    #[test]
+    fn simple_engine_fork_target_continuable_drops_diverged_retained_session() {
+        const SESSION_ID: u64 = 0xCACE_D1A9;
+        let engine = session_cache_test_engine();
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![1, 2, 3],
+        );
+        engine.stash_retained(SESSION_ID, state, false);
+
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let forked = engine
+            .fork_target_continuable(SESSION_ID, &[9, 2, 3, 4], &mlx_gate)
+            .unwrap();
+        drop(mlx_gate);
+
+        assert!(forked.is_none());
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
+    }
+
+    #[test]
+    fn simple_engine_fork_paired_continuable_preserves_retained_session() {
+        const SESSION_ID: u64 = 0xD5A4_CAFE;
+        let engine = session_cache_test_engine();
+        let (pair, mut drafter) = session_live_pair(&[11]);
+
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let publication =
+            engine.seal_session_dspark_publication(SESSION_ID, pair, &mut drafter, &mlx_gate);
+        drop(mlx_gate);
+        engine.publish_session_dspark_publication(SESSION_ID, publication, false);
+
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let forked = engine
+            .fork_paired_continuable(SESSION_ID, &[11, 12], 1, &mlx_gate)
+            .unwrap()
+            .expect("paired retention must fork for an exact dSpark continuation");
+        drop(mlx_gate);
+
+        let (pair, prior) = forked;
+        assert_eq!(prior, 1);
+        assert_eq!(pair.token_len(), 1);
+        drop(pair);
+        assert_eq!(
+            engine.retained_session_tokens(SESSION_ID),
+            Some(vec![11]),
+            "stream cancellation before paired publication must leave the prior retained pair"
+        );
+        assert_eq!(engine.cache_stats().retained_paired_sessions, 1);
+    }
+
+    #[test]
+    fn simple_engine_fork_paired_continuable_keeps_target_only_state_for_cold_prefill() {
+        const SESSION_ID: u64 = 0xD5A4_70A9;
+        let engine = session_cache_test_engine();
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![4, 5, 6],
+        );
+        engine.stash_retained(SESSION_ID, state, false);
+
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let forked = engine
+            .fork_paired_continuable(SESSION_ID, &[4, 5, 6, 7], 1, &mlx_gate)
+            .unwrap();
+        drop(mlx_gate);
+
+        assert!(forked.is_none());
+        assert_eq!(
+            engine.retained_session_tokens(SESSION_ID),
+            Some(vec![4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn simple_engine_session_effectful_seal_failure_preserves_prior_retained_pair() {
         const SESSION_ID: u64 = 0xD5A4_FA11;
         let engine = session_cache_test_engine();
         let (pair, mut drafter) = session_live_pair(&[11]);
@@ -12697,14 +13258,13 @@ mod tests {
         assert_eq!(engine.retained_session_tokens(SESSION_ID), Some(vec![11]));
         assert_eq!(engine.cache_stats().retained_paired_sessions, 1);
 
-        let (retained, prior) = engine
-            .take_continuable(SESSION_ID, &[11, 12])
-            .expect("published pair must move out for an exact continuation");
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let (pair, prior) = engine
+            .fork_paired_continuable(SESSION_ID, &[11, 12], 1, &mlx_gate)
+            .unwrap()
+            .expect("published pair must fork for an exact continuation");
+        drop(mlx_gate);
         assert_eq!(prior, 1);
-        let crate::cache::paired::RetainedState::Paired(pair) = retained else {
-            panic!("fixture must resume an inseparable target/dSpark pair");
-        };
-        let pair = pair.resume(&[11], 1).unwrap();
         let pair = advance_session_pair(pair, &[12]);
 
         // Preserve tap capability so this enters effectful sealing, then inject
@@ -12721,11 +13281,11 @@ mod tests {
         engine.publish_session_dspark_publication(SESSION_ID, publication, false);
 
         let stats = engine.cache_stats();
-        assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
-        assert_eq!(stats.retained_sessions, 0);
-        assert_eq!(stats.retained_paired_sessions, 0);
-        assert_eq!(stats.retained_paired_target_bytes, 0);
-        assert_eq!(stats.retained_paired_dflash_bytes, 0);
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), Some(vec![11]));
+        assert_eq!(stats.retained_sessions, 1);
+        assert_eq!(stats.retained_paired_sessions, 1);
+        assert!(stats.retained_paired_target_bytes > 0);
+        assert!(stats.retained_paired_dflash_bytes > 0);
     }
 
     #[test]

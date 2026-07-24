@@ -179,7 +179,7 @@ port = 8000
 # # prefill_plan_cache = true                         # reuse frozen plans across turns
 # # prefill_plan_cache_entries = 64                   # branch/frontier cap
 # # prefill_suffix_identity_threshold = 128           # small suffixes stay exact
-# # prefill_score_mode  = "full"                      # full | l7 (l7 requires true early-exit support)
+# # prefill_score_mode  = "full"                      # full | l7
 # # prefill_exit_layer  = 7
 
 # --- Remote providers ---

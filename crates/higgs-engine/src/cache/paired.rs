@@ -305,6 +305,7 @@ pub(crate) enum PairedCacheError {
     #[error("retained target/dSpark pair has legacy unproven provenance")]
     UnprovenPair,
     #[error("retained target/dSpark pair metadata unexpectedly has another owner")]
+    #[cfg(test)]
     SharedPairMetadata,
     #[error("live paired-cache advance carries a target half from another branch")]
     ForeignTargetBranch,
@@ -462,6 +463,7 @@ impl SealedPair {
     }
 
     #[must_use]
+    #[cfg(test)]
     fn demote(self) -> AnyCache {
         let Self {
             target,
@@ -812,6 +814,30 @@ impl LivePair {
                 details: error.to_string(),
             })?;
         Ok(layers)
+    }
+
+    /// Publishable target-only checkpoint for a live pair's current prompt
+    /// boundary. Used only before decode on cold/session-bootstrap dSpark
+    /// turns, so a stream disconnect after prefill has a retained prefix but
+    /// an already-resumed paired session is not downgraded on cancellation.
+    pub(crate) fn target_only_checkpoint_for_session(
+        &self,
+        exec: &MlxExecToken,
+    ) -> Result<RetainedState, PairedCacheError> {
+        self.validate_stable()?;
+        let expected = Self::token_boundary(self.tokens.len())?;
+        let target = self.target.cache.try_deep_clone().map_err(|error| {
+            PairedCacheError::TargetMaterialization {
+                details: error.to_string(),
+            }
+        })?;
+        target
+            .validate_absolute_boundary(expected)
+            .map_err(|error| PairedCacheError::TargetBoundary {
+                expected,
+                details: error.to_string(),
+            })?;
+        RetainedState::target_only(target, self.tokens.clone(), exec)
     }
 
     /// Produce the only publishable session outcome from this live branch.
@@ -1214,6 +1240,7 @@ impl PairedCache {
     /// cache with an equal-length slice. Legacy test pairs created by
     /// [`Self::new`] remain intentionally unproven and cannot enter this
     /// correct-by-construction coordinator.
+    #[cfg(test)]
     pub(crate) fn resume(
         self,
         expected_tokens: &[u32],
@@ -1238,6 +1265,45 @@ impl PairedCache {
         let tokens = stamp.tokens.into_vec();
         let live_dflash = dflash.into_live();
         LivePair::from_clean_boundary(target, live_dflash, tokens, expected_taps)
+    }
+
+    /// Fork this retained pair into an independent live branch while leaving
+    /// the retained session entry intact. Session streaming uses this so a
+    /// disconnect cannot erase the previous valid retained boundary before a
+    /// successor is sealed and published.
+    pub(crate) fn fork_live_for_session(
+        &self,
+        expected_tokens: &[u32],
+        expected_taps: usize,
+        _exec: &MlxExecToken,
+    ) -> Result<LivePair, PairedCacheError> {
+        debug_assert!(
+            higgs_models::mlx_exec::held(),
+            "session paired-cache fork requires the process MLX execution gate"
+        );
+        if !self.sealed.metadata.stamp.matches(expected_tokens) {
+            return Err(PairedCacheError::PrefixMismatch {
+                stored_len: self.sealed.metadata.stamp.len,
+                requested_len: expected_tokens.len(),
+            });
+        }
+        if self.sealed.metadata.stamp.branch_epoch.is_none() {
+            return Err(PairedCacheError::UnprovenPair);
+        }
+        let target = self.sealed.target.try_deep_clone().map_err(|error| {
+            PairedCacheError::TargetMaterialization {
+                details: error.to_string(),
+            }
+        })?;
+        let dflash =
+            self.sealed
+                .dflash
+                .fork_live()
+                .map_err(|error| PairedCacheError::DFlashFork {
+                    details: error.to_string(),
+                })?;
+        let tokens = self.sealed.metadata.stamp.tokens.to_vec();
+        LivePair::from_clean_boundary(target, dflash, tokens, expected_taps)
     }
 
     #[must_use]
@@ -1275,6 +1341,7 @@ impl PairedCache {
     /// Consuming `self` makes demotion a whole-pair ownership transition; the
     /// drafter snapshot cannot remain accidentally associated with the target.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn demote(self) -> AnyCache {
         self.sealed.demote()
     }
@@ -1632,6 +1699,46 @@ impl RetainedState {
         PairedCache::new(target, dflash, tokens).map(Self::Paired)
     }
 
+    /// Fork target KV into an independent decode cache without consuming the
+    /// retained entry. The fork is deep because MLX cache mutation may donate
+    /// buffers, so a shallow clone would not be a cancellation-safe checkpoint.
+    pub(crate) fn fork_target_cache_for_session(
+        &self,
+        _exec: &MlxExecToken,
+    ) -> Result<AnyCache, PairedCacheError> {
+        debug_assert!(
+            higgs_models::mlx_exec::held(),
+            "session target-cache fork requires the process MLX execution gate"
+        );
+        let target = match self {
+            Self::TargetOnly(target) => &target.cache,
+            Self::Paired(pair) => &pair.sealed.target,
+        };
+        target
+            .try_deep_clone()
+            .map_err(|error| PairedCacheError::TargetMaterialization {
+                details: error.to_string(),
+            })
+    }
+
+    /// Fork paired state for a dSpark session continuation without consuming
+    /// the retained entry. Target-only retention cannot provide a drafter
+    /// frontier, so callers should cold-prefill and leave it intact until a
+    /// valid successor publishes.
+    pub(crate) fn fork_paired_live_for_session(
+        &self,
+        expected_tokens: &[u32],
+        expected_taps: usize,
+        exec: &MlxExecToken,
+    ) -> Result<Option<LivePair>, PairedCacheError> {
+        match self {
+            Self::TargetOnly(_) => Ok(None),
+            Self::Paired(pair) => pair
+                .fork_live_for_session(expected_tokens, expected_taps, exec)
+                .map(Some),
+        }
+    }
+
     /// Only target-only state may use the historical TurboQuant exemption from
     /// `max_session_tokens`. A paired dSpark snapshot remains uncompressed and
     /// grows with context, so exempting the target half would leave the whole
@@ -1677,6 +1784,7 @@ impl RetainedState {
 
     /// Consume the retained state and return target-only continuity.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn demote(self) -> AnyCache {
         match self {
             Self::TargetOnly(target) => target.cache,
@@ -1883,6 +1991,20 @@ mod tests {
         assert_eq!(pair.frontier.frontier.rows().unwrap(), 2);
         pair.target.cache.validate_absolute_boundary(3).unwrap();
         pair.validate_stable().unwrap();
+    }
+
+    #[test]
+    fn live_pair_target_only_checkpoint_does_not_consume_pair() {
+        let tokens = vec![11, 12];
+        let (pair, mut drafter) = target_ahead_live_pair(&tokens);
+        let exec = higgs_models::mlx_exec::acquire();
+
+        let checkpoint = pair.target_only_checkpoint_for_session(&exec).unwrap();
+        assert!(matches!(&checkpoint, RetainedState::TargetOnly(_)));
+        assert_eq!(checkpoint.tokens(), tokens);
+
+        let sealed = pair.seal(&mut drafter, &exec).unwrap();
+        assert_eq!(sealed.prefix_len(), tokens.len());
     }
 
     #[test]

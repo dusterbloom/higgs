@@ -709,7 +709,7 @@ impl Model {
         clippy::shadow_reuse,
         clippy::similar_names
     )]
-    pub fn pflash_importance<C: KeyValueCache>(
+    pub fn pflash_importance<C: Default + KeyValueCache>(
         &mut self,
         inputs: &Array,
         score_layers: &[usize],
@@ -739,8 +739,15 @@ impl Model {
         let n_kv_heads = self.args.num_key_value_heads;
         let scale = (head_dim as f32).sqrt().recip();
 
+        let early_exit_layer = score_layers
+            .iter()
+            .copied()
+            .max()
+            .filter(|&layer| layer + 1 < n_layers);
+
         // --- Prompt forward, capturing pre-layer residuals at score_layers ---
-        let (logits, prompt_taps) = self.forward_tapping_residuals(inputs, kv_cache, &score_set)?;
+        let (logits, prompt_taps) =
+            self.forward_tapping_residuals(inputs, kv_cache, &score_set, early_exit_layer)?;
         let prompt_len = inputs
             .shape()
             .get(1)
@@ -758,7 +765,7 @@ impl Model {
             // Single-token forward; the tapped residuals are [B, 1, hidden] (the
             // new position entering each scoring layer).
             let (step_logits, step_taps) =
-                self.forward_tapping_residuals(&next_id, kv_cache, &score_set)?;
+                self.forward_tapping_residuals(&next_id, kv_cache, &score_set, early_exit_layer)?;
             for (layer_idx, tap) in &step_taps {
                 if let Some(entry) = lah_taps.iter_mut().find(|(l, _)| l == layer_idx) {
                     entry.1.push(tap.clone());
@@ -820,14 +827,17 @@ impl Model {
     /// each layer in `score_set`. Returns `(logits_at_last_position, taps)` where
     /// each tap is `[B, S, hidden]` (or `[B, 1, hidden]` for single-token inputs).
     /// The KV cache is advanced in place (fresh on first call, grown on decode).
-    fn forward_tapping_residuals<C: KeyValueCache>(
+    fn forward_tapping_residuals<C: Default + KeyValueCache>(
         &mut self,
         inputs: &Array,
         kv_cache: &mut Vec<Option<C>>,
         score_set: &std::collections::HashSet<usize>,
+        early_exit_layer: Option<usize>,
     ) -> Result<(Array, Vec<(usize, Array)>), Exception> {
         if kv_cache.is_empty() {
-            *kv_cache = (0..self.model.layers.len()).map(|_| None).collect();
+            *kv_cache = (0..self.model.layers.len())
+                .map(|_| Some(C::default()))
+                .collect();
         } else if kv_cache.len() != self.model.layers.len() {
             return Err(Exception::custom(format!(
                 "kv_cache length ({}) must match num layers ({})",
@@ -853,6 +863,9 @@ impl Model {
         {
             if score_set.contains(&li) {
                 taps.push((li, h.clone()));
+            }
+            if early_exit_layer == Some(li) {
+                break;
             }
             h = layer.forward(AttentionInput {
                 x: &h,
@@ -1544,6 +1557,37 @@ mod tests {
         let model = Model::new(args).unwrap();
         assert_eq!(model.model_type(), "qwen2");
         assert!(model.lm_head.is_some());
+    }
+
+    #[test]
+    fn pflash_importance_early_exits_before_later_layers() {
+        let args = make_model_args("qwen3", 32, 4, 2, 64, 3);
+        let mut model = Model::new(args).unwrap();
+        let inputs = Array::from_slice(&[1_u32, 2, 3, 4], &[1, 4]);
+        let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+
+        let importance = model
+            .pflash_importance(&inputs, &[1], 1, &mut cache)
+            .unwrap();
+        mlx_rs::transforms::eval([&importance]).unwrap();
+
+        assert_eq!(importance.shape(), vec![4]);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(
+            cache[0].as_ref().unwrap().offset(),
+            5,
+            "layers before the score layer run for prompt plus lookahead"
+        );
+        assert_eq!(
+            cache[1].as_ref().unwrap().offset(),
+            0,
+            "score layer is tapped, not executed"
+        );
+        assert_eq!(
+            cache[2].as_ref().unwrap().offset(),
+            0,
+            "layers after early exit do not run"
+        );
     }
 
     /// Write a minimal config.json to a tempdir and return the directory.

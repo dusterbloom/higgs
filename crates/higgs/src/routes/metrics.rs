@@ -69,6 +69,8 @@ pub struct CacheMetricsView {
     pub session_prompt_boundary_splices: u64,
     /// Diverged/cold sessions routed through exact retained prefill.
     pub session_bootstrap_exact: u64,
+    /// Cold oversized sessions routed through degraded stateless PFlash prefill.
+    pub session_bootstrap_pflash: u64,
     /// Prompt tokens for the most recent session prompt/cache trace.
     pub session_last_prompt_tokens: u64,
     /// Retained tokens for the most recent session prompt/cache trace.
@@ -163,6 +165,9 @@ impl CacheMetricsView {
         self.session_bootstrap_exact = self
             .session_bootstrap_exact
             .saturating_add(stats.session_bootstrap_exact);
+        self.session_bootstrap_pflash = self
+            .session_bootstrap_pflash
+            .saturating_add(stats.session_bootstrap_pflash);
         self.session_last_prompt_tokens = self
             .session_last_prompt_tokens
             .max(stats.session_last_prompt_tokens);
@@ -351,6 +356,7 @@ mod tests {
             session_prompt_prefix_misses: 22,
             session_prompt_boundary_splices: 23,
             session_bootstrap_exact: 24,
+            session_bootstrap_pflash: 25,
             session_last_prompt_tokens: 27,
             session_last_retained_tokens: 28,
             session_last_candidate_tokens: 29,
@@ -424,6 +430,7 @@ mod tests {
         assert_eq!(view.session_prompt_prefix_misses, 44);
         assert_eq!(view.session_prompt_boundary_splices, 46);
         assert_eq!(view.session_bootstrap_exact, 48);
+        assert_eq!(view.session_bootstrap_pflash, 50);
         assert_eq!(view.retained_paired_sessions, 76);
         assert_eq!(view.retained_paired_target_bytes, 78);
         assert_eq!(view.retained_paired_dflash_bytes, 80);
@@ -459,6 +466,7 @@ mod tests {
             ("session_prompt_prefix_misses", 22),
             ("session_prompt_boundary_splices", 23),
             ("session_bootstrap_exact", 24),
+            ("session_bootstrap_pflash", 25),
             ("session_last_prompt_tokens", 27),
             ("session_last_retained_tokens", 28),
             ("session_last_candidate_tokens", 29),
