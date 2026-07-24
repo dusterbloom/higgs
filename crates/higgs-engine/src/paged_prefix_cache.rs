@@ -1574,7 +1574,7 @@ impl PagedPrefixCache {
                 tracing::warn!(error = %error, "Failed to page cache, using clone fallback");
                 let offset = kv_offset(cache).and_then(|value| usize::try_from(value).ok());
                 if offset.is_some_and(|value| value != prefix_tokens.len()) {
-                    tracing::warn!(
+                    tracing::debug!(
                         cache_tokens = offset.unwrap_or_default(),
                         key_tokens = prefix_tokens.len(),
                         "Skipping whole-clone prefix cache store at a different boundary"
@@ -1592,7 +1592,7 @@ impl PagedPrefixCache {
         if matches!(&prepared.endpoint, CachedData::Cloned(_)) {
             let offset = kv_offset(cache).and_then(|value| usize::try_from(value).ok());
             if offset.is_some_and(|value| value != prepared.total_tokens) {
-                tracing::warn!(
+                tracing::debug!(
                     cache_tokens = offset.unwrap_or_default(),
                     key_tokens = prepared.total_tokens,
                     "Skipping whole-clone prefix cache store at a different boundary"
@@ -3148,6 +3148,31 @@ mod tests {
             "Hybrid clones are whole-cache snapshots; storing offset>key_len would replay stale suffix state"
         );
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn hybrid_store_succeeds_when_boundary_matches() {
+        // Contract: a hybrid cache with offset == key_len stores successfully.
+        // This is what the caller (run_prefill) must guarantee by snapshotting
+        // BEFORE the generation suffix is prefilled (stored_clone). The companion
+        // test above proves the rejection when the caller fails to do so.
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let key: Vec<u32> = (0..60).collect();
+        let snapshot = make_hybrid_cache(8, 60);
+
+        cache.store(&key, &snapshot);
+
+        let mut query = key.clone();
+        query.push(999);
+        let matched = cache
+            .find_longest_prefix(&query)
+            .expect("hybrid cache with matching boundary must be stored and retrievable");
+        assert_eq!(matched.prefix_len, 60);
+        assert_eq!(
+            kv_cache_offset(&matched.cache),
+            60,
+            "retrieved cache offset must match the key length exactly"
+        );
     }
 
     #[test]
