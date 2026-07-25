@@ -244,6 +244,7 @@ impl BatchEngine {
                 completion_tokens: 0,
                 token_logprobs: None,
                 reasoning_content: None,
+                cached_prompt_tokens: 0,
             });
         }
 
@@ -289,6 +290,7 @@ impl BatchEngine {
             completion_tokens,
             token_logprobs: all_logprobs,
             reasoning_content: None,
+            cached_prompt_tokens: 0,
         })
     }
 

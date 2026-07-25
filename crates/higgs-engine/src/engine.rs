@@ -15,6 +15,10 @@ pub struct GenerationOutput {
     /// The boundary token is excluded from both fields so it never surfaces in
     /// streamed/returned text. See `SimpleEngine::generate_inner`.
     pub reasoning_content: Option<String>,
+    /// Prompt tokens served from the radix prefix cache, mirroring
+    /// `PrefillProgress.cached` on the streaming path. `0` when the route
+    /// doesn't track prefix-cache reuse (e.g. `DFlash`, batch engine).
+    pub cached_prompt_tokens: u32,
 }
 
 /// Prefill progress for one streaming request, in absolute prompt tokens.
@@ -58,6 +62,7 @@ mod tests {
             completion_tokens: 5,
             token_logprobs: None,
             reasoning_content: None,
+            cached_prompt_tokens: 0,
         };
         assert_eq!(output.text, "Hello world");
         assert_eq!(output.finish_reason, "stop");
@@ -74,6 +79,7 @@ mod tests {
             completion_tokens: 0,
             token_logprobs: None,
             reasoning_content: None,
+            cached_prompt_tokens: 0,
         };
         assert!(output.text.is_empty());
         assert_eq!(output.prompt_tokens, 0);
@@ -136,6 +142,7 @@ mod tests {
             completion_tokens: 3,
             token_logprobs: None,
             reasoning_content: None,
+            cached_prompt_tokens: 0,
         };
         let cloned = output.clone();
         assert_eq!(cloned.text, output.text);
@@ -168,6 +175,7 @@ mod tests {
             completion_tokens: 1,
             token_logprobs: None,
             reasoning_content: None,
+            cached_prompt_tokens: 0,
         };
         let debug_str = format!("{output:?}");
         assert!(debug_str.contains("GenerationOutput"));
@@ -212,6 +220,7 @@ mod tests {
                 ],
             }]),
             reasoning_content: None,
+            cached_prompt_tokens: 0,
         };
         let lps = output.token_logprobs.unwrap();
         assert_eq!(lps.len(), 1);

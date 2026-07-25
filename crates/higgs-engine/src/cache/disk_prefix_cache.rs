@@ -20,7 +20,7 @@ use crate::cache::disk_storage::{
 use crate::cache::paired::{PairedCacheError, RadixPairCheckpoint};
 use crate::paged_prefix_cache::{
     PagedPairedLookupPlan, PagedPrefixCache, PagedPrefixMatch, PairedPrefixCacheStats,
-    PairedPrepareTicket, PairedTouchToken, PreparedPairedPrefix,
+    PairedPrepareTicket, PairedTouchToken, PreparedPairedPrefix, RadixByteStats,
 };
 
 pub const DEFAULT_MIN_TOKENS_TO_PERSIST: usize = 512;
@@ -325,6 +325,13 @@ impl DiskPrefixCache {
 
     pub fn paired_stats(&self) -> PairedPrefixCacheStats {
         self.memory.paired_stats()
+    }
+
+    /// Resident vs logical bytes of the in-memory radix trie. Disk-resident
+    /// prefixes are not counted -- this measures what is held in RAM.
+    #[must_use]
+    pub fn radix_byte_stats(&self) -> RadixByteStats {
+        self.memory.radix_byte_stats()
     }
 
     pub fn clear(&mut self) {

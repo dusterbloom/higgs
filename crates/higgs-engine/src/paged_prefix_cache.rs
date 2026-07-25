@@ -71,6 +71,13 @@ struct GdnSnapshot {
     offset: i32,
 }
 
+// GDN snapshots are independently deep-cloned and evaluated before they are
+// placed behind an Arc. They are immutable after publication, matching the
+// safety invariant used by KvBlock and TqBlock below; MLX's Array handle does
+// not encode that invariant in its auto-trait implementation.
+#[allow(unsafe_code)]
+unsafe impl Sync for GdnSnapshot {}
+
 /// Per-layer block for `TurboQuant` KV cache.
 ///
 /// Each block holds the 5 quantized arrays for `block_size` tokens:
@@ -142,9 +149,10 @@ enum CachedLayerData {
     Kv(Vec<Arc<KvBlock>>),
     /// Attention layer: sequence of `TurboQuant` blocks.
     TurboQuantKv(Vec<Arc<TqBlock>>),
-    /// GDN/SSM layer: state snapshot at block boundary.
-    Gdn(GdnSnapshot),
-    /// Layer had no cache data.
+    /// Layer had no per-edge block run: either a genuinely absent cache layer,
+    /// or a GDN/SSM layer position. GDN state never lives here -- it lives on
+    /// the endpoint (`CachedData::{Paged,TurboQuantPaged}.gdn`), never on an
+    /// edge, because a split parent has no valid GDN state for a new boundary.
     Empty,
 }
 
@@ -167,6 +175,11 @@ struct EdgeBlocks {
     /// Carried on the edge so a block-aligned match that lands *inside* an edge
     /// (not on a stored endpoint) can still reconstruct correctly.
     context: Option<Arc<TurboQuantContext>>,
+    /// Whether these blocks came from a Hybrid (GDN/SSM + KV) store. Hybrid
+    /// edges may only be reconstructed at a stored endpoint (which owns a
+    /// valid GDN snapshot for that exact position) -- never at a partial
+    /// mid-edge or split-node match, which would silently drop the GDN state.
+    hybrid: bool,
 }
 
 /// Block payload carried by a radix edge.
@@ -183,15 +196,33 @@ enum EdgeData {
 /// The actual KV blocks live on the path's edges (`EdgeData::Paged`); this only
 /// records how to interpret them and any non-paged fallback.
 enum CachedData {
-    /// Block-paged cache (dense KV). Blocks are reconstructed from the path.
-    Paged { is_hybrid: bool },
+    /// Block-paged cache (dense KV, or Hybrid KV+GDN). Blocks are
+    /// reconstructed from the path; `gdn` is `Some` for a Hybrid endpoint --
+    /// one GDN/SSM snapshot per layer index (`None` at non-recurrent layers),
+    /// valid at exactly this endpoint's token position.
+    Paged {
+        gdn: Option<Arc<Vec<Option<GdnSnapshot>>>>,
+    },
     /// Block-paged `TurboQuant` cache with shared quantization context.
     TurboQuantPaged {
         context: Arc<TurboQuantContext>,
-        is_hybrid: bool,
+        gdn: Option<Arc<Vec<Option<GdnSnapshot>>>>,
     },
-    /// Full clone fallback (cache too short for paging).
+    /// Full clone fallback (cache too short/misaligned for paging).
     Cloned(AnyCache),
+}
+
+impl CachedData {
+    /// Whether this endpoint carries a companion GDN/SSM snapshot (Hybrid
+    /// model). `Cloned` endpoints carry their own `AnyCache::Hybrid` directly
+    /// and report `false` here -- callers dispatch on the `AnyCache` variant
+    /// for those instead.
+    const fn is_hybrid(&self) -> bool {
+        match self {
+            Self::Paged { gdn } | Self::TurboQuantPaged { gdn, .. } => gdn.is_some(),
+            Self::Cloned(_) => false,
+        }
+    }
 }
 
 /// One exact stored endpoint in the shared target radix.
@@ -249,8 +280,10 @@ struct RadixNode {
 enum MatchEndpoint<'a> {
     /// A stored trie endpoint (full metadata available).
     Stored(&'a CachedEndpoint),
-    /// A block-aligned position inside an edge (no stored endpoint). Paged
-    /// caches are never hybrid; only the optional TQ context is needed.
+    /// A block-aligned position inside an edge (no stored endpoint). Never
+    /// formed against a Hybrid edge (guarded at both formation sites in
+    /// `RadixNode`) -- a Hybrid edge has no valid GDN snapshot except at a
+    /// stored endpoint, so only the optional TQ context is needed here.
     PartialPaged {
         context: Option<Arc<TurboQuantContext>>,
     },
@@ -341,15 +374,15 @@ pub(crate) struct PairedPrepareTicket {
 impl PairedPrepareTicket {
     /// Boundary representable by this ticket's captured target-radix layout.
     ///
-    /// Dense targets publish only complete paged blocks. Hybrid targets use
-    /// the existing exact cloned-endpoint path.
+    /// Dense and Hybrid targets alike publish only complete paged blocks: a
+    /// GDN/SSM snapshot is valid at exactly one token position, so Hybrid
+    /// paging (like dense) requires flooring to a block multiple -- a
+    /// misaligned boundary falls back to the existing whole-clone path
+    /// instead (see `slice_into_blocks`).
     #[must_use]
     pub(crate) const fn store_boundary(self, requested: usize, is_hybrid: bool) -> usize {
-        if is_hybrid {
-            requested
-        } else {
-            requested / self.block_size * self.block_size
-        }
+        let _ = is_hybrid;
+        requested / self.block_size * self.block_size
     }
 }
 
@@ -380,6 +413,31 @@ impl PairedPrefixCacheStats {
     }
 }
 
+/// Byte accounting for the radix prefix cache, split so the block-sharing win
+/// is directly observable.
+///
+/// `resident_bytes` counts each block once: blocks live on the radix edge that
+/// spans their tokens, and every endpoint reaching through that edge shares the
+/// same `Arc`s. `logical_bytes` re-counts each entry's whole root -> endpoint
+/// path, which is what the same set of entries would cost if each stored its
+/// own copy (the pre-paging `Cloned` shape, still used for entries too short or
+/// misaligned to page). `logical_bytes - resident_bytes` is therefore the bytes
+/// saved by paging, and `logical / resident` its sharing factor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RadixByteStats {
+    pub entries: usize,
+    pub resident_bytes: usize,
+    pub logical_bytes: usize,
+}
+
+impl RadixByteStats {
+    /// Bytes avoided by sharing blocks across overlapping prefixes.
+    #[must_use]
+    pub const fn saved_bytes(self) -> usize {
+        self.logical_bytes.saturating_sub(self.resident_bytes)
+    }
+}
+
 /// Owned target reconstruction selected while the radix is locked.
 ///
 /// This contains only immutable array handles / `Arc` bumps. Device copies,
@@ -389,12 +447,12 @@ enum TargetMaterializationPlan {
     Cloned(AnyCache),
     DensePaged {
         layers: Vec<CachedLayerData>,
-        is_hybrid: bool,
+        gdn: Option<Arc<Vec<Option<GdnSnapshot>>>>,
     },
     TurboQuantPaged {
         layers: Vec<CachedLayerData>,
         context: Arc<TurboQuantContext>,
-        is_hybrid: bool,
+        gdn: Option<Arc<Vec<Option<GdnSnapshot>>>>,
     },
 }
 
@@ -507,9 +565,9 @@ impl TargetMaterializationPlan {
     fn materialize(self) -> Result<AnyCache, Exception> {
         match self {
             Self::Cloned(cache) => try_clone_target_for_materialization(&cache),
-            Self::DensePaged { layers, is_hybrid } => {
-                if is_hybrid {
-                    materialize_hybrid(&layers)
+            Self::DensePaged { layers, gdn } => {
+                if let Some(gdn) = gdn {
+                    materialize_hybrid(&layers, &gdn)
                 } else {
                     materialize_kv(&layers)
                 }
@@ -517,10 +575,10 @@ impl TargetMaterializationPlan {
             Self::TurboQuantPaged {
                 layers,
                 context,
-                is_hybrid,
+                gdn,
             } => {
-                if is_hybrid {
-                    materialize_tq_hybrid(&layers, &context)
+                if let Some(gdn) = gdn {
+                    materialize_tq_hybrid(&layers, &context, &gdn)
                 } else {
                     materialize_tq_kv(&layers, &context)
                 }
@@ -678,6 +736,7 @@ impl RadixNode {
         if policy == LookupPolicy::TargetAny
             && block_depth >= min_prefix
             && matches!(&self.edge_blocks, EdgeData::Paged(_))
+            && !path.last().is_some_and(|e| e.hybrid)
         {
             let node_match = MatchResult {
                 prefix_len: block_depth,
@@ -751,6 +810,12 @@ impl RadixNode {
         let EdgeData::Paged(blocks) = &self.edge_blocks else {
             return None;
         };
+        // Hybrid edges have no valid GDN snapshot mid-edge (only at a stored
+        // endpoint) -- refuse the partial match rather than hand back a
+        // KV-only reconstruction that silently drops the recurrent state.
+        if blocks.hybrid {
+            return None;
+        }
         let n_blocks = common / block_size;
         if n_blocks == 0 {
             return None;
@@ -775,6 +840,7 @@ impl RadixNode {
             layers: tail_layers,
             tokens: matched_tokens,
             context: blocks.context.clone(),
+            hybrid: blocks.hybrid,
         };
         Some(MatchResult {
             prefix_len,
@@ -933,6 +999,40 @@ impl RadixNode {
         removed
     }
 
+    /// Walk the trie accumulating resident vs logical bytes. `path_bytes` is the
+    /// block byte total of every edge from the root down to (not including) this
+    /// node, so a stored endpoint can charge its whole path to `logical_bytes`
+    /// while each edge charges itself to `resident_bytes` exactly once.
+    fn accumulate_radix_bytes(&self, path_bytes: usize, stats: &mut RadixByteStats) {
+        let edge_bytes = match &self.edge_blocks {
+            EdgeData::Paged(blocks) => estimated_cached_layers_bytes(&blocks.layers),
+            EdgeData::None => 0,
+        };
+        stats.resident_bytes = stats.resident_bytes.saturating_add(edge_bytes);
+        let path_bytes = path_bytes.saturating_add(edge_bytes);
+
+        if let Some(cached) = self.cached.as_ref() {
+            // Endpoint-owned payload: the GDN snapshot for a paged hybrid, or the
+            // whole cache for a `Cloned` fallback. Never shared, so it counts the
+            // same on both sides of the comparison.
+            let endpoint_bytes = match cached.endpoint.target() {
+                CachedData::Cloned(cache) => cache.estimated_bytes(),
+                CachedData::Paged { gdn } | CachedData::TurboQuantPaged { gdn, .. } => {
+                    gdn.as_deref().map_or(0, |v| estimated_gdn_bytes(v))
+                }
+            };
+            stats.entries = stats.entries.saturating_add(1);
+            stats.resident_bytes = stats.resident_bytes.saturating_add(endpoint_bytes);
+            stats.logical_bytes = stats
+                .logical_bytes
+                .saturating_add(path_bytes.saturating_add(endpoint_bytes));
+        }
+
+        for child in self.children.values() {
+            child.accumulate_radix_bytes(path_bytes, stats);
+        }
+    }
+
     fn accumulate_paired_stats(&self, stats: &mut PairedPrefixCacheStats) {
         if let Some(pair) = self
             .cached
@@ -1038,7 +1138,6 @@ impl CachedLayerData {
                 let tail = blocks.iter().skip(n).map(Arc::clone).collect();
                 (Self::TurboQuantKv(head), Self::TurboQuantKv(tail))
             }
-            Self::Gdn(snap) => (Self::Gdn(snap.clone()), Self::Empty),
             Self::Empty => (Self::Empty, Self::Empty),
         }
     }
@@ -1059,7 +1158,6 @@ impl CachedLayerData {
                 let start = blocks.len().saturating_sub(n);
                 Self::TurboQuantKv(blocks.iter().skip(start).map(Arc::clone).collect())
             }
-            Self::Gdn(snap) => Self::Gdn(snap.clone()),
             Self::Empty => Self::Empty,
         }
     }
@@ -1069,6 +1167,7 @@ impl CachedLayerData {
 struct Ctx {
     block_size: usize,
     context: Option<Arc<TurboQuantContext>>,
+    hybrid: bool,
     entry_id: u64,
     last_accessed: u64,
     last_accessed_at: Instant,
@@ -1087,6 +1186,7 @@ struct InsertOutcome {
 fn edge_blocks_from(
     blocks: Option<Vec<CachedLayerData>>,
     context: Option<Arc<TurboQuantContext>>,
+    hybrid: bool,
 ) -> EdgeData {
     blocks.map_or(EdgeData::None, |layers| {
         let tokens = layer_run_tokens(&layers);
@@ -1094,6 +1194,7 @@ fn edge_blocks_from(
             layers,
             tokens,
             context,
+            hybrid,
         })
     })
 }
@@ -1118,7 +1219,7 @@ fn layer_run_tokens(layers: &[CachedLayerData]) -> usize {
                     return blocks.len() * per_block;
                 }
             }
-            CachedLayerData::Gdn(_) | CachedLayerData::Empty => {}
+            CachedLayerData::Empty => {}
         }
     }
     0
@@ -1145,6 +1246,7 @@ fn split_edge_blocks(edge: EdgeData, n_tokens: usize, block_size: usize) -> (Edg
             let n_blocks = n_tokens / block_size;
             let head_tokens = n_blocks * block_size;
             let tail_tokens = blocks.tokens.saturating_sub(head_tokens);
+            let hybrid = blocks.hybrid;
             let mut head_layers = Vec::with_capacity(blocks.layers.len());
             let mut tail_layers = Vec::with_capacity(blocks.layers.len());
             for layer in &blocks.layers {
@@ -1157,11 +1259,13 @@ fn split_edge_blocks(edge: EdgeData, n_tokens: usize, block_size: usize) -> (Edg
                     layers: head_layers,
                     tokens: head_tokens,
                     context: blocks.context.clone(),
+                    hybrid,
                 }),
                 EdgeData::Paged(EdgeBlocks {
                     layers: tail_layers,
                     tokens: tail_tokens,
                     context: blocks.context,
+                    hybrid,
                 }),
             )
         }
@@ -1350,12 +1454,14 @@ impl PagedPrefixCache {
         if stored_len != prefix_tokens.len() {
             self.remove_exact_paired_endpoint(prefix_tokens);
         }
+        let hybrid = prepared.endpoint.is_hybrid();
         let target = CachedEndpoint::TargetOnly(prepared.endpoint);
         self.publish_prepared(
             prefix_tokens,
             stored_len,
             prepared.blocks,
             prepared.context,
+            hybrid,
             target,
         );
     }
@@ -1387,12 +1493,14 @@ impl PagedPrefixCache {
         if self.root.has_exact_paired_endpoint(tokens_to_store) {
             return;
         }
+        let hybrid = prepared.endpoint.is_hybrid();
         let target = CachedEndpoint::TargetOnly(prepared.endpoint);
         self.publish_prepared(
             prefix_tokens,
             stored_len,
             prepared.blocks,
             prepared.context,
+            hybrid,
             target,
         );
     }
@@ -1538,7 +1646,8 @@ impl PagedPrefixCache {
             endpoint,
         } = prepared;
         let stored_len = tokens.len();
-        self.publish_prepared(&tokens, stored_len, blocks, context, endpoint);
+        let hybrid = endpoint.target().is_hybrid();
+        self.publish_prepared(&tokens, stored_len, blocks, context, hybrid, endpoint);
         Ok(())
     }
 
@@ -1636,6 +1745,7 @@ impl PagedPrefixCache {
         stored_len: usize,
         blocks: Option<Vec<CachedLayerData>>,
         context: Option<Arc<TurboQuantContext>>,
+        hybrid: bool,
         endpoint: CachedEndpoint,
     ) {
         let Some(tokens_to_store) = prefix_tokens.get(..stored_len) else {
@@ -1646,6 +1756,7 @@ impl PagedPrefixCache {
         let ctx = Ctx {
             block_size: self.block_size,
             context,
+            hybrid,
             entry_id,
             last_accessed,
             last_accessed_at: Instant::now(),
@@ -1722,7 +1833,8 @@ impl PagedPrefixCache {
                         .iter()
                         .map(|l| l.take_last_blocks(edge_blocks))
                         .collect();
-                    node.edge_blocks = edge_blocks_from(Some(refreshed), ctx.context.clone());
+                    node.edge_blocks =
+                        edge_blocks_from(Some(refreshed), ctx.context.clone(), ctx.hybrid);
                 }
             }
             let previous = node.cached.take();
@@ -1835,7 +1947,7 @@ impl PagedPrefixCache {
             let is_paired = endpoint.is_paired();
             let new_leaf = RadixNode::leaf(
                 new_edge,
-                edge_blocks_from(remainder, ctx.context.clone()),
+                edge_blocks_from(remainder, ctx.context.clone(), ctx.hybrid),
                 endpoint,
                 ctx.entry_id,
                 ctx.last_accessed,
@@ -1856,7 +1968,7 @@ impl PagedPrefixCache {
         let is_paired = endpoint.is_paired();
         let new_leaf = RadixNode::leaf(
             new_edge,
-            edge_blocks_from(blocks, ctx.context.clone()),
+            edge_blocks_from(blocks, ctx.context.clone(), ctx.hybrid),
             endpoint,
             ctx.entry_id,
             ctx.last_accessed,
@@ -1973,6 +2085,14 @@ impl PagedPrefixCache {
         self.total_bytes = total_endpoint_path_bytes(&self.root);
         self.advance_revision();
         removed
+    }
+
+    /// Resident vs logical byte accounting for the whole radix trie.
+    #[must_use]
+    pub fn radix_byte_stats(&self) -> RadixByteStats {
+        let mut stats = RadixByteStats::default();
+        self.root.accumulate_radix_bytes(0, &mut stats);
+        stats
     }
 
     pub fn paired_stats(&self) -> PairedPrefixCacheStats {
@@ -2137,6 +2257,10 @@ fn validate_prepared_pair_boundary(prepared: &PreparedStore) -> Result<(), Paire
                 });
             }
             for (index, layer) in layers.iter().enumerate() {
+                // `Empty` covers both a genuinely absent cache layer and a
+                // Hybrid GDN/SSM layer position (whose state lives on the
+                // endpoint's `gdn` vec, not here) -- neither carries a block
+                // token count to check, so skip rather than compare against 0.
                 let actual = match layer {
                     CachedLayerData::Kv(blocks) => blocks.iter().fold(0usize, |total, block| {
                         total.saturating_add(
@@ -2162,7 +2286,7 @@ fn validate_prepared_pair_boundary(prepared: &PreparedStore) -> Result<(), Paire
                             )
                         })
                     }
-                    CachedLayerData::Gdn(_) | CachedLayerData::Empty => 0,
+                    CachedLayerData::Empty => continue,
                 };
                 if actual != prepared.total_tokens {
                     return Err(PairedCacheError::TargetBoundary {
@@ -2182,11 +2306,24 @@ fn validate_prepared_pair_boundary(prepared: &PreparedStore) -> Result<(), Paire
 fn prepared_target_bytes(prepared: &PreparedStore) -> usize {
     match &prepared.endpoint {
         CachedData::Cloned(cache) => cache.estimated_bytes(),
-        CachedData::Paged { .. } | CachedData::TurboQuantPaged { .. } => prepared
-            .blocks
-            .as_deref()
-            .map_or(0, estimated_cached_layers_bytes),
+        CachedData::Paged { gdn } | CachedData::TurboQuantPaged { gdn, .. } => {
+            let block_bytes = prepared
+                .blocks
+                .as_deref()
+                .map_or(0, estimated_cached_layers_bytes);
+            let gdn_bytes = gdn.as_deref().map_or(0, |v| estimated_gdn_bytes(v));
+            block_bytes.saturating_add(gdn_bytes)
+        }
     }
+}
+
+/// Estimated device bytes retained by a Hybrid endpoint's GDN/SSM snapshots.
+fn estimated_gdn_bytes(gdn: &[Option<GdnSnapshot>]) -> usize {
+    gdn.iter().flatten().fold(0usize, |total, snapshot| {
+        total
+            .saturating_add(snapshot.conv_state.as_ref().map_or(0, Array::nbytes))
+            .saturating_add(snapshot.ssm_state.as_ref().map_or(0, Array::nbytes))
+    })
 }
 
 fn estimated_cached_layers_bytes(layers: &[CachedLayerData]) -> usize {
@@ -2207,11 +2344,6 @@ fn estimated_cached_layers_bytes(layers: &[CachedLayerData]) -> usize {
                         .saturating_add(block.value_norms.nbytes())
                 })
             }
-            CachedLayerData::Gdn(snapshot) => snapshot
-                .conv_state
-                .as_ref()
-                .map_or(0, Array::nbytes)
-                .saturating_add(snapshot.ssm_state.as_ref().map_or(0, Array::nbytes)),
             CachedLayerData::Empty => 0,
         })
     })
@@ -2238,16 +2370,11 @@ fn slice_into_blocks(
     block_size: usize,
     max_tokens: usize,
 ) -> Result<PreparedStore, Exception> {
-    // Hybrid caches (GDN+KV) can't be block-paged because GDN sequential state
-    // doesn't align to block boundaries. The KV offset would mismatch the GDN
-    // offset after materialization, producing corrupt attention. Use clone instead.
-    let AnyCache::KV(kv_layers) = cache else {
-        return Ok(PreparedStore {
-            blocks: None,
-            context: None,
-            total_tokens: max_tokens,
-            endpoint: CachedData::Cloned(cache.clone()),
-        });
+    let kv_layers = match cache {
+        AnyCache::KV(kv_layers) => kv_layers,
+        AnyCache::Hybrid(layers) => {
+            return slice_hybrid_into_blocks(cache, layers, block_size, max_tokens);
+        }
     };
 
     let offset = kv_offset(cache).unwrap_or(0);
@@ -2281,15 +2408,116 @@ fn slice_into_blocks(
 
     let endpoint = tq_context
         .as_ref()
-        .map_or(CachedData::Paged { is_hybrid: false }, |context| {
+        .map_or(CachedData::Paged { gdn: None }, |context| {
             CachedData::TurboQuantPaged {
                 context: Arc::clone(context),
-                is_hybrid: false,
+                gdn: None,
             }
         });
 
     Ok(PreparedStore {
         blocks: Some(layers),
+        context: tq_context,
+        total_tokens,
+        endpoint,
+    })
+}
+
+/// Slice a Hybrid (GDN/SSM + KV) cache into block-aligned paged data.
+///
+/// A GDN/SSM recurrent state snapshot is valid at exactly one token position.
+/// Paging is only sound when that position is an exact block-size multiple
+/// AND matches `max_tokens` exactly -- the same "exact boundary" contract the
+/// whole-clone fallback has always required (see
+/// `hybrid_store_skips_clone_when_cache_offset_exceeds_key_len`). Any other
+/// case falls back to the existing whole-clone snapshot, unconditionally
+/// correct for any offset/length combination.
+fn slice_hybrid_into_blocks(
+    cache: &AnyCache,
+    layers: &[Option<LayerCache>],
+    block_size: usize,
+    max_tokens: usize,
+) -> Result<PreparedStore, Exception> {
+    let cloned = || PreparedStore {
+        blocks: None,
+        context: None,
+        total_tokens: max_tokens,
+        endpoint: CachedData::Cloned(cache.clone()),
+    };
+
+    let offset = kv_offset(cache).unwrap_or(0);
+    let offset_usize = usize::try_from(offset).unwrap_or(0);
+    if offset_usize == 0 || offset_usize != max_tokens || offset_usize % block_size != 0 {
+        return Ok(cloned());
+    }
+    let num_blocks = offset_usize / block_size;
+    if num_blocks == 0 {
+        return Ok(cloned());
+    }
+
+    let block_size_i32 =
+        i32::try_from(block_size).map_err(|_| Exception::custom("block_size overflow"))?;
+    let total_tokens = num_blocks * block_size;
+
+    // A recurrent state is only valid at the position where it was captured.
+    // If any GDN layer disagrees with the attention boundary, preserve the
+    // previous exact-match behavior instead of publishing a silently corrupt
+    // hybrid endpoint.
+    if layers.iter().any(|layer_opt| {
+        matches!(
+            layer_opt,
+            Some(LayerCache::Arrays(arrays)) if arrays.offset != offset
+        )
+    }) {
+        return Ok(cloned());
+    }
+
+    let mut tq_context: Option<Arc<TurboQuantContext>> = None;
+    let mut gdn: Vec<Option<GdnSnapshot>> = Vec::with_capacity(layers.len());
+    let out_layers: Vec<CachedLayerData> = layers
+        .iter()
+        .map(|layer_opt| match layer_opt {
+            Some(LayerCache::KV(kv)) => {
+                gdn.push(None);
+                if kv.is_quantized() {
+                    if tq_context.is_none() {
+                        tq_context = kv.turbo_arrays().map(|(c, ..)| Arc::clone(c));
+                    }
+                    slice_tq_layer(kv, num_blocks, block_size_i32)
+                } else {
+                    slice_kv_layer(Some(kv), num_blocks, block_size_i32)
+                }
+            }
+            Some(LayerCache::Arrays(arrays)) => {
+                let snapshot = arrays.try_deep_clone()?;
+                gdn.push(Some(GdnSnapshot {
+                    conv_state: snapshot.conv_state,
+                    ssm_state: snapshot.ssm_state,
+                    conv_pos: snapshot.conv_pos,
+                    offset: snapshot.offset,
+                }));
+                Ok(CachedLayerData::Empty)
+            }
+            None => {
+                gdn.push(None);
+                Ok(CachedLayerData::Empty)
+            }
+        })
+        .collect::<Result<_, _>>()?;
+
+    let gdn = Arc::new(gdn);
+    let endpoint = tq_context.as_ref().map_or(
+        CachedData::Paged {
+            gdn: Some(Arc::clone(&gdn)),
+        },
+        |context| CachedData::TurboQuantPaged {
+            context: Arc::clone(context),
+            gdn: Some(Arc::clone(&gdn)),
+        },
+    );
+
+    Ok(PreparedStore {
+        blocks: Some(out_layers),
         context: tq_context,
         total_tokens,
         endpoint,
@@ -2398,17 +2626,17 @@ fn own_target_materialization_plan(
     };
     match endpoint.target() {
         CachedData::Cloned(cache) => Ok(TargetMaterializationPlan::Cloned(cache.clone())),
-        CachedData::Paged { is_hybrid } => Ok(TargetMaterializationPlan::DensePaged {
+        CachedData::Paged { gdn } => Ok(TargetMaterializationPlan::DensePaged {
             layers: flatten_path_layers(&matched.full_path, matched.partial_tail.as_ref()),
-            is_hybrid: *is_hybrid,
+            gdn: gdn.clone(),
         }),
-        CachedData::TurboQuantPaged {
-            context, is_hybrid, ..
-        } => Ok(TargetMaterializationPlan::TurboQuantPaged {
-            layers: flatten_path_layers(&matched.full_path, matched.partial_tail.as_ref()),
-            context: Arc::clone(context),
-            is_hybrid: *is_hybrid,
-        }),
+        CachedData::TurboQuantPaged { context, gdn } => {
+            Ok(TargetMaterializationPlan::TurboQuantPaged {
+                layers: flatten_path_layers(&matched.full_path, matched.partial_tail.as_ref()),
+                context: Arc::clone(context),
+                gdn: gdn.clone(),
+            })
+        }
     }
 }
 
@@ -2430,20 +2658,18 @@ fn materialize(m: &MatchResult) -> Result<AnyCache, Exception> {
         // reconstructed from blocks below and are already independent.
         MatchEndpoint::Stored(endpoint) => match endpoint.target() {
             CachedData::Cloned(cache) => try_clone_target_for_materialization(cache),
-            CachedData::Paged { is_hybrid, .. } => {
+            CachedData::Paged { gdn } => {
                 let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
-                if *is_hybrid {
-                    materialize_hybrid(&layers)
+                if let Some(gdn) = gdn {
+                    materialize_hybrid(&layers, gdn)
                 } else {
                     materialize_kv(&layers)
                 }
             }
-            CachedData::TurboQuantPaged {
-                context, is_hybrid, ..
-            } => {
+            CachedData::TurboQuantPaged { context, gdn } => {
                 let layers = flatten_path_layers(&m.full_path, m.partial_tail.as_ref());
-                if *is_hybrid {
-                    materialize_tq_hybrid(&layers, context)
+                if let Some(gdn) = gdn {
+                    materialize_tq_hybrid(&layers, context, gdn)
                 } else {
                     materialize_tq_kv(&layers, context)
                 }
@@ -2483,7 +2709,6 @@ fn materialize_kv(layers: &[CachedLayerData]) -> Result<AnyCache, Exception> {
                 Err(Exception::custom("TQ layer in non-TQ materialize"))
             }
             CachedLayerData::Empty => Ok(Some(SteppingKeyValueCache::new())),
-            CachedLayerData::Gdn(_) => Err(Exception::custom("Unexpected GDN layer in KV cache")),
         })
         .collect();
     Ok(AnyCache::KV(kv_layers?))
@@ -2499,29 +2724,40 @@ fn materialize_tq_kv(
             CachedLayerData::TurboQuantKv(blocks) => gather_tq_blocks(blocks, context).map(Some),
             CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(Some),
             CachedLayerData::Empty => Ok(Some(SteppingKeyValueCache::new())),
-            CachedLayerData::Gdn(_) => {
-                Err(Exception::custom("Unexpected GDN layer in TQ KV cache"))
-            }
         })
         .collect();
     Ok(AnyCache::KV(kv_layers?))
 }
 
-fn materialize_hybrid(layers: &[CachedLayerData]) -> Result<AnyCache, Exception> {
+/// Interleave a Hybrid endpoint's per-edge KV block runs (`layers`, `Empty`
+/// at recurrent layer positions) with its endpoint-level GDN/SSM snapshots
+/// (`gdn`, indexed the same way) back into `Vec<Option<LayerCache>>`.
+fn materialize_hybrid(
+    layers: &[CachedLayerData],
+    gdn: &[Option<GdnSnapshot>],
+) -> Result<AnyCache, Exception> {
     let hybrid_layers: Result<Vec<_>, _> = layers
         .iter()
-        .map(|layer| match layer {
-            CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(|kv| Some(LayerCache::KV(kv))),
-            CachedLayerData::TurboQuantKv(_) => {
+        .zip(gdn.iter())
+        .map(|(layer, gdn_slot)| match (layer, gdn_slot) {
+            (CachedLayerData::Kv(blocks), None) => {
+                gather_blocks(blocks).map(|kv| Some(LayerCache::KV(kv)))
+            }
+            (CachedLayerData::TurboQuantKv(_), _) => {
                 Err(Exception::custom("TQ layer in non-TQ hybrid materialize"))
             }
-            CachedLayerData::Gdn(snap) => Ok(Some(LayerCache::Arrays(ArraysCache {
+            (CachedLayerData::Empty, Some(snap)) => ArraysCache {
                 conv_state: snap.conv_state.clone(),
                 ssm_state: snap.ssm_state.clone(),
                 conv_pos: snap.conv_pos,
                 offset: snap.offset,
-            }))),
-            CachedLayerData::Empty => Ok(None),
+            }
+            .try_deep_clone()
+            .map(|arrays| Some(LayerCache::Arrays(arrays))),
+            (CachedLayerData::Empty, None) => Ok(None),
+            (CachedLayerData::Kv(_), Some(_)) => Err(Exception::custom(
+                "KV block layer with unexpected GDN snapshot",
+            )),
         })
         .collect();
     Ok(AnyCache::Hybrid(hybrid_layers?))
@@ -2530,21 +2766,30 @@ fn materialize_hybrid(layers: &[CachedLayerData]) -> Result<AnyCache, Exception>
 fn materialize_tq_hybrid(
     layers: &[CachedLayerData],
     context: &Arc<TurboQuantContext>,
+    gdn: &[Option<GdnSnapshot>],
 ) -> Result<AnyCache, Exception> {
     let hybrid_layers: Result<Vec<_>, _> = layers
         .iter()
-        .map(|layer| match layer {
-            CachedLayerData::TurboQuantKv(blocks) => {
+        .zip(gdn.iter())
+        .map(|(layer, gdn_slot)| match (layer, gdn_slot) {
+            (CachedLayerData::TurboQuantKv(blocks), None) => {
                 gather_tq_blocks(blocks, context).map(|kv| Some(LayerCache::KV(kv)))
             }
-            CachedLayerData::Kv(blocks) => gather_blocks(blocks).map(|kv| Some(LayerCache::KV(kv))),
-            CachedLayerData::Gdn(snap) => Ok(Some(LayerCache::Arrays(ArraysCache {
+            (CachedLayerData::Kv(blocks), None) => {
+                gather_blocks(blocks).map(|kv| Some(LayerCache::KV(kv)))
+            }
+            (CachedLayerData::Empty, Some(snap)) => ArraysCache {
                 conv_state: snap.conv_state.clone(),
                 ssm_state: snap.ssm_state.clone(),
                 conv_pos: snap.conv_pos,
                 offset: snap.offset,
-            }))),
-            CachedLayerData::Empty => Ok(None),
+            }
+            .try_deep_clone()
+            .map(|arrays| Some(LayerCache::Arrays(arrays))),
+            (CachedLayerData::Empty, None) => Ok(None),
+            (_, Some(_)) => Err(Exception::custom(
+                "KV block layer with unexpected GDN snapshot",
+            )),
         })
         .collect();
     Ok(AnyCache::Hybrid(hybrid_layers?))
@@ -2557,7 +2802,11 @@ fn gather_blocks(blocks: &[Arc<KvBlock>]) -> Result<SteppingKeyValueCache, Excep
     };
 
     if blocks.len() == 1 {
-        return SteppingKeyValueCache::from_arrays(first.keys.clone(), first.values.clone());
+        // Array::clone() only clones the MLX handle. A one-block reconstruction
+        // must own independent buffers because the caller may append to the
+        // returned cache while the radix entry remains retained.
+        return SteppingKeyValueCache::from_arrays(first.keys.clone(), first.values.clone())
+            .and_then(|cache| cache.try_deep_clone());
     }
 
     let key_arrays: Vec<Array> = blocks.iter().map(|b| b.keys.clone()).collect();
@@ -3024,31 +3273,18 @@ mod tests {
         }
     }
 
-    /// Hybrid (GDN/SSM + KV) caches are deliberately NOT block-paged: GDN
-    /// sequential state cannot be split at a block boundary without corrupting
-    /// attention (the failure mlx-lm #980 reports as "hybrid + paging is
-    /// impossible"). higgs sidesteps it by storing the whole cache as a clone.
-    ///
-    /// This test pins that decision two ways:
-    ///   (1) `slice_into_blocks` on a hybrid returns the `Cloned` endpoint with
-    ///       no blocks — the moment someone makes hybrid block-paged, this fails;
-    ///   (2) the clone round-trips GDN state (`conv_state`/`ssm_state`) and KV
-    ///       byte-identically over a non-block-aligned length (65 tokens), proving
-    ///       reconstruction is exact and length-agnostic (a paged path would
-    ///       realign to 64 and drop the GDN state).
-    /// A future change that *correctly* enables hybrid paging must keep this green.
-    #[test]
-    fn test_hybrid_cache_is_cloned_not_paged_and_byte_identical() {
-        // array_eq over the whole array, by value (respects strided slice views).
-        let arrays_equal = |a: &Array, b: &Array| -> bool {
-            a.array_eq(b, None)
-                .unwrap()
-                .all(None)
-                .unwrap()
-                .item::<bool>()
-        };
+    // array_eq over the whole array, by value (respects strided slice views).
+    fn arrays_equal(a: &Array, b: &Array) -> bool {
+        a.array_eq(b, None)
+            .unwrap()
+            .all(None)
+            .unwrap()
+            .item::<bool>()
+    }
 
-        // Distinct, non-zero content so byte-identity is meaningful, not vacuous.
+    /// Build a hand-rolled 2-layer hybrid cache (GDN layer 0, KV layer 1) with
+    /// distinct, non-zero content so byte-identity checks are meaningful.
+    fn make_content_hybrid_cache(seq: i32) -> (AnyCache, Array, Array, Array, Array) {
         let conv = Array::from_slice(
             &(0..16).map(|x| x as f32 + 1.0).collect::<Vec<_>>(),
             &[1, 4, 4],
@@ -3059,7 +3295,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[1, 16],
         );
-        let seq: i32 = 65; // intentionally NOT a multiple of DEFAULT_BLOCK_SIZE
         let n = (2 * seq * 8) as usize;
         let keys = Array::from_slice(
             &(0..n).map(|x| x as f32 * 0.01).collect::<Vec<_>>(),
@@ -3069,7 +3304,6 @@ mod tests {
             &(0..n).map(|x| x as f32 * -0.02).collect::<Vec<_>>(),
             &[1, 2, seq, 8],
         );
-
         let hybrid = AnyCache::Hybrid(vec![
             Some(LayerCache::Arrays(ArraysCache {
                 conv_state: Some(conv.clone()),
@@ -3081,20 +3315,107 @@ mod tests {
                 SteppingKeyValueCache::from_arrays(keys.clone(), values.clone()).unwrap(),
             )),
         ]);
+        (hybrid, conv, ssm, keys, values)
+    }
 
-        // (1) Invariant: hybrid is stored as a CLONE, never sliced into blocks.
+    /// (a) A block-aligned Hybrid store now takes the PAGED path (not
+    /// Cloned) and round-trips byte-identical: every KV value AND the
+    /// conv_state/ssm_state/conv_pos/offset GDN fields match the original
+    /// exactly.
+    #[test]
+    fn hybrid_block_aligned_store_pages_and_round_trips_byte_identical() {
+        let seq: i32 = 64; // exact multiple of DEFAULT_BLOCK_SIZE
+        let (hybrid, conv, ssm, keys, values) = make_content_hybrid_cache(seq);
+
+        let prepared = slice_into_blocks(&hybrid, DEFAULT_BLOCK_SIZE, seq as usize).unwrap();
+        assert!(
+            prepared.blocks.is_some(),
+            "a block-aligned hybrid store must be sliced into blocks"
+        );
+        assert!(
+            matches!(prepared.endpoint, CachedData::Paged { gdn: Some(_) }),
+            "a block-aligned hybrid endpoint must carry a GDN snapshot vec, not fall back to Cloned"
+        );
+
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        let prefix: Vec<u32> = (0..seq as u32).collect();
+        cache.store(&prefix, &hybrid);
+        let mut query = prefix.clone();
+        query.push(999);
+        let matched = cache
+            .find_longest_prefix(&query)
+            .expect("block-aligned hybrid entry must be retrievable");
+        assert_eq!(matched.prefix_len, seq as usize);
+
+        let AnyCache::Hybrid(layers) = &matched.cache else {
+            panic!("expected hybrid cache");
+        };
+        let Some(LayerCache::Arrays(ac)) = layers[0].as_ref() else {
+            panic!("layer 0 must be GDN");
+        };
+        assert!(
+            arrays_equal(ac.conv_state.as_ref().unwrap(), &conv),
+            "conv_state must round-trip byte-identically"
+        );
+        assert!(
+            arrays_equal(ac.ssm_state.as_ref().unwrap(), &ssm),
+            "ssm_state must round-trip byte-identically"
+        );
+        assert_eq!(ac.conv_pos, 3, "conv_pos must survive the round-trip");
+        assert_eq!(ac.offset, seq, "offset must survive the round-trip");
+        let Some(LayerCache::KV(kv)) = layers[1].as_ref() else {
+            panic!("layer 1 must be KV");
+        };
+        assert!(
+            arrays_equal(kv.keys().unwrap(), &keys),
+            "KV keys must round-trip byte-identically"
+        );
+        assert!(
+            arrays_equal(kv.values().unwrap(), &values),
+            "KV values must round-trip byte-identically"
+        );
+    }
+
+    #[test]
+    fn hybrid_mismatched_gdn_offset_falls_back_to_cloned() {
+        let seq: i32 = 64;
+        let (mut hybrid, _, _, _, _) = make_content_hybrid_cache(seq);
+        let layers = hybrid.as_hybrid_mut().unwrap();
+        let Some(Some(LayerCache::Arrays(arrays))) = layers.first_mut() else {
+            panic!("expected a GDN layer");
+        };
+        arrays.offset -= 1;
+
         let prepared = slice_into_blocks(&hybrid, DEFAULT_BLOCK_SIZE, seq as usize).unwrap();
         assert!(
             prepared.blocks.is_none(),
-            "hybrid must NOT be sliced into blocks (GDN state can't split at a boundary)"
+            "a GDN snapshot at the wrong offset must not be paged"
         );
         assert!(
             matches!(prepared.endpoint, CachedData::Cloned(_)),
-            "hybrid endpoint must be Cloned — the deliberate mlx-lm #980 avoidance"
+            "offset disagreement must degrade to the existing clone path"
+        );
+    }
+
+    /// (b) A misaligned Hybrid store (offset not a multiple of the block
+    /// size) still falls back to `CachedData::Cloned` -- the pre-existing
+    /// behavior -- and round-trips byte-identical for a non-block-aligned
+    /// length. GDN state can never be safely split at a non-block boundary.
+    #[test]
+    fn hybrid_misaligned_store_falls_back_to_cloned_and_round_trips_byte_identical() {
+        let seq: i32 = 65; // intentionally NOT a multiple of DEFAULT_BLOCK_SIZE
+        let (hybrid, conv, ssm, keys, values) = make_content_hybrid_cache(seq);
+
+        let prepared = slice_into_blocks(&hybrid, DEFAULT_BLOCK_SIZE, seq as usize).unwrap();
+        assert!(
+            prepared.blocks.is_none(),
+            "a misaligned hybrid store must NOT be sliced into blocks"
+        );
+        assert!(
+            matches!(prepared.endpoint, CachedData::Cloned(_)),
+            "a misaligned hybrid endpoint must fall back to Cloned"
         );
 
-        // (2) Byte-identity: store -> retrieve reconstructs GDN state + KV exactly,
-        // for the full non-block-aligned length.
         let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
         let prefix: Vec<u32> = (0..seq as u32).collect();
         cache.store(&prefix, &hybrid);
@@ -3131,6 +3452,104 @@ mod tests {
             arrays_equal(kv.values().unwrap(), &values),
             "KV values must round-trip byte-identically"
         );
+    }
+
+    /// (c) A mid-edge partial-prefix lookup against a block-paged hybrid
+    /// entry must never hand back a partially-materialized (KV-only, GDN-
+    /// dropping) cache. It must miss entirely, since no stored endpoint
+    /// exists at the shared (non-stored) length.
+    ///
+    /// Before the partial-match guards, this exact shape (query shares more
+    /// than one whole block with a hybrid edge, then diverges before the
+    /// edge's own stored endpoint) would have reused `partial_edge_match`'s
+    /// KV-only reconstruction with no GDN state at all -- silent corruption.
+    #[test]
+    fn hybrid_partial_edge_match_never_materializes() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+        // 96 tokens = 3 blocks, single edge (no split), block-aligned store.
+        let stored: Vec<u32> = (0..96).collect();
+        cache.store(&stored, &make_mutable_hybrid_cache(96));
+        assert_eq!(cache.len(), 1);
+
+        // Shares the leading 80 tokens (> 2 whole blocks) with the stored
+        // edge, then diverges before the edge's own 96-token endpoint.
+        let mut query: Vec<u32> = (0..80).collect();
+        query.extend(9000..9010);
+        assert!(
+            cache.find_longest_prefix(&query).is_none(),
+            "a hybrid partial-edge match must never materialize (no valid GDN state exists mid-edge)"
+        );
+    }
+
+    /// (d) Two overlapping block-aligned hybrid prefixes (turn 2 extends
+    /// turn 1) share their leading KV blocks by `Arc` identity -- the paging
+    /// dedup win actually applies to Hybrid entries now, not just dense ones.
+    #[test]
+    fn hybrid_overlapping_prefixes_share_kv_blocks() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+
+        let turn1: Vec<u32> = (0..64).collect(); // 2 blocks
+        cache.store(&turn1, &make_mutable_hybrid_cache(64));
+        let before = cache.layer0_block_stats();
+        assert_eq!(before.len(), 2, "turn1 must store 2 layer-0 KV blocks");
+
+        let turn2: Vec<u32> = (0..96).collect(); // extends turn1 by 1 more block
+        cache.store(&turn2, &make_mutable_hybrid_cache(96));
+        let after = cache.layer0_block_stats();
+        assert_eq!(
+            after.len(),
+            3,
+            "turn2 must add exactly 1 new block, reusing turn1's 2: {after:?}"
+        );
+
+        // `Arc::as_ptr` equality is exactly what `Arc::ptr_eq` checks; the
+        // leading blocks captured before turn2's store must still be present
+        // by pointer identity, proving they were reused, not duplicated.
+        let before_ptrs: std::collections::HashSet<usize> =
+            before.iter().map(|(p, _)| *p).collect();
+        let after_ptrs: std::collections::HashSet<usize> = after.iter().map(|(p, _)| *p).collect();
+        assert!(
+            before_ptrs.is_subset(&after_ptrs),
+            "turn1's leading blocks must be reused, not duplicated, by turn2: {before:?} vs {after:?}"
+        );
+
+        // Both turns still reconstruct correctly.
+        let mut q1 = turn1;
+        q1.push(9);
+        let mut q2 = turn2;
+        q2.push(9);
+        assert_eq!(cache.find_longest_prefix(&q1).unwrap().prefix_len, 64);
+        assert_eq!(cache.find_longest_prefix(&q2).unwrap().prefix_len, 96);
+    }
+
+    /// The `/metrics` gauge must actually observe block sharing: a lone entry
+    /// saves nothing, and an overlapping second entry must cost less resident
+    /// than the two entries would cost stored whole.
+    #[test]
+    fn radix_byte_stats_expose_block_sharing() {
+        let mut cache = PagedPrefixCache::new(10, DEFAULT_BLOCK_SIZE);
+
+        let turn1: Vec<u32> = (0..64).collect();
+        cache.store(&turn1, &make_mutable_hybrid_cache(64));
+        let one = cache.radix_byte_stats();
+        assert_eq!(one.entries, 1);
+        assert!(one.resident_bytes > 0, "a stored entry must account bytes");
+        assert_eq!(
+            one.logical_bytes, one.resident_bytes,
+            "a lone entry shares nothing, so logical == resident"
+        );
+        assert_eq!(one.saved_bytes(), 0);
+
+        // Extends turn1, so the trie splits and turn1's blocks are shared.
+        let turn2: Vec<u32> = (0..96).collect();
+        cache.store(&turn2, &make_mutable_hybrid_cache(96));
+        let two = cache.radix_byte_stats();
+        assert_eq!(two.entries, 2);
+        assert!(
+            two.logical_bytes > two.resident_bytes,
+            "overlapping entries must cost less resident than stored whole: {two:?}"
+        );
+        assert!(two.saved_bytes() > 0, "{two:?}");
     }
 
     #[test]
@@ -3793,8 +4212,8 @@ mod tests {
         assert_eq!(block_six.store_boundary(13, false), 12);
         assert_eq!(block_four.store_boundary(11, false), 8);
         assert_eq!(block_six.store_boundary(11, false), 6);
-        assert_eq!(block_four.store_boundary(11, true), 11);
-        assert_eq!(block_six.store_boundary(11, true), 11);
+        assert_eq!(block_four.store_boundary(11, true), 8);
+        assert_eq!(block_six.store_boundary(11, true), 6);
     }
 
     #[test]
@@ -4015,9 +4434,9 @@ mod tests {
     #[test]
     fn cloned_target_materialization_failure_returns_a_cache_miss() {
         let mut cache = PagedPrefixCache::new(10, 4);
-        let tokens: Vec<u32> = (0..8).collect();
+        let tokens: Vec<u32> = (0..6).collect();
         cache
-            .store_paired(&tokens, &make_mutable_hybrid_cache(8), dflash_snapshot(8))
+            .store_paired(&tokens, &make_mutable_hybrid_cache(6), dflash_snapshot(6))
             .unwrap();
         let mut query = tokens;
         query.push(99);
@@ -4202,8 +4621,8 @@ mod tests {
         let matched = find_paired(&mut cache, &query).unwrap();
         assert_eq!(kv_cache_offset(&matched.cache), 4);
         assert!(
-            hybrid_kv_token_is(&matched.cache, 4, 0.0),
-            "paired target must fork the frozen pre-mutation buffer"
+            hybrid_kv_token_is(&matched.cache, 0, 1.0),
+            "paired target must retain the frozen pre-mutation buffer"
         );
     }
 

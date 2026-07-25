@@ -101,6 +101,11 @@ pub struct CacheMetricsView {
     pub retained_paired_dflash_bytes: u64,
     /// Currently stored radix prefixes.
     pub radix_entries: u64,
+    /// Bytes actually held by the radix trie, counting each shared block once.
+    pub radix_resident_bytes: u64,
+    /// Bytes the same entries would hold with no block sharing.
+    /// `radix_logical_bytes - radix_resident_bytes` is the block-paging saving.
+    pub radix_logical_bytes: u64,
     /// Currently stored paired target/dSpark radix endpoints.
     pub paired_radix_entries: u64,
     /// Conservative target bytes retained by paired radix endpoints.
@@ -211,6 +216,12 @@ impl CacheMetricsView {
         self.radix_entries = self
             .radix_entries
             .saturating_add(u64::try_from(stats.radix_entries).unwrap_or(u64::MAX));
+        self.radix_resident_bytes = self
+            .radix_resident_bytes
+            .saturating_add(u64::try_from(stats.radix_resident_bytes).unwrap_or(u64::MAX));
+        self.radix_logical_bytes = self
+            .radix_logical_bytes
+            .saturating_add(u64::try_from(stats.radix_logical_bytes).unwrap_or(u64::MAX));
         self.paired_radix_entries = self
             .paired_radix_entries
             .saturating_add(u64::try_from(stats.paired_radix_entries).unwrap_or(u64::MAX));
@@ -372,6 +383,8 @@ mod tests {
             retained_paired_target_bytes: 39,
             retained_paired_dflash_bytes: 40,
             radix_entries: 41,
+            radix_resident_bytes: 45,
+            radix_logical_bytes: 46,
             paired_radix_entries: 42,
             paired_radix_target_bytes: 43,
             paired_radix_dflash_bytes: 44,

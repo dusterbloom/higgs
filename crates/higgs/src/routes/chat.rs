@@ -346,6 +346,7 @@ async fn chat_completions_non_streaming(
         !stop_sequences.is_empty(),
     );
     let request_id = generate_request_id();
+    let allow_prefix_cache = req.cache_mode.as_deref() != Some("bypass");
     let has_tools = tools.is_some();
     let tool_payload = tool_payload_stats(&effective_messages);
     warn_large_tool_payload(tool_payload);
@@ -384,7 +385,7 @@ async fn chat_completions_non_streaming(
         ));
     } else {
         tokio::task::spawn_blocking(move || {
-            engine.generate_with_thinking_and_pflash_policy(
+            engine.generate_with_thinking_and_pflash_policy_with_cache(
                 &prompt_tokens,
                 max_tokens,
                 &sampling,
@@ -396,6 +397,7 @@ async fn chat_completions_non_streaming(
                 pixel_values,
                 checkpoint_id.as_deref(),
                 &pflash_policy,
+                allow_prefix_cache,
             )
         })
         .await
@@ -505,9 +507,13 @@ async fn chat_completions_non_streaming(
             logprobs: logprobs_response,
         }],
         // Stateless (no session_id) path: reuse is via the radix prefix cache,
-        // which is not surfaced per-request through `GenerationOutput`, so
-        // report no cached tokens rather than a fabricated value.
-        usage: CompletionUsage::new(output.prompt_tokens, output.completion_tokens, 0),
+        // surfaced through `GenerationOutput::cached_prompt_tokens` (mirrors
+        // the streaming route's `PrefillProgress.cached`).
+        usage: CompletionUsage::new(
+            output.prompt_tokens,
+            output.completion_tokens,
+            output.cached_prompt_tokens,
+        ),
     })
 }
 
@@ -743,6 +749,7 @@ async fn chat_completions_stream(
     let collect_prefill_progress = return_progress || include_usage;
     let created = current_unix_timestamp();
     let request_session_id = req.session_id;
+    let allow_prefix_cache = req.cache_mode.as_deref() != Some("bypass");
     let model = req.model;
     let checkpoint_id = req.checkpoint_id;
     let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(0);
@@ -816,7 +823,7 @@ async fn chat_completions_stream(
         });
     } else {
         tokio::task::spawn_blocking(move || {
-            let result = engine.generate_streaming_with_thinking_and_pflash_policy(
+            let result = engine.generate_streaming_with_thinking_and_pflash_policy_with_cache(
                 &prompt_tokens,
                 max_tokens,
                 &sampling,
@@ -830,6 +837,7 @@ async fn chat_completions_stream(
                 pixel_values,
                 checkpoint_id.as_deref(),
                 &pflash_policy,
+                allow_prefix_cache,
             );
             if let Err(e) = result {
                 tracing::error!(error = %e, "Generation error during streaming");

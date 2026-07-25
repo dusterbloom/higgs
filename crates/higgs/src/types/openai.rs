@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatCompletionMessage>,
+    /// Optional Higgs extension controlling prefix-cache participation.
+    /// `"bypass"` still runs inference but neither reads nor writes the
+    /// stateless prefix cache.
+    #[serde(default)]
+    pub cache_mode: Option<String>,
     /// Maximum number of tokens to generate.
     ///
     /// Accepts `max_completion_tokens` and `max_output_tokens` aliases.
@@ -616,6 +621,18 @@ mod tests {
         assert!(req.stream.is_none());
         assert!(req.max_tokens.is_none());
         assert!(req.reasoning.is_none());
+        assert!(req.cache_mode.is_none());
+    }
+
+    #[test]
+    fn test_chat_request_cache_bypass_deserialization() {
+        let json = r#"{
+            "model": "test",
+            "messages": [{"role": "user", "content": "."}],
+            "cache_mode": "bypass"
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cache_mode.as_deref(), Some("bypass"));
     }
 
     #[test]

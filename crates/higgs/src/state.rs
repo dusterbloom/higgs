@@ -521,6 +521,54 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_thinking_and_pflash_policy_with_cache(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        enable_thinking: bool,
+        constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
+    ) -> Result<GenerationOutput, EngineError> {
+        let _gpu = gpu_gate();
+        match self {
+            Self::Simple(e) => e.generate_with_thinking_and_pflash_policy_with_cache(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                logprobs,
+                top_logprobs,
+                enable_thinking,
+                constraint,
+                pixel_values,
+                checkpoint_id,
+                pflash_policy,
+                allow_prefix_cache,
+            ),
+            Self::Batch(e) => e.generate_with_thinking(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                logprobs,
+                top_logprobs,
+                enable_thinking,
+                constraint,
+                pixel_values,
+            ),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_streaming(
         &self,
         prompt_tokens: &[u32],
@@ -617,6 +665,60 @@ impl Engine {
                 pixel_values,
                 checkpoint_id,
                 pflash_policy,
+            ),
+            Self::Batch(e) => e.generate_streaming_with_thinking(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                logprobs,
+                top_logprobs,
+                sender,
+                enable_thinking,
+                return_progress,
+                constraint,
+                pixel_values,
+            ),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_thinking_and_pflash_policy_with_cache(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<higgs_engine::engine::StreamingOutput>,
+        enable_thinking: bool,
+        return_progress: bool,
+        constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
+    ) -> Result<(), EngineError> {
+        let _gpu = gpu_gate();
+        match self {
+            Self::Simple(e) => e.generate_streaming_with_thinking_and_pflash_policy_with_cache(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                logprobs,
+                top_logprobs,
+                sender,
+                enable_thinking,
+                return_progress,
+                constraint,
+                pixel_values,
+                checkpoint_id,
+                pflash_policy,
+                allow_prefix_cache,
             ),
             Self::Batch(e) => e.generate_streaming_with_thinking(
                 prompt_tokens,

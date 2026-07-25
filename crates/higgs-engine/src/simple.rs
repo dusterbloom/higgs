@@ -53,6 +53,7 @@ use crate::{
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 const DEFAULT_PAGED_KV_BLOCK_SIZE: usize = 64;
+const HYBRID_CHECKPOINT_BLOCKS: usize = 1;
 pub const DEFAULT_PFLASH_KEEP_RATIO_MAX: f32 = 0.75;
 pub const DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO: f32 = 0.60;
 pub const DEFAULT_PFLASH_PLAN_CACHE: bool = true;
@@ -120,6 +121,21 @@ fn exact_generation_body<'a>(prompt: &'a [u32], generation_suffix: &[u32]) -> Op
         return None;
     }
     prompt.strip_suffix(generation_suffix)
+}
+
+/// Snapshot boundary for a hybrid two-phase prefill store.
+///
+/// Floors to the prefix-cache block size so the stored entry is block-aligned
+/// and its KV layers can be paged (a GDN snapshot is only valid at the exact
+/// attention boundary it was computed at). A body shorter than one block has
+/// no aligned boundary, so it keeps its exact length: `slice_into_blocks` then
+/// sees a misaligned hybrid and falls back to a whole `Cloned` entry, which is
+/// the pre-paging behaviour. Returning 0 there would disable the two-phase
+/// snapshot entirely and drop hybrid caching for short conversations.
+fn hybrid_checkpoint_boundary(body_len: usize) -> usize {
+    let quantum = DEFAULT_BLOCK_SIZE.saturating_mul(HYBRID_CHECKPOINT_BLOCKS);
+    let aligned = body_len / quantum * quantum;
+    if aligned == 0 { body_len } else { aligned }
 }
 
 fn pflash_cache_source_and_request_tail<'a>(
@@ -1059,6 +1075,10 @@ fn prefix_cache_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_PREFIX_CACHE").ok().as_deref()).unwrap_or(true)
 }
 
+fn cache_policy_allows_prefix_cache(allow_prefix_cache: bool) -> bool {
+    allow_prefix_cache && prefix_cache_enabled()
+}
+
 fn prompt_lookup_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_PROMPT_LOOKUP").ok().as_deref()).unwrap_or(false)
 }
@@ -1647,6 +1667,11 @@ pub struct CacheStats {
     pub retained_paired_dflash_bytes: usize,
     /// Currently stored radix prefixes.
     pub radix_entries: usize,
+    /// Bytes actually held by the radix trie, counting each shared block once.
+    pub radix_resident_bytes: usize,
+    /// Bytes the same entries would hold with no block sharing (each entry's
+    /// whole prefix stored on its own). `logical - resident` is the paging win.
+    pub radix_logical_bytes: usize,
     /// Currently stored paired radix endpoints.
     pub paired_radix_entries: usize,
     /// Conservative target bytes retained by paired radix endpoints.
@@ -2467,6 +2492,18 @@ struct PreparedGeneration<'a> {
     prompt_array: Array,
     prompt_len: u32,
     pixel_values: Option<Array>,
+    /// Prompt tokens genuinely served from reused KV state this turn: the radix
+    /// prefix-cache hit length, or the retained-session prefix on the
+    /// continuation path.
+    ///
+    /// This is NOT `prompt_len - actual_prompt_tokens.len()`. PFlash compressive
+    /// prefill also shrinks `actual_prompt_tokens`, by *discarding* low-salience
+    /// tokens that are never prefilled and never reused, so that difference
+    /// over-reports reuse whenever PFlash is active (measured: a 1798-token
+    /// prompt with 422 survivors reported 1376 "cached" tokens against 0 actual
+    /// cache reuse). `usage.prompt_tokens_details.cached_tokens` is documented as
+    /// reused KV, so it must come from the cache hit itself.
+    reused_prefix_tokens: u32,
     /// Snapshot of the cache at the conversation boundary (full prompt minus
     /// the generation-prompt suffix), captured for HYBRID caches only. Hybrid
     /// (GDN/SSM) state can't be trimmed after the fact, so the only way to store
@@ -3101,10 +3138,14 @@ impl SimpleEngine {
             let retained = lock_or_recover(&self.retained);
             (retained.len(), retained_paired_stats(&retained))
         };
-        let (radix_entries, paired_radix) = {
+        let (radix_entries, paired_radix, radix_bytes) = {
             let mut prefix_cache = lock_or_recover(&self.prefix_cache);
             prefix_cache.evict_idle_paired();
-            (prefix_cache.len(), prefix_cache.paired_stats())
+            (
+                prefix_cache.len(),
+                prefix_cache.paired_stats(),
+                prefix_cache.radix_byte_stats(),
+            )
         };
         CacheStats {
             radix_lookups: self.cache_metrics.radix_lookups.load(Ordering::Relaxed),
@@ -3228,6 +3269,8 @@ impl SimpleEngine {
             retained_paired_target_bytes: retained_paired.target_bytes,
             retained_paired_dflash_bytes: retained_paired.dflash_bytes,
             radix_entries,
+            radix_resident_bytes: radix_bytes.resident_bytes,
+            radix_logical_bytes: radix_bytes.logical_bytes,
             paired_radix_entries: paired_radix.entries,
             paired_radix_target_bytes: paired_radix.target_bytes,
             paired_radix_dflash_bytes: paired_radix.dflash_bytes,
@@ -3871,6 +3914,11 @@ impl SimpleEngine {
             }
         }
 
+        let reused_prefix_tokens = prefix_match
+            .as_ref()
+            .and_then(|m| u32::try_from(m.prefix_len).ok())
+            .unwrap_or(0);
+
         let (actual_prompt_tokens, cache) = if let Some(matched) = prefix_match {
             tracing::debug!(
                 prefix_len = matched.prefix_len,
@@ -3911,6 +3959,7 @@ impl SimpleEngine {
             prompt_array,
             prompt_len,
             pixel_values,
+            reused_prefix_tokens,
             stored_clone: None,
             _mlx_gate: mlx_gate,
         })
@@ -4008,9 +4057,14 @@ impl SimpleEngine {
             // Bit-identical to a single-pass prefill: chunked prefill already
             // advances the cache token-by-token, so body-then-suffix == full.
             let is_hybrid = matches!(prepared.cache, AnyCache::Hybrid(_));
+            // Floor to a coarse checkpoint quantum so the fixed-size GDN
+            // snapshot is not duplicated for every ordinary block. The
+            // prefix cache restores this checkpoint and the normal prefill
+            // path replays the remaining tail. A short body has no checkpoint
+            // and therefore remains on the existing non-stored hybrid path.
             let split_at = if store_prefix_cache && is_hybrid {
                 exact_generation_body(&prepared.actual_prompt_tokens, generation_suffix)
-                    .map_or(0, <[u32]>::len)
+                    .map_or(0, |body| hybrid_checkpoint_boundary(body.len()))
             } else {
                 0
             };
@@ -4186,20 +4240,29 @@ impl SimpleEngine {
             // Dense KV caches block-page: the suffix is dropped at block
             // boundaries and reconstruction stays exact.
             //
-            // Hybrid (GDN/SSM) caches are stored as a whole CLONE and their
-            // sequential state cannot be truncated after the fact (mlx-lm #980).
-            // `run_prefill` therefore two-phase splits a hybrid prefill: it
-            // snapshots `stored_clone` at the conversation boundary (BEFORE the
-            // suffix) and keys that snapshot at the stripped length. The
-            // snapshot's offset == stripped key length, so reuse is exact (no
-            // RoPE/SSM shift) AND cross-turn matching fires (the conversation
-            // boundary recurs verbatim in the next turn). This replaces the old
-            // "key hybrid at full length" path, which was correct but never
-            // matched cross-turn (the suffix diverges), forcing a full re-prefill
-            // every turn.
-            let stripped =
-                exact_generation_body(prompt_tokens, generation_suffix).unwrap_or(prompt_tokens);
+            // Hybrid (GDN/SSM) caches can't be trimmed after the fact
+            // (mlx-lm #980), so `run_prefill` two-phase splits a hybrid
+            // prefill: it snapshots `stored_clone` at the conversation
+            // boundary (BEFORE the suffix, floored to a block multiple above)
+            // and keys that snapshot at ITS OWN resident length -- not a
+            // second, independently recomputed `exact_generation_body` split
+            // -- so the key stays exactly consistent with the flooring by
+            // construction. `PagedPrefixCache::store` block-pages the
+            // snapshot when that boundary is block-aligned and falls back to
+            // a whole clone otherwise (see `slice_into_blocks`); either way
+            // reuse is exact (no RoPE/SSM shift) AND cross-turn matching
+            // fires (the conversation boundary recurs verbatim in the next
+            // turn). This replaces the old "key hybrid at full length" path,
+            // which was correct but never matched cross-turn (the suffix
+            // diverges), forcing a full re-prefill every turn.
             let cache_to_store = prepared.stored_clone.as_ref().unwrap_or(&prepared.cache);
+            let is_hybrid = matches!(cache_to_store, AnyCache::Hybrid(_));
+            let stripped = if prepared.stored_clone.is_some() {
+                let resident = usize::try_from(cache_to_store.resident_len()).unwrap_or(0);
+                prompt_tokens.get(..resident).unwrap_or(prompt_tokens)
+            } else {
+                exact_generation_body(prompt_tokens, generation_suffix).unwrap_or(prompt_tokens)
+            };
             // Correct by construction: hybrid (GDN+KV) caches are whole-clone
             // snapshots whose KV offset cannot be trimmed after prefill. Only
             // store when the two-phase snapshot (stored_clone) exists — its
@@ -4208,7 +4271,6 @@ impl SimpleEngine {
             // boundary guard in prepare_store would correctly reject the
             // mismatch (with a WARN). Skipping silently here is better: the
             // store is intentionally omitted, not attempted and rejected.
-            let is_hybrid = matches!(cache_to_store, AnyCache::Hybrid(_));
             if !is_hybrid || prepared.stored_clone.is_some() {
                 pc.store(stripped, cache_to_store, checkpoint_id);
             }
@@ -5599,6 +5661,9 @@ impl SimpleEngine {
                     prompt_array,
                     prompt_len: total,
                     pixel_values: None,
+                    // Retained-session reuse: `prior` tokens came from the forked
+                    // session cache, the rest is the suffix we prefill now.
+                    reused_prefix_tokens: u32::try_from(prior).unwrap_or(u32::MAX),
                     stored_clone: None,
                     _mlx_gate: mlx_gate,
                 };
@@ -7137,6 +7202,38 @@ impl SimpleEngine {
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
     ) -> Result<GenerationOutput, EngineError> {
+        self.generate_with_thinking_and_pflash_policy_with_cache(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            enable_thinking,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            pflash_policy,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_thinking_and_pflash_policy_with_cache(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        enable_thinking: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
+    ) -> Result<GenerationOutput, EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -7148,6 +7245,8 @@ impl SimpleEngine {
                 completion_tokens: 0,
                 token_logprobs: None,
                 reasoning_content: None,
+                // No prefill ran, so the prefix-cache hit is unknown here.
+                cached_prompt_tokens: 0,
             });
         }
 
@@ -7166,6 +7265,7 @@ impl SimpleEngine {
                 pixel_values,
                 checkpoint_id,
                 pflash_policy,
+                allow_prefix_cache,
             )
         })
     }
@@ -7708,6 +7808,7 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
     ) -> Result<GenerationOutput, EngineError> {
         let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
         let generation_suffix = self.gen_prompt_suffixes.for_request(enable_thinking);
@@ -7760,7 +7861,7 @@ impl SimpleEngine {
                 && !logprobs,
             stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
         );
-        if speculation_route == SpeculationRoute::DFlash {
+        if allow_prefix_cache && speculation_route == SpeculationRoute::DFlash {
             return self.generate_dflash_inner(
                 prepared_prompt_tokens,
                 max_tokens,
@@ -7782,12 +7883,17 @@ impl SimpleEngine {
             prepared_prompt_tokens,
             pixel_values,
             checkpoint_id,
-            compressed.is_none(),
+            allow_prefix_cache && compressed.is_none(),
         )?;
         if compressed.is_some() {
             prepared.prompt_len = Self::prompt_len(prompt_tokens)?;
         }
         let prompt_len = prepared.prompt_len;
+        // Same prefix-cache-hit accounting the streaming route uses to fill
+        // `PrefillProgress.cached` (see `generate_streaming_inner`'s
+        // `prefill_sink`): tokens `prepare_generation` didn't have to
+        // re-prefill because the radix cache already held them.
+        let cached_prompt_tokens = prepared.reused_prefix_tokens;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
             && self.tuning.enable_mtp()
@@ -7805,7 +7911,7 @@ impl SimpleEngine {
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
-            prefix_cache_enabled() && compressed.is_none(),
+            cache_policy_allows_prefix_cache(allow_prefix_cache) && compressed.is_none(),
             checkpoint_id,
             compressed.as_ref(),
             None,
@@ -7842,6 +7948,7 @@ impl SimpleEngine {
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
                 reasoning_content: None,
+                cached_prompt_tokens,
             });
         }
         if has_stop_sequences {
@@ -7861,6 +7968,7 @@ impl SimpleEngine {
                     completion_tokens: 1,
                     token_logprobs: all_logprobs,
                     reasoning_content: None,
+                    cached_prompt_tokens,
                 });
             }
         }
@@ -7879,6 +7987,7 @@ impl SimpleEngine {
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
                 reasoning_content: None,
+                cached_prompt_tokens,
             });
         }
 
@@ -7902,6 +8011,7 @@ impl SimpleEngine {
                 stop_sequences,
                 enable_thinking,
                 thinking_budget,
+                cached_prompt_tokens,
             );
         }
 
@@ -7928,6 +8038,7 @@ impl SimpleEngine {
                 stop_sequences,
                 enable_thinking,
                 thinking_budget,
+                cached_prompt_tokens,
             );
         }
 
@@ -8111,6 +8222,7 @@ impl SimpleEngine {
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
                     reasoning_content,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -8136,6 +8248,7 @@ impl SimpleEngine {
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
                     reasoning_content,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -8163,6 +8276,7 @@ impl SimpleEngine {
                         completion_tokens: completion_len,
                         token_logprobs: all_logprobs,
                         reasoning_content,
+                        cached_prompt_tokens,
                     });
                 }
             }
@@ -8189,6 +8303,7 @@ impl SimpleEngine {
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
                     reasoning_content,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -10289,6 +10404,7 @@ impl SimpleEngine {
         stop_sequences: &[String],
         enable_thinking: bool,
         thinking_budget: u32,
+        cached_prompt_tokens: u32,
     ) -> Result<GenerationOutput, EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
         let unchecked_lookup = unchecked_prompt_lookup_enabled();
@@ -10328,6 +10444,7 @@ impl SimpleEngine {
                     completion_tokens: completion_len,
                     token_logprobs: None,
                     reasoning_content: None,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -10375,6 +10492,7 @@ impl SimpleEngine {
                                         completion_tokens: Self::completion_len(tokens)?,
                                         token_logprobs: None,
                                         reasoning_content: None,
+                                        cached_prompt_tokens,
                                     });
                                 }
 
@@ -10394,6 +10512,7 @@ impl SimpleEngine {
                                             completion_tokens: Self::completion_len(tokens)?,
                                             token_logprobs: None,
                                             reasoning_content: None,
+                                            cached_prompt_tokens,
                                         });
                                     }
                                 }
@@ -10409,6 +10528,7 @@ impl SimpleEngine {
                                         completion_tokens: forced_completion_len,
                                         token_logprobs: None,
                                         reasoning_content: None,
+                                        cached_prompt_tokens,
                                     });
                                 }
                                 break;
@@ -10429,6 +10549,7 @@ impl SimpleEngine {
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
                         reasoning_content: None,
+                        cached_prompt_tokens,
                     });
                 }
             }
@@ -10445,6 +10566,7 @@ impl SimpleEngine {
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
                         reasoning_content: None,
+                        cached_prompt_tokens,
                     });
                 }
             }
@@ -10460,6 +10582,7 @@ impl SimpleEngine {
                     completion_tokens: final_completion_len,
                     token_logprobs: None,
                     reasoning_content: None,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -10489,6 +10612,7 @@ impl SimpleEngine {
         stop_sequences: &[String],
         enable_thinking: bool,
         thinking_budget: u32,
+        cached_prompt_tokens: u32,
     ) -> Result<GenerationOutput, EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
 
@@ -10617,6 +10741,7 @@ impl SimpleEngine {
                                         completion_tokens: Self::completion_len(tokens)?,
                                         token_logprobs: None,
                                         reasoning_content: None,
+                                        cached_prompt_tokens,
                                     });
                                 }
 
@@ -10634,6 +10759,7 @@ impl SimpleEngine {
                                             completion_tokens: Self::completion_len(tokens)?,
                                             token_logprobs: None,
                                             reasoning_content: None,
+                                            cached_prompt_tokens,
                                         });
                                     }
                                 }
@@ -10649,6 +10775,7 @@ impl SimpleEngine {
                                         completion_tokens: completion_len,
                                         token_logprobs: None,
                                         reasoning_content: None,
+                                        cached_prompt_tokens,
                                     });
                                 }
 
@@ -10671,6 +10798,7 @@ impl SimpleEngine {
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
                         reasoning_content: None,
+                        cached_prompt_tokens,
                     });
                 }
             }
@@ -10687,6 +10815,7 @@ impl SimpleEngine {
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
                         reasoning_content: None,
+                        cached_prompt_tokens,
                     });
                 }
             }
@@ -10702,6 +10831,7 @@ impl SimpleEngine {
                     completion_tokens: completion_len,
                     token_logprobs: None,
                     reasoning_content: None,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -11076,6 +11206,42 @@ impl SimpleEngine {
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
     ) -> Result<(), EngineError> {
+        self.generate_streaming_with_thinking_and_pflash_policy_with_cache(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            sender,
+            enable_thinking,
+            return_progress,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            pflash_policy,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_thinking_and_pflash_policy_with_cache(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        return_progress: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
+    ) -> Result<(), EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -11108,6 +11274,7 @@ impl SimpleEngine {
                 pixel_values,
                 checkpoint_id,
                 pflash_policy,
+                allow_prefix_cache,
             )
         })
     }
@@ -11132,6 +11299,7 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
     ) -> Result<(), EngineError> {
         let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
         let generation_suffix = self.gen_prompt_suffixes.for_request(enable_thinking);
@@ -11189,7 +11357,7 @@ impl SimpleEngine {
                 && !logprobs,
             stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
         );
-        if speculation_route == SpeculationRoute::DFlash {
+        if allow_prefix_cache && speculation_route == SpeculationRoute::DFlash {
             return self.generate_dflash_streaming(
                 prepared_prompt_tokens,
                 max_tokens,
@@ -11208,7 +11376,7 @@ impl SimpleEngine {
             prepared_prompt_tokens,
             pixel_values,
             checkpoint_id,
-            compressed.is_none(),
+            allow_prefix_cache && compressed.is_none(),
         )?;
         if compressed.is_some() {
             prepared.prompt_len = Self::prompt_len(prompt_tokens)?;
@@ -11234,9 +11402,7 @@ impl SimpleEngine {
         // consumer — dropped progress events are harmless. The returned guard is
         // held for the prefill's duration and uninstalls the sink on drop.
         let prefill_sink = return_progress.then(|| {
-            let actual_tokens =
-                u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
-            let cached = prompt_len.saturating_sub(actual_tokens);
+            let cached = prepared.reused_prefix_tokens;
             let make_progress_output = move |suffix_done: u32| StreamingOutput {
                 new_text: String::new(),
                 finished: false,
@@ -11269,7 +11435,7 @@ impl SimpleEngine {
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
-            prefix_cache_enabled() && compressed.is_none(),
+            cache_policy_allows_prefix_cache(allow_prefix_cache) && compressed.is_none(),
             checkpoint_id,
             compressed.as_ref(),
             None,
@@ -12112,6 +12278,10 @@ impl DflashSink for DflashBufferedSink {
             completion_tokens: completion_len,
             token_logprobs: None,
             reasoning_content: None,
+            // DFlash doesn't track prefix-cache reuse on either the streaming
+            // or buffered path (see `DflashStreamSink::emit`, which always
+            // sends `prefill_progress: None`).
+            cached_prompt_tokens: 0,
         })
     }
 }
@@ -12260,13 +12430,14 @@ mod tests {
         PFlashPlanCache, PFlashPlanCacheConfig, PrefillCompressionMode, SessionBootstrapReason,
         SessionDsparkDecodeState, SessionGeneration, SessionPrefillStrategy,
         SessionPromptTraceOutcome, SessionPromptTracePayloadStats, SimpleEngine, SpeculationRoute,
-        Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences, common_prefix_token_len,
-        contains_real_user_query, continuation_prior_len, continuation_reject_reason,
-        derive_model_name, detect_thinking_support, dflash_accepts_pflash_plan,
-        dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
-        dflash_resolve_target_then_draft, dflash_sparse_taps_available_for_pflash_plan,
-        dflash_tail_draft_cap, drive_canonical_dspark_round, estimate_paged_kv_blocks,
-        extract_eos_tokens, find_stop_in_tail, lock_or_recover, message_boundary_delta,
+        Tokenizer, adaptive_draft_depth_for_cap, cache_policy_allows_prefix_cache,
+        check_stop_sequences, common_prefix_token_len, contains_real_user_query,
+        continuation_prior_len, continuation_reject_reason, derive_model_name,
+        detect_thinking_support, dflash_accepts_pflash_plan, dflash_canonical_target_is_terminal,
+        dflash_new_stop_prefix_len, dflash_resolve_target_then_draft,
+        dflash_sparse_taps_available_for_pflash_plan, dflash_tail_draft_cap,
+        drive_canonical_dspark_round, estimate_paged_kv_blocks, extract_eos_tokens,
+        find_stop_in_tail, hybrid_checkpoint_boundary, lock_or_recover, message_boundary_delta,
         paired_dflash_exact_domain, parse_enabled_flag, pflash_actual_keep_ratio,
         pflash_auto_plan_worth_executing, pflash_cache_source_and_request_tail,
         pflash_cache_source_and_request_tail_with_boundary, pflash_full_score_budget_exceeded,
@@ -12287,6 +12458,12 @@ mod tests {
         transformer::{Model as TransformerModel, ModelArgs as TransformerModelArgs},
         turboquant::KvCacheConfig,
     };
+
+    #[test]
+    fn cache_bypass_disables_prefix_cache() {
+        assert!(!cache_policy_allows_prefix_cache(false));
+        assert!(cache_policy_allows_prefix_cache(true));
+    }
     use mlx_rs::{
         Array, Dtype,
         ops::indexing::{IndexOp, NewAxis},
@@ -12555,6 +12732,21 @@ mod tests {
         assert_eq!(next_tail, &suffix);
         assert!(next_body.starts_with(previous_body));
         assert!(!next_prompt.starts_with(&previous_prompt));
+    }
+
+    #[test]
+    fn hybrid_checkpoint_boundary_floors_to_block_without_dropping_short_bodies() {
+        // Long bodies floor to a block multiple so the store can be paged.
+        assert_eq!(hybrid_checkpoint_boundary(64), 64);
+        assert_eq!(hybrid_checkpoint_boundary(95), 64);
+        assert_eq!(hybrid_checkpoint_boundary(96), 96);
+        // Sub-block bodies keep their exact length rather than collapsing to 0,
+        // which would skip the two-phase snapshot and drop hybrid caching for
+        // short conversations. These store as whole clones, as before paging.
+        assert_eq!(hybrid_checkpoint_boundary(31), 31);
+        assert_eq!(hybrid_checkpoint_boundary(1), 1);
+        // An empty body still has nothing to snapshot.
+        assert_eq!(hybrid_checkpoint_boundary(0), 0);
     }
 
     #[test]
