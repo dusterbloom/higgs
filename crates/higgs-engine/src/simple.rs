@@ -784,11 +784,27 @@ fn rendered_message_segments(text: &str) -> Option<Vec<RenderedMessageSegment<'_
         }
 
         let body_start = start + IM_START.len();
-        let Some(relative_end) = text.get(body_start..)?.find(IM_END) else {
-            let partial = text.get(start..)?;
-            if partial.get(IM_START.len()..)?.contains(IM_START) {
+        let next_start = text
+            .get(body_start..)?
+            .find(IM_START)
+            .map(|relative| body_start + relative);
+        let frame_end = next_start.unwrap_or(text.len());
+        let frame = text.get(body_start..frame_end)?;
+        let candidate_end = frame.rfind(IM_END).map(|relative| body_start + relative);
+        let structural_end = candidate_end.filter(|candidate| {
+            let end_after = candidate + IM_END.len();
+            text.get(end_after..frame_end)
+                .is_some_and(|tail| tail.trim().is_empty())
+        });
+
+        let Some(end_start) = structural_end else {
+            // A later message start proves this frame was expected to close.
+            // Without one, this is the normal partially-generated final
+            // message and any literal end marker remains message content.
+            if next_start.is_some() {
                 return None;
             }
+            let partial = text.get(start..)?;
             segments.push(RenderedMessageSegment {
                 text_without_end: partial,
                 end_start: None,
@@ -797,7 +813,6 @@ fn rendered_message_segments(text: &str) -> Option<Vec<RenderedMessageSegment<'_
             return Some(segments);
         };
 
-        let end_start = body_start + relative_end;
         let end_after = end_start + IM_END.len();
         let body = text.get(body_start..end_start)?;
         if body.contains(IM_START) {
@@ -12914,6 +12929,41 @@ mod tests {
         let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
         let delta = message_boundary_delta(retained, full).unwrap();
         assert_eq!(delta, "\n<|im_start|>user\nq2<|im_end|>");
+    }
+
+    #[test]
+    fn boundary_delta_accepts_literal_im_end_in_covered_user_content() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_end|> still data<|im_end|>\n<|im_start|>assistant\nanswer";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_end|> still data<|im_end|>\n<|im_start|>assistant\nstored<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n";
+
+        assert_eq!(
+            message_boundary_delta(retained, full),
+            Some("<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n")
+        );
+    }
+
+    #[test]
+    fn boundary_delta_accepts_literal_im_end_in_new_tool_result() {
+        let retained = "<|im_start|>user\nread<|im_end|>\n<|im_start|>assistant\ncall";
+        let full = "<|im_start|>user\nread<|im_end|>\n<|im_start|>assistant\nstored<|im_end|>\n<|im_start|>tool\nquoted <|im_end|> marker<|im_end|>\n<|im_start|>assistant\n";
+
+        assert_eq!(
+            message_boundary_delta(retained, full),
+            Some(
+                "<|im_end|>\n<|im_start|>tool\nquoted <|im_end|> marker<|im_end|>\n<|im_start|>assistant\n"
+            )
+        );
+    }
+
+    #[test]
+    fn boundary_delta_uses_second_of_adjacent_im_end_markers() {
+        let retained = "<|im_start|>user\nliteral ends <|im_end|><|im_end|>";
+        let full = "<|im_start|>user\nliteral ends <|im_end|><|im_end|>\n<|im_start|>assistant\n";
+
+        assert_eq!(
+            message_boundary_delta(retained, full),
+            Some("\n<|im_start|>assistant\n")
+        );
     }
 
     #[test]
