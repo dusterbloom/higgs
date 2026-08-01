@@ -1586,6 +1586,35 @@ struct CacheMetrics {
     sessions_evicted: AtomicU64,
 }
 
+struct PendingContinuationMetrics {
+    continuations: u64,
+    prefill_saved_tokens: u64,
+}
+
+impl PendingContinuationMetrics {
+    fn new(continued: bool, prompt_tokens: u32, prefilled_tokens: u32) -> Self {
+        Self {
+            continuations: u64::from(continued),
+            prefill_saved_tokens: if continued {
+                u64::from(prompt_tokens.saturating_sub(prefilled_tokens))
+            } else {
+                0
+            },
+        }
+    }
+
+    fn commit(self, metrics: &CacheMetrics) {
+        if self.continuations > 0 {
+            metrics
+                .continuations
+                .fetch_add(self.continuations, Ordering::Relaxed);
+            metrics
+                .prefill_saved_tokens
+                .fetch_add(self.prefill_saved_tokens, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Route-level outcome for a session generation and prompt/cache trace.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SessionOutcome {
@@ -2632,6 +2661,82 @@ pub struct SessionPromptTracePayloadStats {
     pub largest_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PFlashLoadSettings {
+    prefill_drafter_configured: bool,
+    prefill_keep_ratio: f32,
+    prefill_chunk: usize,
+    prefill_avgpool: usize,
+    prefill_lookahead: usize,
+    prefill_score_mode: PrefillScoreMode,
+    prefill_exit_layer: usize,
+    prefill_keep_ratio_max: f32,
+    prefill_max_auto_prefill_ratio: f32,
+    prefill_plan_cache: bool,
+    prefill_plan_cache_entries: usize,
+}
+
+impl PFlashLoadSettings {
+    fn validate(self) -> Result<(), EngineError> {
+        if !self.prefill_keep_ratio.is_finite() || !(0.02..=0.95).contains(&self.prefill_keep_ratio)
+        {
+            return Err(EngineError::Generation(format!(
+                "invalid PFlash settings: prefill_keep_ratio={} must be finite and in [0.02, 0.95]",
+                self.prefill_keep_ratio
+            )));
+        }
+        if !self.prefill_keep_ratio_max.is_finite()
+            || self.prefill_keep_ratio_max < self.prefill_keep_ratio
+            || self.prefill_keep_ratio_max > 0.95
+        {
+            return Err(EngineError::Generation(format!(
+                "invalid PFlash settings: prefill_keep_ratio_max={} must be finite and in [{}, 0.95]",
+                self.prefill_keep_ratio_max, self.prefill_keep_ratio
+            )));
+        }
+        if !self.prefill_max_auto_prefill_ratio.is_finite()
+            || !(0.0..=1.0).contains(&self.prefill_max_auto_prefill_ratio)
+        {
+            return Err(EngineError::Generation(format!(
+                "invalid PFlash settings: prefill_max_auto_prefill_ratio={} must be finite and in [0.0, 1.0]",
+                self.prefill_max_auto_prefill_ratio
+            )));
+        }
+        if self.prefill_plan_cache && self.prefill_plan_cache_entries == 0 {
+            return Err(EngineError::Generation(
+                "invalid PFlash settings: prefill_plan_cache_entries must be >= 1".to_owned(),
+            ));
+        }
+        if self.prefill_drafter_configured {
+            if self.prefill_chunk == 0 {
+                return Err(EngineError::Generation(format!(
+                    "invalid PFlash settings: prefill_chunk must be >= 1, got {}",
+                    self.prefill_chunk
+                )));
+            }
+            if self.prefill_avgpool == 0 || self.prefill_avgpool % 2 == 0 {
+                return Err(EngineError::Generation(format!(
+                    "invalid PFlash settings: prefill_avgpool must be odd and >= 1 (symmetric smoothing window), got {}",
+                    self.prefill_avgpool
+                )));
+            }
+            if self.prefill_lookahead == 0 {
+                return Err(EngineError::Generation(format!(
+                    "invalid PFlash settings: prefill_lookahead must be >= 1, got {}",
+                    self.prefill_lookahead
+                )));
+            }
+            if self.prefill_score_mode == PrefillScoreMode::L7 && self.prefill_exit_layer == 0 {
+                return Err(EngineError::Generation(
+                    "invalid PFlash settings: prefill_exit_layer must be >= 1 when prefill_score_mode=l7"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SimpleEngine {
     #[allow(clippy::float_cmp)]
     fn sampled_dspark_requires_ar(&self, params: &SamplingParams) -> bool {
@@ -2768,10 +2873,22 @@ impl SimpleEngine {
         prefill_suffix_identity_threshold: usize,
         session_max_suffix_prefill_tokens: usize,
     ) -> Result<Self, EngineError> {
+        PFlashLoadSettings {
+            prefill_drafter_configured: prefill_drafter_path.is_some(),
+            prefill_keep_ratio,
+            prefill_chunk,
+            prefill_avgpool,
+            prefill_lookahead,
+            prefill_score_mode,
+            prefill_exit_layer,
+            prefill_keep_ratio_max,
+            prefill_max_auto_prefill_ratio,
+            prefill_plan_cache,
+            prefill_plan_cache_entries,
+        }
+        .validate()?;
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
-        let prefill_keep_ratio_max = prefill_keep_ratio_max.clamp(prefill_keep_ratio, 0.95);
-        let prefill_max_auto_prefill_ratio = prefill_max_auto_prefill_ratio.clamp(0.0, 1.0);
         let prefill_plan_cache_entries = prefill_plan_cache_entries.max(1);
         let session_max_suffix_prefill_tokens = session_max_suffix_prefill_tokens.max(1);
 
@@ -3308,22 +3425,6 @@ impl SimpleEngine {
             paired_radix_entries: paired_radix.entries,
             paired_radix_target_bytes: paired_radix.target_bytes,
             paired_radix_dflash_bytes: paired_radix.dflash_bytes,
-        }
-    }
-
-    fn record_continuation_metrics(&self, generation: &SessionGeneration) {
-        if generation.continued {
-            self.cache_metrics
-                .continuations
-                .fetch_add(1, Ordering::Relaxed);
-            self.cache_metrics.prefill_saved_tokens.fetch_add(
-                u64::from(
-                    generation
-                        .prompt_tokens
-                        .saturating_sub(generation.prefilled_tokens),
-                ),
-                Ordering::Relaxed,
-            );
         }
     }
 
@@ -6475,7 +6576,7 @@ impl SimpleEngine {
         // either with the sealed publication.
         let mut resumed = resumed;
         let mut retried_cold = false;
-        let (generation, publication, cap_exempt) = loop {
+        let (generation, publication, cap_exempt, continuation_metrics) = loop {
             let mut stream_output_emitted = false;
             let (pair, prefill_from, continued) = if let Some((pair, prior)) = resumed.take() {
                 (pair, prior, true)
@@ -6501,7 +6602,7 @@ impl SimpleEngine {
                 }
             }
             let attempt =
-                (|| -> Result<(SessionGeneration, Option<SessionDsparkPublication>, bool), EngineError> {
+                (|| -> Result<(SessionGeneration, Option<SessionDsparkPublication>, bool, PendingContinuationMetrics), EngineError> {
                     let prefill_tokens = prompt_tokens.get(prefill_from..).ok_or_else(|| {
                         EngineError::Generation(
                             "session DFlash prefill boundary exceeds prompt".to_owned(),
@@ -6513,6 +6614,8 @@ impl SimpleEngine {
                         ));
                     }
                     let prefilled = u32::try_from(prefill_tokens.len()).unwrap_or(u32::MAX);
+                    let continuation_metrics =
+                        PendingContinuationMetrics::new(continued, total, prefilled);
 
                     let prefill_start = std::time::Instant::now();
                     let (pair, prefill_logits) = pair
@@ -6781,6 +6884,7 @@ impl SimpleEngine {
                         },
                         publication,
                         cap_exempt,
+                        continuation_metrics,
                     ))
                 })();
             match attempt {
@@ -6804,7 +6908,7 @@ impl SimpleEngine {
             }
         };
 
-        self.record_continuation_metrics(&generation);
+        continuation_metrics.commit(&self.cache_metrics);
         drop(drafter);
         drop(model);
         drop(mlx_gate);
@@ -13409,23 +13513,165 @@ mod tests {
     }
 
     #[test]
-    fn failed_warm_dspark_retry_does_not_count_cold_result_as_reuse() {
-        let engine = session_cache_test_engine();
-        let successful_cold_retry = SessionGeneration {
-            text: String::new(),
-            completion_tokens: 1,
-            finish_reason: "length".to_owned(),
-            prompt_tokens: 12,
-            prefilled_tokens: 12,
-            outcome: super::SessionOutcome::ExactBootstrap,
-            continued: false,
+    fn dspark_metric_commit_counts_warm_success_once_and_ignores_cold_retry() {
+        let warm_engine = session_cache_test_engine();
+        super::PendingContinuationMetrics::new(true, 12, 3).commit(&warm_engine.cache_metrics);
+
+        let warm_stats = warm_engine.cache_stats();
+        assert_eq!(warm_stats.continuations, 1);
+        assert_eq!(warm_stats.prefill_saved_tokens, 9);
+
+        let retry_engine = session_cache_test_engine();
+        let failed_warm_attempt = super::PendingContinuationMetrics::new(true, 12, 3);
+        drop(failed_warm_attempt);
+        super::PendingContinuationMetrics::new(false, 12, 12).commit(&retry_engine.cache_metrics);
+
+        let retry_stats = retry_engine.cache_stats();
+        assert_eq!(retry_stats.continuations, 0);
+        assert_eq!(retry_stats.prefill_saved_tokens, 0);
+    }
+
+    fn valid_pflash_load_settings() -> super::PFlashLoadSettings {
+        super::PFlashLoadSettings {
+            prefill_drafter_configured: true,
+            prefill_keep_ratio: 0.10,
+            prefill_chunk: 32,
+            prefill_avgpool: 13,
+            prefill_lookahead: 8,
+            prefill_score_mode: PrefillScoreMode::Full,
+            prefill_exit_layer: 7,
+            prefill_keep_ratio_max: DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            prefill_max_auto_prefill_ratio: DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+            prefill_plan_cache: true,
+            prefill_plan_cache_entries: 64,
+        }
+    }
+
+    #[test]
+    fn pflash_load_settings_reject_unsafe_raw_constructor_values() {
+        let valid = valid_pflash_load_settings();
+        let invalid = [
+            (
+                super::PFlashLoadSettings {
+                    prefill_keep_ratio: 1.0,
+                    ..valid
+                },
+                "prefill_keep_ratio",
+            ),
+            (
+                super::PFlashLoadSettings {
+                    prefill_keep_ratio: f32::NAN,
+                    ..valid
+                },
+                "prefill_keep_ratio",
+            ),
+            (
+                super::PFlashLoadSettings {
+                    prefill_keep_ratio: 0.5,
+                    prefill_keep_ratio_max: 0.4,
+                    ..valid
+                },
+                "prefill_keep_ratio_max",
+            ),
+            (
+                super::PFlashLoadSettings {
+                    prefill_keep_ratio_max: f32::INFINITY,
+                    ..valid
+                },
+                "prefill_keep_ratio_max",
+            ),
+            (
+                super::PFlashLoadSettings {
+                    prefill_chunk: 0,
+                    ..valid
+                },
+                "prefill_chunk",
+            ),
+            (
+                super::PFlashLoadSettings {
+                    prefill_avgpool: 2,
+                    ..valid
+                },
+                "prefill_avgpool",
+            ),
+            (
+                super::PFlashLoadSettings {
+                    prefill_lookahead: 0,
+                    ..valid
+                },
+                "prefill_lookahead",
+            ),
+            (
+                super::PFlashLoadSettings {
+                    prefill_score_mode: PrefillScoreMode::L7,
+                    prefill_exit_layer: 0,
+                    ..valid
+                },
+                "prefill_exit_layer",
+            ),
+            (
+                super::PFlashLoadSettings {
+                    prefill_plan_cache_entries: 0,
+                    ..valid
+                },
+                "prefill_plan_cache_entries",
+            ),
+        ];
+
+        for (settings, expected_field) in invalid {
+            let error = settings.validate().unwrap_err();
+            assert!(
+                matches!(error, EngineError::Generation(_)),
+                "invalid raw settings must return an EngineError"
+            );
+            assert!(
+                error.to_string().contains(expected_field),
+                "expected {expected_field} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_load_with_dflash_rejects_invalid_pflash_before_model_io() {
+        let missing_model = Path::new("/__higgs_missing_invalid_pflash_model__");
+        let tuning = MlxRuntimeTuning::from_model_dir(missing_model, RequestedMlxProfile::Baseline);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SimpleEngine::load_with_dflash(
+                missing_model,
+                KvCacheConfig::default(),
+                tuning,
+                false,
+                None,
+                None,
+                None,
+                PrefillCompressionMode::Off,
+                1.0,
+                4096,
+                32,
+                13,
+                8,
+                PrefillScoreMode::Full,
+                7,
+                DEFAULT_PFLASH_KEEP_RATIO_MAX,
+                DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+                DEFAULT_PFLASH_PLAN_CACHE,
+                DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+                DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+                8192,
+            )
+        }));
+        assert!(
+            outcome.is_ok(),
+            "invalid raw PFlash settings must not panic"
+        );
+        let error = match outcome.unwrap() {
+            Ok(_) => panic!("invalid raw PFlash settings must fail before model I/O"),
+            Err(error) => error,
         };
-
-        engine.record_continuation_metrics(&successful_cold_retry);
-
-        let stats = engine.cache_stats();
-        assert_eq!(stats.continuations, 0);
-        assert_eq!(stats.prefill_saved_tokens, 0);
+        assert!(
+            error.to_string().contains("prefill_keep_ratio"),
+            "expected PFlash validation error, got {error}"
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ use mlx_rs::Array;
 
 use crate::config::{
     HiggsConfig, LocalConfig, ModelConfig, PrefillCompressionMode, resolved_model_supports_batch,
+    validate_pflash_settings,
 };
 use crate::metrics::MetricsStore;
 use crate::router::Router;
@@ -760,6 +761,8 @@ pub fn build_engine(
     model_cfg: &ModelConfig,
     local: &LocalConfig,
 ) -> Result<(String, Engine), String> {
+    validate_pflash_settings(model_cfg)
+        .map_err(|error| format!("invalid PFlash settings: {error}"))?;
     if model_cfg.batch && !resolved_model_supports_batch(resolved)? {
         return Err(format!(
             "batch=true is only supported for standard transformer models (llama, mistral, qwen2, qwen3); '{}' is not supported",
@@ -818,3 +821,32 @@ pub struct AppState {
 
 /// Type alias for the shared state used by Axum handlers.
 pub type SharedState = Arc<AppState>;
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_engine_rejects_invalid_pflash_before_model_load() {
+        let resolved = tempfile::tempdir().unwrap();
+        let model = ModelConfig {
+            path: "missing/model".to_owned(),
+            prefill_keep_ratio: 1.0,
+            ..ModelConfig::default()
+        };
+
+        let outcome = std::panic::catch_unwind(|| {
+            build_engine(resolved.path(), &model, &LocalConfig::default())
+        });
+        assert!(outcome.is_ok(), "invalid PFlash config must not panic");
+        let error = match outcome.unwrap() {
+            Ok(_) => panic!("invalid PFlash config must fail before model load"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("prefill_keep_ratio"),
+            "expected PFlash validation error, got {error}"
+        );
+    }
+}

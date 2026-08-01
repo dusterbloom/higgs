@@ -9,7 +9,7 @@ use axum::{
 use bytes::Bytes;
 
 use crate::{
-    config::ModelConfig,
+    config::{ModelConfig, validate_pflash_settings},
     error::ServerError,
     model_resolver,
     state::{Engine, SharedState, build_engine},
@@ -68,6 +68,8 @@ pub async fn load_model(
             "unsupported combination: TurboQuant KV cache with batch=true".to_owned(),
         ));
     }
+    validate_pflash_settings(&model_cfg)
+        .map_err(|error| ServerError::BadRequest(format!("invalid PFlash config: {error}")))?;
 
     // Cheap collision pre-check when the caller named the model, so we don't pay
     // for a full load just to reject it. `insert_engine` re-checks under the
@@ -289,6 +291,21 @@ mod tests {
         let body = Bytes::from_static(b"{\"path\":\"some/path\",\"name\":\"llama\"}");
         let err = load_model(State(state), body).await.unwrap_err();
         assert!(matches!(err, ServerError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn runtime_load_rejects_invalid_pflash_before_path_resolution() {
+        use axum::response::IntoResponse as _;
+
+        let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
+        let body = Bytes::from_static(br#"{"path":"missing/model","prefill_keep_ratio":1.0}"#);
+
+        let error = load_model(State(state), body).await.unwrap_err();
+        assert!(
+            error.to_string().contains("prefill_keep_ratio"),
+            "route must report the invalid PFlash field before model resolution: {error}"
+        );
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
