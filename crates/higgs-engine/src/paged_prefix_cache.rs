@@ -255,6 +255,16 @@ impl CachedEndpoint {
     const fn is_paired(&self) -> bool {
         matches!(self, Self::TargetAndDflash { .. })
     }
+
+    fn owned_bytes(&self) -> usize {
+        let target_bytes = match self.target() {
+            CachedData::Cloned(cache) => cache.estimated_bytes(),
+            CachedData::Paged { gdn } | CachedData::TurboQuantPaged { gdn, .. } => gdn
+                .as_deref()
+                .map_or(0, |snapshots| estimated_gdn_bytes(snapshots)),
+        };
+        target_bytes.saturating_add(self.dflash().map_or(0, |sidecar| sidecar.dflash_bytes()))
+    }
 }
 
 struct CachedState {
@@ -418,11 +428,11 @@ impl PairedPrefixCacheStats {
 ///
 /// `resident_bytes` counts each block once: blocks live on the radix edge that
 /// spans their tokens, and every endpoint reaching through that edge shares the
-/// same `Arc`s. `logical_bytes` re-counts each entry's whole root -> endpoint
-/// path, which is what the same set of entries would cost if each stored its
-/// own copy (the pre-paging `Cloned` shape, still used for entries too short or
-/// misaligned to page). `logical_bytes - resident_bytes` is therefore the bytes
-/// saved by paging, and `logical / resident` its sharing factor.
+/// same `Arc`s. Endpoint-owned target payloads and dFlash sidecars count once.
+/// `logical_bytes` re-counts each entry's whole root -> endpoint path, which is
+/// what the same set of entries would cost if each stored its own target copy.
+/// `logical_bytes - resident_bytes` is therefore the bytes saved by target
+/// paging, and `logical / resident` its sharing factor.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RadixByteStats {
     pub entries: usize,
@@ -600,12 +610,13 @@ pub struct PagedPrefixCache {
     num_paired: usize,
     max_cached: usize,
     max_paired: usize,
-    /// Resident-byte budget for the cached KV state. `0` disables the budget
-    /// (pure count-based LRU, the historical behaviour).
+    /// Resident-byte budget for cached target state and paired dFlash sidecars.
+    /// `0` disables the budget (pure count-based LRU, the historical behaviour).
     max_bytes: usize,
     /// Conservative tracked bytes of all cached endpoints. Each endpoint's path
-    /// (root to terminal node) is summed, so blocks shared between overlapping
-    /// prefixes are over-counted -- a safe upper bound that never under-evicts.
+    /// (root to terminal node), endpoint-owned target state, and paired dFlash
+    /// sidecar are summed, so blocks shared between overlapping prefixes are
+    /// over-counted -- a safe upper bound that never under-evicts.
     total_bytes: usize,
     block_size: usize,
     instance_id: CacheInstanceId,
@@ -1015,12 +1026,7 @@ impl RadixNode {
             // Endpoint-owned payload: the GDN snapshot for a paged hybrid, or the
             // whole cache for a `Cloned` fallback. Never shared, so it counts the
             // same on both sides of the comparison.
-            let endpoint_bytes = match cached.endpoint.target() {
-                CachedData::Cloned(cache) => cache.estimated_bytes(),
-                CachedData::Paged { gdn } | CachedData::TurboQuantPaged { gdn, .. } => {
-                    gdn.as_deref().map_or(0, |v| estimated_gdn_bytes(v))
-                }
-            };
+            let endpoint_bytes = cached.endpoint.owned_bytes();
             stats.entries = stats.entries.saturating_add(1);
             stats.resident_bytes = stats.resident_bytes.saturating_add(endpoint_bytes);
             stats.logical_bytes = stats
@@ -1306,8 +1312,8 @@ impl PagedPrefixCache {
         }
     }
 
-    /// Set the resident-byte budget for cached KV state. `0` (the default)
-    /// disables the budget and falls back to pure count-based LRU.
+    /// Set the resident-byte budget for target state plus paired dFlash state.
+    /// `0` (the default) disables the budget and falls back to count-based LRU.
     #[must_use]
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
@@ -2355,7 +2361,9 @@ fn estimated_cached_layers_bytes(layers: &[CachedLayerData]) -> usize {
 fn total_endpoint_path_bytes(node: &RadixNode) -> usize {
     fn visit(node: &RadixNode, parent_bytes: usize) -> usize {
         let path_bytes = parent_bytes.saturating_add(node.edge_blocks.total_bytes());
-        let self_bytes = if node.cached.is_some() { path_bytes } else { 0 };
+        let self_bytes = node.cached.as_ref().map_or(0, |cached| {
+            path_bytes.saturating_add(cached.endpoint.owned_bytes())
+        });
         node.children.values().fold(self_bytes, |total, child| {
             total.saturating_add(visit(child, path_bytes))
         })
@@ -2945,6 +2953,49 @@ mod tests {
         assert!(cache.total_bytes() > 0);
     }
 
+    #[test]
+    fn byte_budget_charges_cloned_endpoint_payload() {
+        let tokens = vec![1, 2];
+        let target = make_kv_cache(1, 2);
+        let endpoint_bytes = target.estimated_bytes();
+        assert!(endpoint_bytes > 0);
+
+        let mut cache = PagedPrefixCache::new(10, 4).with_max_bytes(endpoint_bytes - 1);
+        cache.store(&tokens, &target);
+
+        assert!(
+            cache.is_empty(),
+            "clone-owned KV must participate in the byte cap"
+        );
+        assert_eq!(cache.total_bytes(), 0);
+    }
+
+    #[test]
+    fn byte_budget_charges_paired_dflash_sidecar() {
+        let tokens: Vec<u32> = (0..4).collect();
+        let target = make_kv_cache(1, 4);
+        let mut probe = PagedPrefixCache::new(10, 4);
+        probe
+            .store_paired(&tokens, &target, dflash_snapshot(4))
+            .unwrap();
+        let paired_bytes = probe.paired_stats();
+        let target_bytes = paired_bytes.target_bytes;
+        let dflash_bytes = paired_bytes.dflash_bytes;
+        assert!(target_bytes > 0 && dflash_bytes > 0);
+
+        let mut cache = PagedPrefixCache::new(10, 4)
+            .with_max_bytes(target_bytes.saturating_add(dflash_bytes).saturating_sub(1));
+        cache
+            .store_paired(&tokens, &target, dflash_snapshot(4))
+            .unwrap();
+
+        assert!(
+            cache.is_empty(),
+            "paired sidecar bytes must participate in the cap"
+        );
+        assert_eq!(cache.total_bytes(), 0);
+    }
+
     /// Create a Hybrid cache with interleaved KV and GDN layers.
     fn make_hybrid_cache(num_layers: usize, seq_len: i32) -> AnyCache {
         let layers: Vec<Option<LayerCache>> = (0..num_layers)
@@ -2966,6 +3017,22 @@ mod tests {
             })
             .collect();
         AnyCache::Hybrid(layers)
+    }
+
+    #[test]
+    fn byte_budget_charges_paged_hybrid_gdn_payload() {
+        let tokens: Vec<u32> = (0..4).collect();
+        let target = make_hybrid_cache(2, 4);
+        // Layer 1 contributes 512 bytes of paged KV. Layer 0 owns 128 bytes
+        // of endpoint-only conv+SSM state, which must also fit the cap.
+        let mut cache = PagedPrefixCache::new(10, 4).with_max_bytes(512 + 128 - 1);
+        cache.store(&tokens, &target);
+
+        assert!(
+            cache.is_empty(),
+            "paged GDN state must participate in the byte cap"
+        );
+        assert_eq!(cache.total_bytes(), 0);
     }
 
     fn make_mutable_hybrid_cache(seq_len: i32) -> AnyCache {

@@ -33,6 +33,17 @@ use higgs_models::SamplingParams;
 
 const TOOL_RESULT_PROMPT_WARN_BYTES: usize = 16 * 1024;
 
+fn streaming_error_json(message: &str) -> String {
+    serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "code": "generation_error"
+        }
+    })
+    .to_string()
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn chat_completions(
     State(state): State<SharedState>,
@@ -549,8 +560,8 @@ fn warn_large_tool_payload(stats: SessionPromptTracePayloadStats) {
 /// Map a [`SessionGeneration`] (cache-resident continued turn) onto the same
 /// `ChatCompletionResponse` shape as the normal path, preserving reasoning
 /// extraction, tool-call parsing, and the `finish_reason: "tool_calls"`
-/// override. The continued path uses greedy decode without logprobs/streaming,
-/// so logprobs are absent and `finish_reason` defaults to `"stop"`.
+/// override. The continued path uses greedy decode without logprobs, so
+/// logprobs are absent; its actual engine finish reason is preserved.
 fn build_session_response(
     model: &str,
     request_id: &str,
@@ -560,6 +571,7 @@ fn build_session_response(
     thinking_enabled: bool,
 ) -> ChatCompletionResponse {
     let usage = session_usage(&output);
+    let generation_finish_reason = output.finish_reason.clone();
     let output_text = output.text;
     // Same reasoning-tag handling as the normal path: the template opens
     // `<think>` in the prompt, so generated text starts inside the think block.
@@ -587,7 +599,7 @@ fn build_session_response(
             (
                 Some(MessageContent::Text(raw_text)),
                 None,
-                "stop".to_owned(),
+                generation_finish_reason.clone(),
             )
         } else {
             let calls: Vec<ToolCall> = parsed
@@ -614,7 +626,7 @@ fn build_session_response(
         (
             Some(MessageContent::Text(raw_text)),
             None,
-            "stop".to_owned(),
+            generation_finish_reason,
         )
     };
 
@@ -784,6 +796,7 @@ async fn chat_completions_stream(
 
     let tokenizer = engine.tokenizer().clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
     // Cache-resident (session-continued) turns stream from the retained KV
     // cache; everything else does a fresh prefill. Both feed the same
@@ -811,7 +824,7 @@ async fn chat_completions_stream(
                 tool_payload,
                 &pflash_policy_c,
             );
-            match result {
+            match &result {
                 Ok(()) => {}
                 Err(higgs_engine::error::EngineError::Cancelled) => {
                     tracing::debug!(sid, "Session-routed streaming cancelled by client");
@@ -820,6 +833,7 @@ async fn chat_completions_stream(
                     tracing::error!(error = %e, "Session-routed generation error during streaming");
                 }
             }
+            let _ = terminal_tx.send(result.map_err(|error| error.to_string()));
         });
     } else {
         tokio::task::spawn_blocking(move || {
@@ -839,9 +853,10 @@ async fn chat_completions_stream(
                 &pflash_policy,
                 allow_prefix_cache,
             );
-            if let Err(e) = result {
+            if let Err(ref e) = result {
                 tracing::error!(error = %e, "Generation error during streaming");
             }
+            let _ = terminal_tx.send(result.map_err(|error| error.to_string()));
         });
     }
 
@@ -972,6 +987,29 @@ async fn chat_completions_stream(
                 pending_finish_reason = Some(finish_reason);
                 pending_finish_logprobs = if visible_is_empty { chunk_logprobs } else { None };
             }
+        }
+
+        let terminal_error = match terminal_rx.await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(format!(
+                "streaming generation worker terminated unexpectedly: {error}"
+            )),
+        };
+        if let Some(error) = terminal_error {
+            tracing::error!(error = %error, "Streaming generation terminated with an error");
+            if let Some(ref m) = metrics {
+                if let Some(id) = metrics_id {
+                    m.fail_stream(
+                        id,
+                        u64::from(output_token_count),
+                        start.elapsed(),
+                        error.clone(),
+                    );
+                }
+            }
+            yield Ok(Event::default().data(streaming_error_json(&error)));
+            return;
         }
 
         // Flush any remaining buffered content.
@@ -1356,6 +1394,16 @@ mod tests {
     }
 
     #[test]
+    fn streaming_error_uses_openai_error_envelope() {
+        let value: serde_json::Value =
+            serde_json::from_str(&streaming_error_json("decode failed")).unwrap();
+        assert_eq!(value["error"]["message"], "decode failed");
+        assert_eq!(value["error"]["type"], "server_error");
+        assert_eq!(value["error"]["code"], "generation_error");
+        assert_ne!(value, serde_json::json!("[DONE]"));
+    }
+
+    #[test]
     fn generation_defaults_fill_omitted_sampling_fields() {
         let req = chat_request(serde_json::json!({}));
         let defaults = GenerationDefaults {
@@ -1419,6 +1467,7 @@ mod tests {
         let continued = higgs_engine::simple::SessionGeneration {
             text: String::new(),
             completion_tokens: 30,
+            finish_reason: "length".to_owned(),
             prompt_tokens: 1000,
             prefilled_tokens: 120,
             continued: true,
@@ -1438,6 +1487,7 @@ mod tests {
         let cold = higgs_engine::simple::SessionGeneration {
             text: String::new(),
             completion_tokens: 30,
+            finish_reason: "stop".to_owned(),
             prompt_tokens: 1000,
             prefilled_tokens: 1000,
             continued: false,
@@ -1450,6 +1500,22 @@ mod tests {
             ..cold
         };
         assert!(session_usage(&pflash).prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn session_response_preserves_length_finish_reason() {
+        let output = higgs_engine::simple::SessionGeneration {
+            text: "partial".to_owned(),
+            completion_tokens: 1,
+            finish_reason: "length".to_owned(),
+            prompt_tokens: 3,
+            prefilled_tokens: 3,
+            continued: false,
+            outcome: higgs_engine::simple::SessionOutcome::ExactBootstrap,
+        };
+
+        let response = build_session_response("model", "request", output, None, false, false);
+        assert_eq!(response.choices[0].finish_reason, "length");
     }
 
     #[test]

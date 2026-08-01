@@ -291,7 +291,7 @@ fn build_metrics_response(metrics: &MetricsStore) -> MetricsResponse {
 /// Aggregate cache-effectiveness counters across all local engines.
 fn aggregate_cache(router: &crate::router::Router) -> CacheMetricsView {
     let mut v = CacheMetricsView::default();
-    for engine in router.local_engines().values() {
+    for engine in router.local_engines() {
         if let Some(s) = engine.cache_stats() {
             v.add(s);
         }

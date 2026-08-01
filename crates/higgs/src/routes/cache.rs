@@ -21,12 +21,7 @@ pub async fn drop_retained_session(
     State(state): State<SharedState>,
     Path(session_id): Path<u64>,
 ) -> Result<Json<DropRetainedSessionResponse>, ServerError> {
-    let engines = state
-        .router
-        .local_engines()
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
+    let engines = state.router.local_engines();
 
     let dropped = tokio::task::spawn_blocking(move || {
         engines

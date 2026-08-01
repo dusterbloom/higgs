@@ -77,6 +77,12 @@ struct AutoRouteEntry {
     target: RouteTarget,
 }
 
+#[derive(Clone)]
+struct LocalEngineEntry {
+    engine: Arc<Engine>,
+    generation_defaults: GenerationDefaults,
+}
+
 /// Routes model names to local engines or remote providers.
 ///
 /// Resolution order:
@@ -88,9 +94,7 @@ pub struct Router {
     /// Loaded local engines, mutable at runtime via the load/unload endpoints.
     /// Guarded by a `RwLock`: `resolve`/`list` take a read lock and clone the
     /// `Arc` out, so an in-flight request is never tied to map membership.
-    local_engines: RwLock<HashMap<String, Arc<Engine>>>,
-    /// Per-local-model chat defaults from `[[models]].generation_defaults`.
-    local_generation_defaults: RwLock<HashMap<String, GenerationDefaults>>,
+    local_engines: RwLock<HashMap<String, LocalEngineEntry>>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
     auto_candidates: Vec<RouteCandidate>,
@@ -162,6 +166,21 @@ impl Router {
             }
         }
 
+        let local_engines = engines
+            .into_iter()
+            .map(|(name, engine)| {
+                let generation_defaults =
+                    local_generation_defaults.remove(&name).unwrap_or_default();
+                (
+                    name,
+                    LocalEngineEntry {
+                        engine,
+                        generation_defaults,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
         let (auto_router_engine, auto_router_model_name) = if config.auto_router.enabled {
             if config.auto_router.model.is_empty() {
                 return Err("auto_router.enabled is true but model is empty".to_owned());
@@ -170,9 +189,12 @@ impl Router {
                 warn!("auto_router is enabled but no routes have descriptions");
             }
             let auto_model = &config.auto_router.model;
-            let engine = engines.get(auto_model).cloned().ok_or_else(|| {
-                format!("auto_router model '{auto_model}' not found among loaded models")
-            })?;
+            let engine = local_engines
+                .get(auto_model)
+                .map(|entry| Arc::clone(&entry.engine))
+                .ok_or_else(|| {
+                    format!("auto_router model '{auto_model}' not found among loaded models")
+                })?;
             (Some(engine), Some(auto_model.clone()))
         } else {
             (None, None)
@@ -181,8 +203,7 @@ impl Router {
         let default_target = build_route_target(&config.default.provider, None, config)?;
 
         Ok(Self {
-            local_engines: RwLock::new(engines),
-            local_generation_defaults: RwLock::new(local_generation_defaults),
+            local_engines: RwLock::new(local_engines),
             compiled_routes,
             auto_routes,
             auto_candidates,
@@ -217,11 +238,11 @@ impl Router {
         // immediately -- the in-flight request owns the engine independent of
         // map membership, so a concurrent unload can never free it mid-request.
         let direct = self.engines_read().get(model).cloned();
-        if let Some(engine) = direct {
+        if let Some(entry) = direct {
             return Ok(ResolvedRoute::Higgs {
-                engine,
+                engine: entry.engine,
                 model_name: model.to_owned(),
-                generation_defaults: self.generation_defaults_for(model),
+                generation_defaults: entry.generation_defaults,
                 routing_method: RoutingMethod::Direct,
             });
         }
@@ -250,7 +271,7 @@ impl Router {
         let mut models: Vec<(String, bool)> = self
             .engines_read()
             .iter()
-            .map(|(name, engine)| (name.clone(), engine.is_vlm()))
+            .map(|(name, entry)| (name.clone(), entry.engine.is_vlm()))
             .collect();
         models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         models
@@ -279,21 +300,20 @@ impl Router {
         if engines.contains_key(&name) {
             return Err(name);
         }
-        engines.insert(name.clone(), engine);
-        drop(engines);
-        self.generation_defaults_write()
-            .insert(name, generation_defaults);
+        engines.insert(
+            name,
+            LocalEngineEntry {
+                engine,
+                generation_defaults,
+            },
+        );
         Ok(())
     }
 
     /// Remove an engine from the routing table, returning it if present. The
     /// caller is responsible for dropping it once no request still holds a clone.
     pub fn remove_engine(&self, name: &str) -> Option<Arc<Engine>> {
-        let removed = self.engines_write().remove(name);
-        if removed.is_some() {
-            self.generation_defaults_write().remove(name);
-        }
-        removed
+        self.engines_write().remove(name).map(|entry| entry.engine)
     }
 
     /// Map key bound to the auto-router model, if the auto-router is enabled.
@@ -301,39 +321,24 @@ impl Router {
         self.auto_router_model_name.as_deref()
     }
 
-    /// Read-locked view of all local engines (name → engine). The guard lives
-    /// only for the caller's expression; used by metrics cache aggregation.
-    pub fn local_engines(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<Engine>>> {
+    /// Snapshot of all local engines for cache aggregation and session reset.
+    pub fn local_engines(&self) -> Vec<Arc<Engine>> {
         self.engines_read()
+            .values()
+            .map(|entry| Arc::clone(&entry.engine))
+            .collect()
     }
 
     // -- Private helpers ---------------------------------------------------
 
-    fn engines_read(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<Engine>>> {
+    fn engines_read(&self) -> RwLockReadGuard<'_, HashMap<String, LocalEngineEntry>> {
         self.local_engines
             .read()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn engines_write(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<Engine>>> {
+    fn engines_write(&self) -> RwLockWriteGuard<'_, HashMap<String, LocalEngineEntry>> {
         self.local_engines
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn generation_defaults_for(&self, name: &str) -> GenerationDefaults {
-        self.local_generation_defaults
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(name)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn generation_defaults_write(
-        &self,
-    ) -> RwLockWriteGuard<'_, HashMap<String, GenerationDefaults>> {
-        self.local_generation_defaults
             .write()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -382,26 +387,24 @@ impl Router {
             RouteTarget::Higgs { model_rewrite } => {
                 let lookup_name = model_rewrite.as_deref().unwrap_or(model);
                 let engines = self.engines_read();
-                let (engine, resolved_name) = if let Some(engine) = engines.get(lookup_name) {
-                    (Arc::clone(engine), lookup_name.to_owned())
+                let (entry, resolved_name) = if let Some(entry) = engines.get(lookup_name) {
+                    (entry.clone(), lookup_name.to_owned())
                 } else if model == "auto" {
                     // "auto" is a virtual model name; pick any loaded engine
-                    let (name, engine) = engines
+                    let (name, entry) = engines
                         .iter()
                         .next()
                         .ok_or_else(|| "no local models loaded for default route".to_owned())?;
-                    (Arc::clone(engine), name.clone())
+                    (entry.clone(), name.clone())
                 } else {
                     return Err(format!(
                         "model '{lookup_name}' not found among loaded local models"
                     ));
                 };
-                drop(engines);
-                let generation_defaults = self.generation_defaults_for(&resolved_name);
                 Ok(ResolvedRoute::Higgs {
-                    engine,
+                    engine: entry.engine,
                     model_name: resolved_name,
-                    generation_defaults,
+                    generation_defaults: entry.generation_defaults,
                     routing_method: method,
                 })
             }
@@ -1013,6 +1016,36 @@ mod tests {
         assert!(removed.is_some());
         assert!(!router.contains_engine("x"));
         assert!(router.remove_engine("x").is_none());
+    }
+
+    #[tokio::test]
+    async fn inserted_engine_and_defaults_publish_as_one_entry() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "some/model"
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+        let defaults = GenerationDefaults {
+            max_tokens: Some(73),
+            ..GenerationDefaults::default()
+        };
+        router
+            .insert_engine_with_defaults(
+                "atomic".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("atomic")),
+                defaults,
+            )
+            .unwrap();
+
+        match router.resolve("atomic", None).await.unwrap() {
+            ResolvedRoute::Higgs {
+                generation_defaults,
+                ..
+            } => assert_eq!(generation_defaults.max_tokens, Some(73)),
+            ResolvedRoute::Remote { .. } => panic!("expected local route"),
+        }
     }
 
     #[tokio::test]

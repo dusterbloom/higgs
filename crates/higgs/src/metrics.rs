@@ -144,6 +144,30 @@ impl MetricsStore {
         }
     }
 
+    /// Finalize a streaming request that failed after the HTTP response began.
+    pub fn fail_stream(&self, id: u64, output_tokens: u64, duration: Duration, error: String) {
+        let completed = {
+            let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
+            let index = self.id_index.read().unwrap_or_else(PoisonError::into_inner);
+            if let Some(&idx) = index.get(&id) {
+                if let Some(record) = records.get_mut(idx) {
+                    record.status = 500;
+                    record.output_tokens = output_tokens;
+                    record.duration = duration;
+                    record.error_body = Some(error);
+                    Some(record.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(record) = completed {
+            self.log_record(&record);
+        }
+    }
+
     pub fn snapshot(&self) -> Vec<RequestRecord> {
         #[allow(clippy::unchecked_time_subtraction)]
         let cutoff = Instant::now() - self.window;
@@ -437,6 +461,20 @@ mod tests {
         let record = snap.iter().find(|r| r.id == id).expect("record not found");
         assert_eq!(record.output_tokens, 500);
         assert_eq!(record.duration, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn fail_stream_marks_pending_record_as_server_error() {
+        let store = MetricsStore::new(Duration::from_secs(ONE_MINUTE_SECS));
+        let id = store.record_pending(sample_record());
+
+        store.fail_stream(id, 7, Duration::from_secs(2), "decode failed".to_owned());
+
+        let record = store.snapshot().pop().unwrap();
+        assert_eq!(record.status, 500);
+        assert_eq!(record.output_tokens, 7);
+        assert_eq!(record.duration, Duration::from_secs(2));
+        assert_eq!(record.error_body.as_deref(), Some("decode failed"));
     }
 
     #[test]

@@ -1062,14 +1062,31 @@ fn retention_token_cap(
     }
 }
 
+const fn continued_dspark_cold_retry_allowed(
+    continued: bool,
+    retried_cold: bool,
+    stream_output_emitted: bool,
+) -> bool {
+    continued && !retried_cold && !stream_output_emitted
+}
+
 /// Drop retained caches idle longer than `ttl`; returns how many were removed.
 /// Pure map logic, unit-testable without a model.
+#[cfg_attr(not(test), allow(dead_code))]
 fn evict_idle_from(
     map: &mut std::collections::HashMap<u64, RetainedKv>,
     ttl: std::time::Duration,
 ) -> usize {
+    evict_idle_except_from(map, ttl, &std::collections::HashSet::new())
+}
+
+fn evict_idle_except_from(
+    map: &mut std::collections::HashMap<u64, RetainedKv>,
+    ttl: std::time::Duration,
+    active: &std::collections::HashSet<u64>,
+) -> usize {
     let before = map.len();
-    map.retain(|_, kept| kept.last_used.elapsed() < ttl);
+    map.retain(|session_id, kept| active.contains(session_id) || kept.last_used.elapsed() < ttl);
     before.saturating_sub(map.len())
 }
 
@@ -2590,6 +2607,8 @@ pub struct SessionGeneration {
     pub text: String,
     /// Completion tokens generated this turn.
     pub completion_tokens: u32,
+    /// Why generation stopped (`"stop"` for EOS, `"length"` for the budget).
+    pub finish_reason: String,
     /// Total prompt length for this turn (full conversation).
     pub prompt_tokens: u32,
     /// Tokens actually prefilled this turn — the headline win. On a continued
@@ -3420,7 +3439,30 @@ impl SimpleEngine {
     /// dropped. Retained caches pin real KV memory, so this must be called
     /// periodically (and `generate_continued` will also enforce a count cap).
     pub fn evict_idle_retained(&self, ttl: std::time::Duration) -> usize {
-        let dropped = evict_idle_from(&mut lock_or_recover(&self.retained), ttl);
+        // Never remove the published fallback for a request currently holding
+        // its per-session serialization lock. Hold the lock-map guard so a new
+        // request cannot enter between activity detection and retained removal;
+        // hold every available session guard across removal so a request that
+        // already cloned its Arc cannot enter that gap either.
+        let session_locks = lock_or_recover(&self.session_locks);
+        let mut active = std::collections::HashSet::new();
+        let mut inactive_guards = Vec::new();
+        for (&session_id, lock) in session_locks.iter() {
+            match lock.try_lock() {
+                Ok(guard) => {
+                    inactive_guards.push(guard);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    active.insert(session_id);
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    inactive_guards.push(error.into_inner());
+                }
+            }
+        }
+        let dropped = evict_idle_except_from(&mut lock_or_recover(&self.retained), ttl, &active);
+        drop(inactive_guards);
+        drop(session_locks);
         if dropped > 0 {
             self.cache_metrics
                 .sessions_evicted
@@ -5500,6 +5542,7 @@ impl SimpleEngine {
         Ok(SessionGeneration {
             text: output.text,
             completion_tokens: output.completion_tokens,
+            finish_reason: output.finish_reason,
             prompt_tokens: output.prompt_tokens,
             prefilled_tokens: output.prompt_tokens,
             outcome: SessionOutcome::PFlashBootstrap,
@@ -5590,6 +5633,31 @@ impl SimpleEngine {
 
         let total = u32::try_from(prompt_tokens.len())
             .map_err(|_| EngineError::Generation("prompt too long".to_owned()))?;
+        if max_tokens == 0 {
+            if let Some(sender) = sender {
+                send_session_stream_output(
+                    sender,
+                    StreamingOutput {
+                        new_text: String::new(),
+                        finished: true,
+                        finish_reason: Some("length".to_owned()),
+                        prompt_tokens: total,
+                        completion_tokens: 0,
+                        token_logprob: None,
+                        prefill_progress: None,
+                    },
+                )?;
+            }
+            return Ok(SessionGeneration {
+                text: String::new(),
+                completion_tokens: 0,
+                finish_reason: "length".to_owned(),
+                prompt_tokens: total,
+                prefilled_tokens: 0,
+                outcome: SessionOutcome::ExactBootstrap,
+                continued: false,
+            });
+        }
         let has_mtp = {
             let model = self
                 .model
@@ -6244,6 +6312,14 @@ impl SimpleEngine {
         Ok(SessionGeneration {
             text: self.decode_tokens(&generated)?,
             completion_tokens: u32::try_from(generated.len()).unwrap_or(u32::MAX),
+            finish_reason: if generated
+                .last()
+                .is_some_and(|token| self.eos_token_ids.contains(token))
+            {
+                "stop".to_owned()
+            } else {
+                "length".to_owned()
+            },
             prompt_tokens: total,
             prefilled_tokens: prefilled,
             outcome: if continued {
@@ -6384,6 +6460,7 @@ impl SimpleEngine {
         let mut resumed = resumed;
         let mut retried_cold = false;
         let (generation, publication, cap_exempt) = loop {
+            let mut stream_output_emitted = false;
             let (pair, prefill_from, continued) = if let Some((pair, prior)) = resumed.take() {
                 (pair, prior, true)
             } else {
@@ -6496,6 +6573,7 @@ impl SimpleEngine {
                             token_logprob: None,
                             prefill_progress: None,
                         })?;
+                        stream_output_emitted = true;
                     }
 
                     let decode_start = std::time::Instant::now();
@@ -6577,6 +6655,7 @@ impl SimpleEngine {
                                 token_logprob: None,
                                 prefill_progress: None,
                             })?;
+                            stream_output_emitted = true;
                         }
                     }
                     let decode_elapsed = decode_start.elapsed();
@@ -6677,6 +6756,14 @@ impl SimpleEngine {
                         SessionGeneration {
                             text: self.decode_tokens(&generated)?,
                             completion_tokens: u32::try_from(generated.len()).unwrap_or(u32::MAX),
+                            finish_reason: if generated
+                                .last()
+                                .is_some_and(|token| self.eos_token_ids.contains(token))
+                            {
+                                "stop".to_owned()
+                            } else {
+                                "length".to_owned()
+                            },
                             prompt_tokens: total,
                             prefilled_tokens: prefilled,
                             outcome: if continued {
@@ -6693,7 +6780,13 @@ impl SimpleEngine {
             match attempt {
                 Ok(parts) => break parts,
                 Err(EngineError::Cancelled) => return Err(EngineError::Cancelled),
-                Err(error) if continued && !retried_cold => {
+                Err(error)
+                    if continued_dspark_cold_retry_allowed(
+                        continued,
+                        retried_cold,
+                        stream_output_emitted,
+                    ) =>
+                {
                     retried_cold = true;
                     tracing::warn!(
                         session_id,
@@ -12447,17 +12540,17 @@ mod tests {
         SessionPromptTraceOutcome, SessionPromptTracePayloadStats, SimpleEngine, SpeculationRoute,
         Tokenizer, adaptive_draft_depth_for_cap, cache_policy_allows_prefix_cache,
         check_stop_sequences, common_prefix_token_len, contains_real_user_query,
-        continuation_prior_len, continuation_reject_reason, derive_model_name,
-        detect_thinking_support, dflash_accepts_pflash_plan, dflash_canonical_target_is_terminal,
-        dflash_new_stop_prefix_len, dflash_resolve_target_then_draft,
-        dflash_sparse_taps_available_for_pflash_plan, dflash_tail_draft_cap,
-        drive_canonical_dspark_round, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, hybrid_checkpoint_boundary, lock_or_recover, message_boundary_delta,
-        paired_dflash_exact_domain, parse_enabled_flag, pflash_actual_keep_ratio,
-        pflash_auto_plan_worth_executing, pflash_cache_source_and_request_tail,
-        pflash_cache_source_and_request_tail_with_boundary, pflash_full_score_budget_exceeded,
-        resolve_speculation_route, session_prefill_strategy, session_prompt_trace_metrics,
-        stateless_mtp_family_eligible, with_chat_terminator,
+        continuation_prior_len, continuation_reject_reason, continued_dspark_cold_retry_allowed,
+        derive_model_name, detect_thinking_support, dflash_accepts_pflash_plan,
+        dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
+        dflash_resolve_target_then_draft, dflash_sparse_taps_available_for_pflash_plan,
+        dflash_tail_draft_cap, drive_canonical_dspark_round, estimate_paged_kv_blocks,
+        extract_eos_tokens, find_stop_in_tail, hybrid_checkpoint_boundary, lock_or_recover,
+        message_boundary_delta, paired_dflash_exact_domain, parse_enabled_flag,
+        pflash_actual_keep_ratio, pflash_auto_plan_worth_executing,
+        pflash_cache_source_and_request_tail, pflash_cache_source_and_request_tail_with_boundary,
+        pflash_full_score_budget_exceeded, resolve_speculation_route, session_prefill_strategy,
+        session_prompt_trace_metrics, stateless_mtp_family_eligible, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
@@ -13289,6 +13382,26 @@ mod tests {
     }
 
     #[test]
+    fn continued_generation_honors_zero_token_budget_without_sampling() {
+        let engine = session_cache_test_engine();
+        let output = engine
+            .generate_continued(0x2E20, &[1, 2, 3], 0, &SamplingParams::default())
+            .unwrap();
+
+        assert_eq!(output.text, "");
+        assert_eq!(output.completion_tokens, 0);
+        assert_eq!(output.prompt_tokens, 3);
+    }
+
+    #[test]
+    fn continued_dspark_retry_is_forbidden_after_stream_output() {
+        assert!(continued_dspark_cold_retry_allowed(true, false, false));
+        assert!(!continued_dspark_cold_retry_allowed(true, false, true));
+        assert!(!continued_dspark_cold_retry_allowed(true, true, false));
+        assert!(!continued_dspark_cold_retry_allowed(false, false, false));
+    }
+
+    #[test]
     fn simple_engine_drop_retained_session_reports_and_clears() {
         const SESSION_ID: u64 = 0xCACE_E7;
         let engine = session_cache_test_engine();
@@ -13377,6 +13490,43 @@ mod tests {
             true
         );
         handle.join().unwrap();
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
+    }
+
+    #[test]
+    fn idle_eviction_preserves_an_active_session_fallback() {
+        const SESSION_ID: u64 = 0xAC71_0E;
+        let engine = std::sync::Arc::new(session_cache_test_engine());
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![4, 5, 6],
+        );
+        engine.stash_retained(SESSION_ID, state, false);
+        lock_or_recover(&engine.retained)
+            .get_mut(&SESSION_ID)
+            .unwrap()
+            .last_used = std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+        let session_lock = engine.session_lock_for(SESSION_ID);
+        let session_guard = session_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let eviction_engine = std::sync::Arc::clone(&engine);
+        let evictor = std::thread::spawn(move || {
+            eviction_engine.evict_idle_retained(std::time::Duration::from_secs(1))
+        });
+        assert_eq!(evictor.join().unwrap(), 0);
+        assert_eq!(
+            engine.retained_session_tokens(SESSION_ID),
+            Some(vec![4, 5, 6]),
+            "an in-flight request must retain its last valid fallback boundary"
+        );
+
+        drop(session_guard);
+        assert_eq!(
+            engine.evict_idle_retained(std::time::Duration::from_secs(1)),
+            1
+        );
         assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
     }
 
