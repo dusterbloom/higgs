@@ -164,6 +164,18 @@ const fn default_block_size() -> i32 {
     16
 }
 
+static DSPARK_TOPK_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DSPARK_TOPK_HIT16: AtomicU64 = AtomicU64::new(0);
+static DSPARK_TOPK_HIT32: AtomicU64 = AtomicU64::new(0);
+static DSPARK_TOPK_HIT64: AtomicU64 = AtomicU64::new(0);
+static DSPARK_TOPK_HIT128: AtomicU64 = AtomicU64::new(0);
+static DSPARK_TOPK_HIT256: AtomicU64 = AtomicU64::new(0);
+static DSPARK_TOPK_HIT512: AtomicU64 = AtomicU64::new(0);
+static DSPARK_TOPK_RANK_SUM: AtomicU64 = AtomicU64::new(0);
+static DSPARK_TOPK_RANK_MAX: AtomicU64 = AtomicU64::new(0);
+static DSPARK_TOPK_COMPARE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DSPARK_TOPK_COMPARE_HIT: AtomicU64 = AtomicU64::new(0);
+
 // ---------------------------------------------------------------------------
 // SwiGLU MLP (non-quantized)
 // ---------------------------------------------------------------------------
@@ -575,6 +587,12 @@ impl DsparkExtras {
     ) -> Result<Array, Exception> {
         use mlx_rs::ops::indexing::IndexOp;
 
+        let trace = std::env::var("HIGGS_DSPARK_PROPOSE_TRACE").is_ok_and(|v| v == "1");
+        let topk_trace = std::env::var("HIGGS_DSPARK_TOPK_TRACE").is_ok_and(|v| v == "1");
+        let mut ckpt = trace.then(std::time::Instant::now);
+        let mut output_ms = 0.0;
+        let mut markov_ms = Vec::new();
+
         let owned_logits = if base_logits.is_none() {
             Some(
                 self.output
@@ -589,6 +607,14 @@ impl DsparkExtras {
         } else {
             None
         };
+        if let Some(ckpt_ref) = ckpt.as_mut() {
+            if let Some(logits) = owned_logits.as_ref() {
+                crate::mlx_exec::eval([logits])?;
+            }
+            let now = std::time::Instant::now();
+            output_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
+            *ckpt_ref = now;
+        }
         let resolved_logits = base_logits
             .or(owned_logits.as_ref())
             .ok_or_else(|| Exception::custom("dSpark base logits missing"))?;
@@ -600,6 +626,19 @@ impl DsparkExtras {
             .shape()
             .last()
             .ok_or_else(|| Exception::custom("dSpark logits must have a vocabulary axis"))?;
+        let topk_compare = std::env::var("HIGGS_DSPARK_TOPK_COMPARE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&k| k > 0 && k < vocab_size);
+        let topk_fast = std::env::var("HIGGS_DSPARK_TOPK_FAST")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&k| k > 0 && k < vocab_size);
+        let topk_shortlist = topk_fast.or(topk_compare);
+        let topk_base_kernel =
+            std::env::var("HIGGS_DSPARK_TOPK_BASE_KERNEL").is_ok_and(|v| v == "1");
+        let topk_markov_kernel =
+            std::env::var("HIGGS_DSPARK_TOPK_MARKOV_KERNEL").is_ok_and(|v| v == "1");
         let mut previous = Array::from_slice(&[anchor], &[1]);
         let mut sampled = Vec::with_capacity(usize::try_from(block_size).unwrap_or(0));
 
@@ -607,15 +646,203 @@ impl DsparkExtras {
             let base = resolved_logits
                 .index((.., position..position + 1, ..))
                 .reshape(&[-1, vocab_size])?;
+            let topk = if let Some(k) = topk_shortlist {
+                if topk_base_kernel && k == 16 {
+                    let (candidate_vals, candidate_ids) =
+                        crate::metal_kernel::base_top16_blocks(&base)?;
+                    let neg_candidates = candidate_vals.negative()?;
+                    let partition = ops::argpartition_axis(&neg_candidates, k - 1, -1)?;
+                    let candidate_pos = partition.index((.., 0..k));
+                    Some((
+                        candidate_ids.take_along_axis(&candidate_pos, -1)?,
+                        candidate_vals.take_along_axis(&candidate_pos, -1)?,
+                    ))
+                } else {
+                    let neg_base = base.negative()?;
+                    let partition = ops::argpartition_axis(&neg_base, k - 1, -1)?;
+                    let indices = partition.index((.., 0..k));
+                    let values = base.take_along_axis(&indices, -1)?;
+                    Some((indices, values))
+                }
+            } else {
+                None
+            };
             let markov_embedding = (*self.markov_head_a).take_axis(&previous, 0)?;
-            let markov_bias = self.markov_head_b.forward(&markov_embedding)?;
-            let logits = base.add(&markov_bias)?;
-            previous = mlx_rs::argmax_axis!(&logits, -1)?;
+            let shortlist = if let Some((indices, base_topk)) = topk.as_ref() {
+                if topk_markov_kernel && indices.size() == 16 && base_topk.size() == 16 {
+                    Some(crate::metal_kernel::bonsai_q4_markov_top16_argmax(
+                        indices,
+                        base_topk,
+                        &markov_embedding,
+                        &self.markov_head_b.weight,
+                        &self.markov_head_b.scales,
+                        &self.markov_head_b.biases,
+                        self.markov_head_b.group_size,
+                    )?)
+                } else {
+                    let flat_indices = indices.reshape(&[-1])?;
+                    let markov_topk = self
+                        .markov_head_b
+                        .forward_rows(&markov_embedding, &flat_indices)?;
+                    let shortlist_logits = base_topk.add(&markov_topk)?;
+                    let shortlist_pos = mlx_rs::argmax_axis!(&shortlist_logits, -1)?;
+                    Some(
+                        indices
+                            .take_along_axis(&shortlist_pos.reshape(&[-1, 1])?, -1)?
+                            .reshape(&[-1])?,
+                    )
+                }
+            } else {
+                None
+            };
+            if topk_fast.is_some() {
+                previous = shortlist
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("dSpark topK fast shortlist missing"))?
+                    .clone();
+            } else {
+                let markov_bias = self.markov_head_b.forward(&markov_embedding)?;
+                let logits = base.add(&markov_bias)?;
+                previous = mlx_rs::argmax_axis!(&logits, -1)?;
+            }
+            if topk.is_some() {
+                let Some(shortlist) = shortlist.as_ref() else {
+                    return Err(Exception::custom("dSpark topK compare shortlist missing"));
+                };
+                if topk_compare.is_none() {
+                    crate::mlx_exec::eval([shortlist])?;
+                    tracing::debug!(
+                        position,
+                        k = topk_fast.unwrap_or_default(),
+                        shortlist = shortlist.as_slice::<u32>()[0],
+                        "dSpark topK Markov shortlist fast"
+                    );
+                } else if topk_fast.is_some() {
+                    let markov_bias = self.markov_head_b.forward(&markov_embedding)?;
+                    let logits = base.add(&markov_bias)?;
+                    let exact = mlx_rs::argmax_axis!(&logits, -1)?;
+                    crate::mlx_exec::eval([shortlist, &exact])?;
+                    let shortlist_id = shortlist.as_slice::<u32>()[0];
+                    let exact_id = exact.as_slice::<u32>()[0];
+                    let matched = shortlist_id == exact_id;
+                    let total = DSPARK_TOPK_COMPARE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+                    let hits = DSPARK_TOPK_COMPARE_HIT
+                        .fetch_add(u64::from(matched), Ordering::Relaxed)
+                        + u64::from(matched);
+                    tracing::info!(
+                        position,
+                        k = topk_fast.unwrap_or_default(),
+                        exact = exact_id,
+                        shortlist = shortlist_id,
+                        matched,
+                        samples = total,
+                        hit_rate = format!("{:.3}", hits as f64 / total as f64),
+                        "dSpark topK Markov shortlist compare"
+                    );
+                } else {
+                    crate::mlx_exec::eval([shortlist, &previous])?;
+                    let shortlist_id = shortlist.as_slice::<u32>()[0];
+                    let exact_id = previous.as_slice::<u32>()[0];
+                    let matched = shortlist_id == exact_id;
+                    let total = DSPARK_TOPK_COMPARE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+                    let hits = DSPARK_TOPK_COMPARE_HIT
+                        .fetch_add(u64::from(matched), Ordering::Relaxed)
+                        + u64::from(matched);
+                    tracing::info!(
+                        position,
+                        k = topk_compare.unwrap_or_default(),
+                        exact = exact_id,
+                        shortlist = shortlist_id,
+                        matched,
+                        samples = total,
+                        hit_rate = format!("{:.3}", hits as f64 / total as f64),
+                        "dSpark topK Markov shortlist compare"
+                    );
+                }
+            }
+            if topk_trace {
+                let base_f32 = base.as_dtype(mlx_rs::Dtype::Float32)?;
+                crate::mlx_exec::eval([&base_f32, &previous])?;
+                let chosen = usize::try_from(previous.as_slice::<u32>()[0]).unwrap_or(usize::MAX);
+                let base_scores = base_f32.as_slice::<f32>();
+                if let Some(&chosen_score) = base_scores.get(chosen) {
+                    let mut rank = 1usize;
+                    for (idx, &score) in base_scores.iter().enumerate() {
+                        if score > chosen_score || (score == chosen_score && idx < chosen) {
+                            rank += 1;
+                        }
+                    }
+                    let rank_u64 = u64::try_from(rank).unwrap_or(u64::MAX);
+                    let total = DSPARK_TOPK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+                    let sum =
+                        DSPARK_TOPK_RANK_SUM.fetch_add(rank_u64, Ordering::Relaxed) + rank_u64;
+                    DSPARK_TOPK_RANK_MAX.fetch_max(rank_u64, Ordering::Relaxed);
+                    let hit16_count = DSPARK_TOPK_HIT16
+                        .fetch_add(u64::from(rank <= 16), Ordering::Relaxed)
+                        + u64::from(rank <= 16);
+                    let hit32_count = DSPARK_TOPK_HIT32
+                        .fetch_add(u64::from(rank <= 32), Ordering::Relaxed)
+                        + u64::from(rank <= 32);
+                    let hit64_count = DSPARK_TOPK_HIT64
+                        .fetch_add(u64::from(rank <= 64), Ordering::Relaxed)
+                        + u64::from(rank <= 64);
+                    let hit128_count = DSPARK_TOPK_HIT128
+                        .fetch_add(u64::from(rank <= 128), Ordering::Relaxed)
+                        + u64::from(rank <= 128);
+                    let hit256_count = DSPARK_TOPK_HIT256
+                        .fetch_add(u64::from(rank <= 256), Ordering::Relaxed)
+                        + u64::from(rank <= 256);
+                    let hit512_count = DSPARK_TOPK_HIT512
+                        .fetch_add(u64::from(rank <= 512), Ordering::Relaxed)
+                        + u64::from(rank <= 512);
+                    let max_rank = DSPARK_TOPK_RANK_MAX.load(Ordering::Relaxed).max(rank_u64);
+                    tracing::info!(
+                        position,
+                        chosen,
+                        base_rank = rank,
+                        samples = total,
+                        mean_rank = format!("{:.2}", sum as f64 / total as f64),
+                        max_rank,
+                        hit16 = rank <= 16,
+                        hit32 = rank <= 32,
+                        hit64 = rank <= 64,
+                        hit128 = rank <= 128,
+                        hit256 = rank <= 256,
+                        hit512 = rank <= 512,
+                        hit16_rate = format!("{:.3}", hit16_count as f64 / total as f64),
+                        hit32_rate = format!("{:.3}", hit32_count as f64 / total as f64),
+                        hit64_rate = format!("{:.3}", hit64_count as f64 / total as f64),
+                        hit128_rate = format!("{:.3}", hit128_count as f64 / total as f64),
+                        hit256_rate = format!("{:.3}", hit256_count as f64 / total as f64),
+                        hit512_rate = format!("{:.3}", hit512_count as f64 / total as f64),
+                        "dSpark base-topK containment"
+                    );
+                }
+            }
+            if let Some(ckpt_ref) = ckpt.as_mut() {
+                crate::mlx_exec::eval([&previous])?;
+                let now = std::time::Instant::now();
+                markov_ms.push(now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0);
+                *ckpt_ref = now;
+            }
             sampled.push(previous.clone());
         }
 
         let refs: Vec<&Array> = sampled.iter().collect();
-        ops::concatenate_axis(&refs, 0)?.reshape(&[1, block_size])
+        let out = ops::concatenate_axis(&refs, 0)?.reshape(&[1, block_size])?;
+        if let Some(ckpt_ref) = ckpt.as_mut() {
+            crate::mlx_exec::eval([&out])?;
+            let now = std::time::Instant::now();
+            let concat_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
+            tracing::info!(
+                output_ms = format!("{output_ms:.2}"),
+                markov_ms = ?markov_ms.iter().map(|ms| format!("{ms:.2}")).collect::<Vec<_>>(),
+                concat_ms = format!("{concat_ms:.2}"),
+                total_ms = format!("{:.2}", output_ms + markov_ms.iter().sum::<f64>() + concat_ms),
+                "dSpark proposal detail"
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -1310,6 +1537,12 @@ impl DFlashDrafter {
         taps: &[Array],
         cache: &DFlashCache,
     ) -> Result<DFlashForwardTransaction, Exception> {
+        let trace = std::env::var("HIGGS_DSPARK_STAGE_TRACE").is_ok_and(|v| v == "1");
+        let mut ckpt = trace.then(std::time::Instant::now);
+        let mut context_ms = 0.0;
+        let mut log_snr_ms = 0.0;
+        let mut layer_ms = Vec::new();
+
         let rows = self.validate_context_taps(taps, "forward")?;
         self.validate_noise(noise, taps)?;
         let projected_position = cache.projected_position()?;
@@ -1325,6 +1558,18 @@ impl DFlashDrafter {
                 "drafter forward failed to flush its context-tile remainder",
             ));
         }
+        if let Some(ckpt_ref) = ckpt.as_mut() {
+            let mut targets = staged
+                .iter()
+                .flatten()
+                .flat_map(|(keys, values)| [keys, values])
+                .collect::<Vec<_>>();
+            targets.push(&combined);
+            crate::mlx_exec::eval(targets)?;
+            let now = std::time::Instant::now();
+            context_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
+            *ckpt_ref = now;
+        }
         let noise_position = cache
             .position
             .checked_add(rows)
@@ -1334,10 +1579,41 @@ impl DFlashDrafter {
             Some(dspark) => dspark.add_log_snr(noise)?,
             None => noise.clone(),
         };
-        for (layer, lc) in self.layers.iter_mut().zip(staged.iter_mut()) {
+        if let Some(ckpt_ref) = ckpt.as_mut() {
+            crate::mlx_exec::eval([&h])?;
+            let now = std::time::Instant::now();
+            log_snr_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
+            *ckpt_ref = now;
+        }
+        for (index, (layer, lc)) in self.layers.iter_mut().zip(staged.iter_mut()).enumerate() {
             h = layer.forward_noise(&h, lc, noise_position)?;
+            if let Some(ckpt_ref) = ckpt.as_mut() {
+                crate::mlx_exec::eval([&h])?;
+                let now = std::time::Instant::now();
+                layer_ms.push((index, now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0));
+                *ckpt_ref = now;
+            }
         }
         let hidden = self.norm.forward(&h)?;
+        if let Some(ckpt_ref) = ckpt.as_mut() {
+            crate::mlx_exec::eval([&hidden])?;
+            let now = std::time::Instant::now();
+            let norm_ms = now.duration_since(*ckpt_ref).as_secs_f64() * 1000.0;
+            tracing::info!(
+                context_ms = format!("{context_ms:.2}"),
+                log_snr_ms = format!("{log_snr_ms:.2}"),
+                layer_ms = ?layer_ms
+                    .iter()
+                    .map(|(index, ms)| format!("{index}:{ms:.2}"))
+                    .collect::<Vec<_>>(),
+                norm_ms = format!("{norm_ms:.2}"),
+                total_ms = format!(
+                    "{:.2}",
+                    context_ms + log_snr_ms + layer_ms.iter().map(|(_, ms)| *ms).sum::<f64>() + norm_ms
+                ),
+                "dSpark stage detail"
+            );
+        }
         Ok(DFlashForwardTransaction {
             hidden,
             layers: staged,

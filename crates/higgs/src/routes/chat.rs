@@ -13,10 +13,11 @@ use axum::{
     },
 };
 use bytes::Bytes;
+use higgs_engine::simple::SessionPromptTracePayloadStats;
 use tokio_stream::Stream;
 
 use crate::{
-    config::ApiFormat,
+    config::{ApiFormat, GenerationDefaults},
     error::ServerError,
     metrics::{MetricsStore, RequestRecord},
     router::ResolvedRoute,
@@ -25,9 +26,12 @@ use crate::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
         ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent, StopSequence,
         TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
+        merge_repetition_penalty,
     },
 };
 use higgs_models::SamplingParams;
+
+const TOOL_RESULT_PROMPT_WARN_BYTES: usize = 16 * 1024;
 
 #[allow(clippy::too_many_lines)]
 pub async fn chat_completions(
@@ -61,6 +65,7 @@ pub async fn chat_completions(
         ResolvedRoute::Higgs {
             engine,
             model_name,
+            generation_defaults,
             routing_method,
         } => {
             req.model = model_name;
@@ -69,15 +74,22 @@ pub async fn chat_completions(
                     Arc::clone(&state),
                     req,
                     engine,
+                    generation_defaults,
                     state.metrics.clone(),
                     routing_method,
-                )?;
+                )
+                .await?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
-                let response =
-                    chat_completions_non_streaming(Arc::clone(&state), req, engine).await?;
+                let response = chat_completions_non_streaming(
+                    Arc::clone(&state),
+                    req,
+                    engine,
+                    generation_defaults,
+                )
+                .await?;
                 if let Some(ref metrics) = state.metrics {
                     metrics.record(RequestRecord {
                         id: 0,
@@ -252,9 +264,18 @@ async fn chat_completions_non_streaming(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: Arc<Engine>,
+    generation_defaults: GenerationDefaults,
 ) -> Result<ChatCompletionResponse, ServerError> {
-    let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
-    let sampling = build_sampling_params(&req)?;
+    drop_requested_retained_sessions(
+        Arc::clone(&engine),
+        req.drop_session_id,
+        req.drop_session_ids.as_deref(),
+    )
+    .await?;
+
+    let max_tokens =
+        resolved_max_tokens(&req, &generation_defaults, state.config.server.max_tokens);
+    let sampling = build_sampling_params(&req, &generation_defaults)?;
     let stop_sequences = StopSequence::extract(req.stop);
     let want_logprobs = req.logprobs.unwrap_or(false);
     let top_logprobs = req.top_logprobs;
@@ -278,11 +299,12 @@ async fn chat_completions_non_streaming(
         req.chat_template_kwargs
             .as_ref()
             .and_then(|k| k.enable_thinking)
-            .or(req.enable_thinking),
+            .or(req.enable_thinking)
+            .or(generation_defaults.enable_thinking),
     );
 
-    let mut prompt_tokens = engine
-        .prepare_chat_prompt_with_thinking(&messages, tools, thinking_enabled)
+    let (mut prompt_tokens, pflash_policy) = engine
+        .prepare_chat_prompt_with_pflash_policy(&messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
 
     // Preprocess images for VLM
@@ -304,45 +326,49 @@ async fn chat_completions_non_streaming(
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
-    // Opt-in multi-turn KV-cache reuse. Only honored on the non-streaming path
-    // for the Simple engine; `generate_continued` errors for other variants and
-    // we never reach this branch for them because `retained`/`generate_continued`
-    // degrade cleanly. Images and constrained decoding are not supported by the
-    // continued path, so fall back to the normal generation when present.
+    // Opt-in multi-turn KV-cache reuse. Only honored for request shapes the
+    // continued path can preserve; unsupported features fall back to normal
+    // generation, where radix/PFlash stay available.
     //
     // BEST-EFFORT, not exact replay: the retained KV is TurboQuant-compressed
     // (lossy) and the prompt is reconciled in text space below, so a continued
     // turn may differ slightly from a stateless full prefill. Clients needing
     // bit-identical output should omit `session_id` — the radix prefix cache on
     // the normal path is exact. See `SimpleEngine::generate_continued`.
-    let session_id = req
-        .session_id
-        .filter(|_| pixel_values.is_none() && constraint.is_none());
-
     let tokenizer = engine.tokenizer().clone();
     let checkpoint_id = req.checkpoint_id.clone();
+    let session_id = session_continuation_id(
+        req.session_id,
+        pixel_values.is_some(),
+        constraint.is_some(),
+        checkpoint_id.as_deref(),
+        want_logprobs,
+        !stop_sequences.is_empty(),
+    );
     let request_id = generate_request_id();
+    let allow_prefix_cache = req.cache_mode.as_deref() != Some("bypass");
     let has_tools = tools.is_some();
+    let tool_payload = tool_payload_stats(&effective_messages);
+    warn_large_tool_payload(tool_payload);
 
-    if let Some(sid) = session_id {
-        let continued_prompt = continued_prompt_tokens(
-            &engine,
-            sid,
-            &prompt_tokens,
-            &messages,
-            tools,
-            thinking_enabled,
-        );
-
-        let sampling_c = sampling.clone();
+    let output = if let Some(sid) = session_id {
         let engine_c = Arc::clone(&engine);
+        let prompt_tokens_c = prompt_tokens.clone();
+        let messages_c = messages.clone();
+        let tools_c = tools.map(<[serde_json::Value]>::to_vec);
+        let sampling_c = sampling.clone();
+        let pflash_policy_c = pflash_policy.clone();
         let session_output = tokio::task::spawn_blocking(move || {
-            engine_c.generate_continued_with_thinking(
+            engine_c.generate_session_routed_with_thinking(
                 sid,
-                &continued_prompt,
+                &prompt_tokens_c,
+                &messages_c,
+                tools_c.as_deref(),
                 max_tokens,
                 &sampling_c,
                 thinking_enabled,
+                tool_payload,
+                &pflash_policy_c,
             )
         })
         .await
@@ -357,25 +383,27 @@ async fn chat_completions_non_streaming(
             has_tools,
             thinking_enabled,
         ));
-    }
-
-    let output = tokio::task::spawn_blocking(move || {
-        engine.generate_with_thinking(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
-            thinking_enabled,
-            constraint,
-            pixel_values,
-            checkpoint_id.as_deref(),
-        )
-    })
-    .await
-    .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-    .map_err(ServerError::Engine)?;
+    } else {
+        tokio::task::spawn_blocking(move || {
+            engine.generate_with_thinking_and_pflash_policy_with_cache(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                want_logprobs,
+                top_logprobs,
+                thinking_enabled,
+                constraint,
+                pixel_values,
+                checkpoint_id.as_deref(),
+                &pflash_policy,
+                allow_prefix_cache,
+            )
+        })
+        .await
+        .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
+        .map_err(ServerError::Engine)?
+    };
 
     let logprobs_response = output
         .token_logprobs
@@ -384,24 +412,32 @@ async fn chat_completions_non_streaming(
 
     let output_text = output.text;
     // Parse reasoning (think tags) from the output.
-    // When thinking mode is enabled, the template already opened `<think>` in the prompt,
-    // so the generated text starts inside the think block. Prepend `<think>` so the parser
-    // can find the matching `</think>` and split reasoning from visible content.
+    // When thinking mode is enabled, prefer the token-level split the engine
+    // already performed (`output.reasoning_content` / `output.text`), which is
+    // exact and never surfaces the `</think>` delimiter. Fall back to the
+    // string parser only when the engine did not split (e.g. a model that
+    // self-emits `<think>` tags, or thinking disabled at the engine layer).
     let (raw_text, reasoning_content) = if thinking_enabled {
-        let parse_input = if output_text.contains("</think>") {
-            format!("<think>{output_text}")
-        } else {
-            // Model was length-stopped mid-thinking — close the tag so the
-            // parser can extract reasoning instead of leaking raw `<think>`.
-            format!("<think>{output_text}</think>")
-        };
-        let reasoning_result = higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
-        let raw_text = if reasoning_result.reasoning.is_some() {
-            reasoning_result.text
-        } else {
-            output_text
-        };
-        (raw_text, reasoning_result.reasoning)
+        match output.reasoning_content {
+            Some(r) => (output_text, Some(r)),
+            None => {
+                let parse_input = if output_text.contains("</think>") {
+                    format!("<think>{output_text}")
+                } else {
+                    // Model was length-stopped mid-thinking — close the tag so the
+                    // parser can extract reasoning instead of leaking raw `<think>`.
+                    format!("<think>{output_text}</think>")
+                };
+                let reasoning_result =
+                    higgs_engine::reasoning_parser::parse_reasoning(&parse_input);
+                let raw_text = if reasoning_result.reasoning.is_some() {
+                    reasoning_result.text
+                } else {
+                    output_text.clone()
+                };
+                (raw_text, reasoning_result.reasoning)
+            }
+        }
     } else {
         // Model-emitted reasoning (e.g. VibeThinker writes its own
         // `<think>...</think>`): parse it out without the prompt-injection
@@ -470,194 +506,43 @@ async fn chat_completions_non_streaming(
             finish_reason,
             logprobs: logprobs_response,
         }],
-        usage: CompletionUsage {
-            prompt_tokens: output.prompt_tokens,
-            completion_tokens: output.completion_tokens,
-            total_tokens: output.prompt_tokens + output.completion_tokens,
-        },
+        // Stateless (no session_id) path: reuse is via the radix prefix cache,
+        // surfaced through `GenerationOutput::cached_prompt_tokens` (mirrors
+        // the streaming route's `PrefillProgress.cached`).
+        usage: CompletionUsage::new(
+            output.prompt_tokens,
+            output.completion_tokens,
+            output.cached_prompt_tokens,
+        ),
     })
 }
 
-/// Build the token sequence fed to `generate_continued`. The engine guard
-/// prefills only the suffix IFF the retained tokens are a strict token-prefix of
-/// what we pass, so we hand it `retained ++ delta`.
-///
-/// `retained` carries the `<think>...</think>` block the chat template injected
-/// for the prior assistant turn. The canonical multi-turn render strips
-/// `<think>` from historical assistant turns, so match a think-stripped copy of
-/// `retained` against the full render to find the new-turn delta, then append
-/// that delta to the original retained tokens.
-// `print_stderr`: env-gated (HIGGS_DIAG_SESSION_TIMING) diagnostics only.
-#[allow(clippy::print_stderr)]
-fn continued_prompt_tokens(
-    engine: &Arc<Engine>,
-    session_id: u64,
-    prompt_tokens: &[u32],
-    messages: &[higgs_engine::chat_template::ChatMessage],
-    tools: Option<&[serde_json::Value]>,
-    thinking_enabled: bool,
-) -> Vec<u32> {
-    let diag = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
-    let Some(retained) = engine.retained_session_tokens(session_id) else {
-        if diag {
-            eprintln!(
-                "DIAG session-continue-fallback: reason=no_retained_cache session_id={session_id} prompt_tokens={}",
-                prompt_tokens.len()
-            );
+fn tool_payload_stats(messages: &[ChatCompletionMessage]) -> SessionPromptTracePayloadStats {
+    let mut stats = SessionPromptTracePayloadStats::default();
+    for message in messages {
+        if !message.role.eq_ignore_ascii_case("tool") {
+            continue;
         }
-        return prompt_tokens.to_vec();
-    };
-    let retained_text = match engine.tokenizer().decode(&retained, false) {
-        Ok(text) => text,
-        Err(error) => {
-            if diag {
-                eprintln!(
-                    "DIAG session-continue-fallback: reason=decode_retained_failed session_id={session_id} retained_tokens={} error={error}",
-                    retained.len()
-                );
-            }
-            return prompt_tokens.to_vec();
-        }
-    };
-    let full_text = match engine.render_chat_prompt_with_thinking(messages, tools, thinking_enabled)
-    {
-        Ok(text) => text,
-        Err(error) => {
-            if diag {
-                eprintln!(
-                    "DIAG session-continue-fallback: reason=render_full_failed session_id={session_id} retained_tokens={} prompt_tokens={} error={error}",
-                    retained.len(),
-                    prompt_tokens.len()
-                );
-            }
-            return prompt_tokens.to_vec();
-        }
-    };
-    let Some(delta_text) = message_boundary_delta(&retained_text, &full_text) else {
-        if diag {
-            let common = common_prefix_bytes(&retained_text, &full_text);
-            eprintln!(
-                "DIAG session-continue-fallback: reason=boundary_splice_failed session_id={session_id} retained_tokens={} prompt_tokens={} retained_bytes={} full_bytes={} retained_msgs={} full_msgs={} common_bytes={} retained_tail={:?} full_at_mismatch={:?}",
-                retained.len(),
-                prompt_tokens.len(),
-                retained_text.len(),
-                full_text.len(),
-                retained_text.matches(IM_START).count(),
-                full_text.matches(IM_START).count(),
-                common,
-                preview_around(&retained_text, common),
-                preview_around(&full_text, common)
-            );
-        }
-        return prompt_tokens.to_vec();
-    };
-    let Ok(delta_enc) = engine.tokenizer().encode(delta_text, false) else {
-        if diag {
-            eprintln!(
-                "DIAG session-continue-fallback: reason=encode_delta_failed session_id={session_id} delta_bytes={}",
-                delta_text.len()
-            );
-        }
-        return prompt_tokens.to_vec();
-    };
-    if diag {
-        eprintln!(
-            "DIAG session-continue: matched session_id={session_id} retained_tokens={} delta_tokens={} full_prompt_tokens={}",
-            retained.len(),
-            delta_enc.get_ids().len(),
-            prompt_tokens.len()
+        let bytes = message
+            .content
+            .as_ref()
+            .map_or(0, |content| content.text().len());
+        stats.messages += 1;
+        stats.bytes = stats.bytes.saturating_add(bytes);
+        stats.largest_bytes = stats.largest_bytes.max(bytes);
+    }
+    stats
+}
+
+fn warn_large_tool_payload(stats: SessionPromptTracePayloadStats) {
+    if stats.bytes >= TOOL_RESULT_PROMPT_WARN_BYTES {
+        tracing::warn!(
+            tool_result_messages = stats.messages,
+            tool_result_bytes = stats.bytes,
+            tool_result_largest_bytes = stats.largest_bytes,
+            warn_threshold_bytes = TOOL_RESULT_PROMPT_WARN_BYTES,
+            "large raw tool-result replay present in live prompt; compact to handles and recall exact output on demand"
         );
-    }
-    let mut combined = retained;
-    combined.extend_from_slice(delta_enc.get_ids());
-    combined
-}
-
-fn common_prefix_bytes(left: &str, right: &str) -> usize {
-    left.as_bytes()
-        .iter()
-        .zip(right.as_bytes())
-        .take_while(|(l, r)| l == r)
-        .count()
-}
-
-fn preview_around(text: &str, byte_pos: usize) -> String {
-    let start = char_boundary_at_or_before(text, byte_pos.saturating_sub(80));
-    let end = char_boundary_at_or_after(text, byte_pos.saturating_add(80));
-    text.get(start..end).unwrap_or_default().to_owned()
-}
-
-fn char_boundary_at_or_before(text: &str, byte_pos: usize) -> usize {
-    let pos = byte_pos.min(text.len());
-    (0..=pos)
-        .rev()
-        .find(|idx| text.is_char_boundary(*idx))
-        .unwrap_or(0)
-}
-
-fn char_boundary_at_or_after(text: &str, byte_pos: usize) -> usize {
-    let pos = byte_pos.min(text.len());
-    (pos..=text.len())
-        .find(|idx| text.is_char_boundary(*idx))
-        .unwrap_or(text.len())
-}
-
-/// Remove `<think>...</think>` blocks — and the single `\n\n` the chat template
-/// emits after each — from a rendered prompt string. Used by the cache-resident
-/// continuation path to reconcile a retained KV's detokenization (which carries
-/// the per-turn think injection) with the canonical multi-turn render (which
-/// strips think from historical turns), so the retained prefix can be matched.
-const IM_START: &str = "<|im_start|>";
-const IM_END: &str = "<|im_end|>";
-
-/// Splice point for a continued turn: the suffix of the canonical render that
-/// covers the messages the retained KV does NOT yet cover.
-///
-/// The retained detokenization can never byte-match the canonical re-render of
-/// the same messages — think blocks are stripped or replaced by a placeholder
-/// depending on the turn's position relative to the conversation's last user
-/// message, and content/tool-call join whitespace differs from what the model
-/// generated. Instead of canonicalizing (template lore, position-dependent),
-/// splice at message boundaries: the retained text covers as many messages as
-/// it has `<|im_start|>` markers; everything from that boundary onward in the
-/// fresh render is the delta to prefill. The retained prefix keeps the model's
-/// original per-turn text (real thinking, original whitespace) — a known,
-/// accepted divergence source of the best-effort continuation path.
-///
-/// The last retained message usually ends without `<|im_end|>` (the engine
-/// pops the EOS token before stashing), so the delta starts AT the covered
-/// messages' final `<|im_end|>`; when the retained text does end with it, the
-/// delta starts right after instead. Returns `None` (caller falls back to a
-/// full prefill) when the render has fewer messages than the retained text or
-/// the shared first message diverges (client mutated history).
-fn message_boundary_delta<'a>(retained_text: &str, full_text: &'a str) -> Option<&'a str> {
-    let covered = retained_text.matches(IM_START).count();
-    if covered == 0 {
-        return None;
-    }
-    // Mutation guard: the first message (system/user opener) must agree
-    // byte-for-byte between the retained text and the fresh render.
-    let first_end = retained_text
-        .find(IM_END)
-        .map_or_else(|| retained_text.len().min(256), |p| p.min(256));
-    if full_text.get(..first_end) != retained_text.get(..first_end) {
-        return None;
-    }
-    // Offset of the `covered`-th message's closing <|im_end|> in the render:
-    // each covered message renders exactly one.
-    let mut pos = 0usize;
-    for _ in 0..covered {
-        let found = full_text.get(pos..)?.find(IM_END)?;
-        pos = pos + found + IM_END.len();
-    }
-    // pos is just past the covered messages' final <|im_end|>. The retained
-    // text usually lacks that closer (EOS popped at stash time) — include it
-    // in the delta; skip it when the retained text already ends with it.
-    let trimmed = retained_text.trim_end_matches('\n');
-    if trimmed.ends_with(IM_END) {
-        full_text.get(pos..)
-    } else {
-        full_text.get(pos - IM_END.len()..)
     }
 }
 
@@ -674,6 +559,7 @@ fn build_session_response(
     has_tools: bool,
     thinking_enabled: bool,
 ) -> ChatCompletionResponse {
+    let usage = session_usage(&output);
     let output_text = output.text;
     // Same reasoning-tag handling as the normal path: the template opens
     // `<think>` in the prompt, so generated text starts inside the think block.
@@ -749,22 +635,38 @@ fn build_session_response(
             finish_reason,
             logprobs: None,
         }],
-        usage: CompletionUsage {
-            prompt_tokens: output.prompt_tokens,
-            completion_tokens: output.completion_tokens,
-            total_tokens: output.prompt_tokens + output.completion_tokens,
-        },
+        usage,
     }
 }
 
+/// Usage for a session-continuation turn. `cached_tokens` = the prompt tokens
+/// served from the retained KV cache (everything not re-prefilled this turn).
+/// Only a truly continued turn reused a prefix; a cold prefill reports 0.
+fn session_usage(output: &higgs_engine::simple::SessionGeneration) -> CompletionUsage {
+    let cached = if output.continued {
+        output.prompt_tokens.saturating_sub(output.prefilled_tokens)
+    } else {
+        0
+    };
+    CompletionUsage::new(output.prompt_tokens, output.completion_tokens, cached)
+}
+
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
-fn chat_completions_stream(
+async fn chat_completions_stream(
     state: SharedState,
     req: ChatCompletionRequest,
     engine: Arc<Engine>,
+    generation_defaults: GenerationDefaults,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, ServerError> {
+    drop_requested_retained_sessions(
+        Arc::clone(&engine),
+        req.drop_session_id,
+        req.drop_session_ids.as_deref(),
+    )
+    .await?;
+
     let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     // Built here (before the `async_stream::stream!` block, which captures by
     // move) so the tracker can coerce XML-format tool-call values to their
@@ -779,8 +681,9 @@ fn chat_completions_stream(
         );
     }
 
-    let max_tokens = req.max_tokens.unwrap_or(state.config.server.max_tokens);
-    let sampling = build_sampling_params(&req)?;
+    let max_tokens =
+        resolved_max_tokens(&req, &generation_defaults, state.config.server.max_tokens);
+    let sampling = build_sampling_params(&req, &generation_defaults)?;
     let stop_sequences = StopSequence::extract(req.stop);
     let want_logprobs = req.logprobs.unwrap_or(false);
     let top_logprobs = req.top_logprobs;
@@ -801,7 +704,8 @@ fn chat_completions_stream(
         req.chat_template_kwargs
             .as_ref()
             .and_then(|k| k.enable_thinking)
-            .or(req.enable_thinking),
+            .or(req.enable_thinking)
+            .or(generation_defaults.enable_thinking),
     );
 
     // Pass tools into prompt rendering so the chat template emits the
@@ -813,8 +717,8 @@ fn chat_completions_stream(
         .tools
         .as_deref()
         .and_then(|t| if t.is_empty() { None } else { Some(t) });
-    let mut prompt_tokens = engine
-        .prepare_chat_prompt_with_thinking(&messages, prompt_tools, thinking_enabled_stream)
+    let (mut prompt_tokens, pflash_policy) = engine
+        .prepare_chat_prompt_with_pflash_policy(&messages, prompt_tools, thinking_enabled_stream)
         .map_err(ServerError::Engine)?;
 
     // Preprocess images for VLM
@@ -842,12 +746,15 @@ fn chat_completions_stream(
         .as_ref()
         .is_some_and(|opts| opts.include_usage.unwrap_or(false));
     let return_progress = req.return_progress.unwrap_or(false);
+    let collect_prefill_progress = return_progress || include_usage;
     let created = current_unix_timestamp();
-    let tools_for_session = req.tools.clone();
     let request_session_id = req.session_id;
+    let allow_prefix_cache = req.cache_mode.as_deref() != Some("bypass");
     let model = req.model;
     let checkpoint_id = req.checkpoint_id;
     let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(0);
+    let tool_payload = tool_payload_stats(&effective_messages);
+    warn_large_tool_payload(tool_payload);
 
     let start = Instant::now();
     let metrics_id = metrics.as_ref().map(|m| {
@@ -866,158 +773,77 @@ fn chat_completions_stream(
         })
     });
 
-    let stream_session_id = request_session_id
-        .filter(|_| pixel_values.is_none() && constraint.is_none() && !want_logprobs)
-        .filter(|_| checkpoint_id.is_none());
-    if let Some(sid) = stream_session_id {
-        let continued_prompt = continued_prompt_tokens(
-            &engine,
-            sid,
-            &prompt_tokens,
-            &messages,
-            prompt_tools,
-            thinking_enabled_stream,
-        );
-        let engine_c = Arc::clone(&engine);
-        let sampling_c = sampling.clone();
-        let request_id_c = request_id.clone();
-        let model_c = model.clone();
-        let stream = async_stream::stream! {
-            let mut writer = crate::sse::ChatChunkWriter::new(&request_id_c, created, &model_c);
-
-            macro_rules! emit_delta {
-                ($delta:expr, $finish:expr, $logprobs:expr) => {
-                    match writer.write_delta($delta, $finish, $logprobs) {
-                        Ok(json) => yield Ok(Event::default().data(json)),
-                        Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
-                    }
-                };
-            }
-
-            let role_delta = ChatCompletionDelta {
-                role: Some("assistant".to_owned()),
-                content: None,
-                reasoning_content: None,
-                tool_calls: None,
-            };
-            emit_delta!(&role_delta, None, None);
-
-            let session_result = tokio::task::spawn_blocking(move || {
-                engine_c.generate_continued_with_thinking(
-                    sid,
-                    &continued_prompt,
-                    max_tokens,
-                    &sampling_c,
-                    thinking_enabled_stream,
-                )
-            })
-            .await;
-
-            match session_result {
-                Ok(Ok(output)) => {
-                    let tools = tools_for_session.as_deref().filter(|t| !t.is_empty());
-                    let response = build_session_response(
-                        &model_c,
-                        &request_id_c,
-                        output,
-                        tools,
-                        stream_includes_tools,
-                        thinking_enabled_stream,
-                    );
-                    if let Some(choice) = response.choices.first() {
-                        if let Some(reasoning) = choice.message.reasoning_content.clone() {
-                            let d = ChatCompletionDelta {
-                                role: None,
-                                content: None,
-                                reasoning_content: Some(reasoning),
-                                tool_calls: None,
-                            };
-                            emit_delta!(&d, None, None);
-                        }
-                        if let Some(content) = choice.message.content.as_ref() {
-                            let text = content.text();
-                            if !text.is_empty() {
-                                let d = ChatCompletionDelta {
-                                    role: None,
-                                    content: Some(text),
-                                    reasoning_content: None,
-                                    tool_calls: None,
-                                };
-                                emit_delta!(&d, None, None);
-                            }
-                        }
-                        if let Some(tool_calls) = choice.message.tool_calls.as_ref() {
-                            for (index, tool_call) in tool_calls.iter().enumerate() {
-                                let d = ChatCompletionDelta {
-                                    role: None,
-                                    content: None,
-                                    reasoning_content: None,
-                                    tool_calls: Some(vec![ToolCallDelta {
-                                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                                        id: Some(tool_call.id.clone()),
-                                        r#type: Some(tool_call.r#type.clone()),
-                                        function: Some(ToolCallFunctionDelta {
-                                            name: Some(tool_call.function.name.clone()),
-                                            arguments: Some(tool_call.function.arguments.clone()),
-                                        }),
-                                    }]),
-                                };
-                                emit_delta!(&d, None, None);
-                            }
-                        }
-                        let final_delta = ChatCompletionDelta {
-                            role: None,
-                            content: None,
-                            reasoning_content: None,
-                            tool_calls: None,
-                        };
-                        emit_delta!(&final_delta, Some(choice.finish_reason.as_str()), None);
-                    }
-
-                    if include_usage {
-                        match writer.write_usage(&response.usage) {
-                            Ok(json) => yield Ok(Event::default().data(json)),
-                            Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
-                        }
-                    }
-                    if let Some(ref m) = metrics {
-                        if let Some(id) = metrics_id {
-                            m.finalize_stream(id, u64::from(response.usage.completion_tokens), start.elapsed());
-                        }
-                    }
-                }
-                Ok(Err(e)) => tracing::error!(error = %e, "Session generation error during streaming"),
-                Err(e) => tracing::error!(error = %e, "Session generation task join error during streaming"),
-            }
-
-            yield Ok(Event::default().data("[DONE]"));
-        };
-
-        return Ok(Box::pin(stream));
-    }
+    let stream_session_id = session_continuation_id(
+        request_session_id,
+        pixel_values.is_some(),
+        constraint.is_some(),
+        checkpoint_id.as_deref(),
+        want_logprobs,
+        !stop_sequences.is_empty(),
+    );
 
     let tokenizer = engine.tokenizer().clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
-    tokio::task::spawn_blocking(move || {
-        let result = engine.generate_streaming_with_thinking(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
-            &tx,
-            thinking_enabled_stream,
-            return_progress,
-            constraint,
-            pixel_values,
-            checkpoint_id.as_deref(),
-        );
-        if let Err(e) = result {
-            tracing::error!(error = %e, "Generation error during streaming");
-        }
-    });
+    // Cache-resident (session-continued) turns stream from the retained KV
+    // cache; everything else does a fresh prefill. Both feed the same
+    // `StreamingOutput` channel and the same delta/tool-call-tracking loop
+    // below — the session path used to buffer the *entire* completion behind
+    // a `spawn_blocking().await` before emitting a single burst of deltas
+    // (the browser/client would see time-to-first-delta == total elapsed
+    // time on every cache-resident turn). Streaming the retained-cache decode
+    // loop itself (see `generate_continued_streaming_with_thinking`) fixes
+    // that without changing the non-session path at all.
+    if let Some(sid) = stream_session_id {
+        let prompt_tools_c = prompt_tools.map(<[serde_json::Value]>::to_vec);
+        let messages_c = messages.clone();
+        let pflash_policy_c = pflash_policy.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = engine.generate_session_routed_streaming_with_thinking(
+                sid,
+                &prompt_tokens,
+                &messages_c,
+                prompt_tools_c.as_deref(),
+                max_tokens,
+                &sampling,
+                &tx,
+                thinking_enabled_stream,
+                tool_payload,
+                &pflash_policy_c,
+            );
+            match result {
+                Ok(()) => {}
+                Err(higgs_engine::error::EngineError::Cancelled) => {
+                    tracing::debug!(sid, "Session-routed streaming cancelled by client");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Session-routed generation error during streaming");
+                }
+            }
+        });
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let result = engine.generate_streaming_with_thinking_and_pflash_policy_with_cache(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                want_logprobs,
+                top_logprobs,
+                &tx,
+                thinking_enabled_stream,
+                collect_prefill_progress,
+                constraint,
+                pixel_values,
+                checkpoint_id.as_deref(),
+                &pflash_policy,
+                allow_prefix_cache,
+            );
+            if let Err(e) = result {
+                tracing::error!(error = %e, "Generation error during streaming");
+            }
+        });
+    }
 
     let stream = async_stream::stream! {
         let mut writer = crate::sse::ChatChunkWriter::new(&request_id, created, &model);
@@ -1070,6 +896,9 @@ fn chat_completions_stream(
         };
 
         let mut output_token_count: u32 = 0;
+        // Radix prefix-cache tokens reused this turn, taken from the prefill
+        // progress events (`p.cached`). Reported as `prompt_tokens_details`.
+        let mut cached_prompt_tokens: u32 = 0;
         let mut pending_finish_reason: Option<String> = None;
         let mut pending_finish_logprobs: Option<ChoiceLogprobs> = None;
 
@@ -1078,6 +907,7 @@ fn chat_completions_stream(
             // `prompt_progress` chunks when the client opted in, and keep
             // them away from the delta/tool trackers either way.
             if let Some(p) = output.prefill_progress {
+                cached_prompt_tokens = cached_prompt_tokens.max(p.cached);
                 if return_progress {
                     let time_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let json = writer.write_prompt_progress(p.total, p.cached, p.processed, time_ms);
@@ -1212,11 +1042,8 @@ fn chat_completions_stream(
 
         // Emit final chunk with usage only when explicitly requested.
         if include_usage {
-            let usage = CompletionUsage {
-                prompt_tokens: prompt_token_count,
-                completion_tokens: output_token_count,
-                total_tokens: prompt_token_count + output_token_count,
-            };
+            let usage =
+                CompletionUsage::new(prompt_token_count, output_token_count, cached_prompt_tokens);
             match writer.write_usage(&usage) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
@@ -1327,24 +1154,46 @@ fn inject_image_placeholders(messages: &[ChatCompletionMessage]) -> Vec<ChatComp
         .collect()
 }
 
-fn build_sampling_params(req: &ChatCompletionRequest) -> Result<SamplingParams, ServerError> {
-    let speculation =
-        higgs_models::Speculation::parse(req.speculation.as_deref()).map_err(|v| {
-            ServerError::BadRequest(format!(
-                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
-            ))
-        })?;
+fn build_sampling_params(
+    req: &ChatCompletionRequest,
+    defaults: &GenerationDefaults,
+) -> Result<SamplingParams, ServerError> {
+    let speculation = higgs_models::Speculation::parse(
+        req.speculation
+            .as_deref()
+            .or(defaults.speculation.as_deref()),
+    )
+    .map_err(|v| {
+        ServerError::BadRequest(format!(
+            "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
+        ))
+    })?;
+    let repetition_penalty = if req.repetition_penalty.is_some() || req.repeat_penalty.is_some() {
+        merge_repetition_penalty(req.repetition_penalty, req.repeat_penalty)
+    } else {
+        defaults.repetition_penalty
+    };
     Ok(SamplingParams {
-        temperature: req.temperature.unwrap_or(1.0),
-        top_p: req.top_p.unwrap_or(1.0),
-        top_k: req.top_k,
-        min_p: req.min_p,
-        repetition_penalty: req.repetition_penalty,
-        frequency_penalty: req.frequency_penalty,
-        presence_penalty: req.presence_penalty,
+        temperature: req.temperature.or(defaults.temperature).unwrap_or(0.0),
+        top_p: req.top_p.or(defaults.top_p).unwrap_or(1.0),
+        top_k: req.top_k.or(defaults.top_k),
+        min_p: req.min_p.or(defaults.min_p),
+        repetition_penalty,
+        frequency_penalty: req.frequency_penalty.or(defaults.frequency_penalty),
+        presence_penalty: req.presence_penalty.or(defaults.presence_penalty),
         speculation,
         thinking_budget: req.reasoning_budget,
     })
+}
+
+fn resolved_max_tokens(
+    req: &ChatCompletionRequest,
+    defaults: &GenerationDefaults,
+    server_max_tokens: u32,
+) -> u32 {
+    req.max_tokens
+        .or(defaults.max_tokens)
+        .unwrap_or(server_max_tokens)
 }
 
 /// Build a constrained generator from the request's `response_format`.
@@ -1431,6 +1280,61 @@ fn generate_request_id() -> String {
     format!("chatcmpl-{}", uuid::Uuid::new_v4())
 }
 
+fn session_continuation_id(
+    session_id: Option<u64>,
+    has_pixel_values: bool,
+    has_constraint: bool,
+    checkpoint_id: Option<&str>,
+    want_logprobs: bool,
+    has_stop_sequences: bool,
+) -> Option<u64> {
+    session_id
+        .filter(|_| !has_pixel_values)
+        .filter(|_| !has_constraint)
+        .filter(|_| checkpoint_id.is_none())
+        .filter(|_| !want_logprobs)
+        .filter(|_| !has_stop_sequences)
+}
+
+async fn drop_requested_retained_sessions(
+    engine: Arc<Engine>,
+    session_id: Option<u64>,
+    session_ids: Option<&[u64]>,
+) -> Result<(), ServerError> {
+    let ids = retained_session_drop_ids(session_id, session_ids);
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    tokio::task::spawn_blocking(move || {
+        for session_id in ids {
+            let dropped = engine.drop_retained_session(session_id);
+            tracing::info!(
+                session_id,
+                dropped,
+                "retained session drop requested by client"
+            );
+        }
+    })
+    .await
+    .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?;
+
+    Ok(())
+}
+
+fn retained_session_drop_ids(session_id: Option<u64>, session_ids: Option<&[u64]>) -> Vec<u64> {
+    let mut ids = Vec::new();
+    if let Some(session_id) = session_id {
+        ids.push(session_id);
+    }
+    if let Some(session_ids) = session_ids {
+        ids.extend_from_slice(session_ids);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 fn current_unix_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -1440,46 +1344,161 @@ fn current_unix_timestamp() -> i64 {
 mod tests {
     use super::*;
 
+    fn chat_request(extra: serde_json::Value) -> ChatCompletionRequest {
+        let mut request = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        if let (Some(dst), Some(src)) = (request.as_object_mut(), extra.as_object()) {
+            dst.extend(src.clone());
+        }
+        serde_json::from_value(request).unwrap()
+    }
+
     #[test]
-    fn boundary_delta_splices_after_covered_messages() {
-        // Retained: system + user + generated assistant reply (EOS popped, so
-        // no trailing <|im_end|>), with real thinking the render won't have.
-        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nanswer1";
-        // Fresh render: same three messages canonically rendered (thinking
-        // stripped, whitespace differs) plus a new user turn + gen suffix.
-        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nanswer1<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>";
-        let delta = message_boundary_delta(retained, full).unwrap();
-        // Delta starts at the covered messages' closing <|im_end|> (retained
-        // lacks it) and carries everything new.
+    fn generation_defaults_fill_omitted_sampling_fields() {
+        let req = chat_request(serde_json::json!({}));
+        let defaults = GenerationDefaults {
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            min_p: Some(0.0),
+            repetition_penalty: Some(1.1),
+            frequency_penalty: Some(0.2),
+            presence_penalty: Some(0.3),
+            speculation: Some("none".to_owned()),
+            enable_thinking: Some(false),
+        };
+
+        assert_eq!(resolved_max_tokens(&req, &defaults, 1024), 4096);
+        let sampling = build_sampling_params(&req, &defaults).unwrap();
+        assert!((sampling.temperature - 0.7).abs() < f32::EPSILON);
+        assert!((sampling.top_p - 0.95).abs() < f32::EPSILON);
+        assert_eq!(sampling.top_k, Some(20));
+        assert_eq!(sampling.min_p, Some(0.0));
+        assert_eq!(sampling.repetition_penalty, Some(1.1));
+        assert_eq!(sampling.frequency_penalty, Some(0.2));
+        assert_eq!(sampling.presence_penalty, Some(0.3));
+        assert_eq!(sampling.speculation, higgs_models::Speculation::None);
+    }
+
+    #[test]
+    fn request_sampling_fields_override_generation_defaults() {
+        let req = chat_request(serde_json::json!({
+            "max_tokens": 64,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 5,
+            "repeat_penalty": 1.2,
+            "speculation": "auto"
+        }));
+        let defaults = GenerationDefaults {
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            repetition_penalty: Some(1.1),
+            speculation: Some("none".to_owned()),
+            ..GenerationDefaults::default()
+        };
+
+        assert_eq!(resolved_max_tokens(&req, &defaults, 1024), 64);
+        let sampling = build_sampling_params(&req, &defaults).unwrap();
+        assert!(sampling.temperature.abs() < f32::EPSILON);
+        assert!((sampling.top_p - 1.0).abs() < f32::EPSILON);
+        assert_eq!(sampling.top_k, Some(5));
+        assert_eq!(sampling.repetition_penalty, Some(1.2));
+        assert_eq!(sampling.speculation, higgs_models::Speculation::Auto);
+    }
+
+    #[test]
+    fn session_usage_reports_reused_prefix_as_cached() {
+        // A continued turn: 1000-token prompt, only the 120-token suffix was
+        // prefilled, so 880 tokens came from the retained KV cache.
+        let continued = higgs_engine::simple::SessionGeneration {
+            text: String::new(),
+            completion_tokens: 30,
+            prompt_tokens: 1000,
+            prefilled_tokens: 120,
+            continued: true,
+            outcome: higgs_engine::simple::SessionOutcome::Continued,
+        };
+        let usage = session_usage(&continued);
+        assert_eq!(usage.prompt_tokens, 1000);
         assert_eq!(
-            delta,
-            "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>"
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            Some(880)
+        );
+
+        // A cold prefill re-ran the whole prompt: no cached tokens reported.
+        let cold = higgs_engine::simple::SessionGeneration {
+            text: String::new(),
+            completion_tokens: 30,
+            prompt_tokens: 1000,
+            prefilled_tokens: 1000,
+            continued: false,
+            outcome: higgs_engine::simple::SessionOutcome::ExactBootstrap,
+        };
+        assert!(session_usage(&cold).prompt_tokens_details.is_none());
+
+        let pflash = higgs_engine::simple::SessionGeneration {
+            outcome: higgs_engine::simple::SessionOutcome::PFlashBootstrap,
+            ..cold
+        };
+        assert!(session_usage(&pflash).prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn session_continuation_allows_plain_session_id() {
+        assert_eq!(
+            session_continuation_id(Some(42), false, false, None, false, false),
+            Some(42)
         );
     }
 
     #[test]
-    fn boundary_delta_skips_closer_when_retained_has_it() {
-        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>";
-        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
-        let delta = message_boundary_delta(retained, full).unwrap();
-        assert_eq!(delta, "\n<|im_start|>user\nq2<|im_end|>");
+    fn session_continuation_rejects_unsupported_request_shapes() {
+        assert_eq!(
+            session_continuation_id(Some(42), true, false, None, false, false),
+            None
+        );
+        assert_eq!(
+            session_continuation_id(Some(42), false, true, None, false, false),
+            None
+        );
+        assert_eq!(
+            session_continuation_id(None, false, false, None, false, false),
+            None
+        );
+        assert_eq!(
+            session_continuation_id(Some(42), false, false, None, true, false),
+            None
+        );
+        assert_eq!(
+            session_continuation_id(Some(42), false, false, None, false, true),
+            None
+        );
     }
 
     #[test]
-    fn boundary_delta_rejects_mutated_first_message() {
-        // Client rewrote the system prompt between turns: no splice.
-        let retained = "<|im_start|>system\noriginal<|im_end|>\n<|im_start|>user\nq<|im_end|>";
-        let full = "<|im_start|>system\nMUTATED!<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
-        assert!(message_boundary_delta(retained, full).is_none());
+    fn session_continuation_checkpoint_id_takes_precedence() {
+        assert_eq!(
+            session_continuation_id(Some(42), false, false, Some("checkpoint-a"), false, false),
+            None
+        );
     }
 
     #[test]
-    fn boundary_delta_rejects_render_with_fewer_messages() {
-        // Render has fewer message closers than retained covers (history
-        // shrank): no splice.
-        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans";
-        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>";
-        assert!(message_boundary_delta(retained, full).is_none());
+    fn retained_session_drop_ids_are_deduplicated_and_sorted() {
+        assert_eq!(retained_session_drop_ids(None, None), Vec::<u64>::new());
+        assert_eq!(
+            retained_session_drop_ids(Some(9), Some(&[3, 9, 1, 3])),
+            vec![1, 3, 9]
+        );
     }
 
     fn simple_message(role: &str, content: Option<&str>) -> ChatCompletionMessage {

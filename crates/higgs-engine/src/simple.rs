@@ -6,6 +6,7 @@
     clippy::manual_let_else
 )]
 
+use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -13,8 +14,13 @@ use std::sync::{Mutex, MutexGuard};
 use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, Speculation, apply_penalties,
+    cache::SteppingKeyValueCache,
     dflash::{DFlashCache, DFlashConfig, DFlashDrafter, accept_prefix},
     sample,
+    spec_prefill::{
+        HardKeepSpan, PrefillPlanMetadata, PrefillScoreConfig, PrefillScoreMode, SurvivalPlan,
+        adaptive_keep_ratio_from_importance, select_survivors_with_hard_keep,
+    },
     turboquant::KvCacheConfig,
 };
 use mlx_rs::{
@@ -47,6 +53,12 @@ use crate::{
 /// Default maximum number of cached prefixes.
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 const DEFAULT_PAGED_KV_BLOCK_SIZE: usize = 64;
+const HYBRID_CHECKPOINT_BLOCKS: usize = 1;
+pub const DEFAULT_PFLASH_KEEP_RATIO_MAX: f32 = 0.75;
+pub const DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO: f32 = 0.60;
+pub const DEFAULT_PFLASH_PLAN_CACHE: bool = true;
+pub const DEFAULT_PFLASH_PLAN_CACHE_ENTRIES: usize = 64;
+pub const DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD: usize = 128;
 /// Default `<think>` budget (tokens) when a request omits `reasoning_budget`.
 const DEFAULT_THINKING_BUDGET: u32 = 256;
 
@@ -54,6 +66,19 @@ const DEFAULT_THINKING_BUDGET: u32 = 256;
 struct GenerationPromptSuffixes {
     no_thinking: Box<[u32]>,
     thinking: Box<[u32]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillCompressionMode {
+    Off,
+    Auto,
+    Always,
+}
+
+impl Default for PrefillCompressionMode {
+    fn default() -> Self {
+        Self::Off
+    }
 }
 
 impl GenerationPromptSuffixes {
@@ -98,6 +123,417 @@ fn exact_generation_body<'a>(prompt: &'a [u32], generation_suffix: &[u32]) -> Op
     prompt.strip_suffix(generation_suffix)
 }
 
+/// Snapshot boundary for a hybrid two-phase prefill store.
+///
+/// Floors to the prefix-cache block size so the stored entry is block-aligned
+/// and its KV layers can be paged (a GDN snapshot is only valid at the exact
+/// attention boundary it was computed at). A body shorter than one block has
+/// no aligned boundary, so it keeps its exact length: `slice_into_blocks` then
+/// sees a misaligned hybrid and falls back to a whole `Cloned` entry, which is
+/// the pre-paging behaviour. Returning 0 there would disable the two-phase
+/// snapshot entirely and drop hybrid caching for short conversations.
+fn hybrid_checkpoint_boundary(body_len: usize) -> usize {
+    let quantum = DEFAULT_BLOCK_SIZE.saturating_mul(HYBRID_CHECKPOINT_BLOCKS);
+    let aligned = body_len / quantum * quantum;
+    if aligned == 0 { body_len } else { aligned }
+}
+
+fn pflash_cache_source_and_request_tail<'a>(
+    prompt: &'a [u32],
+    generation_suffix: &[u32],
+) -> (&'a [u32], &'a [u32]) {
+    let Some(body) = exact_generation_body(prompt, generation_suffix) else {
+        return (prompt, &[]);
+    };
+    let tail = prompt.get(body.len()..).unwrap_or_default();
+    (body, tail)
+}
+
+fn pflash_cache_source_and_request_tail_with_boundary<'a>(
+    prompt: &'a [u32],
+    generation_suffix: &[u32],
+    body_token_count: Option<usize>,
+) -> (&'a [u32], &'a [u32]) {
+    if let Some(body_token_count) = body_token_count
+        && body_token_count <= prompt.len()
+    {
+        let body = prompt.get(..body_token_count).unwrap_or_default();
+        let tail = prompt.get(body_token_count..).unwrap_or_default();
+        return (body, tail);
+    }
+    pflash_cache_source_and_request_tail(prompt, generation_suffix)
+}
+
+fn dflash_accepts_pflash_plan(
+    compressed: Option<&SurvivalPlan>,
+    sparse_taps_available: bool,
+) -> bool {
+    // Identity plans (and `None`) leave the survivor and source domains
+    // identical, so the existing drafter radix path is unchanged.
+    // A non-contiguous PFlash plan can only feed dSpark when sparse target
+    // taps are captured at resident-row resolution — otherwise the drafter
+    // has no context frontier matching the compressed survivor sequence.
+    compressed.is_none_or(|plan| plan.is_contiguous_identity() || sparse_taps_available)
+}
+
+fn dflash_sparse_taps_available_for_pflash_plan(
+    compressed: Option<&SurvivalPlan>,
+    dflash_is_dspark: bool,
+    model_supports_sparse_prefill: bool,
+) -> bool {
+    compressed.is_some_and(|plan| {
+        !plan.is_contiguous_identity() && dflash_is_dspark && model_supports_sparse_prefill
+    })
+}
+
+fn pflash_actual_keep_ratio(source_tokens: usize, kept_tokens: usize) -> f32 {
+    if source_tokens == 0 {
+        return 0.0;
+    }
+    kept_tokens as f32 / source_tokens as f32
+}
+
+fn pflash_auto_plan_worth_executing(
+    source_tokens: usize,
+    kept_tokens: usize,
+    max_auto_prefill_ratio: f32,
+) -> bool {
+    pflash_actual_keep_ratio(source_tokens, kept_tokens) <= max_auto_prefill_ratio
+}
+
+const DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS: usize = 8192;
+
+fn pflash_full_score_max_tokens() -> usize {
+    std::env::var("HIGGS_PREFLASH_FULL_SCORE_MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS)
+}
+
+fn pflash_full_score_budget_exceeded(
+    score_mode: PrefillScoreMode,
+    source_tokens: usize,
+    max_score_tokens: usize,
+) -> bool {
+    score_mode == PrefillScoreMode::Full && source_tokens > max_score_tokens
+}
+
+fn prefill_min_free_memory_mb() -> usize {
+    std::env::var("HIGGS_PREFLASH_MIN_FREE_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2048)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PFlashPlanCacheConfig {
+    version: u32,
+    score_mode: PrefillScoreMode,
+    exit_layer: usize,
+    keep_floor_bits: u32,
+    keep_ceiling_bits: u32,
+    chunk: usize,
+    avgpool: usize,
+    lookahead: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PFlashPlanCacheEntry {
+    source_tokens: Vec<u32>,
+    plan: SurvivalPlan,
+    config: PFlashPlanCacheConfig,
+    last_used: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PFlashPlanCacheHit {
+    source_len: usize,
+    plan: SurvivalPlan,
+}
+
+#[derive(Clone, Debug)]
+struct PFlashScoreOutcome {
+    plan: SurvivalPlan,
+    score_ms: f64,
+    select_ms: f64,
+    effective_keep_ratio: f32,
+    score_budget_fallback: bool,
+}
+
+/// Request-local prompt policy for lossy PFlash compression.
+///
+/// Ranges are half-open token offsets in the full rendered prompt. They are
+/// interpreted before the generation suffix is split off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PFlashPromptPolicy {
+    pub hard_keep_ranges: Vec<Range<usize>>,
+    pub body_token_count: Option<usize>,
+}
+
+#[derive(Default)]
+struct PFlashPlanCache {
+    entries: Vec<PFlashPlanCacheEntry>,
+    tick: u64,
+}
+
+impl PFlashPlanCache {
+    fn find_longest_prefix(
+        &mut self,
+        tokens: &[u32],
+        config: PFlashPlanCacheConfig,
+    ) -> Option<PFlashPlanCacheHit> {
+        self.tick = self.tick.wrapping_add(1);
+        let mut best_index = None;
+        let mut best_len = 0usize;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let len = entry.source_tokens.len();
+            if entry.config == config
+                && len > best_len
+                && len <= tokens.len()
+                && tokens.starts_with(&entry.source_tokens)
+                && entry.plan.source_token_count == len
+            {
+                best_index = Some(index);
+                best_len = len;
+            }
+        }
+        let index = best_index?;
+        let entry = self.entries.get_mut(index)?;
+        entry.last_used = self.tick;
+        Some(PFlashPlanCacheHit {
+            source_len: entry.source_tokens.len(),
+            plan: entry.plan.clone(),
+        })
+    }
+
+    fn store(
+        &mut self,
+        tokens: &[u32],
+        plan: SurvivalPlan,
+        config: PFlashPlanCacheConfig,
+        max_entries: usize,
+    ) {
+        if tokens.is_empty() || plan.source_token_count != tokens.len() {
+            return;
+        }
+        if plan.target_sparse_prefill_plan().is_err() {
+            return;
+        }
+        self.tick = self.tick.wrapping_add(1);
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.config == config && entry.source_tokens == tokens)
+        {
+            entry.plan = plan;
+            entry.last_used = self.tick;
+            return;
+        }
+        self.entries.retain(|entry| {
+            !(entry.config == config
+                && entry.source_tokens.len() < tokens.len()
+                && tokens.starts_with(&entry.source_tokens))
+        });
+        self.entries.push(PFlashPlanCacheEntry {
+            source_tokens: tokens.to_vec(),
+            plan,
+            config,
+            last_used: self.tick,
+        });
+        while self.entries.len() > max_entries {
+            let evict_index = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            self.entries.remove(evict_index);
+        }
+    }
+}
+
+fn any_model_variant_name(model: &AnyModel) -> &'static str {
+    match model {
+        AnyModel::Transformer(_) => "Transformer",
+        AnyModel::Qwen3Next(_) => "Qwen3Next",
+        AnyModel::Qwen3Moe(_) => "Qwen3Moe",
+        AnyModel::Gemma2(_) => "Gemma2",
+        AnyModel::Gemma3(_) => "Gemma3",
+        AnyModel::Gemma4(_) => "Gemma4",
+        AnyModel::Phi3(_) => "Phi3",
+        AnyModel::Starcoder2(_) => "Starcoder2",
+        AnyModel::LlavaQwen2(_) => "LlavaQwen2",
+        AnyModel::DeepSeekV2(_) => "DeepSeekV2",
+        AnyModel::BonsaiQ1(_) => "BonsaiQ1",
+    }
+}
+
+#[allow(unsafe_code)]
+fn pflash_free_memory_mb() -> Result<usize, EngineError> {
+    let mut active_memory: usize = 0;
+    let mut memory_limit: usize = 0;
+    unsafe {
+        if mlx_sys::mlx_get_active_memory(&raw mut active_memory as *mut _) != 0 {
+            return Err(EngineError::Generation(
+                "failed to query MLX active memory for PFlash guard".to_owned(),
+            ));
+        }
+        if mlx_sys::mlx_get_memory_limit(&raw mut memory_limit as *mut _) != 0 {
+            return Err(EngineError::Generation(
+                "failed to query MLX memory limit for PFlash guard".to_owned(),
+            ));
+        }
+    }
+    if memory_limit == 0 {
+        return Ok(usize::MAX);
+    }
+    let free_bytes = memory_limit.saturating_sub(active_memory);
+    Ok(free_bytes / (1024 * 1024))
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn inserted_byte_span(with_insert: &str, without_insert: &str) -> Option<Range<usize>> {
+    if with_insert == without_insert {
+        return None;
+    }
+    let with = with_insert.as_bytes();
+    let without = without_insert.as_bytes();
+    let mut prefix = 0usize;
+    while prefix < with.len() && prefix < without.len() && with.get(prefix) == without.get(prefix) {
+        prefix += 1;
+    }
+    prefix = floor_char_boundary(with_insert, prefix);
+
+    let mut suffix = 0usize;
+    while suffix < with.len().saturating_sub(prefix)
+        && suffix < without.len().saturating_sub(prefix)
+        && with.get(with.len() - 1 - suffix) == without.get(without.len() - 1 - suffix)
+    {
+        suffix += 1;
+    }
+    let end = ceil_char_boundary(with_insert, with_insert.len().saturating_sub(suffix));
+    (prefix < end).then_some(prefix..end)
+}
+
+fn token_len_for_text(tokenizer: &Tokenizer, text: &str) -> Result<usize, EngineError> {
+    tokenizer
+        .encode(text, false)
+        .map(|encoding| encoding.get_ids().len())
+        .map_err(|e| EngineError::Tokenization(e.to_string()))
+}
+
+fn contains_real_user_query(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        if message.role != "user" {
+            return false;
+        }
+        let content = message.content.trim();
+        !(content.starts_with("<tool_response>") && content.ends_with("</tool_response>"))
+    })
+}
+
+fn pflash_current_user_start_token(
+    renderer: &ChatTemplateRenderer,
+    tokenizer: &Tokenizer,
+    messages: &[ChatMessage],
+    tail_start_message: usize,
+    tools: Option<&[serde_json::Value]>,
+    enable_thinking: bool,
+) -> Result<usize, EngineError> {
+    if tail_start_message == 0 {
+        return Ok(0);
+    }
+
+    let before_tail_messages = &messages[..tail_start_message];
+    if contains_real_user_query(before_tail_messages) {
+        let before_tail =
+            renderer.apply_with_thinking(before_tail_messages, tools, false, enable_thinking)?;
+        return token_len_for_text(tokenizer, &before_tail);
+    }
+
+    const SENTINEL: &str = "__HIGGS_PFLASH_CURRENT_USER_START__";
+    let mut probe_messages = before_tail_messages.to_vec();
+    probe_messages.push(ChatMessage {
+        role: "user".to_owned(),
+        content: SENTINEL.to_owned(),
+        tool_calls: None,
+    });
+    let rendered = renderer.apply_with_thinking(&probe_messages, tools, false, enable_thinking)?;
+    let Some(marker_start) = rendered.rfind(SENTINEL) else {
+        return Ok(0);
+    };
+    token_len_for_text(tokenizer, &rendered[..marker_start])
+}
+
+fn token_range_for_byte_span(
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    byte_span: Range<usize>,
+) -> Result<Option<Range<usize>>, EngineError> {
+    let start = floor_char_boundary(prompt, byte_span.start);
+    let end = ceil_char_boundary(prompt, byte_span.end);
+    if start >= end {
+        return Ok(None);
+    }
+    let token_start = token_len_for_text(tokenizer, &prompt[..start])?;
+    let token_end = token_len_for_text(tokenizer, &prompt[..end])?;
+    Ok((token_start < token_end).then_some(token_start..token_end))
+}
+
+fn push_merged_token_range(
+    ranges: &mut Vec<Range<usize>>,
+    total_tokens: usize,
+    range: Range<usize>,
+) {
+    let start = range.start.min(total_tokens);
+    let end = range.end.min(total_tokens);
+    if start >= end {
+        return;
+    }
+    ranges.push(start..end);
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && range.start < last.end
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    *ranges = merged;
+}
+
+fn clipped_hard_keep_spans(ranges: &[Range<usize>], start: usize, end: usize) -> Vec<HardKeepSpan> {
+    ranges
+        .iter()
+        .filter_map(|range| {
+            let lo = range.start.max(start);
+            let hi = range.end.min(end);
+            (lo < hi).then(|| HardKeepSpan::new(lo - start, hi - start))
+        })
+        .collect()
+}
+
 /// Acquire a `Mutex` lock, recovering from poison by reusing the inner data.
 /// Used in this crate to keep session-management methods infallible while
 /// still satisfying `clippy::unwrap_used`.
@@ -116,6 +552,380 @@ fn continuation_prior_len(prior_tokens: &[u32], full: &[u32]) -> Option<usize> {
     } else {
         Some(prior)
     }
+}
+
+fn common_prefix_token_len(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn continuation_reject_reason(prior_tokens: &[u32], full: &[u32]) -> &'static str {
+    if prior_tokens.is_empty() {
+        "empty_retained"
+    } else if prior_tokens.len() >= full.len() {
+        "not_growing"
+    } else {
+        "token_mismatch"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPrefillStrategy {
+    Continue {
+        session_id: u64,
+    },
+    BootstrapExact {
+        session_id: u64,
+        reason: SessionBootstrapReason,
+    },
+    BootstrapPFlash {
+        session_id: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBootstrapReason {
+    ColdPromptTooLarge {
+        prompt_tokens: usize,
+        max_prefill_tokens: usize,
+    },
+    LargeSuffix {
+        suffix_tokens: usize,
+        max_prefill_tokens: usize,
+    },
+    DivergedOrNotGrowing,
+}
+
+fn session_prefill_strategy(
+    session_id: u64,
+    retained_tokens: Option<&[u32]>,
+    continuation_candidate: &[u32],
+    max_prefill_tokens: usize,
+    pflash_bootstrap_eligible: bool,
+) -> SessionPrefillStrategy {
+    let Some(retained_tokens) = retained_tokens else {
+        if continuation_candidate.len() <= max_prefill_tokens {
+            return SessionPrefillStrategy::Continue { session_id };
+        }
+        if pflash_bootstrap_eligible {
+            return SessionPrefillStrategy::BootstrapPFlash { session_id };
+        }
+        return SessionPrefillStrategy::BootstrapExact {
+            session_id,
+            reason: SessionBootstrapReason::ColdPromptTooLarge {
+                prompt_tokens: continuation_candidate.len(),
+                max_prefill_tokens,
+            },
+        };
+    };
+
+    let prior = retained_tokens.len();
+    if prior == 0
+        || prior >= continuation_candidate.len()
+        || continuation_candidate.get(..prior) != Some(retained_tokens)
+    {
+        return SessionPrefillStrategy::BootstrapExact {
+            session_id,
+            reason: SessionBootstrapReason::DivergedOrNotGrowing,
+        };
+    }
+
+    let suffix_tokens = continuation_candidate.len() - prior;
+    if suffix_tokens <= max_prefill_tokens {
+        SessionPrefillStrategy::Continue { session_id }
+    } else {
+        SessionPrefillStrategy::BootstrapExact {
+            session_id,
+            reason: SessionBootstrapReason::LargeSuffix {
+                suffix_tokens,
+                max_prefill_tokens,
+            },
+        }
+    }
+}
+
+fn session_prompt_trace_metrics(
+    retained_tokens: Option<&[u32]>,
+    prompt_tokens: &[u32],
+    candidate_tokens: &[u32],
+    tool_payload: SessionPromptTracePayloadStats,
+    outcome: SessionPromptTraceOutcome,
+) -> SessionPromptTraceMetrics {
+    let Some(retained) = retained_tokens else {
+        return SessionPromptTraceMetrics {
+            prompt_tokens: prompt_tokens.len(),
+            retained_tokens: 0,
+            candidate_tokens: candidate_tokens.len(),
+            suffix_tokens: candidate_tokens.len(),
+            common_prefix_tokens: 0,
+            divergence_token: None,
+            boundary_splice: false,
+            tool_result_messages: tool_payload.messages,
+            tool_result_bytes: tool_payload.bytes,
+            tool_result_largest_bytes: tool_payload.largest_bytes,
+            outcome,
+        };
+    };
+
+    let common_prefix_tokens = common_prefix_token_len(retained, candidate_tokens);
+    let retained_prefix_of_candidate = !retained.is_empty()
+        && retained.len() < candidate_tokens.len()
+        && common_prefix_tokens == retained.len();
+    let retained_prefix_of_prompt = !retained.is_empty()
+        && retained.len() < prompt_tokens.len()
+        && prompt_tokens.get(..retained.len()) == Some(retained);
+    let divergence_token = if retained_prefix_of_candidate {
+        None
+    } else {
+        Some(common_prefix_tokens)
+    };
+    let suffix_tokens = if retained_prefix_of_candidate {
+        candidate_tokens.len().saturating_sub(retained.len())
+    } else {
+        candidate_tokens.len()
+    };
+
+    SessionPromptTraceMetrics {
+        prompt_tokens: prompt_tokens.len(),
+        retained_tokens: retained.len(),
+        candidate_tokens: candidate_tokens.len(),
+        suffix_tokens,
+        common_prefix_tokens,
+        divergence_token,
+        boundary_splice: !retained_prefix_of_prompt && retained_prefix_of_candidate,
+        tool_result_messages: tool_payload.messages,
+        tool_result_bytes: tool_payload.bytes,
+        tool_result_largest_bytes: tool_payload.largest_bytes,
+        outcome,
+    }
+}
+
+fn common_prefix_bytes(left: &str, right: &str) -> usize {
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .take_while(|(l, r)| l == r)
+        .count()
+}
+
+fn preview_around(text: &str, byte_pos: usize) -> String {
+    let start = char_boundary_at_or_before(text, byte_pos.saturating_sub(80));
+    let end = char_boundary_at_or_after(text, byte_pos.saturating_add(80));
+    text.get(start..end).unwrap_or_default().to_owned()
+}
+
+fn char_boundary_at_or_before(text: &str, byte_pos: usize) -> usize {
+    let pos = byte_pos.min(text.len());
+    (0..=pos)
+        .rev()
+        .find(|idx| text.is_char_boundary(*idx))
+        .unwrap_or(0)
+}
+
+fn char_boundary_at_or_after(text: &str, byte_pos: usize) -> usize {
+    let pos = byte_pos.min(text.len());
+    (pos..=text.len())
+        .find(|idx| text.is_char_boundary(*idx))
+        .unwrap_or(text.len())
+}
+
+const IM_START: &str = "<|im_start|>";
+const IM_END: &str = "<|im_end|>";
+const THINK_START: &str = "<think>";
+const THINK_END: &str = "</think>";
+
+#[derive(Debug)]
+struct RenderedMessageSegment<'a> {
+    text_without_end: &'a str,
+    end_start: Option<usize>,
+    end_after: Option<usize>,
+}
+
+fn message_boundary_delta<'a>(retained_text: &str, full_text: &'a str) -> Option<&'a str> {
+    let retained_segments = rendered_message_segments(retained_text)?;
+    let full_segments = rendered_message_segments(full_text)?;
+    let covered = retained_segments.len();
+    if covered == 0 || full_segments.len() < covered {
+        return None;
+    }
+
+    for (retained, fresh) in retained_segments
+        .iter()
+        .zip(full_segments.iter())
+        .take(covered)
+    {
+        if !segments_compatible(retained, fresh) {
+            return None;
+        }
+    }
+
+    let covered_segment = &full_segments[covered - 1];
+    let end_start = covered_segment.end_start?;
+    let end_after = covered_segment.end_after?;
+
+    let trimmed = retained_text.trim_end_matches('\n');
+    if trimmed.ends_with(IM_END) {
+        full_text.get(end_after..)
+    } else {
+        full_text.get(end_start..)
+    }
+}
+
+fn rendered_message_segments(text: &str) -> Option<Vec<RenderedMessageSegment<'_>>> {
+    let mut segments = Vec::new();
+    let mut pos = 0usize;
+
+    while let Some(relative_start) = text.get(pos..)?.find(IM_START) {
+        let start = pos + relative_start;
+        if !text.get(pos..start)?.trim().is_empty() {
+            return None;
+        }
+
+        let body_start = start + IM_START.len();
+        let next_start = text
+            .get(body_start..)?
+            .find(IM_START)
+            .map(|relative| body_start + relative);
+        let frame_end = next_start.unwrap_or(text.len());
+        let frame = text.get(body_start..frame_end)?;
+        let candidate_end = frame.rfind(IM_END).map(|relative| body_start + relative);
+        let structural_end = candidate_end.filter(|candidate| {
+            let end_after = candidate + IM_END.len();
+            text.get(end_after..frame_end)
+                .is_some_and(|tail| tail.trim().is_empty())
+        });
+
+        let Some(end_start) = structural_end else {
+            // A later message start proves this frame was expected to close.
+            // Without one, this is the normal partially-generated final
+            // message and any literal end marker remains message content.
+            if next_start.is_some() {
+                return None;
+            }
+            let partial = text.get(start..)?;
+            segments.push(RenderedMessageSegment {
+                text_without_end: partial,
+                end_start: None,
+                end_after: None,
+            });
+            return Some(segments);
+        };
+
+        let end_after = end_start + IM_END.len();
+        let body = text.get(body_start..end_start)?;
+        if body.contains(IM_START) {
+            return None;
+        }
+
+        segments.push(RenderedMessageSegment {
+            text_without_end: text.get(start..end_start)?,
+            end_start: Some(end_start),
+            end_after: Some(end_after),
+        });
+        pos = end_after;
+    }
+
+    if !text.get(pos..)?.trim().is_empty() {
+        return None;
+    }
+    Some(segments)
+}
+
+fn segments_compatible(
+    retained: &RenderedMessageSegment<'_>,
+    fresh: &RenderedMessageSegment<'_>,
+) -> bool {
+    let Some(role) = segment_role(retained.text_without_end) else {
+        return false;
+    };
+    if segment_role(fresh.text_without_end) != Some(role) {
+        return false;
+    }
+    if role == "assistant" {
+        return true;
+    }
+    normalized_segment(retained.text_without_end) == normalized_segment(fresh.text_without_end)
+}
+
+fn segment_role(segment: &str) -> Option<&str> {
+    segment
+        .strip_prefix(IM_START)?
+        .split_once('\n')
+        .map(|(role, _)| role)
+}
+
+fn normalized_segment(segment: &str) -> String {
+    let without_think = strip_think_blocks(segment);
+    canonicalize_tool_calls(&without_think)
+        .trim_end_matches('\n')
+        .to_owned()
+}
+
+fn canonicalize_tool_calls(text: &str) -> String {
+    let parsed = crate::tool_parser::parse_tool_calls(text, None);
+    if parsed.tool_calls.is_empty() {
+        return text.to_owned();
+    }
+
+    let mut out = parsed.text.trim_end_matches('\n').to_owned();
+    for call in parsed.tool_calls {
+        out.push_str("\n<tool_call:");
+        out.push_str(&call.name);
+        out.push(':');
+        out.push_str(&canonical_json_value(&call.arguments));
+        out.push('>');
+    }
+    out
+}
+
+fn canonical_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(values) => {
+            let body = values
+                .iter()
+                .map(canonical_json_value)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{body}]")
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let body = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let key = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
+                    format!("{key}:{}", canonical_json_value(value))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        }
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
+    }
+}
+
+fn strip_think_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(start) = rest.find(THINK_START) {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + THINK_START.len()..];
+        let Some(end) = after_start.find(THINK_END) else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        rest = &after_start[end + THINK_END.len()..];
+        if let Some(after_blank) = rest.strip_prefix("\n\n") {
+            rest = after_blank;
+        }
+    }
+
+    out.push_str(rest);
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +996,15 @@ fn session_pair_error(error: PairedCacheError) -> EngineError {
 
 fn radix_pair_error(error: PairedCacheError) -> EngineError {
     EngineError::Generation(format!("radix live dSpark pair: {error}"))
+}
+
+fn send_session_stream_output(
+    sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+    output: StreamingOutput,
+) -> Result<(), EngineError> {
+    sender
+        .blocking_send(output)
+        .map_err(|_| EngineError::Cancelled)
 }
 
 /// Insert a retained KV cache for `session_id`, enforcing the resident-memory
@@ -269,6 +1088,10 @@ fn experimental_paged_kv_enabled() -> bool {
 
 fn prefix_cache_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_PREFIX_CACHE").ok().as_deref()).unwrap_or(true)
+}
+
+fn cache_policy_allows_prefix_cache(allow_prefix_cache: bool) -> bool {
+    allow_prefix_cache && prefix_cache_enabled()
 }
 
 fn prompt_lookup_enabled() -> bool {
@@ -714,8 +1537,66 @@ struct CacheMetrics {
     paired_radix_lookups: AtomicU64,
     paired_radix_hits: AtomicU64,
     prefill_saved_tokens: AtomicU64,
+    pflash_attempts: AtomicU64,
+    pflash_used: AtomicU64,
+    pflash_fallbacks: AtomicU64,
+    pflash_skipped_unprofitable: AtomicU64,
+    pflash_plan_cache_hits: AtomicU64,
+    pflash_last_source_tokens: AtomicU64,
+    pflash_last_kept_tokens: AtomicU64,
+    pflash_last_cache_prefix_tokens: AtomicU64,
+    pflash_last_suffix_tokens: AtomicU64,
+    pflash_last_request_tail_tokens: AtomicU64,
+    pflash_last_score_ms: AtomicU64,
+    pflash_last_select_ms: AtomicU64,
+    pflash_last_total_ms: AtomicU64,
+    pflash_last_effective_keep_ratio_ppm: AtomicU64,
     continuations: AtomicU64,
+    session_prompt_traces: AtomicU64,
+    session_prompt_prefix_misses: AtomicU64,
+    session_prompt_boundary_splices: AtomicU64,
+    session_bootstrap_exact: AtomicU64,
+    session_bootstrap_pflash: AtomicU64,
+    session_last_prompt_tokens: AtomicU64,
+    session_last_retained_tokens: AtomicU64,
+    session_last_candidate_tokens: AtomicU64,
+    session_last_suffix_tokens: AtomicU64,
+    session_last_common_prefix_tokens: AtomicU64,
+    session_last_divergence_token_plus_one: AtomicU64,
+    session_last_tool_result_messages: AtomicU64,
+    session_last_tool_result_bytes: AtomicU64,
+    session_last_tool_result_largest_bytes: AtomicU64,
     sessions_evicted: AtomicU64,
+}
+
+/// Route-level outcome for a session generation and prompt/cache trace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionOutcome {
+    #[default]
+    Continued,
+    ExactBootstrap,
+    PFlashBootstrap,
+}
+
+pub type SessionPromptTraceOutcome = SessionOutcome;
+
+/// Content-safe session prompt/cache trace surfaced through [`CacheStats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionPromptTraceMetrics {
+    pub prompt_tokens: usize,
+    pub retained_tokens: usize,
+    pub candidate_tokens: usize,
+    pub suffix_tokens: usize,
+    pub common_prefix_tokens: usize,
+    /// `None` means the retained token list is a strict prefix of the candidate.
+    pub divergence_token: Option<usize>,
+    /// True when the canonical chat render was not an exact token extension,
+    /// but route-level message-boundary splicing rebuilt `retained ++ delta`.
+    pub boundary_splice: bool,
+    pub tool_result_messages: usize,
+    pub tool_result_bytes: usize,
+    pub tool_result_largest_bytes: usize,
+    pub outcome: SessionPromptTraceOutcome,
 }
 
 /// Snapshot of cache effectiveness for the `/metrics` endpoint.
@@ -731,8 +1612,64 @@ pub struct CacheStats {
     pub paired_radix_hits: u64,
     /// Prompt tokens NOT re-prefilled thanks to reuse (radix + continuation).
     pub prefill_saved_tokens: u64,
+    /// PFlash scoring/planning attempts after config/request eligibility checks.
+    pub pflash_attempts: u64,
+    /// PFlash plans accepted for target execution.
+    pub pflash_used: u64,
+    /// PFlash attempts that fell back or errored before target execution.
+    pub pflash_fallbacks: u64,
+    /// Auto PFlash plans skipped because survivor prefill would cost more than exact cache reuse.
+    pub pflash_skipped_unprofitable: u64,
+    /// In-memory PFlash stable-body plan-cache hits.
+    pub pflash_plan_cache_hits: u64,
+    /// Source prompt tokens for the most recent accepted PFlash plan.
+    pub pflash_last_source_tokens: u64,
+    /// Survivor tokens for the most recent accepted PFlash plan.
+    pub pflash_last_kept_tokens: u64,
+    /// Stable-body prefix tokens reused from the PFlash plan cache.
+    pub pflash_last_cache_prefix_tokens: u64,
+    /// Stable-body suffix tokens scored or identity-appended this turn.
+    pub pflash_last_suffix_tokens: u64,
+    /// Request-specific generation-suffix tokens identity-appended after body planning.
+    pub pflash_last_request_tail_tokens: u64,
+    /// Scorer wall time for the most recent accepted PFlash plan.
+    pub pflash_last_score_ms: u64,
+    /// Survivor-selection wall time for the most recent accepted PFlash plan.
+    pub pflash_last_select_ms: u64,
+    /// End-to-end PFlash planning wall time for the most recent accepted plan.
+    pub pflash_last_total_ms: u64,
+    /// Effective adaptive keep ratio for the most recent accepted plan, parts per million.
+    pub pflash_last_effective_keep_ratio_ppm: u64,
     /// Per-session continuations (a retained cache was reused).
     pub continuations: u64,
+    /// Session prompt/cache observations recorded by the route.
+    pub session_prompt_traces: u64,
+    /// Observed retained-token prefix mismatches after route reconciliation.
+    pub session_prompt_prefix_misses: u64,
+    /// Canonical render mismatches repaired by message-boundary splicing.
+    pub session_prompt_boundary_splices: u64,
+    /// Diverged/cold sessions routed through exact retained prefill.
+    pub session_bootstrap_exact: u64,
+    /// Cold oversized sessions routed through degraded stateless PFlash prefill.
+    pub session_bootstrap_pflash: u64,
+    /// Prompt tokens for the most recent session prompt/cache trace.
+    pub session_last_prompt_tokens: u64,
+    /// Retained tokens for the most recent session prompt/cache trace.
+    pub session_last_retained_tokens: u64,
+    /// Candidate tokens passed to the exact retained-cache guard most recently.
+    pub session_last_candidate_tokens: u64,
+    /// Candidate suffix tokens beyond the retained prefix for the most recent trace.
+    pub session_last_suffix_tokens: u64,
+    /// Common retained/candidate token prefix length for the most recent trace.
+    pub session_last_common_prefix_tokens: u64,
+    /// First divergence token plus one for the most recent trace; 0 means none.
+    pub session_last_divergence_token_plus_one: u64,
+    /// Tool-result messages present in the most recent session request.
+    pub session_last_tool_result_messages: u64,
+    /// Tool-result payload bytes present in the most recent session request.
+    pub session_last_tool_result_bytes: u64,
+    /// Largest single tool-result payload in the most recent session request.
+    pub session_last_tool_result_largest_bytes: u64,
     /// Retained sessions evicted (count cap + idle TTL).
     pub sessions_evicted: u64,
     /// Currently retained per-session caches.
@@ -745,6 +1682,11 @@ pub struct CacheStats {
     pub retained_paired_dflash_bytes: usize,
     /// Currently stored radix prefixes.
     pub radix_entries: usize,
+    /// Bytes actually held by the radix trie, counting each shared block once.
+    pub radix_resident_bytes: usize,
+    /// Bytes the same entries would hold with no block sharing (each entry's
+    /// whole prefix stored on its own). `logical - resident` is the paging win.
+    pub radix_logical_bytes: usize,
     /// Currently stored paired radix endpoints.
     pub paired_radix_entries: usize,
     /// Conservative target bytes retained by paired radix endpoints.
@@ -763,7 +1705,9 @@ pub struct CacheStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DFlashVerifyMode {
     /// Fold the target's ordinary one-token transition until first rejection.
-    /// This is the fail-closed dSpark default and never needs rollback.
+    /// This is the fail-closed fallback for dSpark models outside the validated
+    /// block-verifier domain or when explicitly requested via
+    /// `HIGGS_DFLASH_VERIFY_MODE=canonical`.
     CanonicalS1,
     /// Experimental S>1 target forward plus GDN innovation-tape commit.
     BatchedTape,
@@ -1469,6 +2413,8 @@ pub struct SimpleEngine {
     tokenizer: Tokenizer,
     template: Option<ChatTemplateRenderer>,
     model_name: String,
+    is_vlm: bool,
+    vlm_image_size: Option<i32>,
     eos_token_ids: Vec<u32>,
     /// Control tokens stripped from decoded output (EOS + `<|…|>` chat
     /// delimiters + classic sentinels), while content-bearing special tokens
@@ -1490,6 +2436,22 @@ pub struct SimpleEngine {
     /// Optional `DFlash` block-diffusion speculative decoding state, enabled
     /// when `HIGGS_DFLASH_PATH` points at a drafter checkpoint.
     dflash: Option<DFlashState>,
+    prefill_drafter: Option<std::sync::Arc<std::sync::Mutex<AnyModel>>>,
+    prefill_compression: PrefillCompressionMode,
+    prefill_keep_ratio: f32,
+    prefill_threshold: usize,
+    prefill_chunk: usize,
+    prefill_avgpool: usize,
+    prefill_lookahead: usize,
+    prefill_score_mode: PrefillScoreMode,
+    prefill_exit_layer: usize,
+    prefill_keep_ratio_max: f32,
+    prefill_max_auto_prefill_ratio: f32,
+    prefill_plan_cache: bool,
+    prefill_plan_cache_entries: usize,
+    prefill_suffix_identity_threshold: usize,
+    session_max_suffix_prefill_tokens: usize,
+    pflash_plan_cache: Mutex<PFlashPlanCache>,
     last_dflash_accepts: std::sync::Mutex<Vec<u32>>,
     /// Proposed draft tokens that matched the target before output truncation,
     /// recorded once per DFlash round for exact acceptance telemetry.
@@ -1545,6 +2507,18 @@ struct PreparedGeneration<'a> {
     prompt_array: Array,
     prompt_len: u32,
     pixel_values: Option<Array>,
+    /// Prompt tokens genuinely served from reused KV state this turn: the radix
+    /// prefix-cache hit length, or the retained-session prefix on the
+    /// continuation path.
+    ///
+    /// This is NOT `prompt_len - actual_prompt_tokens.len()`. PFlash compressive
+    /// prefill also shrinks `actual_prompt_tokens`, by *discarding* low-salience
+    /// tokens that are never prefilled and never reused, so that difference
+    /// over-reports reuse whenever PFlash is active (measured: a 1798-token
+    /// prompt with 422 survivors reported 1376 "cached" tokens against 0 actual
+    /// cache reuse). `usage.prompt_tokens_details.cached_tokens` is documented as
+    /// reused KV, so it must come from the cache hit itself.
+    reused_prefix_tokens: u32,
     /// Snapshot of the cache at the conversation boundary (full prompt minus
     /// the generation-prompt suffix), captured for HYBRID caches only. Hybrid
     /// (GDN/SSM) state can't be trimmed after the fact, so the only way to store
@@ -1622,11 +2596,21 @@ pub struct SessionGeneration {
     /// turn this is just the new suffix (tool result + generation prompt), not
     /// `prompt_tokens`.
     pub prefilled_tokens: u32,
+    /// Explicit admission/execution outcome for this session turn.
+    pub outcome: SessionOutcome,
     /// Whether a retained cache was reused (true) or a clean prefill ran (false).
     /// A `true` is a best-effort latency win, NOT an exact-replay guarantee: the
     /// reused KV is TurboQuant-compressed, so the turn's output may differ
     /// slightly from a stateless full prefill (see `generate_continued`).
     pub continued: bool,
+}
+
+/// Content-free prompt payload counters carried into session trace metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionPromptTracePayloadStats {
+    pub messages: usize,
+    pub bytes: usize,
+    pub largest_bytes: usize,
 }
 
 impl SimpleEngine {
@@ -1637,6 +2621,36 @@ impl SimpleEngine {
             .is_some_and(|dflash| dflash.is_dspark && params.temperature != 0.0)
     }
 
+    /// Whether the loaded target model exposes the sparse-prefill-with-taps
+    /// `boundary`. PFlash non-contiguous plans can feed dSpark only when this
+    /// is true, since dSpark's drafter context is primed from tap rows captured
+    /// at survivor-row resolution during the sparse target prefill.
+    fn model_supports_pflash_sparse_prefill(&self) -> bool {
+        // `supports_pflash_sparse_prefill` is a cheap discriminant match on
+        // AnyModel; lock briefly to read it without holding the guard across
+        // any MLX work.
+        let model = lock_or_recover(&self.model);
+        model.supports_pflash_sparse_prefill()
+    }
+
+    /// Cheap route-level predicate for whether a stateless request may enter
+    /// the PFlash compression path. The engine still owns the full policy:
+    /// compatibility checks, memory guard, hard-keep spans, adaptive scoring,
+    /// high-retention skip in `auto`, sparse prefill, and dSpark dispatch all
+    /// remain inside `pflash_compress_if_eligible`.
+    #[must_use]
+    pub fn pflash_can_run_stateless_for_prompt(&self, prompt_tokens: &[u32]) -> bool {
+        if self.prefill_drafter.is_none() {
+            return false;
+        }
+
+        match self.prefill_compression {
+            PrefillCompressionMode::Off => false,
+            PrefillCompressionMode::Auto => prompt_tokens.len() >= self.prefill_threshold,
+            PrefillCompressionMode::Always => true,
+        }
+    }
+
     /// Load a model and tokenizer from a directory.
     pub fn load<P: AsRef<Path>>(
         dir: P,
@@ -1644,7 +2658,29 @@ impl SimpleEngine {
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
     ) -> Result<Self, EngineError> {
-        Self::load_with_dflash(dir, kv_cache_config, tuning, raise_wired_limit, None, None)
+        Self::load_with_dflash(
+            dir,
+            kv_cache_config,
+            tuning,
+            raise_wired_limit,
+            None,
+            None,
+            None,
+            PrefillCompressionMode::Off,
+            0.10,
+            4096,
+            32,
+            13,
+            8,
+            PrefillScoreMode::Full,
+            7,
+            DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+            DEFAULT_PFLASH_PLAN_CACHE,
+            DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+            DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+            8192,
+        )
     }
 
     /// Load a model and tokenizer from a directory with an optional disk prefix
@@ -1663,6 +2699,21 @@ impl SimpleEngine {
             raise_wired_limit,
             None,
             disk_cache_config,
+            None,
+            PrefillCompressionMode::Off,
+            0.10,
+            4096,
+            32,
+            13,
+            8,
+            PrefillScoreMode::Full,
+            7,
+            DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+            DEFAULT_PFLASH_PLAN_CACHE,
+            DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+            DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+            8192,
         )
     }
 
@@ -1682,9 +2733,28 @@ impl SimpleEngine {
         raise_wired_limit: bool,
         dflash_path: Option<&Path>,
         disk_cache_config: Option<DiskPrefixCacheConfig>,
+        prefill_drafter_path: Option<&Path>,
+        prefill_compression: PrefillCompressionMode,
+        prefill_keep_ratio: f32,
+        prefill_threshold: usize,
+        prefill_chunk: usize,
+        prefill_avgpool: usize,
+        prefill_lookahead: usize,
+        prefill_score_mode: PrefillScoreMode,
+        prefill_exit_layer: usize,
+        prefill_keep_ratio_max: f32,
+        prefill_max_auto_prefill_ratio: f32,
+        prefill_plan_cache: bool,
+        prefill_plan_cache_entries: usize,
+        prefill_suffix_identity_threshold: usize,
+        session_max_suffix_prefill_tokens: usize,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
+        let prefill_keep_ratio_max = prefill_keep_ratio_max.clamp(prefill_keep_ratio, 0.95);
+        let prefill_max_auto_prefill_ratio = prefill_max_auto_prefill_ratio.clamp(0.0, 1.0);
+        let prefill_plan_cache_entries = prefill_plan_cache_entries.max(1);
+        let session_max_suffix_prefill_tokens = session_max_suffix_prefill_tokens.max(1);
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model");
 
@@ -1878,7 +2948,19 @@ impl SimpleEngine {
                 let dspark_target_head = drafter.config.is_dspark()
                     && (drafter.config.reuse_target_head()
                         || std::env::var("HIGGS_DSPARK_TARGET_HEAD").is_ok_and(|v| v != "0"));
+                let target_is_bonsai_lowbit = model.is_target_1bit() || model.is_target_2bit();
                 let verify_mode_raw = std::env::var("HIGGS_DFLASH_VERIFY_MODE").ok();
+                // Bonsai low-bit targets have validated block-verifier defaults:
+                // Q1 through the AC-gated row4 release benchmark and Q2 through
+                // the exact ternary row2/head path. Non-Bonsai dSpark sidecars
+                // still fail closed to CanonicalS1 unless explicitly opted in.
+                let verify_mode_raw = verify_mode_raw.or_else(|| {
+                    if drafter.config.is_dspark() && target_is_bonsai_lowbit {
+                        Some("block".to_owned())
+                    } else {
+                        None
+                    }
+                });
                 let requested_verify_mode = DFlashVerifyMode::for_drafter(
                     drafter.config.is_dspark(),
                     verify_mode_raw.as_deref(),
@@ -1932,29 +3014,81 @@ impl SimpleEngine {
             })
             .transpose()?;
 
-        let mut prefix_cache = disk_cache_config.map_or_else(
-            || DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE),
-            |config| match DiskPrefixCache::new(
-                DEFAULT_PREFIX_CACHE_SIZE,
-                DEFAULT_BLOCK_SIZE,
-                config,
-                num_kv_heads,
-                head_dim,
-            ) {
-                Ok(cache) => cache,
+        let mut prefill_mode = prefill_compression;
+        let prefill_drafter = if prefill_mode == PrefillCompressionMode::Off {
+            None
+        } else if let Some(path) = prefill_drafter_path {
+            match model_loader::load_model(path) {
+                Ok(drafter) => {
+                    if let AnyModel::Transformer(ref transformer) = drafter {
+                        tracing::info!(
+                            drafter = %path.display(),
+                            scorer_model_type = transformer.model_type(),
+                            mode = ?prefill_mode,
+                            score_mode = ?prefill_score_mode,
+                            keep_ratio = prefill_keep_ratio,
+                            "PFlash prefill drafter loaded — compressive-prefill scorer armed"
+                        );
+                        Some(std::sync::Arc::new(Mutex::new(drafter)))
+                    } else {
+                        tracing::warn!(
+                            drafter = %path.display(),
+                            loaded_model = any_model_variant_name(&drafter),
+                            "PFlash prefill_drafter must be a dense Transformer scorer; disabling prefill compression"
+                        );
+                        prefill_mode = PrefillCompressionMode::Off;
+                        None
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
+                        drafter = %path.display(),
                         error = %error,
-                        "Failed to initialize disk prefix cache; falling back to memory-only cache"
+                        "Failed to load prefill drafter; falling back to uncompressed prefill"
                     );
-                    DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE)
+                    prefill_mode = PrefillCompressionMode::Off;
+                    None
                 }
-            },
-        );
+            }
+        } else {
+            if prefill_mode != PrefillCompressionMode::Off {
+                tracing::warn!(
+                    mode = ?prefill_mode,
+                    "Prefill compression requested but prefill_drafter is not set; disabling prefill compression"
+                );
+            }
+            prefill_mode = PrefillCompressionMode::Off;
+            None
+        };
+
+        let mut prefix_cache = disk_cache_config
+            .map_or_else(
+                || DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE),
+                |config| match DiskPrefixCache::new(
+                    DEFAULT_PREFIX_CACHE_SIZE,
+                    DEFAULT_BLOCK_SIZE,
+                    config,
+                    num_kv_heads,
+                    head_dim,
+                ) {
+                    Ok(cache) => cache,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Failed to initialize disk prefix cache; falling back to memory-only cache"
+                        );
+                        DiskPrefixCache::memory_only(DEFAULT_PREFIX_CACHE_SIZE, DEFAULT_BLOCK_SIZE)
+                    }
+                },
+            )
+            .with_max_bytes(kv_cache_config.kv_cache_bytes);
         prefix_cache.set_paired_idle_ttl(
             (kv_cache_config.retained_idle_secs > 0)
                 .then(|| std::time::Duration::from_secs(kv_cache_config.retained_idle_secs)),
         );
+
+        let is_vlm = model.is_vlm();
+        let vlm_image_size = model.image_size();
 
         Ok(Self {
             model: Mutex::new(model),
@@ -1968,6 +3102,8 @@ impl SimpleEngine {
             tokenizer,
             template,
             model_name,
+            is_vlm,
+            vlm_image_size,
             eos_token_ids,
             decode_skip_ids,
             enable_thinking,
@@ -1976,6 +3112,22 @@ impl SimpleEngine {
             kv_cache_config,
             tuning,
             dflash,
+            prefill_drafter,
+            prefill_compression: prefill_mode,
+            prefill_keep_ratio,
+            prefill_threshold,
+            prefill_chunk,
+            prefill_avgpool,
+            prefill_lookahead,
+            prefill_score_mode,
+            prefill_exit_layer,
+            prefill_keep_ratio_max,
+            prefill_max_auto_prefill_ratio,
+            prefill_plan_cache,
+            prefill_plan_cache_entries,
+            prefill_suffix_identity_threshold,
+            session_max_suffix_prefill_tokens,
+            pflash_plan_cache: Mutex::new(PFlashPlanCache::default()),
             last_dflash_accepts: Mutex::new(Vec::new()),
             last_dflash_draft_matches: Mutex::new(Vec::new()),
             last_dflash_draft_counts: Mutex::new(Vec::new()),
@@ -2001,10 +3153,14 @@ impl SimpleEngine {
             let retained = lock_or_recover(&self.retained);
             (retained.len(), retained_paired_stats(&retained))
         };
-        let (radix_entries, paired_radix) = {
+        let (radix_entries, paired_radix, radix_bytes) = {
             let mut prefix_cache = lock_or_recover(&self.prefix_cache);
             prefix_cache.evict_idle_paired();
-            (prefix_cache.len(), prefix_cache.paired_stats())
+            (
+                prefix_cache.len(),
+                prefix_cache.paired_stats(),
+                prefix_cache.radix_byte_stats(),
+            )
         };
         CacheStats {
             radix_lookups: self.cache_metrics.radix_lookups.load(Ordering::Relaxed),
@@ -2018,17 +3174,197 @@ impl SimpleEngine {
                 .cache_metrics
                 .prefill_saved_tokens
                 .load(Ordering::Relaxed),
+            pflash_attempts: self.cache_metrics.pflash_attempts.load(Ordering::Relaxed),
+            pflash_used: self.cache_metrics.pflash_used.load(Ordering::Relaxed),
+            pflash_fallbacks: self.cache_metrics.pflash_fallbacks.load(Ordering::Relaxed),
+            pflash_skipped_unprofitable: self
+                .cache_metrics
+                .pflash_skipped_unprofitable
+                .load(Ordering::Relaxed),
+            pflash_plan_cache_hits: self
+                .cache_metrics
+                .pflash_plan_cache_hits
+                .load(Ordering::Relaxed),
+            pflash_last_source_tokens: self
+                .cache_metrics
+                .pflash_last_source_tokens
+                .load(Ordering::Relaxed),
+            pflash_last_kept_tokens: self
+                .cache_metrics
+                .pflash_last_kept_tokens
+                .load(Ordering::Relaxed),
+            pflash_last_cache_prefix_tokens: self
+                .cache_metrics
+                .pflash_last_cache_prefix_tokens
+                .load(Ordering::Relaxed),
+            pflash_last_suffix_tokens: self
+                .cache_metrics
+                .pflash_last_suffix_tokens
+                .load(Ordering::Relaxed),
+            pflash_last_request_tail_tokens: self
+                .cache_metrics
+                .pflash_last_request_tail_tokens
+                .load(Ordering::Relaxed),
+            pflash_last_score_ms: self
+                .cache_metrics
+                .pflash_last_score_ms
+                .load(Ordering::Relaxed),
+            pflash_last_select_ms: self
+                .cache_metrics
+                .pflash_last_select_ms
+                .load(Ordering::Relaxed),
+            pflash_last_total_ms: self
+                .cache_metrics
+                .pflash_last_total_ms
+                .load(Ordering::Relaxed),
+            pflash_last_effective_keep_ratio_ppm: self
+                .cache_metrics
+                .pflash_last_effective_keep_ratio_ppm
+                .load(Ordering::Relaxed),
             continuations: self.cache_metrics.continuations.load(Ordering::Relaxed),
+            session_prompt_traces: self
+                .cache_metrics
+                .session_prompt_traces
+                .load(Ordering::Relaxed),
+            session_prompt_prefix_misses: self
+                .cache_metrics
+                .session_prompt_prefix_misses
+                .load(Ordering::Relaxed),
+            session_prompt_boundary_splices: self
+                .cache_metrics
+                .session_prompt_boundary_splices
+                .load(Ordering::Relaxed),
+            session_bootstrap_exact: self
+                .cache_metrics
+                .session_bootstrap_exact
+                .load(Ordering::Relaxed),
+            session_bootstrap_pflash: self
+                .cache_metrics
+                .session_bootstrap_pflash
+                .load(Ordering::Relaxed),
+            session_last_prompt_tokens: self
+                .cache_metrics
+                .session_last_prompt_tokens
+                .load(Ordering::Relaxed),
+            session_last_retained_tokens: self
+                .cache_metrics
+                .session_last_retained_tokens
+                .load(Ordering::Relaxed),
+            session_last_candidate_tokens: self
+                .cache_metrics
+                .session_last_candidate_tokens
+                .load(Ordering::Relaxed),
+            session_last_suffix_tokens: self
+                .cache_metrics
+                .session_last_suffix_tokens
+                .load(Ordering::Relaxed),
+            session_last_common_prefix_tokens: self
+                .cache_metrics
+                .session_last_common_prefix_tokens
+                .load(Ordering::Relaxed),
+            session_last_divergence_token_plus_one: self
+                .cache_metrics
+                .session_last_divergence_token_plus_one
+                .load(Ordering::Relaxed),
+            session_last_tool_result_messages: self
+                .cache_metrics
+                .session_last_tool_result_messages
+                .load(Ordering::Relaxed),
+            session_last_tool_result_bytes: self
+                .cache_metrics
+                .session_last_tool_result_bytes
+                .load(Ordering::Relaxed),
+            session_last_tool_result_largest_bytes: self
+                .cache_metrics
+                .session_last_tool_result_largest_bytes
+                .load(Ordering::Relaxed),
             sessions_evicted: self.cache_metrics.sessions_evicted.load(Ordering::Relaxed),
             retained_sessions,
             retained_paired_sessions: retained_paired.entries,
             retained_paired_target_bytes: retained_paired.target_bytes,
             retained_paired_dflash_bytes: retained_paired.dflash_bytes,
             radix_entries,
+            radix_resident_bytes: radix_bytes.resident_bytes,
+            radix_logical_bytes: radix_bytes.logical_bytes,
             paired_radix_entries: paired_radix.entries,
             paired_radix_target_bytes: paired_radix.target_bytes,
             paired_radix_dflash_bytes: paired_radix.dflash_bytes,
         }
+    }
+
+    /// Record session prompt/cache reconciliation diagnostics.
+    fn record_session_prompt_trace(&self, trace: SessionPromptTraceMetrics) {
+        self.cache_metrics
+            .session_prompt_traces
+            .fetch_add(1, Ordering::Relaxed);
+        if trace.divergence_token.is_some() {
+            self.cache_metrics
+                .session_prompt_prefix_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if trace.boundary_splice {
+            self.cache_metrics
+                .session_prompt_boundary_splices
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        match trace.outcome {
+            SessionPromptTraceOutcome::Continued => {}
+            SessionPromptTraceOutcome::ExactBootstrap => {
+                self.cache_metrics
+                    .session_bootstrap_exact
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SessionPromptTraceOutcome::PFlashBootstrap => {
+                self.cache_metrics
+                    .session_bootstrap_pflash
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        self.cache_metrics.session_last_prompt_tokens.store(
+            u64::try_from(trace.prompt_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.session_last_retained_tokens.store(
+            u64::try_from(trace.retained_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.session_last_candidate_tokens.store(
+            u64::try_from(trace.candidate_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.session_last_suffix_tokens.store(
+            u64::try_from(trace.suffix_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.session_last_common_prefix_tokens.store(
+            u64::try_from(trace.common_prefix_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics
+            .session_last_divergence_token_plus_one
+            .store(
+                trace
+                    .divergence_token
+                    .and_then(|idx| idx.checked_add(1))
+                    .and_then(|idx| u64::try_from(idx).ok())
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+        self.cache_metrics.session_last_tool_result_messages.store(
+            u64::try_from(trace.tool_result_messages).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.session_last_tool_result_bytes.store(
+            u64::try_from(trace.tool_result_bytes).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics
+            .session_last_tool_result_largest_bytes
+            .store(
+                u64::try_from(trace.tool_result_largest_bytes).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
     }
 
     /// Number of stored prefixes in the radix prefix cache. Observability hook
@@ -2057,9 +3393,27 @@ impl SimpleEngine {
             .map(|kept| kept.state.tokens().to_vec())
     }
 
+    pub const fn session_max_suffix_prefill_tokens(&self) -> usize {
+        self.session_max_suffix_prefill_tokens
+    }
+
+    fn session_lock_for(&self, session_id: u64) -> std::sync::Arc<Mutex<()>> {
+        std::sync::Arc::clone(
+            lock_or_recover(&self.session_locks)
+                .entry(session_id)
+                .or_default(),
+        )
+    }
+
     /// Drop a conversation's retained KV cache, freeing its KV memory.
-    pub fn drop_retained_session(&self, session_id: u64) {
-        lock_or_recover(&self.retained).remove(&session_id);
+    pub fn drop_retained_session(&self, session_id: u64) -> bool {
+        let session_lock = self.session_lock_for(session_id);
+        let _session_guard = session_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lock_or_recover(&self.retained)
+            .remove(&session_id)
+            .is_some()
     }
 
     /// Evict retained caches idle longer than `ttl`; returns how many were
@@ -2080,27 +3434,111 @@ impl SimpleEngine {
         dropped
     }
 
-    /// Look up the retained cache for `session_id` whose tokens are a prefix of
-    /// `full_tokens`, returning the cache and the suffix that still needs
-    /// prefilling. Returns `None` (and drops any stale entry) when there is no
-    /// retained cache or the conversation diverged from it — the caller then
-    /// falls back to a clean full prefill. This is the cache-poisoning guard.
-    fn take_continuable(
+    /// Evict retained sessions using the configured idle TTL.
+    pub fn evict_configured_idle_retained(&self) -> usize {
+        let idle_secs = self.kv_cache_config.retained_idle_secs;
+        if idle_secs == 0 {
+            return 0;
+        }
+        self.evict_idle_retained(std::time::Duration::from_secs(idle_secs))
+    }
+
+    /// Non-destructive target-cache continuation lookup. The retained entry
+    /// remains in the map until this request publishes a successor, so
+    /// cancellation or stream disconnect falls back to the previous valid
+    /// retained boundary instead of leaving the session empty.
+    fn fork_target_continuable(
         &self,
         session_id: u64,
         full_tokens: &[u32],
-    ) -> Option<(RetainedState, usize)> {
+        mlx_gate: &higgs_models::mlx_exec::MlxExecToken,
+    ) -> Result<Option<(AnyCache, usize)>, EngineError> {
         let mut map = lock_or_recover(&self.retained);
         let prior = match map.get(&session_id) {
-            Some(entry) => continuation_prior_len(entry.state.tokens(), full_tokens),
-            None => return None,
+            Some(entry) => {
+                let retained_tokens = entry.state.tokens();
+                let prior = continuation_prior_len(retained_tokens, full_tokens);
+                if prior.is_none() {
+                    tracing::info!(
+                        session_id,
+                        retained_tokens = retained_tokens.len(),
+                        prompt_tokens = full_tokens.len(),
+                        common_prefix_tokens =
+                            common_prefix_token_len(retained_tokens, full_tokens),
+                        reason = continuation_reject_reason(retained_tokens, full_tokens),
+                        "retained session exact-token guard rejected prompt"
+                    );
+                }
+                prior
+            }
+            None => return Ok(None),
         };
-        if let Some(p) = prior {
-            map.remove(&session_id).map(|kept| (kept.state, p))
-        } else {
+        let Some(p) = prior else {
             map.remove(&session_id); // drop the diverged/stale entry
-            None
-        }
+            return Ok(None);
+        };
+        let Some(entry) = map.get_mut(&session_id) else {
+            return Ok(None);
+        };
+        let cache = entry
+            .state
+            .fork_target_cache_for_session(mlx_gate)
+            .map_err(session_pair_error)?;
+        entry.last_used = std::time::Instant::now();
+        Ok(Some((cache, p)))
+    }
+
+    /// Non-destructive paired-cache continuation lookup for exact dSpark
+    /// sessions. Target-only retained state is left intact and the caller cold
+    /// prefills; successful generation will publish a paired successor.
+    fn fork_paired_continuable(
+        &self,
+        session_id: u64,
+        full_tokens: &[u32],
+        expected_taps: usize,
+        mlx_gate: &higgs_models::mlx_exec::MlxExecToken,
+    ) -> Result<Option<(LivePair, usize)>, EngineError> {
+        let mut map = lock_or_recover(&self.retained);
+        let prior = match map.get(&session_id) {
+            Some(entry) => {
+                let retained_tokens = entry.state.tokens();
+                let prior = continuation_prior_len(retained_tokens, full_tokens);
+                if prior.is_none() {
+                    tracing::info!(
+                        session_id,
+                        retained_tokens = retained_tokens.len(),
+                        prompt_tokens = full_tokens.len(),
+                        common_prefix_tokens =
+                            common_prefix_token_len(retained_tokens, full_tokens),
+                        reason = continuation_reject_reason(retained_tokens, full_tokens),
+                        "retained session exact-token guard rejected prompt"
+                    );
+                }
+                prior
+            }
+            None => return Ok(None),
+        };
+        let Some(p) = prior else {
+            map.remove(&session_id); // drop the diverged/stale entry
+            return Ok(None);
+        };
+        let Some(prefix) = full_tokens.get(..p) else {
+            return Err(EngineError::Generation(
+                "retained paired session boundary exceeds prompt".to_owned(),
+            ));
+        };
+        let Some(entry) = map.get_mut(&session_id) else {
+            return Ok(None);
+        };
+        let forked = entry
+            .state
+            .fork_paired_live_for_session(prefix, expected_taps, mlx_gate)
+            .map_err(session_pair_error)?;
+        entry.last_used = std::time::Instant::now();
+        let Some(pair) = forked else {
+            return Ok(None);
+        };
+        Ok(Some((pair, p)))
     }
 
     /// Stash a live cache and the exact tokens it now represents for `session_id`,
@@ -2152,6 +3590,25 @@ impl SimpleEngine {
                 .sessions_evicted
                 .fetch_add(u64::try_from(evicted).unwrap_or(0), Ordering::Relaxed);
         }
+    }
+
+    /// Best-effort pre-decode checkpoint publication. Unlike final session
+    /// publication, an oversized checkpoint must not delete an older usable
+    /// boundary: cancellation should fall back to whatever was retained before
+    /// this attempt rather than converting a cap miss into retained=0.
+    fn stash_retained_checkpoint(&self, session_id: u64, state: RetainedState) {
+        let effective_cap = retention_token_cap(self.kv_cache_config, false, &state);
+        let token_len = state.tokens().len();
+        if effective_cap > 0 && token_len > effective_cap {
+            tracing::warn!(
+                session_id,
+                tokens = token_len,
+                cap = effective_cap,
+                "Skipped oversized session prompt checkpoint; preserving prior retained boundary"
+            );
+            return;
+        }
+        self.stash_retained(session_id, state, false);
     }
 
     /// Get a reference to the tokenizer.
@@ -2254,6 +3711,78 @@ impl SimpleEngine {
         renderer.apply_with_thinking(messages, tools, true, enable_thinking)
     }
 
+    /// Apply chat template, tokenize it, and compute request-local PFlash spans.
+    ///
+    /// The spans are conservative: tool-template insertions and the active
+    /// action tail are kept exact, while older conversation body can still be
+    /// compressed and plan-cached.
+    pub fn prepare_chat_prompt_with_pflash_policy(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+    ) -> Result<(Vec<u32>, PFlashPromptPolicy), EngineError> {
+        let renderer = self.template.as_ref().ok_or_else(|| {
+            EngineError::Template(
+                "This model has no chat template; use /v1/completions instead".to_owned(),
+            )
+        })?;
+        let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
+        let encoding = self
+            .tokenizer
+            .encode(prompt.as_str(), false)
+            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
+        let prompt_tokens = encoding.get_ids().to_vec();
+        let mut hard_keep_ranges = Vec::new();
+        let without_generation_prompt =
+            renderer.apply_with_thinking(messages, tools, false, enable_thinking)?;
+        let body_token_count = token_len_for_text(&self.tokenizer, &without_generation_prompt)?;
+
+        if tools.is_some() {
+            let without_tools =
+                renderer.apply_with_thinking(messages, None, true, enable_thinking)?;
+            if let Some(byte_span) = inserted_byte_span(&prompt, &without_tools)
+                && let Some(token_span) =
+                    token_range_for_byte_span(&self.tokenizer, &prompt, byte_span)?
+            {
+                push_merged_token_range(&mut hard_keep_ranges, prompt_tokens.len(), token_span);
+            }
+        }
+
+        if let Some(tail_start_message) =
+            messages.iter().rposition(|message| message.role == "user")
+        {
+            let start = match pflash_current_user_start_token(
+                renderer,
+                &self.tokenizer,
+                messages,
+                tail_start_message,
+                tools,
+                enable_thinking,
+            ) {
+                Ok(start) => start,
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "PFlash hard-keep prefix boundary probe failed; keeping current-tail range from prompt start"
+                    );
+                    0
+                }
+            };
+            let end = body_token_count;
+            push_merged_token_range(&mut hard_keep_ranges, prompt_tokens.len(), start..end);
+        }
+
+        let body_token_count = body_token_count.min(prompt_tokens.len());
+        Ok((
+            prompt_tokens,
+            PFlashPromptPolicy {
+                hard_keep_ranges,
+                body_token_count: Some(body_token_count),
+            },
+        ))
+    }
+
     /// Apply chat template and tokenize messages with explicit thinking control.
     pub fn prepare_chat_prompt_with_thinking(
         &self,
@@ -2279,21 +3808,13 @@ impl SimpleEngine {
     }
 
     /// Whether the loaded model is a vision-language model.
-    pub fn is_vlm(&self) -> bool {
-        let model = self
-            .model
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        model.is_vlm()
+    pub const fn is_vlm(&self) -> bool {
+        self.is_vlm
     }
 
     /// The expected image size for the VLM's vision encoder, or `None`.
-    pub fn vlm_image_size(&self) -> Option<i32> {
-        let model = self
-            .model
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        model.image_size()
+    pub const fn vlm_image_size(&self) -> Option<i32> {
+        self.vlm_image_size
     }
 
     /// Replace image placeholder tokens with `IMAGE_TOKEN_INDEX` in the token
@@ -2326,6 +3847,7 @@ impl SimpleEngine {
         prompt_tokens: &[u32],
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
+        allow_prefix_cache: bool,
     ) -> Result<PreparedGeneration<'_>, EngineError> {
         let prompt_len = Self::prompt_len(prompt_tokens)?;
         let has_images = pixel_values.is_some();
@@ -2334,7 +3856,7 @@ impl SimpleEngine {
         // Keep that CPU-only candidate selection outside the model lock / MLX
         // execution gate; the later materialization step still runs under the
         // gate because it rebuilds MLX arrays.
-        let disk_prefix_candidate = if has_images {
+        let disk_prefix_candidate = if has_images || !allow_prefix_cache {
             None
         } else {
             let pc = self
@@ -2366,7 +3888,7 @@ impl SimpleEngine {
         // `-[_MTLCommandBuffer addCompletedHandler:]` / `IOGPUMetalCommandBuffer
         // validate` failed assertions during a session-continuation fallback
         // prefill racing a concurrent request's prefix lookup).
-        let use_prefix_cache = !has_images && prefix_cache_enabled();
+        let use_prefix_cache = allow_prefix_cache && !has_images && prefix_cache_enabled();
         let prefix_match = if !use_prefix_cache {
             None
         } else {
@@ -2406,6 +3928,11 @@ impl SimpleEngine {
                     .fetch_add(u64::try_from(m.prefix_len).unwrap_or(0), Ordering::Relaxed);
             }
         }
+
+        let reused_prefix_tokens = prefix_match
+            .as_ref()
+            .and_then(|m| u32::try_from(m.prefix_len).ok())
+            .unwrap_or(0);
 
         let (actual_prompt_tokens, cache) = if let Some(matched) = prefix_match {
             tracing::debug!(
@@ -2447,6 +3974,7 @@ impl SimpleEngine {
             prompt_array,
             prompt_len,
             pixel_values,
+            reused_prefix_tokens,
             stored_clone: None,
             _mlx_gate: mlx_gate,
         })
@@ -2467,6 +3995,7 @@ impl SimpleEngine {
         capture_hidden: bool,
         store_prefix_cache: bool,
         checkpoint_id: Option<&str>,
+        compressed_prefill: Option<&SurvivalPlan>,
         // When Some, the single-pass capture_hidden prefill ALSO collects tap
         // hiddens for these layers (session DFlash drafter context). Chunked
         // and two-phase prefills skip taps — callers must tolerate None.
@@ -2481,8 +4010,47 @@ impl SimpleEngine {
         if Self::probe_warm_drift_enabled(prompt_tokens, prepared.cache.resident_len()) {
             self.probe_warm_drift(prompt_tokens, prepared);
         }
+        let sparse_compressed_prefill =
+            compressed_prefill.filter(|_| prepared.model.supports_pflash_sparse_prefill());
+        if let Some(plan) =
+            compressed_prefill.filter(|_| !prepared.model.supports_pflash_sparse_prefill())
+        {
+            tracing::warn!(
+                source_tokens = plan.source_token_count,
+                kept_tokens = plan.token_ids.len(),
+                target_model = any_model_variant_name(&prepared.model),
+                "PFlash target sparse prefill unsupported; using compressed survivor-domain prefill"
+            );
+        }
         let mut prefill_hidden = None;
-        let logits = if let Some(ref pixel_values) = prepared.pixel_values {
+        let logits = if let Some(plan) = sparse_compressed_prefill {
+            let target_plan = plan.target_sparse_prefill_plan().map_err(|error| {
+                EngineError::Generation(format!("PFlash sparse prefill plan invalid: {error}"))
+            })?;
+            let output = prepared
+                .model
+                .pflash_prefill_sparse(target_plan)
+                .map_err(EngineError::Mlx)?;
+            let resident_len = output.state.resident_len();
+            let logical_next_pos = output.state.next_position();
+            prepared.cache = AnyCache::Hybrid(output.state.into_cache());
+            let actual_keep_ratio = if plan.source_token_count == 0 {
+                1.0
+            } else {
+                resident_len as f64 / plan.source_token_count as f64
+            };
+            tracing::info!(
+                source_tokens = plan.source_token_count,
+                resident_tokens = resident_len,
+                logical_next_pos,
+                actual_keep_ratio,
+                metadata_keep_ratio = plan.metadata.keep_ratio,
+                score_mode = ?plan.metadata.score_mode,
+                "PFlash sparse prefill executed"
+            );
+            higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+            output.logits
+        } else if let Some(ref pixel_values) = prepared.pixel_values {
             // Multimodal path: full forward (VLMs need all tokens for vision)
             prepared
                 .model
@@ -2504,9 +4072,14 @@ impl SimpleEngine {
             // Bit-identical to a single-pass prefill: chunked prefill already
             // advances the cache token-by-token, so body-then-suffix == full.
             let is_hybrid = matches!(prepared.cache, AnyCache::Hybrid(_));
+            // Floor to a coarse checkpoint quantum so the fixed-size GDN
+            // snapshot is not duplicated for every ordinary block. The
+            // prefix cache restores this checkpoint and the normal prefill
+            // path replays the remaining tail. A short body has no checkpoint
+            // and therefore remains on the existing non-stored hybrid path.
             let split_at = if store_prefix_cache && is_hybrid {
                 exact_generation_body(&prepared.actual_prompt_tokens, generation_suffix)
-                    .map_or(0, <[u32]>::len)
+                    .map_or(0, |body| hybrid_checkpoint_boundary(body.len()))
             } else {
                 0
             };
@@ -2682,21 +4255,40 @@ impl SimpleEngine {
             // Dense KV caches block-page: the suffix is dropped at block
             // boundaries and reconstruction stays exact.
             //
-            // Hybrid (GDN/SSM) caches are stored as a whole CLONE and their
-            // sequential state cannot be truncated after the fact (mlx-lm #980).
-            // `run_prefill` therefore two-phase splits a hybrid prefill: it
-            // snapshots `stored_clone` at the conversation boundary (BEFORE the
-            // suffix) and keys that snapshot at the stripped length. The
-            // snapshot's offset == stripped key length, so reuse is exact (no
-            // RoPE/SSM shift) AND cross-turn matching fires (the conversation
-            // boundary recurs verbatim in the next turn). This replaces the old
-            // "key hybrid at full length" path, which was correct but never
-            // matched cross-turn (the suffix diverges), forcing a full re-prefill
-            // every turn.
-            let stripped =
-                exact_generation_body(prompt_tokens, generation_suffix).unwrap_or(prompt_tokens);
+            // Hybrid (GDN/SSM) caches can't be trimmed after the fact
+            // (mlx-lm #980), so `run_prefill` two-phase splits a hybrid
+            // prefill: it snapshots `stored_clone` at the conversation
+            // boundary (BEFORE the suffix, floored to a block multiple above)
+            // and keys that snapshot at ITS OWN resident length -- not a
+            // second, independently recomputed `exact_generation_body` split
+            // -- so the key stays exactly consistent with the flooring by
+            // construction. `PagedPrefixCache::store` block-pages the
+            // snapshot when that boundary is block-aligned and falls back to
+            // a whole clone otherwise (see `slice_into_blocks`); either way
+            // reuse is exact (no RoPE/SSM shift) AND cross-turn matching
+            // fires (the conversation boundary recurs verbatim in the next
+            // turn). This replaces the old "key hybrid at full length" path,
+            // which was correct but never matched cross-turn (the suffix
+            // diverges), forcing a full re-prefill every turn.
             let cache_to_store = prepared.stored_clone.as_ref().unwrap_or(&prepared.cache);
-            pc.store(stripped, cache_to_store, checkpoint_id);
+            let is_hybrid = matches!(cache_to_store, AnyCache::Hybrid(_));
+            let stripped = if prepared.stored_clone.is_some() {
+                let resident = usize::try_from(cache_to_store.resident_len()).unwrap_or(0);
+                prompt_tokens.get(..resident).unwrap_or(prompt_tokens)
+            } else {
+                exact_generation_body(prompt_tokens, generation_suffix).unwrap_or(prompt_tokens)
+            };
+            // Correct by construction: hybrid (GDN+KV) caches are whole-clone
+            // snapshots whose KV offset cannot be trimmed after prefill. Only
+            // store when the two-phase snapshot (stored_clone) exists — its
+            // offset matches the stripped key exactly. Without it, the fallback
+            // (prepared.cache) includes generation-suffix tokens and the
+            // boundary guard in prepare_store would correctly reject the
+            // mismatch (with a WARN). Skipping silently here is better: the
+            // store is intentionally omitted, not attempted and rejected.
+            if !is_hybrid || prepared.stored_clone.is_some() {
+                pc.store(stripped, cache_to_store, checkpoint_id);
+            }
         }
         maybe_clear_mlx_cache(
             self.tuning.clear_cache_after_prefill(),
@@ -3443,8 +5035,10 @@ impl SimpleEngine {
     /// alive across tool hops and prefill ONLY the new suffix on the next turn
     /// (no re-prefill of history). Opt-in per conversation via `session_id`. On
     /// the first turn — or a conversation that diverged from the retained cache —
-    /// it falls back to a clean full prefill (the [`take_continuable`] guard) and
-    /// retains the resulting cache; on a continuation it reuses the live cache.
+    /// it falls back to a clean full prefill (the non-destructive continuation
+    /// fork guard) and retains the resulting cache; on a continuation it forks
+    /// the retained cache and keeps the prior boundary published until a valid
+    /// successor replaces it.
     /// Greedy decode with MTP speculation when the model ships a head (the
     /// stop-aware cycle keeps the retained cache 1:1 with the stashed tokens);
     /// plain sequential decode otherwise.
@@ -3467,7 +5061,6 @@ impl SimpleEngine {
     /// one-shot full prefill; the session path is the right option when the user
     /// experience depends on avoiding repeated long-context prefill.
     ///
-    /// [`take_continuable`]: Self::take_continuable
     pub fn generate_continued(
         &self,
         session_id: u64,
@@ -3498,6 +5091,457 @@ impl SimpleEngine {
         params: &SamplingParams,
         enable_thinking: bool,
     ) -> Result<SessionGeneration, EngineError> {
+        self.generate_continued_impl(
+            session_id,
+            prompt_tokens,
+            max_tokens,
+            params,
+            enable_thinking,
+            None,
+        )
+    }
+
+    /// Cache-resident generation that streams each decoded token to `sender`
+    /// as it is produced, instead of buffering the whole completion and
+    /// returning it in one shot at the end.
+    ///
+    /// This is the session-continuation counterpart of
+    /// [`Self::generate_streaming_with_thinking`]: same wire contract
+    /// (`StreamingOutput` per step, `finish_reason` set on the terminal
+    /// chunk), but decoding from the retained per-session KV cache. The
+    /// DFlash speculation route has no incremental decode loop today, so it
+    /// falls back to the existing buffered path internally and emits the
+    /// whole completion as a single chunk — every other route (MTP-family
+    /// and plain autoregressive, which cover the overwhelming majority of
+    /// cache-resident turns) streams token-by-token.
+    pub fn generate_continued_streaming_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+    ) -> Result<(), EngineError> {
+        self.generate_continued_impl(
+            session_id,
+            prompt_tokens,
+            max_tokens,
+            params,
+            enable_thinking,
+            Some(sender),
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_session_routed_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+        tool_payload: SessionPromptTracePayloadStats,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<SessionGeneration, EngineError> {
+        let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
+        let total_start = std::time::Instant::now();
+        let session_lock = self.session_lock_for(session_id);
+        let _session_guard = session_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let retained_tokens = self.retained_session_tokens(session_id);
+        let continued_prompt = self.continued_prompt_tokens_from_retained(
+            session_id,
+            retained_tokens.as_deref(),
+            prompt_tokens,
+            messages,
+            tools,
+            enable_thinking,
+        );
+        let strategy = session_prefill_strategy(
+            session_id,
+            retained_tokens.as_deref(),
+            &continued_prompt,
+            self.session_max_suffix_prefill_tokens,
+            self.pflash_can_run_stateless_for_prompt(&continued_prompt),
+        );
+
+        match strategy {
+            SessionPrefillStrategy::Continue { session_id } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::Continued,
+                );
+                self.generate_continued_impl_locked(
+                    session_id,
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    enable_thinking,
+                    None,
+                    timing,
+                    total_start,
+                )
+            }
+            SessionPrefillStrategy::BootstrapExact { session_id, reason } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::ExactBootstrap,
+                );
+                self.handle_session_exact_bootstrap(session_id, reason);
+                self.generate_continued_impl_locked(
+                    session_id,
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    enable_thinking,
+                    None,
+                    timing,
+                    total_start,
+                )
+            }
+            SessionPrefillStrategy::BootstrapPFlash { session_id } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::PFlashBootstrap,
+                );
+                self.handle_session_pflash_bootstrap(session_id);
+                self.generate_session_pflash_bootstrap(
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    enable_thinking,
+                    pflash_policy,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_session_routed_streaming_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        max_tokens: u32,
+        params: &SamplingParams,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        tool_payload: SessionPromptTracePayloadStats,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<(), EngineError> {
+        let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
+        let total_start = std::time::Instant::now();
+        let session_lock = self.session_lock_for(session_id);
+        let _session_guard = session_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let retained_tokens = self.retained_session_tokens(session_id);
+        let continued_prompt = self.continued_prompt_tokens_from_retained(
+            session_id,
+            retained_tokens.as_deref(),
+            prompt_tokens,
+            messages,
+            tools,
+            enable_thinking,
+        );
+        let strategy = session_prefill_strategy(
+            session_id,
+            retained_tokens.as_deref(),
+            &continued_prompt,
+            self.session_max_suffix_prefill_tokens,
+            self.pflash_can_run_stateless_for_prompt(&continued_prompt),
+        );
+
+        match strategy {
+            SessionPrefillStrategy::Continue { session_id } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::Continued,
+                );
+                self.generate_continued_impl_locked(
+                    session_id,
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    enable_thinking,
+                    Some(sender),
+                    timing,
+                    total_start,
+                )?;
+                Ok(())
+            }
+            SessionPrefillStrategy::BootstrapExact { session_id, reason } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::ExactBootstrap,
+                );
+                self.handle_session_exact_bootstrap(session_id, reason);
+                self.generate_continued_impl_locked(
+                    session_id,
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    enable_thinking,
+                    Some(sender),
+                    timing,
+                    total_start,
+                )?;
+                Ok(())
+            }
+            SessionPrefillStrategy::BootstrapPFlash { session_id } => {
+                self.record_and_log_session_prompt_trace(
+                    session_id,
+                    retained_tokens.as_deref(),
+                    prompt_tokens,
+                    &continued_prompt,
+                    tool_payload,
+                    SessionPromptTraceOutcome::PFlashBootstrap,
+                );
+                self.handle_session_pflash_bootstrap(session_id);
+                self.generate_session_pflash_bootstrap_streaming(
+                    &continued_prompt,
+                    max_tokens,
+                    params,
+                    sender,
+                    enable_thinking,
+                    pflash_policy,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::print_stderr)]
+    fn continued_prompt_tokens_from_retained(
+        &self,
+        session_id: u64,
+        retained_tokens: Option<&[u32]>,
+        prompt_tokens: &[u32],
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        thinking_enabled: bool,
+    ) -> Vec<u32> {
+        let diag = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
+        let Some(retained) = retained_tokens else {
+            if diag {
+                eprintln!(
+                    "DIAG session-continue-fallback: reason=no_retained_cache session_id={session_id} prompt_tokens={}",
+                    prompt_tokens.len()
+                );
+            }
+            return prompt_tokens.to_vec();
+        };
+        let retained_text = match self.tokenizer.decode(retained, false) {
+            Ok(text) => text,
+            Err(error) => {
+                if diag {
+                    eprintln!(
+                        "DIAG session-continue-fallback: reason=decode_retained_failed session_id={session_id} retained_tokens={} error={error}",
+                        retained.len()
+                    );
+                }
+                return prompt_tokens.to_vec();
+            }
+        };
+        let full_text = match self.render_chat_prompt_with_thinking(
+            messages,
+            tools,
+            thinking_enabled,
+        ) {
+            Ok(text) => text,
+            Err(error) => {
+                if diag {
+                    eprintln!(
+                        "DIAG session-continue-fallback: reason=render_full_failed session_id={session_id} retained_tokens={} prompt_tokens={} error={error}",
+                        retained.len(),
+                        prompt_tokens.len()
+                    );
+                }
+                return prompt_tokens.to_vec();
+            }
+        };
+        let Some(delta_text) = message_boundary_delta(&retained_text, &full_text) else {
+            if diag {
+                let common = common_prefix_bytes(&retained_text, &full_text);
+                eprintln!(
+                    "DIAG session-continue-fallback: reason=boundary_splice_failed session_id={session_id} retained_tokens={} prompt_tokens={} retained_bytes={} full_bytes={} retained_msgs={} full_msgs={} common_bytes={} retained_tail={:?} full_at_mismatch={:?}",
+                    retained.len(),
+                    prompt_tokens.len(),
+                    retained_text.len(),
+                    full_text.len(),
+                    retained_text.matches(IM_START).count(),
+                    full_text.matches(IM_START).count(),
+                    common,
+                    preview_around(&retained_text, common),
+                    preview_around(&full_text, common)
+                );
+            }
+            return prompt_tokens.to_vec();
+        };
+        let Ok(delta_enc) = self.tokenizer.encode(delta_text, false) else {
+            if diag {
+                eprintln!(
+                    "DIAG session-continue-fallback: reason=encode_delta_failed session_id={session_id} delta_bytes={}",
+                    delta_text.len()
+                );
+            }
+            return prompt_tokens.to_vec();
+        };
+        if diag {
+            eprintln!(
+                "DIAG session-continue: matched session_id={session_id} retained_tokens={} delta_tokens={} full_prompt_tokens={}",
+                retained.len(),
+                delta_enc.get_ids().len(),
+                prompt_tokens.len()
+            );
+        }
+        let mut combined = retained.to_vec();
+        combined.extend_from_slice(delta_enc.get_ids());
+        combined
+    }
+
+    fn record_and_log_session_prompt_trace(
+        &self,
+        session_id: u64,
+        retained_tokens: Option<&[u32]>,
+        prompt_tokens: &[u32],
+        candidate_tokens: &[u32],
+        tool_payload: SessionPromptTracePayloadStats,
+        outcome: SessionPromptTraceOutcome,
+    ) {
+        let trace = session_prompt_trace_metrics(
+            retained_tokens,
+            prompt_tokens,
+            candidate_tokens,
+            tool_payload,
+            outcome,
+        );
+        tracing::info!(
+            session_id,
+            prompt_tokens = trace.prompt_tokens,
+            retained_tokens = trace.retained_tokens,
+            candidate_tokens = trace.candidate_tokens,
+            suffix_tokens = trace.suffix_tokens,
+            common_prefix_tokens = trace.common_prefix_tokens,
+            divergence_token = ?trace.divergence_token,
+            boundary_splice = trace.boundary_splice,
+            tool_result_messages = trace.tool_result_messages,
+            tool_result_bytes = trace.tool_result_bytes,
+            tool_result_largest_bytes = trace.tool_result_largest_bytes,
+            ?outcome,
+            "session prompt/cache trace"
+        );
+        self.record_session_prompt_trace(trace);
+    }
+
+    fn handle_session_exact_bootstrap(&self, session_id: u64, reason: SessionBootstrapReason) {
+        tracing::info!(
+            session_id,
+            ?reason,
+            "session continuation bootstrapping exact retained prefill path"
+        );
+    }
+
+    fn handle_session_pflash_bootstrap(&self, session_id: u64) {
+        tracing::info!(
+            session_id,
+            "session continuation bootstrapping degraded stateless PFlash prefill path"
+        );
+    }
+
+    fn generate_session_pflash_bootstrap(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<SessionGeneration, EngineError> {
+        let output = self.generate_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            &[],
+            false,
+            None,
+            enable_thinking,
+            None,
+            None,
+            None,
+            pflash_policy,
+        )?;
+        Ok(SessionGeneration {
+            text: output.text,
+            completion_tokens: output.completion_tokens,
+            prompt_tokens: output.prompt_tokens,
+            prefilled_tokens: output.prompt_tokens,
+            outcome: SessionOutcome::PFlashBootstrap,
+            continued: false,
+        })
+    }
+
+    fn generate_session_pflash_bootstrap_streaming(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<(), EngineError> {
+        self.generate_streaming_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            &[],
+            false,
+            None,
+            sender,
+            enable_thinking,
+            false,
+            None,
+            None,
+            None,
+            pflash_policy,
+        )
+    }
+
+    fn generate_continued_impl(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+        sender: Option<&tokio::sync::mpsc::Sender<StreamingOutput>>,
+    ) -> Result<SessionGeneration, EngineError> {
         let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
         let total_start = std::time::Instant::now();
         // Serialize all work for this conversation: hold the per-session lock for
@@ -3507,15 +5551,34 @@ impl SimpleEngine {
         // Acquired BEFORE the model lock — the global order is session -> model,
         // so this can never deadlock. The map lock itself is released immediately;
         // only the per-session lock is held across the body.
-        let session_lock = std::sync::Arc::clone(
-            lock_or_recover(&self.session_locks)
-                .entry(session_id)
-                .or_default(),
-        );
+        let session_lock = self.session_lock_for(session_id);
         let _session_guard = session_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.generate_continued_impl_locked(
+            session_id,
+            prompt_tokens,
+            max_tokens,
+            params,
+            enable_thinking,
+            sender,
+            timing,
+            total_start,
+        )
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn generate_continued_impl_locked(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+        sender: Option<&tokio::sync::mpsc::Sender<StreamingOutput>>,
+        timing: bool,
+        total_start: std::time::Instant,
+    ) -> Result<SessionGeneration, EngineError> {
         // Opportunistic idle eviction: free retained caches abandoned longer than
         // the configured TTL. Cheap (bounded by max_retained_sessions) and runs
         // on each cache-resident request, so memory is reclaimed without a
@@ -3540,51 +5603,94 @@ impl SimpleEngine {
             has_mtp,
         );
         if speculation_route == SpeculationRoute::DFlash {
-            return self.generate_continued_dflash_locked(
+            let output = self.generate_continued_dflash_locked(
                 session_id,
                 prompt_tokens,
                 max_tokens,
                 params,
                 timing,
                 total_start,
-            );
+                sender,
+            )?;
+            if let Some(sender) = sender {
+                let cached = if output.continued {
+                    output.prompt_tokens.saturating_sub(output.prefilled_tokens)
+                } else {
+                    0
+                };
+                send_session_stream_output(
+                    sender,
+                    StreamingOutput {
+                        new_text: String::new(),
+                        finished: false,
+                        finish_reason: None,
+                        prompt_tokens: output.prompt_tokens,
+                        completion_tokens: 0,
+                        token_logprob: None,
+                        prefill_progress: Some(crate::engine::PrefillProgress {
+                            processed: cached,
+                            cached,
+                            total: output.prompt_tokens,
+                        }),
+                    },
+                )?;
+            }
+            return Ok(output);
         }
 
-        let (mut prepared, prefilled, continued) = if let Some((state, prior)) =
-            self.take_continuable(session_id, prompt_tokens)
-        {
-            let cache = state.demote();
-            debug_assert!(
-                prior <= prompt_tokens.len(),
-                "continuation prior {prior} exceeds prompt length {}",
-                prompt_tokens.len()
-            );
-            let suffix: Vec<u32> = prompt_tokens.get(prior..).unwrap_or_default().to_vec();
-            let prefilled = u32::try_from(suffix.len()).unwrap_or(u32::MAX);
-            let prompt_array = Array::from(suffix.as_slice()).index(NewAxis);
+        let (mut prepared, prefilled, continued) = {
             let model = self
                 .model
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
-            // Same single sanctioned MLX-gate acquisition as prepare_generation —
-            // the continuation path builds PreparedGeneration by hand, so it must
-            // take the gate too or its eval would fire the off-gate assert.
             let mlx_gate = higgs_models::mlx_exec::acquire();
-            let prepared = PreparedGeneration {
-                model,
-                cache,
-                actual_prompt_tokens: suffix,
-                prompt_array,
-                prompt_len: total,
-                pixel_values: None,
-                stored_clone: None,
-                _mlx_gate: mlx_gate,
+
+            let forked = match self.fork_target_continuable(session_id, prompt_tokens, &mlx_gate) {
+                Ok(forked) => forked,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "retained target session could not be forked; cold-prefilling"
+                    );
+                    None
+                }
             };
-            (prepared, prefilled, true)
-        } else {
-            let prepared = self.prepare_generation(prompt_tokens, None, None)?;
-            let prefilled = u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
-            (prepared, prefilled, false)
+
+            if let Some((cache, prior)) = forked {
+                debug_assert!(
+                    prior <= prompt_tokens.len(),
+                    "continuation prior {prior} exceeds prompt length {}",
+                    prompt_tokens.len()
+                );
+                let suffix: Vec<u32> = prompt_tokens.get(prior..).unwrap_or_default().to_vec();
+                let prefilled = u32::try_from(suffix.len()).unwrap_or(u32::MAX);
+                let prompt_array = Array::from(suffix.as_slice()).index(NewAxis);
+                // Same single sanctioned MLX-gate acquisition as prepare_generation —
+                // the continuation path builds PreparedGeneration by hand, so it must
+                // take the gate too or its eval would fire the off-gate assert.
+                let prepared = PreparedGeneration {
+                    model,
+                    cache,
+                    actual_prompt_tokens: suffix,
+                    prompt_array,
+                    prompt_len: total,
+                    pixel_values: None,
+                    // Retained-session reuse: `prior` tokens came from the forked
+                    // session cache, the rest is the suffix we prefill now.
+                    reused_prefix_tokens: u32::try_from(prior).unwrap_or(u32::MAX),
+                    stored_clone: None,
+                    _mlx_gate: mlx_gate,
+                };
+                (prepared, prefilled, true)
+            } else {
+                drop(model);
+                drop(mlx_gate);
+                let prepared = self.prepare_generation(prompt_tokens, None, None, true)?;
+                let prefilled =
+                    u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
+                (prepared, prefilled, false)
+            }
         };
 
         if continued {
@@ -3595,6 +5701,34 @@ impl SimpleEngine {
                 u64::from(total.saturating_sub(prefilled)),
                 Ordering::Relaxed,
             );
+        }
+
+        // Surface the reused prefix to the streaming route before prefill runs:
+        // the route folds `prefill_progress.cached` into the final usage block's
+        // `prompt_tokens_details.cached_tokens` (and forwards it as a
+        // `prompt_progress` chunk when the client opted in).
+        if let Some(sender) = sender {
+            let cached = if continued {
+                total.saturating_sub(prefilled)
+            } else {
+                0
+            };
+            send_session_stream_output(
+                sender,
+                StreamingOutput {
+                    new_text: String::new(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: total,
+                    completion_tokens: 0,
+                    token_logprob: None,
+                    prefill_progress: Some(crate::engine::PrefillProgress {
+                        processed: cached,
+                        cached,
+                        total,
+                    }),
+                },
+            )?;
         }
 
         let prefill_start = std::time::Instant::now();
@@ -3614,18 +5748,101 @@ impl SimpleEngine {
             None,
             None,
             want_mtp,
+            // NOTE: `store_prefix_cache` is deliberately `false` on the
+            // session-resident path. Enabling radix consult/store here crashes
+            // the hybrid (GDN+FA) target with a Metal command-buffer assertion
+            // during KV reconstruction — confirmed empirically (2026-07-17).
+            // The cross-session radix hit on the system+tools prefix must be
+            // achieved a different way (e.g. a non-session first-turn path, or
+            // making the hybrid radix reconstruction safe), not by flipping
+            // this flag.
             false,
+            None,
             None,
             None,
             None,
         )?;
         let prefill_elapsed = prefill_start.elapsed();
+
+        // A cold/bootstrap streaming turn can disconnect after prefill but
+        // before a valid response/tool payload is delivered. Publish that exact
+        // prompt boundary before decode mutates the live cache. Exact
+        // continuations already left the prior retained entry published, so
+        // skip this clone there and let cancellation fall back to that boundary.
+        // A successful turn replaces any checkpoint with prompt+completion
+        // retention at the normal publication point below.
+        if sender.is_some() && !continued {
+            match prepared.cache.try_deep_clone().map_err(|error| {
+                PairedCacheError::TargetMaterialization {
+                    details: error.to_string(),
+                }
+            }) {
+                Ok(prompt_cache) => match RetainedState::target_only(
+                    prompt_cache,
+                    prompt_tokens.to_vec(),
+                    &prepared._mlx_gate,
+                ) {
+                    Ok(state) => self.stash_retained_checkpoint(session_id, state),
+                    Err(error) => tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "Failed to publish prompt checkpoint for cancellable session turn"
+                    ),
+                },
+                Err(error) => tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "Failed to clone prompt cache for cancellable session checkpoint"
+                ),
+            }
+        }
+
         let first_id: u32 = current_token.item();
         let mut generated: Vec<u32> = vec![first_id];
         let mut token_ledger = TokenLedger::new(prompt_tokens.len());
         token_ledger
             .emit_pending(first_id)
             .map_err(session_ledger_error)?;
+
+        // Incremental detokenizer for the streaming path only (`None` when
+        // this is the buffered `generate_continued_with_thinking` caller) —
+        // mirrors `generate_streaming_inner`'s `IncrementalDetok` usage so
+        // streamed text matches a full `decode_tokens` byte-for-byte.
+        let mut detok = sender.map(|_| {
+            IncrementalDetok::new(
+                String::new(),
+                0,
+                std::sync::Arc::clone(&self.decode_skip_ids),
+            )
+        });
+        if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+            let is_eos = self.eos_token_ids.contains(&first_id);
+            let is_max = 1 >= max_tokens;
+            let mut new_text = detok.append(&self.tokenizer, &generated)?;
+            let step_finished = is_eos || is_max;
+            if step_finished {
+                new_text.push_str(&detok.flush(&self.tokenizer, &generated)?);
+            }
+            let finish_reason = if is_eos {
+                Some("stop".to_owned())
+            } else if is_max {
+                Some("length".to_owned())
+            } else {
+                None
+            };
+            send_session_stream_output(
+                sender,
+                StreamingOutput {
+                    new_text,
+                    finished: step_finished,
+                    finish_reason,
+                    prompt_tokens: total,
+                    completion_tokens: 1,
+                    token_logprob: None,
+                    prefill_progress: None,
+                },
+            )?;
+        }
 
         let decode_start = std::time::Instant::now();
         // MTP speculative decode for the session path when the model ships a
@@ -3705,6 +5922,23 @@ impl SimpleEngine {
                     token_ledger
                         .emit_pending(confirmed)
                         .map_err(session_ledger_error)?;
+                    if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+                        let completion_len = u32::try_from(generated.len()).unwrap_or(u32::MAX);
+                        let mut new_text = detok.append(&self.tokenizer, &generated)?;
+                        new_text.push_str(&detok.flush(&self.tokenizer, &generated)?);
+                        send_session_stream_output(
+                            sender,
+                            StreamingOutput {
+                                new_text,
+                                finished: true,
+                                finish_reason: Some("stop".to_owned()),
+                                prompt_tokens: total,
+                                completion_tokens: completion_len,
+                                token_logprob: None,
+                                prefill_progress: None,
+                            },
+                        )?;
+                    }
                     break;
                 }
 
@@ -3731,7 +5965,49 @@ impl SimpleEngine {
                 token_ledger
                     .extend_forwarded(result.tokens.iter().copied())
                     .map_err(session_ledger_error)?;
+                let batch_base = generated.len();
                 generated.extend_from_slice(&result.tokens);
+                if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+                    let mut stop_after_batch = false;
+                    for (i, tok) in result.tokens.iter().enumerate() {
+                        let upto = batch_base + i + 1;
+                        let window = &generated[..upto];
+                        let is_eos = self.eos_token_ids.contains(tok);
+                        let completion_len = u32::try_from(upto).unwrap_or(u32::MAX);
+                        let is_max = completion_len >= max_tokens;
+                        let mut new_text = detok.append(&self.tokenizer, window)?;
+                        let step_finished = is_eos || is_max;
+                        if step_finished {
+                            new_text.push_str(&detok.flush(&self.tokenizer, window)?);
+                        }
+                        let finish_reason = if is_eos {
+                            Some("stop".to_owned())
+                        } else if is_max {
+                            Some("length".to_owned())
+                        } else {
+                            None
+                        };
+                        send_session_stream_output(
+                            sender,
+                            StreamingOutput {
+                                new_text,
+                                finished: step_finished,
+                                finish_reason,
+                                prompt_tokens: total,
+                                completion_tokens: completion_len,
+                                token_logprob: None,
+                                prefill_progress: None,
+                            },
+                        )?;
+                        if step_finished {
+                            stop_after_batch = true;
+                            break;
+                        }
+                    }
+                    if stop_after_batch {
+                        break;
+                    }
+                }
                 current_hidden = result.hidden;
                 confirmed = result.next_token_id;
             }
@@ -3758,7 +6034,36 @@ impl SimpleEngine {
                 token_ledger
                     .emit_pending(next_id)
                     .map_err(session_ledger_error)?;
-                if self.eos_token_ids.contains(&next_id) {
+                let is_eos = self.eos_token_ids.contains(&next_id);
+                if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+                    let completion_len = u32::try_from(generated.len()).unwrap_or(u32::MAX);
+                    let is_max = completion_len >= max_tokens;
+                    let mut new_text = detok.append(&self.tokenizer, &generated)?;
+                    let step_finished = is_eos || is_max;
+                    if step_finished {
+                        new_text.push_str(&detok.flush(&self.tokenizer, &generated)?);
+                    }
+                    let finish_reason = if is_eos {
+                        Some("stop".to_owned())
+                    } else if is_max {
+                        Some("length".to_owned())
+                    } else {
+                        None
+                    };
+                    send_session_stream_output(
+                        sender,
+                        StreamingOutput {
+                            new_text,
+                            finished: step_finished,
+                            finish_reason,
+                            prompt_tokens: total,
+                            completion_tokens: completion_len,
+                            token_logprob: None,
+                            prefill_progress: None,
+                        },
+                    )?;
+                }
+                if is_eos {
                     break;
                 }
                 cur = next;
@@ -3941,6 +6246,11 @@ impl SimpleEngine {
             completion_tokens: u32::try_from(generated.len()).unwrap_or(u32::MAX),
             prompt_tokens: total,
             prefilled_tokens: prefilled,
+            outcome: if continued {
+                SessionOutcome::Continued
+            } else {
+                SessionOutcome::ExactBootstrap
+            },
             continued,
         })
     }
@@ -3998,12 +6308,13 @@ impl SimpleEngine {
     /// Exact greedy/no-thinking dSpark session path.
     ///
     /// The caller owns the per-session lock for this entire method. A retained
-    /// pair is move-reused only when both private halves match the exact prior
-    /// token prefix; target-only state is intentionally discarded because its
-    /// historical tap stream cannot reconstruct drafter continuity. Every
+    /// pair is fork-reused only when both private halves match the exact prior
+    /// token prefix; target-only state stays published while this request cold
+    /// prefills because it cannot reconstruct drafter continuity. Every
     /// successful turn publishes one sealed pair, or one explicit target-only
     /// downgrade when a deterministic tap precondition is unavailable. Once
-    /// effectful sealing begins, any error publishes neither half.
+    /// effectful sealing begins, any error publishes neither half, leaving the
+    /// prior retained boundary intact unless the exact-token guard rejected it.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn generate_continued_dflash_locked(
         &self,
@@ -4013,6 +6324,7 @@ impl SimpleEngine {
         params: &SamplingParams,
         timing: bool,
         total_start: std::time::Instant,
+        sender: Option<&tokio::sync::mpsc::Sender<StreamingOutput>>,
     ) -> Result<SessionGeneration, EngineError> {
         let dflash = self
             .dflash
@@ -4038,19 +6350,6 @@ impl SimpleEngine {
             *value = None;
         }
 
-        // Move a retained pair out of the session map before taking the model
-        // lock. A target-only hit is not sufficient for dSpark because no
-        // independent lookup may supply the missing historical tap frontier.
-        let reusable = self.take_continuable(session_id, prompt_tokens).and_then(
-            |(state, prior)| match state {
-                RetainedState::Paired(pair) => Some((pair, prior)),
-                RetainedState::TargetOnly(target) => {
-                    drop(target);
-                    None
-                }
-            },
-        );
-
         let mut model = self
             .model
             .lock()
@@ -4059,34 +6358,29 @@ impl SimpleEngine {
         let mut drafter = lock_or_recover(&dflash.drafter);
 
         let expected_taps = dflash.tap_layers.len();
-        let resumed = reusable.and_then(|(pair, prior)| {
-            let Some(prefix) = prompt_tokens.get(..prior) else {
+        let resumed = match self.fork_paired_continuable(
+            session_id,
+            prompt_tokens,
+            expected_taps,
+            &mlx_gate,
+        ) {
+            Ok(resumed) => resumed,
+            Err(error) => {
                 tracing::warn!(
                     session_id,
-                    prior,
-                    "Retained paired session boundary exceeds prompt; cold-prefilling"
+                    error = %error,
+                    "Retained paired session could not fork as one proven branch; cold-prefilling"
                 );
-                return None;
-            };
-            match pair.resume(prefix, expected_taps) {
-                Ok(pair) => Some((pair, prior)),
-                Err(error) => {
-                    tracing::warn!(
-                        session_id,
-                        error = %error,
-                        prior,
-                        "Retained paired session could not resume as one proven branch; cold-prefilling"
-                    );
-                    None
-                }
+                None
             }
-        });
+        };
 
         // Cache-state divergence must never fail the request outright: if the
         // resumed (continued) attempt errors, retry ONCE from a cold prefill
-        // within the same request. The retained pair was already moved out of
-        // the session map, so nothing poisoned survives in either outcome —
-        // this only converts a residual 500 into a slower successful turn.
+        // within the same request. The retained pair remains published through
+        // the resumed attempt; a cold retry may replace it with a target-only
+        // prompt checkpoint at the newer boundary, and final success replaces
+        // either with the sealed publication.
         let mut resumed = resumed;
         let mut retried_cold = false;
         let (generation, publication, cap_exempt) = loop {
@@ -4150,6 +6444,16 @@ impl SimpleEngine {
                             )
                         })
                         .map_err(session_pair_error)?;
+                    if sender.is_some() && !continued {
+                        match pair.target_only_checkpoint_for_session(&mlx_gate) {
+                            Ok(state) => self.stash_retained_checkpoint(session_id, state),
+                            Err(error) => tracing::warn!(
+                                session_id,
+                                error = %error,
+                                "Failed to publish dSpark prompt checkpoint for cancellable session turn"
+                            ),
+                        }
+                    }
                     let first_token = sample(&prefill_logits.index((.., -1, ..)), params)
                         .map_err(EngineError::Mlx)?;
                     eval([&first_token]).map_err(EngineError::Mlx)?;
@@ -4160,6 +6464,39 @@ impl SimpleEngine {
                     let max_tokens = usize::try_from(max_tokens).map_err(|_| {
                         EngineError::Generation("max_tokens overflow usize".to_owned())
                     })?;
+                    let mut detok = sender.map(|_| {
+                        IncrementalDetok::new(
+                            String::new(),
+                            0,
+                            std::sync::Arc::clone(&self.decode_skip_ids),
+                        )
+                    });
+
+                    if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+                        let is_eos = self.eos_token_ids.contains(&first_id);
+                        let is_max = decode.len() >= max_tokens;
+                        let mut new_text = detok.append(&self.tokenizer, decode.tokens())?;
+                        let finished = is_eos || is_max;
+                        if finished {
+                            new_text.push_str(&detok.flush(&self.tokenizer, decode.tokens())?);
+                        }
+                        let finish_reason = if is_eos {
+                            Some("stop".to_owned())
+                        } else if is_max {
+                            Some("length".to_owned())
+                        } else {
+                            None
+                        };
+                        send_session_stream_output(sender, StreamingOutput {
+                            new_text,
+                            finished,
+                            finish_reason,
+                            prompt_tokens: total,
+                            completion_tokens: u32::try_from(decode.len()).unwrap_or(u32::MAX),
+                            token_logprob: None,
+                            prefill_progress: None,
+                        })?;
+                    }
 
                     let decode_start = std::time::Instant::now();
                     // This loop owns only session delivery/termination. Ticket creation,
@@ -4213,6 +6550,33 @@ impl SimpleEngine {
                         }
                         if let Ok(mut values) = self.last_dflash_draft_counts.lock() {
                             values.push(u32::try_from(committed.draft_tokens.len()).unwrap_or(0));
+                        }
+                        if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
+                            let pending = decode.pending_token();
+                            let is_eos = pending.is_some_and(|id| self.eos_token_ids.contains(&id));
+                            let is_max = decode.len() >= max_tokens;
+                            let mut new_text = detok.append(&self.tokenizer, decode.tokens())?;
+                            let finished = is_eos || is_max;
+                            if finished {
+                                new_text
+                                    .push_str(&detok.flush(&self.tokenizer, decode.tokens())?);
+                            }
+                            let finish_reason = if is_eos {
+                                Some("stop".to_owned())
+                            } else if is_max {
+                                Some("length".to_owned())
+                            } else {
+                                None
+                            };
+                            send_session_stream_output(sender, StreamingOutput {
+                                new_text,
+                                finished,
+                                finish_reason,
+                                prompt_tokens: total,
+                                completion_tokens: u32::try_from(decode.len()).unwrap_or(u32::MAX),
+                                token_logprob: None,
+                                prefill_progress: None,
+                            })?;
                         }
                     }
                     let decode_elapsed = decode_start.elapsed();
@@ -4315,6 +6679,11 @@ impl SimpleEngine {
                             completion_tokens: u32::try_from(generated.len()).unwrap_or(u32::MAX),
                             prompt_tokens: total,
                             prefilled_tokens: prefilled,
+                            outcome: if continued {
+                                SessionOutcome::Continued
+                            } else {
+                                SessionOutcome::ExactBootstrap
+                            },
                             continued,
                         },
                         publication,
@@ -4323,6 +6692,7 @@ impl SimpleEngine {
                 })();
             match attempt {
                 Ok(parts) => break parts,
+                Err(EngineError::Cancelled) => return Err(EngineError::Cancelled),
                 Err(error) if continued && !retried_cold => {
                     retried_cold = true;
                     tracing::warn!(
@@ -4363,7 +6733,7 @@ impl SimpleEngine {
         policy: &crate::prune::PrunePolicy,
         rope: higgs_models::cache::RopeShift,
     ) -> Result<PrunedGeneration, EngineError> {
-        let mut prepared = self.prepare_generation(prompt_tokens, None, None)?;
+        let mut prepared = self.prepare_generation(prompt_tokens, None, None, true)?;
         let prompt_len = usize::try_from(prepared.prompt_len)
             .map_err(|_| EngineError::Generation("prompt_len overflow".to_owned()))?;
         let (current_token, _, _) = self.run_prefill(
@@ -4375,6 +6745,7 @@ impl SimpleEngine {
             None,
             false,
             prefix_cache_enabled(),
+            None,
             None,
             None,
             None,
@@ -4592,6 +6963,39 @@ impl SimpleEngine {
         decode(&filtered)
     }
 
+    /// Split a completed token sequence into `(content, reasoning)` at the
+    /// `</think>` boundary, excluding the boundary token from both ranges.
+    ///
+    /// This is the token-level analogue of the streaming reasoning tracker and
+    /// the source of truth for the buffered (non-streaming) path: it guarantees
+    /// the `</think>` delimiter never surfaces in either field, unlike the
+    /// string-based `reasoning_parser::parse_reasoning` which can leak it when
+    /// the model (or the thinking-budget fallback) emits the boundary token.
+    fn split_thinking_output(
+        &self,
+        tokens: &[u32],
+        enable_thinking: bool,
+        think_close_token: Option<u32>,
+        think_close_index: Option<usize>,
+    ) -> Result<(String, Option<String>), EngineError> {
+        Ok(match think_close_index {
+            Some(idx) => (
+                self.decode_tokens(&tokens[idx + 1..])?,
+                Some(self.decode_tokens(&tokens[..idx])?),
+            ),
+            None => {
+                if enable_thinking && think_close_token.is_some() {
+                    // Thinking enabled, but the model never closed its think
+                    // block within this turn: the whole sequence is reasoning
+                    // and there is no visible answer yet.
+                    (String::new(), Some(self.decode_tokens(tokens)?))
+                } else {
+                    (self.decode_tokens(tokens)?, None)
+                }
+            }
+        })
+    }
+
     /// The model's hidden dimension (embedding output size).
     pub fn hidden_size(&self) -> i32 {
         let model = self
@@ -4783,6 +7187,68 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
+        self.generate_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            enable_thinking,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            &PFlashPromptPolicy::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_thinking_and_pflash_policy(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        enable_thinking: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<GenerationOutput, EngineError> {
+        self.generate_with_thinking_and_pflash_policy_with_cache(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            enable_thinking,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            pflash_policy,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_thinking_and_pflash_policy_with_cache(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        enable_thinking: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
+    ) -> Result<GenerationOutput, EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -4793,6 +7259,9 @@ impl SimpleEngine {
                 prompt_tokens: Self::prompt_len(prompt_tokens)?,
                 completion_tokens: 0,
                 token_logprobs: None,
+                reasoning_content: None,
+                // No prefill ran, so the prefix-cache hit is unknown here.
+                cached_prompt_tokens: 0,
             });
         }
 
@@ -4810,6 +7279,8 @@ impl SimpleEngine {
                 constraint,
                 pixel_values,
                 checkpoint_id,
+                pflash_policy,
+                allow_prefix_cache,
             )
         })
     }
@@ -4818,8 +7289,527 @@ impl SimpleEngine {
         clippy::significant_drop_tightening,
         clippy::too_many_lines,
         clippy::too_many_arguments,
+        clippy::unnecessary_wraps,
         clippy::float_cmp
     )]
+    fn pflash_plan_cache_config(&self) -> PFlashPlanCacheConfig {
+        PFlashPlanCacheConfig {
+            version: PrefillPlanMetadata::VERSION,
+            score_mode: self.prefill_score_mode,
+            exit_layer: self.prefill_exit_layer,
+            keep_floor_bits: self.prefill_keep_ratio.to_bits(),
+            keep_ceiling_bits: self.prefill_keep_ratio_max.to_bits(),
+            chunk: self.prefill_chunk,
+            avgpool: self.prefill_avgpool,
+            lookahead: self.prefill_lookahead,
+        }
+    }
+
+    fn pflash_cached_prefix(
+        &self,
+        prompt_tokens: &[u32],
+        config: PFlashPlanCacheConfig,
+    ) -> Option<PFlashPlanCacheHit> {
+        if !self.prefill_plan_cache {
+            return None;
+        }
+        self.pflash_plan_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.find_longest_prefix(prompt_tokens, config))
+    }
+
+    fn pflash_store_plan(
+        &self,
+        prompt_tokens: &[u32],
+        plan: &SurvivalPlan,
+        config: PFlashPlanCacheConfig,
+    ) {
+        if !self.prefill_plan_cache {
+            return;
+        }
+        if let Ok(mut cache) = self.pflash_plan_cache.lock() {
+            cache.store(
+                prompt_tokens,
+                plan.clone(),
+                config,
+                self.prefill_plan_cache_entries,
+            );
+        }
+    }
+
+    fn pflash_score_tokens(
+        &self,
+        tokens: &[u32],
+        hard_keep_spans: &[HardKeepSpan],
+    ) -> Result<PFlashScoreOutcome, EngineError> {
+        let max_full_score_tokens = pflash_full_score_max_tokens();
+        if pflash_full_score_budget_exceeded(
+            self.prefill_score_mode,
+            tokens.len(),
+            max_full_score_tokens,
+        ) {
+            tracing::warn!(
+                source_tokens = tokens.len(),
+                max_score_tokens = max_full_score_tokens,
+                score_mode = ?self.prefill_score_mode,
+                "PFlash Full scorer budget exceeded; using bounded recency survivor plan"
+            );
+            return self.pflash_recency_fallback_plan(tokens, hard_keep_spans);
+        }
+
+        let _mlx_gate = (!higgs_models::mlx_exec::held()).then(higgs_models::mlx_exec::acquire);
+        let prefill_lock = self
+            .prefill_drafter
+            .as_ref()
+            .ok_or_else(|| EngineError::Generation("prefill drafter missing".to_owned()))?;
+        let mut drafter = lock_or_recover(prefill_lock);
+
+        let prompt_len = i32::try_from(tokens.len()).map_err(|_| {
+            EngineError::Generation("prompt too long for prefill compression".to_owned())
+        })?;
+        let inputs = Array::from_slice(tokens, &[1, prompt_len]);
+        let num_layers = drafter.num_layers();
+        let score_layers_start = num_layers.saturating_sub(8);
+        let (score_layers, scorer_exit_layer): (Vec<usize>, Option<usize>) =
+            match self.prefill_score_mode {
+                PrefillScoreMode::Full => ((score_layers_start..num_layers).collect(), None),
+                PrefillScoreMode::L7 => {
+                    if self.prefill_exit_layer == 0 {
+                        return Err(EngineError::Generation(
+                            "PFlash-L7 requires prefill_exit_layer >= 1".to_owned(),
+                        ));
+                    }
+                    let exit_layer = self.prefill_exit_layer.min(num_layers.saturating_sub(1));
+                    (vec![exit_layer], Some(exit_layer))
+                }
+            };
+        let score_start = std::time::Instant::now();
+        let mut cache: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+        let raw_importance_scores = drafter.pflash_importance(
+            &inputs,
+            &score_layers,
+            self.prefill_lookahead,
+            &mut cache,
+        )?;
+        eval([&raw_importance_scores]).map_err(EngineError::Mlx)?;
+        let score_ms = score_start.elapsed().as_secs_f64() * 1000.0;
+
+        let select_start = std::time::Instant::now();
+        let importance_scores_f32 = raw_importance_scores
+            .as_dtype(Dtype::Float32)
+            .map_err(EngineError::Mlx)?;
+        let importance_scores = importance_scores_f32.as_slice::<f32>().to_vec();
+        let keep_ceiling = self.prefill_keep_ratio_max;
+        let effective_keep_ratio = adaptive_keep_ratio_from_importance(
+            &importance_scores,
+            self.prefill_keep_ratio,
+            keep_ceiling,
+        );
+        let cfg = PrefillScoreConfig {
+            keep_ratio: effective_keep_ratio,
+            chunk: self.prefill_chunk,
+            avgpool: self.prefill_avgpool,
+            lookahead: self.prefill_lookahead,
+        };
+        let plan =
+            select_survivors_with_hard_keep(tokens, &importance_scores, &cfg, hard_keep_spans)
+                .map_err(|error| {
+                    EngineError::Generation(format!("PFlash survivor selection failed: {error}"))
+                })?;
+        let select_ms = select_start.elapsed().as_secs_f64() * 1000.0;
+        Ok(PFlashScoreOutcome {
+            plan: plan.with_scorer(self.prefill_score_mode, scorer_exit_layer),
+            score_ms,
+            select_ms,
+            effective_keep_ratio,
+            score_budget_fallback: false,
+        })
+    }
+
+    fn pflash_recency_fallback_plan(
+        &self,
+        tokens: &[u32],
+        hard_keep_spans: &[HardKeepSpan],
+    ) -> Result<PFlashScoreOutcome, EngineError> {
+        let select_start = std::time::Instant::now();
+        let source_len = tokens.len();
+        let importance_scores: Vec<f32> = if source_len == 0 {
+            Vec::new()
+        } else {
+            let denom = source_len.max(1) as f32;
+            (0..source_len)
+                .map(|index| (index + 1) as f32 / denom)
+                .collect()
+        };
+        let effective_keep_ratio = self.prefill_keep_ratio;
+        let cfg = PrefillScoreConfig {
+            keep_ratio: effective_keep_ratio,
+            chunk: self.prefill_chunk,
+            avgpool: self.prefill_avgpool,
+            lookahead: 0,
+        };
+        let plan =
+            select_survivors_with_hard_keep(tokens, &importance_scores, &cfg, hard_keep_spans)
+                .map_err(|error| {
+                    EngineError::Generation(format!(
+                        "PFlash recency survivor selection failed: {error}"
+                    ))
+                })?;
+        let select_ms = select_start.elapsed().as_secs_f64() * 1000.0;
+        let scorer_exit_layer = match self.prefill_score_mode {
+            PrefillScoreMode::Full => None,
+            PrefillScoreMode::L7 => Some(self.prefill_exit_layer),
+        };
+        Ok(PFlashScoreOutcome {
+            plan: plan.with_scorer(self.prefill_score_mode, scorer_exit_layer),
+            score_ms: 0.0,
+            select_ms,
+            effective_keep_ratio,
+            score_budget_fallback: true,
+        })
+    }
+
+    fn pflash_identity_plan(&self, tokens: &[u32]) -> Result<SurvivalPlan, EngineError> {
+        let cfg = PrefillScoreConfig {
+            keep_ratio: 0.95,
+            chunk: self.prefill_chunk,
+            avgpool: self.prefill_avgpool,
+            lookahead: self.prefill_lookahead,
+        };
+        let metadata = PrefillPlanMetadata::from_config(&cfg);
+        let exit_layer = match self.prefill_score_mode {
+            PrefillScoreMode::Full => None,
+            PrefillScoreMode::L7 => Some(self.prefill_exit_layer),
+        };
+        SurvivalPlan::identity(tokens, metadata)
+            .map(|plan| plan.with_scorer(self.prefill_score_mode, exit_layer))
+            .map_err(|error| {
+                EngineError::Generation(format!("PFlash identity plan failed: {error}"))
+            })
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn pflash_record_used(
+        &self,
+        source_tokens: usize,
+        kept_tokens: usize,
+        cache_prefix_tokens: usize,
+        suffix_tokens: usize,
+        request_tail_tokens: usize,
+        score_ms: f64,
+        select_ms: f64,
+        total_ms: f64,
+        effective_keep_ratio: f32,
+    ) {
+        self.cache_metrics
+            .pflash_used
+            .fetch_add(1, Ordering::Relaxed);
+        self.cache_metrics.pflash_last_source_tokens.store(
+            u64::try_from(source_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.pflash_last_kept_tokens.store(
+            u64::try_from(kept_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.pflash_last_cache_prefix_tokens.store(
+            u64::try_from(cache_prefix_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.pflash_last_suffix_tokens.store(
+            u64::try_from(suffix_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.pflash_last_request_tail_tokens.store(
+            u64::try_from(request_tail_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics
+            .pflash_last_score_ms
+            .store(score_ms.round().max(0.0) as u64, Ordering::Relaxed);
+        self.cache_metrics
+            .pflash_last_select_ms
+            .store(select_ms.round().max(0.0) as u64, Ordering::Relaxed);
+        self.cache_metrics
+            .pflash_last_total_ms
+            .store(total_ms.round().max(0.0) as u64, Ordering::Relaxed);
+        let keep_ppm = (effective_keep_ratio.clamp(0.0, 1.0) * 1_000_000.0).round() as u64;
+        self.cache_metrics
+            .pflash_last_effective_keep_ratio_ppm
+            .store(keep_ppm, Ordering::Relaxed);
+    }
+
+    fn pflash_unavailable(
+        &self,
+        reason: &'static str,
+        required: bool,
+    ) -> Result<Option<SurvivalPlan>, EngineError> {
+        self.cache_metrics
+            .pflash_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+        if required {
+            return Err(EngineError::Generation(format!(
+                "PFlash required but unavailable: {reason}"
+            )));
+        }
+        tracing::warn!(reason, "PFlash unavailable; using uncompressed prefill");
+        Ok(None)
+    }
+
+    fn pflash_compress_if_eligible(
+        &self,
+        prompt_tokens: &[u32],
+        generation_suffix: &[u32],
+        pflash_policy: &PFlashPromptPolicy,
+        _params: &SamplingParams,
+        pixel_values: Option<&Array>,
+        constraint: Option<&crate::constrained::ConstrainedGenerator>,
+        logprobs: bool,
+        session_id: Option<&u64>,
+    ) -> Result<Option<SurvivalPlan>, EngineError> {
+        if self.prefill_compression == PrefillCompressionMode::Off {
+            return Ok(None);
+        }
+        let pflash_required = self.prefill_compression == PrefillCompressionMode::Always;
+        if self.prefill_drafter.is_none() {
+            return self.pflash_unavailable("prefill drafter missing", pflash_required);
+        }
+        if self.prefill_compression == PrefillCompressionMode::Auto
+            && prompt_tokens.len() < self.prefill_threshold
+        {
+            return Ok(None);
+        }
+        if pixel_values.is_some() || constraint.is_some() || logprobs || session_id.is_some() {
+            return self.pflash_unavailable("request is incompatible", pflash_required);
+        }
+        // Simple engine is single-request only; no batch mode call-path reaches here.
+        self.cache_metrics
+            .pflash_attempts
+            .fetch_add(1, Ordering::Relaxed);
+
+        let min_free_mb = prefill_min_free_memory_mb();
+        let free_mb = match pflash_free_memory_mb() {
+            Ok(free_mb) => free_mb,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    min_free_mb,
+                    "PFlash memory guard unavailable"
+                );
+                return self.pflash_unavailable("memory guard unavailable", pflash_required);
+            }
+        };
+        if free_mb < min_free_mb {
+            tracing::warn!(free_mb, min_free_mb, "Insufficient free memory for PFlash");
+            return self.pflash_unavailable("insufficient free memory", pflash_required);
+        }
+
+        let total_start = std::time::Instant::now();
+        let cache_config = self.pflash_plan_cache_config();
+        let (body_tokens, generation_tail_tokens) =
+            pflash_cache_source_and_request_tail_with_boundary(
+                prompt_tokens,
+                generation_suffix,
+                pflash_policy.body_token_count,
+            );
+        let exact_body_tail_start = pflash_policy
+            .hard_keep_ranges
+            .iter()
+            .filter(|range| range.start < body_tokens.len() && range.end >= body_tokens.len())
+            .map(|range| range.start)
+            .min()
+            .unwrap_or(body_tokens.len());
+        let cache_source_tokens = body_tokens
+            .get(..exact_body_tail_start)
+            .unwrap_or(body_tokens);
+        let request_tail_tokens = prompt_tokens
+            .get(exact_body_tail_start..)
+            .unwrap_or(generation_tail_tokens);
+        let cache_hard_keep_spans = clipped_hard_keep_spans(
+            &pflash_policy.hard_keep_ranges,
+            0,
+            cache_source_tokens.len(),
+        );
+        let cached_prefix = self.pflash_cached_prefix(cache_source_tokens, cache_config);
+        let suffix_identity_threshold = self.prefill_suffix_identity_threshold;
+        let mut cache_prefix_tokens = 0usize;
+        let mut suffix_tokens = cache_source_tokens.len();
+        let mut suffix_identity = false;
+        let mut score_ms = 0.0_f64;
+        let mut select_ms = 0.0_f64;
+        let mut effective_keep_ratio = self.prefill_keep_ratio;
+        let mut score_budget_fallback = false;
+
+        let body_plan = match (|| -> Result<SurvivalPlan, EngineError> {
+            if let Some(hit) = cached_prefix {
+                self.cache_metrics
+                    .pflash_plan_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                cache_prefix_tokens = hit.source_len;
+                suffix_tokens = cache_source_tokens.len().saturating_sub(hit.source_len);
+                if suffix_tokens == 0 {
+                    return Ok(hit.plan);
+                }
+                let suffix = cache_source_tokens
+                    .get(hit.source_len..)
+                    .unwrap_or_default();
+                let suffix_hard_keep_spans = clipped_hard_keep_spans(
+                    &pflash_policy.hard_keep_ranges,
+                    hit.source_len,
+                    cache_source_tokens.len(),
+                );
+                let suffix_plan = if suffix.len() <= suffix_identity_threshold {
+                    suffix_identity = true;
+                    self.pflash_identity_plan(suffix)?
+                } else {
+                    let outcome = self.pflash_score_tokens(suffix, &suffix_hard_keep_spans)?;
+                    score_ms = outcome.score_ms;
+                    select_ms = outcome.select_ms;
+                    effective_keep_ratio = outcome.effective_keep_ratio;
+                    score_budget_fallback = outcome.score_budget_fallback;
+                    outcome.plan
+                };
+                return hit
+                    .plan
+                    .append_suffix(&suffix_plan, suffix_plan.metadata.clone())
+                    .map_err(|error| {
+                        EngineError::Generation(format!(
+                            "PFlash cached-prefix append failed: {error}"
+                        ))
+                    });
+            }
+
+            if cache_source_tokens.is_empty() {
+                return self.pflash_identity_plan(cache_source_tokens);
+            }
+
+            let outcome = self.pflash_score_tokens(cache_source_tokens, &cache_hard_keep_spans)?;
+            score_ms = outcome.score_ms;
+            select_ms = outcome.select_ms;
+            effective_keep_ratio = outcome.effective_keep_ratio;
+            score_budget_fallback = outcome.score_budget_fallback;
+            Ok(outcome.plan)
+        })() {
+            Ok(plan) => {
+                self.pflash_store_plan(cache_source_tokens, &plan, cache_config);
+                plan
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "PFlash compression failed"
+                );
+                return self.pflash_unavailable("compression failed", pflash_required);
+            }
+        };
+        let plan = if request_tail_tokens.is_empty() {
+            body_plan
+        } else {
+            let tail_plan = self.pflash_identity_plan(request_tail_tokens)?;
+            body_plan
+                .append_suffix(&tail_plan, tail_plan.metadata.clone())
+                .map_err(|error| {
+                    EngineError::Generation(format!("PFlash request-tail append failed: {error}"))
+                })?
+        };
+        let original_len = prompt_tokens.len();
+        let kept_len = plan.len();
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        let actual_keep_ratio = pflash_actual_keep_ratio(original_len, kept_len);
+        if self.prefill_compression == PrefillCompressionMode::Auto
+            && !pflash_auto_plan_worth_executing(
+                original_len,
+                kept_len,
+                self.prefill_max_auto_prefill_ratio,
+            )
+        {
+            self.cache_metrics
+                .pflash_skipped_unprofitable
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                original = original_len,
+                kept = kept_len,
+                ratio = format_args!("{kept_len}/{original_len}"),
+                actual_keep_ratio,
+                max_auto_prefill_ratio = self.prefill_max_auto_prefill_ratio,
+                mode = ?plan.metadata.score_mode,
+                cache_prefix_tokens,
+                suffix_tokens,
+                suffix_identity,
+                request_tail_tokens = request_tail_tokens.len(),
+                exact_body_tail_tokens = body_tokens.len().saturating_sub(cache_source_tokens.len()),
+                hard_keep_ranges = pflash_policy.hard_keep_ranges.len(),
+                cache_hard_keep_tokens = cache_hard_keep_spans
+                    .iter()
+                    .map(|span| span.end.saturating_sub(span.start))
+                    .sum::<usize>(),
+                score_ms,
+                select_ms,
+                total_ms,
+                keep_floor = self.prefill_keep_ratio,
+                keep_ceiling = self.prefill_keep_ratio_max,
+                effective_keep_ratio,
+                exit_layer = ?plan.metadata.exit_layer,
+                score_budget_fallback,
+                "PFlash high-retention plan skipped; using exact prefill/cache path"
+            );
+            return Ok(None);
+        }
+        let target_plan = match plan.target_sparse_prefill_plan() {
+            Ok(target_plan) => target_plan,
+            Err(error) => {
+                tracing::warn!(error, "PFlash built invalid sparse prefill plan");
+                return self.pflash_unavailable("invalid sparse plan", pflash_required);
+            }
+        };
+        self.pflash_record_used(
+            original_len,
+            kept_len,
+            cache_prefix_tokens,
+            suffix_tokens,
+            request_tail_tokens.len(),
+            score_ms,
+            select_ms,
+            total_ms,
+            effective_keep_ratio,
+        );
+        tracing::info!(
+            original = original_len,
+            kept = kept_len,
+            ratio = format_args!("{kept_len}/{original_len}"),
+            actual_keep_ratio,
+            positions = plan.original_positions.len(),
+            source = plan.source_token_count,
+            mode = ?plan.metadata.score_mode,
+            cache_prefix_tokens,
+            suffix_tokens,
+            suffix_identity,
+            request_tail_tokens = request_tail_tokens.len(),
+            exact_body_tail_tokens = body_tokens.len().saturating_sub(cache_source_tokens.len()),
+            hard_keep_ranges = pflash_policy.hard_keep_ranges.len(),
+            cache_hard_keep_tokens = cache_hard_keep_spans
+                .iter()
+                .map(|span| span.end.saturating_sub(span.start))
+                .sum::<usize>(),
+            score_ms,
+            select_ms,
+            total_ms,
+            keep_floor = self.prefill_keep_ratio,
+            keep_ceiling = self.prefill_keep_ratio_max,
+            effective_keep_ratio,
+            exit_layer = ?plan.metadata.exit_layer,
+            score_budget_fallback,
+            "PFlash built compressed prefill plan"
+        );
+        tracing::info!(
+            logical_next_pos = target_plan.logical_next_pos,
+            contiguous_identity = plan.is_contiguous_identity(),
+            "PFlash sparse prefill plan accepted"
+        );
+        Ok(Some(plan))
+    }
+
     fn generate_inner(
         &self,
         prompt_tokens: &[u32],
@@ -4832,8 +7822,25 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
     ) -> Result<GenerationOutput, EngineError> {
         let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
+        let generation_suffix = self.gen_prompt_suffixes.for_request(enable_thinking);
+        let compressed = self.pflash_compress_if_eligible(
+            prompt_tokens,
+            generation_suffix,
+            pflash_policy,
+            params,
+            pixel_values.as_ref(),
+            constraint.as_ref(),
+            logprobs,
+            None,
+        )?;
+        let prepared_prompt_tokens: &[u32] = match &compressed {
+            Some(plan) => plan.token_ids.as_slice(),
+            None => prompt_tokens,
+        };
         // DFlash speculative decoding: use the draft-verify loop when a drafter
         // is loaded, the request allows it (`speculation` = auto/dflash), no
         // constraints active, and no multimodal input.
@@ -4843,23 +7850,41 @@ impl SimpleEngine {
                 "sampled dSpark request uses ordinary AR to preserve the shared RNG transition"
             );
         }
+        // PFlash non-contiguous plans can feed dSpark only when this request
+        // will run the sparse target prefill with resident-row tap capture.
+        let dflash_is_dspark = self.dflash.as_ref().is_some_and(|state| state.is_dspark);
+        let model_supports_sparse_taps = self.model_supports_pflash_sparse_prefill();
+        let sparse_taps_available = dflash_sparse_taps_available_for_pflash_plan(
+            compressed.as_ref(),
+            dflash_is_dspark,
+            model_supports_sparse_taps,
+        );
+        let dflash_accepts_prefill_plan =
+            dflash_accepts_pflash_plan(compressed.as_ref(), sparse_taps_available);
+        if compressed.is_some() && !dflash_accepts_prefill_plan && self.dflash.is_some() {
+            tracing::info!(
+                "PFlash non-contiguous plan requires dSpark sparse target prefill; using AR decode"
+            );
+        }
         let speculation_route = resolve_speculation_route(
             params.speculation,
             self.dflash.is_some()
                 && !sampled_dspark
+                && dflash_accepts_prefill_plan
                 && constraint.is_none()
                 && pixel_values.is_none()
                 && !logprobs,
             stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
         );
-        if speculation_route == SpeculationRoute::DFlash {
+        if allow_prefix_cache && speculation_route == SpeculationRoute::DFlash {
             return self.generate_dflash_inner(
-                prompt_tokens,
+                prepared_prompt_tokens,
                 max_tokens,
                 params,
                 stop_sequences,
                 enable_thinking,
                 thinking_budget,
+                compressed.as_ref(),
             );
         }
 
@@ -4869,8 +7894,21 @@ impl SimpleEngine {
         }
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
-        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values, checkpoint_id)?;
+        let mut prepared = self.prepare_generation(
+            prepared_prompt_tokens,
+            pixel_values,
+            checkpoint_id,
+            allow_prefix_cache && compressed.is_none(),
+        )?;
+        if compressed.is_some() {
+            prepared.prompt_len = Self::prompt_len(prompt_tokens)?;
+        }
         let prompt_len = prepared.prompt_len;
+        // Same prefix-cache-hit accounting the streaming route uses to fill
+        // `PrefillProgress.cached` (see `generate_streaming_inner`'s
+        // `prefill_sink`): tokens `prepare_generation` didn't have to
+        // re-prefill because the radix cache already held them.
+        let cached_prompt_tokens = prepared.reused_prefix_tokens;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
             && self.tuning.enable_mtp()
@@ -4881,15 +7919,16 @@ impl SimpleEngine {
             && params.temperature == 0.0;
 
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
-            prompt_tokens,
+            prepared_prompt_tokens,
             self.gen_prompt_suffixes.for_request(enable_thinking),
             &mut prepared,
             params,
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
-            prefix_cache_enabled(),
+            cache_policy_allows_prefix_cache(allow_prefix_cache) && compressed.is_none(),
             checkpoint_id,
+            compressed.as_ref(),
             None,
             None,
         )?;
@@ -4923,6 +7962,8 @@ impl SimpleEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
+                reasoning_content: None,
+                cached_prompt_tokens,
             });
         }
         if has_stop_sequences {
@@ -4941,6 +7982,8 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: 1,
                     token_logprobs: all_logprobs,
+                    reasoning_content: None,
+                    cached_prompt_tokens,
                 });
             }
         }
@@ -4958,6 +8001,8 @@ impl SimpleEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
                 token_logprobs: all_logprobs,
+                reasoning_content: None,
+                cached_prompt_tokens,
             });
         }
 
@@ -4981,6 +8026,7 @@ impl SimpleEngine {
                 stop_sequences,
                 enable_thinking,
                 thinking_budget,
+                cached_prompt_tokens,
             );
         }
 
@@ -5007,6 +8053,7 @@ impl SimpleEngine {
                 stop_sequences,
                 enable_thinking,
                 thinking_budget,
+                cached_prompt_tokens,
             );
         }
 
@@ -5052,6 +8099,11 @@ impl SimpleEngine {
         let mut thinking_tokens: u32 = u32::from(think_close_token.is_some());
         let mut seen_think_close =
             think_close_token.is_some_and(|close_id| first_token_id == close_id);
+        // Index of the `</think>` boundary token in `tokens` once seen, so the
+        // reasoning/answer split can be done at the token level (the boundary
+        // token is then excluded from both decoded ranges). `None` means the
+        // model never closed its think block within this turn.
+        let mut think_close_index: Option<usize> = None;
 
         loop {
             let t0 = std::time::Instant::now();
@@ -5114,11 +8166,13 @@ impl SimpleEngine {
             if let Some(close_id) = think_close_token {
                 if !seen_think_close {
                     if token_id == close_id {
+                        think_close_index = Some(tokens.len());
                         seen_think_close = true;
                     } else {
                         thinking_tokens += 1;
                         if thinking_tokens >= thinking_budget {
                             token_id = close_id;
+                            think_close_index = Some(tokens.len());
                             seen_think_close = true;
                             tracing::info!(
                                 budget = thinking_budget,
@@ -5170,12 +8224,20 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
+                let (split_text, reasoning_content) = self.split_thinking_output(
+                    &tokens,
+                    enable_thinking,
+                    think_close_token,
+                    think_close_index,
+                )?;
                 return Ok(GenerationOutput {
-                    text: self.decode_tokens(&tokens)?,
+                    text: split_text,
                     finish_reason: "stop".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    reasoning_content,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -5188,12 +8250,20 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
+                let (split_text, reasoning_content) = self.split_thinking_output(
+                    &tokens,
+                    enable_thinking,
+                    think_close_token,
+                    think_close_index,
+                )?;
                 return Ok(GenerationOutput {
-                    text: self.decode_tokens(&tokens)?,
+                    text: split_text,
                     finish_reason: "stop".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    reasoning_content,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -5208,12 +8278,20 @@ impl SimpleEngine {
                         total_item_ns,
                         total_other_ns,
                     );
+                    let (_, reasoning_content) = self.split_thinking_output(
+                        &tokens,
+                        enable_thinking,
+                        think_close_token,
+                        think_close_index,
+                    )?;
                     return Ok(GenerationOutput {
                         text: truncated,
                         finish_reason: "stop".to_owned(),
                         prompt_tokens: prompt_len,
                         completion_tokens: completion_len,
                         token_logprobs: all_logprobs,
+                        reasoning_content,
+                        cached_prompt_tokens,
                     });
                 }
             }
@@ -5227,12 +8305,20 @@ impl SimpleEngine {
                     total_item_ns,
                     total_other_ns,
                 );
+                let (split_text, reasoning_content) = self.split_thinking_output(
+                    &tokens,
+                    enable_thinking,
+                    think_close_token,
+                    think_close_index,
+                )?;
                 return Ok(GenerationOutput {
-                    text: self.decode_tokens(&tokens)?,
+                    text: split_text,
                     finish_reason: "length".to_owned(),
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: all_logprobs,
+                    reasoning_content,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -5422,7 +8508,14 @@ impl SimpleEngine {
         drafter: &mut DFlashDrafter,
         prompt_tokens: &[u32],
         dflash: &DFlashState,
+        compressed_prefill: Option<&SurvivalPlan>,
     ) -> Result<DflashPrefillOutcome, EngineError> {
+        if dflash.is_dspark
+            && let Some(plan) = compressed_prefill.filter(|plan| !plan.is_contiguous_identity())
+        {
+            return self.dflash_cold_sparse_prefill(model, drafter, prompt_tokens, dflash, plan);
+        }
+
         let cache = model
             .make_cache_with_config(self.kv_cache_config)
             .map_err(EngineError::Mlx)?;
@@ -5479,6 +8572,67 @@ impl SimpleEngine {
         )
     }
 
+    fn dflash_cold_sparse_prefill(
+        &self,
+        model: &mut AnyModel,
+        drafter: &mut DFlashDrafter,
+        prompt_tokens: &[u32],
+        dflash: &DFlashState,
+        plan: &SurvivalPlan,
+    ) -> Result<DflashPrefillOutcome, EngineError> {
+        if prompt_tokens != plan.token_ids.as_slice() {
+            return Err(EngineError::Generation(
+                "PFlash dSpark sparse prefill received tokens that differ from the survival plan"
+                    .to_owned(),
+            ));
+        }
+        let target_plan = plan.target_sparse_prefill_plan().map_err(|error| {
+            EngineError::Generation(format!("PFlash sparse prefill plan invalid: {error}"))
+        })?;
+        let output = model
+            .pflash_prefill_sparse_with_taps(target_plan, &dflash.tap_layers)
+            .map_err(EngineError::Mlx)?;
+        let resident_len = output.state.resident_len();
+        let logical_next_pos = output.state.next_position();
+        if output.taps.len() != dflash.tap_layers.len()
+            || output
+                .taps
+                .iter()
+                .any(|tap| tap.shape().get(1).copied() != Some(resident_len))
+        {
+            return Err(EngineError::Generation(format!(
+                "PFlash sparse dSpark prefill returned {} taps for {} configured layers at resident_len={resident_len}",
+                output.taps.len(),
+                dflash.tap_layers.len()
+            )));
+        }
+        let cache = AnyCache::Hybrid(output.state.into_cache());
+        let actual_keep_ratio = if plan.source_token_count == 0 {
+            1.0
+        } else {
+            f64::from(resident_len) / plan.source_token_count as f64
+        };
+        tracing::info!(
+            source_tokens = plan.source_token_count,
+            resident_tokens = resident_len,
+            logical_next_pos,
+            actual_keep_ratio,
+            metadata_keep_ratio = plan.metadata.keep_ratio,
+            score_mode = ?plan.metadata.score_mode,
+            "PFlash sparse dSpark prefill executed"
+        );
+        higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+        DflashPrefillOutcome::validated(
+            cache,
+            drafter.make_cache(),
+            output.logits,
+            output.taps,
+            0,
+            resident_len,
+            dflash.tap_layers.len(),
+        )
+    }
+
     /// Materialize or build one exact paired conversation-body prefix, then
     /// prefill the request-specific generation tail into its live branch.
     ///
@@ -5497,9 +8651,16 @@ impl SimpleEngine {
         paired_plan: Option<DflashPairedPrefixPlan>,
         deferred_touch: &mut DeferredPairedTouch<'_>,
         dflash: &DFlashState,
+        compressed_prefill: Option<&SurvivalPlan>,
     ) -> Result<DflashPrefillOutcome, EngineError> {
         let (Some(partition), Some(paired_plan)) = (partition, paired_plan) else {
-            return self.dflash_cold_prefill(model, drafter, prompt_tokens, dflash);
+            return self.dflash_cold_prefill(
+                model,
+                drafter,
+                prompt_tokens,
+                dflash,
+                compressed_prefill,
+            );
         };
 
         let DflashPairedPrefixPlan {
@@ -5537,7 +8698,13 @@ impl SimpleEngine {
             publication_ticket.store_boundary(partition.body_end, pair.target_is_hybrid());
         if publish_boundary == 0 || reused_prefix_len > publish_boundary {
             drop(pair);
-            return self.dflash_cold_prefill(model, drafter, prompt_tokens, dflash);
+            return self.dflash_cold_prefill(
+                model,
+                drafter,
+                prompt_tokens,
+                dflash,
+                compressed_prefill,
+            );
         }
 
         if reused_prefix_len < publish_boundary {
@@ -5573,7 +8740,13 @@ impl SimpleEngine {
                         expected = publish_boundary,
                         "Failed to checkpoint a paired radix dSpark boundary; cold-prefilling"
                     );
-                    return self.dflash_cold_prefill(model, drafter, prompt_tokens, dflash);
+                    return self.dflash_cold_prefill(
+                        model,
+                        drafter,
+                        prompt_tokens,
+                        dflash,
+                        compressed_prefill,
+                    );
                 }
             };
             pair = continued;
@@ -5881,6 +9054,7 @@ impl SimpleEngine {
         stop_sequences: &[String],
         enable_thinking: bool,
         thinking_budget: u32,
+        compressed_prefill: Option<&SurvivalPlan>,
         mut sink: S,
     ) -> Result<S::Output, EngineError> {
         let request_t0 = std::time::Instant::now();
@@ -5888,7 +9062,12 @@ impl SimpleEngine {
             .dflash
             .as_ref()
             .ok_or_else(|| EngineError::Generation("DFlash state missing".to_owned()))?;
-        let prompt_len = Self::prompt_len(prompt_tokens)?;
+        let resident_prompt_len = Self::prompt_len(prompt_tokens)?;
+        let prompt_len = compressed_prefill.map_or(Ok(resident_prompt_len), |plan| {
+            u32::try_from(plan.source_token_count).map_err(|_| {
+                EngineError::Generation("PFlash source prompt length overflow u32".to_owned())
+            })
+        })?;
         if let Ok(mut v) = self.last_dflash_accepts.lock() {
             v.clear();
         }
@@ -5902,7 +9081,9 @@ impl SimpleEngine {
             *timing = None;
         }
 
-        let partition = (dflash.is_dspark && prefix_cache_enabled())
+        let lossy_compressed_prefill =
+            compressed_prefill.is_some_and(|plan| !plan.is_contiguous_identity());
+        let partition = (dflash.is_dspark && prefix_cache_enabled() && !lossy_compressed_prefill)
             .then(|| {
                 DflashPromptPartition::new(
                     prompt_tokens,
@@ -5939,6 +9120,7 @@ impl SimpleEngine {
             paired_plan,
             &mut deferred_touch,
             dflash,
+            compressed_prefill,
         )?;
         let DflashPrefillOutcome {
             mut cache,
@@ -6020,7 +9202,7 @@ impl SimpleEngine {
 
         let mut last_token = i32::try_from(first_token_id)
             .map_err(|_| EngineError::Generation("first_token_id overflow for i32".to_owned()))?;
-        let mut start = i32::try_from(prompt_len)
+        let mut start = i32::try_from(resident_prompt_len)
             .map_err(|_| EngineError::Generation("prompt_len overflow for i32".to_owned()))?;
         let (mut current_taps, mut dspark_frontier) = if is_dspark {
             (
@@ -6036,7 +9218,7 @@ impl SimpleEngine {
             (taps, None)
         };
         let mut dspark_ledger = if is_dspark {
-            let prompt_boundary = usize::try_from(prompt_len)
+            let prompt_boundary = usize::try_from(resident_prompt_len)
                 .map_err(|_| EngineError::Generation("prompt boundary overflow".to_owned()))?;
             let mut ledger = TokenLedger::new(prompt_boundary);
             ledger
@@ -6679,6 +9861,15 @@ impl SimpleEngine {
                     let noise_embedding = model
                         .embed_token_ids(&block_ids)
                         .map_err(EngineError::Mlx)?;
+                    let dspark_phase_trace =
+                        std::env::var("HIGGS_DSPARK_PHASE_TRACE").is_ok_and(|v| v == "1");
+                    let mut dspark_phase_ckpt = if dspark_phase_trace {
+                        higgs_models::mlx_exec::eval([&noise_embedding])
+                            .map_err(EngineError::Mlx)?;
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let draft_transaction = if let Some(frontier) = dspark_frontier.as_ref() {
                         frontier.validate_live_draft(&draft_cache)?;
                         drafter.stage_forward(&noise_embedding, &frontier.taps, &draft_cache)
@@ -6686,6 +9877,19 @@ impl SimpleEngine {
                         drafter.stage_forward(&noise_embedding, &current_taps, &draft_cache)
                     }
                     .map_err(EngineError::Mlx)?;
+                    let mut dspark_stage_ms = 0.0;
+                    let mut dspark_propose_ms = 0.0;
+                    let mut dspark_verify_ms = 0.0;
+                    let mut dspark_resolve_ms = 0.0;
+                    let mut dspark_commit_ms = 0.0;
+                    let mut dspark_target_commit_ms = 0.0;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        higgs_models::mlx_exec::eval([draft_transaction.hidden()])
+                            .map_err(EngineError::Mlx)?;
+                        let now = std::time::Instant::now();
+                        dspark_stage_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        *ckpt = now;
+                    }
                     let staged_position = draft_transaction.position().map_err(EngineError::Mlx)?;
                     if staged_position != start {
                         return Err(EngineError::Generation(format!(
@@ -6703,6 +9907,12 @@ impl SimpleEngine {
                         round_draft_cap,
                         dflash.dspark_target_head,
                     )?;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        proposal.host_tokens()?;
+                        let now = std::time::Instant::now();
+                        dspark_propose_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        *ckpt = now;
+                    }
                     let dspark_anchor_ticket = dspark_ledger
                         .as_mut()
                         .map(|ledger| {
@@ -6722,7 +9932,9 @@ impl SimpleEngine {
                     // skipped attention layer from an advanced layer with no
                     // GDN tape, so partial commit could trim retained history.
                     let early_exit = None;
-                    let row_schedule = if is_dspark {
+                    let dspark_native_verify = is_dspark
+                        && std::env::var("HIGGS_DSPARK_NATIVE_VERIFY").is_ok_and(|v| v == "1");
+                    let row_schedule = if is_dspark && !dspark_native_verify {
                         higgs_models::qwen3_next::DFlashRowSchedule::CanonicalS1
                     } else {
                         higgs_models::qwen3_next::DFlashRowSchedule::NativeBatch
@@ -6737,14 +9949,37 @@ impl SimpleEngine {
                             row_schedule,
                         )
                         .map_err(EngineError::Mlx)?;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        higgs_models::mlx_exec::eval([&verify_logits]).map_err(EngineError::Mlx)?;
+                        let now = std::time::Instant::now();
+                        dspark_verify_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        *ckpt = now;
+                    }
                     // Keep draft tokens device-resident until the target verify
                     // graph reaches its single logits barrier. Pulling them
                     // earlier serializes proposal and verification and can add
                     // a full GPU/host synchronization to every round.
                     let (verify_flat, draft_u32) = dflash_resolve_target_then_draft(
-                        || crate::mtp::verify_targets(&verify_logits, Some(params), Some(&tokens)),
+                        || {
+                            if verify_logits.ndim() == 2 && verify_logits.dtype() == Dtype::Uint32 {
+                                higgs_models::mlx_exec::eval([&verify_logits])
+                                    .map_err(EngineError::Mlx)?;
+                                Ok(verify_logits.as_slice::<u32>().to_vec())
+                            } else {
+                                crate::mtp::verify_targets(
+                                    &verify_logits,
+                                    Some(params),
+                                    Some(&tokens),
+                                )
+                            }
+                        },
                         || proposal.host_tokens(),
                     )?;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        let now = std::time::Instant::now();
+                        dspark_resolve_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        *ckpt = now;
+                    }
                     let mut accepted = accept_prefix(&draft_u32, &verify_flat);
                     let draft_matches = accepted.len().saturating_sub(1);
                     // The cache convention retains one verify-input token
@@ -6779,6 +10014,11 @@ impl SimpleEngine {
                     draft_transaction
                         .commit(&mut draft_cache)
                         .map_err(EngineError::Mlx)?;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        let now = std::time::Instant::now();
+                        dspark_commit_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                        *ckpt = now;
+                    }
                     if is_dspark && draft_cache.position() != start {
                         return Err(EngineError::Generation(format!(
                             "batched dSpark committed drafter boundary {}, expected {start}",
@@ -6849,6 +10089,10 @@ impl SimpleEngine {
                     // truncated chain needs no rollback.
                     let (accepted, verify_taps) =
                         verify_round.commit_target_state(&model, &mut cache)?;
+                    if let Some(ckpt) = dspark_phase_ckpt.as_mut() {
+                        let now = std::time::Instant::now();
+                        dspark_target_commit_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                    }
                     let kept_taps: Vec<Array> = verify_taps
                         .into_iter()
                         .map(|tap| tap.index((.., ..n_accepted, ..)))
@@ -6906,6 +10150,22 @@ impl SimpleEngine {
                     start = start.checked_add(n_accepted).ok_or_else(|| {
                         EngineError::Generation("DFlash target boundary overflow".to_owned())
                     })?;
+                    if dspark_phase_trace {
+                        tracing::info!(
+                            round = rounds,
+                            accepted = n_accepted,
+                            draft_cap = round_draft_cap,
+                            verify_len,
+                            stage_ms = format!("{dspark_stage_ms:.1}"),
+                            propose_ms = format!("{dspark_propose_ms:.1}"),
+                            verify_ms = format!("{dspark_verify_ms:.1}"),
+                            resolve_ms = format!("{dspark_resolve_ms:.1}"),
+                            draft_commit_ms = format!("{dspark_commit_ms:.1}"),
+                            target_commit_ms = format!("{dspark_target_commit_ms:.1}"),
+                            total_ms = format!("{:.1}", round_t0.elapsed().as_secs_f64() * 1000.0),
+                            "dSpark phase timing"
+                        );
+                    }
                     n_accepted
                 };
 
@@ -7159,6 +10419,7 @@ impl SimpleEngine {
         stop_sequences: &[String],
         enable_thinking: bool,
         thinking_budget: u32,
+        cached_prompt_tokens: u32,
     ) -> Result<GenerationOutput, EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
         let unchecked_lookup = unchecked_prompt_lookup_enabled();
@@ -7197,6 +10458,8 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: None,
+                    reasoning_content: None,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -7243,6 +10506,8 @@ impl SimpleEngine {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: Self::completion_len(tokens)?,
                                         token_logprobs: None,
+                                        reasoning_content: None,
+                                        cached_prompt_tokens,
                                     });
                                 }
 
@@ -7261,6 +10526,8 @@ impl SimpleEngine {
                                             prompt_tokens: prompt_len,
                                             completion_tokens: Self::completion_len(tokens)?,
                                             token_logprobs: None,
+                                            reasoning_content: None,
+                                            cached_prompt_tokens,
                                         });
                                     }
                                 }
@@ -7275,6 +10542,8 @@ impl SimpleEngine {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: forced_completion_len,
                                         token_logprobs: None,
+                                        reasoning_content: None,
+                                        cached_prompt_tokens,
                                     });
                                 }
                                 break;
@@ -7294,6 +10563,8 @@ impl SimpleEngine {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        reasoning_content: None,
+                        cached_prompt_tokens,
                     });
                 }
             }
@@ -7309,6 +10580,8 @@ impl SimpleEngine {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        reasoning_content: None,
+                        cached_prompt_tokens,
                     });
                 }
             }
@@ -7323,6 +10596,8 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: final_completion_len,
                     token_logprobs: None,
+                    reasoning_content: None,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -7352,6 +10627,7 @@ impl SimpleEngine {
         stop_sequences: &[String],
         enable_thinking: bool,
         thinking_budget: u32,
+        cached_prompt_tokens: u32,
     ) -> Result<GenerationOutput, EngineError> {
         let has_stop_sequences = !stop_sequences.is_empty();
 
@@ -7479,6 +10755,8 @@ impl SimpleEngine {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: Self::completion_len(tokens)?,
                                         token_logprobs: None,
+                                        reasoning_content: None,
+                                        cached_prompt_tokens,
                                     });
                                 }
 
@@ -7495,6 +10773,8 @@ impl SimpleEngine {
                                             prompt_tokens: prompt_len,
                                             completion_tokens: Self::completion_len(tokens)?,
                                             token_logprobs: None,
+                                            reasoning_content: None,
+                                            cached_prompt_tokens,
                                         });
                                     }
                                 }
@@ -7509,6 +10789,8 @@ impl SimpleEngine {
                                         prompt_tokens: prompt_len,
                                         completion_tokens: completion_len,
                                         token_logprobs: None,
+                                        reasoning_content: None,
+                                        cached_prompt_tokens,
                                     });
                                 }
 
@@ -7530,6 +10812,8 @@ impl SimpleEngine {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        reasoning_content: None,
+                        cached_prompt_tokens,
                     });
                 }
             }
@@ -7545,6 +10829,8 @@ impl SimpleEngine {
                         prompt_tokens: prompt_len,
                         completion_tokens: Self::completion_len(tokens)?,
                         token_logprobs: None,
+                        reasoning_content: None,
+                        cached_prompt_tokens,
                     });
                 }
             }
@@ -7559,6 +10845,8 @@ impl SimpleEngine {
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                     token_logprobs: None,
+                    reasoning_content: None,
+                    cached_prompt_tokens,
                 });
             }
 
@@ -7899,6 +11187,76 @@ impl SimpleEngine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
+        self.generate_streaming_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            sender,
+            enable_thinking,
+            return_progress,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            &PFlashPromptPolicy::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_thinking_and_pflash_policy(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        return_progress: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<(), EngineError> {
+        self.generate_streaming_with_thinking_and_pflash_policy_with_cache(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            sender,
+            enable_thinking,
+            return_progress,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            pflash_policy,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_thinking_and_pflash_policy_with_cache(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        return_progress: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
+    ) -> Result<(), EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -7930,6 +11288,8 @@ impl SimpleEngine {
                 constraint,
                 pixel_values,
                 checkpoint_id,
+                pflash_policy,
+                allow_prefix_cache,
             )
         })
     }
@@ -7953,42 +11313,89 @@ impl SimpleEngine {
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
     ) -> Result<(), EngineError> {
         let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
+        let generation_suffix = self.gen_prompt_suffixes.for_request(enable_thinking);
+        let compressed = self.pflash_compress_if_eligible(
+            prompt_tokens,
+            generation_suffix,
+            pflash_policy,
+            params,
+            pixel_values.as_ref(),
+            constraint.as_ref(),
+            logprobs,
+            None,
+        )?;
+        let prepared_prompt_tokens: &[u32] = match &compressed {
+            Some(plan) => plan.token_ids.as_slice(),
+            None => prompt_tokens,
+        };
         // DFlash streaming: branch BEFORE the normal prefill — the DFlash loop
         // runs its own tap-prefill, so dispatching here (mirroring the
         // non-streaming site) avoids a double prefill. Logprobs requests fall
         // through to the MTP/AR path, which produces per-token logprobs.
+        // PFlash: plan construction is centralized above. dSpark/DFlash sees
+        // the compressed survivor sequence and can use its existing paired
+        // prefix cache; the AR path below uses target sparse prefill.
         let sampled_dspark = self.sampled_dspark_requires_ar(params);
         if sampled_dspark {
             tracing::debug!(
                 "sampled streaming dSpark request uses ordinary AR to preserve the shared RNG transition"
             );
         }
+        // Mirror the non-streaming dispatch: lossy PFlash can feed dSpark only
+        // when this request will run sparse target prefill with resident-row
+        // tap capture.
+        let dflash_is_dspark = self.dflash.as_ref().is_some_and(|state| state.is_dspark);
+        let model_supports_sparse_taps = self.model_supports_pflash_sparse_prefill();
+        let sparse_taps_available = dflash_sparse_taps_available_for_pflash_plan(
+            compressed.as_ref(),
+            dflash_is_dspark,
+            model_supports_sparse_taps,
+        );
+        let dflash_accepts_prefill_plan =
+            dflash_accepts_pflash_plan(compressed.as_ref(), sparse_taps_available);
+        if compressed.is_some() && !dflash_accepts_prefill_plan && self.dflash.is_some() {
+            tracing::info!(
+                "PFlash non-contiguous plan requires dSpark sparse target prefill; using AR streaming decode"
+            );
+        }
         let speculation_route = resolve_speculation_route(
             params.speculation,
             self.dflash.is_some()
                 && !sampled_dspark
+                && dflash_accepts_prefill_plan
                 && constraint.is_none()
                 && pixel_values.is_none()
                 && !logprobs,
             stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
         );
-        if speculation_route == SpeculationRoute::DFlash {
+        if allow_prefix_cache && speculation_route == SpeculationRoute::DFlash {
             return self.generate_dflash_streaming(
-                prompt_tokens,
+                prepared_prompt_tokens,
                 max_tokens,
                 params,
                 stop_sequences,
                 sender,
                 enable_thinking,
                 thinking_budget,
+                compressed.as_ref(),
             );
         }
 
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
-        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values, checkpoint_id)?;
+        let mut prepared = self.prepare_generation(
+            prepared_prompt_tokens,
+            pixel_values,
+            checkpoint_id,
+            allow_prefix_cache && compressed.is_none(),
+        )?;
+        if compressed.is_some() {
+            prepared.prompt_len = Self::prompt_len(prompt_tokens)?;
+        }
         let prompt_len = prepared.prompt_len;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
@@ -8010,9 +11417,7 @@ impl SimpleEngine {
         // consumer — dropped progress events are harmless. The returned guard is
         // held for the prefill's duration and uninstalls the sink on drop.
         let prefill_sink = return_progress.then(|| {
-            let actual_tokens =
-                u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
-            let cached = prompt_len.saturating_sub(actual_tokens);
+            let cached = prepared.reused_prefix_tokens;
             let make_progress_output = move |suffix_done: u32| StreamingOutput {
                 new_text: String::new(),
                 finished: false,
@@ -8038,15 +11443,16 @@ impl SimpleEngine {
         });
 
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
-            prompt_tokens,
+            prepared_prompt_tokens,
             self.gen_prompt_suffixes.for_request(enable_thinking),
             &mut prepared,
             params,
             logprob_top_n,
             constraint.as_ref(),
             capture_mtp_prefill,
-            prefix_cache_enabled(),
+            cache_policy_allows_prefix_cache(allow_prefix_cache) && compressed.is_none(),
             checkpoint_id,
+            compressed.as_ref(),
             None,
             None,
         )?;
@@ -8625,9 +12031,84 @@ pub(crate) fn extract_eos_tokens(model_dir: &Path) -> Vec<u32> {
     }
 
     if ids.is_empty() {
-        tracing::warn!("No eos_token_id found in config.json, generation will rely on max_tokens");
+        ids = eos_from_tokenizer_config(model_dir);
+    }
+    if ids.is_empty() {
+        tracing::warn!(
+            "No eos_token_id found in config.json or tokenizer_config.json, generation will rely on max_tokens"
+        );
     }
     ids
+}
+
+/// Harvest EOS token IDs from `tokenizer_config.json` when model configs omit
+/// `eos_token_id`. A model that never signals EOS forces generation to run to
+/// `max_tokens` (a very large default), pegging the GPU indefinitely. We read
+/// the standard `eos_token` field first, then fall back to scanning the added
+/// special tokens for a known end-of-sequence signature.
+///
+/// Returns empty if nothing is found, preserving the caller's warn-and-rely-on
+/// `max_tokens` path. Callers only invoke this when config-derived ids are empty,
+/// so a real `eos_token_id` is never overridden.
+fn eos_from_tokenizer_config(model_dir: &Path) -> Vec<u32> {
+    let Ok(text) = std::fs::read_to_string(model_dir.join("tokenizer_config.json")) else {
+        return vec![];
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return vec![];
+    };
+
+    // Primary: the standard `eos_token` field (string or {"content": ...}),
+    // resolved via the existing decoder lookup.
+    if let Some(content) = eos_token_field_content(&config) {
+        if let Some(id) = special_token_id(model_dir, &content) {
+            return vec![id];
+        }
+    }
+
+    // Fallback: scan added special tokens for an end-of-sequence signature.
+    config
+        .get("added_tokens_decoder")
+        .and_then(serde_json::Value::as_object)
+        .map(|decoder| {
+            decoder
+                .iter()
+                .filter_map(|(id, info)| {
+                    let content = info.get("content").and_then(serde_json::Value::as_str)?;
+                    is_eos_signature(content)
+                        .then(|| id.parse::<u32>().ok())
+                        .flatten()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract the token-content string named by `tokenizer_config.json`'s
+/// `eos_token` field, which may be a bare string or an object with `content`.
+fn eos_token_field_content(config: &serde_json::Value) -> Option<String> {
+    match config.get("eos_token")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(o) => o
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// A special-token content string is an end-of-sequence marker if it carries a
+/// known EOS signature and is not a begin/pad/unknown/mask marker (which would
+/// otherwise be mistaken for a stop).
+fn is_eos_signature(content: &str) -> bool {
+    let c = content.to_ascii_lowercase();
+    (c.contains("end_of_text")
+        || c.contains("eot")
+        || c.contains("end_of_turn")
+        || c.contains("im_end")
+        || c == "</s>"
+        || c.contains("eos"))
+        && !(c.contains("bos") || c.contains("pad") || c.contains("unk") || c.contains("mask"))
 }
 
 /// Parse an `eos_token_id` JSON value (a single number or an array of numbers).
@@ -8811,6 +12292,11 @@ impl DflashSink for DflashBufferedSink {
             prompt_tokens: prompt_len,
             completion_tokens: completion_len,
             token_logprobs: None,
+            reasoning_content: None,
+            // DFlash doesn't track prefix-cache reuse on either the streaming
+            // or buffered path (see `DflashStreamSink::emit`, which always
+            // sends `prefill_progress: None`).
+            cached_prompt_tokens: 0,
         })
     }
 }
@@ -8902,6 +12388,7 @@ impl SimpleEngine {
         stop_sequences: &[String],
         enable_thinking: bool,
         thinking_budget: u32,
+        compressed_prefill: Option<&SurvivalPlan>,
     ) -> Result<GenerationOutput, EngineError> {
         self.dflash_decode(
             prompt_tokens,
@@ -8910,6 +12397,7 @@ impl SimpleEngine {
             stop_sequences,
             enable_thinking,
             thinking_budget,
+            compressed_prefill,
             DflashBufferedSink::default(),
         )
     }
@@ -8925,6 +12413,7 @@ impl SimpleEngine {
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         enable_thinking: bool,
         thinking_budget: u32,
+        compressed_prefill: Option<&SurvivalPlan>,
     ) -> Result<(), EngineError> {
         let detok = IncrementalDetok::new(
             String::new(),
@@ -8938,6 +12427,7 @@ impl SimpleEngine {
             stop_sequences,
             enable_thinking,
             thinking_budget,
+            compressed_prefill,
             DflashStreamSink { sender, detok },
         )
     }
@@ -8947,15 +12437,27 @@ impl SimpleEngine {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        CanonicalDflashRound, DFlashVerifyMode, DFlashVerifyRound, DflashPromptPartition,
+        CanonicalDflashRound, DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS, DEFAULT_PFLASH_KEEP_RATIO_MAX,
+        DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO, DEFAULT_PFLASH_PLAN_CACHE,
+        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+        DFlashVerifyMode, DFlashVerifyRound, DflashPrefillOutcome, DflashPromptPartition,
         DflashTapFrontier, EngineError, GenerationPromptSuffixes, IncrementalDetok, LivePair,
-        SessionDsparkDecodeState, SessionGeneration, SimpleEngine, SpeculationRoute, Tokenizer,
-        adaptive_draft_depth_for_cap, check_stop_sequences, continuation_prior_len,
-        derive_model_name, detect_thinking_support, dflash_canonical_target_is_terminal,
-        dflash_new_stop_prefix_len, dflash_resolve_target_then_draft, dflash_tail_draft_cap,
+        PFlashPlanCache, PFlashPlanCacheConfig, PrefillCompressionMode, SessionBootstrapReason,
+        SessionDsparkDecodeState, SessionGeneration, SessionPrefillStrategy,
+        SessionPromptTraceOutcome, SessionPromptTracePayloadStats, SimpleEngine, SpeculationRoute,
+        Tokenizer, adaptive_draft_depth_for_cap, cache_policy_allows_prefix_cache,
+        check_stop_sequences, common_prefix_token_len, contains_real_user_query,
+        continuation_prior_len, continuation_reject_reason, derive_model_name,
+        detect_thinking_support, dflash_accepts_pflash_plan, dflash_canonical_target_is_terminal,
+        dflash_new_stop_prefix_len, dflash_resolve_target_then_draft,
+        dflash_sparse_taps_available_for_pflash_plan, dflash_tail_draft_cap,
         drive_canonical_dspark_round, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, lock_or_recover, paired_dflash_exact_domain, parse_enabled_flag,
-        resolve_speculation_route, stateless_mtp_family_eligible, with_chat_terminator,
+        find_stop_in_tail, hybrid_checkpoint_boundary, lock_or_recover, message_boundary_delta,
+        paired_dflash_exact_domain, parse_enabled_flag, pflash_actual_keep_ratio,
+        pflash_auto_plan_worth_executing, pflash_cache_source_and_request_tail,
+        pflash_cache_source_and_request_tail_with_boundary, pflash_full_score_budget_exceeded,
+        resolve_speculation_route, session_prefill_strategy, session_prompt_trace_metrics,
+        stateless_mtp_family_eligible, with_chat_terminator,
     };
     use crate::chat_template::ChatMessage;
     use crate::decode::token_ledger::TokenLedger;
@@ -8965,15 +12467,662 @@ mod tests {
         AnyCache, AnyModel, SamplingParams, Speculation,
         cache::{KeyValueCache, SteppingKeyValueCache},
         dflash::{DFlashConfig, DFlashDrafter},
+        spec_prefill::{
+            HardKeepSpan, PrefillPlanMetadata, PrefillScoreConfig, PrefillScoreMode, SurvivalPlan,
+        },
         transformer::{Model as TransformerModel, ModelArgs as TransformerModelArgs},
         turboquant::KvCacheConfig,
     };
+
+    #[test]
+    fn cache_bypass_disables_prefix_cache() {
+        assert!(!cache_policy_allows_prefix_cache(false));
+        assert!(cache_policy_allows_prefix_cache(true));
+    }
     use mlx_rs::{
         Array, Dtype,
         ops::indexing::{IndexOp, NewAxis},
         transforms::eval,
     };
     use std::path::Path;
+
+    fn pflash_test_config(chunk: usize) -> PFlashPlanCacheConfig {
+        PFlashPlanCacheConfig {
+            version: PrefillPlanMetadata::VERSION,
+            score_mode: PrefillScoreMode::Full,
+            exit_layer: 7,
+            keep_floor_bits: 0.10_f32.to_bits(),
+            keep_ceiling_bits: 0.75_f32.to_bits(),
+            chunk,
+            avgpool: 13,
+            lookahead: 8,
+        }
+    }
+
+    fn pflash_identity(tokens: &[u32]) -> SurvivalPlan {
+        SurvivalPlan::identity(
+            tokens,
+            PrefillPlanMetadata::from_config(&PrefillScoreConfig::default()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pflash_auto_executes_only_when_survivor_ratio_is_low() {
+        let source_tokens = 1_000;
+        let profitable_kept =
+            (source_tokens as f32 * DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO).round() as usize;
+        assert!(pflash_auto_plan_worth_executing(
+            source_tokens,
+            profitable_kept,
+            DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+        ));
+        assert!(!pflash_auto_plan_worth_executing(
+            source_tokens,
+            profitable_kept + 1,
+            DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+        ));
+        assert!(pflash_auto_plan_worth_executing(source_tokens, 700, 0.75,));
+    }
+
+    #[test]
+    fn pflash_actual_keep_ratio_handles_empty_sources() {
+        assert_eq!(pflash_actual_keep_ratio(0, 0), 0.0);
+        assert!(pflash_auto_plan_worth_executing(
+            0,
+            0,
+            DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+        ));
+    }
+
+    #[test]
+    fn pflash_full_score_budget_only_limits_full_scorer() {
+        assert!(!pflash_full_score_budget_exceeded(
+            PrefillScoreMode::Full,
+            8192,
+            8192,
+        ));
+        assert!(pflash_full_score_budget_exceeded(
+            PrefillScoreMode::Full,
+            8193,
+            8192,
+        ));
+        assert!(!pflash_full_score_budget_exceeded(
+            PrefillScoreMode::L7,
+            65_536,
+            8192,
+        ));
+    }
+
+    #[test]
+    fn pflash_large_full_prompt_uses_scoreless_recency_fallback() {
+        let engine = session_cache_test_engine();
+        let source_len = DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS + 1024;
+        let tokens: Vec<u32> = (0..source_len as u32).collect();
+        let hard_keep = [HardKeepSpan::new(4000, 4010)];
+
+        let outcome = engine.pflash_score_tokens(&tokens, &hard_keep).unwrap();
+
+        assert!(outcome.score_budget_fallback);
+        assert_eq!(outcome.score_ms, 0.0);
+        assert_eq!(outcome.effective_keep_ratio, 0.10);
+        assert!(outcome.plan.len() < tokens.len());
+        assert_eq!(outcome.plan.original_positions.first().copied(), Some(0));
+        assert_eq!(
+            outcome.plan.original_positions.last().copied(),
+            Some((source_len - 1) as i32)
+        );
+        for position in 4000..4010 {
+            assert!(
+                outcome.plan.original_positions.contains(&(position as i32)),
+                "hard-keep position {position} must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn dflash_accepts_pflash_plan_only_when_sparse_taps_were_captured() {
+        // Two coordinate systems are at play for non-contiguous PFlash plans:
+        //   * target RoPE / logical_next_pos  = source_token_count
+        //   * resident frontier / tap rows    = survivor count
+        // The dSpark drafter reads tap rows, so it can only consume a
+        // non-contiguous plan after a sparse target prefill has captured taps
+        // at survivor-row resolution. Without those taps, dSpark MUST be
+        // rejected (fall back to AR) even if a drafter is loaded.
+        let identity = pflash_identity(&[1, 2, 3, 4]);
+        let lossy = SurvivalPlan {
+            token_ids: vec![10, 11, 99],
+            original_positions: vec![0, 8, 15],
+            source_token_count: 16,
+            metadata: PrefillPlanMetadata::from_config(&PrefillScoreConfig::default()),
+        };
+
+        // Identity plan: dSpark eligible regardless of tap capture.
+        assert!(dflash_accepts_pflash_plan(Some(&identity), false));
+        assert!(dflash_accepts_pflash_plan(Some(&identity), true));
+        // No compressed plan: dSpark eligible.
+        assert!(dflash_accepts_pflash_plan(None, false));
+        // Lossy plan without sparse taps: dSpark MUST reject.
+        assert!(
+            !dflash_accepts_pflash_plan(Some(&lossy), false),
+            "lossy PFlash plan without sparse taps must keep dSpark off"
+        );
+        // Lossy plan with captured sparse taps: dSpark eligible.
+        assert!(
+            dflash_accepts_pflash_plan(Some(&lossy), true),
+            "lossy PFlash plan with sparse taps captured must admit dSpark"
+        );
+    }
+
+    #[test]
+    fn pflash_lossy_plan_routes_to_dspark_only_on_sparse_tap_path() {
+        let lossy = SurvivalPlan {
+            token_ids: vec![10, 11, 99],
+            original_positions: vec![0, 8, 15],
+            source_token_count: 16,
+            metadata: PrefillPlanMetadata::from_config(&PrefillScoreConfig::default()),
+        };
+        for &(dflash_is_dspark, model_supports_sparse, expected) in &[
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let sparse_taps_available = dflash_sparse_taps_available_for_pflash_plan(
+                Some(&lossy),
+                dflash_is_dspark,
+                model_supports_sparse,
+            );
+            assert_eq!(sparse_taps_available, expected);
+            assert_eq!(
+                dflash_accepts_pflash_plan(Some(&lossy), sparse_taps_available),
+                expected,
+                "lossy PFlash dSpark eligibility must require dSpark plus sparse target taps \
+                 (dflash_is_dspark={dflash_is_dspark}, model_supports_sparse_prefill={model_supports_sparse})"
+            );
+        }
+
+        for &dflash_is_dspark in &[false, true] {
+            let no_plan =
+                dflash_sparse_taps_available_for_pflash_plan(None, dflash_is_dspark, true);
+            assert!(!no_plan);
+            assert!(
+                dflash_accepts_pflash_plan(None, no_plan),
+                "ordinary DFlash path remains eligible without PFlash"
+            );
+        }
+
+        let identity = pflash_identity(&[1, 2, 3, 4]);
+        let identity_sparse =
+            dflash_sparse_taps_available_for_pflash_plan(Some(&identity), false, false);
+        assert!(!identity_sparse);
+        assert!(dflash_accepts_pflash_plan(Some(&identity), identity_sparse));
+    }
+
+    #[test]
+    fn dflash_prefill_outcome_accepts_sparse_resident_boundary() {
+        let resident_len = 3;
+        let logical_next_pos = 16;
+        let keys = Array::zeros::<f32>(&[1, 1, resident_len, 1]).unwrap();
+        let values = Array::zeros::<f32>(&[1, 1, resident_len, 1]).unwrap();
+        let mut kv = SteppingKeyValueCache::from_arrays(keys, values).unwrap();
+        kv.set_position_offset(logical_next_pos).unwrap();
+        let mut arrays = higgs_models::qwen3_next::ArraysCache::new();
+        arrays.offset = resident_len;
+        let cache = AnyCache::Hybrid(vec![
+            Some(higgs_models::qwen3_next::LayerCache::KV(kv)),
+            Some(higgs_models::qwen3_next::LayerCache::Arrays(arrays)),
+        ]);
+        cache.validate_absolute_boundary(resident_len).unwrap();
+
+        let drafter = session_test_drafter();
+        let draft_cache = drafter.make_cache();
+        let taps = vec![Array::zeros::<f32>(&[1, resident_len, 4]).unwrap()];
+        let logits = Array::zeros::<f32>(&[1, 1, 8]).unwrap();
+        let outcome =
+            DflashPrefillOutcome::validated(cache, draft_cache, logits, taps, 0, resident_len, 1)
+                .unwrap();
+        assert_eq!(outcome.draft_cache.position(), 0);
+        assert_eq!(outcome.taps[0].shape().get(1).copied(), Some(resident_len));
+    }
+
+    #[test]
+    fn pflash_plan_cache_returns_longest_matching_prefix() {
+        let mut cache = PFlashPlanCache::default();
+        let config = pflash_test_config(32);
+        cache.store(&[1, 2, 3], pflash_identity(&[1, 2, 3]), config, 64);
+        cache.store(
+            &[1, 2, 3, 4, 5],
+            pflash_identity(&[1, 2, 3, 4, 5]),
+            config,
+            64,
+        );
+
+        let hit = cache
+            .find_longest_prefix(&[1, 2, 3, 4, 5, 6, 7], config)
+            .unwrap();
+        assert_eq!(hit.source_len, 5);
+        assert_eq!(hit.plan.token_ids, &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn pflash_plan_cache_rejects_config_mismatch() {
+        let mut cache = PFlashPlanCache::default();
+        let config = pflash_test_config(32);
+        cache.store(&[1, 2, 3], pflash_identity(&[1, 2, 3]), config, 64);
+
+        assert!(
+            cache
+                .find_longest_prefix(&[1, 2, 3, 4], pflash_test_config(64))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pflash_plan_cache_prunes_superseded_linear_prefix() {
+        let mut cache = PFlashPlanCache::default();
+        let config = pflash_test_config(32);
+        cache.store(&[1, 2, 3], pflash_identity(&[1, 2, 3]), config, 64);
+        cache.store(&[1, 2, 3, 4], pflash_identity(&[1, 2, 3, 4]), config, 64);
+
+        assert_eq!(cache.entries.len(), 1);
+        let hit = cache.find_longest_prefix(&[1, 2, 3, 4, 5], config).unwrap();
+        assert_eq!(hit.source_len, 4);
+        assert_eq!(hit.plan.token_ids, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn pflash_cache_source_strips_request_generation_suffix() {
+        let suffix = [90, 91];
+        let previous_prompt = [1, 2, 3, 90, 91];
+        let next_prompt = [1, 2, 3, 4, 5, 90, 91];
+
+        let (previous_body, previous_tail) =
+            pflash_cache_source_and_request_tail(&previous_prompt, &suffix);
+        let (next_body, next_tail) = pflash_cache_source_and_request_tail(&next_prompt, &suffix);
+
+        assert_eq!(previous_body, &[1, 2, 3]);
+        assert_eq!(previous_tail, &suffix);
+        assert_eq!(next_body, &[1, 2, 3, 4, 5]);
+        assert_eq!(next_tail, &suffix);
+        assert!(next_body.starts_with(previous_body));
+        assert!(!next_prompt.starts_with(&previous_prompt));
+    }
+
+    #[test]
+    fn hybrid_checkpoint_boundary_floors_to_block_without_dropping_short_bodies() {
+        // Long bodies floor to a block multiple so the store can be paged.
+        assert_eq!(hybrid_checkpoint_boundary(64), 64);
+        assert_eq!(hybrid_checkpoint_boundary(95), 64);
+        assert_eq!(hybrid_checkpoint_boundary(96), 96);
+        // Sub-block bodies keep their exact length rather than collapsing to 0,
+        // which would skip the two-phase snapshot and drop hybrid caching for
+        // short conversations. These store as whole clones, as before paging.
+        assert_eq!(hybrid_checkpoint_boundary(31), 31);
+        assert_eq!(hybrid_checkpoint_boundary(1), 1);
+        // An empty body still has nothing to snapshot.
+        assert_eq!(hybrid_checkpoint_boundary(0), 0);
+    }
+
+    #[test]
+    fn pflash_cache_source_prefers_rendered_body_boundary() {
+        let suffix = [90, 91];
+        let prompt = [1, 2, 3, 4, 5, 77, 78];
+
+        let (body, tail) =
+            pflash_cache_source_and_request_tail_with_boundary(&prompt, &suffix, Some(5));
+
+        assert_eq!(body, &[1, 2, 3, 4, 5]);
+        assert_eq!(tail, &[77, 78]);
+    }
+
+    #[test]
+    fn pflash_cache_source_boundary_accepts_empty_tail() {
+        let suffix = [90, 91];
+        let prompt = [1, 2, 3, 4, 5];
+
+        let (body, tail) =
+            pflash_cache_source_and_request_tail_with_boundary(&prompt, &suffix, Some(5));
+
+        assert_eq!(body, &[1, 2, 3, 4, 5]);
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn pflash_real_user_query_ignores_wrapped_tool_responses() {
+        let no_query = [ChatMessage {
+            role: "user".to_owned(),
+            content: "<tool_response>{\"ok\":true}</tool_response>".to_owned(),
+            tool_calls: None,
+        }];
+        let system_only = [ChatMessage {
+            role: "system".to_owned(),
+            content: "policy".to_owned(),
+            tool_calls: None,
+        }];
+        let real_query = [ChatMessage {
+            role: "user".to_owned(),
+            content: "what next?".to_owned(),
+            tool_calls: None,
+        }];
+
+        assert!(!contains_real_user_query(&no_query));
+        assert!(!contains_real_user_query(&system_only));
+        assert!(contains_real_user_query(&real_query));
+    }
+
+    #[test]
+    fn cold_long_session_without_pflash_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let prompt = vec![7; MAX_PREFILL_TOKENS + 1];
+
+        assert_eq!(
+            session_prefill_strategy(42, None, &prompt, MAX_PREFILL_TOKENS, false),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::ColdPromptTooLarge {
+                    prompt_tokens: prompt.len(),
+                    max_prefill_tokens: MAX_PREFILL_TOKENS,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn cold_long_session_with_pflash_uses_degraded_bootstrap() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let prompt = vec![7; MAX_PREFILL_TOKENS + 1];
+
+        assert_eq!(
+            session_prefill_strategy(42, None, &prompt, MAX_PREFILL_TOKENS, true),
+            SessionPrefillStrategy::BootstrapPFlash { session_id: 42 }
+        );
+    }
+
+    #[test]
+    fn cold_short_session_still_seeds_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let prompt = vec![7; MAX_PREFILL_TOKENS];
+
+        assert_eq!(
+            session_prefill_strategy(42, None, &prompt, MAX_PREFILL_TOKENS, true),
+            SessionPrefillStrategy::Continue { session_id: 42 }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_small_exact_suffix_continues() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+        let mut candidate = retained.clone();
+        candidate.extend(std::iter::repeat_n(9, MAX_PREFILL_TOKENS));
+
+        assert_eq!(
+            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS, true,),
+            SessionPrefillStrategy::Continue { session_id: 42 }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_large_suffix_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+        let mut candidate = retained.clone();
+        candidate.extend(std::iter::repeat_n(9, MAX_PREFILL_TOKENS + 1));
+
+        assert_eq!(
+            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS, true,),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::LargeSuffix {
+                    suffix_tokens: MAX_PREFILL_TOKENS + 1,
+                    max_prefill_tokens: MAX_PREFILL_TOKENS,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_diverged_candidate_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+        let candidate = vec![1, 2, 4, 9];
+
+        assert_eq!(
+            session_prefill_strategy(42, Some(&retained), &candidate, MAX_PREFILL_TOKENS, true,),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::DivergedOrNotGrowing,
+            }
+        );
+    }
+
+    #[test]
+    fn warm_session_with_not_growing_candidate_bootstraps_exact_retained_cache() {
+        const MAX_PREFILL_TOKENS: usize = 128;
+        let retained = vec![1, 2, 3];
+
+        assert_eq!(
+            session_prefill_strategy(42, Some(&retained), &retained, MAX_PREFILL_TOKENS, true,),
+            SessionPrefillStrategy::BootstrapExact {
+                session_id: 42,
+                reason: SessionBootstrapReason::DivergedOrNotGrowing,
+            }
+        );
+    }
+
+    #[test]
+    fn boundary_delta_splices_after_covered_messages() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nanswer1";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nanswer1<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>";
+        let delta = message_boundary_delta(retained, full).unwrap();
+
+        assert_eq!(
+            delta,
+            "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>"
+        );
+    }
+
+    #[test]
+    fn boundary_delta_skips_closer_when_retained_has_it() {
+        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>";
+        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+        let delta = message_boundary_delta(retained, full).unwrap();
+        assert_eq!(delta, "\n<|im_start|>user\nq2<|im_end|>");
+    }
+
+    #[test]
+    fn boundary_delta_accepts_literal_im_end_in_covered_user_content() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_end|> still data<|im_end|>\n<|im_start|>assistant\nanswer";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_end|> still data<|im_end|>\n<|im_start|>assistant\nstored<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n";
+
+        assert_eq!(
+            message_boundary_delta(retained, full),
+            Some("<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n")
+        );
+    }
+
+    #[test]
+    fn boundary_delta_accepts_literal_im_end_in_new_tool_result() {
+        let retained = "<|im_start|>user\nread<|im_end|>\n<|im_start|>assistant\ncall";
+        let full = "<|im_start|>user\nread<|im_end|>\n<|im_start|>assistant\nstored<|im_end|>\n<|im_start|>tool\nquoted <|im_end|> marker<|im_end|>\n<|im_start|>assistant\n";
+
+        assert_eq!(
+            message_boundary_delta(retained, full),
+            Some(
+                "<|im_end|>\n<|im_start|>tool\nquoted <|im_end|> marker<|im_end|>\n<|im_start|>assistant\n"
+            )
+        );
+    }
+
+    #[test]
+    fn boundary_delta_uses_second_of_adjacent_im_end_markers() {
+        let retained = "<|im_start|>user\nliteral ends <|im_end|><|im_end|>";
+        let full = "<|im_start|>user\nliteral ends <|im_end|><|im_end|>\n<|im_start|>assistant\n";
+
+        assert_eq!(
+            message_boundary_delta(retained, full),
+            Some("\n<|im_start|>assistant\n")
+        );
+    }
+
+    #[test]
+    fn boundary_delta_treats_generated_assistant_as_retained_source_of_truth() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nI'm **NanoBot** - compact and direct.";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nI'm **NanoBot** (surname: Bonsai) - compact, direct, and local.<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+        let delta = message_boundary_delta(retained, full).unwrap();
+
+        assert_eq!(
+            delta,
+            "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn boundary_delta_treats_closed_assistant_segments_as_retained_truth() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nactual generated answer<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\nsecond generated answer";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nnormalized stored answer<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\nsecond stored answer<|im_end|>\n<|im_start|>user\nq3<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+        let delta = message_boundary_delta(retained, full).unwrap();
+
+        assert_eq!(
+            delta,
+            "<|im_end|>\n<|im_start|>user\nq3<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn boundary_delta_rejects_non_assistant_role_mismatch() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq1<|im_end|>";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>assistant\nq1<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_partial_non_assistant_boundary() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\npartial";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\npartial edited<|im_end|>\n<|im_start|>assistant\n";
+
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_mutated_first_message() {
+        let retained = "<|im_start|>system\noriginal<|im_end|>\n<|im_start|>user\nq<|im_end|>";
+        let full = "<|im_start|>system\nMUTATED!<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_mutated_middle_message() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nold context<|im_end|>\n<|im_start|>assistant\nanswer";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nNEW context<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_late_system_prompt_mutation() {
+        let original_tail = "a".repeat(300);
+        let mutated_tail = format!("{}b", "a".repeat(299));
+        let retained =
+            format!("<|im_start|>system\n{original_tail}<|im_end|>\n<|im_start|>user\nq");
+        let full =
+            format!("<|im_start|>system\n{mutated_tail}<|im_end|>\n<|im_start|>user\nq<|im_end|>");
+        assert!(message_boundary_delta(&retained, &full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_template_marker_inside_message_content() {
+        let retained = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_start|>user\nnot a boundary<|im_end|>";
+        let full = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nliteral <|im_start|>user\nnot a boundary<|im_end|>\n<|im_start|>assistant\n";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_rejects_render_with_fewer_messages() {
+        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans";
+        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>";
+        assert!(message_boundary_delta(retained, full).is_none());
+    }
+
+    #[test]
+    fn boundary_delta_accepts_equivalent_tool_call_replay() {
+        let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nread it<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=read_file>\n<parameter=path>\nCargo.toml\n</parameter>\n</function>\n</tool_call>";
+        let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nread it<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"arguments\":{\"path\":\"Cargo.toml\"},\"name\":\"read_file\"}\n</tool_call><|im_end|>\n<|im_start|>tool\n[workspace]\n<|im_end|>\n<|im_start|>assistant\n<think>";
+
+        let delta = message_boundary_delta(retained, full).unwrap();
+
+        assert_eq!(
+            delta,
+            "<|im_end|>\n<|im_start|>tool\n[workspace]\n<|im_end|>\n<|im_start|>assistant\n<think>"
+        );
+    }
+
+    #[test]
+    fn session_prompt_trace_reports_boundary_splice_and_tool_payload() {
+        let retained = [1, 2, 3];
+        let canonical = [9, 9, 9, 4, 5, 6];
+        let candidate = [1, 2, 3, 4, 5, 6];
+        let tool_payload = SessionPromptTracePayloadStats {
+            messages: 2,
+            bytes: 100,
+            largest_bytes: 80,
+        };
+
+        let trace = session_prompt_trace_metrics(
+            Some(&retained),
+            &canonical,
+            &candidate,
+            tool_payload,
+            SessionPromptTraceOutcome::Continued,
+        );
+
+        assert_eq!(trace.common_prefix_tokens, retained.len());
+        assert_eq!(trace.divergence_token, None);
+        assert_eq!(trace.suffix_tokens, 3);
+        assert!(trace.boundary_splice);
+        assert_eq!(trace.tool_result_messages, 2);
+        assert_eq!(trace.tool_result_bytes, 100);
+        assert_eq!(trace.tool_result_largest_bytes, 80);
+    }
+
+    #[test]
+    fn session_prompt_trace_reports_prefix_mismatch() {
+        let retained = [1, 2, 3];
+        let candidate = [1, 2, 4, 5];
+        let trace = session_prompt_trace_metrics(
+            Some(&retained),
+            &candidate,
+            &candidate,
+            SessionPromptTracePayloadStats::default(),
+            SessionPromptTraceOutcome::ExactBootstrap,
+        );
+
+        assert_eq!(trace.common_prefix_tokens, 2);
+        assert_eq!(trace.divergence_token, Some(2));
+        assert_eq!(trace.suffix_tokens, candidate.len());
+        assert!(!trace.boundary_splice);
+    }
+
+    #[test]
+    fn session_prompt_metrics_distinguish_pflash_from_exact_bootstrap() {
+        let engine = session_cache_test_engine();
+        let prompt = [1, 2, 3, 4];
+
+        engine.record_session_prompt_trace(session_prompt_trace_metrics(
+            None,
+            &prompt,
+            &prompt,
+            SessionPromptTracePayloadStats::default(),
+            SessionPromptTraceOutcome::PFlashBootstrap,
+        ));
+
+        let stats = engine.cache_stats();
+        assert_eq!(stats.session_bootstrap_exact, 0);
+        assert_eq!(stats.session_bootstrap_pflash, 1);
+    }
 
     fn validated_session_target(boundary: i32) -> AnyCache {
         let layer = if boundary == 0 {
@@ -9089,6 +13238,8 @@ mod tests {
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             template: None,
             model_name: "synthetic-session-cache".to_owned(),
+            is_vlm: false,
+            vlm_image_size: None,
             eos_token_ids: Vec::new(),
             decode_skip_ids: std::sync::Arc::new(std::collections::HashSet::new()),
             enable_thinking: false,
@@ -9100,6 +13251,22 @@ mod tests {
                 RequestedMlxProfile::Baseline,
             ),
             dflash: None,
+            prefill_drafter: None,
+            prefill_compression: PrefillCompressionMode::Off,
+            prefill_keep_ratio: 0.10,
+            prefill_threshold: 4096,
+            prefill_chunk: 32,
+            prefill_avgpool: 13,
+            prefill_lookahead: 8,
+            prefill_score_mode: PrefillScoreMode::Full,
+            prefill_exit_layer: 7,
+            prefill_keep_ratio_max: DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            prefill_max_auto_prefill_ratio: DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+            prefill_plan_cache: DEFAULT_PFLASH_PLAN_CACHE,
+            prefill_plan_cache_entries: DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+            prefill_suffix_identity_threshold: DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+            session_max_suffix_prefill_tokens: 8192,
+            pflash_plan_cache: std::sync::Mutex::new(PFlashPlanCache::default()),
             last_dflash_accepts: std::sync::Mutex::new(Vec::new()),
             last_dflash_draft_matches: std::sync::Mutex::new(Vec::new()),
             last_dflash_draft_counts: std::sync::Mutex::new(Vec::new()),
@@ -9122,7 +13289,200 @@ mod tests {
     }
 
     #[test]
-    fn simple_engine_session_effectful_seal_failure_republishes_neither_half() {
+    fn simple_engine_drop_retained_session_reports_and_clears() {
+        const SESSION_ID: u64 = 0xCACE_E7;
+        let engine = session_cache_test_engine();
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![1, 2, 3],
+        );
+
+        engine.stash_retained(SESSION_ID, state, false);
+        assert_eq!(
+            engine.retained_session_tokens(SESSION_ID),
+            Some(vec![1, 2, 3])
+        );
+
+        assert!(engine.drop_retained_session(SESSION_ID));
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
+        assert_eq!(engine.retained_session_count(), 0);
+        assert!(!engine.drop_retained_session(SESSION_ID));
+    }
+
+    #[test]
+    fn oversized_prompt_checkpoint_preserves_prior_retained_boundary() {
+        const SESSION_ID: u64 = 0xCACE_C4A9;
+        let mut engine = session_cache_test_engine();
+        engine.kv_cache_config.max_session_tokens = 2;
+        let prior = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![1],
+        );
+        engine.stash_retained(SESSION_ID, prior, false);
+
+        let oversized_checkpoint =
+            crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+                AnyCache::KV(Vec::new()),
+                vec![1, 2, 3],
+            );
+        engine.stash_retained_checkpoint(SESSION_ID, oversized_checkpoint);
+
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), Some(vec![1]));
+    }
+
+    #[test]
+    fn simple_engine_drop_retained_session_waits_for_session_lock() {
+        const SESSION_ID: u64 = 0xD202_5E55;
+        let engine = std::sync::Arc::new(session_cache_test_engine());
+        let session_lock = std::sync::Arc::clone(
+            lock_or_recover(&engine.session_locks)
+                .entry(SESSION_ID)
+                .or_default(),
+        );
+        let session_guard = session_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let drop_engine = std::sync::Arc::clone(&engine);
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let dropped = drop_engine.drop_retained_session(SESSION_ID);
+            done_tx.send(dropped).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![9, 10, 11],
+        );
+        engine.stash_retained(SESSION_ID, state, false);
+        assert_eq!(
+            engine.retained_session_tokens(SESSION_ID),
+            Some(vec![9, 10, 11])
+        );
+
+        drop(session_guard);
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            true
+        );
+        handle.join().unwrap();
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
+    }
+
+    #[test]
+    fn simple_engine_fork_target_continuable_preserves_retained_session() {
+        const SESSION_ID: u64 = 0xCACE_11ED;
+        let engine = session_cache_test_engine();
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![1, 2, 3],
+        );
+        engine.stash_retained(SESSION_ID, state, false);
+
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let forked = engine
+            .fork_target_continuable(SESSION_ID, &[1, 2, 3, 4], &mlx_gate)
+            .unwrap()
+            .expect("target retention must fork for an exact continuation");
+        drop(mlx_gate);
+
+        let (cache, prior) = forked;
+        drop(cache);
+        assert_eq!(prior, 3);
+        assert_eq!(
+            engine.retained_session_tokens(SESSION_ID),
+            Some(vec![1, 2, 3]),
+            "stream cancellation before successor publication must leave the prior retained cache"
+        );
+    }
+
+    #[test]
+    fn simple_engine_fork_target_continuable_drops_diverged_retained_session() {
+        const SESSION_ID: u64 = 0xCACE_D1A9;
+        let engine = session_cache_test_engine();
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![1, 2, 3],
+        );
+        engine.stash_retained(SESSION_ID, state, false);
+
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let forked = engine
+            .fork_target_continuable(SESSION_ID, &[9, 2, 3, 4], &mlx_gate)
+            .unwrap();
+        drop(mlx_gate);
+
+        assert!(forked.is_none());
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
+    }
+
+    #[test]
+    fn simple_engine_fork_paired_continuable_preserves_retained_session() {
+        const SESSION_ID: u64 = 0xD5A4_CAFE;
+        let engine = session_cache_test_engine();
+        let (pair, mut drafter) = session_live_pair(&[11]);
+
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let publication =
+            engine.seal_session_dspark_publication(SESSION_ID, pair, &mut drafter, &mlx_gate);
+        drop(mlx_gate);
+        engine.publish_session_dspark_publication(SESSION_ID, publication, false);
+
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let forked = engine
+            .fork_paired_continuable(SESSION_ID, &[11, 12], 1, &mlx_gate)
+            .unwrap()
+            .expect("paired retention must fork for an exact dSpark continuation");
+        drop(mlx_gate);
+
+        let (pair, prior) = forked;
+        assert_eq!(prior, 1);
+        assert_eq!(pair.token_len(), 1);
+        drop(pair);
+        assert_eq!(
+            engine.retained_session_tokens(SESSION_ID),
+            Some(vec![11]),
+            "stream cancellation before paired publication must leave the prior retained pair"
+        );
+        assert_eq!(engine.cache_stats().retained_paired_sessions, 1);
+    }
+
+    #[test]
+    fn simple_engine_fork_paired_continuable_keeps_target_only_state_for_cold_prefill() {
+        const SESSION_ID: u64 = 0xD5A4_70A9;
+        let engine = session_cache_test_engine();
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![4, 5, 6],
+        );
+        engine.stash_retained(SESSION_ID, state, false);
+
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let forked = engine
+            .fork_paired_continuable(SESSION_ID, &[4, 5, 6, 7], 1, &mlx_gate)
+            .unwrap();
+        drop(mlx_gate);
+
+        assert!(forked.is_none());
+        assert_eq!(
+            engine.retained_session_tokens(SESSION_ID),
+            Some(vec![4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn simple_engine_session_effectful_seal_failure_preserves_prior_retained_pair() {
         const SESSION_ID: u64 = 0xD5A4_FA11;
         let engine = session_cache_test_engine();
         let (pair, mut drafter) = session_live_pair(&[11]);
@@ -9140,14 +13500,13 @@ mod tests {
         assert_eq!(engine.retained_session_tokens(SESSION_ID), Some(vec![11]));
         assert_eq!(engine.cache_stats().retained_paired_sessions, 1);
 
-        let (retained, prior) = engine
-            .take_continuable(SESSION_ID, &[11, 12])
-            .expect("published pair must move out for an exact continuation");
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let (pair, prior) = engine
+            .fork_paired_continuable(SESSION_ID, &[11, 12], 1, &mlx_gate)
+            .unwrap()
+            .expect("published pair must fork for an exact continuation");
+        drop(mlx_gate);
         assert_eq!(prior, 1);
-        let crate::cache::paired::RetainedState::Paired(pair) = retained else {
-            panic!("fixture must resume an inseparable target/dSpark pair");
-        };
-        let pair = pair.resume(&[11], 1).unwrap();
         let pair = advance_session_pair(pair, &[12]);
 
         // Preserve tap capability so this enters effectful sealing, then inject
@@ -9164,11 +13523,11 @@ mod tests {
         engine.publish_session_dspark_publication(SESSION_ID, publication, false);
 
         let stats = engine.cache_stats();
-        assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
-        assert_eq!(stats.retained_sessions, 0);
-        assert_eq!(stats.retained_paired_sessions, 0);
-        assert_eq!(stats.retained_paired_target_bytes, 0);
-        assert_eq!(stats.retained_paired_dflash_bytes, 0);
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), Some(vec![11]));
+        assert_eq!(stats.retained_sessions, 1);
+        assert_eq!(stats.retained_paired_sessions, 1);
+        assert!(stats.retained_paired_target_bytes > 0);
+        assert!(stats.retained_paired_dflash_bytes > 0);
     }
 
     #[test]
@@ -9664,6 +14023,16 @@ mod tests {
         assert_eq!(continuation_prior_len(&[1, 2, 3], &[7, 8, 9, 10]), None);
         // History edited at the very first token → fallback.
         assert_eq!(continuation_prior_len(&[1, 2, 3], &[9, 2, 3, 4]), None);
+        assert_eq!(common_prefix_token_len(&[1, 2, 3], &[1, 2, 9, 4]), 2);
+        assert_eq!(
+            continuation_reject_reason(&[1, 2, 3], &[1, 2, 9, 4]),
+            "token_mismatch"
+        );
+        assert_eq!(
+            continuation_reject_reason(&[1, 2, 3], &[1, 2, 3]),
+            "not_growing"
+        );
+        assert_eq!(continuation_reject_reason(&[], &[1, 2]), "empty_retained");
         // A genuine prefix is accepted even across a collision — and that is
         // SOUND: a retained cache is always paired with its exact tokens, so
         // reuse is only ever offered when those tokens really do lead the new
@@ -9911,6 +14280,21 @@ mod tests {
             false,
             Some(Path::new(&drafter)),
             None,
+            None,
+            PrefillCompressionMode::Off,
+            0.10,
+            4096,
+            32,
+            13,
+            8,
+            PrefillScoreMode::Full,
+            7,
+            DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+            DEFAULT_PFLASH_PLAN_CACHE,
+            DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+            DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+            8192,
         )
         .expect("load DFlash engine");
 
@@ -10124,6 +14508,21 @@ mod tests {
             false,
             Some(Path::new(&drafter)),
             None,
+            None,
+            PrefillCompressionMode::Off,
+            0.10,
+            4096,
+            32,
+            13,
+            8,
+            PrefillScoreMode::Full,
+            7,
+            DEFAULT_PFLASH_KEEP_RATIO_MAX,
+            DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+            DEFAULT_PFLASH_PLAN_CACHE,
+            DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+            DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+            8192,
         )
         .expect("load paired target + drafter");
         let dflash = engine.dflash.as_ref().expect("DFlash state");
@@ -10869,6 +15268,21 @@ mod tests {
                 false,
                 Some(Path::new(&drafter)),
                 None,
+                None,
+                PrefillCompressionMode::Off,
+                0.10,
+                4096,
+                32,
+                13,
+                8,
+                PrefillScoreMode::Full,
+                7,
+                DEFAULT_PFLASH_KEEP_RATIO_MAX,
+                DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+                DEFAULT_PFLASH_PLAN_CACHE,
+                DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+                DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+                8192,
             )
             .expect("load DFlash engine")
         };
@@ -10997,6 +15411,42 @@ mod tests {
         .unwrap();
         let ids = extract_eos_tokens(dir.path());
         assert_eq!(ids, vec![2], "non-gemma must not add end_of_turn: {ids:?}");
+    }
+
+    /// When config.json omits `eos_token_id`, harvest the EOS from
+    /// `tokenizer_config.json`'s standard `eos_token` field. Without this,
+    /// generation can only stop at `max_tokens`, pegging the GPU indefinitely.
+    #[test]
+    fn extract_eos_tokens_harvests_eos_token_field() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type":"llama"}"#); // no eos_token_id
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"eos_token":"<|end_of_text|>","added_tokens_decoder":{"2":{"content":"<|end_of_text|>"}}}"#,
+        )
+        .unwrap();
+        let ids = extract_eos_tokens(dir.path());
+        assert!(
+            ids.contains(&2),
+            "harvested eos_token from tokenizer_config: {ids:?}"
+        );
+    }
+
+    /// When there is no explicit `eos_token` field, fall back to scanning the
+    /// added special tokens for a known end-of-sequence signature, and never
+    /// mistake a begin-of-sequence token for EOS.
+    #[test]
+    fn extract_eos_tokens_scans_added_tokens_for_eos_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), r#"{"model_type":"llama"}"#); // no eos_token_id
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"2":{"content":"<|end_of_text|>"},"1":{"content":"<s>"}}}"#,
+        )
+        .unwrap();
+        let ids = extract_eos_tokens(dir.path());
+        assert!(ids.contains(&2), "scanned EOS signature added: {ids:?}");
+        assert!(!ids.contains(&1), "BOS must not be treated as EOS: {ids:?}");
     }
 
     // --- detect_thinking_support tests ---

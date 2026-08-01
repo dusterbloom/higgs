@@ -99,7 +99,11 @@ pub async fn load_model(
 
     state
         .router
-        .insert_engine(name.clone(), Arc::new(engine))
+        .insert_engine_with_defaults(
+            name.clone(),
+            Arc::new(engine),
+            model_cfg.generation_defaults.clone(),
+        )
         .map_err(|n| ServerError::Conflict(format!("model '{n}' is already loaded")))?;
 
     tracing::info!(model_name = %name, "Model loaded at runtime");

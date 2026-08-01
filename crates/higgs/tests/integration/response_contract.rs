@@ -23,12 +23,8 @@ use higgs::types::openai::{
     EmbeddingUsage, MessageContent, ModelList, ModelObject, ToolCall, ToolCallFunction,
 };
 
-const fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
-    CompletionUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: prompt + completion,
-    }
+fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
+    CompletionUsage::new(prompt, completion, 0)
 }
 
 const fn make_anthropic_usage(input: u32, output: u32) -> AnthropicUsage {

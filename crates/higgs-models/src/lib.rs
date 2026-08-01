@@ -1,4 +1,5 @@
 pub mod bonsai_q1;
+pub mod bonsai_q2;
 pub mod cache;
 pub mod deepseek_v2;
 pub mod dflash;
@@ -9,6 +10,24 @@ pub mod gemma4;
 pub mod llava_qwen2;
 /// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
 mod metal_kernel;
+#[doc(hidden)]
+pub mod q2_row2_bench {
+    use mlx_rs::{Array, error::Exception};
+
+    /// Opaque handle for release-build microbenchmarks that need the internal
+    /// Bonsai Q2 row2 layout without exposing `metal_kernel` as public API.
+    pub struct BonsaiQ2Row2Bench(crate::metal_kernel::BonsaiQ2Row2);
+
+    impl BonsaiQ2Row2Bench {
+        pub fn from_row_major(weight: &Array, scales: &Array) -> Result<Self, Exception> {
+            crate::metal_kernel::BonsaiQ2Row2::from_row_major(weight, scales).map(Self)
+        }
+
+        pub fn m5_contract(&self, x: &Array, bias: &Array) -> Result<Array, Exception> {
+            crate::metal_kernel::bonsai_q2_row2_m5_contract(x, self.0.as_ref(), bias)
+        }
+    }
+}
 pub mod mlx_exec;
 pub mod phi3;
 pub mod progress;
@@ -184,6 +203,40 @@ impl AnyCache {
                 }
             }
         }
+    }
+
+    /// Approximate resident byte size of the KV state (keys + values + any
+    /// TurboQuant storage). Conservative: counts every layer's full K/V
+    /// buffers, so shared/overlapping prefixes are over-counted across
+    /// entries — a safe upper bound for a size budget that must never
+    /// under-evict.
+    #[must_use]
+    pub fn approx_bytes(&self) -> usize {
+        let mut total = 0usize;
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter().flatten() {
+                    total = total.saturating_add(layer.keys().map(|a| a.nbytes()).unwrap_or(0));
+                    total = total.saturating_add(layer.values().map(|a| a.nbytes()).unwrap_or(0));
+                    if let Some((_, kc, kn, kg, vc, vn)) = layer.turbo_arrays() {
+                        total = total.saturating_add(kc.nbytes());
+                        total = total.saturating_add(kn.nbytes());
+                        total = total.saturating_add(kg.nbytes());
+                        total = total.saturating_add(vc.nbytes());
+                        total = total.saturating_add(vn.nbytes());
+                    }
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        total = total.saturating_add(kv.keys().map(|a| a.nbytes()).unwrap_or(0));
+                        total = total.saturating_add(kv.values().map(|a| a.nbytes()).unwrap_or(0));
+                    }
+                }
+            }
+        }
+        total
     }
 
     /// Resident token count (the dense KV offset) of the first KV layer, or 0.
@@ -830,6 +883,26 @@ impl AnyModel {
         }
     }
 
+    /// Whether the target is the 1-bit Bonsai variant (affine quantization at
+    /// 1 bit). This enables the validated Bonsai row4/dSpark defaults while
+    /// leaving unrelated models on their generic policy.
+    pub fn is_target_1bit(&self) -> bool {
+        match self {
+            Self::Qwen3Next(m) => m.args.default_quant_spec().bits == 1,
+            _ => false,
+        }
+    }
+
+    /// Whether the target is the 2-bit Bonsai variant (affine quantization at
+    /// 2 bits). The 2-bit target defaults to the validated exact dSpark block
+    /// verifier plus row2/head verifier kernels; AR decode still uses MLX stock.
+    pub fn is_target_2bit(&self) -> bool {
+        match self {
+            Self::Qwen3Next(m) => m.args.default_quant_spec().bits == 2,
+            _ => false,
+        }
+    }
+
     /// Run the MTP head to produce draft logits for position t+2.
     ///
     /// Returns draft logits `[B, 1, vocab]`, or an error if no MTP head.
@@ -1240,6 +1313,81 @@ impl AnyModel {
             _ => Err(Exception::custom(
                 "forward_with_hidden_taps requires Qwen3Next + Hybrid cache",
             )),
+        }
+    }
+
+    /// PFlash compressive-prefill scorer (SpecPrefill). Computes per-token
+    /// prompt importance via lookahead attention. Only the dense `Transformer`
+    /// variant is supported — the drafter must be a vanilla Qwen3-class model.
+    /// See `transformer::Model::pflash_importance` and `.planning/DESIGN-pflash-higgs.md`.
+    pub fn pflash_importance(
+        &mut self,
+        inputs: &Array,
+        score_layers: &[usize],
+        lookahead: usize,
+        kv_cache: &mut Vec<Option<cache::SteppingKeyValueCache>>,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Transformer(m) => m.pflash_importance(inputs, score_layers, lookahead, kv_cache),
+            _ => Err(Exception::custom(
+                "pflash_importance requires a dense Transformer drafter (got non-Transformer model)",
+            )),
+        }
+    }
+
+    /// Whether this target can execute a PFlash survivor plan with restored
+    /// source positions and a separate logical decode cursor.
+    #[must_use]
+    pub fn supports_pflash_sparse_prefill(&self) -> bool {
+        matches!(self, Self::Qwen3Next(_))
+    }
+
+    /// Checked target sparse-prefill boundary for PFlash survivor plans.
+    ///
+    /// Currently only Qwen3Next/Bonsai hybrid checkpoints have a target-side
+    /// sparse boundary. Packed `BonsaiQ1` is intentionally unsupported here.
+    pub fn pflash_prefill_sparse(
+        &mut self,
+        plan: spec_prefill::TargetSparsePrefillPlan<'_>,
+    ) -> Result<qwen3_next::Qwen3NextSparsePrefillOutput, Exception> {
+        match self {
+            Self::Qwen3Next(model) => model.prefill_sparse(plan),
+            Self::BonsaiQ1(_) => Err(Exception::custom(
+                "PFlash sparse prefill is unsupported for packed BonsaiQ1 models",
+            )),
+            _ => Err(Exception::custom(
+                "PFlash sparse prefill requires a Qwen3Next/Bonsai hybrid target",
+            )),
+        }
+    }
+
+    /// Sparse-prefill boundary that also captures dSpark drafter taps at the
+    /// requested layers. Tap rows are indexed by resident survivor position;
+    /// RoPE and `logical_next_pos` still track the source prompt domain.
+    ///
+    /// Same dispatch surface as [`Self::pflash_prefill_sparse`]: only
+    /// Qwen3Next/Bonsai hybrid targets implement it.
+    pub fn pflash_prefill_sparse_with_taps(
+        &mut self,
+        plan: spec_prefill::TargetSparsePrefillPlan<'_>,
+        tap_layers: &[usize],
+    ) -> Result<qwen3_next::Qwen3NextSparsePrefillOutput, Exception> {
+        match self {
+            Self::Qwen3Next(model) => model.prefill_sparse_with_taps(plan, tap_layers),
+            Self::BonsaiQ1(_) => Err(Exception::custom(
+                "PFlash sparse prefill with taps is unsupported for packed BonsaiQ1 models",
+            )),
+            _ => Err(Exception::custom(
+                "PFlash sparse prefill with taps requires a Qwen3Next/Bonsai hybrid target",
+            )),
+        }
+    }
+
+    /// Number of transformer layers (PFlash scorer uses the last few).
+    pub fn num_layers(&self) -> usize {
+        match self {
+            Self::Transformer(m) => m.num_layers() as usize,
+            _ => 0,
         }
     }
 

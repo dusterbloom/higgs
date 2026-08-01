@@ -78,6 +78,14 @@ pub struct KvCacheConfig {
     /// from abandoned conversations. Default 1800 (30 min).
     #[serde(default = "default_retained_idle_secs")]
     pub retained_idle_secs: u64,
+    /// Resident-byte budget for the prefix KV cache (paged/paired radix under
+    /// the simple engine, LRU prefix cache under the batch engine). Eviction
+    /// becomes size-aware: the least-recently-used entry is dropped while the
+    /// tracked KV byte total exceeds this budget, in addition to the
+    /// count-based cap. `0` (default) disables the budget and falls back to
+    /// pure count-based LRU.
+    #[serde(default)]
+    pub kv_cache_bytes: usize,
 }
 
 const fn default_bits() -> u8 {
@@ -109,6 +117,7 @@ impl Default for KvCacheConfig {
             max_retained_sessions: default_max_retained_sessions(),
             max_session_tokens: 0,
             retained_idle_secs: default_retained_idle_secs(),
+            kv_cache_bytes: 0,
         }
     }
 }

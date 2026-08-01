@@ -391,6 +391,7 @@ pub struct SteppingKeyValueCache {
     values: Option<Array>,
     turbo: Option<TurboQuantStorage>,
     config: KvCacheConfig,
+    logical_offset: Option<i32>,
     offset: i32,
     step: i32,
 }
@@ -413,6 +414,7 @@ impl Default for SteppingKeyValueCache {
             values: None,
             turbo: None,
             config: KvCacheConfig::default(),
+            logical_offset: None,
             offset: 0,
             step: 256,
         }
@@ -443,6 +445,7 @@ impl SteppingKeyValueCache {
             values: None,
             turbo: Some(TurboQuantStorage::new(context)),
             config: turbo_config,
+            logical_offset: None,
             offset: 0,
             step: 256,
         })
@@ -452,6 +455,30 @@ impl SteppingKeyValueCache {
         self.config
     }
 
+    /// Absolute position to use for RoPE on the next append.
+    ///
+    /// Normally this is identical to the resident cache length. PFlash sparse
+    /// prefill keeps resident K/V compact while the next decode token still
+    /// belongs at the original source prompt position.
+    pub const fn position_offset(&self) -> i32 {
+        match self.logical_offset {
+            Some(offset) => offset,
+            None => self.offset,
+        }
+    }
+
+    /// Override the absolute RoPE cursor while leaving resident K/V compact.
+    pub fn set_position_offset(&mut self, logical_offset: i32) -> Result<(), Exception> {
+        if logical_offset < self.offset {
+            return Err(Exception::custom(format!(
+                "set_position_offset: logical offset {logical_offset} is below resident offset {}",
+                self.offset
+            )));
+        }
+        self.logical_offset = Some(logical_offset);
+        Ok(())
+    }
+
     /// Roll back the cache offset by `n` positions.
     ///
     /// Used by MTP speculative decode to undo a rejected draft token's KV entry.
@@ -459,6 +486,9 @@ impl SteppingKeyValueCache {
     pub fn trim_by(&mut self, n: usize) {
         let trim = i32::try_from(n).unwrap_or(i32::MAX);
         self.offset = self.offset.saturating_sub(trim).max(0);
+        if let Some(logical_offset) = self.logical_offset.as_mut() {
+            *logical_offset = logical_offset.saturating_sub(trim).max(self.offset);
+        }
     }
 
     /// Prune the half-open token span `[a, b)` from a dense cache, compacting the
@@ -533,6 +563,9 @@ impl SteppingKeyValueCache {
         self.keys = Some(new_keys);
         self.values = Some(new_values);
         self.offset = off - delta;
+        if let Some(logical_offset) = self.logical_offset.as_mut() {
+            *logical_offset = logical_offset.saturating_sub(delta).max(self.offset);
+        }
         Ok(())
     }
 
@@ -562,6 +595,7 @@ impl SteppingKeyValueCache {
                 .map(TurboQuantStorage::try_deep_clone)
                 .transpose()?,
             config: self.config,
+            logical_offset: self.logical_offset,
             offset: self.offset,
             step: self.step,
         })
@@ -624,6 +658,7 @@ impl SteppingKeyValueCache {
             values: Some(values),
             turbo: None,
             config: KvCacheConfig::default(),
+            logical_offset: None,
             offset,
             step: 256,
         })
@@ -688,6 +723,7 @@ impl SteppingKeyValueCache {
                 capacity,
             }),
             config,
+            logical_offset: None,
             offset,
             step: 256,
         })
@@ -897,6 +933,7 @@ impl SteppingKeyValueCache {
         let new_tokens = *keys.shape().get(2).ok_or_else(|| {
             Exception::custom("update_and_view: keys must have a token dim at axis 2")
         })?;
+        let logical_prev = self.logical_offset;
 
         let new_view = if let Some(turbo) = self.turbo.as_mut() {
             if new_tokens > 1 && turbo.capacity == 0 {
@@ -949,6 +986,9 @@ impl SteppingKeyValueCache {
             })?,
             KvCacheView::TurboQuant(turbo_view) => turbo_view.seq_len,
         };
+        if let Some(previous) = logical_prev {
+            self.logical_offset = Some(previous + new_tokens);
+        }
         Ok(new_view)
     }
 }

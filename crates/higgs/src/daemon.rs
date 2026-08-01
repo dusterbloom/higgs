@@ -162,6 +162,25 @@ port = 8000
 # kv_max_sessions = 8           # max retained conversations, LRU-evicted (>= 1)
 # kv_max_session_tokens = 0     # drop a conversation's KV past N tokens (0 = unlimited)
 # kv_retained_idle_secs = 1800  # evict KV idle longer than N seconds (0 = never)
+# kv_cache_bytes = 0            # prefix KV cache byte budget (0 = disabled; evicts LRU over budget)
+# # Speculative decoding (decode) + compressive prefill (PFlash) drafters:
+# # draft_model      = "/path/to/dspark-drafter"      # decode speculation (DFlash/dSpark)
+# # Validated low-bit Bonsai targets default to the block (BatchedTape) verifier.
+# # Unsupported domains fail closed to canonical S=1; set HIGGS_DFLASH_VERIFY_MODE=canonical
+# # to opt any model back to S=1.
+# # PFlash scorer/compressor: must load as a dense Transformer (for example
+# # Qwen3-0.6B). Bonsai Ternary/Q2 remains the target, not the prefill drafter.
+# # prefill_drafter  = "mlx-community/Qwen3-0.6B-4bit"
+# # prefill_compression = "off"                       # off | auto | always
+# # prefill_threshold   = 4096                        # auto: enable above this many prompt tokens
+# # prefill_keep_ratio  = 0.10                        # adaptive floor
+# # prefill_keep_ratio_max = 0.75                     # adaptive ceiling
+# # prefill_max_auto_prefill_ratio = 0.60             # auto skip ceiling for high-retention plans
+# # prefill_plan_cache = true                         # reuse frozen plans across turns
+# # prefill_plan_cache_entries = 64                   # branch/frontier cap
+# # prefill_suffix_identity_threshold = 128           # small suffixes stay exact
+# # prefill_score_mode  = "full"                      # full | l7
+# # prefill_exit_layer  = 7
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.

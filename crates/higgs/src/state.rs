@@ -7,13 +7,18 @@ use higgs_engine::chat_template::ChatMessage;
 use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::{MlxRuntimeTuning, resolve_runtime_tuning};
-use higgs_engine::simple::{CacheStats, SessionGeneration, SimpleEngine};
+use higgs_engine::simple::{
+    CacheStats, PFlashPromptPolicy, PrefillCompressionMode as EnginePrefillCompressionMode,
+    SessionGeneration, SessionPromptTracePayloadStats, SimpleEngine,
+};
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
 use higgs_models::turboquant::KvCacheConfig;
 use mlx_rs::Array;
 
-use crate::config::{HiggsConfig, LocalConfig, ModelConfig, resolved_model_supports_batch};
+use crate::config::{
+    HiggsConfig, LocalConfig, ModelConfig, PrefillCompressionMode, resolved_model_supports_batch,
+};
 use crate::metrics::MetricsStore;
 use crate::router::Router;
 
@@ -59,8 +64,28 @@ impl Engine {
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
         draft_model: Option<&Path>,
+        prefill_drafter: Option<&Path>,
+        prefill_compression: PrefillCompressionMode,
+        prefill_keep_ratio: f32,
+        prefill_threshold: usize,
+        prefill_chunk: usize,
+        prefill_avgpool: usize,
+        prefill_lookahead: usize,
+        prefill_score_mode: higgs_models::spec_prefill::PrefillScoreMode,
+        prefill_exit_layer: usize,
+        prefill_keep_ratio_max: f32,
+        prefill_max_auto_prefill_ratio: f32,
+        prefill_plan_cache: bool,
+        prefill_plan_cache_entries: usize,
+        prefill_suffix_identity_threshold: usize,
+        session_max_suffix_prefill_tokens: usize,
         disk_cache_config: Option<DiskPrefixCacheConfig>,
     ) -> Result<Self, EngineError> {
+        let prefill_compression = match prefill_compression {
+            PrefillCompressionMode::Off => EnginePrefillCompressionMode::Off,
+            PrefillCompressionMode::Auto => EnginePrefillCompressionMode::Auto,
+            PrefillCompressionMode::Always => EnginePrefillCompressionMode::Always,
+        };
         SimpleEngine::load_with_dflash(
             dir,
             kv_cache_config,
@@ -68,6 +93,21 @@ impl Engine {
             raise_wired_limit,
             draft_model,
             disk_cache_config,
+            prefill_drafter,
+            prefill_compression,
+            prefill_keep_ratio,
+            prefill_threshold,
+            prefill_chunk,
+            prefill_avgpool,
+            prefill_lookahead,
+            prefill_score_mode,
+            prefill_exit_layer,
+            prefill_keep_ratio_max,
+            prefill_max_auto_prefill_ratio,
+            prefill_plan_cache,
+            prefill_plan_cache_entries,
+            prefill_suffix_identity_threshold,
+            session_max_suffix_prefill_tokens,
         )
         .map(|e| Self::Simple(Box::new(e)))
     }
@@ -187,37 +227,32 @@ impl Engine {
         }
     }
 
-    /// Render the chat template to its prompt STRING (the exact text
-    /// [`Self::prepare_chat_prompt_with_thinking`] tokenizes). Only the Simple
-    /// engine, which owns retained session caches, needs this — it lets the
-    /// continuation path compute a text-anchored delta against the retained
-    /// tokens' own detokenization. Other variants have no retained cache, so
-    /// this is unreachable for them.
-    pub fn render_chat_prompt_with_thinking(
+    pub fn prepare_chat_prompt_with_pflash_policy(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
-    ) -> Result<String, EngineError> {
+    ) -> Result<(Vec<u32>, PFlashPromptPolicy), EngineError> {
         match self {
-            Self::Simple(e) => e.render_chat_prompt_with_thinking(messages, tools, enable_thinking),
-            Self::Batch(_) => Err(EngineError::Generation(
-                "render_chat_prompt_with_thinking is only used by the Simple engine".to_owned(),
-            )),
+            Self::Simple(e) => {
+                e.prepare_chat_prompt_with_pflash_policy(messages, tools, enable_thinking)
+            }
+            Self::Batch(e) => e
+                .prepare_chat_prompt_with_thinking(messages, tools, enable_thinking)
+                .map(|tokens| (tokens, PFlashPromptPolicy::default())),
             #[cfg(test)]
-            Self::Stub(_) => Ok(String::new()),
+            Self::Stub(_) => Ok((Vec::new(), PFlashPromptPolicy::default())),
         }
     }
 
-    /// The exact token sequence a retained session cache currently holds
-    /// (prompt + previously generated tokens), or `None` when no live cache
-    /// exists for this `session_id`. Only the Simple engine retains caches.
-    pub fn retained_session_tokens(&self, session_id: u64) -> Option<Vec<u32>> {
+    /// Drop a retained per-session KV cache. Exact radix/disk prefix caches are
+    /// independent and are intentionally left intact.
+    pub fn drop_retained_session(&self, session_id: u64) -> bool {
         match self {
-            Self::Simple(e) => e.retained_session_tokens(session_id),
-            Self::Batch(_) => None,
+            Self::Simple(e) => e.drop_retained_session(session_id),
+            Self::Batch(_) => false,
             #[cfg(test)]
-            Self::Stub(_) => None,
+            Self::Stub(_) => false,
         }
     }
 
@@ -262,6 +297,7 @@ impl Engine {
         params: &SamplingParams,
         enable_thinking: bool,
     ) -> Result<SessionGeneration, EngineError> {
+        let _gpu = gpu_gate();
         match self {
             Self::Simple(e) => e.generate_continued_with_thinking(
                 session_id,
@@ -272,6 +308,109 @@ impl Engine {
             ),
             Self::Batch(_) => Err(EngineError::Generation(
                 "session_id (continued generation) is only supported by the Simple engine"
+                    .to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    /// Streaming counterpart of [`Self::generate_continued_with_thinking`]:
+    /// emits each decoded token via `sender` instead of buffering the whole
+    /// completion.
+    pub fn generate_continued_streaming_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+    ) -> Result<(), EngineError> {
+        let _gpu = gpu_gate();
+        match self {
+            Self::Simple(e) => e.generate_continued_streaming_with_thinking(
+                session_id,
+                prompt_tokens,
+                max_tokens,
+                params,
+                sender,
+                enable_thinking,
+            ),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "session_id (continued generation) is only supported by the Simple engine"
+                    .to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_session_routed_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        max_tokens: u32,
+        params: &SamplingParams,
+        enable_thinking: bool,
+        tool_payload: SessionPromptTracePayloadStats,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<SessionGeneration, EngineError> {
+        let _gpu = gpu_gate();
+        match self {
+            Self::Simple(e) => e.generate_session_routed_with_thinking(
+                session_id,
+                prompt_tokens,
+                messages,
+                tools,
+                max_tokens,
+                params,
+                enable_thinking,
+                tool_payload,
+                pflash_policy,
+            ),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "session_id (session-routed generation) is only supported by the Simple engine"
+                    .to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_session_routed_streaming_with_thinking(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        max_tokens: u32,
+        params: &SamplingParams,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        tool_payload: SessionPromptTracePayloadStats,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<(), EngineError> {
+        let _gpu = gpu_gate();
+        match self {
+            Self::Simple(e) => e.generate_session_routed_streaming_with_thinking(
+                session_id,
+                prompt_tokens,
+                messages,
+                tools,
+                max_tokens,
+                params,
+                sender,
+                enable_thinking,
+                tool_payload,
+                pflash_policy,
+            ),
+            Self::Batch(_) => Err(EngineError::Generation(
+                "session_id (session-routed streaming) is only supported by the Simple engine"
                     .to_owned(),
             )),
             #[cfg(test)]
@@ -320,9 +459,39 @@ impl Engine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
+        self.generate_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            enable_thinking,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            &PFlashPromptPolicy::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_thinking_and_pflash_policy(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        enable_thinking: bool,
+        constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<GenerationOutput, EngineError> {
         let _gpu = gpu_gate();
         match self {
-            Self::Simple(e) => e.generate_with_thinking(
+            Self::Simple(e) => e.generate_with_thinking_and_pflash_policy(
                 prompt_tokens,
                 max_tokens,
                 params,
@@ -333,6 +502,55 @@ impl Engine {
                 constraint,
                 pixel_values,
                 checkpoint_id,
+                pflash_policy,
+            ),
+            Self::Batch(e) => e.generate_with_thinking(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                logprobs,
+                top_logprobs,
+                enable_thinking,
+                constraint,
+                pixel_values,
+            ),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_thinking_and_pflash_policy_with_cache(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        enable_thinking: bool,
+        constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
+    ) -> Result<GenerationOutput, EngineError> {
+        let _gpu = gpu_gate();
+        match self {
+            Self::Simple(e) => e.generate_with_thinking_and_pflash_policy_with_cache(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                logprobs,
+                top_logprobs,
+                enable_thinking,
+                constraint,
+                pixel_values,
+                checkpoint_id,
+                pflash_policy,
+                allow_prefix_cache,
             ),
             Self::Batch(e) => e.generate_with_thinking(
                 prompt_tokens,
@@ -397,9 +615,43 @@ impl Engine {
         pixel_values: Option<Array>,
         checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
+        self.generate_streaming_with_thinking_and_pflash_policy(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            sender,
+            enable_thinking,
+            return_progress,
+            constraint,
+            pixel_values,
+            checkpoint_id,
+            &PFlashPromptPolicy::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_thinking_and_pflash_policy(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        enable_thinking: bool,
+        return_progress: bool,
+        constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+    ) -> Result<(), EngineError> {
         let _gpu = gpu_gate();
         match self {
-            Self::Simple(e) => e.generate_streaming_with_thinking(
+            Self::Simple(e) => e.generate_streaming_with_thinking_and_pflash_policy(
                 prompt_tokens,
                 max_tokens,
                 params,
@@ -412,6 +664,61 @@ impl Engine {
                 constraint,
                 pixel_values,
                 checkpoint_id,
+                pflash_policy,
+            ),
+            Self::Batch(e) => e.generate_streaming_with_thinking(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                logprobs,
+                top_logprobs,
+                sender,
+                enable_thinking,
+                return_progress,
+                constraint,
+                pixel_values,
+            ),
+            #[cfg(test)]
+            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_with_thinking_and_pflash_policy_with_cache(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<higgs_engine::engine::StreamingOutput>,
+        enable_thinking: bool,
+        return_progress: bool,
+        constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
+        pixel_values: Option<Array>,
+        checkpoint_id: Option<&str>,
+        pflash_policy: &PFlashPromptPolicy,
+        allow_prefix_cache: bool,
+    ) -> Result<(), EngineError> {
+        let _gpu = gpu_gate();
+        match self {
+            Self::Simple(e) => e.generate_streaming_with_thinking_and_pflash_policy_with_cache(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                logprobs,
+                top_logprobs,
+                sender,
+                enable_thinking,
+                return_progress,
+                constraint,
+                pixel_values,
+                checkpoint_id,
+                pflash_policy,
+                allow_prefix_cache,
             ),
             Self::Batch(e) => e.generate_streaming_with_thinking(
                 prompt_tokens,
@@ -471,6 +778,21 @@ pub fn build_engine(
             tuning,
             local.raise_wired_limit,
             model_cfg.draft_model.as_deref().map(Path::new),
+            model_cfg.prefill_drafter.as_deref().map(Path::new),
+            model_cfg.prefill_compression,
+            model_cfg.prefill_keep_ratio,
+            model_cfg.prefill_threshold,
+            model_cfg.prefill_chunk,
+            model_cfg.prefill_avgpool,
+            model_cfg.prefill_lookahead,
+            model_cfg.prefill_score_mode,
+            model_cfg.prefill_exit_layer,
+            model_cfg.prefill_keep_ratio_max,
+            model_cfg.prefill_max_auto_prefill_ratio,
+            model_cfg.prefill_plan_cache,
+            model_cfg.prefill_plan_cache_entries,
+            model_cfg.prefill_suffix_identity_threshold,
+            model_cfg.kv_max_suffix_prefill_tokens,
             model_cfg.disk_prefix_cache_config(resolved),
         )
         .map_err(|e| e.to_string())?

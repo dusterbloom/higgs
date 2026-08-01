@@ -4,7 +4,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use regex::Regex;
 use tracing::warn;
 
-use crate::config::{ApiFormat, HiggsConfig};
+use crate::config::{ApiFormat, GenerationDefaults, HiggsConfig};
 use crate::state::Engine;
 
 /// How a model name was resolved to its target.
@@ -26,6 +26,7 @@ pub enum ResolvedRoute {
     Higgs {
         engine: Arc<Engine>,
         model_name: String,
+        generation_defaults: GenerationDefaults,
         routing_method: RoutingMethod,
     },
     /// Forward to a remote provider.
@@ -88,6 +89,8 @@ pub struct Router {
     /// Guarded by a `RwLock`: `resolve`/`list` take a read lock and clone the
     /// `Arc` out, so an in-flight request is never tied to map membership.
     local_engines: RwLock<HashMap<String, Arc<Engine>>>,
+    /// Per-local-model chat defaults from `[[models]].generation_defaults`.
+    local_generation_defaults: RwLock<HashMap<String, GenerationDefaults>>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
     auto_candidates: Vec<RouteCandidate>,
@@ -110,6 +113,13 @@ impl Router {
         let mut auto_routes = Vec::new();
         let mut auto_candidates = Vec::new();
         let mut seen_names = HashSet::new();
+        let mut local_generation_defaults = HashMap::new();
+
+        for model in &config.models {
+            if let Some(name) = &model.name {
+                local_generation_defaults.insert(name.clone(), model.generation_defaults.clone());
+            }
+        }
 
         for route in &config.routes {
             if route.pattern.is_none() && route.description.is_none() {
@@ -172,6 +182,7 @@ impl Router {
 
         Ok(Self {
             local_engines: RwLock::new(engines),
+            local_generation_defaults: RwLock::new(local_generation_defaults),
             compiled_routes,
             auto_routes,
             auto_candidates,
@@ -210,6 +221,7 @@ impl Router {
             return Ok(ResolvedRoute::Higgs {
                 engine,
                 model_name: model.to_owned(),
+                generation_defaults: self.generation_defaults_for(model),
                 routing_method: RoutingMethod::Direct,
             });
         }
@@ -253,19 +265,35 @@ impl Router {
     /// already taken (checked under the write lock, so it is race-free against
     /// concurrent loads).
     pub fn insert_engine(&self, name: String, engine: Arc<Engine>) -> Result<(), String> {
+        self.insert_engine_with_defaults(name, engine, GenerationDefaults::default())
+    }
+
+    /// Register a freshly-loaded engine with per-model request defaults.
+    pub fn insert_engine_with_defaults(
+        &self,
+        name: String,
+        engine: Arc<Engine>,
+        generation_defaults: GenerationDefaults,
+    ) -> Result<(), String> {
         let mut engines = self.engines_write();
         if engines.contains_key(&name) {
             return Err(name);
         }
-        engines.insert(name, engine);
+        engines.insert(name.clone(), engine);
         drop(engines);
+        self.generation_defaults_write()
+            .insert(name, generation_defaults);
         Ok(())
     }
 
     /// Remove an engine from the routing table, returning it if present. The
     /// caller is responsible for dropping it once no request still holds a clone.
     pub fn remove_engine(&self, name: &str) -> Option<Arc<Engine>> {
-        self.engines_write().remove(name)
+        let removed = self.engines_write().remove(name);
+        if removed.is_some() {
+            self.generation_defaults_write().remove(name);
+        }
+        removed
     }
 
     /// Map key bound to the auto-router model, if the auto-router is enabled.
@@ -289,6 +317,23 @@ impl Router {
 
     fn engines_write(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<Engine>>> {
         self.local_engines
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn generation_defaults_for(&self, name: &str) -> GenerationDefaults {
+        self.local_generation_defaults
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn generation_defaults_write(
+        &self,
+    ) -> RwLockWriteGuard<'_, HashMap<String, GenerationDefaults>> {
+        self.local_generation_defaults
             .write()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -352,9 +397,11 @@ impl Router {
                     ));
                 };
                 drop(engines);
+                let generation_defaults = self.generation_defaults_for(&resolved_name);
                 Ok(ResolvedRoute::Higgs {
                     engine,
                     model_name: resolved_name,
+                    generation_defaults,
                     routing_method: method,
                 })
             }
@@ -813,6 +860,46 @@ mod tests {
                 assert_eq!(routing_method, RoutingMethod::Direct);
             }
             ResolvedRoute::Remote { .. } => panic!("expected exact local model to win"),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_model_resolution_carries_generation_defaults() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "prism-ml/Ternary-Bonsai-27B-mlx-2bit"
+            name = "bonsai-27b-q2"
+
+            [models.generation_defaults]
+            max_tokens = 4096
+            temperature = 0.0
+            top_p = 1.0
+            speculation = "auto"
+            enable_thinking = false
+            "#,
+        );
+        let mut engines = HashMap::new();
+        engines.insert(
+            "bonsai-27b-q2".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("bonsai-27b-q2")),
+        );
+
+        let router = Router::from_config(&config, engines).unwrap();
+        let result = router.resolve("bonsai-27b-q2", None).await.unwrap();
+
+        match result {
+            ResolvedRoute::Higgs {
+                generation_defaults,
+                ..
+            } => {
+                assert_eq!(generation_defaults.max_tokens, Some(4096));
+                assert_eq!(generation_defaults.temperature, Some(0.0));
+                assert_eq!(generation_defaults.top_p, Some(1.0));
+                assert_eq!(generation_defaults.speculation.as_deref(), Some("auto"));
+                assert_eq!(generation_defaults.enable_thinking, Some(false));
+            }
+            ResolvedRoute::Remote { .. } => panic!("expected Higgs route"),
         }
     }
 

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use higgs_engine::mlx_tuning::resolve_effective_mlx_profile;
+use higgs_models::spec_prefill::PrefillScoreMode;
 
 use crate::config::HiggsConfig;
 use crate::model_resolver;
@@ -300,6 +301,17 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 result,
             );
         }
+        // A byte budget smaller than a single typical prefix defeats the cache
+        // (every store evicts immediately). Warn but don't fail — 0 disables it.
+        if kv.kv_cache_bytes > 0 && kv.kv_cache_bytes < 1 << 20 {
+            warn(
+                &format!(
+                    "model {label} kv_cache_bytes={} is very low (< 1 MiB) — the prefix cache will likely evict every entry and provide no reuse (use 0 to disable the budget, or a larger value)",
+                    kv.kv_cache_bytes
+                ),
+                result,
+            );
+        }
         if model.batch && model.kv_cache_config().is_turboquant() {
             fail(
                 &format!(
@@ -338,6 +350,150 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                     result,
                 );
                 continue;
+            }
+        }
+        // PFlash compressive prefill (docs/RESEARCH-pflash-prior-art.md).
+        if let Some(ref pd) = model.prefill_drafter {
+            if !std::path::Path::new(pd).exists() {
+                fail(
+                    &format!("model {label} prefill_drafter path does not exist: {pd}"),
+                    result,
+                );
+                continue;
+            }
+            if model.batch {
+                fail(
+                    &format!(
+                        "model {label} sets prefill_drafter but PFlash is simple-engine only (batch=true)"
+                    ),
+                    result,
+                );
+                continue;
+            }
+        }
+        if model.prefill_compression != crate::config::PrefillCompressionMode::Off
+            && model.prefill_drafter.is_none()
+        {
+            fail(
+                &format!(
+                    "model {label} sets prefill_compression={:?} but no prefill_drafter is configured",
+                    model.prefill_compression
+                ),
+                result,
+            );
+            continue;
+        }
+        if model.prefill_drafter.is_some()
+            && model.prefill_compression != crate::config::PrefillCompressionMode::Off
+        {
+            warn(
+                &format!(
+                    "model {label} enables PFlash (mode={:?}, keep_ratio={}, threshold={}): \
+                     max_auto_prefill_ratio={}; \
+                     compressed output is NOT byte-identical to uncompressed. \
+                     Validate on your workload before relying on it.",
+                    model.prefill_compression,
+                    model.prefill_keep_ratio,
+                    model.prefill_threshold,
+                    model.prefill_max_auto_prefill_ratio
+                ),
+                result,
+            );
+        }
+        if !(0.02..=0.95).contains(&model.prefill_keep_ratio) {
+            fail(
+                &format!(
+                    "model {label} prefill_keep_ratio={} out of range [0.02, 0.95]",
+                    model.prefill_keep_ratio
+                ),
+                result,
+            );
+            continue;
+        }
+        if !(model.prefill_keep_ratio..=0.95).contains(&model.prefill_keep_ratio_max) {
+            fail(
+                &format!(
+                    "model {label} prefill_keep_ratio_max={} must be in [{}, 0.95]",
+                    model.prefill_keep_ratio_max, model.prefill_keep_ratio
+                ),
+                result,
+            );
+            continue;
+        }
+        if !(0.0..=1.0).contains(&model.prefill_max_auto_prefill_ratio) {
+            fail(
+                &format!(
+                    "model {label} prefill_max_auto_prefill_ratio={} out of range [0.0, 1.0]",
+                    model.prefill_max_auto_prefill_ratio
+                ),
+                result,
+            );
+            continue;
+        }
+        if model.prefill_plan_cache && model.prefill_plan_cache_entries == 0 {
+            fail(
+                &format!("model {label} prefill_plan_cache_entries must be >= 1"),
+                result,
+            );
+            continue;
+        }
+        if model.prefill_suffix_identity_threshold > 512 {
+            warn(
+                &format!(
+                    "model {label} prefill_suffix_identity_threshold={} is high; exact suffix prefill can dominate TTFT on slow targets",
+                    model.prefill_suffix_identity_threshold
+                ),
+                result,
+            );
+        }
+        if model.prefill_drafter.is_some() {
+            if model.prefill_chunk == 0 {
+                fail(
+                    &format!(
+                        "model {label} prefill_chunk must be >= 1, got {}",
+                        model.prefill_chunk
+                    ),
+                    result,
+                );
+                continue;
+            }
+            if model.prefill_avgpool == 0 || model.prefill_avgpool % 2 == 0 {
+                fail(
+                    &format!(
+                        "model {label} prefill_avgpool must be odd and >= 1 (symmetric smoothing window), got {}",
+                        model.prefill_avgpool
+                    ),
+                    result,
+                );
+                continue;
+            }
+            if model.prefill_lookahead == 0 {
+                fail(
+                    &format!(
+                        "model {label} prefill_lookahead must be >= 1, got {}",
+                        model.prefill_lookahead
+                    ),
+                    result,
+                );
+                continue;
+            }
+            if model.prefill_score_mode == PrefillScoreMode::L7 && model.prefill_exit_layer == 0 {
+                fail(
+                    &format!(
+                        "model {label} prefill_exit_layer must be >= 1 when prefill_score_mode=l7"
+                    ),
+                    result,
+                );
+                continue;
+            }
+            if model.prefill_threshold < 1024 {
+                warn(
+                    &format!(
+                        "model {label} prefill_threshold={} is very low; compressing short prompts costs more than it saves",
+                        model.prefill_threshold
+                    ),
+                    result,
+                );
             }
         }
         match model_resolver::resolve(&model.path) {

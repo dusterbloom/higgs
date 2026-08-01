@@ -117,7 +117,13 @@ impl BatchEngine {
         std::thread::Builder::new()
             .name("batch-engine".into())
             .spawn(move || {
-                worker_loop(model, &tok, &eos_ids, request_rx);
+                worker_loop(
+                    model,
+                    &tok,
+                    &eos_ids,
+                    request_rx,
+                    kv_cache_config.kv_cache_bytes,
+                );
             })
             .map_err(|e| EngineError::Generation(format!("Failed to spawn worker: {e}")))?;
 
@@ -237,6 +243,8 @@ impl BatchEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
                 token_logprobs: None,
+                reasoning_content: None,
+                cached_prompt_tokens: 0,
             });
         }
 
@@ -281,6 +289,8 @@ impl BatchEngine {
             prompt_tokens: prompt_len,
             completion_tokens,
             token_logprobs: all_logprobs,
+            reasoning_content: None,
+            cached_prompt_tokens: 0,
         })
     }
 
@@ -406,8 +416,10 @@ fn worker_loop(
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
     mut request_rx: tokio::sync::mpsc::Receiver<BatchRequest>,
+    prefix_cache_bytes: usize,
 ) {
-    let mut prefix_cache = PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE);
+    let mut prefix_cache =
+        PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE).with_max_bytes(prefix_cache_bytes);
     let mut active: Vec<ActiveRequest> = Vec::new();
 
     // This dedicated worker thread is the sole owner of `model` (it was moved

@@ -27,11 +27,17 @@ use higgs_engine::{
     chat_template::{ChatMessage, ChatTemplateRenderer},
     mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile},
     paged_prefix_cache::MAX_PAIRED_RADIX_ENTRIES,
-    simple::SimpleEngine,
+    simple::{
+        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+        DEFAULT_PFLASH_PLAN_CACHE, DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+        DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD, PrefillCompressionMode, SimpleEngine,
+    },
 };
-use higgs_models::{SamplingParams, Speculation, turboquant::KvCacheConfig};
+use higgs_models::{
+    SamplingParams, Speculation, spec_prefill::PrefillScoreMode, turboquant::KvCacheConfig,
+};
 use support::{
-    ReferenceDsparkEnv, ScopedEnvVar, assert_acceptance_within, assert_bonsai_27b_full_q4,
+    ReferenceDsparkEnv, ScopedEnvVar, assert_acceptance_within, assert_bonsai_27b_full_lowbit,
     assert_decode_tps_within, dflash_acceptance, dflash_decode_tps, dflash_prefill_seconds,
 };
 
@@ -91,9 +97,7 @@ fn generation_suffix(engine: &SimpleEngine, renderer: &ChatTemplateRenderer) -> 
         .to_vec()
 }
 
-#[test]
-#[ignore = "loads real Bonsai target + dSpark drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
-fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
+fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_impl(target_bits: u64) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_test_writer()
@@ -105,7 +109,7 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
     let drafter = std::env::var("HIGGS_DFLASH_DRAFTER_DIR")
         .expect("set HIGGS_DFLASH_DRAFTER_DIR to the MLX dSpark drafter");
     let target_path = Path::new(&target);
-    assert_bonsai_27b_full_q4(target_path, Path::new(&drafter));
+    assert_bonsai_27b_full_lowbit(target_path, Path::new(&drafter), target_bits);
     let renderer =
         ChatTemplateRenderer::from_model_dir(target_path).expect("load target chat template");
     let tuning = MlxRuntimeTuning::from_model_dir(target_path, RequestedMlxProfile::Auto);
@@ -118,6 +122,21 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
         false,
         Some(Path::new(&drafter)),
         None,
+        None,
+        PrefillCompressionMode::Off,
+        0.10,
+        4096,
+        32,
+        13,
+        8,
+        PrefillScoreMode::Full,
+        7,
+        DEFAULT_PFLASH_KEEP_RATIO_MAX,
+        DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+        DEFAULT_PFLASH_PLAN_CACHE,
+        DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+        DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+        8192,
     )
     .expect("load paired dSpark engine");
     let params = greedy_dflash();
@@ -662,4 +681,16 @@ fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
         after_evicted_probe.paired_radix_dflash_bytes,
         after_cap_third.paired_radix_dflash_bytes
     );
+}
+
+#[test]
+#[ignore = "loads real Bonsai target + dSpark drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold() {
+    bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_impl(1)
+}
+
+#[test]
+#[ignore = "loads real Bonsai target + dSpark drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR"]
+fn bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_q2() {
+    bonsai_radix_pair_reuses_only_conversation_body_and_clear_restores_cold_impl(2)
 }

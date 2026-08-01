@@ -17,7 +17,6 @@ pub mod prune_eval;
 pub mod reasoning_parser;
 pub mod scheduler;
 pub mod simple;
-pub mod spec_prefill;
 pub mod tool_parser;
 
 pub use tokenizers;

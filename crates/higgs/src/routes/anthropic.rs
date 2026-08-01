@@ -63,6 +63,7 @@ pub async fn create_message(
             engine,
             model_name,
             routing_method,
+            ..
         } => {
             req.model = model_name;
             let start = Instant::now();
@@ -231,7 +232,7 @@ async fn create_message_non_streaming(
             ))
         })?;
     let sampling = SamplingParams {
-        temperature: req.temperature.unwrap_or(1.0),
+        temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k,
         speculation,
@@ -326,7 +327,7 @@ fn create_message_stream(
             ))
         })?;
     let sampling = SamplingParams {
-        temperature: req.temperature.unwrap_or(1.0),
+        temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k,
         speculation,

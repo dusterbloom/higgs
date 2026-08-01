@@ -114,6 +114,7 @@ static CANONICAL_CONV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
+    spec_prefill::TargetSparsePrefillPlan,
     utils::{AttentionMask, apply_rope, create_causal_mask},
     yarn::{compute_yarn_freqs, yarn_get_mscale},
 };
@@ -384,7 +385,7 @@ fn has_loaded_affine_q1_biases(scales: &Array, biases: &Array) -> bool {
         )
 }
 
-fn validate_dflash_q1_linear(
+fn validate_dflash_affine_lowbit_linear(
     path: &str,
     weight: &Array,
     scales: &Array,
@@ -393,19 +394,19 @@ fn validate_dflash_q1_linear(
     bits: i32,
     mode: crate::quant_mode::QuantMode,
 ) -> Result<(), Exception> {
-    if mode != crate::quant_mode::QuantMode::Affine || bits != 1 || group_size != 128 {
+    if mode != crate::quant_mode::QuantMode::Affine || !matches!(bits, 1 | 2) || group_size != 128 {
         return Err(Exception::custom(format!(
-            "{path} is outside the proven dSpark Q1 domain: mode={mode:?} bits={bits} group_size={group_size}"
+            "{path} is outside the proven low-bit affine domain: mode={mode:?} bits={bits} group_size={group_size}"
         )));
     }
     let [rows, packed_columns] = *weight.shape() else {
         return Err(Exception::custom(format!(
-            "{path} must have a loaded two-dimensional packed Q1 weight"
+            "{path} must have a loaded two-dimensional packed low-bit affine weight"
         )));
     };
     let [scale_rows, scale_columns] = *scales.shape() else {
         return Err(Exception::custom(format!(
-            "{path} must have two-dimensional Q1 scales"
+            "{path} must have two-dimensional low-bit affine scales"
         )));
     };
     if weight.dtype() != Dtype::Uint32
@@ -415,17 +416,18 @@ fn validate_dflash_q1_linear(
         )
     {
         return Err(Exception::custom(format!(
-            "{path} has invalid Q1 dtypes weight={:?} scales={:?}",
+            "{path} has invalid low-bit affine dtypes weight={:?} scales={:?}",
             weight.dtype(),
             scales.dtype()
         )));
     }
+    let cols_per_word = 32 / bits;
     let logical_columns = packed_columns
-        .checked_mul(32)
-        .ok_or_else(|| Exception::custom(format!("{path} Q1 shape overflow")))?;
+        .checked_mul(cols_per_word)
+        .ok_or_else(|| Exception::custom(format!("{path} low-bit affine shape overflow")))?;
     if logical_columns % group_size != 0 {
         return Err(Exception::custom(format!(
-            "{path} logical Q1 width {logical_columns} is not divisible by group size {group_size}"
+            "{path} logical low-bit affine width {logical_columns} is not divisible by group size {group_size}"
         )));
     }
     let expected_scale_columns = logical_columns / group_size;
@@ -435,14 +437,14 @@ fn validate_dflash_q1_linear(
         || scale_columns != expected_scale_columns
     {
         return Err(Exception::custom(format!(
-            "{path} has inconsistent packed Q1 weight/scales shapes {:?}/{:?}",
+            "{path} has inconsistent packed low-bit affine weight/scales shapes {:?}/{:?}",
             weight.shape(),
             scales.shape()
         )));
     }
     if !has_symmetric_q1_biases(biases) && !has_loaded_affine_q1_biases(scales, biases) {
         return Err(Exception::custom(format!(
-            "{path} must use the validated symmetric-Q1 bias sentinel or a nonempty floating-point affine bias matching scales shape {:?}; got shape {:?} dtype {:?}",
+            "{path} must use the validated low-bit-affine bias sentinel or a nonempty floating-point affine bias matching scales shape {:?}; got shape {:?} dtype {:?}",
             scales.shape(),
             biases.shape(),
             biases.dtype()
@@ -451,7 +453,7 @@ fn validate_dflash_q1_linear(
     Ok(())
 }
 
-fn bonsai_q1_qmm_max_rows() -> i32 {
+pub(crate) fn bonsai_q1_qmm_max_rows() -> i32 {
     static MAX_ROWS: OnceLock<i32> = OnceLock::new();
     *MAX_ROWS.get_or_init(|| {
         std::env::var("HIGGS_BONSAI_QMM_MAX_ROWS")
@@ -472,8 +474,106 @@ pub(crate) fn quantized_forward(
 ) -> Result<Array, Exception> {
     if bits == 1 {
         affine_q1_forward(x, weight, scales, biases, group_size)
+    } else if bits == 2 {
+        affine_q2_simd_forward(x, weight, scales, biases, group_size)
     } else {
         ops::quantized_matmul(x, weight, scales, biases, true, group_size, bits)
+    }
+}
+
+/// Affine 2-bit matrix multiply using the MLX-qdot simdgroup kernel.
+///
+/// Affine 2-bit matrix multiply defaults to MLX stock for full-model AR.
+///
+/// The custom simdgroup Q2 kernel can win isolated microbench shapes, but the
+/// full Ternary-Bonsai-27B decode path is faster with MLX stock by default.
+/// Keep the custom route opt-in for future sweeps.
+fn affine_q2_simd_forward(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    let x_shape = x.shape();
+    let row_count: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    let use_simd = std::env::var("HIGGS_BONSAI_Q2_SIMD")
+        .ok()
+        .is_some_and(|value| value == "1")
+        && if let [n_rows, k_packed] = *weight.shape() {
+            let k_dim = k_packed.saturating_mul(16);
+            row_count == 1 && n_rows == 17408 && k_dim == 5120
+        } else {
+            false
+        };
+
+    if use_simd {
+        crate::metal_kernel::bonsai_q2_qmv_simd(x, weight, scales, biases, group_size)
+    } else {
+        ops::quantized_matmul(x, weight, scales, biases, true, group_size, 2)
+    }
+}
+
+/// Affine 2-bit matrix multiplication using Higgs' runtime Metal kernels.
+///
+/// Currently NOT wired into `quantized_forward` because the direct-port Q2
+/// qmv_fast kernel measures ~17% slower than MLX stock `quantized_matmul` for
+/// M=1 on Bonsai-27B-2bit (7.7 tok/s vs 9.2 tok/s baseline). MLX's stock
+/// affine bits=2 kernel is well-tuned for the M=1 AR path; the Q2 win lives in
+/// the Phase 3D TG-LUT4 M=5 specialization, where one packed-word load is
+/// shared across 5 verifier rows via the 2-LUT identity.
+///
+/// Kept here as `#[allow(dead_code)]` so Phase 3D can wire it in for verifier
+/// M=5+ only without re-implementing the dispatch logic. The narrow Q2 kernels
+/// (`bonsai_q2_qmv`, `bonsai_q2_qmm`) remain bit-exact-validated against the
+/// CPU oracle in `bonsai_q2::tests`.
+#[allow(dead_code)]
+fn affine_q2_forward(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    let x_shape = x.shape();
+    let input_dim = x_shape
+        .last()
+        .copied()
+        .ok_or_else(|| Exception::custom("2-bit affine input has no dimensions"))?;
+    let weight_shape = weight.shape();
+    let packed_dim = weight_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| Exception::custom("2-bit affine weight must be a matrix"))?;
+    let expected_input_dim = packed_dim
+        .checked_mul(16)
+        .ok_or_else(|| Exception::custom("2-bit affine input dimension overflow"))?;
+    if input_dim != expected_input_dim {
+        return Err(Exception::custom(format!(
+            "2-bit affine input dim {input_dim} does not match packed weight dim {expected_input_dim}"
+        )));
+    }
+    if group_size <= 0 || expected_input_dim % group_size != 0 {
+        return Err(Exception::custom(format!(
+            "invalid 2-bit affine group size {group_size} for input dim {expected_input_dim}"
+        )));
+    }
+
+    let row_count: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    if row_count == 1 {
+        crate::metal_kernel::bonsai_q2_qmv(x, weight, scales, biases, group_size)
+    } else if row_count > 0 && row_count <= bonsai_q1_qmm_max_rows() {
+        crate::metal_kernel::bonsai_q2_qmm(x, weight, scales, biases, group_size)
+    } else {
+        // Phase 3E will insert bonsai_q2_wide_qmm here. For now, route to MLX
+        // stock affine quantized_matmul which dequantizes internally.
+        ops::quantized_matmul(x, weight, scales, biases, true, group_size, 2)
     }
 }
 
@@ -524,6 +624,15 @@ fn affine_q1_forward(
     } else if row_count > 0 && row_count <= bonsai_q1_qmm_max_rows() {
         crate::metal_kernel::bonsai_q1_qmm(x, weight, scales, biases, group_size)
     } else {
+        // Native packed-Q1 wide QMM (gated by HIGGS_BONSAI_QMM_WIDE). Reads each
+        // packed weight roughly once per m-tile instead of materializing a full
+        // fp16 dequant projection. Falls through to the dense dequant path when
+        // disabled or outside the validated shape domain.
+        if let Some(y) =
+            crate::metal_kernel::bonsai_q1_wide_qmm(x, weight, scales, biases, group_size)?
+        {
+            return Ok(y);
+        }
         let dense = crate::metal_kernel::bonsai_q1_dequant(weight, scales, biases, group_size)?
             .as_dtype(x.dtype())?;
         x.matmul(&dense.transpose()?)
@@ -571,6 +680,7 @@ pub(crate) struct QLinear {
     /// path; `MxFp4` routes through the FFI bypass in [`crate::quant_mode`].
     pub(crate) mode: crate::quant_mode::QuantMode,
     weight_layout: QLinearWeightLayout,
+    q2_row2: OnceLock<crate::metal_kernel::BonsaiQ2Row2>,
 }
 
 impl QLinear {
@@ -624,11 +734,47 @@ impl QLinear {
             bits,
             mode,
             weight_layout: QLinearWeightLayout::Canonical,
+            q2_row2: OnceLock::new(),
         })
     }
 
     fn reset_weight_layout(&mut self) {
         self.weight_layout = QLinearWeightLayout::Canonical;
+        self.q2_row2 = OnceLock::new();
+    }
+
+    fn q2_row2_m5_ternary_forward(&self, x: &Array) -> Result<Option<Array>, Exception> {
+        let row2_enabled = std::env::var("HIGGS_DSPARK_Q2_ROW2_MLP").map_or(true, |v| v != "0");
+        if !row2_enabled
+            || self.mode != crate::quant_mode::QuantMode::Affine
+            || self.bits != 2
+            || self.group_size != 128
+            || !matches!(self.weight_layout, QLinearWeightLayout::Canonical)
+        {
+            return Ok(None);
+        }
+        let x_shape = x.shape();
+        let m_rows: i32 = x_shape
+            .iter()
+            .take(x_shape.len().saturating_sub(1))
+            .product();
+        if m_rows != 5 {
+            return Ok(None);
+        }
+        if self.q2_row2.get().is_none() {
+            let packed =
+                crate::metal_kernel::BonsaiQ2Row2::from_row_major(&self.weight, &self.scales)?;
+            let _ = self.q2_row2.set(packed);
+        }
+        let packed = self
+            .q2_row2
+            .get()
+            .ok_or_else(|| Exception::custom("Q2 row2 cache was not initialized"))?
+            .as_ref();
+        if packed.n_rows() == 5120 && packed.k_dim() == 17408 {
+            return crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(x, packed, 4).map(Some);
+        }
+        crate::metal_kernel::bonsai_q2_row2_m5_ternary_direct(x, packed).map(Some)
     }
 
     fn bonsai_row4(&self) -> Result<Option<crate::metal_kernel::BonsaiQ1Row4Ref<'_>>, Exception> {
@@ -655,7 +801,28 @@ impl QLinear {
                 Ok(((*n_rows, *k_dim), false))
             }
             QLinearWeightLayout::Canonical => {
-                validate_dflash_q1_linear(
+                // TG-LUT4 row4 promotion is a Q1-only optimization. A canonical
+                // tensor that is not Q1 affine (e.g. an 8-bit group-64 model
+                // loaded while HIGGS_BONSAI_TG_LUT4=1 is set globally) is simply
+                // not a promotion candidate — decline silently so it falls
+                // through to the standard forward path. Derive [N,K] from the
+                // scales (group_count * group_size), which is packing-independent,
+                // so the caller's gate/up/down shape-consistency check still holds.
+                let is_q1_affine = self.mode == crate::quant_mode::QuantMode::Affine
+                    && self.bits == 1
+                    && self.group_size == 128;
+                if !is_q1_affine {
+                    let [n_rows, n_groups] = *self.scales.shape() else {
+                        return Err(Exception::custom(format!(
+                            "{path} canonical scales must have shape [N, K/group]"
+                        )));
+                    };
+                    let k_dim = n_groups
+                        .checked_mul(self.group_size)
+                        .ok_or_else(|| Exception::custom(format!("{path} canonical K overflow")))?;
+                    return Ok(((n_rows, k_dim), false));
+                }
+                validate_dflash_affine_lowbit_linear(
                     path,
                     &self.weight,
                     &self.scales,
@@ -725,6 +892,13 @@ impl QLinear {
                     x.dtype()
                 )));
             }
+            // Native packed-Q1 wide QMM against the authoritative row4 buffers
+            // (gated by HIGGS_BONSAI_QMM_WIDE). Falls through to the row4
+            // dequant + dense matmul path when disabled or outside the validated
+            // shape domain.
+            if let Some(y) = crate::metal_kernel::bonsai_q1_row4_wide_qmm_view(x, packed)? {
+                return Ok(y);
+            }
             // Wide prefill dequantizes directly from the authoritative row4
             // buffers. No transient canonical packed copy is materialized.
             let dense =
@@ -735,6 +909,9 @@ impl QLinear {
         // Fast path: batched quantized GEMM for verify (T>1, T<=16).
         // Fuses T matmuls into one Metal kernel dispatch — eliminates
         // pipeline bubbles. Gated by env var until validated.
+        if let Some(y) = self.q2_row2_m5_ternary_forward(x)? {
+            return Ok(y);
+        }
         if let Some(t) = self.qgemm_verify_shape(x) {
             let fast = if self.mode == crate::quant_mode::QuantMode::MxFp4 {
                 qgemm_mxfp4_4bit(x, &self.weight, &self.scales, self.group_size, t)
@@ -803,6 +980,20 @@ impl QLinear {
                 )
             }
         }
+    }
+
+    pub(crate) fn forward_rows(&self, x: &Array, rows: &Array) -> Result<Array, Exception> {
+        use mlx_rs::ops::indexing::take_axis;
+
+        if self.mode != crate::quant_mode::QuantMode::Affine || self.bits == 1 {
+            return Err(Exception::custom(
+                "QLinear::forward_rows currently supports affine bits>=2 only",
+            ));
+        }
+        let weight = take_axis(&self.weight, rows, 0)?;
+        let scales = take_axis(&self.scales, rows, 0)?;
+        let biases = take_axis(&self.biases, rows, 0)?;
+        quantized_forward(x, &weight, &scales, &biases, self.group_size, self.bits)
     }
 
     fn qgemm_verify_shape(&self, x: &Array) -> Option<i32> {
@@ -875,7 +1066,7 @@ impl QLinear {
 
 fn validate_dflash_qlinear(path: &str, linear: &QLinear) -> Result<(), Exception> {
     match &linear.weight_layout {
-        QLinearWeightLayout::Canonical => validate_dflash_q1_linear(
+        QLinearWeightLayout::Canonical => validate_dflash_affine_lowbit_linear(
             path,
             &linear.weight,
             &linear.scales,
@@ -902,6 +1093,8 @@ fn validate_dflash_qlinear(path: &str, linear: &QLinear) -> Result<(), Exception
                     has_symmetric_q1_biases(&linear.biases)
                 )));
             }
+            // BonsaiRow4 is intentionally Q1-only; Q2 low-bit-affine layout
+            // remains Canonical.
             // Rebuild the typed view from the current parameter handles. This
             // validates shape, dtype, contiguity, and the logical dimensions
             // recorded in metadata, so a same-shaped parameter-tree update
@@ -1152,12 +1345,12 @@ fn compiled_gdn_decode_enabled() -> bool {
 
 fn async_layer_state_eval_enabled() -> bool {
     *ASYNC_LAYER_STATE_EVAL_ENABLED.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("HIGGS_ASYNC_LAYER_STATE_EVAL")
                 .ok()
                 .map(|s| s.trim().to_ascii_lowercase())
                 .as_deref(),
-            Some("1" | "true" | "on" | "yes")
+            Some("0" | "false" | "off" | "no")
         )
     })
 }
@@ -4068,6 +4261,7 @@ impl Qwen3NextAttention {
         // (L=1 is always length-independent, and the fused kernel is faster on
         // the per-token hot path).
         let offset = cache.offset();
+        let rope_offset = cache.position_offset();
         let rope_dim = self.rope.dimensions;
         let rope_base = self.rope.base;
         let rope_scale = self.rope.scale;
@@ -4119,14 +4313,14 @@ impl Qwen3NextAttention {
         queries = apply_qwen3_next_rope_scheduled(
             queries,
             &self.rope,
-            offset,
+            rope_offset,
             self.yarn.as_ref(),
             row_schedule,
         )?;
         keys = apply_qwen3_next_rope_scheduled(
             keys,
             &self.rope,
-            offset,
+            rope_offset,
             self.yarn.as_ref(),
             row_schedule,
         )?;
@@ -4383,9 +4577,9 @@ impl DenseQwen3NextAttention {
             .reshape(&[B, L, self.num_key_value_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let offset = cache.offset();
-        queries = apply_qwen3_next_rope(queries, &self.rope, offset, self.yarn.as_ref())?;
-        keys = apply_qwen3_next_rope(keys, &self.rope, offset, self.yarn.as_ref())?;
+        let rope_offset = cache.position_offset();
+        queries = apply_qwen3_next_rope(queries, &self.rope, rope_offset, self.yarn.as_ref())?;
+        keys = apply_qwen3_next_rope(keys, &self.rope, rope_offset, self.yarn.as_ref())?;
 
         let view = cache.update_and_view(keys, values)?;
         let try_tq_decode = mask.is_none() && L == 1;
@@ -6513,8 +6707,7 @@ impl FfnBlock {
 
     fn tg_lut4_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED
-            .get_or_init(|| std::env::var("HIGGS_BONSAI_TG_LUT4").is_ok_and(|value| value == "1"))
+        *ENABLED.get_or_init(|| std::env::var("HIGGS_BONSAI_TG_LUT4").map_or(true, |v| v != "0"))
     }
 
     fn tg_lut4_fused_mlp_enabled() -> bool {
@@ -7038,6 +7231,152 @@ impl DecoderLayer {
 pub enum LayerCache {
     KV(SteppingKeyValueCache),
     Arrays(ArraysCache),
+}
+
+/// Opaque state produced by checked Qwen3Next sparse prefill.
+///
+/// The cache stores only resident survivor rows (`resident_len`), while
+/// `next_position` is the absolute logical token position decode must use
+/// next. Until ordinary decode is taught this split, this state is deliberately
+/// not exposed as a normal `AnyCache`.
+#[derive(Debug, Clone)]
+pub struct Qwen3NextSparsePrefillState {
+    cache: Vec<Option<LayerCache>>,
+    resident_len: i32,
+    next_position: i32,
+}
+
+impl Qwen3NextSparsePrefillState {
+    #[must_use]
+    pub const fn resident_len(&self) -> i32 {
+        self.resident_len
+    }
+
+    #[must_use]
+    pub const fn next_position(&self) -> i32 {
+        self.next_position
+    }
+
+    #[must_use]
+    pub fn layer_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    #[must_use]
+    pub fn into_cache(self) -> Vec<Option<LayerCache>> {
+        self.cache
+    }
+}
+
+/// Last-token logits and private sparse-prefill state.
+#[derive(Debug, Clone)]
+pub struct Qwen3NextSparsePrefillOutput {
+    pub logits: Array,
+    pub state: Qwen3NextSparsePrefillState,
+    /// Tap hidden states captured at the requested layers during sparse
+    /// prefill, in tap-layer order. Each row count equals `state.resident_len`
+    /// (the survivor count), NOT the source prompt length — dSpark's drafter
+    /// context frontier tracks residents, while RoPE/logical positions track
+    /// the source. Empty when no tap layers were requested.
+    pub taps: Vec<Array>,
+}
+
+fn validate_target_sparse_prefill_plan(plan: TargetSparsePrefillPlan<'_>) -> Result<(), Exception> {
+    if plan.token_ids.len() != plan.original_positions.len() {
+        return Err(Exception::custom(format!(
+            "Qwen3Next sparse prefill token_ids ({}) and original_positions ({}) length mismatch",
+            plan.token_ids.len(),
+            plan.original_positions.len()
+        )));
+    }
+    if plan.token_ids.is_empty() {
+        return Err(Exception::custom(
+            "Qwen3Next sparse prefill requires at least one survivor token",
+        ));
+    }
+    let source_len = usize::try_from(plan.logical_next_pos).map_err(|_| {
+        Exception::custom(format!(
+            "Qwen3Next sparse prefill logical_next_pos {} must be non-negative",
+            plan.logical_next_pos
+        ))
+    })?;
+    if source_len == 0 {
+        return Err(Exception::custom(
+            "Qwen3Next sparse prefill source length must be positive",
+        ));
+    }
+    let mut previous = None;
+    for &position in plan.original_positions {
+        if position < 0 {
+            return Err(Exception::custom(format!(
+                "Qwen3Next sparse prefill original position {position} must be non-negative"
+            )));
+        }
+        if usize::try_from(position).unwrap_or(usize::MAX) >= source_len {
+            return Err(Exception::custom(format!(
+                "Qwen3Next sparse prefill original position {position} outside source length {source_len}"
+            )));
+        }
+        if previous.is_some_and(|prev| position <= prev) {
+            return Err(Exception::custom(
+                "Qwen3Next sparse prefill original positions must be strictly increasing",
+            ));
+        }
+        previous = Some(position);
+    }
+    if plan.original_positions.first().copied() != Some(0) {
+        return Err(Exception::custom(
+            "Qwen3Next sparse prefill requires survivor position 0",
+        ));
+    }
+    let final_pos = plan
+        .logical_next_pos
+        .checked_sub(1)
+        .ok_or_else(|| Exception::custom("Qwen3Next sparse prefill source length underflow"))?;
+    if plan.original_positions.last().copied() != Some(final_pos) {
+        return Err(Exception::custom(format!(
+            "Qwen3Next sparse prefill requires final source position {final_pos}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate tap-layer selection for sparse prefill. Tap layers must be unique,
+/// strictly increasing, and (when a model is in scope) `< num_layers`. The
+/// plan-only check rejects unsorted/duplicate ids; the per-model check adds
+/// the upper-bound range. This mirrors `forward_raw_hidden_with_taps`'s
+/// contract so the sparse boundary raises the same error shape before any
+/// forward work begins.
+fn validate_target_sparse_prefill_tap_layers(
+    plan: TargetSparsePrefillPlan<'_>,
+    tap_layers: &[usize],
+) -> Result<(), Exception> {
+    // Plan validity is the caller's responsibility — re-running it here would
+    // mask whether a tap-layer error came from the plan or the tap list.
+    let _ = plan;
+    if tap_layers.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Exception::custom(
+            "Qwen3Next sparse prefill tap layers must be unique, strictly increasing, and in range",
+        ));
+    }
+    Ok(())
+}
+
+fn set_sparse_cache_logical_positions(
+    cache: &mut [Option<LayerCache>],
+    logical_next_pos: i32,
+) -> Result<(), Exception> {
+    for (index, layer_cache) in cache.iter_mut().enumerate() {
+        let Some(layer_cache) = layer_cache else {
+            return Err(Exception::custom(format!(
+                "Qwen3Next sparse prefill missing layer cache {index}"
+            )));
+        };
+        if let LayerCache::KV(kv) = layer_cache {
+            kv.set_position_offset(logical_next_pos)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -7699,12 +8038,12 @@ impl Qwen3NextCausalLM {
             || self.args.dense_attention_outputs
         {
             return Err(Exception::custom(
-                "dSpark block verification is proven only for the dense all-Q1 Bonsai target",
+                "dSpark block verification is proven only for the dense low-bit-affine Bonsai target",
             ));
         }
 
         let validate_linear = |path: &str, linear: &QLinear| validate_dflash_qlinear(path, linear);
-        validate_dflash_q1_linear(
+        validate_dflash_affine_lowbit_linear(
             "model.embed_tokens",
             &self.model.embed_tokens.weight,
             &self.model.embed_tokens.scales,
@@ -7833,6 +8172,89 @@ impl Qwen3NextCausalLM {
                 }
             })
             .collect()
+    }
+
+    /// Experimental sparse-prefill boundary for PFlash survivor plans.
+    ///
+    /// The cache keeps only resident survivor rows, while full-attention layers
+    /// use each survivor's original source position for RoPE. Decode then
+    /// continues from `logical_next_pos`, not from the compact resident length.
+    pub fn prefill_sparse(
+        &mut self,
+        plan: TargetSparsePrefillPlan<'_>,
+    ) -> Result<Qwen3NextSparsePrefillOutput, Exception> {
+        validate_target_sparse_prefill_plan(plan)?;
+        let len = i32::try_from(plan.len()).map_err(|_| {
+            Exception::custom(format!(
+                "Qwen3Next sparse prefill length {} exceeds i32::MAX",
+                plan.len()
+            ))
+        })?;
+        let inputs = Array::from_slice(plan.token_ids, &[1, len]);
+        let positions = Array::from_slice(plan.original_positions, &[len]);
+        let mut cache = self.make_cache();
+        let hidden = self.forward_hidden_sparse(&inputs, &positions, &mut cache)?;
+        let h_last = hidden.index((.., -1.., ..));
+        let logits = self.compute_logits(&h_last)?;
+        set_sparse_cache_logical_positions(&mut cache, plan.logical_next_pos)?;
+        Ok(Qwen3NextSparsePrefillOutput {
+            logits,
+            state: Qwen3NextSparsePrefillState {
+                cache,
+                resident_len: len,
+                next_position: plan.logical_next_pos,
+            },
+            taps: Vec::new(),
+        })
+    }
+
+    /// Sparse-prefill boundary that also captures tap hidden states at the
+    /// requested layers, for dSpark drafter context priming.
+    ///
+    /// Tap rows are indexed by **resident survivor position** (the compact
+    /// domain the GDN/SSM and drafter context frontier operate on), NOT by
+    /// source prompt position. RoPE and `logical_next_pos` still track the
+    /// source domain. dSpark is eligible after this call returns because the
+    /// drafter can prime its per-layer context from the captured tap rows.
+    pub fn prefill_sparse_with_taps(
+        &mut self,
+        plan: TargetSparsePrefillPlan<'_>,
+        tap_layers: &[usize],
+    ) -> Result<Qwen3NextSparsePrefillOutput, Exception> {
+        validate_target_sparse_prefill_plan(plan)?;
+        validate_target_sparse_prefill_tap_layers(plan, tap_layers)?;
+        if tap_layers
+            .iter()
+            .any(|&index| index >= self.model.layers.len())
+        {
+            return Err(Exception::custom(format!(
+                "Qwen3Next sparse prefill tap layer out of range: model has {} layers",
+                self.model.layers.len()
+            )));
+        }
+        let len = i32::try_from(plan.len()).map_err(|_| {
+            Exception::custom(format!(
+                "Qwen3Next sparse prefill length {} exceeds i32::MAX",
+                plan.len()
+            ))
+        })?;
+        let inputs = Array::from_slice(plan.token_ids, &[1, len]);
+        let positions = Array::from_slice(plan.original_positions, &[len]);
+        let mut cache = self.make_cache();
+        let (hidden, taps) =
+            self.forward_hidden_sparse_with_taps(&inputs, &positions, &mut cache, tap_layers)?;
+        let h_last = hidden.index((.., -1.., ..));
+        let logits = self.compute_logits(&h_last)?;
+        set_sparse_cache_logical_positions(&mut cache, plan.logical_next_pos)?;
+        Ok(Qwen3NextSparsePrefillOutput {
+            logits,
+            state: Qwen3NextSparsePrefillState {
+                cache,
+                resident_len: len,
+                next_position: plan.logical_next_pos,
+            },
+            taps,
+        })
     }
 
     /// Forward pass returning raw hidden states (before final `RMSNorm`).
@@ -9007,7 +9429,16 @@ impl Qwen3NextCausalLM {
             detail.final_norm_ms += now.duration_since(*ckpt).as_secs_f64() * 1000.0;
             *ckpt = now;
         }
-        let logits = self.project_logits(&normed)?;
+        let q2_head_argmax_enabled = self.args.default_quant_spec().bits == 2
+            && std::env::var("HIGGS_DSPARK_Q2_HEAD_ARGMAX").map_or(true, |v| v != "0");
+        let logits = if q2_head_argmax_enabled && T == 5 && !layer_detail_timing {
+            match self.project_q2_m5_argmax_ids(&normed)? {
+                Some(ids) => ids,
+                None => self.project_logits(&normed)?,
+            }
+        } else {
+            self.project_logits(&normed)?
+        };
         if let Some(ckpt) = tail_detail_ckpt.as_mut() {
             mlx_rs::transforms::eval([&logits])?;
             let now = std::time::Instant::now();
@@ -9374,6 +9805,26 @@ impl Qwen3NextCausalLM {
     /// Input: `[B, T, hidden_size]`. Returns: `[B, T, vocab_size]`.
     pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
         self.project_logits(hidden)
+    }
+
+    fn project_q2_m5_argmax_ids(&self, hidden: &Array) -> Result<Option<Array>, Exception> {
+        let Some(head) = self.lm_head.as_ref() else {
+            return Ok(None);
+        };
+        if head.mode != crate::quant_mode::QuantMode::Affine
+            || head.bits != 2
+            || head.group_size != 128
+            || !matches!(hidden.shape(), [1, 5, _])
+        {
+            return Ok(None);
+        }
+        let (maxv, maxid) = crate::metal_kernel::bonsai_q2_m5_ternary_argmax_candidates(
+            hidden,
+            &head.weight,
+            &head.scales,
+            head.group_size,
+        )?;
+        crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid).map(Some)
     }
 
     fn project_logits(&self, hidden: &Array) -> Result<Array, Exception> {
@@ -12047,7 +12498,7 @@ mod tests {
         let weight = Array::from_slice(&[0_u32; 8], &[2, 4]);
         let scales = Array::from_slice(&[0.25_f32, 0.5], &[2, 1]);
         let validate = |biases: &Array| {
-            validate_dflash_q1_linear(
+            validate_dflash_affine_lowbit_linear(
                 "fixture",
                 &weight,
                 &scales,
@@ -12303,6 +12754,199 @@ mod tests {
             LayerCache::Arrays(c) => assert_eq!(c.offset, 0),
             LayerCache::KV(_) => panic!("Expected Arrays variant"),
         }
+    }
+
+    #[test]
+    fn target_sparse_prefill_validation_accepts_identity_boundary() {
+        let tokens = [1_u32, 2, 3, 4];
+        let positions = [0_i32, 1, 2, 3];
+        let plan = TargetSparsePrefillPlan {
+            token_ids: &tokens,
+            original_positions: &positions,
+            logical_next_pos: 4,
+        };
+
+        validate_target_sparse_prefill_plan(plan).unwrap();
+        assert!(plan.is_contiguous_identity());
+    }
+
+    #[test]
+    fn target_sparse_prefill_validation_rejects_malformed_boundaries() {
+        let tokens = [1_u32, 2, 3];
+        let positions = [0_i32, 2];
+        assert!(
+            validate_target_sparse_prefill_plan(TargetSparsePrefillPlan {
+                token_ids: &tokens,
+                original_positions: &positions,
+                logical_next_pos: 4,
+            })
+            .is_err()
+        );
+
+        let positions = [0_i32, 3, 2];
+        assert!(
+            validate_target_sparse_prefill_plan(TargetSparsePrefillPlan {
+                token_ids: &tokens,
+                original_positions: &positions,
+                logical_next_pos: 4,
+            })
+            .is_err()
+        );
+
+        let positions = [1_i32, 2, 3];
+        assert!(
+            validate_target_sparse_prefill_plan(TargetSparsePrefillPlan {
+                token_ids: &tokens,
+                original_positions: &positions,
+                logical_next_pos: 4,
+            })
+            .is_err()
+        );
+
+        let positions = [0_i32, 2, 4];
+        assert!(
+            validate_target_sparse_prefill_plan(TargetSparsePrefillPlan {
+                token_ids: &tokens,
+                original_positions: &positions,
+                logical_next_pos: 4,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn target_sparse_prefill_validation_accepts_lossy_boundary() {
+        let tokens = [1_u32, 2, 3];
+        let positions = [0_i32, 8, 15];
+        let plan = TargetSparsePrefillPlan {
+            token_ids: &tokens,
+            original_positions: &positions,
+            logical_next_pos: 16,
+        };
+
+        validate_target_sparse_prefill_plan(plan).unwrap();
+        assert!(!plan.is_contiguous_identity());
+    }
+
+    #[test]
+    fn sparse_prefill_with_taps_rejects_unsorted_tap_layers() {
+        // Coordinate-system smoke test (no checkpoint): the tap-layer validator
+        // must reject out-of-range or non strictly-increasing layer ids before
+        // any forward work begins. Mirrors `forward_raw_with_taps`'s contract.
+        let tokens = [1_u32, 2, 3, 4];
+        let positions = [0_i32, 1, 2, 3];
+        let plan = TargetSparsePrefillPlan {
+            token_ids: &tokens,
+            original_positions: &positions,
+            logical_next_pos: 4,
+        };
+        validate_target_sparse_prefill_plan(plan).unwrap();
+
+        fn check(plan: TargetSparsePrefillPlan<'_>, tap_layers: &[usize]) -> Result<(), Exception> {
+            validate_target_sparse_prefill_tap_layers(plan, tap_layers)
+        }
+
+        // Strictly increasing in-range layers are accepted.
+        assert!(check(plan, &[0_usize, 1, 2]).is_ok());
+        // Empty tap set is always valid (identity-dispatch fast path).
+        assert!(check(plan, &[]).is_ok());
+        // Out-of-range (>= num layers is unknown at plan level, so the validator
+        // only rejects strictly-decreasing pairs and duplicates here; the model
+        // boundary re-checks against its own layer count).
+        assert!(check(plan, &[1_usize, 0]).is_err());
+        assert!(check(plan, &[0_usize, 0]).is_err());
+        assert!(check(plan, &[2_usize, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn sparse_prefill_output_carries_resident_and_logical_coordinates() {
+        // Static contract: the sparse output preserves the two coordinate
+        // systems even when taps are attached. `resident_len` counts survivors
+        // (tap rows / GDN-SSM offset), `next_position` is the absolute source
+        // position (RoPE / logical decode cursor).
+        let tokens = [10_u32, 11, 99];
+        let positions = [0_i32, 8, 15];
+        let plan = TargetSparsePrefillPlan {
+            token_ids: &tokens,
+            original_positions: &positions,
+            logical_next_pos: 16,
+        };
+        validate_target_sparse_prefill_plan(plan).unwrap();
+
+        // Mirror the constructor's coordinate invariants without running a
+        // real backbone: taps default to empty until captured, resident_len
+        // equals the survivor count, and next_position equals logical_next_pos.
+        let state = Qwen3NextSparsePrefillState {
+            cache: Vec::new(),
+            resident_len: i32::try_from(tokens.len()).unwrap(),
+            next_position: plan.logical_next_pos,
+        };
+        let output = Qwen3NextSparsePrefillOutput {
+            logits: Array::zeros::<f32>(&[1, 1]).unwrap(),
+            state: state.clone(),
+            taps: Vec::new(),
+        };
+        assert_eq!(output.state.resident_len(), 3);
+        assert_eq!(output.state.next_position(), 16);
+        assert!(output.taps.is_empty());
+        // Each captured tap row count MUST equal the resident survivor count,
+        // not the source length — that is the contract dSpark relies on.
+        let resident_rows = output.state.resident_len();
+        let fake_tap = Array::zeros::<f32>(&[1, resident_rows, 1]).unwrap();
+        let output_with_tap = Qwen3NextSparsePrefillOutput {
+            logits: Array::zeros::<f32>(&[1, 1]).unwrap(),
+            state,
+            taps: vec![fake_tap],
+        };
+        assert_eq!(output_with_tap.taps.len(), 1);
+        let tap_rows = output_with_tap.taps[0].shape().get(1).copied().unwrap_or(0);
+        assert_eq!(
+            tap_rows, resident_rows,
+            "tap row count must track resident survivors, not source length"
+        );
+    }
+
+    #[test]
+    fn sparse_prefill_cache_keeps_resident_boundary_and_logical_rope_cursor() {
+        let resident_len = 3;
+        let logical_next_pos = 16;
+        let mut kv = SteppingKeyValueCache::new();
+        let keys = Array::zeros::<f32>(&[1, 1, resident_len, 4]).unwrap();
+        let values = Array::zeros::<f32>(&[1, 1, resident_len, 4]).unwrap();
+        kv.update_and_view(keys, values).unwrap();
+        assert_eq!(kv.offset(), resident_len);
+        assert_eq!(kv.position_offset(), resident_len);
+
+        let mut arrays = ArraysCache::new();
+        arrays.offset = resident_len;
+        let mut cache = vec![Some(LayerCache::KV(kv)), Some(LayerCache::Arrays(arrays))];
+
+        set_sparse_cache_logical_positions(&mut cache, logical_next_pos).unwrap();
+        match cache.first().and_then(Option::as_ref).unwrap() {
+            LayerCache::KV(kv) => {
+                assert_eq!(
+                    kv.offset(),
+                    resident_len,
+                    "resident KV rows remain compact survivors"
+                );
+                assert_eq!(
+                    kv.position_offset(),
+                    logical_next_pos,
+                    "next decode RoPE position resumes at the source length"
+                );
+            }
+            LayerCache::Arrays(_) => panic!("first layer should be KV"),
+        }
+        match cache.get(1).and_then(Option::as_ref).unwrap() {
+            LayerCache::Arrays(arrays) => assert_eq!(
+                arrays.offset, resident_len,
+                "GDN/SSM state remains resident-boundary based"
+            ),
+            LayerCache::KV(_) => panic!("second layer should be Arrays"),
+        }
+        crate::AnyCache::Hybrid(cache)
+            .validate_absolute_boundary(resident_len)
+            .unwrap();
     }
 
     #[test]
@@ -14509,10 +15153,19 @@ mod tests {
         );
     }
 
-    fn deterministic_q1_params(rows: i32, columns: i32, salt: u32) -> (Array, Array, Array) {
+    fn deterministic_affine_lowbit_params(
+        bits: i32,
+        rows: i32,
+        columns: i32,
+        salt: u32,
+    ) -> (Array, Array, Array) {
         const GROUP_SIZE: i32 = 128;
+        assert!(matches!(bits, 1 | 2));
+        assert_eq!(32 % bits, 0);
         assert_eq!(columns % GROUP_SIZE, 0);
-        let words_per_row = columns / 32;
+        let cols_per_word = 32 / bits;
+        assert_eq!(columns % cols_per_word, 0);
+        let words_per_row = columns / cols_per_word;
         let patterns = [
             0xA5A5_5A5A_u32,
             0x3C3C_C3C3_u32,
@@ -14538,6 +15191,14 @@ mod tests {
         (weight, scales, symmetric_q1_bias_sentinel())
     }
 
+    fn deterministic_q1_params(rows: i32, columns: i32, salt: u32) -> (Array, Array, Array) {
+        deterministic_affine_lowbit_params(1, rows, columns, salt)
+    }
+
+    fn deterministic_q2_params(rows: i32, columns: i32, salt: u32) -> (Array, Array, Array) {
+        deterministic_affine_lowbit_params(2, rows, columns, salt)
+    }
+
     fn install_deterministic_q1(linear: &mut QLinear, rows: i32, columns: i32, salt: u32) {
         let (weight, scales, biases) = deterministic_q1_params(rows, columns, salt);
         linear.weight = Param::new(weight);
@@ -14545,6 +15206,16 @@ mod tests {
         linear.biases = Param::new(biases);
         linear.group_size = 128;
         linear.bits = 1;
+        linear.mode = crate::quant_mode::QuantMode::Affine;
+    }
+
+    fn install_deterministic_q2(linear: &mut QLinear, rows: i32, columns: i32, salt: u32) {
+        let (weight, scales, biases) = deterministic_q2_params(rows, columns, salt);
+        linear.weight = Param::new(weight);
+        linear.scales = Param::new(scales);
+        linear.biases = Param::new(biases);
+        linear.group_size = 128;
+        linear.bits = 2;
         linear.mode = crate::quant_mode::QuantMode::Affine;
     }
 
@@ -14563,12 +15234,27 @@ mod tests {
         embedding.mode = crate::quant_mode::QuantMode::Affine;
     }
 
-    fn deterministic_hybrid_q1_model() -> Qwen3NextCausalLM {
+    fn install_deterministic_q2_embedding(
+        embedding: &mut QEmbedding,
+        rows: i32,
+        columns: i32,
+        salt: u32,
+    ) {
+        let (weight, scales, biases) = deterministic_q2_params(rows, columns, salt);
+        embedding.weight = Param::new(weight);
+        embedding.scales = Param::new(scales);
+        embedding.biases = Param::new(biases);
+        embedding.group_size = 128;
+        embedding.bits = 2;
+        embedding.mode = crate::quant_mode::QuantMode::Affine;
+    }
+
+    fn deterministic_hybrid_affine_lowbit_model(bits: i32, num_layers: i32) -> Qwen3NextCausalLM {
         let mut args = valid_causal_lm_args();
         args.hidden_size = 128;
         args.intermediate_size = 128;
         args.vocab_size = 128;
-        args.num_hidden_layers = 2;
+        args.num_hidden_layers = num_layers;
         args.full_attention_interval = 2;
         args.num_attention_heads = 2;
         args.num_key_value_heads = 1;
@@ -14582,7 +15268,7 @@ mod tests {
         args.decoder_sparse_step = 0;
         args.quantization = Some(QuantizationConfig {
             group_size: 128,
-            bits: 1,
+            bits,
             mode: crate::quant_mode::QuantMode::Affine,
         });
         args.quant_overrides.clear();
@@ -14591,13 +15277,23 @@ mod tests {
         let intermediate = args.intermediate_size;
         let vocab = args.vocab_size;
         let mut model = Qwen3NextCausalLM::new(args).unwrap();
-        install_deterministic_q1_embedding(&mut model.model.embed_tokens, vocab, hidden, 1);
-        install_deterministic_q1(
-            model.lm_head.as_mut().expect("untied LM head"),
-            vocab,
-            hidden,
-            3,
-        );
+        if bits == 1 {
+            install_deterministic_q1_embedding(&mut model.model.embed_tokens, vocab, hidden, 1);
+            install_deterministic_q1(
+                model.lm_head.as_mut().expect("untied LM head"),
+                vocab,
+                hidden,
+                3,
+            );
+        } else {
+            install_deterministic_q2_embedding(&mut model.model.embed_tokens, vocab, hidden, 1);
+            install_deterministic_q2(
+                model.lm_head.as_mut().expect("untied LM head"),
+                vocab,
+                hidden,
+                3,
+            );
+        }
         model.model.norm.weight = Param::new(Array::ones::<f32>(&[hidden]).unwrap());
 
         for (layer_index, layer) in model.model.layers.iter_mut().enumerate() {
@@ -14605,40 +15301,77 @@ mod tests {
             layer.input_layernorm.weight = Param::new(Array::ones::<f32>(&[hidden]).unwrap());
             layer.post_attention_layernorm.weight =
                 Param::new(Array::ones::<f32>(&[hidden]).unwrap());
-            install_deterministic_q1(
-                layer.mlp.gate_proj.as_mut().expect("dense gate projection"),
-                intermediate,
-                hidden,
-                salt,
-            );
-            install_deterministic_q1(
-                layer.mlp.up_proj.as_mut().expect("dense up projection"),
-                intermediate,
-                hidden,
-                salt + 1,
-            );
-            install_deterministic_q1(
-                layer.mlp.down_proj.as_mut().expect("dense down projection"),
-                hidden,
-                intermediate,
-                salt + 2,
-            );
+            if bits == 1 {
+                install_deterministic_q1(
+                    layer.mlp.gate_proj.as_mut().expect("dense gate projection"),
+                    intermediate,
+                    hidden,
+                    salt,
+                );
+                install_deterministic_q1(
+                    layer.mlp.up_proj.as_mut().expect("dense up projection"),
+                    intermediate,
+                    hidden,
+                    salt + 1,
+                );
+                install_deterministic_q1(
+                    layer.mlp.down_proj.as_mut().expect("dense down projection"),
+                    hidden,
+                    intermediate,
+                    salt + 2,
+                );
+            } else {
+                install_deterministic_q2(
+                    layer.mlp.gate_proj.as_mut().expect("dense gate projection"),
+                    intermediate,
+                    hidden,
+                    salt,
+                );
+                install_deterministic_q2(
+                    layer.mlp.up_proj.as_mut().expect("dense up projection"),
+                    intermediate,
+                    hidden,
+                    salt + 1,
+                );
+                install_deterministic_q2(
+                    layer.mlp.down_proj.as_mut().expect("dense down projection"),
+                    hidden,
+                    intermediate,
+                    salt + 2,
+                );
+            }
 
             if let Some(gdn) = layer.linear_attn.as_mut() {
                 let value_dim = gdn.num_v_heads * gdn.head_v_dim;
-                install_deterministic_q1(
-                    &mut gdn.in_proj_qkvz,
-                    2 * (gdn.key_dim + value_dim),
-                    hidden,
-                    salt + 3,
-                );
-                install_deterministic_q1(
-                    &mut gdn.in_proj_ba,
-                    2 * gdn.num_v_heads,
-                    hidden,
-                    salt + 4,
-                );
-                install_deterministic_q1(&mut gdn.out_proj, hidden, value_dim, salt + 5);
+                if bits == 1 {
+                    install_deterministic_q1(
+                        &mut gdn.in_proj_qkvz,
+                        2 * (gdn.key_dim + value_dim),
+                        hidden,
+                        salt + 3,
+                    );
+                    install_deterministic_q1(
+                        &mut gdn.in_proj_ba,
+                        2 * gdn.num_v_heads,
+                        hidden,
+                        salt + 4,
+                    );
+                    install_deterministic_q1(&mut gdn.out_proj, hidden, value_dim, salt + 5);
+                } else {
+                    install_deterministic_q2(
+                        &mut gdn.in_proj_qkvz,
+                        2 * (gdn.key_dim + value_dim),
+                        hidden,
+                        salt + 3,
+                    );
+                    install_deterministic_q2(
+                        &mut gdn.in_proj_ba,
+                        2 * gdn.num_v_heads,
+                        hidden,
+                        salt + 4,
+                    );
+                    install_deterministic_q2(&mut gdn.out_proj, hidden, value_dim, salt + 5);
+                }
                 let conv_values = (0..gdn.conv_dim * gdn.conv_kernel_size)
                     .map(|index| {
                         const TAPS: [f32; 4] = [0.125, -0.0625, 0.03125, 0.25];
@@ -14657,15 +15390,27 @@ mod tests {
                 let attention = layer.self_attn.as_mut().expect("full attention layer");
                 let q_rows = 2 * attention.num_attention_heads * model.args.head_dim;
                 let kv_rows = attention.num_key_value_heads * model.args.head_dim;
-                install_deterministic_q1(&mut attention.q_proj, q_rows, hidden, salt + 3);
-                install_deterministic_q1(&mut attention.k_proj, kv_rows, hidden, salt + 4);
-                install_deterministic_q1(&mut attention.v_proj, kv_rows, hidden, salt + 5);
-                install_deterministic_q1(
-                    &mut attention.o_proj,
-                    hidden,
-                    attention.num_attention_heads * model.args.head_dim,
-                    salt + 6,
-                );
+                if bits == 1 {
+                    install_deterministic_q1(&mut attention.q_proj, q_rows, hidden, salt + 3);
+                    install_deterministic_q1(&mut attention.k_proj, kv_rows, hidden, salt + 4);
+                    install_deterministic_q1(&mut attention.v_proj, kv_rows, hidden, salt + 5);
+                    install_deterministic_q1(
+                        &mut attention.o_proj,
+                        hidden,
+                        attention.num_attention_heads * model.args.head_dim,
+                        salt + 6,
+                    );
+                } else {
+                    install_deterministic_q2(&mut attention.q_proj, q_rows, hidden, salt + 3);
+                    install_deterministic_q2(&mut attention.k_proj, kv_rows, hidden, salt + 4);
+                    install_deterministic_q2(&mut attention.v_proj, kv_rows, hidden, salt + 5);
+                    install_deterministic_q2(
+                        &mut attention.o_proj,
+                        hidden,
+                        attention.num_attention_heads * model.args.head_dim,
+                        salt + 6,
+                    );
+                }
                 attention.q_norm.weight =
                     Param::new(Array::ones::<f32>(&[model.args.head_dim]).unwrap());
                 attention.k_norm.weight =
@@ -14673,6 +15418,14 @@ mod tests {
             }
         }
         model
+    }
+
+    fn deterministic_hybrid_q1_model() -> Qwen3NextCausalLM {
+        deterministic_hybrid_affine_lowbit_model(1, 2)
+    }
+
+    fn deterministic_hybrid_q2_model() -> Qwen3NextCausalLM {
+        deterministic_hybrid_affine_lowbit_model(2, 4)
     }
 
     fn retain_loaded_affine_q1_bias(linear: &mut QLinear) {
@@ -14743,6 +15496,27 @@ mod tests {
         assert_eq!(retained, 15, "fixture must retain every active affine bias");
         assert!(!has_symmetric_q1_biases(&model.model.embed_tokens.biases));
         model.validate_dflash_block_domain(5).unwrap();
+    }
+
+    #[test]
+    fn test_qwen3_5_q2_target_passes_dflash_block_domain() {
+        deterministic_hybrid_q2_model()
+            .validate_dflash_block_domain(5)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_qwen3_5_q2_target_rejects_for_invalid_group_size() {
+        let mut model = deterministic_hybrid_q2_model();
+        model.model.embed_tokens.group_size = 64;
+        assert!(model.validate_dflash_block_domain(5).is_err());
+    }
+
+    #[test]
+    fn test_qwen3_5_q3_target_rejects() {
+        let mut model = deterministic_hybrid_q2_model();
+        model.model.embed_tokens.bits = 3;
+        assert!(model.validate_dflash_block_domain(5).is_err());
     }
 
     fn eval_hybrid_cache(cache: &[Option<LayerCache>]) {
@@ -16544,6 +17318,7 @@ mod tests {
                 bits,
                 mode: crate::quant_mode::QuantMode::Affine,
                 weight_layout: QLinearWeightLayout::Canonical,
+                q2_row2: std::sync::OnceLock::new(),
             }
         };
 
@@ -16561,6 +17336,7 @@ mod tests {
                 bits,
                 mode: crate::quant_mode::QuantMode::Affine,
                 weight_layout: QLinearWeightLayout::Canonical,
+                q2_row2: std::sync::OnceLock::new(),
             }
         };
 
@@ -25083,7 +25859,7 @@ fn forward_attention_sparse(
         .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
 
     // Q is projected to 2 * num_heads * head_dim (doubled for gating)
-    let q_proj_output = attn.q_proj.forward(x)?;
+    let q_proj_output = attn.q_proj.forward_decode_fast(x)?;
     let q_reshaped = q_proj_output.reshape(&[b, l, attn.num_attention_heads, -1])?;
     let q_halves = q_reshaped.split(2, Some(-1))?;
     let queries_pre = q_halves
@@ -25094,8 +25870,8 @@ fn forward_attention_sparse(
         .ok_or_else(|| Exception::custom("split produced empty result"))?
         .reshape(&[b, l, -1])?;
 
-    let keys_raw = attn.k_proj.forward(x)?;
-    let values_raw = attn.v_proj.forward(x)?;
+    let keys_raw = attn.k_proj.forward_decode_fast(x)?;
+    let values_raw = attn.v_proj.forward_decode_fast(x)?;
 
     // Per-head RmsNorm then transpose to [B, H, L, D]
     let mut queries = attn
@@ -25110,52 +25886,35 @@ fn forward_attention_sparse(
         .reshape(&[b, l, attn.num_key_value_heads, -1])?
         .transpose_axes(&[0, 2, 1, 3])?;
 
-    // Apply RoPE at CUSTOM positions using rope_dynamic
-    tracing::debug!(
-        "forward_attention_sparse: queries.shape={:?}, keys.shape={:?}, positions.shape={:?}",
-        queries.shape(),
-        keys.shape(),
-        positions.shape()
-    );
     let (queries_with_rope, keys_with_rope) =
-        match attn.apply_rope_at_positions(&queries, &keys, positions) {
-            Ok(result) => {
-                tracing::debug!("rope_dynamic succeeded");
-                result
-            }
-            Err(e) => {
-                tracing::error!("rope_dynamic failed: {:?}", e);
-                return Err(e);
-            }
-        };
+        attn.apply_rope_at_positions(&queries, &keys, positions)?;
     queries = queries_with_rope;
     keys = keys_with_rope;
 
     // Update cache with custom-positioned keys/values
-    let (cached_keys, cached_values) = cache.update_and_fetch(keys, values)?;
-    let final_keys = cached_keys;
-    let final_values = cached_values;
+    let (final_keys, final_values) = cache.update_and_fetch(keys, values)?;
 
-    // Compute attention
-    let output = crate::utils::scaled_dot_product_attention(
+    let output = fast::scaled_dot_product_attention(
         queries,
         final_keys,
         final_values,
         attn.scale,
-        None, // No mask needed for sparse prefill
+        Some(fast::ScaledDotProductAttentionMask::Causal),
+        None::<&Array>,
     )?
     .transpose_axes(&[0, 2, 1, 3])?
     .reshape(&[b, l, -1])?;
 
-    let gated = output.multiply(nn::sigmoid(&gate)?)?;
-    attn.o_proj.forward(&gated)
+    let gated = sigmoid_mul(&gate, &output)?;
+    attn.o_proj.forward_decode_fast(&gated)
 }
 
 impl Qwen3NextCausalLM {
     /// Forward pass with custom `RoPE` positions for sparse prefill.
     ///
-    /// This method applies `RoPE` at arbitrary (non-contiguous) positions using
-    /// `rope_dynamic`, enabling sparse prefill where only selected tokens are processed.
+    /// Full-attention layers apply `RoPE` at arbitrary, non-contiguous source
+    /// positions. Linear-attention/GDN layers run over the compact survivor
+    /// sequence, which is intentionally lossy.
     ///
     /// # Arguments
     /// * `inputs` - Selected tokens [B, N] where N = number of selected tokens
@@ -25222,6 +25981,81 @@ impl Qwen3NextCausalLM {
         }
 
         self.model.norm.forward(&h)
+    }
+
+    /// Same as [`Self::forward_hidden_sparse`] but also captures post-residual
+    /// hidden states at the requested tap layers.
+    ///
+    /// Tap row count equals the survivor count (`inputs` seq dim), not the
+    /// source prompt length — dSpark's drafter context frontier counts
+    /// residents. Returned taps are in ascending tap-layer order.
+    pub fn forward_hidden_sparse_with_taps(
+        &mut self,
+        inputs: &Array,
+        positions: &Array,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        if kv_cache.is_empty() {
+            *kv_cache = self.make_cache();
+        }
+
+        if kv_cache.len() != self.model.layers.len() {
+            return Err(Exception::custom(format!(
+                "cache length ({}) must match num layers ({})",
+                kv_cache.len(),
+                self.model.layers.len()
+            )));
+        }
+
+        let mut taps = Vec::with_capacity(tap_layers.len());
+
+        for (layer_idx, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(kv_cache.iter_mut())
+            .enumerate()
+        {
+            let cache = layer_cache
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Layer cache is None"))?;
+
+            let normed = layer.input_layernorm.forward(&h)?;
+            let r = if layer.is_linear {
+                let attn = layer
+                    .linear_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing"))?;
+                let LayerCache::Arrays(ssm_cache) = cache else {
+                    return Err(Exception::custom("Expected ArraysCache"));
+                };
+                attn.forward(&normed, None, ssm_cache)?
+            } else {
+                let attn = layer
+                    .self_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing"))?;
+                let LayerCache::KV(layer_kv) = cache else {
+                    return Err(Exception::custom("Expected KVCache"));
+                };
+                forward_attention_sparse(attn, &normed, positions, layer_kv)?
+            };
+
+            let h2 = h.add(r)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            h = h2.add(mlp_out)?;
+
+            if tap_layers.binary_search(&layer_idx).is_ok() {
+                taps.push(h.clone());
+            }
+        }
+
+        let hidden = self.model.norm.forward(&h)?;
+        Ok((hidden, taps))
     }
 }
 

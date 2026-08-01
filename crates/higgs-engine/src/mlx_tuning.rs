@@ -200,7 +200,8 @@ impl ModelMetadata {
     }
 
     fn should_clear_cache_after_prefill(&self) -> bool {
-        matches!(self.model_type.as_deref(), Some("qwen3_5")) && self.quantization_bits == Some(1)
+        matches!(self.model_type.as_deref(), Some("qwen3_5"))
+            && matches!(self.quantization_bits, Some(bits) if (1..=4).contains(&bits))
     }
 }
 
@@ -623,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen35_q1_clears_prefill_allocator_cache_by_default() {
+    fn test_qwen35_low_bit_affine_clears_prefill_allocator_cache_by_default() {
         let metadata = ModelMetadata {
             model_type: Some("qwen3_5".to_owned()),
             quantization_bits: Some(1),
@@ -636,11 +637,39 @@ mod tests {
         );
         assert!(tuning.clear_cache_after_prefill());
 
-        let non_q1 = ModelMetadata {
-            quantization_bits: Some(2),
-            ..metadata
+        // Q1 through Q4 all dequantize large projections during prefill and need
+        // the allocator cache cleared to avoid multi-GB post-prefill residency.
+        for bits in [1, 2, 3, 4] {
+            let low_bit = ModelMetadata {
+                quantization_bits: Some(bits),
+                ..metadata.clone()
+            };
+            assert!(
+                low_bit.should_clear_cache_after_prefill(),
+                "bits={bits} should clear cache after prefill"
+            );
+        }
+
+        // Dense (bits=0) and 8-bit re-quant paths do not materialize oversized
+        // fp16 dequant projections and therefore should not trigger.
+        for bits in [0, 8] {
+            let dense_or_8bit = ModelMetadata {
+                quantization_bits: Some(bits),
+                ..metadata.clone()
+            };
+            assert!(
+                !dense_or_8bit.should_clear_cache_after_prefill(),
+                "bits={bits} should not clear cache after prefill"
+            );
+        }
+
+        // Non-Qwen3.5 architectures are out of domain regardless of bits.
+        let non_qwen35 = ModelMetadata {
+            model_type: Some("qwen3".to_owned()),
+            quantization_bits: Some(1),
+            ..metadata.clone()
         };
-        assert!(!non_q1.should_clear_cache_after_prefill());
+        assert!(!non_qwen35.should_clear_cache_after_prefill());
     }
 
     fn write_json(path: &std::path::Path, value: &serde_json::Value) -> std::io::Result<()> {

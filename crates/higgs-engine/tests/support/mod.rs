@@ -63,7 +63,7 @@ impl ReferenceDsparkEnv {
     }
 }
 
-pub(crate) fn assert_bonsai_27b_full_q4(target: &Path, drafter: &Path) {
+pub(crate) fn assert_bonsai_27b_full_lowbit(target: &Path, drafter: &Path, target_bits: u64) {
     let target_config: serde_json::Value = serde_json::from_slice(
         &std::fs::read(target.join("config.json")).expect("read Bonsai target config"),
     )
@@ -80,10 +80,11 @@ pub(crate) fn assert_bonsai_27b_full_q4(target: &Path, drafter: &Path) {
         text.get("num_hidden_layers").and_then(|v| v.as_u64()),
         Some(64)
     );
+    let bits = text.pointer("/quantization/bits").and_then(|v| v.as_u64());
     assert_eq!(
-        text.pointer("/quantization/bits").and_then(|v| v.as_u64()),
-        Some(1),
-        "release gates require the Bonsai-27B 1-bit target"
+        bits,
+        Some(target_bits),
+        "release gates require the Bonsai-27B {target_bits}-bit target, got {bits:?}"
     );
 
     let drafter_config: serde_json::Value = serde_json::from_slice(
