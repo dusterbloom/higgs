@@ -42,7 +42,7 @@
 - Verify: repository and test state only
 
 **Interfaces:**
-- Consumes: `integration/nightly-pflash-cache` at design commit `f1bc364e8`.
+- Consumes: `integration/nightly-pflash-cache` at prepared baseline commit `7f4cec4ad` (the approved design/plan plus required `.worktrees` ignore preparation).
 - Produces: recorded clean status, source/target commit identities, and passing NanBeige baseline tests before the merge.
 
 - [ ] **Step 1: Verify branch and worktree state**
