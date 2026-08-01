@@ -1,11 +1,9 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use higgs_engine::mlx_tuning::resolve_effective_mlx_profile;
-use higgs_models::spec_prefill::PrefillScoreMode;
-
 use crate::config::HiggsConfig;
 use crate::model_resolver;
+use higgs_engine::mlx_tuning::resolve_effective_mlx_profile;
 
 pub struct DoctorResult {
     pub passes: u32,
@@ -400,41 +398,8 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 result,
             );
         }
-        if !(0.02..=0.95).contains(&model.prefill_keep_ratio) {
-            fail(
-                &format!(
-                    "model {label} prefill_keep_ratio={} out of range [0.02, 0.95]",
-                    model.prefill_keep_ratio
-                ),
-                result,
-            );
-            continue;
-        }
-        if !(model.prefill_keep_ratio..=0.95).contains(&model.prefill_keep_ratio_max) {
-            fail(
-                &format!(
-                    "model {label} prefill_keep_ratio_max={} must be in [{}, 0.95]",
-                    model.prefill_keep_ratio_max, model.prefill_keep_ratio
-                ),
-                result,
-            );
-            continue;
-        }
-        if !(0.0..=1.0).contains(&model.prefill_max_auto_prefill_ratio) {
-            fail(
-                &format!(
-                    "model {label} prefill_max_auto_prefill_ratio={} out of range [0.0, 1.0]",
-                    model.prefill_max_auto_prefill_ratio
-                ),
-                result,
-            );
-            continue;
-        }
-        if model.prefill_plan_cache && model.prefill_plan_cache_entries == 0 {
-            fail(
-                &format!("model {label} prefill_plan_cache_entries must be >= 1"),
-                result,
-            );
+        if let Err(error) = crate::config::validate_pflash_settings(model) {
+            fail(&format!("model {label} {error}"), result);
             continue;
         }
         if model.prefill_suffix_identity_threshold > 512 {
@@ -447,45 +412,6 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             );
         }
         if model.prefill_drafter.is_some() {
-            if model.prefill_chunk == 0 {
-                fail(
-                    &format!(
-                        "model {label} prefill_chunk must be >= 1, got {}",
-                        model.prefill_chunk
-                    ),
-                    result,
-                );
-                continue;
-            }
-            if model.prefill_avgpool == 0 || model.prefill_avgpool % 2 == 0 {
-                fail(
-                    &format!(
-                        "model {label} prefill_avgpool must be odd and >= 1 (symmetric smoothing window), got {}",
-                        model.prefill_avgpool
-                    ),
-                    result,
-                );
-                continue;
-            }
-            if model.prefill_lookahead == 0 {
-                fail(
-                    &format!(
-                        "model {label} prefill_lookahead must be >= 1, got {}",
-                        model.prefill_lookahead
-                    ),
-                    result,
-                );
-                continue;
-            }
-            if model.prefill_score_mode == PrefillScoreMode::L7 && model.prefill_exit_layer == 0 {
-                fail(
-                    &format!(
-                        "model {label} prefill_exit_layer must be >= 1 when prefill_score_mode=l7"
-                    ),
-                    result,
-                );
-                continue;
-            }
             if model.prefill_threshold < 1024 {
                 warn(
                     &format!(

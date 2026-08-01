@@ -3311,6 +3311,22 @@ impl SimpleEngine {
         }
     }
 
+    fn record_continuation_metrics(&self, generation: &SessionGeneration) {
+        if generation.continued {
+            self.cache_metrics
+                .continuations
+                .fetch_add(1, Ordering::Relaxed);
+            self.cache_metrics.prefill_saved_tokens.fetch_add(
+                u64::from(
+                    generation
+                        .prompt_tokens
+                        .saturating_sub(generation.prefilled_tokens),
+                ),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     /// Record session prompt/cache reconciliation diagnostics.
     fn record_session_prompt_trace(&self, trace: SessionPromptTraceMetrics) {
         self.cache_metrics
@@ -6498,16 +6514,6 @@ impl SimpleEngine {
                     }
                     let prefilled = u32::try_from(prefill_tokens.len()).unwrap_or(u32::MAX);
 
-                    if continued {
-                        self.cache_metrics
-                            .continuations
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.cache_metrics.prefill_saved_tokens.fetch_add(
-                            u64::from(total.saturating_sub(prefilled)),
-                            Ordering::Relaxed,
-                        );
-                    }
-
                     let prefill_start = std::time::Instant::now();
                     let (pair, prefill_logits) = pair
                         .prefill_known(prefill_tokens, |exact_suffix, target_cache, draft_cache| {
@@ -6798,6 +6804,7 @@ impl SimpleEngine {
             }
         };
 
+        self.record_continuation_metrics(&generation);
         drop(drafter);
         drop(model);
         drop(mlx_gate);
@@ -13399,6 +13406,26 @@ mod tests {
         assert!(!continued_dspark_cold_retry_allowed(true, false, true));
         assert!(!continued_dspark_cold_retry_allowed(true, true, false));
         assert!(!continued_dspark_cold_retry_allowed(false, false, false));
+    }
+
+    #[test]
+    fn failed_warm_dspark_retry_does_not_count_cold_result_as_reuse() {
+        let engine = session_cache_test_engine();
+        let successful_cold_retry = SessionGeneration {
+            text: String::new(),
+            completion_tokens: 1,
+            finish_reason: "length".to_owned(),
+            prompt_tokens: 12,
+            prefilled_tokens: 12,
+            outcome: super::SessionOutcome::ExactBootstrap,
+            continued: false,
+        };
+
+        engine.record_continuation_metrics(&successful_cold_retry);
+
+        let stats = engine.cache_stats();
+        assert_eq!(stats.continuations, 0);
+        assert_eq!(stats.prefill_saved_tokens, 0);
     }
 
     #[test]

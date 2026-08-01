@@ -607,6 +607,59 @@ const fn default_prefill_exit_layer() -> usize {
     7
 }
 
+pub(crate) fn validate_pflash_settings(model: &ModelConfig) -> Result<(), String> {
+    if !model.prefill_keep_ratio.is_finite() || !(0.02..=0.95).contains(&model.prefill_keep_ratio) {
+        return Err(format!(
+            "prefill_keep_ratio={} must be finite and in [0.02, 0.95]",
+            model.prefill_keep_ratio
+        ));
+    }
+    if !model.prefill_keep_ratio_max.is_finite()
+        || model.prefill_keep_ratio_max < model.prefill_keep_ratio
+        || model.prefill_keep_ratio_max > 0.95
+    {
+        return Err(format!(
+            "prefill_keep_ratio_max={} must be finite and in [{}, 0.95]",
+            model.prefill_keep_ratio_max, model.prefill_keep_ratio
+        ));
+    }
+    if !model.prefill_max_auto_prefill_ratio.is_finite()
+        || !(0.0..=1.0).contains(&model.prefill_max_auto_prefill_ratio)
+    {
+        return Err(format!(
+            "prefill_max_auto_prefill_ratio={} must be finite and in [0.0, 1.0]",
+            model.prefill_max_auto_prefill_ratio
+        ));
+    }
+    if model.prefill_plan_cache && model.prefill_plan_cache_entries == 0 {
+        return Err("prefill_plan_cache_entries must be >= 1".to_owned());
+    }
+    if model.prefill_drafter.is_some() {
+        if model.prefill_chunk == 0 {
+            return Err(format!(
+                "prefill_chunk must be >= 1, got {}",
+                model.prefill_chunk
+            ));
+        }
+        if model.prefill_avgpool == 0 || model.prefill_avgpool % 2 == 0 {
+            return Err(format!(
+                "prefill_avgpool must be odd and >= 1 (symmetric smoothing window), got {}",
+                model.prefill_avgpool
+            ));
+        }
+        if model.prefill_lookahead == 0 {
+            return Err(format!(
+                "prefill_lookahead must be >= 1, got {}",
+                model.prefill_lookahead
+            ));
+        }
+        if model.prefill_score_mode == PrefillScoreMode::L7 && model.prefill_exit_layer == 0 {
+            return Err("prefill_exit_layer must be >= 1 when prefill_score_mode=l7".to_owned());
+        }
+    }
+    Ok(())
+}
+
 /// When the PFlash compressive-prefill drafter is invoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1140,14 +1193,9 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
                 model.path
             ));
         }
-        if !model.prefill_max_auto_prefill_ratio.is_finite()
-            || !(0.0..=1.0).contains(&model.prefill_max_auto_prefill_ratio)
-        {
-            return Err(format!(
-                "prefill_max_auto_prefill_ratio must be a finite ratio between 0.0 and 1.0 for model {}",
-                model.path
-            ));
-        }
+        validate_pflash_settings(model).map_err(|error| {
+            format!("invalid PFlash settings for model {}: {error}", model.path)
+        })?;
         if model.disk_cache_enabled && model.max_disk_blocks == 0 {
             return Err(format!(
                 "max_disk_blocks must be greater than zero for model {}",
@@ -1949,6 +1997,65 @@ mod tests {
         )
         .unwrap();
         assert!(load_config_file(&invalid_path, None).is_err());
+    }
+
+    #[test]
+    fn test_config_file_rejects_invalid_pflash_settings_before_model_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_settings = [
+            ("keep-one", "prefill_keep_ratio = 1.0", "prefill_keep_ratio"),
+            ("keep-nan", "prefill_keep_ratio = nan", "prefill_keep_ratio"),
+            (
+                "max-infinite",
+                "prefill_keep_ratio_max = inf",
+                "prefill_keep_ratio_max",
+            ),
+            (
+                "reversed-range",
+                "prefill_keep_ratio = 0.5\nprefill_keep_ratio_max = 0.4",
+                "prefill_keep_ratio_max",
+            ),
+            (
+                "zero-chunk",
+                "prefill_drafter = \"some/drafter\"\nprefill_chunk = 0",
+                "prefill_chunk",
+            ),
+            (
+                "even-avgpool",
+                "prefill_drafter = \"some/drafter\"\nprefill_avgpool = 2",
+                "prefill_avgpool",
+            ),
+            (
+                "zero-lookahead",
+                "prefill_drafter = \"some/drafter\"\nprefill_lookahead = 0",
+                "prefill_lookahead",
+            ),
+            (
+                "zero-l7-exit",
+                "prefill_drafter = \"some/drafter\"\nprefill_score_mode = \"l7\"\nprefill_exit_layer = 0",
+                "prefill_exit_layer",
+            ),
+            (
+                "zero-plan-cache",
+                "prefill_plan_cache = true\nprefill_plan_cache_entries = 0",
+                "prefill_plan_cache_entries",
+            ),
+        ];
+
+        for (name, settings, expected_field) in invalid_settings {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(
+                &path,
+                format!("[[models]]\npath = \"some/model\"\n{settings}\n"),
+            )
+            .unwrap();
+            let error = load_config_file(&path, None)
+                .expect_err("invalid PFlash settings must fail config validation");
+            assert!(
+                error.contains(expected_field),
+                "{name}: expected {expected_field} in error, got {error}"
+            );
+        }
     }
 
     #[test]
