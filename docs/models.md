@@ -59,6 +59,7 @@ Nanbeige uses repeated shared-weight decoder loops with loop-aware KV cache slot
 | Qwen3.5 dense | `mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` |
 | Qwen3.5 MoE | `NexVeridian/Qwen3.5-35B-A3B-3bit` |
 | Qwen3.6 MoE | `mlx-community/Qwen3.6-35B-A3B-4bit` |
+| Qwen3.6 MoE (eschamoe) | `EschaLabs/Qwen3.6-35B-A3B-Escha-W2` (converted at load; see below) |
 | Nanbeige | `MercuriusDream/Nanbeige4.2-3B-mlx-6bit` |
 | DeepSeek-V2 | `mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx` |
 
@@ -68,10 +69,53 @@ Nanbeige uses repeated shared-weight decoder loops with loop-aware KV cache slot
 - The cached-model smoke matrix covered `mlx-community/Qwen3.6-35B-A3B-4bit` plus `mlx-community/Llama-3.2-1B-Instruct-4bit`, `mlx-community/Qwen2.5-3B-Instruct-4bit`, `mlx-community/Qwen3-1.7B-4bit`, and `mlx-community/Qwen3-Coder-Next-4bit`.
 - OpenAI-style chat requests use non-thinking mode by default for `Qwen3.6` unless the request explicitly opts into reasoning.
 
+## EschaLabs `eschamoe` Checkpoints
+
+Higgs loads EschaLabs trellis-quantized (`eschamoe`) checkpoints, for example
+`EschaLabs/Qwen3.6-35B-A3B-Escha-W2` (a 2-bit trellis release of
+Qwen3.6-35B-A3B). No config field is needed — detection is automatic:
+
+- A checkpoint is treated as `eschamoe` when `quantize_config.json` declares
+  `quant_method: "eschamoe"`, or, as a fallback, when `config.json` declares it
+  under `quantization_config.quant_method`. `quantize_config.json` wins when
+  both files are present.
+- `model_type` stays `qwen3_5_moe`, so the model serves through the existing
+  Qwen3.5/3.6-MoE path.
+
+At load, Higgs decodes the trellis weights on the CPU and requantizes them in
+memory to MLX affine 4-bit (group size 64) — the same layout as
+`mlx-community/Qwen3.6-35B-A3B-4bit`.
+
+**Memory: the on-disk size is misleading.** The 2-bit trellis download is small
+(12.3 GB for the 35B release), but the converted model is roughly 20 GB
+resident. Size your machine for the resident number, not the download.
+`higgs doctor` estimates the resident size from `config.json` and warns when it
+crowds system RAM.
+
+**Slow first load.** The trellis decode is CPU-bound: about 140 s for the 35B
+checkpoint. A long first start is expected — it is not a hang.
+
+**Limitations.**
+
+- Support is currently text-only.
+- The MTP draft head in the published checkpoint is not usable: it ships the
+  MoE router and shared expert but no routed expert weights, so Higgs disables
+  MTP for this checkpoint and decodes without speculation.
+
+Worked config entry:
+
+```toml
+[[models]]
+name = "qwen36-escha"
+path = "EschaLabs/Qwen3.6-35B-A3B-Escha-W2"
+```
+
 ## Model Input Requirements
 
 - Local models can be referenced by Hugging Face model ID or local path.
-- The model must be in MLX `safetensors` format.
+- The model must be in MLX `safetensors` format. EschaLabs `eschamoe` trellis
+  checkpoints are the exception; Higgs converts them in memory at load (see
+  above).
 - The checkpoint must use a supported `config.json` `model_type`.
 - macOS local serving requires `mlx.metallib` next to the executable. Release artifacts bundle it, and source builds restore it from Cargo build output when possible.
 

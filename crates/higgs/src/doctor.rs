@@ -462,10 +462,224 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                     }
                 };
                 pass(&format!("model {label} resolvable ({profile_msg})"), result);
+                check_eschamoe_checkpoint(&resolved, &label, result);
             }
             Err(err) => fail(&format!("model {label} not found: {err}"), result),
         }
     }
+}
+
+// -- Eschamoe checkpoint checks --
+
+/// Check an eschamoe checkpoint before the server starts.
+///
+/// The check validates the quantization declaration, estimates the resident
+/// size after conversion, and warns about the slow CPU-bound load.
+fn check_eschamoe_checkpoint(model_dir: &std::path::Path, label: &str, result: &mut DoctorResult) {
+    check_eschamoe_checkpoint_with_ram(model_dir, label, total_system_ram_bytes(), result);
+}
+
+fn check_eschamoe_checkpoint_with_ram(
+    model_dir: &std::path::Path,
+    label: &str,
+    ram_bytes: Option<u64>,
+    result: &mut DoctorResult,
+) {
+    let is_eschamoe = match higgs_models::eschamoe::is_eschamoe_checkpoint(model_dir) {
+        Ok(flag) => flag,
+        Err(err) => {
+            fail(
+                &format!(
+                    "model {label} has a malformed quantization declaration in \
+                     quantize_config.json or config.json (field quant_method): {err}"
+                ),
+                result,
+            );
+            return;
+        }
+    };
+
+    if !check_quant_method_declarations(model_dir, label, result) {
+        return;
+    }
+    if !is_eschamoe {
+        return;
+    }
+
+    let target = higgs_models::eschamoe::CONVERSION_TARGET;
+    pass(
+        &format!(
+            "model {label} is an eschamoe trellis checkpoint; higgs converts it to MLX affine \
+             {}-bit (group size {}) in memory at load",
+            target.bits, target.group_size
+        ),
+        result,
+    );
+    warn(
+        &format!(
+            "model {label} is an eschamoe checkpoint: the trellis decode runs on the CPU at load \
+             (~140s for the 35B checkpoint); a long first start is expected, not a hang"
+        ),
+        result,
+    );
+    match eschamoe_resident_estimate_bytes(model_dir) {
+        Some(estimate) => check_eschamoe_memory(estimate, ram_bytes, label, result),
+        None => warn(
+            &format!(
+                "model {label} config.json lacks size fields (num_hidden_layers, num_experts, \
+                 moe_intermediate_size, hidden_size, vocab_size); cannot estimate resident \
+                 memory after eschamoe conversion"
+            ),
+            result,
+        ),
+    }
+}
+
+/// Compare the `quant_method` declarations of the two config files.
+///
+/// A conflict or a bad field type is an error. Return `false` on error.
+fn check_quant_method_declarations(
+    model_dir: &std::path::Path,
+    label: &str,
+    result: &mut DoctorResult,
+) -> bool {
+    let mut methods: Vec<(&str, String)> = Vec::new();
+    for file in ["quantize_config.json", "config.json"] {
+        let Ok(raw) = std::fs::read_to_string(model_dir.join(file)) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            // `is_eschamoe_checkpoint` already reports files that are not JSON.
+            continue;
+        };
+        if let Some(quant_config) = value.get("quantization_config") {
+            if !quant_config.is_object() {
+                fail(
+                    &format!("model {label} {file} field quantization_config is not a JSON object"),
+                    result,
+                );
+                return false;
+            }
+        }
+        let method = value.get("quant_method").or_else(|| {
+            value
+                .get("quantization_config")
+                .and_then(|qc| qc.get("quant_method"))
+        });
+        match method {
+            Some(serde_json::Value::String(name)) => methods.push((file, name.clone())),
+            Some(_) => {
+                fail(
+                    &format!("model {label} {file} field quant_method is not a string"),
+                    result,
+                );
+                return false;
+            }
+            None => {}
+        }
+    }
+    if let [(file_a, method_a), (file_b, method_b)] = methods.as_slice() {
+        if method_a != method_b {
+            fail(
+                &format!(
+                    "model {label} {file_a} quant_method=\"{method_a}\" conflicts with {file_b} \
+                     quant_method=\"{method_b}\"; the loader obeys {file_a}"
+                ),
+                result,
+            );
+            return false;
+        }
+    }
+    true
+}
+
+/// Estimate the resident bytes of an eschamoe model after conversion.
+///
+/// The estimate counts the expert weights and the vocabulary weights. These
+/// weights dominate the total. The count uses the affine conversion layout:
+/// packed values plus one fp16 scale and one fp16 bias per group.
+fn eschamoe_resident_estimate_bytes(model_dir: &std::path::Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let field = |key: &str| config.get(key)?.as_u64();
+    let layers = field("num_hidden_layers")?;
+    let experts = field("num_experts")?;
+    let moe_intermediate = field("moe_intermediate_size")?;
+    let hidden = field("hidden_size")?;
+    let vocab = field("vocab_size")?;
+
+    // Three projections per expert: gate, up, and down.
+    let expert_params = layers * 3 * experts * moe_intermediate * hidden;
+    // The embedding table and the output head.
+    let vocab_params = 2 * vocab * hidden;
+    let params = expert_params + vocab_params;
+
+    let target = higgs_models::eschamoe::CONVERSION_TARGET;
+    let bits = u64::try_from(target.bits).ok()?;
+    let group_size = u64::try_from(target.group_size).ok()?;
+    Some(params * bits / 8 + params * 4 / group_size)
+}
+
+/// Warn when the resident estimate crowds the memory of the machine.
+///
+/// No public accessor gives the Metal working-set limit to the doctor. Thus
+/// the check uses 75% of the total system RAM as a stand-in and says so.
+fn check_eschamoe_memory(
+    estimate: u64,
+    ram_bytes: Option<u64>,
+    label: &str,
+    result: &mut DoctorResult,
+) {
+    let Some(ram) = ram_bytes else { return };
+    let threshold = ram / 4 * 3;
+    if estimate > threshold {
+        warn(
+            &format!(
+                "model {label} needs an estimated {:.1} GiB resident after eschamoe conversion — \
+                 far more than the on-disk size suggests (the 35B release is 12.3 GB on disk but \
+                 ~20 GB resident). That exceeds 75% of system RAM ({:.1} GiB). No Metal \
+                 working-set accessor is available to doctor, so total RAM is the reference; the \
+                 real Metal limit is lower. Expect memory pressure or an OOM kill",
+                gib(estimate),
+                gib(ram)
+            ),
+            result,
+        );
+    } else {
+        pass(
+            &format!(
+                "model {label} estimated resident size after eschamoe conversion (~{:.1} GiB \
+                 weights) fits in system RAM ({:.1} GiB)",
+                gib(estimate),
+                gib(ram)
+            ),
+            result,
+        );
+    }
+}
+
+/// Convert bytes to GiB for display.
+#[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+const fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// Read the total system RAM in bytes.
+///
+/// The engine reads the Metal working-set limit through a private helper.
+/// The doctor cannot call it, so the doctor reads the total RAM instead.
+#[cfg(target_os = "macos")]
+fn total_system_ram_bytes() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn total_system_ram_bytes() -> Option<u64> {
+    None
 }
 
 /// Catch `[local]` keys mistakenly written under `[server]`.
@@ -1362,6 +1576,91 @@ mod tests {
         // Should pass for model found, but warn for no descriptions
         assert_eq!(result.passes, 1);
         assert_eq!(result.warnings, 1);
+    }
+
+    // -- Eschamoe checkpoint checks --
+
+    fn write_model_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        dir
+    }
+
+    /// A small eschamoe model dir. The formula gives 2304 estimate bytes:
+    /// params = 2*3*4*8*16 + 2*32*16 = 4096; 4096*4/8 + 4096*4/64 = 2304.
+    fn eschamoe_model_dir() -> tempfile::TempDir {
+        write_model_dir(&[
+            ("quantize_config.json", r#"{"quant_method":"eschamoe"}"#),
+            (
+                "config.json",
+                r#"{"model_type":"qwen3_5_moe","num_hidden_layers":2,"num_experts":4,
+                    "moe_intermediate_size":8,"hidden_size":16,"vocab_size":32}"#,
+            ),
+        ])
+    }
+
+    #[test]
+    fn test_eschamoe_conflicting_quant_method_fails() {
+        let dir = write_model_dir(&[
+            ("quantize_config.json", r#"{"quant_method":"awq"}"#),
+            (
+                "config.json",
+                r#"{"quantization_config":{"quant_method":"eschamoe"}}"#,
+            ),
+        ]);
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), &mut result);
+        assert_eq!(result.failures, 1);
+        assert_eq!(result.passes, 0);
+    }
+
+    #[test]
+    fn test_eschamoe_malformed_quantize_config_fails() {
+        let dir = write_model_dir(&[("quantize_config.json", "not json")]);
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_eschamoe_exceeds_ram_warns_memory_and_slow_load() {
+        let dir = eschamoe_model_dir();
+        let mut result = empty_result();
+        // 2304 estimate bytes exceed 75% of 1024 bytes of injected RAM.
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1024), &mut result);
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.passes, 1);
+        // One warn for the slow CPU load, one for the memory estimate.
+        assert_eq!(result.warnings, 2);
+    }
+
+    #[test]
+    fn test_eschamoe_fits_ram_passes_memory_check() {
+        let dir = eschamoe_model_dir();
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), &mut result);
+        assert_eq!(result.failures, 0);
+        // Detection pass plus memory-fit pass; slow-load warn remains.
+        assert_eq!(result.passes, 2);
+        assert_eq!(result.warnings, 1);
+    }
+
+    #[test]
+    fn test_eschamoe_resident_estimate_formula() {
+        let dir = eschamoe_model_dir();
+        assert_eq!(eschamoe_resident_estimate_bytes(dir.path()), Some(2304));
+    }
+
+    #[test]
+    fn test_non_eschamoe_dir_is_silent() {
+        let dir = write_model_dir(&[("config.json", r#"{"model_type":"llama"}"#)]);
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), &mut result);
+        assert_eq!(result.passes, 0);
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 0);
     }
 
     // -- Provider reachability --
