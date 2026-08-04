@@ -747,6 +747,27 @@ pub fn classify(key: &str) -> (Storage, &str) {
     (Storage::Dense, key)
 }
 
+/// Whether a key holds an `RMSNorm` weight the checkpoint stores as `w - 1`.
+///
+/// Escha centres its norm weights on zero. Every `RMSNorm` follows that
+/// convention except the gated norm of the GDN block, which keeps the plain
+/// weight. Measured against `mlx-community/Qwen3.6-35B-A3B-4bit`, all 101
+/// offset tensors match at `|escha + 1 - base| <= 0.008`, the bf16 step, and
+/// the 30 `linear_attn.norm` tensors match exactly with no offset.
+///
+/// A norm is the only 1-D weight whose last name part holds `norm`, so the
+/// name gives the answer with no list of layers to maintain.
+fn is_offset_rmsnorm(key: &str) -> bool {
+    let Some(module) = key.strip_suffix(".weight") else {
+        return false;
+    };
+    !module.ends_with(".linear_attn.norm")
+        && module
+            .rsplit('.')
+            .next()
+            .is_some_and(|part| part.contains("norm"))
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint conversion
 // ---------------------------------------------------------------------------
@@ -878,8 +899,13 @@ fn triple_entries(target: &str, [w, s, b]: Triple) -> [(String, Array); 3] {
 }
 
 /// The six tensors of one trellis projection.
+///
+/// The `prefix` field holds the checkpoint name of the projection, for example
+/// `model.layers.7.mlp.experts.gate_up_proj`. The checks name it in their
+/// messages, so a warning points at one tensor of the checkpoint.
 #[derive(Debug, Clone, Copy)]
 pub struct TrellisGroup<'a> {
+    pub prefix: &'a str,
     pub code: &'a Array,
     pub config: &'a Array,
     pub rin: &'a Array,
@@ -936,6 +962,7 @@ impl TrellisGroup<'_> {
         if let Some(mean) = rout_mean_if_off(self.rout)? {
             tracing::warn!(
                 mean,
+                projection = self.prefix,
                 "eschamoe escha_rout |mean| is far from the expected 1.0; the checkpoint may \
                  not follow the released convention"
             );
@@ -1258,8 +1285,9 @@ fn convert_checkpoint_impl(
                     // makes a quantized layer for each of them, and that layer
                     // needs a scales tensor and a biases tensor. Thus this code
                     // quantizes each 2-D weight. The other dense tensors are
-                    // norms, the 3-D conv1d weight, or 1-D vectors. They go to
-                    // the model with no change.
+                    // norms, the 3-D conv1d weight, or 1-D vectors. Only the
+                    // offset norms change; the rest go to the model as they
+                    // are.
                     match key.strip_suffix(".weight").filter(|_| value.ndim() == 2) {
                         Some(module) => {
                             let target = AffineTarget::resolve(quantization, module);
@@ -1274,6 +1302,13 @@ fn convert_checkpoint_impl(
                         // exchanges the last two axes.
                         None if key.ends_with(".conv1d.weight") && value.ndim() == 3 => {
                             made.push((key.clone(), ops::swap_axes(&value, 1, 2)?));
+                        }
+                        // An offset norm holds `w - 1`. Restore `w`, and keep
+                        // the checkpoint dtype so the model reads it as it
+                        // reads every other norm.
+                        None if is_offset_rmsnorm(key) => {
+                            let one = Array::from_f32(1.0).as_dtype(value.dtype())?;
+                            made.push((key.clone(), ops::add(&value, &one)?));
                         }
                         None => made.push((key.clone(), value)),
                     }
@@ -1297,6 +1332,7 @@ fn convert_checkpoint_impl(
                 let s_in = take(&format!("{prefix}.escha_s_in"))?;
                 let s_out = take(&format!("{prefix}.escha_s_out"))?;
                 let group = TrellisGroup {
+                    prefix,
                     code: &code,
                     config: &config,
                     rin: &rin,
@@ -1461,6 +1497,7 @@ mod tests {
     impl OwnedGroup {
         const fn as_group(&self) -> TrellisGroup<'_> {
             TrellisGroup {
+                prefix: "synthetic",
                 code: &self.code,
                 config: &self.config,
                 rin: &self.rin,
@@ -1797,6 +1834,45 @@ mod tests {
         assert!(dequant_expert(&bad, &ones, &ones, &ones, &ones, &s).is_err());
     }
 
+    /// Test that the offset applies to every norm the checkpoint holds and to
+    /// nothing else. The `w - 1` convention was measured against
+    /// `mlx-community/Qwen3.6-35B-A3B-4bit`: 101 tensors match after the
+    /// offset, the 30 `linear_attn.norm` tensors match without it.
+    #[test]
+    fn is_offset_rmsnorm_splits_the_norms_from_everything_else() {
+        // Every norm key shape the checkpoint holds, in the normalized form.
+        // The GDN gated norm is the one norm that keeps the plain weight.
+        let offset = [
+            "language_model.model.layers.0.input_layernorm.weight",
+            "language_model.model.layers.39.post_attention_layernorm.weight",
+            "language_model.model.layers.3.self_attn.q_norm.weight",
+            "language_model.model.layers.3.self_attn.k_norm.weight",
+            "language_model.model.norm.weight",
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.self_attn.k_norm.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+        ];
+        let plain = [
+            "language_model.model.layers.0.linear_attn.norm.weight",
+            "language_model.model.layers.0.linear_attn.A_log",
+            "language_model.model.layers.0.linear_attn.dt_bias",
+            "language_model.model.layers.0.linear_attn.conv1d.weight",
+            "language_model.model.layers.0.mlp.gate.weight",
+            "language_model.model.layers.0.mlp.shared_expert_gate.weight",
+            "language_model.model.layers.3.self_attn.q_proj.weight_int8",
+            "language_model.model.embed_tokens.weight_int8",
+            "lm_head.weight_int8",
+        ];
+        for key in offset {
+            assert!(is_offset_rmsnorm(key), "{key} holds w - 1");
+        }
+        for key in plain {
+            assert!(!is_offset_rmsnorm(key), "{key} holds the plain value");
+        }
+    }
+
     /// Test that each key format of the checkpoint gives a correct parameter
     /// path. The key names come from `model.safetensors.index.json`.
     #[test]
@@ -1947,6 +2023,7 @@ mod tests {
         let pfx = "model.language_model.layers.0.mlp.experts.gate_up_proj";
         let get = |s: &str| t.get(&format!("{pfx}{s}")).unwrap();
         let group = TrellisGroup {
+            prefix: pfx,
             code: get(".escha_code"),
             config: get(".escha_config"),
             rin: get(".escha_rin"),
@@ -2003,6 +2080,10 @@ mod tests {
                 .unwrap()
                 .item::<f32>();
             let scale = want.abs().unwrap().max(None).unwrap().item::<f32>();
+            eprintln!(
+                "part {part}: affine requant err {err:.6} range {scale:.6} rel {:.3e}",
+                err / scale
+            );
             assert!(
                 err < 0.1 * scale,
                 "part {part}: requantization error {err} vs range {scale}"
@@ -2059,6 +2140,7 @@ mod tests {
         let pfx = "model.language_model.layers.0.mlp.experts.gate_up_proj";
         let get = |s: &str| t.get(&format!("{pfx}{s}")).unwrap();
         let group = TrellisGroup {
+            prefix: pfx,
             code: get(".escha_code"),
             config: get(".escha_config"),
             rin: get(".escha_rin"),

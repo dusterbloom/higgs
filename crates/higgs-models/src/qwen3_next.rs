@@ -25006,8 +25006,11 @@ mod tests {
                 .unwrap()
                 .max(None)
                 .unwrap();
-            eval([&diff]).unwrap();
-            eprintln!("logits max abs diff vs {path}: {:.6}", diff.item::<f32>());
+            let scale = reference.abs().unwrap().max(None).unwrap();
+            eval([&diff, &scale]).unwrap();
+            let (d, s) = (diff.item::<f32>(), scale.item::<f32>());
+            eprintln!("logits max abs diff vs {path}: {d:.6}");
+            eprintln!("ref max abs logit: {s:.6}  relative: {:.3e}", d / s);
         }
     }
 

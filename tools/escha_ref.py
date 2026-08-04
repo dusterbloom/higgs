@@ -34,9 +34,13 @@ Verified over layers {0,1,3,20,39} x experts {0,7} x both projections
 (K=2 and K=3): global cosine 0.945 - 0.990 against the base model.
 
 Usage:
-    python3 tools/escha_ref.py gate                          # Phase 0 gate
+    python3 tools/escha_ref.py gate [layers] [experts]        # Phase 0 gate
     python3 tools/escha_ref.py probe [layer] [proj] [expert]  # score orderings
     python3 tools/escha_ref.py dump <layer> <proj> <expert> <out.npy>
+
+`layers` and `experts` are comma-separated index specs, each item a single
+index or an inclusive range: `0-39`, `0,7,15`, `0-3,20`. Both default to the
+sample above.
 
 All three read the checkpoints over HTTP with byte ranges, so a run costs a few
 MB rather than a full shard download.
@@ -355,12 +359,34 @@ def probe(layer: int = 0, proj: str = "gate_up_proj", expert: int = 0) -> int:
     return 0 if best[1] >= 0.9 else 1
 
 
-def gate(layers=(0, 1, 3, 20, 39), experts=(0, 7)) -> int:
-    """Phase 0 gate: decode must track the unquantized base model everywhere."""
+GATE_LAYERS = (0, 1, 3, 20, 39)
+GATE_EXPERTS = (0, 7)
+
+
+def index_set(spec: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Parse an index spec: comma-separated items, each a single index `N` or
+    an inclusive range `A-B`. An empty spec keeps `default`."""
+    if not spec:
+        return default
+    out: list[int] = []
+    for item in spec.split(","):
+        lo, _, hi = item.partition("-")
+        out.extend(range(int(lo), int(hi or lo) + 1))
+    return tuple(out)
+
+
+def gate(layers: str = "", experts: str = "") -> int:
+    """Phase 0 gate: decode must track the unquantized base model everywhere.
+
+    `layers` and `experts` are index specs (see `index_set`). Each empty one
+    keeps the sample the format was pinned on: layers {0,1,3,20,39} x experts
+    {0,7}. A run costs two range reads per cell, so a wide sweep is slow but
+    still cheap in bytes.
+    """
     print("layer  expert  gate_up   down")
     worst, worst_at = 1.0, ""
-    for layer in layers:
-        for expert in experts:
+    for layer in index_set(layers, GATE_LAYERS):
+        for expert in index_set(experts, GATE_EXPERTS):
             cols = [score(layer, proj, expert)[0] for proj in ("gate_up_proj", "down_proj")]
             print(f"  {layer:3}  {expert:5}   {cols[0]:+.4f}  {cols[1]:+.4f}")
             for proj, c in zip(("gate_up_proj", "down_proj"), cols):
@@ -420,7 +446,7 @@ def main(argv: list[str]) -> int:
     if cmd == "probe":
         return probe(*args)
     if cmd == "gate":
-        return gate()
+        return gate(*argv[2:])
     if cmd == "fixture":
         return fixture(*args)
     if cmd == "dump" and len(args) == 4:
