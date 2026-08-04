@@ -11415,7 +11415,7 @@ fn force_eschamoe_quant_layout(
 /// keys of an MTP sidecar file get a prefix.
 ///
 /// The second result holds the native expert weights of each layer. It is
-/// empty unless `HIGGS_ESCHA_NATIVE=1` selects the native mode.
+/// empty when `HIGGS_ESCHA_NATIVE=0` selects the affine mode.
 fn checkpoint_tensors(
     model_path: &Path,
 ) -> Result<crate::eschamoe::ConvertedCheckpoint, crate::error::ModelError> {

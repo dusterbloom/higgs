@@ -95,7 +95,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 - Serve MLX models from Hugging Face IDs or local paths.
 - Support current model families including Qwen 3.6, Qwen 3.x, Nanbeige, Llama, Mistral, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, and LLaVA-Qwen2.
-- Load EschaLabs `eschamoe` trellis-quantized checkpoints (e.g. `EschaLabs/Qwen3.6-35B-A3B-Escha-W2`) with automatic detection and in-memory conversion to MLX affine 4-bit — no config field needed. See [docs/models.md](docs/models.md#eschalabs-eschamoe-checkpoints).
+- Load EschaLabs `eschamoe` trellis-quantized checkpoints (e.g. `EschaLabs/Qwen3.6-35B-A3B-Escha-W2`) with automatic detection — no config field needed. The experts stay in their trellis form and decode on the GPU, so the 35B release holds ~11 GB and loads in seconds. See [docs/models.md](docs/models.md#eschalabs-eschamoe-checkpoints).
 - Expose local serving through OpenAI and Anthropic-compatible endpoints.
 
 ### Use one endpoint for local and remote models
@@ -129,7 +129,7 @@ curl http://localhost:8000/v1/chat/completions \
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
 - `[local].allow_runtime_model_load` defaults to `false`. Enable it to load/unload models at runtime via `POST`/`DELETE /v1/models`; protect it with `server.api_key`.
 - `batch=true` is only supported for standard transformer families with true batched decode support.
-- EschaLabs `eschamoe` checkpoints convert at load: the resident model is much larger than the download (12.3 GB on disk becomes ~20 GB resident for the 35B release), and the CPU-bound conversion makes the first start slow (~140 s). `higgs doctor` warns when the converted size crowds system RAM.
+- EschaLabs `eschamoe` checkpoints keep their experts in the trellis form by default: 12.3 GB on disk becomes ~11 GB resident for the 35B release, and the load takes seconds. Set `HIGGS_ESCHA_NATIVE=0` to decode every expert to affine 4-bit instead, which raises the same model to ~22 GB resident and ~140 s of CPU-bound conversion at start. `higgs doctor` estimates the resident size for the active mode and warns when it crowds system RAM.
 
 ## Performance
 

@@ -82,18 +82,31 @@ Qwen3.6-35B-A3B). No config field is needed — detection is automatic:
 - `model_type` stays `qwen3_5_moe`, so the model serves through the existing
   Qwen3.5/3.6-MoE path.
 
-At load, Higgs decodes the trellis weights on the CPU and requantizes them in
-memory to MLX affine 4-bit (group size 64) — the same layout as
-`mlx-community/Qwen3.6-35B-A3B-4bit`.
+### Native and affine paths
 
-**Memory: the on-disk size is misleading.** The 2-bit trellis download is small
-(12.3 GB for the 35B release), but the converted model is roughly 20 GB
-resident. Size your machine for the resident number, not the download.
-`higgs doctor` estimates the resident size from `config.json` and warns when it
-crowds system RAM.
+Higgs has two ways to load these checkpoints. The native path is the default.
 
-**Slow first load.** The trellis decode is CPU-bound: about 140 s for the 35B
-checkpoint. A long first start is expected — it is not a hang.
+**Native (default).** The expert projections stay in their trellis form and a
+Metal kernel decodes them during the forward pass. Only the non-expert weights
+convert, to MLX affine 4-bit (group size 64). The 35B release holds about
+11 GB and loads in a few seconds.
+
+**Affine (`HIGGS_ESCHA_NATIVE=0`).** Every expert decodes on the CPU and
+requantizes in memory to MLX affine 4-bit — the same layout as
+`mlx-community/Qwen3.6-35B-A3B-4bit`. The same 35B release then holds about
+22 GB and takes roughly 140 s to start, so it needs a machine with memory to
+spare. The path stays available for comparing the kernel against a plain
+affine baseline.
+
+`higgs doctor` estimates the resident size for whichever mode is active and
+warns when it crowds system RAM. On the native path it reads the trellis rate
+of each projection from `quantization_config.layer_meta`; note that the rate
+varies per projection, so a checkpoint named `W2` is not uniformly 2-bit — the
+35B release uses 2 bits for `gate_up_proj` and 3 for `down_proj`.
+
+**Memory: the on-disk size is misleading on the affine path.** The 2-bit
+trellis download is 12.3 GB for the 35B release; converted, it is roughly
+22 GB. Size the machine for the resident number, not the download.
 
 **Limitations.**
 

@@ -1190,9 +1190,17 @@ pub fn convert_checkpoint(
     Ok(convert_checkpoint_impl(model_dir, quantization, false)?.0)
 }
 
-/// Whether the native expert path is on. Set `HIGGS_ESCHA_NATIVE=1`.
+/// Whether the native expert path is on. Set `HIGGS_ESCHA_NATIVE=0` for the
+/// affine path.
+///
+/// The native path keeps each expert projection in its trellis form and reads
+/// it with the Metal kernel. The affine path decodes every expert and
+/// requantizes the result to 4 bits. For the 35B release the native path holds
+/// 11.2 GB and loads in about 6 s; the affine path holds 21.7 GB and takes
+/// about 140 s, which crowds a 32 GB machine. Thus the native path is the
+/// default, and the affine path stays available for comparison.
 pub fn native_mode() -> bool {
-    std::env::var("HIGGS_ESCHA_NATIVE").is_ok_and(|v| v == "1")
+    !std::env::var("HIGGS_ESCHA_NATIVE").is_ok_and(|v| v == "0")
 }
 
 /// The tensor list and the native expert weights of one conversion.

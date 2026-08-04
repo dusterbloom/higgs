@@ -476,13 +476,20 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
 /// The check validates the quantization declaration, estimates the resident
 /// size after conversion, and warns about the slow CPU-bound load.
 fn check_eschamoe_checkpoint(model_dir: &std::path::Path, label: &str, result: &mut DoctorResult) {
-    check_eschamoe_checkpoint_with_ram(model_dir, label, total_system_ram_bytes(), result);
+    check_eschamoe_checkpoint_with_ram(
+        model_dir,
+        label,
+        total_system_ram_bytes(),
+        higgs_models::eschamoe::native_mode(),
+        result,
+    );
 }
 
 fn check_eschamoe_checkpoint_with_ram(
     model_dir: &std::path::Path,
     label: &str,
     ram_bytes: Option<u64>,
+    native: bool,
     result: &mut DoctorResult,
 ) {
     let is_eschamoe = match higgs_models::eschamoe::is_eschamoe_checkpoint(model_dir) {
@@ -507,22 +514,37 @@ fn check_eschamoe_checkpoint_with_ram(
     }
 
     let target = higgs_models::eschamoe::CONVERSION_TARGET;
-    pass(
-        &format!(
-            "model {label} is an eschamoe trellis checkpoint; higgs converts it to MLX affine \
-             {}-bit (group size {}) in memory at load",
-            target.bits, target.group_size
-        ),
-        result,
-    );
-    warn(
-        &format!(
-            "model {label} is an eschamoe checkpoint: the trellis decode runs on the CPU at load \
-             (~140s for the 35B checkpoint); a long first start is expected, not a hang"
-        ),
-        result,
-    );
-    match eschamoe_resident_estimate_bytes(model_dir) {
+    if native {
+        pass(
+            &format!(
+                "model {label} is an eschamoe trellis checkpoint; higgs keeps the experts in the \
+                 trellis form and reads them with the Metal kernel. The other weights become MLX \
+                 affine {}-bit (group size {}).",
+                target.bits, target.group_size
+            ),
+            result,
+        );
+    } else {
+        pass(
+            &format!(
+                "model {label} is an eschamoe trellis checkpoint; HIGGS_ESCHA_NATIVE=0 selects \
+                 the affine path, so higgs decodes every expert to MLX affine {}-bit (group size \
+                 {}) in memory at load",
+                target.bits, target.group_size
+            ),
+            result,
+        );
+        warn(
+            &format!(
+                "model {label} is an eschamoe checkpoint on the affine path: the trellis decode \
+                 runs on the CPU at load (~140s for the 35B checkpoint) and the result is about \
+                 twice the resident size of the native path; a long first start is expected, not \
+                 a hang. Unset HIGGS_ESCHA_NATIVE for the native path."
+            ),
+            result,
+        );
+    }
+    match eschamoe_resident_estimate_bytes(model_dir, native) {
         Some(estimate) => check_eschamoe_memory(estimate, ram_bytes, label, result),
         None => warn(
             &format!(
@@ -596,28 +618,72 @@ fn check_quant_method_declarations(
 /// Estimate the resident bytes of an eschamoe model after conversion.
 ///
 /// The estimate counts the expert weights and the vocabulary weights. These
-/// weights dominate the total. The count uses the affine conversion layout:
-/// packed values plus one fp16 scale and one fp16 bias per group.
-fn eschamoe_resident_estimate_bytes(model_dir: &std::path::Path) -> Option<u64> {
+/// weights dominate the total.
+///
+/// The vocabulary weights always take the affine layout: packed values plus
+/// one fp16 scale and one fp16 bias per group. The expert weights depend on
+/// the mode. The affine path gives them the same layout. The native path
+/// keeps the trellis codes, which hold `K` bits for each weight, and `K`
+/// differs per projection: the 35B release uses 2 bits for `gate_up_proj` and
+/// 3 for `down_proj`. Thus the native estimate reads the rate of each
+/// projection from `quantization_config.layer_meta` and falls back to the
+/// affine estimate when that block is absent.
+fn eschamoe_resident_estimate_bytes(model_dir: &std::path::Path, native: bool) -> Option<u64> {
     let raw = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
     let config: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let field = |key: &str| config.get(key)?.as_u64();
+    // A checkpoint with a vision tower nests the text fields under
+    // `text_config`. The released 35B escha checkpoint has that shape, so a
+    // top-level read alone finds nothing and the estimate never runs.
+    let field = |key: &str| -> Option<u64> {
+        config
+            .get(key)
+            .or_else(|| config.get("text_config").and_then(|text| text.get(key)))?
+            .as_u64()
+    };
     let layers = field("num_hidden_layers")?;
     let experts = field("num_experts")?;
     let moe_intermediate = field("moe_intermediate_size")?;
     let hidden = field("hidden_size")?;
     let vocab = field("vocab_size")?;
 
-    // Three projections per expert: gate, up, and down.
-    let expert_params = layers * 3 * experts * moe_intermediate * hidden;
-    // The embedding table and the output head.
-    let vocab_params = 2 * vocab * hidden;
-    let params = expert_params + vocab_params;
-
     let target = higgs_models::eschamoe::CONVERSION_TARGET;
     let bits = u64::try_from(target.bits).ok()?;
     let group_size = u64::try_from(target.group_size).ok()?;
-    Some(params * bits / 8 + params * 4 / group_size)
+    let affine_bytes = |params: u64| params * bits / 8 + params * 4 / group_size;
+
+    // Three projections per expert: gate, up, and down.
+    let expert_params = layers * 3 * experts * moe_intermediate * hidden;
+    let expert_bytes = if native {
+        trellis_expert_bytes(&config).unwrap_or_else(|| affine_bytes(expert_params))
+    } else {
+        affine_bytes(expert_params)
+    };
+
+    // The embedding table and the output head.
+    Some(expert_bytes + affine_bytes(2 * vocab * hidden))
+}
+
+/// Sum the trellis code bytes of every expert projection.
+///
+/// Each entry of `quantization_config.layer_meta` gives the expert count, the
+/// two feature lengths, and the rate `K`. The code holds `K` bits for each
+/// weight. Give `None` when the block is absent or an entry lacks a field, so
+/// the caller can fall back.
+fn trellis_expert_bytes(config: &serde_json::Value) -> Option<u64> {
+    let meta = config
+        .get("quantization_config")?
+        .get("layer_meta")?
+        .as_object()?;
+    if meta.is_empty() {
+        return None;
+    }
+    let mut bits = 0u64;
+    for entry in meta.values() {
+        let field = |key: &str| entry.get(key)?.as_u64();
+        bits +=
+            field("num_experts")? * field("in_features")? * field("out_features")? * field("K")?;
+    }
+    Some(bits / 8)
 }
 
 /// Warn when the resident estimate crowds the memory of the machine.
@@ -1611,7 +1677,7 @@ mod tests {
             ),
         ]);
         let mut result = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), &mut result);
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), true, &mut result);
         assert_eq!(result.failures, 1);
         assert_eq!(result.passes, 0);
     }
@@ -1620,44 +1686,116 @@ mod tests {
     fn test_eschamoe_malformed_quantize_config_fails() {
         let dir = write_model_dir(&[("quantize_config.json", "not json")]);
         let mut result = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), &mut result);
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), true, &mut result);
         assert_eq!(result.failures, 1);
     }
 
     #[test]
-    fn test_eschamoe_exceeds_ram_warns_memory_and_slow_load() {
+    fn test_eschamoe_exceeds_ram_warns_memory() {
         let dir = eschamoe_model_dir();
-        let mut result = empty_result();
         // 2304 estimate bytes exceed 75% of 1024 bytes of injected RAM.
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1024), &mut result);
-        assert_eq!(result.failures, 0);
-        assert_eq!(result.passes, 1);
-        // One warn for the slow CPU load, one for the memory estimate.
-        assert_eq!(result.warnings, 2);
+        let mut native = empty_result();
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1024), true, &mut native);
+        assert_eq!(native.failures, 0);
+        assert_eq!(native.passes, 1);
+        // The native path warns about the memory estimate and nothing else.
+        assert_eq!(native.warnings, 1);
+
+        let mut affine = empty_result();
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1024), false, &mut affine);
+        assert_eq!(affine.failures, 0);
+        assert_eq!(affine.passes, 1);
+        // The affine path adds the slow CPU load warning.
+        assert_eq!(affine.warnings, 2);
     }
 
     #[test]
     fn test_eschamoe_fits_ram_passes_memory_check() {
         let dir = eschamoe_model_dir();
-        let mut result = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), &mut result);
-        assert_eq!(result.failures, 0);
-        // Detection pass plus memory-fit pass; slow-load warn remains.
-        assert_eq!(result.passes, 2);
-        assert_eq!(result.warnings, 1);
+        let mut native = empty_result();
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), true, &mut native);
+        assert_eq!(native.failures, 0);
+        // Detection pass plus memory-fit pass, and no warning.
+        assert_eq!(native.passes, 2);
+        assert_eq!(native.warnings, 0);
+
+        let mut affine = empty_result();
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), false, &mut affine);
+        assert_eq!(affine.passes, 2);
+        assert_eq!(affine.warnings, 1);
     }
 
+    /// Test that the size fields are found under `text_config` too. A
+    /// checkpoint with a vision tower nests them there, and the released 35B
+    /// escha checkpoint does. The numbers match the flat fixture, so the
+    /// estimate must agree with it.
+    #[test]
+    fn test_eschamoe_estimate_reads_nested_text_config() {
+        let dir = write_model_dir(&[
+            ("quantize_config.json", r#"{"quant_method":"eschamoe"}"#),
+            (
+                "config.json",
+                r#"{"model_type":"qwen3_5_moe","text_config":{"num_hidden_layers":2,
+                    "num_experts":4,"moe_intermediate_size":8,"hidden_size":16,
+                    "vocab_size":32}}"#,
+            ),
+        ]);
+        assert_eq!(
+            eschamoe_resident_estimate_bytes(dir.path(), false),
+            Some(2304)
+        );
+    }
+
+    /// Test the estimate in both modes. The fixture has no `layer_meta`, so
+    /// the native estimate falls back to the affine one.
     #[test]
     fn test_eschamoe_resident_estimate_formula() {
         let dir = eschamoe_model_dir();
-        assert_eq!(eschamoe_resident_estimate_bytes(dir.path()), Some(2304));
+        assert_eq!(
+            eschamoe_resident_estimate_bytes(dir.path(), false),
+            Some(2304)
+        );
+        assert_eq!(
+            eschamoe_resident_estimate_bytes(dir.path(), true),
+            Some(2304)
+        );
+    }
+
+    /// Test that the native estimate reads the trellis rate of each
+    /// projection. The two entries hold 4*8*16*2 and 4*16*8*3 bits, so the
+    /// codes take (1024 + 1536) / 8 = 320 bytes. The vocabulary adds
+    /// 2*32*16 = 1024 params, which take 1024*4/8 + 1024*4/64 = 576 bytes.
+    #[test]
+    fn test_eschamoe_native_estimate_uses_the_trellis_rate() {
+        let dir = write_model_dir(&[
+            ("quantize_config.json", r#"{"quant_method":"eschamoe"}"#),
+            (
+                "config.json",
+                r#"{"model_type":"qwen3_5_moe","num_hidden_layers":2,"num_experts":4,
+                    "moe_intermediate_size":8,"hidden_size":16,"vocab_size":32,
+                    "quantization_config":{"quant_method":"eschamoe","layer_meta":{
+                      "layers.0.mlp.experts.gate_up_proj":{"K":2,"num_experts":4,
+                        "in_features":8,"out_features":16},
+                      "layers.0.mlp.experts.down_proj":{"K":3,"num_experts":4,
+                        "in_features":16,"out_features":8}}}}"#,
+            ),
+        ]);
+        assert_eq!(
+            eschamoe_resident_estimate_bytes(dir.path(), true),
+            Some(320 + 576)
+        );
+        // The affine path ignores `layer_meta` and keeps the old formula.
+        assert_eq!(
+            eschamoe_resident_estimate_bytes(dir.path(), false),
+            Some(2304)
+        );
     }
 
     #[test]
     fn test_non_eschamoe_dir_is_silent() {
         let dir = write_model_dir(&[("config.json", r#"{"model_type":"llama"}"#)]);
         let mut result = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), &mut result);
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), true, &mut result);
         assert_eq!(result.passes, 0);
         assert_eq!(result.warnings, 0);
         assert_eq!(result.failures, 0);
