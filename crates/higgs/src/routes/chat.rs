@@ -936,7 +936,11 @@ async fn chat_completions_stream(
                 .as_ref()
                 .map(|lp| logprobs_to_response(std::slice::from_ref(lp), &tokenizer));
 
-            let (visible, reasoning) = reasoning_tracker.process(&output.new_text);
+            let (visible, reasoning) = if thinking_enabled_stream {
+                reasoning_tracker.process(&output.new_text)
+            } else {
+                (output.new_text.clone(), String::new())
+            };
 
             if !reasoning.is_empty() {
                 let d = ChatCompletionDelta {
