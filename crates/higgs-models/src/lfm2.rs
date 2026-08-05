@@ -11,11 +11,12 @@ use std::path::Path;
 use mlx_rs::{
     builder::Builder,
     error::Exception,
-    macros::ModuleParameters,
+    macros::{ModuleParameters, Quantizable},
     module::Module,
     nn,
     ops,
     ops::indexing::IndexOp,
+    quantization::MaybeQuantized,
     Array, Dtype,
 };use serde::Deserialize;
 
@@ -68,8 +69,10 @@ fn default_max_pos() -> i32 { 128_000 }
 fn default_true() -> bool { true }
 fn default_quant_mode() -> String { "affine".to_owned() }
 
-fn linear_no_bias(in_f: i32, out_f: i32) -> Result<nn::Linear, Exception> {
-    nn::LinearBuilder::new(in_f, out_f).bias(false).build()
+fn linear_no_bias(in_f: i32, out_f: i32) -> Result<MaybeQuantized<nn::Linear>, Exception> {
+    Ok(MaybeQuantized::Original(
+        nn::LinearBuilder::new(in_f, out_f).bias(false).build()?
+    ))
 }
 
 impl Lfm2Config {
@@ -112,14 +115,16 @@ impl Lfm2Config {
 // Short convolution block
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct Lfm2ShortConv {
+    #[quantizable]
     #[param]
-    in_proj: nn::Linear,
+    in_proj: MaybeQuantized<nn::Linear>,
     #[param]
     conv: nn::Conv1d,
+    #[quantizable]
     #[param]
-    out_proj: nn::Linear,
+    out_proj: MaybeQuantized<nn::Linear>,
     conv_kernel: i32,
     hidden_size: i32,
 }
@@ -208,16 +213,20 @@ impl Lfm2ShortConv {
 // GQA Attention
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct Lfm2Attention {
+    #[quantizable]
     #[param]
-    q_proj: nn::Linear,
+    q_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    k_proj: nn::Linear,
+    k_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    v_proj: nn::Linear,
+    v_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    out_proj: nn::Linear,
+    out_proj: MaybeQuantized<nn::Linear>,
     #[param]
     q_layernorm: nn::RmsNorm,
     #[param]
@@ -288,14 +297,17 @@ impl Lfm2Attention {
 // SwiGLu MLP
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct Lfm2MLP {
+    #[quantizable]
     #[param]
-    w1: nn::Linear,
+    w1: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    w2: nn::Linear,
+    w2: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    w3: nn::Linear,
+    w3: MaybeQuantized<nn::Linear>,
 }
 
 impl Lfm2MLP {
@@ -320,16 +332,19 @@ impl Lfm2MLP {
 // Decoder layer
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct Lfm2DecoderLayer {
+    #[quantizable]
     #[param]
     conv: Option<Lfm2ShortConv>,
+    #[quantizable]
     #[param]
     self_attn: Option<Lfm2Attention>,
     #[param]
     operator_norm: nn::RmsNorm,
     #[param]
     ffn_norm: nn::RmsNorm,
+    #[quantizable]
     #[param]
     feed_forward: Lfm2MLP,
     is_conv: bool,
@@ -385,10 +400,12 @@ impl Lfm2DecoderLayer {
 // Model
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct Lfm2Model {
+    #[quantizable]
     #[param]
-    embed_tokens: nn::Embedding,
+    embed_tokens: MaybeQuantized<nn::Embedding>,
+    #[quantizable]
     #[param]
     layers: Vec<Lfm2DecoderLayer>,
     #[param]
@@ -402,7 +419,7 @@ impl Lfm2Model {
             .map(|(i, _)| Lfm2DecoderLayer::new(config, i))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            embed_tokens: nn::Embedding::new(config.vocab_size, config.hidden_size)?,
+            embed_tokens: MaybeQuantized::Original(nn::Embedding::new(config.vocab_size, config.hidden_size)?),
             layers,
             embedding_norm: nn::RmsNormBuilder::new(config.hidden_size).eps(config.norm_eps).build()?,
             config: config.clone(),
@@ -424,7 +441,10 @@ impl Lfm2Model {
     }
 
     pub fn as_linear(&self, hidden: &Array) -> Result<Array, Exception> {
-        self.embed_tokens.as_linear(hidden)
+        match &self.embed_tokens {
+            MaybeQuantized::Original(e) => e.as_linear(hidden),
+            MaybeQuantized::Quantized(e) => e.as_linear(hidden),
+        }
     }
 }
 
@@ -432,13 +452,15 @@ impl Lfm2Model {
 // Causal LM
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct Lfm2CausalLM {
     pub config: Lfm2Config,
+    #[quantizable]
     #[param]
     model: Lfm2Model,
+    #[quantizable]
     #[param]
-    lm_head: Option<nn::Linear>,
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
 impl Lfm2CausalLM {
@@ -485,6 +507,11 @@ pub fn load_lfm2_model(model_dir: &Path) -> Result<Lfm2CausalLM, ModelError> {
     let config = Lfm2Config::from_model_dir(model_dir)?;
     let mut model = Lfm2CausalLM::new(&config).map_err(ModelError::Mlx)?;
     let quantized = config.quantization.is_some();
+    if quantized {
+        let q = config.quantization.as_ref().unwrap();
+        model = mlx_rs::nn::quantize(model, Some(q.group_size), Some(q.bits as i32))
+            .map_err(ModelError::Mlx)?;
+    }
     crate::load_quantized_safetensors_weights(&mut model, model_dir, quantized)?;
     Ok(model)
 }
