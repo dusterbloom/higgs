@@ -130,7 +130,7 @@ impl Lfm2ShortConv {
         let k = config.conv_l_cache;
         Ok(Self {
             in_proj: linear_no_bias(h, 3 * h)?,
-            conv: nn::Conv1dBuilder::new(h, h, k).bias(false).groups(h).padding(k - 1).build()?,
+            conv: nn::Conv1dBuilder::new(h, h, k).bias(false).groups(h).padding(0).build()?,
             out_proj: linear_no_bias(h, h)?,
             conv_kernel: k,
             hidden_size: h,
@@ -151,12 +151,12 @@ impl Lfm2ShortConv {
 
         let gated = gate_b.multiply(&value_x)?; // [B, T, H]
 
-        // Causal depthwise conv: MLX Conv1d with padding=K-1 pads both sides,
-        // then we trim to first T outputs (matching PyTorch causal_conv1d_fn).
-        let conv_out = self.conv.forward(&gated)?; // [B, T+K-1, H]
-        let conv_trimmed = conv_out.index((.., ..t, ..)); // [B, T, H]
-
-        let gated_conv = gate_c.multiply(&conv_trimmed)?;
+        // Causal depthwise conv: left-pad by K-1, conv with padding=0
+        // Matches mlx-lm: mx.pad(Bx, [(0,0), (K-1,0), (0,0)]) then conv
+        let pad = ops::zeros_dtype(&[b, self.conv_kernel - 1, h], gated.dtype())?;
+        let padded = ops::concatenate_axis(&[&pad, &gated], 1)?; // [B, T+K-1, H]
+        let conv_out = self.conv.forward(&padded)?; // [B, T, H]
+        let gated_conv = gate_c.multiply(&conv_out)?;
 
         // Update conv_state: keep last K-1 time steps [B, K-1, H]
         if t > 0 {
@@ -274,7 +274,7 @@ impl Lfm2Attention {
         let view = kv_cache.update_and_view(k, v)?;
         let (cached_keys, cached_values) = view.into_dense()?;
 
-        let sdpa_mask = mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::from);
+        let sdpa_mask = (t > 1).then_some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal);
         let out = mlx_rs::fast::scaled_dot_product_attention(
             &q, &cached_keys, &cached_values, self.scale, sdpa_mask, None::<&Array>,
         )?;
@@ -455,10 +455,10 @@ impl Lfm2CausalLM {
     pub fn forward(
         &mut self,
         inputs: &Array,
-        mask: Option<&Array>,
+        _mask: Option<&Array>,
         cache: &mut Vec<Option<LayerCache>>,
     ) -> Result<Array, Exception> {
-        let h = self.model.forward(inputs, mask, cache)?;
+        let h = self.model.forward(inputs, None, cache)?;
         let h_last = h.index((.., -1.., ..));
         match &mut self.lm_head {
             Some(head) => head.forward(&h_last),
