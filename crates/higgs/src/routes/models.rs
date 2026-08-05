@@ -74,11 +74,11 @@ pub async fn load_model(
     // Cheap collision pre-check when the caller named the model, so we don't pay
     // for a full load just to reject it. `insert_engine` re-checks under the
     // write lock, so this is an optimization, not the source of truth.
-    if let Some(ref name) = model_cfg.name {
+    // If the model is already loaded, return success (no-op) instead of 409,
+    // so that switch/load operations don't fail when targeting the default model.
+    if let Some(name) = &model_cfg.name {
         if state.router.contains_engine(name) {
-            return Err(ServerError::Conflict(format!(
-                "model '{name}' is already loaded"
-            )));
+            return Ok(Json(model_object(name.clone(), false)));
         }
     }
 
