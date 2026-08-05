@@ -200,8 +200,13 @@ impl ModelMetadata {
     }
 
     fn should_clear_cache_after_prefill(&self) -> bool {
-        matches!(self.model_type.as_deref(), Some("qwen3_5"))
-            && matches!(self.quantization_bits, Some(bits) if (1..=4).contains(&bits))
+        match self.model_type.as_deref() {
+            Some("qwen3_5") => {
+                matches!(self.quantization_bits, Some(bits) if (1..=4).contains(&bits))
+            }
+            Some("qwen3_5_moe") => true,
+            _ => false,
+        }
     }
 }
 
@@ -670,6 +675,16 @@ mod tests {
             ..metadata.clone()
         };
         assert!(!non_qwen35.should_clear_cache_after_prefill());
+
+        // Qwen3.5-MoE (eschamoe native trellis path) always clears,
+        // even without traditional quantization bits, because the
+        // trellis decode creates transient weight intermediates.
+        let moe = ModelMetadata {
+            model_type: Some("qwen3_5_moe".to_owned()),
+            quantization_bits: None,
+            ..metadata.clone()
+        };
+        assert!(moe.should_clear_cache_after_prefill());
     }
 
     fn write_json(path: &std::path::Path, value: &serde_json::Value) -> std::io::Result<()> {
