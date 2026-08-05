@@ -36,6 +36,7 @@ pub fn is_supported(model_type: &str) -> bool {
             | "qwen3_moe"
             | "qwen3_5"
             | "qwen3_5_moe"
+            | "lfm2"
             | "nanbeige"
             | "gemma2"
             | "gemma3"

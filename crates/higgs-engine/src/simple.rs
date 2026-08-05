@@ -367,6 +367,7 @@ fn any_model_variant_name(model: &AnyModel) -> &'static str {
         AnyModel::Starcoder2(_) => "Starcoder2",
         AnyModel::LlavaQwen2(_) => "LlavaQwen2",
         AnyModel::DeepSeekV2(_) => "DeepSeekV2",
+        AnyModel::Lfm2(_) => "Lfm2",
         AnyModel::BonsaiQ1(_) => "BonsaiQ1",
     }
 }

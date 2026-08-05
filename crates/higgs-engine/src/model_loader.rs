@@ -67,6 +67,11 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Qwen3Next(model))
         }
+        "lfm2" => {
+            let model = higgs_models::lfm2::load_lfm2_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Lfm2(model))
+        }
         "qwen3_moe" => {
             let model = higgs_models::qwen3_moe::load_qwen3_moe_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
