@@ -167,6 +167,7 @@ impl Lfm2ShortConv {
         if t > 0 {
             let keep_from = (t - (self.conv_kernel - 1)).max(0);
             cache.conv_state = Some(gated.index((.., keep_from.., ..)).clone());
+            cache.offset += t;
         }
 
         self.out_proj.forward(&gated_conv)
@@ -199,6 +200,7 @@ impl Lfm2ShortConv {
         let conv_len = conv_full.shape()[1];
         let keep_from = (conv_len - (k - 1)).max(0);
         cache.conv_state = Some(conv_full.index((.., keep_from.., ..)).clone());
+        cache.offset += 1;
 
         // Manual depthwise conv on the K-length window (no padding needed)
         let conv_out = self.conv.forward(&conv_full)?; // [B, 1, H]
