@@ -19,6 +19,36 @@ Higgs is a single static Rust binary that serves local models, proxies to provid
 - you switch between local and hosted models
 - you want one API surface for apps, agents, and terminal tools
 
+## The `nightly` branch
+
+`nightly` is the development branch of [dusterbloom/higgs](https://github.com/dusterbloom/higgs), a
+fork of [panbanda/higgs](https://github.com/panbanda/higgs). It carries inference work that has not
+landed upstream. Homebrew and crates.io track upstream, so build this branch from source:
+
+```bash
+git clone -b nightly https://github.com/dusterbloom/higgs
+cd higgs && cargo build --release -p higgs
+```
+
+What it adds:
+
+- **EschaLabs `eschamoe` trellis checkpoints, read natively on Metal.** The experts stay in trellis
+  form and decode in a Metal kernel instead of being expanded. `Qwen3.6-35B-A3B-Escha-W2` holds
+  11.2 GB and loads in 6 s, against 21.7 GB and 141 s expanded — 190 tok/s prefill and 29 tok/s
+  decode at 1k context on an M4. Evidence:
+  [escha-mlx-evidence](https://dusterbloom.github.io/escha-mlx-evidence/).
+- **Speculative decoding.** DFlash drafters, Prism dSpark paired-cache speculation, and MTP draft
+  heads, with cache snapshots sealed at exact token boundaries.
+- **Low-bit Metal kernels.** Bonsai 1-bit and 2-bit decode paths, including simdgroup-cooperating
+  Q2 kernels and a row2 layout extended to the LM head. Evidence:
+  [bonsai_evidence](https://dusterbloom.github.io/bonsai_evidence/).
+- **Prefill and prefix caching.** PFlash speculative prefill scoring, sparse prefill caching, and a
+  paged/radix prefix cache with corrected `cached_tokens` accounting.
+- **Quantization.** TurboQuant KV quantization and per-tensor mxfp4 / affine / dense modes.
+- **Models.** Nanbeige, the Qwen3.5/3.6 MoE family via `qwen3_next`, and YaRN rope scaling.
+
+Upstream features below apply to this branch too.
+
 ## Breaking-Change Highlights
 
 - `higgs serve` remains the ad hoc foreground entrypoint for `--model`, `--port`, `--batch`, and related flags.
