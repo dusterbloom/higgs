@@ -16,7 +16,6 @@ use mlx_rs::{
     nn,
     ops,
     ops::indexing::IndexOp,
-    quantization::MaybeQuantized,
     Array,
 };
 use serde::Deserialize;
@@ -113,11 +112,11 @@ impl Lfm2Config {
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Lfm2ShortConv {
     #[param]
-    in_proj: MaybeQuantized<nn::Linear>,
+    in_proj: nn::Linear,
     #[param]
     conv: nn::Conv1d,
     #[param]
-    out_proj: MaybeQuantized<nn::Linear>,
+    out_proj: nn::Linear,
     conv_kernel: i32,
     hidden_size: i32,
 }
@@ -127,9 +126,9 @@ impl Lfm2ShortConv {
         let h = config.hidden_size;
         let k = config.conv_l_cache;
         Ok(Self {
-            in_proj: MaybeQuantized::Original(nn::Linear::new(h, 3 * h)?),
+            in_proj: nn::Linear::new(h, 3 * h)?,
             conv: nn::Conv1dBuilder::new(h, h, k).bias(false).groups(h).padding(0).build()?,
-            out_proj: MaybeQuantized::Original(nn::Linear::new(h, h)?),
+            out_proj: nn::Linear::new(h, h)?,
             conv_kernel: k,
             hidden_size: h,
         })
@@ -148,23 +147,21 @@ impl Lfm2ShortConv {
         let value_x = reshaped.index((.., .., 2, ..));
 
         let gated = gate_b.multiply(&value_x)?; // [B, T, H]
-        let conv_in = gated.transpose_axes(&[0, 2, 1])?; // [B, H, T]
 
-        // Left-pad by K-1, depthwise conv, trim to T
+        // Left-pad time axis by K-1, depthwise conv (MLX uses [B, L, C])
         if t > 0 {
-            let pad = ops::zeros_dtype(&[b, h, self.conv_kernel - 1], conv_in.dtype())?;
-            let padded = ops::concatenate_axis(&[&pad, &conv_in], -1)?;
-            let conv_out = self.conv.forward(&padded)?;
-            let conv_trimmed = conv_out.index((.., .., ..t));
+            let pad = ops::zeros_dtype(&[b, self.conv_kernel - 1, h], gated.dtype())?;
+            let padded = ops::concatenate_axis(&[&pad, &gated], 1)?;
+            let conv_out = self.conv.forward(&padded)?; // [B, T+K-1, H]
+            let conv_trimmed = conv_out.index((.., ..t, ..)); // [B, T, H]
 
-            let gated_conv = gate_c.transpose_axes(&[0, 2, 1])?.multiply(&conv_trimmed)?;
-            let out = gated_conv.transpose_axes(&[0, 2, 1])?;
+            let gated_conv = gate_c.multiply(&conv_trimmed)?; // [B, T, H]
 
-            // Update conv_state: keep last K-1 of conv_in
+            // Update conv_state: keep last K-1 time steps [B, K-1, H]
             let keep_from = (t - (self.conv_kernel - 1)).max(0);
-            cache.conv_state = Some(conv_in.index((.., .., keep_from..)).clone());
+            cache.conv_state = Some(gated.index((.., keep_from.., ..)).clone());
 
-            self.out_proj.forward(&out)
+            self.out_proj.forward(&gated_conv)
         } else {
             self.out_proj.forward(&gated)
         }
@@ -183,30 +180,26 @@ impl Lfm2ShortConv {
         let gate_c = reshaped.index((.., .., 1, ..));
         let value_x = reshaped.index((.., .., 2, ..));
 
-        let gated = gate_b.multiply(&value_x)?;
-        let conv_in = gated.transpose_axes(&[0, 2, 1])?; // [B, H, 1]
+        let gated = gate_b.multiply(&value_x)?; // [B, 1, H]
 
-        // Build conv input from state + new token
+        // Build conv input from state + new token [B, K, H]
         let conv_full = if let Some(prev) = cache.conv_state.take() {
-            ops::concatenate_axis(&[&prev, &conv_in], -1)?
+            ops::concatenate_axis(&[&prev, &gated], 1)?
         } else {
-            let zeros = ops::zeros_dtype(&[b, h, k - 1], conv_in.dtype())?;
-            ops::concatenate_axis(&[&zeros, &conv_in], -1)?
+            let zeros = ops::zeros_dtype(&[b, k - 1, h], gated.dtype())?;
+            ops::concatenate_axis(&[&zeros, &gated], 1)?
         };
 
-        // Keep last K-1 as new state
-        let conv_len = conv_full.shape().last().copied().unwrap_or(0);
+        // Keep last K-1 as new state [B, K-1, H]
+        let conv_len = conv_full.shape()[1];
         let keep_from = (conv_len - (k - 1)).max(0);
-        cache.conv_state = Some(conv_full.index((.., .., keep_from..)).clone());
+        cache.conv_state = Some(conv_full.index((.., keep_from.., ..)).clone());
 
-        let conv_out = self.conv.forward(&conv_full)?; // [B, H, ?]
-        let last_idx = conv_out.shape()[2] - 1;
-        let conv_last = conv_out.index((.., .., last_idx..));
+        let conv_out = self.conv.forward(&conv_full)?; // [B, K, H]
+        let conv_last = conv_out.index((.., (conv_out.shape()[1] - 1).., ..)); // [B, 1, H]
 
-        let gated_conv = gate_c.transpose_axes(&[0, 2, 1])?.multiply(&conv_last)?;
-        let out = gated_conv.transpose_axes(&[0, 2, 1])?;
-
-        self.out_proj.forward(&out)
+        let gated_conv = gate_c.multiply(&conv_last)?;
+        self.out_proj.forward(&gated_conv)
     }
 }
 
@@ -217,17 +210,17 @@ impl Lfm2ShortConv {
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Lfm2Attention {
     #[param]
-    q_proj: MaybeQuantized<nn::Linear>,
+    q_proj: nn::Linear,
     #[param]
-    k_proj: MaybeQuantized<nn::Linear>,
+    k_proj: nn::Linear,
     #[param]
-    v_proj: MaybeQuantized<nn::Linear>,
+    v_proj: nn::Linear,
     #[param]
-    out_proj: MaybeQuantized<nn::Linear>,
+    out_proj: nn::Linear,
     #[param]
-    q_norm: nn::RmsNorm,
+    q_layernorm: nn::RmsNorm,
     #[param]
-    k_norm: nn::RmsNorm,
+    k_layernorm: nn::RmsNorm,
     num_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
@@ -242,12 +235,12 @@ impl Lfm2Attention {
         let nkv = config.num_key_value_heads;
         let hd = config.head_dim();
         Ok(Self {
-            q_proj: MaybeQuantized::Original(nn::Linear::new(h, nh * hd)?),
-            k_proj: MaybeQuantized::Original(nn::Linear::new(h, nkv * hd)?),
-            v_proj: MaybeQuantized::Original(nn::Linear::new(h, nkv * hd)?),
-            out_proj: MaybeQuantized::Original(nn::Linear::new(h, nh * hd)?),
-            q_norm: nn::RmsNormBuilder::new(hd).eps(config.norm_eps).build()?,
-            k_norm: nn::RmsNormBuilder::new(hd).eps(config.norm_eps).build()?,
+            q_proj: nn::Linear::new(h, nh * hd)?,
+            k_proj: nn::Linear::new(h, nkv * hd)?,
+            v_proj: nn::Linear::new(h, nkv * hd)?,
+            out_proj: nn::Linear::new(h, nh * hd)?,
+            q_layernorm: nn::RmsNormBuilder::new(hd).eps(config.norm_eps).build()?,
+            k_layernorm: nn::RmsNormBuilder::new(hd).eps(config.norm_eps).build()?,
             num_heads: nh,
             num_kv_heads: nkv,
             head_dim: hd,
@@ -270,8 +263,8 @@ impl Lfm2Attention {
         let k = self.k_proj.forward(hidden)?.reshape(&[b, t, nkv, hd])?.transpose_axes(&[0, 2, 1, 3])?;
         let v = self.v_proj.forward(hidden)?.reshape(&[b, t, nkv, hd])?.transpose_axes(&[0, 2, 1, 3])?;
 
-        let q = self.q_norm.forward(&q)?;
-        let k = self.k_norm.forward(&k)?;
+        let q = self.q_layernorm.forward(&q)?;
+        let k = self.k_layernorm.forward(&k)?;
 
         let offset = kv_cache.offset();
         let q = apply_rope(&q, &self.rope, offset)?;
@@ -297,20 +290,20 @@ impl Lfm2Attention {
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Lfm2MLP {
     #[param]
-    w1: MaybeQuantized<nn::Linear>,
+    w1: nn::Linear,
     #[param]
-    w2: MaybeQuantized<nn::Linear>,
+    w2: nn::Linear,
     #[param]
-    w3: MaybeQuantized<nn::Linear>,
+    w3: nn::Linear,
 }
 
 impl Lfm2MLP {
     pub fn new(config: &Lfm2Config) -> Result<Self, Exception> {
         let (h, i) = (config.hidden_size, config.intermediate_size);
         Ok(Self {
-            w1: MaybeQuantized::Original(nn::Linear::new(h, i)?),
-            w2: MaybeQuantized::Original(nn::Linear::new(i, h)?),
-            w3: MaybeQuantized::Original(nn::Linear::new(h, i)?),
+            w1: nn::Linear::new(h, i)?,
+            w2: nn::Linear::new(i, h)?,
+            w3: nn::Linear::new(h, i)?,
         })
     }
 
@@ -331,29 +324,29 @@ pub struct Lfm2DecoderLayer {
     #[param]
     conv: Option<Lfm2ShortConv>,
     #[param]
-    attn: Option<Lfm2Attention>,
+    self_attn: Option<Lfm2Attention>,
     #[param]
     operator_norm: nn::RmsNorm,
     #[param]
     ffn_norm: nn::RmsNorm,
     #[param]
-    mlp: Lfm2MLP,
+    feed_forward: Lfm2MLP,
     is_conv: bool,
 }
 
 impl Lfm2DecoderLayer {
     pub fn new(config: &Lfm2Config, layer_idx: usize) -> Result<Self, Exception> {
         let is_conv = !config.is_attention_layer(layer_idx);
-        let (conv, attn) = if is_conv {
+        let (conv, self_attn) = if is_conv {
             (Some(Lfm2ShortConv::new(config)?), None)
         } else {
             (None, Some(Lfm2Attention::new(config)?))
         };
         Ok(Self {
-            conv, attn,
+            conv, self_attn,
             operator_norm: nn::RmsNormBuilder::new(config.hidden_size).eps(config.norm_eps).build()?,
             ffn_norm: nn::RmsNormBuilder::new(config.hidden_size).eps(config.norm_eps).build()?,
-            mlp: Lfm2MLP::new(config)?,
+            feed_forward: Lfm2MLP::new(config)?,
             is_conv,
         })
     }
@@ -377,12 +370,12 @@ impl Lfm2DecoderLayer {
             let LayerCache::KV(kv) = layer_cache else {
                 return Err(Exception::custom("lfm2: attn layer expects KV cache"));
             };
-            self.attn.as_mut().unwrap().forward(&normed, mask, kv)?
+            self.self_attn.as_mut().unwrap().forward(&normed, mask, kv)?
         };
 
         let h = hidden.add(&op_out)?;
         let normed = self.ffn_norm.forward(&h)?;
-        let mlp_out = self.mlp.forward(&normed)?;
+        let mlp_out = self.feed_forward.forward(&normed)?;
         h.add(&mlp_out)
     }
 }
@@ -394,7 +387,7 @@ impl Lfm2DecoderLayer {
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Lfm2Model {
     #[param]
-    embed_tokens: MaybeQuantized<nn::Embedding>,
+    embed_tokens: nn::Embedding,
     #[param]
     layers: Vec<Lfm2DecoderLayer>,
     #[param]
@@ -408,7 +401,7 @@ impl Lfm2Model {
             .map(|(i, _)| Lfm2DecoderLayer::new(config, i))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            embed_tokens: MaybeQuantized::Original(nn::Embedding::new(config.vocab_size, config.hidden_size)?),
+            embed_tokens: nn::Embedding::new(config.vocab_size, config.hidden_size)?,
             layers,
             embedding_norm: nn::RmsNormBuilder::new(config.hidden_size).eps(config.norm_eps).build()?,
             config: config.clone(),
@@ -430,10 +423,7 @@ impl Lfm2Model {
     }
 
     pub fn as_linear(&self, hidden: &Array) -> Result<Array, Exception> {
-        match &self.embed_tokens {
-            MaybeQuantized::Original(e) => e.as_linear(hidden),
-            MaybeQuantized::Quantized(e) => e.as_linear(hidden),
-        }
+        self.embed_tokens.as_linear(hidden)
     }
 }
 
@@ -447,7 +437,7 @@ pub struct Lfm2CausalLM {
     #[param]
     model: Lfm2Model,
     #[param]
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
+    lm_head: Option<nn::Linear>,
 }
 
 impl Lfm2CausalLM {
@@ -456,7 +446,7 @@ impl Lfm2CausalLM {
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(MaybeQuantized::Original(nn::Linear::new(config.hidden_size, config.vocab_size)?))
+            Some(nn::Linear::new(config.hidden_size, config.vocab_size)?)
         };
         Ok(Self { config: config.clone(), model, lm_head })
     }
