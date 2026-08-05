@@ -127,7 +127,7 @@ impl Lfm2ShortConv {
         let k = config.conv_l_cache;
         Ok(Self {
             in_proj: nn::Linear::new(h, 3 * h)?,
-            conv: nn::Conv1dBuilder::new(h, h, k).bias(false).groups(h).padding(0).build()?,
+            conv: nn::Conv1dBuilder::new(h, h, k).bias(false).groups(h).padding(k - 1).build()?,
             out_proj: nn::Linear::new(h, h)?,
             conv_kernel: k,
             hidden_size: h,
@@ -148,23 +148,20 @@ impl Lfm2ShortConv {
 
         let gated = gate_b.multiply(&value_x)?; // [B, T, H]
 
-        // Left-pad time axis by K-1, depthwise conv (MLX uses [B, L, C])
+        // Causal depthwise conv: MLX Conv1d with padding=K-1 pads both sides,
+        // then we trim to first T outputs (matching PyTorch causal_conv1d_fn).
+        let conv_out = self.conv.forward(&gated)?; // [B, T+K-1, H]
+        let conv_trimmed = conv_out.index((.., ..t, ..)); // [B, T, H]
+
+        let gated_conv = gate_c.multiply(&conv_trimmed)?;
+
+        // Update conv_state: keep last K-1 time steps [B, K-1, H]
         if t > 0 {
-            let pad = ops::zeros_dtype(&[b, self.conv_kernel - 1, h], gated.dtype())?;
-            let padded = ops::concatenate_axis(&[&pad, &gated], 1)?;
-            let conv_out = self.conv.forward(&padded)?; // [B, T+K-1, H]
-            let conv_trimmed = conv_out.index((.., ..t, ..)); // [B, T, H]
-
-            let gated_conv = gate_c.multiply(&conv_trimmed)?; // [B, T, H]
-
-            // Update conv_state: keep last K-1 time steps [B, K-1, H]
             let keep_from = (t - (self.conv_kernel - 1)).max(0);
             cache.conv_state = Some(gated.index((.., keep_from.., ..)).clone());
-
-            self.out_proj.forward(&gated_conv)
-        } else {
-            self.out_proj.forward(&gated)
         }
+
+        self.out_proj.forward(&gated_conv)
     }
 
     /// Single-step decode. `hidden`: `[B, 1, H]` → `[B, 1, H]`.
@@ -195,10 +192,11 @@ impl Lfm2ShortConv {
         let keep_from = (conv_len - (k - 1)).max(0);
         cache.conv_state = Some(conv_full.index((.., keep_from.., ..)).clone());
 
-        let conv_out = self.conv.forward(&conv_full)?; // [B, K, H]
-        let conv_last = conv_out.index((.., (conv_out.shape()[1] - 1).., ..)); // [B, 1, H]
+        // Manual depthwise conv on the K-length window (no padding needed)
+        let conv_out = self.conv.forward(&conv_full)?; // [B, 1, H]
+        let last = conv_out.index((.., conv_out.shape()[1] - 1.., ..));
 
-        let gated_conv = gate_c.multiply(&conv_last)?;
+        let gated_conv = gate_c.multiply(&last)?;
         self.out_proj.forward(&gated_conv)
     }
 }
