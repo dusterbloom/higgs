@@ -16,9 +16,8 @@ use mlx_rs::{
     nn,
     ops,
     ops::indexing::IndexOp,
-    Array,
-};
-use serde::Deserialize;
+    Array, Dtype,
+};use serde::Deserialize;
 
 use crate::cache::{KeyValueCache, SteppingKeyValueCache};
 use crate::error::ModelError;
@@ -68,6 +67,10 @@ fn default_norm_eps() -> f32 { 1e-5 }
 fn default_max_pos() -> i32 { 128_000 }
 fn default_true() -> bool { true }
 fn default_quant_mode() -> String { "affine".to_owned() }
+
+fn linear_no_bias(in_f: i32, out_f: i32) -> Result<nn::Linear, Exception> {
+    nn::LinearBuilder::new(in_f, out_f).bias(false).build()
+}
 
 impl Lfm2Config {
     pub fn from_model_dir(model_dir: &Path) -> Result<Self, ModelError> {
@@ -126,9 +129,9 @@ impl Lfm2ShortConv {
         let h = config.hidden_size;
         let k = config.conv_l_cache;
         Ok(Self {
-            in_proj: nn::Linear::new(h, 3 * h)?,
+            in_proj: linear_no_bias(h, 3 * h)?,
             conv: nn::Conv1dBuilder::new(h, h, k).bias(false).groups(h).padding(k - 1).build()?,
-            out_proj: nn::Linear::new(h, h)?,
+            out_proj: linear_no_bias(h, h)?,
             conv_kernel: k,
             hidden_size: h,
         })
@@ -233,10 +236,10 @@ impl Lfm2Attention {
         let nkv = config.num_key_value_heads;
         let hd = config.head_dim();
         Ok(Self {
-            q_proj: nn::Linear::new(h, nh * hd)?,
-            k_proj: nn::Linear::new(h, nkv * hd)?,
-            v_proj: nn::Linear::new(h, nkv * hd)?,
-            out_proj: nn::Linear::new(h, nh * hd)?,
+            q_proj: linear_no_bias(h, nh * hd)?,
+            k_proj: linear_no_bias(h, nkv * hd)?,
+            v_proj: linear_no_bias(h, nkv * hd)?,
+            out_proj: linear_no_bias(h, nh * hd)?,
             q_layernorm: nn::RmsNormBuilder::new(hd).eps(config.norm_eps).build()?,
             k_layernorm: nn::RmsNormBuilder::new(hd).eps(config.norm_eps).build()?,
             num_heads: nh,
@@ -299,9 +302,9 @@ impl Lfm2MLP {
     pub fn new(config: &Lfm2Config) -> Result<Self, Exception> {
         let (h, i) = (config.hidden_size, config.intermediate_size);
         Ok(Self {
-            w1: nn::Linear::new(h, i)?,
-            w2: nn::Linear::new(i, h)?,
-            w3: nn::Linear::new(h, i)?,
+            w1: linear_no_bias(h, i)?,
+            w2: linear_no_bias(i, h)?,
+            w3: linear_no_bias(h, i)?,
         })
     }
 
@@ -444,7 +447,7 @@ impl Lfm2CausalLM {
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(nn::Linear::new(config.hidden_size, config.vocab_size)?)
+            Some(linear_no_bias(config.hidden_size, config.vocab_size)?)
         };
         Ok(Self { config: config.clone(), model, lm_head })
     }
