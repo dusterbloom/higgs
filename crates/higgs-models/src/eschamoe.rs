@@ -596,9 +596,26 @@ impl EschaProj {
     ///
     /// The input `x` has shape `[rows, in]` in a float dtype. The input
     /// `eids` has shape `[rows]`, dtype uint32. Sorted ids give the best
-    /// speed on the scratch path. Unsorted ids stay correct on both paths.
-    /// The result has shape `[rows, out]`, dtype f32.
+    /// speed on the scratch path and on the GEMM path. Unsorted ids stay
+    /// correct on all three paths. The result has shape `[rows, out]`,
+    /// dtype f32.
     pub fn gather_forward(&self, x: &Array, eids: &Array) -> Result<Array, ModelError> {
+        self.gather_forward_mode(x, eids, trellis_gemm_mode())
+    }
+
+    /// The body of [`Self::gather_forward`] with the prefill path chosen by
+    /// the caller.
+    ///
+    /// The flag `gemm` selects the trellis GEMM kernel over the scratch path
+    /// above the row limit. [`trellis_gemm_mode`] reads it from the
+    /// environment once. The tests pass it directly, so one process can take
+    /// both prefill paths.
+    fn gather_forward_mode(
+        &self,
+        x: &Array,
+        eids: &Array,
+        gemm: bool,
+    ) -> Result<Array, ModelError> {
         let rows = *x.shape().first().ok_or_else(|| {
             ModelError::ShapeMismatch("gather_forward input must be [rows, in]".to_owned())
         })?;
@@ -607,6 +624,8 @@ impl EschaProj {
         let xh = had_blockwise(&x.as_dtype(Dtype::Float32)?.multiply(&su_rows)?, -1)?;
         let y_pre = if rows <= Self::GATHER_QMV_MAX_ROWS {
             crate::metal_kernel::eschamoe_gather_qmv(&xh, &self.code, eids, &self.spec)?
+        } else if gemm {
+            crate::metal_kernel::eschamoe_gather_qgemm(&xh, &self.code, eids, &self.spec)?
         } else {
             self.scratch_matmul(&xh, eids)?
         };
@@ -618,19 +637,41 @@ impl EschaProj {
     /// The function splits the rows into runs with one expert each. It
     /// decodes the expert of each run once. Then one matmul serves the whole
     /// run.
-    // ponytail: the ceiling is the decode bandwidth. Each prefill call writes
-    // and reads up to E_used * in * out half words of scratch. A native
-    // trellis GEMM kernel would remove the scratch traffic. Build one when
-    // prefill throughput becomes the bottleneck.
+    ///
+    /// The run scan reads `eids` on the host. That read waits for the GPU.
+    /// MLX builds its graph on the host, so a run-length split needs the
+    /// boundaries as host integers, and no MLX operation gives them without
+    /// a wait. The two sync-free forms both need new code:
+    ///
+    /// - a batched decode kernel that writes the whole `[E, in, out]` weight,
+    ///   with [`mlx_rs::ops::gather_mm`] on top. It reads the boundaries as a
+    ///   GPU array, but it holds every expert of the projection at once.
+    /// - a trellis GEMM kernel that reads `code` and `eids` directly. It has
+    ///   no scratch weight and no boundaries.
+    ///
+    /// `eids` is the same array for both projections of a layer, so the wait
+    /// happens once per layer, not once per projection.
+    ///
+    /// The second form now exists as
+    /// [`crate::metal_kernel::eschamoe_gather_qgemm`], behind
+    /// [`trellis_gemm_mode`]. This path stays as its reference and as the
+    /// default. Refer to that kernel for the measured comparison.
+    ///
+    /// The matmul runs in f16. The decode kernel already gives `Ŵ` in f16 and
+    /// the MLX half GEMM accumulates in f32, so the f16 form costs one
+    /// rounding of the activation and one of the result. In exchange it drops
+    /// an `[in, out]` f32 copy of every decoded expert.
     fn scratch_matmul(&self, xh: &Array, eids: &Array) -> Result<Array, ModelError> {
-        let ids: Vec<u32> = eids.as_slice::<u32>().to_vec();
-        let mut run_experts: Vec<u32> = Vec::new();
+        let ids = eids.as_slice::<u32>();
+        let mut run_experts: Vec<i32> = Vec::new();
         let mut boundaries: Vec<i32> = Vec::new();
         for (i, &id) in ids.iter().enumerate() {
-            if run_experts.last() == Some(&id) {
+            let expert = i32::try_from(id)
+                .map_err(|_| ModelError::ShapeMismatch(format!("expert id {id} exceeds i32")))?;
+            if run_experts.last() == Some(&expert) {
                 continue;
             }
-            run_experts.push(id);
+            run_experts.push(expert);
             if i > 0 {
                 boundaries.push(
                     i32::try_from(i).map_err(|_| {
@@ -639,17 +680,20 @@ impl EschaProj {
                 );
             }
         }
-        let parts = xh.split_axis(&boundaries, Some(0))?;
+        let parts = xh
+            .as_dtype(Dtype::Float16)?
+            .split_axis(&boundaries, Some(0))?;
         let mut segments: Vec<Array> = Vec::with_capacity(parts.len());
         for (part, &expert) in parts.iter().zip(&run_experts) {
-            let sel = Array::from_slice(&[expert], &[1]);
-            let code_e = self.code.take_axis(&sel, 0)?.squeeze_axes(&[0])?;
-            let w_e = crate::metal_kernel::eschamoe_dequant_tiles(&code_e, &self.spec)?
-                .as_dtype(Dtype::Float32)?;
+            // A range index slices the code tensor. The slice shares the
+            // buffer and stays row-contiguous, so the decode kernel reads the
+            // resident words. An integer index would gather a copy instead.
+            let code_e = self.code.index(expert..expert + 1).squeeze_axes(&[0])?;
+            let w_e = crate::metal_kernel::eschamoe_dequant_tiles(&code_e, &self.spec)?;
             segments.push(ops::matmul(part, &w_e)?);
         }
         let refs: Vec<&Array> = segments.iter().collect();
-        Ok(ops::concatenate_axis(&refs, 0)?)
+        Ok(ops::concatenate_axis(&refs, 0)?.as_dtype(Dtype::Float32)?)
     }
 }
 
@@ -1201,6 +1245,18 @@ pub fn convert_checkpoint(
 /// default, and the affine path stays available for comparison.
 pub fn native_mode() -> bool {
     !std::env::var("HIGGS_ESCHA_NATIVE").is_ok_and(|v| v == "0")
+}
+
+/// Report whether the prefill path uses the trellis GEMM kernel.
+///
+/// Set `HIGGS_ESCHA_TRELLIS_GEMM=1` to select the kernel. The default is the
+/// scratch path of [`EschaProj::scratch_matmul`]. The GEMM kernel drops the
+/// dense scratch weight and the host read of the expert ids, and the scratch
+/// path stays as the reference. The choice is read once and cached: the
+/// caller is the per-layer expert forward.
+pub fn trellis_gemm_mode() -> bool {
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("HIGGS_ESCHA_TRELLIS_GEMM").is_ok_and(|v| v == "1"))
 }
 
 /// The tensor list and the native expert weights of one conversion.
@@ -2105,6 +2161,11 @@ mod tests {
     /// the conversion of the trellis tensors and the int8 tensors, the GDN
     /// fusion, and the forward code. It stops with no error if the checkpoint
     /// is not available.
+    ///
+    /// The two steps take the two expert paths of [`EschaProj::gather_forward`]
+    /// on real weights. Five tokens give `5 * top_k` rows, which is above
+    /// [`EschaProj::GATHER_QMV_MAX_ROWS`] and takes the scratch path. The step
+    /// that follows gives `top_k` rows and takes the matvec kernel.
     #[test]
     fn eschamoe_checkpoint_loads_and_runs_forward() {
         let dir = test_model_dir();
@@ -2119,17 +2180,25 @@ mod tests {
         let mut model = crate::qwen3_next::load_qwen3_5_moe_model(&dir)
             .unwrap_or_else(|e| panic!("load failed: {e}"));
 
-        let tokens = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
         let mut cache = model.make_cache();
-        let logits = model
-            .forward(&tokens, None, &mut cache)
-            .unwrap_or_else(|e| panic!("forward failed: {e}"));
+        let mut step = |tokens: &[i32], label: &str| {
+            let len = i32::try_from(tokens.len()).unwrap();
+            let batch = Array::from_slice(tokens, &[1, len]);
+            let logits = model
+                .forward(&batch, None, &mut cache)
+                .unwrap_or_else(|e| panic!("{label} forward failed: {e}"));
 
-        // `forward` returns the logits of the last position only.
-        let vocab = *logits.shape().last().unwrap();
-        assert_eq!(logits.shape(), [1, 1, vocab]);
-        let peak = logits.abs().unwrap().max(None).unwrap().item::<f32>();
-        assert!(peak.is_finite() && peak > 0.0, "logits degenerate: {peak}");
+            // `forward` returns the logits of the last position only.
+            let vocab = *logits.shape().last().unwrap();
+            assert_eq!(logits.shape(), [1, 1, vocab], "{label}");
+            let peak = logits.abs().unwrap().max(None).unwrap().item::<f32>();
+            assert!(
+                peak.is_finite() && peak > 0.0,
+                "{label} logits degenerate: {peak}"
+            );
+        };
+        step(&[1, 2, 3, 4, 5], "prefill");
+        step(&[6], "decode");
     }
 
     #[test]
@@ -2710,6 +2779,186 @@ mod tests {
             diff <= 2e-3 * scale,
             "gather kernel diverges: {diff} vs scale {scale}"
         );
+    }
+
+    /// Give the largest relative gap between two arrays of the same shape.
+    ///
+    /// The scale is the largest magnitude of the reference. Thus the result
+    /// compares against the value range of the reference, not against zero.
+    fn max_rel_gap(got: &Array, want: &Array) -> f32 {
+        let g = got.as_slice::<f32>();
+        let w = want.as_slice::<f32>();
+        assert_eq!(g.len(), w.len());
+        let diff = g
+            .iter()
+            .zip(w)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let scale = w.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        if scale > 0.0 { diff / scale } else { diff }
+    }
+
+    /// The trellis GEMM must agree with the scratch path it replaces.
+    ///
+    /// Both paths compute `y_pre = xh @ Ŵ`. They differ in the accumulation
+    /// order and in the activation dtype: the scratch path rounds `xh` and
+    /// the product to f16, and the GEMM holds f32 until the store. Thus the
+    /// gate is a relative error, not equality.
+    ///
+    /// The configurations cover both rates of the release and both release
+    /// shapes with 256 experts. The last configuration has an output size
+    /// that is not a multiple of the column block of the kernel. No
+    /// checkpoint has that shape, because the Hadamard block of 128 divides
+    /// every axis. It reaches the kernel only through a hand-built
+    /// [`EschaSpec`], and it holds the column guard of the decode under test.
+    ///
+    /// The row list is 70 rows: 33 of one expert, 1 of a second, 36 of the
+    /// highest expert index. That covers a row count that is not a multiple
+    /// of the row block, a run of one row, a block that spans three experts,
+    /// and a partial trailing block. The second pass over the same rows uses
+    /// an unsorted order.
+    #[test]
+    fn eschamoe_gather_qgemm_matches_scratch_matmul() {
+        let _exec = crate::mlx_exec::acquire();
+        const ROWS: usize = 70;
+
+        for &(k, in_f, out_f, experts) in &[
+            (2usize, 2048, 1024, 256),
+            (3usize, 512, 2048, 256),
+            (3usize, 32, 48, 4),
+        ] {
+            let g = synth_group(Some(experts), k, in_f, out_f);
+            let s = EschaSpec {
+                k,
+                mcg: true,
+                num_experts: experts,
+                in_features: in_f,
+                out_features: out_f,
+            };
+            let proj =
+                EschaProj::new(g.code.clone(), &g.rin, &g.rout, &g.s_in, &g.s_out, s).unwrap();
+
+            let (a, b, c) = (
+                0u32,
+                u32::try_from(experts / 2).unwrap(),
+                u32::try_from(experts - 1).unwrap(),
+            );
+            let mut sorted: Vec<u32> = Vec::with_capacity(ROWS);
+            sorted.resize(33, a);
+            sorted.push(b);
+            sorted.resize(ROWS, c);
+            // 37 and 70 are coprime, so the stride gives a permutation.
+            let shuffled: Vec<u32> = (0..ROWS).map(|i| sorted[(i * 37) % ROWS]).collect();
+
+            let rows = i32::try_from(ROWS).unwrap();
+            let x_vals: Vec<f32> = pseudo_random(ROWS * in_f as usize, 0x6E33 ^ k as u64)
+                .into_iter()
+                .map(|v| f32::from(v) / 32768.0 - 1.0)
+                .collect();
+            let x = Array::from_slice(&x_vals, &[rows, in_f]);
+
+            for (ids, order) in [(&sorted, "sorted"), (&shuffled, "unsorted")] {
+                let label = format!("K={k} {in_f}x{out_f} {order}");
+                let eids = Array::from_slice(ids, &[rows]);
+
+                let want = proj.scratch_matmul(&x, &eids).unwrap();
+                let got =
+                    crate::metal_kernel::eschamoe_gather_qgemm(&x, &proj.code, &eids, &proj.spec)
+                        .unwrap();
+                assert_eq!(got.shape(), [rows, out_f], "{label}");
+                assert_eq!(got.dtype(), Dtype::Float32, "{label}");
+                let rel = max_rel_gap(&got, &want);
+                eprintln!("qgemm {label}: max |gemm - scratch| / scale = {rel}");
+                assert!(rel <= 1e-3, "{label}: relative gap {rel} exceeds 1e-3");
+            }
+
+            // The dispatch of `gather_forward`. The two prefill paths must
+            // agree through the Hadamard and the channel scales as well. The
+            // Hadamard needs both axes to be a multiple of its block, so the
+            // guard configuration above stops at the kernel comparison.
+            if in_f % HAD_BLOCK == 0 && out_f % HAD_BLOCK == 0 {
+                let eids = Array::from_slice(&shuffled, &[rows]);
+                let scratch = proj.gather_forward_mode(&x, &eids, false).unwrap();
+                let gemm = proj.gather_forward_mode(&x, &eids, true).unwrap();
+                let rel = max_rel_gap(&gemm, &scratch);
+                eprintln!("qgemm K={k} {in_f}x{out_f} forward: relative gap = {rel}");
+                assert!(rel <= 1e-3, "forward dispatch: relative gap {rel}");
+            }
+        }
+    }
+
+    /// Time the two prefill paths at the shape of one release layer.
+    ///
+    /// Set `HIGGS_ESCHA_GEMM_BENCH` to run. The row count is one chunk of
+    /// 1024 tokens at top_k 8. The run needs a GPU and about 1.5 GB.
+    ///
+    /// Two id patterns run. `even` gives every expert exactly 32 rows, which
+    /// lines each run up with the row block of the kernel. `ragged` varies
+    /// the run length around 32, which is what a router gives. The ragged
+    /// pattern is the honest number: a block that spans two experts takes two
+    /// passes over the input axis.
+    #[test]
+    fn eschamoe_gather_qgemm_bench() {
+        if std::env::var("HIGGS_ESCHA_GEMM_BENCH").is_err() {
+            return;
+        }
+        let _exec = crate::mlx_exec::acquire();
+        const ROWS: i32 = 8192;
+        const REPS: u32 = 3;
+
+        // Sorted ids with run lengths that vary around 8192 / 256.
+        let ragged: Vec<u32> = {
+            let jitter = pseudo_random(256, 0x2A17);
+            let mut ids = Vec::with_capacity(ROWS as usize);
+            for (e, j) in jitter.iter().enumerate() {
+                let len = 32i32 + i32::from(j % 21) - 10;
+                let id = u32::try_from(e).unwrap();
+                for _ in 0..len.max(1) {
+                    if i32::try_from(ids.len()).unwrap() < ROWS {
+                        ids.push(id);
+                    }
+                }
+            }
+            ids.resize(ROWS as usize, 255);
+            ids
+        };
+        let even: Vec<u32> = (0..ROWS).map(|i| u32::try_from(i / 32).unwrap()).collect();
+
+        for &(name, k, in_f, out_f) in
+            &[("gate_up", 2usize, 2048, 1024), ("down", 3usize, 512, 2048)]
+        {
+            let g = synth_group(Some(256), k, in_f, out_f);
+            let s = g.as_group().spec().unwrap();
+            let proj =
+                EschaProj::new(g.code.clone(), &g.rin, &g.rout, &g.s_in, &g.s_out, s).unwrap();
+            let x_vals: Vec<f32> = pseudo_random(ROWS as usize * in_f as usize, 0xB0DE)
+                .into_iter()
+                .map(|v| f32::from(v) / 32768.0 - 1.0)
+                .collect();
+            let x = Array::from_slice(&x_vals, &[ROWS, in_f]);
+
+            for (ids, order) in [(&even, "even"), (&ragged, "ragged")] {
+                let eids = Array::from_slice(ids, &[ROWS]);
+                let time = |label: &str, run: &dyn Fn() -> Array| {
+                    let warm = run();
+                    crate::mlx_exec::eval([&warm]).unwrap();
+                    let start = std::time::Instant::now();
+                    for _ in 0..REPS {
+                        let y = run();
+                        crate::mlx_exec::eval([&y]).unwrap();
+                    }
+                    let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(REPS);
+                    eprintln!("bench {name} {in_f}x{out_f} {order} {label}: {ms:.2} ms");
+                    ms
+                };
+                let scratch = time("scratch", &|| proj.scratch_matmul(&x, &eids).unwrap());
+                let gemm = time("qgemm", &|| {
+                    crate::metal_kernel::eschamoe_gather_qgemm(&x, &proj.code, &eids, &proj.spec)
+                        .unwrap()
+                });
+                eprintln!("bench {name} {order}: speedup {:.2}x", scratch / gemm);
+            }
+        }
     }
 }
 

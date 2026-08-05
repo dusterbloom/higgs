@@ -8367,8 +8367,21 @@ impl Qwen3NextCausalLM {
         };
 
         // HIGGS_PROFILE=1: instrument per-layer timing with eval barriers.
-        // Samples layers 0-3 (3 GDN + 1 FA), extrapolates to all 64 layers.
+        // Samples one full-attention cycle (the leading GDN layers plus the
+        // first FA layer) and extrapolates to this model's real layer counts,
+        // which depend on `full_attention_interval` and `num_hidden_layers`.
         let profiling = std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1") && T == 1;
+        let prof_fa_layers = self.model.layers.iter().filter(|l| !l.is_linear).count();
+        let prof_gdn_layers = self.model.layers.len() - prof_fa_layers;
+        // Sample through the first FA layer so both layer types are covered for
+        // any interval. Zero when the stack has no FA layer, in which case the
+        // report below is skipped anyway.
+        let prof_sample_layers = self
+            .model
+            .layers
+            .iter()
+            .position(|l| !l.is_linear)
+            .map_or(0, |idx| idx + 1);
         let mut prof_gdn_attn_ns: u128 = 0;
         let mut prof_gdn_mlp_ns: u128 = 0;
         let mut prof_fa_attn_ns: u128 = 0;
@@ -8392,7 +8405,7 @@ impl Qwen3NextCausalLM {
                 fa_mask.as_ref()
             };
 
-            let sample_this = profiling && layer_idx < 4;
+            let sample_this = profiling && layer_idx < prof_sample_layers;
             let t0 = if sample_this {
                 mlx_rs::transforms::eval([&h])?;
                 Some(std::time::Instant::now())
@@ -8489,15 +8502,19 @@ impl Qwen3NextCausalLM {
                 let gdn_mlp_avg = prof_gdn_mlp_ns as f64 / f64::from(prof_gdn_samples);
                 let fa_attn_avg = prof_fa_attn_ns as f64 / f64::from(prof_fa_samples);
                 let fa_mlp_avg = prof_fa_mlp_ns as f64 / f64::from(prof_fa_samples);
-                let est_total =
-                    (gdn_attn_avg + gdn_mlp_avg).mul_add(48.0, (fa_attn_avg + fa_mlp_avg) * 16.0);
+                let est_total = (gdn_attn_avg + gdn_mlp_avg).mul_add(
+                    prof_gdn_layers as f64,
+                    (fa_attn_avg + fa_mlp_avg) * prof_fa_layers as f64,
+                );
                 tracing::info!(
+                    gdn_layers = prof_gdn_layers,
+                    fa_layers = prof_fa_layers,
                     gdn_attn_ms = format!("{:.2}", gdn_attn_avg / 1e6),
                     gdn_mlp_ms = format!("{:.2}", gdn_mlp_avg / 1e6),
                     fa_attn_ms = format!("{:.2}", fa_attn_avg / 1e6),
                     fa_mlp_ms = format!("{:.2}", fa_mlp_avg / 1e6),
                     est_total_ms = format!("{:.1}", est_total / 1e6),
-                    "PROFILE: per-layer avg (×48 GDN + ×16 FA)"
+                    "PROFILE: per-layer avg (×{prof_gdn_layers} GDN + ×{prof_fa_layers} FA)"
                 );
             }
         }

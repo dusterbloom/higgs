@@ -540,12 +540,16 @@ fn create_escha_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 static ESCHA_QMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 /// Check the gather inputs. Give the row count and the tile dims.
+///
+/// The `label` names the calling kernel in each error message. The matvec
+/// kernel and the GEMM kernel share the same input contract.
 #[allow(dead_code)]
 fn check_gather_inputs(
     xh: &Array,
     code: &Array,
     expert_ids: &Array,
     spec: &EschaSpec,
+    label: &str,
 ) -> Result<(i32, [i32; 3]), Exception> {
     let (tiles_k, tiles_n) = spec.tiles();
     let tile_dims = [
@@ -556,20 +560,20 @@ fn check_gather_inputs(
     let code_ok = matches!(code.shape(), &[_, a, b, c] if [a, b, c] == tile_dims);
     if code.dtype() != Dtype::Int16 || !code_ok {
         return Err(Exception::custom(format!(
-            "eschamoe_gather_qmv: code {:?} {:?} does not match [E, {tile_dims:?}] int16",
+            "{label}: code {:?} {:?} does not match [E, {tile_dims:?}] int16",
             code.dtype(),
             code.shape()
         )));
     }
     let &[rows, cols] = xh.shape() else {
         return Err(Exception::custom(format!(
-            "eschamoe_gather_qmv: xh has shape {:?}, not two dims",
+            "{label}: xh has shape {:?}, not two dims",
             xh.shape()
         )));
     };
     if xh.dtype() != Dtype::Float32 || cols != spec.in_features {
         return Err(Exception::custom(format!(
-            "eschamoe_gather_qmv: xh {:?} {:?} does not match [rows, {}] float32",
+            "{label}: xh {:?} {:?} does not match [rows, {}] float32",
             xh.dtype(),
             xh.shape(),
             spec.in_features
@@ -577,7 +581,7 @@ fn check_gather_inputs(
     }
     if expert_ids.dtype() != Dtype::Uint32 || expert_ids.shape() != [rows] {
         return Err(Exception::custom(format!(
-            "eschamoe_gather_qmv: expert_ids {:?} {:?} does not match [{rows}] uint32",
+            "{label}: expert_ids {:?} {:?} does not match [{rows}] uint32",
             expert_ids.dtype(),
             expert_ids.shape()
         )));
@@ -611,7 +615,7 @@ pub fn eschamoe_gather_qmv(
             "eschamoe_gather_qmv: K={k} out of range 1..=8"
         )));
     }
-    let (rows, tile_dims) = check_gather_inputs(xh, code, expert_ids, spec)?;
+    let (rows, tile_dims) = check_gather_inputs(xh, code, expert_ids, spec, "eschamoe_gather_qmv")?;
 
     let stream = Stream::task_local_or_default();
     let cached = ESCHA_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_escha_qmv_kernel()));
@@ -676,6 +680,431 @@ pub fn eschamoe_gather_qmv(
         } else {
             Err(Exception::custom(format!(
                 "eschamoe_gather_qmv failed: {}",
+                take_last_error()
+            )))
+        };
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Eschamoe trellis GEMM (prefill path).
+//
+// The matvec kernel above decodes one output column for one row. This kernel
+// decodes one output column block for a block of rows, so the decode cost
+// divides over the rows of the block. No dense weight reaches device memory.
+//
+// One threadgroup of `QGEMM_THREADS` threads owns a block of `QGEMM_BM` rows
+// and `QGEMM_BN` output columns. It walks the input axis one tile row at a
+// time. Each step decodes the eight 16 by 16 tiles of the block into
+// threadgroup memory, stages the matching activation slab, and runs a
+// register-tiled product of `RM` rows by `RN` columns for each thread. The
+// weight block holds 8 KB and the activation block 2 KB, which leaves room
+// for three threadgroups on one core.
+//
+// Rows of a block may name different experts. The threadgroup walks the
+// distinct experts of its block, one pass each. Rows outside the expert of the
+// pass stage a zero activation, so they gain nothing and need no branch.
+//
+// A pass costs the whole input axis, so an extra pass would double the work if
+// every thread joined it. It does not: a sorted id list splits a block between
+// experts at one row, so on an extra pass all but one of the eight row groups
+// hold no row of that expert and skip the product. Only the decode and the
+// staging repeat.
+//
+// The pass count is the same for every thread, so the barriers stay uniform.
+//
+// Two other forms measured worse. Holding the weight block in half rather than
+// float halves its size, and the per-element widening in the inner loop costs
+// more than the occupancy gains. Decoding a pair of experts into two weight
+// slots removes the repeat of the decode, but it does not pay: the decode per
+// output element is `slots / BM` either way, so the second slot only earns its
+// 8 KB back if `BN` shrinks to hold the space, which doubles the column blocks
+// and doubles the decode again.
+// ---------------------------------------------------------------------------
+
+/// Rows in one output block. Mirrors `BM` in the GEMM kernel source.
+const QGEMM_BM: i32 = 32;
+
+/// Output columns in one block. Mirrors `BN` in the GEMM kernel source.
+const QGEMM_BN: i32 = 128;
+
+/// Threads in one GEMM threadgroup. Mirrors `NT` in the GEMM kernel source,
+/// which must equal `BM / RM * BN / RN`.
+const QGEMM_THREADS: i32 = 128;
+
+#[allow(dead_code)]
+const ESCHA_QGEMM_KERNEL_SOURCE: &str = r#"
+constexpr int NT = 128;         // threads in the threadgroup
+constexpr int BM = 32;          // rows in a block
+constexpr int TNB = 8;          // tile columns in a block
+constexpr int BN = 16 * TNB;    // output columns in a block
+constexpr int RM = 4;           // rows one thread owns
+constexpr int RN = 8;           // columns one thread owns
+constexpr int CG = BN / RN;     // column groups, BM / RM * CG must equal NT
+constexpr int WORDS = 8 * K;    // 32-bit words in one packed tile
+constexpr int IN = TK * 16;
+constexpr int OUT = TN * 16;
+constexpr int XP = BM + 1;      // the pad keeps the staged rows off one bank
+constexpr int PAIRS = TNB * 128;    // code pairs in one tile row of a block
+constexpr uint RMASK = (1u << RM) - 1u;
+
+// The block must divide over the threads, and a thread must keep the same
+// code pair on every tile it decodes. The second holds when NT is a whole
+// number of the 128 pairs of one tile.
+static_assert(BM / RM * CG == NT, "the threads must cover the output block");
+static_assert(NT % 128 == 0, "a thread must own one code pair of every tile");
+static_assert(PAIRS % NT == 0, "the code pairs must divide over the threads");
+static_assert(BM * 16 % NT == 0, "the activation slab must divide over the threads");
+
+threadgroup float x_sh[16 * XP];
+threadgroup float w_sh[16 * BN];
+threadgroup uint e_sh[BM];
+
+uint tid = thread_index_in_threadgroup;
+uint rows = cb[4];
+uint row0 = threadgroup_position_in_grid.y * uint(BM);
+uint col0 = threadgroup_position_in_grid.x * uint(BN);
+uint nrow = min(uint(BM), rows - row0);
+
+if (tid < nrow) {
+    e_sh[tid] = eids[row0 + tid];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// The thread owns RM rows and RN columns of the block. CG threads share one
+// row group, so they read the same activation values as a broadcast and one
+// contiguous span of the weight block between them.
+uint rbase = (tid / uint(CG)) * uint(RM);
+uint cbase = (tid % uint(CG)) * uint(RN);
+
+float acc[RM][RN];
+for (uint i = 0u; i < uint(RM); ++i) {
+    for (uint j = 0u; j < uint(RN); ++j) {
+        acc[i][j] = 0.0f;
+    }
+}
+
+// The decode address math of this thread. A thread owns the same code pair
+// of every tile it touches, so the bit offsets and the two element slots
+// hold for the whole walk and leave the loops below.
+//
+// The pair index is tid % 128 and the tile column starts at tid / 128, since
+// the block holds TNB * 128 pairs and the threadgroup holds 256 threads.
+uint p = tid & 127u;
+uint tb0 = tid >> 7;
+
+// The bit offsets copy unpack_tile. The wrap term 256 * K comes before the
+// term -16. Thus the unsigned value stays 0 or more.
+uint b0 = 2u * p * uint(K) + uint(K) + 256u * uint(K) - 16u;
+uint b2 = b0 + uint(K) + 16u;
+uint i0 = (b0 / 32u) % uint(WORDS);
+uint i1w = (b2 - 1u) / 32u;
+uint s1 = (i1w + 1u) * 32u - b2;
+uint i1 = i1w % uint(WORDS);
+
+// The closed form of tile_perm gives the slot of the two elements inside a
+// tile. The tile column adds tb * 16 to the column at use.
+uint woff[2];
+for (uint e = 0u; e < 2u; ++e) {
+    uint i = 2u * p + e;
+    uint g = i >> 3;
+    uint ii = i & 3u;
+    uint r = (g % 4u) * 2u + (ii & 1u) + 8u * (ii >> 1);
+    uint c = g / 4u + 8u * ((i >> 2) & 1u);
+    woff[e] = r * uint(BN) + c;
+}
+
+// The activation slot of this thread. It is fixed for the same reason.
+uint xm = tid >> 4;
+uint xk = tid & 15u;
+uint tn0 = col0 / 16u;
+
+// The expert walk. Every thread reads the same e_sh and derives the same
+// mask, so the pass count is uniform across the threadgroup.
+uint valid = (nrow >= 32u) ? 0xFFFFFFFFu : ((1u << nrow) - 1u);
+uint done = 0u;
+
+while (done != valid) {
+    uint pending = valid & ~done;
+    uint cur = 0u;
+    uint live = 0u;
+    bool found = false;
+    for (uint m = 0u; m < nrow; ++m) {
+        if (((pending >> m) & 1u) == 0u) {
+            continue;
+        }
+        if (!found) {
+            cur = e_sh[m];
+            found = true;
+        }
+        if (e_sh[m] == cur) {
+            live |= 1u << m;
+        }
+    }
+    done |= live;
+
+    // Whether this thread holds a row of the pass. A sorted block splits
+    // between experts at one row, so on each extra pass most row groups are
+    // empty and skip the product below.
+    bool active = ((live >> rbase) & RMASK) != 0u;
+
+    // The packed tiles of this expert. A tile starts on a multiple of
+    // 16 * K shorts, which is a multiple of four bytes, so the 32-bit view
+    // of the words stays aligned.
+    const device uint* ecode = (const device uint*)(
+        code + ulong(cur) * ulong(TK) * ulong(TN) * ulong(16 * K));
+
+    for (uint tk = 0u; tk < uint(TK); ++tk) {
+        // The barrier closes the read of the previous step.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Stage the activation slab. A row outside the expert stages zero.
+        for (uint q = 0u; q < uint(BM) * 16u / uint(NT); ++q) {
+            uint m = xm + q * (uint(NT) / 16u);
+            float v = 0.0f;
+            if (((live >> m) & 1u) != 0u) {
+                v = xh[(row0 + m) * uint(IN) + tk * 16u + xk];
+            }
+            x_sh[xk * uint(XP) + m] = v;
+        }
+
+        // Decode the TNB tiles of this tile row. The bit math and the
+        // element order copy the tile decode kernel.
+        for (uint q = 0u; q < uint(PAIRS) / uint(NT); ++q) {
+            uint tb = tb0 + q * (uint(NT) / 128u);
+            uint tn = tn0 + tb;
+
+            uint w1 = 0u;
+            if (tn < uint(TN)) {
+                const device uint* tile =
+                    ecode + (tk * uint(TN) + tn) * uint(WORDS);
+
+                // The 64-bit funnel makes the shift safe when s1 is 0.
+                ulong bits = (ulong(tile[i0]) << 32) | ulong(tile[i1]);
+                w1 = uint(bits >> s1);
+
+                // The codebook hash. The half cast repeats the f16 round
+                // of the CPU decode.
+                uint h0 = ((w1 >> uint(K)) & 0xFFFFu) * cb[0] + cb[1];
+                uint h1 = (w1 & 0xFFFFu) * cb[0] + cb[1];
+                half2 v0 = as_type<half2>((h0 & cb[2]) ^ cb[3]);
+                half2 v1 = as_type<half2>((h1 & cb[2]) ^ cb[3]);
+                w_sh[woff[0] + tb * 16u] =
+                    float(half(float(v0.x) + float(v0.y)));
+                w_sh[woff[1] + tb * 16u] =
+                    float(half(float(v1.x) + float(v1.y)));
+            } else {
+                w_sh[woff[0] + tb * 16u] = 0.0f;
+                w_sh[woff[1] + tb * 16u] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active) {
+            for (uint kk = 0u; kk < 16u; ++kk) {
+                float a[RM];
+                float b[RN];
+                for (uint i = 0u; i < uint(RM); ++i) {
+                    a[i] = x_sh[kk * uint(XP) + rbase + i];
+                }
+                for (uint j = 0u; j < uint(RN); ++j) {
+                    b[j] = w_sh[kk * uint(BN) + cbase + j];
+                }
+                for (uint i = 0u; i < uint(RM); ++i) {
+                    for (uint j = 0u; j < uint(RN); ++j) {
+                        acc[i][j] = fma(a[i], b[j], acc[i][j]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+for (uint i = 0u; i < uint(RM); ++i) {
+    uint m = rbase + i;
+    if (m >= nrow) {
+        break;
+    }
+    for (uint j = 0u; j < uint(RN); ++j) {
+        uint n = col0 + cbase + j;
+        if (n < uint(OUT)) {
+            dst[(row0 + m) * uint(OUT) + n] = acc[i][j];
+        }
+    }
+}
+"#;
+
+#[allow(unsafe_code, dead_code)]
+fn create_escha_qgemm_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"xh", c"code", c"eids", c"cb"]);
+    let out_vec = cstr_vec(&[c"dst"]);
+    let source = CString::new(ESCHA_QGEMM_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_eschamoe_gather_qgemm".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,  // The tile pointer math needs row-contiguous inputs.
+            false, // atomic_outputs
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(dead_code)]
+static ESCHA_QGEMM_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+/// Multiply a block of activation rows with selected expert trellis weights.
+///
+/// The contract matches [`eschamoe_gather_qmv`]: `xh` is the `[rows, in]`
+/// float32 matrix that already carries the input scales and the input
+/// Hadamard of its expert, `code` is the full
+/// `[experts, tiles_k, tiles_n, 16 * K]` int16 trellis tensor, and
+/// `expert_ids` maps each row to one expert. The result is
+/// `y_pre = xh @ Ŵ` as a `[rows, out]` float32 matrix.
+///
+/// The two kernels differ in the reuse of the decode. The matvec kernel
+/// decodes one output column for one row, which suits a short row count. This
+/// kernel decodes one output column block for 32 rows, which suits prefill.
+/// Neither kernel writes a dense weight, and neither reads `expert_ids` on
+/// the host.
+///
+/// Sorted ids give the best speed: a block whose rows name one expert takes
+/// one pass. Unsorted ids stay correct and cost one pass for each distinct
+/// expert of the block.
+///
+/// Measured against the scratch path on an M4 with 10 GPU cores, at 8192 rows
+/// over 256 experts, which is one chunk of 1024 tokens at `top_k` 8:
+///
+/// | projection            | run lengths | scratch | this    | ratio |
+/// |-----------------------|-------------|---------|---------|-------|
+/// | `gate_up` 2048 x 1024 | all 32      | 37.2 ms | 24.2 ms | 1.54x |
+/// | `gate_up` 2048 x 1024 | 32 +- 10    | 40.0 ms | 36.9 ms | 1.09x |
+/// | down 512 x 2048       | all 32      | 20.6 ms | 13.0 ms | 1.58x |
+/// | down 512 x 2048       | 32 +- 10    | 20.3 ms | 18.4 ms | 1.11x |
+///
+/// A router gives the second row of each pair. The gap between the two rows
+/// is the pass repeat: at a mean run of 32 rows, a block of 32 rows spans two
+/// experts about as often as one, and the second pass repeats the decode.
+///
+/// The table comes from an idle machine. Two effects push the real gain above
+/// it. The `eids` of the measurement already sit in host memory, so the
+/// scratch path pays no wait for them, while in the model the array comes from
+/// a GPU argsort and the host read drains the queue once per layer. And the
+/// scratch path streams about 2 GB for each call, so it loses more than this
+/// kernel when the memory system is busy: with a model resident and serving,
+/// the same two ragged rows measured 1.6x to 1.9x rather than 1.1x.
+///
+// ponytail: the inner product is scalar fma, which reaches about 1.4 TFLOP/s
+// of the 3.6 TFLOP/s the chip gives. The next step is `simdgroup_matrix`, the
+// form the MLX GEMM kernels use. The decode and the block walk stay as they
+// are; only the product loop changes. Take it when the expert path is the
+// measured bottleneck: at 40 layers this path is under half of a prefill
+// chunk, so removing it entirely would not double prefill.
+#[allow(unsafe_code, dead_code)]
+pub fn eschamoe_gather_qgemm(
+    xh: &Array,
+    code: &Array,
+    expert_ids: &Array,
+    spec: &EschaSpec,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let [mul, add, mask, xor] = crate::eschamoe::gpu_codebook(spec).ok_or_else(|| {
+        Exception::custom("eschamoe_gather_qgemm: the codebook has no verified GPU decode")
+    })?;
+    let k = i32::try_from(spec.k).unwrap_or(0);
+    if !(1..=8).contains(&k) {
+        return Err(Exception::custom(format!(
+            "eschamoe_gather_qgemm: K={k} out of range 1..=8"
+        )));
+    }
+    let (rows, tile_dims) =
+        check_gather_inputs(xh, code, expert_ids, spec, "eschamoe_gather_qgemm")?;
+    let row_count = u32::try_from(rows)
+        .map_err(|_| Exception::custom("eschamoe_gather_qgemm: negative row count"))?;
+
+    let stream = Stream::task_local_or_default();
+    let cached = ESCHA_QGEMM_KERNEL.get_or_init(|| CachedMetalKernel(create_escha_qgemm_kernel()));
+    let out_shape = [rows, spec.out_features];
+    // The codebook constants and the row count travel in one uint32 input.
+    // A template value goes into the generated MSL function name, and a
+    // high-bit constant prints negative there. Refer to the note in
+    // eschamoe_dequant_tiles.
+    let cb_arr = Array::from_slice(&[mul, add, mask, xor, row_count], &[5]);
+
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"TK".as_ptr(),
+            tile_dims[0],
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"TN".as_ptr(),
+            tile_dims[1],
+        );
+        // One threadgroup covers QGEMM_BM rows and QGEMM_BN columns. The grid
+        // gives the total thread count on each axis.
+        let blocks_n = spec.out_features.div_euclid(QGEMM_BN)
+            + i32::from(spec.out_features.rem_euclid(QGEMM_BN) != 0);
+        let blocks_m = rows.div_euclid(QGEMM_BM) + i32::from(rows.rem_euclid(QGEMM_BM) != 0);
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config,
+            blocks_n * QGEMM_THREADS,
+            blocks_m,
+            1,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, QGEMM_THREADS, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
+
+        let input_ptrs = [
+            xh.as_ptr(),
+            code.as_ptr(),
+            expert_ids.as_ptr(),
+            cb_arr.as_ptr(),
+        ];
+        let inputs_vec = mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len());
+        let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+        let status = mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        );
+
+        let result = if status == 0 {
+            let mut out_ptr = mlx_sys::mlx_array_new();
+            let get_status = mlx_sys::mlx_vector_array_get(&raw mut out_ptr, outputs_vec, 0);
+            if get_status == 0 {
+                Ok(Array::from_ptr(out_ptr))
+            } else {
+                mlx_sys::mlx_array_free(out_ptr);
+                Err(Exception::custom(format!(
+                    "eschamoe_gather_qgemm: output read failed: {}",
+                    take_last_error()
+                )))
+            }
+        } else {
+            Err(Exception::custom(format!(
+                "eschamoe_gather_qgemm failed: {}",
                 take_last_error()
             )))
         };
