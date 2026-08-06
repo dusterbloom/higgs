@@ -464,7 +464,8 @@ async fn chat_completions_non_streaming(
 
     let (content, tool_calls, finish_reason) = if has_tools {
         let schema = higgs_engine::tool_parser::ToolSchema::from_tools(tools);
-        let parsed = higgs_engine::tool_parser::parse_tool_calls(&raw_text, schema.as_ref());
+        let parsed =
+            higgs_engine::tool_parser::parse_tool_calls(&raw_text, schema.as_ref());
         if parsed.tool_calls.is_empty() {
             (
                 Some(MessageContent::Text(raw_text)),
@@ -493,8 +494,14 @@ async fn chat_completions_non_streaming(
             (text, Some(calls), "tool_calls".to_owned())
         }
     } else {
+        // LFM2 / LFM2.5 emit `<|tool_call_start|>[func(args)]<|tool_call_end|>`
+        // spontaneously even on tool-less requests. Strip the delimiters so
+        // they don't reach the client as visible text.
+        let visible = raw_text
+            .replace("<|tool_call_start|>", "")
+            .replace("<|tool_call_end|>", "");
         (
-            Some(MessageContent::Text(raw_text)),
+            Some(MessageContent::Text(visible)),
             None,
             output.finish_reason,
         )
@@ -623,8 +630,14 @@ fn build_session_response(
             (text, Some(calls), "tool_calls".to_owned())
         }
     } else {
+        // LFM2 / LFM2.5 emit `<|tool_call_start|>[func(args)]<|tool_call_end|>`
+        // spontaneously even on tool-less requests. Strip the delimiters so
+        // they don't reach the client as visible text.
+        let visible = raw_text
+            .replace("<|tool_call_start|>", "")
+            .replace("<|tool_call_end|>", "");
         (
-            Some(MessageContent::Text(raw_text)),
+            Some(MessageContent::Text(visible)),
             None,
             generation_finish_reason,
         )
@@ -680,6 +693,10 @@ async fn chat_completions_stream(
     .await?;
 
     let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    // LFM2 / LFM2.5 emit `<|tool_call_start|>[func(args)]<|tool_call_end|>`
+    // spontaneously even on tool-less requests; strip the delimiters from
+    // visible streaming text when tools are absent.
+    let strip_lfm2_delimiters = !stream_includes_tools;
     // Built here (before the `async_stream::stream!` block, which captures by
     // move) so the tracker can coerce XML-format tool-call values to their
     // declared JSON types.
@@ -983,9 +1000,16 @@ async fn chat_completions_stream(
             }
 
             if !tool_out.visible.is_empty() {
+                let visible = if strip_lfm2_delimiters {
+                    tool_out.visible
+                        .replace("<|tool_call_start|>", "")
+                        .replace("<|tool_call_end|>", "")
+                } else {
+                    tool_out.visible
+                };
                 let d = ChatCompletionDelta {
                     role: None,
-                    content: Some(tool_out.visible),
+                    content: Some(visible),
                     reasoning_content: None,
                     tool_calls: None,
                 };
@@ -1056,9 +1080,16 @@ async fn chat_completions_stream(
             emit_delta!(&d, None, None);
         }
         if !flush_tool_out.visible.is_empty() {
+            let visible = if strip_lfm2_delimiters {
+                flush_tool_out.visible
+                    .replace("<|tool_call_start|>", "")
+                    .replace("<|tool_call_end|>", "")
+            } else {
+                flush_tool_out.visible
+            };
             let d = ChatCompletionDelta {
                 role: None,
-                content: Some(flush_tool_out.visible),
+                content: Some(visible),
                 reasoning_content: None,
                 tool_calls: None,
             };
@@ -1066,9 +1097,16 @@ async fn chat_completions_stream(
         }
         let final_tool_out = tool_tracker.flush();
         if !final_tool_out.visible.is_empty() {
+            let visible = if strip_lfm2_delimiters {
+                final_tool_out.visible
+                    .replace("<|tool_call_start|>", "")
+                    .replace("<|tool_call_end|>", "")
+            } else {
+                final_tool_out.visible
+            };
             let d = ChatCompletionDelta {
                 role: None,
-                content: Some(final_tool_out.visible),
+                content: Some(visible),
                 reasoning_content: None,
                 tool_calls: None,
             };

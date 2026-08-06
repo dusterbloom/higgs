@@ -11948,14 +11948,17 @@ const MAX_DETOK_WINDOW: usize = 64;
 /// by the non-streaming decode path ([`SimpleEngine::decode_tokens`]) and the
 /// streaming detokenizer ([`IncrementalDetok`]) so the two strip identically.
 ///
-/// The `<|…|>` shape alone is NOT sufficient to call a token control: LFM2.5
-/// registers `<|tool_call_start|>` / `<|tool_call_end|>` with `special = false`
-/// precisely because they carry content, while marking `<|im_start|>` and
-/// `<|tool_list_start|>` special. Stripping by shape deleted the delimiters
-/// before [`crate::tool_parser::parse_tool_calls`] could see them, so every
-/// LFM2 tool call surfaced as a bare `[func(args)]` string in the assistant
-/// content and no `tool_calls` were ever emitted. The tokenizer's own
-/// `special` flag is the model's answer to this question — honour it.
+/// The `<|…|>` shape signals a control token. We strip all of them by
+/// default except for a small allowlist of content-bearing delimiters that
+/// the tool-call parser needs to see:
+///
+/// - `<|tool_call_start|>` / `<|tool_call_end|>` — LFM2/LFM2.5 tool-call
+///   markup. These are registered with `special = false` by the tokenizer
+///   because they carry content, but Qwen-family tokenizers also register
+///   `<|fim_prefix|>`, `<|fim_middle|>`, `<|fim_suffix|>`, `<|fim_pad|>`,
+///   `<|repo_name|>`, and `<|file_sep|>` with `special = false`. Trusting
+///   the flag leaks FIM/repo tokens into visible content. Invert the
+///   default: everything `<|…|>` is control unless explicitly allowlisted.
 pub(crate) fn content_preserving_skip_ids(
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
@@ -11963,7 +11966,11 @@ pub(crate) fn content_preserving_skip_ids(
     let mut ids: std::collections::HashSet<u32> = eos_token_ids.iter().copied().collect();
     for (id, added) in tokenizer.get_added_tokens_decoder() {
         let content = added.content.as_str();
-        let is_control = (added.special && content.starts_with("<|") && content.ends_with("|>"))
+        let is_content_delimiter = matches!(
+            content,
+            "<|tool_call_start|>" | "<|tool_call_end|>"
+        );
+        let is_control = (content.starts_with("<|") && content.ends_with("|>") && !is_content_delimiter)
             || matches!(content, "<s>" | "</s>" | "<pad>" | "<unk>" | "<mask>");
         if is_control {
             ids.insert(id);
@@ -16310,11 +16317,11 @@ mod tests {
         );
     }
 
-    /// LFM2.5 registers `<|tool_call_start|>` / `<|tool_call_end|>` with
-    /// `special = false` because they carry content, while `<|im_start|>` and
-    /// `<|tool_list_start|>` are special. Classifying by the `<|…|>` shape alone
-    /// stripped the tool-call delimiters before the parser ran, so every LFM2
-    /// tool call arrived as a bare `[func(args)]` string with no `tool_calls`.
+    /// Tool-call delimiters reach the parser; everything else `<|…|>` is
+    /// stripped regardless of the tokenizer's `special` flag. Qwen-family
+    /// tokenizers register `<|fim_prefix|>`, `<|fim_middle|>`, `<|fim_suffix|>`,
+    /// `<|fim_pad|>`, `<|repo_name|>`, and `<|file_sep|>` with `special = false`
+    /// — if we trusted the flag those would leak into visible content.
     #[test]
     fn skip_ids_keep_non_special_pipe_delimited_tool_markup() {
         let mut tok = Tokenizer::new(tokenizers::models::bpe::BPE::default());
@@ -16325,15 +16332,33 @@ mod tests {
         let _ = tok.add_tokens([
             tokenizers::AddedToken::from("<|tool_call_start|>", false),
             tokenizers::AddedToken::from("<|tool_call_end|>", false),
+            // Qwen FIM tokens: special=false but still control, must be stripped.
+            tokenizers::AddedToken::from("<|fim_prefix|>", false),
+            tokenizers::AddedToken::from("<|fim_middle|>", false),
+            tokenizers::AddedToken::from("<|fim_suffix|>", false),
+            tokenizers::AddedToken::from("<|fim_pad|>", false),
+            tokenizers::AddedToken::from("<|repo_name|>", false),
+            tokenizers::AddedToken::from("<|file_sep|>", false),
         ]);
         let skip = super::content_preserving_skip_ids(&tok, &[]);
 
-        for control in ["<|im_start|>", "<|tool_list_start|>"] {
+        // Control tokens (special=true or not allowlisted) → stripped.
+        for control in [
+            "<|im_start|>",
+            "<|tool_list_start|>",
+            "<|fim_prefix|>",
+            "<|fim_middle|>",
+            "<|fim_suffix|>",
+            "<|fim_pad|>",
+            "<|repo_name|>",
+            "<|file_sep|>",
+        ] {
             assert!(
                 skip.contains(&tok.token_to_id(control).unwrap()),
-                "{control} is special — still stripped"
+                "{control} must be stripped (control, not content)"
             );
         }
+        // Content-bearing tool-call delimiters → not stripped.
         for markup in ["<|tool_call_start|>", "<|tool_call_end|>"] {
             assert!(
                 !skip.contains(&tok.token_to_id(markup).unwrap()),
