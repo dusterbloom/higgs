@@ -479,6 +479,15 @@ impl Lfm2CausalLM {
     pub fn forward(
         &mut self,
         inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        self.forward_hidden(inputs, mask, cache)
+    }
+
+    pub fn forward_hidden(
+        &mut self,
+        inputs: &Array,
         _mask: Option<&Array>,
         cache: &mut Vec<Option<LayerCache>>,
     ) -> Result<Array, Exception> {
