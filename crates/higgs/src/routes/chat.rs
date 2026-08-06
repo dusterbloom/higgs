@@ -882,6 +882,10 @@ async fn chat_completions_stream(
         };
         emit_delta!(&role_delta, None, None);
 
+        // When thinking is enabled, the template added <think> so we start
+        // inside it. When disabled, start in content mode — the tracker will
+        // still detect and strip any <think> tags the model generates, routing
+        // all output (reasoning + answer) to content via the flag below.
         let mut reasoning_tracker = if thinking_enabled_stream {
             higgs_engine::reasoning_parser::StreamingReasoningTracker::new_inside_think()
         } else {
@@ -939,15 +943,15 @@ async fn chat_completions_stream(
             let (visible, reasoning) = reasoning_tracker.process(&output.new_text);
 
             if !reasoning.is_empty() {
-                let (rc, rr) = if thinking_enabled_stream {
+                let (content, reasoning_content) = if thinking_enabled_stream {
                     (None, Some(reasoning))
                 } else {
                     (Some(reasoning), None)
                 };
                 let d = ChatCompletionDelta {
                     role: None,
-                    content: rc,
-                    reasoning_content: rr,
+                    content,
+                    reasoning_content,
                     tool_calls: None,
                 };
                 emit_delta!(&d, None, None);
@@ -1020,15 +1024,15 @@ async fn chat_completions_stream(
         // Flush any remaining buffered content.
         let (flush_vis, flush_reas) = reasoning_tracker.flush();
         if !flush_reas.is_empty() {
-            let (fc, fr) = if thinking_enabled_stream {
+            let (content, reasoning_content) = if thinking_enabled_stream {
                 (None, Some(flush_reas))
             } else {
                 (Some(flush_reas), None)
             };
             let d = ChatCompletionDelta {
                 role: None,
-                content: fc,
-                reasoning_content: fr,
+                content,
+                reasoning_content,
                 tool_calls: None,
             };
             emit_delta!(&d, None, None);
