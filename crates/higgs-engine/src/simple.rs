@@ -11947,6 +11947,15 @@ const MAX_DETOK_WINDOW: usize = 64;
 /// so they survive decoding and reach the tool-call / reasoning parsers. Shared
 /// by the non-streaming decode path ([`SimpleEngine::decode_tokens`]) and the
 /// streaming detokenizer ([`IncrementalDetok`]) so the two strip identically.
+///
+/// The `<|…|>` shape alone is NOT sufficient to call a token control: LFM2.5
+/// registers `<|tool_call_start|>` / `<|tool_call_end|>` with `special = false`
+/// precisely because they carry content, while marking `<|im_start|>` and
+/// `<|tool_list_start|>` special. Stripping by shape deleted the delimiters
+/// before [`crate::tool_parser::parse_tool_calls`] could see them, so every
+/// LFM2 tool call surfaced as a bare `[func(args)]` string in the assistant
+/// content and no `tool_calls` were ever emitted. The tokenizer's own
+/// `special` flag is the model's answer to this question — honour it.
 pub(crate) fn content_preserving_skip_ids(
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
@@ -11954,7 +11963,7 @@ pub(crate) fn content_preserving_skip_ids(
     let mut ids: std::collections::HashSet<u32> = eos_token_ids.iter().copied().collect();
     for (id, added) in tokenizer.get_added_tokens_decoder() {
         let content = added.content.as_str();
-        let is_control = (content.starts_with("<|") && content.ends_with("|>"))
+        let is_control = (added.special && content.starts_with("<|") && content.ends_with("|>"))
             || matches!(content, "<s>" | "</s>" | "<pad>" | "<unk>" | "<mask>");
         if is_control {
             ids.insert(id);
@@ -16299,6 +16308,38 @@ mod tests {
             !skip.contains(&tok.token_to_id("<tool_call>").unwrap()),
             "<tool_call> preserved"
         );
+    }
+
+    /// LFM2.5 registers `<|tool_call_start|>` / `<|tool_call_end|>` with
+    /// `special = false` because they carry content, while `<|im_start|>` and
+    /// `<|tool_list_start|>` are special. Classifying by the `<|…|>` shape alone
+    /// stripped the tool-call delimiters before the parser ran, so every LFM2
+    /// tool call arrived as a bare `[func(args)]` string with no `tool_calls`.
+    #[test]
+    fn skip_ids_keep_non_special_pipe_delimited_tool_markup() {
+        let mut tok = Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        let _ = tok.add_special_tokens([
+            tokenizers::AddedToken::from("<|im_start|>", true),
+            tokenizers::AddedToken::from("<|tool_list_start|>", true),
+        ]);
+        let _ = tok.add_tokens([
+            tokenizers::AddedToken::from("<|tool_call_start|>", false),
+            tokenizers::AddedToken::from("<|tool_call_end|>", false),
+        ]);
+        let skip = super::content_preserving_skip_ids(&tok, &[]);
+
+        for control in ["<|im_start|>", "<|tool_list_start|>"] {
+            assert!(
+                skip.contains(&tok.token_to_id(control).unwrap()),
+                "{control} is special — still stripped"
+            );
+        }
+        for markup in ["<|tool_call_start|>", "<|tool_call_end|>"] {
+            assert!(
+                !skip.contains(&tok.token_to_id(markup).unwrap()),
+                "{markup} is content — must reach the tool parser"
+            );
+        }
     }
 
     #[test]
