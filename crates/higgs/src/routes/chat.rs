@@ -936,17 +936,18 @@ async fn chat_completions_stream(
                 .as_ref()
                 .map(|lp| logprobs_to_response(std::slice::from_ref(lp), &tokenizer));
 
-            let (visible, reasoning) = if thinking_enabled_stream {
-                reasoning_tracker.process(&output.new_text)
-            } else {
-                (output.new_text.clone(), String::new())
-            };
+            let (visible, reasoning) = reasoning_tracker.process(&output.new_text);
 
             if !reasoning.is_empty() {
+                let (rc, rr) = if thinking_enabled_stream {
+                    (None, Some(reasoning))
+                } else {
+                    (Some(reasoning), None)
+                };
                 let d = ChatCompletionDelta {
                     role: None,
-                    content: None,
-                    reasoning_content: Some(reasoning),
+                    content: rc,
+                    reasoning_content: rr,
                     tool_calls: None,
                 };
                 emit_delta!(&d, None, None);
@@ -1019,10 +1020,15 @@ async fn chat_completions_stream(
         // Flush any remaining buffered content.
         let (flush_vis, flush_reas) = reasoning_tracker.flush();
         if !flush_reas.is_empty() {
+            let (fc, fr) = if thinking_enabled_stream {
+                (None, Some(flush_reas))
+            } else {
+                (Some(flush_reas), None)
+            };
             let d = ChatCompletionDelta {
                 role: None,
-                content: None,
-                reasoning_content: Some(flush_reas),
+                content: fc,
+                reasoning_content: fr,
                 tool_calls: None,
             };
             emit_delta!(&d, None, None);
