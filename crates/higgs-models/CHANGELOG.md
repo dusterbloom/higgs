@@ -1,5 +1,59 @@
 # Changelog
 
+## [2.0.0](https://github.com/dusterbloom/higgs/compare/higgs-models-v1.6.1...higgs-models-v2.0.0) (2026-08-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* higgs start is now config/profile-only, attach is a strict daemon dashboard, shellenv/exec fail fast on invalid or unreachable targets, and exact local model matches now take precedence over regex routes.
+
+### Features
+
+* add qwen3.5/qwen3.6 turboquant stack ([4f165ee](https://github.com/dusterbloom/higgs/commit/4f165eeca1166ac1d1b62cbaf523b83d344b9a22))
+* **bonsai-q1:** packed engine scaffold with upstream MLX guard ([#142](https://github.com/dusterbloom/higgs/issues/142)) ([fe43aab](https://github.com/dusterbloom/higgs/commit/fe43aabe44104ab285e19e8ff73c724c0875cbe0))
+* **bonsai:** run Bonsai-Q1 bits=1 on vanilla MLX via JIT qmv_fast kernels (no mlx-rs fork) ([#182](https://github.com/dusterbloom/higgs/issues/182)) ([b604754](https://github.com/dusterbloom/higgs/commit/b604754cab79f3f91a95d863324db46e8765e14a))
+* **cache:** AnyCache::trim_by dispatcher for spec-decode rollback ([#143](https://github.com/dusterbloom/higgs/issues/143)) ([229c111](https://github.com/dusterbloom/higgs/commit/229c1110f2da4c3d93ac79c8f28c2435e0c97aad))
+* enable MiniCPM5-1B (explicit head_dim + special-token decode + tojson kwarg + tool parser) ([#176](https://github.com/dusterbloom/higgs/issues/176)) ([05464e2](https://github.com/dusterbloom/higgs/commit/05464e22fd67a713ccf8a42d6547fab260d401cb))
+* harden CLI, dashboard, routing, and MLX runtime ([4dfc930](https://github.com/dusterbloom/higgs/commit/4dfc930365ec1d8eb8143508fe63c41b21001ba1))
+* **models:** add Gemma 3 and Gemma 4 inference support ([4f301fc](https://github.com/dusterbloom/higgs/commit/4f301fcc0d45e2922df4203149f05a24a9f46ae6))
+* **qwen3_next:** mixed-bit Qwen3.5 GDN BA loading fallback ([#148](https://github.com/dusterbloom/higgs/issues/148)) ([cc18616](https://github.com/dusterbloom/higgs/commit/cc186160756c9d5741fc18baecbacd3666eeacf3))
+* Qwen3.5 model architecture, TurboQuant KV cache, and model-level optimizations ([1514737](https://github.com/dusterbloom/higgs/commit/1514737d4e1fb108c68b3150e9104aae5b20f400))
+* **qwen35:** Qwen3.6 MoE MTP speculative decode + checkpoint memory-safety fix ([#183](https://github.com/dusterbloom/higgs/issues/183)) ([4989955](https://github.com/dusterbloom/higgs/commit/49899557c5e4fef561c6d79ab957ad0656f486ab))
+* **serve:** stream prefill progress (llama.cpp-compatible prompt_progress) ([#184](https://github.com/dusterbloom/higgs/issues/184)) ([e7b2c8a](https://github.com/dusterbloom/higgs/commit/e7b2c8a41689c7e8e1f1fc4d657a4fa17bba2a96))
+
+
+### Bug Fixes
+
+* address coderabbit issues ([6f10bc6](https://github.com/dusterbloom/higgs/commit/6f10bc6d733c192d30c5ab3aed76e4a2e2a69818))
+* address review items across models and engine — PR [#74](https://github.com/dusterbloom/higgs/issues/74) ([8863e2d](https://github.com/dusterbloom/higgs/commit/8863e2d11dacbdada6e560556813c051bf265d8b))
+* align turboquant tests with rand 0.10 ([d0617c4](https://github.com/dusterbloom/higgs/commit/d0617c495f4d81f941492c247e45c4b91c996236))
+* **bonsai:** apply causal mask during prefill ([#203](https://github.com/dusterbloom/higgs/issues/203)) ([ecd78e5](https://github.com/dusterbloom/higgs/commit/ecd78e58c959d375715dec16bbd3551a09c487f3))
+* cargo fmt + restore higgs crate build on PR [#74](https://github.com/dusterbloom/higgs/issues/74) ([050af95](https://github.com/dusterbloom/higgs/commit/050af9590968c129dc8f0a5003d4af47f6591da5))
+* clear lint and review blockers ([9c8b878](https://github.com/dusterbloom/higgs/commit/9c8b878bb654ba8865f3455c91ba457b83d1161b))
+* **deps:** update rust crate safetensors to 0.7 ([#151](https://github.com/dusterbloom/higgs/issues/151)) ([a177ef6](https://github.com/dusterbloom/higgs/commit/a177ef6ce08508a08fa20ab9be4175d3a3a77476))
+* **deps:** update rust crate safetensors to 0.8 ([#201](https://github.com/dusterbloom/higgs/issues/201)) ([27d20e2](https://github.com/dusterbloom/higgs/commit/27d20e2bc8bd4daba65b7ed29c2558ef9ae554a0))
+* **engine,models:** cache config propagation, ndim guards, FSM ordering ([37d2ddd](https://github.com/dusterbloom/higgs/commit/37d2ddd3c222614373f9ee3c49b43e5e69e35c62))
+* **engine,models:** clippy clean lib targets on PR [#74](https://github.com/dusterbloom/higgs/issues/74) (51→0 errors) ([ebf3192](https://github.com/dusterbloom/higgs/commit/ebf319238ed9a79c8efc18bba6b0fbfc6b98f3e3))
+* gate rng import to tests ([1161eaa](https://github.com/dusterbloom/higgs/commit/1161eaa5c81f11fd736527525abcf2327e604e48))
+* honor qwen3 next gate quantization ([00958e1](https://github.com/dusterbloom/higgs/commit/00958e1687201e9ed02875dd606bcfb406ab08ed))
+* make pre-push pass on dust stack ([2695165](https://github.com/dusterbloom/higgs/commit/26951659aa8ff56d0362a6916827dbe9cf6fae88))
+* **models:** clippy clean for higgs-models on PR [#74](https://github.com/dusterbloom/higgs/issues/74) (part 2/2) ([1b4470b](https://github.com/dusterbloom/higgs/commit/1b4470bd7e286c259cf03a63f34fa1a773d9642a))
+* **models:** clippy clean in 5/7 files on PR [#74](https://github.com/dusterbloom/higgs/issues/74) (part 1/2) ([af57c32](https://github.com/dusterbloom/higgs/commit/af57c3223e81c0328d8217794358e52ec3aadd35))
+* restore rng import and checkout pin ([8771fa0](https://github.com/dusterbloom/higgs/commit/8771fa00c7d0a3f1fd83fd55594c441c95e214ba))
+* satisfy clippy on qwen3.6 tests ([ab2920a](https://github.com/dusterbloom/higgs/commit/ab2920a182c2a76f8a2e54b67479a044d9513024))
+* stabilize dust stack CI ([8e629e3](https://github.com/dusterbloom/higgs/commit/8e629e35e53bb65b9a6dd718be5d2d50a79e297c))
+* suffix float literals for new float_literal_f32_fallback lint ([#230](https://github.com/dusterbloom/higgs/issues/230)) ([83029e4](https://github.com/dusterbloom/higgs/commit/83029e409cf0bbfbc03d363590edba920de3b1f4))
+* support mlx qwen3.6 smoke ([7046849](https://github.com/dusterbloom/higgs/commit/704684970b3cf43ad9bc3644e74422e378dacfd4))
+
+
+### Performance Improvements
+
+* **dtype:** preserve fp16 through scalar multiply in deepseek_v2 + siglip ([5dfbd15](https://github.com/dusterbloom/higgs/commit/5dfbd159926113e5a53a620933f701d7dd3c6ff2))
+* **dtype:** preserve fp16 through scalar multiply in deepseek_v2 + siglip ([90aec29](https://github.com/dusterbloom/higgs/commit/90aec296ada971231dff254cad1095eac1c92646))
+* **models:** opt-in fused MoE gate+up — 3→2 expert matmuls per layer ([#141](https://github.com/dusterbloom/higgs/issues/141)) ([60d7cb4](https://github.com/dusterbloom/higgs/commit/60d7cb48f28ddff5254f8aece898a24a1a475d66))
+* **sampling:** partial-sort path for small top-k ([67a5a06](https://github.com/dusterbloom/higgs/commit/67a5a06f479a9c0ded06af00a07ccafab392ef4c))
+* **sampling:** partial-sort path for small top-k ([bab4519](https://github.com/dusterbloom/higgs/commit/bab4519bdc5bb4d4f2ad7bc90086c054e55131b0))
+
 ## [1.6.1](https://github.com/panbanda/higgs/compare/higgs-models-v1.6.0...higgs-models-v1.6.1) (2026-08-11)
 
 
