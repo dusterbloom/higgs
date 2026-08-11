@@ -1,5 +1,79 @@
 # Changelog
 
+## [2.0.0](https://github.com/dusterbloom/higgs/compare/higgs-v1.6.1...higgs-v2.0.0) (2026-08-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* higgs start is now config/profile-only, attach is a strict daemon dashboard, shellenv/exec fail fast on invalid or unreachable targets, and exact local model matches now take precedence over regex routes.
+
+### Features
+
+* add --profile CLI flag, TUI routing tab, and config visibility ([#45](https://github.com/dusterbloom/higgs/issues/45)) ([95dda05](https://github.com/dusterbloom/higgs/commit/95dda054071942979aaa2a9c5611a067c0f227d5))
+* add `higgs exec -- <command>` subcommand ([#49](https://github.com/dusterbloom/higgs/issues/49)) ([b61dbf5](https://github.com/dusterbloom/higgs/commit/b61dbf575ff2ec944e81751f654a65b1b746a90f))
+* add `higgs run -- <command>` subcommand ([#47](https://github.com/dusterbloom/higgs/issues/47)) ([72339d2](https://github.com/dusterbloom/higgs/commit/72339d270a3c71db4c0ba052a8fddfa91b62c953))
+* add name field to ModelConfig ([#43](https://github.com/dusterbloom/higgs/issues/43)) ([54147e0](https://github.com/dusterbloom/higgs/commit/54147e01ec1e1d9d0f308aff1d5228716207b9c7))
+* add qwen3.5/qwen3.6 turboquant stack ([4f165ee](https://github.com/dusterbloom/higgs/commit/4f165eeca1166ac1d1b62cbaf523b83d344b9a22))
+* API routes — thinking mode streaming and tool call validation ([5f7e62c](https://github.com/dusterbloom/higgs/commit/5f7e62cb8eeb168dfb36d98eea2d39c54cf4e950))
+* **chat:** streaming tool-call deltas + Qwen-friendly arg normalisation ([#164](https://github.com/dusterbloom/higgs/issues/164)) ([8f01163](https://github.com/dusterbloom/higgs/commit/8f01163a0a60950c011048f8bd3c6d906b3e8a01))
+* **doctor:** validate ServerSection fields ([0250c42](https://github.com/dusterbloom/higgs/commit/0250c422d022e72a00095cd2def1ed5996dfb762))
+* **doctor:** validate ServerSection fields ([554371f](https://github.com/dusterbloom/higgs/commit/554371f890cf23a7e2fd1141109e51cb9f26c2d5))
+* harden CLI, dashboard, routing, and MLX runtime ([4dfc930](https://github.com/dusterbloom/higgs/commit/4dfc930365ec1d8eb8143508fe63c41b21001ba1))
+* harden default security posture ([1b41a5c](https://github.com/dusterbloom/higgs/commit/1b41a5c93696a7492ef4bf7e941982341edf50ab))
+* **higgs:** migrate from huggingface-cli to hf ([#180](https://github.com/dusterbloom/higgs/issues/180)) ([aaecdb4](https://github.com/dusterbloom/higgs/commit/aaecdb4fa7225dc7fc5375982bc2f6c7945eaf2f))
+* resize routing sidebar ([913e015](https://github.com/dusterbloom/higgs/commit/913e0150e2779b22f154a03ad456693ac6512f81))
+* server config — TurboQuant, thinking budget, chunked prefill settings ([5b63e4c](https://github.com/dusterbloom/higgs/commit/5b63e4c9bedee401adf6f23b319316f55727c7f1))
+* **serve:** stream prefill progress (llama.cpp-compatible prompt_progress) ([#184](https://github.com/dusterbloom/higgs/issues/184)) ([e7b2c8a](https://github.com/dusterbloom/higgs/commit/e7b2c8a41689c7e8e1f1fc4d657a4fa17bba2a96))
+* ship mlx.metallib alongside the higgs binary ([#39](https://github.com/dusterbloom/higgs/issues/39)) ([deaa322](https://github.com/dusterbloom/higgs/commit/deaa32275c8ef8236846cc1adc2edf24d698fbe5))
+* tune qwen3.6 thinking defaults ([6969834](https://github.com/dusterbloom/higgs/commit/696983431b7c404bf5efea4978398251603ac6ec))
+* unified AI gateway with proxy routing and format translation ([#38](https://github.com/dusterbloom/higgs/issues/38)) ([7c5668b](https://github.com/dusterbloom/higgs/commit/7c5668b67a4de113447dce9297c56ace23f5f017))
+
+
+### Bug Fixes
+
+* address CI lint and test failures ([0d8e259](https://github.com/dusterbloom/higgs/commit/0d8e2594809589fe405a3b8091e669164b2e8e52))
+* address coderabbit issues ([6f10bc6](https://github.com/dusterbloom/higgs/commit/6f10bc6d733c192d30c5ab3aed76e4a2e2a69818))
+* address follow-up review issues ([5c857ce](https://github.com/dusterbloom/higgs/commit/5c857ce32f5eeab4fe020c9760a2bd5a0e984c05))
+* address review comments ([36c6484](https://github.com/dusterbloom/higgs/commit/36c6484acd486af7744507ebb974e5a62ecf1f93))
+* address review follow-ups ([d2b312e](https://github.com/dusterbloom/higgs/commit/d2b312e0c447b33b65505e8b34adfa74d240da96))
+* backtick TcpListener in doc comment for clippy doc_markdown ([94acea7](https://github.com/dusterbloom/higgs/commit/94acea7730105895be598bb04d9580de4ea3195a))
+* cargo fmt + restore higgs crate build on PR [#74](https://github.com/dusterbloom/higgs/issues/74) ([050af95](https://github.com/dusterbloom/higgs/commit/050af9590968c129dc8f0a5003d4af47f6591da5))
+* clarify metallib recovery hint ([645dbb0](https://github.com/dusterbloom/higgs/commit/645dbb0201b3a54e3be754a6165ca4bbd951141b))
+* clear lint and review blockers ([9c8b878](https://github.com/dusterbloom/higgs/commit/9c8b878bb654ba8865f3455c91ba457b83d1161b))
+* **config:** timeout validation and figment model merge ([441884d](https://github.com/dusterbloom/higgs/commit/441884d6450e2ce486ff3e131b37033296ea3cc9))
+* correct comment about signal handler behavior ([81cbd71](https://github.com/dusterbloom/higgs/commit/81cbd71e38957287cdc81c1e098bc4c8d81a7801))
+* default Qwen3.6 to non-thinking mode ([#150](https://github.com/dusterbloom/higgs/issues/150)) ([372020e](https://github.com/dusterbloom/higgs/commit/372020ec5198b47bfb29babbaf60b4250507a76e))
+* **doctor:** bracket IPv6 host when binding port; add api_key/rate_limit positive-path tests ([7177476](https://github.com/dusterbloom/higgs/commit/717747662379fe1cf89b01b5db5fdf50246504a3))
+* improve Anthropic API compatibility ([16ee50d](https://github.com/dusterbloom/higgs/commit/16ee50d5b4d1e7e24bdbd3e7e97a2f8943b15a23))
+* improve Anthropic API compatibility ([ff7e96c](https://github.com/dusterbloom/higgs/commit/ff7e96c94b308cfe5d83ea8d162e96e2e50d7e0e))
+* log warning instead of silently discarding signal handler error ([6946974](https://github.com/dusterbloom/higgs/commit/6946974df001540b071ebc97bf7dc3fecfa68371))
+* make pre-push pass on dust stack ([2695165](https://github.com/dusterbloom/higgs/commit/26951659aa8ff56d0362a6916827dbe9cf6fae88))
+* normalize auto_router.model to a name like routes do ([1e741c5](https://github.com/dusterbloom/higgs/commit/1e741c5c83133923565b59260e9bf64d41cd3e87))
+* normalize auto_router.model to a name like routes do ([3b52db4](https://github.com/dusterbloom/higgs/commit/3b52db488c4099e44b22712640f82f3f57f8efaa))
+* remove incorrect default_value on Option&lt;u8&gt; CLI arg — PR [#75](https://github.com/dusterbloom/higgs/issues/75) ([bf87bbd](https://github.com/dusterbloom/higgs/commit/bf87bbd4b9f5b2a88e386f2bb7b03beb0f07534d))
+* resolve auto_router model by basename when config uses full path ([#41](https://github.com/dusterbloom/higgs/issues/41)) ([7220fa2](https://github.com/dusterbloom/higgs/commit/7220fa27ce4f9f67b587ea9a5a3785735d3cfb1d))
+* restore higgs crate build on PR [#75](https://github.com/dusterbloom/higgs/issues/75) — chat.rs usage stubs ([f92d139](https://github.com/dusterbloom/higgs/commit/f92d139e4d8b1319169d168c73c92db52bf01a4d))
+* restore pattern matching fallback in force routing mode ([c1bb2c3](https://github.com/dusterbloom/higgs/commit/c1bb2c39c2fc8a377a7fab2a0c792f3ec6794899))
+* restore pattern matching fallback in force routing mode ([217249f](https://github.com/dusterbloom/higgs/commit/217249f2612cde2bf92ac81d10228ee6c6b9b4f8))
+* route first streamed token through incremental detokenizer ([722218d](https://github.com/dusterbloom/higgs/commit/722218df3cfb10c8671721cf45888ec45e31187c))
+* **routes:** close think tag on length-stopped reasoning in OpenAI path ([5c2ea56](https://github.com/dusterbloom/higgs/commit/5c2ea56566fafbf8198f2bca34d3454ea70c2ca2))
+* satisfy clippy duration lint ([20c6aae](https://github.com/dusterbloom/higgs/commit/20c6aaebdafba342e62e33ed4b904dcc5620dc0a))
+* split long first doc paragraphs for clippy ([c195312](https://github.com/dusterbloom/higgs/commit/c1953125d8399f899236d7917f26b94051fccb4b))
+* stabilize dust stack CI ([8e629e3](https://github.com/dusterbloom/higgs/commit/8e629e35e53bb65b9a6dd718be5d2d50a79e297c))
+* strip thinking tags from Anthropic route, fix force routing, add proxy usage tracking ([89f8db2](https://github.com/dusterbloom/higgs/commit/89f8db2c889971b8c2ae21dec8d63ea70308491e))
+* strip thinking tags, fix force routing, add proxy usage metrics ([0ffbabb](https://github.com/dusterbloom/higgs/commit/0ffbabb1cb0abbca70d5c01bea007028b21d6ff4))
+* suffix float literals for new float_literal_f32_fallback lint ([#230](https://github.com/dusterbloom/higgs/issues/230)) ([83029e4](https://github.com/dusterbloom/higgs/commit/83029e409cf0bbfbc03d363590edba920de3b1f4))
+* support clippy across toolchains ([abc316d](https://github.com/dusterbloom/higgs/commit/abc316d1c573db20a1921530782752f41ee745f4))
+* support mlx qwen3.6 smoke ([7046849](https://github.com/dusterbloom/higgs/commit/704684970b3cf43ad9bc3644e74422e378dacfd4))
+* type alias for build_router signature assertion ([d084592](https://github.com/dusterbloom/higgs/commit/d0845926a64c0179646855b628ef0da737e31b2f))
+* use 128+signal convention for signal-killed child exit codes ([89b7ae0](https://github.com/dusterbloom/higgs/commit/89b7ae0cb98b3bf372d49b83f65ef8e23d5d722c))
+
+
+### Performance Improvements
+
+* **sse:** pre-serialize static chunk fields for streaming routes ([056f4b4](https://github.com/dusterbloom/higgs/commit/056f4b4e316d27ab5c960b954619996f63653942))
+* **sse:** pre-serialize static chunk fields for streaming routes ([d8e02ba](https://github.com/dusterbloom/higgs/commit/d8e02ba9114f799cf47ebc6074385c14b7cf44cf))
+
 ## [1.6.1](https://github.com/panbanda/higgs/compare/higgs-v1.6.0...higgs-v1.6.1) (2026-08-11)
 
 
