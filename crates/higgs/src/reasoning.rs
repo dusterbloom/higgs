@@ -20,6 +20,39 @@ fn model_defaults_to_non_thinking(model_names: &[&str]) -> bool {
     })
 }
 
+/// LFM2.5 unconditionally injects `<think>` at the generation prompt
+/// (its template ignores `enable_thinking`), so the reasoning tracker
+/// MUST start inside a think block — otherwise the model's output is
+/// misclassified as visible text.
+fn model_always_thinks(model_names: &[&str]) -> bool {
+    model_names.iter().any(|model_name| {
+        let normalized = model_name.to_ascii_lowercase();
+        // Match "lfm2.5" or "lfm2_5" but not "lfm2" (the non-thinking base).
+        // Use boundary checks so "lfm2.5" matches but "lfm25" does not.
+        for (idx, _) in normalized.match_indices("lfm2.5") {
+            let before_ok = idx == 0
+                || normalized.as_bytes().get(idx - 1)
+                    .is_some_and(|b| !b.is_ascii_alphanumeric());
+            let after_ok = normalized.as_bytes().get(idx + "lfm2.5".len())
+                .is_none_or(|b| !b.is_ascii_alphanumeric());
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        for (idx, _) in normalized.match_indices("lfm2_5") {
+            let before_ok = idx == 0
+                || normalized.as_bytes().get(idx - 1)
+                    .is_some_and(|b| !b.is_ascii_alphanumeric());
+            let after_ok = normalized.as_bytes().get(idx + "lfm2_5".len())
+                .is_none_or(|b| !b.is_ascii_alphanumeric());
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 pub fn effective_thinking_enabled(
     engine_default: bool,
     model_names: &[&str],
@@ -28,6 +61,12 @@ pub fn effective_thinking_enabled(
 ) -> bool {
     if !engine_default {
         return false;
+    }
+
+    // Models whose template unconditionally injects `<think>` (LFM2.5)
+    // always need the tracker in sync — explicit toggles can't override.
+    if model_always_thinks(model_names) {
+        return true;
     }
 
     // An explicit per-request toggle (`chat_template_kwargs.enable_thinking`,
@@ -169,5 +208,45 @@ mod tests {
             None,
             Some(true),
         ));
+    }
+
+    #[test]
+    fn lfm25_always_thinks_ignores_explicit_false() {
+        // LFM2.5 injects <think> unconditionally — explicit /thinking off
+        // must not break the tracker/template sync.
+        assert!(effective_thinking_enabled(
+            true,
+            &["local:lfm2.5-2.6b-8bit"],
+            None,
+            Some(false),
+        ));
+    }
+
+    #[test]
+    fn lfm25_always_thinks_even_with_reasoning_none() {
+        assert!(effective_thinking_enabled(
+            true,
+            &["lfm2.5-foo"],
+            Some(&ReasoningConfig {
+                effort: Some("none".to_owned()),
+            }),
+            None,
+        ));
+    }
+
+    #[test]
+    fn lfm2_base_does_not_always_think() {
+        // Plain LFM2 (not 2.5) has a different template without <think>.
+        assert!(!model_always_thinks(&["lfm2-2.6b"]));
+    }
+
+    #[test]
+    fn lfm25_underscore_variant() {
+        assert!(model_always_thinks(&["lfm2_5-3b"]));
+    }
+
+    #[test]
+    fn lfm25_mid_path() {
+        assert!(model_always_thinks(&["mlx-community/lfm2.5-2.6b-4bit"]));
     }
 }

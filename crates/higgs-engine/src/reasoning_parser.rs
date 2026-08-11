@@ -12,6 +12,8 @@
 
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
+const COT_OPEN: &str = "<|cot_start|>";
+const COT_CLOSE: &str = "<|cot_end|>";
 
 /// Result of parsing reasoning tags from model output.
 #[derive(Debug, Clone)]
@@ -34,40 +36,48 @@ pub fn parse_reasoning(text: &str) -> ReasoningParseResult {
     let mut remaining = text;
 
     loop {
-        if let Some(start_pos) = remaining.find(THINK_OPEN) {
-            visible.push_str(remaining.get(..start_pos).unwrap_or_default());
-
-            let after_open = remaining
-                .get(start_pos + THINK_OPEN.len()..)
-                .unwrap_or_default();
-
-            if let Some(end_pos) = after_open.find(THINK_CLOSE) {
-                let think_content = after_open.get(..end_pos).unwrap_or_default().trim();
-                if !think_content.is_empty() {
-                    if !reasoning.is_empty() {
-                        reasoning.push('\n');
-                    }
-                    reasoning.push_str(think_content);
-                }
-                found_thinking = true;
-
-                remaining = after_open
-                    .get(end_pos + THINK_CLOSE.len()..)
-                    .unwrap_or_default();
-            } else {
-                // Unclosed <think> tag -- treat remaining as reasoning
-                let unclosed = after_open.trim();
-                if !unclosed.is_empty() {
-                    if !reasoning.is_empty() {
-                        reasoning.push('\n');
-                    }
-                    reasoning.push_str(unclosed);
-                }
-                found_thinking = true;
+        // Find the earliest opener: <think> or <|cot_start|>.
+        let think_pos = remaining.find(THINK_OPEN);
+        let cot_pos = remaining.find(COT_OPEN);
+        let (start_pos, open_len, close_tag) = match (think_pos, cot_pos) {
+            (Some(t), Some(c)) if t <= c => (t, THINK_OPEN.len(), THINK_CLOSE),
+            (Some(t), None) => (t, THINK_OPEN.len(), THINK_CLOSE),
+            (_, Some(c)) => (c, COT_OPEN.len(), COT_CLOSE),
+            (None, None) => {
+                visible.push_str(remaining);
                 break;
             }
+        };
+
+        visible.push_str(remaining.get(..start_pos).unwrap_or_default());
+
+        let after_open = remaining
+            .get(start_pos + open_len..)
+            .unwrap_or_default();
+
+        if let Some(end_pos) = after_open.find(close_tag) {
+            let think_content = after_open.get(..end_pos).unwrap_or_default().trim();
+            if !think_content.is_empty() {
+                if !reasoning.is_empty() {
+                    reasoning.push('\n');
+                }
+                reasoning.push_str(think_content);
+            }
+            found_thinking = true;
+
+            remaining = after_open
+                .get(end_pos + close_tag.len()..)
+                .unwrap_or_default();
         } else {
-            visible.push_str(remaining);
+            // Unclosed think/cot tag -- treat remaining as reasoning
+            let unclosed = after_open.trim();
+            if !unclosed.is_empty() {
+                if !reasoning.is_empty() {
+                    reasoning.push('\n');
+                }
+                reasoning.push_str(unclosed);
+            }
+            found_thinking = true;
             break;
         }
     }

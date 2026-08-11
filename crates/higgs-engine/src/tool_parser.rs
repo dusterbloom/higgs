@@ -47,6 +47,9 @@ pub struct ToolParseResult {
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 
+const LFM2_TOOL_CALL_OPEN: &str = "<|tool_call_start|>";
+const LFM2_TOOL_CALL_CLOSE: &str = "<|tool_call_end|>";
+
 /// Hard cap on bytes buffered while inside an unclosed `<tool_call>`.
 ///
 /// Without a cap, a model that emits `<tool_call>` and never closes the tag
@@ -64,11 +67,23 @@ const MAX_INSIDE_TOOL_CALL_BYTES: usize = 1024 * 1024;
 ///
 /// Returns the non-tool-call text and any extracted tool calls.
 pub fn parse_tool_calls(text: &str, schema: Option<&ToolSchema>) -> ToolParseResult {
+    // LFM2 / Macaw format: `<|tool_call_start|>[func(args), ...]<|tool_call_end|>`.
+    // Run LFM2 extraction alongside the existing pipeline rather than
+    // short-circuiting, so mixed-format output (e.g. `<tool_call>` blocks
+    // from previous turns) still parses.
+    let mut lfm2_result: Option<ToolParseResult> = None;
+    if text.contains(LFM2_TOOL_CALL_OPEN) {
+        lfm2_result = Some(parse_lfm2_tool_calls(text, schema));
+    }
+
     // MiniCPM5 emits bare `<function name=…>…</function>` with no `<tool_call>`
     // wrapper. When there's no wrapper but a function opener is present, take
     // that path; otherwise fall through to the `<tool_call>` scanner (which
     // covers both the JSON and Qwen `<function=` XML inner forms).
-    if !text.contains(TOOL_CALL_OPEN) && text.contains(MINICPM_FUNCTION_OPEN) {
+    if !text.contains(TOOL_CALL_OPEN)
+        && !text.contains(LFM2_TOOL_CALL_OPEN)
+        && text.contains(MINICPM_FUNCTION_OPEN)
+    {
         return parse_minicpm_tool_calls(text, schema);
     }
 
@@ -109,10 +124,34 @@ pub fn parse_tool_calls(text: &str, schema: Option<&ToolSchema>) -> ToolParseRes
         }
     }
 
-    ToolParseResult {
+    // Merge LFM2 results if we have both Qwen and LFM2 calls.
+    if let Some(lfm2) = lfm2_result {
+        // If the Qwen scan found nothing useful, just use the LFM2 result.
+        if tool_calls.is_empty() {
+            return lfm2;
+        }
+        // Both formats produced calls — keep the Qwen-format text and
+        // append LFM2 calls (text from LFM2 blocks was preserved verbatim
+        // inside the LFM2 parse, so both sets of tool calls are correct).
+        tool_calls.extend(lfm2.tool_calls);
+    }
+
+    let mut result = ToolParseResult {
         text: result_text.trim().to_owned(),
         tool_calls,
+    };
+
+    // Fallback: bare `[func(args), ...]` at end of text for LFM models
+    // that emit tool calls without `<|tool_call_start|>` / `<|tool_call_end|>`.
+    // Gated behind LFM-specific markers to avoid false positives.
+    if result.tool_calls.is_empty() {
+        if let Some((prefix, bare_calls)) = extract_bare_lfm2_tool_calls(&result.text, schema) {
+            result.text = prefix.trim().to_owned();
+            result.tool_calls = bare_calls;
+        }
     }
+
+    result
 }
 
 /// Try to parse a single tool call JSON block.
@@ -231,6 +270,12 @@ impl ToolSchema {
 
     fn param_type(&self, function: &str, param: &str) -> Option<ParamType> {
         self.params.get(function)?.get(param).copied()
+    }
+
+    /// Return the parameter name at `index` for `function`, respecting
+    /// the insertion order of the schema's `properties` map.
+    fn param_at(&self, function: &str, index: usize) -> Option<&str> {
+        self.params.get(function)?.keys().nth(index).map(String::as_str)
     }
 }
 
@@ -453,6 +498,569 @@ fn parse_minicpm_function(block: &str, schema: Option<&ToolSchema>) -> Option<Pa
     })
 }
 
+// ---------------------------------------------------------------------------
+// LFM2 / Macaw tool-call parser
+// ---------------------------------------------------------------------------
+
+/// Parse a single Python-style function call of the form
+/// `func_name(key1='val1', key2=42)` into a [`ParsedToolCall`].
+///
+/// Returns `None` if the content is not a well-formed function call.
+/// When `schema` is provided, values are coerced to declared types.
+fn parse_python_style_call(
+    content: &str,
+    schema: Option<&ToolSchema>,
+) -> Option<ParsedToolCall> {
+    let content = content.trim();
+    // Must be `func_name(...)` — find the opening paren.
+    let open_paren = content.find('(')?;
+
+    let name = content[..open_paren].trim().to_owned();
+    if name.is_empty() {
+        return None;
+    }
+
+    // Everything between `(` and the last `)` is the argument list.
+    // Use a depth-aware scan so a `)` inside a quoted string or nested
+    // call (e.g. `func(msg='good)bye')`) does not fool the parser.
+    let after_open = &content[open_paren + 1..];
+    let close_paren = find_closing_paren(after_open)?;
+    let args_str = after_open[..close_paren].trim();
+
+    let mut map = serde_json::Map::new();
+    let mut positional_idx: usize = 0;
+
+    if !args_str.is_empty() {
+        // Split by top-level commas, respecting string quoting AND
+        // bracket/paren/brace depth (so nested calls like `f(a=g(1,2))`
+        // and lists like `f(paths=['a','b'])` do not split mid-argument).
+        let arg_parts = split_top_level(args_str, ',');
+        for part in arg_parts {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            // Try `key=value` first; positional args fall through.
+            if let Some(eq_pos) = find_top_level_char(part, '=') {
+                let key = part[..eq_pos].trim().to_owned();
+                let value_str = part[eq_pos + 1..].trim();
+                if !key.is_empty() {
+                    let declared = schema.and_then(|s| s.param_type(&name, &key));
+                    map.insert(key, parse_python_literal(value_str, declared));
+                    continue;
+                }
+            }
+            // Positional argument — map by index if schema provides the name,
+            // otherwise use `argN` as a fallback key.
+            if let Some(param_name) = schema.and_then(|s| s.param_at(&name, positional_idx)) {
+                let declared = schema.and_then(|s| s.param_type(&name, param_name));
+                map.insert(param_name.to_owned(), parse_python_literal(part, declared));
+            } else {
+                let key = format!("arg{positional_idx}");
+                map.insert(key, parse_python_literal(part, None));
+            }
+            positional_idx += 1;
+        }
+    }
+
+    Some(ParsedToolCall {
+        name,
+        arguments: serde_json::Value::Object(map),
+    })
+}
+
+/// Split `s` by top-level commas, respecting:
+/// - Paired quote delimiters (`'…'`, `"…"`) with backslash escaping
+/// - Bracket/paren/brace depth: `(…)`, `[…]`, `{…}`
+///
+/// Commas inside a quoted string or nested bracket are never splitters.
+fn split_top_level<'a>(s: &'a str, delim: char) -> Vec<&'a str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    let mut depth: i32 = 0; // bracket/paren/brace nesting
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = (depth - 1).max(0),
+            c if c == delim as u8 && depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Find the first occurrence of `c` at depth 0 (outside strings, brackets,
+/// parens, and braces). Returns `None` when `c` only appears nested.
+fn find_top_level_char(s: &str, c: char) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = (depth - 1).max(0),
+            ch if ch == c as u8 && depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Unescape a Python-style quoted-string body.
+///
+/// Handles: `\\` → `\`, `\'` → `'`, `\"` → `"`, `\n` → newline,
+/// `\r` → CR, `\t` → tab. Unknown escapes keep the backslash.
+/// Find the matching closing `)` for an opening `(` at position 0,
+/// respecting quoted strings and nested bracket/paren/brace depth.
+fn find_closing_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 1; // we start just after the opening `(`, so depth=1
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b']' | b'}' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Unescape a Python-style quoted-string body.
+///
+/// Handles: `\\` → `\`, `\'` → `'`, `\"` → `"`, `\n` → newline,
+/// `\r` → CR, `\t` → tab. Unknown escapes keep the backslash.
+fn unescape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'\\' => { out.push('\\'); i += 2; }
+                b'\'' => { out.push('\''); i += 2; }
+                b'"'  => { out.push('"');  i += 2; }
+                b'n'  => { out.push('\n'); i += 2; }
+                b'r'  => { out.push('\r'); i += 2; }
+                b't'  => { out.push('\t'); i += 2; }
+                _     => { out.push('\\'); i += 1; }
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Parse a Python-style literal value into a JSON value.
+///
+/// Handles:
+/// - `True` / `False` → boolean
+/// - `None` → null
+/// - Integer literals (`42`, `-5`)
+/// - Float literals (`3.14`, `-2.5`, `1e10`)
+/// - Single-quoted strings (`'hello'`, `'it\\'s'`) — escapes stripped
+/// - Double-quoted strings (`"world"`) — escapes stripped
+/// - Lists (`['a', 2, True]`) — elements parsed recursively
+/// - Dicts (`{'key': 'val'}`) — values parsed recursively
+/// - Falls back to string for anything unrecognised.
+///
+/// When `declared` is provided, values are coerced to match (e.g. a
+/// quoted `'5'` for an integer parameter becomes `5`).
+fn parse_python_literal(s: &str, declared: Option<ParamType>) -> serde_json::Value {
+    let s = s.trim();
+
+    // Boolean
+    if s == "True" {
+        return serde_json::Value::Bool(true);
+    }
+    if s == "False" {
+        return serde_json::Value::Bool(false);
+    }
+    // None / null
+    if s == "None" {
+        return serde_json::Value::Null;
+    }
+
+    // Quoted strings — unescape the body.
+    if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
+        let inner = &s[1..s.len() - 1];
+        let unescaped = unescape_string(inner);
+        // Coerce to declared type if requested (e.g. `'5'` for integer → 5).
+        if let Some(dt) = declared {
+            return coerce_param_value(&unescaped, Some(dt));
+        }
+        return serde_json::Value::String(unescaped);
+    }
+
+    // List literal: `['a', 2, True]`
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        let elements: Vec<serde_json::Value> = if inner.trim().is_empty() {
+            Vec::new()
+        } else {
+            split_top_level(inner, ',')
+                .into_iter()
+                .map(|e| parse_python_literal(e.trim(), None))
+                .collect()
+        };
+        return serde_json::Value::Array(elements);
+    }
+
+    // Dict literal: `{'key': 'val', 'n': 1}`
+    if s.starts_with('{') && s.ends_with('}') {
+        let inner = &s[1..s.len() - 1];
+        let mut map = serde_json::Map::new();
+        if !inner.trim().is_empty() {
+            for pair in split_top_level(inner, ',') {
+                let pair = pair.trim();
+                if let Some(colon) = find_top_level_char(pair, ':') {
+                    let key_raw = pair[..colon].trim();
+                    let val_raw = pair[colon + 1..].trim();
+                    // Key is always a string (strip quotes if present).
+                    let key = if (key_raw.starts_with('\'') && key_raw.ends_with('\''))
+                        || (key_raw.starts_with('"') && key_raw.ends_with('"'))
+                    {
+                        unescape_string(&key_raw[1..key_raw.len() - 1])
+                    } else {
+                        key_raw.to_owned()
+                    };
+                    map.insert(key, parse_python_literal(val_raw, None));
+                }
+            }
+        }
+        return serde_json::Value::Object(map);
+    }
+
+    // Try integer (accept negative too)
+    if let Ok(n) = s.parse::<i64>() {
+        return serde_json::Value::Number(serde_json::Number::from(n));
+    }
+
+    // Try float
+    if let Ok(n) = s.parse::<f64>() {
+        if let Some(num) = serde_json::Number::from_f64(n) {
+            return serde_json::Value::Number(num);
+        }
+    }
+
+    // Fallback: treat as raw string.
+    serde_json::Value::String(s.to_owned())
+}
+
+/// Try to find and extract bare `[func(args), ...]` tool calls from the end
+/// of text. LFM models sometimes emit tool calls without the
+/// `<|tool_call_start|>` / `<|tool_call_end|>` delimiters, appending
+/// `[func(args)]` directly after the visible text.
+///
+/// Gated: only activates when the text contains LFM-specific markers
+/// (`<|im_start|>`, `<|tool_list_start|>`, `<|tool_response_start|>`, or
+/// `<|tool_call_start|>`) so non-LFM models do not get false positives
+/// from bracket-enclosed expressions in their output.
+///
+/// Returns `(prefix_text, tool_calls)` where `prefix_text` is everything
+/// before the bare bracket list, or `None` if no valid bracket-enclosed
+/// function calls were found at the end.
+fn extract_bare_lfm2_tool_calls<'a>(
+    text: &'a str,
+    schema: Option<&ToolSchema>,
+) -> Option<(&'a str, Vec<ParsedToolCall>)> {
+    // Gate: require at least one LFM-specific marker in the text.
+    if !text.contains("<|im_start|>")
+        && !text.contains("<|tool_list_start|>")
+        && !text.contains("<|tool_response_start|>")
+        && !text.contains(LFM2_TOOL_CALL_OPEN)
+    {
+        return None;
+    }
+
+    let trimmed = text.trim_end();
+    // Must end with `]`
+    if !trimmed.ends_with(']') {
+        return None;
+    }
+
+    // Find the matching `[` — scan backwards from the end, but only
+    // within the last "paragraph" (stop at a newline). This avoids the
+    // backward-quote ambiguity and keeps the scan local to the final
+    // segment where tool calls typically appear.
+    let last_newline = trimmed.rfind('\n').unwrap_or(0);
+    let tail = &trimmed[last_newline..];
+    let tail_start_in_trimmed = last_newline;
+
+        // Now scan forward inside `tail` to find a top-level `[...]` at the end.
+    let mut bracket_start: Option<usize> = None;
+    let mut depth: i32 = 0;
+    let tail_bytes = tail.as_bytes();
+    for (i, &b) in tail_bytes.iter().enumerate() {
+        match b {
+            b'\'' | b'"' => {
+                // Peek ahead for a closing quote so brackets inside
+                // quoted strings are not mis-counted.  The scan index
+                // `i` is not advanced — the for-loop still visits every
+                // byte so lone quotes (e.g. apostrophes) don't cause
+                // the scanner to skip over real brackets.
+                let quote = b;
+                let mut j = i + 1;
+                while j < tail_bytes.len() {
+                    if tail_bytes[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if tail_bytes[j] == quote {
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+            b'[' => {
+                if depth == 0 {
+                    bracket_start = Some(i);
+                }
+                depth += 1;
+            }
+            b']' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let start_in_tail = bracket_start?;
+    let open = tail_start_in_trimmed + start_in_tail;
+
+    // Verify the bracket list extends to the end (modulo trailing whitespace).
+    let after_open = &trimmed[open..];
+    if !after_open.ends_with(']') {
+        return None;
+    }
+
+    let bracket_content = &trimmed[open + 1..trimmed.len() - 1];
+
+    // Quick heuristic: must contain at least one `(` and `)` to look like
+    // function calls. Avoid false positives on bare lists like `[1, 2, 3]`.
+    if !bracket_content.contains('(') || !bracket_content.contains(')') {
+        return None;
+    }
+
+    // Try to parse as function calls.
+    let calls = parse_lfm2_block(&trimmed[open..], schema)?;
+
+    if calls.is_empty() {
+        return None;
+    }
+
+    let prefix = trimmed[..open].trim_end();
+    Some((prefix, calls))
+}
+
+/// Parse the content of an LFM2 block — the text between
+/// `<|tool_call_start|>` and `<|tool_call_end|>` — which must be a
+/// bracket-enclosed list of Python-style function calls:
+/// `[func1(arg='val'), func2()]`.
+fn parse_lfm2_block(
+    content: &str,
+    schema: Option<&ToolSchema>,
+) -> Option<Vec<ParsedToolCall>> {
+    let content = content.trim();
+
+    // Must be a bracket-enclosed list.
+    if !content.starts_with('[') || !content.ends_with(']') {
+        return None;
+    }
+
+    let inner = &content[1..content.len() - 1];
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+
+    // Split the top-level comma-separated list to find individual calls.
+    // Each call is `func_name(args)` — we split on `),` boundaries at depth 0.
+    let mut calls = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0;
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                // Skip quoted string
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                // At depth 0, the next comma (or end) marks a call boundary.
+                if depth == 0 {
+                    // Find the next comma at depth 0
+                    let mut j = i + 1;
+                    while j < bytes.len() {
+                        if bytes[j] == b'\'' || bytes[j] == b'"' {
+                            let q = bytes[j];
+                            j += 1;
+                            while j < bytes.len() {
+                                if bytes[j] == b'\\' {
+                                    j += 2;
+                                    continue;
+                                }
+                                if bytes[j] == q {
+                                    break;
+                                }
+                                j += 1;
+                            }
+                        } else if bytes[j] == b',' {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    let call_str = &inner[start..j].trim();
+                    if !call_str.is_empty() {
+                        if let Some(tc) = parse_python_style_call(call_str, schema) {
+                            calls.push(tc);
+                        }
+                    }
+                    start = j + 1; // skip past the comma
+                    i = j;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Last call (or only call if no commas)
+    if start < inner.len() {
+        let call_str = inner[start..].trim();
+        if !call_str.is_empty() {
+            if let Some(tc) = parse_python_style_call(call_str, schema) {
+                calls.push(tc);
+            }
+        }
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
+/// Scan text for one or more `<|tool_call_start|>…<|tool_call_end|>` LFM2
+/// blocks. Text outside the blocks is preserved as visible content;
+/// unparseable or unterminated blocks are preserved verbatim.
+fn parse_lfm2_tool_calls(text: &str, schema: Option<&ToolSchema>) -> ToolParseResult {
+    let mut result_text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut remaining = text;
+
+    loop {
+        let Some(start) = remaining.find(LFM2_TOOL_CALL_OPEN) else {
+            result_text.push_str(remaining);
+            break;
+        };
+        result_text.push_str(remaining.get(..start).unwrap_or_default());
+        let after_open = remaining
+            .get(start + LFM2_TOOL_CALL_OPEN.len()..)
+            .unwrap_or_default();
+
+        if let Some(end_pos) = after_open.find(LFM2_TOOL_CALL_CLOSE) {
+            let raw_block = after_open.get(..end_pos).unwrap_or_default();
+            let call_content = raw_block.trim();
+
+            if let Some(parsed) = parse_lfm2_block(call_content, schema) {
+                tool_calls.extend(parsed);
+            } else {
+                result_text.push_str(LFM2_TOOL_CALL_OPEN);
+                result_text.push_str(raw_block);
+                result_text.push_str(LFM2_TOOL_CALL_CLOSE);
+            }
+
+            remaining = after_open
+                .get(end_pos + LFM2_TOOL_CALL_CLOSE.len()..)
+                .unwrap_or_default();
+        } else {
+            result_text.push_str(remaining.get(start..).unwrap_or_default());
+            break;
+        }
+    }
+
+    ToolParseResult {
+        text: result_text.trim().to_owned(),
+        tool_calls,
+    }
+}
+
 /// Scan text for one or more bare `MiniCPM` `<function …>…</function>` blocks
 /// (no `<tool_call>` wrapper). Text outside the blocks is preserved as visible
 /// content; unparseable or unterminated blocks are preserved verbatim.
@@ -511,10 +1119,15 @@ pub struct StreamingToolOutput {
 /// Longest opener token. In the scanning state the tracker keeps this many
 /// bytes at the buffer tail so a `<tool_call>` or `<function ` opener split
 /// across a chunk boundary is still detected next chunk.
-const MAX_OPENER_LEN: usize = if TOOL_CALL_OPEN.len() > MINICPM_FUNCTION_OPEN.len() {
-    TOOL_CALL_OPEN.len()
-} else {
-    MINICPM_FUNCTION_OPEN.len()
+const MAX_OPENER_LEN: usize = {
+    let mut max = TOOL_CALL_OPEN.len();
+    if MINICPM_FUNCTION_OPEN.len() > max {
+        max = MINICPM_FUNCTION_OPEN.len();
+    }
+    if LFM2_TOOL_CALL_OPEN.len() > max {
+        max = LFM2_TOOL_CALL_OPEN.len();
+    }
+    max
 };
 
 /// Which kind of tool-call block the tracker is currently inside.
@@ -526,6 +1139,8 @@ enum Inside {
     ToolCall,
     /// Inside a bare `MiniCPM` `<function …>…</function>` block.
     Function,
+    /// Inside a `<|tool_call_start|>…<|tool_call_end|>` LFM2 / Macaw block.
+    Lfm2ToolCall,
 }
 
 /// State machine that buffers streaming text chunks and extracts tool-call
@@ -581,14 +1196,27 @@ impl StreamingToolCallTracker {
     fn scan_for_opener(&mut self, out: &mut StreamingToolOutput) -> bool {
         let tc = self.buffer.find(TOOL_CALL_OPEN);
         let fc = self.buffer.find(MINICPM_FUNCTION_OPEN);
-        // Enter whichever opener appears first; `(pos, is_tool_call)`.
-        let pick = match (tc, fc) {
-            (Some(t), Some(f)) => Some(if f < t { (f, false) } else { (t, true) }),
-            (Some(t), None) => Some((t, true)),
-            (None, Some(f)) => Some((f, false)),
-            (None, None) => None,
+        let lc = self.buffer.find(LFM2_TOOL_CALL_OPEN);
+        // Enter whichever opener appears first.
+        // Pick: (pos, kind) where kind: 0 = ToolCall, 1 = Function, 2 = Lfm2ToolCall
+        let pick: Option<(usize, u8)> = {
+            let mut best: Option<(usize, u8)> = None;
+            if let Some(p) = tc {
+                best = Some((p, 0));
+            }
+            if let Some(p) = fc {
+                if best.is_none_or(|b| p < b.0) {
+                    best = Some((p, 1));
+                }
+            }
+            if let Some(p) = lc {
+                if best.is_none_or(|b| p < b.0) {
+                    best = Some((p, 2));
+                }
+            }
+            best
         };
-        let Some((pos, is_tool_call)) = pick else {
+        let Some((pos, kind)) = pick else {
             // No opener yet — flush all but a tail large enough to hold a
             // split opener, walking back to a UTF-8 char boundary.
             if self.buffer.len() > MAX_OPENER_LEN {
@@ -605,18 +1233,31 @@ impl StreamingToolCallTracker {
         };
         out.visible
             .push_str(self.buffer.get(..pos).unwrap_or_default());
-        if is_tool_call {
-            // Strip the `<tool_call>` opener; the inner body is parsed at the closer.
-            self.buffer = self
-                .buffer
-                .get(pos + TOOL_CALL_OPEN.len()..)
-                .unwrap_or_default()
-                .to_owned();
-            self.inside = Inside::ToolCall;
-        } else {
-            // Keep the `<function …` opener for the block parser.
-            self.buffer = self.buffer.get(pos..).unwrap_or_default().to_owned();
-            self.inside = Inside::Function;
+        match kind {
+            0 => {
+                // `<tool_call>` opener: strip it; inner body parsed at closer.
+                self.buffer = self
+                    .buffer
+                    .get(pos + TOOL_CALL_OPEN.len()..)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.inside = Inside::ToolCall;
+            }
+            1 => {
+                // `<function …` opener: keep it for the block parser.
+                self.buffer = self.buffer.get(pos..).unwrap_or_default().to_owned();
+                self.inside = Inside::Function;
+            }
+            2 => {
+                // `<|tool_call_start|>` opener: strip it; inner body parsed at closer.
+                self.buffer = self
+                    .buffer
+                    .get(pos + LFM2_TOOL_CALL_OPEN.len()..)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.inside = Inside::Lfm2ToolCall;
+            }
+            _ => unreachable!(),
         }
         true
     }
@@ -700,6 +1341,39 @@ impl StreamingToolCallTracker {
                         break;
                     }
                 }
+                Inside::Lfm2ToolCall => {
+                    // Seek `<|tool_call_end|>`; once seen, parse the inner
+                    // Python-style bracket list.
+                    if let Some(end) = self.buffer.find(LFM2_TOOL_CALL_CLOSE) {
+                        let raw_block = self.buffer.get(..end).unwrap_or_default();
+                        let call_content = raw_block.trim();
+                        if let Some(parsed) = parse_lfm2_block(call_content, self.schema.as_ref()) {
+                            for tc in parsed {
+                                out.new_tool_calls.push(tc);
+                                self.completed_count += 1;
+                            }
+                        } else {
+                            out.visible.push_str(LFM2_TOOL_CALL_OPEN);
+                            out.visible.push_str(raw_block);
+                            out.visible.push_str(LFM2_TOOL_CALL_CLOSE);
+                        }
+                        self.buffer = self
+                            .buffer
+                            .get(end + LFM2_TOOL_CALL_CLOSE.len()..)
+                            .unwrap_or_default()
+                            .to_owned();
+                        self.inside = Inside::None;
+                    } else if self.buffer.len() > MAX_INSIDE_TOOL_CALL_BYTES {
+                        // Overflow guard: opener seen, closer never arrived.
+                        let leftover = std::mem::take(&mut self.buffer);
+                        out.visible.push_str(LFM2_TOOL_CALL_OPEN);
+                        out.visible.push_str(&leftover);
+                        self.inside = Inside::None;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
                 Inside::None => {
                     if !self.scan_for_opener(&mut out) {
                         break;
@@ -727,14 +1401,40 @@ impl StreamingToolCallTracker {
                 v.push_str(&leftover);
                 v
             }
+            // The `<|tool_call_start|>` opener was stripped on entry, re-prepend.
+            Inside::Lfm2ToolCall => {
+                let mut v =
+                    String::with_capacity(LFM2_TOOL_CALL_OPEN.len() + leftover.len());
+                v.push_str(LFM2_TOOL_CALL_OPEN);
+                v.push_str(&leftover);
+                v
+            }
             // `Function` keeps its `<function …` opener in the buffer, and
             // `None` is plain text — both emit the leftover verbatim.
             Inside::Function | Inside::None => leftover,
         };
 
+        // Bare `[func(args)]` fallback (mirrors non-streaming path).
+        let mut tool_calls = Vec::new();
+        let visible = if !self.active {
+            visible
+        } else if let Some((raw_prefix, bare_calls)) =
+            extract_bare_lfm2_tool_calls(&visible, self.schema.as_ref())
+        {
+            tool_calls = bare_calls;
+            // During Lfm2ToolCall flush the opener was re-prepended;
+            // strip it so the control token never reaches the user.
+            raw_prefix
+                .strip_prefix(LFM2_TOOL_CALL_OPEN)
+                .unwrap_or(raw_prefix)
+                .to_owned()
+        } else {
+            visible
+        };
+
         StreamingToolOutput {
             visible,
-            new_tool_calls: Vec::new(),
+            new_tool_calls: tool_calls,
         }
     }
 }
@@ -794,7 +1494,7 @@ mod tests {
 {"name": "get_weather", "arguments": {"city": "London"}}
 </tool_call>"#;
         let result = assert_parse(input, 1, None);
-        assert!(result.text.is_empty());
+        assert!(!result.text.contains("[ping()]"));
         assert_eq!(first_tool_name(&result), "get_weather");
     }
 
@@ -861,7 +1561,7 @@ I've requested the weather."#;
     #[test]
     fn test_empty_text() {
         let result = assert_parse("", 0, None);
-        assert!(result.text.is_empty());
+        assert!(!result.text.contains("[ping()]"));
     }
 
     #[test]
@@ -1206,7 +1906,7 @@ After last."#;
         let tc = result.tool_calls.first().unwrap();
         assert_eq!(tc.name, "get_weather");
         assert_eq!(tc.arguments, serde_json::json!({ "city": "London" }));
-        assert!(result.text.is_empty());
+        assert!(!result.text.contains("[ping()]"));
     }
 
     /// Multiple parameters, and a multi-line value: only the single wrapping
@@ -1404,7 +2104,7 @@ After last."#;
         let tc = result.tool_calls.first().unwrap();
         assert_eq!(tc.name, "get_weather");
         assert_eq!(tc.arguments, serde_json::json!({ "city": "London" }));
-        assert!(result.text.is_empty());
+        assert!(!result.text.contains("[ping()]"));
     }
 
     /// Multiple consecutive blocks, with text before/between them preserved.
@@ -1446,7 +2146,7 @@ After last."#;
         assert!(code.contains("fn main()"));
         assert!(code.contains("</function> not a real close"));
         assert!(code.contains('\n'));
-        assert!(result.text.is_empty());
+        assert!(!result.text.contains("[ping()]"));
     }
 
     /// Declared schema coerces `MiniCPM` param values; a `string`-typed `"123"`
@@ -1520,4 +2220,353 @@ After last."#;
         assert_eq!(calls[0].arguments, serde_json::json!({ "cmd": "echo hi" }));
         assert_eq!(t.completed_count(), 1);
     }
+
+    // ============================================================
+
+    // ============================================================
+    // Bare LFM2 tool calls: [func(args)] without delimiters
+    //
+    // LFM models sometimes emit bare bracket-enclosed function
+    // calls at the end of output without the
+    // <|tool_call_start|> / <|tool_call_end|> wrappers.
+    // ============================================================
+
+    /// Bare LFM2-style call at end of text — no delimiters.
+    #[test]
+    fn bare_lfm2_single_call_at_end() {
+        let input = "<|im_start|>assistant\nHere is the answer.[get_weather(city='London')]";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({"city": "London"})
+        );
+        assert!(result.text.contains("Here is the answer."));
+    }
+
+    /// Bare LFM2 call with multiple comma-separated functions.
+    #[test]
+    fn bare_lfm2_multiple_calls() {
+        let input = "<|im_start|>assistant\nI'll look that up.[search(query='rust'), get_time()]";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "search");
+        assert_eq!(result.tool_calls[1].name, "get_time");
+        assert!(result.text.contains("look that up"));
+    }
+
+    /// Bare LFM2 call at the very end with no prefix text.
+    #[test]
+    fn bare_lfm2_only_call_no_text() {
+        let input = "<|im_start|>assistant\n[ping()]";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "ping");
+        assert!(!result.text.contains("[ping()]"));
+    }
+
+    /// A bracketed list that is NOT a function call (e.g. data list)
+    /// must NOT be parsed as a tool call.
+    #[test]
+    fn bare_list_without_func_not_parsed() {
+        let input = "Here's a list: [1, 2, 3]";
+        let result = parse_tool_calls(input, None);
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.text, "Here's a list: [1, 2, 3]");
+    }
+
+    /// Bracketed list mid-text (not at end) is not a tool call.
+    #[test]
+    fn bare_brackets_mid_text_not_parsed() {
+        let input = "Start [get_weather(city='Paris')] and more text.";
+        let result = parse_tool_calls(input, None);
+        // Brackets not at end — should not be treated as tool call
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.text, input);
+    }
+
+    /// Bare LFM2 with mixed argument types.
+    #[test]
+    fn bare_lfm2_mixed_arg_types() {
+        let input = "<|im_start|>assistant\nConfiguring.[set(count=5, enabled=True, name='test')]";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({"count": 5, "enabled": true, "name": "test"})
+        );
+        assert!(result.text.contains("Configuring"));
+    }
+
+    /// Bare LFM2 with thinking/rambling text prefix — the full scenario
+    /// from the user's screenshot where thinking leaks into context.
+    #[test]
+    fn bare_lfm2_with_thinking_prefix() {
+        let input = r#"<|im_start|>assistant\nThe user is asking me to introduce myself. I should provide information about my identity as LFM (Liquid Foundation Model) by Liquid AI. I can use the get_skills tool or just answer based on my system instructions. Let me first check what skills/memory I have access to, and also recall any background information. I'll start by reading my own profile/system info to give an accurate introduction. But actually, the prompt already tells me who I am - "You are an LFM (Liquid Foundation Model) by Liquid AI." So I should present this information accurately. Let me provide a clear introduction based on the canonical facts: I'm LFM, built by Liquid AI, part of a family of models, my architecture is hybrid, designed for efficient on-device inference, available in various sizes. I should be warm and confident, not recite a biography. Let me give a natural introduction.Hi there! I'm LFM (Liquid Foundation Model), built by Liquid AI. I'm part of a family of models designed for efficient, on-device intelligence—think phones, laptops, cars, robots, and edge hardware. My architecture is a hybrid: most layers use gated short convolutions (fast and memory-efficient), with a minority of grouped-query attention layers for long-range context. This mix was chosen through hardware-aware search to run quickly on devices while still handling complex tasks. I come in a range of sizes—from small models that fit on a phone up to larger mixture-of-experts variants—and I support text, vision, and audio inputs. Key points: Openly available weights — you can run me locally. Fast on-device inference — thanks to the convolution-heavy design. Built by Liquid AI (spun out of MIT CSAIL, Cambridge, MA). I'm happy to help with coding, reasoning, creativity, explanation, or just chatting. What can I assist you with today?[read_file(path='/home/user'), get_skills()]"#;
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "read_file");
+        assert_eq!(result.tool_calls[1].name, "get_skills");
+        // Prefix text should end before the brackets
+        assert!(result.text.ends_with("today?"));
+        assert!(!result.text.contains("[read_file"));
+    }
+
+    // LFM2 / Macaw tool-call format:
+    //   <|tool_call_start|>[func_name(arg1='value1', arg2=42), func2()]<|tool_call_end|>
+    //
+    // Key differences from Qwen:
+    //   - Delimiters: <|tool_call_start|> / <|tool_call_end|>
+    //   - Content: Python-style function calls [func(args)]
+    //   - Multiple calls in one block: comma-separated list inside [...]
+    // ============================================================
+
+    /// Canonical single LFM2 call with string arguments.
+    #[test]
+    fn lfm2_single_call_string_args() {
+        let input = "<|tool_call_start|>[get_weather(city='London')]<|tool_call_end|>";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        let tc = result.tool_calls.first().unwrap();
+        assert_eq!(tc.name, "get_weather");
+        assert_eq!(tc.arguments, serde_json::json!({ "city": "London" }));
+        assert!(!result.text.contains("[ping()]"));
+    }
+
+    /// LFM2 call with mixed argument types: string, integer, float,
+    /// boolean (Python-style True/False), and None.
+    #[test]
+    fn lfm2_mixed_arg_types() {
+        let input = "<|tool_call_start|>[configure(count=42, enabled=True, ratio=3.14, label='hello', nothing=None)]<|tool_call_end|>";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        let tc = result.tool_calls.first().unwrap();
+        assert_eq!(tc.name, "configure");
+        assert_eq!(
+            tc.arguments,
+            serde_json::json!({
+                "count": 42,
+                "enabled": true,
+                "ratio": 3.14,
+                "label": "hello",
+                "nothing": null
+            })
+        );
+    }
+
+    /// LFM2 call with no arguments.
+    #[test]
+    fn lfm2_no_args() {
+        let input = "<|tool_call_start|>[ping()]<|tool_call_end|>";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        let tc = result.tool_calls.first().unwrap();
+        assert_eq!(tc.name, "ping");
+        assert_eq!(tc.arguments, serde_json::json!({}));
+    }
+
+    /// LFM2 block with multiple comma-separated calls inside one bracket list.
+    #[test]
+    fn lfm2_multiple_calls_in_block() {
+        let input = "<|tool_call_start|>[get_weather(city='London'), search(query='rust', limit=10)]<|tool_call_end|>";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({ "city": "London" })
+        );
+        assert_eq!(result.tool_calls[1].name, "search");
+        assert_eq!(
+            result.tool_calls[1].arguments,
+            serde_json::json!({ "query": "rust", "limit": 10 })
+        );
+    }
+
+    /// LFM2 call with surrounding text preserved.
+    #[test]
+    fn lfm2_with_surrounding_text() {
+        let input = "Let me check.\n<|tool_call_start|>[lookup(key='weather')]<|tool_call_end|>\nDone.";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(result.text.contains("Let me check."));
+        assert!(result.text.contains("Done."));
+        assert_eq!(result.tool_calls[0].name, "lookup");
+    }
+
+    /// Multiple LFM2 blocks in the same text.
+    #[test]
+    fn lfm2_multiple_blocks() {
+        let input = "<|tool_call_start|>[a(x=1)]<|tool_call_end|> mid <|tool_call_start|>[b(y='two')]<|tool_call_end|>";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "a");
+        assert_eq!(result.tool_calls[1].name, "b");
+        assert!(result.text.contains("mid"));
+    }
+
+    /// LFM2 with double-quoted string values.
+    #[test]
+    fn lfm2_double_quoted_strings() {
+        let input = r#"<|tool_call_start|>[echo(msg="hello world")]<|tool_call_end|>"#;
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({ "msg": "hello world" })
+        );
+    }
+
+    /// LFM2 with negative numbers.
+    #[test]
+    fn lfm2_negative_numbers() {
+        let input = "<|tool_call_start|>[adjust(offset=-5, factor=-2.5)]<|tool_call_end|>";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({ "offset": -5, "factor": -2.5 })
+        );
+    }
+
+    /// LFM2 with False boolean.
+    #[test]
+    fn lfm2_bool_false() {
+        let input = "<|tool_call_start|>[toggle(active=False)]<|tool_call_end|>";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({ "active": false })
+        );
+    }
+
+    /// Unclosed LFM2 block is preserved as visible text.
+    #[test]
+    fn lfm2_unclosed_tag_preserved() {
+        let input = "prefix <|tool_call_start|>[incomplete(";
+        let result = parse_tool_calls(input, None);
+        assert!(result.tool_calls.is_empty());
+        assert!(result.text.contains("<|tool_call_start|>"));
+        assert!(result.text.contains("[incomplete("));
+    }
+
+    /// Invalid LFM2 content (not bracketed) preserved as raw.
+    #[test]
+    fn lfm2_invalid_content_preserved() {
+        let input = "<|tool_call_start|>not a bracketed list<|tool_call_end|>";
+        let result = parse_tool_calls(input, None);
+        assert!(result.tool_calls.is_empty());
+        assert!(result.text.contains("<|tool_call_start|>"));
+        assert!(result.text.contains("not a bracketed list"));
+    }
+
+    /// LFM2 call with empty string value.
+    #[test]
+    fn lfm2_empty_string_value() {
+        let input = "<|tool_call_start|>[log(msg='')]<|tool_call_end|>";
+        let result = parse_tool_calls(input, None);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({ "msg": "" })
+        );
+    }
+
+    /// Streaming: LFM2 call in a single chunk.
+    #[test]
+    fn streaming_lfm2_single_chunk() {
+        let mut t = StreamingToolCallTracker::new(true, None);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &["<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>"],
+        );
+        assert!(
+            vis.trim().is_empty(),
+            "pure LFM2 call should yield no visible text, got {vis:?}"
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments, serde_json::json!({ "city": "Paris" }));
+        assert_eq!(t.completed_count(), 1);
+    }
+
+    /// Streaming: LFM2 tag split across chunk boundaries.
+    #[test]
+    fn streaming_lfm2_split_across_chunks() {
+        let mut t = StreamingToolCallTracker::new(true, None);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &[
+                "<|tool_call",
+                "_start|>",
+                "[search(query='rust', ",
+                "limit=5)]",
+                "<|tool_call_",
+                "end|>",
+            ],
+        );
+        assert!(
+            vis.trim().is_empty(),
+            "split LFM2 must not leak to visible, got {vis:?}"
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({ "query": "rust", "limit": 5 })
+        );
+        assert_eq!(t.completed_count(), 1);
+    }
+
+    /// Streaming: LFM2 with surrounding text.
+    #[test]
+    fn streaming_lfm2_with_text() {
+        let mut t = StreamingToolCallTracker::new(true, None);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &[
+                "Okay, ",
+                "<|tool_call_start|>[do_it()]<|tool_call_end|>",
+                " there.",
+            ],
+        );
+        assert!(vis.contains("Okay,"));
+        assert!(vis.contains("there."));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "do_it");
+    }
+
+    /// Streaming: unclosed LFM2 tag flushed as visible.
+    #[test]
+    fn streaming_lfm2_unclosed_tag_flushed() {
+        let mut t = StreamingToolCallTracker::new(true, None);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &["<|tool_call_start|>[partial(stuck='yes'"],
+        );
+        assert!(vis.contains("<|tool_call_start|>"));
+        assert!(vis.contains("partial"));
+        assert!(vis.contains("stuck"));
+        assert!(calls.is_empty());
+    }
+
+    /// Streaming: LFM2 invalid content preserved.
+    #[test]
+    fn streaming_lfm2_invalid_content_preserved() {
+        let mut t = StreamingToolCallTracker::new(true, None);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &[
+                "<|tool_call_start|>bad stuff<|tool_call_end|> after",
+            ],
+        );
+        assert!(vis.contains("<|tool_call_start|>"));
+        assert!(vis.contains("bad stuff"));
+        assert!(vis.contains("after"));
+        assert!(calls.is_empty());
+    }
+
+
 }
