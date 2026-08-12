@@ -4658,7 +4658,11 @@ impl SimpleEngine {
                 let body_hidden = if capture_hidden {
                     let (hidden, _logits) = prepared
                         .model
-                        .forward_with_hidden(&body_array, None, &mut prepared.cache)
+                        .forward_with_hidden_last_token_logits(
+                            &body_array,
+                            None,
+                            &mut prepared.cache,
+                        )
                         .map_err(EngineError::Mlx)?;
                     Some(hidden)
                 } else if body_ids.len() > chunked_threshold_len {
@@ -4703,7 +4707,11 @@ impl SimpleEngine {
                 if capture_hidden {
                     let (suffix_hidden, logits) = prepared
                         .model
-                        .forward_with_hidden(&suffix_array, None, &mut prepared.cache)
+                        .forward_with_hidden_last_token_logits(
+                            &suffix_array,
+                            None,
+                            &mut prepared.cache,
+                        )
                         .map_err(EngineError::Mlx)?;
                     // Reconstruct the full-prompt hidden for the MTP head.
                     prefill_hidden = match body_hidden {
@@ -4744,7 +4752,11 @@ impl SimpleEngine {
                     }
                     _ => prepared
                         .model
-                        .forward_with_hidden(&prepared.prompt_array, None, &mut prepared.cache)
+                        .forward_with_hidden_last_token_logits(
+                            &prepared.prompt_array,
+                            None,
+                            &mut prepared.cache,
+                        )
                         .map_err(EngineError::Mlx)?,
                 };
                 prefill_hidden = Some(hidden);

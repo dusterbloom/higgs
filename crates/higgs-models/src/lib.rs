@@ -1011,6 +1011,25 @@ impl AnyModel {
         }
     }
 
+    /// Prefill-only hidden capture with last-token vocabulary projection.
+    /// MTP verification still uses [`Self::forward_with_hidden`] because it
+    /// requires logits for every candidate position.
+    pub fn forward_with_hidden_last_token_logits(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<(Array, Array), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_hidden_last_token_logits(inputs, mask, c)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_hidden_last_token_logits only supported for Qwen3Next",
+            )),
+        }
+    }
+
     /// The model's hidden dimension.
     pub fn hidden_size(&self) -> i32 {
         match self {

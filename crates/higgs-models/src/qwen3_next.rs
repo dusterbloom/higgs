@@ -7497,6 +7497,16 @@ fn apply_qwen3_next_rope(
     apply_qwen3_next_rope_scheduled(x, rope, offset, yarn, DFlashRowSchedule::NativeBatch)
 }
 
+fn last_token_hidden_for_projection(hidden: &Array) -> Result<Array, Exception> {
+    let shape = hidden.shape();
+    if shape.len() != 3 || shape.get(1).copied().unwrap_or(0) <= 0 {
+        return Err(Exception::custom(format!(
+            "last-token projection requires non-empty [B, T, D] hidden states, got {shape:?}"
+        )));
+    }
+    Ok(hidden.index((.., -1.., ..)))
+}
+
 #[allow(clippy::shadow_reuse, clippy::indexing_slicing)]
 fn apply_qwen3_next_rope_scheduled(
     x: Array,
@@ -9117,6 +9127,23 @@ impl Qwen3NextCausalLM {
         Ok((h_raw, logits))
     }
 
+    /// Prefill variant for MTP priming: retain every raw hidden row, but apply
+    /// the vocabulary projection only to the final row. Quantized projections
+    /// may select a different kernel for `T` rows than for one row, so using the
+    /// all-position verifier API here can change the first greedy token relative
+    /// to ordinary autoregressive prefill.
+    #[allow(non_snake_case)]
+    pub(crate) fn forward_with_hidden_last_token_logits(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<(Array, Array), Exception> {
+        let h_raw = self.forward_raw_hidden(inputs, mask, kv_cache)?;
+        let logits = self.project_raw_hidden_last(&h_raw)?;
+        Ok((h_raw, logits))
+    }
+
     #[allow(non_snake_case)]
     pub fn forward_with_taps(
         &mut self,
@@ -9167,7 +9194,7 @@ impl Qwen3NextCausalLM {
         // row is mathematically equivalent but can select a different MLX
         // kernel and is not a construction-level equivalence guarantee.
         let normed = self.model.norm.forward(hidden)?;
-        let last = normed.index((.., -1, ..));
+        let last = last_token_hidden_for_projection(&normed)?;
         let batch = hidden.shape().first().copied().ok_or_else(|| {
             Exception::custom("project_raw_hidden_last: hidden has no batch axis")
         })?;
@@ -15105,6 +15132,20 @@ mod tests {
                 .unwrap(),
         );
         attention
+    }
+
+    #[test]
+    fn hidden_capture_prefill_projects_only_the_last_token_logits() {
+        let _exec = crate::mlx_exec::acquire();
+        let hidden = Array::from_slice(&(0_i32..24).collect::<Vec<_>>(), &[1, 3, 8]);
+        let selected = last_token_hidden_for_projection(&hidden).unwrap();
+        mlx_rs::transforms::eval([&selected]).unwrap();
+
+        assert_eq!(selected.shape(), &[1, 1, 8]);
+        assert_eq!(
+            selected.as_slice::<i32>(),
+            &(16_i32..24).collect::<Vec<_>>()
+        );
     }
 
     #[test]
