@@ -2536,12 +2536,19 @@ mod tests {
     #[test]
     fn arrays_cache_deep_clone_materializes_both_recurrent_states() {
         let _exec = crate::mlx_exec::acquire();
+        let conv_source = Array::from_slice(
+            &[
+                0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0,
+            ],
+            &[1, 3, 4],
+        )
+        .as_dtype(mlx_rs::Dtype::Float16)
+        .unwrap();
         let live = qwen3_next::ArraysCache {
-            conv_state: Some(
-                Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4])
-                    .as_dtype(mlx_rs::Dtype::Float16)
-                    .unwrap(),
-            ),
+            // Production retains a trailing slice of the convolution input.
+            // Keep this view non-contiguous so the copy regression exercises
+            // the real recurrent-cache shape rather than a packed fixture.
+            conv_state: Some(conv_source.index((.., 1..3, ..))),
             ssm_state: Some(Array::from_slice(&[5.0_f32, 6.0, 7.0, 8.0], &[1, 2, 2])),
             conv_pos: 3,
             offset: 11,
@@ -2554,6 +2561,11 @@ mod tests {
         let copied_conv = checkpoint.conv_state.as_ref().unwrap();
         assert_eq!(copied_conv.dtype(), live_conv.dtype());
         assert_eq!(copied_conv.shape(), live_conv.shape());
+        assert_eq!(
+            copied_conv.as_slice::<half::f16>(),
+            live_conv.as_slice::<half::f16>(),
+            "deep-cloned convolution history must preserve every source value"
+        );
         assert_ne!(
             copied_conv.as_slice::<half::f16>().as_ptr(),
             live_conv.as_slice::<half::f16>().as_ptr()

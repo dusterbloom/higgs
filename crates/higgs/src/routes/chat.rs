@@ -13,7 +13,8 @@ use axum::{
     },
 };
 use bytes::Bytes;
-use higgs_engine::simple::SessionPromptTracePayloadStats;
+use higgs_engine::chat_template::ChatPromptMode;
+use higgs_engine::simple::{SessionContinuationPolicy, SessionPromptTracePayloadStats};
 use tokio_stream::Stream;
 
 use crate::{
@@ -24,14 +25,30 @@ use crate::{
     state::{Engine, SharedState},
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
-        ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent, StopSequence,
-        TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
-        merge_repetition_penalty,
+        ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent,
+        SessionCachePolicy, StopSequence, TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction,
+        ToolCallFunctionDelta, TopLogprob, merge_repetition_penalty,
     },
 };
 use higgs_models::SamplingParams;
 
 const TOOL_RESULT_PROMPT_WARN_BYTES: usize = 16 * 1024;
+
+fn continuation_policy(policy: Option<SessionCachePolicy>) -> SessionContinuationPolicy {
+    match policy.unwrap_or(SessionCachePolicy::BestEffort) {
+        SessionCachePolicy::BestEffort => SessionContinuationPolicy::BestEffort,
+        SessionCachePolicy::RequireContinuation => SessionContinuationPolicy::RequireContinuation,
+    }
+}
+
+fn map_session_engine_error(error: higgs_engine::error::EngineError) -> ServerError {
+    match error {
+        higgs_engine::error::EngineError::RetainedSessionUnavailable(session_id) => {
+            ServerError::RetainedSessionUnavailable(session_id)
+        }
+        other => ServerError::Engine(other),
+    }
+}
 
 fn streaming_error_json(message: &str) -> String {
     serde_json::json!({
@@ -277,15 +294,10 @@ async fn chat_completions_non_streaming(
     engine: Arc<Engine>,
     generation_defaults: GenerationDefaults,
 ) -> Result<ChatCompletionResponse, ServerError> {
-    drop_requested_retained_sessions(
-        Arc::clone(&engine),
-        req.drop_session_id,
-        req.drop_session_ids.as_deref(),
-    )
-    .await?;
-
     let max_tokens =
         resolved_max_tokens(&req, &generation_defaults, state.config.server.max_tokens);
+    let prompt_mode = chat_prompt_mode(req.session_id, max_tokens);
+    let continuation_policy = continuation_policy(req.session_cache_policy);
     let sampling = build_sampling_params(&req, &generation_defaults)?;
     let stop_sequences = StopSequence::extract(req.stop);
     let want_logprobs = req.logprobs.unwrap_or(false);
@@ -315,8 +327,19 @@ async fn chat_completions_non_streaming(
     );
 
     let (mut prompt_tokens, pflash_policy) = engine
-        .prepare_chat_prompt_with_pflash_policy(&messages, tools, thinking_enabled)
+        .prepare_chat_prompt_with_pflash_policy(&messages, tools, thinking_enabled, prompt_mode)
         .map_err(ServerError::Engine)?;
+    validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
+    validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
+    drop_requested_retained_sessions(
+        Arc::clone(&engine),
+        req.drop_session_id,
+        req.drop_session_ids.as_deref(),
+    )
+    .await?;
+    let lease_active = req
+        .session_lease
+        .is_some_and(|lease| engine.lease_retained_session(lease.session_id, lease.ttl_seconds));
 
     // Preprocess images for VLM
     let pixel_values = if !images.is_empty() && engine.is_vlm() {
@@ -356,6 +379,13 @@ async fn chat_completions_non_streaming(
         want_logprobs,
         !stop_sequences.is_empty(),
     );
+    if continuation_policy == SessionContinuationPolicy::RequireContinuation && session_id.is_none()
+    {
+        engine.record_required_continuation_miss();
+        return Err(ServerError::RetainedSessionUnavailable(
+            req.session_id.unwrap_or_default(),
+        ));
+    }
     let request_id = generate_request_id();
     let allow_prefix_cache = req.cache_mode.as_deref() != Some("bypass");
     let has_tools = tools.is_some();
@@ -380,11 +410,12 @@ async fn chat_completions_non_streaming(
                 thinking_enabled,
                 tool_payload,
                 &pflash_policy_c,
+                continuation_policy,
             )
         })
         .await
         .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-        .map_err(ServerError::Engine)?;
+        .map_err(map_session_engine_error)?;
 
         return Ok(build_session_response(
             &req.model,
@@ -393,6 +424,7 @@ async fn chat_completions_non_streaming(
             tools,
             has_tools,
             thinking_enabled,
+            lease_active,
         ));
     } else {
         tokio::task::spawn_blocking(move || {
@@ -524,7 +556,8 @@ async fn chat_completions_non_streaming(
             output.prompt_tokens,
             output.completion_tokens,
             output.cached_prompt_tokens,
-        ),
+        )
+        .with_session_lease_active(lease_active),
     })
 }
 
@@ -569,8 +602,9 @@ fn build_session_response(
     tools: Option<&[serde_json::Value]>,
     has_tools: bool,
     thinking_enabled: bool,
+    lease_active: bool,
 ) -> ChatCompletionResponse {
-    let usage = session_usage(&output);
+    let usage = session_usage(&output).with_session_lease_active(lease_active);
     let generation_finish_reason = output.finish_reason.clone();
     let output_text = output.text;
     // Same reasoning-tag handling as the normal path: the template opens
@@ -656,7 +690,13 @@ fn build_session_response(
 /// Only a truly continued turn reused a prefix; a cold prefill reports 0.
 fn session_usage(output: &higgs_engine::simple::SessionGeneration) -> CompletionUsage {
     let cached = if output.continued {
-        output.prompt_tokens.saturating_sub(output.prefilled_tokens)
+        let forwarded_prompt_tokens =
+            if output.completion_tokens == 0 && output.finish_reason == "length" {
+                output.prompt_tokens.saturating_sub(1)
+            } else {
+                output.prompt_tokens
+            };
+        forwarded_prompt_tokens.saturating_sub(output.prefilled_tokens)
     } else {
         0
     };
@@ -672,13 +712,6 @@ async fn chat_completions_stream(
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, ServerError> {
-    drop_requested_retained_sessions(
-        Arc::clone(&engine),
-        req.drop_session_id,
-        req.drop_session_ids.as_deref(),
-    )
-    .await?;
-
     let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     // Built here (before the `async_stream::stream!` block, which captures by
     // move) so the tracker can coerce XML-format tool-call values to their
@@ -695,6 +728,8 @@ async fn chat_completions_stream(
 
     let max_tokens =
         resolved_max_tokens(&req, &generation_defaults, state.config.server.max_tokens);
+    let prompt_mode = chat_prompt_mode(req.session_id, max_tokens);
+    let continuation_policy = continuation_policy(req.session_cache_policy);
     let sampling = build_sampling_params(&req, &generation_defaults)?;
     let stop_sequences = StopSequence::extract(req.stop);
     let want_logprobs = req.logprobs.unwrap_or(false);
@@ -730,8 +765,24 @@ async fn chat_completions_stream(
         .as_deref()
         .and_then(|t| if t.is_empty() { None } else { Some(t) });
     let (mut prompt_tokens, pflash_policy) = engine
-        .prepare_chat_prompt_with_pflash_policy(&messages, prompt_tools, thinking_enabled_stream)
+        .prepare_chat_prompt_with_pflash_policy(
+            &messages,
+            prompt_tools,
+            thinking_enabled_stream,
+            prompt_mode,
+        )
         .map_err(ServerError::Engine)?;
+    validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
+    validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
+    drop_requested_retained_sessions(
+        Arc::clone(&engine),
+        req.drop_session_id,
+        req.drop_session_ids.as_deref(),
+    )
+    .await?;
+    let lease_active = req
+        .session_lease
+        .is_some_and(|lease| engine.lease_retained_session(lease.session_id, lease.ttl_seconds));
 
     // Preprocess images for VLM
     let pixel_values = if !images.is_empty() && engine.is_vlm() {
@@ -769,6 +820,115 @@ async fn chat_completions_stream(
     warn_large_tool_payload(tool_payload);
 
     let start = Instant::now();
+    let stream_session_id = session_continuation_id(
+        request_session_id,
+        pixel_values.is_some(),
+        constraint.is_some(),
+        checkpoint_id.as_deref(),
+        want_logprobs,
+        !stop_sequences.is_empty(),
+    );
+    if continuation_policy == SessionContinuationPolicy::RequireContinuation
+        && stream_session_id.is_none()
+    {
+        engine.record_required_continuation_miss();
+        return Err(ServerError::RetainedSessionUnavailable(
+            request_session_id.unwrap_or_default(),
+        ));
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let (acceptance, acceptance_rx) =
+        if continuation_policy == SessionContinuationPolicy::RequireContinuation {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+    // Cache-resident (session-continued) turns stream from the retained KV
+    // cache; everything else does a fresh prefill. Both feed the same
+    // `StreamingOutput` channel and the same delta/tool-call-tracking loop
+    // below — the session path used to buffer the *entire* completion behind
+    // a `spawn_blocking().await` before emitting a single burst of deltas
+    // (the browser/client would see time-to-first-delta == total elapsed
+    // time on every cache-resident turn). Streaming the retained-cache decode
+    // loop itself (see `generate_continued_streaming_with_thinking`) fixes
+    // that without changing the non-session path at all.
+    if let Some(sid) = stream_session_id {
+        let worker_engine = Arc::clone(&engine);
+        let prompt_tools_c = prompt_tools.map(<[serde_json::Value]>::to_vec);
+        let messages_c = messages.clone();
+        let pflash_policy_c = pflash_policy.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = worker_engine.generate_session_routed_streaming_with_thinking(
+                sid,
+                &prompt_tokens,
+                &messages_c,
+                prompt_tools_c.as_deref(),
+                max_tokens,
+                &sampling,
+                &tx,
+                thinking_enabled_stream,
+                tool_payload,
+                &pflash_policy_c,
+                continuation_policy,
+                acceptance,
+            );
+            match &result {
+                Ok(()) => {}
+                Err(higgs_engine::error::EngineError::Cancelled) => {
+                    tracing::debug!(sid, "Session-routed streaming cancelled by client");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Session-routed generation error during streaming");
+                }
+            }
+            let _ = terminal_tx.send(result.map_err(|error| error.to_string()));
+        });
+    } else {
+        let worker_engine = Arc::clone(&engine);
+        tokio::task::spawn_blocking(move || {
+            let result = worker_engine
+                .generate_streaming_with_thinking_and_pflash_policy_with_cache(
+                    &prompt_tokens,
+                    max_tokens,
+                    &sampling,
+                    &stop_sequences,
+                    want_logprobs,
+                    top_logprobs,
+                    &tx,
+                    thinking_enabled_stream,
+                    collect_prefill_progress,
+                    constraint,
+                    pixel_values,
+                    checkpoint_id.as_deref(),
+                    &pflash_policy,
+                    allow_prefix_cache,
+                );
+            if let Err(ref e) = result {
+                tracing::error!(error = %e, "Generation error during streaming");
+            }
+            let _ = terminal_tx.send(result.map_err(|error| error.to_string()));
+        });
+    }
+
+    if let Some(acceptance_rx) = acceptance_rx {
+        match acceptance_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(session_id)) => {
+                return Err(ServerError::RetainedSessionUnavailable(session_id));
+            }
+            Err(_) => {
+                return Err(ServerError::InternalError(
+                    "session continuation worker exited before acceptance".to_owned(),
+                ));
+            }
+        }
+    }
+
+    let tokenizer = engine.tokenizer().clone();
     let metrics_id = metrics.as_ref().map(|m| {
         m.record_pending(RequestRecord {
             id: 0,
@@ -784,81 +944,6 @@ async fn chat_completions_stream(
             error_body: None,
         })
     });
-
-    let stream_session_id = session_continuation_id(
-        request_session_id,
-        pixel_values.is_some(),
-        constraint.is_some(),
-        checkpoint_id.as_deref(),
-        want_logprobs,
-        !stop_sequences.is_empty(),
-    );
-
-    let tokenizer = engine.tokenizer().clone();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-
-    // Cache-resident (session-continued) turns stream from the retained KV
-    // cache; everything else does a fresh prefill. Both feed the same
-    // `StreamingOutput` channel and the same delta/tool-call-tracking loop
-    // below — the session path used to buffer the *entire* completion behind
-    // a `spawn_blocking().await` before emitting a single burst of deltas
-    // (the browser/client would see time-to-first-delta == total elapsed
-    // time on every cache-resident turn). Streaming the retained-cache decode
-    // loop itself (see `generate_continued_streaming_with_thinking`) fixes
-    // that without changing the non-session path at all.
-    if let Some(sid) = stream_session_id {
-        let prompt_tools_c = prompt_tools.map(<[serde_json::Value]>::to_vec);
-        let messages_c = messages.clone();
-        let pflash_policy_c = pflash_policy.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = engine.generate_session_routed_streaming_with_thinking(
-                sid,
-                &prompt_tokens,
-                &messages_c,
-                prompt_tools_c.as_deref(),
-                max_tokens,
-                &sampling,
-                &tx,
-                thinking_enabled_stream,
-                tool_payload,
-                &pflash_policy_c,
-            );
-            match &result {
-                Ok(()) => {}
-                Err(higgs_engine::error::EngineError::Cancelled) => {
-                    tracing::debug!(sid, "Session-routed streaming cancelled by client");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Session-routed generation error during streaming");
-                }
-            }
-            let _ = terminal_tx.send(result.map_err(|error| error.to_string()));
-        });
-    } else {
-        tokio::task::spawn_blocking(move || {
-            let result = engine.generate_streaming_with_thinking_and_pflash_policy_with_cache(
-                &prompt_tokens,
-                max_tokens,
-                &sampling,
-                &stop_sequences,
-                want_logprobs,
-                top_logprobs,
-                &tx,
-                thinking_enabled_stream,
-                collect_prefill_progress,
-                constraint,
-                pixel_values,
-                checkpoint_id.as_deref(),
-                &pflash_policy,
-                allow_prefix_cache,
-            );
-            if let Err(ref e) = result {
-                tracing::error!(error = %e, "Generation error during streaming");
-            }
-            let _ = terminal_tx.send(result.map_err(|error| error.to_string()));
-        });
-    }
 
     let stream = async_stream::stream! {
         let mut writer = crate::sse::ChatChunkWriter::new(&request_id, created, &model);
@@ -1080,8 +1165,12 @@ async fn chat_completions_stream(
 
         // Emit final chunk with usage only when explicitly requested.
         if include_usage {
-            let usage =
-                CompletionUsage::new(prompt_token_count, output_token_count, cached_prompt_tokens);
+            let usage = CompletionUsage::new(
+                prompt_token_count,
+                output_token_count,
+                cached_prompt_tokens,
+            )
+            .with_session_lease_active(lease_active);
             match writer.write_usage(&usage) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
@@ -1234,6 +1323,14 @@ fn resolved_max_tokens(
         .unwrap_or(server_max_tokens)
 }
 
+const fn chat_prompt_mode(session_id: Option<u64>, max_tokens: u32) -> ChatPromptMode {
+    if session_id.is_some() && max_tokens == 0 {
+        ChatPromptMode::SessionPrefill
+    } else {
+        ChatPromptMode::Generation
+    }
+}
+
 /// Build a constrained generator from the request's `response_format`.
 ///
 /// Returns `None` if no constraint is needed (text mode or absent).
@@ -1334,6 +1431,30 @@ fn session_continuation_id(
         .filter(|_| !has_stop_sequences)
 }
 
+fn validate_prompt_limit(
+    max_prompt_tokens: Option<u32>,
+    prompt_tokens: usize,
+) -> Result<(), ServerError> {
+    if let Some(limit) = max_prompt_tokens {
+        if prompt_tokens > usize::try_from(limit).unwrap_or(usize::MAX) {
+            return Err(ServerError::ContextLengthExceeded {
+                prompt_tokens,
+                max_prompt_tokens: limit,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_session_lease_ttl(ttl_seconds: Option<u32>) -> Result<(), ServerError> {
+    if ttl_seconds.is_some_and(|ttl| ttl == 0 || ttl > 300) {
+        return Err(ServerError::BadRequest(
+            "session_lease.ttl_seconds must be between 1 and 300".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 async fn drop_requested_retained_sessions(
     engine: Arc<Engine>,
     session_id: Option<u64>,
@@ -1380,7 +1501,85 @@ fn current_unix_timestamp() -> i64 {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
+    use std::collections::HashMap;
+
+    use axum::body::Body;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
     use super::*;
+
+    fn streaming_test_state() -> SharedState {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n").unwrap();
+        let config = crate::config::load_config_file(&path, None).unwrap();
+        let router = crate::router::Router::from_config(&config, HashMap::new()).unwrap();
+        Arc::new(crate::state::AppState {
+            router,
+            config,
+            http_client: reqwest::Client::new(),
+            metrics: None,
+        })
+    }
+
+    fn axum_session_test_app(engine_name: &str) -> (axum::Router, Arc<Engine>) {
+        let engine = Arc::new(Engine::test_stub(engine_name));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n").unwrap();
+        let config = crate::config::load_config_file(&path, None).unwrap();
+        let router = crate::router::Router::from_config(
+            &config,
+            HashMap::from([(engine_name.to_owned(), Arc::clone(&engine))]),
+        )
+        .unwrap();
+        let state = Arc::new(crate::state::AppState {
+            router,
+            config,
+            http_client: reqwest::Client::new(),
+            metrics: None,
+        });
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state);
+        (app, engine)
+    }
+
+    fn axum_chat_request(model: &str, extra: serde_json::Value) -> Request<Body> {
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn axum_sse_events(body: &str) -> (Vec<serde_json::Value>, usize) {
+        let mut events = Vec::new();
+        let mut done = 0;
+        for line in body.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                done += 1;
+            } else {
+                events.push(serde_json::from_str(data).unwrap());
+            }
+        }
+        (events, done)
+    }
 
     fn chat_request(extra: serde_json::Value) -> ChatCompletionRequest {
         let mut request = serde_json::json!({
@@ -1514,8 +1713,368 @@ mod tests {
             outcome: higgs_engine::simple::SessionOutcome::ExactBootstrap,
         };
 
-        let response = build_session_response("model", "request", output, None, false, false);
+        let response =
+            build_session_response("model", "request", output, None, false, false, false);
         assert_eq!(response.choices[0].finish_reason, "length");
+    }
+
+    #[test]
+    fn session_response_marks_only_confirmed_lease() {
+        let output = higgs_engine::simple::SessionGeneration {
+            text: String::new(),
+            completion_tokens: 0,
+            finish_reason: "length".to_owned(),
+            prompt_tokens: 3,
+            prefilled_tokens: 2,
+            continued: false,
+            outcome: higgs_engine::simple::SessionOutcome::ExactBootstrap,
+        };
+        let response = build_session_response("model", "request", output, None, false, false, true);
+        assert_eq!(response.usage.higgs_session_lease_active, Some(1));
+    }
+
+    #[tokio::test]
+    async fn streaming_required_worker_rejection_returns_http_409_before_sse() {
+        let engine = Arc::new(Engine::test_stub("raw-accept-worker-reject"));
+        let request = chat_request(serde_json::json!({
+            "stream": true,
+            "session_id": 42,
+            "session_cache_policy": "require_continuation"
+        }));
+
+        let error = match chat_completions_stream(
+            streaming_test_state(),
+            request,
+            engine,
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await
+        {
+            Ok(_) => panic!("required miss opened an SSE response"),
+            Err(error) => error,
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "retained_session_unavailable");
+    }
+
+    #[tokio::test]
+    async fn streaming_required_materialization_failure_errors_before_sse() {
+        let request = chat_request(serde_json::json!({
+            "stream": true,
+            "session_id": 42,
+            "max_tokens": 0,
+            "session_cache_policy": "require_continuation"
+        }));
+
+        let error = match chat_completions_stream(
+            streaming_test_state(),
+            request,
+            Arc::new(Engine::test_stub("zero-prefix-materialization-fail")),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await
+        {
+            Ok(_) => panic!("materialization failure opened an SSE response"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_required_post_admission_miss_returns_http_409() {
+        let request = chat_request(serde_json::json!({
+            "session_id": 42,
+            "max_tokens": 0,
+            "session_cache_policy": "require_continuation"
+        }));
+
+        let error = chat_completions_non_streaming(
+            streaming_test_state(),
+            request,
+            Arc::new(Engine::test_stub(
+                "blocking-required-post-admission-evicted",
+            )),
+            GenerationDefaults::default(),
+        )
+        .await
+        .unwrap_err();
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "retained_session_unavailable");
+    }
+
+    #[tokio::test]
+    async fn required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409() {
+        let request = || {
+            chat_request(serde_json::json!({
+                "stream": true,
+                "stream_options": {"include_usage": true},
+                "session_id": 42,
+                "max_tokens": 0,
+                "session_cache_policy": "require_continuation"
+            }))
+        };
+
+        let accepted_engine = Arc::new(Engine::test_stub("zero-prefix-accept"));
+        let accepted = chat_completions_stream(
+            streaming_test_state(),
+            request(),
+            Arc::clone(&accepted_engine),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await
+        .expect("explicit zero-prefix retention should be accepted");
+        let response = axum::response::sse::Sse::new(accepted).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("\"prompt_tokens\":1"));
+        assert!(body.contains("\"completion_tokens\":0"));
+        assert!(body.contains("\"total_tokens\":1"));
+        assert!(body.contains("\"finish_reason\":\"length\""));
+        assert!(body.contains("data: [DONE]"));
+        assert_eq!(
+            accepted_engine.route_test_mutations(),
+            1,
+            "accepted zero-prefix prefill did not publish exactly once"
+        );
+
+        let rejected_engine = Arc::new(Engine::test_stub("zero-prefix-evicted"));
+        let error = match chat_completions_stream(
+            streaming_test_state(),
+            request(),
+            Arc::clone(&rejected_engine),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await
+        {
+            Ok(_) => panic!("evicted zero-prefix retention opened an SSE response"),
+            Err(error) => error,
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "retained_session_unavailable");
+        assert_eq!(rejected_engine.route_test_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn axum_session_extensions_preserve_status_usage_and_mutation_order() {
+        let (accepted_app, accepted_engine) = axum_session_test_app("zero-prefix-accept");
+        let seed = accepted_app
+            .clone()
+            .oneshot(axum_chat_request(
+                "zero-prefix-accept",
+                serde_json::json!({
+                    "session_id": 42,
+                    "max_tokens": 0,
+                    "max_prompt_tokens": 1,
+                    "session_cache_policy": "best_effort"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(seed.status(), axum::http::StatusCode::OK);
+        let seed_body = seed.into_body().collect().await.unwrap().to_bytes();
+        let seed_body: serde_json::Value = serde_json::from_slice(&seed_body).unwrap();
+        assert_eq!(seed_body["choices"].as_array().unwrap().len(), 1);
+        assert_eq!(seed_body["choices"][0]["message"]["content"], "");
+        assert!(
+            seed_body["choices"][0]["message"]
+                .get("tool_calls")
+                .is_none()
+        );
+        assert_eq!(seed_body["choices"][0]["finish_reason"], "length");
+        assert_eq!(seed_body["usage"]["prompt_tokens"], 1);
+        assert_eq!(seed_body["usage"]["completion_tokens"], 0);
+        assert_eq!(seed_body["usage"]["total_tokens"], 1);
+        assert!(seed_body["usage"].get("prompt_tokens_details").is_none());
+        assert!(
+            seed_body["usage"]
+                .get("higgs_session_lease_active")
+                .is_none()
+        );
+
+        let leased = accepted_app
+            .clone()
+            .oneshot(axum_chat_request(
+                "zero-prefix-accept",
+                serde_json::json!({
+                    "session_id": 43,
+                    "max_tokens": 0,
+                    "max_prompt_tokens": 1,
+                    "session_lease": {"session_id": 42, "ttl_seconds": 300},
+                    "session_cache_policy": "best_effort"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(leased.status(), axum::http::StatusCode::OK);
+        let leased_body = leased.into_body().collect().await.unwrap().to_bytes();
+        let leased_body: serde_json::Value = serde_json::from_slice(&leased_body).unwrap();
+        assert_eq!(leased_body["usage"]["prompt_tokens"], 1);
+        assert_eq!(leased_body["usage"]["completion_tokens"], 0);
+        assert_eq!(leased_body["usage"]["total_tokens"], 1);
+        assert!(leased_body["usage"].get("prompt_tokens_details").is_none());
+        assert_eq!(leased_body["usage"]["higgs_session_lease_active"], 1);
+
+        let continued = accepted_app
+            .clone()
+            .oneshot(axum_chat_request(
+                "zero-prefix-accept",
+                serde_json::json!({
+                    "stream": true,
+                    "stream_options": {"include_usage": true},
+                    "session_id": 42,
+                    "max_tokens": 0,
+                    "max_prompt_tokens": 1,
+                    "session_cache_policy": "require_continuation"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(continued.status(), axum::http::StatusCode::OK);
+        let continued_body = continued.into_body().collect().await.unwrap().to_bytes();
+        let (continued_events, done) =
+            axum_sse_events(&String::from_utf8(continued_body.to_vec()).unwrap());
+        assert_eq!(done, 1);
+        let usage: Vec<_> = continued_events
+            .iter()
+            .filter_map(|event| event.get("usage"))
+            .collect();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0]["prompt_tokens"], 1);
+        assert_eq!(usage[0]["completion_tokens"], 0);
+        assert_eq!(usage[0]["total_tokens"], 1);
+        assert_eq!(usage[0]["prompt_tokens_details"]["cached_tokens"], 1);
+        assert!(usage[0].get("higgs_session_lease_active").is_none());
+
+        let singular = accepted_app
+            .clone()
+            .oneshot(axum_chat_request(
+                "zero-prefix-accept",
+                serde_json::json!({
+                    "session_id": 44,
+                    "drop_session_id": 42,
+                    "max_tokens": 0,
+                    "max_prompt_tokens": 1,
+                    "session_cache_policy": "best_effort"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(singular.status(), axum::http::StatusCode::OK);
+        let plural = accepted_app
+            .oneshot(axum_chat_request(
+                "zero-prefix-accept",
+                serde_json::json!({
+                    "session_id": 45,
+                    "drop_session_id": 43,
+                    "drop_session_ids": [44, 43, 44],
+                    "max_tokens": 0,
+                    "max_prompt_tokens": 1,
+                    "session_cache_policy": "best_effort"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(plural.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            accepted_engine.route_test_mutation_sequence(),
+            [
+                "retain:42",
+                "lease:42:300",
+                "retain:43",
+                "continue:42",
+                "drop:42",
+                "retain:44",
+                "drop:43",
+                "drop:44",
+                "retain:45"
+            ]
+        );
+        assert_eq!(accepted_engine.route_test_retained_sessions(), [45]);
+
+        let (limited_app, limited_engine) = axum_session_test_app("prompt-limit-mutation-spy");
+        let limited = limited_app
+            .oneshot(axum_chat_request(
+                "prompt-limit-mutation-spy",
+                serde_json::json!({
+                    "session_id": 42,
+                    "max_tokens": 0,
+                    "max_prompt_tokens": 2,
+                    "drop_session_ids": [7, 7],
+                    "session_lease": {"session_id": 8, "ttl_seconds": 300},
+                    "session_cache_policy": "best_effort"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), axum::http::StatusCode::BAD_REQUEST);
+        let limited_body = limited.into_body().collect().await.unwrap().to_bytes();
+        let limited_body: serde_json::Value = serde_json::from_slice(&limited_body).unwrap();
+        assert_eq!(limited_body["error"]["code"], "context_length_exceeded");
+        assert_eq!(limited_engine.route_test_mutations(), 0);
+
+        let (ttl_app, ttl_engine) = axum_session_test_app("prompt-limit-mutation-spy");
+        let invalid_ttl = ttl_app
+            .oneshot(axum_chat_request(
+                "prompt-limit-mutation-spy",
+                serde_json::json!({
+                    "session_id": 42,
+                    "max_tokens": 0,
+                    "max_prompt_tokens": 3,
+                    "drop_session_ids": [7, 8],
+                    "session_lease": {"session_id": 8, "ttl_seconds": 301}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_ttl.status(), axum::http::StatusCode::BAD_REQUEST);
+        let invalid_ttl_body = invalid_ttl.into_body().collect().await.unwrap().to_bytes();
+        let invalid_ttl_body: serde_json::Value =
+            serde_json::from_slice(&invalid_ttl_body).unwrap();
+        assert_eq!(invalid_ttl_body["error"]["type"], "invalid_request_error");
+        assert_eq!(ttl_engine.route_test_mutations(), 0);
+
+        let (missing_app, missing_engine) = axum_session_test_app("zero-prefix-evicted");
+        let missing = missing_app
+            .oneshot(axum_chat_request(
+                "zero-prefix-evicted",
+                serde_json::json!({
+                    "stream": true,
+                    "session_id": 42,
+                    "max_tokens": 0,
+                    "session_cache_policy": "require_continuation"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), axum::http::StatusCode::CONFLICT);
+        let missing_body = missing.into_body().collect().await.unwrap().to_bytes();
+        let missing_body: serde_json::Value = serde_json::from_slice(&missing_body).unwrap();
+        assert_eq!(
+            missing_body["error"]["code"],
+            "retained_session_unavailable"
+        );
+        assert_eq!(missing_engine.route_test_mutations(), 0);
     }
 
     #[test]
@@ -1565,6 +2124,182 @@ mod tests {
             retained_session_drop_ids(Some(9), Some(&[3, 9, 1, 3])),
             vec![1, 3, 9]
         );
+    }
+
+    #[test]
+    fn prompt_limit_uses_authoritative_rendered_token_count() {
+        assert!(validate_prompt_limit(None, 3).is_ok());
+        assert!(validate_prompt_limit(Some(3), 3).is_ok());
+        let error = validate_prompt_limit(Some(2), 3).unwrap_err();
+        assert!(matches!(
+            error,
+            ServerError::ContextLengthExceeded {
+                prompt_tokens: 3,
+                max_prompt_tokens: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn session_prefill_mode_requires_session_and_zero_budget() {
+        use higgs_engine::chat_template::ChatPromptMode;
+
+        assert_eq!(
+            chat_prompt_mode(Some(42), 0),
+            ChatPromptMode::SessionPrefill
+        );
+        assert_eq!(chat_prompt_mode(None, 0), ChatPromptMode::Generation);
+        assert_eq!(chat_prompt_mode(Some(42), 1), ChatPromptMode::Generation);
+    }
+
+    #[tokio::test]
+    async fn axum_session_prefill_mode_is_authoritative_before_mutation() {
+        let (app, engine) = axum_session_test_app("session-prefill-render-spy");
+
+        let accepted = app
+            .clone()
+            .oneshot(axum_chat_request(
+                "session-prefill-render-spy",
+                serde_json::json!({
+                    "session_id": 42,
+                    "max_tokens": 0,
+                    "max_prompt_tokens": 1,
+                    "session_cache_policy": "best_effort"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), axum::http::StatusCode::OK);
+
+        let streaming_accepted = app
+            .clone()
+            .oneshot(axum_chat_request(
+                "session-prefill-render-spy",
+                serde_json::json!({
+                    "stream": true,
+                    "stream_options": {"include_usage": true},
+                    "session_id": 45,
+                    "max_tokens": 0,
+                    "max_prompt_tokens": 1,
+                    "session_cache_policy": "best_effort"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(streaming_accepted.status(), axum::http::StatusCode::OK);
+        let body = streaming_accepted
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let (events, done) = axum_sse_events(&String::from_utf8(body.to_vec()).unwrap());
+        assert_eq!(done, 1);
+        assert!(events.iter().any(|event| {
+            event["choices"][0]["finish_reason"] == serde_json::Value::String("length".to_owned())
+        }));
+        assert_eq!(engine.route_test_mutations(), 2);
+
+        let streaming_rejected = app
+            .clone()
+            .oneshot(axum_chat_request(
+                "session-prefill-render-spy",
+                serde_json::json!({
+                    "stream": true,
+                    "session_id": 44,
+                    "max_tokens": 1,
+                    "max_prompt_tokens": 1,
+                    "drop_session_ids": [42],
+                    "session_cache_policy": "best_effort"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            streaming_rejected.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let body = streaming_rejected
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert_eq!(engine.route_test_mutations(), 2);
+
+        let rejected = app
+            .oneshot(axum_chat_request(
+                "session-prefill-render-spy",
+                serde_json::json!({
+                    "session_id": 43,
+                    "max_tokens": 1,
+                    "max_prompt_tokens": 1,
+                    "drop_session_ids": [42],
+                    "session_cache_policy": "best_effort"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(engine.route_test_mutations(), 2);
+    }
+
+    #[tokio::test]
+    async fn prompt_limit_rejects_before_blocking_and_streaming_session_mutations() {
+        let engine = Arc::new(Engine::test_stub("prompt-limit-mutation-spy"));
+        let request = || {
+            chat_request(serde_json::json!({
+                "session_id": 42,
+                "max_prompt_tokens": 2,
+                "drop_session_id": 7,
+                "session_lease": {"session_id": 8, "ttl_seconds": 60}
+            }))
+        };
+
+        let blocking = chat_completions_non_streaming(
+            streaming_test_state(),
+            request(),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await;
+        assert!(matches!(
+            blocking,
+            Err(ServerError::ContextLengthExceeded {
+                prompt_tokens: 3,
+                max_prompt_tokens: 2
+            })
+        ));
+        assert_eq!(engine.route_test_mutations(), 0);
+
+        let streaming = chat_completions_stream(
+            streaming_test_state(),
+            request(),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await;
+        assert!(matches!(
+            streaming,
+            Err(ServerError::ContextLengthExceeded {
+                prompt_tokens: 3,
+                max_prompt_tokens: 2
+            })
+        ));
+        assert_eq!(engine.route_test_mutations(), 0);
+    }
+
+    #[test]
+    fn session_lease_ttl_is_bounded_to_wire_contract() {
+        assert!(validate_session_lease_ttl(None).is_ok());
+        assert!(validate_session_lease_ttl(Some(1)).is_ok());
+        assert!(validate_session_lease_ttl(Some(300)).is_ok());
+        assert!(validate_session_lease_ttl(Some(0)).is_err());
+        assert!(validate_session_lease_ttl(Some(301)).is_err());
     }
 
     fn simple_message(role: &str, content: Option<&str>) -> ChatCompletionMessage {

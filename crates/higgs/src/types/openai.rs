@@ -15,6 +15,9 @@ pub struct ChatCompletionRequest {
     /// Accepts `max_completion_tokens` and `max_output_tokens` aliases.
     #[serde(default, alias = "max_completion_tokens", alias = "max_output_tokens")]
     pub max_tokens: Option<u32>,
+    /// Reject when the fully rendered prompt exceeds this exact token count.
+    #[serde(default)]
+    pub max_prompt_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
@@ -91,6 +94,12 @@ pub struct ChatCompletionRequest {
     /// Omitted by default — behavior is unchanged when absent.
     #[serde(default)]
     pub session_id: Option<u64>,
+    /// Best-effort idle-eviction lease for an already retained session.
+    #[serde(default)]
+    pub session_lease: Option<SessionLease>,
+    /// Whether a missing retained continuation may cold-prefill.
+    #[serde(default)]
+    pub session_cache_policy: Option<SessionCachePolicy>,
     /// Optional Higgs extension: drop a retained per-session KV cache before
     /// serving this request. This is for logical session resets; it does not
     /// clear exact radix/disk prefix caches.
@@ -102,6 +111,19 @@ pub struct ChatCompletionRequest {
     /// the route.
     #[serde(default)]
     pub drop_session_ids: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct SessionLease {
+    pub session_id: u64,
+    pub ttl_seconds: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCachePolicy {
+    BestEffort,
+    RequireContinuation,
 }
 
 /// Subset of `chat_template_kwargs` that Higgs acts on.
@@ -466,6 +488,9 @@ pub struct CompletionUsage {
     /// a measured zero for paths that don't track reuse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Higgs extension emitted as `1` only after a lease is confirmed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub higgs_session_lease_active: Option<u32>,
 }
 
 impl CompletionUsage {
@@ -480,7 +505,14 @@ impl CompletionUsage {
             total_tokens: prompt_tokens + completion_tokens,
             prompt_tokens_details: (cached_tokens > 0)
                 .then_some(PromptTokensDetails { cached_tokens }),
+            higgs_session_lease_active: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_session_lease_active(mut self, active: bool) -> Self {
+        self.higgs_session_lease_active = active.then_some(1);
+        self
     }
 }
 
@@ -622,6 +654,48 @@ mod tests {
         assert!(req.max_tokens.is_none());
         assert!(req.reasoning.is_none());
         assert!(req.cache_mode.is_none());
+        assert!(req.max_prompt_tokens.is_none());
+        assert!(req.session_lease.is_none());
+        assert!(req.session_cache_policy.is_none());
+    }
+
+    #[test]
+    fn chat_request_parses_prefill_and_session_lease_controls() {
+        let req = chat_request_with(
+            r#""max_prompt_tokens": 32768,
+                "session_lease": {"session_id": 41, "ttl_seconds": 300},
+                "session_cache_policy": "require_continuation""#,
+        );
+
+        assert_eq!(req.max_prompt_tokens, Some(32_768));
+        let lease = req.session_lease.expect("session lease");
+        assert_eq!(lease.session_id, 41);
+        assert_eq!(lease.ttl_seconds, 300);
+        assert_eq!(
+            req.session_cache_policy,
+            Some(SessionCachePolicy::RequireContinuation)
+        );
+    }
+
+    #[test]
+    fn chat_request_rejects_unknown_session_cache_policy() {
+        let json = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "session_cache_policy": "cold_fallback"
+        }"#;
+        assert!(serde_json::from_str::<ChatCompletionRequest>(json).is_err());
+    }
+
+    #[test]
+    fn usage_emits_confirmed_session_lease_only() {
+        let inactive = serde_json::to_value(CompletionUsage::new(8, 0, 0)).unwrap();
+        assert!(inactive.get("higgs_session_lease_active").is_none());
+
+        let active =
+            serde_json::to_value(CompletionUsage::new(8, 0, 0).with_session_lease_active(true))
+                .unwrap();
+        assert_eq!(active["higgs_session_lease_active"], 1);
     }
 
     #[test]

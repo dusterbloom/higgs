@@ -517,12 +517,15 @@ pub struct ModelConfig {
     pub kv_max_sessions: usize,
     /// Drop a conversation's retained KV once it exceeds this many tokens
     /// (`0` = unlimited). Bounds a single conversation's resident KV.
-    #[serde(default)]
+    #[serde(default = "default_kv_max_session_tokens")]
     pub kv_max_session_tokens: usize,
     /// Evict retained session KV and memory-only paired target+dSpark radix
     /// endpoints idle longer than this many seconds (`0` = never).
     #[serde(default = "default_kv_retained_idle_secs")]
     pub kv_retained_idle_secs: u64,
+    /// Hard aggregate byte limit for retained per-session KV state.
+    #[serde(default = "default_kv_max_retained_bytes")]
+    pub kv_max_retained_bytes: usize,
     /// Maximum exact suffix tokens to append to a retained session before
     /// falling back to the stateless radix/PFlash path. Cold session bootstraps
     /// are still executed exactly so the retained KV can seed later turns.
@@ -683,15 +686,23 @@ const fn default_min_tokens_to_persist() -> usize {
 }
 
 const fn default_kv_max_sessions() -> usize {
-    8
+    2
 }
 
 const fn default_kv_retained_idle_secs() -> u64 {
-    1800
+    300
+}
+
+const fn default_kv_max_session_tokens() -> usize {
+    32_768
 }
 
 const fn default_kv_max_suffix_prefill_tokens() -> usize {
-    8192
+    24_576
+}
+
+const fn default_kv_max_retained_bytes() -> usize {
+    2_147_483_648
 }
 
 impl ModelConfig {
@@ -707,6 +718,7 @@ impl ModelConfig {
             max_retained_sessions: self.kv_max_sessions,
             max_session_tokens: self.kv_max_session_tokens,
             retained_idle_secs: self.kv_retained_idle_secs,
+            max_retained_bytes: self.kv_max_retained_bytes,
             kv_cache_bytes: self.kv_cache_bytes,
         }
     }
@@ -769,8 +781,9 @@ impl Default for ModelConfig {
             max_disk_blocks: default_max_disk_blocks(),
             min_tokens_to_persist: default_min_tokens_to_persist(),
             kv_max_sessions: default_kv_max_sessions(),
-            kv_max_session_tokens: 0,
+            kv_max_session_tokens: default_kv_max_session_tokens(),
             kv_retained_idle_secs: default_kv_retained_idle_secs(),
+            kv_max_retained_bytes: default_kv_max_retained_bytes(),
             kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
             kv_cache_bytes: 0,
         }
@@ -1019,8 +1032,9 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             max_disk_blocks: default_max_disk_blocks(),
             min_tokens_to_persist: default_min_tokens_to_persist(),
             kv_max_sessions: default_kv_max_sessions(),
-            kv_max_session_tokens: 0,
+            kv_max_session_tokens: 32_768,
             kv_retained_idle_secs: default_kv_retained_idle_secs(),
+            kv_max_retained_bytes: default_kv_max_retained_bytes(),
             kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
             kv_cache_bytes: 0,
         })
@@ -1131,8 +1145,9 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     max_disk_blocks: default_max_disk_blocks(),
                     min_tokens_to_persist: default_min_tokens_to_persist(),
                     kv_max_sessions: default_kv_max_sessions(),
-                    kv_max_session_tokens: 0,
+                    kv_max_session_tokens: 32_768,
                     kv_retained_idle_secs: default_kv_retained_idle_secs(),
+                    kv_max_retained_bytes: default_kv_max_retained_bytes(),
                     kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
                     kv_cache_bytes: 0,
                 })
@@ -1358,8 +1373,9 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         max_disk_blocks: default_max_disk_blocks(),
         min_tokens_to_persist: default_min_tokens_to_persist(),
         kv_max_sessions: default_kv_max_sessions(),
-        kv_max_session_tokens: 0,
+        kv_max_session_tokens: 32_768,
         kv_retained_idle_secs: default_kv_retained_idle_secs(),
+        kv_max_retained_bytes: default_kv_max_retained_bytes(),
         kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
         kv_cache_bytes: 0,
     });
@@ -1907,20 +1923,22 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        assert_eq!(model.kv_max_sessions, 8);
-        assert_eq!(model.kv_max_session_tokens, 0);
-        assert_eq!(model.kv_retained_idle_secs, 1800);
-        assert_eq!(model.kv_max_suffix_prefill_tokens, 8192);
+        assert_eq!(model.kv_max_sessions, 2);
+        assert_eq!(model.kv_max_session_tokens, 32_768);
+        assert_eq!(model.kv_retained_idle_secs, 300);
+        assert_eq!(model.kv_max_suffix_prefill_tokens, 24_576);
+        assert_eq!(model.kv_max_retained_bytes, 2_147_483_648);
         let kv = model.kv_cache_config();
-        assert_eq!(kv.max_retained_sessions, 8);
-        assert_eq!(kv.max_session_tokens, 0);
-        assert_eq!(kv.retained_idle_secs, 1800);
+        assert_eq!(kv.max_retained_sessions, 2);
+        assert_eq!(kv.max_session_tokens, 32_768);
+        assert_eq!(kv.retained_idle_secs, 300);
+        assert_eq!(kv.max_retained_bytes, 2_147_483_648);
 
         // Explicit values parse and map into KvCacheConfig.
         let path2 = dir.path().join("explicit.toml");
         std::fs::write(
             &path2,
-            "[[models]]\npath = \"some/model\"\nkv_max_sessions = 4\nkv_max_session_tokens = 4096\nkv_retained_idle_secs = 300\nkv_max_suffix_prefill_tokens = 2048\n",
+            "[[models]]\npath = \"some/model\"\nkv_max_sessions = 4\nkv_max_session_tokens = 4096\nkv_retained_idle_secs = 300\nkv_max_suffix_prefill_tokens = 2048\nkv_max_retained_bytes = 1048576\n",
         )
         .unwrap();
         let model2 = load_config_file(&path2, None)
@@ -1933,6 +1951,7 @@ mod tests {
         assert_eq!(kv2.max_retained_sessions, 4);
         assert_eq!(kv2.max_session_tokens, 4096);
         assert_eq!(kv2.retained_idle_secs, 300);
+        assert_eq!(kv2.max_retained_bytes, 1_048_576);
         assert_eq!(model2.kv_max_suffix_prefill_tokens, 2048);
 
         // kv_max_sessions = 0 is rejected at load (validate catches it).

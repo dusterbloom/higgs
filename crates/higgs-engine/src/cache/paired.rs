@@ -1764,6 +1764,18 @@ impl RetainedState {
         }
     }
 
+    /// Conservative total resident bytes owned by this retained publication.
+    #[must_use]
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::TargetOnly(target) => target.cache.estimated_bytes(),
+            Self::Paired(pair) => {
+                let (target_bytes, dflash_bytes) = pair.estimated_bytes();
+                target_bytes.saturating_add(dflash_bytes)
+            }
+        }
+    }
+
     /// Consume paired state only when it still matches the requested key.
     ///
     /// Target-only state and mismatched pairs are returned intact so the
