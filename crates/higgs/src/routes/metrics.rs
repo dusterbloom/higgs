@@ -93,6 +93,18 @@ pub struct CacheMetricsView {
     pub sessions_evicted: u64,
     /// Currently retained per-session caches.
     pub retained_sessions: u64,
+    /// Conservative total bytes owned by retained per-session cache state.
+    pub retained_bytes: u64,
+    /// Existing retained sessions currently protected from idle eviction.
+    pub active_leases: u64,
+    /// Leases observed expiring during retention maintenance.
+    pub expired_leases: u64,
+    /// Active leases broken to enforce hard count or byte bounds.
+    pub broken_leases: u64,
+    /// Session requests that performed prefill-only publication.
+    pub prefill_only_requests: u64,
+    /// Required-continuation requests rejected before a cold prefill.
+    pub required_continuation_misses: u64,
     /// Currently retained sessions that own an inseparable target/dSpark pair.
     pub retained_paired_sessions: u64,
     /// Conservative target bytes retained by paired sessions.
@@ -204,6 +216,20 @@ impl CacheMetricsView {
         self.retained_sessions = self
             .retained_sessions
             .saturating_add(u64::try_from(stats.retained_sessions).unwrap_or(u64::MAX));
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(u64::try_from(stats.retained_bytes).unwrap_or(u64::MAX));
+        self.active_leases = self
+            .active_leases
+            .saturating_add(u64::try_from(stats.active_leases).unwrap_or(u64::MAX));
+        self.expired_leases = self.expired_leases.saturating_add(stats.expired_leases);
+        self.broken_leases = self.broken_leases.saturating_add(stats.broken_leases);
+        self.prefill_only_requests = self
+            .prefill_only_requests
+            .saturating_add(stats.prefill_only_requests);
+        self.required_continuation_misses = self
+            .required_continuation_misses
+            .saturating_add(stats.required_continuation_misses);
         self.retained_paired_sessions = self
             .retained_paired_sessions
             .saturating_add(u64::try_from(stats.retained_paired_sessions).unwrap_or(u64::MAX));
@@ -379,15 +405,21 @@ mod tests {
             session_last_tool_result_largest_bytes: 35,
             sessions_evicted: 36,
             retained_sessions: 37,
-            retained_paired_sessions: 38,
-            retained_paired_target_bytes: 39,
-            retained_paired_dflash_bytes: 40,
-            radix_entries: 41,
-            radix_resident_bytes: 45,
-            radix_logical_bytes: 46,
-            paired_radix_entries: 42,
-            paired_radix_target_bytes: 43,
-            paired_radix_dflash_bytes: 44,
+            retained_bytes: 38,
+            active_leases: 39,
+            expired_leases: 40,
+            broken_leases: 41,
+            prefill_only_requests: 42,
+            required_continuation_misses: 43,
+            retained_paired_sessions: 44,
+            retained_paired_target_bytes: 45,
+            retained_paired_dflash_bytes: 46,
+            radix_entries: 47,
+            radix_resident_bytes: 51,
+            radix_logical_bytes: 52,
+            paired_radix_entries: 48,
+            paired_radix_target_bytes: 49,
+            paired_radix_dflash_bytes: 50,
         }
     }
 
@@ -444,12 +476,18 @@ mod tests {
         assert_eq!(view.session_prompt_boundary_splices, 46);
         assert_eq!(view.session_bootstrap_exact, 48);
         assert_eq!(view.session_bootstrap_pflash, 50);
-        assert_eq!(view.retained_paired_sessions, 76);
-        assert_eq!(view.retained_paired_target_bytes, 78);
-        assert_eq!(view.retained_paired_dflash_bytes, 80);
-        assert_eq!(view.paired_radix_entries, 84);
-        assert_eq!(view.paired_radix_target_bytes, 86);
-        assert_eq!(view.paired_radix_dflash_bytes, 88);
+        assert_eq!(view.retained_bytes, 76);
+        assert_eq!(view.active_leases, 78);
+        assert_eq!(view.expired_leases, 80);
+        assert_eq!(view.broken_leases, 82);
+        assert_eq!(view.prefill_only_requests, 84);
+        assert_eq!(view.required_continuation_misses, 86);
+        assert_eq!(view.retained_paired_sessions, 88);
+        assert_eq!(view.retained_paired_target_bytes, 90);
+        assert_eq!(view.retained_paired_dflash_bytes, 92);
+        assert_eq!(view.paired_radix_entries, 96);
+        assert_eq!(view.paired_radix_target_bytes, 98);
+        assert_eq!(view.paired_radix_dflash_bytes, 100);
     }
 
     #[test]
@@ -489,12 +527,18 @@ mod tests {
             ("session_last_tool_result_messages", 33),
             ("session_last_tool_result_bytes", 34),
             ("session_last_tool_result_largest_bytes", 35),
-            ("retained_paired_sessions", 38),
-            ("retained_paired_target_bytes", 39),
-            ("retained_paired_dflash_bytes", 40),
-            ("paired_radix_entries", 42),
-            ("paired_radix_target_bytes", 43),
-            ("paired_radix_dflash_bytes", 44),
+            ("retained_bytes", 38),
+            ("active_leases", 39),
+            ("expired_leases", 40),
+            ("broken_leases", 41),
+            ("prefill_only_requests", 42),
+            ("required_continuation_misses", 43),
+            ("retained_paired_sessions", 44),
+            ("retained_paired_target_bytes", 45),
+            ("retained_paired_dflash_bytes", 46),
+            ("paired_radix_entries", 48),
+            ("paired_radix_target_bytes", 49),
+            ("paired_radix_dflash_bytes", 50),
         ] {
             assert_eq!(
                 rendered.get(name).and_then(serde_json::Value::as_u64),

@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard};
 use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, Speculation, apply_penalties,
-    cache::SteppingKeyValueCache,
+    cache::{SteppingKeyValueCache, turboquant_activation_threshold},
     dflash::{DFlashCache, DFlashConfig, DFlashDrafter, accept_prefix},
     sample,
     spec_prefill::{
@@ -38,7 +38,7 @@ use crate::{
             SessionDsparkPublication,
         },
     },
-    chat_template::{ChatMessage, ChatTemplateRenderer},
+    chat_template::{ChatMessage, ChatPromptMode, ChatTemplateRenderer},
     decode::token_ledger::{LedgerError, RetentionAction, SpeculativeTicket, TokenLedger},
     engine::{GenerationOutput, StreamingOutput},
     error::EngineError,
@@ -61,6 +61,34 @@ pub const DEFAULT_PFLASH_PLAN_CACHE_ENTRIES: usize = 64;
 pub const DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD: usize = 128;
 /// Default `<think>` budget (tokens) when a request omits `reasoning_budget`.
 const DEFAULT_THINKING_BUDGET: u32 = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedKvStorage {
+    Dense,
+    TurboQuantWithinCap,
+    TurboQuantOverCap,
+}
+
+fn retained_kv_storage(config: KvCacheConfig, total_tokens: usize) -> RetainedKvStorage {
+    retained_kv_storage_at(config, total_tokens, turboquant_activation_threshold())
+}
+
+fn retained_kv_storage_at(
+    config: KvCacheConfig,
+    total_tokens: usize,
+    activation_threshold: i32,
+) -> RetainedKvStorage {
+    let over_dense_cap = config.max_session_tokens > 0 && total_tokens > config.max_session_tokens;
+    if over_dense_cap {
+        RetainedKvStorage::TurboQuantOverCap
+    } else if config.is_turboquant()
+        && i32::try_from(total_tokens).is_ok_and(|tokens| tokens >= activation_threshold)
+    {
+        RetainedKvStorage::TurboQuantWithinCap
+    } else {
+        RetainedKvStorage::Dense
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct GenerationPromptSuffixes {
@@ -542,8 +570,8 @@ fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// How many leading tokens a retained cache already covers, if `prior_tokens`
-/// is a strict prefix of `full` AND `full` actually extends it. `None` means the
+/// How many leading tokens a non-empty retained cache already covers, if
+/// `prior_tokens` is a strict prefix of `full`. `None` means the
 /// conversation diverged (client edited/retried/reordered) or didn't grow — the
 /// caller must then fall back to a clean full prefill. The cache-poisoning guard.
 fn continuation_prior_len(prior_tokens: &[u32], full: &[u32]) -> Option<usize> {
@@ -553,6 +581,32 @@ fn continuation_prior_len(prior_tokens: &[u32], full: &[u32]) -> Option<usize> {
     } else {
         Some(prior)
     }
+}
+
+fn retained_continuation_prior_len(
+    prior_tokens: &[u32],
+    full: &[u32],
+    run_mode: SessionRunMode,
+) -> Option<usize> {
+    // Prefill-only can publish an already-retained boundary without evaluating
+    // an empty suffix. A published zero-token cache is likewise a valid explicit
+    // boundary, even though the generic strict-prefix guard rejects empties.
+    if run_mode == SessionRunMode::PrefillOnly && prior_tokens == full {
+        Some(prior_tokens.len())
+    } else if prior_tokens.is_empty() && !full.is_empty() {
+        Some(0)
+    } else {
+        continuation_prior_len(prior_tokens, full)
+    }
+}
+
+fn canonical_prompt_extension<'a>(
+    retained_tokens: &[u32],
+    prompt_tokens: &'a [u32],
+) -> Option<&'a [u32]> {
+    prompt_tokens
+        .starts_with(retained_tokens)
+        .then_some(prompt_tokens)
 }
 
 fn common_prefix_token_len(left: &[u32], right: &[u32]) -> usize {
@@ -623,8 +677,7 @@ fn session_prefill_strategy(
     };
 
     let prior = retained_tokens.len();
-    if prior == 0
-        || prior >= continuation_candidate.len()
+    if prior >= continuation_candidate.len()
         || continuation_candidate.get(..prior) != Some(retained_tokens)
     {
         return SessionPrefillStrategy::BootstrapExact {
@@ -703,6 +756,7 @@ fn session_prompt_trace_metrics(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn common_prefix_bytes(left: &str, right: &str) -> usize {
     left.as_bytes()
         .iter()
@@ -711,12 +765,14 @@ fn common_prefix_bytes(left: &str, right: &str) -> usize {
         .count()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn preview_around(text: &str, byte_pos: usize) -> String {
     let start = char_boundary_at_or_before(text, byte_pos.saturating_sub(80));
     let end = char_boundary_at_or_after(text, byte_pos.saturating_add(80));
     text.get(start..end).unwrap_or_default().to_owned()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn char_boundary_at_or_before(text: &str, byte_pos: usize) -> usize {
     let pos = byte_pos.min(text.len());
     (0..=pos)
@@ -725,6 +781,7 @@ fn char_boundary_at_or_before(text: &str, byte_pos: usize) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn char_boundary_at_or_after(text: &str, byte_pos: usize) -> usize {
     let pos = byte_pos.min(text.len());
     (pos..=text.len())
@@ -744,6 +801,7 @@ struct RenderedMessageSegment<'a> {
     end_after: Option<usize>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn message_boundary_delta<'a>(retained_text: &str, full_text: &'a str) -> Option<&'a str> {
     let retained_segments = rendered_message_segments(retained_text)?;
     let full_segments = rendered_message_segments(full_text)?;
@@ -780,7 +838,9 @@ fn rendered_message_segments(text: &str) -> Option<Vec<RenderedMessageSegment<'_
 
     while let Some(relative_start) = text.get(pos..)?.find(IM_START) {
         let start = pos + relative_start;
-        if !text.get(pos..start)?.trim().is_empty() {
+        // Allow leading content (e.g. BOS token) before the first segment,
+        // but enforce whitespace-only separation between subsequent segments.
+        if pos > 0 && !text.get(pos..start)?.trim().is_empty() {
             return None;
         }
 
@@ -1008,11 +1068,115 @@ fn send_session_stream_output(
         .map_err(|_| EngineError::Cancelled)
 }
 
-/// Insert a retained KV cache for `session_id`, enforcing the resident-memory
-/// bounds: a per-session token cap (drop instead of retain once the
-/// conversation's KV exceeds `max_session_tokens`; `0` = unlimited) and a count
-/// cap (LRU-evict until at most `max_sessions`, clamped to >= 1). Pure map logic,
-/// so the bounds are unit-testable without loading a model.
+#[derive(Debug, Clone, Copy)]
+struct RetentionLimits {
+    max_sessions: usize,
+    max_session_tokens: usize,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RetentionMutation {
+    evicted: usize,
+    expired_leases: usize,
+    broken_leases: usize,
+    oversized: bool,
+}
+
+fn stash_into_bounded_with_source(
+    map: &mut std::collections::HashMap<u64, RetainedKv>,
+    session_id: u64,
+    state: RetainedState,
+    limits: RetentionLimits,
+    source: RetainedPromptSource,
+) -> RetentionMutation {
+    let now = std::time::Instant::now();
+    let mut result = RetentionMutation::default();
+    for entry in map.values_mut() {
+        if entry.lease_expires_at.is_some_and(|expiry| expiry <= now) {
+            entry.lease_expires_at = None;
+            result.expired_leases = result.expired_leases.saturating_add(1);
+        }
+    }
+
+    let state_bytes = state.estimated_bytes();
+    if (limits.max_session_tokens > 0 && state.tokens().len() > limits.max_session_tokens)
+        || state_bytes > limits.max_bytes
+    {
+        // Too large to retain — also forget any prior smaller cache for this id
+        // so it can't linger past the cap. Not counted as an eviction.
+        if map
+            .remove(&session_id)
+            .is_some_and(|prior| prior.lease_expires_at.is_some_and(|expiry| expiry > now))
+        {
+            result.broken_leases = result.broken_leases.saturating_add(1);
+        }
+        result.oversized = true;
+        return result;
+    }
+    let lease_expires_at = map
+        .get(&session_id)
+        .and_then(|prior| prior.lease_expires_at)
+        .filter(|expiry| *expiry > now);
+    map.insert(
+        session_id,
+        RetainedKv {
+            state,
+            last_used: now,
+            lease_expires_at,
+            source,
+        },
+    );
+    let cap = limits.max_sessions.max(1);
+    let total_bytes = |entries: &std::collections::HashMap<u64, RetainedKv>| {
+        entries.values().fold(0usize, |total, entry| {
+            total.saturating_add(entry.state.estimated_bytes())
+        })
+    };
+    while map.len() > cap || total_bytes(map) > limits.max_bytes {
+        let unleased_oldest = map
+            .iter()
+            .filter(|(_, kept)| kept.lease_expires_at.is_none())
+            .min_by_key(|(_, kept)| kept.last_used)
+            .map(|(&id, _)| id);
+        let earliest_lease = map
+            .iter()
+            .filter_map(|(&id, kept)| kept.lease_expires_at.map(|expiry| (id, expiry)))
+            .min_by_key(|(_, expiry)| *expiry)
+            .map(|(id, _)| id);
+        match unleased_oldest.or(earliest_lease) {
+            Some(id) => {
+                if map
+                    .remove(&id)
+                    .is_some_and(|entry| entry.lease_expires_at.is_some())
+                {
+                    result.broken_leases = result.broken_leases.saturating_add(1);
+                }
+                result.evicted = result.evicted.saturating_add(1);
+            }
+            None => break,
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+fn stash_into_bounded(
+    map: &mut std::collections::HashMap<u64, RetainedKv>,
+    session_id: u64,
+    state: RetainedState,
+    limits: RetentionLimits,
+) -> RetentionMutation {
+    stash_into_bounded_with_source(
+        map,
+        session_id,
+        state,
+        limits,
+        RetainedPromptSource::GeneratedAssistantReplay,
+    )
+}
+
+#[cfg(test)]
 fn stash_into(
     map: &mut std::collections::HashMap<u64, RetainedKv>,
     session_id: u64,
@@ -1020,35 +1184,17 @@ fn stash_into(
     max_sessions: usize,
     max_session_tokens: usize,
 ) -> usize {
-    if max_session_tokens > 0 && state.tokens().len() > max_session_tokens {
-        // Too large to retain — also forget any prior smaller cache for this id
-        // so it can't linger past the cap. Not counted as an eviction.
-        map.remove(&session_id);
-        return 0;
-    }
-    map.insert(
+    stash_into_bounded(
+        map,
         session_id,
-        RetainedKv {
-            state,
-            last_used: std::time::Instant::now(),
+        state,
+        RetentionLimits {
+            max_sessions,
+            max_session_tokens,
+            max_bytes: usize::MAX,
         },
-    );
-    let cap = max_sessions.max(1);
-    let mut evicted = 0;
-    while map.len() > cap {
-        let oldest = map
-            .iter()
-            .min_by_key(|(_, kept)| kept.last_used)
-            .map(|(&id, _)| id);
-        match oldest {
-            Some(id) => {
-                map.remove(&id);
-                evicted += 1;
-            }
-            None => break,
-        }
-    }
-    evicted
+    )
+    .evicted
 }
 
 fn retention_token_cap(
@@ -1078,17 +1224,30 @@ fn evict_idle_from(
     map: &mut std::collections::HashMap<u64, RetainedKv>,
     ttl: std::time::Duration,
 ) -> usize {
-    evict_idle_except_from(map, ttl, &std::collections::HashSet::new())
+    evict_idle_except_from(map, ttl, &std::collections::HashSet::new()).evicted
 }
 
 fn evict_idle_except_from(
     map: &mut std::collections::HashMap<u64, RetainedKv>,
     ttl: std::time::Duration,
     active: &std::collections::HashSet<u64>,
-) -> usize {
-    let before = map.len();
-    map.retain(|session_id, kept| active.contains(session_id) || kept.last_used.elapsed() < ttl);
-    before.saturating_sub(map.len())
+) -> RetentionMutation {
+    let now = std::time::Instant::now();
+    let mut result = RetentionMutation::default();
+    map.retain(|session_id, kept| {
+        if kept.lease_expires_at.is_some_and(|expiry| expiry <= now) {
+            kept.lease_expires_at = None;
+            result.expired_leases = result.expired_leases.saturating_add(1);
+        }
+        let keep = active.contains(session_id)
+            || kept.lease_expires_at.is_some()
+            || kept.last_used.elapsed() < ttl;
+        if !keep {
+            result.evicted = result.evicted.saturating_add(1);
+        }
+        keep
+    });
+    result
 }
 
 fn parse_enabled_flag(raw: Option<&str>) -> Option<bool> {
@@ -1585,6 +1744,10 @@ struct CacheMetrics {
     session_last_tool_result_bytes: AtomicU64,
     session_last_tool_result_largest_bytes: AtomicU64,
     sessions_evicted: AtomicU64,
+    expired_leases: AtomicU64,
+    broken_leases: AtomicU64,
+    prefill_only_requests: AtomicU64,
+    required_continuation_misses: AtomicU64,
 }
 
 struct PendingContinuationMetrics {
@@ -1623,6 +1786,49 @@ pub enum SessionOutcome {
     Continued,
     ExactBootstrap,
     PFlashBootstrap,
+}
+
+/// Whether a session request decodes a completion or only publishes prompt KV.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionRunMode {
+    Generation,
+    PrefillOnly,
+}
+
+/// Cold-prefill behavior when a retained session cannot continue exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionContinuationPolicy {
+    #[default]
+    BestEffort,
+    RequireContinuation,
+}
+
+/// Reports whether a required-continuation streaming request has atomically
+/// reserved its retained cache before the HTTP response is opened.
+pub type SessionStreamAcceptance = tokio::sync::oneshot::Sender<Result<(), u64>>;
+
+#[cfg(test)]
+std::thread_local! {
+    static PREFILL_SAMPLE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+static REQUIRED_POST_ADMISSION_EVICT_SESSION: AtomicU64 = AtomicU64::new(0);
+
+fn sample_prefill_logits(logits: &Array, params: &SamplingParams) -> Result<Array, EngineError> {
+    #[cfg(test)]
+    PREFILL_SAMPLE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+    sample(logits, params).map_err(EngineError::Mlx)
+}
+
+#[cfg(test)]
+fn reset_prefill_sample_count() {
+    PREFILL_SAMPLE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn prefill_sample_count() -> u64 {
+    PREFILL_SAMPLE_COUNT.with(std::cell::Cell::get)
 }
 
 pub type SessionPromptTraceOutcome = SessionOutcome;
@@ -1721,6 +1927,18 @@ pub struct CacheStats {
     pub sessions_evicted: u64,
     /// Currently retained per-session caches.
     pub retained_sessions: usize,
+    /// Conservative total bytes owned by retained per-session cache state.
+    pub retained_bytes: usize,
+    /// Existing retained sessions currently protected from idle eviction.
+    pub active_leases: usize,
+    /// Leases observed expiring during retention maintenance.
+    pub expired_leases: u64,
+    /// Active leases broken to enforce hard count or byte bounds.
+    pub broken_leases: u64,
+    /// Session requests that performed prefill-only publication.
+    pub prefill_only_requests: u64,
+    /// Required-continuation requests rejected before a cold prefill.
+    pub required_continuation_misses: u64,
     /// Currently retained sessions that own an inseparable target/dSpark pair.
     pub retained_paired_sessions: usize,
     /// Conservative target bytes retained by paired sessions.
@@ -2522,6 +2740,30 @@ pub struct SimpleEngine {
 struct RetainedKv {
     state: RetainedState,
     last_used: std::time::Instant,
+    lease_expires_at: Option<std::time::Instant>,
+    source: RetainedPromptSource,
+}
+
+/// Identifies which canonical token contract produced a retained cache.
+///
+/// Generated assistant text may require the existing message-boundary replay
+/// reconciliation because detokenize→retokenize is not BPE-stable. A
+/// prefill-only request has no generated text: its route token array is the
+/// sole authority and must never enter that replay renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedPromptSource {
+    GeneratedAssistantReplay,
+    CanonicalPrefill,
+}
+
+fn select_continuation_candidate(
+    source: RetainedPromptSource,
+    canonical_prompt_tokens: &[u32],
+) -> Option<Vec<u32>> {
+    match source {
+        RetainedPromptSource::CanonicalPrefill => Some(canonical_prompt_tokens.to_vec()),
+        RetainedPromptSource::GeneratedAssistantReplay => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2648,9 +2890,9 @@ pub struct SessionGeneration {
     /// Explicit admission/execution outcome for this session turn.
     pub outcome: SessionOutcome,
     /// Whether a retained cache was reused (true) or a clean prefill ran (false).
-    /// A `true` is a best-effort latency win, NOT an exact-replay guarantee: the
-    /// reused KV is TurboQuant-compressed, so the turn's output may differ
-    /// slightly from a stateless full prefill (see `generate_continued`).
+    /// A `true` means the retained boundary was reused. KV remains dense and
+    /// exact below both the session-token cap and TurboQuant activation boundary;
+    /// retention becomes lossy only after crossing one of those boundaries.
     pub continued: bool,
 }
 
@@ -3283,12 +3525,70 @@ impl SimpleEngine {
         lock_or_recover(&self.retained).len()
     }
 
+    /// Diagnostic-only read of current retained state. Admission must use the
+    /// locked streaming acceptance handshake; this snapshot is inherently racy.
+    pub fn retained_session_can_continue(&self, session_id: u64, prompt_tokens: &[u32]) -> bool {
+        lock_or_recover(&self.retained)
+            .get(&session_id)
+            .is_some_and(|entry| {
+                continuation_prior_len(entry.state.tokens(), prompt_tokens).is_some()
+            })
+    }
+
+    pub fn record_required_continuation_miss(&self) {
+        self.cache_metrics
+            .required_continuation_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Lease an existing retained session against idle eviction. Count and byte
+    /// limits remain hard and may still evict it.
+    pub fn lease_retained_session(&self, session_id: u64, ttl: std::time::Duration) -> bool {
+        if ttl.is_zero() {
+            return false;
+        }
+        let ttl = ttl.min(std::time::Duration::from_secs(300));
+        let session_lock = self.session_lock_for(session_id);
+        let _session_guard = session_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(expiry) = std::time::Instant::now().checked_add(ttl) else {
+            return false;
+        };
+        let mut retained = lock_or_recover(&self.retained);
+        let Some(entry) = retained.get_mut(&session_id) else {
+            return false;
+        };
+        entry.lease_expires_at = Some(expiry);
+        true
+    }
+
+    #[must_use]
+    pub fn active_retained_lease_count(&self) -> usize {
+        let now = std::time::Instant::now();
+        lock_or_recover(&self.retained)
+            .values()
+            .filter(|entry| entry.lease_expires_at.is_some_and(|expiry| expiry > now))
+            .count()
+    }
+
     /// Snapshot of cache effectiveness (hit rate, prefill saved, evictions,
     /// resident sizes) for observability / the `/metrics` endpoint.
     pub fn cache_stats(&self) -> CacheStats {
-        let (retained_sessions, retained_paired) = {
+        let (retained_sessions, retained_bytes, active_leases, retained_paired) = {
             let retained = lock_or_recover(&self.retained);
-            (retained.len(), retained_paired_stats(&retained))
+            let now = std::time::Instant::now();
+            (
+                retained.len(),
+                retained.values().fold(0usize, |total, entry| {
+                    total.saturating_add(entry.state.estimated_bytes())
+                }),
+                retained
+                    .values()
+                    .filter(|entry| entry.lease_expires_at.is_some_and(|expiry| expiry > now))
+                    .count(),
+                retained_paired_stats(&retained),
+            )
         };
         let (radix_entries, paired_radix, radix_bytes) = {
             let mut prefix_cache = lock_or_recover(&self.prefix_cache);
@@ -3417,6 +3717,18 @@ impl SimpleEngine {
                 .load(Ordering::Relaxed),
             sessions_evicted: self.cache_metrics.sessions_evicted.load(Ordering::Relaxed),
             retained_sessions,
+            retained_bytes,
+            active_leases,
+            expired_leases: self.cache_metrics.expired_leases.load(Ordering::Relaxed),
+            broken_leases: self.cache_metrics.broken_leases.load(Ordering::Relaxed),
+            prefill_only_requests: self
+                .cache_metrics
+                .prefill_only_requests
+                .load(Ordering::Relaxed),
+            required_continuation_misses: self
+                .cache_metrics
+                .required_continuation_misses
+                .load(Ordering::Relaxed),
             retained_paired_sessions: retained_paired.entries,
             retained_paired_target_bytes: retained_paired.target_bytes,
             retained_paired_dflash_bytes: retained_paired.dflash_bytes,
@@ -3530,6 +3842,29 @@ impl SimpleEngine {
             .map(|kept| kept.state.tokens().to_vec())
     }
 
+    fn retained_prompt_source_for_tokens(
+        &self,
+        session_id: u64,
+        retained_tokens: &[u32],
+    ) -> RetainedPromptSource {
+        lock_or_recover(&self.retained)
+            .get(&session_id)
+            .filter(|kept| kept.state.tokens() == retained_tokens)
+            .map_or(RetainedPromptSource::GeneratedAssistantReplay, |kept| {
+                kept.source
+            })
+    }
+
+    fn prefill_publication_source(&self, session_id: u64) -> RetainedPromptSource {
+        // A fresh prefill-only request publishes route-canonical tokens. When
+        // it extends an older generated-assistant cache, preserve that older
+        // replay contract conservatively: the routed candidate may already
+        // contain a text-reconciled suffix and must not be relabeled canonical.
+        lock_or_recover(&self.retained)
+            .get(&session_id)
+            .map_or(RetainedPromptSource::CanonicalPrefill, |kept| kept.source)
+    }
+
     pub const fn session_max_suffix_prefill_tokens(&self) -> usize {
         self.session_max_suffix_prefill_tokens
     }
@@ -3540,6 +3875,23 @@ impl SimpleEngine {
                 .entry(session_id)
                 .or_default(),
         )
+    }
+
+    #[cfg(test)]
+    fn inject_post_admission_hard_eviction_for_test(&self, session_id: u64) {
+        if REQUIRED_POST_ADMISSION_EVICT_SESSION
+            .compare_exchange(session_id, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        for other_session_id in [session_id.wrapping_add(1), session_id.wrapping_add(2)] {
+            self.stash_retained(
+                other_session_id,
+                RetainedState::target_only_unchecked_for_test(AnyCache::KV(Vec::new()), Vec::new()),
+                false,
+            );
+        }
     }
 
     /// Drop a conversation's retained KV cache, freeing its KV memory.
@@ -3578,20 +3930,27 @@ impl SimpleEngine {
                 }
             }
         }
-        let dropped = evict_idle_except_from(&mut lock_or_recover(&self.retained), ttl, &active);
+        let mutation = evict_idle_except_from(&mut lock_or_recover(&self.retained), ttl, &active);
         drop(inactive_guards);
         drop(session_locks);
-        if dropped > 0 {
-            self.cache_metrics
-                .sessions_evicted
-                .fetch_add(u64::try_from(dropped).unwrap_or(0), Ordering::Relaxed);
+        if mutation.evicted > 0 {
+            self.cache_metrics.sessions_evicted.fetch_add(
+                u64::try_from(mutation.evicted).unwrap_or(0),
+                Ordering::Relaxed,
+            );
+        }
+        if mutation.expired_leases > 0 {
+            self.cache_metrics.expired_leases.fetch_add(
+                u64::try_from(mutation.expired_leases).unwrap_or(0),
+                Ordering::Relaxed,
+            );
         }
         // Drop per-session locks no longer referenced by any in-flight request
         // (strong_count == 1 ⇒ only this map holds the Arc). Bounds the lock map
         // so a long-lived server doesn't accumulate one entry per distinct id.
         lock_or_recover(&self.session_locks)
             .retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
-        dropped
+        mutation.evicted
     }
 
     /// Evict retained sessions using the configured idle TTL.
@@ -3611,13 +3970,14 @@ impl SimpleEngine {
         &self,
         session_id: u64,
         full_tokens: &[u32],
+        run_mode: SessionRunMode,
         mlx_gate: &higgs_models::mlx_exec::MlxExecToken,
     ) -> Result<Option<(AnyCache, usize)>, EngineError> {
         let mut map = lock_or_recover(&self.retained);
         let prior = match map.get(&session_id) {
             Some(entry) => {
                 let retained_tokens = entry.state.tokens();
-                let prior = continuation_prior_len(retained_tokens, full_tokens);
+                let prior = retained_continuation_prior_len(retained_tokens, full_tokens, run_mode);
                 if prior.is_none() {
                     tracing::info!(
                         session_id,
@@ -3705,21 +4065,24 @@ impl SimpleEngine {
     /// so the next turn prefills only the suffix. Caps the number of resident
     /// sessions (each pins GB-scale KV), evicting the least-recently-used.
     ///
-    /// Before stashing, the cache's resident KV is TurboQuant-compressed
-    /// ([`AnyCache::quantize_for_retention`]) so a conversation that decoded dense
-    /// — the default, or any turn below the TQ activation threshold — does not pin
-    /// fp16 KV between turns. The next turn continues by appending to the now-TQ
-    /// cache (the ordinary TurboQuant decode-append path). Compression is
-    /// best-effort: a layer that can't be packed stays dense and continuation
-    /// still works, just uncompressed.
+    /// Below the session-token cap and TurboQuant activation boundary, retained
+    /// KV stays dense so continuation is byte-stable with the ordinary dense
+    /// path. At or beyond either boundary, the caller compresses it before
+    /// publication to preserve the configured memory bound.
     #[allow(clippy::doc_markdown)]
-    /// Publish an ALREADY-PREPARED retained cache (TurboQuant-compressed AND
-    /// evaluated by the caller while the model lock was held — see
-    /// `generate_continued`) into the session map. This does NO MLX work: MLX's
+    /// Publish an ALREADY-PREPARED retained cache (dense or TurboQuant, and
+    /// evaluated by the caller while the model lock was held) into the session
+    /// map. This does NO MLX work: MLX's
     /// Metal command buffer is process-global and aborts on concurrent eval, so
     /// all GPU work must stay serialized under the model lock, which this
     /// function does not hold.
-    fn stash_retained(&self, session_id: u64, state: RetainedState, target_only_cap_exempt: bool) {
+    fn stash_retained_with_source(
+        &self,
+        session_id: u64,
+        state: RetainedState,
+        target_only_cap_exempt: bool,
+        source: RetainedPromptSource,
+    ) {
         // `target_only_cap_exempt`: the caller compressed target KV to
         // TurboQuant because it exceeded the dense token cap. Preserve the
         // historical exemption for target-only retention, but never apply it
@@ -3738,18 +4101,44 @@ impl SimpleEngine {
                 token_len, effective_cap
             );
         }
-        let evicted = stash_into(
+        let mutation = stash_into_bounded_with_source(
             &mut lock_or_recover(&self.retained),
             session_id,
             state,
-            self.kv_cache_config.max_retained_sessions,
-            effective_cap,
+            RetentionLimits {
+                max_sessions: self.kv_cache_config.max_retained_sessions,
+                max_session_tokens: effective_cap,
+                max_bytes: self.kv_cache_config.max_retained_bytes,
+            },
+            source,
         );
-        if evicted > 0 {
-            self.cache_metrics
-                .sessions_evicted
-                .fetch_add(u64::try_from(evicted).unwrap_or(0), Ordering::Relaxed);
+        if mutation.evicted > 0 {
+            self.cache_metrics.sessions_evicted.fetch_add(
+                u64::try_from(mutation.evicted).unwrap_or(0),
+                Ordering::Relaxed,
+            );
         }
+        if mutation.expired_leases > 0 {
+            self.cache_metrics.expired_leases.fetch_add(
+                u64::try_from(mutation.expired_leases).unwrap_or(0),
+                Ordering::Relaxed,
+            );
+        }
+        if mutation.broken_leases > 0 {
+            self.cache_metrics.broken_leases.fetch_add(
+                u64::try_from(mutation.broken_leases).unwrap_or(0),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn stash_retained(&self, session_id: u64, state: RetainedState, target_only_cap_exempt: bool) {
+        self.stash_retained_with_source(
+            session_id,
+            state,
+            target_only_cap_exempt,
+            RetainedPromptSource::GeneratedAssistantReplay,
+        );
     }
 
     /// Best-effort pre-decode checkpoint publication. Unlike final session
@@ -3881,13 +4270,20 @@ impl SimpleEngine {
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
+        mode: ChatPromptMode,
     ) -> Result<(Vec<u32>, PFlashPromptPolicy), EngineError> {
         let renderer = self.template.as_ref().ok_or_else(|| {
             EngineError::Template(
                 "This model has no chat template; use /v1/completions instead".to_owned(),
             )
         })?;
-        let prompt = renderer.apply_with_thinking(messages, tools, true, enable_thinking)?;
+        let add_generation_prompt = mode.add_generation_prompt();
+        let prompt = renderer.apply_with_thinking(
+            messages,
+            tools,
+            add_generation_prompt,
+            enable_thinking,
+        )?;
         let encoding = self
             .tokenizer
             .encode(prompt.as_str(), false)
@@ -3899,8 +4295,12 @@ impl SimpleEngine {
         let body_token_count = token_len_for_text(&self.tokenizer, &without_generation_prompt)?;
 
         if tools.is_some() {
-            let without_tools =
-                renderer.apply_with_thinking(messages, None, true, enable_thinking)?;
+            let without_tools = renderer.apply_with_thinking(
+                messages,
+                None,
+                add_generation_prompt,
+                enable_thinking,
+            )?;
             if let Some(byte_span) = inserted_byte_span(&prompt, &without_tools)
                 && let Some(token_span) =
                     token_range_for_byte_span(&self.tokenizer, &prompt, byte_span)?
@@ -4140,17 +4540,14 @@ impl SimpleEngine {
         })
     }
 
-    /// Run the prefill forward pass and sample the first token. Stores the
+    /// Evaluate the prefill forward pass without sampling. Stores the
     /// post-prefill KV state back into the prefix cache (skipped for multimodal).
-    /// Optionally computes logprobs for the first token.
     #[allow(clippy::too_many_arguments)]
-    fn run_prefill(
+    fn run_prefill_evaluation(
         &self,
         prompt_tokens: &[u32],
         generation_suffix: &[u32],
         prepared: &mut PreparedGeneration<'_>,
-        params: &SamplingParams,
-        logprob_top_n: Option<u32>,
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
         capture_hidden: bool,
         store_prefix_cache: bool,
@@ -4161,7 +4558,7 @@ impl SimpleEngine {
         // and two-phase prefills skip taps — callers must tolerate None.
         prefill_tap_layers: Option<&[usize]>,
         prefill_taps_out: Option<&mut Vec<Array>>,
-    ) -> Result<(Array, Option<LogprobArrays>, Option<Array>), EngineError> {
+    ) -> Result<(Array, Option<Array>), EngineError> {
         // DIAGNOSTIC (HIGGS_DIAG_WARM_DRIFT=1): when reuse is active (the
         // prepared cache is a reused clone with offset > 0), forward the FULL
         // prompt on a fresh cache and compare the reused clone's KV to the fresh
@@ -4262,7 +4659,11 @@ impl SimpleEngine {
                 let body_hidden = if capture_hidden {
                     let (hidden, _logits) = prepared
                         .model
-                        .forward_with_hidden(&body_array, None, &mut prepared.cache)
+                        .forward_with_hidden_last_token_logits(
+                            &body_array,
+                            None,
+                            &mut prepared.cache,
+                        )
                         .map_err(EngineError::Mlx)?;
                     Some(hidden)
                 } else if body_ids.len() > chunked_threshold_len {
@@ -4307,7 +4708,11 @@ impl SimpleEngine {
                 if capture_hidden {
                     let (suffix_hidden, logits) = prepared
                         .model
-                        .forward_with_hidden(&suffix_array, None, &mut prepared.cache)
+                        .forward_with_hidden_last_token_logits(
+                            &suffix_array,
+                            None,
+                            &mut prepared.cache,
+                        )
                         .map_err(EngineError::Mlx)?;
                     // Reconstruct the full-prompt hidden for the MTP head.
                     prefill_hidden = match body_hidden {
@@ -4348,7 +4753,11 @@ impl SimpleEngine {
                     }
                     _ => prepared
                         .model
-                        .forward_with_hidden(&prepared.prompt_array, None, &mut prepared.cache)
+                        .forward_with_hidden_last_token_logits(
+                            &prepared.prompt_array,
+                            None,
+                            &mut prepared.cache,
+                        )
                         .map_err(EngineError::Mlx)?,
                 };
                 prefill_hidden = Some(hidden);
@@ -4373,29 +4782,8 @@ impl SimpleEngine {
             last_logits
         };
 
-        let current_token = sample(&constrained_logits, params).map_err(EngineError::Mlx)?;
-
-        let logprob_data = if let Some(top_n) = logprob_top_n {
-            let scaled = if params.temperature <= f32::EPSILON {
-                constrained_logits
-            } else {
-                constrained_logits
-                    .multiply(Array::from_f32(1.0 / params.temperature))
-                    .map_err(EngineError::Mlx)?
-            };
-            Some(
-                LogprobArrays::compute(&scaled, &current_token, Some(top_n))
-                    .map_err(EngineError::Mlx)?,
-            )
-        } else {
-            None
-        };
-
         {
-            let mut eval_targets: Vec<&Array> = vec![&current_token];
-            if let Some(ref lp) = logprob_data {
-                eval_targets.extend(lp.eval_targets());
-            }
+            let mut eval_targets: Vec<&Array> = vec![&constrained_logits];
             if let Some(ref hidden) = prefill_hidden {
                 eval_targets.push(hidden);
             }
@@ -4455,6 +4843,60 @@ impl SimpleEngine {
             "simple_post_prefill",
         );
 
+        Ok((constrained_logits, prefill_hidden))
+    }
+
+    /// Evaluate prompt KV, then sample the first generation token.
+    #[allow(clippy::too_many_arguments)]
+    fn run_prefill(
+        &self,
+        prompt_tokens: &[u32],
+        generation_suffix: &[u32],
+        prepared: &mut PreparedGeneration<'_>,
+        params: &SamplingParams,
+        logprob_top_n: Option<u32>,
+        constraint: Option<&crate::constrained::ConstrainedGenerator>,
+        capture_hidden: bool,
+        store_prefix_cache: bool,
+        checkpoint_id: Option<&str>,
+        compressed_prefill: Option<&SurvivalPlan>,
+        prefill_tap_layers: Option<&[usize]>,
+        prefill_taps_out: Option<&mut Vec<Array>>,
+    ) -> Result<(Array, Option<LogprobArrays>, Option<Array>), EngineError> {
+        let (constrained_logits, prefill_hidden) = self.run_prefill_evaluation(
+            prompt_tokens,
+            generation_suffix,
+            prepared,
+            constraint,
+            capture_hidden,
+            store_prefix_cache,
+            checkpoint_id,
+            compressed_prefill,
+            prefill_tap_layers,
+            prefill_taps_out,
+        )?;
+        let current_token = sample_prefill_logits(&constrained_logits, params)?;
+        let logprob_data = if let Some(top_n) = logprob_top_n {
+            let scaled = if params.temperature <= f32::EPSILON {
+                constrained_logits
+            } else {
+                constrained_logits
+                    .multiply(Array::from_f32(1.0 / params.temperature))
+                    .map_err(EngineError::Mlx)?
+            };
+            Some(
+                LogprobArrays::compute(&scaled, &current_token, Some(top_n))
+                    .map_err(EngineError::Mlx)?,
+            )
+        } else {
+            None
+        };
+
+        let mut eval_targets: Vec<&Array> = vec![&current_token];
+        if let Some(ref lp) = logprob_data {
+            eval_targets.extend(lp.eval_targets());
+        }
+        eval(eval_targets).map_err(EngineError::Mlx)?;
         Ok((current_token, logprob_data, prefill_hidden))
     }
 
@@ -5203,15 +5645,13 @@ impl SimpleEngine {
     /// stop-aware cycle keeps the retained cache 1:1 with the stashed tokens);
     /// plain sequential decode otherwise.
     ///
-    /// # Best-effort: output is approximate, not bit-identical
+    /// # Retained precision policy
     ///
-    /// This per-session path is a **latency optimization, not an exact-replay
-    /// guarantee**. A continued turn's output can differ slightly from a stateless
-    /// full prefill of the same conversation, because (1) when TurboQuant is
-    /// enabled, the retained KV is compressed for between-turn storage
-    /// (`quantize_for_retention`), which is lossy (with `kv_cache = off` the
-    /// retained KV stays dense and exact), and (2) the continuation prompt is
-    /// reconciled in text space
+    /// Below both the session-token cap and TurboQuant activation boundary,
+    /// retained KV remains dense and the continuation path preserves the same
+    /// numerical primitives as cold dense prefill. Beyond either boundary,
+    /// retention uses TurboQuant and becomes a best-effort latency optimization.
+    /// In both cases the continuation prompt is reconciled in text space
     /// (decode the retained tokens, strip `<think>` blocks, re-match the prefix),
     /// which can diverge from a cleanly-rendered stateless prompt.
     ///
@@ -5306,6 +5746,7 @@ impl SimpleEngine {
         enable_thinking: bool,
         tool_payload: SessionPromptTracePayloadStats,
         pflash_policy: &PFlashPromptPolicy,
+        continuation_policy: SessionContinuationPolicy,
     ) -> Result<SessionGeneration, EngineError> {
         let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
         let total_start = std::time::Instant::now();
@@ -5330,6 +5771,28 @@ impl SimpleEngine {
             self.session_max_suffix_prefill_tokens,
             self.pflash_can_run_stateless_for_prompt(&continued_prompt),
         );
+        let run_mode = if max_tokens == 0 {
+            SessionRunMode::PrefillOnly
+        } else {
+            SessionRunMode::Generation
+        };
+        let exact_retained_prefix = retained_tokens.as_deref().is_some_and(|retained| {
+            retained_continuation_prior_len(retained, &continued_prompt, run_mode).is_some()
+        });
+        if continuation_policy == SessionContinuationPolicy::RequireContinuation
+            && (!matches!(strategy, SessionPrefillStrategy::Continue { .. })
+                || !exact_retained_prefix)
+        {
+            self.cache_metrics
+                .required_continuation_misses
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(EngineError::RetainedSessionUnavailable(session_id));
+        }
+
+        #[cfg(test)]
+        if continuation_policy == SessionContinuationPolicy::RequireContinuation {
+            self.inject_post_admission_hard_eviction_for_test(session_id);
+        }
 
         match strategy {
             SessionPrefillStrategy::Continue { session_id } => {
@@ -5347,6 +5810,8 @@ impl SimpleEngine {
                     max_tokens,
                     params,
                     enable_thinking,
+                    None,
+                    continuation_policy,
                     None,
                     timing,
                     total_start,
@@ -5368,6 +5833,8 @@ impl SimpleEngine {
                     max_tokens,
                     params,
                     enable_thinking,
+                    None,
+                    continuation_policy,
                     None,
                     timing,
                     total_start,
@@ -5407,6 +5874,8 @@ impl SimpleEngine {
         enable_thinking: bool,
         tool_payload: SessionPromptTracePayloadStats,
         pflash_policy: &PFlashPromptPolicy,
+        continuation_policy: SessionContinuationPolicy,
+        mut acceptance: Option<SessionStreamAcceptance>,
     ) -> Result<(), EngineError> {
         let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
         let total_start = std::time::Instant::now();
@@ -5431,6 +5900,26 @@ impl SimpleEngine {
             self.session_max_suffix_prefill_tokens,
             self.pflash_can_run_stateless_for_prompt(&continued_prompt),
         );
+        let run_mode = if max_tokens == 0 {
+            SessionRunMode::PrefillOnly
+        } else {
+            SessionRunMode::Generation
+        };
+        let exact_retained_prefix = retained_tokens.as_deref().is_some_and(|retained| {
+            retained_continuation_prior_len(retained, &continued_prompt, run_mode).is_some()
+        });
+        if continuation_policy == SessionContinuationPolicy::RequireContinuation
+            && (!matches!(strategy, SessionPrefillStrategy::Continue { .. })
+                || !exact_retained_prefix)
+        {
+            if let Some(acceptance) = acceptance.take() {
+                let _ = acceptance.send(Err(session_id));
+            }
+            self.cache_metrics
+                .required_continuation_misses
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(EngineError::RetainedSessionUnavailable(session_id));
+        }
 
         match strategy {
             SessionPrefillStrategy::Continue { session_id } => {
@@ -5449,6 +5938,8 @@ impl SimpleEngine {
                     params,
                     enable_thinking,
                     Some(sender),
+                    continuation_policy,
+                    acceptance,
                     timing,
                     total_start,
                 )?;
@@ -5471,6 +5962,8 @@ impl SimpleEngine {
                     params,
                     enable_thinking,
                     Some(sender),
+                    continuation_policy,
+                    None,
                     timing,
                     total_start,
                 )?;
@@ -5518,6 +6011,33 @@ impl SimpleEngine {
             }
             return prompt_tokens.to_vec();
         };
+        let source = self.retained_prompt_source_for_tokens(session_id, retained);
+        if let Some(canonical) = select_continuation_candidate(source, prompt_tokens) {
+            if diag {
+                eprintln!(
+                    "DIAG session-continue: canonical-prefill session_id={session_id} retained_tokens={} full_prompt_tokens={}",
+                    retained.len(),
+                    canonical.len()
+                );
+            }
+            return canonical;
+        }
+        // The route's tokenization is authoritative. When it already extends
+        // the retained cache exactly, keep it byte-for-byte: detokenizing and
+        // re-tokenizing a message-boundary delta can otherwise omit the one
+        // deliberately unprefilled token or change BPE boundaries. Text-space
+        // reconciliation remains only for generated-assistant replay, where
+        // the canonical message render is not itself a token-prefix.
+        if let Some(canonical) = canonical_prompt_extension(retained, prompt_tokens) {
+            if diag {
+                eprintln!(
+                    "DIAG session-continue: exact-token-prefix session_id={session_id} retained_tokens={} full_prompt_tokens={}",
+                    retained.len(),
+                    canonical.len()
+                );
+            }
+            return canonical.to_vec();
+        }
         let retained_text = match self.tokenizer.decode(retained, false) {
             Ok(text) => text,
             Err(error) => {
@@ -5723,6 +6243,8 @@ impl SimpleEngine {
             params,
             enable_thinking,
             sender,
+            SessionContinuationPolicy::BestEffort,
+            None,
             timing,
             total_start,
         )
@@ -5737,6 +6259,8 @@ impl SimpleEngine {
         params: &SamplingParams,
         enable_thinking: bool,
         sender: Option<&tokio::sync::mpsc::Sender<StreamingOutput>>,
+        continuation_policy: SessionContinuationPolicy,
+        mut acceptance: Option<SessionStreamAcceptance>,
         timing: bool,
         total_start: std::time::Instant,
     ) -> Result<SessionGeneration, EngineError> {
@@ -5751,7 +6275,76 @@ impl SimpleEngine {
 
         let total = u32::try_from(prompt_tokens.len())
             .map_err(|_| EngineError::Generation("prompt too long".to_owned()))?;
-        if max_tokens == 0 {
+        let run_mode = if max_tokens == 0 {
+            SessionRunMode::PrefillOnly
+        } else {
+            SessionRunMode::Generation
+        };
+        let prefill_publication_source = match run_mode {
+            SessionRunMode::PrefillOnly => self.prefill_publication_source(session_id),
+            SessionRunMode::Generation => RetainedPromptSource::GeneratedAssistantReplay,
+        };
+        let run_prompt = match run_mode {
+            SessionRunMode::Generation => prompt_tokens,
+            SessionRunMode::PrefillOnly => prompt_tokens
+                .get(..prompt_tokens.len().saturating_sub(1))
+                .unwrap_or_default(),
+        };
+        let run_total = u32::try_from(run_prompt.len())
+            .map_err(|_| EngineError::Generation("run prompt too long".to_owned()))?;
+        if run_prompt.is_empty() {
+            let mut continued = false;
+            if run_mode == SessionRunMode::PrefillOnly {
+                let model = self
+                    .model
+                    .lock()
+                    .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+                let mlx_gate = higgs_models::mlx_exec::acquire();
+                let cache = if continuation_policy == SessionContinuationPolicy::RequireContinuation
+                {
+                    match self.fork_target_continuable(session_id, run_prompt, run_mode, &mlx_gate)
+                    {
+                        Ok(Some((cache, _))) => {
+                            continued = true;
+                            cache
+                        }
+                        Ok(None) | Err(_) => {
+                            if let Some(acceptance) = acceptance.take() {
+                                let _ = acceptance.send(Err(session_id));
+                            }
+                            self.cache_metrics
+                                .required_continuation_misses
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(EngineError::RetainedSessionUnavailable(session_id));
+                        }
+                    }
+                } else {
+                    model
+                        .make_cache_with_config(self.kv_cache_config)
+                        .map_err(EngineError::Mlx)?
+                };
+                let retained_state = RetainedState::target_only(cache, Vec::new(), &mlx_gate)
+                    .map_err(session_pair_error)?;
+                if let Some(acceptance) = acceptance.take() {
+                    let _ = acceptance.send(Ok(()));
+                }
+                drop(model);
+                drop(mlx_gate);
+                self.stash_retained_with_source(
+                    session_id,
+                    retained_state,
+                    false,
+                    prefill_publication_source,
+                );
+                if continued {
+                    self.cache_metrics
+                        .continuations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.cache_metrics
+                    .prefill_only_requests
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(sender) = sender {
                 send_session_stream_output(
                     sender,
@@ -5772,8 +6365,12 @@ impl SimpleEngine {
                 finish_reason: "length".to_owned(),
                 prompt_tokens: total,
                 prefilled_tokens: 0,
-                outcome: SessionOutcome::ExactBootstrap,
-                continued: false,
+                outcome: if continued {
+                    SessionOutcome::Continued
+                } else {
+                    SessionOutcome::ExactBootstrap
+                },
+                continued,
             });
         }
         let has_mtp = {
@@ -5788,7 +6385,7 @@ impl SimpleEngine {
             self.dflash.is_some() && paired_dflash_exact_domain(params, enable_thinking),
             has_mtp,
         );
-        if speculation_route == SpeculationRoute::DFlash {
+        if run_mode == SessionRunMode::Generation && speculation_route == SpeculationRoute::DFlash {
             let output = self.generate_continued_dflash_locked(
                 session_id,
                 prompt_tokens,
@@ -5831,25 +6428,42 @@ impl SimpleEngine {
                 .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
             let mlx_gate = higgs_models::mlx_exec::acquire();
 
-            let forked = match self.fork_target_continuable(session_id, prompt_tokens, &mlx_gate) {
-                Ok(forked) => forked,
-                Err(error) => {
-                    tracing::warn!(
-                        session_id,
-                        error = %error,
-                        "retained target session could not be forked; cold-prefilling"
-                    );
-                    None
+            let forked =
+                match self.fork_target_continuable(session_id, run_prompt, run_mode, &mlx_gate) {
+                    Ok(forked) => forked,
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id,
+                            error = %error,
+                            "retained target session could not be forked; cold-prefilling"
+                        );
+                        None
+                    }
+                };
+
+            // A required request is accepted only after its retained
+            // cache has been forked into request-local state. From this point,
+            // deletion or eviction of the published session cannot force a
+            // cold prefill or invalidate the in-flight generation.
+            if continuation_policy == SessionContinuationPolicy::RequireContinuation
+                && forked.is_none()
+            {
+                if let Some(acceptance) = acceptance.take() {
+                    let _ = acceptance.send(Err(session_id));
                 }
-            };
+                self.cache_metrics
+                    .required_continuation_misses
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(EngineError::RetainedSessionUnavailable(session_id));
+            }
 
             if let Some((cache, prior)) = forked {
                 debug_assert!(
-                    prior <= prompt_tokens.len(),
+                    prior <= run_prompt.len(),
                     "continuation prior {prior} exceeds prompt length {}",
-                    prompt_tokens.len()
+                    run_prompt.len()
                 );
-                let suffix: Vec<u32> = prompt_tokens.get(prior..).unwrap_or_default().to_vec();
+                let suffix: Vec<u32> = run_prompt.get(prior..).unwrap_or_default().to_vec();
                 let prefilled = u32::try_from(suffix.len()).unwrap_or(u32::MAX);
                 let prompt_array = Array::from(suffix.as_slice()).index(NewAxis);
                 // Same single sanctioned MLX-gate acquisition as prepare_generation —
@@ -5860,7 +6474,7 @@ impl SimpleEngine {
                     cache,
                     actual_prompt_tokens: suffix,
                     prompt_array,
-                    prompt_len: total,
+                    prompt_len: run_total,
                     pixel_values: None,
                     // Retained-session reuse: `prior` tokens came from the forked
                     // session cache, the rest is the suffix we prefill now.
@@ -5872,19 +6486,23 @@ impl SimpleEngine {
             } else {
                 drop(model);
                 drop(mlx_gate);
-                let prepared = self.prepare_generation(prompt_tokens, None, None, true)?;
+                let prepared = self.prepare_generation(run_prompt, None, None, true)?;
                 let prefilled =
                     u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
                 (prepared, prefilled, false)
             }
         };
 
+        if let Some(acceptance) = acceptance.take() {
+            let _ = acceptance.send(Ok(()));
+        }
+
         if continued {
             self.cache_metrics
                 .continuations
                 .fetch_add(1, Ordering::Relaxed);
             self.cache_metrics.prefill_saved_tokens.fetch_add(
-                u64::from(total.saturating_sub(prefilled)),
+                u64::from(run_total.saturating_sub(prefilled)),
                 Ordering::Relaxed,
             );
         }
@@ -5895,7 +6513,7 @@ impl SimpleEngine {
         // `prompt_progress` chunk when the client opted in).
         if let Some(sender) = sender {
             let cached = if continued {
-                total.saturating_sub(prefilled)
+                run_total.saturating_sub(prefilled)
             } else {
                 0
             };
@@ -5905,13 +6523,13 @@ impl SimpleEngine {
                     new_text: String::new(),
                     finished: false,
                     finish_reason: None,
-                    prompt_tokens: total,
+                    prompt_tokens: run_total,
                     completion_tokens: 0,
                     token_logprob: None,
                     prefill_progress: Some(crate::engine::PrefillProgress {
                         processed: cached,
                         cached,
-                        total,
+                        total: run_total,
                     }),
                 },
             )?;
@@ -5925,30 +6543,112 @@ impl SimpleEngine {
             && prepared.model.has_mtp()
             && max_tokens > 1;
         // dSpark sessions returned through the paired-cache path above. The
-        // remaining selectors are deliberately sidecar-free MTP or AR.
-        let (current_token, _, prefill_hidden) = self.run_prefill(
-            prompt_tokens,
-            self.gen_prompt_suffixes.for_request(enable_thinking),
-            &mut prepared,
-            params,
-            None,
-            None,
-            want_mtp,
-            // NOTE: `store_prefix_cache` is deliberately `false` on the
-            // session-resident path. Enabling radix consult/store here crashes
-            // the hybrid (GDN+FA) target with a Metal command-buffer assertion
-            // during KV reconstruction — confirmed empirically (2026-07-17).
-            // The cross-session radix hit on the system+tools prefix must be
-            // achieved a different way (e.g. a non-session first-turn path, or
-            // making the hybrid radix reconstruction safe), not by flipping
-            // this flag.
-            false,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        // remaining selectors are deliberately sidecar-free MTP or AR. Session
+        // prefix-cache storage stays disabled because hybrid reconstruction is
+        // not safe on this path (see `run_prefill_evaluation`).
+        let sampled_prefill = match run_mode {
+            SessionRunMode::PrefillOnly => {
+                if !prepared.actual_prompt_tokens.is_empty() {
+                    let _ = prepared
+                        .model
+                        .forward_chunked(
+                            &prepared.prompt_array,
+                            &mut prepared.cache,
+                            self.tuning.chunked_prefill_chunk_size(),
+                        )
+                        .map_err(EngineError::Mlx)?;
+                    maybe_clear_mlx_cache(
+                        self.tuning.clear_cache_after_prefill(),
+                        "simple_post_prefill",
+                    );
+                }
+                None
+            }
+            SessionRunMode::Generation => Some(self.run_prefill(
+                run_prompt,
+                self.gen_prompt_suffixes.for_request(enable_thinking),
+                &mut prepared,
+                params,
+                None,
+                None,
+                want_mtp,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )?),
+        };
         let prefill_elapsed = prefill_start.elapsed();
+
+        if run_mode == SessionRunMode::PrefillOnly {
+            let PreparedGeneration {
+                mut cache,
+                model,
+                _mlx_gate: mlx_gate,
+                ..
+            } = prepared;
+            let boundary = i32::try_from(run_prompt.len())
+                .map_err(|_| EngineError::Generation("retained prompt too long".to_owned()))?;
+            cache
+                .validate_absolute_boundary(boundary)
+                .map_err(EngineError::Mlx)?;
+            let retained_storage = retained_kv_storage(self.kv_cache_config, run_prompt.len());
+            let mut cap_exempt = false;
+            if retained_storage != RetainedKvStorage::Dense {
+                if cache
+                    .quantize_for_retention(self.kv_cache_config)
+                    .unwrap_or(0)
+                    > 0
+                {
+                    cap_exempt = retained_storage == RetainedKvStorage::TurboQuantOverCap;
+                }
+            }
+            let retained_state = RetainedState::target_only(cache, run_prompt.to_vec(), &mlx_gate)
+                .map_err(session_pair_error)?;
+            drop(model);
+            drop(mlx_gate);
+            self.stash_retained_with_source(
+                session_id,
+                retained_state,
+                cap_exempt,
+                prefill_publication_source,
+            );
+            self.cache_metrics
+                .prefill_only_requests
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(sender) = sender {
+                send_session_stream_output(
+                    sender,
+                    StreamingOutput {
+                        new_text: String::new(),
+                        finished: true,
+                        finish_reason: Some("length".to_owned()),
+                        prompt_tokens: total,
+                        completion_tokens: 0,
+                        token_logprob: None,
+                        prefill_progress: None,
+                    },
+                )?;
+            }
+            return Ok(SessionGeneration {
+                text: String::new(),
+                completion_tokens: 0,
+                finish_reason: "length".to_owned(),
+                prompt_tokens: total,
+                prefilled_tokens: prefilled,
+                outcome: if continued {
+                    SessionOutcome::Continued
+                } else {
+                    SessionOutcome::ExactBootstrap
+                },
+                continued,
+            });
+        }
+
+        let (current_token, _, prefill_hidden) = sampled_prefill.ok_or_else(|| {
+            EngineError::Generation("generation prefill did not sample a token".to_owned())
+        })?;
 
         // A cold/bootstrap streaming turn can disconnect after prefill but
         // before a valid response/tool payload is delivered. Publish that exact
@@ -6306,13 +7006,10 @@ impl SimpleEngine {
         // Retain the live cache + the exact tokens it now holds (prompt +
         // generated) so the next hop continues from here.
         //
-        // Compress (TurboQuant) AND evaluate the cache while the model lock is
-        // STILL HELD. MLX's Metal command buffer is process-global and aborts on
-        // concurrent eval across threads, so every MLX/GPU operation must be
-        // serialized by the model Mutex (the engine's de-facto MLX-execution
-        // lock). Doing this before `drop(model)` keeps this request's GPU work
-        // from racing the next request's forward pass; `stash_retained` then only
-        // publishes the already-evaluated cache.
+        // Evaluate the retained cache, and compress it only when the retention
+        // policy selects TurboQuant, while the model lock is STILL HELD. MLX's
+        // Metal command buffer is process-global and aborts on concurrent eval,
+        // so every MLX/GPU operation remains serialized by the model mutex.
         let PreparedGeneration {
             mut cache,
             model,
@@ -6320,22 +7017,10 @@ impl SimpleEngine {
             ..
         } = prepared;
         let retain_start = std::time::Instant::now();
-        // Only compress retained KV when TurboQuant is actually enabled. With
-        // mode=Off (the default) the user opted out of quantization — and the
-        // compress/dequant round trip is pure loss there: ~2s CPU to pack at
-        // turn end, then EVERY full-attention layer re-dequantizes the whole
-        // cache on CPU during the next continuation's prefill (measured ~4s of
-        // a 4.1s warm-turn TTFT at 4k tokens on Qwen3.6-35B). Dense retention
-        // is also exact, removing one documented lossiness source. Resident
-        // memory stays bounded by max_retained_sessions / max_session_tokens /
-        // the idle TTL, which apply either way.
-        // Over the dense token cap, fall back to TurboQuant retention instead
-        // of dropping: a 39.5k-token session that lost retention re-prefilled
-        // for 149.8s on the next turn, versus a bounded ~4-6x-smaller TQ
-        // resident and a CPU dequant on resume (tens of seconds at that size,
-        // and GPU dequant work is in flight). Exactness was already
-        // best-effort on this path.
-        let cap = self.kv_cache_config.max_session_tokens;
+        // Dense retention is the exact path below both the configured session
+        // cap and the execution-time TurboQuant activation boundary. At or
+        // beyond either boundary, quantization provides the bounded-memory
+        // fallback instead of dropping the session and forcing a full prefill.
         let total_turn_tokens = prompt_tokens.len().saturating_add(retained_generated.len());
         let boundary_valid = i32::try_from(total_turn_tokens).map_or_else(
             |_| {
@@ -6361,9 +7046,10 @@ impl SimpleEngine {
                 )
             },
         );
-        let over_dense_cap = cap > 0 && total_turn_tokens > cap;
+        let retained_storage = retained_kv_storage(self.kv_cache_config, total_turn_tokens);
+        let over_dense_cap = retained_storage == RetainedKvStorage::TurboQuantOverCap;
         let mut cap_exempt = false;
-        if boundary_valid && (self.kv_cache_config.is_turboquant() || over_dense_cap) {
+        if boundary_valid && retained_storage != RetainedKvStorage::Dense {
             match cache.quantize_for_retention(self.kv_cache_config) {
                 Ok(layers) if layers > 0 => {
                     cap_exempt = over_dense_cap;
@@ -6805,10 +7491,12 @@ impl SimpleEngine {
                     )?;
                     let retained_boundary = pair.token_len();
 
-                    let cap = self.kv_cache_config.max_session_tokens;
-                    let over_dense_cap = cap > 0 && retained_boundary > cap;
+                    let retained_storage =
+                        retained_kv_storage(self.kv_cache_config, retained_boundary);
+                    let over_dense_cap =
+                        retained_storage == RetainedKvStorage::TurboQuantOverCap;
                     let mut cap_exempt = false;
-                    if self.kv_cache_config.is_turboquant() || over_dense_cap {
+                    if retained_storage != RetainedKvStorage::Dense {
                         match pair.quantize_target_for_retention(self.kv_cache_config, &mlx_gate) {
                             Ok(layers) if layers > 0 => {
                                 cap_exempt = over_dense_cap;
@@ -12663,10 +13351,12 @@ mod tests {
         DEFAULT_PFLASH_PLAN_CACHE_ENTRIES, DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
         DFlashVerifyMode, DFlashVerifyRound, DflashPrefillOutcome, DflashPromptPartition,
         DflashTapFrontier, EngineError, GenerationPromptSuffixes, IncrementalDetok, LivePair,
-        PFlashPlanCache, PFlashPlanCacheConfig, PrefillCompressionMode, SessionBootstrapReason,
-        SessionDsparkDecodeState, SessionGeneration, SessionPrefillStrategy,
-        SessionPromptTraceOutcome, SessionPromptTracePayloadStats, SimpleEngine, SpeculationRoute,
-        Tokenizer, adaptive_draft_depth_for_cap, cache_policy_allows_prefix_cache,
+        PFlashPlanCache, PFlashPlanCacheConfig, PFlashPromptPolicy, PrefillCompressionMode,
+        REQUIRED_POST_ADMISSION_EVICT_SESSION, RetainedKvStorage, RetainedPromptSource,
+        SessionBootstrapReason, SessionContinuationPolicy, SessionDsparkDecodeState,
+        SessionGeneration, SessionOutcome, SessionPrefillStrategy, SessionPromptTraceOutcome,
+        SessionPromptTracePayloadStats, SessionRunMode, SimpleEngine, SpeculationRoute, Tokenizer,
+        adaptive_draft_depth_for_cap, cache_policy_allows_prefix_cache, canonical_prompt_extension,
         check_stop_sequences, common_prefix_token_len, contains_real_user_query,
         continuation_prior_len, continuation_reject_reason, continued_dspark_cold_retry_allowed,
         derive_model_name, detect_thinking_support, dflash_accepts_pflash_plan,
@@ -12677,10 +13367,12 @@ mod tests {
         message_boundary_delta, paired_dflash_exact_domain, parse_enabled_flag,
         pflash_actual_keep_ratio, pflash_auto_plan_worth_executing,
         pflash_cache_source_and_request_tail, pflash_cache_source_and_request_tail_with_boundary,
-        pflash_full_score_budget_exceeded, resolve_speculation_route, session_prefill_strategy,
-        session_prompt_trace_metrics, stateless_mtp_family_eligible, with_chat_terminator,
+        pflash_full_score_budget_exceeded, prefill_sample_count, reset_prefill_sample_count,
+        resolve_speculation_route, retained_kv_storage_at, select_continuation_candidate,
+        session_prefill_strategy, session_prompt_trace_metrics, stateless_mtp_family_eligible,
+        with_chat_terminator,
     };
-    use crate::chat_template::ChatMessage;
+    use crate::chat_template::{ChatMessage, ChatPromptMode, ChatTemplateRenderer};
     use crate::decode::token_ledger::TokenLedger;
     use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
     use crate::scheduler::RoundRobinScheduler;
@@ -13119,6 +13811,128 @@ mod tests {
     }
 
     #[test]
+    fn exact_token_prompt_extension_bypasses_text_splice() {
+        let retained = [1, 2, 3];
+        let canonical = [1, 2, 3, 4, 5];
+
+        assert_eq!(
+            canonical_prompt_extension(&retained, &canonical),
+            Some(canonical.as_slice())
+        );
+        assert_eq!(canonical_prompt_extension(&[1, 9], &canonical), None);
+    }
+
+    #[test]
+    fn session_prefill_prompt_omits_only_generation_suffix() {
+        let engine = session_prompt_template_test_engine();
+        let messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "question".into(),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "call".into(),
+                tool_calls: None,
+            },
+        ];
+
+        let (prefill, prefill_policy) = engine
+            .prepare_chat_prompt_with_pflash_policy(
+                &messages,
+                None,
+                false,
+                ChatPromptMode::SessionPrefill,
+            )
+            .unwrap();
+        let (generation, generation_policy) = engine
+            .prepare_chat_prompt_with_pflash_policy(
+                &messages,
+                None,
+                false,
+                ChatPromptMode::Generation,
+            )
+            .unwrap();
+
+        assert!(generation.starts_with(&prefill));
+        assert!(generation.len() > prefill.len());
+        assert_eq!(prefill_policy.body_token_count, Some(prefill.len()));
+        assert_eq!(generation_policy.body_token_count, Some(prefill.len()));
+    }
+
+    #[test]
+    fn session_prefill_boundary_reuses_canonical_expansion_without_sampling() {
+        let engine = session_prompt_template_test_engine();
+        let session_id = 0xC011;
+        let original_messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "question".into(),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "call".into(),
+                tool_calls: None,
+            },
+        ];
+        let mut expanded_messages = original_messages.clone();
+        expanded_messages.push(ChatMessage {
+            role: "user".into(),
+            content: "question".into(),
+            tool_calls: None,
+        });
+
+        let (prefill_tokens, _) = engine
+            .prepare_chat_prompt_with_pflash_policy(
+                &original_messages,
+                None,
+                false,
+                ChatPromptMode::SessionPrefill,
+            )
+            .unwrap();
+        let (expanded_tokens, expanded_policy) = engine
+            .prepare_chat_prompt_with_pflash_policy(
+                &expanded_messages,
+                None,
+                false,
+                ChatPromptMode::Generation,
+            )
+            .unwrap();
+
+        reset_prefill_sample_count();
+        engine
+            .generate_continued(session_id, &prefill_tokens, 0, &SamplingParams::default())
+            .unwrap();
+        let retained = prefill_tokens[..prefill_tokens.len() - 1].to_vec();
+        assert_eq!(
+            engine.retained_session_tokens(session_id),
+            Some(retained.clone())
+        );
+        assert!(expanded_tokens.starts_with(&retained));
+
+        let output = engine
+            .generate_session_routed_with_thinking(
+                session_id,
+                &expanded_tokens,
+                &expanded_messages,
+                None,
+                0,
+                &SamplingParams::default(),
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &expanded_policy,
+                SessionContinuationPolicy::RequireContinuation,
+            )
+            .unwrap();
+
+        assert!(output.continued);
+        assert_eq!(output.prompt_tokens as usize, expanded_tokens.len());
+        assert_eq!(prefill_sample_count(), 0);
+    }
+
+    #[test]
     fn warm_session_with_not_growing_candidate_bootstraps_exact_retained_cache() {
         const MAX_PREFILL_TOKENS: usize = 128;
         let retained = vec![1, 2, 3];
@@ -13145,11 +13959,179 @@ mod tests {
     }
 
     #[test]
+    fn retained_prompt_continuation_keeps_new_tool_result() {
+        let engine = session_prompt_template_test_engine();
+
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_owned(),
+                content: "question".to_owned(),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: "call".to_owned(),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "tool".to_owned(),
+                content: "Tokyo 27C".to_owned(),
+                tool_calls: None,
+            },
+        ];
+        let tools = vec![serde_json::json!({"name": "exec"})];
+        let full_text = engine
+            .render_chat_prompt_with_thinking(&messages, Some(&tools), true)
+            .unwrap();
+        let prompt_tokens = engine
+            .tokenizer
+            .encode(full_text, false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        let retained_tokens = engine
+            .tokenizer
+            .encode(
+                "<|im_start|> system tools <|im_end|> \
+                 <|im_start|> user question <|im_end|> \
+                 <|im_start|> assistant call",
+                false,
+            )
+            .unwrap()
+            .get_ids()
+            .to_vec();
+
+        let candidate = engine.continued_prompt_tokens_from_retained(
+            42,
+            Some(&retained_tokens),
+            &prompt_tokens,
+            &messages,
+            Some(&tools),
+            true,
+        );
+        let candidate_text = engine.tokenizer.decode(&candidate, false).unwrap();
+
+        assert!(
+            candidate_text.contains("<|im_start|> tool Tokyo 27C"),
+            "retained continuation omitted the new tool result: {candidate_text}"
+        );
+        assert_eq!(
+            candidate_text.matches("<|im_start|> system tools").count(),
+            1,
+            "retained continuation injected another tools-bearing system frame: {candidate_text}"
+        );
+    }
+
+    #[test]
     fn boundary_delta_skips_closer_when_retained_has_it() {
         let retained = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>";
         let full = "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\nans<|im_end|>\n<|im_start|>user\nq2<|im_end|>";
         let delta = message_boundary_delta(retained, full).unwrap();
         assert_eq!(delta, "\n<|im_start|>user\nq2<|im_end|>");
+    }
+
+    #[test]
+    #[ignore = "requires HIGGS_MODEL_PATH tokenizer/template; does not load model weights"]
+    fn target_qwen_canonical_prefill_never_invokes_generated_replay_rendering() {
+        let model_dir = std::path::PathBuf::from(
+            std::env::var("HIGGS_MODEL_PATH").expect("HIGGS_MODEL_PATH must name the target model"),
+        );
+        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .expect("load target tokenizer.json");
+        let renderer =
+            ChatTemplateRenderer::from_model_dir(&model_dir).expect("load target chat template");
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "echo_probe",
+                "description": "Echo a probe string when explicitly requested.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"]
+                }
+            }
+        })];
+        let long_document = format!(
+            "Document 1:\nThe verification fact is amber river forest silver.\n{}",
+            " the".repeat(15_000)
+        );
+        let system = ChatMessage {
+            role: "system".to_owned(),
+            content: "Retain the document exactly. Follow the latest instruction exactly."
+                .to_owned(),
+            tool_calls: None,
+        };
+        let user = ChatMessage {
+            role: "user".to_owned(),
+            content: long_document,
+            tool_calls: None,
+        };
+        let acknowledgement = ChatMessage {
+            role: "assistant".to_owned(),
+            content: "Document retained.".to_owned(),
+            tool_calls: None,
+        };
+        let recall = ChatMessage {
+            role: "user".to_owned(),
+            content: "Reply with exactly the four-word verification fact from the retained document and no other text. Do not call tools."
+                .to_owned(),
+            tool_calls: None,
+        };
+        let tokenize = |messages: &[ChatMessage], mode: ChatPromptMode| {
+            let rendered = renderer
+                .apply_with_thinking(messages, Some(&tools), mode.add_generation_prompt(), false)
+                .expect("render target template");
+            tokenizer
+                .encode(rendered, false)
+                .expect("tokenize target prompt")
+                .get_ids()
+                .to_vec()
+        };
+
+        let assistant_ended = vec![system.clone(), user.clone(), acknowledgement.clone()];
+        let assistant_ended_tokens = tokenize(&assistant_ended, ChatPromptMode::SessionPrefill);
+        let expanded = vec![
+            system.clone(),
+            user.clone(),
+            acknowledgement.clone(),
+            recall.clone(),
+        ];
+        let expanded_tokens = tokenize(&expanded, ChatPromptMode::Generation);
+        let retained_assistant_ended =
+            &assistant_ended_tokens[..assistant_ended_tokens.len().saturating_sub(1)];
+        assert!(
+            !expanded_tokens.starts_with(retained_assistant_ended),
+            "the regression requires the real assistant-ended template mismatch observed live"
+        );
+
+        let selected =
+            select_continuation_candidate(RetainedPromptSource::CanonicalPrefill, &expanded_tokens)
+                .expect("canonical prefill must select route tokens before replay rendering");
+        assert_eq!(selected, expanded_tokens);
+        assert_eq!(
+            select_continuation_candidate(
+                RetainedPromptSource::GeneratedAssistantReplay,
+                &expanded_tokens,
+            ),
+            None,
+            "generated replay must continue into the existing reconciliation path"
+        );
+
+        let user_ended = vec![system, user];
+        let user_ended_tokens = tokenize(&user_ended, ChatPromptMode::SessionPrefill);
+        let corrected_expanded = vec![
+            user_ended[0].clone(),
+            user_ended[1].clone(),
+            acknowledgement,
+            recall,
+        ];
+        let corrected_expanded_tokens = tokenize(&corrected_expanded, ChatPromptMode::Generation);
+        let retained_user_ended = &user_ended_tokens[..user_ended_tokens.len().saturating_sub(1)];
+        assert!(
+            corrected_expanded_tokens.starts_with(retained_user_ended),
+            "ordinary user-ended prefill must be an exact target-token prefix"
+        );
     }
 
     #[test]
@@ -13496,6 +14478,52 @@ mod tests {
         }
     }
 
+    fn session_prompt_word_tokenizer() -> Tokenizer {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "WhitespaceSplit"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "[UNK]": 0,
+                    "<|im_start|>": 1,
+                    "<|im_end|>": 2,
+                    "system": 3,
+                    "tools": 4,
+                    "user": 5,
+                    "question": 6,
+                    "assistant": 7,
+                    "call": 8,
+                    "tool": 9,
+                    "Tokyo": 10,
+                    "27C": 11
+                },
+                "unk_token": "[UNK]"
+            }
+        }"#;
+        Tokenizer::from_bytes(json.as_bytes()).unwrap()
+    }
+
+    fn session_prompt_template_test_engine() -> SimpleEngine {
+        let mut engine = session_cache_test_engine();
+        engine.tokenizer = session_prompt_word_tokenizer();
+        engine.template = Some(
+            ChatTemplateRenderer::new(
+                r#"{% if tools %}<|im_start|> system tools <|im_end|> {% endif %}
+{% for message in messages %}<|im_start|> {{ message.role }} {{ message.content }} <|im_end|> {% endfor %}
+{% if add_generation_prompt %}<|im_start|> assistant{% endif %}"#,
+            )
+            .unwrap(),
+        );
+        engine
+    }
+
     #[test]
     fn continued_generation_exposes_request_scoped_thinking_control() {
         let _: fn(
@@ -13512,6 +14540,7 @@ mod tests {
     #[test]
     fn continued_generation_honors_zero_token_budget_without_sampling() {
         let engine = session_cache_test_engine();
+        reset_prefill_sample_count();
         let output = engine
             .generate_continued(0x2E20, &[1, 2, 3], 0, &SamplingParams::default())
             .unwrap();
@@ -13519,6 +14548,445 @@ mod tests {
         assert_eq!(output.text, "");
         assert_eq!(output.completion_tokens, 0);
         assert_eq!(output.prompt_tokens, 3);
+        assert_eq!(output.prefilled_tokens, 2);
+        assert_eq!(engine.retained_session_tokens(0x2E20), Some(vec![1, 2]));
+        assert_eq!(engine.cache_stats().prefill_only_requests, 1);
+        assert_eq!(prefill_sample_count(), 0, "prefill-only sampled a token");
+    }
+
+    #[test]
+    fn one_token_prefill_publishes_zero_prefix_without_breaking_lease() {
+        let engine = session_cache_test_engine();
+        engine
+            .generate_continued(0x0A11, &[1, 2, 3], 0, &SamplingParams::default())
+            .unwrap();
+        assert!(engine.lease_retained_session(0x0A11, std::time::Duration::from_secs(60)));
+
+        let output = engine
+            .generate_continued(0x0A11, &[9], 0, &SamplingParams::default())
+            .unwrap();
+        assert_eq!(output.prefilled_tokens, 0);
+        assert_eq!(engine.retained_session_tokens(0x0A11), Some(vec![]));
+        assert_eq!(engine.active_retained_lease_count(), 1);
+        engine
+            .generate_continued(0x0A11, &[7], 0, &SamplingParams::default())
+            .unwrap();
+        assert_eq!(engine.retained_session_tokens(0x0A11), Some(vec![]));
+        assert_eq!(engine.active_retained_lease_count(), 1);
+
+        let continued = engine
+            .generate_session_routed_with_thinking(
+                0x0A11,
+                &[4, 5],
+                &[],
+                None,
+                1,
+                &SamplingParams::default(),
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::RequireContinuation,
+            )
+            .unwrap();
+        assert!(continued.continued, "zero-prefix cache was not continuable");
+    }
+
+    #[test]
+    fn required_prefill_accepts_already_retained_run_boundary() {
+        let engine = session_cache_test_engine();
+        engine
+            .generate_continued(0xB0A0, &[1, 2, 3], 0, &SamplingParams::default())
+            .unwrap();
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(4);
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+
+        engine
+            .generate_session_routed_streaming_with_thinking(
+                0xB0A0,
+                &[1, 2, 4],
+                &[],
+                None,
+                0,
+                &SamplingParams::default(),
+                &output_tx,
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::RequireContinuation,
+                Some(accept_tx),
+            )
+            .unwrap();
+        assert_eq!(accept_rx.blocking_recv().unwrap(), Ok(()));
+        assert_eq!(engine.retained_session_tokens(0xB0A0), Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn required_one_token_prefill_accepts_only_existing_zero_prefix() {
+        let engine = session_cache_test_engine();
+        engine
+            .generate_continued(0x01CE, &[9], 0, &SamplingParams::default())
+            .unwrap();
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(2);
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+
+        engine
+            .generate_session_routed_streaming_with_thinking(
+                0x01CE,
+                &[7],
+                &[],
+                None,
+                0,
+                &SamplingParams::default(),
+                &output_tx,
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::RequireContinuation,
+                Some(accept_tx),
+            )
+            .unwrap();
+
+        assert_eq!(accept_rx.blocking_recv().unwrap(), Ok(()));
+        let terminal = output_rx.blocking_recv().unwrap();
+        assert!(terminal.finished);
+        assert_eq!((terminal.prompt_tokens, terminal.completion_tokens), (1, 0));
+        assert_eq!(engine.retained_session_tokens(0x01CE), Some(vec![]));
+        assert_eq!(engine.cache_stats().continuations, 1);
+    }
+
+    #[test]
+    fn blocking_required_one_token_prefill_uses_retained_zero_prefix() {
+        let engine = session_cache_test_engine();
+        let session_id = 0xB10C;
+        engine
+            .generate_continued(session_id, &[9], 0, &SamplingParams::default())
+            .unwrap();
+
+        let output = engine
+            .generate_session_routed_with_thinking(
+                session_id,
+                &[7],
+                &[],
+                None,
+                0,
+                &SamplingParams::default(),
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::RequireContinuation,
+            )
+            .unwrap();
+
+        assert!(output.continued);
+        assert_eq!(output.outcome, SessionOutcome::Continued);
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.prefilled_tokens, 0);
+    }
+
+    #[test]
+    fn blocking_required_one_token_prefill_rejects_post_admission_hard_eviction() {
+        let engine = session_cache_test_engine();
+        let session_id = 0xE71B;
+        engine
+            .generate_continued(session_id, &[9], 0, &SamplingParams::default())
+            .unwrap();
+        REQUIRED_POST_ADMISSION_EVICT_SESSION
+            .store(session_id, std::sync::atomic::Ordering::SeqCst);
+
+        let result = engine.generate_session_routed_with_thinking(
+            session_id,
+            &[7],
+            &[],
+            None,
+            0,
+            &SamplingParams::default(),
+            false,
+            SessionPromptTracePayloadStats::default(),
+            &PFlashPromptPolicy::default(),
+            SessionContinuationPolicy::RequireContinuation,
+        );
+        REQUIRED_POST_ADMISSION_EVICT_SESSION.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(matches!(
+            result,
+            Err(EngineError::RetainedSessionUnavailable(id)) if id == session_id
+        ));
+        assert!(engine.retained_session_tokens(session_id).is_none());
+    }
+
+    #[test]
+    fn required_one_token_prefill_materialization_failure_is_never_accepted() {
+        let engine = session_cache_test_engine();
+        let session_id = 0xFA11;
+        engine.stash_retained(
+            session_id,
+            crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+                validated_session_target(1),
+                Vec::new(),
+            ),
+            false,
+        );
+        let before = engine.cache_stats().prefill_only_requests;
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(2);
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+
+        let error = engine
+            .generate_session_routed_streaming_with_thinking(
+                session_id,
+                &[7],
+                &[],
+                None,
+                0,
+                &SamplingParams::default(),
+                &output_tx,
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::RequireContinuation,
+                Some(accept_tx),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, EngineError::Generation(_)));
+        assert!(
+            accept_rx.blocking_recv().is_err(),
+            "worker accepted before retained-state materialization failed"
+        );
+        assert!(output_rx.try_recv().is_err());
+        assert_eq!(engine.cache_stats().prefill_only_requests, before);
+    }
+
+    #[test]
+    fn required_one_token_prefill_rejects_hard_evicted_zero_prefix_without_mutation() {
+        let engine = session_cache_test_engine();
+        engine
+            .generate_continued(0xE71C, &[9], 0, &SamplingParams::default())
+            .unwrap();
+        for (session_id, token) in [(0xE71D, 1), (0xE71E, 2)] {
+            engine.stash_retained(
+                session_id,
+                crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+                    AnyCache::KV(Vec::new()),
+                    vec![token],
+                ),
+                false,
+            );
+        }
+        assert!(engine.retained_session_tokens(0xE71C).is_none());
+        let before = engine.cache_stats().prefill_only_requests;
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(2);
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+
+        let error = engine
+            .generate_session_routed_streaming_with_thinking(
+                0xE71C,
+                &[7],
+                &[],
+                None,
+                0,
+                &SamplingParams::default(),
+                &output_tx,
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::RequireContinuation,
+                Some(accept_tx),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::RetainedSessionUnavailable(0xE71C)
+        ));
+        assert_eq!(accept_rx.blocking_recv().unwrap(), Err(0xE71C));
+        assert!(output_rx.try_recv().is_err());
+        assert_eq!(engine.cache_stats().prefill_only_requests, before);
+        assert!(engine.retained_session_tokens(0xE71C).is_none());
+    }
+
+    #[test]
+    fn empty_generation_does_not_delete_same_session_or_lease() {
+        let engine = session_cache_test_engine();
+        engine
+            .generate_continued(0xE000, &[1, 2, 3], 0, &SamplingParams::default())
+            .unwrap();
+        assert!(engine.lease_retained_session(0xE000, std::time::Duration::from_secs(60)));
+
+        engine
+            .generate_continued(0xE000, &[], 1, &SamplingParams::default())
+            .unwrap();
+        assert_eq!(engine.retained_session_tokens(0xE000), Some(vec![1, 2]));
+        assert_eq!(engine.active_retained_lease_count(), 1);
+    }
+
+    #[test]
+    fn prefill_only_metrics_use_retained_run_prompt_length() {
+        let engine = session_cache_test_engine();
+        engine
+            .generate_continued(0x0E7A, &[1, 2, 3, 4], 0, &SamplingParams::default())
+            .unwrap();
+
+        let blocking = engine
+            .generate_continued(0x0E7A, &[1, 2, 3, 4, 5], 0, &SamplingParams::default())
+            .unwrap();
+        assert_eq!(blocking.prompt_tokens, 5);
+        assert_eq!(blocking.prefilled_tokens, 1);
+        assert_eq!(engine.cache_stats().prefill_saved_tokens, 3);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        engine
+            .generate_continued_streaming_with_thinking(
+                0x0E7A,
+                &[1, 2, 3, 4, 5, 6],
+                0,
+                &SamplingParams::default(),
+                &tx,
+                false,
+            )
+            .unwrap();
+        let progress = rx.blocking_recv().unwrap().prefill_progress.unwrap();
+        assert_eq!(
+            (progress.cached, progress.processed, progress.total),
+            (4, 4, 5)
+        );
+        assert_eq!(engine.cache_stats().prefill_saved_tokens, 7);
+    }
+
+    #[test]
+    fn stateless_zero_token_budget_is_tokenize_only() {
+        let engine = session_cache_test_engine();
+        let output = engine
+            .generate(
+                &[1, 2, 3],
+                0,
+                &SamplingParams::default(),
+                &[],
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(output.text, "");
+        assert_eq!(output.prompt_tokens, 3);
+        assert_eq!(output.completion_tokens, 0);
+        assert_eq!(engine.retained_session_count(), 0);
+        assert_eq!(engine.cache_stats().prefill_only_requests, 0);
+    }
+
+    #[test]
+    fn required_continuation_miss_returns_before_cold_prefill() {
+        let engine = session_cache_test_engine();
+        let error = engine
+            .generate_session_routed_with_thinking(
+                0xCAFE,
+                &[1, 2, 3],
+                &[],
+                None,
+                1,
+                &SamplingParams::default(),
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::RequireContinuation,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::RetainedSessionUnavailable(0xCAFE)
+        ));
+        assert!(engine.retained_session_tokens(0xCAFE).is_none());
+        assert_eq!(engine.cache_stats().required_continuation_misses, 1);
+    }
+
+    #[test]
+    fn required_stream_reports_rejection_before_generation() {
+        let engine = session_cache_test_engine();
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(1);
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+
+        let error = engine
+            .generate_session_routed_streaming_with_thinking(
+                0xACCE,
+                &[1, 2, 3],
+                &[],
+                None,
+                1,
+                &SamplingParams::default(),
+                &output_tx,
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::RequireContinuation,
+                Some(accept_tx),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::RetainedSessionUnavailable(0xACCE)
+        ));
+        assert_eq!(accept_rx.blocking_recv().unwrap(), Err(0xACCE));
+    }
+
+    #[test]
+    fn accepted_required_stream_survives_concurrent_session_deletion() {
+        let engine = std::sync::Arc::new(session_cache_test_engine());
+        engine
+            .generate_continued(0xA11C, &[1, 2, 3], 0, &SamplingParams::default())
+            .unwrap();
+        assert_eq!(engine.retained_session_tokens(0xA11C).unwrap(), vec![1, 2]);
+
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+        let worker_engine = std::sync::Arc::clone(&engine);
+        let worker = std::thread::spawn(move || {
+            worker_engine.generate_session_routed_streaming_with_thinking(
+                0xA11C,
+                &[1, 2, 4],
+                &[],
+                None,
+                1,
+                &SamplingParams::default(),
+                &output_tx,
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::RequireContinuation,
+                Some(accept_tx),
+            )
+        });
+
+        assert_eq!(accept_rx.blocking_recv().unwrap(), Ok(()));
+        while output_rx.len() == 0 {
+            std::thread::yield_now();
+        }
+
+        let delete_engine = std::sync::Arc::clone(&engine);
+        let (deleted_tx, deleted_rx) = std::sync::mpsc::channel();
+        let deletion = std::thread::spawn(move || {
+            let _ = deleted_tx.send(delete_engine.drop_retained_session(0xA11C));
+        });
+        assert!(
+            deleted_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+
+        while let Some(output) = output_rx.blocking_recv() {
+            if output.finished {
+                break;
+            }
+        }
+        worker.join().unwrap().unwrap();
+        assert!(
+            deleted_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+        );
+        deletion.join().unwrap();
     }
 
     #[test]
@@ -13713,6 +15181,25 @@ mod tests {
     }
 
     #[test]
+    fn lease_confirms_existing_session_and_explicit_deletion_wins() {
+        const SESSION_ID: u64 = 0x1EA5_E;
+        let engine = session_cache_test_engine();
+        assert!(!engine.lease_retained_session(SESSION_ID, std::time::Duration::from_secs(60)));
+
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            AnyCache::KV(Vec::new()),
+            vec![1, 2, 3],
+        );
+        engine.stash_retained(SESSION_ID, state, false);
+        assert!(engine.lease_retained_session(SESSION_ID, std::time::Duration::from_secs(60)));
+        assert_eq!(engine.active_retained_lease_count(), 1);
+
+        assert!(engine.drop_retained_session(SESSION_ID));
+        assert_eq!(engine.active_retained_lease_count(), 0);
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
+    }
+
+    #[test]
     fn oversized_prompt_checkpoint_preserves_prior_retained_boundary() {
         const SESSION_ID: u64 = 0xCACE_C4A9;
         let mut engine = session_cache_test_engine();
@@ -13832,7 +15319,12 @@ mod tests {
 
         let mlx_gate = higgs_models::mlx_exec::acquire();
         let forked = engine
-            .fork_target_continuable(SESSION_ID, &[1, 2, 3, 4], &mlx_gate)
+            .fork_target_continuable(
+                SESSION_ID,
+                &[1, 2, 3, 4],
+                SessionRunMode::Generation,
+                &mlx_gate,
+            )
             .unwrap()
             .expect("target retention must fork for an exact continuation");
         drop(mlx_gate);
@@ -13859,7 +15351,12 @@ mod tests {
 
         let mlx_gate = higgs_models::mlx_exec::acquire();
         let forked = engine
-            .fork_target_continuable(SESSION_ID, &[9, 2, 3, 4], &mlx_gate)
+            .fork_target_continuable(
+                SESSION_ID,
+                &[9, 2, 3, 4],
+                SessionRunMode::Generation,
+                &mlx_gate,
+            )
             .unwrap();
         drop(mlx_gate);
 
@@ -14481,6 +15978,39 @@ mod tests {
     }
 
     #[test]
+    fn retained_kv_stays_dense_below_both_exactness_boundaries() {
+        let turboquant = KvCacheConfig {
+            mode: higgs_models::turboquant::KvCacheMode::Turboquant,
+            max_session_tokens: 32_768,
+            ..KvCacheConfig::default()
+        };
+
+        assert_eq!(
+            retained_kv_storage_at(turboquant, 15_319, 100_000),
+            RetainedKvStorage::Dense,
+            "configured TurboQuant must not make a below-threshold retained session lossy"
+        );
+        assert_eq!(
+            retained_kv_storage_at(turboquant, 100_000, 100_000),
+            RetainedKvStorage::TurboQuantOverCap,
+            "the configured dense-session cap takes precedence at long context"
+        );
+
+        let unlimited = KvCacheConfig {
+            max_session_tokens: 0,
+            ..turboquant
+        };
+        assert_eq!(
+            retained_kv_storage_at(unlimited, 99_999, 100_000),
+            RetainedKvStorage::Dense
+        );
+        assert_eq!(
+            retained_kv_storage_at(unlimited, 100_000, 100_000),
+            RetainedKvStorage::TurboQuantWithinCap
+        );
+    }
+
+    #[test]
     fn retention_caps_bound_the_retained_map() {
         use super::{RetainedKv, evict_idle_from, retention_token_cap, stash_into};
         use crate::cache::paired::RetainedState;
@@ -14564,6 +16094,8 @@ mod tests {
                 RetainedKv {
                     state: dummy(vec![1]),
                     last_used: Instant::now(),
+                    lease_expires_at: None,
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
                 },
             );
         }
@@ -14626,6 +16158,8 @@ mod tests {
             RetainedKv {
                 state: paired_retained_state(1),
                 last_used: Instant::now(),
+                lease_expires_at: None,
+                source: super::RetainedPromptSource::GeneratedAssistantReplay,
             },
         );
 
@@ -14672,6 +16206,168 @@ mod tests {
         assert_eq!(plateau.entries, 2);
         assert_eq!(plateau.target_bytes, target_bytes * 2);
         assert_eq!(plateau.dflash_bytes, dflash_bytes * 2);
+    }
+
+    #[test]
+    fn retained_state_total_bytes_cover_target_only_and_paired_state() {
+        let target_only = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            validated_session_target(1),
+            vec![7],
+        );
+        assert!(target_only.estimated_bytes() > 0);
+
+        let paired = paired_retained_state(1);
+        let (target_bytes, dflash_bytes) = paired.paired_estimated_bytes().unwrap();
+        assert_eq!(
+            paired.estimated_bytes(),
+            target_bytes.saturating_add(dflash_bytes)
+        );
+    }
+
+    #[test]
+    fn active_lease_survives_idle_until_expiry_and_expiry_is_reported() {
+        use super::{RetainedKv, evict_idle_except_from};
+        use crate::cache::paired::RetainedState;
+        use higgs_models::AnyCache;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let state =
+            RetainedState::target_only_unchecked_for_test(AnyCache::KV(Vec::new()), vec![1]);
+        let now = Instant::now();
+        let mut retained = HashMap::from([(
+            1,
+            RetainedKv {
+                state,
+                last_used: now - Duration::from_secs(60),
+                lease_expires_at: Some(now + Duration::from_secs(60)),
+                source: super::RetainedPromptSource::GeneratedAssistantReplay,
+            },
+        )]);
+
+        let active = evict_idle_except_from(
+            &mut retained,
+            Duration::from_secs(1),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(active.evicted, 0);
+        assert_eq!(active.expired_leases, 0);
+
+        retained.get_mut(&1).unwrap().lease_expires_at = Some(now - Duration::from_secs(1));
+        let expired = evict_idle_except_from(
+            &mut retained,
+            Duration::from_secs(1),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(expired.evicted, 1);
+        assert_eq!(expired.expired_leases, 1);
+    }
+
+    #[test]
+    fn hard_limits_evict_unleased_then_earliest_expiring_lease() {
+        use super::{RetainedKv, RetentionLimits, stash_into_bounded};
+        use crate::cache::paired::RetainedState;
+        use higgs_models::AnyCache;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let dummy =
+            || RetainedState::target_only_unchecked_for_test(AnyCache::KV(Vec::new()), vec![1]);
+        let now = Instant::now();
+        let limits = RetentionLimits {
+            max_sessions: 2,
+            max_session_tokens: 32_768,
+            max_bytes: usize::MAX,
+        };
+        let mut retained = HashMap::from([
+            (
+                1,
+                RetainedKv {
+                    state: dummy(),
+                    last_used: now - Duration::from_secs(20),
+                    lease_expires_at: Some(now + Duration::from_secs(30)),
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            ),
+            (
+                2,
+                RetainedKv {
+                    state: dummy(),
+                    last_used: now - Duration::from_secs(10),
+                    lease_expires_at: None,
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            ),
+        ]);
+
+        let first = stash_into_bounded(&mut retained, 3, dummy(), limits);
+        assert_eq!(first.evicted, 1);
+        assert_eq!(first.broken_leases, 0);
+        assert!(retained.contains_key(&1));
+        assert!(!retained.contains_key(&2));
+
+        retained.get_mut(&3).unwrap().lease_expires_at = Some(now + Duration::from_secs(90));
+        retained.insert(
+            4,
+            RetainedKv {
+                state: dummy(),
+                last_used: now,
+                lease_expires_at: Some(now + Duration::from_secs(120)),
+                source: super::RetainedPromptSource::GeneratedAssistantReplay,
+            },
+        );
+        let all_leased = stash_into_bounded(&mut retained, 4, dummy(), limits);
+        assert_eq!(all_leased.evicted, 1);
+        assert_eq!(all_leased.broken_leases, 1);
+        assert!(!retained.contains_key(&1), "earliest lease expires first");
+        assert!(retained.contains_key(&3));
+        assert!(retained.contains_key(&4));
+    }
+
+    #[test]
+    fn retained_byte_limit_evicts_and_rejects_oversized_entries() {
+        use super::{RetentionLimits, stash_into_bounded};
+        use std::collections::HashMap;
+
+        let sample_bytes = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            validated_session_target(1),
+            vec![7],
+        )
+        .estimated_bytes();
+        assert!(sample_bytes > 0);
+        let state = || {
+            crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+                validated_session_target(1),
+                vec![7],
+            )
+        };
+        let limits = RetentionLimits {
+            max_sessions: 8,
+            max_session_tokens: 32_768,
+            max_bytes: sample_bytes.saturating_mul(2),
+        };
+        let mut retained = HashMap::new();
+        assert_eq!(
+            stash_into_bounded(&mut retained, 1, state(), limits).evicted,
+            0
+        );
+        assert_eq!(
+            stash_into_bounded(&mut retained, 2, state(), limits).evicted,
+            0
+        );
+        assert_eq!(
+            stash_into_bounded(&mut retained, 3, state(), limits).evicted,
+            1
+        );
+        assert_eq!(retained.len(), 2);
+
+        let oversized_limits = RetentionLimits {
+            max_bytes: sample_bytes.saturating_sub(1),
+            ..limits
+        };
+        let rejected = stash_into_bounded(&mut retained, 9, state(), oversized_limits);
+        assert!(rejected.oversized);
+        assert!(!retained.contains_key(&9));
     }
 
     /// Write a config.json file into the given directory with the provided JSON content.

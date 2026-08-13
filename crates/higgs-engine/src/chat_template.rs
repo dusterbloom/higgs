@@ -4,6 +4,21 @@ use serde::Serialize;
 
 use crate::error::EngineError;
 
+/// Whether a rendered chat prompt opens the next assistant generation turn or
+/// stops at the exact boundary of the completed messages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatPromptMode {
+    #[default]
+    Generation,
+    SessionPrefill,
+}
+
+impl ChatPromptMode {
+    pub const fn add_generation_prompt(self) -> bool {
+        matches!(self, Self::Generation)
+    }
+}
+
 /// A chat message for template rendering.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {

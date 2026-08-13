@@ -28,6 +28,17 @@ pub enum ServerError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    #[error(
+        "Rendered prompt has {prompt_tokens} tokens, exceeding max_prompt_tokens={max_prompt_tokens}"
+    )]
+    ContextLengthExceeded {
+        prompt_tokens: usize,
+        max_prompt_tokens: u32,
+    },
+
+    #[error("Retained session {0} is unavailable for required continuation")]
+    RetainedSessionUnavailable(u64),
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
@@ -46,33 +57,54 @@ pub enum ServerError {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
-        let (status, error_type, message) = match &self {
+        let (status, error_type, message, code) = match &self {
             Self::Engine(e) => {
                 tracing::error!(error = %e, "Engine error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "server_error",
                     "Internal server error".to_owned(),
+                    None,
                 )
             }
             Self::BadRequest(msg) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 msg.clone(),
+                None,
+            ),
+            Self::ContextLengthExceeded {
+                prompt_tokens,
+                max_prompt_tokens,
+            } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!(
+                    "Rendered prompt has {prompt_tokens} tokens, exceeding max_prompt_tokens={max_prompt_tokens}"
+                ),
+                Some("context_length_exceeded"),
+            ),
+            Self::RetainedSessionUnavailable(session_id) => (
+                StatusCode::CONFLICT,
+                "conflict",
+                format!("Retained session {session_id} is unavailable for required continuation"),
+                Some("retained_session_unavailable"),
             ),
             Self::ModelNotFound(model) => (
                 StatusCode::NOT_FOUND,
                 "model_not_found",
                 format!("Model '{model}' is not loaded"),
+                None,
             ),
-            Self::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone()),
-            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
+            Self::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone(), None),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone(), None),
             Self::InternalError(msg) => {
                 tracing::error!(error = %msg, "Internal error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "server_error",
                     "Internal server error".to_owned(),
+                    None,
                 )
             }
             Self::ProxyError(msg) => {
@@ -81,6 +113,7 @@ impl IntoResponse for ServerError {
                     StatusCode::BAD_GATEWAY,
                     "proxy_error",
                     "Upstream provider error".to_owned(),
+                    None,
                 )
             }
         };
@@ -89,7 +122,7 @@ impl IntoResponse for ServerError {
             error: ErrorDetail {
                 message,
                 r#type: error_type.to_owned(),
-                code: None,
+                code: code.map(str::to_owned),
             },
         });
 
@@ -172,6 +205,26 @@ mod tests {
         let (_, body) = response_status_and_body(resp).await;
 
         assert!(body["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn context_limit_and_required_continuation_have_stable_codes() {
+        let (status, body) = response_status_and_body(
+            ServerError::ContextLengthExceeded {
+                prompt_tokens: 4,
+                max_prompt_tokens: 3,
+            }
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+
+        let (status, body) =
+            response_status_and_body(ServerError::RetainedSessionUnavailable(42).into_response())
+                .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "retained_session_unavailable");
     }
 
     #[tokio::test]

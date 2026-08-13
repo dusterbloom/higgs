@@ -19,6 +19,9 @@ pub enum EngineError {
 
     #[error("Generation cancelled")]
     Cancelled,
+
+    #[error("Retained session {0} is unavailable for required continuation")]
+    RetainedSessionUnavailable(u64),
 }
 
 #[cfg(test)]

@@ -67,6 +67,14 @@ fn turboquant_activate_at() -> i32 {
     })
 }
 
+/// Token boundary at which dense execution switches to TurboQuant.
+/// Retention uses the same boundary so a session cannot become lossy between
+/// turns while its next append would still select the exact dense path.
+#[must_use]
+pub fn turboquant_activation_threshold() -> i32 {
+    turboquant_activate_at()
+}
+
 const fn should_activate_turboquant(offset: i32, new_tokens: i32, activate_at: i32) -> bool {
     activate_at <= 0 || offset + new_tokens >= activate_at
 }
@@ -394,6 +402,22 @@ pub struct SteppingKeyValueCache {
     logical_offset: Option<i32>,
     offset: i32,
     step: i32,
+}
+
+fn dense_growth_capacity(valid_rows: i32, new_rows: i32, step: i32) -> Result<i32, Exception> {
+    if valid_rows < 0 || new_rows <= 0 || step <= 0 {
+        return Err(Exception::custom(format!(
+            "dense growth requires non-negative valid rows and positive lengths, got valid={valid_rows} new={new_rows} step={step}"
+        )));
+    }
+    let required = valid_rows
+        .checked_add(new_rows)
+        .ok_or_else(|| Exception::custom("dense cache capacity overflow"))?;
+    Ok(required
+        .checked_add(step - 1)
+        .ok_or_else(|| Exception::custom("dense cache rounding overflow"))?
+        .div_euclid(step)
+        * step)
 }
 
 #[derive(Debug, Clone)]
@@ -846,11 +870,7 @@ impl SteppingKeyValueCache {
             let k_head_dim = dim(k_shape, 3, "keys D")?;
             let v_head_dim = dim(v_shape, 3, "values D")?;
 
-            let n_steps = (self.step + new_tokens - 1) / self.step;
-            let new_slots = n_steps * self.step;
-
-            let new_k = ops::zeros_dtype(&[b, n_kv_heads, new_slots, k_head_dim], keys.dtype())?;
-            let new_v = ops::zeros_dtype(&[b, n_kv_heads, new_slots, v_head_dim], values.dtype())?;
+            let target_capacity = dense_growth_capacity(prev, new_tokens, self.step)?;
 
             let (grown_k, grown_v) = match (self.keys.as_ref(), self.values.as_ref()) {
                 (Some(old_k), Some(old_v)) => {
@@ -859,11 +879,25 @@ impl SteppingKeyValueCache {
                     } else {
                         (old_k.clone(), old_v.clone())
                     };
+                    let retained_capacity = *trimmed_k.shape().get(2).ok_or_else(|| {
+                        Exception::custom("trimmed dense key cache has no token axis")
+                    })?;
+                    let new_slots = target_capacity - retained_capacity;
+                    let new_k =
+                        ops::zeros_dtype(&[b, n_kv_heads, new_slots, k_head_dim], keys.dtype())?;
+                    let new_v =
+                        ops::zeros_dtype(&[b, n_kv_heads, new_slots, v_head_dim], values.dtype())?;
                     let cat_k = concatenate_axis(&[trimmed_k, new_k], 2)?;
                     let cat_v = concatenate_axis(&[trimmed_v, new_v], 2)?;
                     (cat_k, cat_v)
                 }
-                _ => (new_k, new_v),
+                _ => (
+                    ops::zeros_dtype(&[b, n_kv_heads, target_capacity, k_head_dim], keys.dtype())?,
+                    ops::zeros_dtype(
+                        &[b, n_kv_heads, target_capacity, v_head_dim],
+                        values.dtype(),
+                    )?,
+                ),
             };
             self.keys = Some(grown_k);
             self.values = Some(grown_v);
@@ -880,12 +914,6 @@ impl SteppingKeyValueCache {
 
         let updated_k = slice_update_axis2(k, keys, prev, new_tokens)?;
         let updated_v = slice_update_axis2(v, values, prev, new_tokens)?;
-        // DIAGNOSTIC (HIGGS_DIAG_EVAL_CACHE=1): force-eval the slice_update result
-        // so the stored cache is concrete (independent of later layer temporaries).
-        // Tests the lazy-recycling corruption hypothesis.
-        if std::env::var("HIGGS_DIAG_EVAL_CACHE").is_ok_and(|flag| flag == "1") {
-            mlx_rs::transforms::eval([&updated_k, &updated_v])?;
-        }
         self.keys = Some(updated_k);
         self.values = Some(updated_v);
 
@@ -2053,6 +2081,44 @@ mod tests {
             backing.as_slice::<f32>().as_ptr(),
             "materialized output must not alias the transposed backing allocation"
         );
+    }
+
+    #[test]
+    fn dense_growth_rounds_total_valid_length_not_suffix_length() {
+        assert_eq!(dense_growth_capacity(15_276, 43, 256).unwrap(), 15_360);
+        assert_eq!(dense_growth_capacity(14_336, 983, 256).unwrap(), 15_360);
+        assert_eq!(dense_growth_capacity(0, 983, 256).unwrap(), 1_024);
+    }
+
+    #[test]
+    fn compact_retained_dense_cache_regrows_to_absolute_step_boundary() {
+        let _exec = crate::mlx_exec::acquire();
+        let prefix = ops::zeros_dtype(&[1, 1, 15_276, 4], Dtype::Bfloat16).unwrap();
+        let mut cache = SteppingKeyValueCache::from_arrays(prefix.clone(), prefix).unwrap();
+        let appended_values = (0..43 * 4)
+            .map(|index| (index as f32 * 0.031_25).sin())
+            .collect::<Vec<_>>();
+        let appended = Array::from_slice(&appended_values, &[1, 1, 43, 4])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+
+        let view = cache
+            .update_and_view(appended.clone(), appended.clone())
+            .unwrap();
+        let (keys, values) = view.into_dense().unwrap();
+        assert_eq!(keys.shape(), &[1, 1, 15_319, 4]);
+        assert_eq!(values.shape(), &[1, 1, 15_319, 4]);
+        assert_eq!(cache.keys().unwrap().shape(), &[1, 1, 15_360, 4]);
+        assert_eq!(cache.values().unwrap().shape(), &[1, 1, 15_360, 4]);
+
+        let key_tail = slice_axis2(&keys, 15_276, 15_319).unwrap();
+        let value_tail = slice_axis2(&values, 15_276, 15_319).unwrap();
+        let expected = appended.as_dtype(Dtype::Float32).unwrap();
+        let key_tail = key_tail.as_dtype(Dtype::Float32).unwrap();
+        let value_tail = value_tail.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&expected, &key_tail, &value_tail]).unwrap();
+        assert_eq!(key_tail.as_slice::<f32>(), expected.as_slice::<f32>());
+        assert_eq!(value_tail.as_slice::<f32>(), expected.as_slice::<f32>());
     }
 
     #[test]

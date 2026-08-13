@@ -65,19 +65,22 @@ pub struct KvCacheConfig {
     pub seed: u64,
     /// Max conversations whose live KV cache is retained between turns for
     /// cache-resident multi-turn. LRU-evicted beyond this; bounds the *number*
-    /// of resident caches. Must be >= 1. Default 8.
+    /// of resident caches. Must be >= 1. Default 2.
     #[serde(default = "default_max_retained_sessions")]
     pub max_retained_sessions: usize,
     /// Drop a conversation's retained KV once it covers more than this many
     /// tokens (`0` = unlimited). Bounds a single conversation's resident KV; the
-    /// next turn then full-prefills. Default 0.
-    #[serde(default)]
+    /// next turn then full-prefills. Default 32,768.
+    #[serde(default = "default_max_session_tokens")]
     pub max_session_tokens: usize,
     /// Evict retained session KV and memory-only paired target+dSpark radix
     /// endpoints idle longer than this many seconds (`0` = never). Frees memory
-    /// from abandoned conversations. Default 1800 (30 min).
+    /// from abandoned conversations. Default 300 (5 min).
     #[serde(default = "default_retained_idle_secs")]
     pub retained_idle_secs: u64,
+    /// Hard aggregate byte limit for retained per-session KV state.
+    #[serde(default = "default_max_retained_bytes")]
+    pub max_retained_bytes: usize,
     /// Resident-byte budget for the prefix KV cache (paged/paired radix under
     /// the simple engine, LRU prefix cache under the batch engine). Eviction
     /// becomes size-aware: the least-recently-used entry is dropped while the
@@ -97,11 +100,19 @@ const fn default_norm_correction() -> bool {
 }
 
 const fn default_max_retained_sessions() -> usize {
-    8
+    2
 }
 
 const fn default_retained_idle_secs() -> u64 {
-    1800
+    300
+}
+
+const fn default_max_session_tokens() -> usize {
+    32_768
+}
+
+const fn default_max_retained_bytes() -> usize {
+    2_147_483_648
 }
 
 impl Default for KvCacheConfig {
@@ -115,8 +126,9 @@ impl Default for KvCacheConfig {
             adaptive_dense_layers: 0,
             seed: 0,
             max_retained_sessions: default_max_retained_sessions(),
-            max_session_tokens: 0,
+            max_session_tokens: default_max_session_tokens(),
             retained_idle_secs: default_retained_idle_secs(),
+            max_retained_bytes: default_max_retained_bytes(),
             kv_cache_bytes: 0,
         }
     }
@@ -1532,6 +1544,15 @@ pub(crate) fn pack_indices_gpu(
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_session_limits_have_bounded_service_defaults() {
+        let config = KvCacheConfig::default();
+        assert_eq!(config.max_retained_sessions, 2);
+        assert_eq!(config.max_session_tokens, 32_768);
+        assert_eq!(config.retained_idle_secs, 300);
+        assert_eq!(config.max_retained_bytes, 2_147_483_648);
+    }
     use rand::SeedableRng;
 
     fn make_context(bits: u8, head_dim: i32) -> TurboQuantContext {

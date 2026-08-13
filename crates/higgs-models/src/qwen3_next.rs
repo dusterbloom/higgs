@@ -1536,22 +1536,43 @@ const int position = static_cast<int>(thread_position_in_grid.y);
 const int batch_index = static_cast<int>(thread_position_in_grid.z);
 const int mixed_index = (batch_index * T + position) * D + channel;
 
-// Match canonical_conv1d_step exactly: current tap first, then one rounded
-// multiply and one rounded add for each available lag, newest to oldest.
-InT accumulator = static_cast<InT>(
-    mixed_qkv[mixed_index] * weight_t[(K - 1) * D + channel]);
 const int available = min(max(offset_init + position, 0), K - 1);
-for (int lag = 0; lag < available; ++lag) {
-  const int prior_position = position - 1 - lag;
-  InT prior;
-  if (prior_position >= 0) {
-    prior = mixed_qkv[(batch_index * T + prior_position) * D + channel];
-  } else {
-    const int history_index = (K - 2) - (lag - position);
-    prior = history[(batch_index * (K - 1) + history_index) * D + channel];
+InT accumulator;
+if (APPEND_STABLE_WINDOW != 0) {
+  accumulator = static_cast<InT>(0);
+  for (int lag = available - 1; lag >= 0; --lag) {
+    const int prior_position = position - 1 - lag;
+    InT prior;
+    if (prior_position >= 0) {
+      prior = mixed_qkv[(batch_index * T + prior_position) * D + channel];
+    } else {
+      const int history_index = (K - 2) - (lag - position);
+      prior = history[(batch_index * (K - 1) + history_index) * D + channel];
+    }
+    InT product =
+        static_cast<InT>(prior * weight_t[(K - 2 - lag) * D + channel]);
+    accumulator = static_cast<InT>(accumulator + product);
   }
-  InT product = static_cast<InT>(prior * weight_t[(K - 2 - lag) * D + channel]);
-  accumulator = static_cast<InT>(accumulator + product);
+  InT current = static_cast<InT>(
+      mixed_qkv[mixed_index] * weight_t[(K - 1) * D + channel]);
+  accumulator = static_cast<InT>(accumulator + current);
+} else {
+  // Match canonical_conv1d_step exactly: current first, then newest history.
+  accumulator = static_cast<InT>(
+      mixed_qkv[mixed_index] * weight_t[(K - 1) * D + channel]);
+  for (int lag = 0; lag < available; ++lag) {
+    const int prior_position = position - 1 - lag;
+    InT prior;
+    if (prior_position >= 0) {
+      prior = mixed_qkv[(batch_index * T + prior_position) * D + channel];
+    } else {
+      const int history_index = (K - 2) - (lag - position);
+      prior = history[(batch_index * (K - 1) + history_index) * D + channel];
+    }
+    InT product =
+        static_cast<InT>(prior * weight_t[(K - 2 - lag) * D + channel]);
+    accumulator = static_cast<InT>(accumulator + product);
+  }
 }
 preactivation[mixed_index] = accumulator;
 ";
@@ -1591,6 +1612,7 @@ fn configure_canonical_conv_kernel(
     seq_len: i32,
     conv_dim: i32,
     kernel_size: i32,
+    reduction: CanonicalConvReduction,
 ) -> mlx_sys::mlx_fast_metal_kernel_config {
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
@@ -1604,6 +1626,7 @@ fn configure_canonical_conv_kernel(
             (c"T", seq_len),
             (c"D", conv_dim),
             (c"K", kernel_size),
+            (c"APPEND_STABLE_WINDOW", reduction.template_value()),
         ] {
             mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
                 config,
@@ -1634,7 +1657,7 @@ fn canonical_conv_kernel_supported(
     kernel_size: i32,
 ) -> bool {
     batch == 1
-        && (1..=5).contains(&seq_len)
+        && seq_len > 0
         && kernel_size == 4
         && mixed_qkv.dtype() == Dtype::Bfloat16
         && history.dtype() == Dtype::Bfloat16
@@ -1642,6 +1665,10 @@ fn canonical_conv_kernel_supported(
         && mixed_qkv.shape() == [batch, seq_len, conv_dim]
         && history.shape() == [batch, kernel_size - 1, conv_dim]
         && weight_t.shape() == [kernel_size, conv_dim]
+}
+
+fn canonical_conv_config_is_persistent(seq_len: i32) -> bool {
+    (1..=8).contains(&seq_len) || seq_len == 1_024
 }
 
 #[allow(unsafe_code, clippy::too_many_arguments)]
@@ -1654,6 +1681,7 @@ fn canonical_conv_preactivation_ffi(
     seq_len: i32,
     conv_dim: i32,
     kernel_size: i32,
+    reduction: CanonicalConvReduction,
 ) -> Result<Array, Exception> {
     if !canonical_conv_kernel_supported(
         mixed_qkv,
@@ -1685,22 +1713,42 @@ fn canonical_conv_preactivation_ffi(
         seq_len,
         conv_dim,
         kernel_size,
+        reduction,
     };
-    let config = CANONICAL_CONV_CONFIG_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .entry(key)
-            .or_insert_with(|| {
-                CachedMetalKernelConfig(configure_canonical_conv_kernel(
-                    in_dtype,
-                    batch,
-                    seq_len,
-                    conv_dim,
-                    kernel_size,
-                ))
-            })
-            .0
+    // FastMetal configurations specialize the sequence length. Cache the
+    // finite hot set used by canonical decode blocks and standard chunked
+    // prefill; arbitrary tail lengths are request-owned so a long-lived
+    // server cannot retain one C++ configuration per observed prompt suffix.
+    let request_config = (!canonical_conv_config_is_persistent(seq_len)).then(|| {
+        CachedMetalKernelConfig(configure_canonical_conv_kernel(
+            in_dtype,
+            batch,
+            seq_len,
+            conv_dim,
+            kernel_size,
+            reduction,
+        ))
     });
+    let config = if let Some(request_config) = request_config.as_ref() {
+        request_config.0
+    } else {
+        CANONICAL_CONV_CONFIG_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .entry(key)
+                .or_insert_with(|| {
+                    CachedMetalKernelConfig(configure_canonical_conv_kernel(
+                        in_dtype,
+                        batch,
+                        seq_len,
+                        conv_dim,
+                        kernel_size,
+                        reduction,
+                    ))
+                })
+                .0
+        })
+    };
     let kernel =
         CANONICAL_CONV_KERNEL.get_or_init(|| CachedMetalKernel(create_canonical_conv_kernel()));
     let offset_scalar = unsafe { mlx_sys::mlx_array_new_int(offset_init) };
@@ -3099,12 +3147,28 @@ struct GatedDeltaKernelConfigKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CanonicalConvReduction {
+    CanonicalS1,
+    AppendStableWindow,
+}
+
+impl CanonicalConvReduction {
+    const fn template_value(self) -> i32 {
+        match self {
+            Self::CanonicalS1 => 0,
+            Self::AppendStableWindow => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CanonicalConvKernelConfigKey {
     in_dtype: mlx_sys::mlx_dtype,
     batch: i32,
     seq_len: i32,
     conv_dim: i32,
     kernel_size: i32,
+    reduction: CanonicalConvReduction,
 }
 
 /// Complete specialization and output-geometry key for the tape-recording GDN
@@ -4210,7 +4274,6 @@ impl Qwen3NextAttention {
         let L = *shape
             .get(1)
             .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-
         // Q is projected to 2 * num_heads * head_dim (doubled for gating)
         let q_proj_output = self.q_proj.forward_decode_fast(x)?;
         let q_reshaped = q_proj_output.reshape(&[B, L, self.num_attention_heads, -1])?;
@@ -4262,54 +4325,6 @@ impl Qwen3NextAttention {
         // the per-token hot path).
         let offset = cache.offset();
         let rope_offset = cache.position_offset();
-        let rope_dim = self.rope.dimensions;
-        let rope_base = self.rope.base;
-        let rope_scale = self.rope.scale;
-        // DIAGNOSTIC (HIGGS_DIAG_ROPE_COMPARE=1): verify apply_rope_manual
-        // computes the SAME rotation as mlx_fast_rope for a fixed length — the
-        // correctness gate before landing the manual rope as the default. Fires
-        // once (first FA layer, offset==0, L>1). Compares on the PRE-rope keys.
-        #[allow(
-            clippy::print_stderr,
-            clippy::indexing_slicing,
-            clippy::shadow_unrelated
-        )]
-        if std::env::var("HIGGS_DIAG_ROPE_COMPARE").is_ok_and(|v| v == "1")
-            && offset == 0
-            && L > 1
-            && DIAG_ROPE_COMPARE_FIRED
-                .compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            let pos: Vec<i32> = (offset..offset + L).collect();
-            let positions = Array::from_slice(&pos, &[L]);
-            let keys_fast = apply_rope(&keys, &self.rope, offset);
-            let keys_manual = apply_rope_manual(&keys, &positions, rope_dim, rope_base, rope_scale);
-            if let (Ok(kf), Ok(km)) = (keys_fast, keys_manual) {
-                let (kfv, _) = diag_materialize(&kf).unwrap_or((vec![], vec![]));
-                let (kmv, _) = diag_materialize(&km).unwrap_or((vec![], vec![]));
-                let n = kfv.len().min(kmv.len());
-                let mut max_abs = 0.0f32;
-                let mut diffs = 0usize;
-                for i in 0..n {
-                    let d = (kfv[i] - kmv[i]).abs();
-                    if d > max_abs {
-                        max_abs = d;
-                    }
-                    if kfv[i].to_bits() != kmv[i].to_bits() {
-                        diffs += 1;
-                    }
-                }
-                eprintln!(
-                    "DIAG ROPE-COMPARE fast-vs-manual (fixed len, first FA): max_abs={max_abs:.3e} diffs={diffs}/{n}"
-                );
-            }
-        }
         queries = apply_qwen3_next_rope_scheduled(
             queries,
             &self.rope,
@@ -4404,7 +4419,6 @@ impl Qwen3NextAttention {
             let _ = mlx_rs::transforms::eval([&output]);
             PROF_TQ_ATTN_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
         }
-
         if diag_attn {
             let stored_vec = cache.keys().and_then(mat_vec);
             DIAG_ATTN_CAPTURED.with(|c| {
@@ -5135,6 +5149,33 @@ impl SwitchMlpWeights {
 
         // idx_sorted: [N] — monotonically non-decreasing expert indices
         let idx_sorted = idx_flat.take_axis(&order, 0)?;
+        let original_rows = b * l * top_k;
+        // MLX 0.30.6 changes gather-QMM dispatch below four rows per expert;
+        // identical routed rows then round differently depending on suffix
+        // length. Pad only the sorted RHS domain with zero rows assigned to the
+        // last expert, and discard them after the projection. Real routing,
+        // scores, and output order remain untouched.
+        let num_experts = *self
+            .gate_proj
+            .weight
+            .shape()
+            .first()
+            .ok_or_else(|| Exception::custom("expert weight has no expert dimension"))?;
+        let required_rows = num_experts * 4;
+        let padding_rows = required_rows.saturating_sub(original_rows);
+        let (x_sorted, idx_sorted) = if padding_rows > 0 {
+            let x_padding = ops::zeros_dtype(&[padding_rows, 1, d], x.dtype())?;
+            let last_expert = u32::try_from(num_experts - 1)
+                .map_err(|_| Exception::custom("expert count must fit in u32"))?;
+            let fill = Array::from_slice(&[last_expert], &[]);
+            let index_padding = Array::full::<u32>(&[padding_rows], &fill)?;
+            (
+                ops::concatenate_axis(&[&x_sorted, &x_padding], 0)?,
+                ops::concatenate_axis(&[&idx_sorted, &index_padding], 0)?,
+            )
+        } else {
+            (x_sorted, idx_sorted)
+        };
 
         // Native trellis path. It reuses the sort above. Only the three
         // gather_qmm calls change. Gate and up are one fused dispatch.
@@ -5716,6 +5757,31 @@ impl GatedDeltaNet {
         silu_direct(&conv_flat.reshape(&[batch, 1, self.conv_dim])?)
     }
 
+    fn transposed_conv_weight(&mut self, dtype: Dtype) -> Result<Array, Exception> {
+        if let Some(weight) = self
+            .conv_weight_t
+            .as_ref()
+            .filter(|weight| weight.dtype() == dtype)
+        {
+            return Ok(weight.clone());
+        }
+
+        let shape = self.conv1d.weight.shape();
+        let weight = if shape.len() == 3 && shape[2] == 1 {
+            self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?
+        } else if shape.len() == 3 && shape[1] == 1 {
+            self.conv1d.weight.squeeze_axes(&[1])?.transpose()?
+        } else {
+            return Err(Exception::custom(format!(
+                "Unexpected conv1d weight shape: {shape:?}"
+            )));
+        };
+        let weight = weight.as_dtype(dtype)?;
+        weight.eval()?;
+        self.conv_weight_t = Some(weight.clone());
+        Ok(weight)
+    }
+
     fn decode_conv1d_step(
         &mut self,
         mixed_qkv: &Array,
@@ -5723,16 +5789,7 @@ impl GatedDeltaNet {
         batch: i32,
     ) -> Result<Array, Exception> {
         let history_len = self.conv_kernel_size.saturating_sub(1);
-        let wt = if let Some(w) = &self.conv_weight_t {
-            w.clone()
-        } else {
-            // Conv1d weight: [conv_dim, kernel_size, 1] -> [kernel_size, conv_dim]
-            let raw_w = self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?;
-            let typed_w = raw_w.as_dtype(mixed_qkv.dtype())?;
-            typed_w.eval()?;
-            self.conv_weight_t = Some(typed_w.clone());
-            typed_w
-        };
+        let wt = self.transposed_conv_weight(mixed_qkv.dtype())?;
 
         let conv_out = if history_len > 0 {
             if cache.conv_state.is_none() {
@@ -5906,7 +5963,6 @@ impl GatedDeltaNet {
         } else {
             None
         };
-
         let mut diag_conv_input: Option<(Vec<f32>, Vec<i32>)> = None;
         let conv_out = if S == 1 {
             self.decode_conv1d_step(&mixed_qkv, cache, B)?
@@ -5949,55 +6005,35 @@ impl GatedDeltaNet {
                 None
             };
             diag_conv_input = diag_conv_input_val;
-            // DIAGNOSTIC (HIGGS_DIAG_CONV_MANUAL=1): use a length-independent
-            // windowed conv (per-position slice * weight * sum) instead of MLX's
-            // conv1d, which is length-dependent at the first n_keep (left-pad)
-            // boundary positions. Mirrors forward_stateless's windowed conv.
-            #[allow(
-                clippy::shadow_unrelated,
-                clippy::shadow_reuse,
-                clippy::indexing_slicing,
-                clippy::as_conversions
-            )]
-            if std::env::var("HIGGS_DIAG_CONV_MANUAL").is_ok_and(|v| v == "1") {
-                // Materialize conv_input to a CONCRETE array first when
-                // HIGGS_DIAG_CONV_EVAL_INPUT=1, to test whether MLX's lazy
-                // graph (concatenate of lazy zeros + lazy mixed_qkv) is the
-                // source of the length-dependent boundary output.
-                let conv_input_mat =
-                    if std::env::var("HIGGS_DIAG_CONV_EVAL_INPUT").is_ok_and(|v| v == "1") {
-                        let _ = mlx_rs::transforms::eval([&conv_input]);
-                        conv_input.clone()
-                    } else {
-                        conv_input.clone()
-                    };
-                let wt = {
-                    let shape = self.conv1d.weight.shape();
-                    let w = if shape.len() == 3 && shape[2] == 1 {
-                        self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?
-                    } else if shape.len() == 3 && shape[1] == 1 {
-                        self.conv1d.weight.squeeze_axes(&[1])?.transpose()?
-                    } else {
-                        return Err(Exception::custom(format!(
-                            "Unexpected conv1d weight shape: {shape:?}"
-                        )));
-                    };
-                    w.as_dtype(inputs.dtype())?
-                };
-                let ks = self.conv_kernel_size;
-                let mut windows = Vec::with_capacity(S as usize);
-                for i in 0..S {
-                    windows.push(
-                        conv_input_mat
-                            .index((.., i..i + ks, ..))
-                            .multiply(&wt)?
-                            .sum_axes(&[1], true)?,
-                    );
-                }
-                silu_direct(&ops::concatenate_axis(
-                    &windows.iter().collect::<Vec<_>>(),
-                    1,
-                )?)?
+            let weight_t = self.transposed_conv_weight(inputs.dtype())?;
+            // Qwen GDN prefill must use one append-stable convolution
+            // primitive across cold chunks and retained-session suffixes.
+            // MLX Conv1d changes its reduction schedule with sequence length;
+            // after many recurrent layers that boundary drift can change the
+            // greedy answer. This Metal specialization keeps the proven
+            // oldest-to-newest BF16 window reduction for every row in one
+            // dispatch, independent of the request's tail length.
+            if canonical_conv_kernel_supported(
+                &mixed_qkv,
+                &conv_state,
+                &weight_t,
+                B,
+                S,
+                self.conv_dim,
+                self.conv_kernel_size,
+            ) {
+                let preactivation = canonical_conv_preactivation_ffi(
+                    &mixed_qkv,
+                    &conv_state,
+                    &weight_t,
+                    cache.offset,
+                    B,
+                    S,
+                    self.conv_dim,
+                    self.conv_kernel_size,
+                    CanonicalConvReduction::AppendStableWindow,
+                )?;
+                silu_direct(&preactivation)?
             } else {
                 silu_direct(&self.conv1d.forward(&conv_input)?)?
             }
@@ -6087,7 +6123,6 @@ impl GatedDeltaNet {
                 Dtype::Float32,
             )?,
         };
-
         // Fused kernel: computes g, beta, AND runs the full recurrence in one dispatch.
         let (y, new_state) = gated_delta_kernel_ffi(
             &norm_q,
@@ -6505,25 +6540,7 @@ impl GatedDeltaNet {
         cache.conv_pos = if n_keep > 0 { n_keep - 1 } else { -1 };
 
         let conv_out = if S <= 8 && row_schedule == DFlashRowSchedule::CanonicalS1 {
-            let wt = match &self.conv_weight_t {
-                Some(w) => w.clone(),
-                None => {
-                    let shape = self.conv1d.weight.shape();
-                    let w = if shape.len() == 3 && shape[2] == 1 {
-                        self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?
-                    } else if shape.len() == 3 && shape[1] == 1 {
-                        self.conv1d.weight.squeeze_axes(&[1])?.transpose()?
-                    } else {
-                        return Err(Exception::custom(format!(
-                            "Unexpected conv1d weight shape: {shape:?}"
-                        )));
-                    };
-                    let w = w.as_dtype(inputs.dtype())?;
-                    w.eval()?;
-                    self.conv_weight_t = Some(w.clone());
-                    w
-                }
-            };
+            let wt = self.transposed_conv_weight(inputs.dtype())?;
             if canonical_conv_enabled()
                 && canonical_conv_kernel_supported(
                     &mixed_qkv,
@@ -6544,6 +6561,7 @@ impl GatedDeltaNet {
                     S,
                     self.conv_dim,
                     self.conv_kernel_size,
+                    CanonicalConvReduction::CanonicalS1,
                 )?;
                 // Keep activation on the existing two MLX primitives. Running
                 // them over the complete block is elementwise-identical to the
@@ -7081,7 +7099,6 @@ impl FfnBlock {
             } else {
                 raw_scores
             };
-
             let switch_ref = self
                 .switch_mlp
                 .as_mut()
@@ -7104,8 +7121,8 @@ impl FfnBlock {
 
             let shared_gate_val = nn::sigmoid(&seg_ref.forward(x)?)?;
             let shared_out = shared_y.multiply(&shared_gate_val)?;
-
-            expert_sum.add(shared_out)
+            let out = expert_sum.add(shared_out)?;
+            Ok(out)
         } else {
             // Dense SwiGLU with configurable gate/up path so we can benchmark
             // whether one large fused matmul or two smaller matmuls are faster
@@ -7468,17 +7485,8 @@ pub struct Qwen3NextCausalLM {
     moe_mtp: Option<MoeMtpHead>,
 }
 
-// Diag flags read once: this dispatcher runs per q/k per FA layer per chunk,
-// and `std::env::var` takes a process-wide lock. The flags are only ever set
-// before process start (no `set_var` in the tree).
-static DIAG_ROPE_MANUAL: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("HIGGS_DIAG_ROPE_MANUAL").is_ok_and(|v| v == "1"));
-static DIAG_ROPE_PERHEAD: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("HIGGS_DIAG_ROPE_PERHEAD").is_ok_and(|v| v == "1"));
-
-// `shadow_reuse` for the positions Vec→Array rebind (and the YaRN prescale
-// rebind of `x`); `indexing_slicing` for the diag per-head branch's fixed
-// 4-dim shape access.
+// `shadow_reuse` covers the YaRN prescale rebind of `x`; `indexing_slicing`
+// covers the fixed 4-D attention tensor shape.
 #[allow(clippy::shadow_reuse, clippy::indexing_slicing)]
 fn apply_qwen3_next_rope(
     x: Array,
@@ -7487,6 +7495,16 @@ fn apply_qwen3_next_rope(
     yarn: Option<&YarnRope>,
 ) -> Result<Array, Exception> {
     apply_qwen3_next_rope_scheduled(x, rope, offset, yarn, DFlashRowSchedule::NativeBatch)
+}
+
+fn last_token_hidden_for_projection(hidden: &Array) -> Result<Array, Exception> {
+    let shape = hidden.shape();
+    if shape.len() != 3 || shape.get(1).copied().unwrap_or(0) <= 0 {
+        return Err(Exception::custom(format!(
+            "last-token projection requires non-empty [B, T, D] hidden states, got {shape:?}"
+        )));
+    }
+    Ok(hidden.index((.., -1.., ..)))
 }
 
 #[allow(clippy::shadow_reuse, clippy::indexing_slicing)]
@@ -7528,29 +7546,122 @@ fn apply_qwen3_next_rope_scheduled(
         }
         return ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 2);
     }
-    if seq_len > 1 || *DIAG_ROPE_MANUAL {
-        let positions: Vec<i32> = (offset..offset + seq_len).collect();
-        let positions = Array::from_slice(&positions, &[seq_len]);
-        return apply_rope_manual_with_freqs(
-            &x,
+    if seq_len > 1 {
+        return apply_rope_prefill_append_stable(&x, rope, offset, yarn_freqs);
+    }
+
+    apply_fast_rope_with_freqs(&x, rope, offset, yarn_freqs)
+}
+
+const ROPE_PREFILL_BLOCK_ROWS: i32 = 1_024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RopePrefillBlock {
+    absolute_start: i32,
+    input_start: i32,
+    leading_rows: i32,
+    valid_rows: i32,
+    trailing_rows: i32,
+}
+
+fn plan_rope_prefill_blocks(offset: i32, seq_len: i32) -> Result<Vec<RopePrefillBlock>, Exception> {
+    if offset < 0 || seq_len <= 0 {
+        return Err(Exception::custom(format!(
+            "RoPE prefill requires non-negative offset and positive length, got offset={offset} len={seq_len}"
+        )));
+    }
+
+    let mut blocks = Vec::new();
+    let mut input_start = 0;
+    while input_start < seq_len {
+        let absolute_position = offset + input_start;
+        let absolute_start =
+            absolute_position.div_euclid(ROPE_PREFILL_BLOCK_ROWS) * ROPE_PREFILL_BLOCK_ROWS;
+        let leading_rows = absolute_position - absolute_start;
+        let valid_rows = (seq_len - input_start).min(ROPE_PREFILL_BLOCK_ROWS - leading_rows);
+        let trailing_rows = ROPE_PREFILL_BLOCK_ROWS - leading_rows - valid_rows;
+        blocks.push(RopePrefillBlock {
+            absolute_start,
+            input_start,
+            leading_rows,
+            valid_rows,
+            trailing_rows,
+        });
+        input_start += valid_rows;
+    }
+    Ok(blocks)
+}
+
+fn apply_rope_prefill_append_stable(
+    x: &Array,
+    rope: &nn::Rope,
+    offset: i32,
+    yarn_freqs: Option<&Array>,
+) -> Result<Array, Exception> {
+    use mlx_rs::ops;
+
+    let [batch, heads, seq_len, head_dim] = <[i32; 4]>::try_from(x.shape())
+        .map_err(|_| Exception::custom("append-stable RoPE requires [B, H, L, D] input"))?;
+    // MLX elementwise BF16×F32 dispatch changes numerical behavior with the
+    // token dimension (43-row retained suffix versus 983-row cold tail was the
+    // observed failure). Align every prefill to absolute 1,024-token blocks so
+    // identical positions execute identical kernels; zero padding is removed
+    // before K/V publication and never becomes part of the logical prompt.
+    let blocks = plan_rope_prefill_blocks(offset, seq_len)?;
+    let mut outputs = Vec::with_capacity(blocks.len());
+
+    for block in blocks {
+        let segment = x.index((
+            ..,
+            ..,
+            block.input_start..block.input_start + block.valid_rows,
+            ..,
+        ));
+        let mut padded_parts = Vec::with_capacity(3);
+        if block.leading_rows > 0 {
+            padded_parts.push(ops::zeros_dtype(
+                &[batch, heads, block.leading_rows, head_dim],
+                x.dtype(),
+            )?);
+        }
+        padded_parts.push(segment);
+        if block.trailing_rows > 0 {
+            padded_parts.push(ops::zeros_dtype(
+                &[batch, heads, block.trailing_rows, head_dim],
+                x.dtype(),
+            )?);
+        }
+        let padded = if padded_parts.len() == 1 {
+            padded_parts.remove(0)
+        } else {
+            ops::concatenate_axis(&padded_parts.iter().collect::<Vec<_>>(), 2)?
+        };
+        let positions = Array::from_slice(
+            &(block.absolute_start..block.absolute_start + ROPE_PREFILL_BLOCK_ROWS)
+                .collect::<Vec<_>>(),
+            &[ROPE_PREFILL_BLOCK_ROWS],
+        );
+        let rotated = apply_rope_manual_with_freqs(
+            &padded,
             &positions,
             rope.dimensions,
             rope.base,
             rope.scale,
             yarn_freqs,
-        );
+        )?;
+        outputs.push(rotated.index((
+            ..,
+            ..,
+            block.leading_rows..block.leading_rows + block.valid_rows,
+            ..,
+        )));
     }
 
-    if *DIAG_ROPE_PERHEAD {
-        let shape = x.shape().to_vec();
-        let batch_heads = shape[0] * shape[1];
-        let seq = shape[2];
-        let dim = shape[3];
-        let flat = x.reshape(&[batch_heads, seq, dim])?;
-        return apply_fast_rope_with_freqs(&flat, rope, offset, yarn_freqs)?.reshape(&shape);
+    if outputs.len() == 1 {
+        Ok(outputs.remove(0))
+    } else {
+        ops::concatenate_axis(&outputs.iter().collect::<Vec<_>>(), 2)
     }
-
-    apply_fast_rope_with_freqs(&x, rope, offset, yarn_freqs)
 }
 
 /// Decode-path rope: `mlx_fast_rope`, with optional precomputed `YaRN` periods.
@@ -7678,16 +7789,12 @@ fn apply_rope_manual_with_freqs(
     // silently promotes the FA KV cache and SDPA to f32 — 2x KV memory and 2x
     // attention bandwidth on every prefill chunk and decode step.
     let x_dtype = x.dtype();
-    let output_first = ops::subtract(
-        &ops::multiply(&x_first, &cos)?,
-        &ops::multiply(&x_second, &sin)?,
-    )?
-    .as_dtype(x_dtype)?;
-    let output_second = ops::add(
-        &ops::multiply(&x_first, &sin)?,
-        &ops::multiply(&x_second, &cos)?,
-    )?
-    .as_dtype(x_dtype)?;
+    let first_cos = ops::multiply(&x_first, &cos)?;
+    let second_sin = ops::multiply(&x_second, &sin)?;
+    let first_sin = ops::multiply(&x_first, &sin)?;
+    let second_cos = ops::multiply(&x_second, &cos)?;
+    let output_first = ops::subtract(&first_cos, &second_sin)?.as_dtype(x_dtype)?;
+    let output_second = ops::add(&first_sin, &second_cos)?.as_dtype(x_dtype)?;
 
     let last_axis = i32::try_from(ndim.saturating_sub(1))
         .map_err(|_| Exception::custom("ndim too large for i32"))?;
@@ -7792,8 +7899,6 @@ pub fn diag_report_hidden_diff(label: &str, short: &[DiagLayer], long: &[DiagLay
 // DIAGNOSTIC: probe-driven capture of the first FA layer's keys (pre-write and
 // post-write), as fully-materialized owned Vec<f32>. The probe requests capture,
 // runs a forward, retrieves, then compares two forwards directly.
-static DIAG_ROPE_COMPARE_FIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 type DiagAttnCapture = (
     i32,
     Option<(Vec<f32>, Vec<i32>)>, // x (attention input = normed h)
@@ -8054,16 +8159,6 @@ impl Qwen3NextCausalLM {
         if compiled_gdn_decode_enabled() {
             return Err(Exception::custom(
                 "HIGGS_COMPILED_GDN_DECODE uses a different S=1 recurrent primitive",
-            ));
-        }
-        if *DIAG_ROPE_MANUAL {
-            return Err(Exception::custom(
-                "HIGGS_DIAG_ROPE_MANUAL changes the S=1 RoPE primitive",
-            ));
-        }
-        if *DIAG_ROPE_PERHEAD {
-            return Err(Exception::custom(
-                "HIGGS_DIAG_ROPE_PERHEAD changes the S=1 RoPE primitive",
             ));
         }
         if bonsai_q1_qmm_max_rows() < rows {
@@ -8441,7 +8536,7 @@ impl Qwen3NextCausalLM {
                 let attn_ns = start.elapsed().as_nanos();
                 let t1 = std::time::Instant::now();
                 let mlp_out = layer.mlp.forward(&normed_post)?;
-                h = h2.add(mlp_out)?;
+                h = h2.add(&mlp_out)?;
                 mlx_rs::transforms::eval([&h])?;
                 let mlp_ns = t1.elapsed().as_nanos();
 
@@ -8458,7 +8553,7 @@ impl Qwen3NextCausalLM {
                 let h2 = h.add(r)?;
                 let normed_post = layer.post_attention_layernorm.forward(&h2)?;
                 let mlp_out = layer.mlp.forward(&normed_post)?;
-                h = h2.add(mlp_out)?;
+                h = h2.add(&mlp_out)?;
             }
 
             if tap_layers.is_some_and(|layers| layers.binary_search(&layer_idx).is_ok()) {
@@ -8636,7 +8731,6 @@ impl Qwen3NextCausalLM {
         let T = *shape
             .get(1)
             .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
-
         // If chunk_size covers the whole sequence, just do a normal forward.
         if chunk_size >= T {
             return self.forward(inputs, mask, kv_cache);
@@ -9033,6 +9127,23 @@ impl Qwen3NextCausalLM {
         Ok((h_raw, logits))
     }
 
+    /// Prefill variant for MTP priming: retain every raw hidden row, but apply
+    /// the vocabulary projection only to the final row. Quantized projections
+    /// may select a different kernel for `T` rows than for one row, so using the
+    /// all-position verifier API here can change the first greedy token relative
+    /// to ordinary autoregressive prefill.
+    #[allow(non_snake_case)]
+    pub(crate) fn forward_with_hidden_last_token_logits(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<(Array, Array), Exception> {
+        let h_raw = self.forward_raw_hidden(inputs, mask, kv_cache)?;
+        let logits = self.project_raw_hidden_last(&h_raw)?;
+        Ok((h_raw, logits))
+    }
+
     #[allow(non_snake_case)]
     pub fn forward_with_taps(
         &mut self,
@@ -9083,7 +9194,7 @@ impl Qwen3NextCausalLM {
         // row is mathematically equivalent but can select a different MLX
         // kernel and is not a construction-level equivalence guarantee.
         let normed = self.model.norm.forward(hidden)?;
-        let last = normed.index((.., -1, ..));
+        let last = last_token_hidden_for_projection(&normed)?;
         let batch = hidden.shape().first().copied().ok_or_else(|| {
             Exception::custom("project_raw_hidden_last: hidden has no batch axis")
         })?;
@@ -11778,6 +11889,148 @@ mod tests {
         assert_eq!(out.dtype(), mlx_rs::Dtype::Bfloat16);
     }
 
+    #[test]
+    fn manual_rope_is_append_stable_at_real_chunk_geometry() {
+        const LONG_LEN: i32 = 983;
+        const TAIL_LEN: i32 = 43;
+        const LONG_OFFSET: i32 = 14_336;
+        const HEADS: i32 = 2;
+        const HEAD_DIM: i32 = 256;
+        const ROTARY_DIM: i32 = 64;
+
+        let value = |head: i32, position: i32, dimension: i32| {
+            let index = (head * LONG_LEN + position) * HEAD_DIM + dimension;
+            ((index as f32).mul_add(0.37, 0.11)).sin() * 1.7
+        };
+        let long_values = (0..LONG_LEN)
+            .flat_map(|position| {
+                (0..HEADS).flat_map(move |head| {
+                    (0..HEAD_DIM).map(move |dimension| value(head, position, dimension))
+                })
+            })
+            .collect::<Vec<_>>();
+        let long = Array::from_slice(&long_values, &[1, LONG_LEN, HEADS, HEAD_DIM])
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap()
+            .transpose_axes(&[0, 2, 1, 3])
+            .unwrap();
+        let short_values = (LONG_LEN - TAIL_LEN..LONG_LEN)
+            .flat_map(|position| {
+                (0..HEADS).flat_map(move |head| {
+                    (0..HEAD_DIM).map(move |dimension| value(head, position, dimension))
+                })
+            })
+            .collect::<Vec<_>>();
+        let short = Array::from_slice(&short_values, &[1, TAIL_LEN, HEADS, HEAD_DIM])
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap()
+            .transpose_axes(&[0, 2, 1, 3])
+            .unwrap();
+        let long_positions = Array::from_slice(
+            &(LONG_OFFSET..LONG_OFFSET + LONG_LEN).collect::<Vec<_>>(),
+            &[LONG_LEN],
+        );
+        let short_positions = Array::from_slice(
+            &((LONG_OFFSET + LONG_LEN - TAIL_LEN)..LONG_OFFSET + LONG_LEN).collect::<Vec<_>>(),
+            &[TAIL_LEN],
+        );
+
+        let long_rotated = apply_rope_manual_with_freqs(
+            &long,
+            &long_positions,
+            ROTARY_DIM,
+            10_000_000.0,
+            1.0,
+            None,
+        )
+        .unwrap()
+        .index((.., .., LONG_LEN - TAIL_LEN.., ..));
+        let short_rotated = apply_rope_manual_with_freqs(
+            &short,
+            &short_positions,
+            ROTARY_DIM,
+            10_000_000.0,
+            1.0,
+            None,
+        )
+        .unwrap();
+
+        assert_canonical_array_exact(
+            "manual RoPE real 983-to-43 append stability",
+            &short_rotated,
+            &long_rotated,
+        );
+
+        let rope = nn::RopeBuilder::new(ROTARY_DIM)
+            .traditional(false)
+            .base(10_000_000.0)
+            .scale(1.0)
+            .build()
+            .unwrap();
+        let long_stable = apply_rope_prefill_append_stable(&long, &rope, LONG_OFFSET, None)
+            .unwrap()
+            .index((.., .., LONG_LEN - TAIL_LEN.., ..));
+        let short_stable = apply_rope_prefill_append_stable(
+            &short,
+            &rope,
+            LONG_OFFSET + LONG_LEN - TAIL_LEN,
+            None,
+        )
+        .unwrap();
+        assert_canonical_array_exact(
+            "absolute-block RoPE real 983-to-43 append stability",
+            &short_stable,
+            &long_stable,
+        );
+    }
+
+    #[test]
+    fn append_stable_rope_blocks_align_retained_and_cold_suffix_geometry() {
+        let cold = plan_rope_prefill_blocks(14_336, 983).unwrap();
+        let retained = plan_rope_prefill_blocks(15_276, 43).unwrap();
+
+        assert_eq!(
+            cold,
+            [RopePrefillBlock {
+                absolute_start: 14_336,
+                input_start: 0,
+                leading_rows: 0,
+                valid_rows: 983,
+                trailing_rows: 41,
+            }]
+        );
+        assert_eq!(
+            retained,
+            [RopePrefillBlock {
+                absolute_start: 14_336,
+                input_start: 0,
+                leading_rows: 940,
+                valid_rows: 43,
+                trailing_rows: 41,
+            }]
+        );
+
+        assert_eq!(
+            plan_rope_prefill_blocks(1_020, 12).unwrap(),
+            [
+                RopePrefillBlock {
+                    absolute_start: 0,
+                    input_start: 0,
+                    leading_rows: 1_020,
+                    valid_rows: 4,
+                    trailing_rows: 0,
+                },
+                RopePrefillBlock {
+                    absolute_start: 1_024,
+                    input_start: 4,
+                    leading_rows: 0,
+                    valid_rows: 8,
+                    trailing_rows: 1_016,
+                },
+            ]
+        );
+    }
+
     /// Default-rope byte-exactness gate: the inverse frequencies of the
     /// manual prefill path must stay bit-for-bit identical to the historical
     /// inline formula `base^(-2i/dims)` — any drift here silently changes
@@ -14212,6 +14465,70 @@ mod tests {
     }
 
     #[test]
+    fn append_stable_sorted_gather_matches_identical_short_tail() {
+        let num_experts = 8;
+        let hidden = 64;
+        let top_k = 2;
+        let prefix_len = 16;
+        let tail_len = 4;
+        let mut block = SwitchMlpWeights::from_quant(64, 4).unwrap();
+
+        for projection in [
+            &mut block.gate_proj,
+            &mut block.up_proj,
+            &mut block.down_proj,
+        ] {
+            let weights = mlx_rs::random::uniform::<f32, f32>(
+                -1.0,
+                1.0,
+                &[num_experts, hidden, hidden],
+                None,
+            )
+            .unwrap();
+            let (weight, scales, biases) = quantize_weights(&weights, 64, 4);
+            *projection.weight = weight;
+            *projection.scales = scales;
+            *projection.biases = biases;
+        }
+
+        let long_values: Vec<f32> = (0..((prefix_len + tail_len) * hidden))
+            .map(|index| ((index % 97) as f32 - 48.0) / 31.0)
+            .collect();
+        let long = Array::from_slice(&long_values, &[1, prefix_len + tail_len, hidden])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let short = long.index((.., prefix_len.., ..));
+        let long_indices: Vec<u32> = (0..((prefix_len + tail_len) * top_k))
+            .map(|index| (index % num_experts) as u32)
+            .collect();
+        let long_indices = Array::from_slice(&long_indices, &[1, prefix_len + tail_len, top_k]);
+        let short_indices = long_indices.index((.., prefix_len.., ..));
+
+        let short_out = block
+            .forward_gather_global_sort(&short, &short_indices)
+            .unwrap();
+        let long_out = block
+            .forward_gather_global_sort(&long, &long_indices)
+            .unwrap()
+            .index((.., prefix_len.., .., ..));
+        short_out.eval().unwrap();
+        long_out.eval().unwrap();
+
+        let max_diff: f32 = short_out
+            .subtract(&long_out)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        assert_eq!(
+            max_diff, 0.0,
+            "identical logical rows must be append-stable"
+        );
+    }
+
+    #[test]
     fn test_moe_gate_up_fusion_parity() {
         // Fused gate+up (2 gather_qmm) must match unfused (3 gather_qmm).
         // Uses random weights + distinct per-token inputs to stress sort/unsort.
@@ -14815,6 +15132,20 @@ mod tests {
                 .unwrap(),
         );
         attention
+    }
+
+    #[test]
+    fn hidden_capture_prefill_projects_only_the_last_token_logits() {
+        let _exec = crate::mlx_exec::acquire();
+        let hidden = Array::from_slice(&(0_i32..24).collect::<Vec<_>>(), &[1, 3, 8]);
+        let selected = last_token_hidden_for_projection(&hidden).unwrap();
+        mlx_rs::transforms::eval([&selected]).unwrap();
+
+        assert_eq!(selected.shape(), &[1, 1, 8]);
+        assert_eq!(
+            selected.as_slice::<i32>(),
+            &(16_i32..24).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -16085,6 +16416,77 @@ mod tests {
         }
     }
 
+    fn canonical_conv_bf16_pattern(shape: &[i32], salt: i32, modulus: i32, divisor: f32) -> Array {
+        let size = shape.iter().product::<i32>();
+        let values = (0..size)
+            .map(|index| {
+                let centered = (index * 29 + salt).rem_euclid(modulus) - modulus / 2;
+                centered as f32 / divisor
+            })
+            .collect::<Vec<_>>();
+        let array = Array::from_slice(&values, shape)
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        array.eval().unwrap();
+        array
+    }
+
+    fn ordered_canonical_conv_reference(
+        gdn: &GatedDeltaNet,
+        mixed_qkv: &Array,
+        history: &Array,
+        weight_t: &Array,
+        offset_init: i32,
+    ) -> Array {
+        let batch = mixed_qkv.shape()[0];
+        let seq_len = mixed_qkv.shape()[1];
+        let conv_dim = gdn.conv_dim;
+        let history_len = gdn.conv_kernel_size - 1;
+        let mut rows = Vec::with_capacity(seq_len as usize);
+        for position in 0..seq_len {
+            let current = mixed_qkv.index((.., position..position + 1, ..));
+            let available = (offset_init + position).clamp(0, history_len);
+            rows.push(
+                gdn.canonical_conv1d_step(&current, weight_t, available, batch, |lag| {
+                    if lag < position {
+                        mixed_qkv
+                            .index((.., position - 1 - lag..position - lag, ..))
+                            .reshape(&[batch, conv_dim])
+                    } else {
+                        let history_index = history_len - 1 - (lag - position);
+                        history
+                            .index((.., history_index..history_index + 1, ..))
+                            .reshape(&[batch, conv_dim])
+                    }
+                })
+                .unwrap(),
+            );
+        }
+        ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1).unwrap()
+    }
+
+    fn append_stable_mlx_window_conv_preactivation_reference(
+        mixed_qkv: &Array,
+        history: &Array,
+        weight_t: &Array,
+    ) -> Array {
+        let seq_len = mixed_qkv.shape()[1];
+        let kernel_size = weight_t.shape()[0];
+        let conv_input = ops::concatenate_axis(&[history, mixed_qkv], 1).unwrap();
+        let mut windows = Vec::with_capacity(seq_len as usize);
+        for position in 0..seq_len {
+            windows.push(
+                conv_input
+                    .index((.., position..position + kernel_size, ..))
+                    .multiply(weight_t)
+                    .unwrap()
+                    .sum_axes(&[1], true)
+                    .unwrap(),
+            );
+        }
+        ops::concatenate_axis(&windows.iter().collect::<Vec<_>>(), 1).unwrap()
+    }
+
     #[test]
     fn canonical_conv_metal_matches_ordered_s1_bf16_exact_m1_through_m5() {
         let args = valid_causal_lm_args();
@@ -16095,26 +16497,17 @@ mod tests {
         let conv_dim = gdn.conv_dim;
         assert_eq!(kernel_size, 4);
 
-        let bf16_pattern = |shape: &[i32], salt: i32, modulus: i32, divisor: f32| {
-            let size = shape.iter().product::<i32>();
-            let values = (0..size)
-                .map(|index| {
-                    let centered = (index * 29 + salt).rem_euclid(modulus) - modulus / 2;
-                    centered as f32 / divisor
-                })
-                .collect::<Vec<_>>();
-            let array = Array::from_slice(&values, shape)
-                .as_dtype(Dtype::Bfloat16)
-                .unwrap();
-            array.eval().unwrap();
-            array
-        };
-        let history = bf16_pattern(&[batch, history_len, conv_dim], 7, 61, 47.0);
-        let weight_t = bf16_pattern(&[kernel_size, conv_dim], 19, 67, 59.0);
+        let history = canonical_conv_bf16_pattern(&[batch, history_len, conv_dim], 7, 61, 47.0);
+        let weight_t = canonical_conv_bf16_pattern(&[kernel_size, conv_dim], 19, 67, 59.0);
 
         for offset_init in [0, 1, 2, 3, 11] {
             for seq_len in 1..=5 {
-                let mixed_qkv = bf16_pattern(&[batch, seq_len, conv_dim], 31 + seq_len, 71, 53.0);
+                let mixed_qkv = canonical_conv_bf16_pattern(
+                    &[batch, seq_len, conv_dim],
+                    31 + seq_len,
+                    71,
+                    53.0,
+                );
                 let actual_preactivation = canonical_conv_preactivation_ffi(
                     &mixed_qkv,
                     &history,
@@ -16124,6 +16517,7 @@ mod tests {
                     seq_len,
                     conv_dim,
                     kernel_size,
+                    CanonicalConvReduction::CanonicalS1,
                 )
                 .unwrap();
 
@@ -16201,7 +16595,7 @@ mod tests {
 
         let fp16_history = history.as_dtype(Dtype::Float16).unwrap();
         assert!(!canonical_conv_kernel_supported(
-            &bf16_pattern(&[batch, 5, conv_dim], 3, 71, 53.0),
+            &canonical_conv_bf16_pattern(&[batch, 5, conv_dim], 3, 71, 53.0),
             &fp16_history,
             &weight_t,
             batch,
@@ -16209,6 +16603,129 @@ mod tests {
             conv_dim,
             kernel_size,
         ));
+    }
+
+    #[test]
+    fn canonical_conv_metal_matches_ordered_s1_bf16_exact_for_prefill_lengths() {
+        let args = valid_causal_lm_args();
+        let gdn = GatedDeltaNet::new(&args, "test.layer.linear_attn").unwrap();
+        let batch = 1;
+        let kernel_size = gdn.conv_kernel_size;
+        let history_len = kernel_size - 1;
+        let conv_dim = gdn.conv_dim;
+        assert_eq!(kernel_size, 4);
+
+        let history = canonical_conv_bf16_pattern(&[batch, history_len, conv_dim], 7, 61, 47.0);
+        let weight_t = canonical_conv_bf16_pattern(&[kernel_size, conv_dim], 19, 67, 59.0);
+        for (seq_len, offset_init) in [(43, 15_360), (1_024, 0), (1_024, 15_360)] {
+            let mixed_qkv =
+                canonical_conv_bf16_pattern(&[batch, seq_len, conv_dim], 31 + seq_len, 71, 53.0);
+            let actual_preactivation = canonical_conv_preactivation_ffi(
+                &mixed_qkv,
+                &history,
+                &weight_t,
+                offset_init,
+                batch,
+                seq_len,
+                conv_dim,
+                kernel_size,
+                CanonicalConvReduction::CanonicalS1,
+            )
+            .unwrap();
+            let actual = silu_direct(&actual_preactivation).unwrap();
+            let expected = ordered_canonical_conv_reference(
+                &gdn,
+                &mixed_qkv,
+                &history,
+                &weight_t,
+                offset_init,
+            );
+            assert_canonical_array_exact(
+                &format!("canonical prefill conv offset={offset_init} T={seq_len}"),
+                &actual,
+                &expected,
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_conv_metal_matches_append_stable_mlx_window_reduction() {
+        let args = valid_causal_lm_args();
+        let gdn = GatedDeltaNet::new(&args, "test.layer.linear_attn").unwrap();
+        let batch = 1;
+        let kernel_size = gdn.conv_kernel_size;
+        let history_len = kernel_size - 1;
+        let conv_dim = gdn.conv_dim;
+        let history = canonical_conv_bf16_pattern(&[batch, history_len, conv_dim], 7, 61, 47.0);
+        let weight_t = canonical_conv_bf16_pattern(&[kernel_size, conv_dim], 19, 67, 59.0);
+
+        for seq_len in [43, 1_024] {
+            let mixed_qkv =
+                canonical_conv_bf16_pattern(&[batch, seq_len, conv_dim], 31 + seq_len, 71, 53.0);
+            let actual_preactivation = canonical_conv_preactivation_ffi(
+                &mixed_qkv,
+                &history,
+                &weight_t,
+                15_360,
+                batch,
+                seq_len,
+                conv_dim,
+                kernel_size,
+                CanonicalConvReduction::AppendStableWindow,
+            )
+            .unwrap();
+            let expected_preactivation = append_stable_mlx_window_conv_preactivation_reference(
+                &mixed_qkv, &history, &weight_t,
+            );
+            let actual = silu_direct(&actual_preactivation).unwrap();
+            let expected = silu_direct(&expected_preactivation).unwrap();
+            assert_canonical_array_exact(
+                &format!("append-stable MLX window reduction T={seq_len}"),
+                &actual,
+                &expected,
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_conv_config_cache_is_bounded_for_arbitrary_prefill_lengths() {
+        let args = valid_causal_lm_args();
+        let gdn = GatedDeltaNet::new(&args, "test.layer.linear_attn").unwrap();
+        let batch = 1;
+        let kernel_size = gdn.conv_kernel_size;
+        let history_len = kernel_size - 1;
+        let conv_dim = gdn.conv_dim;
+        let history = canonical_conv_bf16_pattern(&[batch, history_len, conv_dim], 7, 61, 47.0);
+        let weight_t = canonical_conv_bf16_pattern(&[kernel_size, conv_dim], 19, 67, 59.0);
+
+        CANONICAL_CONV_CONFIG_CACHE.with(|cache| cache.borrow_mut().clear());
+        for seq_len in [1, 5, 8, 9, 43, 57, 1_024, 2_048] {
+            let mixed_qkv =
+                canonical_conv_bf16_pattern(&[batch, seq_len, conv_dim], 31 + seq_len, 71, 53.0);
+            let output = canonical_conv_preactivation_ffi(
+                &mixed_qkv,
+                &history,
+                &weight_t,
+                15_360,
+                batch,
+                seq_len,
+                conv_dim,
+                kernel_size,
+                CanonicalConvReduction::AppendStableWindow,
+            )
+            .unwrap();
+            output.eval().unwrap();
+        }
+
+        let mut cached_lengths = CANONICAL_CONV_CONFIG_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .keys()
+                .map(|key| key.seq_len)
+                .collect::<Vec<_>>()
+        });
+        cached_lengths.sort_unstable();
+        assert_eq!(cached_lengths, [1, 5, 8, 1_024]);
     }
 
     /// Measures only the divergent portion of CanonicalS1 short-block
@@ -16304,6 +16821,7 @@ mod tests {
                 SEQ_LEN,
                 CONV_DIM,
                 KERNEL_SIZE,
+                CanonicalConvReduction::CanonicalS1,
             )
             .unwrap();
             silu_direct(&preactivation).unwrap()

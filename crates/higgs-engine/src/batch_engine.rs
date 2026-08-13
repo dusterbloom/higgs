@@ -22,7 +22,7 @@ use mlx_rs::{
 use tokenizers::Tokenizer;
 
 use crate::{
-    chat_template::{ChatMessage, ChatTemplateRenderer},
+    chat_template::{ChatMessage, ChatPromptMode, ChatTemplateRenderer},
     engine::{GenerationOutput, StreamingOutput},
     error::EngineError,
     model_loader,
@@ -175,7 +175,18 @@ impl BatchEngine {
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
     ) -> Result<Vec<u32>, EngineError> {
-        let prompt = self.template.apply(messages, tools, true)?;
+        self.prepare_chat_prompt_for_mode(messages, tools, ChatPromptMode::Generation)
+    }
+
+    pub fn prepare_chat_prompt_for_mode(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        mode: ChatPromptMode,
+    ) -> Result<Vec<u32>, EngineError> {
+        let prompt = self
+            .template
+            .apply(messages, tools, mode.add_generation_prompt())?;
         let encoding = self
             .tokenizer
             .encode(prompt.as_str(), false)
@@ -974,6 +985,78 @@ fn materialize_decode_step(
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    fn batch_prompt_test_engine() -> BatchEngine {
+        let tokenizer = Tokenizer::from_bytes(
+            br#"{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": {"type": "WhitespaceSplit"},
+                "post_processor": null,
+                "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {
+                        "[UNK]": 0,
+                        "<|im_start|>": 1,
+                        "<|im_end|>": 2,
+                        "user": 3,
+                        "question": 4,
+                        "assistant": 5,
+                        "answer": 6
+                    },
+                    "unk_token": "[UNK]"
+                }
+            }"#,
+        )
+        .unwrap();
+        let template = ChatTemplateRenderer::new(
+            r#"{% for message in messages %}<|im_start|> {{ message.role }} {{ message.content }} <|im_end|> {% endfor %}
+{% if add_generation_prompt %}<|im_start|> assistant{% endif %}"#,
+        )
+        .unwrap();
+        let (request_tx, _request_rx) = tokio::sync::mpsc::channel(1);
+        BatchEngine {
+            request_tx,
+            tokenizer,
+            template,
+            model_name: "batch-prompt-test".to_owned(),
+            eos_token_ids: Vec::new(),
+            hidden_size: AtomicI32::new(1),
+        }
+    }
+
+    #[test]
+    fn batch_session_prefill_omits_generation_suffix_without_changing_default() {
+        let engine = batch_prompt_test_engine();
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_owned(),
+                content: "question".to_owned(),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: "answer".to_owned(),
+                tool_calls: None,
+            },
+        ];
+
+        let default = engine.prepare_chat_prompt(&messages, None).unwrap();
+        let generation = engine
+            .prepare_chat_prompt_for_mode(&messages, None, ChatPromptMode::Generation)
+            .unwrap();
+        let prefill = engine
+            .prepare_chat_prompt_for_mode(&messages, None, ChatPromptMode::SessionPrefill)
+            .unwrap();
+
+        assert_eq!(default, generation);
+        assert!(generation.starts_with(&prefill));
+        assert!(generation.len() > prefill.len());
+    }
 
     // -----------------------------------------------------------------------
     // materialize_decode_step

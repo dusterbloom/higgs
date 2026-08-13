@@ -159,9 +159,11 @@ port = 8000
 # mlx_profile = "throughput"
 # batch = false
 # # Cache-resident multi-turn KV retention limits (bound resident memory):
-# kv_max_sessions = 8           # max retained conversations, LRU-evicted (>= 1)
-# kv_max_session_tokens = 0     # drop a conversation's KV past N tokens (0 = unlimited)
-# kv_retained_idle_secs = 1800  # evict KV idle longer than N seconds (0 = never)
+# kv_max_sessions = 2                    # max retained conversations, LRU-evicted (>= 1)
+# kv_max_session_tokens = 32768          # drop a conversation's KV past N tokens (0 = unlimited)
+# kv_retained_idle_secs = 300            # evict KV idle longer than N seconds (0 = never)
+# kv_max_suffix_prefill_tokens = 24576   # maximum exact suffix before degraded bootstrap
+# kv_max_retained_bytes = 2147483648     # aggregate retained session KV byte limit
 # kv_cache_bytes = 0            # prefix KV cache byte budget (0 = disabled; evicts LRU over budget)
 # # Speculative decoding (decode) + compressive prefill (PFlash) drafters:
 # # draft_model      = "/path/to/dspark-drafter"      # decode speculation (DFlash/dSpark)
@@ -902,7 +904,19 @@ mod tests {
         with_temp_config_dir(|dir| {
             std::fs::create_dir_all(dir).unwrap();
             cmd_init(None);
-            assert!(dir.join("config.toml").exists());
+            let config = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            for expected in [
+                "kv_max_sessions = 2",
+                "kv_max_session_tokens = 32768",
+                "kv_retained_idle_secs = 300",
+                "kv_max_suffix_prefill_tokens = 24576",
+                "kv_max_retained_bytes = 2147483648",
+            ] {
+                assert!(
+                    config.contains(expected),
+                    "missing shipped default: {expected}"
+                );
+            }
         });
     }
 

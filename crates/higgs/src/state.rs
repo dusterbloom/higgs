@@ -3,13 +3,14 @@ use std::sync::Arc;
 
 use higgs_engine::batch_engine::BatchEngine;
 use higgs_engine::cache::DiskPrefixCacheConfig;
-use higgs_engine::chat_template::ChatMessage;
+use higgs_engine::chat_template::{ChatMessage, ChatPromptMode};
 use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
 use higgs_engine::mlx_tuning::{MlxRuntimeTuning, resolve_runtime_tuning};
 use higgs_engine::simple::{
     CacheStats, PFlashPromptPolicy, PrefillCompressionMode as EnginePrefillCompressionMode,
-    SessionGeneration, SessionPromptTracePayloadStats, SimpleEngine,
+    SessionContinuationPolicy, SessionGeneration, SessionPromptTracePayloadStats,
+    SessionStreamAcceptance, SimpleEngine,
 };
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
@@ -40,6 +41,111 @@ use crate::router::Router;
 /// gate should be narrowed to cross-model boundaries.
 static GPU_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(test)]
+pub struct RouteTestStub {
+    name: String,
+    mutations: std::sync::atomic::AtomicU64,
+    mutation_sequence: std::sync::Mutex<Vec<String>>,
+    retained_sessions: std::sync::Mutex<std::collections::HashSet<u64>>,
+}
+
+#[cfg(test)]
+impl RouteTestStub {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            mutations: std::sync::atomic::AtomicU64::new(0),
+            mutation_sequence: std::sync::Mutex::new(Vec::new()),
+            retained_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn record_mutation(&self) {
+        self.mutations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_named_mutation(&self, mutation: String) {
+        self.record_mutation();
+        self.mutation_sequence.lock().unwrap().push(mutation);
+    }
+
+    fn route_session(&self, session_id: u64) -> bool {
+        let continued = {
+            let mut sessions = self.retained_sessions.lock().unwrap();
+            let continued = sessions.contains(&session_id);
+            sessions.insert(session_id);
+            continued
+        };
+        let action = if continued { "continue" } else { "retain" };
+        self.record_named_mutation(format!("{action}:{session_id}"));
+        continued
+    }
+
+    fn retained_session_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<_> = self
+            .retained_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn drop_session(&self, session_id: u64) -> bool {
+        let dropped = self.retained_sessions.lock().unwrap().remove(&session_id);
+        self.record_named_mutation(format!("drop:{session_id}"));
+        dropped
+    }
+
+    fn lease_session(&self, session_id: u64, ttl_seconds: u32) -> bool {
+        let retained = self.retained_sessions.lock().unwrap().contains(&session_id);
+        if retained {
+            self.record_named_mutation(format!("lease:{session_id}:{ttl_seconds}"));
+        }
+        retained
+    }
+
+    fn mutation_count(&self) -> u64 {
+        self.mutations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn mutation_sequence(&self) -> Vec<String> {
+        self.mutation_sequence.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+fn route_test_tokenizer() -> &'static Tokenizer {
+    static TOKENIZER: std::sync::OnceLock<Tokenizer> = std::sync::OnceLock::new();
+    TOKENIZER.get_or_init(|| {
+        Tokenizer::from_bytes(
+            br#"{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": null,
+                "post_processor": null,
+                "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {"[UNK]": 0, "token": 7},
+                    "unk_token": "[UNK]"
+                }
+            }"#,
+        )
+        .expect("valid route test tokenizer")
+    })
+}
+
 /// Acquire the global GPU gate, recovering from poisoning so a panic mid-eval
 /// cannot permanently wedge all inference.
 fn gpu_gate() -> std::sync::MutexGuard<'static, ()> {
@@ -54,7 +160,7 @@ pub enum Engine {
     Simple(Box<SimpleEngine>),
     Batch(Box<BatchEngine>),
     #[cfg(test)]
-    Stub(String),
+    Stub(RouteTestStub),
 }
 
 impl Engine {
@@ -123,7 +229,31 @@ impl Engine {
 
     #[cfg(test)]
     pub fn test_stub(name: &str) -> Self {
-        Self::Stub(name.to_owned())
+        Self::Stub(RouteTestStub::new(name))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_test_mutations(&self) -> u64 {
+        match self {
+            Self::Stub(stub) => stub.mutation_count(),
+            _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_test_mutation_sequence(&self) -> Vec<String> {
+        match self {
+            Self::Stub(stub) => stub.mutation_sequence(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_test_retained_sessions(&self) -> Vec<u64> {
+        match self {
+            Self::Stub(stub) => stub.retained_session_ids(),
+            _ => Vec::new(),
+        }
     }
 
     pub fn model_name(&self) -> &str {
@@ -131,7 +261,7 @@ impl Engine {
             Self::Simple(e) => e.model_name(),
             Self::Batch(e) => e.model_name(),
             #[cfg(test)]
-            Self::Stub(name) => name,
+            Self::Stub(stub) => stub.name(),
         }
     }
 
@@ -140,6 +270,14 @@ impl Engine {
         match self {
             Self::Simple(e) => e.tokenizer(),
             Self::Batch(e) => e.tokenizer(),
+            #[cfg(test)]
+            Self::Stub(stub)
+                if stub.name().starts_with("zero-prefix-")
+                    || stub.name() == "blocking-required-post-admission-evicted"
+                    || stub.name() == "session-prefill-render-spy" =>
+            {
+                route_test_tokenizer()
+            }
             #[cfg(test)]
             Self::Stub(_) => panic!("Engine::test_stub has no tokenizer"),
         }
@@ -233,14 +371,31 @@ impl Engine {
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
+        mode: ChatPromptMode,
     ) -> Result<(Vec<u32>, PFlashPromptPolicy), EngineError> {
         match self {
             Self::Simple(e) => {
-                e.prepare_chat_prompt_with_pflash_policy(messages, tools, enable_thinking)
+                e.prepare_chat_prompt_with_pflash_policy(messages, tools, enable_thinking, mode)
             }
             Self::Batch(e) => e
-                .prepare_chat_prompt_with_thinking(messages, tools, enable_thinking)
+                .prepare_chat_prompt_for_mode(messages, tools, mode)
                 .map(|tokens| (tokens, PFlashPromptPolicy::default())),
+            #[cfg(test)]
+            Self::Stub(stub) if stub.name() == "session-prefill-render-spy" => Ok((
+                match mode {
+                    ChatPromptMode::SessionPrefill => vec![7],
+                    ChatPromptMode::Generation => vec![7, 8],
+                },
+                PFlashPromptPolicy::default(),
+            )),
+            #[cfg(test)]
+            Self::Stub(stub) if stub.name() == "prompt-limit-mutation-spy" => {
+                Ok((vec![1, 2, 3], PFlashPromptPolicy::default()))
+            }
+            #[cfg(test)]
+            Self::Stub(stub) if stub.name().starts_with("zero-prefix-") => {
+                Ok((vec![7], PFlashPromptPolicy::default()))
+            }
             #[cfg(test)]
             Self::Stub(_) => Ok((Vec::new(), PFlashPromptPolicy::default())),
         }
@@ -253,7 +408,51 @@ impl Engine {
             Self::Simple(e) => e.drop_retained_session(session_id),
             Self::Batch(_) => false,
             #[cfg(test)]
-            Self::Stub(_) => false,
+            Self::Stub(stub) => {
+                if stub.name() == "zero-prefix-accept" {
+                    return stub.drop_session(session_id);
+                }
+                if stub.name() == "prompt-limit-mutation-spy" {
+                    stub.record_mutation();
+                }
+                false
+            }
+        }
+    }
+
+    /// Confirm an idle-eviction lease only when the requested retained session exists.
+    pub fn lease_retained_session(&self, session_id: u64, ttl_seconds: u32) -> bool {
+        match self {
+            Self::Simple(e) => e.lease_retained_session(
+                session_id,
+                std::time::Duration::from_secs(u64::from(ttl_seconds)),
+            ),
+            Self::Batch(_) => false,
+            #[cfg(test)]
+            Self::Stub(stub) => {
+                if stub.name() == "zero-prefix-accept" {
+                    return stub.lease_session(session_id, ttl_seconds);
+                }
+                if stub.name() == "prompt-limit-mutation-spy" {
+                    stub.record_mutation();
+                }
+                false
+            }
+        }
+    }
+
+    pub fn retained_session_can_continue(&self, session_id: u64, prompt_tokens: &[u32]) -> bool {
+        match self {
+            Self::Simple(e) => e.retained_session_can_continue(session_id, prompt_tokens),
+            Self::Batch(_) => false,
+            #[cfg(test)]
+            Self::Stub(stub) => stub.name() == "raw-accept-worker-reject",
+        }
+    }
+
+    pub fn record_required_continuation_miss(&self) {
+        if let Self::Simple(engine) = self {
+            engine.record_required_continuation_miss();
         }
     }
 
@@ -312,7 +511,12 @@ impl Engine {
                     .to_owned(),
             )),
             #[cfg(test)]
-            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+            Self::Stub(stub) => {
+                if stub.name() == "prompt-limit-mutation-spy" {
+                    stub.record_mutation();
+                }
+                Err(EngineError::Generation("test stub".to_owned()))
+            }
         }
     }
 
@@ -359,6 +563,7 @@ impl Engine {
         enable_thinking: bool,
         tool_payload: SessionPromptTracePayloadStats,
         pflash_policy: &PFlashPromptPolicy,
+        continuation_policy: SessionContinuationPolicy,
     ) -> Result<SessionGeneration, EngineError> {
         let _gpu = gpu_gate();
         match self {
@@ -372,13 +577,50 @@ impl Engine {
                 enable_thinking,
                 tool_payload,
                 pflash_policy,
+                continuation_policy,
             ),
             Self::Batch(_) => Err(EngineError::Generation(
                 "session_id (session-routed generation) is only supported by the Simple engine"
                     .to_owned(),
             )),
             #[cfg(test)]
-            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+            Self::Stub(stub) => {
+                if stub.name() == "blocking-required-post-admission-evicted" {
+                    return Err(EngineError::RetainedSessionUnavailable(session_id));
+                }
+                if stub.name() == "session-prefill-render-spy" {
+                    stub.record_mutation();
+                    return Ok(SessionGeneration {
+                        text: String::new(),
+                        completion_tokens: 0,
+                        finish_reason: "length".to_owned(),
+                        prompt_tokens: u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX),
+                        prefilled_tokens: u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX),
+                        continued: false,
+                        outcome: higgs_engine::simple::SessionOutcome::ExactBootstrap,
+                    });
+                }
+                if stub.name() == "zero-prefix-accept" {
+                    let continued = stub.route_session(session_id);
+                    return Ok(SessionGeneration {
+                        text: String::new(),
+                        completion_tokens: 0,
+                        finish_reason: "length".to_owned(),
+                        prompt_tokens: 1,
+                        prefilled_tokens: if continued { 0 } else { 1 },
+                        continued,
+                        outcome: if continued {
+                            higgs_engine::simple::SessionOutcome::Continued
+                        } else {
+                            higgs_engine::simple::SessionOutcome::ExactBootstrap
+                        },
+                    });
+                }
+                if stub.name() == "prompt-limit-mutation-spy" {
+                    stub.record_mutation();
+                }
+                Err(EngineError::Generation("test stub".to_owned()))
+            }
         }
     }
 
@@ -395,6 +637,8 @@ impl Engine {
         enable_thinking: bool,
         tool_payload: SessionPromptTracePayloadStats,
         pflash_policy: &PFlashPromptPolicy,
+        continuation_policy: SessionContinuationPolicy,
+        mut acceptance: Option<SessionStreamAcceptance>,
     ) -> Result<(), EngineError> {
         let _gpu = gpu_gate();
         match self {
@@ -409,13 +653,87 @@ impl Engine {
                 enable_thinking,
                 tool_payload,
                 pflash_policy,
+                continuation_policy,
+                acceptance,
             ),
-            Self::Batch(_) => Err(EngineError::Generation(
-                "session_id (session-routed streaming) is only supported by the Simple engine"
-                    .to_owned(),
-            )),
+            Self::Batch(_) => {
+                if let Some(acceptance) = acceptance.take() {
+                    let _ = acceptance.send(Err(session_id));
+                }
+                Err(EngineError::Generation(
+                    "session_id (session-routed streaming) is only supported by the Simple engine"
+                        .to_owned(),
+                ))
+            }
             #[cfg(test)]
-            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+            Self::Stub(stub) if stub.name() == "session-prefill-render-spy" => {
+                stub.record_mutation();
+                if let Some(acceptance) = acceptance.take() {
+                    let _ = acceptance.send(Ok(()));
+                }
+                sender
+                    .blocking_send(StreamingOutput {
+                        new_text: String::new(),
+                        finished: true,
+                        finish_reason: Some("length".to_owned()),
+                        prompt_tokens: u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX),
+                        completion_tokens: 0,
+                        token_logprob: None,
+                        prefill_progress: None,
+                    })
+                    .map_err(|_| EngineError::Cancelled)
+            }
+            #[cfg(test)]
+            Self::Stub(stub) if stub.name() == "zero-prefix-materialization-fail" => {
+                Err(EngineError::Generation(
+                    "injected retained-state materialization failure".to_owned(),
+                ))
+            }
+            #[cfg(test)]
+            Self::Stub(stub) if stub.name() == "zero-prefix-accept" => {
+                let continued = stub.route_session(session_id);
+                if let Some(acceptance) = acceptance.take() {
+                    let _ = acceptance.send(Ok(()));
+                }
+                if continued {
+                    sender
+                        .blocking_send(StreamingOutput {
+                            new_text: String::new(),
+                            finished: false,
+                            finish_reason: None,
+                            prompt_tokens: 1,
+                            completion_tokens: 0,
+                            token_logprob: None,
+                            prefill_progress: Some(higgs_engine::engine::PrefillProgress {
+                                processed: 1,
+                                cached: 1,
+                                total: 1,
+                            }),
+                        })
+                        .map_err(|_| EngineError::Cancelled)?;
+                }
+                sender
+                    .blocking_send(StreamingOutput {
+                        new_text: String::new(),
+                        finished: true,
+                        finish_reason: Some("length".to_owned()),
+                        prompt_tokens: 1,
+                        completion_tokens: 0,
+                        token_logprob: None,
+                        prefill_progress: None,
+                    })
+                    .map_err(|_| EngineError::Cancelled)
+            }
+            #[cfg(test)]
+            Self::Stub(stub) => {
+                if stub.name() == "prompt-limit-mutation-spy" {
+                    stub.record_mutation();
+                }
+                if let Some(acceptance) = acceptance.take() {
+                    let _ = acceptance.send(Err(session_id));
+                }
+                Err(EngineError::RetainedSessionUnavailable(session_id))
+            }
         }
     }
 
