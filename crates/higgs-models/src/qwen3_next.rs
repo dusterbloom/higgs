@@ -85,6 +85,12 @@ impl Drop for CachedMetalKernel {
 /// Cached `GatedDeltaNet` Metal kernel -- created once, reused for all layers.
 static GATED_DELTA_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
+/// Cached tape-recording GDN kernel -- outputs (y, `state_out`, `delta_tape`).
+static GATED_DELTA_TAPE_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+/// Cached tape-replay kernel -- inputs (tape, k, a, `a_log`, `dt_bias`, `state_in`, T), outputs `state_out`.
+static TAPE_REPLAY_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
 use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
@@ -966,6 +972,546 @@ fn gated_delta_kernel_ffi(
         if !config_is_cached {
             mlx_sys::mlx_fast_metal_kernel_config_free(config);
         }
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(t_scalar);
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Stateless GDN kernel wrapper: thin shim that runs the normal kernel and
+// then returns `state_in` unchanged so callers can keep the kv cache pristine.
+// ---------------------------------------------------------------------------
+
+/// Stateless wrapper around `gated_delta_kernel_ffi`: returns `(y, state_in)`.
+/// The kernel still produces a fresh `state_out`, but it is discarded; callers
+/// receive `state_in.clone()` so they can verify without mutating the cache.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_kernel_ffi_stateless(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    a_log: &Array,
+    a: &Array,
+    dt_bias: &Array,
+    b: &Array,
+    state_in: &Array,
+    batch: i32,
+    seq_len: i32,
+    num_k_heads: i32,
+    head_k_dim: i32,
+    num_v_heads: i32,
+    head_v_dim: i32,
+) -> Result<(Array, Array), Exception> {
+    let (y, _new_state) = gated_delta_kernel_ffi(
+        q,
+        k,
+        v,
+        a_log,
+        a,
+        dt_bias,
+        b,
+        state_in,
+        batch,
+        seq_len,
+        num_k_heads,
+        head_k_dim,
+        num_v_heads,
+        head_v_dim,
+    )?;
+    Ok((y, state_in.clone()))
+}
+
+// ---------------------------------------------------------------------------
+// Tape-recording GDN kernel: same recurrence, also outputs innovation delta
+// ---------------------------------------------------------------------------
+
+/// Tape-recording variant of the GDN kernel. Identical computation but also
+/// outputs `innovation_tape[B, T, Hv, Dv]` -- the delta residual at each step.
+/// Used for `DFlash` verify: on partial rejection, we replay only accepted steps
+/// from the tape instead of re-running the full forward.
+const GATED_DELTA_TAPE_KERNEL_SOURCE: &str = r"
+auto n = thread_position_in_grid.z;
+auto b_idx = n / Hv;
+auto hv_idx = n % Hv;
+auto hk_idx = hv_idx / (Hv / Hk);
+constexpr int n_per_t = Dk / 32;
+
+auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+y += b_idx * T * Hv * Dv + hv_idx * Dv;
+auto tape_ = innovation_tape + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+auto dk_idx = thread_position_in_threadgroup.x;
+auto dv_idx = thread_position_in_grid.y;
+
+auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+float state[n_per_t];
+for (int i = 0; i < n_per_t; ++i) {
+  auto s_idx = n_per_t * dk_idx + i;
+  state[i] = static_cast<float>(i_state[s_idx]);
+}
+
+float a_log_val = static_cast<float>(a_log[hv_idx]);
+float dt_bias_val = static_cast<float>(dt_bias[hv_idx]);
+
+auto a_ = a + b_idx * T * Hv;
+auto b_ = b + b_idx * T * Hv;
+
+for (int t = 0; t < T; ++t) {
+  float x = static_cast<float>(a_[hv_idx]) + dt_bias_val;
+  float sp = fmax(x, 0.0f) + log1p(exp(-fabs(x)));
+  float g_val = exp(-exp(a_log_val) * sp);
+
+  float beta_val = 1.0f / (1.0f + exp(-static_cast<float>(b_[hv_idx])));
+
+  {
+    float kv_mem = 0.0f;
+    for (int i = 0; i < n_per_t; ++i) {
+      auto s_idx = n_per_t * dk_idx + i;
+      state[i] = state[i] * g_val;
+      kv_mem += state[i] * k_[s_idx];
+    }
+    kv_mem = simd_sum(kv_mem);
+
+    auto delta = (v_[dv_idx] - kv_mem) * beta_val;
+
+    float out = 0.0f;
+    for (int i = 0; i < n_per_t; ++i) {
+      auto s_idx = n_per_t * dk_idx + i;
+      state[i] = state[i] + k_[s_idx] * delta;
+      out += state[i] * q_[s_idx];
+    }
+    out = simd_sum(out);
+    if (thread_index_in_simdgroup == 0) {
+      y[dv_idx] = static_cast<InT>(out);
+      tape_[dv_idx] = delta;
+    }
+  }
+  // Match mlx-lm precision: cast state to InT between timesteps
+  for (int i = 0; i < n_per_t; ++i) {
+    state[i] = static_cast<float>(static_cast<InT>(state[i]));
+  }
+  q_ += Hk * Dk;
+  k_ += Hk * Dk;
+  v_ += Hv * Dv;
+  y += Hv * Dv;
+  tape_ += Hv * Dv;
+  a_ += Hv;
+  b_ += Hv;
+}
+for (int i = 0; i < n_per_t; ++i) {
+  auto s_idx = n_per_t * dk_idx + i;
+  o_state[s_idx] = static_cast<InT>(state[i]);
+}
+";
+
+#[allow(unsafe_code)]
+fn create_gated_delta_tape_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let input_names: [&std::ffi::CStr; 9] = [
+        c"q",
+        c"k",
+        c"v",
+        c"a_log",
+        c"a",
+        c"dt_bias",
+        c"b",
+        c"state_in",
+        c"T",
+    ];
+    let output_names: [&std::ffi::CStr; 3] = [c"y", c"state_out", c"innovation_tape"];
+
+    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
+
+    let source =
+        CString::new(GATED_DELTA_TAPE_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+
+    unsafe {
+        let in_vec =
+            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"gated_delta_tape".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_gated_delta_tape_kernel(
+    in_dtype: mlx_sys::mlx_dtype,
+    batch: i32,
+    seq_len: i32,
+    num_k_heads: i32,
+    head_k_dim: i32,
+    num_v_heads: i32,
+    head_v_dim: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"InT".as_ptr(),
+            in_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Dk".as_ptr(),
+            head_k_dim,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Dv".as_ptr(),
+            head_v_dim,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Hk".as_ptr(),
+            num_k_heads,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Hv".as_ptr(),
+            num_v_heads,
+        );
+
+        let y_shape = [batch, seq_len, num_v_heads, head_v_dim];
+        let state_shape = [batch, num_v_heads, head_v_dim, head_k_dim];
+        let tape_shape = [batch, seq_len, num_v_heads, head_v_dim];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            in_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            state_shape.as_ptr(),
+            state_shape.len(),
+            in_dtype,
+        );
+        // Tape stores deltas in float32 for precision (matches dflash-mlx)
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            tape_shape.as_ptr(),
+            tape_shape.len(),
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
+
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 32, head_v_dim, batch * num_v_heads);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1);
+
+        config
+    }
+}
+
+/// Tape-recording GDN kernel: returns `(y, state_out, innovation_tape)`.
+#[allow(unsafe_code, clippy::too_many_arguments)]
+pub(crate) fn gated_delta_kernel_ffi_with_tape(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    a_log: &Array,
+    a: &Array,
+    dt_bias: &Array,
+    b: &Array,
+    state_in: &Array,
+    batch: i32,
+    seq_len: i32,
+    num_k_heads: i32,
+    head_k_dim: i32,
+    num_v_heads: i32,
+    head_v_dim: i32,
+) -> Result<(Array, Array, Array), Exception> {
+    ensure_ffi_error_handler();
+
+    let stream = Stream::task_local_or_default();
+    let in_dtype = unsafe { mlx_sys::mlx_array_dtype(q.as_ptr()) };
+
+    let cached =
+        GATED_DELTA_TAPE_KERNEL.get_or_init(|| CachedMetalKernel(create_gated_delta_tape_kernel()));
+    let config = configure_gated_delta_tape_kernel(
+        in_dtype,
+        batch,
+        seq_len,
+        num_k_heads,
+        head_k_dim,
+        num_v_heads,
+        head_v_dim,
+    );
+
+    let t_scalar = unsafe { mlx_sys::mlx_array_new_int(seq_len) };
+    let input_ptrs = [
+        q.as_ptr(),
+        k.as_ptr(),
+        v.as_ptr(),
+        a_log.as_ptr(),
+        a.as_ptr(),
+        dt_bias.as_ptr(),
+        b.as_ptr(),
+        state_in.as_ptr(),
+        t_scalar,
+    ];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        let mlx_msg = FFI_LAST_ERROR
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
+        Err(Exception::custom(format!(
+            "gated_delta_tape_kernel failed: {mlx_msg}"
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        let mut state_ptr = unsafe { mlx_sys::mlx_array_new() };
+        let mut tape_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe {
+            mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0);
+            mlx_sys::mlx_vector_array_get(&raw mut state_ptr, outputs_vec, 1);
+            mlx_sys::mlx_vector_array_get(&raw mut tape_ptr, outputs_vec, 2);
+        }
+        Ok((
+            unsafe { Array::from_ptr(y_ptr) },
+            unsafe { Array::from_ptr(state_ptr) },
+            unsafe { Array::from_ptr(tape_ptr) },
+        ))
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(t_scalar);
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Tape replay kernel: replays accepted steps to advance GDN state
+// ---------------------------------------------------------------------------
+
+/// Replays the GDN recurrence from a recorded innovation tape.
+/// Inputs: `tape[B,T,Hv,Dv]`, `k[B,T,Hk,Dk]`, `a[B,T,Hv]`, `a_log[Hv]`,
+/// `dt_bias[Hv]`, `state_in[B,Hv,Dv,Dk]`. Output: `state_out[B,Hv,Dv,Dk]`.
+const TAPE_REPLAY_KERNEL_SOURCE: &str = r"
+auto n = thread_position_in_grid.z;
+auto b_idx = n / Hv;
+auto hv_idx = n % Hv;
+auto hk_idx = hv_idx / (Hv / Hk);
+constexpr int n_per_t = Dk / 32;
+
+auto tape_ = tape + b_idx * T * Hv * Dv + hv_idx * Dv;
+auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+auto dk_idx = thread_position_in_threadgroup.x;
+auto dv_idx = thread_position_in_grid.y;
+
+auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+float state[n_per_t];
+for (int i = 0; i < n_per_t; ++i) {
+  auto s_idx = n_per_t * dk_idx + i;
+  state[i] = static_cast<float>(i_state[s_idx]);
+}
+
+// a_log and dt_bias are [B * Hv] when batched across layers
+float a_log_val = static_cast<float>(a_log[b_idx * Hv + hv_idx]);
+float dt_bias_val = static_cast<float>(dt_bias[b_idx * Hv + hv_idx]);
+auto a_ = a + b_idx * T * Hv;
+
+for (int t = 0; t < T; ++t) {
+  float x = static_cast<float>(a_[hv_idx]) + dt_bias_val;
+  float sp = fmax(x, 0.0f) + log1p(exp(-fabs(x)));
+  float g_val = exp(-exp(a_log_val) * sp);
+
+  auto delta = tape_[dv_idx];
+  for (int i = 0; i < n_per_t; ++i) {
+    auto s_idx = n_per_t * dk_idx + i;
+    state[i] = state[i] * g_val + k_[s_idx] * delta;
+  }
+  // Match mlx-lm precision: cast state to InT between timesteps
+  for (int i = 0; i < n_per_t; ++i) {
+    state[i] = static_cast<float>(static_cast<InT>(state[i]));
+  }
+  tape_ += Hv * Dv;
+  k_ += Hk * Dk;
+  a_ += Hv;
+}
+for (int i = 0; i < n_per_t; ++i) {
+  auto s_idx = n_per_t * dk_idx + i;
+  o_state[s_idx] = static_cast<InT>(state[i]);
+}
+";
+
+#[allow(unsafe_code)]
+fn create_tape_replay_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let input_names: [&std::ffi::CStr; 7] =
+        [c"tape", c"k", c"a", c"a_log", c"dt_bias", c"state_in", c"T"];
+    let output_names: [&std::ffi::CStr; 1] = [c"state_out"];
+
+    let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
+    let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
+
+    let source = CString::new(TAPE_REPLAY_KERNEL_SOURCE).unwrap_or_else(|_| CString::default());
+
+    unsafe {
+        let in_vec =
+            mlx_sys::mlx_vector_string_new_data(input_ptrs.as_ptr().cast_mut(), input_ptrs.len());
+        let out_vec =
+            mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"tape_replay".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+/// Replay accepted steps from a recorded innovation tape.
+/// Returns the new SSM state after replaying `seq_len` steps.
+#[allow(unsafe_code, clippy::too_many_arguments)]
+pub(crate) fn tape_replay_kernel_ffi(
+    tape: &Array,
+    k: &Array,
+    a: &Array,
+    a_log: &Array,
+    dt_bias: &Array,
+    state_in: &Array,
+    batch: i32,
+    seq_len: i32,
+    num_k_heads: i32,
+    head_k_dim: i32,
+    num_v_heads: i32,
+    head_v_dim: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let stream = Stream::task_local_or_default();
+    let in_dtype = unsafe { mlx_sys::mlx_array_dtype(state_in.as_ptr()) };
+
+    let cached = TAPE_REPLAY_KERNEL.get_or_init(|| CachedMetalKernel(create_tape_replay_kernel()));
+
+    let config = unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"InT".as_ptr(),
+            in_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Dk".as_ptr(),
+            head_k_dim,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Dv".as_ptr(),
+            head_v_dim,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Hk".as_ptr(),
+            num_k_heads,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"Hv".as_ptr(),
+            num_v_heads,
+        );
+
+        let state_shape = [batch, num_v_heads, head_v_dim, head_k_dim];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            state_shape.as_ptr(),
+            state_shape.len(),
+            in_dtype,
+        );
+
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 32, head_v_dim, batch * num_v_heads);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1);
+
+        config
+    };
+
+    let t_scalar = unsafe { mlx_sys::mlx_array_new_int(seq_len) };
+    let input_ptrs = [
+        tape.as_ptr(),
+        k.as_ptr(),
+        a.as_ptr(),
+        a_log.as_ptr(),
+        dt_bias.as_ptr(),
+        state_in.as_ptr(),
+        t_scalar,
+    ];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        let mlx_msg = FFI_LAST_ERROR
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
+        Err(Exception::custom(format!(
+            "tape_replay_kernel failed: {mlx_msg}"
+        )))
+    } else {
+        let mut state_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe {
+            mlx_sys::mlx_vector_array_get(&raw mut state_ptr, outputs_vec, 0);
+        }
+        Ok(unsafe { Array::from_ptr(state_ptr) })
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
         mlx_sys::mlx_vector_array_free(inputs_vec);
         mlx_sys::mlx_vector_array_free(outputs_vec);
         mlx_sys::mlx_array_free(t_scalar);
@@ -2478,6 +3024,27 @@ impl Updatable for ArraysCache {
     }
 }
 
+/// Recorded intermediate values from a tape-recording GDN forward pass.
+///
+/// Enables cheap tape replay on partial rejection — no re-running projections,
+/// conv1d, norms, or attention. Just `state = state * g + k * delta`.
+pub struct GdnLayerTape {
+    /// Innovation delta at each timestep: `[B, T, Hv, Dv]`
+    pub delta_tape: Array,
+    /// Post-conv, post-norm key vectors: `[B, T, Hk, Dk]`
+    pub norm_k: Array,
+    /// Projected gate values: `[B, T, Hv]`
+    pub a_proj: Array,
+    /// Raw QKV input to conv1d (for `conv_state` rebuild): `[B, T, conv_dim]`
+    pub qkv_input: Array,
+    /// Pre-forward `conv_state` for rollback: `[B, K-1, conv_dim]`
+    pub conv_state_init: Option<Array>,
+    /// Pre-forward `ssm_state` for rollback: `[B, Hv, Dv, Dk]`
+    pub ssm_state_init: Option<Array>,
+    /// Pre-forward cache offset for rollback
+    pub offset_init: i32,
+}
+
 fn compute_g_direct(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array, Exception> {
     let a_plus_bias = a.add(dt_bias)?;
     let sp = nn::softplus(&a_plus_bias)?;
@@ -3020,6 +3587,504 @@ impl GatedDeltaNet {
         let a = a_raw.reshape(&[B, S, nv])?;
 
         Ok((q, k, v, z, b, a))
+    }
+
+    /// Replay accepted steps from a recorded tape, advancing SSM state.
+    /// Also rebuilds `conv_state` for the accepted prefix.
+    #[allow(non_snake_case, dead_code)]
+    fn replay_from_tape(
+        &self,
+        tape: &GdnLayerTape,
+        n_accepted: i32,
+        cache: &mut ArraysCache,
+    ) -> Result<(), Exception> {
+        if n_accepted <= 0 {
+            return Ok(());
+        }
+
+        // Slice tape data to accepted steps only
+        let tape_slice = tape.delta_tape.index((.., ..n_accepted, ..));
+        let k_slice = tape.norm_k.index((.., ..n_accepted, ..));
+        let a_slice = tape.a_proj.index((.., ..n_accepted, ..));
+
+        let state = if let Some(s) = cache.ssm_state.take() {
+            s
+        } else {
+            let dt = tape.delta_tape.dtype();
+            ops::zeros_dtype(&[1, self.num_v_heads, self.head_v_dim, self.head_k_dim], dt)?
+        };
+
+        let new_state = tape_replay_kernel_ffi(
+            &tape_slice,
+            &k_slice,
+            &a_slice,
+            &self.A_log,
+            &self.dt_bias,
+            &state,
+            1,
+            n_accepted,
+            self.num_k_heads,
+            self.head_k_dim,
+            self.num_v_heads,
+            self.head_v_dim,
+        )?;
+        cache.ssm_state = Some(new_state);
+        cache.offset += n_accepted;
+
+        // Rebuild conv_state from recorded qkv input
+        let ks = self.conv_kernel_size;
+        let n_keep = ks - 1;
+        if n_keep > 0 {
+            let qkv_slice = tape.qkv_input.index((.., ..n_accepted, ..));
+            // Prepend existing conv_state (or zeros), take last n_keep entries
+            let prefix = match &cache.conv_state {
+                Some(cs) => cs.clone(),
+                None => ops::zeros_dtype(&[1, n_keep, self.conv_dim], tape.qkv_input.dtype())?,
+            };
+            let full = ops::concatenate_axis(&[&prefix, &qkv_slice], 1)?;
+            let total_len = *full
+                .shape()
+                .get(1)
+                .ok_or_else(|| Exception::custom("conv rebuild: missing seq dim"))?;
+            let start = total_len - n_keep;
+            let cs = full.index((.., start.., ..));
+            let cs_shape = cs.shape().to_vec();
+            cache.conv_state = Some(cs.flatten(None, None)?.reshape(&cs_shape)?);
+        }
+
+        Ok(())
+    }
+
+    /// Side-effect-free forward used by `DFlash` verify. Identical numerics to
+    /// `forward`, but reads `cache.conv_state` / `cache.ssm_state` without
+    /// mutating them so a rejected speculation can be retried cleanly.
+    // Numerical kernel: tensor shape indices known finite; explicit casts preferred over try_from for hot path.
+    #[allow(
+        non_snake_case,
+        clippy::too_many_lines,
+        clippy::indexing_slicing,
+        clippy::as_conversions,
+        clippy::cast_sign_loss,
+        clippy::if_not_else,
+        clippy::single_match_else,
+        clippy::shadow_unrelated,
+        clippy::shadow_reuse
+    )]
+    fn forward_stateless(
+        &mut self,
+        inputs: &Array,
+        _mask: Option<&AttentionMask>,
+        cache: &ArraysCache,
+    ) -> Result<Array, Exception> {
+        let shape = inputs.shape();
+        let B = *shape
+            .first()
+            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
+        let S = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
+
+        // Project inputs — same as stateful forward
+        let (q, k, v, z, b, a) = if self.use_separate_projections {
+            let qkv_proj = self
+                .in_proj_qkv
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_qkv missing"))?;
+            let z_proj = self
+                .in_proj_z
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_z missing"))?;
+            let b_proj = self
+                .in_proj_b
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_b missing"))?;
+            let a_proj = self
+                .in_proj_a
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_a missing"))?;
+
+            let qkv = qkv_proj.forward(inputs)?;
+            let z = z_proj
+                .forward(inputs)?
+                .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+            let b = b_proj.forward(inputs)?;
+            let a = a_proj.forward(inputs)?;
+
+            let split_indices = &[self.key_dim, self.key_dim * 2];
+            let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
+            let q = qkv_parts
+                .first()
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+            let k = qkv_parts
+                .get(1)
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+            let v = qkv_parts
+                .get(2)
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+
+            (q, k, v, z, b, a)
+        } else {
+            let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
+            let mixed_ba = self.in_proj_ba.forward(inputs)?;
+            self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?
+        };
+
+        // Conv1d — read conv_state without consuming it
+        let q_flat = q.reshape(&[B, S, -1])?;
+        let k_flat = k.reshape(&[B, S, -1])?;
+        let v_flat = v.reshape(&[B, S, -1])?;
+        let mixed_qkv = ops::concatenate_axis(&[&q_flat, &k_flat, &v_flat], -1)?;
+
+        // Borrow conv_state without taking it (stateless must not mutate cache)
+        let conv_state = match &cache.conv_state {
+            Some(state) => state.clone(),
+            None => ops::zeros_dtype(
+                &[B, self.conv_kernel_size - 1, self.conv_dim],
+                inputs.dtype(),
+            )?,
+        };
+        let conv_input = ops::concatenate_axis(&[&conv_state, &mixed_qkv], 1)?;
+
+        // DO NOT update cache.conv_state
+
+        let conv_out = if S > 1 && S <= 32 {
+            let wt = match &self.conv_weight_t {
+                Some(w) => w.clone(),
+                None => {
+                    let shape = self.conv1d.weight.shape();
+                    let w = if shape.len() == 3 && shape[2] == 1 {
+                        self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?
+                    } else if shape.len() == 3 && shape[1] == 1 {
+                        self.conv1d.weight.squeeze_axes(&[1])?.transpose()?
+                    } else {
+                        return Err(Exception::custom(format!(
+                            "Unexpected conv1d weight shape: {shape:?}"
+                        )));
+                    };
+                    let w = w.as_dtype(inputs.dtype())?;
+                    w.eval()?;
+                    // Don't cache weight here — stateless should be side-effect-free
+                    w
+                }
+            };
+            let ks = self.conv_kernel_size;
+            let mut windows = Vec::with_capacity(S as usize);
+            for i in 0..S {
+                windows.push(
+                    conv_input
+                        .index((.., i..i + ks, ..))
+                        .multiply(&wt)?
+                        .sum_axes(&[1], true)?,
+                );
+            }
+            nn::silu(&ops::concatenate_axis(
+                &windows.iter().collect::<Vec<_>>(),
+                1,
+            )?)?
+        } else {
+            // Stateless path: clone-coerce rather than mutate self.conv1d.weight,
+            // matching the qk_norm_weight_* clone pattern below.
+            let in_dt = inputs.dtype();
+            if self.conv1d.weight.dtype() != in_dt {
+                let coerced = self.conv1d.weight.as_dtype(in_dt)?;
+                let out = ops::conv1d(&conv_input, &coerced, 1, 0, 1, self.conv_dim)?;
+                nn::silu(&out)?
+            } else {
+                nn::silu(&self.conv1d.forward(&conv_input)?)?
+            }
+        };
+
+        let split_indices = &[self.key_dim, self.key_dim * 2];
+        let conv_parts = conv_out.split_axis(split_indices, Some(-1))?;
+        let conv_q = conv_parts
+            .first()
+            .ok_or_else(|| Exception::custom("conv split failed"))?
+            .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+        let conv_k = conv_parts
+            .get(1)
+            .ok_or_else(|| Exception::custom("conv split failed"))?
+            .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+        let conv_v = conv_parts
+            .get(2)
+            .ok_or_else(|| Exception::custom("conv split failed"))?
+            .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+
+        let in_dt = inputs.dtype();
+        let qk_wq = if self.qk_norm_weight_q.dtype() != in_dt {
+            self.qk_norm_weight_q.as_dtype(in_dt)?
+        } else {
+            self.qk_norm_weight_q.clone()
+        };
+        let qk_wk = if self.qk_norm_weight_k.dtype() != in_dt {
+            self.qk_norm_weight_k.as_dtype(in_dt)?
+        } else {
+            self.qk_norm_weight_k.clone()
+        };
+
+        let norm_q = fast::rms_norm(&conv_q, &qk_wq, 1e-6)?;
+        let norm_k = fast::rms_norm(&conv_k, &qk_wk, 1e-6)?;
+
+        // Stateless SSM recurrence — state_out := state_in
+        let state = match &cache.ssm_state {
+            Some(s) => s.clone(),
+            None => ops::zeros_dtype(
+                &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
+                inputs.dtype(),
+            )?,
+        };
+        let (y, _unchanged_state) = gated_delta_kernel_ffi_stateless(
+            &norm_q,
+            &norm_k,
+            &conv_v,
+            &self.A_log,
+            &a,
+            &self.dt_bias,
+            &b,
+            &state,
+            B,
+            S,
+            self.num_k_heads,
+            self.head_k_dim,
+            self.num_v_heads,
+            self.head_v_dim,
+        )?;
+        // DO NOT update cache.ssm_state or cache.offset
+
+        let normed = self.norm.forward(&y)?;
+        let gated_out = swiglu(&z, &normed)?;
+
+        let out_flat = gated_out.reshape(&[B, S, -1])?;
+        self.out_proj.forward(&out_flat)
+    }
+
+    /// Tape-recording forward: identical output, also returns a `GdnLayerTape`
+    /// containing everything needed to cheaply replay accepted steps.
+    /// State IS updated (normal forward) — on full acceptance, zero extra work.
+    // Numerical kernel: tensor shape indices known finite; explicit casts preferred over try_from for hot path.
+    #[allow(
+        non_snake_case,
+        clippy::too_many_lines,
+        clippy::indexing_slicing,
+        clippy::as_conversions,
+        clippy::cast_sign_loss,
+        clippy::single_match_else,
+        clippy::shadow_unrelated,
+        clippy::shadow_reuse
+    )]
+    fn forward_with_tape(
+        &mut self,
+        inputs: &Array,
+        _mask: Option<&AttentionMask>,
+        cache: &mut ArraysCache,
+    ) -> Result<(Array, GdnLayerTape), Exception> {
+        let shape = inputs.shape();
+        let B = *shape
+            .first()
+            .ok_or_else(|| Exception::custom("need >= 2 dims"))?;
+        let S = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("need >= 2 dims"))?;
+
+        let (q, k, v, z, b, a) = if self.use_separate_projections {
+            let qkv_proj = self
+                .in_proj_qkv
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_qkv missing"))?;
+            let z_proj = self
+                .in_proj_z
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_z missing"))?;
+            let b_proj = self
+                .in_proj_b
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_b missing"))?;
+            let a_proj = self
+                .in_proj_a
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_a missing"))?;
+
+            let qkv = qkv_proj.forward(inputs)?;
+            let z = z_proj
+                .forward(inputs)?
+                .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+            let b = b_proj.forward(inputs)?;
+            let a = a_proj.forward(inputs)?;
+
+            let split_indices = &[self.key_dim, self.key_dim * 2];
+            let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
+            let q = qkv_parts
+                .first()
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+            let k = qkv_parts
+                .get(1)
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+            let v = qkv_parts
+                .get(2)
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+            (q, k, v, z, b, a)
+        } else {
+            let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
+            let mixed_ba = self.in_proj_ba.forward(inputs)?;
+            self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?
+        };
+
+        // Save a for replay (before any reshape that might happen)
+        let a_for_replay = a.clone();
+
+        // Conv1d — same as normal forward
+        let q_flat = q.reshape(&[B, S, -1])?;
+        let k_flat = k.reshape(&[B, S, -1])?;
+        let v_flat = v.reshape(&[B, S, -1])?;
+        let mixed_qkv = ops::concatenate_axis(&[&q_flat, &k_flat, &v_flat], -1)?;
+
+        // Save qkv for conv_state rebuild on replay
+        let qkv_for_replay = mixed_qkv.clone();
+
+        // Capture initial state for rollback (Python `_GDNStateCapture` equivalent)
+        let conv_state_init = cache.conv_state.clone();
+        let ssm_state_init = cache.ssm_state.clone();
+        let offset_init = cache.offset;
+
+        let conv_state = match cache.conv_state.take() {
+            Some(state) => state,
+            None => ops::zeros_dtype(
+                &[B, self.conv_kernel_size - 1, self.conv_dim],
+                inputs.dtype(),
+            )?,
+        };
+        let conv_input = ops::concatenate_axis(&[&conv_state, &mixed_qkv], 1)?;
+
+        let n_keep = self.conv_kernel_size - 1;
+        let conv_input_len = *conv_input
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("conv_input missing seq dim"))?;
+        let keep_start = conv_input_len - n_keep;
+        let cs = conv_input.index((.., keep_start.., ..));
+        let cs_shape = cs.shape().to_vec();
+        cache.conv_state = Some(cs.flatten(None, None)?.reshape(&cs_shape)?);
+
+        let conv_out = if S > 1 && S <= 32 {
+            let wt = match &self.conv_weight_t {
+                Some(w) => w.clone(),
+                None => {
+                    let shape = self.conv1d.weight.shape();
+                    let w = if shape.len() == 3 && shape[2] == 1 {
+                        self.conv1d.weight.squeeze_axes(&[-1])?.transpose()?
+                    } else if shape.len() == 3 && shape[1] == 1 {
+                        self.conv1d.weight.squeeze_axes(&[1])?.transpose()?
+                    } else {
+                        return Err(Exception::custom(format!(
+                            "Unexpected conv1d weight shape: {shape:?}"
+                        )));
+                    };
+                    let w = w.as_dtype(inputs.dtype())?;
+                    w.eval()?;
+                    self.conv_weight_t = Some(w.clone());
+                    w
+                }
+            };
+            let ks = self.conv_kernel_size;
+            let mut windows = Vec::with_capacity(S as usize);
+            for i in 0..S {
+                windows.push(
+                    conv_input
+                        .index((.., i..i + ks, ..))
+                        .multiply(&wt)?
+                        .sum_axes(&[1], true)?,
+                );
+            }
+            nn::silu(&ops::concatenate_axis(
+                &windows.iter().collect::<Vec<_>>(),
+                1,
+            )?)?
+        } else {
+            // Mirror the S>1 dtype coercion for the native Conv1d path.
+            let in_dt = inputs.dtype();
+            if self.conv1d.weight.dtype() != in_dt {
+                let coerced = self.conv1d.weight.as_dtype(in_dt)?;
+                coerced.eval()?;
+                self.conv1d.weight = Param::new(coerced);
+            }
+            nn::silu(&self.conv1d.forward(&conv_input)?)?
+        };
+
+        let split_indices = &[self.key_dim, self.key_dim * 2];
+        let conv_parts = conv_out.split_axis(split_indices, Some(-1))?;
+        let conv_q = conv_parts
+            .first()
+            .ok_or_else(|| Exception::custom("conv split failed"))?
+            .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+        let conv_k = conv_parts
+            .get(1)
+            .ok_or_else(|| Exception::custom("conv split failed"))?
+            .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+        let conv_v = conv_parts
+            .get(2)
+            .ok_or_else(|| Exception::custom("conv split failed"))?
+            .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+
+        let in_dt = inputs.dtype();
+        if self.qk_norm_weight_q.dtype() != in_dt {
+            self.qk_norm_weight_q = self.qk_norm_weight_q.as_dtype(in_dt)?;
+            self.qk_norm_weight_k = self.qk_norm_weight_k.as_dtype(in_dt)?;
+        }
+
+        let norm_q = fast::rms_norm(&conv_q, &self.qk_norm_weight_q, 1e-6)?;
+        let norm_k = fast::rms_norm(&conv_k, &self.qk_norm_weight_k, 1e-6)?;
+
+        // Save norm_k for replay
+        let norm_k_for_replay = norm_k.clone();
+
+        // Tape-recording kernel — state IS updated, tape IS recorded
+        let state = match cache.ssm_state.take() {
+            Some(s) => s,
+            None => ops::zeros_dtype(
+                &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
+                inputs.dtype(),
+            )?,
+        };
+        let (y, new_state, delta_tape) = gated_delta_kernel_ffi_with_tape(
+            &norm_q,
+            &norm_k,
+            &conv_v,
+            &self.A_log,
+            &a,
+            &self.dt_bias,
+            &b,
+            &state,
+            B,
+            S,
+            self.num_k_heads,
+            self.head_k_dim,
+            self.num_v_heads,
+            self.head_v_dim,
+        )?;
+        cache.ssm_state = Some(new_state);
+        cache.offset += S;
+
+        let normed = self.norm.forward(&y)?;
+        let gated_out = swiglu(&z, &normed)?;
+        let out_flat = gated_out.reshape(&[B, S, -1])?;
+        let output = self.out_proj.forward(&out_flat)?;
+
+        let tape = GdnLayerTape {
+            delta_tape,
+            norm_k: norm_k_for_replay,
+            a_proj: a_for_replay,
+            qkv_input: qkv_for_replay,
+            conv_state_init,
+            ssm_state_init,
+            offset_init,
+        };
+
+        Ok((output, tape))
     }
 }
 
@@ -4228,6 +5293,596 @@ impl Qwen3NextCausalLM {
             None => self.model.embed_tokens.as_linear(&h_normed)?,
         };
         Ok((h_raw, logits))
+    }
+
+    /// Forward pass returning logits + hidden states at specified tap layers.
+    ///
+    /// Used by `DFlash` speculative decoding: the target model produces logits
+    /// AND collects intermediate hidden states that condition the drafter.
+    /// Each tap hidden is `[B, T, hidden_size]`, captured post-residual/post-MLP.
+    /// Returns `(all_position_logits, vec_of_tap_hidden_states)`.
+    #[allow(non_snake_case)]
+    pub fn forward_with_taps(
+        &mut self,
+        inputs: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        if kv_cache.is_empty() {
+            *kv_cache = self.make_cache();
+        }
+
+        if kv_cache.len() != self.model.layers.len() {
+            return Err(Exception::custom(format!(
+                "cache length ({}) must match num layers ({})",
+                kv_cache.len(),
+                self.model.layers.len()
+            )));
+        }
+
+        let shape = h.shape();
+        let T = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("Hidden state must have >= 2 dims"))?;
+
+        let fa_mask: Option<AttentionMask> = if T > 1 {
+            let kv_offset = kv_cache
+                .iter()
+                .find_map(|lc| match lc.as_ref()? {
+                    LayerCache::KV(kv) => Some(kv.offset()),
+                    LayerCache::Arrays(_) => None,
+                })
+                .unwrap_or(0);
+
+            if kv_offset > 0 {
+                Some(AttentionMask::Array(create_causal_mask(
+                    T,
+                    Some(kv_offset),
+                )?))
+            } else {
+                Some(AttentionMask::Causal)
+            }
+        } else {
+            None
+        };
+
+        let mut taps = Vec::with_capacity(tap_layers.len());
+
+        for (layer_idx, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(kv_cache.iter_mut())
+            .enumerate()
+        {
+            let cache = layer_cache
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Layer cache is None"))?;
+            let mask_ref = if layer.is_linear {
+                None
+            } else {
+                fa_mask.as_ref()
+            };
+
+            let normed = layer.input_layernorm.forward(&h)?;
+
+            let r = if layer.is_linear {
+                let attn = layer
+                    .linear_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing"))?;
+                let LayerCache::Arrays(ssm_cache) = cache else {
+                    return Err(Exception::custom("Expected ArraysCache"));
+                };
+                attn.forward(&normed, mask_ref, ssm_cache)?
+            } else {
+                let attn = layer
+                    .self_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing"))?;
+                let LayerCache::KV(layer_kv) = cache else {
+                    return Err(Exception::custom("Expected KVCache"));
+                };
+                attn.forward(&normed, mask_ref, layer_kv)?
+            };
+
+            let h2 = h.add(r)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            h = h2.add(mlp_out)?;
+
+            if tap_layers.contains(&layer_idx) {
+                taps.push(h.clone());
+            }
+        }
+
+        let normed = self.model.norm.forward(&h)?;
+        let logits = self.project_logits(&normed)?;
+
+        Ok((logits, taps))
+    }
+
+    /// Stateless verify pass: identical to `forward_with_taps` but GDN layers
+    /// use `forward_stateless` — they compute correct outputs without updating
+    /// `ssm_state` or `conv_state`. KV cache layers update normally (needed for
+    /// future decode). Eliminates GdnStateBackup/restore overhead in `DFlash` verify.
+    ///
+    /// After verify, the caller runs `forward_hidden` with only the accepted
+    /// tokens to commit the GDN state for those positions.
+    #[allow(non_snake_case)]
+    pub fn forward_with_taps_stateless(
+        &mut self,
+        inputs: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        if kv_cache.is_empty() {
+            *kv_cache = self.make_cache();
+        }
+
+        if kv_cache.len() != self.model.layers.len() {
+            return Err(Exception::custom(format!(
+                "cache length ({}) must match num layers ({})",
+                kv_cache.len(),
+                self.model.layers.len()
+            )));
+        }
+
+        let shape = h.shape();
+        let T = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("Hidden state must have >= 2 dims"))?;
+
+        let fa_mask: Option<AttentionMask> = if T > 1 {
+            let kv_offset = kv_cache
+                .iter()
+                .find_map(|lc| match lc.as_ref()? {
+                    LayerCache::KV(kv) => Some(kv.offset()),
+                    LayerCache::Arrays(_) => None,
+                })
+                .unwrap_or(0);
+
+            if kv_offset > 0 {
+                Some(AttentionMask::Array(create_causal_mask(
+                    T,
+                    Some(kv_offset),
+                )?))
+            } else {
+                Some(AttentionMask::Causal)
+            }
+        } else {
+            None
+        };
+
+        let mut taps = Vec::with_capacity(tap_layers.len());
+
+        for (layer_idx, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(kv_cache.iter_mut())
+            .enumerate()
+        {
+            let cache = layer_cache
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Layer cache is None"))?;
+            let mask_ref = if layer.is_linear {
+                None
+            } else {
+                fa_mask.as_ref()
+            };
+
+            let normed = layer.input_layernorm.forward(&h)?;
+
+            let r = if layer.is_linear {
+                let attn = layer
+                    .linear_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing"))?;
+                let LayerCache::Arrays(ssm_cache) = cache else {
+                    return Err(Exception::custom("Expected ArraysCache"));
+                };
+                // STATELESS: GDN state not updated
+                attn.forward_stateless(&normed, mask_ref, ssm_cache)?
+            } else {
+                let attn = layer
+                    .self_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing"))?;
+                let LayerCache::KV(layer_kv) = cache else {
+                    return Err(Exception::custom("Expected KVCache"));
+                };
+                // KV cache updates normally — needed for future decode
+                attn.forward(&normed, mask_ref, layer_kv)?
+            };
+
+            let h2 = h.add(r)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            h = h2.add(mlp_out)?;
+
+            if tap_layers.contains(&layer_idx) {
+                taps.push(h.clone());
+            }
+        }
+
+        let normed = self.model.norm.forward(&h)?;
+        let logits = self.project_logits(&normed)?;
+
+        Ok((logits, taps))
+    }
+
+    /// Tape-recording verify pass: runs normal forward (state IS updated) and
+    /// records innovation tape per GDN layer. Returns `(logits, taps, tape_data)`.
+    ///
+    /// On full acceptance (89% of rounds): zero extra work — state already correct.
+    /// On partial rejection: restore conv+ssm snapshots, replay `tape[:n_accepted]`.
+    // Numerical kernel dispatch: long fn but single straight-line decode loop, casts are timing arithmetic over small counters.
+    #[allow(
+        non_snake_case,
+        clippy::too_many_lines,
+        clippy::type_complexity,
+        clippy::cast_precision_loss,
+        clippy::as_conversions,
+        clippy::map_unwrap_or
+    )]
+    pub fn forward_with_taps_tape(
+        &mut self,
+        inputs: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>, Vec<Option<GdnLayerTape>>), Exception> {
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        if kv_cache.is_empty() {
+            *kv_cache = self.make_cache();
+        }
+
+        if kv_cache.len() != self.model.layers.len() {
+            return Err(Exception::custom(format!(
+                "cache length ({}) must match num layers ({})",
+                kv_cache.len(),
+                self.model.layers.len()
+            )));
+        }
+
+        let shape = h.shape();
+        let T = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("Hidden state must have >= 2 dims"))?;
+
+        let fa_mask: Option<AttentionMask> = if T > 1 {
+            let kv_offset = kv_cache
+                .iter()
+                .find_map(|lc| match lc.as_ref()? {
+                    LayerCache::KV(kv) => Some(kv.offset()),
+                    LayerCache::Arrays(_) => None,
+                })
+                .unwrap_or(0);
+
+            if kv_offset > 0 {
+                Some(AttentionMask::Array(create_causal_mask(
+                    T,
+                    Some(kv_offset),
+                )?))
+            } else {
+                Some(AttentionMask::Causal)
+            }
+        } else {
+            None
+        };
+
+        let mut taps = Vec::with_capacity(tap_layers.len());
+        let mut layer_tapes: Vec<Option<GdnLayerTape>> =
+            Vec::with_capacity(self.model.layers.len());
+
+        // Optional per-layer GDN/FA timing. Gated by env to avoid the eval()
+        // stalls (which serialize the GPU pipeline) in normal runs. Numbers
+        // produced under timing are upper bounds: they include synchronization
+        // cost that real execution overlaps. Useful for the GDN-vs-FA ratio.
+        let layer_timing = std::env::var("HIGGS_DFLASH_LAYER_TIMING")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let mut gdn_total_ms = 0.0_f64;
+        let mut fa_total_ms = 0.0_f64;
+        let mut gdn_count = 0usize;
+        let mut fa_count = 0usize;
+        let mut layer_ckpt = if layer_timing {
+            mlx_rs::transforms::eval([&h])?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        for (layer_idx, (layer, layer_cache)) in self
+            .model
+            .layers
+            .iter_mut()
+            .zip(kv_cache.iter_mut())
+            .enumerate()
+        {
+            let cache = layer_cache
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Layer cache is None"))?;
+            let is_linear = layer.is_linear;
+            let mask_ref = if is_linear { None } else { fa_mask.as_ref() };
+
+            let normed = layer.input_layernorm.forward(&h)?;
+
+            let (r, tape) = if is_linear {
+                let attn = layer
+                    .linear_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing"))?;
+                let LayerCache::Arrays(ssm_cache) = cache else {
+                    return Err(Exception::custom("Expected ArraysCache"));
+                };
+                let (out, tape) = attn.forward_with_tape(&normed, mask_ref, ssm_cache)?;
+                (out, Some(tape))
+            } else {
+                let attn = layer
+                    .self_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing"))?;
+                let LayerCache::KV(layer_kv) = cache else {
+                    return Err(Exception::custom("Expected KVCache"));
+                };
+                (attn.forward(&normed, mask_ref, layer_kv)?, None)
+            };
+
+            layer_tapes.push(tape);
+
+            let h2 = h.add(r)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            h = h2.add(mlp_out)?;
+
+            if tap_layers.contains(&layer_idx) {
+                taps.push(h.clone());
+            }
+
+            if let Some(ckpt) = layer_ckpt.as_mut() {
+                mlx_rs::transforms::eval([&h])?;
+                let now = std::time::Instant::now();
+                let dt_ms = now.duration_since(*ckpt).as_secs_f64() * 1000.0;
+                if is_linear {
+                    gdn_total_ms += dt_ms;
+                    gdn_count += 1;
+                } else {
+                    fa_total_ms += dt_ms;
+                    fa_count += 1;
+                }
+                *ckpt = now;
+            }
+        }
+
+        let normed = self.model.norm.forward(&h)?;
+        let logits = self.project_logits(&normed)?;
+
+        if layer_timing {
+            mlx_rs::transforms::eval([&logits])?;
+            let tail_ms = layer_ckpt
+                .map(|c| c.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            tracing::info!(
+                "dflash_layer_timing seq={} gdn_layers={} gdn_total_ms={:.1} gdn_avg={:.2}ms \
+                 fa_layers={} fa_total_ms={:.1} fa_avg={:.2}ms tail_ms={:.1}",
+                T,
+                gdn_count,
+                gdn_total_ms,
+                gdn_total_ms / gdn_count.max(1) as f64,
+                fa_count,
+                fa_total_ms,
+                fa_total_ms / fa_count.max(1) as f64,
+                tail_ms,
+            );
+        }
+
+        Ok((logits, taps, layer_tapes))
+    }
+
+    /// Replay accepted steps from recorded tape data on partial rejection.
+    /// Restores GDN state from `snapshots`, replays `tape[:n_accepted]`,
+    /// and rolls back KV cache for rejected positions.
+    ///
+    /// All GDN layers are batched into a single Metal kernel dispatch
+    /// (concat along batch dim, one kernel call, split back) to avoid
+    /// per-layer dispatch overhead (~0.4ms × 24 layers = 10ms → <1ms).
+    // Numerical kernel: layer indices and counts known finite; explicit casts preferred over try_from.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::indexing_slicing,
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
+    pub fn replay_tape_rollback(
+        &self,
+        layer_tapes: &[Option<GdnLayerTape>],
+        kv_cache: &mut [Option<LayerCache>],
+        n_accepted: i32,
+        kv_rollback: i32,
+    ) -> Result<(), Exception> {
+        use mlx_rs::ops;
+
+        // Collect GDN layer data for batched replay
+        struct GdnReplayEntry<'a> {
+            cache_idx: usize,
+            tape: &'a GdnLayerTape,
+            layer: &'a GatedDeltaNet,
+            snap_state: Array,
+        }
+
+        let mut gdn_entries: Vec<GdnReplayEntry> = Vec::new();
+
+        // First pass: restore state from tape's initial snapshot, rollback KV, collect GDN entries
+        for (i, lc) in kv_cache.iter_mut().enumerate() {
+            match lc {
+                Some(LayerCache::Arrays(ac)) => {
+                    if let Some(Some(tape)) = layer_tapes.get(i) {
+                        // Restore from tape-captured initial state (Python _GDNStateCapture equivalent)
+                        ac.conv_state.clone_from(&tape.conv_state_init);
+                        ac.ssm_state.clone_from(&tape.ssm_state_init);
+                        ac.offset = tape.offset_init;
+
+                        let gdn_layer = self.model.layers[i]
+                            .linear_attn
+                            .as_ref()
+                            .ok_or_else(|| Exception::custom("linear_attn missing for replay"))?;
+
+                        let state = if let Some(s) = tape.ssm_state_init.clone() {
+                            s
+                        } else {
+                            let dt = tape.delta_tape.dtype();
+                            ops::zeros_dtype(
+                                &[
+                                    1,
+                                    gdn_layer.num_v_heads,
+                                    gdn_layer.head_v_dim,
+                                    gdn_layer.head_k_dim,
+                                ],
+                                dt,
+                            )?
+                        };
+
+                        gdn_entries.push(GdnReplayEntry {
+                            cache_idx: i,
+                            tape,
+                            layer: gdn_layer,
+                            snap_state: state,
+                        });
+                    }
+                }
+                Some(LayerCache::KV(kv)) if kv_rollback > 0 => {
+                    kv.trim_by(kv_rollback.unsigned_abs().try_into().unwrap_or(usize::MAX));
+                }
+                Some(LayerCache::KV(_)) | None => {}
+            }
+        }
+
+        if gdn_entries.is_empty() {
+            return Ok(());
+        }
+
+        // Batch all GDN layers: concat tape/k/a/state/A_log/dt_bias along batch dim
+        let tape_slices: Vec<Array> = gdn_entries
+            .iter()
+            .map(|e| e.tape.delta_tape.index((.., ..n_accepted, ..)))
+            .collect();
+        let k_slices: Vec<Array> = gdn_entries
+            .iter()
+            .map(|e| e.tape.norm_k.index((.., ..n_accepted, ..)))
+            .collect();
+        let a_slices: Vec<Array> = gdn_entries
+            .iter()
+            .map(|e| e.tape.a_proj.index((.., ..n_accepted, ..)))
+            .collect();
+        let states: Vec<&Array> = gdn_entries.iter().map(|e| &e.snap_state).collect();
+        let a_logs: Vec<&Array> = gdn_entries.iter().map(|e| e.layer.A_log.as_ref()).collect();
+        let dt_biases: Vec<&Array> = gdn_entries
+            .iter()
+            .map(|e| e.layer.dt_bias.as_ref())
+            .collect();
+
+        let tape_refs: Vec<&Array> = tape_slices.iter().collect();
+        let k_refs: Vec<&Array> = k_slices.iter().collect();
+        let a_refs: Vec<&Array> = a_slices.iter().collect();
+
+        let batched_tape = ops::concatenate_axis(&tape_refs, 0)?;
+        let batched_k = ops::concatenate_axis(&k_refs, 0)?;
+        let batched_a = ops::concatenate_axis(&a_refs, 0)?;
+        let batched_state = ops::concatenate_axis(&states, 0)?;
+        // Flatten A_log [Hv] per layer → [num_layers * Hv]
+        let batched_a_log = ops::concatenate_axis(&a_logs, 0)?;
+        let batched_dt_bias = ops::concatenate_axis(&dt_biases, 0)?;
+
+        let num_layers = gdn_entries.len() as i32;
+        let e0 = &gdn_entries[0];
+
+        // Single kernel dispatch for all GDN layers
+        let batched_new_state = tape_replay_kernel_ffi(
+            &batched_tape,
+            &batched_k,
+            &batched_a,
+            &batched_a_log,
+            &batched_dt_bias,
+            &batched_state,
+            num_layers,
+            n_accepted,
+            e0.layer.num_k_heads,
+            e0.layer.head_k_dim,
+            e0.layer.num_v_heads,
+            e0.layer.head_v_dim,
+        )?;
+
+        // Split results back to individual layers and rebuild conv_state
+        for (offset, entry) in gdn_entries.iter().enumerate() {
+            let Some(LayerCache::Arrays(ac)) = &mut kv_cache[entry.cache_idx] else {
+                continue;
+            };
+
+            // Extract this layer's state from the batched result
+            let start = offset as i32;
+            let new_state = batched_new_state.index((start..start + 1, .., .., ..));
+            ac.ssm_state = Some(new_state);
+            ac.offset += n_accepted;
+
+            // Rebuild conv_state from recorded qkv input
+            let ks = entry.layer.conv_kernel_size;
+            let n_keep = ks - 1;
+            if n_keep > 0 {
+                let qkv_slice = entry.tape.qkv_input.index((.., ..n_accepted, ..));
+                let prefix = match &ac.conv_state {
+                    Some(cs) => cs.clone(),
+                    None => ops::zeros_dtype(
+                        &[1, n_keep, entry.layer.conv_dim],
+                        entry.tape.qkv_input.dtype(),
+                    )?,
+                };
+                let full = ops::concatenate_axis(&[&prefix, &qkv_slice], 1)?;
+                let total_len = *full
+                    .shape()
+                    .get(1)
+                    .ok_or_else(|| Exception::custom("conv rebuild: missing seq dim"))?;
+                let cs_start = total_len - n_keep;
+                let cs = full.index((.., cs_start.., ..));
+                let cs_shape = cs.shape().to_vec();
+                ac.conv_state = Some(cs.flatten(None, None)?.reshape(&cs_shape)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Embed raw token IDs through the target model's embedding layer.
+    ///
+    /// Used by `DFlash` to convert `[anchor, mask, mask, ...]` block into
+    /// the embedding space expected by the drafter.
+    pub fn embed_token_ids(&self, token_ids: &Array) -> Result<Array, Exception> {
+        self.model.embed_tokens.forward(token_ids)
+    }
+
+    /// Apply only the `lm_head` to pre-computed hidden states.
+    ///
+    /// Used by `DFlash`: the drafter produces hidden states in the target model's
+    /// hidden space, and we project them through the target's `lm_head` to get logits.
+    /// Input: `[B, T, hidden_size]`. Returns: `[B, T, vocab_size]`.
+    pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
+        self.project_logits(hidden)
+    }
+
+    fn project_logits(&self, hidden: &Array) -> Result<Array, Exception> {
+        self.lm_head.as_ref().map_or_else(
+            || self.model.embed_tokens.as_linear(hidden),
+            |head| head.forward(hidden),
+        )
     }
 }
 
