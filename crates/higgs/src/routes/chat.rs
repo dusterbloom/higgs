@@ -1361,7 +1361,7 @@ fn build_sampling_params(
         frequency_penalty: req.frequency_penalty.or(defaults.frequency_penalty),
         presence_penalty: req.presence_penalty.or(defaults.presence_penalty),
         speculation,
-        thinking_budget: req.reasoning_budget,
+        thinking_budget: req.reasoning_budget.or(defaults.thinking_budget),
     })
 }
 
@@ -1668,6 +1668,7 @@ mod tests {
             presence_penalty: Some(0.3),
             speculation: Some("none".to_owned()),
             enable_thinking: Some(false),
+            thinking_budget: Some(2048),
         };
 
         assert_eq!(resolved_max_tokens(&req, &defaults, 1024), 4096);
@@ -1680,6 +1681,7 @@ mod tests {
         assert_eq!(sampling.frequency_penalty, Some(0.2));
         assert_eq!(sampling.presence_penalty, Some(0.3));
         assert_eq!(sampling.speculation, higgs_models::Speculation::None);
+        assert_eq!(sampling.thinking_budget, Some(2048));
     }
 
     #[test]
@@ -1690,7 +1692,8 @@ mod tests {
             "top_p": 1.0,
             "top_k": 5,
             "repeat_penalty": 1.2,
-            "speculation": "auto"
+            "speculation": "auto",
+            "reasoning_budget": 512
         }));
         let defaults = GenerationDefaults {
             max_tokens: Some(4096),
@@ -1699,6 +1702,7 @@ mod tests {
             top_k: Some(20),
             repetition_penalty: Some(1.1),
             speculation: Some("none".to_owned()),
+            thinking_budget: Some(2048),
             ..GenerationDefaults::default()
         };
 
@@ -1709,6 +1713,7 @@ mod tests {
         assert_eq!(sampling.top_k, Some(5));
         assert_eq!(sampling.repetition_penalty, Some(1.2));
         assert_eq!(sampling.speculation, higgs_models::Speculation::Auto);
+        assert_eq!(sampling.thinking_budget, Some(512));
     }
 
     #[test]

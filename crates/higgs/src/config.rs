@@ -560,6 +560,10 @@ pub struct GenerationDefaults {
     pub speculation: Option<String>,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    /// Default thinking-token budget for this model. Request-level
+    /// `reasoning_budget` takes precedence when present.
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
 }
 
 const fn default_norm_correction() -> bool {
