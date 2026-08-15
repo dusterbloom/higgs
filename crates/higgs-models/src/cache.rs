@@ -19,6 +19,23 @@ pub enum KvCacheView {
 static TURBOQUANT_ACTIVATE_AT: OnceLock<i32> = OnceLock::new();
 static TURBOQUANT_INACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
 const DEFAULT_TURBOQUANT_ACTIVATE_AT: i32 = 2048;
+static MLA_LATENT_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
+const DEFAULT_MLA_LATENT_CACHE_ENABLED: bool = false;
+
+fn parse_mla_latent_cache_enabled(raw: Option<&str>) -> bool {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "on" | "yes") => true,
+        Some("0" | "false" | "off" | "no") => false,
+        _ => DEFAULT_MLA_LATENT_CACHE_ENABLED,
+    }
+}
+
+/// Whether `DeepSeek` MLA caches should store compressed latent rows.
+pub fn mla_latent_cache_enabled() -> bool {
+    *MLA_LATENT_CACHE_ENABLED.get_or_init(|| {
+        parse_mla_latent_cache_enabled(std::env::var("HIGGS_MLA_LATENT_CACHE").ok().as_deref())
+    })
+}
 
 fn parse_turboquant_activate_at(raw: Option<&str>) -> i32 {
     raw.and_then(|s| s.parse::<i32>().ok())
@@ -217,6 +234,10 @@ impl TurboQuantKvView {
 
 /// Trait for key-value caches used in autoregressive generation.
 pub trait KeyValueCache {
+    /// Whether this cache stores MLA compressed rows.
+    fn is_mla(&self) -> bool {
+        false
+    }
     /// Whether the cache stores quantized KV pairs.
     fn is_quantized(&self) -> bool {
         false
@@ -249,12 +270,23 @@ pub trait KeyValueCache {
     ) -> Result<(Array, Array), Exception> {
         self.update_and_view(keys, values)?.into_dense()
     }
+
+    /// Append MLA latent rows and return the full latent cache plus prior offset.
+    fn update_latent_and_fetch(&mut self, _rows: Array) -> Result<(Array, i32), Exception> {
+        Err(Exception::custom(
+            "cache does not support MLA latent storage",
+        ))
+    }
 }
 
 impl<T> KeyValueCache for &'_ mut T
 where
     T: KeyValueCache,
 {
+    fn is_mla(&self) -> bool {
+        T::is_mla(self)
+    }
+
     fn is_quantized(&self) -> bool {
         T::is_quantized(self)
     }
@@ -285,6 +317,10 @@ where
         values: Array,
     ) -> Result<(Array, Array), Exception> {
         T::update_and_fetch(self, keys, values)
+    }
+
+    fn update_latent_and_fetch(&mut self, rows: Array) -> Result<(Array, i32), Exception> {
+        T::update_latent_and_fetch(self, rows)
     }
 }
 
@@ -357,9 +393,17 @@ pub struct SteppingKeyValueCache {
     keys: Option<Array>,
     values: Option<Array>,
     turbo: Option<TurboQuantStorage>,
+    mla: Option<MlaStorage>,
     config: KvCacheConfig,
     offset: i32,
     step: i32,
+}
+
+#[derive(Debug, Clone)]
+struct MlaStorage {
+    latent: Option<Array>, // [1, 1, capacity, kv_lora_rank + rope_dim]
+    kv_lora_rank: i32,
+    rope_dim: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +423,7 @@ impl Default for SteppingKeyValueCache {
             keys: None,
             values: None,
             turbo: None,
+            mla: None,
             config: KvCacheConfig::default(),
             offset: 0,
             step: 256,
@@ -409,7 +454,37 @@ impl SteppingKeyValueCache {
             keys: None,
             values: None,
             turbo: Some(TurboQuantStorage::new(context)),
+            mla: None,
             config: turbo_config,
+            offset: 0,
+            step: 256,
+        })
+    }
+
+    /// Construct an MLA cache that stores compressed latent plus shared `RoPE` K.
+    pub fn new_mla(
+        kv_lora_rank: i32,
+        rope_dim: i32,
+        config: KvCacheConfig,
+    ) -> Result<Self, Exception> {
+        if config.is_turboquant() {
+            return Err(Exception::custom(
+                "MLA latent cache cannot be combined with TurboQuant",
+            ));
+        }
+        if kv_lora_rank <= 0 || rope_dim <= 0 {
+            return Err(Exception::custom("MLA latent dimensions must be positive"));
+        }
+        Ok(Self {
+            keys: None,
+            values: None,
+            turbo: None,
+            mla: Some(MlaStorage {
+                latent: None,
+                kv_lora_rank,
+                rope_dim,
+            }),
+            config,
             offset: 0,
             step: 256,
         })
@@ -442,6 +517,11 @@ impl SteppingKeyValueCache {
             keys: self.keys.as_ref().map(eval_deep_clone),
             values: self.values.as_ref().map(eval_deep_clone),
             turbo: self.turbo.as_ref().map(TurboQuantStorage::deep_clone),
+            mla: self.mla.as_ref().map(|m| MlaStorage {
+                latent: m.latent.as_ref().map(eval_deep_clone),
+                kv_lora_rank: m.kv_lora_rank,
+                rope_dim: m.rope_dim,
+            }),
             config: self.config,
             offset: self.offset,
             step: self.step,
@@ -460,6 +540,9 @@ impl SteppingKeyValueCache {
         if let Some(ref turbo) = self.turbo {
             targets.extend(turbo.eval_targets());
         }
+        if let Some(Some(latent)) = self.mla.as_ref().map(|m| m.latent.as_ref()) {
+            targets.push(latent);
+        }
         targets
     }
 
@@ -471,6 +554,27 @@ impl SteppingKeyValueCache {
     /// Read-only access to internal value array (includes allocated-but-unused slots).
     pub const fn values(&self) -> Option<&Array> {
         self.values.as_ref()
+    }
+
+    /// Read-only access to the MLA latent buffer (including unused capacity).
+    pub const fn latent_array(&self) -> Option<&Array> {
+        match &self.mla {
+            Some(storage) => storage.latent.as_ref(),
+            None => None,
+        }
+    }
+
+    /// Whether this cache stores MLA compressed latents instead of dense K/V.
+    pub const fn is_mla(&self) -> bool {
+        self.mla.is_some()
+    }
+
+    /// MLA latent and shared-RoPE widths, when this is an MLA cache.
+    pub const fn mla_dimensions(&self) -> Option<(i32, i32)> {
+        match &self.mla {
+            Some(storage) => Some((storage.kv_lora_rank, storage.rope_dim)),
+            None => None,
+        }
     }
 
     /// Simultaneous mutable access to the key and value arrays.
@@ -491,6 +595,41 @@ impl SteppingKeyValueCache {
             keys: Some(keys),
             values: Some(values),
             turbo: None,
+            mla: None,
+            config: KvCacheConfig::default(),
+            offset,
+            step: 256,
+        })
+    }
+
+    /// Restore a pre-filled MLA latent cache from `[1, 1, T, r + rope]` rows.
+    pub fn from_latent_array(
+        latent: Array,
+        kv_lora_rank: i32,
+        rope_dim: i32,
+    ) -> Result<Self, Exception> {
+        let [b, h, offset, width] = <[i32; 4]>::try_from(latent.shape()).map_err(|_| {
+            Exception::custom("from_latent_array: latent must be [1, 1, T, r + rope]")
+        })?;
+        if b != 1
+            || h != 1
+            || width != kv_lora_rank + rope_dim
+            || kv_lora_rank <= 0
+            || rope_dim <= 0
+        {
+            return Err(Exception::custom(
+                "from_latent_array: invalid MLA latent shape or dimensions",
+            ));
+        }
+        Ok(Self {
+            keys: None,
+            values: None,
+            turbo: None,
+            mla: Some(MlaStorage {
+                latent: Some(latent),
+                kv_lora_rank,
+                rope_dim,
+            }),
             config: KvCacheConfig::default(),
             offset,
             step: 256,
@@ -555,6 +694,7 @@ impl SteppingKeyValueCache {
                 value_norms: Some(value_norms),
                 capacity,
             }),
+            mla: None,
             config,
             offset,
             step: 256,
@@ -725,6 +865,49 @@ impl SteppingKeyValueCache {
             KvCacheView::TurboQuant(turbo_view) => turbo_view.seq_len,
         };
         Ok(new_view)
+    }
+
+    fn update_latent(&mut self, rows: &Array) -> Result<(Array, i32), Exception> {
+        let storage = self
+            .mla
+            .as_mut()
+            .ok_or_else(|| Exception::custom("cache does not support MLA latent storage"))?;
+        let [b, h, new_tokens, width] = <[i32; 4]>::try_from(rows.shape())
+            .map_err(|_| Exception::custom("MLA rows must be [1, 1, T, r + rope]"))?;
+        if b != 1 || h != 1 || width != storage.kv_lora_rank + storage.rope_dim {
+            return Err(Exception::custom(
+                "MLA rows shape does not match cache dimensions",
+            ));
+        }
+        let prev = self.offset;
+        let capacity = storage
+            .latent
+            .as_ref()
+            .and_then(|a| a.shape().get(2).copied())
+            .unwrap_or(0);
+        if prev + new_tokens > capacity {
+            let slots = ((new_tokens + self.step - 1) / self.step) * self.step;
+            let grown = ops::zeros_dtype(&[1, 1, slots, width], rows.dtype())?;
+            storage.latent = Some(match storage.latent.take() {
+                Some(old) => concatenate_axis(&[slice_axis2(&old, 0, prev)?, grown], 2)?,
+                None => grown,
+            });
+        }
+        let latent = storage
+            .latent
+            .as_ref()
+            .ok_or_else(|| Exception::custom("MLA latent missing after grow"))?;
+        storage.latent = Some(slice_update_axis2(latent, rows, prev, new_tokens)?);
+        self.offset = prev + new_tokens;
+        let full = slice_axis2(
+            storage
+                .latent
+                .as_ref()
+                .ok_or_else(|| Exception::custom("MLA latent missing after update"))?,
+            0,
+            self.offset,
+        )?;
+        Ok((full, self.offset))
     }
 }
 
@@ -975,6 +1158,9 @@ impl TurboQuantStorage {
 }
 
 impl KeyValueCache for SteppingKeyValueCache {
+    fn is_mla(&self) -> bool {
+        self.is_mla()
+    }
     fn is_quantized(&self) -> bool {
         self.config.is_turboquant()
     }
@@ -995,6 +1181,10 @@ impl KeyValueCache for SteppingKeyValueCache {
 
     fn update_and_view(&mut self, keys: Array, values: Array) -> Result<KvCacheView, Exception> {
         self.update_and_view_with_activation_threshold(&keys, &values, turboquant_activate_at())
+    }
+
+    fn update_latent_and_fetch(&mut self, rows: Array) -> Result<(Array, i32), Exception> {
+        self.update_latent(&rows)
     }
 }
 
@@ -1616,6 +1806,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_mla_latent_cache_enabled_accepts_common_flag_values() {
+        assert!(parse_mla_latent_cache_enabled(Some("1")));
+        assert!(!parse_mla_latent_cache_enabled(Some("0")));
+        assert!(parse_mla_latent_cache_enabled(Some("on")));
+        assert!(parse_mla_latent_cache_enabled(Some("TRUE")));
+        assert!(!parse_mla_latent_cache_enabled(Some("no")));
+        assert!(!parse_mla_latent_cache_enabled(Some("garbage")));
+    }
+
+    #[test]
     fn should_activate_turboquant_respects_threshold() {
         assert!(should_activate_turboquant(10, 1, 0));
         assert!(!should_activate_turboquant(3, 1, 8));
@@ -1678,5 +1878,37 @@ mod tests {
         assert_eq!(propagated.bits, 4, "bits must be carried from context");
         assert_eq!(propagated.seed, 99, "seed must be carried from context");
         assert!(matches!(propagated.mode, KvCacheMode::Turboquant));
+    }
+
+    #[test]
+    fn mla_storage_appends_trims_and_clones_independently() {
+        let mut cache = SteppingKeyValueCache::new_mla(4, 2, KvCacheConfig::default()).unwrap();
+        let first = Array::ones::<f32>(&[1, 1, 3, 6]).unwrap();
+        let (stored, offset) = cache.update_latent_and_fetch(first).unwrap();
+        assert_eq!(stored.shape(), &[1, 1, 3, 6]);
+        assert_eq!(offset, 3);
+        assert!(cache.is_mla());
+        assert_eq!(cache.eval_targets().len(), 1);
+
+        cache.trim_by(1);
+        let replacement = Array::zeros::<f32>(&[1, 1, 1, 6]).unwrap();
+        let (rewritten, rewritten_offset) = cache.update_latent_and_fetch(replacement).unwrap();
+        assert_eq!(rewritten.shape(), &[1, 1, 3, 6]);
+        assert_eq!(rewritten_offset, 3);
+
+        let checkpoint = cache.deep_clone();
+        let update = Array::full::<f32>(&[1, 1, 1, 6], &Array::from_f32(2.0)).unwrap();
+        cache.update_latent_and_fetch(update).unwrap();
+        assert_eq!(checkpoint.offset(), 3);
+        assert_eq!(checkpoint.latent_array().unwrap().shape(), &[1, 1, 256, 6]);
+    }
+
+    #[test]
+    fn mla_from_latent_array_round_trips() {
+        let latent = Array::ones::<f32>(&[1, 1, 5, 6]).unwrap();
+        let cache = SteppingKeyValueCache::from_latent_array(latent, 4, 2).unwrap();
+        assert!(cache.is_mla());
+        assert_eq!(cache.offset(), 5);
+        assert_eq!(cache.latent_array().unwrap().shape(), &[1, 1, 5, 6]);
     }
 }

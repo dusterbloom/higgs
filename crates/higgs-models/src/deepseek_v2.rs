@@ -21,11 +21,12 @@ use mlx_rs::{
 use serde::Deserialize;
 
 use crate::{
-    cache::{KeyValueCache, SteppingKeyValueCache},
+    cache::{KeyValueCache, SteppingKeyValueCache, mla_latent_cache_enabled},
     error::ModelError,
     qwen3_next::{
         QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections, swiglu,
     },
+    turboquant::KvCacheConfig,
     utils::{AttentionMask, create_attention_mask},
 };
 
@@ -268,12 +269,14 @@ struct DeepSeekV2Attention {
     kv_lora_rank: i32,
     qk_nope_head_dim: i32,
     qk_rope_head_dim: i32,
-    _v_head_dim: i32,
+    v_head_dim: i32,
     scale: f32,
     rope_base: f32,
     yarn_freqs: Option<Array>,
     yarn_mscale: f32,
     use_compressed_query: bool,
+    absorbed_k: Option<Array>,
+    absorbed_v: Option<Array>,
 }
 
 impl DeepSeekV2Attention {
@@ -375,16 +378,70 @@ impl DeepSeekV2Attention {
             kv_lora_rank: args.kv_lora_rank,
             qk_nope_head_dim: args.qk_nope_head_dim,
             qk_rope_head_dim: args.qk_rope_head_dim,
-            _v_head_dim: args.v_head_dim,
+            v_head_dim: args.v_head_dim,
             scale,
             rope_base: args.rope_theta,
             yarn_freqs,
             yarn_mscale,
             use_compressed_query,
+            absorbed_k: None,
+            absorbed_v: None,
         })
     }
 
-    #[allow(non_snake_case)]
+    fn absorbed_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<(&Array, &Array), Exception> {
+        if self.absorbed_k.is_none() || self.absorbed_v.is_none() {
+            let weight = ops::dequantize(
+                &self.kv_b_proj.weight,
+                &self.kv_b_proj.scales,
+                &*self.kv_b_proj.biases,
+                self.kv_b_proj.group_size,
+                self.kv_b_proj.bits,
+            )?;
+            // `kv_b_proj` output rows are contiguous within each head:
+            // [head0 K, head0 V, head1 K, head1 V, ...]. Split after reshaping
+            // so K/V rows remain associated with their original head.
+            let per_head_weight = weight.reshape(&[
+                self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+                self.kv_lora_rank,
+            ])?;
+            let k = per_head_weight
+                .index((.., ..self.qk_nope_head_dim, ..))
+                .reshape(&[1, self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank])?;
+            let v = per_head_weight
+                .index((.., self.qk_nope_head_dim.., ..))
+                .reshape(&[1, self.num_heads, self.v_head_dim, self.kv_lora_rank])?
+                .transpose_axes(&[0, 1, 3, 2])?;
+            self.absorbed_k = Some(k);
+            self.absorbed_v = Some(v);
+        }
+        let cached_k = self
+            .absorbed_k
+            .as_ref()
+            .ok_or_else(|| Exception::custom("absorbed K missing"))?;
+        let cached_v = self
+            .absorbed_v
+            .as_ref()
+            .ok_or_else(|| Exception::custom("absorbed V missing"))?;
+        // Keep this cast here: MLX scalar/rope operations can promote fp16 inputs
+        // to fp32, which otherwise changes both cache residency and QLinear input dtype.
+        if cached_k.dtype() != dtype || cached_v.dtype() != dtype {
+            self.absorbed_k = Some(cached_k.as_dtype(dtype)?);
+            self.absorbed_v = Some(cached_v.as_dtype(dtype)?);
+        }
+        let k = self
+            .absorbed_k
+            .as_ref()
+            .ok_or_else(|| Exception::custom("absorbed K missing after cast"))?;
+        let v = self
+            .absorbed_v
+            .as_ref()
+            .ok_or_else(|| Exception::custom("absorbed V missing after cast"))?;
+        Ok((k, v))
+    }
+
+    #[allow(non_snake_case, clippy::too_many_lines)]
     fn forward<C: KeyValueCache>(
         &mut self,
         x: &Array,
@@ -441,14 +498,8 @@ impl DeepSeekV2Attention {
             .reshape(&[B, L, 1, self.qk_rope_head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // Decompress KV
-        let kv = self
-            .kv_b_proj
-            .forward(&self.kv_a_layernorm.forward(&kv_latent)?)?
-            .reshape(&[B, L, self.num_heads, -1])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let k_nope = kv.index((.., .., .., ..self.qk_nope_head_dim));
-        let v_decompressed = kv.index((.., .., .., self.qk_nope_head_dim..));
+        let use_absorbed = cache.as_ref().is_some_and(|c| KeyValueCache::is_mla(*c));
+        let latent = self.kv_a_layernorm.forward(&kv_latent)?;
 
         // Apply RoPE
         let offset = cache.as_ref().map_or(0, |c| KeyValueCache::offset(*c));
@@ -469,6 +520,42 @@ impl DeepSeekV2Attention {
             self.yarn_mscale,
             offset,
         )?;
+
+        if use_absorbed {
+            let kv_lora_rank = self.kv_lora_rank;
+            let scale = self.scale;
+            let (absorbed_k, absorbed_v) = self.absorbed_weights(q_nope.dtype())?;
+            let q_latent = q_nope.matmul(absorbed_k)?;
+            let queries = ops::concatenate_axis(&[&q_latent, &q_pe], -1)?;
+            let rows =
+                ops::concatenate_axis(&[&latent.reshape(&[B, 1, L, kv_lora_rank])?, &k_pe], -1)?;
+            let (history, _) = cache
+                .ok_or_else(|| Exception::custom("MLA latent path requires a cache"))?
+                .update_latent_and_fetch(rows)?;
+            let values = history.index((.., .., .., ..kv_lora_rank));
+            let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
+            let output = fast::scaled_dot_product_attention(
+                queries,
+                history,
+                values,
+                scale,
+                sdpa_mask,
+                None::<&Array>,
+            )?
+            .matmul(absorbed_v)?
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[B, L, -1])?;
+            return self.o_proj.forward(&output);
+        }
+
+        // Decompress KV (the legacy dense cache path).
+        let kv = self
+            .kv_b_proj
+            .forward(&latent)?
+            .reshape(&[B, L, self.num_heads, -1])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k_nope = kv.index((.., .., .., ..self.qk_nope_head_dim));
+        let v_decompressed = kv.index((.., .., .., self.qk_nope_head_dim..));
 
         // Repeat k_pe for all heads: [B, 1, L, D] -> [B, num_heads, L, D]
         let k_pe_expanded =
@@ -807,6 +894,23 @@ impl DeepSeekV2CausalLM {
         })
     }
 
+    pub fn make_cache(&self) -> Result<Vec<Option<SteppingKeyValueCache>>, Exception> {
+        (0..self.args.num_hidden_layers)
+            .map(|_| {
+                if mla_latent_cache_enabled() {
+                    SteppingKeyValueCache::new_mla(
+                        self.args.kv_lora_rank,
+                        self.args.qk_rope_head_dim,
+                        KvCacheConfig::default(),
+                    )
+                } else {
+                    Ok(SteppingKeyValueCache::new())
+                }
+                .map(Some)
+            })
+            .collect()
+    }
+
     #[allow(non_snake_case)]
     pub fn forward_hidden(
         &mut self,
@@ -823,8 +927,19 @@ impl DeepSeekV2CausalLM {
 
         if kv_cache.is_empty() {
             *kv_cache = (0..self.model.layers.len())
-                .map(|_| Some(SteppingKeyValueCache::new()))
-                .collect();
+                .map(|_| {
+                    if mla_latent_cache_enabled() {
+                        SteppingKeyValueCache::new_mla(
+                            self.args.kv_lora_rank,
+                            self.args.qk_rope_head_dim,
+                            KvCacheConfig::default(),
+                        )
+                    } else {
+                        Ok(SteppingKeyValueCache::new())
+                    }
+                    .map(Some)
+                })
+                .collect::<Result<_, _>>()?;
         } else if kv_cache.len() != self.model.layers.len() {
             return Err(Exception::custom(format!(
                 "kv_cache length ({}) must match num layers ({})",
@@ -916,6 +1031,46 @@ pub fn load_deepseek_v2_model<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::module::Param;
+
+    fn random_qlinear(input_dim: i32, output_dim: i32) -> QLinear {
+        let group_size = 32;
+        let bits = 4;
+        let raw =
+            mlx_rs::random::normal::<f32>(&[output_dim, input_dim], None, None, None).unwrap();
+        let (weight, scales, biases) = ops::quantize(&raw, group_size, bits).unwrap();
+        QLinear {
+            weight: Param::new(weight),
+            scales: Param::new(scales),
+            biases: Param::new(biases),
+            group_size,
+            bits,
+        }
+    }
+
+    fn random_attention() -> DeepSeekV2Attention {
+        let args = small_args();
+        let mut attention = DeepSeekV2Attention::new(&args, 64, 4).unwrap();
+        attention.q_proj = Some(random_qlinear(64, 4 * (16 + 8)));
+        attention.kv_a_proj_with_mqa = random_qlinear(64, 32 + 8);
+        attention.kv_b_proj = random_qlinear(32, 4 * (16 + 16));
+        attention.o_proj = random_qlinear(4 * 16, 64);
+        attention
+    }
+
+    fn assert_attention_outputs_close(dense: &Array, absorbed: &Array, step: &str) {
+        assert_eq!(dense.shape(), absorbed.shape());
+        let max_delta = dense
+            .as_slice::<f32>()
+            .iter()
+            .zip(absorbed.as_slice::<f32>().iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_delta < 1e-2,
+            "{step} absorbed MLA output diverged from dense cache: max_delta={max_delta}"
+        );
+    }
 
     fn v2_lite_args() -> DeepSeekV2ModelArgs {
         DeepSeekV2ModelArgs {
@@ -986,6 +1141,35 @@ mod tests {
             moe_layer_freq: Some(1),
             quantization: None,
         }
+    }
+
+    #[test]
+    fn absorbed_mla_attention_matches_dense_cache_for_prefill_and_decode() {
+        let mut dense_attention = random_attention();
+        let mut absorbed_attention = dense_attention.clone();
+        let mut dense_cache = SteppingKeyValueCache::new();
+        let mut absorbed_cache =
+            SteppingKeyValueCache::new_mla(32, 8, KvCacheConfig::default()).unwrap();
+
+        let prefill = mlx_rs::random::normal::<f32>(&[1, 6, 64], None, None, None).unwrap();
+        let prefill_mask =
+            create_attention_mask(&prefill, &[Some(SteppingKeyValueCache::new())], None).unwrap();
+        let dense_prefill = dense_attention
+            .forward(&prefill, prefill_mask.as_ref(), Some(&mut dense_cache))
+            .unwrap();
+        let absorbed_prefill = absorbed_attention
+            .forward(&prefill, prefill_mask.as_ref(), Some(&mut absorbed_cache))
+            .unwrap();
+        assert_attention_outputs_close(&dense_prefill, &absorbed_prefill, "prefill");
+
+        let decode = mlx_rs::random::normal::<f32>(&[1, 1, 64], None, None, None).unwrap();
+        let dense_decode = dense_attention
+            .forward(&decode, None, Some(&mut dense_cache))
+            .unwrap();
+        let absorbed_decode = absorbed_attention
+            .forward(&decode, None, Some(&mut absorbed_cache))
+            .unwrap();
+        assert_attention_outputs_close(&dense_decode, &absorbed_decode, "decode");
     }
 
     #[test]
