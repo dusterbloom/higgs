@@ -46,12 +46,7 @@ const fn default_tie_word_embeddings() -> bool {
     true
 }
 
-/// Quantization parameters from config.json.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Gemma 2 model configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -932,6 +927,9 @@ pub fn load_gemma2_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma2CausalLM,
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let raw_model = Gemma2CausalLM::new(args)?;
 
     let mut model = if let Some(ref qc) = quantization {

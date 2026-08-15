@@ -38,12 +38,7 @@ const fn default_rope_theta() -> f32 {
     10000.0
 }
 
-/// Quantization parameters from config.json.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Starcoder2 model configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -647,6 +642,9 @@ pub fn load_starcoder2_model<P: AsRef<Path>>(
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let raw_model = Starcoder2CausalLM::new(args)?;
 
     let mut model = if let Some(ref qc) = quantization {

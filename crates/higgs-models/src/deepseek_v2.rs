@@ -645,8 +645,69 @@ struct DeepSeekV2MlpBlock {
     is_moe: bool,
 }
 
+fn deepseek_expert_projection_quantization(
+    args: &DeepSeekV2ModelArgs,
+    layer_idx: i32,
+    num_experts: i32,
+    projection: &str,
+    fallback_group_size: i32,
+    fallback_bits: i32,
+) -> Result<(i32, i32), Exception> {
+    let Some(settings) = args.quantization.as_ref() else {
+        return Ok((fallback_group_size, fallback_bits));
+    };
+    let paths = (0..num_experts)
+        .map(|expert_idx| format!("model.layers.{layer_idx}.mlp.experts.{expert_idx}.{projection}"))
+        .collect::<Vec<_>>();
+    let quant = settings
+        .resolve_uniform(paths.iter().map(String::as_str))
+        .map_err(Exception::custom)?;
+    if matches!(quant, crate::quant_config::TensorQuant::Unquantized) {
+        return Err(Exception::custom(format!(
+            "dense (unquantized) expert projections are not supported by the fused MoE path; tensor {}",
+            paths.first().map_or(projection, String::as_str)
+        )));
+    }
+    Ok((quant.group_size(), quant.bits()))
+}
+
+/// Every checkpoint tensor path this architecture actually resolves against
+/// a per-tensor quantization override while constructing the model.
+///
+/// Attention projections (`q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`,
+/// `kv_b_proj`, `o_proj`) and dense-layer `mlp.{gate,up,down}_proj` are
+/// always built from the scalar `group_size`/`bits` fallback — an override
+/// for one of those paths must be rejected rather than silently dropped.
+fn consumed_quantization_paths(args: &DeepSeekV2ModelArgs) -> std::collections::HashSet<String> {
+    let mut consumed = std::collections::HashSet::new();
+    consumed.insert("model.embed_tokens".to_owned());
+    consumed.insert("lm_head".to_owned());
+
+    if let Some(n_routed) = args.n_routed_experts.filter(|n| n.is_positive()) {
+        for layer_idx in 0..args.num_hidden_layers {
+            if !args.is_moe_layer(layer_idx) {
+                continue;
+            }
+            for expert_idx in 0..n_routed {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    consumed.insert(format!(
+                        "model.layers.{layer_idx}.mlp.experts.{expert_idx}.{projection}"
+                    ));
+                }
+            }
+        }
+    }
+
+    consumed
+}
+
 impl DeepSeekV2MlpBlock {
-    fn new_moe(args: &DeepSeekV2ModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new_moe(
+        args: &DeepSeekV2ModelArgs,
+        layer_idx: i32,
+        ql: i32,
+        qb: i32,
+    ) -> Result<Self, Exception> {
         let n_routed = args
             .n_routed_experts
             .ok_or_else(|| Exception::custom("n_routed_experts required for MoE layer"))?;
@@ -657,6 +718,24 @@ impl DeepSeekV2MlpBlock {
             .is_some()
             .then(|| SharedExperts::new(ql, qb))
             .transpose()?;
+        let expert_gate = deepseek_expert_projection_quantization(
+            args,
+            layer_idx,
+            n_routed,
+            "gate_proj",
+            ql,
+            qb,
+        )?;
+        let expert_up =
+            deepseek_expert_projection_quantization(args, layer_idx, n_routed, "up_proj", ql, qb)?;
+        let expert_down = deepseek_expert_projection_quantization(
+            args,
+            layer_idx,
+            n_routed,
+            "down_proj",
+            ql,
+            qb,
+        )?;
 
         Ok(Self {
             gate: Some(
@@ -664,7 +743,11 @@ impl DeepSeekV2MlpBlock {
                     .bias(false)
                     .build()?,
             ),
-            switch_mlp: Some(SwitchMlpWeights::new(ql, qb)?),
+            switch_mlp: Some(SwitchMlpWeights::new_with_projection_quantization(
+                expert_gate,
+                expert_up,
+                expert_down,
+            )?),
             shared_experts: shared,
             gate_proj: None,
             down_proj: None,
@@ -789,7 +872,7 @@ impl DeepSeekV2DecoderLayer {
         qb: i32,
     ) -> Result<Self, Exception> {
         let mlp = if args.is_moe_layer(layer_idx) {
-            DeepSeekV2MlpBlock::new_moe(args, ql, qb)?
+            DeepSeekV2MlpBlock::new_moe(args, layer_idx, ql, qb)?
         } else {
             DeepSeekV2MlpBlock::new_dense(ql, qb)?
         };
@@ -837,13 +920,19 @@ struct DeepSeekV2Inner {
 }
 
 impl DeepSeekV2Inner {
-    fn new(args: &DeepSeekV2ModelArgs, ql: i32, qb: i32) -> Result<Self, Exception> {
+    fn new(
+        args: &DeepSeekV2ModelArgs,
+        ql: i32,
+        qb: i32,
+        embed_ql: i32,
+        embed_qb: i32,
+    ) -> Result<Self, Exception> {
         let layers = (0..args.num_hidden_layers)
             .map(|i| DeepSeekV2DecoderLayer::new(args, i, ql, qb))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
-            embed_tokens: QEmbedding::new(ql, qb)?,
+            embed_tokens: QEmbedding::new(embed_ql, embed_qb)?,
             layers,
             norm: nn::RmsNormBuilder::new(args.hidden_size)
                 .eps(args.rms_norm_eps)
@@ -877,14 +966,32 @@ impl DeepSeekV2CausalLM {
             return Err(Exception::custom("num_attention_heads must be positive"));
         }
 
+        if let Some(settings) = args.quantization.as_ref() {
+            settings
+                .assert_all_overrides_consumed(&consumed_quantization_paths(&args))
+                .map_err(Exception::custom)?;
+        }
+
         let ql = args.quantization.as_ref().map_or(64, |q| q.group_size);
         let qb = args.quantization.as_ref().map_or(4, |q| q.bits);
 
-        let model = DeepSeekV2Inner::new(&args, ql, qb)?;
+        let embed_quant = args
+            .quantization
+            .as_ref()
+            .map(|settings| settings.resolve("model.embed_tokens"));
+        let embed_ql = embed_quant.map_or(ql, crate::quant_config::TensorQuant::group_size);
+        let embed_qb = embed_quant.map_or(qb, crate::quant_config::TensorQuant::bits);
+        let model = DeepSeekV2Inner::new(&args, ql, qb, embed_ql, embed_qb)?;
+        let lm_head_quant = args
+            .quantization
+            .as_ref()
+            .map(|settings| settings.resolve("lm_head"));
+        let lm_head_ql = lm_head_quant.map_or(ql, crate::quant_config::TensorQuant::group_size);
+        let lm_head_qb = lm_head_quant.map_or(qb, crate::quant_config::TensorQuant::bits);
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(QLinear::new(ql, qb)?)
+            Some(QLinear::new(lm_head_ql, lm_head_qb)?)
         };
 
         Ok(Self {
@@ -1102,10 +1209,7 @@ mod tests {
             topk_group: Some(1),
             first_k_dense_replace: 1,
             moe_layer_freq: Some(1),
-            quantization: Some(QuantizationConfig {
-                group_size: 64,
-                bits: 4,
-            }),
+            quantization: Some(QuantizationConfig::new(64, 4)),
         }
     }
 
@@ -1299,6 +1403,55 @@ mod tests {
         let model = DeepSeekV2CausalLM::new(args).unwrap();
         assert_eq!(model.args.num_hidden_layers, 2);
         assert!(model.lm_head.is_none(), "tied embeddings => no lm_head");
+    }
+
+    #[test]
+    fn test_model_new_rejects_unsupported_per_tensor_override() {
+        // kv_b_proj is always built from the scalar group_size/bits
+        // fallback (needed for MLA absorption); an override for it must be
+        // rejected rather than silently ignored.
+        let mut args = small_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{"group_size": 64, "bits": 4, "model.layers.0.self_attn.kv_b_proj": false}"#,
+            )
+            .unwrap(),
+        );
+        let err = DeepSeekV2CausalLM::new(args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("model.layers.0.self_attn.kv_b_proj"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_model_new_rejects_dense_expert_projection_override() {
+        // A `false` (unquantized) override for a fused expert projection
+        // can't be honored by the gather_qmm MoE path.
+        // Layer 1 is MoE with 4 experts (small_args); all of them must be
+        // overridden to `false` to reach the loud-failure check rather than
+        // the "fused tensor group requires uniform quantization" check.
+        let mut args = small_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.layers.1.mlp.experts.0.gate_proj": false,
+                    "model.layers.1.mlp.experts.1.gate_proj": false,
+                    "model.layers.1.mlp.experts.2.gate_proj": false,
+                    "model.layers.1.mlp.experts.3.gate_proj": false
+                }"#,
+            )
+            .unwrap(),
+        );
+        let err = DeepSeekV2CausalLM::new(args).unwrap_err();
+        assert!(
+            err.to_string().contains("dense (unquantized) expert")
+                && err.to_string().contains("gate_proj"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -35,12 +35,7 @@ const fn default_rope_theta() -> f32 {
     10000.0
 }
 
-/// Quantization parameters from config.json.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Phi-3 model configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -566,6 +561,9 @@ pub fn load_phi3_model<P: AsRef<Path>>(model_dir: P) -> Result<Phi3CausalLM, Mod
     let args = load_phi3_model_args(model_path)?;
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let raw_model = Phi3CausalLM::new(args)?;
 
     tracing::info!(
