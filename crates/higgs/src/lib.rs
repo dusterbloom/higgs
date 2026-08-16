@@ -54,7 +54,7 @@ pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
 }
 
 /// Build the Axum router with all routes and middleware.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::significant_drop_tightening)]
 pub fn build_router(
     state: SharedState,
     timeout_secs: f64,

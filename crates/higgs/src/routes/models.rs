@@ -7,6 +7,7 @@ use axum::{
     http::StatusCode,
 };
 use bytes::Bytes;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::{
     config::ModelConfig,
@@ -65,8 +66,8 @@ pub async fn load_model(
     }
 
     // Cheap collision pre-check when the caller named the model, so we don't pay
-    // for a full load just to reject it. `insert_engine` re-checks under the
-    // write lock, so this is an optimization, not the source of truth.
+    // for a full load just to reject it. `insert_runtime_engine` re-checks under
+    // the write lock, so this is an optimization, not the source of truth.
     if let Some(ref name) = model_cfg.name {
         if state.router.contains_engine(name) {
             return Err(ServerError::Conflict(format!(
@@ -75,32 +76,57 @@ pub async fn load_model(
         }
     }
 
-    // Resolve the path without prompting -- the server has no interactive stdin.
-    let resolved = model_resolver::resolve(&model_cfg.path).map_err(|e| {
+    // Resolve and authorize once without prompting -- the server has no
+    // interactive stdin. The returned canonical path is the exact path passed
+    // to the loader; arbitrary local directories are rejected.
+    let resolved = model_resolver::resolve_runtime_model(
+        &model_cfg.path,
+        &state.config.local.runtime_model_roots,
+    )
+    .map_err(|e| {
         ServerError::BadRequest(format!(
             "model '{}' not found locally: {e}; pre-download it (e.g. `huggingface-cli download {}`)",
             model_cfg.path, model_cfg.path
         ))
     })?;
 
+    // Serialize/bound concurrent loads: each load is GPU- and memory-heavy and
+    // concurrent large loads can OOM the host. The owned permits are captured
+    // by the blocking task so cancellation of this request cannot release them
+    // while the load continues.
+    let runtime_load_permit = state
+        .router
+        .acquire_runtime_load()
+        .await
+        .map_err(|message| {
+            if message.starts_with("runtime model budget reached") {
+                ServerError::BadRequest(message)
+            } else {
+                ServerError::InternalError(message)
+            }
+        })?;
+
     // The weight load is blocking and GPU-bound; keep it off the async runtime.
     let local = state.config.local.clone();
     let cfg = model_cfg.clone();
-    let (name, engine) = tokio::task::spawn_blocking(move || build_engine(&resolved, &cfg, &local))
-        .await
-        .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?
-        .map_err(ServerError::BadRequest)?;
+    let (name, engine, resident_permit) = tokio::task::spawn_blocking(move || {
+        build_engine(&resolved, &cfg, &local)
+            .map(|(name, engine)| (name, engine, runtime_load_permit.into_resident_permit()))
+    })
+    .await
+    .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?
+    .map_err(ServerError::BadRequest)?;
 
     state
         .router
-        .insert_engine(name.clone(), Arc::new(engine))
-        .map_err(|n| ServerError::Conflict(format!("model '{n}' is already loaded")))?;
+        .insert_runtime_engine(name.clone(), Arc::new(engine), resident_permit)
+        .map_err(ServerError::Conflict)?;
 
     tracing::info!(model_name = %name, "Model loaded at runtime");
     Ok(Json(model_object(name)))
 }
 
-/// `DELETE /v1/models/{name}` -- unload a model and free its GPU memory.
+/// `DELETE /v1/models/{name}` -- unload a model and release its engine resources.
 ///
 /// Returns `204` once the model is fully unloaded, `202` if a request was still
 /// in flight past the drain timeout (the final free is detached), `404` if no
@@ -109,22 +135,37 @@ pub async fn unload_model(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ServerError> {
+    if !state.config.local.allow_runtime_model_load {
+        return Err(ServerError::Forbidden(
+            "runtime model loading is disabled; set local.allow_runtime_model_load = true to enable it"
+                .to_owned(),
+        ));
+    }
+
     if state.router.auto_router_model_name() == Some(name.as_str()) {
         return Err(ServerError::Conflict(format!(
             "model '{name}' is bound to the auto-router and cannot be unloaded"
         )));
     }
 
-    let engine = state
+    let (engine, resident_permit) = state
         .router
-        .remove_engine(&name)
-        .ok_or_else(|| ServerError::ModelNotFound(name.clone()))?;
+        .remove_runtime_engine(&name)
+        .ok_or_else(|| ServerError::ModelNotFound(name.clone()))?
+        .into_parts();
 
     // The map entry is gone, so no new request can take a reference and the
-    // strong count only decreases. Free GPU memory once the last in-flight
+    // strong count only decreases. Drop the engine once the last in-flight
     // request releases its clone; detach past the timeout so a long generation
-    // can't block the response.
-    if drain_and_drop(engine, DRAIN_TIMEOUT).await {
+    // cannot block the response. MLX may retain allocator/cache state after the
+    // engine drop, so this endpoint does not promise a full process-wide cache
+    // purge.
+    // Own the drain in a detached task so cancellation of this request cannot
+    // release the engine or its resident quota permit prematurely.
+    let drained = tokio::spawn(drain_and_drop(engine, resident_permit, DRAIN_TIMEOUT))
+        .await
+        .map_err(|e| ServerError::InternalError(format!("model unload task failed: {e}")))?;
+    if drained {
         tracing::info!(model_name = %name, "Model unloaded");
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -133,24 +174,29 @@ pub async fn unload_model(
     }
 }
 
-/// Wait until `engine` is solely owned here, then drop it (freeing GPU memory).
+/// Wait until `engine` is solely owned here, then drop it.
 ///
 /// Returns `true` if dropped within `timeout`; `false` if it timed out and the
 /// final drop was handed to a detached task. Dropping is intentionally not gated
 /// on the process-wide GPU gate: engine teardown frees MLX buffers but never
 /// runs an `eval`, so it cannot race the cross-model output-array table that the
 /// gate protects.
-async fn drain_and_drop(mut engine: Arc<Engine>, timeout: Duration) -> bool {
+async fn drain_and_drop(
+    mut engine: Arc<Engine>,
+    resident_permit: Option<OwnedSemaphorePermit>,
+    timeout: Duration,
+) -> bool {
     let start = Instant::now();
     loop {
         match Arc::try_unwrap(engine) {
             Ok(owned) => {
                 drop(owned);
+                drop(resident_permit);
                 return true;
             }
             Err(shared) => {
                 if start.elapsed() >= timeout {
-                    tokio::spawn(drain_in_background(shared));
+                    tokio::spawn(drain_in_background(shared, resident_permit));
                     return false;
                 }
                 engine = shared;
@@ -161,11 +207,15 @@ async fn drain_and_drop(mut engine: Arc<Engine>, timeout: Duration) -> bool {
 }
 
 /// Poll until the detached engine reference is sole-owned, then drop it.
-async fn drain_in_background(mut engine: Arc<Engine>) {
+async fn drain_in_background(
+    mut engine: Arc<Engine>,
+    resident_permit: Option<OwnedSemaphorePermit>,
+) {
     loop {
         match Arc::try_unwrap(engine) {
             Ok(owned) => {
                 drop(owned);
+                drop(resident_permit);
                 return;
             }
             Err(shared) => {
@@ -196,7 +246,11 @@ fn model_objects_sorted<'a>(names: impl Iterator<Item = &'a str>) -> Vec<ModelOb
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(
+    clippy::panic,
+    clippy::significant_drop_tightening,
+    clippy::unwrap_used
+)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -277,6 +331,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_engines_do_not_consume_runtime_model_budget() {
+        let state = build_state(
+            "[local]\nallow_runtime_model_load = true\nruntime_max_loaded_models = 1\n",
+            stub_engines(&["startup"]),
+        );
+        let body = Bytes::from_static(b"{\"path\":\"org/model\",\"name\":\"runtime\"}");
+        let err = load_model(State(state), body).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::BadRequest(message)
+                if !message.contains("runtime model budget reached")
+        ));
+    }
+
+    #[tokio::test]
     async fn unload_unknown_returns_not_found() {
         let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
         let err = unload_model(State(state), Path("ghost".to_owned()))
@@ -295,6 +364,9 @@ mod tests {
             [auto_router]
             enabled = true
             model = "router"
+
+            [local]
+            allow_runtime_model_load = true
         "#;
         let state = build_state(toml, stub_engines(&["router"]));
         let err = unload_model(State(Arc::clone(&state)), Path("router".to_owned()))
@@ -322,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn drain_and_drop_drops_sole_owner_immediately() {
         let engine = Arc::new(Engine::test_stub("solo"));
-        assert!(drain_and_drop(engine, Duration::from_secs(1)).await);
+        assert!(drain_and_drop(engine, None, Duration::from_secs(1)).await);
     }
 
     #[tokio::test]
@@ -335,7 +407,7 @@ mod tests {
             drop(clone);
         });
         let start = Instant::now();
-        assert!(drain_and_drop(engine, Duration::from_secs(5)).await);
+        assert!(drain_and_drop(engine, None, Duration::from_secs(5)).await);
         assert!(
             start.elapsed() >= Duration::from_millis(100),
             "should have waited for the clone to drop"
@@ -346,8 +418,98 @@ mod tests {
     async fn drain_and_drop_times_out_and_detaches() {
         let engine = Arc::new(Engine::test_stub("stuck"));
         let clone = Arc::clone(&engine); // held past the timeout
-        let drained = drain_and_drop(engine, Duration::from_millis(80)).await;
+        let drained = drain_and_drop(engine, None, Duration::from_millis(80)).await;
         assert!(!drained, "should time out while a reference is held");
         drop(clone); // let the detached task finish
+    }
+
+    #[tokio::test]
+    async fn resident_permit_stays_held_until_unload_drain_finishes() {
+        let state = build_state(
+            "[local]\nallow_runtime_model_load = true\nruntime_max_loaded_models = 1\n",
+            HashMap::new(),
+        );
+        let load_permit = state.router.acquire_runtime_load().await.unwrap();
+        state
+            .router
+            .insert_runtime_engine(
+                "runtime".to_owned(),
+                Arc::new(Engine::test_stub("runtime")),
+                load_permit.into_resident_permit(),
+            )
+            .unwrap();
+        let removed = state.router.remove_runtime_engine("runtime").unwrap();
+        let (engine, resident_permit) = removed.into_parts();
+        let in_flight = Arc::clone(&engine);
+        let draining = tokio::spawn(drain_and_drop(
+            engine,
+            resident_permit,
+            Duration::from_secs(1),
+        ));
+
+        assert!(state.router.acquire_runtime_load().await.is_err());
+        drop(in_flight);
+        assert!(draining.await.unwrap());
+        assert!(state.router.acquire_runtime_load().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn canceled_unload_handler_keeps_resident_permit_until_drain() {
+        let state = build_state(
+            "[local]\nallow_runtime_model_load = true\nruntime_max_loaded_models = 1\n",
+            HashMap::new(),
+        );
+        let engine = Arc::new(Engine::test_stub("runtime"));
+        let in_flight = Arc::clone(&engine);
+        let load_permit = state.router.acquire_runtime_load().await.unwrap();
+        state
+            .router
+            .insert_runtime_engine(
+                "runtime".to_owned(),
+                engine,
+                load_permit.into_resident_permit(),
+            )
+            .unwrap();
+        assert!(state.router.acquire_runtime_load().await.is_err());
+
+        let unload = tokio::spawn(unload_model(
+            State(Arc::clone(&state)),
+            Path("runtime".to_owned()),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while state.router.contains_engine("runtime") {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok(),
+            "unload should detach the engine promptly"
+        );
+        unload.abort();
+        let _ = unload.await;
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                state.router.acquire_runtime_load()
+            )
+            .await
+            .unwrap()
+            .is_err(),
+            "canceling unload released the resident permit too early"
+        );
+        drop(in_flight);
+        let acquired = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.router.acquire_runtime_load().await.is_ok() {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(acquired);
     }
 }

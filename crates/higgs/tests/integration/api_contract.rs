@@ -5,7 +5,8 @@
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::tests_outside_test_module,
-    clippy::needless_pass_by_value
+    clippy::needless_pass_by_value,
+    clippy::significant_drop_tightening
 )]
 
 use std::collections::HashMap;
@@ -111,7 +112,7 @@ async fn load_model_disabled_returns_403() {
 }
 
 #[tokio::test]
-async fn unload_unknown_model_returns_404() {
+async fn unload_model_disabled_returns_403() {
     let app = build_router(build_test_state(None), 300.0, None, 0, 1024, None);
     let response = app
         .oneshot(
@@ -124,7 +125,7 @@ async fn unload_unknown_model_returns_404() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

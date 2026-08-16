@@ -69,6 +69,11 @@ port = 8000
 [local]
 mlx_profile = "auto"
 raise_wired_limit = false
+# Runtime POST/DELETE /v1/models requires server.api_key.
+# allow_runtime_model_load = false
+# runtime_model_roots = ["/models"]
+# runtime_max_loaded_models = 2
+# runtime_max_concurrent_loads = 1
 
 # --- Local models ---
 [[models]]

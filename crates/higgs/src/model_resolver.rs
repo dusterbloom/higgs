@@ -36,6 +36,92 @@ pub fn is_hf_model_id(s: &str) -> bool {
     matches!(s.split_once('/'), Some((org, name)) if !org.is_empty() && !name.is_empty() && !name.contains('/'))
 }
 
+/// Policy gate for caller-supplied runtime-load paths.
+///
+/// Accepts Hugging Face model ids (which resolve through the local HF cache,
+/// not the caller's filesystem) unless the same string names an existing local
+/// directory. Local paths are accepted only when they resolve (after `~`
+/// expansion and symlink resolution) inside one of `roots`. Returns a reason
+/// string on rejection.
+#[cfg(test)]
+fn runtime_load_path_allowed(path: &str, roots: &[String]) -> Result<(), String> {
+    // A syntactically valid `org/name` can also be a relative local
+    // directory. `resolve` prefers existing directories, so do not let that
+    // local path bypass the filesystem allowlist.
+    if is_hf_model_id(path) && !Path::new(path).is_dir() {
+        return Ok(());
+    }
+    canonical_runtime_local_path(path, roots).map(|_| ())
+}
+
+/// Resolve and authorize one runtime-load request, returning the exact path
+/// that the loader must use.
+///
+/// HF-shaped inputs are resolved cache-only after the initial local-directory
+/// check; they are never passed back through `resolve`, which prefers
+/// caller-relative directories.
+pub fn resolve_runtime_model(path: &str, roots: &[String]) -> Result<PathBuf, String> {
+    resolve_runtime_model_with_cache(path, roots, default_hf_cache().as_deref())
+}
+
+fn resolve_runtime_model_with_cache(
+    path: &str,
+    roots: &[String],
+    cache_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if is_hf_model_id(path) && !Path::new(path).is_dir() {
+        let (org, name) = path
+            .split_once('/')
+            .ok_or_else(|| format!("invalid Hugging Face model id '{path}'"))?;
+        let snapshot = cache_root
+            .ok_or_else(|| format!("Hugging Face cache is not configured for '{path}'"))
+            .and_then(|cache| resolve_hf_snapshot(cache, org, name))?;
+        return snapshot
+            .canonicalize()
+            .map_err(|e| format!("cached model '{path}' cannot be resolved: {e}"));
+    }
+
+    canonical_runtime_local_path(path, roots)
+}
+
+fn canonical_runtime_local_path(path: &str, roots: &[String]) -> Result<PathBuf, String> {
+    if roots.is_empty() {
+        return Err(format!(
+            "path '{path}' is not a Hugging Face model id and local.runtime_model_roots is empty; \
+             use an HF model id or configure local.runtime_model_roots"
+        ));
+    }
+    let expanded = expand_user_path(path);
+    let canonical = expanded
+        .canonicalize()
+        .map_err(|e| format!("path '{path}' cannot be resolved: {e}"))?;
+    for root in roots {
+        let root_expanded = expand_user_path(root);
+        let root_canonical = root_expanded.canonicalize().map_err(|e| {
+            format!(
+                "configured local.runtime_model_roots entry '{}' cannot be resolved: {e}",
+                root_expanded.display()
+            )
+        })?;
+        if canonical.starts_with(&root_canonical) {
+            return Ok(canonical);
+        }
+    }
+    Err(format!(
+        "path '{path}' is outside all configured local.runtime_model_roots"
+    ))
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    path.strip_prefix("~/").map_or_else(
+        || PathBuf::from(path),
+        |rest| {
+            directories::BaseDirs::new()
+                .map_or_else(|| PathBuf::from(path), |d| d.home_dir().join(rest))
+        },
+    )
+}
+
 /// Testable resolver with explicit cache root.
 fn resolve_with_cache(path: &str, cache_root: Option<&Path>) -> Result<PathBuf, String> {
     let as_path = Path::new(path);
@@ -279,6 +365,60 @@ mod tests {
     #[test]
     fn test_is_hf_model_id_empty_name_is_false() {
         assert!(!is_hf_model_id("org/"));
+    }
+
+    #[test]
+    fn test_runtime_policy_does_not_treat_existing_relative_directory_as_hf_id() {
+        assert!(Path::new("src/.").is_dir());
+        assert!(runtime_load_path_allowed("src/.", &[]).is_err());
+    }
+
+    #[test]
+    fn test_runtime_policy_allows_hf_id_without_local_roots() {
+        assert!(runtime_load_path_allowed("org/model", &[]).is_ok());
+    }
+
+    #[test]
+    fn test_runtime_policy_allows_existing_directory_inside_root() {
+        assert!(runtime_load_path_allowed("src/.", &["src".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn test_runtime_policy_reports_unresolvable_configured_root() {
+        let model_root = tempfile::tempdir().unwrap();
+        let missing_root = model_root.path().join("missing-root");
+        let model = model_root.path().join("model");
+        std::fs::create_dir(&model).unwrap();
+        let roots = vec![missing_root.to_string_lossy().into_owned()];
+
+        let error = runtime_load_path_allowed(model.to_str().unwrap(), &roots).unwrap_err();
+        assert!(error.contains("configured local.runtime_model_roots entry"));
+    }
+
+    #[test]
+    fn test_runtime_resolver_returns_canonical_hf_snapshot() {
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = create_hf_cache(cache.path(), "org", "model", "abc123");
+        let resolved =
+            resolve_runtime_model_with_cache("org/model", &[], Some(cache.path())).unwrap();
+
+        assert_eq!(resolved, snapshot.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_runtime_policy_rejects_symlink_escape_from_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_model = outside.path().join("model");
+        std::fs::create_dir(&outside_model).unwrap();
+        std::os::unix::fs::symlink(&outside_model, root.path().join("linked-model")).unwrap();
+
+        let roots = vec![root.path().to_string_lossy().into_owned()];
+        assert!(
+            runtime_load_path_allowed(root.path().join("linked-model").to_str().unwrap(), &roots)
+                .is_err()
+        );
     }
 
     // --- tilde expansion error message test ---

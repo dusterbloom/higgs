@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use regex::Regex;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tracing::warn;
 
 use crate::config::{ApiFormat, HiggsConfig};
@@ -76,6 +77,33 @@ struct AutoRouteEntry {
     target: RouteTarget,
 }
 
+/// Owned coordination permits for one runtime load attempt.
+pub(crate) struct RuntimeLoadPermit {
+    _load_permit: OwnedSemaphorePermit,
+    resident_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl RuntimeLoadPermit {
+    /// Release the load-attempt permit while retaining the resident-model
+    /// permit with the loaded engine.
+    pub(crate) fn into_resident_permit(self) -> Option<OwnedSemaphorePermit> {
+        self.resident_permit
+    }
+}
+
+/// Engine removed from routing, retaining its resident quota permit until the
+/// caller finishes draining all in-flight `Arc` references.
+pub(crate) struct RemovedEngine {
+    engine: Arc<Engine>,
+    resident_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl RemovedEngine {
+    pub(crate) fn into_parts(self) -> (Arc<Engine>, Option<OwnedSemaphorePermit>) {
+        (self.engine, self.resident_permit)
+    }
+}
+
 /// Routes model names to local engines or remote providers.
 ///
 /// Resolution order:
@@ -88,6 +116,14 @@ pub struct Router {
     /// Guarded by a `RwLock`: `resolve`/`list` take a read lock and clone the
     /// `Arc` out, so an in-flight request is never tied to map membership.
     local_engines: RwLock<HashMap<String, Arc<Engine>>>,
+    /// Runtime engine names and their resident quota permits. Startup-configured
+    /// engines are intentionally excluded from this map.
+    runtime_engine_names: RwLock<HashMap<String, Option<OwnedSemaphorePermit>>>,
+    /// Bounds concurrent GPU- and memory-heavy runtime load attempts.
+    runtime_load_semaphore: Arc<Semaphore>,
+    /// Bounds resident runtime engines. A permit remains held through unload
+    /// draining, so the cap describes engine lifetime rather than map entries.
+    runtime_resident_semaphore: Option<Arc<Semaphore>>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
     auto_candidates: Vec<RouteCandidate>,
@@ -106,6 +142,21 @@ impl Router {
         config: &HiggsConfig,
         engines: HashMap<String, Arc<Engine>>,
     ) -> Result<Self, String> {
+        let max_concurrent = config.local.runtime_max_concurrent_loads;
+        if max_concurrent == 0 || max_concurrent > Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "runtime_max_concurrent_loads must be between 1 and {}",
+                Semaphore::MAX_PERMITS
+            ));
+        }
+        if let Some(max_loaded) = config.local.runtime_max_loaded_models
+            && (max_loaded == 0 || max_loaded > Semaphore::MAX_PERMITS)
+        {
+            return Err(format!(
+                "runtime_max_loaded_models must be between 1 and {}",
+                Semaphore::MAX_PERMITS
+            ));
+        }
         let mut compiled_routes = Vec::new();
         let mut auto_routes = Vec::new();
         let mut auto_candidates = Vec::new();
@@ -172,6 +223,13 @@ impl Router {
 
         Ok(Self {
             local_engines: RwLock::new(engines),
+            runtime_engine_names: RwLock::new(HashMap::new()),
+            runtime_load_semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            runtime_resident_semaphore: config
+                .local
+                .runtime_max_loaded_models
+                .map(Semaphore::new)
+                .map(Arc::new),
             compiled_routes,
             auto_routes,
             auto_candidates,
@@ -237,6 +295,42 @@ impl Router {
         self.engines_read().contains_key(name)
     }
 
+    /// Number of engines inserted through the runtime-load API.
+    #[cfg(test)]
+    pub(crate) fn runtime_engine_count(&self) -> usize {
+        self.runtime_engine_names
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Acquire the attempt and resident permits for one runtime load.
+    pub(crate) async fn acquire_runtime_load(&self) -> Result<RuntimeLoadPermit, String> {
+        let load_permit = Arc::clone(&self.runtime_load_semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|e| format!("runtime load gate closed: {e}"))?;
+        let resident_permit = match &self.runtime_resident_semaphore {
+            Some(semaphore) => match Arc::clone(semaphore).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(TryAcquireError::NoPermits) => {
+                    return Err(
+                        "runtime model budget reached; unload a runtime model before loading another"
+                            .to_owned(),
+                    );
+                }
+                Err(TryAcquireError::Closed) => {
+                    return Err("runtime resident-model gate closed".to_owned());
+                }
+            },
+            None => None,
+        };
+        Ok(RuntimeLoadPermit {
+            _load_permit: load_permit,
+            resident_permit,
+        })
+    }
+
     /// Register a freshly-loaded engine. Returns `Err(name)` if the name is
     /// already taken (checked under the write lock, so it is race-free against
     /// concurrent loads).
@@ -250,10 +344,61 @@ impl Router {
         Ok(())
     }
 
+    /// Register an engine loaded through the runtime API, enforcing the
+    /// resident runtime-model budget while holding the write lock.
+    pub(crate) fn insert_runtime_engine(
+        &self,
+        name: String,
+        engine: Arc<Engine>,
+        resident_permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<(), String> {
+        let mut engines = self.engines_write();
+        if engines.contains_key(&name) {
+            return Err(format!("model '{name}' is already loaded"));
+        }
+
+        let mut runtime_names = self
+            .runtime_engine_names
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        engines.insert(name.clone(), engine);
+        runtime_names.insert(name, resident_permit);
+        drop(runtime_names);
+        drop(engines);
+        Ok(())
+    }
+
     /// Remove an engine from the routing table, returning it if present. The
-    /// caller is responsible for dropping it once no request still holds a clone.
+    /// caller is responsible for dropping it once no request still holds a
+    /// clone.
     pub fn remove_engine(&self, name: &str) -> Option<Arc<Engine>> {
-        self.engines_write().remove(name)
+        let (engine, resident_permit) = self.remove_engine_with_permit(name)?.into_parts();
+        drop(resident_permit);
+        Some(engine)
+    }
+
+    /// Remove a runtime engine while retaining its resident quota permit until
+    /// all in-flight `Arc` references have drained.
+    pub(crate) fn remove_runtime_engine(&self, name: &str) -> Option<RemovedEngine> {
+        self.remove_engine_with_permit(name)
+    }
+
+    fn remove_engine_with_permit(&self, name: &str) -> Option<RemovedEngine> {
+        // Keep both locks in the same order used by insert_runtime_engine so
+        // a same-name load cannot insert between engine and quota removal.
+        let mut engines = self.engines_write();
+        let removed = engines.remove(name)?;
+        let mut runtime_names = self
+            .runtime_engine_names
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let resident_permit = runtime_names.remove(name).flatten();
+        drop(runtime_names);
+        drop(engines);
+        Some(RemovedEngine {
+            engine: removed,
+            resident_permit,
+        })
     }
 
     /// Map key bound to the auto-router model, if the auto-router is enabled.
@@ -400,7 +545,8 @@ fn build_route_target(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::shadow_unrelated
+    clippy::shadow_unrelated,
+    clippy::significant_drop_tightening
 )]
 mod tests {
     use super::*;
@@ -907,7 +1053,77 @@ mod tests {
         let removed = router.remove_engine("x");
         assert!(removed.is_some());
         assert!(!router.contains_engine("x"));
+        assert_eq!(router.runtime_engine_count(), 0);
         assert!(router.remove_engine("x").is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_engine_count_excludes_startup_engines() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "startup/model"
+            [local]
+            runtime_max_loaded_models = 1
+            "#,
+        );
+        let mut engines = HashMap::new();
+        engines.insert(
+            "startup".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("startup")),
+        );
+        let router = Router::from_config(&config, engines).unwrap();
+
+        assert_eq!(router.runtime_engine_count(), 0);
+        let load_permit = router.acquire_runtime_load().await.unwrap();
+        router
+            .insert_runtime_engine(
+                "runtime".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("runtime")),
+                load_permit.into_resident_permit(),
+            )
+            .unwrap();
+        assert_eq!(router.runtime_engine_count(), 1);
+        assert_eq!(router.local_model_names().len(), 2);
+        assert!(router.acquire_runtime_load().await.is_err());
+        let removed = router.remove_runtime_engine("runtime").unwrap();
+        assert!(router.acquire_runtime_load().await.is_err());
+        drop(removed);
+        assert!(router.acquire_runtime_load().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn runtime_load_permit_survives_outer_cancellation() {
+        let config = config_from_toml(
+            r#"
+            [provider.stub]
+            url = "http://127.0.0.1:1"
+            [local]
+            runtime_max_concurrent_loads = 1
+            "#,
+        );
+        let router = Arc::new(Router::from_config(&config, HashMap::new()).unwrap());
+        let permit = router.acquire_runtime_load().await.unwrap();
+        let blocking = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(permit);
+        });
+        let outer = tokio::spawn(async move {
+            let _ = blocking.await;
+        });
+        outer.abort();
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                router.acquire_runtime_load()
+            )
+            .await
+            .is_err(),
+            "permit was released while the blocking load task was still running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+        assert!(router.acquire_runtime_load().await.is_ok());
     }
 
     #[tokio::test]

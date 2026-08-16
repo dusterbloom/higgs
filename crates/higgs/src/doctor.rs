@@ -71,6 +71,10 @@ fn check_config_valid(result: &mut DoctorResult) {
 
 fn check_server_section(config: &crate::config::HiggsConfig, result: &mut DoctorResult) {
     let server = &config.server;
+    let has_api_key = server
+        .api_key
+        .as_deref()
+        .is_some_and(|api_key| !api_key.trim().is_empty());
 
     if server.max_tokens == 0 {
         fail(
@@ -130,7 +134,7 @@ fn check_server_section(config: &crate::config::HiggsConfig, result: &mut Doctor
         );
     }
 
-    if server.api_key.is_some() {
+    if has_api_key {
         pass("server.api_key set; API key auth enabled", result);
     } else {
         pass(
@@ -143,7 +147,7 @@ fn check_server_section(config: &crate::config::HiggsConfig, result: &mut Doctor
         server.host.parse::<std::net::IpAddr>(),
         Ok(ip) if !ip.is_loopback()
     );
-    if non_loopback && server.api_key.is_none() {
+    if non_loopback && !has_api_key {
         warn(
             &format!(
                 "server.host=\"{}\" is reachable from the network but server.api_key is unset; \
@@ -333,10 +337,29 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
 
 fn check_runtime_model_load(config: &HiggsConfig, result: &mut DoctorResult) {
     if config.local.allow_runtime_model_load {
-        warn(
-            "local.allow_runtime_model_load is enabled: POST/DELETE /v1/models can load and unload models at runtime; ensure server.api_key restricts this to trusted operators",
-            result,
-        );
+        // The runtime-load endpoints are mutating admin surface. When no
+        // server.api_key is configured the bearer-auth layer is not installed
+        // at all, so POST/DELETE /v1/models (with permissive CORS) would be
+        // fully unauthenticated. That combination is the dangerous config the
+        // feature docs caution against, so it fails the doctor outright.
+        let has_api_key = config
+            .server
+            .api_key
+            .as_deref()
+            .is_some_and(|api_key| !api_key.trim().is_empty());
+        if has_api_key {
+            pass(
+                "runtime model load/unload enabled; server.api_key restricts it",
+                result,
+            );
+        } else {
+            fail(
+                "local.allow_runtime_model_load is enabled but server.api_key is unset: \
+                 POST/DELETE /v1/models would be unauthenticated. Set server.api_key \
+                 or disable local.allow_runtime_model_load",
+                result,
+            );
+        }
     } else {
         pass("runtime model load/unload disabled", result);
     }
@@ -593,6 +616,42 @@ mod tests {
         fail("test", &mut result);
         assert_eq!(result.passes, 0);
         assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn runtime_load_without_api_key_fails_doctor() {
+        let mut config = HiggsConfig::default();
+        config.local.allow_runtime_model_load = true;
+        let mut result = empty_result();
+
+        check_runtime_model_load(&config, &mut result);
+
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn runtime_load_with_api_key_passes_doctor() {
+        let mut config = HiggsConfig::default();
+        config.local.allow_runtime_model_load = true;
+        config.server.api_key = Some("test-key".to_owned());
+        let mut result = empty_result();
+
+        check_runtime_model_load(&config, &mut result);
+
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.passes, 1);
+    }
+
+    #[test]
+    fn runtime_load_with_blank_api_key_fails_doctor() {
+        let mut config = HiggsConfig::default();
+        config.local.allow_runtime_model_load = true;
+        config.server.api_key = Some("  ".to_owned());
+        let mut result = empty_result();
+
+        check_runtime_model_load(&config, &mut result);
+
         assert_eq!(result.failures, 1);
     }
 

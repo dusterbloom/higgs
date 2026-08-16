@@ -102,7 +102,7 @@ pub fn cmd_stop(profile: Option<&str>, force: bool) -> i32 {
     }
 }
 
-#[allow(clippy::print_stderr)]
+#[allow(clippy::print_stderr, clippy::too_many_lines)]
 pub fn cmd_init(profile: Option<&str>) {
     let dir = config::config_dir();
     let filename = profile.map_or_else(
@@ -148,6 +148,9 @@ port = 8000
 # Allow loading/unloading models at runtime via POST/DELETE /v1/models.
 # Off by default; protect with server.api_key before enabling.
 # allow_runtime_model_load = false
+# runtime_model_roots = ["/models"]
+# runtime_max_loaded_models = 2
+# runtime_max_concurrent_loads = 1
 
 # --- Local models ---
 # Each [[models]] entry loads an MLX model into GPU memory.

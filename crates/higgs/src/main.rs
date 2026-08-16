@@ -143,6 +143,7 @@ fn load_config_for_command(cli: &Cli) -> Result<HiggsConfig, Box<dyn std::error:
     config::load_config_file(&path, None).map_err(Into::into)
 }
 
+#[allow(clippy::significant_drop_tightening)]
 async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     init_tracing(cli.verbose);
 
