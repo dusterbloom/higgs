@@ -105,6 +105,7 @@ pub fn quantize(
             gs_opt,
             bits_opt,
             mode.cstr().as_ptr(),
+            /* global_scale */ mlx_sys::mlx_array_new(),
             Stream::task_local_or_default().as_ptr(),
         );
         if status != 0 {
@@ -182,6 +183,7 @@ pub fn dequantize(
             gs_opt,
             bits_opt,
             mode.cstr().as_ptr(),
+            /* global_scale */ mlx_sys::mlx_array_new(),
             optional_dtype_none(),
             Stream::task_local_or_default().as_ptr(),
         );

@@ -931,6 +931,15 @@ impl QLinear {
             // Fall through to standard path if kernel fails.
         }
 
+        // Crossrow multi-row QMV (ported from the promoted mlx.fast kernel
+        // family): affine-4 g64 verify shapes share each packed weight read
+        // across input-row pairs. Bit-exact per row with the stock qmv_fast
+        // path; gated by HIGGS_CROSSROW_QMV (default on).
+        if let Some(y) = self.crossrow_qmv_forward(x)? {
+            return Ok(y);
+        }
+
+
         match self.mode {
             crate::quant_mode::QuantMode::MxFp4 => crate::quant_mode::quantized_matmul(
                 x,
@@ -994,6 +1003,47 @@ impl QLinear {
         let scales = take_axis(&self.scales, rows, 0)?;
         let biases = take_axis(&self.biases, rows, 0)?;
         quantized_forward(x, &weight, &scales, &biases, self.group_size, self.bits)
+    }
+
+    fn crossrow_qmv_forward(&self, x: &Array) -> Result<Option<Array>, Exception> {
+        let enabled = std::env::var("HIGGS_CROSSROW_QMV").map_or(true, |v| v != "0");
+        if !enabled
+            || self.mode != crate::quant_mode::QuantMode::Affine
+            || self.bits != 4
+            || self.group_size != 64
+        {
+            return Ok(None);
+        }
+        let x_shape = x.shape();
+        if x_shape.len() < 2 {
+            return Ok(None);
+        }
+        let m_rows: i32 = x_shape
+            .iter()
+            .take(x_shape.len().saturating_sub(1))
+            .product();
+        if !(2..=9).contains(&m_rows) {
+            return Ok(None);
+        }
+        let Some(&k_in) = x_shape.last() else { return Ok(None) };
+        let [n_rows, k_packed] = *self.weight.shape() else {
+            return Ok(None);
+        };
+        let k_dim = k_packed * 8;
+        if k_dim != k_in || k_dim % 512 != 0 || n_rows % 8 != 0 {
+            return Ok(None);
+        }
+        let mut out_shape = x_shape.to_vec();
+        let _ = out_shape.pop();
+        out_shape.push(n_rows);
+        let y = crate::crossrow_qmv::crossrow_qmv_verify(
+            x,
+            &self.weight,
+            &self.scales,
+            &self.biases,
+            m_rows,
+        )?;
+        Ok(Some(y.reshape(&out_shape)?))
     }
 
     fn qgemm_verify_shape(&self, x: &Array) -> Option<i32> {
@@ -11405,6 +11455,23 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
         }
     }
 
+    // Chunked load-time eval. A single `model.eval()` materializes the whole
+    // graph — every loaded shard assignment plus the 288 fused GDN projection
+    // concats — as ONE Metal command buffer; on smaller unified-memory boxes
+    // (e.g. a 32 GiB M4 hosting this 15.2 GiB checkpoint) that buffer blows
+    // the GPU watchdog (`kIOGPUCommandBufferCallbackErrorTimeout`) during
+    // load. Evaluating per-parameter keeps every dispatch small at the cost
+    // of extra syncs during an untimed load. Enabled by default; opt out
+    // with HIGGS_LOAD_EVAL_CHUNKED=0.
+    if std::env::var("HIGGS_LOAD_EVAL_CHUNKED")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+    {
+        for (_, param) in params.iter() {
+            (**param).eval().map_err(crate::error::ModelError::from)?;
+        }
+    }
+
     model
         .eval()
         .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
@@ -11702,6 +11769,20 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             bytes = compacted.bytes,
             "Dropped validated symmetric Q1 bias tensors"
         );
+    }
+
+    // Chunked load-time eval (same rationale as load_qwen3_next_weights): a
+    // single whole-model eval materializes the 288 GDN fusion concats plus
+    // every shard assignment as one Metal command buffer, which blows the
+    // GPU watchdog on smaller unified-memory boxes. Opt out with
+    // HIGGS_LOAD_EVAL_CHUNKED=0.
+    if std::env::var("HIGGS_LOAD_EVAL_CHUNKED")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+    {
+        for (_, param) in params.iter() {
+            (**param).eval().map_err(crate::error::ModelError::from)?;
+        }
     }
 
     model
