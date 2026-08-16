@@ -10,6 +10,7 @@ pub mod gemma3;
 pub mod gemma4;
 pub mod llava_qwen2;
 /// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
+mod crossrow_qmv;
 mod metal_kernel;
 #[doc(hidden)]
 pub mod q2_row2_bench {

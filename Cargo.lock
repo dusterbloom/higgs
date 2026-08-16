@@ -297,7 +297,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2056,15 +2056,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -2438,7 +2429,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/dusterbloom/mlx-rs.git?branch=mlx-0.31#b46423d2447d3db354c134a0ef25ff55dfdfe8b6"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2450,7 +2441,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/dusterbloom/mlx-rs.git?branch=mlx-0.31#b46423d2447d3db354c134a0ef25ff55dfdfe8b6"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -2461,7 +2452,7 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/dusterbloom/mlx-rs.git?branch=mlx-0.31#b46423d2447d3db354c134a0ef25ff55dfdfe8b6"
 dependencies = [
  "dyn-clone",
  "half",
@@ -2484,7 +2475,7 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/oxideai/mlx-rs.git?rev=f4aa309c79b6be35255ca7d34157dfc10d9ed4c9#f4aa309c79b6be35255ca7d34157dfc10d9ed4c9"
+source = "git+https://github.com/dusterbloom/mlx-rs.git?branch=mlx-0.31#b46423d2447d3db354c134a0ef25ff55dfdfe8b6"
 dependencies = [
  "bindgen",
  "cc",
@@ -3996,7 +3987,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
