@@ -66,10 +66,12 @@ const CROSSROW_QMV_ENTRY: &str = r"
 
   const int out_row = int(tid.y) * 8 + int(sg) * ROWS_PER_SIMD;
 
+
   // load_vector bits==4 (verbatim ladder)
   // Raw x load: higgs passes plain activations (not pre-scaled 4-bit x),
   // so unlike the vendored qmv_fast ladder there is no x-side dequant.
-  auto load_x4 = [](const device OutT* src, thread float* xt) {
+  // x is bf16 regardless of the f32 OutT the scales promotion selects.
+  auto load_x4 = [](const device bfloat16_t* src, thread float* xt) {
     float sum = 0;
     for (int i = 0; i < VPT; ++i) {
       float v = float(src[i]);
@@ -137,7 +139,7 @@ const CROSSROW_QMV_ENTRY: &str = r"
       thread float bia[ROWS_PER_SIMD];
       fetch_block(k, pk, scl, bia);
       thread float x0[VPT];
-        const device OutT* xm0 = reinterpret_cast<const device OutT*>(x) + first_m * K + k + int(lid) * VPT;
+        const device bfloat16_t* xm0 = reinterpret_cast<const device bfloat16_t*>(x) + first_m * K + k + int(lid) * VPT;
       const float sum0 = load_x4(xm0, x0);
       if (has_pair) {
         thread float x1[VPT];
@@ -196,7 +198,7 @@ fn crossrow_kernel() -> &'static CachedMetalKernel {
                 output_ptrs.len(),
             );
             let kernel = mlx_sys::mlx_fast_metal_kernel_new(
-                c"higgs_crossrow_qmv_affine4_g64_v2".as_ptr(),
+                c"higgs_crossrow_qmv_affine4_g64".as_ptr(),
                 in_vec,
                 out_vec,
                 source.as_ptr(),
@@ -227,7 +229,9 @@ pub(crate) fn crossrow_qmv_verify(
     let k_dim = k_packed * 8;
     let x_flat = x.reshape(&[t_rows, k_dim])?;
     let stream = Stream::task_local_or_default();
-    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+    // Stock quantized_matmul promotes to the scales dtype (f32 for our
+    // checkpoints); match it so per-row outputs round identically.
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(scales.as_ptr()) };
 
     let kernel = crossrow_kernel();
     unsafe {
@@ -255,15 +259,17 @@ pub(crate) fn crossrow_qmv_verify(
         // grid: x-groups cover ceil(M/2) pairs; y covers 8-output tiles.
         let grid_x = (t_rows + 1) / 2;
         let grid_y = (n_rows as usize + 7) / 8;
-        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
-            config,
-            grid_x as i32,
-            grid_y as i32,
-            1,
-        );
+        // mlx fast kernels dispatch THREADS (dispatch_threads), so the grid
+        // is total thread counts: gx groups * 64 threads each.
+        let gx = grid_x as i32 * 64;
+        let gy = grid_y as i32;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, gx, gy, 1);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(
             config, 64, 1, 1,
         );
+        if std::env::var("HIGGS_CROSSROW_VERBOSE").is_ok() {
+            mlx_sys::mlx_fast_metal_kernel_config_set_verbose(config, true);
+        }
         let out_shape = [t_rows, n_rows];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
@@ -375,6 +381,7 @@ mod tests {
                 let want = ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0).unwrap();
 
                 let g32 = got.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+                g32.eval().unwrap();
                 let w32r = want.as_dtype(mlx_rs::Dtype::Float32).unwrap();
                 let diff = ops::abs(&ops::subtract(&g32, &w32r).unwrap()).unwrap();
                 let mx = ops::max(&diff, None).unwrap();
