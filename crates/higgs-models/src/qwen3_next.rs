@@ -939,7 +939,6 @@ impl QLinear {
             return Ok(y);
         }
 
-
         match self.mode {
             crate::quant_mode::QuantMode::MxFp4 => crate::quant_mode::quantized_matmul(
                 x,
@@ -1007,32 +1006,17 @@ impl QLinear {
 
     fn crossrow_qmv_forward(&self, x: &Array) -> Result<Option<Array>, Exception> {
         let enabled = std::env::var("HIGGS_CROSSROW_QMV").map_or(true, |v| v != "0");
-        if !enabled
-            || self.mode != crate::quant_mode::QuantMode::Affine
-            || self.bits != 4
-            || self.group_size != 64
-        {
-            return Ok(None);
-        }
         let x_shape = x.shape();
-        if x_shape.len() < 2 {
-            return Ok(None);
-        }
-        let m_rows: i32 = x_shape
-            .iter()
-            .take(x_shape.len().saturating_sub(1))
-            .product();
-        if !(2..=9).contains(&m_rows) {
-            return Ok(None);
-        }
-        let Some(&k_in) = x_shape.last() else { return Ok(None) };
-        let [n_rows, k_packed] = *self.weight.shape() else {
+        let Some((m_rows, n_rows)) = crossrow_qmv_shape(
+            enabled,
+            self.mode,
+            self.bits,
+            self.group_size,
+            x_shape,
+            self.weight.shape(),
+        ) else {
             return Ok(None);
         };
-        let k_dim = k_packed * 8;
-        if k_dim != k_in || k_dim % 512 != 0 || n_rows % 8 != 0 {
-            return Ok(None);
-        }
         let mut out_shape = x_shape.to_vec();
         let _ = out_shape.pop();
         out_shape.push(n_rows);
@@ -1112,6 +1096,37 @@ impl QLinear {
             self.forward(x)
         }
     }
+}
+
+fn crossrow_qmv_shape(
+    enabled: bool,
+    mode: crate::quant_mode::QuantMode,
+    bits: i32,
+    group_size: i32,
+    x_shape: &[i32],
+    weight_shape: &[i32],
+) -> Option<(i32, i32)> {
+    if !enabled
+        || mode != crate::quant_mode::QuantMode::Affine
+        || bits != 4
+        || group_size != 64
+        || x_shape.len() < 2
+    {
+        return None;
+    }
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    if !(2..=9).contains(&m_rows) {
+        return None;
+    }
+    let &k_in = x_shape.last()?;
+    let [n_rows, k_packed] = *weight_shape else {
+        return None;
+    };
+    let k_dim = k_packed * 8;
+    (k_dim == k_in && k_dim % 512 == 0 && n_rows % 8 == 0).then_some((m_rows, n_rows))
 }
 
 fn validate_dflash_qlinear(path: &str, linear: &QLinear) -> Result<(), Exception> {
@@ -11838,6 +11853,65 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
+
+    #[test]
+    fn crossrow_qmv_eligibility_preserves_fallback_boundaries() {
+        use crate::quant_mode::QuantMode;
+
+        for m_rows in 2..=9 {
+            assert_eq!(
+                crossrow_qmv_shape(true, QuantMode::Affine, 4, 64, &[m_rows, 1024], &[16, 128]),
+                Some((m_rows, 16)),
+                "eligible M={m_rows} should use crossrow QMV"
+            );
+        }
+
+        let x_shape = &[2, 1024];
+        let weight_shape = &[16, 128];
+        let eligible = |enabled, mode, bits, group_size, x: &[i32], weight: &[i32]| {
+            crossrow_qmv_shape(enabled, mode, bits, group_size, x, weight)
+        };
+        assert_eq!(
+            eligible(false, QuantMode::Affine, 4, 64, x_shape, weight_shape),
+            None
+        );
+        assert_eq!(
+            eligible(true, QuantMode::Affine, 4, 64, &[1, 1024], weight_shape),
+            None
+        );
+        assert_eq!(
+            eligible(true, QuantMode::Affine, 4, 64, &[10, 1024], weight_shape),
+            None
+        );
+        assert_eq!(
+            eligible(true, QuantMode::Dense, 4, 64, x_shape, weight_shape),
+            None
+        );
+        assert_eq!(
+            eligible(true, QuantMode::MxFp4, 4, 64, x_shape, weight_shape),
+            None
+        );
+        assert_eq!(
+            eligible(true, QuantMode::Affine, 3, 64, x_shape, weight_shape),
+            None
+        );
+        assert_eq!(
+            eligible(true, QuantMode::Affine, 4, 32, x_shape, weight_shape),
+            None
+        );
+        assert_eq!(
+            eligible(true, QuantMode::Affine, 4, 64, &[2, 768], &[16, 96]),
+            None
+        );
+        assert_eq!(
+            eligible(true, QuantMode::Affine, 4, 64, &[2, 512], weight_shape),
+            None
+        );
+        assert_eq!(
+            eligible(true, QuantMode::Affine, 4, 64, x_shape, &[10, 128]),
+            None
+        );
+    }
 
     #[test]
     fn gated_delta_tape_config_key_covers_specialization_and_output_geometry() {
