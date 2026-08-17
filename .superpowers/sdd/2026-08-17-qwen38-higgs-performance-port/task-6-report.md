@@ -50,6 +50,21 @@ $ git diff --check
 exit 0
 ~~~
 
+### Whole-trajectory parity rerun after final-review fix
+
+Using the exact grouped-ON and stock-OFF commands above with the same model,
+prompt, depth, and decode settings:
+
+| Path | Measured tok/s | Measured digest | Whole count | Whole digest | Total cycle ms |
+| --- | ---: | --- | ---: | --- | ---: |
+| grouped ON | 3.51 | `03a5ca3d6f61a958` | 34 | `b9e078dd8d30e814` | 9400.844 |
+| stock OFF | 3.00 | `03a5ca3d6f61a958` | 34 | `b9e078dd8d30e814` | 11012.790 |
+
+The warm-up-inclusive trajectory now matches exactly in both modes; the final
+review parity finding is resolved. The original three-trial timing medians
+remain the performance comparison because this rerun exists to validate the
+instrumentation change.
+
 ## Follow-up production-cycle benchmark (2026-08-18)
 
 The local Qwen3.8 27B checkpoint was available at
