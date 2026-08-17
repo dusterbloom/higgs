@@ -394,6 +394,7 @@ mod tests {
         k: i32,
     ) {
         let got = crossrow_qmv_verify(x, w, s, b, m).unwrap();
+        assert_eq!(got.dtype(), s.dtype(), "{case} M={m}: output dtype");
         let mut rows = Vec::new();
         for r in 0..m {
             let xr = x

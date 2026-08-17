@@ -933,7 +933,7 @@ impl QLinear {
 
         // Crossrow multi-row QMV (ported from the promoted mlx.fast kernel
         // family): affine-4 g64 verify shapes share each packed weight read
-        // across input-row pairs. Bit-exact per row with the stock qmv_fast
+        // across input-row groups. Bit-exact per row with the stock qmv_fast
         // path; gated by HIGGS_CROSSROW_QMV (default on).
         if let Some(y) = self.crossrow_qmv_forward(x)? {
             return Ok(y);
@@ -1020,13 +1020,15 @@ impl QLinear {
         let mut out_shape = x_shape.to_vec();
         let _ = out_shape.pop();
         out_shape.push(n_rows);
-        let y = crate::crossrow_qmv::crossrow_qmv_verify(
+        let Some(y) = crossrow_qmv_result(crate::crossrow_qmv::crossrow_qmv_verify(
             x,
             &self.weight,
             &self.scales,
             &self.biases,
             m_rows,
-        )?;
+        )) else {
+            return Ok(None);
+        };
         Ok(Some(y.reshape(&out_shape)?))
     }
 
@@ -1096,6 +1098,10 @@ impl QLinear {
             self.forward(x)
         }
     }
+}
+
+fn crossrow_qmv_result<T>(result: Result<T, Exception>) -> Option<T> {
+    result.ok()
 }
 
 fn crossrow_qmv_shape(
@@ -11853,6 +11859,14 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
+
+    #[test]
+    fn crossrow_qmv_error_uses_stock_fallback() {
+        let kernel_result: Result<(), Exception> =
+            Err(Exception::custom("synthetic crossrow kernel failure"));
+
+        assert!(crossrow_qmv_result(kernel_result).is_none());
+    }
 
     #[test]
     fn crossrow_qmv_eligibility_preserves_fallback_boundaries() {
