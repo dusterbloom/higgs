@@ -1050,6 +1050,39 @@ mod tests {
             })
     }
 
+    #[derive(Default)]
+    struct BenchmarkTokenAccounting {
+        measured: Vec<u32>,
+        whole_trajectory: Vec<u32>,
+    }
+
+    impl BenchmarkTokenAccounting {
+        fn record_warmup(&mut self, tokens: &[u32]) {
+            self.whole_trajectory.extend_from_slice(tokens);
+        }
+
+        fn record_measured(&mut self, tokens: &[u32]) {
+            self.measured.extend_from_slice(tokens);
+            self.whole_trajectory.extend_from_slice(tokens);
+        }
+
+        fn measured_count(&self) -> usize {
+            self.measured.len()
+        }
+
+        fn measured_digest(&self) -> u64 {
+            emitted_token_digest(&self.measured)
+        }
+
+        fn whole_trajectory_count(&self) -> usize {
+            self.whole_trajectory.len()
+        }
+
+        fn whole_trajectory_digest(&self) -> u64 {
+            emitted_token_digest(&self.whole_trajectory)
+        }
+    }
+
     #[test]
     fn draft_match_helper_accepts_identical_tokens() {
         assert!(draft_matches_target(17, 17));
@@ -1173,6 +1206,25 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_token_accounting_includes_warmup_in_whole_trajectory_only() {
+        let mut accounting = BenchmarkTokenAccounting::default();
+
+        accounting.record_warmup(&[1, 2]);
+        accounting.record_measured(&[3, 4, 5]);
+
+        assert_eq!(accounting.measured_count(), 3);
+        assert_eq!(
+            accounting.measured_digest(),
+            emitted_token_digest(&[3, 4, 5])
+        );
+        assert_eq!(accounting.whole_trajectory_count(), 5);
+        assert_eq!(
+            accounting.whole_trajectory_digest(),
+            emitted_token_digest(&[1, 2, 3, 4, 5])
+        );
+    }
+
+    #[test]
     #[ignore = "requires model files on disk"]
     #[allow(clippy::cast_precision_loss)]
     fn bench_production_mtp_cycle_real_model() {
@@ -1269,6 +1321,8 @@ mod tests {
             draft_depth
         );
 
+        let mut token_accounting = BenchmarkTokenAccounting::default();
+
         for warmup_cycle in 1..=WARMUP_CYCLES {
             let result = super::mtp_cycle(
                 &mut model,
@@ -1283,6 +1337,7 @@ mod tests {
             let mut eval_targets = vec![&result.hidden];
             eval_targets.extend(mtp_cache.iter().flat_map(|layer| layer.eval_targets()));
             higgs_models::mlx_exec::eval(eval_targets).expect("evaluate warm-up MTP cycle state");
+            token_accounting.record_warmup(&result.tokens);
 
             println!(
                 "warmup_cycle={warmup_cycle}/{WARMUP_CYCLES} configured_draft_depth={draft_depth} verifier_rows_T={} drafted={} accepted={} emitted={}",
@@ -1300,7 +1355,6 @@ mod tests {
         let mut total_verifier_rows = 0_usize;
         let mut min_verifier_rows = usize::MAX;
         let mut max_verifier_rows = 0_usize;
-        let mut emitted_token_ids = Vec::with_capacity(decode_steps.saturating_add(draft_depth));
 
         while usize::try_from(stats.emitted()).unwrap_or(usize::MAX) < decode_steps {
             let cycle = usize::try_from(stats.cycles()).unwrap_or(usize::MAX) + 1;
@@ -1322,7 +1376,7 @@ mod tests {
             let verifier_rows = result.drafted.saturating_add(1);
 
             stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
-            emitted_token_ids.extend_from_slice(&result.tokens);
+            token_accounting.record_measured(&result.tokens);
             total_cycle_ns = total_cycle_ns.saturating_add(elapsed.as_nanos());
             total_verifier_rows = total_verifier_rows.saturating_add(verifier_rows);
             min_verifier_rows = min_verifier_rows.min(verifier_rows);
@@ -1349,7 +1403,7 @@ mod tests {
         let cycles = stats.cycles();
         let total_seconds = total_cycle_ns as f64 / 1e9;
         println!(
-            "AVG production MTP: configured_draft_depth={} warmup_cycles={} cycles={} verifier_rows_total={} verifier_rows_min={} verifier_rows_max={} verifier_rows_avg={:.2} drafted={} accepted={} accept_rate={:.1}% emitted={} emitted_digest_fnv1a64={:016x} total_cycle_ms={:.3} avg_cycle_ms={:.3} tok/s={:.2}",
+            "AVG production MTP: configured_draft_depth={} warmup_cycles={} cycles={} verifier_rows_total={} verifier_rows_min={} verifier_rows_max={} verifier_rows_avg={:.2} drafted={} accepted={} accept_rate={:.1}% measured_emitted={} measured_digest_fnv1a64={:016x} whole_trajectory_emitted={} whole_trajectory_digest_fnv1a64={:016x} total_cycle_ms={:.3} avg_cycle_ms={:.3} tok/s={:.2}",
             draft_depth,
             WARMUP_CYCLES,
             cycles,
@@ -1360,8 +1414,10 @@ mod tests {
             stats.drafted(),
             stats.accepted_drafts(),
             stats.acceptance_rate_percent(),
-            stats.emitted(),
-            emitted_token_digest(&emitted_token_ids),
+            token_accounting.measured_count(),
+            token_accounting.measured_digest(),
+            token_accounting.whole_trajectory_count(),
+            token_accounting.whole_trajectory_digest(),
             total_seconds * 1e3,
             total_seconds * 1e3 / f64::from(cycles),
             f64::from(stats.emitted()) / total_seconds,

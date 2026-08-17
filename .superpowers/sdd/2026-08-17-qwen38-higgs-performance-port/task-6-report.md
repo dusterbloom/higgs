@@ -2,7 +2,12 @@
 
 ## Status
 
-Implemented and compile-verified an ignored real-model benchmark that exercises the production MTP cycle. The real-model benchmark was not run, per the task follow-up instruction.
+Implemented and compile-verified an ignored real-model benchmark that exercises
+the production MTP cycle. On 2026-08-18, the benchmark was run as a three-trial
+grouped-ON/stock-OFF AB against the local Qwen3.8 27B checkpoint. The measured
+suffix matched by emitted-token count and digest in all six runs; the final
+review fix also makes subsequent runs report a comparable whole-trajectory
+count and digest that include the unmeasured warm-up.
 
 ## Changed files
 
@@ -26,9 +31,12 @@ The benchmark is colocated with the existing `mtp.rs` unit tests so it can call 
 
 Greedy token selection uses the existing MLX `ops::indexing::argmax_axis` convention. Draft depth is resolved by `MlxRuntimeTuning::from_model_dir(..., RequestedMlxProfile::Auto)`, so `HIGGS_MTP_DRAFT_N_MAX` follows the production parser, default, and 1..=8 clamp. `HIGGS_MODEL_PATH`, `BENCH_PROMPT_LEN`, and `BENCH_DECODE_STEPS` follow the existing ignored benchmark conventions; prompt and decode defaults are 256 and 32.
 
-Each cycle prints configured draft depth, verifier batch rows (`T = drafted + 1`), drafted count, accepted count/rate, emitted count, cycle time, and cycle tok/s. The summary prints cycle count, total/min/max/average verifier rows, total drafted/accepted/emitted counts, aggregate acceptance rate, total/average cycle time, and aggregate tok/s. A configured depth of 1..=8 exercises verifier row counts T=2..=9.
+Each cycle prints configured draft depth, verifier batch rows (`T = drafted + 1`), drafted count, accepted count/rate, emitted count, cycle time, and cycle tok/s. The summary prints cycle count, total/min/max/average verifier rows, total drafted/accepted counts, measured emitted count/digest, whole-trajectory emitted count/digest, aggregate acceptance rate, total/average cycle time, and aggregate tok/s. The whole trajectory is the warm-up result followed by the measured suffix; timing statistics remain measured-only. A configured depth of 1..=8 exercises verifier row counts T=2..=9.
 
-No parser or accounting helper was added, so there was no new deterministic helper suitable for a separate TDD unit test. The harness is ignored and normal tests do not load model files.
+A benchmark-only token-accounting helper keeps the measured suffix and whole
+trajectory separate. Deterministic unit coverage verifies that warm-up tokens
+affect only the whole-trajectory count/digest. The harness remains ignored and
+normal tests do not load model files.
 
 ## Commands and outputs
 
@@ -48,9 +56,10 @@ The local Qwen3.8 27B checkpoint was available at
 `/Users/peppi/AI-Models/qwen38-higgs`. The new engine-level benchmark exercised
 the production `mtp_cycle` with `HIGGS_MTP_DRAFT_N_MAX=8`,
 `BENCH_PROMPT_LEN=256`, `BENCH_DECODE_STEPS=32`, one unmeasured warm-up cycle,
-and `HIGGS_MTP_ADAPTIVE_DRAFT=0`. Each run used verifier rows `T=9`, drafted
-56 rows, accepted 26 (46.4%), emitted 33 tokens, and reported the same
-`emitted_digest_fnv1a64=03a5ca3d6f61a958`.
+and `HIGGS_MTP_ADAPTIVE_DRAFT=0`. Grouped runs set `HIGGS_CROSSROW_QMV=1`;
+stock runs set `HIGGS_CROSSROW_QMV=0`. Each run used verifier rows `T=9`,
+drafted 56 rows, accepted 26 (46.4%), emitted 33 measured tokens, and reported
+the same measured-suffix digest `03a5ca3d6f61a958`.
 
 Raw measured summaries:
 
@@ -68,8 +77,11 @@ Three-run medians are **3.67 tok/s grouped** versus **2.90 tok/s stock**
 11379.003 ms to 9000.226 ms. The grouped path is noisier on the first trial,
 so the raw samples remain recorded rather than presenting only the median.
 
-This is an exact-output, production-cycle measurement; the previous
-one-draft model microbenchmark remains useful only as a narrow diagnostic.
+This AB established exact parity for the measured suffix. The benchmark at the
+time did not include the warm-up tokens in its digest; the final-review fix now
+reports a whole-trajectory count/digest so future stock/grouped trials can
+compare the warm-up and measured suffix together. The previous one-draft model
+microbenchmark remains useful only as a narrow diagnostic.
 
 ### Initial focused compile
 
@@ -111,23 +123,41 @@ test result: ok. 15 passed; 0 failed; 1 ignored; 0 measured; 529 filtered out; f
 
 ## Benchmark invocation
 
-The benchmark was intentionally not run during this task. Stock and grouped cross-row builds can be measured with identical values using:
+The 2026-08-18 AB used the following grouped-ON command three times:
 
 ~~~bash
-HIGGS_MODEL_PATH=/absolute/path/to/local/qwen3.8-model \
+HIGGS_MODEL_PATH=/Users/peppi/AI-Models/qwen38-higgs \
 BENCH_PROMPT_LEN=256 \
 BENCH_DECODE_STEPS=32 \
 HIGGS_MTP_DRAFT_N_MAX=8 \
+HIGGS_MTP_ADAPTIVE_DRAFT=0 \
+HIGGS_CROSSROW_QMV=1 \
 cargo test -p higgs-engine --release --lib \
   mtp::tests::bench_production_mtp_cycle_real_model -- \
   --ignored --exact --nocapture
 ~~~
 
-Use the same model, prompt length, decode steps, draft depth, and warm process state for both stock and grouped cross-row trials.
+The stock-OFF command was identical except for the explicit cross-row opt-out:
+
+~~~bash
+HIGGS_MODEL_PATH=/Users/peppi/AI-Models/qwen38-higgs \
+BENCH_PROMPT_LEN=256 \
+BENCH_DECODE_STEPS=32 \
+HIGGS_MTP_DRAFT_N_MAX=8 \
+HIGGS_MTP_ADAPTIVE_DRAFT=0 \
+HIGGS_CROSSROW_QMV=0 \
+cargo test -p higgs-engine --release --lib \
+  mtp::tests::bench_production_mtp_cycle_real_model -- \
+  --ignored --exact --nocapture
+~~~
 
 ## Concerns
 
-None for the bounded harness implementation. Runtime performance numbers and stock-versus-grouped token/timing comparison remain deliberately uncollected because the follow-up explicitly prohibited running the real-model benchmark.
+The six-run AB captured measured-suffix parity, not full-trajectory parity,
+because its digest accumulator started after warm-up. The final-review fix
+closes that instrumentation gap for future runs without changing the recorded
+2026-08-18 timings or production MTP behavior. No other bounded-harness concern
+is known.
 
 ## Fix worker update (2026-08-18)
 
@@ -159,7 +189,8 @@ None for the bounded harness implementation. Runtime performance numbers and sto
   benchmark.
 - Added deterministic unit coverage for explicit/default path resolution and
   the emitted-token digest. No production MTP behavior or grouped cross-row code
-  changed. The real-model benchmark was not run.
+  changed. The real-model benchmark was subsequently run in the 2026-08-18 AB
+  recorded above.
 
 ### Fix round 1 verification
 
@@ -169,6 +200,40 @@ test result: ok. 14 passed; 0 failed; 1 ignored; 0 measured; 534 filtered out
 
 $ cargo test -p higgs-engine --release --lib mtp --no-run
 Finished `release` profile [optimized] target(s) in 1m 12s
+Executable unittests src/lib.rs (target/release/deps/higgs_engine-6ae3dd2051b08dd8)
+
+$ rustfmt --edition 2024 --check crates/higgs-engine/src/mtp.rs
+exit 0
+
+$ git diff --check
+exit 0
+~~~
+
+## Final-review fix wave (2026-08-18)
+
+- Added benchmark-only token accounting that records warm-up `result.tokens`
+  before the measured loop, then records measured tokens in both the measured
+  suffix and whole trajectory. The summary now reports
+  `measured_emitted`/`measured_digest_fnv1a64` and
+  `whole_trajectory_emitted`/`whole_trajectory_digest_fnv1a64` separately.
+  Cycle elapsed time is still captured before measured token accounting, so the
+  existing timing boundary and production MTP semantics are unchanged.
+- Added deterministic coverage proving that warm-up tokens affect the
+  whole-trajectory count/digest but not the measured count/digest. The focused
+  MTP test run passed 15 tests with the real-model benchmark still ignored.
+- Updated this report to record the actual 2026-08-18 AB, its exact grouped-ON
+  and stock-OFF environment settings, and the original measured-suffix scope of
+  its parity evidence. Removed duplicate unchecked Tasks 4 and 5 from the local
+  SDD progress ledger.
+
+### Final-review verification
+
+~~~text
+$ cargo test -p higgs-engine --lib mtp::tests:: -- --nocapture
+test result: ok. 15 passed; 0 failed; 1 ignored; 0 measured; 534 filtered out
+
+$ cargo test -p higgs-engine --release --lib mtp --no-run
+Finished `release` profile [optimized] target(s) in 1m 11s
 Executable unittests src/lib.rs (target/release/deps/higgs_engine-6ae3dd2051b08dd8)
 
 $ rustfmt --edition 2024 --check crates/higgs-engine/src/mtp.rs
