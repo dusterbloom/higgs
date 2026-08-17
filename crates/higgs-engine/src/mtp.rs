@@ -1015,6 +1015,40 @@ mod tests {
         AdaptiveDraftDepth, MtpStats, accepted_draft_prefix_len, draft_matches_target,
         emitted_tokens, prompt_lookup_draft,
     };
+    use std::path::{Path, PathBuf};
+
+    fn resolve_benchmark_model_path(
+        explicit: Option<PathBuf>,
+        default: PathBuf,
+        exists: impl Fn(&Path) -> bool,
+    ) -> Result<Option<PathBuf>, String> {
+        if let Some(path) = explicit {
+            if exists(&path) {
+                Ok(Some(path))
+            } else {
+                Err(format!(
+                    "HIGGS_MODEL_PATH was set but does not exist: {}",
+                    path.display()
+                ))
+            }
+        } else if exists(&default) {
+            Ok(Some(default))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn emitted_token_digest(tokens: &[u32]) -> u64 {
+        const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .fold(FNV_OFFSET_BASIS, |digest, byte| {
+                (digest ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+            })
+    }
 
     #[test]
     fn draft_match_helper_accepts_identical_tokens() {
@@ -1105,10 +1139,44 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_model_path_rejects_an_invalid_explicit_path() {
+        let explicit = PathBuf::from("/explicit/missing-model");
+        let result = resolve_benchmark_model_path(
+            Some(explicit.clone()),
+            PathBuf::from("/default/model"),
+            |_| false,
+        );
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "HIGGS_MODEL_PATH was set but does not exist: {}",
+                explicit.display()
+            ))
+        );
+    }
+
+    #[test]
+    fn benchmark_model_path_allows_an_absent_default_path() {
+        let result =
+            resolve_benchmark_model_path(None, PathBuf::from("/default/missing-model"), |_| false);
+
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn emitted_token_digest_is_stable() {
+        assert_eq!(
+            emitted_token_digest(&[1, 256, u32::MAX]),
+            0x50b2_6df1_06c3_b41b
+        );
+    }
+
+    #[test]
     #[ignore = "requires model files on disk"]
     #[allow(clippy::cast_precision_loss)]
     fn bench_production_mtp_cycle_real_model() {
-        use std::{path::Path, time::Instant};
+        use std::time::Instant;
 
         use higgs_models::AnyModel;
         use mlx_rs::{Array, ops::indexing::IndexOp};
@@ -1118,14 +1186,23 @@ mod tests {
             model_loader,
         };
 
-        let model_path = std::env::var("HIGGS_MODEL_PATH").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").expect("HOME must be set");
-            format!("{home}/.cache/lm-studio/models/mlx-community/Qwen3.5-27B-4bit")
-        });
-        if !Path::new(&model_path).exists() {
-            println!("Model not found at {model_path}, skipping");
+        const WARMUP_CYCLES: usize = 1;
+
+        let explicit_model_path = std::env::var_os("HIGGS_MODEL_PATH").map(PathBuf::from);
+        let default_model_path = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"))
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-27B-4bit");
+        let Some(model_path) = resolve_benchmark_model_path(
+            explicit_model_path,
+            default_model_path.clone(),
+            Path::exists,
+        )
+        .unwrap_or_else(|message| panic!("{message}")) else {
+            println!(
+                "Default model not found at {}, skipping",
+                default_model_path.display()
+            );
             return;
-        }
+        };
 
         let prompt_len: i32 = std::env::var("BENCH_PROMPT_LEN")
             .ok()
@@ -1137,13 +1214,15 @@ mod tests {
             .and_then(|value| value.parse().ok())
             .filter(|value| *value > 0)
             .unwrap_or(32);
-        let draft_depth =
-            MlxRuntimeTuning::from_model_dir(Path::new(&model_path), RequestedMlxProfile::Auto)
-                .mtp_draft_n_max();
+        let draft_depth = MlxRuntimeTuning::from_model_dir(&model_path, RequestedMlxProfile::Auto)
+            .mtp_draft_n_max();
 
         let mut model = model_loader::load_model(&model_path).expect("load benchmark model");
         if !model.has_mtp() {
-            println!("Model at {model_path} has no MTP head, skipping");
+            println!(
+                "Model at {} has no MTP head, skipping",
+                model_path.display()
+            );
             return;
         }
         let vocab_size = match &model {
@@ -1182,16 +1261,46 @@ mod tests {
             .expect("evaluate MTP bootstrap");
         let mut confirmed_token_id: u32 = next_token.item();
 
+        println!(
+            "MTP production-cycle benchmark: model={} prompt_len={} decode_steps={} configured_draft_depth={} warmup_cycles={WARMUP_CYCLES}",
+            model_path.display(),
+            prompt_len,
+            decode_steps,
+            draft_depth
+        );
+
+        for warmup_cycle in 1..=WARMUP_CYCLES {
+            let result = super::mtp_cycle(
+                &mut model,
+                &mut cache,
+                &mut mtp_cache,
+                &current_hidden,
+                confirmed_token_id,
+                draft_depth,
+            )
+            .expect("run warm-up production MTP cycle");
+            cache.eval().expect("evaluate warm-up backbone cache");
+            let mut eval_targets = vec![&result.hidden];
+            eval_targets.extend(mtp_cache.iter().flat_map(|layer| layer.eval_targets()));
+            higgs_models::mlx_exec::eval(eval_targets).expect("evaluate warm-up MTP cycle state");
+
+            println!(
+                "warmup_cycle={warmup_cycle}/{WARMUP_CYCLES} configured_draft_depth={draft_depth} verifier_rows_T={} drafted={} accepted={} emitted={}",
+                result.drafted.saturating_add(1),
+                result.drafted,
+                result.accepted_drafts,
+                result.tokens.len()
+            );
+            current_hidden = result.hidden;
+            confirmed_token_id = result.next_token_id;
+        }
+
         let mut stats = super::MtpStats::default();
         let mut total_cycle_ns = 0_u128;
         let mut total_verifier_rows = 0_usize;
         let mut min_verifier_rows = usize::MAX;
         let mut max_verifier_rows = 0_usize;
-
-        println!(
-            "MTP production-cycle benchmark: model={} prompt_len={} decode_steps={} configured_draft_depth={}",
-            model_path, prompt_len, decode_steps, draft_depth
-        );
+        let mut emitted_token_ids = Vec::with_capacity(decode_steps.saturating_add(draft_depth));
 
         while usize::try_from(stats.emitted()).unwrap_or(usize::MAX) < decode_steps {
             let cycle = usize::try_from(stats.cycles()).unwrap_or(usize::MAX) + 1;
@@ -1205,10 +1314,15 @@ mod tests {
                 draft_depth,
             )
             .expect("run production MTP cycle");
+            cache.eval().expect("evaluate measured backbone cache");
+            let mut eval_targets = vec![&result.hidden];
+            eval_targets.extend(mtp_cache.iter().flat_map(|layer| layer.eval_targets()));
+            higgs_models::mlx_exec::eval(eval_targets).expect("evaluate measured MTP cycle state");
             let elapsed = cycle_start.elapsed();
             let verifier_rows = result.drafted.saturating_add(1);
 
             stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
+            emitted_token_ids.extend_from_slice(&result.tokens);
             total_cycle_ns = total_cycle_ns.saturating_add(elapsed.as_nanos());
             total_verifier_rows = total_verifier_rows.saturating_add(verifier_rows);
             min_verifier_rows = min_verifier_rows.min(verifier_rows);
@@ -1235,8 +1349,9 @@ mod tests {
         let cycles = stats.cycles();
         let total_seconds = total_cycle_ns as f64 / 1e9;
         println!(
-            "AVG production MTP: configured_draft_depth={} cycles={} verifier_rows_total={} verifier_rows_min={} verifier_rows_max={} verifier_rows_avg={:.2} drafted={} accepted={} accept_rate={:.1}% emitted={} total_cycle_ms={:.3} avg_cycle_ms={:.3} tok/s={:.2}",
+            "AVG production MTP: configured_draft_depth={} warmup_cycles={} cycles={} verifier_rows_total={} verifier_rows_min={} verifier_rows_max={} verifier_rows_avg={:.2} drafted={} accepted={} accept_rate={:.1}% emitted={} emitted_digest_fnv1a64={:016x} total_cycle_ms={:.3} avg_cycle_ms={:.3} tok/s={:.2}",
             draft_depth,
+            WARMUP_CYCLES,
             cycles,
             total_verifier_rows,
             min_verifier_rows,
@@ -1246,6 +1361,7 @@ mod tests {
             stats.accepted_drafts(),
             stats.acceptance_rate_percent(),
             stats.emitted(),
+            emitted_token_digest(&emitted_token_ids),
             total_seconds * 1e3,
             total_seconds * 1e3 / f64::from(cycles),
             f64::from(stats.emitted()) / total_seconds,
