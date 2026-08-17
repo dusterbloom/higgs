@@ -42,6 +42,35 @@ $ git diff --check
 exit 0
 ~~~
 
+## Follow-up production-cycle benchmark (2026-08-18)
+
+The local Qwen3.8 27B checkpoint was available at
+`/Users/peppi/AI-Models/qwen38-higgs`. The new engine-level benchmark exercised
+the production `mtp_cycle` with `HIGGS_MTP_DRAFT_N_MAX=8`,
+`BENCH_PROMPT_LEN=256`, `BENCH_DECODE_STEPS=32`, one unmeasured warm-up cycle,
+and `HIGGS_MTP_ADAPTIVE_DRAFT=0`. Each run used verifier rows `T=9`, drafted
+56 rows, accepted 26 (46.4%), emitted 33 tokens, and reported the same
+`emitted_digest_fnv1a64=03a5ca3d6f61a958`.
+
+Raw measured summaries:
+
+| Path | Total cycle ms | Avg cycle ms | tok/s |
+| --- | ---: | ---: | ---: |
+| grouped ON 1 | 10931.201 | 1561.600 | 3.02 |
+| stock OFF 1 | 11535.084 | 1647.869 | 2.86 |
+| stock OFF 2 | 11379.003 | 1625.572 | 2.90 |
+| grouped ON 2 | 9000.226 | 1285.747 | 3.67 |
+| grouped ON 3 | 8985.552 | 1283.650 | 3.67 |
+| stock OFF 3 | 11312.717 | 1616.102 | 2.92 |
+
+Three-run medians are **3.67 tok/s grouped** versus **2.90 tok/s stock**
+(approximately **26.6% faster**), with a median total-cycle reduction from
+11379.003 ms to 9000.226 ms. The grouped path is noisier on the first trial,
+so the raw samples remain recorded rather than presenting only the median.
+
+This is an exact-output, production-cycle measurement; the previous
+one-draft model microbenchmark remains useful only as a narrow diagnostic.
+
 ### Initial focused compile
 
 ~~~text
