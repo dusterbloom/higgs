@@ -29,7 +29,7 @@ The benchmark is colocated with the existing `mtp.rs` unit tests so it can call 
 4. Mirror that token with `mirror_mtp_token`.
 5. Repeatedly call production `mtp_cycle` at the runtime-configured draft depth.
 
-Greedy token selection uses the existing MLX `ops::indexing::argmax_axis` convention. Draft depth is resolved by `MlxRuntimeTuning::from_model_dir(..., RequestedMlxProfile::Auto)`, so `HIGGS_MTP_DRAFT_N_MAX` follows the production parser, default, and 1..=8 clamp. `HIGGS_MODEL_PATH`, `BENCH_PROMPT_LEN`, and `BENCH_DECODE_STEPS` follow the existing ignored benchmark conventions; prompt and decode defaults are 256 and 32.
+Greedy token selection uses the existing MLX `mlx_rs::argmax_axis!(..., -1)` macro convention. Draft depth is resolved by `MlxRuntimeTuning::from_model_dir(..., RequestedMlxProfile::Auto)`, so `HIGGS_MTP_DRAFT_N_MAX` follows the production parser, default, and 1..=8 clamp. `HIGGS_MODEL_PATH`, `BENCH_PROMPT_LEN`, and `BENCH_DECODE_STEPS` follow the existing ignored benchmark conventions; prompt and decode defaults are 256 and 32.
 
 Each cycle prints configured draft depth, verifier batch rows (`T = drafted + 1`), drafted count, accepted count/rate, emitted count, cycle time, and cycle tok/s. The summary prints cycle count, total/min/max/average verifier rows, total drafted/accepted counts, measured emitted count/digest, whole-trajectory emitted count/digest, aggregate acceptance rate, total/average cycle time, and aggregate tok/s. The whole trajectory is the warm-up result followed by the measured suffix; timing statistics remain measured-only. A configured depth of 1..=8 exercises verifier row counts T=2..=9.
 
@@ -52,7 +52,7 @@ exit 0
 
 ### Whole-trajectory parity rerun after final-review fix
 
-Using the exact grouped-ON and stock-OFF commands above with the same model,
+Using the exact grouped-ON and stock-OFF commands below with the same model,
 prompt, depth, and decode settings:
 
 | Path | Measured tok/s | Measured digest | Whole count | Whole digest | Total cycle ms |
@@ -109,7 +109,8 @@ error[E0423]: expected function, found macro `argmax_axis`
 warning: unused import: `argmax_axis`
 ~~~
 
-The import was corrected from the root macro to the existing function convention, `mlx_rs::ops::indexing::argmax_axis`.
+The attempted import was removed; both call sites use the existing
+`mlx_rs::argmax_axis!(..., -1)` macro convention.
 
 ### Focused debug compile after correction
 
