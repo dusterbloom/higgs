@@ -47,6 +47,24 @@ constexpr int VPT = 16;
 constexpr int BLOCK = VPT * SIMD_W;
 ";
 
+const fn crossrow_group_layout(t_rows: i32) -> &'static [i32] {
+    match t_rows {
+        2 => &[2],
+        3 => &[2, 1],
+        4 => &[2, 2],
+        5 => &[3, 2],
+        6 => &[3, 3],
+        7 => &[3, 2, 2],
+        8 => &[3, 3, 2],
+        9 => &[3, 3, 3],
+        _ => &[],
+    }
+}
+
+const fn crossrow_group_count(t_rows: i32) -> i32 {
+    crossrow_group_layout(t_rows).len() as i32
+}
+
 // The kernel body source selects on M at runtime through template dispatch in
 // a thin trampoline; mlx fast kernels compile per template instantiation.
 const CROSSROW_QMV_ENTRY: &str = r"
@@ -321,6 +339,33 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, unsafe_code)]
     use super::*;
     use mlx_rs::ops;
+
+    #[test]
+    fn crossrow_group_layout_covers_supported_rows() {
+        let expected = [
+            (2, &[2][..]),
+            (3, &[2, 1][..]),
+            (4, &[2, 2][..]),
+            (5, &[3, 2][..]),
+            (6, &[3, 3][..]),
+            (7, &[3, 2, 2][..]),
+            (8, &[3, 3, 2][..]),
+            (9, &[3, 3, 3][..]),
+        ];
+        for (rows, groups) in expected {
+            assert_eq!(crossrow_group_layout(rows), groups);
+            assert_eq!(crossrow_group_count(rows), groups.len() as i32);
+            assert_eq!(groups.iter().sum::<i32>(), rows);
+        }
+    }
+
+    #[test]
+    fn crossrow_group_layout_rejects_unsupported_rows() {
+        for rows in [i32::MIN, -1, 0, 1, 10, i32::MAX] {
+            assert!(crossrow_group_layout(rows).is_empty());
+            assert_eq!(crossrow_group_count(rows), 0);
+        }
+    }
 
     /// Every M in 2..=9 must produce bit-identical rows to stock
     /// quantized_matmul executed per row (the exactness contract the MTP
