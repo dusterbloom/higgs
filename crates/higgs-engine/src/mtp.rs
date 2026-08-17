@@ -1103,4 +1103,152 @@ mod tests {
 
         assert!(prompt_lookup_draft(&context, 3, 4, 3).is_empty());
     }
+
+    #[test]
+    #[ignore = "requires model files on disk"]
+    #[allow(clippy::cast_precision_loss)]
+    fn bench_production_mtp_cycle_real_model() {
+        use std::{path::Path, time::Instant};
+
+        use higgs_models::AnyModel;
+        use mlx_rs::{Array, ops::indexing::IndexOp};
+
+        use crate::{
+            mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile},
+            model_loader,
+        };
+
+        let model_path = std::env::var("HIGGS_MODEL_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME must be set");
+            format!("{home}/.cache/lm-studio/models/mlx-community/Qwen3.5-27B-4bit")
+        });
+        if !Path::new(&model_path).exists() {
+            println!("Model not found at {model_path}, skipping");
+            return;
+        }
+
+        let prompt_len: i32 = std::env::var("BENCH_PROMPT_LEN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(256);
+        let decode_steps: usize = std::env::var("BENCH_DECODE_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(32);
+        let draft_depth =
+            MlxRuntimeTuning::from_model_dir(Path::new(&model_path), RequestedMlxProfile::Auto)
+                .mtp_draft_n_max();
+
+        let mut model = model_loader::load_model(&model_path).expect("load benchmark model");
+        if !model.has_mtp() {
+            println!("Model at {model_path} has no MTP head, skipping");
+            return;
+        }
+        let vocab_size = match &model {
+            AnyModel::Qwen3Next(model) => {
+                u32::try_from(model.args.vocab_size).expect("positive vocabulary size")
+            }
+            _ => unreachable!("an MTP model must use the Qwen3Next wrapper"),
+        };
+        let prompt_tokens: Vec<u32> = (0..u32::try_from(prompt_len).unwrap())
+            .map(|token| token % vocab_size)
+            .collect();
+        let prompt = Array::from_slice(&prompt_tokens, &[1, prompt_len]);
+        let mut cache = model.make_cache().expect("create backbone cache");
+        let (prefill_hidden, prefill_logits) = model
+            .forward_with_hidden_last_token_logits(&prompt, None, &mut cache)
+            .expect("prefill benchmark prompt");
+        let first_token =
+            mlx_rs::argmax_axis!(&prefill_logits.index((.., -1, ..)), -1).expect("prefill argmax");
+
+        let mut mtp_cache = model.make_mtp_cache().expect("create MTP cache");
+        super::prime_mtp_cache(&mut model, &mut mtp_cache, &prompt_tokens, &prefill_hidden)
+            .expect("prime MTP cache");
+
+        let first_token_id: u32 = first_token.item();
+        let first_input = Array::from_slice(&[i32::try_from(first_token_id).unwrap()], &[1, 1]);
+        let (first_hidden, first_logits) = model
+            .forward_with_hidden(&first_input, None, &mut cache)
+            .expect("bootstrap production MTP decode");
+        let next_token =
+            mlx_rs::argmax_axis!(&first_logits.index((.., -1, ..)), -1).expect("bootstrap argmax");
+        let previous_hidden = prefill_hidden.index((.., -1.., ..));
+        super::mirror_mtp_token(&mut model, &mut mtp_cache, &previous_hidden, first_token_id)
+            .expect("mirror bootstrap token into MTP cache");
+        let mut current_hidden = first_hidden.index((.., -1.., ..));
+        higgs_models::mlx_exec::eval([&next_token, &current_hidden])
+            .expect("evaluate MTP bootstrap");
+        let mut confirmed_token_id: u32 = next_token.item();
+
+        let mut stats = super::MtpStats::default();
+        let mut total_cycle_ns = 0_u128;
+        let mut total_verifier_rows = 0_usize;
+        let mut min_verifier_rows = usize::MAX;
+        let mut max_verifier_rows = 0_usize;
+
+        println!(
+            "MTP production-cycle benchmark: model={} prompt_len={} decode_steps={} configured_draft_depth={}",
+            model_path, prompt_len, decode_steps, draft_depth
+        );
+
+        while usize::try_from(stats.emitted()).unwrap_or(usize::MAX) < decode_steps {
+            let cycle = usize::try_from(stats.cycles()).unwrap_or(usize::MAX) + 1;
+            let cycle_start = Instant::now();
+            let result = super::mtp_cycle(
+                &mut model,
+                &mut cache,
+                &mut mtp_cache,
+                &current_hidden,
+                confirmed_token_id,
+                draft_depth,
+            )
+            .expect("run production MTP cycle");
+            let elapsed = cycle_start.elapsed();
+            let verifier_rows = result.drafted.saturating_add(1);
+
+            stats.record_cycle(result.drafted, result.tokens.len(), result.accepted_drafts);
+            total_cycle_ns = total_cycle_ns.saturating_add(elapsed.as_nanos());
+            total_verifier_rows = total_verifier_rows.saturating_add(verifier_rows);
+            min_verifier_rows = min_verifier_rows.min(verifier_rows);
+            max_verifier_rows = max_verifier_rows.max(verifier_rows);
+            current_hidden = result.hidden;
+            confirmed_token_id = result.next_token_id;
+
+            println!(
+                "cycle={cycle} configured_draft_depth={draft_depth} verifier_rows_T={verifier_rows} drafted={} accepted={} accept_rate={:.1}% emitted={} total_emitted={} cycle_ms={:.3} tok/s={:.2}",
+                result.drafted,
+                result.accepted_drafts,
+                if result.drafted == 0 {
+                    0.0
+                } else {
+                    result.accepted_drafts as f64 * 100.0 / result.drafted as f64
+                },
+                result.tokens.len(),
+                stats.emitted(),
+                elapsed.as_secs_f64() * 1e3,
+                result.tokens.len() as f64 / elapsed.as_secs_f64(),
+            );
+        }
+
+        let cycles = stats.cycles();
+        let total_seconds = total_cycle_ns as f64 / 1e9;
+        println!(
+            "AVG production MTP: configured_draft_depth={} cycles={} verifier_rows_total={} verifier_rows_min={} verifier_rows_max={} verifier_rows_avg={:.2} drafted={} accepted={} accept_rate={:.1}% emitted={} total_cycle_ms={:.3} avg_cycle_ms={:.3} tok/s={:.2}",
+            draft_depth,
+            cycles,
+            total_verifier_rows,
+            min_verifier_rows,
+            max_verifier_rows,
+            total_verifier_rows as f64 / f64::from(cycles),
+            stats.drafted(),
+            stats.accepted_drafts(),
+            stats.acceptance_rate_percent(),
+            stats.emitted(),
+            total_seconds * 1e3,
+            total_seconds * 1e3 / f64::from(cycles),
+            f64::from(stats.emitted()) / total_seconds,
+        );
+    }
 }
