@@ -55,4 +55,3 @@ Retain `HIGGS_ESCHA_NATIVE=0` as the affine escape hatch and `HIGGS_ESCHA_TRELLI
 ## Rollback and upstream shape
 
 Keep changes localized to `crates/higgs-models/src/eschamoe.rs`, `crates/higgs-models/src/metal_kernel.rs`, `crates/higgs-models/src/qwen3_next.rs`, and focused tests/docs. Preserve the existing affine and scratch paths as explicit fallbacks. Split correctness/validation from optional performance changes so the first upstream review can land without requiring a benchmark-dependent default change.
-
