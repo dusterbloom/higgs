@@ -15,7 +15,8 @@ The exact Task 2 comparison was selected:
 | Setting | Value |
 | --- | --- |
 | model | `/Users/peppi/AI-Models/qwen38-higgs` |
-| prompt / decode | `256` / `128` |
+| prompt length | `BENCH_PROMPT_LEN=256` |
+| decode steps | `BENCH_DECODE_STEPS=128` |
 | draft depth | `HIGGS_MTP_DRAFT_N_MAX=5` (verifier `T=6`) |
 | adaptive draft | `HIGGS_MTP_ADAPTIVE_DRAFT=0` |
 | mirror verify | `HIGGS_MTP_MIRROR_VERIFY=0` |
@@ -28,25 +29,28 @@ The existing release test executable was verified to contain
 ## Capture attempt and artifacts
 
 The grouped capture was launched outside the sandbox using the Metal System
-Trace template, the pinned grouped environment above, and a `90s` time limit.
-Instruments did not start a recording because the requested output path already
-existed:
+Trace template, the pinned grouped environment above, and `--time-limit 10m`.
+The supplied log,
+`/private/tmp/higgs-metal/qwen38-grouped-20260818T005804Z.log`, records the
+single exact production-MTP benchmark output (one passed test) followed by the
+existing-output-path error. Instruments did not start a recording because the
+requested output path already existed:
 
 ```text
 Trace file already exists at path: /private/tmp/higgs-metal/qwen38-grouped.trace.
 Specify append-run option to append a run to it.
 ```
 
-That exact message is preserved in
-`/private/tmp/higgs-metal/qwen38-grouped.log`. Per the bounded-attempt rule,
-the command was not retried and the stock capture was not started.
+Per the bounded-attempt rule, the command was not retried and the stock capture
+was not started.
 
-The pre-existing `/private/tmp/higgs-metal/qwen38-grouped.trace` was 96 bytes,
-so it is not a usable trace artifact. Its accompanying pre-existing
-`qwen38-grouped-benchmark.log` shows that an earlier invocation ran five
-ignored tests and was still running after 60 seconds; it did not establish the
-single exact production-MTP benchmark. It is retained but excluded from
-analysis.
+The requested pre-existing output path
+`/private/tmp/higgs-metal/qwen38-grouped.trace` is a 96-byte file. The attempt
+also left `/private/tmp/higgs-metal/qwen38-grouped-20260818T005804Z.trace`, a
+320-byte trace bundle. Neither artifact is a valid Metal trace and neither is
+used for classification. The earlier `qwen38-grouped-benchmark.log` ran five
+ignored tests and was still running after 60 seconds; it is unrelated to the
+single exact production-MTP output in the supplied attempt log.
 
 An attempt to export the pre-existing trace table of contents also failed in
 the sandbox before trace analysis:
@@ -86,3 +90,15 @@ optimization.
   filter runs unrelated ignored tests.
 - Run `xctrace export` where Instruments may write its cache directory, then
   export both trace TOCs before drawing GPU or CPU-launch conclusions.
+
+## Fix verification
+
+- Rechecked this report against the Task 3 brief and
+  `/private/tmp/higgs-metal/qwen38-grouped-20260818T005804Z.log`: the attempted
+  command used `--time-limit 10m`, with `BENCH_PROMPT_LEN=256`,
+  `BENCH_DECODE_STEPS=128`, `HIGGS_MTP_DRAFT_N_MAX=5`,
+  `HIGGS_MTP_ADAPTIVE_DRAFT=0`, `HIGGS_MTP_MIRROR_VERIFY=0`, and grouped
+  `HIGGS_CROSSROW_QMV=1` (stock comparison `HIGGS_CROSSROW_QMV=0`).
+- Restored the unrelated performance-port Task 6 report exactly to
+  `1dd909aab`; Task 6 will aggregate Task 3 evidence later.
+- `git diff --check` exited 0.
