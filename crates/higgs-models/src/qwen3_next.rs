@@ -14602,9 +14602,7 @@ mod tests {
         for rows in [31_i32, 32, 33] {
             let values: Vec<f32> = (0..rows)
                 .flat_map(|row| {
-                    (0..hidden).map(move |col| {
-                        ((row * 17 + col * 3) % 101) as f32 / 101.0 / 256.0
-                    })
+                    (0..hidden).map(move |col| ((row * 17 + col * 3) % 101) as f32 / 101.0 / 256.0)
                 })
                 .collect();
             let ids: Vec<u32> = (0..rows).map(|row| (row % 2) as u32).collect();

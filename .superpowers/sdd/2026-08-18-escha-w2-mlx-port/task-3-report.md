@@ -191,3 +191,28 @@ builds or tests in this round.
 ## Open issues
 
 None.
+
+## Post-review runtime validation
+
+After storage was reclaimed, the dedicated branch completed:
+
+- `cargo build --release`: **PASS** (`Finished release profile [optimized]`).
+- `eschamoe::tests::eschamoe_gather_kernels_preserve_logical_row_bits`: **PASS**.
+- `eschamoe::tests::eschamoe_gather_qgemm_matches_scratch_matmul`: **PASS**; the
+  reported relative gaps stayed below `4.0e-4` across K=2/K=3, sorted and
+  unsorted fixtures.
+- Gather contract validation: **5 PASS**.
+- Invalid QMV/QGEMM expert-row guards: **2 PASS**.
+- Native short-domain and 31/32/33 dispatch-order tests: **PASS** after commit
+  `69fe38895` bounded the synthetic input magnitude. The original fixture
+  reached about `43,218` after SwiGLU and overflowed the intentional f16
+  scratch matmul at the down projection; production code was not involved.
+
+The ignored real-checkpoint fixture was attempted against the complete local
+`Qwen3.6-35B-A3B-Escha-W2` checkpoint in both affine and native modes. Both
+processes aborted before loading weights with MLX's
+`NSRangeException: __NSArray0 objectAtIndex: index 0 beyond bounds for empty
+array` from `metal::Device` enumeration. No logits or 129-token digest was
+produced. Focused fresh processes can still enumerate and execute Metal, so
+this remains a heavyweight fixture/device-enumeration blocker rather than a
+parity result.
