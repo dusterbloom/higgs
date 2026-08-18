@@ -5078,6 +5078,19 @@ pub(crate) struct SwitchMlpWeights {
     escha: Option<crate::eschamoe::EschaSwitchMlp>,
 }
 
+const fn routed_domain_rows(original_rows: i32, num_experts: i32, native_escha: bool) -> i32 {
+    if native_escha {
+        original_rows
+    } else {
+        let required_rows = num_experts * 4;
+        if original_rows < required_rows {
+            required_rows
+        } else {
+            original_rows
+        }
+    }
+}
+
 impl SwitchMlpWeights {
     pub(crate) fn new(args: &Qwen3NextModelArgs, prefix: &str) -> Result<Self, Exception> {
         let (gate_proj, down_proj, up_proj) = new_mlp_projections(args, prefix)?;
@@ -5221,37 +5234,13 @@ impl SwitchMlpWeights {
         // idx_sorted: [N] — monotonically non-decreasing expert indices
         let idx_sorted = idx_flat.take_axis(&order, 0)?;
         let original_rows = b * l * top_k;
-        // MLX 0.30.6 changes gather-QMM dispatch below four rows per expert;
-        // identical routed rows then round differently depending on suffix
-        // length. Pad only the sorted RHS domain with zero rows assigned to the
-        // last expert, and discard them after the projection. Real routing,
-        // scores, and output order remain untouched.
-        let num_experts = *self
-            .gate_proj
-            .weight
-            .shape()
-            .first()
-            .ok_or_else(|| Exception::custom("expert weight has no expert dimension"))?;
-        let required_rows = num_experts * 4;
-        let padding_rows = required_rows.saturating_sub(original_rows);
-        let (x_sorted, idx_sorted) = if padding_rows > 0 {
-            let x_padding = ops::zeros_dtype(&[padding_rows, 1, d], x.dtype())?;
-            let last_expert = u32::try_from(num_experts - 1)
-                .map_err(|_| Exception::custom("expert count must fit in u32"))?;
-            let fill = Array::from_slice(&[last_expert], &[]);
-            let index_padding = Array::full::<u32>(&[padding_rows], &fill)?;
-            (
-                ops::concatenate_axis(&[&x_sorted, &x_padding], 0)?,
-                ops::concatenate_axis(&[&idx_sorted, &index_padding], 0)?,
-            )
-        } else {
-            (x_sorted, idx_sorted)
-        };
 
-        // Native trellis path. It reuses the sort above. Only the three
-        // gather_qmm calls change. Gate and up are one fused dispatch.
+        // Native trellis path. It reuses the unpadded sort above. Only the
+        // three gather_qmm calls change. Gate and up are one fused dispatch.
         if let Some(escha) = &self.escha {
-            let x2 = x_sorted.reshape(&[b * l * top_k, d])?;
+            let native_rows =
+                routed_domain_rows(original_rows, escha.gate_up.spec.num_experts, true);
+            let x2 = x_sorted.reshape(&[native_rows, d])?;
             let eids = idx_sorted.as_dtype(Dtype::Uint32)?;
             let gate_up = escha
                 .gate_up
@@ -5275,6 +5264,33 @@ impl SwitchMlpWeights {
             let out_unsorted = out_flat.take_axis(&inv_order, 0)?;
             return out_unsorted.reshape(&[b, l, top_k, d]);
         }
+
+        // MLX 0.30.6 changes gather-QMM dispatch below four rows per expert;
+        // identical routed rows then round differently depending on suffix
+        // length. Pad only the sorted RHS domain with zero rows assigned to the
+        // last expert, and discard them after the projection. Real routing,
+        // scores, and output order remain untouched.
+        let num_experts = *self
+            .gate_proj
+            .weight
+            .shape()
+            .first()
+            .ok_or_else(|| Exception::custom("expert weight has no expert dimension"))?;
+        let required_rows = routed_domain_rows(original_rows, num_experts, false);
+        let padding_rows = required_rows.saturating_sub(original_rows);
+        let (x_sorted, idx_sorted) = if padding_rows > 0 {
+            let x_padding = ops::zeros_dtype(&[padding_rows, 1, d], x.dtype())?;
+            let last_expert = u32::try_from(num_experts - 1)
+                .map_err(|_| Exception::custom("expert count must fit in u32"))?;
+            let fill = Array::from_slice(&[last_expert], &[]);
+            let index_padding = Array::full::<u32>(&[padding_rows], &fill)?;
+            (
+                ops::concatenate_axis(&[&x_sorted, &x_padding], 0)?,
+                ops::concatenate_axis(&[&idx_sorted, &index_padding], 0)?,
+            )
+        } else {
+            (x_sorted, idx_sorted)
+        };
 
         // --- gather_qmm with coalesced access ---
         let gate_out = gather_qmm(
@@ -14535,6 +14551,21 @@ mod tests {
 
         let result = block.forward_gather_global_sort(&x, &indices).unwrap();
         assert_eq!(result.shape(), &[1, 4, 2, 64]);
+    }
+
+    #[test]
+    fn test_forward_gather_global_sort_native_route_domain_is_unpadded() {
+        let num_experts = 2;
+
+        assert_eq!(routed_domain_rows(2, num_experts, true), 2);
+        assert_eq!(routed_domain_rows(2, num_experts, false), 8);
+        for rows in [31, 32, 33] {
+            assert_eq!(
+                routed_domain_rows(rows, num_experts, true),
+                rows,
+                "native routing must preserve the flattened domain at the QMV/QGEMM boundary"
+            );
+        }
     }
 
     #[test]
