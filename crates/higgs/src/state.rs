@@ -48,6 +48,11 @@ pub enum Engine {
     Batch(Box<BatchEngine>),
     #[cfg(test)]
     Stub(String),
+    #[cfg(test)]
+    StubWithOutput {
+        name: String,
+        output: String,
+    },
 }
 
 impl Engine {
@@ -74,12 +79,22 @@ impl Engine {
         Self::Stub(name.to_owned())
     }
 
+    #[cfg(test)]
+    pub fn test_stub_with_output(name: &str, output: &str) -> Self {
+        Self::StubWithOutput {
+            name: name.to_owned(),
+            output: output.to_owned(),
+        }
+    }
+
     pub fn model_name(&self) -> &str {
         match self {
             Self::Simple(e) => e.model_name(),
             Self::Batch(e) => e.model_name(),
             #[cfg(test)]
             Self::Stub(name) => name,
+            #[cfg(test)]
+            Self::StubWithOutput { name, .. } => name,
         }
     }
 
@@ -89,7 +104,9 @@ impl Engine {
             Self::Simple(e) => e.tokenizer(),
             Self::Batch(e) => e.tokenizer(),
             #[cfg(test)]
-            Self::Stub(_) => panic!("Engine::test_stub has no tokenizer"),
+            Self::Stub(_) | Self::StubWithOutput { .. } => {
+                panic!("Engine::test_stub has no tokenizer")
+            }
         }
     }
 
@@ -98,7 +115,7 @@ impl Engine {
             Self::Simple(e) => e.eos_token_ids(),
             Self::Batch(e) => e.eos_token_ids(),
             #[cfg(test)]
-            Self::Stub(_) => &[],
+            Self::Stub(_) | Self::StubWithOutput { .. } => &[],
         }
     }
 
@@ -107,7 +124,7 @@ impl Engine {
             Self::Simple(e) => e.hidden_size(),
             Self::Batch(e) => e.hidden_size(),
             #[cfg(test)]
-            Self::Stub(_) => 0,
+            Self::Stub(_) | Self::StubWithOutput { .. } => 0,
         }
     }
 
@@ -116,7 +133,7 @@ impl Engine {
             Self::Simple(e) => e.enable_thinking(),
             Self::Batch(_) => false,
             #[cfg(test)]
-            Self::Stub(_) => false,
+            Self::Stub(_) | Self::StubWithOutput { .. } => false,
         }
     }
 
@@ -125,7 +142,7 @@ impl Engine {
             Self::Simple(e) => e.is_vlm(),
             Self::Batch(_) => false,
             #[cfg(test)]
-            Self::Stub(_) => false,
+            Self::Stub(_) | Self::StubWithOutput { .. } => false,
         }
     }
 
@@ -134,7 +151,7 @@ impl Engine {
             Self::Simple(e) => e.vlm_image_size(),
             Self::Batch(_) => None,
             #[cfg(test)]
-            Self::Stub(_) => None,
+            Self::Stub(_) | Self::StubWithOutput { .. } => None,
         }
     }
 
@@ -143,7 +160,7 @@ impl Engine {
             Self::Simple(e) => e.replace_image_tokens(tokens),
             Self::Batch(_) => {}
             #[cfg(test)]
-            Self::Stub(_) => {}
+            Self::Stub(_) | Self::StubWithOutput { .. } => {}
         }
     }
 
@@ -156,7 +173,7 @@ impl Engine {
             Self::Simple(e) => e.prepare_chat_prompt(messages, tools),
             Self::Batch(e) => e.prepare_chat_prompt(messages, tools),
             #[cfg(test)]
-            Self::Stub(_) => Ok(Vec::new()),
+            Self::Stub(_) | Self::StubWithOutput { .. } => Ok(Vec::new()),
         }
     }
 
@@ -172,7 +189,7 @@ impl Engine {
             }
             Self::Batch(e) => e.prepare_chat_prompt_with_thinking(messages, tools, enable_thinking),
             #[cfg(test)]
-            Self::Stub(_) => Ok(Vec::new()),
+            Self::Stub(_) | Self::StubWithOutput { .. } => Ok(Vec::new()),
         }
     }
 
@@ -240,6 +257,14 @@ impl Engine {
             ),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+            #[cfg(test)]
+            Self::StubWithOutput { output, .. } => Ok(higgs_engine::engine::GenerationOutput {
+                text: output.clone(),
+                finish_reason: "stop".to_owned(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                token_logprobs: None,
+            }),
         }
     }
 
@@ -311,7 +336,9 @@ impl Engine {
                 pixel_values,
             ),
             #[cfg(test)]
-            Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
+            Self::Stub(_) | Self::StubWithOutput { .. } => {
+                Err(EngineError::Generation("test stub".to_owned()))
+            }
         }
     }
 
@@ -321,7 +348,7 @@ impl Engine {
             Self::Simple(e) => e.embed(token_ids),
             Self::Batch(e) => e.embed(token_ids),
             #[cfg(test)]
-            Self::Stub(_) => Ok(Vec::new()),
+            Self::Stub(_) | Self::StubWithOutput { .. } => Ok(Vec::new()),
         }
     }
 }

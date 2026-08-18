@@ -36,24 +36,6 @@ pub fn is_hf_model_id(s: &str) -> bool {
     matches!(s.split_once('/'), Some((org, name)) if !org.is_empty() && !name.is_empty() && !name.contains('/'))
 }
 
-/// Policy gate for caller-supplied runtime-load paths.
-///
-/// Accepts Hugging Face model ids (which resolve through the local HF cache,
-/// not the caller's filesystem) unless the same string names an existing local
-/// directory. Local paths are accepted only when they resolve (after `~`
-/// expansion and symlink resolution) inside one of `roots`. Returns a reason
-/// string on rejection.
-#[cfg(test)]
-fn runtime_load_path_allowed(path: &str, roots: &[String]) -> Result<(), String> {
-    // A syntactically valid `org/name` can also be a relative local
-    // directory. `resolve` prefers existing directories, so do not let that
-    // local path bypass the filesystem allowlist.
-    if is_hf_model_id(path) && !Path::new(path).is_dir() {
-        return Ok(());
-    }
-    canonical_runtime_local_path(path, roots).map(|_| ())
-}
-
 /// Resolve and authorize one runtime-load request, returning the exact path
 /// that the loader must use.
 ///
@@ -96,13 +78,7 @@ fn canonical_runtime_local_path(path: &str, roots: &[String]) -> Result<PathBuf,
         .canonicalize()
         .map_err(|e| format!("path '{path}' cannot be resolved: {e}"))?;
     for root in roots {
-        let root_expanded = expand_user_path(root);
-        let root_canonical = root_expanded.canonicalize().map_err(|e| {
-            format!(
-                "configured local.runtime_model_roots entry '{}' cannot be resolved: {e}",
-                root_expanded.display()
-            )
-        })?;
+        let root_canonical = canonical_runtime_model_root(root)?;
         if canonical.starts_with(&root_canonical) {
             return Ok(canonical);
         }
@@ -110,6 +86,31 @@ fn canonical_runtime_local_path(path: &str, roots: &[String]) -> Result<PathBuf,
     Err(format!(
         "path '{path}' is outside all configured local.runtime_model_roots"
     ))
+}
+
+pub(crate) fn validate_runtime_model_root(root: &str) -> Result<(), String> {
+    canonical_runtime_model_root(root).map(|_| ())
+}
+
+fn canonical_runtime_model_root(root: &str) -> Result<PathBuf, String> {
+    if root.trim().is_empty() {
+        return Err("configured local.runtime_model_roots entry must not be blank".to_owned());
+    }
+
+    let expanded = expand_user_path(root);
+    let canonical = expanded.canonicalize().map_err(|e| {
+        format!(
+            "configured local.runtime_model_roots entry '{}' cannot be resolved: {e}",
+            expanded.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "configured local.runtime_model_roots entry '{}' is not a directory",
+            expanded.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 fn expand_user_path(path: &str) -> PathBuf {
@@ -368,31 +369,76 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_policy_does_not_treat_existing_relative_directory_as_hf_id() {
+    fn test_runtime_resolver_rejects_existing_relative_directory_without_roots() {
         assert!(Path::new("src/.").is_dir());
-        assert!(runtime_load_path_allowed("src/.", &[]).is_err());
+        let error = resolve_runtime_model_with_cache("src/.", &[], None).unwrap_err();
+
+        assert_eq!(
+            error,
+            "path 'src/.' is not a Hugging Face model id and local.runtime_model_roots is empty; \
+             use an HF model id or configure local.runtime_model_roots"
+        );
     }
 
     #[test]
-    fn test_runtime_policy_allows_hf_id_without_local_roots() {
-        assert!(runtime_load_path_allowed("org/model", &[]).is_ok());
+    fn test_runtime_resolver_allows_hf_id_to_reach_cache_resolution() {
+        let error = resolve_runtime_model_with_cache("org/model", &[], None).unwrap_err();
+
+        assert_eq!(
+            error,
+            "Hugging Face cache is not configured for 'org/model'"
+        );
     }
 
     #[test]
-    fn test_runtime_policy_allows_existing_directory_inside_root() {
-        assert!(runtime_load_path_allowed("src/.", &["src".to_owned()]).is_ok());
+    fn test_runtime_resolver_allows_existing_directory_inside_root() {
+        let resolved =
+            resolve_runtime_model_with_cache("src/.", &["src".to_owned()], None).unwrap();
+
+        assert_eq!(resolved, Path::new("src").canonicalize().unwrap());
     }
 
     #[test]
-    fn test_runtime_policy_reports_unresolvable_configured_root() {
+    fn test_runtime_resolver_reports_unresolvable_configured_root() {
         let model_root = tempfile::tempdir().unwrap();
         let missing_root = model_root.path().join("missing-root");
         let model = model_root.path().join("model");
         std::fs::create_dir(&model).unwrap();
         let roots = vec![missing_root.to_string_lossy().into_owned()];
 
-        let error = runtime_load_path_allowed(model.to_str().unwrap(), &roots).unwrap_err();
-        assert!(error.contains("configured local.runtime_model_roots entry"));
+        let error =
+            resolve_runtime_model_with_cache(model.to_str().unwrap(), &roots, None).unwrap_err();
+        assert!(error.starts_with(&format!(
+            "configured local.runtime_model_roots entry '{}' cannot be resolved:",
+            missing_root.display()
+        )));
+    }
+
+    #[test]
+    fn test_validate_runtime_model_root_rejects_blank_root() {
+        for root in ["", "  \t"] {
+            let error = validate_runtime_model_root(root).unwrap_err();
+            assert_eq!(
+                error,
+                "configured local.runtime_model_roots entry must not be blank"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_runtime_model_root_rejects_file() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("model-file");
+        std::fs::write(&file, "not a directory").unwrap();
+
+        let error = validate_runtime_model_root(file.to_str().unwrap()).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "configured local.runtime_model_roots entry '{}' is not a directory",
+                file.display()
+            )
+        );
     }
 
     #[test]
@@ -407,17 +453,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_runtime_policy_rejects_symlink_escape_from_root() {
+    fn test_runtime_resolver_rejects_symlink_escape_from_root() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let outside_model = outside.path().join("model");
         std::fs::create_dir(&outside_model).unwrap();
-        std::os::unix::fs::symlink(&outside_model, root.path().join("linked-model")).unwrap();
+        let linked_model = root.path().join("linked-model");
+        std::os::unix::fs::symlink(&outside_model, &linked_model).unwrap();
 
         let roots = vec![root.path().to_string_lossy().into_owned()];
-        assert!(
-            runtime_load_path_allowed(root.path().join("linked-model").to_str().unwrap(), &roots)
-                .is_err()
+        let error = resolve_runtime_model_with_cache(linked_model.to_str().unwrap(), &roots, None)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            format!(
+                "path '{}' is outside all configured local.runtime_model_roots",
+                linked_model.display()
+            )
         );
     }
 

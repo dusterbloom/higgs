@@ -77,6 +77,17 @@ struct AutoRouteEntry {
     target: RouteTarget,
 }
 
+/// Internal failures while acquiring runtime-model coordination permits.
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum RuntimeLoadError {
+    #[error("runtime model budget reached; unload a runtime model before loading another")]
+    ResidentBudgetExhausted,
+    #[error("runtime load gate closed")]
+    LoadGateClosed,
+    #[error("runtime resident-model gate closed")]
+    ResidentGateClosed,
+}
+
 /// Owned coordination permits for one runtime load attempt.
 pub(crate) struct RuntimeLoadPermit {
     _load_permit: OwnedSemaphorePermit,
@@ -251,7 +262,7 @@ impl Router {
         messages: Option<&[serde_json::Value]>,
     ) -> Result<ResolvedRoute, String> {
         if self.auto_router_force || model == "auto" {
-            if let Some(resolved) = self.try_auto_route(messages).await {
+            if let Some(resolved) = self.try_auto_route(messages).await? {
                 return Ok(resolved);
             }
             if model == "auto" {
@@ -305,22 +316,19 @@ impl Router {
     }
 
     /// Acquire the attempt and resident permits for one runtime load.
-    pub(crate) async fn acquire_runtime_load(&self) -> Result<RuntimeLoadPermit, String> {
+    pub(crate) async fn acquire_runtime_load(&self) -> Result<RuntimeLoadPermit, RuntimeLoadError> {
         let load_permit = Arc::clone(&self.runtime_load_semaphore)
             .acquire_owned()
             .await
-            .map_err(|e| format!("runtime load gate closed: {e}"))?;
+            .map_err(|_| RuntimeLoadError::LoadGateClosed)?;
         let resident_permit = match &self.runtime_resident_semaphore {
             Some(semaphore) => match Arc::clone(semaphore).try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(TryAcquireError::NoPermits) => {
-                    return Err(
-                        "runtime model budget reached; unload a runtime model before loading another"
-                            .to_owned(),
-                    );
+                    return Err(RuntimeLoadError::ResidentBudgetExhausted);
                 }
                 Err(TryAcquireError::Closed) => {
-                    return Err("runtime resident-model gate closed".to_owned());
+                    return Err(RuntimeLoadError::ResidentGateClosed);
                 }
             },
             None => None,
@@ -368,13 +376,20 @@ impl Router {
         Ok(())
     }
 
-    /// Remove an engine from the routing table, returning it if present. The
-    /// caller is responsible for dropping it once no request still holds a
-    /// clone.
+    /// Non-draining removal for startup engines. Runtime engines must use
+    /// `remove_runtime_engine` so their resident quota permit remains held
+    /// while references drain.
     pub fn remove_engine(&self, name: &str) -> Option<Arc<Engine>> {
-        let (engine, resident_permit) = self.remove_engine_with_permit(name)?.into_parts();
-        drop(resident_permit);
-        Some(engine)
+        let mut engines = self.engines_write();
+        let runtime_names = self
+            .runtime_engine_names
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if runtime_names.contains_key(name) {
+            return None;
+        }
+        drop(runtime_names);
+        engines.remove(name)
     }
 
     /// Remove a runtime engine while retaining its resident quota permit until
@@ -423,11 +438,15 @@ impl Router {
     async fn try_auto_route(
         &self,
         messages: Option<&[serde_json::Value]>,
-    ) -> Option<ResolvedRoute> {
-        let auto_engine = self.auto_router_engine.as_ref()?;
-        let msg_slice = messages?;
+    ) -> Result<Option<ResolvedRoute>, String> {
+        let Some(auto_engine) = self.auto_router_engine.as_ref() else {
+            return Ok(None);
+        };
+        let Some(msg_slice) = messages else {
+            return Ok(None);
+        };
         if self.auto_candidates.is_empty() || msg_slice.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let engine_clone = Arc::clone(auto_engine);
@@ -442,16 +461,23 @@ impl Router {
             }),
         )
         .await;
-        let name = if let Ok(join_result) = timeout_result {
-            join_result.ok()??
-        } else {
-            warn!("auto-router classification timed out after {timeout:?}");
-            return None;
+        let name = match timeout_result {
+            Ok(Ok(Some(name))) => name,
+            Ok(Ok(None) | Err(_)) => return Ok(None),
+            Err(_) => {
+                warn!("auto-router classification timed out after {timeout:?}");
+                return Ok(None);
+            }
         };
 
-        let entry = self.auto_routes.iter().find(|r| r.name == name)?;
+        let Some(entry) = self.auto_routes.iter().find(|r| r.name == name) else {
+            return Ok(None);
+        };
+        self.resolve_selected_auto_route(entry).map(Some)
+    }
+
+    fn resolve_selected_auto_route(&self, entry: &AutoRouteEntry) -> Result<ResolvedRoute, String> {
         self.resolve_target(&entry.target, "auto", RoutingMethod::Auto)
-            .ok()
     }
 
     fn resolve_target(
@@ -466,7 +492,7 @@ impl Router {
                 let engines = self.engines_read();
                 let (engine, resolved_name) = if let Some(engine) = engines.get(lookup_name) {
                     (Arc::clone(engine), lookup_name.to_owned())
-                } else if model == "auto" {
+                } else if model == "auto" && model_rewrite.is_none() {
                     // "auto" is a virtual model name; pick any loaded engine
                     let (name, engine) = engines
                         .iter()
@@ -1058,6 +1084,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_draining_remove_refuses_runtime_engine() {
+        let config = config_from_toml(
+            r#"
+            [provider.stub]
+            url = "http://127.0.0.1:1"
+            [local]
+            runtime_max_loaded_models = 1
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+        let load_permit = router.acquire_runtime_load().await.unwrap();
+        router
+            .insert_runtime_engine(
+                "runtime".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("runtime")),
+                load_permit.into_resident_permit(),
+            )
+            .unwrap();
+
+        assert!(router.remove_engine("runtime").is_none());
+        assert!(router.contains_engine("runtime"));
+        assert_eq!(
+            router.acquire_runtime_load().await.err().unwrap(),
+            RuntimeLoadError::ResidentBudgetExhausted
+        );
+
+        drop(router.remove_runtime_engine("runtime"));
+    }
+
+    #[tokio::test]
     async fn runtime_engine_count_excludes_startup_engines() {
         let config = config_from_toml(
             r#"
@@ -1085,11 +1141,31 @@ mod tests {
             .unwrap();
         assert_eq!(router.runtime_engine_count(), 1);
         assert_eq!(router.local_model_names().len(), 2);
-        assert!(router.acquire_runtime_load().await.is_err());
+        assert_eq!(
+            router.acquire_runtime_load().await.err().unwrap(),
+            RuntimeLoadError::ResidentBudgetExhausted
+        );
         let removed = router.remove_runtime_engine("runtime").unwrap();
         assert!(router.acquire_runtime_load().await.is_err());
         drop(removed);
         assert!(router.acquire_runtime_load().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn closed_runtime_load_gate_returns_typed_error() {
+        let config = config_from_toml(
+            r#"
+            [provider.stub]
+            url = "http://127.0.0.1:1"
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+        router.runtime_load_semaphore.close();
+
+        assert_eq!(
+            router.acquire_runtime_load().await.err().unwrap(),
+            RuntimeLoadError::LoadGateClosed
+        );
     }
 
     #[tokio::test]
@@ -1156,6 +1232,46 @@ mod tests {
             Ok(ResolvedRoute::Remote { .. }) => panic!("expected Higgs route"),
             Err(e) => panic!("should resolve to first engine, got error: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn selected_auto_route_with_missing_higgs_rewrite_returns_error() {
+        let config = config_from_toml(
+            r#"
+            [auto_router]
+            enabled = true
+            model = "router"
+
+            [[models]]
+            path = "router"
+            name = "router"
+
+            [[routes]]
+            name = "missing-local"
+            description = "route to a model that is not loaded"
+            provider = "higgs"
+            model = "missing"
+            "#,
+        );
+        let mut engines = HashMap::new();
+        engines.insert(
+            "router".to_owned(),
+            Arc::new(crate::state::Engine::test_stub_with_output(
+                "router",
+                r#"{"route":"missing-local"}"#,
+            )),
+        );
+        let router = Router::from_config(&config, engines).unwrap();
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "route this request"
+        })];
+        let error = match router.resolve("auto", Some(&messages)).await {
+            Err(error) => error,
+            Ok(_) => panic!("expected missing explicit rewrite to fail"),
+        };
+
+        assert_eq!(error, "model 'missing' not found among loaded local models");
     }
 
     #[test]

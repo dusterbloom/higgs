@@ -363,6 +363,16 @@ fn check_runtime_model_load(config: &HiggsConfig, result: &mut DoctorResult) {
     } else {
         pass("runtime model load/unload disabled", result);
     }
+
+    for root in &config.local.runtime_model_roots {
+        match model_resolver::validate_runtime_model_root(root) {
+            Ok(()) => pass(
+                &format!("runtime model root '{root}' is resolvable"),
+                result,
+            ),
+            Err(err) => fail(&err, result),
+        }
+    }
 }
 
 fn check_duplicate_models(config: &HiggsConfig, result: &mut DoctorResult) {
@@ -652,6 +662,21 @@ mod tests {
 
         check_runtime_model_load(&config, &mut result);
 
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn runtime_load_with_unresolvable_root_fails_doctor() {
+        let missing_root = tempfile::tempdir().unwrap().path().join("missing-root");
+        let mut config = HiggsConfig::default();
+        config.local.allow_runtime_model_load = true;
+        config.local.runtime_model_roots = vec![missing_root.to_string_lossy().into_owned()];
+        config.server.api_key = Some("test-key".to_owned());
+        let mut result = empty_result();
+
+        check_runtime_model_load(&config, &mut result);
+
+        assert_eq!(result.passes, 1);
         assert_eq!(result.failures, 1);
     }
 

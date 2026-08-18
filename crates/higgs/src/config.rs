@@ -901,7 +901,10 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
             return Err("server.api_key contains invalid characters".to_owned());
         }
     }
-
+    validate_runtime_model_load_api_key(config)?;
+    for root in &config.local.runtime_model_roots {
+        crate::model_resolver::validate_runtime_model_root(root)?;
+    }
     if config.local.runtime_max_concurrent_loads == 0 {
         return Err("runtime_max_concurrent_loads must be greater than zero".to_owned());
     }
@@ -923,6 +926,15 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
         }
     }
 
+    Ok(())
+}
+
+fn validate_runtime_model_load_api_key(config: &HiggsConfig) -> Result<(), String> {
+    if config.local.allow_runtime_model_load && config.server.api_key.is_none() {
+        return Err(
+            "server.api_key is required when local.allow_runtime_model_load is enabled".to_owned(),
+        );
+    }
     Ok(())
 }
 
@@ -1207,6 +1219,43 @@ mod tests {
 
         let err = load_config_file(&path, None).unwrap_err();
         assert!(err.contains("server.api_key contains invalid characters"));
+    }
+
+    #[test]
+    fn test_runtime_model_load_without_api_key_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n\n[local]\nallow_runtime_model_load = true\n",
+        )
+        .unwrap();
+
+        let err = load_config_file(&path, None).unwrap_err();
+        assert!(
+            err.contains(
+                "server.api_key is required when local.allow_runtime_model_load is enabled"
+            )
+        );
+    }
+
+    #[test]
+    fn test_invalid_runtime_model_root_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, "not a directory").unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n\n[local]\nruntime_model_roots = [\"{}\"]\n",
+                file.display()
+            ),
+        )
+        .unwrap();
+
+        let err = load_config_file(&path, None).unwrap_err();
+        assert!(err.contains("is not a directory"), "got: {err}");
     }
 
     #[test]

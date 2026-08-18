@@ -69,10 +69,15 @@ port = 8000
 [local]
 mlx_profile = "auto"
 raise_wired_limit = false
-# Runtime POST/DELETE /v1/models requires server.api_key.
+# Runtime POST/DELETE /v1/models requires allow_runtime_model_load = true
+# and a non-empty server.api_key.
 # allow_runtime_model_load = false
+# Empty runtime_model_roots permits only cached Hugging Face model IDs;
+# configured roots constrain local runtime model paths to those directories.
 # runtime_model_roots = ["/models"]
+# Limits runtime-loaded models only; startup-configured [[models]] do not count.
 # runtime_max_loaded_models = 2
+# Limits simultaneous runtime model load attempts.
 # runtime_max_concurrent_loads = 1
 
 # --- Local models ---

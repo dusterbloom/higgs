@@ -13,6 +13,7 @@ use crate::{
     config::ModelConfig,
     error::ServerError,
     model_resolver,
+    router::RuntimeLoadError,
     state::{Engine, SharedState, build_engine},
     types::openai::{ModelList, ModelObject},
 };
@@ -23,6 +24,9 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Poll cadence while draining references to an unloaded model.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Warning cadence while a detached unload is still waiting on references.
+const DRAIN_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// `GET /v1/models` -- list the locally loaded models.
 pub async fn list_models(State(state): State<SharedState>) -> Json<ModelList> {
@@ -98,13 +102,7 @@ pub async fn load_model(
         .router
         .acquire_runtime_load()
         .await
-        .map_err(|message| {
-            if message.starts_with("runtime model budget reached") {
-                ServerError::BadRequest(message)
-            } else {
-                ServerError::InternalError(message)
-            }
-        })?;
+        .map_err(map_runtime_load_error)?;
 
     // The weight load is blocking and GPU-bound; keep it off the async runtime.
     let local = state.config.local.clone();
@@ -126,6 +124,16 @@ pub async fn load_model(
     Ok(Json(model_object(name)))
 }
 
+fn map_runtime_load_error(error: RuntimeLoadError) -> ServerError {
+    let message = error.to_string();
+    match error {
+        RuntimeLoadError::ResidentBudgetExhausted => ServerError::BadRequest(message),
+        RuntimeLoadError::LoadGateClosed | RuntimeLoadError::ResidentGateClosed => {
+            ServerError::InternalError(message)
+        }
+    }
+}
+
 /// `DELETE /v1/models/{name}` -- unload a model and release its engine resources.
 ///
 /// Returns `204` once the model is fully unloaded, `202` if a request was still
@@ -137,7 +145,7 @@ pub async fn unload_model(
 ) -> Result<StatusCode, ServerError> {
     if !state.config.local.allow_runtime_model_load {
         return Err(ServerError::Forbidden(
-            "runtime model loading is disabled; set local.allow_runtime_model_load = true to enable it"
+            "runtime model unloading is disabled; set local.allow_runtime_model_load = true to enable it"
                 .to_owned(),
         ));
     }
@@ -207,10 +215,18 @@ async fn drain_and_drop(
 }
 
 /// Poll until the detached engine reference is sole-owned, then drop it.
-async fn drain_in_background(
+async fn drain_in_background(engine: Arc<Engine>, resident_permit: Option<OwnedSemaphorePermit>) {
+    drain_in_background_with_warning_interval(engine, resident_permit, DRAIN_WARNING_INTERVAL)
+        .await;
+}
+
+async fn drain_in_background_with_warning_interval(
     mut engine: Arc<Engine>,
     resident_permit: Option<OwnedSemaphorePermit>,
+    warning_interval: Duration,
 ) {
+    let start = Instant::now();
+    let mut last_warning = start;
     loop {
         match Arc::try_unwrap(engine) {
             Ok(owned) => {
@@ -219,6 +235,19 @@ async fn drain_in_background(
                 return;
             }
             Err(shared) => {
+                let now = Instant::now();
+                if now.duration_since(last_warning) >= warning_interval {
+                    let elapsed_ms =
+                        u64::try_from(now.duration_since(start).as_millis()).unwrap_or(u64::MAX);
+                    let strong_count =
+                        u64::try_from(Arc::strong_count(&shared)).unwrap_or(u64::MAX);
+                    tracing::warn!(
+                        elapsed_ms,
+                        strong_count,
+                        "Model unload is still waiting for references to drain"
+                    );
+                    last_warning = now;
+                }
                 engine = shared;
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
@@ -254,9 +283,53 @@ fn model_objects_sorted<'a>(names: impl Iterator<Item = &'a str>) -> Vec<ModelOb
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
-    use crate::router::Router;
+    use crate::router::{Router, RuntimeLoadError};
     use crate::state::AppState;
+    use tracing::{Event, Subscriber, field::Visit};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    #[derive(Clone, Default)]
+    struct DrainWarningCapture {
+        fields: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+
+    impl<S> Layer<S> for DrainWarningCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = DrainWarningVisitor::default();
+            event.record(&mut visitor);
+            if let (Some(elapsed_ms), Some(strong_count)) =
+                (visitor.elapsed_ms, visitor.strong_count)
+            {
+                self.fields.lock().unwrap().push((elapsed_ms, strong_count));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct DrainWarningVisitor {
+        elapsed_ms: Option<u64>,
+        strong_count: Option<u64>,
+    }
+
+    impl Visit for DrainWarningVisitor {
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "elapsed_ms" => self.elapsed_ms = Some(value),
+                "strong_count" => self.strong_count = Some(value),
+                _ => {}
+            }
+        }
+    }
 
     fn build_state(toml: &str, engines: HashMap<String, Arc<Engine>>) -> SharedState {
         let dir = tempfile::tempdir().unwrap();
@@ -318,11 +391,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unload_disabled_returns_forbidden_with_unloading_message() {
+        let state = build_state(
+            "[local]\nallow_runtime_model_load = false\n",
+            HashMap::new(),
+        );
+
+        let err = unload_model(State(state), Path("model".to_owned()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ServerError::Forbidden(message)
+                if message == "runtime model unloading is disabled; set local.allow_runtime_model_load = true to enable it"
+        ));
+    }
+
+    #[tokio::test]
     async fn load_existing_name_conflicts() {
         // allow_runtime on + an already-loaded "llama"; naming it again is a
         // conflict caught before any (impossible, in-test) GPU load.
         let state = build_state(
-            "[local]\nallow_runtime_model_load = true\n",
+            "[server]\napi_key = \"test-api-key\"\n[local]\nallow_runtime_model_load = true\n",
             stub_engines(&["llama"]),
         );
         let body = Bytes::from_static(b"{\"path\":\"some/path\",\"name\":\"llama\"}");
@@ -333,21 +424,43 @@ mod tests {
     #[tokio::test]
     async fn startup_engines_do_not_consume_runtime_model_budget() {
         let state = build_state(
-            "[local]\nallow_runtime_model_load = true\nruntime_max_loaded_models = 1\n",
+            "[server]\napi_key = \"test-api-key\"\n[local]\nallow_runtime_model_load = true\nruntime_max_loaded_models = 1\n",
             stub_engines(&["startup"]),
         );
         let body = Bytes::from_static(b"{\"path\":\"org/model\",\"name\":\"runtime\"}");
         let err = load_model(State(state), body).await.unwrap_err();
+        let ServerError::BadRequest(message) = err else {
+            panic!("expected runtime resolver bad request, got: {err}");
+        };
+        assert_eq!(
+            message,
+            "model 'org/model' not found locally: could not read HF cache ref for 'org/model': No such file or directory (os error 2); pre-download it (e.g. `huggingface-cli download org/model`)"
+        );
+    }
+
+    #[test]
+    fn runtime_load_errors_map_by_typed_variant() {
         assert!(matches!(
-            err,
+            map_runtime_load_error(RuntimeLoadError::ResidentBudgetExhausted),
             ServerError::BadRequest(message)
-                if !message.contains("runtime model budget reached")
+                if message == "runtime model budget reached; unload a runtime model before loading another"
+        ));
+        assert!(matches!(
+            map_runtime_load_error(RuntimeLoadError::LoadGateClosed),
+            ServerError::InternalError(message) if message == "runtime load gate closed"
+        ));
+        assert!(matches!(
+            map_runtime_load_error(RuntimeLoadError::ResidentGateClosed),
+            ServerError::InternalError(message) if message == "runtime resident-model gate closed"
         ));
     }
 
     #[tokio::test]
     async fn unload_unknown_returns_not_found() {
-        let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
+        let state = build_state(
+            "[server]\napi_key = \"test-api-key\"\n[local]\nallow_runtime_model_load = true\n",
+            HashMap::new(),
+        );
         let err = unload_model(State(state), Path("ghost".to_owned()))
             .await
             .unwrap_err();
@@ -365,6 +478,9 @@ mod tests {
             enabled = true
             model = "router"
 
+            [server]
+            api_key = "test-api-key"
+
             [local]
             allow_runtime_model_load = true
         "#;
@@ -380,7 +496,7 @@ mod tests {
     #[tokio::test]
     async fn unload_removes_engine_and_frees_it() {
         let state = build_state(
-            "[local]\nallow_runtime_model_load = true\n",
+            "[server]\napi_key = \"test-api-key\"\n[local]\nallow_runtime_model_load = true\n",
             stub_engines(&["llama"]),
         );
         let status = unload_model(State(Arc::clone(&state)), Path("llama".to_owned()))
@@ -423,10 +539,41 @@ mod tests {
         drop(clone); // let the detached task finish
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_drain_warns_periodically_while_references_remain() {
+        let capture = DrainWarningCapture::default();
+        let captured_fields = Arc::clone(&capture.fields);
+        let subscriber = tracing_subscriber::registry().with(capture);
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let engine = Arc::new(Engine::test_stub("stuck"));
+        let in_flight = Arc::clone(&engine);
+
+        let draining = tokio::spawn(drain_in_background_with_warning_interval(
+            engine,
+            None,
+            Duration::from_millis(30),
+        ));
+        tokio::time::sleep(Duration::from_millis(125)).await;
+
+        let warnings = captured_fields.lock().unwrap().clone();
+        assert!(warnings.len() >= 2, "captured warnings: {warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|(elapsed_ms, strong_count)| *elapsed_ms >= 30 && *strong_count == 2),
+            "captured warnings: {warnings:?}"
+        );
+        drop(in_flight);
+        tokio::time::timeout(Duration::from_secs(1), draining)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn resident_permit_stays_held_until_unload_drain_finishes() {
         let state = build_state(
-            "[local]\nallow_runtime_model_load = true\nruntime_max_loaded_models = 1\n",
+            "[server]\napi_key = \"test-api-key\"\n[local]\nallow_runtime_model_load = true\nruntime_max_loaded_models = 1\n",
             HashMap::new(),
         );
         let load_permit = state.router.acquire_runtime_load().await.unwrap();
@@ -456,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn canceled_unload_handler_keeps_resident_permit_until_drain() {
         let state = build_state(
-            "[local]\nallow_runtime_model_load = true\nruntime_max_loaded_models = 1\n",
+            "[server]\napi_key = \"test-api-key\"\n[local]\nallow_runtime_model_load = true\nruntime_max_loaded_models = 1\n",
             HashMap::new(),
         );
         let engine = Arc::new(Engine::test_stub("runtime"));

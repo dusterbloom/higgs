@@ -226,6 +226,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_conflict_returns_409_with_contract_body() {
+        let message = "model is already loaded";
+        let resp = ServerError::Conflict(message.to_owned()).into_response();
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "conflict");
+        assert_eq!(body["error"]["message"], message);
+        assert!(body["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_forbidden_returns_403_with_contract_body() {
+        let message = "runtime model loading is disabled";
+        let resp = ServerError::Forbidden(message.to_owned()).into_response();
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "forbidden");
+        assert_eq!(body["error"]["message"], message);
+        assert!(body["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
     async fn test_proxy_error_returns_502() {
         let error = ServerError::ProxyError("connection refused".to_owned());
         let resp = error.into_response();
