@@ -216,3 +216,32 @@ array` from `metal::Device` enumeration. No logits or 129-token digest was
 produced. Focused fresh processes can still enumerate and execute Metal, so
 this remains a heavyweight fixture/device-enumeration blocker rather than a
 parity result.
+
+## Production-path validation
+
+The fixture was rerun with direct Metal access after confirming that the
+ordinary sandbox cannot enumerate the host GPU. The native production path
+(`HIGGS_ESCHA_NATIVE=1`, the default) now passes end-to-end:
+
+```text
+load: 6.4s
+rss_after_load=5.78 GiB
+mlx_active=11.16 GB
+mlx_peak=11.64 GB
+rss_after_forward=5.09 GiB
+mlx_active=11.26 GB
+mlx_peak=11.69 GB
+129-token greedy trajectory written successfully
+test result: 1 passed
+```
+
+This exercises the same `load_qwen3_5_moe_model` entry point used by
+`crates/higgs-engine/src/model_loader.rs`, followed by a real forward and 129
+greedy decode steps. The native path retains the trellis expert tensors and
+fits the 32-GiB host.
+
+The affine comparison (`HIGGS_ESCHA_NATIVE=0`) reached the real load path but
+was terminated with `SIGKILL` during conversion. Its documented converted
+footprint is approximately 21.7 GB before model/loader overhead, so this is a
+host-memory limit rather than a routing or MLX correctness failure. The
+production default remains native for this checkpoint.
