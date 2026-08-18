@@ -32,9 +32,11 @@ The grouped capture was launched outside the sandbox using the Metal System
 Trace template, the pinned grouped environment above, and `--time-limit 10m`.
 The supplied log,
 `/private/tmp/higgs-metal/qwen38-grouped-20260818T005804Z.log`, records the
-single exact production-MTP benchmark output (one passed test) followed by the
-existing-output-path error. Instruments did not start a recording because the
-requested output path already existed:
+single exact production-MTP benchmark output (one passed test) and ends with
+the successful benchmark run output. It does not contain the existing-output-
+path error. That error belongs only to
+`/private/tmp/higgs-metal/qwen38-grouped.log`, which records that Instruments
+did not start a recording because the requested output path already existed:
 
 ```text
 Trace file already exists at path: /private/tmp/higgs-metal/qwen38-grouped.trace.
@@ -46,11 +48,13 @@ was not started.
 
 The requested pre-existing output path
 `/private/tmp/higgs-metal/qwen38-grouped.trace` is a 96-byte file. The attempt
-also left `/private/tmp/higgs-metal/qwen38-grouped-20260818T005804Z.trace`, a
-320-byte trace bundle. Neither artifact is a valid Metal trace and neither is
-used for classification. The earlier `qwen38-grouped-benchmark.log` ran five
-ignored tests and was still running after 60 seconds; it is unrelated to the
-single exact production-MTP output in the supplied attempt log.
+also left `/private/tmp/higgs-metal/qwen38-grouped-20260818T005804Z.trace`,
+whose 320-byte directory entry corresponds to a ~307 MiB bundle:
+`du -sh /private/tmp/higgs-metal/qwen38-grouped-20260818T005804Z.trace` reports
+`307M`. It is not a 320-byte bundle. Neither artifact is a valid Metal trace
+and neither is used for classification. The earlier `qwen38-grouped-benchmark.log`
+ran five ignored tests and was still running after 60 seconds; it is unrelated
+to the single exact production-MTP output in the timestamped benchmark log.
 
 An attempt to export the pre-existing trace table of contents also failed in
 the sandbox before trace analysis:
@@ -101,4 +105,15 @@ optimization.
   `HIGGS_CROSSROW_QMV=1` (stock comparison `HIGGS_CROSSROW_QMV=0`).
 - Restored the unrelated performance-port Task 6 report exactly to
   `1dd909aab`; Task 6 will aggregate Task 3 evidence later.
+- `git diff --check` exited 0.
+
+## Fix verification (round 2)
+
+- Confirmed the timestamped trace is documented as a ~307 MiB bundle, with its
+  320-byte directory entry distinguished from the `du -sh` result of `307M`.
+- Confirmed the existing-output-path error is attributed only to
+  `/private/tmp/higgs-metal/qwen38-grouped.log`; the timestamped benchmark log
+  is documented as ending with the successful run output.
+- Preserved the exact `10m`/environment names, the no-trace/no-classification
+  conclusion, and the Task 6 restoration.
 - `git diff --check` exited 0.
