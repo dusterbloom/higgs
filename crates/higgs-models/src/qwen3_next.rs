@@ -5078,19 +5078,6 @@ pub(crate) struct SwitchMlpWeights {
     escha: Option<crate::eschamoe::EschaSwitchMlp>,
 }
 
-const fn routed_domain_rows(original_rows: i32, num_experts: i32, native_escha: bool) -> i32 {
-    if native_escha {
-        original_rows
-    } else {
-        let required_rows = num_experts * 4;
-        if original_rows < required_rows {
-            required_rows
-        } else {
-            original_rows
-        }
-    }
-}
-
 impl SwitchMlpWeights {
     pub(crate) fn new(args: &Qwen3NextModelArgs, prefix: &str) -> Result<Self, Exception> {
         let (gate_proj, down_proj, up_proj) = new_mlp_projections(args, prefix)?;
@@ -5238,9 +5225,7 @@ impl SwitchMlpWeights {
         // Native trellis path. It reuses the unpadded sort above. Only the
         // three gather_qmm calls change. Gate and up are one fused dispatch.
         if let Some(escha) = &self.escha {
-            let native_rows =
-                routed_domain_rows(original_rows, escha.gate_up.spec.num_experts, true);
-            let x2 = x_sorted.reshape(&[native_rows, d])?;
+            let x2 = x_sorted.reshape(&[original_rows, d])?;
             let eids = idx_sorted.as_dtype(Dtype::Uint32)?;
             let gate_up = escha
                 .gate_up
@@ -5276,7 +5261,7 @@ impl SwitchMlpWeights {
             .shape()
             .first()
             .ok_or_else(|| Exception::custom("expert weight has no expert dimension"))?;
-        let required_rows = routed_domain_rows(original_rows, num_experts, false);
+        let required_rows = num_experts * 4;
         let padding_rows = required_rows.saturating_sub(original_rows);
         let (x_sorted, idx_sorted) = if padding_rows > 0 {
             let x_padding = ops::zeros_dtype(&[padding_rows, 1, d], x.dtype())?;
@@ -14553,17 +14538,114 @@ mod tests {
         assert_eq!(result.shape(), &[1, 4, 2, 64]);
     }
 
-    #[test]
-    fn test_forward_gather_global_sort_native_route_domain_is_unpadded() {
-        let num_experts = 2;
+    fn native_escha_proj(in_features: i32, out_features: i32) -> crate::eschamoe::EschaProj {
+        const EXPERTS: i32 = 2;
+        const K: usize = 2;
 
-        assert_eq!(routed_domain_rows(2, num_experts, true), 2);
-        assert_eq!(routed_domain_rows(2, num_experts, false), 8);
-        for rows in [31, 32, 33] {
-            assert_eq!(
-                routed_domain_rows(rows, num_experts, true),
-                rows,
-                "native routing must preserve the flattened domain at the QMV/QGEMM boundary"
+        let spec = crate::eschamoe::EschaSpec {
+            k: K,
+            mcg: true,
+            num_experts: EXPERTS,
+            in_features,
+            out_features,
+        };
+        let (tiles_k, tiles_n) = spec.tiles();
+        let words = spec.words_per_tile();
+        let code_len = EXPERTS as usize * tiles_k * tiles_n * words;
+        let code = Array::from_slice(
+            &vec![0_i16; code_len],
+            &[
+                EXPERTS,
+                i32::try_from(tiles_k).unwrap(),
+                i32::try_from(tiles_n).unwrap(),
+                i32::try_from(words).unwrap(),
+            ],
+        );
+        let rin = Array::ones::<f32>(&[EXPERTS, in_features]).unwrap();
+        let rout = Array::ones::<f32>(&[EXPERTS, out_features]).unwrap();
+        let s_in = Array::ones::<f32>(&[EXPERTS, in_features]).unwrap();
+        let s_out = Array::ones::<f32>(&[EXPERTS, out_features]).unwrap();
+        crate::eschamoe::EschaProj::new(code, &rin, &rout, &s_in, &s_out, spec).unwrap()
+    }
+
+    fn native_escha_switch_mlp() -> SwitchMlpWeights {
+        const HIDDEN: i32 = crate::eschamoe::HAD_BLOCK;
+        const INTERMEDIATE: i32 = crate::eschamoe::HAD_BLOCK;
+
+        let gate_up = native_escha_proj(HIDDEN, 2 * INTERMEDIATE);
+        let down = native_escha_proj(INTERMEDIATE, HIDDEN);
+        let mut block = SwitchMlpWeights::from_quant(64, 4).unwrap();
+        block.set_escha(crate::eschamoe::EschaSwitchMlp { gate_up, down });
+        block
+    }
+
+    #[test]
+    fn test_forward_gather_global_sort_native_short_domain_is_unpadded() {
+        let _exec = crate::mlx_exec::acquire();
+        let hidden = crate::eschamoe::HAD_BLOCK;
+        let block = native_escha_switch_mlp();
+        let values: Vec<f32> = (0..hidden).map(|i| (i as f32 - 32.0) / 64.0).collect();
+        let x = Array::from_slice(&values, &[1, 1, hidden]);
+        let indices = Array::from_slice(&[1_u32, 0], &[1, 1, 2]);
+
+        let result = block.forward_gather_global_sort(&x, &indices).unwrap();
+        result.eval().unwrap();
+        assert_eq!(result.shape(), &[1, 1, 2, hidden]);
+    }
+
+    #[test]
+    fn test_forward_gather_global_sort_native_preserves_order_at_dispatch_boundary() {
+        let _exec = crate::mlx_exec::acquire();
+        let hidden = crate::eschamoe::HAD_BLOCK;
+        let block = native_escha_switch_mlp();
+
+        for rows in [31_i32, 32, 33] {
+            let values: Vec<f32> = (0..rows)
+                .flat_map(|row| {
+                    (0..hidden).map(move |col| ((row * 17 + col * 3) % 101) as f32 / 101.0)
+                })
+                .collect();
+            let ids: Vec<u32> = (0..rows).map(|row| (row % 2) as u32).collect();
+            let x = Array::from_slice(&values, &[1, rows, hidden]);
+            let indices = Array::from_slice(&ids, &[1, rows, 1]);
+            let result = block.forward_gather_global_sort(&x, &indices).unwrap();
+
+            let reversed_values: Vec<f32> = values
+                .chunks(hidden as usize)
+                .rev()
+                .flatten()
+                .copied()
+                .collect();
+            let reversed_ids: Vec<u32> = ids.iter().rev().copied().collect();
+            let reversed_x = Array::from_slice(&reversed_values, &[1, rows, hidden]);
+            let reversed_indices = Array::from_slice(&reversed_ids, &[1, rows, 1]);
+            let reversed = block
+                .forward_gather_global_sort(&reversed_x, &reversed_indices)
+                .unwrap();
+            result.eval().unwrap();
+            reversed.eval().unwrap();
+
+            assert_eq!(result.shape(), &[1, rows, 1, hidden]);
+            let reverse_order: Vec<u32> = (0..rows as u32).rev().collect();
+            let reverse_order = Array::from_slice(&reverse_order, &[rows]);
+            let restored = reversed
+                .reshape(&[rows, hidden])
+                .unwrap()
+                .take_axis(&reverse_order, 0)
+                .unwrap();
+            let max_diff: f32 = result
+                .reshape(&[rows, hidden])
+                .unwrap()
+                .subtract(&restored)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item();
+            assert!(
+                max_diff < 1e-5,
+                "native global sort changed original routing order at {rows} rows: {max_diff}"
             );
         }
     }
