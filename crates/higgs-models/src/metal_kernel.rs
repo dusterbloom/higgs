@@ -7994,15 +7994,32 @@ mod tests {
         const ROWS: i32 = 70;
         const INVALID_ROW: usize = 33;
         let (xh, code, _, spec) = gather_test_inputs(ROWS);
-        let mut ids = vec![0u32; ROWS as usize];
-        ids[INVALID_ROW] = 2;
-        ids[INVALID_ROW + 1..].fill(1);
-        let ids = Array::from_slice(&ids, &[ROWS]);
+        let mut mixed_ids = vec![0u32; ROWS as usize];
+        mixed_ids[INVALID_ROW] = 2;
+        mixed_ids[INVALID_ROW + 1..].fill(1);
+        let mut valid_ids = mixed_ids.clone();
+        valid_ids[INVALID_ROW] = 1;
+        let mixed_ids = Array::from_slice(&mixed_ids, &[ROWS]);
+        let valid_ids = Array::from_slice(&valid_ids, &[ROWS]);
 
-        let output = eschamoe_gather_qgemm(&xh, &code, &ids, &spec).unwrap();
+        let output = eschamoe_gather_qgemm(&xh, &code, &mixed_ids, &spec).unwrap();
+        let valid_reference = eschamoe_gather_qgemm(&xh, &code, &valid_ids, &spec).unwrap();
         assert_eq!(output.shape(), &[ROWS, spec.out_features]);
         assert_eq!(output.dtype(), Dtype::Float32);
-        eval([&output]).unwrap();
+        eval([&output, &valid_reference]).unwrap();
+
+        let row_width = spec.out_features as usize;
+        for row in [INVALID_ROW - 1, INVALID_ROW + 1, 64] {
+            let row_start = row * row_width;
+            let got = &output.as_slice::<f32>()[row_start..row_start + row_width];
+            let want = &valid_reference.as_slice::<f32>()[row_start..row_start + row_width];
+            assert!(
+                want.iter().any(|&value| value != 0.0),
+                "valid reference row {row} must exercise a nonzero result"
+            );
+            assert_eq!(got, want, "valid row {row} changed around invalid row");
+        }
+
         let row_start = INVALID_ROW * spec.out_features as usize;
         let invalid_row =
             &output.as_slice::<f32>()[row_start..row_start + spec.out_features as usize];
