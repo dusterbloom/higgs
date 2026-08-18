@@ -363,6 +363,40 @@ pub struct LocalConfig {
     /// Raise MLX's wired memory limit to the device-recommended maximum.
     #[serde(default)]
     pub raise_wired_limit: bool,
+    /// Allow loading and unloading models at runtime via `POST`/`DELETE /v1/models`.
+    ///
+    /// Off by default: the load endpoint reads local model directories but does
+    /// not download them, so it is opt-in and only reachable by authenticated
+    /// operators. Requires
+    /// `server.api_key` to be set (the doctor fails otherwise, since without
+    /// an api key the mutating endpoints would be unauthenticated).
+    #[serde(default)]
+    pub allow_runtime_model_load: bool,
+    /// Optional allowlist of local directory roots a runtime load may read.
+    ///
+    /// When non-empty, `POST /v1/models` accepts Hugging Face model ids
+    /// (resolved through the local HF cache) and absolute or relative paths
+    /// that resolve inside one of these roots; anything else is a 400.
+    /// Empty (the default) means only Hugging Face model ids are accepted —
+    /// no arbitrary local filesystem reads from caller-supplied paths.
+    #[serde(default)]
+    pub runtime_model_roots: Vec<String>,
+    /// Maximum number of models that may be resident via runtime loads.
+    ///
+    /// Counts only models loaded through `POST /v1/models`; startup-configured
+    /// models are not budgeted. `None` (the default) means no explicit cap —
+    /// memory is still bounded by the machine and by
+    /// `runtime_max_concurrent_loads` serializing loads. A typical value on a
+    /// 64 GB host is 1-2 large models.
+    #[serde(default)]
+    pub runtime_max_loaded_models: Option<usize>,
+    /// Maximum number of runtime load attempts that may run concurrently.
+    ///
+    /// Each load is GPU- and memory-heavy; concurrent loads of large models
+    /// can out-of-memory the host before any single load fails. Default 1
+    /// (loads serialize).
+    #[serde(default = "default_runtime_max_concurrent_loads")]
+    pub runtime_max_concurrent_loads: usize,
     /// Internal requested profile after resolving precedence (`model` > `--mlx-profile` > `HIGGS_MLX_PROFILE` > local default).
     #[serde(skip, default)]
     pub requested_mlx_profile: RequestedMlxProfile,
@@ -373,9 +407,17 @@ impl Default for LocalConfig {
         Self {
             mlx_profile: MlxProfile::Auto,
             raise_wired_limit: false,
+            allow_runtime_model_load: false,
+            runtime_model_roots: Vec::new(),
+            runtime_max_loaded_models: None,
+            runtime_max_concurrent_loads: default_runtime_max_concurrent_loads(),
             requested_mlx_profile: RequestedMlxProfile::Auto,
         }
     }
+}
+
+const fn default_runtime_max_concurrent_loads() -> usize {
+    1
 }
 
 // -- Model config -----------------------------------------------------------
@@ -851,6 +893,48 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
         return Err("timeout must be a finite, positive number".to_owned());
     }
 
+    if let Some(api_key) = config.server.api_key.as_deref() {
+        if api_key.trim().is_empty() {
+            return Err("server.api_key must not be blank".to_owned());
+        }
+        if api_key.bytes().any(|byte| byte <= b' ' || byte >= 0x7f) {
+            return Err("server.api_key contains invalid characters".to_owned());
+        }
+    }
+    validate_runtime_model_load_api_key(config)?;
+    for root in &config.local.runtime_model_roots {
+        crate::model_resolver::validate_runtime_model_root(root)?;
+    }
+    if config.local.runtime_max_concurrent_loads == 0 {
+        return Err("runtime_max_concurrent_loads must be greater than zero".to_owned());
+    }
+    if config.local.runtime_max_concurrent_loads > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(format!(
+            "runtime_max_concurrent_loads exceeds Tokio's maximum of {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        ));
+    }
+    if let Some(max_loaded) = config.local.runtime_max_loaded_models {
+        if max_loaded == 0 {
+            return Err("runtime_max_loaded_models must be greater than zero".to_owned());
+        }
+        if max_loaded > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "runtime_max_loaded_models exceeds Tokio's maximum of {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_runtime_model_load_api_key(config: &HiggsConfig) -> Result<(), String> {
+    if config.local.allow_runtime_model_load && config.server.api_key.is_none() {
+        return Err(
+            "server.api_key is required when local.allow_runtime_model_load is enabled".to_owned(),
+        );
+    }
     Ok(())
 }
 
@@ -1087,11 +1171,108 @@ mod tests {
         assert!(config.server.api_key.is_none());
         assert_eq!(config.server.rate_limit, 0);
         assert_eq!(config.local.mlx_profile, MlxProfile::Auto);
+        assert_eq!(config.local.runtime_max_concurrent_loads, 1);
         assert_eq!(
             config.local.requested_mlx_profile,
             RequestedMlxProfile::Auto
         );
         assert_eq!(config.default.provider, "higgs");
+    }
+
+    #[test]
+    fn test_zero_runtime_concurrent_loads_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n\n[local]\nruntime_max_concurrent_loads = 0\n",
+        )
+        .unwrap();
+
+        let err = load_config_file(&path, None).unwrap_err();
+        assert!(err.contains("runtime_max_concurrent_loads must be greater than zero"));
+    }
+
+    #[test]
+    fn test_blank_api_key_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n\n[server]\napi_key = \"   \"\n",
+        )
+        .unwrap();
+
+        let err = load_config_file(&path, None).unwrap_err();
+        assert!(err.contains("server.api_key must not be blank"));
+    }
+
+    #[test]
+    fn test_control_character_api_key_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n\n[server]\napi_key = \"bad\\u0001key\"\n",
+        )
+        .unwrap();
+
+        let err = load_config_file(&path, None).unwrap_err();
+        assert!(err.contains("server.api_key contains invalid characters"));
+    }
+
+    #[test]
+    fn test_runtime_model_load_without_api_key_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n\n[local]\nallow_runtime_model_load = true\n",
+        )
+        .unwrap();
+
+        let err = load_config_file(&path, None).unwrap_err();
+        assert!(
+            err.contains(
+                "server.api_key is required when local.allow_runtime_model_load is enabled"
+            )
+        );
+    }
+
+    #[test]
+    fn test_invalid_runtime_model_root_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, "not a directory").unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n\n[local]\nruntime_model_roots = [\"{}\"]\n",
+                file.display()
+            ),
+        )
+        .unwrap();
+
+        let err = load_config_file(&path, None).unwrap_err();
+        assert!(err.contains("is not a directory"), "got: {err}");
+    }
+
+    #[test]
+    fn test_runtime_semaphore_limits_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let too_many = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        std::fs::write(
+            &path,
+            format!(
+                "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n\n[local]\nruntime_max_concurrent_loads = {too_many}\nruntime_max_loaded_models = {too_many}\n"
+            ),
+        )
+        .unwrap();
+
+        let err = load_config_file(&path, None).unwrap_err();
+        assert!(err.contains("runtime_max_concurrent_loads exceeds"));
     }
 
     #[test]

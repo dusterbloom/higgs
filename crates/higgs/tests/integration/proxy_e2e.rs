@@ -11,7 +11,8 @@
     clippy::tests_outside_test_module,
     clippy::needless_pass_by_value,
     clippy::unreadable_literal,
-    clippy::needless_borrows_for_generic_args
+    clippy::needless_borrows_for_generic_args,
+    clippy::significant_drop_tightening
 )]
 
 use std::collections::HashMap;

@@ -5,7 +5,8 @@
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::tests_outside_test_module,
-    clippy::needless_pass_by_value
+    clippy::needless_pass_by_value,
+    clippy::significant_drop_tightening
 )]
 
 use std::collections::HashMap;
@@ -89,6 +90,42 @@ async fn metrics_endpoint_returns_snapshot_json() {
     assert_eq!(json["totals"]["output_tokens"], 34);
     assert_eq!(json["models"][0]["name"], "llama");
     assert_eq!(json["providers"][0]["name"], "higgs");
+}
+
+#[tokio::test]
+async fn load_model_disabled_returns_403() {
+    // Default test config has no [local] section, so runtime loading is off.
+    let app = build_router(build_test_state(None), 300.0, None, 0, 1024, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"path":"some/model"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn unload_model_disabled_returns_403() {
+    let app = build_router(build_test_state(None), 300.0, None, 0, 1024, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/models/ghost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

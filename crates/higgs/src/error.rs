@@ -31,6 +31,12 @@ pub enum ServerError {
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Internal error: {0}")]
     InternalError(String),
 
@@ -59,6 +65,8 @@ impl IntoResponse for ServerError {
                 "model_not_found",
                 format!("Model '{model}' is not loaded"),
             ),
+            Self::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone()),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
             Self::InternalError(msg) => {
                 tracing::error!(error = %msg, "Internal error");
                 (
@@ -215,6 +223,30 @@ mod tests {
         assert!(error_obj.get("message").is_some());
         assert!(error_obj.get("type").is_some());
         assert!(error_obj.get("code").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_conflict_returns_409_with_contract_body() {
+        let message = "model is already loaded";
+        let resp = ServerError::Conflict(message.to_owned()).into_response();
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "conflict");
+        assert_eq!(body["error"]["message"], message);
+        assert!(body["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_forbidden_returns_403_with_contract_body() {
+        let message = "runtime model loading is disabled";
+        let resp = ServerError::Forbidden(message.to_owned()).into_response();
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "forbidden");
+        assert_eq!(body["error"]["message"], message);
+        assert!(body["error"]["code"].is_null());
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use regex::Regex;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tracing::warn;
 
 use crate::config::{ApiFormat, HiggsConfig};
@@ -76,6 +77,44 @@ struct AutoRouteEntry {
     target: RouteTarget,
 }
 
+/// Internal failures while acquiring runtime-model coordination permits.
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum RuntimeLoadError {
+    #[error("runtime model budget reached; unload a runtime model before loading another")]
+    ResidentBudgetExhausted,
+    #[error("runtime load gate closed")]
+    LoadGateClosed,
+    #[error("runtime resident-model gate closed")]
+    ResidentGateClosed,
+}
+
+/// Owned coordination permits for one runtime load attempt.
+pub(crate) struct RuntimeLoadPermit {
+    _load_permit: OwnedSemaphorePermit,
+    resident_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl RuntimeLoadPermit {
+    /// Release the load-attempt permit while retaining the resident-model
+    /// permit with the loaded engine.
+    pub(crate) fn into_resident_permit(self) -> Option<OwnedSemaphorePermit> {
+        self.resident_permit
+    }
+}
+
+/// Engine removed from routing, retaining its resident quota permit until the
+/// caller finishes draining all in-flight `Arc` references.
+pub(crate) struct RemovedEngine {
+    engine: Arc<Engine>,
+    resident_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl RemovedEngine {
+    pub(crate) fn into_parts(self) -> (Arc<Engine>, Option<OwnedSemaphorePermit>) {
+        (self.engine, self.resident_permit)
+    }
+}
+
 /// Routes model names to local engines or remote providers.
 ///
 /// Resolution order:
@@ -84,11 +123,25 @@ struct AutoRouteEntry {
 /// 3. Pattern matching (first match wins)
 /// 4. Default provider fallback
 pub struct Router {
-    local_engines: HashMap<String, Arc<Engine>>,
+    /// Loaded local engines, mutable at runtime via the load/unload endpoints.
+    /// Guarded by a `RwLock`: `resolve`/`list` take a read lock and clone the
+    /// `Arc` out, so an in-flight request is never tied to map membership.
+    local_engines: RwLock<HashMap<String, Arc<Engine>>>,
+    /// Runtime engine names and their resident quota permits. Startup-configured
+    /// engines are intentionally excluded from this map.
+    runtime_engine_names: RwLock<HashMap<String, Option<OwnedSemaphorePermit>>>,
+    /// Bounds concurrent GPU- and memory-heavy runtime load attempts.
+    runtime_load_semaphore: Arc<Semaphore>,
+    /// Bounds resident runtime engines. A permit remains held through unload
+    /// draining, so the cap describes engine lifetime rather than map entries.
+    runtime_resident_semaphore: Option<Arc<Semaphore>>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
     auto_candidates: Vec<RouteCandidate>,
     auto_router_engine: Option<Arc<Engine>>,
+    /// Map key bound to the auto-router model, if enabled. Unloading it is
+    /// refused because `auto_router_engine` keeps a separate `Arc` alive.
+    auto_router_model_name: Option<String>,
     auto_router_force: bool,
     auto_router_timeout_ms: u64,
     default_target: RouteTarget,
@@ -100,6 +153,21 @@ impl Router {
         config: &HiggsConfig,
         engines: HashMap<String, Arc<Engine>>,
     ) -> Result<Self, String> {
+        let max_concurrent = config.local.runtime_max_concurrent_loads;
+        if max_concurrent == 0 || max_concurrent > Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "runtime_max_concurrent_loads must be between 1 and {}",
+                Semaphore::MAX_PERMITS
+            ));
+        }
+        if let Some(max_loaded) = config.local.runtime_max_loaded_models
+            && (max_loaded == 0 || max_loaded > Semaphore::MAX_PERMITS)
+        {
+            return Err(format!(
+                "runtime_max_loaded_models must be between 1 and {}",
+                Semaphore::MAX_PERMITS
+            ));
+        }
         let mut compiled_routes = Vec::new();
         let mut auto_routes = Vec::new();
         let mut auto_candidates = Vec::new();
@@ -146,7 +214,7 @@ impl Router {
             }
         }
 
-        let auto_router_engine = if config.auto_router.enabled {
+        let (auto_router_engine, auto_router_model_name) = if config.auto_router.enabled {
             if config.auto_router.model.is_empty() {
                 return Err("auto_router.enabled is true but model is empty".to_owned());
             }
@@ -157,19 +225,27 @@ impl Router {
             let engine = engines.get(auto_model).cloned().ok_or_else(|| {
                 format!("auto_router model '{auto_model}' not found among loaded models")
             })?;
-            Some(engine)
+            (Some(engine), Some(auto_model.clone()))
         } else {
-            None
+            (None, None)
         };
 
         let default_target = build_route_target(&config.default.provider, None, config)?;
 
         Ok(Self {
-            local_engines: engines,
+            local_engines: RwLock::new(engines),
+            runtime_engine_names: RwLock::new(HashMap::new()),
+            runtime_load_semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            runtime_resident_semaphore: config
+                .local
+                .runtime_max_loaded_models
+                .map(Semaphore::new)
+                .map(Arc::new),
             compiled_routes,
             auto_routes,
             auto_candidates,
             auto_router_engine,
+            auto_router_model_name,
             auto_router_force: config.auto_router.force,
             auto_router_timeout_ms: config.auto_router.timeout_ms,
             default_target,
@@ -186,7 +262,7 @@ impl Router {
         messages: Option<&[serde_json::Value]>,
     ) -> Result<ResolvedRoute, String> {
         if self.auto_router_force || model == "auto" {
-            if let Some(resolved) = self.try_auto_route(messages).await {
+            if let Some(resolved) = self.try_auto_route(messages).await? {
                 return Ok(resolved);
             }
             if model == "auto" {
@@ -195,10 +271,13 @@ impl Router {
             // force mode: auto-routing returned nothing, fall through to normal resolution
         }
 
-        // Direct engine lookup
-        if let Some(engine) = self.local_engines.get(model) {
+        // Direct engine lookup. Clone the Arc out and drop the read guard
+        // immediately -- the in-flight request owns the engine independent of
+        // map membership, so a concurrent unload can never free it mid-request.
+        let direct = self.engines_read().get(model).cloned();
+        if let Some(engine) = direct {
             return Ok(ResolvedRoute::Higgs {
-                engine: Arc::clone(engine),
+                engine,
                 model_name: model.to_owned(),
                 routing_method: RoutingMethod::Direct,
             });
@@ -215,21 +294,159 @@ impl Router {
         self.resolve_target(&self.default_target, model, RoutingMethod::Default)
     }
 
-    /// Returns all loaded local engines.
-    pub const fn local_engines(&self) -> &HashMap<String, Arc<Engine>> {
-        &self.local_engines
+    /// Sorted names of all loaded local engines (snapshot under a read lock).
+    pub fn local_model_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.engines_read().keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Whether a local engine is currently registered under `name`.
+    pub fn contains_engine(&self, name: &str) -> bool {
+        self.engines_read().contains_key(name)
+    }
+
+    /// Number of engines inserted through the runtime-load API.
+    #[cfg(test)]
+    pub(crate) fn runtime_engine_count(&self) -> usize {
+        self.runtime_engine_names
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Acquire the attempt and resident permits for one runtime load.
+    pub(crate) async fn acquire_runtime_load(&self) -> Result<RuntimeLoadPermit, RuntimeLoadError> {
+        let load_permit = Arc::clone(&self.runtime_load_semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|_| RuntimeLoadError::LoadGateClosed)?;
+        let resident_permit = match &self.runtime_resident_semaphore {
+            Some(semaphore) => match Arc::clone(semaphore).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(TryAcquireError::NoPermits) => {
+                    return Err(RuntimeLoadError::ResidentBudgetExhausted);
+                }
+                Err(TryAcquireError::Closed) => {
+                    return Err(RuntimeLoadError::ResidentGateClosed);
+                }
+            },
+            None => None,
+        };
+        Ok(RuntimeLoadPermit {
+            _load_permit: load_permit,
+            resident_permit,
+        })
+    }
+
+    /// Register a freshly-loaded engine. Returns `Err(name)` if the name is
+    /// already taken (checked under the write lock, so it is race-free against
+    /// concurrent loads).
+    pub fn insert_engine(&self, name: String, engine: Arc<Engine>) -> Result<(), String> {
+        let mut engines = self.engines_write();
+        if engines.contains_key(&name) {
+            return Err(name);
+        }
+        engines.insert(name, engine);
+        drop(engines);
+        Ok(())
+    }
+
+    /// Register an engine loaded through the runtime API, enforcing the
+    /// resident runtime-model budget while holding the write lock.
+    pub(crate) fn insert_runtime_engine(
+        &self,
+        name: String,
+        engine: Arc<Engine>,
+        resident_permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<(), String> {
+        let mut engines = self.engines_write();
+        if engines.contains_key(&name) {
+            return Err(format!("model '{name}' is already loaded"));
+        }
+
+        let mut runtime_names = self
+            .runtime_engine_names
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        engines.insert(name.clone(), engine);
+        runtime_names.insert(name, resident_permit);
+        drop(runtime_names);
+        drop(engines);
+        Ok(())
+    }
+
+    /// Non-draining removal for startup engines. Runtime engines must use
+    /// `remove_runtime_engine` so their resident quota permit remains held
+    /// while references drain.
+    pub fn remove_engine(&self, name: &str) -> Option<Arc<Engine>> {
+        let mut engines = self.engines_write();
+        let runtime_names = self
+            .runtime_engine_names
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if runtime_names.contains_key(name) {
+            return None;
+        }
+        drop(runtime_names);
+        engines.remove(name)
+    }
+
+    /// Remove a runtime engine while retaining its resident quota permit until
+    /// all in-flight `Arc` references have drained.
+    pub(crate) fn remove_runtime_engine(&self, name: &str) -> Option<RemovedEngine> {
+        self.remove_engine_with_permit(name)
+    }
+
+    fn remove_engine_with_permit(&self, name: &str) -> Option<RemovedEngine> {
+        // Keep both locks in the same order used by insert_runtime_engine so
+        // a same-name load cannot insert between engine and quota removal.
+        let mut engines = self.engines_write();
+        let removed = engines.remove(name)?;
+        let mut runtime_names = self
+            .runtime_engine_names
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let resident_permit = runtime_names.remove(name).flatten();
+        drop(runtime_names);
+        drop(engines);
+        Some(RemovedEngine {
+            engine: removed,
+            resident_permit,
+        })
+    }
+
+    /// Map key bound to the auto-router model, if the auto-router is enabled.
+    pub fn auto_router_model_name(&self) -> Option<&str> {
+        self.auto_router_model_name.as_deref()
     }
 
     // -- Private helpers ---------------------------------------------------
 
+    fn engines_read(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<Engine>>> {
+        self.local_engines
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn engines_write(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<Engine>>> {
+        self.local_engines
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     async fn try_auto_route(
         &self,
         messages: Option<&[serde_json::Value]>,
-    ) -> Option<ResolvedRoute> {
-        let auto_engine = self.auto_router_engine.as_ref()?;
-        let msg_slice = messages?;
+    ) -> Result<Option<ResolvedRoute>, String> {
+        let Some(auto_engine) = self.auto_router_engine.as_ref() else {
+            return Ok(None);
+        };
+        let Some(msg_slice) = messages else {
+            return Ok(None);
+        };
         if self.auto_candidates.is_empty() || msg_slice.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let engine_clone = Arc::clone(auto_engine);
@@ -244,16 +461,23 @@ impl Router {
             }),
         )
         .await;
-        let name = if let Ok(join_result) = timeout_result {
-            join_result.ok()??
-        } else {
-            warn!("auto-router classification timed out after {timeout:?}");
-            return None;
+        let name = match timeout_result {
+            Ok(Ok(Some(name))) => name,
+            Ok(Ok(None) | Err(_)) => return Ok(None),
+            Err(_) => {
+                warn!("auto-router classification timed out after {timeout:?}");
+                return Ok(None);
+            }
         };
 
-        let entry = self.auto_routes.iter().find(|r| r.name == name)?;
+        let Some(entry) = self.auto_routes.iter().find(|r| r.name == name) else {
+            return Ok(None);
+        };
+        self.resolve_selected_auto_route(entry).map(Some)
+    }
+
+    fn resolve_selected_auto_route(&self, entry: &AutoRouteEntry) -> Result<ResolvedRoute, String> {
         self.resolve_target(&entry.target, "auto", RoutingMethod::Auto)
-            .ok()
     }
 
     fn resolve_target(
@@ -265,21 +489,22 @@ impl Router {
         match target {
             RouteTarget::Higgs { model_rewrite } => {
                 let lookup_name = model_rewrite.as_deref().unwrap_or(model);
-                let (engine, resolved_name) =
-                    if let Some(engine) = self.local_engines.get(lookup_name) {
-                        (Arc::clone(engine), lookup_name.to_owned())
-                    } else if model == "auto" {
-                        // "auto" is a virtual model name; pick any loaded engine
-                        let (name, engine) =
-                            self.local_engines.iter().next().ok_or_else(|| {
-                                "no local models loaded for default route".to_owned()
-                            })?;
-                        (Arc::clone(engine), name.clone())
-                    } else {
-                        return Err(format!(
-                            "model '{lookup_name}' not found among loaded local models"
-                        ));
-                    };
+                let engines = self.engines_read();
+                let (engine, resolved_name) = if let Some(engine) = engines.get(lookup_name) {
+                    (Arc::clone(engine), lookup_name.to_owned())
+                } else if model == "auto" && model_rewrite.is_none() {
+                    // "auto" is a virtual model name; pick any loaded engine
+                    let (name, engine) = engines
+                        .iter()
+                        .next()
+                        .ok_or_else(|| "no local models loaded for default route".to_owned())?;
+                    (Arc::clone(engine), name.clone())
+                } else {
+                    return Err(format!(
+                        "model '{lookup_name}' not found among loaded local models"
+                    ));
+                };
+                drop(engines);
                 Ok(ResolvedRoute::Higgs {
                     engine,
                     model_name: resolved_name,
@@ -346,7 +571,8 @@ fn build_route_target(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::shadow_unrelated
+    clippy::shadow_unrelated,
+    clippy::significant_drop_tightening
 )]
 mod tests {
     use super::*;
@@ -801,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn local_engines_accessor_returns_engines() {
+    fn local_model_names_lists_engines() {
         let config = config_from_toml(
             r#"
             [[models]]
@@ -809,7 +1035,171 @@ mod tests {
             "#,
         );
         let router = Router::from_config(&config, HashMap::new()).unwrap();
-        assert!(router.local_engines().is_empty());
+        assert!(router.local_model_names().is_empty());
+
+        let mut engines = HashMap::new();
+        engines.insert(
+            "b".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("b")),
+        );
+        engines.insert(
+            "a".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("a")),
+        );
+        let router = Router::from_config(&config, engines).unwrap();
+        assert_eq!(router.local_model_names(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn insert_remove_and_contains_engine() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "some/model"
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+
+        assert!(!router.contains_engine("x"));
+        router
+            .insert_engine(
+                "x".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("x")),
+            )
+            .unwrap();
+        assert!(router.contains_engine("x"));
+
+        // Duplicate insert is rejected with the conflicting name.
+        let dup = router.insert_engine(
+            "x".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("x")),
+        );
+        assert_eq!(dup, Err("x".to_owned()));
+
+        let removed = router.remove_engine("x");
+        assert!(removed.is_some());
+        assert!(!router.contains_engine("x"));
+        assert_eq!(router.runtime_engine_count(), 0);
+        assert!(router.remove_engine("x").is_none());
+    }
+
+    #[tokio::test]
+    async fn non_draining_remove_refuses_runtime_engine() {
+        let config = config_from_toml(
+            r#"
+            [provider.stub]
+            url = "http://127.0.0.1:1"
+            [local]
+            runtime_max_loaded_models = 1
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+        let load_permit = router.acquire_runtime_load().await.unwrap();
+        router
+            .insert_runtime_engine(
+                "runtime".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("runtime")),
+                load_permit.into_resident_permit(),
+            )
+            .unwrap();
+
+        assert!(router.remove_engine("runtime").is_none());
+        assert!(router.contains_engine("runtime"));
+        assert_eq!(
+            router.acquire_runtime_load().await.err().unwrap(),
+            RuntimeLoadError::ResidentBudgetExhausted
+        );
+
+        drop(router.remove_runtime_engine("runtime"));
+    }
+
+    #[tokio::test]
+    async fn runtime_engine_count_excludes_startup_engines() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "startup/model"
+            [local]
+            runtime_max_loaded_models = 1
+            "#,
+        );
+        let mut engines = HashMap::new();
+        engines.insert(
+            "startup".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("startup")),
+        );
+        let router = Router::from_config(&config, engines).unwrap();
+
+        assert_eq!(router.runtime_engine_count(), 0);
+        let load_permit = router.acquire_runtime_load().await.unwrap();
+        router
+            .insert_runtime_engine(
+                "runtime".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("runtime")),
+                load_permit.into_resident_permit(),
+            )
+            .unwrap();
+        assert_eq!(router.runtime_engine_count(), 1);
+        assert_eq!(router.local_model_names().len(), 2);
+        assert_eq!(
+            router.acquire_runtime_load().await.err().unwrap(),
+            RuntimeLoadError::ResidentBudgetExhausted
+        );
+        let removed = router.remove_runtime_engine("runtime").unwrap();
+        assert!(router.acquire_runtime_load().await.is_err());
+        drop(removed);
+        assert!(router.acquire_runtime_load().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn closed_runtime_load_gate_returns_typed_error() {
+        let config = config_from_toml(
+            r#"
+            [provider.stub]
+            url = "http://127.0.0.1:1"
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+        router.runtime_load_semaphore.close();
+
+        assert_eq!(
+            router.acquire_runtime_load().await.err().unwrap(),
+            RuntimeLoadError::LoadGateClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_load_permit_survives_outer_cancellation() {
+        let config = config_from_toml(
+            r#"
+            [provider.stub]
+            url = "http://127.0.0.1:1"
+            [local]
+            runtime_max_concurrent_loads = 1
+            "#,
+        );
+        let router = Arc::new(Router::from_config(&config, HashMap::new()).unwrap());
+        let permit = router.acquire_runtime_load().await.unwrap();
+        let blocking = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(permit);
+        });
+        let outer = tokio::spawn(async move {
+            let _ = blocking.await;
+        });
+        outer.abort();
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                router.acquire_runtime_load()
+            )
+            .await
+            .is_err(),
+            "permit was released while the blocking load task was still running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+        assert!(router.acquire_runtime_load().await.is_ok());
     }
 
     #[tokio::test]
@@ -842,6 +1232,46 @@ mod tests {
             Ok(ResolvedRoute::Remote { .. }) => panic!("expected Higgs route"),
             Err(e) => panic!("should resolve to first engine, got error: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn selected_auto_route_with_missing_higgs_rewrite_returns_error() {
+        let config = config_from_toml(
+            r#"
+            [auto_router]
+            enabled = true
+            model = "router"
+
+            [[models]]
+            path = "router"
+            name = "router"
+
+            [[routes]]
+            name = "missing-local"
+            description = "route to a model that is not loaded"
+            provider = "higgs"
+            model = "missing"
+            "#,
+        );
+        let mut engines = HashMap::new();
+        engines.insert(
+            "router".to_owned(),
+            Arc::new(crate::state::Engine::test_stub_with_output(
+                "router",
+                r#"{"route":"missing-local"}"#,
+            )),
+        );
+        let router = Router::from_config(&config, engines).unwrap();
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "route this request"
+        })];
+        let error = match router.resolve("auto", Some(&messages)).await {
+            Err(error) => error,
+            Ok(_) => panic!("expected missing explicit rewrite to fail"),
+        };
+
+        assert_eq!(error, "model 'missing' not found among loaded local models");
     }
 
     #[test]

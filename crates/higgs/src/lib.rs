@@ -33,7 +33,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use tower_http::{
@@ -54,7 +54,7 @@ pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
 }
 
 /// Build the Axum router with all routes and middleware.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::significant_drop_tightening)]
 pub fn build_router(
     state: SharedState,
     timeout_secs: f64,
@@ -67,7 +67,11 @@ pub fn build_router(
 
     let mut api_routes = Router::new()
         .route("/metrics", get(routes::metrics::metrics))
-        .route("/v1/models", get(routes::models::list_models))
+        .route(
+            "/v1/models",
+            get(routes::models::list_models).post(routes::models::load_model),
+        )
+        .route("/v1/models/{name}", delete(routes::models::unload_model))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
         .route("/v1/embeddings", post(routes::embeddings::embeddings))
