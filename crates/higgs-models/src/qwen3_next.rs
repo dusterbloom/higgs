@@ -260,6 +260,10 @@ pub(crate) struct QLinear {
     pub(crate) bits: i32,
 }
 
+fn crossrow_qmv_rows_supported(m_rows: i32) -> bool {
+    matches!(m_rows, 2 | 3 | 5 | 6 | 8 | 9)
+}
+
 impl QLinear {
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn new(group_size: i32, bits: i32) -> Result<Self, Exception> {
@@ -277,6 +281,9 @@ impl QLinear {
         if self.bits == 0 {
             dense_linear_no_bias_forward(&self.weight, x)
         } else {
+            if let Some(y) = self.crossrow_qmv_forward(x) {
+                return Ok(y);
+            }
             quantized_forward(
                 x,
                 &self.weight,
@@ -286,6 +293,53 @@ impl QLinear {
                 self.bits,
             )
         }
+    }
+
+    /// Use the crossrow verifier only for the validated affine-4/group-64
+    /// shapes. Any kernel error deliberately falls back to stock QMV so the
+    /// optimization cannot change model correctness.
+    fn crossrow_qmv_forward(&self, x: &Array) -> Option<Array> {
+        if std::env::var("HIGGS_CROSSROW_QMV").map_or(false, |v| v == "0")
+            || self.bits != 4
+            || self.group_size != 64
+        {
+            return None;
+        }
+        let x_shape = x.shape();
+        if x_shape.len() < 2 {
+            return None;
+        }
+        let m_rows: i32 = x_shape
+            .iter()
+            .take(x_shape.len().saturating_sub(1))
+            .product();
+        // M4 and M7 were measured to diverge from stock on the Qwen3.8
+        // verifier trajectory; keep those production boundaries conservative.
+        if !crossrow_qmv_rows_supported(m_rows) {
+            return None;
+        }
+        let Some(&k_in) = x_shape.last() else {
+            return None;
+        };
+        let [n_rows, k_packed] = *self.weight.shape() else {
+            return None;
+        };
+        let k_dim = k_packed * 8;
+        if k_dim != k_in || k_dim % 512 != 0 || n_rows % 8 != 0 {
+            return None;
+        }
+        let mut out_shape = x_shape.to_vec();
+        let _ = out_shape.pop();
+        out_shape.push(n_rows);
+        crate::crossrow_qmv::crossrow_qmv_verify(
+            x,
+            &self.weight,
+            &self.scales,
+            &self.biases,
+            m_rows,
+        )
+        .ok()
+        .and_then(|y| y.reshape(&out_shape).ok())
     }
 
     /// Decode-only fast path for 4-bit single-token inference.
@@ -5217,6 +5271,15 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
         }
     }
 
+    if std::env::var("HIGGS_LOAD_EVAL_CHUNKED")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+    {
+        for (_, param) in params.iter() {
+            (**param).eval().map_err(crate::error::ModelError::from)?;
+        }
+    }
+
     model
         .eval()
         .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
@@ -5475,6 +5538,16 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
+
+    #[test]
+    fn crossrow_qmv_preserves_m4_m7_fallback_boundaries() {
+        for rows in [2, 3, 5, 6, 8, 9] {
+            assert!(crossrow_qmv_rows_supported(rows));
+        }
+        for rows in [i32::MIN, -1, 0, 1, 4, 7, 10, i32::MAX] {
+            assert!(!crossrow_qmv_rows_supported(rows));
+        }
+    }
 
     #[test]
     fn qlinear_zero_bits_uses_dense_weight() {
