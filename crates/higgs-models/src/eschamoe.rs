@@ -2798,6 +2798,162 @@ mod tests {
         if scale > 0.0 { diff / scale } else { diff }
     }
 
+    /// Require every f32 output row to have the same bits as `want`.
+    fn assert_rows_match_bits(got: &Array, want: &[u32], out_f: i32, label: &str) {
+        assert_eq!(got.shape().last(), Some(&out_f), "{label}");
+        for (row, values) in got.as_slice::<f32>().chunks(out_f as usize).enumerate() {
+            let bits: Vec<u32> = values.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(bits, want, "{label}: row {row}");
+        }
+    }
+
+    /// Identical logical rows must not depend on neighboring rows or dispatch shape.
+    ///
+    /// The direct-kernel checks compare f32 bits from the same kernel, not from
+    /// the tolerance-only scratch oracle below. The distinct-expert case also
+    /// compares corresponding logical rows after an unsorted permutation.
+    #[test]
+    fn eschamoe_gather_kernels_preserve_logical_row_bits() {
+        let _exec = crate::mlx_exec::acquire();
+        const EXPERTS: i32 = 32;
+        const EXPERT: u32 = 17;
+
+        let (in_f, out_f) = (HAD_BLOCK * 2, HAD_BLOCK);
+        let g = synth_group(Some(EXPERTS), 2, in_f, out_f);
+        let s = EschaSpec {
+            k: 2,
+            mcg: true,
+            num_experts: EXPERTS,
+            in_features: in_f,
+            out_features: out_f,
+        };
+        let proj = EschaProj::new(g.code.clone(), &g.rin, &g.rout, &g.s_in, &g.s_out, s).unwrap();
+
+        let x_values: Vec<f32> = pseudo_random(in_f as usize, 0xB17E)
+            .into_iter()
+            .map(|value| f32::from(value) / 32768.0 - 1.0)
+            .collect();
+        let x = Array::from_slice(&x_values, &[1, in_f]);
+        let (xh_row, _) = factored_row_and_ref(
+            &x,
+            &g.code,
+            &g.rin,
+            &g.s_in,
+            i32::try_from(EXPERT).unwrap(),
+            &proj.spec,
+        );
+        let repeated = |row: &[f32], rows: usize| {
+            let values: Vec<f32> = row.iter().copied().cycle().take(rows * row.len()).collect();
+            Array::from_slice(&values, &[i32::try_from(rows).unwrap(), in_f])
+        };
+        let repeated_ids = |expert: u32, rows: usize| {
+            Array::from_slice(&vec![expert; rows], &[i32::try_from(rows).unwrap()])
+        };
+
+        let one_xh = repeated(&xh_row, 1);
+        let one_eid = repeated_ids(EXPERT, 1);
+        let qmv_one =
+            crate::metal_kernel::eschamoe_gather_qmv(&one_xh, &proj.code, &one_eid, &proj.spec)
+                .unwrap();
+        let qmv_bits: Vec<u32> = qmv_one
+            .as_slice::<f32>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        for rows in [1usize, 31, 32] {
+            let got = crate::metal_kernel::eschamoe_gather_qmv(
+                &repeated(&xh_row, rows),
+                &proj.code,
+                &repeated_ids(EXPERT, rows),
+                &proj.spec,
+            )
+            .unwrap();
+            assert_rows_match_bits(&got, &qmv_bits, out_f, &format!("qmv rows={rows}"));
+        }
+
+        let qgemm_one =
+            crate::metal_kernel::eschamoe_gather_qgemm(&one_xh, &proj.code, &one_eid, &proj.spec)
+                .unwrap();
+        let qgemm_bits: Vec<u32> = qgemm_one
+            .as_slice::<f32>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        for rows in [1usize, 31, 32, 33] {
+            let got = crate::metal_kernel::eschamoe_gather_qgemm(
+                &repeated(&xh_row, rows),
+                &proj.code,
+                &repeated_ids(EXPERT, rows),
+                &proj.spec,
+            )
+            .unwrap();
+            assert_rows_match_bits(&got, &qgemm_bits, out_f, &format!("qgemm rows={rows}"));
+        }
+
+        let sorted_ids: Vec<u32> = (0..EXPERTS as u32).collect();
+        let permutation: Vec<usize> = (0..EXPERTS as usize).map(|i| (i * 13) % 32).collect();
+        let unsorted_ids: Vec<u32> = permutation.iter().map(|&i| sorted_ids[i]).collect();
+        let rows = EXPERTS as usize;
+        let xh = repeated(&xh_row, rows);
+        let sorted = crate::metal_kernel::eschamoe_gather_qgemm(
+            &xh,
+            &proj.code,
+            &Array::from_slice(&sorted_ids, &[EXPERTS]),
+            &proj.spec,
+        )
+        .unwrap();
+        let unsorted = crate::metal_kernel::eschamoe_gather_qgemm(
+            &xh,
+            &proj.code,
+            &Array::from_slice(&unsorted_ids, &[EXPERTS]),
+            &proj.spec,
+        )
+        .unwrap();
+        let sorted_rows: Vec<Vec<u32>> = sorted
+            .as_slice::<f32>()
+            .chunks(out_f as usize)
+            .map(|row| row.iter().map(|value| value.to_bits()).collect())
+            .collect();
+        for (row, &sorted_row) in unsorted
+            .as_slice::<f32>()
+            .chunks(out_f as usize)
+            .zip(&permutation)
+        {
+            let bits: Vec<u32> = row.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(bits, sorted_rows[sorted_row], "unsorted expert row");
+        }
+
+        for (rows, qgemm) in [(32usize, false), (33, true)] {
+            let raw = repeated(&x_values, rows);
+            let eids = repeated_ids(EXPERT, rows);
+            let got = proj.gather_forward_mode(&raw, &eids, true).unwrap();
+            let xh = repeated(&xh_row, rows);
+            let y_pre = if qgemm {
+                crate::metal_kernel::eschamoe_gather_qgemm(&xh, &proj.code, &eids, &proj.spec)
+                    .unwrap()
+            } else {
+                crate::metal_kernel::eschamoe_gather_qmv(&xh, &proj.code, &eids, &proj.spec)
+                    .unwrap()
+            };
+            let sv_rows = proj.sv.take_axis(&eids, 0).unwrap();
+            let want = had_blockwise(&y_pre, -1)
+                .unwrap()
+                .multiply(&sv_rows)
+                .unwrap();
+            let got_bits: Vec<u32> = got
+                .as_slice::<f32>()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect();
+            let want_bits: Vec<u32> = want
+                .as_slice::<f32>()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect();
+            assert_eq!(got_bits, want_bits, "dispatch rows={rows}");
+        }
+    }
+
     /// The trellis GEMM must agree with the scratch path it replaces.
     ///
     /// Both paths compute `y_pre = xh @ Ŵ`. They differ in the accumulation
