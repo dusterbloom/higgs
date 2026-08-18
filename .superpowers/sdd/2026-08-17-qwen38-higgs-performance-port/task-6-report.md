@@ -226,6 +226,61 @@ closes that instrumentation gap for future runs without changing the recorded
 2026-08-18 timings or production MTP behavior. No other bounded-harness concern
 is known.
 
+## Task 2 verifier dispatch comparison (2026-08-18)
+
+Task 1 selected `HIGGS_MTP_DRAFT_N_MAX=5`, which produces verifier width
+`T=6`. Three fresh-process trials were run for each condition against
+`/Users/peppi/AI-Models/qwen38-higgs` with `BENCH_PROMPT_LEN=256`,
+`BENCH_DECODE_STEPS=128`, `HIGGS_MTP_ADAPTIVE_DRAFT=0`, and
+`HIGGS_MTP_MIRROR_VERIFY=0`. Grouped used `HIGGS_CROSSROW_QMV=1`; stock used
+`HIGGS_CROSSROW_QMV=0`; QGEMM used `HIGGS_CROSSROW_QMV=0` and
+`HIGGS_QGEMM_VERIFY=1`. All nine external processes exited 0.
+
+Complete logs are retained at `/private/tmp/higgs-qwen38-sweep/` as
+`dispatch-{grouped,stock,qgemm}-run-{1,2,3}.log`. The first sandboxed grouped
+attempt is preserved separately as `dispatch-grouped-sandbox-abort.log`; it
+aborted during MLX Metal initialization with
+`NSRangeException` from an empty Metal device array. The external run was
+required for Metal access, as in Task 1.
+
+Raw summaries:
+
+| Condition | Run | Cycles | Rows | Drafted | Accepted | Measured count/digest | Whole count/digest | Total ms | Avg ms | Tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: |
+| grouped | 1 | 29 | 174 | 145 | 103 | 132 / `35c68639d86d7d4e` | 133 / `0fd2400ecb5dfe42` | 13721.673 | 473.161 | 9.62 |
+| grouped | 2 | 29 | 174 | 145 | 103 | 132 / `35c68639d86d7d4e` | 133 / `0fd2400ecb5dfe42` | 13751.803 | 474.200 | 9.60 |
+| grouped | 3 | 29 | 174 | 145 | 103 | 132 / `35c68639d86d7d4e` | 133 / `0fd2400ecb5dfe42` | 13701.233 | 472.456 | 9.63 |
+| stock | 1 | 29 | 174 | 145 | 103 | 132 / `35c68639d86d7d4e` | 133 / `0fd2400ecb5dfe42` | 16336.401 | 563.324 | 8.08 |
+| stock | 2 | 29 | 174 | 145 | 103 | 132 / `35c68639d86d7d4e` | 133 / `0fd2400ecb5dfe42` | 16460.322 | 567.597 | 8.02 |
+| stock | 3 | 29 | 174 | 145 | 103 | 132 / `35c68639d86d7d4e` | 133 / `0fd2400ecb5dfe42` | 16517.959 | 569.585 | 7.99 |
+| QGEMM | 1 | 28 | 168 | 140 | 104 | 132 / `35c68639d86d7d4e` | 133 / `0fd2400ecb5dfe42` | 26349.971 | 941.070 | 5.01 |
+| QGEMM | 2 | 28 | 168 | 140 | 104 | 132 / `35c68639d86d7d4e` | 133 / `0fd2400ecb5dfe42` | 26044.451 | 930.159 | 5.07 |
+| QGEMM | 3 | 28 | 168 | 140 | 104 | 132 / `35c68639d86d7d4e` | 133 / `0fd2400ecb5dfe42` | 26159.381 | 934.264 | 5.05 |
+
+Exactness was equal across all three conditions in every trial: measured
+`132 / 35c68639d86d7d4e`, whole trajectory `133 / 0fd2400ecb5dfe42`,
+verifier rows/drafted/accepted `174/145/103` for grouped and stock, and
+`168/140/104` for QGEMM. The QGEMM gate was shape-eligible at `T=6`, but
+dispatch status is indeterminate: the implementation silently falls through to
+stock when the kernel call returns an error, and the logs provide no dispatch
+telemetry. The distinct, slower timing is retained only as an observed exact
+QGEMM condition, not as evidence of kernel acceptance or a fallback speed.
+
+Three-run medians were grouped `13721.673 ms / 473.161 ms / 9.62 tok/s`,
+stock `16460.322 ms / 567.597 ms / 8.02 tok/s`, and QGEMM `26159.381 ms /
+934.264 ms / 5.05 tok/s`. Grouped was 19.95% faster than stock by median
+throughput and 16.63% lower in median total cycle time. QGEMM is rejected
+pending dispatch telemetry and remains out of the trace candidates; its
+observed timing was 37.0% slower than stock but is not treated as a kernel
+speed result.
+
+Trace-condition selection: retain the exact grouped/stock pair at selected
+depth 5 (`T=6`) for Metal tracing, with grouped as the faster condition. Do not
+add QGEMM as a third trace condition. The Task 1 depth matrix remains the
+dispatch guard for `T=2..9`: eligible exact grouped/stock pairs were depths
+1, 2, 4, 5, 7, and 8; depths 3 and 6 were excluded for count/trajectory
+divergence before speed ranking.
+
 ## Fix worker update (2026-08-18)
 
 - Replaced the benchmark's two callable `argmax_axis` expressions with the
