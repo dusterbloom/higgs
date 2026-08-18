@@ -1124,7 +1124,7 @@ fn crossrow_qmv_shape(
         .iter()
         .take(x_shape.len().saturating_sub(1))
         .product();
-    if !(2..=9).contains(&m_rows) {
+    if !(2..=9).contains(&m_rows) || matches!(m_rows, 4 | 7) {
         return None;
     }
     let &k_in = x_shape.last()?;
@@ -11872,11 +11872,18 @@ mod tests {
     fn crossrow_qmv_eligibility_preserves_fallback_boundaries() {
         use crate::quant_mode::QuantMode;
 
-        for m_rows in 2..=9 {
+        for m_rows in [2, 3, 5, 6, 8, 9] {
             assert_eq!(
                 crossrow_qmv_shape(true, QuantMode::Affine, 4, 64, &[m_rows, 1024], &[16, 128]),
                 Some((m_rows, 16)),
                 "eligible M={m_rows} should use crossrow QMV"
+            );
+        }
+        for m_rows in [4, 7] {
+            assert_eq!(
+                crossrow_qmv_shape(true, QuantMode::Affine, 4, 64, &[m_rows, 1024], &[16, 128]),
+                None,
+                "excluded M={m_rows} should use stock QMV"
             );
         }
 
