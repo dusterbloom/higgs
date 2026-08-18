@@ -50,6 +50,105 @@ $ git diff --check
 exit 0
 ~~~
 
+## Task 6 long-run validation (2026-08-18)
+
+No Task 4 or Task 5 production candidate was retained. Final validation used
+the base grouped configuration at selected draft depth 5:
+
+```text
+model=/Users/peppi/AI-Models/qwen38-higgs
+HIGGS_CROSSROW_QMV=1
+HIGGS_MTP_DRAFT_N_MAX=5
+HIGGS_MTP_ADAPTIVE_DRAFT=0
+HIGGS_MTP_MIRROR_VERIFY=0
+HIGGS_QGEMM_VERIFY=0
+```
+
+Five fresh-process Low Power trials at prompt 256 / decode 256 all passed on
+AC power at 100% charge with `lowpowermode=1`, and no thermal/performance
+warning was recorded. Every run had `T=6`, 255 drafted, 210 accepted, 261
+measured emitted, and 262 whole-trajectory emitted, with identical digests:
+
+```text
+measured=133107837a5f4f82
+whole=9946577669a58f4e
+```
+
+The tok/s samples were 7.39, 7.34, 7.39, 7.21, and 7.46; median 7.39
+tok/s. Raw logs:
+`/private/tmp/higgs-qwen38-final-validation/task6-lpm-p256-d256-run-{1..5}.log`.
+
+One matching stock-dispatch Low Power control at the same prompt/decode
+settings also preserved the exact long trajectory: 261 measured and 262
+whole emitted, with measured digest `133107837a5f4f82` and whole digest
+`9946577669a58f4e`. It measured 5.85 tok/s and is retained as an exactness
+control, not as a new performance matrix. Raw log:
+`/private/tmp/higgs-qwen38-final-validation/task6-lpm-p256-d256-stock-run-1.log`.
+
+Three fresh-process Low Power prompt-shape trials at prompt 1024 / decode 128
+also passed with stable `T=6`, 150 drafted, 98 accepted, 128 measured
+emitted, and 129 whole emitted. All three had identical digests:
+
+```text
+measured=7b9e5bcb7778f298
+whole=7294d83a1d7e7d83
+```
+
+Tok/s was 5.95, 5.91, and 6.11; median 5.95 tok/s. Raw logs:
+`/private/tmp/higgs-qwen38-final-validation/task6-lpm-p1024-d128-run-{1..3}.log`.
+
+Normal-mode trials were not run because `sudo -n true` reported that a
+password is required. This is an explicit validation deviation. Earlier
+Task 1/Task 2 benchmark controls remain historical throughput evidence, but
+Task 2 did not capture a `pmset` power snapshot; no new normal/Low-Power
+paired performance claim is made.
+
+Final verification artifacts:
+
+- `/private/tmp/higgs-qwen38-final-validation/final-crossrow-release.log` —
+  6/6 release cross-row tests passed.
+- `/private/tmp/higgs-qwen38-final-validation/final-release-check.log` —
+  release checks passed.
+- `/private/tmp/higgs-qwen38-final-validation/final-release-build.log` —
+  release build completed.
+- `rustfmt --edition 2024 --check crates/higgs-engine/src/mtp.rs` and both
+  `git diff --check` checks passed.
+
+Final retained state: base grouped schedule `[3,2]`, no metadata-broadcast
+candidate, no M=5 schedule candidate, and no FastMetal configuration cache.
+
+### Final-review verifier-width fallback (2026-08-18)
+
+Final review connected the Task 1 excluded depth-3 and depth-6 results to
+verifier widths `M=4` and `M=7`, respectively. At those widths the grouped
+and stock runs had reproducibly different verifier-row totals and
+drafted/accepted progression. Even though the recorded measured and
+whole-trajectory digests matched at the fixed decode boundary, this violates
+the accepted-token invariant required to admit the grouped path.
+
+The conservative production decision is host-side stock fallback for exactly
+`M=4` and `M=7`. `crossrow_qmv_shape` continues to admit the verified widths
+`M=2,3,5,6,8,9`; the Metal kernel, row-group schedules, quantization and shape
+gates, environment behavior, and existing stock fallback are unchanged.
+Production commit: `17393ffd2` (`fix(qwen3): fall back for M4 and M7`).
+
+The eligibility regression test was changed first. Its required red run failed
+with `M=4` returning `Some((4, 16))` instead of `None`; the complete log is
+`/private/tmp/higgs-qwen38-sweep/task6-fallback-red.log`. A fresh post-change
+focused green run passed 1/1 in
+`/private/tmp/higgs-qwen38-sweep/task6-fallback-green.log`, and the post-red
+host release `crossrow_qmv` suite passed 6/6 in
+`/private/tmp/higgs-qwen38-sweep/task6-fallback-release-host.log`. A separate
+sandbox rerun hit the known empty-Metal-device initialization abort and is not
+used as passing evidence. Release checks for `higgs-models` and
+`higgs-engine` also passed.
+
+No new normal-mode or Low Power Mode real-model performance run was made for
+this correctness-only fix, and no new normal/LPM performance is claimed. All
+prior measurements remain preserved as historical evidence; the excluded
+`M=4` and `M=7` grouped timings are not evidence for an eligible production
+path.
+
 ## Task 1 low-power depth sweep (2026-08-18)
 
 Ran three fresh-process trials for grouped (`HIGGS_CROSSROW_QMV=1`) and stock
