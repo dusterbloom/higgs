@@ -226,6 +226,33 @@ closes that instrumentation gap for future runs without changing the recorded
 2026-08-18 timings or production MTP behavior. No other bounded-harness concern
 is known.
 
+## Task 3 bounded Metal-trace update (2026-08-18)
+
+Task 3 selected the Task 2 grouped/stock pair at depth 5 (`T=6`) and attempted
+a 90-second grouped Metal System Trace with the local Qwen3.8 checkpoint,
+prompt 256, decode 128, adaptive draft disabled, and mirror verification
+disabled. Instruments refused to start because
+`/private/tmp/higgs-metal/qwen38-grouped.trace` already existed:
+
+```text
+Trace file already exists at path: /private/tmp/higgs-metal/qwen38-grouped.trace.
+Specify append-run option to append a run to it.
+```
+
+The attempt was not retried and no stock trace was started. The existing trace
+is only 96 bytes; its accompanying prior benchmark log ran unrelated ignored
+tests and is not usable evidence for the requested pair. TOC export in the
+sandbox additionally failed because Instruments could not create
+`~/Library/Caches/com.apple.dt.InstrumentsCLI/path_manager` (Cocoa error 513 /
+POSIX `Operation not permitted`).
+
+Consequently the workload remains **indeterminate**: Task 2's exact external
+benchmark establishes a 19.95% grouped end-to-end throughput improvement over
+stock, but it cannot distinguish kernel duration, CPU launch gaps, or draft
+synchronization. No Tasks 4--6 optimization should claim a GPU/kernel cause
+until valid grouped and stock traces are captured and exported. Full evidence
+is in `.superpowers/sdd/2026-08-18-qwen38-low-power-optimization/task-3-report.md`.
+
 ## Task 2 verifier dispatch comparison (2026-08-18)
 
 Task 1 selected `HIGGS_MTP_DRAFT_N_MAX=5`, which produces verifier width
