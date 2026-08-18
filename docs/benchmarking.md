@@ -27,6 +27,27 @@ cargo run --release -p higgs-bench --bin bench_decode -- \
 - reproducible JSON/Markdown output with redacted host metadata and local
   filesystem paths by default
 
+## Escha Native Exactness Fixture
+
+The ignored Escha fixture compares affine and native checkpoint modes for one
+fixed prompt. The token digest contains the initial greedy argmax token and 128
+subsequent token IDs. Run the affine reference and native comparison as two
+fresh processes because native-mode selection is process-global:
+
+```bash
+HIGGS_ESCHA_NATIVE=0 \
+HIGGS_ESCHA_LOGITS_OUT=/tmp/escha-affine-logits.safetensors \
+HIGGS_ESCHA_TOKEN_DIGEST_OUT=/tmp/escha-affine-tokens.txt \
+cargo test -p higgs-models --release qwen3_next::tests::escha_native_fixture \
+  -- --ignored --exact --nocapture
+
+HIGGS_ESCHA_NATIVE=1 \
+HIGGS_ESCHA_LOGITS_REF=/tmp/escha-affine-logits.safetensors \
+HIGGS_ESCHA_TOKEN_DIGEST_REF=/tmp/escha-affine-tokens.txt \
+cargo test -p higgs-models --release qwen3_next::tests::escha_native_fixture \
+  -- --ignored --exact --nocapture
+```
+
 ## MTP Draft-Depth Sweep
 
 Use the focused MTP sweep to compare baseline greedy decode with MTP disabled

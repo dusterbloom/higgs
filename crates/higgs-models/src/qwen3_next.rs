@@ -25764,14 +25764,23 @@ mod tests {
     /// `HIGGS_ESCHA_NATIVE` selects the load mode. The test sends one fixed
     /// prompt through the model. Set `HIGGS_ESCHA_LOGITS_OUT` to save the
     /// logits. Set `HIGGS_ESCHA_LOGITS_REF` to compare against a saved file.
-    /// Run the test once for each mode. The second run prints the max abs
-    /// difference between the two modes.
+    /// `HIGGS_ESCHA_TOKEN_DIGEST_OUT` writes the initial greedy argmax token
+    /// and 128 subsequent token IDs. `HIGGS_ESCHA_TOKEN_DIGEST_REF` parses and
+    /// compares all 129 IDs. Run these as two fresh processes because the
+    /// native-mode selection is process-global:
     ///
     /// ```bash
-    /// HIGGS_ESCHA_NATIVE=0 HIGGS_ESCHA_LOGITS_OUT=/tmp/escha_affine.safetensors \
-    ///   cargo test -p higgs-models --release -- escha_native_fixture --ignored --nocapture
-    /// HIGGS_ESCHA_NATIVE=1 HIGGS_ESCHA_LOGITS_REF=/tmp/escha_affine.safetensors \
-    ///   cargo test -p higgs-models --release -- escha_native_fixture --ignored --nocapture
+    /// HIGGS_ESCHA_NATIVE=0 \
+    /// HIGGS_ESCHA_LOGITS_OUT=/tmp/escha-affine-logits.safetensors \
+    /// HIGGS_ESCHA_TOKEN_DIGEST_OUT=/tmp/escha-affine-tokens.txt \
+    /// cargo test -p higgs-models --release qwen3_next::tests::escha_native_fixture \
+    ///   -- --ignored --exact --nocapture
+    ///
+    /// HIGGS_ESCHA_NATIVE=1 \
+    /// HIGGS_ESCHA_LOGITS_REF=/tmp/escha-affine-logits.safetensors \
+    /// HIGGS_ESCHA_TOKEN_DIGEST_REF=/tmp/escha-affine-tokens.txt \
+    /// cargo test -p higgs-models --release qwen3_next::tests::escha_native_fixture \
+    ///   -- --ignored --exact --nocapture
     /// ```
     #[test]
     #[ignore = "requires escha model files on disk"]
@@ -25835,6 +25844,54 @@ mod tests {
             let (d, s) = (diff.item::<f32>(), scale.item::<f32>());
             eprintln!("logits max abs diff vs {path}: {d:.6}");
             eprintln!("ref max abs logit: {s:.6}  relative: {:.3e}", d / s);
+        }
+
+        let token_digest_out = std::env::var("HIGGS_ESCHA_TOKEN_DIGEST_OUT").ok();
+        let token_digest_ref = std::env::var("HIGGS_ESCHA_TOKEN_DIGEST_REF").ok();
+        if token_digest_out.is_some() || token_digest_ref.is_some() {
+            let first = ops::indexing::argmax_axis(&logits.index((.., -1, ..)), -1, false).unwrap();
+            eval([&first]).unwrap();
+            let mut trajectory = Vec::with_capacity(129);
+            trajectory.push(first.item::<u32>());
+            trajectory.extend(decode_greedy(&mut model, &logits, &mut cache, 128));
+            assert_eq!(trajectory.len(), 129, "greedy trajectory length");
+
+            if let Some(path) = token_digest_ref {
+                let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+                    panic!("failed to read token digest reference {path}: {err}")
+                });
+                let reference: Vec<u32> = text
+                    .split_whitespace()
+                    .enumerate()
+                    .map(|(index, token)| {
+                        token.parse::<u32>().unwrap_or_else(|err| {
+                            panic!(
+                                "invalid token digest ID {token:?} at index {index} in {path}: {err}"
+                            )
+                        })
+                    })
+                    .collect();
+                assert_eq!(
+                    reference.len(),
+                    129,
+                    "token digest reference {path} must contain exactly 129 IDs"
+                );
+                assert_eq!(
+                    trajectory, reference,
+                    "greedy token trajectory differs from {path}"
+                );
+                eprintln!("token trajectory matches {path}");
+            }
+            if let Some(path) = token_digest_out {
+                let digest = trajectory
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                std::fs::write(&path, format!("{digest}\n"))
+                    .unwrap_or_else(|err| panic!("failed to write token digest {path}: {err}"));
+                eprintln!("saved 129-token trajectory to {path}");
+            }
         }
     }
 
