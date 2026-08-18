@@ -447,6 +447,17 @@ uint row = threadgroup_position_in_grid.y;
 uint tid = thread_index_in_threadgroup;
 uint sg = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
+uint o = threadgroup_position_in_grid.x * 4u + sg;
+uint expert = eids[row];
+
+// Router-produced ids take the direct resident-code path below. A malformed
+// device id fails closed before any expert-dependent pointer arithmetic.
+if (expert >= uint(E)) {
+    if (lane == 0u && o < uint(OUT)) {
+        dst[row * uint(OUT) + o] = 0.0f;
+    }
+    return;
+}
 
 // Stage the transformed activation row of this expert.
 for (uint i = tid; i < uint(IN); i += 128u) {
@@ -454,7 +465,6 @@ for (uint i = tid; i < uint(IN); i += 128u) {
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-uint o = threadgroup_position_in_grid.x * 4u + sg;
 if (o >= uint(OUT)) {
     return;
 }
@@ -466,7 +476,7 @@ uint cb2 = (c >> 3) & 1u;
 uint c7 = c & 7u;
 
 const device short* base =
-    code + ulong(eids[row]) * ulong(TK) * ulong(TN) * ulong(16 * K);
+    code + ulong(expert) * ulong(TK) * ulong(TN) * ulong(16 * K);
 
 // Each lane owns one code pair. The pair index inverts the closed form
 // of tile_perm for a fixed column. One pair gives two adjacent rows.
@@ -557,12 +567,17 @@ fn check_gather_inputs(
         i32::try_from(tiles_n).unwrap_or(i32::MAX),
         i32::try_from(spec.words_per_tile()).unwrap_or(i32::MAX),
     ];
-    let code_ok = matches!(code.shape(), &[_, a, b, c] if [a, b, c] == tile_dims);
+    let code_ok = matches!(
+        code.shape(),
+        &[experts, a, b, c]
+            if experts == spec.num_experts && [a, b, c] == tile_dims
+    );
     if code.dtype() != Dtype::Int16 || !code_ok {
         return Err(Exception::custom(format!(
-            "{label}: code {:?} {:?} does not match [E, {tile_dims:?}] int16",
+            "{label}: code {:?} {:?} does not match [{}, {tile_dims:?}] int16",
             code.dtype(),
-            code.shape()
+            code.shape(),
+            spec.num_experts,
         )));
     }
     let &[rows, cols] = xh.shape() else {
@@ -597,6 +612,10 @@ fn check_gather_inputs(
 /// trellis tensor. The input `expert_ids` maps each row to one expert.
 /// The result is `y_pre = xh @ Ŵ` as a `[rows, out]` float32 matrix. The
 /// caller applies the output Hadamard and the output scales.
+///
+/// Router-produced IDs in `0..spec.num_experts` read the resident trellis
+/// directly. A malformed device-resident ID fails closed to a zero row in the
+/// kernel, before expert-dependent pointer arithmetic and without a host sync.
 #[allow(unsafe_code, dead_code)]
 pub fn eschamoe_gather_qmv(
     xh: &Array,
@@ -626,6 +645,11 @@ pub fn eschamoe_gather_qmv(
 
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"E".as_ptr(),
+            spec.num_experts,
+        );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k);
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
             config,
@@ -848,16 +872,14 @@ while (done != valid) {
     }
     done |= live;
 
+    // Invalid device ids still participate in the uniform expert walk so all
+    // barriers remain aligned, but their pass is inactive and stages zeros.
+    bool expert_valid = cur < uint(E);
+
     // Whether this thread holds a row of the pass. A sorted block splits
     // between experts at one row, so on each extra pass most row groups are
     // empty and skip the product below.
-    bool active = ((live >> rbase) & RMASK) != 0u;
-
-    // The packed tiles of this expert. A tile starts on a multiple of
-    // 16 * K shorts, which is a multiple of four bytes, so the 32-bit view
-    // of the words stays aligned.
-    const device uint* ecode = (const device uint*)(
-        code + ulong(cur) * ulong(TK) * ulong(TN) * ulong(16 * K));
+    bool active = expert_valid && ((live >> rbase) & RMASK) != 0u;
 
     for (uint tk = 0u; tk < uint(TK); ++tk) {
         // The barrier closes the read of the previous step.
@@ -867,7 +889,7 @@ while (done != valid) {
         for (uint q = 0u; q < uint(BM) * 16u / uint(NT); ++q) {
             uint m = xm + q * (uint(NT) / 16u);
             float v = 0.0f;
-            if (((live >> m) & 1u) != 0u) {
+            if (expert_valid && ((live >> m) & 1u) != 0u) {
                 v = xh[(row0 + m) * uint(IN) + tk * 16u + xk];
             }
             x_sh[xk * uint(XP) + m] = v;
@@ -880,7 +902,12 @@ while (done != valid) {
             uint tn = tn0 + tb;
 
             uint w1 = 0u;
-            if (tn < uint(TN)) {
+            if (expert_valid && tn < uint(TN)) {
+                // Form the expert base only after validating cur. A tile
+                // starts on a multiple of four bytes, so the uint view stays
+                // aligned.
+                const device uint* ecode = (const device uint*)(
+                    code + ulong(cur) * ulong(TK) * ulong(TN) * ulong(16 * K));
                 const device uint* tile =
                     ecode + (tk * uint(TN) + tn) * uint(WORDS);
 
@@ -1044,6 +1071,11 @@ pub fn eschamoe_gather_qgemm(
 
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"E".as_ptr(),
+            spec.num_experts,
+        );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k);
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
             config,
@@ -7871,6 +7903,111 @@ mod tests {
     use mlx_rs::Dtype;
 
     const GROUP_SIZE: i32 = 128;
+
+    fn gather_test_spec() -> EschaSpec {
+        EschaSpec {
+            k: 2,
+            mcg: true,
+            num_experts: 2,
+            in_features: 16,
+            out_features: 16,
+        }
+    }
+
+    fn gather_test_inputs(rows: i32) -> (Array, Array, Array, EschaSpec) {
+        let spec = gather_test_spec();
+        let xh = Array::from_slice(
+            &vec![1.0f32; (rows * spec.in_features) as usize],
+            &[rows, 16],
+        );
+        let code = Array::from_slice(&vec![0i16; 2 * 16 * 2], &[2, 1, 1, 32]);
+        let ids = Array::from_slice(&vec![0u32; rows as usize], &[rows]);
+        (xh, code, ids, spec)
+    }
+
+    #[test]
+    fn gather_inputs_accept_valid_contract() {
+        let (xh, code, ids, spec) = gather_test_inputs(2);
+
+        assert_eq!(
+            check_gather_inputs(&xh, &code, &ids, &spec, "test").unwrap(),
+            (2, [1, 1, 32])
+        );
+    }
+
+    #[test]
+    fn gather_inputs_reject_code_expert_count_mismatch() {
+        let (xh, _, ids, spec) = gather_test_inputs(2);
+        let wrong_expert_count = Array::from_slice(&vec![0i16; 3 * 16 * 2], &[3, 1, 1, 32]);
+
+        assert!(check_gather_inputs(&xh, &wrong_expert_count, &ids, &spec, "test").is_err());
+    }
+
+    #[test]
+    fn gather_inputs_reject_wrong_code_tile_dims() {
+        let (xh, _, ids, spec) = gather_test_inputs(2);
+        let wrong_tile_dims = Array::from_slice(&vec![0i16; 2 * 16], &[2, 1, 1, 16]);
+
+        assert!(check_gather_inputs(&xh, &wrong_tile_dims, &ids, &spec, "test").is_err());
+    }
+
+    #[test]
+    fn gather_inputs_reject_wrong_expert_id_dtype() {
+        let (xh, code, ids, spec) = gather_test_inputs(2);
+
+        assert!(
+            check_gather_inputs(
+                &xh,
+                &code,
+                &ids.as_dtype(Dtype::Int32).unwrap(),
+                &spec,
+                "test"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gather_inputs_reject_wrong_expert_id_row_count() {
+        let (xh, code, _, spec) = gather_test_inputs(2);
+        let short_ids = Array::from_slice(&[0u32], &[1]);
+
+        assert!(check_gather_inputs(&xh, &code, &short_ids, &spec, "test").is_err());
+    }
+
+    #[test]
+    fn eschamoe_gather_qmv_zeroes_invalid_expert_row() {
+        let _exec = crate::mlx_exec::acquire();
+        let (xh, code, _, spec) = gather_test_inputs(1);
+        let ids = Array::from_slice(&[2u32], &[1]);
+
+        let output = eschamoe_gather_qmv(&xh, &code, &ids, &spec).unwrap();
+        assert_eq!(output.shape(), &[1, spec.out_features]);
+        assert_eq!(output.dtype(), Dtype::Float32);
+        eval([&output]).unwrap();
+        assert!(output.as_slice::<f32>().iter().all(|&value| value == 0.0));
+    }
+
+    #[test]
+    fn eschamoe_gather_qgemm_zeroes_invalid_expert_row_across_blocks() {
+        let _exec = crate::mlx_exec::acquire();
+        const ROWS: i32 = 70;
+        const INVALID_ROW: usize = 33;
+        let (xh, code, _, spec) = gather_test_inputs(ROWS);
+        let mut ids = vec![0u32; ROWS as usize];
+        ids[INVALID_ROW] = 2;
+        ids[INVALID_ROW + 1..].fill(1);
+        let ids = Array::from_slice(&ids, &[ROWS]);
+
+        let output = eschamoe_gather_qgemm(&xh, &code, &ids, &spec).unwrap();
+        assert_eq!(output.shape(), &[ROWS, spec.out_features]);
+        assert_eq!(output.dtype(), Dtype::Float32);
+        eval([&output]).unwrap();
+        let row_start = INVALID_ROW * spec.out_features as usize;
+        let invalid_row =
+            &output.as_slice::<f32>()[row_start..row_start + spec.out_features as usize];
+        assert!(invalid_row.iter().all(|&value| value == 0.0));
+    }
 
     fn patterned_weights(n: i32, k: i32, dtype: Dtype, symmetric: bool) -> (Array, Array, Array) {
         assert_eq!(k % GROUP_SIZE, 0);
