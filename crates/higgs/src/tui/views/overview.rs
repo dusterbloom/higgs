@@ -269,7 +269,7 @@ fn draw_live_log(
         .skip(scroll)
         .take(50)
         .map(|r| {
-            let status_style = if r.status >= 400 {
+            let status_style = if r.is_error() {
                 Style::default().fg(Color::Red)
             } else {
                 Style::default().fg(Color::Green)
@@ -283,8 +283,9 @@ fn draw_live_log(
             };
             Row::new(vec![
                 Cell::from(format_time_ago(age)).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(r.model.as_str()),
-                Cell::from(r.provider.as_str()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(r.model.as_deref().unwrap_or("-")),
+                Cell::from(r.provider.as_deref().unwrap_or("-"))
+                    .style(Style::default().fg(Color::DarkGray)),
                 Cell::from(route_label).style(route_style),
                 Cell::from(r.status.to_string()).style(status_style),
                 Cell::from(format_duration(r.duration))
@@ -362,8 +363,8 @@ mod tests {
             id: 0,
             timestamp: Instant::now(),
             wallclock: Utc::now(),
-            model: "claude-opus-4-6".to_owned(),
-            provider: "anthropic".to_owned(),
+            model: Some("claude-opus-4-6".to_owned()),
+            provider: Some("anthropic".to_owned()),
             routing_method: RoutingMethod::Default,
             status: 200,
             duration: Duration::from_millis(500),

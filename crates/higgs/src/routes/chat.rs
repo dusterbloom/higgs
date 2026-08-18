@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::HeaderMap,
     response::{
         IntoResponse, Sse,
@@ -17,7 +17,7 @@ use tokio_stream::Stream;
 use crate::{
     config::ApiFormat,
     error::ServerError,
-    metrics::{MetricsStore, RequestRecord},
+    metrics::{MetricsStore, RequestMetricsContext, RequestRecord},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::openai::{
@@ -31,11 +31,13 @@ use higgs_models::SamplingParams;
 #[allow(clippy::too_many_lines)]
 pub async fn chat_completions(
     State(state): State<SharedState>,
+    Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
     let mut req: ChatCompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
+    request_metrics.set_requested_model(&req.model);
 
     if req.messages.is_empty() {
         return Err(ServerError::BadRequest(
@@ -72,6 +74,9 @@ pub async fn chat_completions(
                     routing_method,
                 )?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                if state.metrics.is_some() {
+                    request_metrics.mark_recorded();
+                }
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
@@ -82,8 +87,8 @@ pub async fn chat_completions(
                         id: 0,
                         timestamp: Instant::now(),
                         wallclock: chrono::Utc::now(),
-                        model: response.model.clone(),
-                        provider: "higgs".to_owned(),
+                        model: Some(response.model.clone()),
+                        provider: Some("higgs".to_owned()),
                         routing_method: routing_method.into(),
                         status: 200,
                         duration: start.elapsed(),
@@ -91,6 +96,7 @@ pub async fn chat_completions(
                         output_tokens: u64::from(response.usage.completion_tokens),
                         error_body: None,
                     });
+                    request_metrics.mark_recorded();
                 }
                 Ok(Json(response).into_response())
             }
@@ -130,8 +136,8 @@ pub async fn chat_completions(
                             id: 0,
                             timestamp: Instant::now(),
                             wallclock: chrono::Utc::now(),
-                            model: metrics_model.clone(),
-                            provider: provider_name.clone(),
+                            model: Some(metrics_model.clone()),
+                            provider: Some(provider_name.clone()),
                             routing_method: routing_method.into(),
                             status: result.as_ref().map_or(502, |resp| resp.status().as_u16()),
                             duration: start.elapsed(),
@@ -139,6 +145,7 @@ pub async fn chat_completions(
                             output_tokens: 0,
                             error_body: None,
                         });
+                        request_metrics.mark_recorded();
                     }
                     result
                 }
@@ -172,8 +179,8 @@ pub async fn chat_completions(
                                 id: 0,
                                 timestamp: Instant::now(),
                                 wallclock: chrono::Utc::now(),
-                                model: metrics_model.clone(),
-                                provider: provider_name.clone(),
+                                model: Some(metrics_model.clone()),
+                                provider: Some(provider_name.clone()),
                                 routing_method: routing_method.into(),
                                 status: upstream_status,
                                 duration: start.elapsed(),
@@ -181,6 +188,7 @@ pub async fn chat_completions(
                                 output_tokens: 0,
                                 error_body: None,
                             });
+                            request_metrics.mark_recorded();
                         }
                         if upstream_status >= 400 {
                             let status_code = axum::http::StatusCode::from_u16(upstream_status)
@@ -203,14 +211,18 @@ pub async fn chat_completions(
                         let resp_bytes = upstream.bytes().await.map_err(|e| {
                             ServerError::ProxyError(format!("Failed to read response: {e}"))
                         })?;
-                        let usage = crate::proxy::extract_usage(&resp_bytes);
+                        let usage = if (200..300).contains(&upstream_status) {
+                            crate::proxy::extract_usage(&resp_bytes)
+                        } else {
+                            (0, 0)
+                        };
                         if let Some(ref metrics) = state.metrics {
                             metrics.record(RequestRecord {
                                 id: 0,
                                 timestamp: Instant::now(),
                                 wallclock: chrono::Utc::now(),
-                                model: metrics_model.clone(),
-                                provider: provider_name.clone(),
+                                model: Some(metrics_model.clone()),
+                                provider: Some(provider_name.clone()),
                                 routing_method: routing_method.into(),
                                 status: upstream_status,
                                 duration: start.elapsed(),
@@ -218,6 +230,7 @@ pub async fn chat_completions(
                                 output_tokens: usage.1,
                                 error_body: None,
                             });
+                            request_metrics.mark_recorded();
                         }
                         let status_code = axum::http::StatusCode::from_u16(upstream_status)
                             .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
@@ -500,8 +513,8 @@ fn chat_completions_stream(
             id: 0,
             timestamp: Instant::now(),
             wallclock: chrono::Utc::now(),
-            model: model.clone(),
-            provider: "higgs".to_owned(),
+            model: Some(model.clone()),
+            provider: Some("higgs".to_owned()),
             routing_method: routing_method.into(),
             status: 200,
             duration: Duration::ZERO,

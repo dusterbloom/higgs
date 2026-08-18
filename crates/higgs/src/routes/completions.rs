@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::HeaderMap,
     response::{
         IntoResponse, Sse,
@@ -17,7 +17,7 @@ use tokio_stream::Stream;
 use crate::{
     config::ApiFormat,
     error::ServerError,
-    metrics::{MetricsStore, RequestRecord},
+    metrics::{MetricsStore, RequestMetricsContext, RequestRecord},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::openai::{
@@ -30,11 +30,13 @@ use higgs_models::SamplingParams;
 #[allow(clippy::too_many_lines)]
 pub async fn completions(
     State(state): State<SharedState>,
+    Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
     let req: CompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
+    request_metrics.set_requested_model(&req.model);
 
     if req.prompt.is_empty() {
         return Err(ServerError::BadRequest(
@@ -65,6 +67,9 @@ pub async fn completions(
                     routing_method,
                 )?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                if state.metrics.is_some() {
+                    request_metrics.mark_recorded();
+                }
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
@@ -74,8 +79,8 @@ pub async fn completions(
                         id: 0,
                         timestamp: Instant::now(),
                         wallclock: chrono::Utc::now(),
-                        model: model_name,
-                        provider: "higgs".to_owned(),
+                        model: Some(model_name),
+                        provider: Some("higgs".to_owned()),
                         routing_method: routing_method.into(),
                         status: 200,
                         duration: start.elapsed(),
@@ -83,6 +88,7 @@ pub async fn completions(
                         output_tokens: u64::from(response.usage.completion_tokens),
                         error_body: None,
                     });
+                    request_metrics.mark_recorded();
                 }
                 Ok(Json(response).into_response())
             }
@@ -125,8 +131,8 @@ pub async fn completions(
                     id: 0,
                     timestamp: Instant::now(),
                     wallclock: chrono::Utc::now(),
-                    model: metrics_model,
-                    provider: provider_name,
+                    model: Some(metrics_model),
+                    provider: Some(provider_name),
                     routing_method: routing_method.into(),
                     status,
                     duration: start.elapsed(),
@@ -134,6 +140,7 @@ pub async fn completions(
                     output_tokens: 0,
                     error_body: None,
                 });
+                request_metrics.mark_recorded();
             }
             response
         }
@@ -251,8 +258,8 @@ fn completions_stream(
             id: 0,
             timestamp: Instant::now(),
             wallclock: chrono::Utc::now(),
-            model: model_name,
-            provider: "higgs".to_owned(),
+            model: Some(model_name),
+            provider: Some("higgs".to_owned()),
             routing_method: routing_method.into(),
             status: 200,
             duration: std::time::Duration::ZERO,

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
@@ -11,7 +11,7 @@ use bytes::Bytes;
 use crate::{
     config::ApiFormat,
     error::ServerError,
-    metrics::RequestRecord,
+    metrics::{RequestMetricsContext, RequestRecord},
     router::ResolvedRoute,
     state::SharedState,
     types::openai::{
@@ -22,11 +22,13 @@ use crate::{
 #[allow(clippy::too_many_lines)]
 pub async fn embeddings(
     State(state): State<SharedState>,
+    Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let req: EmbeddingRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
+    request_metrics.set_requested_model(&req.model);
 
     let resolved = state
         .router
@@ -88,8 +90,8 @@ pub async fn embeddings(
                     id: 0,
                     timestamp: Instant::now(),
                     wallclock: chrono::Utc::now(),
-                    model: model_name,
-                    provider: "higgs".to_owned(),
+                    model: Some(model_name),
+                    provider: Some("higgs".to_owned()),
                     routing_method: routing_method.into(),
                     status: 200,
                     duration: start.elapsed(),
@@ -97,6 +99,7 @@ pub async fn embeddings(
                     output_tokens: 0,
                     error_body: None,
                 });
+                request_metrics.mark_recorded();
             }
 
             Ok(Json(EmbeddingResponse {
@@ -148,8 +151,8 @@ pub async fn embeddings(
                     id: 0,
                     timestamp: Instant::now(),
                     wallclock: chrono::Utc::now(),
-                    model: metrics_model,
-                    provider: provider_name,
+                    model: Some(metrics_model),
+                    provider: Some(provider_name),
                     routing_method: routing_method.into(),
                     status,
                     duration: start.elapsed(),
@@ -157,6 +160,7 @@ pub async fn embeddings(
                     output_tokens: 0,
                     error_body: None,
                 });
+                request_metrics.mark_recorded();
             }
             response
         }

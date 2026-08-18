@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::HeaderMap,
     response::{
         IntoResponse, Sse,
@@ -18,7 +18,7 @@ use crate::{
     anthropic_adapter::{anthropic_messages_to_engine, openai_finish_to_anthropic_stop},
     config::ApiFormat,
     error::ServerError,
-    metrics::MetricsStore,
+    metrics::{MetricsStore, RequestMetricsContext},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::anthropic::{
@@ -33,11 +33,13 @@ use higgs_models::SamplingParams;
 #[allow(clippy::too_many_lines)]
 pub async fn create_message(
     State(state): State<SharedState>,
+    Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
     let mut req: CreateMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
+    request_metrics.set_requested_model(&req.model);
 
     if req.messages.is_empty() {
         return Err(ServerError::BadRequest(
@@ -70,6 +72,9 @@ pub async fn create_message(
                 let stream =
                     create_message_stream(req, engine, state.metrics.clone(), routing_method)?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                if state.metrics.is_some() {
+                    request_metrics.mark_recorded();
+                }
                 Ok(sse.into_response())
             } else {
                 let response = create_message_non_streaming(req, engine).await?;
@@ -78,8 +83,8 @@ pub async fn create_message(
                         id: 0,
                         timestamp: Instant::now(),
                         wallclock: chrono::Utc::now(),
-                        model: response.model.clone(),
-                        provider: "higgs".to_owned(),
+                        model: Some(response.model.clone()),
+                        provider: Some("higgs".to_owned()),
                         routing_method: routing_method.into(),
                         status: 200,
                         duration: start.elapsed(),
@@ -87,6 +92,7 @@ pub async fn create_message(
                         output_tokens: u64::from(response.usage.output_tokens),
                         error_body: None,
                     });
+                    request_metrics.mark_recorded();
                 }
                 Ok(Json(response).into_response())
             }
@@ -200,12 +206,15 @@ pub async fn create_message(
             };
             if let Some(ref metrics) = state.metrics {
                 let status = result.as_ref().map_or(502, |resp| resp.status().as_u16());
+                if !(200..300).contains(&status) {
+                    usage = (0, 0);
+                }
                 metrics.record(crate::metrics::RequestRecord {
                     id: 0,
                     timestamp: Instant::now(),
                     wallclock: chrono::Utc::now(),
-                    model: metrics_model,
-                    provider: provider_name,
+                    model: Some(metrics_model),
+                    provider: Some(provider_name),
                     routing_method: routing_method.into(),
                     status,
                     duration: start.elapsed(),
@@ -213,6 +222,7 @@ pub async fn create_message(
                     output_tokens: usage.1,
                     error_body: None,
                 });
+                request_metrics.mark_recorded();
             }
             result
         }
@@ -364,8 +374,8 @@ fn create_message_stream(
             id: 0,
             timestamp: Instant::now(),
             wallclock: chrono::Utc::now(),
-            model: model.clone(),
-            provider: "higgs".to_owned(),
+            model: Some(model.clone()),
+            provider: Some("higgs".to_owned()),
             routing_method: routing_method.into(),
             status: 200,
             duration: std::time::Duration::ZERO,
@@ -500,11 +510,13 @@ fn create_message_stream(
 
 pub async fn count_tokens(
     State(state): State<SharedState>,
+    Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
     let req: CountTokensRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
+    request_metrics.set_requested_model(&req.model);
 
     let messages_json = serde_json::to_value(&req.messages).ok().and_then(|v| {
         if let serde_json::Value::Array(a) = v {
