@@ -50,6 +50,57 @@ $ git diff --check
 exit 0
 ~~~
 
+## Task 1 low-power depth sweep (2026-08-18)
+
+Ran three fresh-process trials for grouped (`HIGGS_CROSSROW_QMV=1`) and stock
+(`HIGGS_CROSSROW_QMV=0`) at each `HIGGS_MTP_DRAFT_N_MAX` depth 1..8, with
+`BENCH_PROMPT_LEN=256`, `BENCH_DECODE_STEPS=64`,
+`HIGGS_MTP_ADAPTIVE_DRAFT=0`, and `HIGGS_MTP_MIRROR_VERIFY=0`. Complete raw
+logs are under `/private/tmp/higgs-qwen38-sweep/`.
+
+Power metadata: initial `pmset -g ps` was AC Power, battery 48% charging;
+final was AC Power, battery 66% charging. `pmset -g custom` reported
+`lowpowermode 0` both times. `pmset -g therm` returned macOS status errors
+(`0xe00002bc`) for thermal/performance/CPU power status; no visible thermal
+pressure or battery drain occurred.
+
+The first sandboxed process aborted in MLX Metal initialization with
+`NSRangeException` from `mlx::core::metal::DeviceC2Ev` (empty Metal device
+array). `system_profiler SPDisplaysDataType` reported an Apple M4 with Metal
+supported. The exact trial was rerun outside the sandbox, then the full 48-run
+matrix completed with exit 0. This was an execution-environment blocker, not a
+model or harness failure.
+
+Raw three-run medians:
+
+| Depth | Grouped total ms | Grouped avg ms | Grouped tok/s | Stock total ms | Stock avg ms | Stock tok/s | Pair |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| 1 | 9877.375 | 282.211 | 6.58 | 9082.451 | 259.499 | 7.16 | eligible |
+| 2 | 8578.653 | 343.146 | 7.58 | 8052.787 | 322.111 | 8.07 | eligible |
+| 3 | 9216.686 | 418.940 | 7.16 | 8843.216 | 421.106 | 7.46 | excluded |
+| 4 | 9581.873 | 504.309 | 6.78 | 10049.022 | 528.896 | 6.47 | eligible |
+| 5 | 8361.479 | 522.592 | 7.89 | 9239.099 | 577.444 | 7.14 | eligible |
+| 6 | 9852.398 | 656.827 | 6.80 | 9541.908 | 681.565 | 7.02 | excluded |
+| 7 | 9717.756 | 694.125 | 7.00 | 11769.862 | 840.704 | 5.78 | eligible |
+| 8 | 11121.603 | 794.400 | 6.20 | 14362.995 | 1025.928 | 4.80 | eligible |
+
+Exact same-depth grouped/stock parity fields (grouped / stock):
+
+| Depth | Verifier rows | Drafted | Accepted | Measured count/digest | Whole count/digest | Result |
+| ---: | :---: | :---: | :---: | :--- | :--- | :--- |
+| 1 | 70 / 70 | 35 / 35 | 30 / 30 | 65 / `d9f7648e69fb6545` | 66 / `b1a92999f97f9409` | equal |
+| 2 | 75 / 75 | 50 / 50 | 40 / 40 | 65 / `d9f7648e69fb6545` | 66 / `b1a92999f97f9409` | equal |
+| 3 | 88 / 84 | 66 / 63 | 44 / 45 | 66 / `627c449dc3ba967e` | 67 / `791ce5685e0782f2` | excluded |
+| 4 | 95 / 95 | 76 / 76 | 46 / 46 | 65 / `d9f7648e69fb6545` | 66 / `b1a92999f97f9409` | equal |
+| 5 | 96 / 96 | 80 / 80 | 50 / 50 | 66 / `627c449dc3ba967e` | 67 / `791ce5685e0782f2` | equal |
+| 6 | 105 / 98 | 90 / 84 | 52 / 53 | 67 / `726e7a647ed849c2` | 68 / `0ea78be42d60840e` | excluded |
+| 7 | 112 / 112 | 98 / 98 | 54 / 54 | 68 / `fd0928623b9f2e8f` | 69 / `fc6d89c2f6e52f83` | equal |
+| 8 | 126 / 126 | 112 / 112 | 55 / 55 | 69 / `c2925335c643d359` | 70 / `26d2263a1dcf7215` | equal |
+
+Depths 3 and 6 were excluded before ranking because their verifier-row totals
+and drafted/accepted counts differed. Selected depth: **5**, the highest
+grouped median throughput among eligible exact-parity pairs (7.89 tok/s).
+
 ### Whole-trajectory parity rerun after final-review fix
 
 Using the exact grouped-ON and stock-OFF commands below with the same model,
