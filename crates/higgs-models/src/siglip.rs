@@ -274,38 +274,72 @@ impl SigLipVisionModel {
 // Image preprocessing
 // ---------------------------------------------------------------------------
 
-/// Preprocess an image for the `SigLIP` vision encoder.
+/// Preprocess N images into a single `[N, H, W, 3]` NHWC array.
+///
+/// Each image is decoded, resized to `image_size x image_size`, and normalized
+/// SigLIP-style. An empty input yields a `[0, 1, 1, 3]` empty array.
+pub fn preprocess_images_batch(
+    images: &[&[u8]],
+    image_size: u32,
+) -> Result<Array, crate::vision::VisionError> {
+    let arrays: Vec<Array> = images
+        .iter()
+        .map(|b| preprocess_image(b, image_size))
+        .collect::<Result<_, _>>()
+        .map_err(|e| crate::vision::VisionError::Preprocess(e.to_string()))?;
+    if arrays.is_empty() {
+        return Ok(Array::from_slice::<f32>(&[], &[0, 1, 1, 3]));
+    }
+    let refs: Vec<&Array> = arrays.iter().collect();
+    mlx_rs::ops::concatenate_axis(&refs, 0)
+        .map_err(|e| crate::vision::VisionError::Preprocess(e.to_string()))
+}
+
+/// Decode, resize to an exact target, and apply `SigLIP` normalization.
 ///
 /// Steps:
-/// 1. Resize to `image_size x image_size`
-/// 2. Convert to float32 and normalize to [0, 1]
-/// 3. Apply `SigLIP` normalization (maps [0, 1] to [-1, 1])
+/// 1. Decode the image bytes
+/// 2. Resize to the exact `target` dimensions with the given `filter`
+/// 3. Convert to float32, normalize to [0, 1], then map [0, 1] to [-1, 1]
 /// 4. Return as `[1, H, W, 3]` NHWC array
-pub fn preprocess_image(
+pub fn preprocess_image_resized(
     image_bytes: &[u8],
-    image_size: u32,
-) -> Result<Array, crate::error::ModelError> {
-    use image::imageops::FilterType;
+    target: (u32, u32),
+    filter: image::imageops::FilterType,
+) -> Result<Array, crate::vision::VisionError> {
     let img = image::load_from_memory(image_bytes)
-        .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e)))?;
-
-    let resized = img.resize_exact(image_size, image_size, FilterType::Lanczos3);
+        .map_err(|e| crate::vision::VisionError::Decode(e.to_string()))?;
+    let resized = img.resize_exact(target.0, target.1, filter);
     let rgb = resized.to_rgb8();
-
     let (w, h) = rgb.dimensions();
     let pixels = rgb.into_raw();
-
     let mut float_pixels: Vec<f32> = pixels.iter().map(|&p| f32::from(p) / 255.0).collect();
-
     // mean = [0.5, 0.5, 0.5], std = [0.5, 0.5, 0.5]
     for pixel in &mut float_pixels {
         *pixel = (*pixel - 0.5) / 0.5;
     }
-
     #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
-    let array = Array::from_slice(&float_pixels, &[1, h as i32, w as i32, 3]);
+    Ok(Array::from_slice(
+        &float_pixels,
+        &[1, h as i32, w as i32, 3],
+    ))
+}
 
-    Ok(array)
+/// Preprocess an image for the `SigLIP` vision encoder.
+///
+/// Thin wrapper over [`preprocess_image_resized`] resizing to
+/// `image_size x image_size` with `Lanczos3`, mapping errors to
+/// [`crate::error::ModelError`].
+pub fn preprocess_image(
+    image_bytes: &[u8],
+    image_size: u32,
+) -> Result<Array, crate::error::ModelError> {
+    preprocess_image_resized(
+        image_bytes,
+        (image_size, image_size),
+        image::imageops::FilterType::Lanczos3,
+    )
+    .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e)))
 }
 
 /// Preprocess an image from a file path.
@@ -320,6 +354,44 @@ pub fn preprocess_image_from_path(
 // ---------------------------------------------------------------------------
 // Weight loading helpers
 // ---------------------------------------------------------------------------
+
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generate a 1x1 red PNG in-memory (no fixture files on disk).
+    fn test_png() -> Vec<u8> {
+        let mut img = image::RgbImage::new(1, 1);
+        img.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        // `write_to` needs `Write + Seek`; `Cursor<Vec<u8>>` provides both.
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png)
+            .expect("encode test PNG");
+        buf.into_inner()
+    }
+
+    #[test]
+    fn batch_preprocess_shape_matches_count() {
+        let png = test_png();
+        let arr = preprocess_images_batch(&[png.as_slice(), png.as_slice()], 32).unwrap();
+        assert_eq!(arr.shape(), &[2, 32, 32, 3]);
+    }
+
+    #[test]
+    fn batch_preprocess_empty_returns_zero_dim_array() {
+        let arr = preprocess_images_batch(&[], 32).unwrap();
+        assert_eq!(arr.shape(), &[0, 1, 1, 3]);
+    }
+
+    #[test]
+    fn preprocess_image_resized_uses_exact_target() {
+        let png = test_png();
+        let arr =
+            preprocess_image_resized(&png, (16, 8), image::imageops::FilterType::Lanczos3).unwrap();
+        assert_eq!(arr.shape(), &[1, 8, 16, 3]);
+    }
+}
 
 /// Load `SigLIP` vision model weights from safetensors.
 ///
