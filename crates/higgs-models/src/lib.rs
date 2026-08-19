@@ -14,6 +14,7 @@ pub mod progress;
 pub mod quant_config;
 pub mod qwen3_moe;
 pub mod qwen3_next;
+pub mod qwen_vl;
 pub mod registry;
 pub mod siglip;
 pub mod spec_prefill;
@@ -250,6 +251,9 @@ pub enum AnyModel {
     Starcoder2(starcoder2::Starcoder2CausalLM),
     /// LLaVA-Qwen2 vision-language model (nanoLLaVA architecture).
     LlavaQwen2(llava_qwen2::LlavaQwen2Model),
+    /// Qwen-VL vision-language model (Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL) on a
+    /// `Qwen3Next` text backbone with dynamic-resolution vision.
+    QwenVl(qwen_vl::QwenVlModel),
     /// DeepSeek-V2 with Multi-head Latent Attention and sparse `MoE`.
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
     /// Bonsai-Q1: packed 1.25-bpw Qwen3-shaped target (1.7B / 8B).
@@ -335,6 +339,7 @@ impl AnyModel {
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text(inputs, mask, c),
+            (Self::QwenVl(m), AnyCache::Hybrid(c)) => m.forward_text(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
             // BonsaiQ1 builds its causal mask internally; any externally-provided
@@ -367,6 +372,7 @@ impl AnyModel {
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_hidden(inputs, mask, c),
+            (Self::QwenVl(m), AnyCache::Hybrid(c)) => m.forward_text_hidden(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
             (Self::BonsaiQ1(m), AnyCache::KV(c)) => bonsai_q1::forward_trunk_free(m, c, inputs),
@@ -419,6 +425,7 @@ impl AnyModel {
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_all_logits(inputs, mask, c),
+            (Self::QwenVl(m), AnyCache::Hybrid(c)) => m.forward_text_all_logits(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
                 let (_, logits) = m.forward_with_hidden(inputs, mask, c)?;
@@ -523,6 +530,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer models",
@@ -552,6 +560,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => None,
         }
@@ -576,6 +585,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -598,6 +608,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -620,6 +631,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -642,6 +654,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -676,6 +689,7 @@ impl AnyModel {
             Self::Phi3(m) => m.args.hidden_size,
             Self::Starcoder2(m) => m.args.hidden_size,
             Self::LlavaQwen2(m) => m.hidden_size(),
+            Self::QwenVl(m) => m.hidden_size(),
             Self::DeepSeekV2(m) => m.args.hidden_size,
             Self::BonsaiQ1(m) => i32::try_from(m.config.hidden).unwrap_or(i32::MAX),
         }
@@ -714,6 +728,7 @@ impl AnyModel {
                 m.head_dim()
                     .map_err(|err| Exception::custom(err.to_string()))?,
             )),
+            Self::QwenVl(m) => Ok((m.num_key_value_heads(), m.head_dim())),
             Self::DeepSeekV2(m) => Ok((
                 m.args.num_key_value_heads,
                 m.args.qk_nope_head_dim + m.args.qk_rope_head_dim,
@@ -830,6 +845,13 @@ impl AnyModel {
                 }
                 Ok(make_kv_cache(m.num_hidden_layers()))
             }
+            Self::QwenVl(m) => {
+                if kv_cache_config.is_turboquant() {
+                    Ok(AnyCache::Hybrid(m.make_lm_cache_turbo(kv_cache_config)?))
+                } else {
+                    Ok(AnyCache::Hybrid(m.make_lm_cache()))
+                }
+            }
             Self::DeepSeekV2(m) => {
                 if kv_cache_config.is_turboquant() {
                     return Err(Exception::custom(
@@ -860,7 +882,7 @@ impl AnyModel {
 
     /// Whether this model is a vision-language model that supports image input.
     pub const fn is_vlm(&self) -> bool {
-        matches!(self, Self::LlavaQwen2(_))
+        matches!(self, Self::LlavaQwen2(_) | Self::QwenVl(_))
     }
 
     /// Capability metadata if this model supports vision.
@@ -872,6 +894,7 @@ impl AnyModel {
     pub fn as_vision(&self) -> Option<&dyn VisionModel> {
         match self {
             Self::LlavaQwen2(m) => Some(m),
+            Self::QwenVl(m) => Some(m),
             Self::Transformer(_)
             | Self::Qwen3Next(_)
             | Self::Qwen3Moe(_)
@@ -889,6 +912,7 @@ impl AnyModel {
     pub fn as_vision_mut(&mut self) -> Option<&mut dyn VisionModel> {
         match self {
             Self::LlavaQwen2(m) => Some(m),
+            Self::QwenVl(m) => Some(m),
             Self::Transformer(_)
             | Self::Qwen3Next(_)
             | Self::Qwen3Moe(_)

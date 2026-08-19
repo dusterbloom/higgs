@@ -606,13 +606,7 @@ impl ModelAdapter for BuiltinAdapter {
                 .map_err(ModelError::Json)
                 .and_then(|args| crate::deepseek_v2::load_deepseek_v2_model_with_args(dir, args))
                 .map(AnyModel::DeepSeekV2),
-            // TEMPORARY (Task 11 replaces this): load only the text backbone
-            // through the Qwen3.5 dense loader; the vision tower is ignored.
-            // Task 11 wires this to
-            // `crate::qwen_vl::load_qwen_vl_model_from_value(dir, &model.raw)`.
-            LoadKind::QwenVl => qwen35_args(model)
-                .and_then(|args| crate::qwen3_next::load_qwen3_5_model_with_args(dir, args))
-                .map(AnyModel::Qwen3Next),
+            LoadKind::QwenVl => crate::qwen_vl::load_qwen_vl_model_from_value(dir, &model.raw),
         }
     }
 }

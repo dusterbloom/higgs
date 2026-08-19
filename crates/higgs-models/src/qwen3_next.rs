@@ -4113,6 +4113,15 @@ impl Qwen3NextCausalLM {
         self.model.embed_tokens.forward(&ids)
     }
 
+    /// Look up embeddings for a batch of token ids. Shape: `[1, L, hidden]`.
+    ///
+    /// Used by the Qwen-VL multimodal path, which embeds a masked id array
+    /// (sentinels replaced by 0) before merging image features into the
+    /// embedding sequence.
+    pub fn embed_tokens_batch(&self, ids: &Array) -> Result<Array, Exception> {
+        self.model.embed_tokens.forward(ids)
+    }
+
     fn embed_tokens_from_ids(&self, token_ids: &[u32]) -> Result<Array, Exception> {
         let token_i32s: Vec<i32> = token_ids
             .iter()
