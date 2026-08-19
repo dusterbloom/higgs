@@ -6,6 +6,7 @@ pub mod error;
 pub mod gemma2;
 pub mod gemma3;
 pub mod gemma4;
+pub mod gemma_vision;
 pub mod llava_qwen2;
 /// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
 mod metal_kernel;
