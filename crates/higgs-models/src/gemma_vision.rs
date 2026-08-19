@@ -46,9 +46,23 @@
 //! 4. **Normalization** — `mean = std = 0.5` (the Gemma 3
 //!    `preprocessor_config` values; identical to the `SigLIP` path), mapping
 //!    `[0, 255] -> [-1, 1]`.
+//! 5. **Aspect-aware crop set** — the grid is rotated to the image's long axis
+//!    so its denser divisions sample the direction that actually extends
+//!    beyond `image_size`: landscape/square inputs use the default 2-row x
+//!    3-col set `[(0,0), (0,1), (1,0), (1,1), (0,2), (1,2)]`, portrait inputs
+//!    use the transposed 3-row x 2-col set `[(0,0), (0,1), (1,0), (1,1),
+//!    (2,0), (2,1)]`.
+//! 6. **Distinct-window dedup** — the short axis collapses to exactly
+//!    `image_size` after the resize, so its grid anchors coincide (e.g. the
+//!    two row anchors of a landscape image). Windows that are pixel-identical
+//!    are emitted **once** (first occurrence, keeping its offset), so
+//!    identical pixels never carry two different positional offsets. A square
+//!    input therefore yields a single whole-image crop. The crop/offset
+//!    counts below are the *distinct* counts; `per_image_tokens` uses them.
 //!
-//! The default crop set is the plan's 3x2 grid: 4 corners + 2 vertical
-//! centers, `[(0,0), (0,1), (1,0), (1,1), (0,2), (1,2)]`.
+//! The default crop set is the plan's 3x2 grid: 4 corners + 2 centers,
+//! `[(0,0), (0,1), (1,0), (1,1), (0,2), (1,2)]` (see [`default_crop_set`] and
+//! [`portrait_crop_set`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -151,15 +165,25 @@ pub fn gemma_tokens_per_crop(
 
 /// Default pan-and-scan crop set: `(row_frac, col_frac)` over a 3x2 grid.
 ///
-/// Four corners plus the two vertical centers. The exact set is
-/// checkpoint-specific; `vision_config.crop_size` or the reference gemma3
-/// processor defines it.
+/// Four corners plus the two horizontal centers (2 row fractions x 3 column
+/// fractions). The exact set is checkpoint-specific; `vision_config.crop_size`
+/// or the reference gemma3 processor defines it. Used for square and
+/// landscape inputs; [`portrait_crop_set`] is the 90° rotation used when the
+/// image is taller than wide.
 pub fn default_crop_set() -> Vec<(i32, i32)> {
     vec![(0, 0), (0, 1), (1, 0), (1, 1), (0, 2), (1, 2)]
 }
 
-/// The output of [`pan_and_scan`]: one normalized crop per entry of
-/// `config.crop_set`, plus the matching positional offsets.
+/// Rotated crop set for portrait (taller-than-wide) images: 3 row fractions
+/// x 2 column fractions, so the denser grid divisions lie along the vertical
+/// (long) axis and the crops stay distinct.
+pub fn portrait_crop_set() -> Vec<(i32, i32)> {
+    vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]
+}
+
+/// The output of [`pan_and_scan`]: one normalized crop per **distinct** anchor
+/// of the aspect-aware crop set (pixel-identical windows from the short-axis
+/// collapse are deduplicated), plus the matching positional offsets.
 #[derive(Debug, Clone)]
 pub struct PanAndScan {
     /// Crops in `[1, image_size, image_size, 3]` NHWC float32 form,
@@ -173,9 +197,17 @@ pub struct PanAndScan {
 /// Run Gemma pan-and-scan preprocessing on one image.
 ///
 /// Decodes `image_bytes`, resizes the image so its shorter side becomes
-/// `config.image_size`, crops one `image_size²` window per entry of
-/// `config.crop_set` (anchored per the module docs), and normalizes each crop
-/// to `[1, image_size, image_size, 3]`.
+/// `config.image_size`, crops one `image_size²` window per entry of the
+/// aspect-aware crop set (anchored per the module docs), and normalizes each
+/// crop to `[1, image_size, image_size, 3]`.
+///
+/// The crop set is rotated to the image's long axis ([`default_crop_set`] for
+/// square/landscape, [`portrait_crop_set`] for portrait), and windows that are
+/// pixel-identical because the short axis collapsed to `image_size` (e.g. the
+/// two row anchors of a landscape image) are deduplicated: the output holds
+/// one crop per **distinct anchor**, so identical pixels never carry two
+/// different positional offsets. A square input therefore yields a single
+/// (whole-image) crop.
 pub fn pan_and_scan(
     image_bytes: &[u8],
     config: &GemmaVisionConfig,
@@ -208,6 +240,14 @@ pub fn pan_and_scan(
     // image_size > 0 was validated above, so this conversion always succeeds.
     let target = u32::try_from(image_size).unwrap_or(u32::MAX);
 
+    // Aspect-aware crop set: the denser grid divisions lie along the long axis
+    // so the crops stay distinct for non-square inputs.
+    let crop_set = if orig_w < orig_h {
+        portrait_crop_set()
+    } else {
+        default_crop_set()
+    };
+
     // Resize so the shorter side becomes exactly `target`; the longer side is
     // then >= target, so every crop window fits. Aspect ratio is preserved and
     // nothing is letterboxed/padded. New dims use integer round-half-up of
@@ -228,20 +268,50 @@ pub fn pan_and_scan(
         .to_rgb8();
 
     let grid = image_size / patch_size;
-    let mut crops = Vec::with_capacity(config.crop_set.len());
-    let mut offsets = Vec::with_capacity(config.crop_set.len());
-    for &(row, col) in &config.crop_set {
+    let mut crops = Vec::with_capacity(crop_set.len());
+    let mut offsets = Vec::with_capacity(crop_set.len());
+    let mut seen_anchors: Vec<(u32, u32)> = Vec::with_capacity(crop_set.len());
+    for &(row, col) in &crop_set {
         // Offsets in patch units along each axis — the plan's sketch verbatim
         // (truncating integer division).
         let offset_row = (row * (grid - 1)) / 2;
         let offset_col = (col * (grid - 1)) / 2;
-        offsets.push(offset_row * grid + offset_col);
 
-        let crop = crop_square(&resized, row, col, target);
-        crops.push(to_normalized_array(crop, target));
+        let (x, y) = crop_anchor(row, col, target, new_w, new_h);
+        // Windows that are pixel-identical because the short axis collapsed to
+        // `target` must not be emitted twice with different offsets — keep the
+        // first occurrence only (its offset is the long-axis position).
+        if seen_anchors.iter().any(|&(sx, sy)| sx == x && sy == y) {
+            continue;
+        }
+        seen_anchors.push((x, y));
+        offsets.push(offset_row * grid + offset_col);
+        crops.push(to_normalized_array(
+            crop_square(&resized, row, col, target),
+            target,
+        ));
     }
 
     Ok(PanAndScan { crops, offsets })
+}
+
+/// Top-left pixel of the `target x target` crop window for crop-set coordinate
+/// `(row, col)`: `anchor = round((coord / 2) * (span - target))` clamped to
+/// `[0, span - target]` per axis (see the module docs).
+///
+/// `span >= target` on both axes is guaranteed by the shorter-side resize in
+/// [`pan_and_scan`], so the window always fits.
+fn crop_anchor(row: i32, col: i32, target: u32, span_w: u32, span_h: u32) -> (u32, u32) {
+    let anchor = |coord: i32, span: u32| -> u32 {
+        let span_i = i64::from(span);
+        let target_i = i64::from(target);
+        let delta = span_i.saturating_sub(target_i); // >= 0 under shorter-side resize
+        // round-half-up of (coord * delta) / 2, then clamp to [0, delta].
+        let raw = (i64::from(coord) * delta + 1) / 2;
+        let clamped = raw.clamp(0, delta);
+        u32::try_from(clamped).unwrap_or(u32::MAX)
+    };
+    (anchor(col, span_w), anchor(row, span_h))
 }
 
 // ---------------------------------------------------------------------------
@@ -489,8 +559,15 @@ impl GemmaVisionTower {
                 })?;
                 let crop = row_in_image / k;
                 let row_in_crop = row_in_image % k;
-                let crop_global = *cum_crops.get(image_idx).unwrap_or(&0) + crop;
-                let crop_offset = *batch.image_offsets.get(crop_global).unwrap_or(&0);
+                let crop_global = *cum_crops
+                    .get(image_idx)
+                    .ok_or_else(|| Exception::custom("Gemma vision: image index out of bounds"))?
+                    + crop;
+                let crop_offset = *batch.image_offsets.get(crop_global).ok_or_else(|| {
+                    Exception::custom(format!(
+                        "Gemma vision: missing offset for crop {crop_global}"
+                    ))
+                })?;
                 let position = crop_offset
                     + i32::try_from(row_in_crop).map_err(|_| {
                         Exception::custom("Gemma vision: row index overflow for i32")
@@ -596,19 +673,14 @@ fn load_safetensor_weight_map(model_path: &Path) -> Result<HashMap<String, Array
 ///
 /// `span >= target` on both axes is guaranteed by the shorter-side resize in
 /// [`pan_and_scan`], so the window always fits.
+/// Extract the `target x target` RGB window for crop-set coordinate `(row,
+/// col)` (anchored via [`crop_anchor`]; see the module docs).
+///
+/// `span >= target` on both axes is guaranteed by the shorter-side resize in
+/// [`pan_and_scan`], so the window always fits.
 fn crop_square(rgb: &image::RgbImage, row: i32, col: i32, target: u32) -> image::RgbImage {
     let (w, h) = rgb.dimensions();
-    let anchor = |coord: i32, span: u32| -> u32 {
-        let span_i = i64::from(span);
-        let target_i = i64::from(target);
-        let delta = span_i.saturating_sub(target_i); // >= 0 under shorter-side resize
-        // round-half-up of (coord * delta) / 2, then clamp to [0, delta].
-        let raw = (i64::from(coord) * delta + 1) / 2;
-        let clamped = raw.clamp(0, delta);
-        u32::try_from(clamped).unwrap_or(u32::MAX)
-    };
-    let x = anchor(col, w);
-    let y = anchor(row, h);
+    let (x, y) = crop_anchor(row, col, target, w, h);
     debug_assert!(
         x.checked_add(target).is_some_and(|end| end <= w),
         "pan-and-scan crop window overflows the resized image width"
@@ -677,8 +749,11 @@ mod tests {
     }
 
     #[test]
-    fn pan_and_scan_produces_expected_crop_count() {
-        // config: image_size 896, patch_size 16 -> 6 crops (3x2 pan-and-scan grid)
+    fn pan_and_scan_landscape_yields_distinct_long_axis_crops() {
+        // 3x2 px landscape: the shorter side (h=2) is resized to 896 ->
+        // 1344x896. The default 2x3 grid's row anchors collapse (h == target)
+        // and the three column anchors 0/224/448 stay distinct; the row
+        // duplicates are deduplicated, leaving one crop per distinct anchor.
         let cfg = GemmaVisionConfig {
             image_size: 896,
             patch_size: 16,
@@ -686,10 +761,14 @@ mod tests {
             tokens_per_crop: 784,
             crop_set: default_crop_set(),
         };
-        let ps = pan_and_scan(&test_png(), &cfg).unwrap();
-        assert_eq!(ps.crops.len(), cfg.crop_set.len());
-        assert_eq!(ps.offsets.len(), cfg.crop_set.len());
+        let ps = pan_and_scan(&test_png_wh(3, 2), &cfg).unwrap();
+        assert_eq!(ps.crops.len(), 3);
+        assert_eq!(ps.offsets.len(), 3);
         assert_eq!(ps.crops[0].shape(), &[1, 896, 896, 3]);
+        // All crops are pixel-distinct (no duplicated windows).
+        assert_ne!(ps.crops[0].as_slice::<f32>(), ps.crops[1].as_slice::<f32>());
+        assert_ne!(ps.crops[1].as_slice::<f32>(), ps.crops[2].as_slice::<f32>());
+        assert_ne!(ps.crops[0].as_slice::<f32>(), ps.crops[2].as_slice::<f32>());
     }
 
     #[test]
@@ -701,16 +780,20 @@ mod tests {
             tokens_per_crop: 4,
             crop_set: default_crop_set(),
         };
+        // A square input collapses to a single whole-image crop (every grid
+        // anchor is (0,0)) — no panning is needed for a square image.
         let ps = pan_and_scan(&test_png(), &cfg).unwrap();
-        assert_eq!(ps.crops.len(), 6);
-        assert_eq!(ps.offsets.len(), 6);
+        assert_eq!(ps.crops.len(), 1);
+        assert_eq!(ps.offsets.len(), 1);
+        assert_eq!(ps.offsets[0], 0);
         assert_eq!(ps.crops[0].shape(), &[1, 32, 32, 3]);
     }
 
     #[test]
     fn pan_and_scan_offsets_match_sketch_formula() {
         // grid = 56: offset_row = (r * 55) / 2, offset_col = (c * 55) / 2,
-        // offset = offset_row * 56 + offset_col, for the default 3x2 crop set.
+        // offset = offset_row * 56 + offset_col. For landscape the kept crops
+        // are the three column anchors (0,0), (0,1), (0,2) -> offsets 0, 27, 55.
         let cfg = GemmaVisionConfig {
             image_size: 896,
             patch_size: 16,
@@ -718,16 +801,19 @@ mod tests {
             tokens_per_crop: 784,
             crop_set: default_crop_set(),
         };
-        let ps = pan_and_scan(&test_png(), &cfg).unwrap();
-        assert_eq!(ps.offsets, vec![0, 27, 1512, 1539, 55, 1567]);
+        let ps = pan_and_scan(&test_png_wh(3, 2), &cfg).unwrap();
+        assert_eq!(ps.offsets, vec![0, 27, 55]);
+        // Portrait rotates the grid: the kept crops are the three row anchors
+        // (0,0), (1,0), (2,0) -> offsets 0, 1512, 3080.
+        let ps_portrait = pan_and_scan(&test_png_wh(2, 3), &cfg).unwrap();
+        assert_eq!(ps_portrait.offsets, vec![0, 1512, 3080]);
     }
 
     #[test]
     fn pan_and_scan_pans_across_the_long_axis() {
-        // Portrait 2x3 px: the shorter side (w=2) is resized to 32 -> 32x48,
-        // so row anchors 0 and 8 (frac 0 vs 0.5) yield different crops, while
-        // the column anchors coincide (w == target). crops[0] = (0,0) at
-        // anchor (0,0); crops[2] = (1,0) at anchor (8,0).
+        // Portrait 2x3 px: resized to 32x48. The rotated 3x2 grid keeps the
+        // three distinct row anchors (0, 8, 16); the short-axis (column)
+        // duplicates are deduplicated, so every crop is pixel-distinct.
         let png = test_png_wh(2, 3);
         let cfg = GemmaVisionConfig {
             image_size: 32,
@@ -737,9 +823,11 @@ mod tests {
             crop_set: default_crop_set(),
         };
         let ps = pan_and_scan(&png, &cfg).unwrap();
+        assert_eq!(ps.crops.len(), 3);
+        assert_eq!(ps.offsets.len(), 3);
+        assert_ne!(ps.crops[0].as_slice::<f32>(), ps.crops[1].as_slice::<f32>());
+        assert_ne!(ps.crops[1].as_slice::<f32>(), ps.crops[2].as_slice::<f32>());
         assert_ne!(ps.crops[0].as_slice::<f32>(), ps.crops[2].as_slice::<f32>());
-        // (0,1) shares (0,0)'s anchor on the degenerate (short) axis.
-        assert_eq!(ps.crops[0].as_slice::<f32>(), ps.crops[1].as_slice::<f32>());
     }
 
     #[test]
@@ -985,19 +1073,21 @@ mod tests {
         let img = ImageInput {
             position: 0,
             message_index: 0,
-            bytes: test_png(),
+            // 3x2 px landscape: resized to 24x16, the default 2x3 grid keeps
+            // the three distinct column anchors (0, 4, 8) after dedup.
+            bytes: test_png_wh(3, 2),
             media_type: "image/png".to_owned(),
             detail: crate::vision::ImageDetail::Auto,
             max_dims: None,
         };
         let batch = tower.preprocess_images(&[img]).unwrap();
-        // 6 crops x 4 tokens per crop.
-        assert_eq!(batch.per_image_tokens, vec![24]);
-        assert_eq!(batch.pixel_values.shape().first(), Some(&6));
-        assert_eq!(batch.image_offsets.len(), 6);
-        // Grid 4: offset_row=(r*3)/2, offset_col=(c*3)/2, linear = row*4+col:
-        // (0,0)=0, (0,1)=1, (1,0)=4, (1,1)=5, (0,2)=3, (1,2)=7.
-        assert_eq!(batch.image_offsets, vec![0, 1, 4, 5, 3, 7]);
+        // 3 distinct crops x 4 tokens per crop.
+        assert_eq!(batch.per_image_tokens, vec![12]);
+        assert_eq!(batch.pixel_values.shape().first(), Some(&3));
+        assert_eq!(batch.image_offsets.len(), 3);
+        // Grid 4, landscape: kept crops (0,0), (0,1), (0,2) ->
+        // offset_col=(c*3)/2 = 0, 1, 3.
+        assert_eq!(batch.image_offsets, vec![0, 1, 3]);
     }
 
     #[test]
@@ -1006,7 +1096,7 @@ mod tests {
         let img = ImageInput {
             position: 0,
             message_index: 0,
-            bytes: test_png(),
+            bytes: test_png_wh(3, 2),
             media_type: "image/png".to_owned(),
             detail: crate::vision::ImageDetail::Auto,
             max_dims: None,
@@ -1022,36 +1112,33 @@ mod tests {
     #[test]
     fn tower_build_position_offsets_places_image_rows_at_crop_offsets() {
         let tower = tiny_tower();
-        // [text, <24 image rows>, text]
+        // [text, <12 image rows>, text] — one landscape image, 3 crops x 4.
         let mut ids = vec![1i32];
-        ids.extend(std::iter::repeat_n(crate::vision::IMAGE_TOKEN_INDEX, 24));
+        ids.extend(std::iter::repeat_n(crate::vision::IMAGE_TOKEN_INDEX, 12));
         ids.push(2);
         // [1, L] like the engine's prompt array.
-        let input_ids = Array::from_slice(&ids, &[1, 26]);
+        let input_ids = Array::from_slice(&ids, &[1, 14]);
 
         let batch = ImageBatch {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
-            per_image_tokens: vec![24],
+            per_image_tokens: vec![12],
             image_sizes: vec![(16, 16)],
-            image_offsets: vec![0, 1, 4, 5, 3, 7],
+            image_offsets: vec![0, 1, 3],
             layout: ImageTokenLayout::default(),
         };
         let offsets = tower.build_position_offsets(&input_ids, &batch).unwrap();
         mlx_rs::transforms::eval([&offsets]).unwrap();
         let vals: Vec<i32> = offsets.as_slice().to_vec();
-        assert_eq!(vals.len(), 26);
+        assert_eq!(vals.len(), 14);
         assert_eq!(vals[0], 0); // text keeps its natural position
         // Crop rows: crop c at offset o -> positions [o, o+1, o+2, o+3].
-        let expected_rows: [i32; 24] = [
+        let expected_rows: [i32; 12] = [
             0, 1, 2, 3, // crop 0 @ 0
             1, 2, 3, 4, // crop 1 @ 1
-            4, 5, 6, 7, // crop 2 @ 4
-            5, 6, 7, 8, // crop 3 @ 5
-            3, 4, 5, 6, // crop 4 @ 3
-            7, 8, 9, 10, // crop 5 @ 7
+            3, 4, 5, 6, // crop 2 @ 3
         ];
-        assert_eq!(&vals[1..25], &expected_rows);
-        assert_eq!(vals[25], 25); // trailing text keeps its natural position
+        assert_eq!(&vals[1..13], &expected_rows);
+        assert_eq!(vals[13], 13); // trailing text keeps its natural position
     }
 
     #[test]

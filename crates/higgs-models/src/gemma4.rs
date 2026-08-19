@@ -2600,6 +2600,68 @@ mod tests {
         );
     }
 
+    /// End-to-end `VisionModel::forward_multimodal`: tower encode -> pool ->
+    /// merge -> offsets -> backbone (incl. cross-layer KV sharing), with a
+    /// tower sized to the tiny LM's hidden dim so the whole pipeline runs.
+    #[test]
+    fn forward_multimodal_end_to_end_with_matching_dims() {
+        use crate::gemma_vision::{GemmaVisionConfig, GemmaVisionTower};
+        use crate::siglip::{SigLipVisionConfig, SigLipVisionModel};
+
+        let mut model = Gemma4CausalLM::new(small_model_args()).unwrap();
+        model.eval().unwrap();
+
+        // Tower hidden == LM hidden (32, see `small_model_args`) so the dim
+        // check passes.
+        let siglip = SigLipVisionConfig {
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_channels: 3,
+            patch_size: 4,
+            image_size: 16,
+            layer_norm_eps: 1e-6,
+            hidden_act: "gelu_pytorch_tanh".to_owned(),
+        };
+        let vcfg = GemmaVisionConfig {
+            image_size: 16,
+            patch_size: 4,
+            num_patches: 16,
+            tokens_per_crop: 4,
+            crop_set: crate::gemma_vision::default_crop_set(),
+        };
+        model.vision = Some(GemmaVisionTower::new(
+            vcfg,
+            SigLipVisionModel::new(&siglip).unwrap(),
+        ));
+
+        // One landscape image: 3 crops x 4 tokens = 12 rows.
+        let batch = ImageBatch {
+            pixel_values: Array::from_slice(&[0.5f32; 3 * 16 * 16 * 3], &[3, 16, 16, 3]),
+            per_image_tokens: vec![12],
+            image_sizes: vec![(16, 16)],
+            image_offsets: vec![0, 1, 3],
+            layout: crate::vision::ImageTokenLayout::default(),
+        };
+        // [text, 12 sentinels, text]
+        let mut ids = vec![7i32];
+        ids.extend(std::iter::repeat_n(crate::vision::IMAGE_TOKEN_INDEX, 12));
+        ids.push(8);
+        let input_ids = Array::from_slice(&ids, &[1, 14]);
+
+        let mut cache = crate::AnyCache::KV(vec![]);
+        let logits = model
+            .forward_multimodal(&input_ids, &batch, &mut cache)
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 1, 64]);
+        mlx_rs::transforms::eval([&logits]).unwrap();
+        assert!(
+            logits.as_slice::<f32>().iter().all(|v| v.is_finite()),
+            "forward_multimodal produced non-finite logits"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // MoE expert-weight remap (fused SwitchGLU layout -> stacked Linear)
     // -----------------------------------------------------------------------
