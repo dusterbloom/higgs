@@ -21,6 +21,7 @@ pub mod starcoder2;
 pub mod transformer;
 pub mod turboquant;
 pub mod utils;
+pub mod vision;
 pub mod yarn;
 
 use std::collections::{HashMap, HashSet};
