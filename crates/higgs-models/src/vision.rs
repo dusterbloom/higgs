@@ -17,7 +17,10 @@ use crate::AnyCache;
 pub const IMAGE_TOKEN_INDEX: i32 = -200;
 
 /// Resolution control from the request (`detail` / `max_width` semantics).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serde parses the `OpenAI` wire values `"auto"` / `"low"` / `"high"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ImageDetail {
     #[default]
     Auto,

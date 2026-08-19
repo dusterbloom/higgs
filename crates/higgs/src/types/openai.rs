@@ -135,6 +135,9 @@ pub enum ContentPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageUrl {
     pub url: String,
+    /// `OpenAI` `detail` resolution control (`auto` / `low` / `high`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<higgs_models::vision::ImageDetail>,
 }
 
 /// A message in a chat conversation.
@@ -969,6 +972,7 @@ mod tests {
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,abc".to_owned(),
+                    detail: None,
                 },
             },
             ContentPart::Text {
@@ -987,6 +991,7 @@ mod tests {
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,abc".to_owned(),
+                    detail: None,
                 },
             },
         ]);
@@ -1008,6 +1013,7 @@ mod tests {
         let with_image = MessageContent::Parts(vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
                 url: "data:image/png;base64,abc".to_owned(),
+                detail: None,
             },
         }]);
         assert!(with_image.has_images());
