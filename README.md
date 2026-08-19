@@ -99,7 +99,7 @@ curl http://localhost:8000/v1/chat/completions \
 ### Run open-weight models locally on Apple Silicon
 
 - Serve MLX models from Hugging Face IDs or local paths.
-- Support current model families including Qwen 3.8, Qwen 3.x, Llama, Mistral, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, and LLaVA-Qwen2. Qwen 3.5+ checkpoints (3.5, 3.6, and 3.8; dense and MoE) use the Qwen 3.5 adapters, including `*ForConditionalGeneration` wrappers whose text-model config lives in `text_config`. Unknown newer versions in a supported family use the nearest structurally compatible adapter and log an untested-version warning; unknown families are rejected with the supported family/version list.
+- Support current model families including Qwen 3.8, Qwen 3.x, Llama, Mistral, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, LLaVA-Qwen2, and Qwen-VL. Qwen 3.5+ checkpoints (3.5, 3.6, and 3.8; dense and MoE) use the Qwen 3.5 adapters, including `*ForConditionalGeneration` wrappers whose text-model config lives in `text_config`. Unknown newer versions in a supported family use the nearest structurally compatible adapter and log an untested-version warning; unknown families are rejected with the supported family/version list.
 - Expose local serving through OpenAI and Anthropic-compatible endpoints.
 
 ### Use one endpoint for local and remote models
@@ -125,6 +125,20 @@ curl http://localhost:8000/v1/chat/completions \
 - Run in the foreground with `higgs serve` or as a background daemon with config-driven `higgs start`.
 - Open the daemon metrics dashboard with `higgs attach` for routing, latency, throughput, and error visibility.
 - Validate config and model/provider setup with `higgs doctor`.
+
+## Vision Support
+
+Higgs accepts image input on the OpenAI chat endpoint (`/v1/chat/completions`, streaming and non-streaming) for three vision-language families. Each family uses its own preprocessing scheme; see [docs/models.md](docs/models.md) for the per-family table and current constraints.
+
+- **LLaVA-Qwen2** (`llava-qwen2`) — square-resize preprocessing to the checkpoint's `vision_config.image_size` (384 for nanoLLaVA). Setting `detail: "low"` on **every** image halves that target (floored at 128 px); `auto`/`high` use the full size. Each `<image>` marker expands to one embedding per vision patch.
+- **Qwen-VL** (`qwen2_5_vl`, `qwen3_vl`, `qwen3_5_vl`) — dynamic-resolution preprocessing: each image is resized into the checkpoint's `[min_pixels, max_pixels]` pixel budget (`256·28²` / `1280·28²` defaults), its patch grid is merged 2×2, and `<|vision_start|><|image_pad|><|vision_end|>` markers carry the features. The text backbone loads through the Qwen3.5 dense/MoE loaders (the Qwen3Next path), so Qwen3.5 and escha-w2/eschamoe backbones work under the same Qwen-VL wrapper.
+- **Gemma 3 / Gemma 4** (`gemma3`, `gemma4` multimodal checkpoints) — pan-and-scan preprocessing: the image is scaled so its shorter side matches the tower's `image_size`, then several aspect-aware `image_size²` crops are encoded with positional offsets, expanding `<start_of_image><end_of_image>` markers into `mm_tokens_per_image` embeddings per crop. Text-only checkpoints (`gemma3_text`, `gemma4_text`) stay text-only and reject images with a 400.
+
+Images are supplied as OpenAI `image_url` content parts — either `data:` base64 URIs or `http(s)://` URLs (fetched with `server.image_fetch_timeout`). Supported media types: PNG, JPEG, WebP, GIF, BMP. Multiple images per request are supported, and `detail` (`auto`/`low`/`high`) selects the LLaVA resolution tier while other families ignore it.
+
+Image handling is strict: a 400 is returned for images sent to a model without vision, for images over `server.max_image_bytes`, for malformed/unsupported images, and for failed URL fetches. Image requests never use the in-memory or disk prefix cache and disable MTP speculative decode.
+
+The new `[server]` fields (`max_image_bytes`, `image_fetch_timeout`, `max_image_dimension`) and the per-model `disable_vision` flag are in the config reference: [docs/configuration.md](docs/configuration.md).
 
 ## Apple Silicon Notes
 
