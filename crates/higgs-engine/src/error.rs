@@ -1,4 +1,5 @@
 use higgs_models::error::ModelError;
+use higgs_models::vision::VisionError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -16,6 +17,9 @@ pub enum EngineError {
 
     #[error("Generation error: {0}")]
     Generation(String),
+
+    #[error("Vision error: {0}")]
+    Vision(#[from] VisionError),
 }
 
 #[allow(clippy::panic, clippy::unwrap_used)]

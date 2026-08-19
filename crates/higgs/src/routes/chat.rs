@@ -12,6 +12,7 @@ use axum::{
     },
 };
 use bytes::Bytes;
+use higgs_engine::engine::StreamingOutput;
 use tokio_stream::Stream;
 
 use crate::{
@@ -306,29 +307,18 @@ async fn chat_completions_non_streaming(
         req.reasoning.as_ref(),
     );
 
-    let mut prompt_tokens = engine
+    let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
 
-    // Multimodal requests: preprocess the extracted media into an `ImageBatch`
-    // (family-native pixel layout + per-image feature counts), then expand
-    // each family marker token into its sentinel run so the sentinel count
-    // matches `sum(batch.per_image_tokens)` expected by the embedding merge.
-    // Both preprocessing and token postprocessing failures are client problems
-    // (bad/malformed image data), so they map to strict 400s.
-    let image_batch = if !media.is_empty() && engine.is_vlm() {
-        let inputs: Vec<higgs_models::vision::ImageInput> =
-            media.into_iter().map(MediaItem::into).collect();
-        let batch = engine
-            .preprocess_images(&inputs)
-            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-        engine
-            .postprocess_image_tokens(&mut prompt_tokens, &batch)
-            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-        Some(batch)
-    } else {
-        None
-    };
+    // Multimodal requests: hand the raw decoded images to the engine, which
+    // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
+    // its model lock; BatchEngine inside its worker thread) and expands each
+    // family marker token into its sentinel run. Preprocessing failures are
+    // client problems (bad/malformed image data), so they map to strict 400s
+    // via `EngineError::Vision` below.
+    let image_inputs = (!media.is_empty() && engine.is_vlm())
+        .then(|| media.into_iter().map(MediaItem::into).collect());
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
@@ -343,12 +333,12 @@ async fn chat_completions_non_streaming(
             top_logprobs,
             thinking_enabled,
             constraint,
-            image_batch,
+            image_inputs,
         )
     })
     .await
     .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-    .map_err(ServerError::Engine)?;
+    .map_err(map_engine_error)?;
 
     let request_id = generate_request_id();
     let has_tools = tools.is_some();
@@ -505,29 +495,19 @@ async fn chat_completions_stream(
     // </tool_call>` blocks the model produces and turns them into
     // structured `ToolCallDelta` SSE events.
     let prompt_tools = req.tools.as_deref().filter(|t| !t.is_empty());
-    let mut prompt_tokens = engine
+    let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&messages, prompt_tools, thinking_enabled_stream)
         .map_err(ServerError::Engine)?;
 
-    // Multimodal requests: preprocess the extracted media into an `ImageBatch`
-    // (family-native pixel layout + per-image feature counts), then expand
-    // each family marker token into its sentinel run so the sentinel count
-    // matches `sum(batch.per_image_tokens)` expected by the embedding merge.
-    // Both preprocessing and token postprocessing failures are client problems
-    // (bad/malformed image data), so they map to strict 400s.
-    let image_batch = if !media.is_empty() && engine.is_vlm() {
-        let inputs: Vec<higgs_models::vision::ImageInput> =
-            media.into_iter().map(MediaItem::into).collect();
-        let batch = engine
-            .preprocess_images(&inputs)
-            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-        engine
-            .postprocess_image_tokens(&mut prompt_tokens, &batch)
-            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-        Some(batch)
-    } else {
-        None
-    };
+    // Multimodal requests: hand the raw decoded images to the engine, which
+    // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
+    // its model lock; BatchEngine inside its worker thread) and expands each
+    // family marker token into its sentinel run. Preprocessing failures are
+    // client problems (bad/malformed image data): the non-streaming path maps
+    // them to strict 400s, and the streaming path surfaces them as an
+    // error-finish chunk instead of a silently truncated stream.
+    let image_inputs = (!media.is_empty() && engine.is_vlm())
+        .then(|| media.into_iter().map(MediaItem::into).collect());
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
@@ -572,10 +552,25 @@ async fn chat_completions_stream(
             thinking_enabled_stream,
             return_progress,
             constraint,
-            image_batch,
+            image_inputs,
         );
         if let Err(e) = result {
             tracing::error!(error = %e, "Generation error during streaming");
+            // Vision preprocessing failures are client problems (bad/malformed
+            // image data): surface them as an error-finish chunk rather than
+            // ending the stream without explanation.
+            if let higgs_engine::error::EngineError::Vision(v) = &e {
+                tracing::warn!(error = %v, "Vision preprocessing failed during streaming");
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: String::new(),
+                    finished: true,
+                    finish_reason: Some("error".to_owned()),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+            }
         }
     });
 
@@ -830,6 +825,20 @@ fn convert_messages(
             }
         })
         .collect()
+}
+
+/// Map an engine error to a server error, surfacing vision preprocessing
+/// failures (malformed client image data) as strict 400s and passing every
+/// other engine error through as a 500.
+fn map_engine_error(e: higgs_engine::error::EngineError) -> ServerError {
+    match e {
+        higgs_engine::error::EngineError::Vision(v) => ServerError::BadRequest(v.to_string()),
+        other @ (higgs_engine::error::EngineError::Model(_)
+        | higgs_engine::error::EngineError::Mlx(_)
+        | higgs_engine::error::EngineError::Tokenization(_)
+        | higgs_engine::error::EngineError::Template(_)
+        | higgs_engine::error::EngineError::Generation(_)) => ServerError::Engine(other),
+    }
 }
 
 /// Reject images when the resolved model has no vision support.

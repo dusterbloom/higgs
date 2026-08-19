@@ -114,7 +114,7 @@ impl Engine {
     pub fn is_vlm(&self) -> bool {
         match self {
             Self::Simple(e) => e.is_vlm(),
-            Self::Batch(_) => false,
+            Self::Batch(e) => e.is_vlm(),
             #[cfg(test)]
             Self::Stub(_) => false,
         }
@@ -124,7 +124,7 @@ impl Engine {
     pub fn image_marker_text(&self) -> Option<&'static str> {
         match self {
             Self::Simple(e) => e.image_marker_text(),
-            Self::Batch(_) => None,
+            Self::Batch(e) => e.image_marker_text(),
             #[cfg(test)]
             Self::Stub(_) => None,
         }
@@ -134,7 +134,7 @@ impl Engine {
     pub fn vision_capabilities(&self) -> Option<VisionCapabilities> {
         match self {
             Self::Simple(e) => e.vision_capabilities(),
-            Self::Batch(_) => None,
+            Self::Batch(e) => e.vision_capabilities(),
             #[cfg(test)]
             Self::Stub(_) => None,
         }
@@ -142,13 +142,16 @@ impl Engine {
 
     /// Preprocess decoded images into a family-native [`ImageBatch`].
     ///
-    /// Only the simple (serialized) engine can serve a vision model; `Batch`
-    /// and `Stub` variants error.
+    /// Only the simple (serialized) engine preprocesses here; the batch engine
+    /// preprocesses inside its worker thread (the model lives there), so its
+    /// arm errors — the route must pass raw [`ImageInput`]s to `generate_*`
+    /// instead.
     pub fn preprocess_images(&self, images: &[ImageInput]) -> Result<ImageBatch, VisionError> {
         match self {
             Self::Simple(e) => e.preprocess_images(images),
             Self::Batch(_) => Err(VisionError::Preprocess(
-                "batch engine has no vision model".to_owned(),
+                "batch engine preprocesses images inside its worker; pass image_inputs to generate"
+                    .to_owned(),
             )),
             #[cfg(test)]
             Self::Stub(_) => Err(VisionError::Preprocess("stub".to_owned())),
@@ -208,7 +211,7 @@ impl Engine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        image_batch: Option<ImageBatch>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -219,7 +222,7 @@ impl Engine {
             top_logprobs,
             self.enable_thinking(),
             constraint,
-            image_batch,
+            image_inputs,
         )
     }
 
@@ -234,7 +237,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        image_batch: Option<ImageBatch>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<GenerationOutput, EngineError> {
         match self {
             Self::Simple(e) => e.generate_with_thinking(
@@ -246,7 +249,7 @@ impl Engine {
                 top_logprobs,
                 enable_thinking,
                 constraint,
-                image_batch,
+                image_inputs,
             ),
             Self::Batch(e) => e.generate_with_thinking(
                 prompt_tokens,
@@ -257,7 +260,7 @@ impl Engine {
                 top_logprobs,
                 enable_thinking,
                 constraint,
-                image_batch,
+                image_inputs,
             ),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
@@ -275,7 +278,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        image_batch: Option<ImageBatch>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -289,7 +292,7 @@ impl Engine {
             // /v1/completions convenience entry never streams prefill progress.
             false,
             constraint,
-            image_batch,
+            image_inputs,
         )
     }
 
@@ -306,7 +309,7 @@ impl Engine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        image_batch: Option<ImageBatch>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<(), EngineError> {
         match self {
             Self::Simple(e) => e.generate_streaming_with_thinking(
@@ -320,7 +323,7 @@ impl Engine {
                 enable_thinking,
                 return_progress,
                 constraint,
-                image_batch,
+                image_inputs,
             ),
             Self::Batch(e) => e.generate_streaming_with_thinking(
                 prompt_tokens,
@@ -333,7 +336,7 @@ impl Engine {
                 enable_thinking,
                 return_progress,
                 constraint,
-                image_batch,
+                image_inputs,
             ),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),

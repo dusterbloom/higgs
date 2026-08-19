@@ -601,6 +601,37 @@ impl SimpleEngine {
             .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))
     }
 
+    /// Preprocess raw image inputs into a family-native [`ImageBatch`] and
+    /// expand the family marker tokens in a copy of `prompt_tokens` into the
+    /// sentinel run the batch expects.
+    ///
+    /// Runs under the model lock (the engine owns `AnyModel`, unlike the batch
+    /// engine whose worker preprocesses instead). Text-only requests pass
+    /// through unchanged. Errors are [`EngineError::Vision`] so the route can
+    /// map malformed image data to a client-facing 400.
+    fn resolve_images(
+        &self,
+        prompt_tokens: &[u32],
+        image_inputs: Option<Vec<ImageInput>>,
+    ) -> Result<(Vec<u32>, Option<ImageBatch>), EngineError> {
+        let Some(inputs) = image_inputs else {
+            return Ok((prompt_tokens.to_vec(), None));
+        };
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let v = model.as_vision().ok_or_else(|| {
+            EngineError::Vision(VisionError::Preprocess(
+                "model has no vision; cannot process images".to_owned(),
+            ))
+        })?;
+        let batch = v.preprocess_images(&inputs)?;
+        let mut tokens = prompt_tokens.to_vec();
+        v.postprocess_image_tokens(&mut tokens, &self.tokenizer, &batch)?;
+        Ok((tokens, Some(batch)))
+    }
+
     /// Look up the prefix cache, lock the model, and resolve the actual tokens
     /// to feed into the forward pass.
     fn prepare_generation(
@@ -1054,9 +1085,10 @@ impl SimpleEngine {
 
     /// Generate a complete response from a token prompt.
     ///
-    /// For multimodal requests, pass `image_batch` with preprocessed image
-    /// data and ensure `prompt_tokens` contains `IMAGE_TOKEN_INDEX` at image
-    /// positions.
+    /// For multimodal requests, pass `image_inputs` with the decoded images
+    /// (in client order) and ensure `prompt_tokens` contains the family marker
+    /// tokens at image positions; the engine preprocesses them into a
+    /// family-native batch and expands the markers into sentinel runs.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -1067,7 +1099,7 @@ impl SimpleEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        image_batch: Option<ImageBatch>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -1078,7 +1110,7 @@ impl SimpleEngine {
             top_logprobs,
             self.enable_thinking,
             constraint,
-            image_batch,
+            image_inputs,
         )
     }
 
@@ -1093,16 +1125,20 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        image_batch: Option<ImageBatch>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<GenerationOutput, EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
+        // Multimodal preprocessing happens here, under the model lock, so the
+        // route has a single shape for both engines. `image_inputs` becomes a
+        // family-native batch and the marker tokens expand into sentinels.
+        let (resolved_tokens, image_batch) = self.resolve_images(prompt_tokens, image_inputs)?;
         if max_tokens == 0 {
             return Ok(GenerationOutput {
                 text: String::new(),
                 finish_reason: "length".to_owned(),
-                prompt_tokens: Self::prompt_len(prompt_tokens)?,
+                prompt_tokens: Self::prompt_len(&resolved_tokens)?,
                 completion_tokens: 0,
                 token_logprobs: None,
             });
@@ -1112,7 +1148,7 @@ impl SimpleEngine {
         // instead of creating a new Stream (5 FFI calls) per operation.
         with_new_default_stream(Stream::new(), || {
             self.generate_inner(
-                prompt_tokens,
+                &resolved_tokens,
                 max_tokens,
                 params,
                 stop_sequences,
@@ -2248,7 +2284,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        image_batch: Option<ImageBatch>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -2263,7 +2299,7 @@ impl SimpleEngine {
             // streams prefill progress.
             false,
             constraint,
-            image_batch,
+            image_inputs,
         )
     }
 
@@ -2280,13 +2316,16 @@ impl SimpleEngine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        image_batch: Option<ImageBatch>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<(), EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
+        // Multimodal preprocessing happens here, under the model lock (see
+        // [`Self::generate_with_thinking`]).
+        let (resolved_tokens, image_batch) = self.resolve_images(prompt_tokens, image_inputs)?;
         if max_tokens == 0 {
-            let prompt_len = Self::prompt_len(prompt_tokens)?;
+            let prompt_len = Self::prompt_len(&resolved_tokens)?;
             let _ = sender.blocking_send(StreamingOutput {
                 new_text: String::new(),
                 finished: true,
@@ -2301,7 +2340,7 @@ impl SimpleEngine {
 
         with_new_default_stream(Stream::new(), || {
             self.generate_streaming_inner(
-                prompt_tokens,
+                &resolved_tokens,
                 max_tokens,
                 params,
                 stop_sequences,
