@@ -2120,6 +2120,52 @@ git commit -m "feat(engine): batch-mode vision with multimodal prefill and batch
 
 ---
 
+### Task 14b: Wire `Engine::Batch` into the vision route path (Task 14 review gap)
+
+> **Added post-review (2026-08-19):** Task 14's reviewer adjudicated a plan-level gap: the batch gate accepts `batch=true` for VLMs (`adapter.rs` `batch_engine: true` for LLAVA_QWEN2/QWEN_VL), but `Engine::is_vlm()` / `image_marker_text()` / `vision_capabilities()` / `preprocess_images()` / `postprocess_image_tokens()` still return `false`/`None`/error for the `Engine::Batch` variant, so the HTTP route layer cannot send images to a batch-engine VLM. Text-only requests through a batch VLM work; image requests are unservable. The design spec chose "images work in both simple and batch mode." This task closes it.
+
+**Files:**
+- Modify: `crates/higgs-engine/src/batch_engine.rs`
+- Modify: `crates/higgs/src/state.rs`
+- Modify: `crates/higgs/src/routes/chat.rs` (only if the route's `engine.is_vlm()` / `preprocess_images` calls need no change — verify; likely unchanged since `state::Engine` delegates)
+
+**Interfaces:**
+- Consumes: `Engine::Batch`'s existing `generate*` pass-through of `image_batch` (Task 14); `VisionModel` trait methods.
+- Produces:
+  - `BatchEngine` captures vision capability at `load()`: `is_vlm: bool`, `image_marker_text: Option<&'static str>`, `vision_capabilities: Option<VisionCapabilities>` stored on the struct (the `AnyModel` itself lives in the worker thread — the handle cannot lock it). NOTE: `image_marker_text` returns `&'static str` so storing it is trivial; `VisionCapabilities` is `Clone`-able (verify; if not, store the fields needed by the route).
+  - `BatchEngine::is_vlm()`, `BatchEngine::image_marker_text()`, `BatchEngine::vision_capabilities()` accessors.
+  - `state::Engine::is_vlm()` / `image_marker_text()` / `vision_capabilities()` `Self::Batch(e)` arms delegate to these accessors (replacing the hardcoded `false`/`None`).
+  - **Worker-side preprocessing**: `BatchRequest` already carries `image_batch: Option<ImageBatch>` — change it to carry `image_inputs: Vec<ImageInput>` instead, and have the worker's `start_prefill`/`advance_prefill` call `model.as_vision().preprocess_images(&inputs)` + `postprocess_image_tokens(&mut prompt_tokens, &batch)` inside the worker thread (which owns `&mut AnyModel`), producing the `ImageBatch` there. This avoids the `SimpleEngine`-style lock entirely — the worker has the model.
+  - `state::Engine::preprocess_images` for `Self::Batch(_)` → error remains (the route shouldn't call it for batch — the worker does it); the ROUTE must instead be changed to pass `Vec<ImageInput>` through `generate_*` for batch engines. **Design decision for the implementer**: either (a) keep the route's preprocess-then-pass-`ImageBatch` shape by having `state::Engine::preprocess_images` return an error for Batch and adding a separate `generate_*` path that accepts raw inputs for Batch, or (b) change both engines' `generate_*` to accept `image_inputs: Option<Vec<ImageInput>>` and preprocess inside each engine (Simple locks the model, Batch does it in the worker). Prefer (b) — one route shape, preprocessing colocated with the model. If (b) ripples too far (Simple's `run_prefill` and routes), fall back to (a) with a documented per-engine split. State your choice in the report.
+  - The route's gate (`check_vision_capability`) and marker rendering already work once `Engine::is_vlm()` / `image_marker_text()` are correct for Batch.
+
+- [ ] **Step 1: Write the failing test**
+
+In `batch_engine.rs`'s test module (or `state.rs`'s): assert `Engine::Batch(...)` reports the captured vision capability. If a cheap BatchEngine test instance exists, assert `is_vlm()` reflects the loaded model; otherwise test the capability-capture helper directly (e.g. a `fn capture_vision_capabilities(model: &AnyModel) -> (bool, Option<&'static str>, Option<VisionCapabilities>)` pure function).
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test --release -p higgs-engine --lib` and `cargo test --release -p higgs state::tests --lib`
+Expected: FAIL — Batch still reports no vision.
+
+- [ ] **Step 3: Implement**
+
+Per the Interfaces block; the worker-side preprocess in `start_prefill`/`advance_prefill` mirrors the route's simple-engine pipeline (extract → preprocess → postprocess → `forward_multimodal`), moved into the worker where `&mut AnyModel` is available.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test --release -p higgs-engine --lib && cargo test --release -p higgs -- --test-threads=1`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/higgs-engine/src/batch_engine.rs crates/higgs/src/state.rs crates/higgs/src/routes/chat.rs
+git commit -m "feat(engine): route vision requests to batch-engine VLMs"
+```
+
+---
+
 ### Task 15: MTP disable for image requests + embeddings rejection
 
 **Files:**
