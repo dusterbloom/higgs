@@ -273,6 +273,15 @@ pub struct ServerSection {
     pub timeout: f64,
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
+    /// Maximum decoded byte size accepted per image (20 MiB default).
+    #[serde(default = "default_max_image_bytes")]
+    pub max_image_bytes: usize,
+    /// HTTP fetch timeout for remote image URLs, in seconds.
+    #[serde(default = "default_image_fetch_timeout")]
+    pub image_fetch_timeout: f64,
+    /// Long-edge pixel cap applied before family-specific preprocessing.
+    #[serde(default = "default_max_image_dimension")]
+    pub max_image_dimension: u32,
     /// CORS allow-list of origins. Unset = no CORS headers are sent;
     /// `["*"]` allows any origin (permissive).
     pub cors_origins: Option<Vec<String>>,
@@ -288,6 +297,9 @@ impl Default for ServerSection {
             rate_limit: 0,
             timeout: default_timeout(),
             max_body_size: default_max_body_size(),
+            max_image_bytes: default_max_image_bytes(),
+            image_fetch_timeout: default_image_fetch_timeout(),
+            max_image_dimension: default_max_image_dimension(),
             cors_origins: None,
         }
     }
@@ -311,6 +323,18 @@ const fn default_timeout() -> f64 {
 
 const fn default_max_body_size() -> usize {
     10 * 1024 * 1024
+}
+
+const fn default_max_image_bytes() -> usize {
+    20 << 20
+}
+
+const fn default_image_fetch_timeout() -> f64 {
+    10.0
+}
+
+const fn default_max_image_dimension() -> u32 {
+    4096
 }
 
 // -- Local defaults ---------------------------------------------------------
@@ -393,6 +417,13 @@ pub struct ModelConfig {
     /// Enable the separate batch engine for this model.
     #[serde(default)]
     pub batch: bool,
+    /// Force-disable vision processing for this model, rejecting image input.
+    ///
+    /// Escape hatch for checkpoints whose vision tower fails to load. On a
+    /// checkpoint with no vision capability the flag is a no-op; `higgs doctor`
+    /// warns when that happens.
+    #[serde(default)]
+    pub disable_vision: bool,
     /// Maximum prompt tokens to prefill per batch-loop iteration. `None` and
     /// `0` retain synchronous prefill behavior.
     #[serde(default)]
@@ -701,6 +732,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             name: None,
             mlx_profile: None,
             batch: args.batch,
+            disable_vision: false,
             prefill_yield_tokens: None,
             kv_cache,
             kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
@@ -815,6 +847,7 @@ fn extract_config(
                     name: None,
                     mlx_profile: None,
                     batch: serve_args.batch,
+                    disable_vision: false,
                     prefill_yield_tokens: None,
                     kv_cache,
                     kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
@@ -984,6 +1017,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         name: Some(name.clone()),
         mlx_profile: None,
         batch: false,
+        disable_vision: false,
         prefill_yield_tokens: None,
         kv_cache: KvCacheMode::Off,
         kv_bits: default_kv_bits(),
@@ -1163,6 +1197,29 @@ mod tests {
             RequestedMlxProfile::Auto
         );
         assert_eq!(config.default.provider, "higgs");
+        assert_eq!(config.server.max_image_bytes, 20 << 20);
+        assert!((config.server.image_fetch_timeout - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.server.max_image_dimension, 4096);
+    }
+
+    #[test]
+    fn config_defaults_preserve_behavior() {
+        // An empty document must resolve to the pre-vision defaults: the same
+        // per-image cap, fetch timeout, and long-edge limit the media pipeline
+        // used as constants before these fields existed.
+        let config = extract_config(Figment::new().merge(Toml::string("")), "test", None).unwrap();
+        assert_eq!(config.server.max_image_bytes, 20 << 20);
+        assert!((config.server.image_fetch_timeout - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.server.max_image_dimension, 4096);
+
+        // Model entries parse with vision enabled by default.
+        let model_config = extract_config(
+            Figment::new().merge(Toml::string("[[models]]\npath = \"org/model\"\n")),
+            "test",
+            None,
+        )
+        .unwrap();
+        assert!(!model_config.models.first().unwrap().disable_vision);
     }
 
     #[test]

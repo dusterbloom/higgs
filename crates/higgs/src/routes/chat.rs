@@ -18,10 +18,7 @@ use tokio_stream::Stream;
 use crate::{
     config::ApiFormat,
     error::ServerError,
-    media::{
-        IMAGE_FETCH_TIMEOUT_DEFAULT, MAX_IMAGE_BYTES_DEFAULT, MAX_IMAGE_DIMENSION_DEFAULT,
-        MediaExtractor, MediaItem,
-    },
+    media::{MediaExtractor, MediaItem},
     metrics::{MetricsStore, RequestMetricsContext, RequestRecord},
     router::ResolvedRoute,
     state::{Engine, SharedState},
@@ -281,9 +278,9 @@ async fn chat_completions_non_streaming(
     // Extract media and gate on vision capability: a strict 400 when images
     // are sent to a model that cannot see them.
     let media_extractor = MediaExtractor::new(
-        MAX_IMAGE_BYTES_DEFAULT,
-        IMAGE_FETCH_TIMEOUT_DEFAULT,
-        MAX_IMAGE_DIMENSION_DEFAULT,
+        state.config.server.max_image_bytes,
+        state.config.server.image_fetch_timeout,
+        state.config.server.max_image_dimension,
     )?;
     let media = media_extractor.extract_openai(&req.messages).await?;
     check_vision_capability(&media, engine.is_vlm(), engine.model_name())?;
@@ -469,9 +466,9 @@ async fn chat_completions_stream(
     // Extract media and gate on vision capability: a strict 400 when images
     // are sent to a model that cannot see them.
     let media_extractor = MediaExtractor::new(
-        MAX_IMAGE_BYTES_DEFAULT,
-        IMAGE_FETCH_TIMEOUT_DEFAULT,
-        MAX_IMAGE_DIMENSION_DEFAULT,
+        state.config.server.max_image_bytes,
+        state.config.server.image_fetch_timeout,
+        state.config.server.max_image_dimension,
     )?;
     let media = media_extractor.extract_openai(&req.messages).await?;
     check_vision_capability(&media, engine.is_vlm(), engine.model_name())?;

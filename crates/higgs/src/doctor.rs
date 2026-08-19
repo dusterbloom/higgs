@@ -68,6 +68,7 @@ fn check_config_valid(result: &mut DoctorResult) {
     pass("config file is valid", result);
 }
 
+#[allow(clippy::too_many_lines)]
 fn check_server_section(config: &crate::config::HiggsConfig, result: &mut DoctorResult) {
     let server = &config.server;
 
@@ -113,6 +114,42 @@ fn check_server_section(config: &crate::config::HiggsConfig, result: &mut Doctor
     } else {
         pass(
             &format!("server.max_body_size={} bytes", server.max_body_size),
+            result,
+        );
+    }
+
+    if server.max_image_bytes > server.max_body_size {
+        warn(
+            "server.max_image_bytes > server.max_body_size: images can never arrive within the body cap",
+            result,
+        );
+    } else {
+        pass(
+            &format!("server.max_image_bytes={} bytes", server.max_image_bytes),
+            result,
+        );
+    }
+
+    if (64..=16384).contains(&server.max_image_dimension) {
+        pass(
+            &format!("server.max_image_dimension={}", server.max_image_dimension),
+            result,
+        );
+    } else {
+        fail(
+            "server.max_image_dimension must be within 64..=16384",
+            result,
+        );
+    }
+
+    if !server.image_fetch_timeout.is_finite() || server.image_fetch_timeout <= 0.0 {
+        fail(
+            "server.image_fetch_timeout must be a positive finite number of seconds",
+            result,
+        );
+    } else {
+        pass(
+            &format!("server.image_fetch_timeout={}s", server.image_fetch_timeout),
             result,
         );
     }
@@ -262,6 +299,49 @@ fn model_label(model: &crate::config::ModelConfig) -> String {
     )
 }
 
+/// Whether a checkpoint declares vision capability from its own `config.json`:
+/// a `vision_config` key or a `*_vl` model type (wrapper or effective).
+///
+/// This is the checkpoint-side signal; it is independent of whether the
+/// resolved adapter implements vision ([`model_loader::ModelConfig`]'s
+/// `capabilities.vision`).
+fn checkpoint_declares_vision(detected: &higgs_models::adapter::DetectedModel) -> bool {
+    detected.raw.get("vision_config").is_some()
+        || detected.model_type.contains("_vl")
+        || detected
+            .wrapper_model_type
+            .as_deref()
+            .is_some_and(|model_type| model_type.contains("_vl"))
+}
+
+/// The vision column for the capability report.
+///
+/// Mirrors runtime capability gating at the adapter-capability level:
+/// `supported` when the resolved adapter implements vision, `tower-ignored`
+/// when the checkpoint declares vision weights that the resolved text-only
+/// adapter skips, and `none` otherwise. The parenthetical names the
+/// checkpoint's declared model type (wrapper when present), matching the
+/// family names a loaded model would report.
+fn vision_status(
+    inspected: &model_loader::ModelConfig,
+    detected: Option<&higgs_models::adapter::DetectedModel>,
+) -> String {
+    let Some(detected_config) = detected else {
+        return "vision: none".to_owned();
+    };
+    let family = detected_config
+        .wrapper_model_type
+        .as_deref()
+        .unwrap_or(detected_config.model_type.as_str());
+    if inspected.capabilities.vision {
+        format!("vision: supported ({family})")
+    } else if checkpoint_declares_vision(detected_config) {
+        format!("vision: tower-ignored ({family})")
+    } else {
+        "vision: none".to_owned()
+    }
+}
+
 fn check_prefill_yield_tokens(
     label: &str,
     prefill_yield_tokens: Option<u32>,
@@ -407,6 +487,28 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                         continue;
                     }
                 };
+                let detected = higgs_models::adapter::detect(&resolved).ok();
+                if model.disable_vision
+                    && !detected.as_ref().is_some_and(checkpoint_declares_vision)
+                {
+                    warn(
+                        &format!(
+                            "model {label} sets disable_vision=true but the checkpoint has no vision weights; the flag is a no-op"
+                        ),
+                        result,
+                    );
+                }
+                if !inspected.capabilities.vision
+                    && detected.as_ref().is_some_and(checkpoint_declares_vision)
+                {
+                    warn(
+                        &format!(
+                            "model {label} checkpoint contains vision weights that Higgs will ignore (adapter '{}' does not implement vision)",
+                            inspected.adapter_id
+                        ),
+                        result,
+                    );
+                }
                 if model.batch && !inspected.capabilities.batch_engine {
                     fail(
                         &format!(
@@ -439,9 +541,10 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 let version = inspected
                     .version
                     .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
+                let vision = vision_status(&inspected, detected.as_ref());
                 pass(
                     &format!(
-                        "model {label} resolvable (adapter={}, family={}, version={version}; {profile_msg})",
+                        "model {label} resolvable (adapter={}, family={}, version={version}; {vision}; {profile_msg})",
                         inspected.adapter_id, inspected.family
                     ),
                     result,
@@ -739,6 +842,7 @@ mod tests {
                     name: None,
                     mlx_profile: None,
                     batch: false,
+                    disable_vision: false,
                     prefill_yield_tokens: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
@@ -756,6 +860,7 @@ mod tests {
                     name: None,
                     mlx_profile: None,
                     batch: false,
+                    disable_vision: false,
                     prefill_yield_tokens: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
@@ -786,6 +891,7 @@ mod tests {
                     name: None,
                     mlx_profile: None,
                     batch: false,
+                    disable_vision: false,
                     prefill_yield_tokens: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
@@ -803,6 +909,7 @@ mod tests {
                     name: None,
                     mlx_profile: None,
                     batch: false,
+                    disable_vision: false,
                     prefill_yield_tokens: None,
                     kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                     kv_bits: 3,
@@ -1001,6 +1108,13 @@ mod tests {
     fn server_with(modify: impl FnOnce(&mut ServerSection)) -> HiggsConfig {
         let mut server = ServerSection::default();
         modify(&mut server);
+        // Keep the image cap within the body cap so the default advisory (the
+        // 20 MiB image cap exceeds the 10 MiB body cap) doesn't fire in tests
+        // isolating other server checks. Tests exercising the advisory set
+        // `max_image_bytes` themselves and build the config directly.
+        if server.max_image_bytes > server.max_body_size {
+            server.max_image_bytes = server.max_body_size;
+        }
         HiggsConfig {
             server,
             ..HiggsConfig::default()
@@ -1013,7 +1127,9 @@ mod tests {
         let mut result = empty_result();
         check_server_section(&config, &mut result);
         assert_eq!(result.failures, 0);
-        assert_eq!(result.warnings, 0);
+        // Advisory only: the default image cap (20 MiB) exceeds the default
+        // body cap (10 MiB), which the doctor flags on an untouched config.
+        assert_eq!(result.warnings, 1);
     }
 
     #[test]
@@ -1079,6 +1195,78 @@ mod tests {
         let mut result = empty_result();
         check_server_section(&config, &mut result);
         assert!(result.warnings >= 1);
+        assert_eq!(result.failures, 0);
+    }
+
+    // -- Vision server-section validation --
+
+    #[test]
+    fn doctor_warns_when_image_cap_exceeds_body_cap() {
+        let mut server = ServerSection::default();
+        server.max_image_bytes = server.max_body_size + 1;
+        let config = HiggsConfig {
+            server,
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert_eq!(result.failures, 0);
+        assert!(result.warnings >= 1);
+    }
+
+    #[test]
+    fn test_max_image_dimension_below_range_fails() {
+        let config = server_with(|s| s.max_image_dimension = 63);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
+    }
+
+    #[test]
+    fn test_max_image_dimension_above_range_fails() {
+        let config = server_with(|s| s.max_image_dimension = 16385);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
+    }
+
+    #[test]
+    fn test_max_image_dimension_in_range_passes() {
+        let config = server_with(|s| s.max_image_dimension = 4096);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_image_fetch_timeout_zero_fails() {
+        let config = server_with(|s| s.image_fetch_timeout = 0.0);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
+    }
+
+    #[test]
+    fn test_image_fetch_timeout_negative_fails() {
+        let config = server_with(|s| s.image_fetch_timeout = -1.0);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
+    }
+
+    #[test]
+    fn test_image_fetch_timeout_nan_fails() {
+        let config = server_with(|s| s.image_fetch_timeout = f64::NAN);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
+    }
+
+    #[test]
+    fn test_image_fetch_timeout_positive_passes() {
+        let config = server_with(|s| s.image_fetch_timeout = 10.0);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
         assert_eq!(result.failures, 0);
     }
 
@@ -1282,6 +1470,7 @@ mod tests {
                 name: None,
                 mlx_profile: None,
                 batch: false,
+                disable_vision: false,
                 prefill_yield_tokens: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
@@ -1316,6 +1505,7 @@ mod tests {
                 name: None,
                 mlx_profile: None,
                 batch: false,
+                disable_vision: false,
                 prefill_yield_tokens: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
@@ -1352,6 +1542,7 @@ mod tests {
                 name: None,
                 mlx_profile: None,
                 batch: false,
+                disable_vision: false,
                 prefill_yield_tokens: None,
                 kv_cache: higgs_models::turboquant::KvCacheMode::Off,
                 kv_bits: 3,
@@ -1413,6 +1604,7 @@ mod tests {
             name: None,
             mlx_profile: None,
             batch: false,
+            disable_vision: false,
             prefill_yield_tokens: None,
             kv_cache: higgs_models::turboquant::KvCacheMode::Off,
             kv_bits: 3,
@@ -1431,6 +1623,16 @@ mod tests {
         std::fs::write(
             dir.join("config.json"),
             format!(r#"{{"model_type": "{model_type}"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// Write a config.json that declares vision capability (`vision_config`)
+    /// alongside the given `model_type`.
+    fn write_model_config_with_vision(dir: &std::path::Path, model_type: &str) {
+        std::fs::write(
+            dir.join("config.json"),
+            format!(r#"{{"model_type": "{model_type}", "vision_config": {{"hidden_size": 768}}}}"#),
         )
         .unwrap();
     }
@@ -1606,6 +1808,95 @@ mod tests {
             assert_eq!(result.passes, 0);
             assert_eq!(result.warnings, 0);
             assert_eq!(result.failures, 0);
+        });
+    }
+
+    // -- Vision capability report --
+
+    #[test]
+    fn test_vision_status_supported_for_vision_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_with_vision(dir.path(), "llava-qwen2");
+        let inspected = model_loader::ModelConfig::from_dir(dir.path()).unwrap();
+        let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+        assert_eq!(
+            vision_status(&inspected, Some(&detected)),
+            "vision: supported (llava-qwen2)"
+        );
+    }
+
+    #[test]
+    fn test_vision_status_tower_ignored_for_text_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_with_vision(dir.path(), "gemma3");
+        let inspected = model_loader::ModelConfig::from_dir(dir.path()).unwrap();
+        let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+        assert!(!inspected.capabilities.vision);
+        assert_eq!(
+            vision_status(&inspected, Some(&detected)),
+            "vision: tower-ignored (gemma3)"
+        );
+    }
+
+    #[test]
+    fn test_vision_status_none_for_text_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "qwen2");
+        let inspected = model_loader::ModelConfig::from_dir(dir.path()).unwrap();
+        let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+        assert_eq!(vision_status(&inspected, Some(&detected)), "vision: none");
+    }
+
+    #[test]
+    fn test_doctor_warns_tower_ignored_for_multimodal_checkpoint() {
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_with_vision(dir.path(), "gemma3");
+            let model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(result.failures, 0);
+            assert_eq!(result.warnings, 1);
+        });
+    }
+
+    #[test]
+    fn test_doctor_disable_vision_noop_warns_for_text_checkpoint() {
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), "qwen2");
+            let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            model.disable_vision = true;
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(result.failures, 0);
+            assert_eq!(result.warnings, 1);
+        });
+    }
+
+    #[test]
+    fn test_doctor_disable_vision_noop_not_flagged_for_vlm() {
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_with_vision(dir.path(), "llava-qwen2");
+            let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            model.disable_vision = true;
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(result.failures, 0);
+            assert_eq!(result.warnings, 0);
         });
     }
 }

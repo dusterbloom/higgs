@@ -102,7 +102,7 @@ pub fn cmd_stop(profile: Option<&str>, force: bool) -> i32 {
     }
 }
 
-#[allow(clippy::print_stderr)]
+#[allow(clippy::print_stderr, clippy::too_many_lines)]
 pub fn cmd_init(profile: Option<&str>) {
     let dir = config::config_dir();
     let filename = profile.map_or_else(
@@ -138,6 +138,9 @@ port = 8000
 # rate_limit = 0
 # CORS origin allow-list for browser clients. Unset = no CORS headers.
 # cors_origins = ["*"]
+# max_image_bytes = 20971520   # per-image decoded byte cap (default 20 MiB); keep below max_body_size
+# image_fetch_timeout = 10.0   # remote image URL fetch timeout in seconds
+# max_image_dimension = 4096   # long-edge pixel cap before family preprocessing
 
 # --- Local serving defaults ---
 # MLX profile applies to simple-engine local models. "auto" picks balanced for
@@ -159,6 +162,7 @@ port = 8000
 # kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
 # prefill_yield_tokens = 512 # optional: interleave decode during long prefills
 # mla_latent_cache = true # DeepSeek-V2 only: compressed latent KV cache; cannot combine with kv_cache = "turboquant"
+# disable_vision = true # force-disable vision for this model (escape hatch)
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.
