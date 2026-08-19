@@ -89,6 +89,12 @@ pub struct ImageBatch {
     pub pixel_values: Array,
     /// Number of embedding rows each image expands to, in image order.
     pub per_image_tokens: Vec<usize>,
+    /// Actual (unpadded) `(height, width)` per image, in image order.
+    ///
+    /// Dynamic-resolution families stack images into a padded common canvas;
+    /// encoders must crop each slice back to these dims before the vision
+    /// tower so padded regions never feed the model.
+    pub image_sizes: Vec<(u32, u32)>,
     /// Token layout for this batch (k can depend on preprocessing output).
     pub layout: ImageTokenLayout,
 }
@@ -247,6 +253,7 @@ mod tests {
         let batch = ImageBatch {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
             per_image_tokens: vec![1],
+            image_sizes: vec![(1, 1); 1],
             layout: ImageTokenLayout {
                 start: None,
                 end: None,
@@ -271,6 +278,7 @@ mod tests {
         let batch = ImageBatch {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
             per_image_tokens: vec![1, 1],
+            image_sizes: vec![(1, 1); 2],
             layout: ImageTokenLayout::default(),
         };
         let merged = merge_embeddings(&ids, &text_embeddings, &features, &batch).unwrap();
@@ -297,6 +305,7 @@ mod tests {
         let batch = ImageBatch {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
             per_image_tokens: vec![2],
+            image_sizes: vec![(1, 1); 1],
             layout: ImageTokenLayout::default(),
         };
         let merged = merge_embeddings(&ids, &text_embeddings, &features, &batch).unwrap();
@@ -319,7 +328,8 @@ mod tests {
         let features = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
         let batch = ImageBatch {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
-            per_image_tokens: vec![2], // expects 2 sentinels, ids has 1
+            per_image_tokens: vec![2],
+            image_sizes: vec![(1, 1); 1], // expects 2 sentinels, ids has 1
             layout: ImageTokenLayout::default(),
         };
         let err = merge_embeddings(&ids, &text_embeddings, &features, &batch).unwrap_err();
@@ -340,6 +350,7 @@ mod tests {
         let batch = ImageBatch {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
             per_image_tokens: vec![],
+            image_sizes: vec![(1, 1); 0],
             layout: ImageTokenLayout::default(),
         };
         let merged = merge_embeddings(&ids, &text_embeddings, &empty_features, &batch).unwrap();

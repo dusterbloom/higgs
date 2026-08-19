@@ -275,6 +275,9 @@ impl VisionModel for LlavaQwen2Model {
             pixel_values,
             // Each image expands to `num_patches` feature rows in the merge.
             per_image_tokens: vec![num_patches; images.len()],
+            // LLaVA resizes every image to the same square target, so the
+            // batch canvas is unpadded and sizes are uniform.
+            image_sizes: vec![(target, target); images.len()],
             layout: ImageTokenLayout::default(),
         })
     }

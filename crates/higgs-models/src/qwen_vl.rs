@@ -256,6 +256,17 @@ pub fn get_grid(h: u32, w: u32, patch: u32, merge: u32) -> (u32, u32) {
     (gh.div_ceil(merge).max(1), gw.div_ceil(merge).max(1))
 }
 
+/// Merged feature rows an image of `height × width` yields after the tower and
+/// the 2×2 spatial merge — the per-image token budget.
+///
+/// This is the pure per-image grid computation shared by preprocessing (token
+/// budget) and encoding (row-count assertion), so a mixed-resolution batch is
+/// always budgeted from each image's **own** dims.
+fn image_feature_rows(height: u32, width: u32, patch: u32, merge: u32) -> usize {
+    let (gh, gw) = get_grid(height, width, patch, merge);
+    usize::try_from(gh * gw).unwrap_or(usize::MAX)
+}
+
 /// Reference Qwen-VL pixel-shuffle (transformers `image_processing_qwen2_vl.py`).
 ///
 /// Rearranges a channels-first image `[C, H, W]` (H/W multiples of
@@ -503,12 +514,32 @@ impl QwenVlModel {
     /// Encode every image in the batch through the tower + 2×2 merge +
     /// projector, returning `[sum(per_image_tokens), lm_hidden]` feature rows.
     fn encode_all_images(&mut self, batch: &ImageBatch) -> Result<Array, Exception> {
-        let n = batch.pixel_values.shape().first().copied().unwrap_or(0);
+        let n =
+            usize::try_from(batch.pixel_values.shape().first().copied().unwrap_or(0)).unwrap_or(0);
+        if batch.image_sizes.len() != n {
+            return Err(Exception::custom(format!(
+                "Qwen-VL: batch has {n} pixel canvases but {} image_sizes entries",
+                batch.image_sizes.len()
+            )));
+        }
         let patch = self.config.patch_size;
         let merge = self.config.merge_size;
-        let mut rows: Vec<Array> = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
-        for i in 0..n {
-            let pixel = batch.pixel_values.index((i..i + 1, .., .., ..)); // [1, H, W, 3]
+        let mut rows: Vec<Array> = Vec::with_capacity(n);
+        for (i, &(image_h, image_w)) in batch.image_sizes.iter().enumerate() {
+            let (image_h_i32, image_w_i32) = (
+                i32::try_from(image_h)
+                    .map_err(|_| Exception::custom("Qwen-VL: image height overflow"))?,
+                i32::try_from(image_w)
+                    .map_err(|_| Exception::custom("Qwen-VL: image width overflow"))?,
+            );
+            let i32_idx =
+                i32::try_from(i).map_err(|_| Exception::custom("Qwen-VL: batch index overflow"))?;
+            // Crop to the image's own (unpadded) dims — the batch canvas is
+            // zero-padded to the largest image, and padded regions must never
+            // reach the tower.
+            let pixel = batch
+                .pixel_values
+                .index((i32_idx..i32_idx + 1, ..image_h_i32, ..image_w_i32, ..));
             let &[_, h, w, _] = pixel.shape() else {
                 return Err(Exception::custom(
                     "Qwen-VL: expected [1, H, W, 3] pixel slice",
@@ -516,6 +547,17 @@ impl QwenVlModel {
             };
             let gh = h / patch;
             let gw = w / patch;
+            // The SigLIP-shaped tower only supports its nominal grid today
+            // (fixed learned position table); fail loudly instead of letting
+            // the position lookup raise a cryptic broadcast error.
+            let num_patches = self.vision_tower.num_patches();
+            if gh * gw != num_patches {
+                return Err(Exception::custom(format!(
+                    "Qwen-VL: image grid {gh}×{gw} ({gh}*{gw} patches) does not match the \
+                     tower's nominal {num_patches} patches — dynamic grids need the \
+                     Qwen-VL RoPE tower (not yet implemented)"
+                )));
+            }
             // Tower features: one row per (patch-sized) grid cell.
             let feats = self.vision_tower.forward(&pixel)?; // [1, gh*gw, hidden]
             let hidden = self.config.vision_config.hidden_size;
@@ -529,11 +571,26 @@ impl QwenVlModel {
                 .index(0); // [tokens, hidden*merge*merge]
             rows.push(self.mm_projector.forward(&merged)?);
         }
-        if rows.is_empty() {
-            return Ok(Array::from_slice(&[0.0f32; 0], &[0, self.hidden_size()]));
+        let image_features = if rows.is_empty() {
+            Array::from_slice(&[0.0f32; 0], &[0, self.hidden_size()])
+        } else {
+            let refs: Vec<&Array> = rows.iter().collect();
+            mlx_rs::ops::concatenate_axis(&refs, 0)?
+        };
+        // Loud check: the encoded row count must match the token budget the
+        // prompt was expanded to. `merge_embeddings` only validates the
+        // SENTINEL count (not the feature-row count), so any mismatch here
+        // would otherwise silently mis-align features to tokens.
+        let expected: usize = batch.per_image_tokens.iter().sum();
+        let actual =
+            usize::try_from(image_features.shape().first().copied().unwrap_or(0)).unwrap_or(0);
+        if actual != expected {
+            return Err(Exception::custom(format!(
+                "Qwen-VL: encoded {actual} image feature rows, expected {expected} \
+                 (sum of per_image_tokens)"
+            )));
         }
-        let refs: Vec<&Array> = rows.iter().collect();
-        mlx_rs::ops::concatenate_axis(&refs, 0)
+        Ok(image_features)
     }
 }
 
@@ -565,6 +622,7 @@ impl VisionModel for QwenVlModel {
         let factor = patch * merge;
         let mut arrays = Vec::with_capacity(images.len());
         let mut per_image_tokens = Vec::with_capacity(images.len());
+        let mut image_sizes = Vec::with_capacity(images.len());
         let mut max_h = 0u32;
         let mut max_w = 0u32;
         for img in images {
@@ -580,10 +638,10 @@ impl VisionModel for QwenVlModel {
             )?;
             let array = preprocess_qwen_vl_image(&img.bytes, (rw, rh))?;
             arrays.push(array);
-            let (gh, gw) = get_grid(rh, rw, patch, merge);
-            let tokens = usize::try_from(gh * gw)
-                .map_err(|_| VisionError::Preprocess("grid overflow".into()))?;
-            per_image_tokens.push(tokens);
+            // Token budget from the image's OWN resized dims; the padded batch
+            // canvas must never change this (see `encode_all_images`).
+            per_image_tokens.push(image_feature_rows(rh, rw, patch, merge));
+            image_sizes.push((rh, rw));
             max_h = max_h.max(rh);
             max_w = max_w.max(rw);
         }
@@ -591,6 +649,7 @@ impl VisionModel for QwenVlModel {
         Ok(ImageBatch {
             pixel_values,
             per_image_tokens,
+            image_sizes,
             layout: ImageTokenLayout::default(),
         })
     }
@@ -872,6 +931,33 @@ mod tests {
     fn grid_computation_handles_non_aligned_inputs() {
         assert_eq!(get_grid(30, 60, 14, 2), (1, 2));
         assert_eq!(get_grid(14, 14, 14, 2), (1, 1));
+    }
+
+    #[test]
+    fn per_image_feature_rows_reflect_own_resolutions() {
+        // Each image's token budget comes from its OWN resized dims: 448×448 →
+        // merged grid (16,16) → 256 rows; 336×336 → (12,12) → 144 rows.
+        assert_eq!(image_feature_rows(448, 448, 14, 2), 256);
+        assert_eq!(image_feature_rows(336, 336, 14, 2), 144);
+        // Wider images keep their aspect: 1120×448 → (40,16) → 640 rows.
+        assert_eq!(image_feature_rows(1120, 448, 14, 2), 640);
+    }
+
+    #[test]
+    fn mixed_resolution_batch_budget_matches_per_image_rows() {
+        // The review-caught bug: deriving grids from the PADDED canvas (the
+        // batch max dims) inflates smaller images' rows — 336×336 would be
+        // budgeted as 256 instead of 144, mis-aligning features to tokens.
+        assert_ne!(
+            image_feature_rows(448, 448, 14, 2),
+            image_feature_rows(336, 336, 14, 2)
+        );
+        // Correct mixed-batch budget is 400 (= 256 + 144), not 512.
+        let mixed: usize = [448, 336]
+            .iter()
+            .map(|&h| image_feature_rows(h, h, 14, 2))
+            .sum();
+        assert_eq!(mixed, 400);
     }
 
     #[test]
