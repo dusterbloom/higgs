@@ -6,7 +6,12 @@
 //! runs, and merges image features into the text embedding sequence before the
 //! transformer runs (see [`merge_embeddings`]).
 
-use mlx_rs::{Array, error::Exception};
+use mlx_rs::{
+    Array,
+    error::Exception,
+    ops::indexing::{IndexOp, NewAxis},
+    transforms::eval,
+};
 use tokenizers::Tokenizer;
 
 use crate::AnyCache;
@@ -147,7 +152,77 @@ pub fn is_supported_image_media_type(media_type: &str) -> bool {
     )
 }
 
+/// Merge text embeddings and image features at `IMAGE_TOKEN_INDEX` positions.
+///
+/// `input_ids` is `[1, seq_len]` with `IMAGE_TOKEN_INDEX` at image-feature
+/// positions; `text_embeddings` is the matching `[1, seq_len, hidden]` token
+/// embedding sequence. `image_features` holds `sum(batch.per_image_tokens)`
+/// rows of `[hidden]` in image order (the family impl concatenates per-image
+/// features). Walking the token sequence, each sentinel position consumes the
+/// next feature row; every other position keeps its token embedding. The
+/// result is `[1, seq_len, hidden]` — one merged row per input position.
+///
+/// Errors when the number of sentinel positions does not match
+/// `sum(batch.per_image_tokens)`. An empty batch returns the text embeddings
+/// unchanged.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+pub fn merge_embeddings(
+    input_ids: &Array,
+    text_embeddings: &Array,
+    image_features: &Array,
+    batch: &ImageBatch,
+) -> Result<Array, Exception> {
+    // input_ids: [1, seq_len], text_embeddings: [1, seq_len, hidden]
+    // image_features: [sum(per_image_tokens), hidden]
+    eval([input_ids])?;
+    let ids: Vec<i32> = input_ids.index(0).as_slice::<i32>().to_vec();
+
+    let expected: usize = batch.per_image_tokens.iter().sum();
+    let sentinel_count = ids.iter().filter(|id| **id == IMAGE_TOKEN_INDEX).count();
+    if sentinel_count != expected {
+        return Err(Exception::custom(format!(
+            "expected {expected} image feature positions, found {sentinel_count}"
+        )));
+    }
+    if expected == 0 {
+        return Ok(text_embeddings.clone());
+    }
+
+    // Build one [1, 1, hidden] segment per input position: text segments come
+    // from text_embeddings; sentinel segments consume the next feature row
+    // (expanded from [1, hidden] with NewAxis so all segments concatenate
+    // along axis 1).
+    let mut segments: Vec<Array> = Vec::with_capacity(ids.len());
+    let mut feat_idx = 0i32;
+    for (i, id) in ids.iter().enumerate() {
+        if *id == IMAGE_TOKEN_INDEX {
+            segments.push(
+                image_features
+                    .index((feat_idx..feat_idx + 1, ..))
+                    .index(NewAxis),
+            );
+            feat_idx += 1;
+        } else {
+            segments.push(text_embeddings.index((.., i as i32..i as i32 + 1, ..)));
+        }
+    }
+
+    let seg_refs: Vec<&Array> = segments.iter().collect();
+    mlx_rs::ops::concatenate_axis(&seg_refs, 1)
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::float_cmp,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 mod tests {
     use super::*;
 
@@ -180,5 +255,95 @@ mod tests {
         };
         assert_eq!(batch.per_image_tokens, vec![1]);
         assert!(batch.layout.start.is_none());
+    }
+
+    #[test]
+    fn merge_embeddings_two_images_in_one_sequence() {
+        // input_ids: [text, SENTINEL, text, SENTINEL, text]
+        let ids = Array::from_slice(&[1i32, IMAGE_TOKEN_INDEX, 2, IMAGE_TOKEN_INDEX, 3], &[1, 5]);
+        // text_embeddings [1, 5, 4]: row j is all `j as f32`, distinct per position
+        let text_data: Vec<f32> = (0..5)
+            .flat_map(|j| std::iter::repeat(j as f32).take(4))
+            .collect();
+        let text_embeddings = Array::from_slice(&text_data, &[1, 5, 4]);
+        // image features: 2 images, 1 token each, dim 4
+        let features = Array::from_slice(&[9.0f32, 9.1, 9.2, 9.3, 8.0, 8.1, 8.2, 8.3], &[2, 4]);
+        let batch = ImageBatch {
+            pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
+            per_image_tokens: vec![1, 1],
+            layout: ImageTokenLayout::default(),
+        };
+        let merged = merge_embeddings(&ids, &text_embeddings, &features, &batch).unwrap();
+        assert_eq!(merged.shape(), &[1, 5, 4]);
+        let flat = merged.as_slice::<f32>();
+        let row = |i: usize| &flat[i * 4..(i + 1) * 4];
+        // text positions keep their token embeddings; sentinels get feature rows
+        assert_eq!(row(0), &[0.0, 0.0, 0.0, 0.0]); // text id 1
+        assert_eq!(row(1), &[9.0, 9.1, 9.2, 9.3]); // features[0]
+        assert_eq!(row(2), &[2.0, 2.0, 2.0, 2.0]); // text id 2
+        assert_eq!(row(3), &[8.0, 8.1, 8.2, 8.3]); // features[1]
+        assert_eq!(row(4), &[4.0, 4.0, 4.0, 4.0]); // text id 3
+    }
+
+    #[test]
+    fn merge_embeddings_one_image_two_tokens() {
+        // One image that expands to two feature rows: [text, SENTINEL, SENTINEL, text]
+        let ids = Array::from_slice(&[5i32, IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, 6], &[1, 4]);
+        let text_data: Vec<f32> = (0..4)
+            .flat_map(|j| std::iter::repeat(j as f32).take(3))
+            .collect();
+        let text_embeddings = Array::from_slice(&text_data, &[1, 4, 3]);
+        let features = Array::from_slice(&[7.0f32, 7.1, 7.2, 6.0, 6.1, 6.2], &[2, 3]);
+        let batch = ImageBatch {
+            pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
+            per_image_tokens: vec![2],
+            layout: ImageTokenLayout::default(),
+        };
+        let merged = merge_embeddings(&ids, &text_embeddings, &features, &batch).unwrap();
+        assert_eq!(merged.shape(), &[1, 4, 3]);
+        let flat = merged.as_slice::<f32>();
+        let row = |i: usize| &flat[i * 3..(i + 1) * 3];
+        assert_eq!(row(0), &[0.0, 0.0, 0.0]);
+        assert_eq!(row(1), &[7.0, 7.1, 7.2]); // features[0]
+        assert_eq!(row(2), &[6.0, 6.1, 6.2]); // features[1]
+        assert_eq!(row(3), &[3.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn merge_embeddings_rejects_sentinel_count_mismatch() {
+        let ids = Array::from_slice(&[1i32, IMAGE_TOKEN_INDEX, 2], &[1, 3]);
+        let text_data: Vec<f32> = (0..3)
+            .flat_map(|j| std::iter::repeat(j as f32).take(2))
+            .collect();
+        let text_embeddings = Array::from_slice(&text_data, &[1, 3, 2]);
+        let features = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
+        let batch = ImageBatch {
+            pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
+            per_image_tokens: vec![2], // expects 2 sentinels, ids has 1
+            layout: ImageTokenLayout::default(),
+        };
+        let err = merge_embeddings(&ids, &text_embeddings, &features, &batch).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected 2 image feature positions, found 1")
+        );
+    }
+
+    #[test]
+    fn merge_embeddings_without_sentinels_returns_text_embeddings() {
+        let ids = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
+        let text_data: Vec<f32> = (0..3)
+            .flat_map(|j| std::iter::repeat(j as f32).take(2))
+            .collect();
+        let text_embeddings = Array::from_slice(&text_data, &[1, 3, 2]);
+        let empty_features = Array::from_slice(&[0.0f32; 0], &[0, 2]);
+        let batch = ImageBatch {
+            pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
+            per_image_tokens: vec![],
+            layout: ImageTokenLayout::default(),
+        };
+        let merged = merge_embeddings(&ids, &text_embeddings, &empty_features, &batch).unwrap();
+        assert_eq!(merged.shape(), &[1, 3, 2]);
+        assert_eq!(merged.as_slice::<f32>(), text_embeddings.as_slice::<f32>());
     }
 }

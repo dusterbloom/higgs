@@ -14,8 +14,7 @@ use mlx_rs::{
     error::Exception,
     module::{Module, Param},
     nn,
-    ops::indexing::{IndexOp, NewAxis},
-    transforms::eval,
+    ops::indexing::IndexOp,
 };
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -161,42 +160,27 @@ impl LlavaQwen2Model {
         self.mm_projector.forward(vision_features)
     }
 
-    /// Forward pass with a single image.
+    /// Encode N images through the vision tower and projector.
     ///
-    /// `input_ids`: token IDs `[1, seq_len]` with `IMAGE_TOKEN_INDEX` at image positions.
-    /// `pixel_values`: preprocessed image `[1, H, W, 3]`.
-    /// `cache`: KV cache for the language model.
-    ///
-    /// Replaces `IMAGE_TOKEN_INDEX` positions with projected image features,
-    /// then runs the combined sequence through the language model.
-    pub fn forward_multimodal_single<C: KeyValueCache>(
-        &mut self,
-        input_ids: &Array,
-        pixel_values: &Array,
-        cache: &mut Vec<Option<C>>,
-    ) -> Result<Array, Exception> {
-        // Validate batch=1 assumption
-        let batch = input_ids
-            .shape()
-            .first()
-            .copied()
-            .ok_or_else(|| Exception::custom("input_ids must have >= 2 dims"))?;
-        if batch != 1 {
-            return Err(Exception::custom(format!(
-                "LLaVA-Qwen2 only supports batch_size=1, got {batch}"
-            )));
+    /// Input: `pixel_values` with shape `[N, H, W, 3]` (NHWC).
+    /// Output: projected features `[sum(per_image_tokens), hidden]` — for
+    /// `LLaVA` each image expands to `num_patches` rows, so
+    /// `[N * num_patches, hidden]` with one row per patch.
+    pub fn encode_image_batch(&mut self, pixel_values: &Array) -> Result<Array, Exception> {
+        let n = pixel_values.shape().first().copied().unwrap_or(0);
+        if n <= 1 {
+            // Single-image path (kept for exactness with existing behavior).
+            let feats = self.encode_image(pixel_values)?; // [1, num_patches, hidden]
+            return Ok(feats.index(0));
         }
-        let image_features = self.encode_image(pixel_values)?;
-        // Replace IMAGE_TOKEN_INDEX sentinel with 0 before embedding lookup to
-        // avoid out-of-bounds access. merge_embeddings overwrites these positions.
-        let sentinel = Array::from_slice(&[IMAGE_TOKEN_INDEX], &[1]);
-        let is_sentinel = input_ids.eq(&sentinel)?;
-        let zero = Array::from_slice(&[0_i32], &[1]);
-        let safe_ids = mlx_rs::ops::r#where(&is_sentinel, &zero, input_ids)?;
-        let text_embeddings = self.language_model.embed_tokens(&safe_ids)?;
-        let combined = merge_embeddings(input_ids, &text_embeddings, &image_features)?;
-        self.language_model
-            .forward_from_embeddings(&combined, None, cache)
+        let mut rows = Vec::new();
+        for i in 0..n {
+            let single = pixel_values.index((i..i + 1, .., .., ..));
+            let feats = self.encode_image(&single)?; // [1, num_patches, hidden]
+            rows.push(feats.index(0)); // [num_patches, hidden]
+        }
+        let refs: Vec<&Array> = rows.iter().collect();
+        mlx_rs::ops::concatenate_axis(&refs, 0)
     }
 }
 
@@ -259,9 +243,12 @@ impl VisionModel for LlavaQwen2Model {
                 return Err(batch_err);
             }
         };
+        let num_patches = usize::try_from(self.vision_tower.num_patches())
+            .map_err(|e| VisionError::Preprocess(format!("invalid vision num_patches: {e}")))?;
         Ok(ImageBatch {
             pixel_values,
-            per_image_tokens: vec![1; images.len()],
+            // Each image expands to `num_patches` feature rows in the merge.
+            per_image_tokens: vec![num_patches; images.len()],
             layout: ImageTokenLayout::default(),
         })
     }
@@ -293,76 +280,26 @@ impl VisionModel for LlavaQwen2Model {
         let AnyCache::KV(c) = cache else {
             return Err(Exception::custom("LLaVA-Qwen2 requires a KV cache"));
         };
-        // Single-image path for Phase 1; multi-image merge lands in Task 7.
-        self.forward_multimodal_single(input_ids, &batch.pixel_values, c)
-    }
-}
-
-/// Merge text embeddings and image features at `IMAGE_TOKEN_INDEX` positions.
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
-fn merge_embeddings(
-    input_ids: &Array,
-    text_embeddings: &Array,
-    image_features: &Array,
-) -> Result<Array, Exception> {
-    // input_ids: [1, seq_len], text_embeddings: [1, seq_len, hidden_size]
-    // image_features: [1, num_patches, hidden_size]
-    eval([input_ids])?;
-    let ids: Vec<i32> = input_ids.index(0).as_slice::<i32>().to_vec();
-
-    let image_positions: Vec<usize> = ids
-        .iter()
-        .enumerate()
-        .filter(|(_, id)| **id == IMAGE_TOKEN_INDEX)
-        .map(|(i, _)| i)
-        .collect();
-
-    if image_positions.is_empty() {
-        return Ok(text_embeddings.clone());
-    }
-
-    // Only single-image is supported; multiple IMAGE_TOKEN_INDEX positions
-    // would duplicate the same features, inflating the sequence length.
-    if image_positions.len() > 1 {
-        return Err(Exception::custom(format!(
-            "Expected 1 image token position, found {}",
-            image_positions.len()
-        )));
-    }
-
-    let image_feats = image_features.index(0); // [num_patches, hidden_size]
-
-    let mut segments: Vec<Array> = Vec::new();
-    let mut text_start: usize = 0;
-
-    for &img_pos in &image_positions {
-        if img_pos > text_start {
-            let text_seg = text_embeddings.index((.., text_start as i32..img_pos as i32, ..));
-            segments.push(text_seg);
+        // Validate batch=1 assumption.
+        let batch_size = input_ids.shape().first().copied().unwrap_or(0);
+        if batch_size != 1 {
+            return Err(Exception::custom(format!(
+                "LLaVA-Qwen2 only supports batch_size=1, got {batch_size}"
+            )));
         }
-        segments.push(image_feats.index(NewAxis));
-        text_start = img_pos + 1;
+        let image_features = self.encode_image_batch(&batch.pixel_values)?; // [sum(per_image_tokens), hidden]
+        // Replace IMAGE_TOKEN_INDEX sentinel with 0 before embedding lookup to
+        // avoid out-of-bounds access. merge_embeddings overwrites these positions.
+        let sentinel = Array::from_slice(&[IMAGE_TOKEN_INDEX], &[1]);
+        let is_sentinel = input_ids.eq(&sentinel)?;
+        let zero = Array::from_slice(&[0_i32], &[1]);
+        let safe_ids = mlx_rs::ops::r#where(&is_sentinel, &zero, input_ids)?;
+        let text_embeddings = self.language_model.embed_tokens(&safe_ids)?;
+        let combined =
+            crate::vision::merge_embeddings(input_ids, &text_embeddings, &image_features, batch)?;
+        self.language_model
+            .forward_from_embeddings(&combined, None, c)
     }
-
-    let seq_len = ids.len();
-    if text_start < seq_len {
-        let text_seg = text_embeddings.index((.., text_start as i32..seq_len as i32, ..));
-        segments.push(text_seg);
-    }
-
-    if segments.len() == 1 {
-        return segments
-            .into_iter()
-            .next()
-            .ok_or_else(|| Exception::custom("internal error: empty segments"));
-    }
-
-    let seg_refs: Vec<&Array> = segments.iter().collect();
-    mlx_rs::ops::concatenate_axis(&seg_refs, 1)
 }
 
 // ---------------------------------------------------------------------------

@@ -217,6 +217,11 @@ impl SigLipVisionModel {
         })
     }
 
+    /// Number of patch embeddings produced per image.
+    pub const fn num_patches(&self) -> i32 {
+        self.num_patches
+    }
+
     /// Forward pass.
     ///
     /// Input: `pixel_values` with shape `[B, H, W, C]` (NHWC, channels last).
