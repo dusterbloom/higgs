@@ -69,9 +69,10 @@ Notes:
   `<start_of_image><end_of_image>`. Markers are spliced at each image's true
   position, so multiple images per request are supported in all three families.
 - **Backbones**: Qwen-VL runs on the Qwen3Next text backbone, loaded through the
-  Qwen3.5 dense/MoE loaders, so Qwen3.5 and escha-w2 (eschamoe) backbones work
-  under the same Qwen-VL wrapper — escha quantization is confined to expert
-  projections and is orthogonal to the vision wrapper.
+  Qwen3.5 dense/MoE loaders. escha-w2 (eschamoe) backbones are expected to work
+  under the same wrapper per the design spec — escha quantization is confined to
+  expert projections and is orthogonal to the vision wrapper — but there is no
+  in-tree escha checkpoint to verify against.
 - **Doctor status**: `higgs doctor` reports a `vision:` status in each model's
   capability line: `vision: supported (<model_type>)`, `vision: tower-ignored
   (<model_type>)`, or `vision: none`. `supported` means the resolved adapter
