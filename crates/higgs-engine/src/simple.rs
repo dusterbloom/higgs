@@ -6,6 +6,7 @@
     clippy::manual_let_else
 )]
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -607,15 +608,16 @@ impl SimpleEngine {
     ///
     /// Runs under the model lock (the engine owns `AnyModel`, unlike the batch
     /// engine whose worker preprocesses instead). Text-only requests pass
-    /// through unchanged. Errors are [`EngineError::Vision`] so the route can
-    /// map malformed image data to a client-facing 400.
-    fn resolve_images(
+    /// through unchanged (the tokens are borrowed, not copied). Errors are
+    /// [`EngineError::Vision`] so the route can map malformed image data to a
+    /// client-facing 400.
+    fn resolve_images<'a>(
         &self,
-        prompt_tokens: &[u32],
+        prompt_tokens: &'a [u32],
         image_inputs: Option<Vec<ImageInput>>,
-    ) -> Result<(Vec<u32>, Option<ImageBatch>), EngineError> {
+    ) -> Result<(Cow<'a, [u32]>, Option<ImageBatch>), EngineError> {
         let Some(inputs) = image_inputs else {
-            return Ok((prompt_tokens.to_vec(), None));
+            return Ok((Cow::Borrowed(prompt_tokens), None));
         };
         let model = self
             .model
@@ -629,7 +631,7 @@ impl SimpleEngine {
         let batch = v.preprocess_images(&inputs)?;
         let mut tokens = prompt_tokens.to_vec();
         v.postprocess_image_tokens(&mut tokens, &self.tokenizer, &batch)?;
-        Ok((tokens, Some(batch)))
+        Ok((Cow::Owned(tokens), Some(batch)))
     }
 
     /// Look up the prefix cache, lock the model, and resolve the actual tokens
@@ -1138,7 +1140,7 @@ impl SimpleEngine {
             return Ok(GenerationOutput {
                 text: String::new(),
                 finish_reason: "length".to_owned(),
-                prompt_tokens: Self::prompt_len(&resolved_tokens)?,
+                prompt_tokens: Self::prompt_len(resolved_tokens.as_ref())?,
                 completion_tokens: 0,
                 token_logprobs: None,
             });
@@ -1148,7 +1150,7 @@ impl SimpleEngine {
         // instead of creating a new Stream (5 FFI calls) per operation.
         with_new_default_stream(Stream::new(), || {
             self.generate_inner(
-                &resolved_tokens,
+                resolved_tokens.as_ref(),
                 max_tokens,
                 params,
                 stop_sequences,
@@ -2325,7 +2327,7 @@ impl SimpleEngine {
         // [`Self::generate_with_thinking`]).
         let (resolved_tokens, image_batch) = self.resolve_images(prompt_tokens, image_inputs)?;
         if max_tokens == 0 {
-            let prompt_len = Self::prompt_len(&resolved_tokens)?;
+            let prompt_len = Self::prompt_len(resolved_tokens.as_ref())?;
             let _ = sender.blocking_send(StreamingOutput {
                 new_text: String::new(),
                 finished: true,
@@ -2340,7 +2342,7 @@ impl SimpleEngine {
 
         with_new_default_stream(Stream::new(), || {
             self.generate_streaming_inner(
-                &resolved_tokens,
+                resolved_tokens.as_ref(),
                 max_tokens,
                 params,
                 stop_sequences,

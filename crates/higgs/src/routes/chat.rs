@@ -314,9 +314,12 @@ async fn chat_completions_non_streaming(
     // Multimodal requests: hand the raw decoded images to the engine, which
     // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
     // its model lock; BatchEngine inside its worker thread) and expands each
-    // family marker token into its sentinel run. Preprocessing failures are
-    // client problems (bad/malformed image data), so they map to strict 400s
-    // via `EngineError::Vision` below.
+    // family marker token into its sentinel run. Image preprocessing
+    // failures are client problems (bad/malformed image data): they surface
+    // as `EngineError::Vision` — Simple preprocesses synchronously in the
+    // engine, and the batch worker marks worker-side preprocessing failures
+    // so its generate tails reconstruct the same error — and `map_engine_error`
+    // below maps them to strict 400s.
     let image_inputs = (!media.is_empty() && engine.is_vlm())
         .then(|| media.into_iter().map(MediaItem::into).collect());
 
@@ -502,10 +505,11 @@ async fn chat_completions_stream(
     // Multimodal requests: hand the raw decoded images to the engine, which
     // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
     // its model lock; BatchEngine inside its worker thread) and expands each
-    // family marker token into its sentinel run. Preprocessing failures are
-    // client problems (bad/malformed image data): the non-streaming path maps
-    // them to strict 400s, and the streaming path surfaces them as an
-    // error-finish chunk instead of a silently truncated stream.
+    // family marker token into its sentinel run. Image preprocessing
+    // failures are client problems (bad/malformed image data): the
+    // non-streaming path maps `EngineError::Vision` to strict 400s, and the
+    // streaming path surfaces any engine failure as an error-finish chunk
+    // instead of a silently truncated stream.
     let image_inputs = (!media.is_empty() && engine.is_vlm())
         .then(|| media.into_iter().map(MediaItem::into).collect());
 
@@ -556,21 +560,18 @@ async fn chat_completions_stream(
         );
         if let Err(e) = result {
             tracing::error!(error = %e, "Generation error during streaming");
-            // Vision preprocessing failures are client problems (bad/malformed
-            // image data): surface them as an error-finish chunk rather than
-            // ending the stream without explanation.
-            if let higgs_engine::error::EngineError::Vision(v) = &e {
-                tracing::warn!(error = %v, "Vision preprocessing failed during streaming");
-                let _ = tx.blocking_send(StreamingOutput {
-                    new_text: String::new(),
-                    finished: true,
-                    finish_reason: Some("error".to_owned()),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    token_logprob: None,
-                    prefill_progress: None,
-                });
-            }
+            // Any engine failure (image preprocessing included) surfaces as an
+            // error-finish chunk rather than ending the stream without
+            // explanation.
+            let _ = tx.blocking_send(StreamingOutput {
+                new_text: String::new(),
+                finished: true,
+                finish_reason: Some("error".to_owned()),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                token_logprob: None,
+                prefill_progress: None,
+            });
         }
     });
 

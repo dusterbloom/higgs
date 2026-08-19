@@ -337,8 +337,23 @@ impl BatchEngine {
         let mut finish_reason = "length".to_owned();
         let mut completion_tokens: u32 = 0;
         let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
+        // The worker reports the post-preprocess prompt length on every chunk;
+        // capture it from the first one so multimodal usage matches the
+        // sentinel-expanded token count actually prefilled.
+        let mut reported_prompt_len: Option<u32> = None;
 
         while let Some(output) = internal_rx.blocking_recv() {
+            // Worker-sent error chunks (prefill/decode failures) fail the
+            // request instead of surfacing as an empty success.
+            if matches!(
+                output.finish_reason.as_deref(),
+                Some(WORKER_ERROR_FINISH | WORKER_ERROR_FINISH_VISION)
+            ) {
+                return Err(worker_error_from_output(&output));
+            }
+            if reported_prompt_len.is_none() {
+                reported_prompt_len = Some(output.prompt_tokens);
+            }
             full_text.push_str(&output.new_text);
             completion_tokens = output.completion_tokens;
             if let Some(ref reason) = output.finish_reason {
@@ -355,7 +370,7 @@ impl BatchEngine {
         Ok(GenerationOutput {
             text: full_text,
             finish_reason,
-            prompt_tokens: prompt_len,
+            prompt_tokens: reported_prompt_len.unwrap_or(prompt_len),
             completion_tokens,
             token_logprobs: all_logprobs,
         })
@@ -448,6 +463,15 @@ impl BatchEngine {
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
         while let Some(output) = internal_rx.blocking_recv() {
+            // Worker-sent error chunks (prefill/decode failures) fail the
+            // request; the caller surfaces the failure (the route sends an
+            // error-finish chunk to the SSE stream).
+            if matches!(
+                output.finish_reason.as_deref(),
+                Some(WORKER_ERROR_FINISH | WORKER_ERROR_FINISH_VISION)
+            ) {
+                return Err(worker_error_from_output(&output));
+            }
             let finished = output.finished;
             if sender.blocking_send(output).is_err() {
                 break; // Client disconnected
@@ -494,6 +518,7 @@ fn worker_loop(
         if pending_prefill.is_none() {
             if let Ok(req) = request_rx.try_recv() {
                 if prefill_yield_tokens == 0 {
+                    let response_tx = req.response_tx.clone();
                     match prefill_request(
                         &mut model,
                         &mut prefix_cache,
@@ -503,18 +528,26 @@ fn worker_loop(
                     ) {
                         Ok(Some(ar)) => active.push(ar),
                         Ok(None) => {}
-                        Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                        Err(e) => {
+                            send_prefill_error(&response_tx, &e);
+                            tracing::error!(error = %e, "Prefill failed");
+                        }
                     }
                 } else {
+                    let response_tx = req.response_tx.clone();
                     match start_prefill(&model, tokenizer, &mut prefix_cache, req) {
                         Ok(prefill) => pending_prefill = Some(prefill),
-                        Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                        Err(e) => {
+                            send_prefill_error(&response_tx, &e);
+                            tracing::error!(error = %e, "Prefill failed");
+                        }
                     }
                 }
             }
         }
 
         if let Some(prefill) = pending_prefill.take() {
+            let response_tx = prefill.req.response_tx.clone();
             match advance_prefill(
                 &mut model,
                 &mut prefix_cache,
@@ -529,6 +562,7 @@ fn worker_loop(
                 Ok(PrefillAdvance::Complete(Some(ar))) => active.push(ar),
                 Ok(PrefillAdvance::Complete(None)) => {}
                 Err(e) => {
+                    send_prefill_error(&response_tx, &e);
                     tracing::error!(error = %e, "Prefill failed");
                 }
             }
@@ -538,6 +572,7 @@ fn worker_loop(
         if active.is_empty() && pending_prefill.is_none() {
             if let Some(req) = request_rx.blocking_recv() {
                 if prefill_yield_tokens == 0 {
+                    let response_tx = req.response_tx.clone();
                     match prefill_request(
                         &mut model,
                         &mut prefix_cache,
@@ -548,14 +583,19 @@ fn worker_loop(
                         Ok(Some(ar)) => active.push(ar),
                         Ok(None) => continue,
                         Err(e) => {
+                            send_prefill_error(&response_tx, &e);
                             tracing::error!(error = %e, "Prefill failed");
                             continue;
                         }
                     }
                 } else {
+                    let response_tx = req.response_tx.clone();
                     match start_prefill(&model, tokenizer, &mut prefix_cache, req) {
                         Ok(prefill) => pending_prefill = Some(prefill),
-                        Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                        Err(e) => {
+                            send_prefill_error(&response_tx, &e);
+                            tracing::error!(error = %e, "Prefill failed");
+                        }
                     }
                     continue;
                 }
@@ -587,7 +627,7 @@ fn worker_loop(
                 tracing::error!(error = %e, "Batched decode round failed");
                 for (i, ar) in active.iter().enumerate() {
                     let _ = ar.response_tx.blocking_send(StreamingOutput {
-                        new_text: String::new(),
+                        new_text: format!("decode failed: {e}"),
                         finished: true,
                         finish_reason: Some("error".to_owned()),
                         prompt_tokens: ar.prompt_len,
@@ -641,7 +681,7 @@ fn run_pipelined_decode_round(
                     Err(e) => {
                         tracing::error!(error = %e, "async_eval failed");
                         let _ = ar.response_tx.blocking_send(StreamingOutput {
-                            new_text: String::new(),
+                            new_text: format!("decode step failed: {e}"),
                             finished: true,
                             finish_reason: Some("error".to_owned()),
                             prompt_tokens: ar.prompt_len,
@@ -657,7 +697,7 @@ fn run_pipelined_decode_round(
             Err(e) => {
                 tracing::error!(error = %e, "Decode graph build failed");
                 let _ = ar.response_tx.blocking_send(StreamingOutput {
-                    new_text: String::new(),
+                    new_text: format!("decode graph build failed: {e}"),
                     finished: true,
                     finish_reason: Some("error".to_owned()),
                     prompt_tokens: ar.prompt_len,
@@ -812,6 +852,53 @@ fn preprocess_images_in_worker(
     v.postprocess_image_tokens(&mut tokens, tokenizer, &batch)?;
     req.prompt_tokens = tokens;
     Ok(Some(batch))
+}
+
+/// `finish_reason` sent by the worker on prefill failure; the error message
+/// rides in `new_text` (the generate tails convert the chunk back into an
+/// `Err`). The `:vision` form marks client-caused image preprocessing
+/// failures so the tail reconstructs [`EngineError::Vision`] and the route
+/// maps it to a strict 400.
+const WORKER_ERROR_FINISH: &str = "error";
+/// See [`WORKER_ERROR_FINISH`].
+const WORKER_ERROR_FINISH_VISION: &str = "error:vision";
+
+/// Send an error-finish chunk to a failed request's response channel so the
+/// generate tail converts it into an `Err` — the client sees a failure
+/// instead of an empty success. The message rides in `new_text`.
+fn send_prefill_error(tx: &tokio::sync::mpsc::Sender<StreamingOutput>, error: &EngineError) {
+    let (finish_reason, message) = match error {
+        EngineError::Vision(_) => (WORKER_ERROR_FINISH_VISION, error.to_string()),
+        EngineError::Model(_)
+        | EngineError::Mlx(_)
+        | EngineError::Tokenization(_)
+        | EngineError::Template(_)
+        | EngineError::Generation(_) => (WORKER_ERROR_FINISH, error.to_string()),
+    };
+    let _ = tx.blocking_send(StreamingOutput {
+        new_text: message,
+        finished: true,
+        finish_reason: Some(finish_reason.to_owned()),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        token_logprob: None,
+        prefill_progress: None,
+    });
+}
+
+/// Convert a worker-sent error chunk back into an [`EngineError`] so the
+/// generate tails can fail the request (see [`send_prefill_error`]).
+fn worker_error_from_output(output: &StreamingOutput) -> EngineError {
+    match output.finish_reason.as_deref() {
+        Some(WORKER_ERROR_FINISH_VISION) => {
+            EngineError::Vision(VisionError::Preprocess(output.new_text.clone()))
+        }
+        _ => EngineError::Generation(if output.new_text.is_empty() {
+            "generation failed".to_owned()
+        } else {
+            output.new_text.clone()
+        }),
+    }
 }
 
 /// Set up cache reuse once, before the prompt begins advancing through chunks.
@@ -1637,6 +1724,226 @@ mod tests {
         assert!(
             err.to_string().contains("has no vision"),
             "expected worker-side vision preprocessing failure, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Worker prefill error protocol
+    // -----------------------------------------------------------------------
+
+    /// The worker's error-finish chunks must round-trip back into an
+    /// `EngineError` in the generate tails, with vision failures typed as
+    /// `EngineError::Vision` so the route can map them to 400s.
+    #[test]
+    fn worker_error_chunk_round_trips_into_engine_error() {
+        let output = StreamingOutput {
+            new_text: "image preprocessing failed: bad png".to_owned(),
+            finished: true,
+            finish_reason: Some(WORKER_ERROR_FINISH_VISION.to_owned()),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_logprob: None,
+            prefill_progress: None,
+        };
+        let err = worker_error_from_output(&output);
+        assert!(
+            matches!(err, EngineError::Vision(_)),
+            "vision-marked chunk must reconstruct EngineError::Vision, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("bad png"),
+            "error message must survive the round trip, got: {err}"
+        );
+
+        let generic = StreamingOutput {
+            new_text: "generation failed: boom".to_owned(),
+            finished: true,
+            finish_reason: Some(WORKER_ERROR_FINISH.to_owned()),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_logprob: None,
+            prefill_progress: None,
+        };
+        let err = worker_error_from_output(&generic);
+        assert!(
+            matches!(err, EngineError::Generation(_)),
+            "plain error chunk must reconstruct EngineError::Generation, got: {err}"
+        );
+        assert!(err.to_string().contains("boom"));
+
+        // An empty message degrades to a readable generic message.
+        let empty = StreamingOutput {
+            new_text: String::new(),
+            finished: true,
+            finish_reason: Some(WORKER_ERROR_FINISH.to_owned()),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_logprob: None,
+            prefill_progress: None,
+        };
+        assert_eq!(
+            worker_error_from_output(&empty).to_string(),
+            "Generation error: generation failed"
+        );
+    }
+
+    /// `send_prefill_error` emits the message and the vision marker so the
+    /// tail can reconstruct the error.
+    #[test]
+    fn send_prefill_error_carries_message_and_vision_marker() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let vision_err = EngineError::Vision(VisionError::Decode("corrupt png".to_owned()));
+        send_prefill_error(&tx, &vision_err);
+        let chunk = rx.blocking_recv().unwrap();
+        assert_eq!(
+            chunk.finish_reason.as_deref(),
+            Some(WORKER_ERROR_FINISH_VISION)
+        );
+        assert!(chunk.new_text.contains("corrupt png"));
+
+        let gen_err = EngineError::Generation("prompt too long".to_owned());
+        send_prefill_error(&tx, &gen_err);
+        let chunk = rx.blocking_recv().unwrap();
+        assert_eq!(chunk.finish_reason.as_deref(), Some(WORKER_ERROR_FINISH));
+        assert!(chunk.new_text.contains("prompt too long"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multimodal prefill dispatch + cache behaviour
+    // -----------------------------------------------------------------------
+
+    /// A multimodal `PendingPrefill` must dispatch its single prefill pass to
+    /// `forward_multimodal` (not the chunked text forward), and `complete_prefill`
+    /// must never store a multimodal post-prefill state into the prefix cache.
+    #[test]
+    fn multimodal_prefill_dispatches_to_forward_multimodal_and_skips_cache_store() {
+        use higgs_models::qwen3_next::{Qwen3NextCausalLM, Qwen3NextModelArgs};
+        use higgs_models::vision::ImageTokenLayout;
+
+        let args: Qwen3NextModelArgs = serde_json::from_str(
+            r#"{
+                "model_type": "qwen3_next",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-06,
+                "vocab_size": 128,
+                "max_position_embeddings": 512,
+                "full_attention_interval": 4,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_conv_kernel_dim": 4,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "shared_expert_intermediate_size": 64,
+                "moe_intermediate_size": 32,
+                "norm_topk_prob": true
+            }"#,
+        )
+        .unwrap();
+        let mut model = AnyModel::Qwen3Next(Qwen3NextCausalLM::new(args).unwrap());
+        let tokenizer = make_tokenizer();
+        let prompt: Vec<u32> = (0..24).collect();
+
+        // --- Dispatch: a multimodal prefill must run `forward_multimodal`. ---
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let req = BatchRequest {
+            prompt_tokens: prompt.clone(),
+            max_tokens: 4,
+            params: SamplingParams::default(),
+            stop_sequences: vec![],
+            logprobs: false,
+            top_logprobs: None,
+            constraint: None,
+            response_tx: tx,
+            image_inputs: vec![],
+        };
+        let dummy_batch = ImageBatch {
+            pixel_values: Array::from_slice(&[0.0_f32; 3], &[1, 1, 1, 3]),
+            per_image_tokens: vec![],
+            image_sizes: vec![],
+            image_offsets: vec![],
+            layout: ImageTokenLayout::default(),
+        };
+        let mut prefix_cache = PrefixCache::new(8);
+        let prefill = PendingPrefill {
+            request_id: 1,
+            req,
+            prompt_len: 24,
+            tokens: prompt.clone(),
+            offset: 0,
+            cache: model.make_cache().unwrap(),
+            image_batch: Some(dummy_batch),
+        };
+        // A tiny quantum must still run ONE multimodal forward: the prefill
+        // must dispatch to `forward_multimodal` (which errors on this
+        // non-VLM stub) instead of the chunked text path.
+        let Err(err) = advance_prefill(&mut model, &mut prefix_cache, &tokenizer, &[], prefill, 1)
+        else {
+            panic!("multimodal prefill must run forward_multimodal, not chunked forward")
+        };
+        assert!(
+            err.to_string()
+                .contains("does not support multimodal forward"),
+            "expected forward_multimodal dispatch error, got: {err}"
+        );
+
+        // --- Cache: `complete_prefill` must not store multimodal state. ---
+        // Seed a 16-token prefix so a text request WOULD match it; run
+        // `complete_prefill` with the same 24-token prompt and observe whether
+        // the cache gets extended to the full prompt.
+        let run_complete = |has_images: bool| {
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            let req = BatchRequest {
+                prompt_tokens: prompt.clone(),
+                max_tokens: 4,
+                params: SamplingParams::default(),
+                stop_sequences: vec![],
+                logprobs: false,
+                top_logprobs: None,
+                constraint: None,
+                response_tx: tx,
+                image_inputs: vec![],
+            };
+            let mut prefix_cache = PrefixCache::new(8);
+            let partial_cache = model.make_cache().unwrap();
+            prefix_cache.store(&prompt[..16], partial_cache);
+            let last_logits = Array::from_slice(&[0.0_f32; 128], &[1, 128]);
+            let cache = model.make_cache().unwrap();
+            let result = complete_prefill(
+                &mut prefix_cache,
+                &tokenizer,
+                &[],
+                req,
+                24,
+                cache,
+                last_logits,
+                has_images,
+            );
+            if let Err(e) = result {
+                panic!("complete_prefill must succeed: {e}");
+            }
+            let matched = prefix_cache
+                .find_longest_prefix(&prompt)
+                .expect("the seeded 16-token prefix must still match the 24-token prompt");
+            matched.prefix_len
+        };
+
+        assert_eq!(
+            run_complete(true),
+            16,
+            "multimodal prefill must NOT store its state into the prefix cache"
+        );
+        assert_eq!(
+            run_complete(false),
+            24,
+            "text prefill stores the full prompt so the contrast is meaningful"
         );
     }
 }
