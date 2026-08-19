@@ -289,26 +289,14 @@ async fn chat_completions_non_streaming(
         req.reasoning.as_ref(),
     );
 
-    let mut prompt_tokens = engine
+    let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
 
-    // Preprocess images for VLM
-    let pixel_values = if !images.is_empty() && engine.is_vlm() {
-        engine.replace_image_tokens(&mut prompt_tokens);
-        let image_size = engine.vlm_image_size().unwrap_or(384);
-        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
-        let size = image_size as u32;
-        let first_image = images
-            .into_iter()
-            .next()
-            .ok_or_else(|| ServerError::BadRequest("Image data is empty".to_owned()))?;
-        let pv = higgs_models::siglip::preprocess_image(&first_image, size)
-            .map_err(|e| ServerError::InternalError(format!("Image preprocessing failed: {e}")))?;
-        Some(pv)
-    } else {
-        None
-    };
+    // Multimodal requests are rewired in Task 8 (extract → preprocess →
+    // ImageBatch → postprocess_image_tokens); until then routes pass no image
+    // batch and VLM image inference is temporarily disabled.
+    let image_batch: Option<higgs_models::vision::ImageBatch> = None;
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
@@ -323,7 +311,7 @@ async fn chat_completions_non_streaming(
             top_logprobs,
             thinking_enabled,
             constraint,
-            pixel_values,
+            image_batch,
         )
     })
     .await
@@ -474,26 +462,14 @@ fn chat_completions_stream(
     // </tool_call>` blocks the model produces and turns them into
     // structured `ToolCallDelta` SSE events.
     let prompt_tools = req.tools.as_deref().filter(|t| !t.is_empty());
-    let mut prompt_tokens = engine
+    let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&messages, prompt_tools, thinking_enabled_stream)
         .map_err(ServerError::Engine)?;
 
-    // Preprocess images for VLM
-    let pixel_values = if !images.is_empty() && engine.is_vlm() {
-        engine.replace_image_tokens(&mut prompt_tokens);
-        let image_size = engine.vlm_image_size().unwrap_or(384);
-        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
-        let size = image_size as u32;
-        let first_image = images
-            .into_iter()
-            .next()
-            .ok_or_else(|| ServerError::BadRequest("Image data is empty".to_owned()))?;
-        let pv = higgs_models::siglip::preprocess_image(&first_image, size)
-            .map_err(|e| ServerError::InternalError(format!("Image preprocessing failed: {e}")))?;
-        Some(pv)
-    } else {
-        None
-    };
+    // Multimodal requests are rewired in Task 8 (extract → preprocess →
+    // ImageBatch → postprocess_image_tokens); until then routes pass no image
+    // batch and VLM image inference is temporarily disabled.
+    let image_batch: Option<higgs_models::vision::ImageBatch> = None;
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
@@ -538,7 +514,7 @@ fn chat_completions_stream(
             thinking_enabled_stream,
             return_progress,
             constraint,
-            pixel_values,
+            image_batch,
         );
         if let Err(e) = result {
             tracing::error!(error = %e, "Generation error during streaming");

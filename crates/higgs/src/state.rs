@@ -10,7 +10,7 @@ use higgs_engine::simple::SimpleEngine;
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
 use higgs_models::turboquant::KvCacheConfig;
-use mlx_rs::Array;
+use higgs_models::vision::{ImageBatch, VisionCapabilities, VisionError};
 
 use crate::config::HiggsConfig;
 use crate::metrics::MetricsStore;
@@ -120,21 +120,37 @@ impl Engine {
         }
     }
 
-    pub fn vlm_image_size(&self) -> Option<i32> {
+    /// The marker text injected at each image position before tokenization.
+    pub fn image_marker_text(&self) -> Option<&'static str> {
         match self {
-            Self::Simple(e) => e.vlm_image_size(),
+            Self::Simple(e) => e.image_marker_text(),
             Self::Batch(_) => None,
             #[cfg(test)]
             Self::Stub(_) => None,
         }
     }
 
-    pub fn replace_image_tokens(&self, tokens: &mut [u32]) {
+    /// Capability metadata for the loaded model, if it supports vision.
+    pub fn vision_capabilities(&self) -> Option<VisionCapabilities> {
         match self {
-            Self::Simple(e) => e.replace_image_tokens(tokens),
-            Self::Batch(_) => {}
+            Self::Simple(e) => e.vision_capabilities(),
+            Self::Batch(_) => None,
             #[cfg(test)]
-            Self::Stub(_) => {}
+            Self::Stub(_) => None,
+        }
+    }
+
+    /// Expand image marker tokens into the sentinel runs for `batch`.
+    pub fn postprocess_image_tokens(
+        &self,
+        tokens: &mut Vec<u32>,
+        batch: &ImageBatch,
+    ) -> Result<(), VisionError> {
+        match self {
+            Self::Simple(e) => e.postprocess_image_tokens(tokens, batch),
+            Self::Batch(_) => Ok(()),
+            #[cfg(test)]
+            Self::Stub(_) => Ok(()),
         }
     }
 
@@ -177,7 +193,7 @@ impl Engine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -188,7 +204,7 @@ impl Engine {
             top_logprobs,
             self.enable_thinking(),
             constraint,
-            pixel_values,
+            image_batch,
         )
     }
 
@@ -203,7 +219,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<GenerationOutput, EngineError> {
         match self {
             Self::Simple(e) => e.generate_with_thinking(
@@ -215,19 +231,26 @@ impl Engine {
                 top_logprobs,
                 enable_thinking,
                 constraint,
-                pixel_values,
+                image_batch,
             ),
-            Self::Batch(e) => e.generate_with_thinking(
-                prompt_tokens,
-                max_tokens,
-                params,
-                stop_sequences,
-                logprobs,
-                top_logprobs,
-                enable_thinking,
-                constraint,
-                pixel_values,
-            ),
+            Self::Batch(e) => {
+                if image_batch.is_some() {
+                    return Err(EngineError::Generation(
+                        "Batch engine does not support multimodal (image) inputs".to_owned(),
+                    ));
+                }
+                e.generate_with_thinking(
+                    prompt_tokens,
+                    max_tokens,
+                    params,
+                    stop_sequences,
+                    logprobs,
+                    top_logprobs,
+                    enable_thinking,
+                    constraint,
+                    None,
+                )
+            }
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
         }
@@ -244,7 +267,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -258,7 +281,7 @@ impl Engine {
             // /v1/completions convenience entry never streams prefill progress.
             false,
             constraint,
-            pixel_values,
+            image_batch,
         )
     }
 
@@ -275,7 +298,7 @@ impl Engine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<(), EngineError> {
         match self {
             Self::Simple(e) => e.generate_streaming_with_thinking(
@@ -289,21 +312,28 @@ impl Engine {
                 enable_thinking,
                 return_progress,
                 constraint,
-                pixel_values,
+                image_batch,
             ),
-            Self::Batch(e) => e.generate_streaming_with_thinking(
-                prompt_tokens,
-                max_tokens,
-                params,
-                stop_sequences,
-                logprobs,
-                top_logprobs,
-                sender,
-                enable_thinking,
-                return_progress,
-                constraint,
-                pixel_values,
-            ),
+            Self::Batch(e) => {
+                if image_batch.is_some() {
+                    return Err(EngineError::Generation(
+                        "Batch engine does not support multimodal (image) inputs".to_owned(),
+                    ));
+                }
+                e.generate_streaming_with_thinking(
+                    prompt_tokens,
+                    max_tokens,
+                    params,
+                    stop_sequences,
+                    logprobs,
+                    top_logprobs,
+                    sender,
+                    enable_thinking,
+                    return_progress,
+                    constraint,
+                    None,
+                )
+            }
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
         }
@@ -333,3 +363,15 @@ pub struct AppState {
 
 /// Type alias for the shared state used by Axum handlers.
 pub type SharedState = Arc<AppState>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stub_engine_reports_no_vision() {
+        let engine = Engine::test_stub("test-stub");
+        assert!(!engine.is_vlm());
+        assert!(engine.vision_capabilities().is_none());
+    }
+}

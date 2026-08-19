@@ -37,6 +37,7 @@ use serde_json::Value;
 
 use crate::error::ModelError;
 use crate::turboquant::KvCacheConfig;
+use crate::vision::{ImageBatch, VisionCapabilities, VisionModel};
 
 static BONSAI_IGNORED_MASK_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -862,10 +863,32 @@ impl AnyModel {
         matches!(self, Self::LlavaQwen2(_))
     }
 
-    /// The expected image size for the VLM's vision encoder, or `None` for text-only models.
-    pub const fn image_size(&self) -> Option<i32> {
+    /// Capability metadata if this model supports vision.
+    pub fn vision_capabilities(&self) -> Option<VisionCapabilities> {
+        self.as_vision().map(VisionModel::vision_capabilities)
+    }
+
+    /// The vision implementation for this model, if it has one.
+    pub fn as_vision(&self) -> Option<&dyn VisionModel> {
         match self {
-            Self::LlavaQwen2(m) => Some(m.image_size()),
+            Self::LlavaQwen2(m) => Some(m),
+            Self::Transformer(_)
+            | Self::Qwen3Next(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => None,
+        }
+    }
+
+    /// The mutable vision implementation for this model, if it has one.
+    pub fn as_vision_mut(&mut self) -> Option<&mut dyn VisionModel> {
+        match self {
+            Self::LlavaQwen2(m) => Some(m),
             Self::Transformer(_)
             | Self::Qwen3Next(_)
             | Self::Qwen3Moe(_)
@@ -886,17 +909,17 @@ impl AnyModel {
     pub fn forward_multimodal(
         &mut self,
         input_ids: &Array,
-        pixel_values: &Array,
+        batch: &ImageBatch,
         cache: &mut AnyCache,
     ) -> Result<Array, Exception> {
-        match (self, cache) {
-            (Self::LlavaQwen2(m), AnyCache::KV(c)) => {
-                m.forward_multimodal(input_ids, pixel_values, c)
-            }
-            _ => Err(Exception::custom(
-                "Model does not support multimodal forward",
-            )),
-        }
+        self.as_vision_mut().map_or_else(
+            || {
+                Err(Exception::custom(
+                    "Model does not support multimodal forward",
+                ))
+            },
+            |v| v.forward_multimodal(input_ids, batch, cache),
+        )
     }
 }
 
@@ -2272,6 +2295,15 @@ mod tests {
             AnyCache::KV(layers) => assert_eq!(layers.len(), 2),
             AnyCache::Hybrid(_) => panic!("Expected KV cache for Qwen3Moe"),
         }
+    }
+
+    #[test]
+    fn text_models_report_no_vision() {
+        let model = qwen3_moe::Qwen3MoeCausalLM::new(small_qwen3_moe_args()).unwrap();
+        let any = AnyModel::Qwen3Moe(model);
+        assert!(any.as_vision().is_none());
+        assert!(any.vision_capabilities().is_none());
+        assert!(!any.is_vlm());
     }
 
     #[test]

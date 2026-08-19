@@ -18,14 +18,20 @@ use mlx_rs::{
     transforms::eval,
 };
 use serde::Deserialize;
+use tokenizers::Tokenizer;
 
+use crate::AnyCache;
 use crate::cache::KeyValueCache;
 use crate::error::ModelError;
-use crate::siglip::{SigLipVisionConfig, SigLipVisionModel, load_siglip_weights};
+use crate::siglip::{SigLipVisionConfig, SigLipVisionModel, load_siglip_weights, preprocess_image};
 use crate::transformer;
+use crate::vision::{
+    ImageBatch, ImageInput, ImageTokenLayout, ImageTokenLayoutKind, VisionCapabilities,
+    VisionError, VisionModel,
+};
 
 /// Token ID used as a placeholder for image positions in the input sequence.
-pub const IMAGE_TOKEN_INDEX: i32 = -200;
+pub use crate::vision::IMAGE_TOKEN_INDEX;
 
 /// Full LLaVA-Qwen2 config from config.json.
 #[derive(Debug, Deserialize)]
@@ -152,7 +158,7 @@ impl LlavaQwen2Model {
         self.mm_projector.forward(vision_features)
     }
 
-    /// Forward pass with an image.
+    /// Forward pass with a single image.
     ///
     /// `input_ids`: token IDs `[1, seq_len]` with `IMAGE_TOKEN_INDEX` at image positions.
     /// `pixel_values`: preprocessed image `[1, H, W, 3]`.
@@ -160,7 +166,7 @@ impl LlavaQwen2Model {
     ///
     /// Replaces `IMAGE_TOKEN_INDEX` positions with projected image features,
     /// then runs the combined sequence through the language model.
-    pub fn forward_multimodal<C: KeyValueCache>(
+    pub fn forward_multimodal_single<C: KeyValueCache>(
         &mut self,
         input_ids: &Array,
         pixel_values: &Array,
@@ -188,6 +194,82 @@ impl LlavaQwen2Model {
         let combined = merge_embeddings(input_ids, &text_embeddings, &image_features)?;
         self.language_model
             .forward_from_embeddings(&combined, None, cache)
+    }
+}
+
+impl VisionModel for LlavaQwen2Model {
+    fn vision_capabilities(&self) -> VisionCapabilities {
+        VisionCapabilities {
+            families: vec!["llava-qwen2"],
+            image_sizes: vec![self.image_size],
+            supported_media: vec![
+                "image/png",
+                "image/jpeg",
+                "image/webp",
+                "image/gif",
+                "image/bmp",
+            ],
+            layout_kind: ImageTokenLayoutKind::Sentinel,
+        }
+    }
+
+    fn image_marker_text(&self) -> &'static str {
+        "<image>"
+    }
+
+    fn preprocess_images(&self, images: &[ImageInput]) -> Result<ImageBatch, VisionError> {
+        // Full multi-image implementation lands in Task 6; for now implement
+        // the single-image path so the trait compiles and Phase 1 tests pass.
+        let size = u32::try_from(self.image_size)
+            .map_err(|_| VisionError::Preprocess("invalid image_size".to_owned()))?;
+        let mut pixel_values = Vec::with_capacity(images.len());
+        for img in images {
+            pixel_values.push(
+                preprocess_image(&img.bytes, size)
+                    .map_err(|e| VisionError::Preprocess(e.to_string()))?,
+            );
+        }
+        Ok(ImageBatch {
+            pixel_values: if pixel_values.is_empty() {
+                Array::from_slice::<f32>(&[], &[0, 1, 1, 3])
+            } else {
+                mlx_rs::ops::concatenate_axis(&pixel_values.iter().collect::<Vec<_>>(), 0)
+                    .map_err(|e| VisionError::Preprocess(e.to_string()))?
+            },
+            per_image_tokens: vec![1; images.len()],
+            layout: ImageTokenLayout::default(),
+        })
+    }
+
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    fn postprocess_image_tokens(
+        &self,
+        tokens: &mut Vec<u32>,
+        tokenizer: &Tokenizer,
+        _batch: &ImageBatch,
+    ) -> Result<(), VisionError> {
+        let Some(marker_id) = tokenizer.token_to_id("<image>") else {
+            return Ok(()); // tokenizer without <image>: nothing to expand
+        };
+        for t in tokens.iter_mut() {
+            if *t == marker_id {
+                *t = IMAGE_TOKEN_INDEX as u32;
+            }
+        }
+        Ok(())
+    }
+
+    fn forward_multimodal(
+        &mut self,
+        input_ids: &Array,
+        batch: &ImageBatch,
+        cache: &mut AnyCache,
+    ) -> Result<Array, Exception> {
+        let AnyCache::KV(c) = cache else {
+            return Err(Exception::custom("LLaVA-Qwen2 requires a KV cache"));
+        };
+        // Single-image path for Phase 1; multi-image merge lands in Task 7.
+        self.forward_multimodal_single(input_ids, &batch.pixel_values, c)
     }
 }
 

@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
     turboquant::KvCacheConfig,
+    vision::{ImageBatch, VisionCapabilities, VisionError, VisionModel},
 };
 use mlx_rs::{
     Array, Dtype, Stream,
@@ -273,7 +274,7 @@ struct PreparedGeneration<'a> {
     actual_prompt_tokens: Vec<u32>,
     prompt_array: Array,
     prompt_len: u32,
-    pixel_values: Option<Array>,
+    image_batch: Option<ImageBatch>,
     disk_loaded: bool,
 }
 
@@ -526,17 +527,46 @@ impl SimpleEngine {
         model.is_vlm()
     }
 
-    /// The expected image size for the VLM's vision encoder, or `None`.
-    pub fn vlm_image_size(&self) -> Option<i32> {
+    /// The marker text injected at each image position before tokenization.
+    pub fn image_marker_text(&self) -> Option<&'static str> {
         let model = self
             .model
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        model.image_size()
+        model.as_vision().map(VisionModel::image_marker_text)
+    }
+
+    /// Capability metadata for the loaded model, if it supports vision.
+    pub fn vision_capabilities(&self) -> Option<VisionCapabilities> {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        model.as_vision().map(VisionModel::vision_capabilities)
+    }
+
+    /// Expand image marker tokens into the sentinel runs for `batch`.
+    pub fn postprocess_image_tokens(
+        &self,
+        tokens: &mut Vec<u32>,
+        batch: &ImageBatch,
+    ) -> Result<(), VisionError> {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(v) = model.as_vision() else {
+            return Ok(());
+        };
+        v.postprocess_image_tokens(tokens, &self.tokenizer, batch)
     }
 
     /// Replace image placeholder tokens with `IMAGE_TOKEN_INDEX` in the token
     /// sequence. The `<image>` token ID is looked up from the tokenizer.
+    ///
+    /// Superseded by [`Self::postprocess_image_tokens`] (Task 8 route rewiring);
+    /// kept temporarily so existing callers compile during the transition.
+    #[deprecated(note = "use postprocess_image_tokens with an ImageBatch instead")]
     #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
     pub fn replace_image_tokens(&self, tokens: &mut [u32]) {
         let Some(image_token_id) = self.tokenizer.token_to_id("<image>") else {
@@ -563,10 +593,10 @@ impl SimpleEngine {
     fn prepare_generation(
         &self,
         prompt_tokens: &[u32],
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<PreparedGeneration<'_>, EngineError> {
         let prompt_len = Self::prompt_len(prompt_tokens)?;
-        let has_images = pixel_values.is_some();
+        let has_images = image_batch.is_some();
 
         // Skip prefix caching for multimodal requests: different images
         // produce different KV states even with identical token sequences.
@@ -665,7 +695,7 @@ impl SimpleEngine {
             actual_prompt_tokens,
             prompt_array,
             prompt_len,
-            pixel_values,
+            image_batch,
             disk_loaded,
         })
     }
@@ -683,11 +713,11 @@ impl SimpleEngine {
         capture_hidden: bool,
     ) -> Result<(Array, Option<LogprobArrays>, Option<Array>), EngineError> {
         let mut prefill_hidden = None;
-        let logits = if let Some(ref pixel_values) = prepared.pixel_values {
+        let logits = if let Some(ref batch) = prepared.image_batch {
             // Multimodal path: full forward (VLMs need all tokens for vision)
             prepared
                 .model
-                .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
+                .forward_multimodal(&prepared.prompt_array, batch, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
         } else {
             // Text-only prefill: use chunked prefill for long sequences to bound
@@ -752,7 +782,7 @@ impl SimpleEngine {
         }
 
         // Skip prefix cache for multimodal (image-specific KV states)
-        if prepared.pixel_values.is_none() {
+        if prepared.image_batch.is_none() {
             let mut pc = self
                 .prefix_cache
                 .lock()
@@ -1011,7 +1041,7 @@ impl SimpleEngine {
 
     /// Generate a complete response from a token prompt.
     ///
-    /// For multimodal requests, pass `pixel_values` with preprocessed image
+    /// For multimodal requests, pass `image_batch` with preprocessed image
     /// data and ensure `prompt_tokens` contains `IMAGE_TOKEN_INDEX` at image
     /// positions.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_arguments)]
@@ -1024,7 +1054,7 @@ impl SimpleEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -1035,7 +1065,7 @@ impl SimpleEngine {
             top_logprobs,
             self.enable_thinking,
             constraint,
-            pixel_values,
+            image_batch,
         )
     }
 
@@ -1050,7 +1080,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<GenerationOutput, EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
@@ -1077,7 +1107,7 @@ impl SimpleEngine {
                 top_logprobs,
                 enable_thinking,
                 constraint,
-                pixel_values,
+                image_batch,
             )
         })
     }
@@ -1097,17 +1127,17 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<GenerationOutput, EngineError> {
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
-        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
+        let mut prepared = self.prepare_generation(prompt_tokens, image_batch)?;
         let prompt_len = prepared.prompt_len;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
             && self.tuning.enable_mtp()
             && prepared.model.has_mtp()
-            && prepared.pixel_values.is_none()
+            && prepared.image_batch.is_none()
             && constraint.is_none()
             && !logprobs
             && params.temperature == 0.0;
@@ -2205,7 +2235,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -2220,7 +2250,7 @@ impl SimpleEngine {
             // streams prefill progress.
             false,
             constraint,
-            pixel_values,
+            image_batch,
         )
     }
 
@@ -2237,7 +2267,7 @@ impl SimpleEngine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<(), EngineError> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
@@ -2268,7 +2298,7 @@ impl SimpleEngine {
                 enable_thinking,
                 return_progress,
                 constraint,
-                pixel_values,
+                image_batch,
             )
         })
     }
@@ -2290,17 +2320,17 @@ impl SimpleEngine {
         enable_thinking: bool,
         return_progress: bool,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<(), EngineError> {
         let logprob_top_n = logprobs.then(|| top_logprobs.unwrap_or(0));
 
-        let mut prepared = self.prepare_generation(prompt_tokens, pixel_values)?;
+        let mut prepared = self.prepare_generation(prompt_tokens, image_batch)?;
         let prompt_len = prepared.prompt_len;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
             && self.tuning.enable_mtp()
             && prepared.model.has_mtp()
-            && prepared.pixel_values.is_none()
+            && prepared.image_batch.is_none()
             && constraint.is_none()
             && !logprobs
             && params.temperature == 0.0;
