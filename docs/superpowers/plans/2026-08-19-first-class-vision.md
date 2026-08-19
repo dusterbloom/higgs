@@ -2020,19 +2020,30 @@ git commit -m "feat(models): Gemma 3/4 vision towers with pan-and-scan"
 
 ### Task 14: Batch engine multimodal prefill + batched decode for VLM families
 
+> **Pre-flight ruling (human approved):** `Qwen3Next` models use
+> `AnyCache::Hybrid(Vec<Option<LayerCache>>)`, and `AnyModel::forward_batched`
+> rejects Hybrid caches outright. This task therefore implements
+> `Qwen3NextCausalLM::forward_batched` for **Hybrid caches** (per-request
+> offsets + batched projections over the hybrid SSM/attention stack, mirroring
+> `Transformer::forward_batched`), so Qwen-VL (Qwen3Next-backed) gets true
+> batched decode. LLaVA (Transformer-backed) delegates to the inner
+> `Transformer::forward_batched`.
+
 **Files:**
 - Modify: `crates/higgs-engine/src/batch_engine.rs`
-- Modify: `crates/higgs-models/src/qwen3_next.rs` (`forward_batched` for the backbone)
+- Modify: `crates/higgs-models/src/qwen3_next.rs` (`forward_batched` for the backbone, Hybrid cache)
 - Modify: `crates/higgs-models/src/llava_qwen2.rs` (delegate batched decode to the Qwen2 transformer)
-- Modify: `crates/higgs-models/src/lib.rs` (`AnyModel::forward_batched` arms)
+- Modify: `crates/higgs-models/src/lib.rs` (`AnyModel::forward_batched` arms — accept `AnyCache::Hybrid` for `Qwen3Next`, `AnyCache::KV` for `LlavaQwen2`)
+- Modify: `crates/higgs/src/doctor.rs` + startup gate + README (extend the `batch=true` family allowlist)
 
 **Interfaces:**
-- Consumes: `ImageBatch` (Task 1), `forward_multimodal` (Task 2/7/11), `BatchRequest` (existing).
+- Consumes: `ImageBatch` (Task 1), `forward_multimodal` (Task 2/7/11), `BatchRequest` (existing), `Transformer::forward_batched` (existing, the porting reference).
 - Produces:
   - `BatchRequest { … , image_batch: Option<ImageBatch> }`
   - `start_prefill`/`advance_prefill` multimodal path (single-pass merged-embedding forward; skip prefix-cache lookup)
-  - `AnyModel::forward_batched` arms for `LlavaQwen2` (delegate to inner `Transformer::forward_batched`) and `QwenVl` (new `Qwen3NextCausalLM::forward_batched`)
-  - `Qwen3NextCausalLM::forward_batched(&mut self, inputs: &Array, kv_caches: &mut [&mut Vec<Option<LayerCache>>]) -> Result<Array, Exception>` — port the `Transformer::forward_batched` structure (per-request offsets, batched projections, per-request RoPE/cache updates) to the Qwen3Next layer stack.
+  - `Qwen3NextCausalLM::forward_batched(&mut self, inputs: &Array, kv_caches: &mut [&mut Vec<Option<LayerCache>>]) -> Result<Array, Exception>` — port `Transformer::forward_batched`: per-request position offsets from each cache, batched projections over the stacked `[N, 1]` inputs, per-request RoPE/cache updates inside the layer loop, LM head applied per request. Must handle both `LayerCache::KV` and `LayerCache::Arrays` entries per request, and the hybrid SSM/attention layer mix (`qwen3_next.rs` layers are a `Vec<DecoderLayer>` where each layer may be attention or SSM — follow how `forward_raw_from_hidden` iterates them).
+  - `AnyModel::forward_batched` arms: `LlavaQwen2` → inner `Transformer::forward_batched` (KV cache); `QwenVl` → `m.language_model.forward_batched` (Hybrid cache); `AnyCache::Hybrid` no longer rejected when the model is `Qwen3Next`/`QwenVl`.
+  - `batch=true` allowlist extended to `llava-qwen2` and `qwen3_5_vl` (doctor + startup + README).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2048,10 +2059,29 @@ fn multimodal_batch_request_skips_prefix_cache_and_runs_forward_multimodal() {
 }
 ```
 
+And in `qwen3_next.rs`'s test module, a batched-decode parity test:
+
+```rust
+#[test]
+fn forward_batched_matches_forward_on_single_request() {
+    // Build a tiny Qwen3Next model (existing test constructor). Two requests:
+    // (a) run forward() on one token with a fresh cache
+    // (b) run forward_batched(&[token]) with one cache
+    // assert logits equal (after eval) within 1e-5.
+}
+
+#[test]
+fn forward_batched_two_requests_different_offsets() {
+    // Request A has 3 cached tokens (offset 3), request B has 1 (offset 1).
+    // Stack [A_next, B_next] through forward_batched; assert each output row
+    // matches a single-request forward() at its own offset.
+}
+```
+
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p higgs-engine batch_engine::tests --lib`
-Expected: FAIL — `image_batch` field doesn't exist.
+Run: `cargo test -p higgs-engine batch_engine::tests --lib && cargo test -p higgs-models qwen3_next::tests --lib`
+Expected: FAIL — `image_batch` field doesn't exist; `forward_batched` not defined on `Qwen3NextCausalLM`.
 
 - [ ] **Step 3: Implement**
 
@@ -2071,18 +2101,20 @@ if let Some(batch) = &prefill.req.image_batch {
 }
 ```
 
-- `forward_batched` for the VLM families: `LlavaQwen2` → `m.language_model.forward_batched(inputs, kv_refs)` (its inner model is a `Transformer`); `QwenVl` → `m.language_model.forward_batched(inputs, kv_refs)`; Gemma variants when implemented. Add `Qwen3NextCausalLM::forward_batched` by porting the transformer version (per-request offsets from each cache, batched projections over the stacked single tokens, per-request RoPE/cache writes). This is the largest single function — reuse the layer structure of `forward_raw_from_hidden` where possible.
-- Extend the `batch=true` config gate (doctor + server startup + README) family-by-family as each wrapper's batched decode lands: after this task, `batch=true` is valid for `llama`, `mistral`, `qwen2`, `qwen3` (existing) + `llava-qwen2` (new) + `qwen3_5_vl` (new).
+Then the batched decode work, in order:
+1. **Port `Transformer::forward_batched` to `Qwen3NextCausalLM`.** Read `Transformer::forward_batched` (in `crates/higgs-models/src/transformer.rs`, ~line 697) carefully first — it is the reference: per-request offsets from `kv_caches[i].first().offset()`, batched projections over `[N, 1]` stacked tokens, then a per-request loop for RoPE/attention/cache writes. `Qwen3Next` differs in: cache entries are `LayerCache` (KV or Arrays), and layers mix attention/SSM (each `DecoderLayer` has its own forward that consumes the cache). The faithful approach for the first version: **loop layers; for each layer, loop requests** — per-request `layer.forward` with that request's cache — which is correct but not batched across requests; then, as a second pass within the same task, batch the heavy projections (Q/K/V, gate/up) across requests where the layer structure permits, keeping per-request RoPE/SSM state writes. The parity tests above must pass at the end; if full projection batching proves infeasible for SSM layers, the per-request loop over layers is acceptable **only if** the parity tests pass and the batch decode path is still one forward call per round from the engine's perspective.
+2. **`AnyModel::forward_batched` arms:** accept `AnyCache::Hybrid` when the model is `Qwen3Next` (convert `&mut AnyCache` → `&mut Vec<Option<LayerCache>>`), and `AnyCache::KV` when the model is `LlavaQwen2` (delegate to the inner Qwen2 `Transformer`). Keep rejecting Hybrid for non-Qwen3Next models (Gemma 3/4 don't use it).
+3. **`batch=true` gate:** extend the allowlist (`llama`, `mistral`, `qwen2`, `qwen3` + `llava-qwen2` + `qwen3_5_vl`) in `doctor.rs`, the server-startup batch check, and the README batch-support section.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p higgs-engine --lib && cargo test -p higgs -- --test-threads=1`
-Expected: PASS.
+Run: `cargo test -p higgs-engine --lib && cargo test -p higgs-models --lib && cargo test -p higgs -- --test-threads=1`
+Expected: PASS — parity tests and all existing tests green.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/higgs-engine/src/batch_engine.rs crates/higgs-models/src/qwen3_next.rs crates/higgs-models/src/llava_qwen2.rs crates/higgs-models/src/lib.rs
+git add crates/higgs-engine/src/batch_engine.rs crates/higgs-models/src/qwen3_next.rs crates/higgs-models/src/llava_qwen2.rs crates/higgs-models/src/lib.rs crates/higgs/src/doctor.rs README.md
 git commit -m "feat(engine): batch-mode vision with multimodal prefill and batched decode"
 ```
 
