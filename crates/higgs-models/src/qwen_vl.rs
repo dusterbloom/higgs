@@ -537,9 +537,10 @@ impl QwenVlModel {
             // Crop to the image's own (unpadded) dims — the batch canvas is
             // zero-padded to the largest image, and padded regions must never
             // reach the tower.
-            let pixel = batch
-                .pixel_values
-                .index((i32_idx..i32_idx + 1, ..image_h_i32, ..image_w_i32, ..));
+            let pixel =
+                batch
+                    .pixel_values
+                    .index((i32_idx..i32_idx + 1, ..image_h_i32, ..image_w_i32, ..));
             let &[_, h, w, _] = pixel.shape() else {
                 return Err(Exception::custom(
                     "Qwen-VL: expected [1, H, W, 3] pixel slice",
@@ -650,6 +651,7 @@ impl VisionModel for QwenVlModel {
             pixel_values,
             per_image_tokens,
             image_sizes,
+            image_offsets: vec![],
             layout: ImageTokenLayout::default(),
         })
     }

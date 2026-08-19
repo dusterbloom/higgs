@@ -25,6 +25,128 @@ pub(crate) fn apply_rope(x: &Array, rope: &nn::Rope, offset: i32) -> Result<Arra
     )
 }
 
+/// Apply `RoPE` with a per-position offset array (`offsets` is `[L]`).
+///
+/// Used by the Gemma `VisionModel` path to honor pan-and-scan crop offsets:
+/// image feature rows are rotated at their crop's grid-slot position instead
+/// of their sequential position.
+///
+/// `offsets` holds **absolute** positions (not additive offsets on top of the
+/// sequential index) — `offsets[i] = base + i` is equivalent to the scalar
+/// path's `apply_rope(x, rope, base)`. Scale multiplies the positions.
+///
+/// Implemented manually (not `mlx_fast_rope_dynamic`): the vendored MLX fast
+/// rope kernel only accepts a scalar or per-batch offset (`size == 1` or
+/// `size == B`), so per-position offsets need the explicit cos/sin rotation
+/// below (same approach as the Qwen3-Next sparse-prefill path).
+pub(crate) fn apply_rope_dynamic(
+    x: &Array,
+    rope: &nn::Rope,
+    offsets: &Array,
+) -> Result<Array, Exception> {
+    apply_rope_at_positions_manual(x, offsets, rope.dimensions, rope.base, rope.scale)
+}
+
+/// Manual `RoPE` rotation at per-position `positions` (`[L]` or `[B, L]`).
+///
+/// `x` is `[B, H, L, D]` (or `[B, L, D]`). The standard (non-traditional)
+/// rotary formula splits the last axis in half and rotates with
+/// `angle = positions * scale * base^(-2i/dim)`.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn apply_rope_at_positions_manual(
+    x: &Array,
+    positions: &Array,
+    dimensions: i32,
+    base: f32,
+    scale: f32,
+) -> Result<Array, Exception> {
+    use mlx_rs::ops;
+
+    // x shape: [B, H, L, D] or [B, L, D]
+    let shape = x.shape();
+    let ndim = shape.len();
+
+    if ndim < 2 {
+        return Err(Exception::custom("Input must have at least 2 dimensions"));
+    }
+
+    // Normalize 3D [B, L, D] to 4D [B, 1, L, D] so the rotation below can use
+    // fixed 4-axis slicing; the result is reshaped back at the end.
+    let x4d = if ndim == 3 {
+        let b = *shape
+            .first()
+            .ok_or_else(|| Exception::custom("Input must have at least 2 dimensions"))?;
+        let l = *shape
+            .get(1)
+            .ok_or_else(|| Exception::custom("Input must have at least 2 dimensions"))?;
+        let d = *shape
+            .get(2)
+            .ok_or_else(|| Exception::custom("Input must have at least 2 dimensions"))?;
+        x.reshape(&[b, 1, l, d])?
+    } else {
+        x.clone()
+    };
+
+    let half_dim = dimensions / 2;
+    let half_dim_i32 = half_dim;
+    let dimensions_f32 = f32::from(i16::try_from(dimensions).unwrap_or(i16::MAX));
+
+    // Compute frequencies: base^(-2i/dimensions) for i in [0, half_dim)
+    let inv_freq: Vec<f32> = (0..half_dim)
+        .map(|i| {
+            let i_f32 = f32::from(i16::try_from(i).unwrap_or(i16::MAX));
+            let power = -2.0 * i_f32 / dimensions_f32;
+            base.powf(power)
+        })
+        .collect();
+    let inv_freq_arr = Array::from_slice(&inv_freq, &[half_dim_i32]);
+
+    // Get positions as [L] or [B, L]
+    let pos_shape = positions.shape();
+    let l_dim = *pos_shape
+        .last()
+        .ok_or_else(|| Exception::custom("positions must have at least 1 dim"))?;
+
+    // Compute angles: (positions * scale) * inv_freq
+    let positions_scaled = positions.multiply(Array::from_f32(scale))?;
+    let positions_expanded = positions_scaled.reshape(&[l_dim, 1])?;
+    let inv_freq_expanded = inv_freq_arr.reshape(&[1, half_dim_i32])?;
+    let angles = ops::multiply(&positions_expanded, &inv_freq_expanded)?;
+
+    // Compute cos and sin
+    let cos_raw = ops::cos(&angles)?;
+    let sin_raw = ops::sin(&angles)?;
+
+    // Reshape for broadcasting against [B, H, L, D]: [1, 1, L, half_dim]
+    let cos = cos_raw.reshape(&[1, 1, l_dim, half_dim_i32])?;
+    let sin = sin_raw.reshape(&[1, 1, l_dim, half_dim_i32])?;
+
+    // Split x into two halves along last dimension
+    let x_first = x4d.index((.., .., .., ..half_dim));
+    let x_second = x4d.index((.., .., .., half_dim..));
+
+    // Apply RoPE rotation
+    // output_first = x_first * cos - x_second * sin
+    // output_second = x_first * sin + x_second * cos
+    let output_first = ops::subtract(
+        &ops::multiply(&x_first, &cos)?,
+        &ops::multiply(&x_second, &sin)?,
+    )?;
+    let output_second = ops::add(
+        &ops::multiply(&x_first, &sin)?,
+        &ops::multiply(&x_second, &cos)?,
+    )?;
+
+    // Concatenate back
+    let output = ops::concatenate_axis(&[&output_first, &output_second], -1)?;
+
+    if ndim == 3 {
+        output.reshape(shape)
+    } else {
+        Ok(output)
+    }
+}
+
 /// Attention mask variant.
 #[derive(Debug, Clone)]
 pub(crate) enum AttentionMask {

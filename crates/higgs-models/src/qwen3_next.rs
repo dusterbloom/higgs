@@ -1571,23 +1571,11 @@ impl Qwen3NextAttention {
         keys: &Array,
         positions: &Array,
     ) -> Result<(Array, Array), Exception> {
-        // Use manual RoPE implementation for per-token positions
-        let queries_with_rope = apply_rope_manual(
-            queries,
-            positions,
-            self.rope.dimensions,
-            self.rope.base,
-            self.rope.scale,
-        )?;
-
-        let keys_with_rope = apply_rope_manual(
-            keys,
-            positions,
-            self.rope.dimensions,
-            self.rope.base,
-            self.rope.scale,
-        )?;
-
+        // Manual RoPE implementation for per-token positions (the vendored MLX
+        // fast rope only accepts a scalar offset); shared with Gemma 3/4 via
+        // `crate::utils::apply_rope_dynamic`.
+        let queries_with_rope = crate::utils::apply_rope_dynamic(queries, &self.rope, positions)?;
+        let keys_with_rope = crate::utils::apply_rope_dynamic(keys, &self.rope, positions)?;
         Ok((queries_with_rope, keys_with_rope))
     }
 }
@@ -3523,96 +3511,6 @@ pub struct Qwen3NextCausalLM {
     dense_mtp: Option<DenseMtpHead>,
     #[param]
     moe_mtp: Option<MoeMtpHead>,
-}
-
-// Manual RoPE implementation for arbitrary positions
-/// Manual `RoPE` implementation for arbitrary positions
-#[allow(dead_code)]
-fn apply_rope_manual(
-    x: &Array,
-    positions: &Array,
-    dimensions: i32,
-    base: f32,
-    _scale: f32,
-) -> Result<Array, Exception> {
-    use mlx_rs::ops;
-
-    // x shape: [B, H, L, D] or [B, L, D]
-    let shape = x.shape();
-    let ndim = shape.len();
-
-    if ndim < 2 {
-        return Err(Exception::custom("Input must have at least 2 dimensions"));
-    }
-
-    let half_dim = dimensions / 2;
-    let half_dim_i32 = half_dim;
-    #[allow(clippy::cast_precision_loss)]
-    let dimensions_f32 = f32::from(i16::try_from(dimensions).unwrap_or(i16::MAX));
-
-    // Compute frequencies: base^(-2i/dimensions) for i in [0, half_dim)
-    let inv_freq: Vec<f32> = (0..half_dim)
-        .map(|i| {
-            #[allow(clippy::cast_precision_loss)]
-            let i_f32 = f32::from(i16::try_from(i).unwrap_or(i16::MAX));
-            let power = -2.0 * i_f32 / dimensions_f32;
-            base.powf(power)
-        })
-        .collect();
-    let inv_freq_arr = Array::from_slice(&inv_freq, &[half_dim_i32]);
-
-    // Get positions as [L] or [B, L]
-    let pos_shape = positions.shape();
-    let l_dim = *pos_shape
-        .last()
-        .ok_or_else(|| Exception::custom("positions must have at least 1 dim"))?;
-
-    tracing::debug!(
-        "apply_rope_manual: x.shape={:?}, positions.shape={:?}, dimensions={}, base={}",
-        x.shape(),
-        positions.shape(),
-        dimensions,
-        base
-    );
-    // Compute angles: positions * inv_freq
-    // positions: [L], inv_freq: [half_dim] -> angles: [L, half_dim]
-    let positions_expanded = positions.reshape(&[l_dim, 1])?;
-    let inv_freq_expanded = inv_freq_arr.reshape(&[1, half_dim_i32])?;
-    let angles = ops::multiply(&positions_expanded, &inv_freq_expanded)?;
-
-    // Compute cos and sin
-    let cos_raw = ops::cos(&angles)?;
-    let sin_raw = ops::sin(&angles)?;
-
-    // Reshape for broadcasting: [1, 1, L, half_dim] or [1, L, half_dim]
-    let cos_shape: Vec<i32> = if ndim == 4 {
-        vec![1, 1, l_dim, half_dim_i32]
-    } else {
-        vec![1, l_dim, half_dim_i32]
-    };
-    let cos = cos_raw.reshape(&cos_shape)?;
-    let sin = sin_raw.reshape(&cos_shape)?;
-
-    // Split x into two halves along last dimension
-    let x_first = x.index((.., .., .., ..half_dim));
-    let x_second = x.index((.., .., .., half_dim..));
-
-    // Apply RoPE rotation
-    // output_first = x_first * cos - x_second * sin
-    // output_second = x_first * sin + x_second * cos
-    let output_first = ops::subtract(
-        &ops::multiply(&x_first, &cos)?,
-        &ops::multiply(&x_second, &sin)?,
-    )?;
-    let output_second = ops::add(
-        &ops::multiply(&x_first, &sin)?,
-        &ops::multiply(&x_second, &cos)?,
-    )?;
-
-    // Concatenate back
-    let last_axis = i32::try_from(ndim.saturating_sub(1))
-        .map_err(|_| Exception::custom("ndim too large for i32"))?;
-    ops::concatenate_axis(&[&output_first, &output_second], last_axis)
 }
 
 impl Qwen3NextCausalLM {

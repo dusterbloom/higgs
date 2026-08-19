@@ -53,6 +53,7 @@ impl SigLipVisionConfig {
 // SigLIP Attention
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 struct SigLipAttention {
     q_proj: nn::Linear,
     k_proj: nn::Linear,
@@ -121,6 +122,7 @@ impl SigLipAttention {
 // SigLIP MLP
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 struct SigLipMlp {
     fc1: nn::Linear,
     fc2: nn::Linear,
@@ -145,6 +147,7 @@ impl SigLipMlp {
 // SigLIP Encoder Layer
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 struct SigLipEncoderLayer {
     self_attn: SigLipAttention,
     layer_norm1: nn::LayerNorm,
@@ -185,6 +188,7 @@ impl SigLipEncoderLayer {
 ///
 /// Takes pixel values `[B, H, W, C]` (NHWC, channels last for MLX) and
 /// produces hidden states `[B, num_patches, hidden_size]`.
+#[derive(Debug, Clone)]
 pub struct SigLipVisionModel {
     patch_embedding: nn::Conv2d,
     position_embedding: nn::Embedding,
@@ -237,7 +241,8 @@ impl SigLipVisionModel {
         let embeddings = patch_embeds.reshape(&[b, h * w, c])?;
 
         // Add position embeddings
-        let position_ids = arange!(stop = self.num_patches)?;
+        // int32: Embedding lookup (gather) requires integral indices.
+        let position_ids = arange!(stop = self.num_patches, dtype = i32)?;
         let pos_embeds = self.position_embedding.forward(&position_ids)?;
         let mut hidden_states = embeddings.add(&pos_embeds)?;
 
@@ -260,7 +265,8 @@ impl SigLipVisionModel {
         };
         let embeddings = patch_embeds.reshape(&[b, h * w, c])?;
 
-        let position_ids = arange!(stop = self.num_patches)?;
+        // int32: Embedding lookup (gather) requires integral indices.
+        let position_ids = arange!(stop = self.num_patches, dtype = i32)?;
         let pos_embeds = self.position_embedding.forward(&position_ids)?;
         let mut hidden_states = embeddings.add(&pos_embeds)?;
 

@@ -95,6 +95,9 @@ pub struct ImageBatch {
     /// encoders must crop each slice back to these dims before the vision
     /// tower so padded regions never feed the model.
     pub image_sizes: Vec<(u32, u32)>,
+    /// Positional offset of each encoded crop, in crop order across images
+    /// (Gemma pan-and-scan only; empty for families without crop offsets).
+    pub image_offsets: Vec<i32>,
     /// Token layout for this batch (k can depend on preprocessing output).
     pub layout: ImageTokenLayout,
 }
@@ -254,6 +257,7 @@ mod tests {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
             per_image_tokens: vec![1],
             image_sizes: vec![(1, 1); 1],
+            image_offsets: vec![],
             layout: ImageTokenLayout {
                 start: None,
                 end: None,
@@ -279,6 +283,7 @@ mod tests {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
             per_image_tokens: vec![1, 1],
             image_sizes: vec![(1, 1); 2],
+            image_offsets: vec![],
             layout: ImageTokenLayout::default(),
         };
         let merged = merge_embeddings(&ids, &text_embeddings, &features, &batch).unwrap();
@@ -306,6 +311,7 @@ mod tests {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
             per_image_tokens: vec![2],
             image_sizes: vec![(1, 1); 1],
+            image_offsets: vec![],
             layout: ImageTokenLayout::default(),
         };
         let merged = merge_embeddings(&ids, &text_embeddings, &features, &batch).unwrap();
@@ -329,7 +335,8 @@ mod tests {
         let batch = ImageBatch {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
             per_image_tokens: vec![2],
-            image_sizes: vec![(1, 1); 1], // expects 2 sentinels, ids has 1
+            image_sizes: vec![(1, 1); 1],
+            image_offsets: vec![], // expects 2 sentinels, ids has 1
             layout: ImageTokenLayout::default(),
         };
         let err = merge_embeddings(&ids, &text_embeddings, &features, &batch).unwrap_err();
@@ -351,6 +358,7 @@ mod tests {
             pixel_values: Array::from_slice(&[0.0f32; 3], &[1, 1, 1, 3]),
             per_image_tokens: vec![],
             image_sizes: vec![(1, 1); 0],
+            image_offsets: vec![],
             layout: ImageTokenLayout::default(),
         };
         let merged = merge_embeddings(&ids, &text_embeddings, &empty_features, &batch).unwrap();

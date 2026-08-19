@@ -278,6 +278,7 @@ impl VisionModel for LlavaQwen2Model {
             // LLaVA resizes every image to the same square target, so the
             // batch canvas is unpadded and sizes are uniform.
             image_sizes: vec![(target, target); images.len()],
+            image_offsets: vec![],
             layout: ImageTokenLayout::default(),
         })
     }

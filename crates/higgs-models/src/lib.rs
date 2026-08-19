@@ -882,8 +882,8 @@ impl AnyModel {
     }
 
     /// Whether this model is a vision-language model that supports image input.
-    pub const fn is_vlm(&self) -> bool {
-        matches!(self, Self::LlavaQwen2(_) | Self::QwenVl(_))
+    pub fn is_vlm(&self) -> bool {
+        self.as_vision().is_some()
     }
 
     /// Capability metadata if this model supports vision.
@@ -896,12 +896,14 @@ impl AnyModel {
         match self {
             Self::LlavaQwen2(m) => Some(m),
             Self::QwenVl(m) => Some(m),
+            // Gemma 3/4 are vision-capable only when a vision tower was loaded
+            // (multimodal checkpoints); text-only variants report `None`.
+            Self::Gemma3(m) => m.has_vision_tower().then_some(m),
+            Self::Gemma4(m) => m.has_vision_tower().then_some(m),
             Self::Transformer(_)
             | Self::Qwen3Next(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
-            | Self::Gemma3(_)
-            | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::DeepSeekV2(_)
@@ -914,12 +916,13 @@ impl AnyModel {
         match self {
             Self::LlavaQwen2(m) => Some(m),
             Self::QwenVl(m) => Some(m),
+            // Gemma 3/4 are vision-capable only when a vision tower was loaded.
+            Self::Gemma3(m) => m.has_vision_tower().then_some(m),
+            Self::Gemma4(m) => m.has_vision_tower().then_some(m),
             Self::Transformer(_)
             | Self::Qwen3Next(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
-            | Self::Gemma3(_)
-            | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::DeepSeekV2(_)
@@ -1726,6 +1729,23 @@ pub(crate) fn checkpoint_has_key_suffix(model_path: &Path, suffix: &str) -> bool
         files.iter().any(|f| {
             Array::load_safetensors(f)
                 .is_ok_and(|loaded| loaded.keys().any(|k| k.ends_with(suffix)))
+        })
+    })
+}
+
+/// Whether any weight key in the checkpoint contains `needle` (e.g. a
+/// `vision_tower.` prefix on multimodal Gemma checkpoints). Like
+/// [`checkpoint_has_key_suffix`], prefers the shard index when present.
+pub(crate) fn checkpoint_has_key_containing(model_path: &Path, needle: &str) -> bool {
+    let index_path = model_path.join("model.safetensors.index.json");
+    if let Ok(json) = std::fs::read_to_string(&index_path)
+        && let Ok(index) = serde_json::from_str::<WeightMapIndex>(&json)
+    {
+        return index.weight_map.keys().any(|k| k.contains(needle));
+    }
+    collect_safetensors_files(model_path).is_ok_and(|files| {
+        files.iter().any(|f| {
+            Array::load_safetensors(f).is_ok_and(|loaded| loaded.keys().any(|k| k.contains(needle)))
         })
     })
 }
