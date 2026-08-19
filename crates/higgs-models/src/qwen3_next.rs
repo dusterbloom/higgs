@@ -3725,15 +3725,29 @@ impl Qwen3NextCausalLM {
     ///
     /// Used internally by `forward_hidden` (which adds norm) and
     /// `forward_with_hidden` (which needs raw states for MTP).
-    #[allow(non_snake_case, clippy::too_many_lines)]
+    #[allow(non_snake_case)]
     fn forward_raw_hidden(
         &mut self,
         inputs: &Array,
         _mask: Option<&Array>,
         kv_cache: &mut Vec<Option<LayerCache>>,
     ) -> Result<Array, Exception> {
-        let mut h = self.model.embed_tokens.forward(inputs)?;
+        let h = self.model.embed_tokens.forward(inputs)?;
+        self.forward_raw_from_hidden(h, kv_cache)
+    }
 
+    /// Layer stack from a pre-computed hidden/embedding array (no embed lookup).
+    ///
+    /// Builds the attention mask from the hidden shape, sizes `kv_cache` to the
+    /// layer count, and runs every `DecoderLayer`. The `_mask` argument of
+    /// `forward_raw_hidden` was historically ignored; this refactor preserves
+    /// that behavior exactly — no attention masking is applied here.
+    #[allow(non_snake_case, clippy::too_many_lines)]
+    fn forward_raw_from_hidden(
+        &mut self,
+        mut h: Array,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
         if kv_cache.is_empty() {
             *kv_cache = self.make_cache();
         }
@@ -3918,6 +3932,52 @@ impl Qwen3NextCausalLM {
             Some(head) => head.forward(&h_last),
             None => self.model.embed_tokens.as_linear(&h_last),
         }
+    }
+
+    /// Forward pass starting from pre-merged embeddings (VLM path), skipping
+    /// the `embed_tokens` lookup.
+    ///
+    /// The caller merges image features into the text embedding array before
+    /// calling this — the same contract as
+    /// `crate::Model::forward_from_embeddings` (the generic transformer).
+    /// Returns logits for the **last position only** (shape `[B, 1, vocab]`),
+    /// matching [`Qwen3NextCausalLM::forward`].
+    ///
+    /// Like `forward_raw_hidden`, the `mask` argument is currently ignored
+    /// (the causal mask is derived from the hidden shape and cache offset).
+    #[allow(non_snake_case)]
+    pub fn forward_from_embeddings(
+        &mut self,
+        embeddings: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_raw_from_hidden(embeddings.clone(), kv_cache)?;
+        let h_normed = self.model.norm.forward(&h)?;
+        let h_last = h_normed.index((.., -1.., ..)); // [B, 1, hidden]
+
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&h_last),
+            None => self.model.embed_tokens.as_linear(&h_last),
+        }
+    }
+
+    /// Forward pass starting from pre-merged embeddings, returning hidden
+    /// states after the final `RMSNorm` (before the LM head) for **all**
+    /// positions — the embedding counterpart of [`Qwen3NextCausalLM::forward_hidden`].
+    ///
+    /// Used by MTP-adjacent paths that need per-position hidden states from a
+    /// pre-merged (VLM) embedding array. `mask` is ignored, as in
+    /// `forward_from_embeddings`.
+    #[allow(non_snake_case)]
+    pub fn forward_from_embeddings_hidden(
+        &mut self,
+        embeddings: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_raw_from_hidden(embeddings.clone(), kv_cache)?;
+        self.model.norm.forward(&h)
     }
 
     /// Forward pass producing logits for **only the last token**.
@@ -5666,6 +5726,190 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    /// Fill every placeholder weight of a freshly-constructed tiny model with
+    /// valid random (quantized) values so a forward pass is well-defined.
+    ///
+    /// `QLinear`/`QEmbedding` params are built as shape-`[1]` placeholders and
+    /// are replaced by the safetensors loader in production; for unit tests we
+    /// generate dense random weights of the correct shape and quantize them.
+    /// RmsNorm weights, `Conv1d` weights and GDN `A_log`/`dt_bias` are already
+    /// initialized by their constructors and are left untouched.
+    #[allow(clippy::too_many_lines)]
+    fn randomize_weights(model: &mut Qwen3NextCausalLM) -> Result<(), Exception> {
+        use mlx_rs::module::ModuleParameters;
+
+        // Copy scalars out of `args` so the immutable borrow does not conflict
+        // with the mutable borrow of the params below.
+        let hidden = model.args.hidden_size;
+        let vocab = model.args.vocab_size;
+        let n_heads = model.args.num_attention_heads;
+        let n_kv = model.args.num_key_value_heads;
+        let head_dim = model.args.head_dim;
+        let key_dim = model.args.linear_num_key_heads * model.args.linear_key_head_dim;
+        let value_dim = model.args.linear_num_value_heads * model.args.linear_value_head_dim;
+        let n_v_heads = model.args.linear_num_value_heads;
+        let conv_dim = 2 * key_dim + value_dim;
+        let conv_kernel = model.args.linear_conv_kernel_dim;
+        let n_experts = model.args.num_experts;
+        let moe_interm = model.args.moe_intermediate_size;
+        let shared_interm = model.args.shared_expert_intermediate_size;
+        let dense_interm = model.args.intermediate_size;
+
+        // group_size must divide every quantized K/L dimension; the tiny
+        // config's hidden/intermediate dims are all multiples of 64.
+        const GROUP_SIZE: i32 = 64;
+        const BITS: i32 = 4;
+
+        let mut params = model.parameters_mut().flatten();
+        let keys: Vec<String> = params.keys().map(ToString::to_string).collect();
+        for key in &keys {
+            if !key.ends_with(".weight") {
+                continue;
+            }
+            let base = key.trim_end_matches(".weight");
+            let scales_key = format!("{base}.scales");
+            let biases_key = format!("{base}.biases");
+
+            // Depthwise conv1d: the mlx-rs builder ignores `groups` and
+            // produces a `[conv_dim, kernel, conv_dim]` placeholder, but the
+            // forward path expects `[conv_dim, kernel, 1]` (real checkpoints
+            // ship this shape and the loader replaces it).
+            if base.ends_with(".linear_attn.conv1d") {
+                let dense = mlx_rs::random::uniform::<f32, f32>(
+                    -0.5,
+                    0.5,
+                    &[conv_dim, conv_kernel, 1],
+                    None,
+                )?;
+                if let Some(param) = params.get_mut(key.as_str()) {
+                    **param = dense;
+                }
+                continue;
+            }
+
+            if !params.contains_key(scales_key.as_str())
+                || !params.contains_key(biases_key.as_str())
+            {
+                // Dense param already initialized (RmsNorm, A_log, dt_bias, ...).
+                continue;
+            }
+
+            let shape: Vec<i32> = if base == "model.embed_tokens" || base == "lm_head" {
+                vec![vocab, hidden]
+            } else if base.ends_with(".self_attn.q_proj") {
+                vec![2 * n_heads * head_dim, hidden]
+            } else if base.ends_with(".self_attn.k_proj") || base.ends_with(".self_attn.v_proj") {
+                vec![n_kv * head_dim, hidden]
+            } else if base.ends_with(".self_attn.o_proj") {
+                // SDPA emits all `num_attention_heads`; o_proj maps back to hidden.
+                vec![hidden, n_heads * head_dim]
+            } else if base.ends_with(".linear_attn.in_proj_qkvz") {
+                vec![2 * key_dim + 2 * value_dim, hidden]
+            } else if base.ends_with(".linear_attn.in_proj_ba") {
+                // Flat [`b_all|a_all`], one scalar per v-head: 2 * num_v_heads rows.
+                vec![2 * n_v_heads, hidden]
+            } else if base.ends_with(".linear_attn.out_proj") {
+                vec![hidden, value_dim]
+            } else if base.ends_with(".mlp.gate") {
+                vec![n_experts, hidden]
+            } else if base.ends_with(".mlp.shared_expert_gate") {
+                vec![shared_interm, hidden]
+            } else if base.ends_with(".mlp.switch_mlp.gate_proj")
+                || base.ends_with(".mlp.switch_mlp.up_proj")
+            {
+                vec![n_experts, moe_interm, hidden]
+            } else if base.ends_with(".mlp.switch_mlp.down_proj") {
+                vec![n_experts, hidden, moe_interm]
+            } else if base.ends_with(".mlp.shared_expert.gate_proj")
+                || base.ends_with(".mlp.shared_expert.up_proj")
+            {
+                vec![shared_interm, hidden]
+            } else if base.ends_with(".mlp.shared_expert.down_proj") {
+                vec![hidden, shared_interm]
+            } else if base.ends_with(".mlp.gate_proj") || base.ends_with(".mlp.up_proj") {
+                vec![dense_interm, hidden]
+            } else if base.ends_with(".mlp.down_proj") {
+                vec![hidden, dense_interm]
+            } else {
+                return Err(Exception::custom(format!(
+                    "randomize_weights: unknown quantized param `{base}`"
+                )));
+            };
+
+            let dense = mlx_rs::random::uniform::<f32, f32>(-0.5, 0.5, &shape, None)?;
+            let (w, s, b) = mlx_rs::ops::quantize(&dense, GROUP_SIZE, BITS)?;
+            if let Some(param) = params.get_mut(key.as_str()) {
+                **param = w;
+            }
+            if let Some(param) = params.get_mut(scales_key.as_str()) {
+                **param = s;
+            }
+            if let Some(param) = params.get_mut(biases_key.as_str()) {
+                **param = b;
+            }
+        }
+        Ok(())
+    }
+
+    /// Backbone parity gate: running the layer stack from pre-computed
+    /// embeddings must produce exactly the same hidden states and last-position
+    /// logits as running it from token ids (the id path performs the embed
+    /// lookup internally). This is the contract Task 9's VLM callers rely on.
+    #[test]
+    fn forward_from_embeddings_matches_forward_hidden_on_text() {
+        use mlx_rs::module::ModuleParametersExt;
+
+        let args = valid_causal_lm_args();
+        let mut model = Qwen3NextCausalLM::new(args).unwrap();
+        randomize_weights(&mut model).unwrap();
+        model.eval().unwrap();
+
+        // Short prompt as raw ids (the tiny test model has no tokenizer).
+        let tokens: Vec<u32> = vec![42, 17, 7, 255, 3, 9, 100];
+        let ids = Array::from_slice(&tokens, &[1, 7]);
+
+        // h1 = model.forward_hidden(&ids, None, &mut cache1)
+        let mut cache1: Vec<Option<LayerCache>> = Vec::new();
+        let h1 = model.forward_hidden(&ids, None, &mut cache1).unwrap();
+
+        // emb = model.embed_tokens_from_ids(&tokens); h2 = forward_from_embeddings_hidden
+        let emb = model.embed_tokens_from_ids(&tokens).unwrap();
+        let mut cache2: Vec<Option<LayerCache>> = Vec::new();
+        let h2 = model
+            .forward_from_embeddings_hidden(&emb, None, &mut cache2)
+            .unwrap();
+
+        mlx_rs::transforms::eval([&h1, &h2]).unwrap();
+        assert_eq!(h1.shape(), h2.shape(), "hidden shapes must match");
+        let diff = h1.subtract(&h2).unwrap().abs().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        assert!(
+            max_diff < 1e-5,
+            "hidden parity: forward_from_embeddings(embeds) != forward_hidden(ids), max |diff| = {max_diff}"
+        );
+
+        // forward_from_embeddings returns last-position logits; must equal forward().
+        let mut cache3: Vec<Option<LayerCache>> = Vec::new();
+        let logits_token = model.forward(&ids, None, &mut cache3).unwrap();
+        let mut cache4: Vec<Option<LayerCache>> = Vec::new();
+        let logits_emb = model
+            .forward_from_embeddings(&emb, None, &mut cache4)
+            .unwrap();
+
+        mlx_rs::transforms::eval([&logits_token, &logits_emb]).unwrap();
+        assert_eq!(
+            logits_token.shape(),
+            logits_emb.shape(),
+            "logits shapes must match"
+        );
+        let diff2 = logits_token.subtract(&logits_emb).unwrap().abs().unwrap();
+        let max_diff2: f32 = diff2.max(None).unwrap().item();
+        assert!(
+            max_diff2 < 1e-5,
+            "logits parity: forward_from_embeddings(embeds) != forward(ids), max |diff| = {max_diff2}"
+        );
     }
 
     #[test]
