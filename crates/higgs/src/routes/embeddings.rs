@@ -19,6 +19,13 @@ use crate::{
     },
 };
 
+/// POST /v1/embeddings — text-only.
+///
+/// Images are rejected by the type system: [`EmbeddingInput`] accepts only a
+/// plain string or an array of strings (see [`crate::types::openai::EmbeddingInput`]),
+/// so a request carrying an `image_url` content part fails serde
+/// deserialization with a 400 before this handler runs. There is no code path
+/// that accepts image data here.
 #[allow(clippy::too_many_lines)]
 pub async fn embeddings(
     State(state): State<SharedState>,
@@ -164,5 +171,48 @@ pub async fn embeddings(
             }
             response
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// `EmbeddingInput` is `Single(String) | Multiple(Vec<String>)`, so an
+    /// OpenAI-style `image_url` content part (an object) cannot deserialize —
+    /// serde rejects it and the route 400s before the handler runs.
+    #[test]
+    fn embedding_input_rejects_image_url_content() {
+        // Single-input with an image_url object.
+        let single = json!({
+            "model": "test-model",
+            "input": {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        });
+        let err = serde_json::from_value::<EmbeddingRequest>(single).unwrap_err();
+        assert!(!err.to_string().is_empty());
+
+        // Array-of-inputs with an image_url object inside.
+        let multiple = json!({
+            "model": "test-model",
+            "input": [
+                "plain text",
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}}
+            ]
+        });
+        assert!(serde_json::from_value::<EmbeddingRequest>(multiple).is_err());
+    }
+
+    /// Plain strings still deserialize (guards against over-strictness).
+    #[test]
+    fn embedding_input_accepts_plain_strings() {
+        let single = json!({"model": "test-model", "input": "hello"});
+        let req: EmbeddingRequest = serde_json::from_value(single).unwrap();
+        assert!(matches!(req.input, EmbeddingInput::Single(_)));
+
+        let multiple = json!({"model": "test-model", "input": ["a", "b"]});
+        let req: EmbeddingRequest = serde_json::from_value(multiple).unwrap();
+        assert!(matches!(req.input, EmbeddingInput::Multiple(_)));
     }
 }

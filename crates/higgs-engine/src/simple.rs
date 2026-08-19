@@ -88,6 +88,24 @@ fn mtp_prefill_priming_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_MTP_PRIME_PREFILL").ok().as_deref()).unwrap_or(true)
 }
 
+/// Whether MTP speculative decode may run for this request.
+///
+/// MTP requires a model with MTP heads, greedy decoding (temperature == 0),
+/// no constraints, and no logprobs. Requests carrying images must never take
+/// the MTP path: draft logits at image positions are meaningless, so image
+/// requests always fall back to the plain decode path.
+#[allow(clippy::float_cmp, clippy::fn_params_excessive_bools)]
+fn mtp_allowed(
+    enable_mtp: bool,
+    has_mtp: bool,
+    has_images: bool,
+    constrained: bool,
+    logprobs: bool,
+    temperature: f32,
+) -> bool {
+    enable_mtp && has_mtp && !has_images && !constrained && !logprobs && temperature == 0.0
+}
+
 fn parse_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -1184,14 +1202,15 @@ impl SimpleEngine {
 
         let mut prepared = self.prepare_generation(prompt_tokens, image_batch)?;
         let prompt_len = prepared.prompt_len;
-        #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
-            && self.tuning.enable_mtp()
-            && prepared.model.has_mtp()
-            && prepared.image_batch.is_none()
-            && constraint.is_none()
-            && !logprobs
-            && params.temperature == 0.0;
+            && mtp_allowed(
+                self.tuning.enable_mtp(),
+                prepared.model.has_mtp(),
+                prepared.image_batch.is_some(),
+                constraint.is_some(),
+                logprobs,
+                params.temperature,
+            );
 
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
             prompt_tokens,
@@ -1250,8 +1269,14 @@ impl SimpleEngine {
         // Architecture-neutral speculative decode: prompt-lookup drafting plus
         // batched verifier logits. Explicitly opt-in while benchmark data is
         // collected because the normal path has a pipelined single-token loop.
+        // Never for image requests: the verifier would run against KV states
+        // holding image embeddings, and draft logits are meaningless there.
         #[allow(clippy::float_cmp)]
-        if prompt_lookup_enabled() && constraint.is_none() && !logprobs && params.temperature == 0.0
+        if prompt_lookup_enabled()
+            && prepared.image_batch.is_none()
+            && constraint.is_none()
+            && !logprobs
+            && params.temperature == 0.0
         {
             return self.prompt_lookup_generate(
                 &mut prepared.model,
@@ -1266,14 +1291,17 @@ impl SimpleEngine {
         }
 
         // MTP speculative decode: enabled by the resolved MLX runtime tuning.
-        // Only for greedy (temperature == 0), no constraints, no logprobs.
-        #[allow(clippy::float_cmp)]
-        if self.tuning.enable_mtp()
-            && prepared.model.has_mtp()
-            && constraint.is_none()
-            && !logprobs
-            && params.temperature == 0.0
-        {
+        // Only for greedy (temperature == 0), no constraints, no logprobs,
+        // and never for image requests (draft logits at image positions are
+        // meaningless — see `mtp_allowed`).
+        if mtp_allowed(
+            self.tuning.enable_mtp(),
+            prepared.model.has_mtp(),
+            prepared.image_batch.is_some(),
+            constraint.is_some(),
+            logprobs,
+            params.temperature,
+        ) {
             let actual_prompt_tokens = prepared.actual_prompt_tokens.clone();
             return self.mtp_generate(
                 &mut prepared.model,
@@ -2380,14 +2408,15 @@ impl SimpleEngine {
 
         let mut prepared = self.prepare_generation(prompt_tokens, image_batch)?;
         let prompt_len = prepared.prompt_len;
-        #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
-            && self.tuning.enable_mtp()
-            && prepared.model.has_mtp()
-            && prepared.image_batch.is_none()
-            && constraint.is_none()
-            && !logprobs
-            && params.temperature == 0.0;
+            && mtp_allowed(
+                self.tuning.enable_mtp(),
+                prepared.model.has_mtp(),
+                prepared.image_batch.is_some(),
+                constraint.is_some(),
+                logprobs,
+                params.temperature,
+            );
 
         // Stream prefill progress only when the caller opted in (OpenAI
         // `return_progress: true`). Direct higgs-engine callers and BatchEngine
@@ -2506,14 +2535,16 @@ impl SimpleEngine {
             return Ok(());
         }
 
-        // MTP speculative decode (streaming): greedy, no constraints, no logprobs.
-        #[allow(clippy::float_cmp)]
-        if self.tuning.enable_mtp()
-            && prepared.model.has_mtp()
-            && constraint.is_none()
-            && !logprobs
-            && params.temperature == 0.0
-        {
+        // MTP speculative decode (streaming): greedy, no constraints, no
+        // logprobs, and never for image requests (see `mtp_allowed`).
+        if mtp_allowed(
+            self.tuning.enable_mtp(),
+            prepared.model.has_mtp(),
+            prepared.image_batch.is_some(),
+            constraint.is_some(),
+            logprobs,
+            params.temperature,
+        ) {
             let actual_prompt_tokens = prepared.actual_prompt_tokens.clone();
             return self.mtp_generate_streaming(
                 &mut prepared.model,
@@ -3091,7 +3122,7 @@ mod tests {
     use super::{
         IncrementalDetok, Tokenizer, adaptive_draft_depth_for_cap, check_stop_sequences,
         derive_model_name, detect_thinking_support, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, parse_enabled_flag,
+        find_stop_in_tail, mtp_allowed, parse_enabled_flag,
     };
     use std::path::Path;
 
@@ -3172,6 +3203,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path(), r#"{"model_type": "qwen3_5_moe"}"#);
         assert!(detect_thinking_support(dir.path()));
+    }
+
+    // --- MTP gate ---
+
+    /// A request carrying images must NEVER take the MTP/speculative-decode
+    /// path, even on an MTP-enabled model: draft logits at image positions are
+    /// meaningless. The gate predicate must reject any request with an image
+    /// batch while still admitting otherwise-identical text requests.
+    #[test]
+    fn image_request_disables_mtp() {
+        // Same request twice — with and without an image batch.
+        assert!(
+            mtp_allowed(true, true, false, false, false, 0.0),
+            "text-only greedy request is MTP-eligible"
+        );
+        assert!(
+            !mtp_allowed(true, true, true, false, false, 0.0),
+            "image request must never take the MTP path"
+        );
+    }
+
+    /// The other MTP preconditions stay enforced by the same predicate.
+    #[test]
+    fn mtp_allowed_keeps_existing_preconditions() {
+        // MTP disabled in runtime tuning.
+        assert!(!mtp_allowed(false, true, false, false, false, 0.0));
+        // Model without MTP heads.
+        assert!(!mtp_allowed(true, false, false, false, false, 0.0));
+        // Constrained decoding.
+        assert!(!mtp_allowed(true, true, false, true, false, 0.0));
+        // Logprobs requested.
+        assert!(!mtp_allowed(true, true, false, false, true, 0.0));
+        // Non-greedy sampling.
+        assert!(!mtp_allowed(true, true, false, false, false, 0.7));
     }
 
     /// A plain Llama (no reasoning `model_type`, no `enable_thinking` in the
