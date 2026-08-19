@@ -10,7 +10,7 @@ use higgs_engine::simple::SimpleEngine;
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
 use higgs_models::turboquant::KvCacheConfig;
-use higgs_models::vision::{ImageBatch, VisionCapabilities, VisionError};
+use higgs_models::vision::{ImageBatch, ImageInput, VisionCapabilities, VisionError};
 
 use crate::config::HiggsConfig;
 use crate::metrics::MetricsStore;
@@ -137,6 +137,21 @@ impl Engine {
             Self::Batch(_) => None,
             #[cfg(test)]
             Self::Stub(_) => None,
+        }
+    }
+
+    /// Preprocess decoded images into a family-native [`ImageBatch`].
+    ///
+    /// Only the simple (serialized) engine can serve a vision model; `Batch`
+    /// and `Stub` variants error.
+    pub fn preprocess_images(&self, images: &[ImageInput]) -> Result<ImageBatch, VisionError> {
+        match self {
+            Self::Simple(e) => e.preprocess_images(images),
+            Self::Batch(_) => Err(VisionError::Preprocess(
+                "batch engine has no vision model".to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(VisionError::Preprocess("stub".to_owned())),
         }
     }
 
@@ -373,5 +388,12 @@ mod tests {
         let engine = Engine::test_stub("test-stub");
         assert!(!engine.is_vlm());
         assert!(engine.vision_capabilities().is_none());
+    }
+
+    #[test]
+    fn stub_engine_preprocess_images_errors() {
+        let engine = Engine::test_stub("test-stub");
+        let err = engine.preprocess_images(&[]).unwrap_err();
+        assert!(err.to_string().contains("stub"));
     }
 }

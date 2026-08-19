@@ -289,7 +289,7 @@ async fn chat_completions_non_streaming(
 
     // Build effective messages: text parts with the family marker spliced at
     // each image part's true position. Text-only requests pass through
-    // unchanged. (Marker-to-sentinel expansion lands in Task 8.)
+    // unchanged. The marker tokens are expanded into sentinel runs below.
     let effective_messages = if media.is_empty() {
         req.messages.clone()
     } else {
@@ -306,14 +306,29 @@ async fn chat_completions_non_streaming(
         req.reasoning.as_ref(),
     );
 
-    let prompt_tokens = engine
+    let mut prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
 
-    // Multimodal requests are rewired in Task 8 (extract → preprocess →
-    // ImageBatch → postprocess_image_tokens); until then routes pass no image
-    // batch and VLM image inference is temporarily disabled.
-    let image_batch: Option<higgs_models::vision::ImageBatch> = None;
+    // Multimodal requests: preprocess the extracted media into an `ImageBatch`
+    // (family-native pixel layout + per-image feature counts), then expand
+    // each family marker token into its sentinel run so the sentinel count
+    // matches `sum(batch.per_image_tokens)` expected by the embedding merge.
+    // Both preprocessing and token postprocessing failures are client problems
+    // (bad/malformed image data), so they map to strict 400s.
+    let image_batch = if !media.is_empty() && engine.is_vlm() {
+        let inputs: Vec<higgs_models::vision::ImageInput> =
+            media.into_iter().map(MediaItem::into).collect();
+        let batch = engine
+            .preprocess_images(&inputs)
+            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+        engine
+            .postprocess_image_tokens(&mut prompt_tokens, &batch)
+            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+        Some(batch)
+    } else {
+        None
+    };
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
@@ -470,7 +485,7 @@ async fn chat_completions_stream(
 
     // Build effective messages: text parts with the family marker spliced at
     // each image part's true position. Text-only requests pass through
-    // unchanged. (Marker-to-sentinel expansion lands in Task 8.)
+    // unchanged. The marker tokens are expanded into sentinel runs below.
     let effective_messages = if media.is_empty() {
         req.messages.clone()
     } else {
@@ -490,14 +505,29 @@ async fn chat_completions_stream(
     // </tool_call>` blocks the model produces and turns them into
     // structured `ToolCallDelta` SSE events.
     let prompt_tools = req.tools.as_deref().filter(|t| !t.is_empty());
-    let prompt_tokens = engine
+    let mut prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&messages, prompt_tools, thinking_enabled_stream)
         .map_err(ServerError::Engine)?;
 
-    // Multimodal requests are rewired in Task 8 (extract → preprocess →
-    // ImageBatch → postprocess_image_tokens); until then routes pass no image
-    // batch and VLM image inference is temporarily disabled.
-    let image_batch: Option<higgs_models::vision::ImageBatch> = None;
+    // Multimodal requests: preprocess the extracted media into an `ImageBatch`
+    // (family-native pixel layout + per-image feature counts), then expand
+    // each family marker token into its sentinel run so the sentinel count
+    // matches `sum(batch.per_image_tokens)` expected by the embedding merge.
+    // Both preprocessing and token postprocessing failures are client problems
+    // (bad/malformed image data), so they map to strict 400s.
+    let image_batch = if !media.is_empty() && engine.is_vlm() {
+        let inputs: Vec<higgs_models::vision::ImageInput> =
+            media.into_iter().map(MediaItem::into).collect();
+        let batch = engine
+            .preprocess_images(&inputs)
+            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+        engine
+            .postprocess_image_tokens(&mut prompt_tokens, &batch)
+            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+        Some(batch)
+    } else {
+        None
+    };
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 

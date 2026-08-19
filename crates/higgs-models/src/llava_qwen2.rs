@@ -201,6 +201,32 @@ fn llava_target_size(image_size: i32, details: &[ImageDetail]) -> u32 {
     size as u32
 }
 
+/// Expand `<image>` marker ids into `num_patches` consecutive sentinels.
+///
+/// [`merge_embeddings`](crate::vision::merge_embeddings) requires exactly
+/// `sum(batch.per_image_tokens)` sentinel positions; `LLaVA` expands every
+/// `<image>` marker into `num_patches` (one per vision patch) so a batch of N
+/// images yields `N * num_patches` feature positions. Tokens that are not the
+/// marker (including other special tokens) pass through unchanged.
+fn expand_image_markers(tokens: &mut Vec<u32>, marker_id: u32, num_patches: usize, sentinel: u32) {
+    if num_patches == 0 {
+        return;
+    }
+    let marker_count = tokens.iter().filter(|&&t| t == marker_id).count();
+    if marker_count == 0 {
+        return;
+    }
+    tokens.reserve(marker_count * (num_patches - 1));
+    let original = std::mem::take(tokens);
+    for t in original {
+        if t == marker_id {
+            tokens.extend(std::iter::repeat_n(sentinel, num_patches));
+        } else {
+            tokens.push(t);
+        }
+    }
+}
+
 impl VisionModel for LlavaQwen2Model {
     fn vision_capabilities(&self) -> VisionCapabilities {
         VisionCapabilities {
@@ -263,11 +289,12 @@ impl VisionModel for LlavaQwen2Model {
         let Some(marker_id) = tokenizer.token_to_id("<image>") else {
             return Ok(()); // tokenizer without <image>: nothing to expand
         };
-        for t in tokens.iter_mut() {
-            if *t == marker_id {
-                *t = IMAGE_TOKEN_INDEX as u32;
-            }
-        }
+        let num_patches = usize::try_from(self.vision_tower.num_patches())
+            .map_err(|e| VisionError::Preprocess(format!("invalid vision num_patches: {e}")))?;
+        // Each <image> marker becomes `num_patches` consecutive sentinels so
+        // the sentinel count matches `sum(batch.per_image_tokens)` required by
+        // `merge_embeddings` (N images -> N * num_patches feature rows).
+        expand_image_markers(tokens, marker_id, num_patches, IMAGE_TOKEN_INDEX as u32);
         Ok(())
     }
 
@@ -457,5 +484,40 @@ mod tests {
     fn llava_target_size_low_is_floored_at_128() {
         assert_eq!(llava_target_size(64, &[ImageDetail::Low]), 128);
         assert_eq!(llava_target_size(0, &[ImageDetail::Low]), 128);
+    }
+
+    #[test]
+    fn expand_image_markers_single_marker_becomes_num_patches_sentinels() {
+        // One <image> marker (id 99) must expand to `num_patches` consecutive
+        // sentinels so the count matches `sum(per_image_tokens)` in merge.
+        let mut tokens = vec![1, 2, 99, 3];
+        expand_image_markers(&mut tokens, 99, 4, IMAGE_TOKEN_INDEX as u32);
+        let s = IMAGE_TOKEN_INDEX as u32;
+        assert_eq!(tokens, vec![1, 2, s, s, s, s, 3]);
+    }
+
+    #[test]
+    fn expand_image_markers_two_markers_expand_in_order() {
+        let mut tokens = vec![1, 99, 2, 99, 3];
+        expand_image_markers(&mut tokens, 99, 3, IMAGE_TOKEN_INDEX as u32);
+        let s = IMAGE_TOKEN_INDEX as u32;
+        assert_eq!(tokens, vec![1, s, s, s, 2, s, s, s, 3]);
+        assert_eq!(tokens.len(), 9);
+    }
+
+    #[test]
+    fn expand_image_markers_without_markers_is_unchanged() {
+        let mut tokens = vec![1, 2, 3];
+        expand_image_markers(&mut tokens, 99, 4, IMAGE_TOKEN_INDEX as u32);
+        assert_eq!(tokens, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn expand_image_markers_uses_image_token_index_sentinel() {
+        let mut tokens = vec![99];
+        expand_image_markers(&mut tokens, 99, 2, IMAGE_TOKEN_INDEX as u32);
+        assert_eq!(tokens, vec![IMAGE_TOKEN_INDEX as u32; 2]);
+        assert_eq!(tokens[0], IMAGE_TOKEN_INDEX as u32);
+        assert_eq!(tokens[0] as i32, IMAGE_TOKEN_INDEX);
     }
 }

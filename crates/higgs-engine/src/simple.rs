@@ -12,7 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
     turboquant::KvCacheConfig,
-    vision::{ImageBatch, VisionCapabilities, VisionError, VisionModel},
+    vision::{ImageBatch, ImageInput, VisionCapabilities, VisionError, VisionModel},
 };
 use mlx_rs::{
     Array, Dtype, Stream,
@@ -543,6 +543,19 @@ impl SimpleEngine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         model.as_vision().map(VisionModel::vision_capabilities)
+    }
+
+    /// Preprocess decoded images into a family-native [`ImageBatch`] ready for
+    /// the multimodal forward pass. Errors when the model has no vision.
+    pub fn preprocess_images(&self, images: &[ImageInput]) -> Result<ImageBatch, VisionError> {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let v = model
+            .as_vision()
+            .ok_or_else(|| VisionError::Preprocess("model has no vision".to_owned()))?;
+        v.preprocess_images(images)
     }
 
     /// Expand image marker tokens into the sentinel runs for `batch`.
