@@ -23,11 +23,14 @@ use tokenizers::Tokenizer;
 use crate::AnyCache;
 use crate::cache::KeyValueCache;
 use crate::error::ModelError;
-use crate::siglip::{SigLipVisionConfig, SigLipVisionModel, load_siglip_weights, preprocess_image};
+use crate::siglip::{
+    SigLipVisionConfig, SigLipVisionModel, load_siglip_weights, preprocess_image_resized,
+    preprocess_images_batch,
+};
 use crate::transformer;
 use crate::vision::{
-    ImageBatch, ImageInput, ImageTokenLayout, ImageTokenLayoutKind, VisionCapabilities,
-    VisionError, VisionModel,
+    ImageBatch, ImageDetail, ImageInput, ImageTokenLayout, ImageTokenLayoutKind,
+    VisionCapabilities, VisionError, VisionModel,
 };
 
 /// Token ID used as a placeholder for image positions in the input sequence.
@@ -197,6 +200,23 @@ impl LlavaQwen2Model {
     }
 }
 
+/// Resolve the shared `LLaVA` preprocessing target from the request's detail tiers.
+///
+/// `LLaVA` is a fixed square processor, so every image in the batch is resized
+/// to the same target. The highest requested tier wins: only when *every*
+/// image is `Low` do we downscale to half the encoder's native size (floored
+/// at 128px); `Auto`/`High` (and empty inputs) use `image_size` as-is.
+#[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+fn llava_target_size(image_size: i32, details: &[ImageDetail]) -> u32 {
+    let all_low = !details.is_empty() && details.iter().all(|d| *d == ImageDetail::Low);
+    let size = if all_low {
+        (image_size / 2).max(128)
+    } else {
+        image_size
+    };
+    size as u32
+}
+
 impl VisionModel for LlavaQwen2Model {
     fn vision_capabilities(&self) -> VisionCapabilities {
         VisionCapabilities {
@@ -218,24 +238,29 @@ impl VisionModel for LlavaQwen2Model {
     }
 
     fn preprocess_images(&self, images: &[ImageInput]) -> Result<ImageBatch, VisionError> {
-        // Full multi-image implementation lands in Task 6; for now implement
-        // the single-image path so the trait compiles and Phase 1 tests pass.
-        let size = u32::try_from(self.image_size)
-            .map_err(|_| VisionError::Preprocess("invalid image_size".to_owned()))?;
-        let mut pixel_values = Vec::with_capacity(images.len());
-        for img in images {
-            pixel_values.push(
-                preprocess_image(&img.bytes, size)
-                    .map_err(|e| VisionError::Preprocess(e.to_string()))?,
-            );
-        }
+        let details: Vec<ImageDetail> = images.iter().map(|i| i.detail).collect();
+        let target = llava_target_size(self.image_size, &details);
+
+        let bytes: Vec<&[u8]> = images.iter().map(|i| i.bytes.as_slice()).collect();
+        let pixel_values = match preprocess_images_batch(&bytes, target) {
+            Ok(pixel_values) => pixel_values,
+            Err(batch_err) => {
+                // `preprocess_images_batch` collapses every failure into
+                // `Preprocess`; re-run the offending image through the decode
+                // path so malformed bytes surface as `VisionError::Decode`
+                // rather than a server-side preprocessing error.
+                for img in images {
+                    preprocess_image_resized(
+                        &img.bytes,
+                        (target, target),
+                        image::imageops::FilterType::Lanczos3,
+                    )?;
+                }
+                return Err(batch_err);
+            }
+        };
         Ok(ImageBatch {
-            pixel_values: if pixel_values.is_empty() {
-                Array::from_slice::<f32>(&[], &[0, 1, 1, 3])
-            } else {
-                mlx_rs::ops::concatenate_axis(&pixel_values.iter().collect::<Vec<_>>(), 0)
-                    .map_err(|e| VisionError::Preprocess(e.to_string()))?
-            },
+            pixel_values,
             per_image_tokens: vec![1; images.len()],
             layout: ImageTokenLayout::default(),
         })
@@ -459,4 +484,41 @@ fn load_safetensor_weights(model_dir: &Path) -> Result<HashMap<String, Array>, M
         all_weights.extend(loaded);
     }
     Ok(all_weights)
+}
+
+#[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llava_target_size_uses_native_size_unless_all_low() {
+        assert_eq!(llava_target_size(384, &[]), 384);
+        assert_eq!(llava_target_size(384, &[ImageDetail::Auto]), 384);
+        assert_eq!(llava_target_size(384, &[ImageDetail::High]), 384);
+        // Highest requested tier wins: a single Auto/High forces full size.
+        assert_eq!(
+            llava_target_size(384, &[ImageDetail::Auto, ImageDetail::Low]),
+            384
+        );
+        assert_eq!(
+            llava_target_size(384, &[ImageDetail::High, ImageDetail::Low]),
+            384
+        );
+    }
+
+    #[test]
+    fn llava_target_size_low_downscales_to_half() {
+        assert_eq!(llava_target_size(384, &[ImageDetail::Low]), 192);
+        assert_eq!(
+            llava_target_size(384, &[ImageDetail::Low, ImageDetail::Low]),
+            192
+        );
+    }
+
+    #[test]
+    fn llava_target_size_low_is_floored_at_128() {
+        assert_eq!(llava_target_size(64, &[ImageDetail::Low]), 128);
+        assert_eq!(llava_target_size(0, &[ImageDetail::Low]), 128);
+    }
 }

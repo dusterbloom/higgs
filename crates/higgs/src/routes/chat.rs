@@ -26,8 +26,9 @@ use crate::{
     state::{Engine, SharedState},
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
-        ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent, StopSequence,
-        TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, TopLogprob,
+        ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, ContentPart, MessageContent,
+        StopSequence, TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction,
+        ToolCallFunctionDelta, TopLogprob,
     },
 };
 use higgs_models::SamplingParams;
@@ -286,13 +287,13 @@ async fn chat_completions_non_streaming(
     let media = media_extractor.extract_openai(&req.messages).await?;
     check_vision_capability(&media, engine.is_vlm(), engine.model_name())?;
 
-    // Build effective messages: text parts with marker text at image positions.
-    // (Full marker rendering lands in Task 8; for now preserve text-only behavior:
-    //  if media.is_empty(), messages pass through unchanged.)
+    // Build effective messages: text parts with the family marker spliced at
+    // each image part's true position. Text-only requests pass through
+    // unchanged. (Marker-to-sentinel expansion lands in Task 8.)
     let effective_messages = if media.is_empty() {
         req.messages.clone()
     } else {
-        inject_markers(&req.messages, media.len(), engine.image_marker_text())
+        render_markers(&req.messages, engine.image_marker_text())
     };
 
     let messages = convert_messages(&effective_messages);
@@ -467,13 +468,13 @@ async fn chat_completions_stream(
     let media = media_extractor.extract_openai(&req.messages).await?;
     check_vision_capability(&media, engine.is_vlm(), engine.model_name())?;
 
-    // Build effective messages: text parts with marker text at image positions.
-    // (Full marker rendering lands in Task 8; for now preserve text-only behavior:
-    //  if media.is_empty(), messages pass through unchanged.)
+    // Build effective messages: text parts with the family marker spliced at
+    // each image part's true position. Text-only requests pass through
+    // unchanged. (Marker-to-sentinel expansion lands in Task 8.)
     let effective_messages = if media.is_empty() {
         req.messages.clone()
     } else {
-        inject_markers(&req.messages, media.len(), engine.image_marker_text())
+        render_markers(&req.messages, engine.image_marker_text())
     };
 
     let messages = convert_messages(&effective_messages);
@@ -816,11 +817,10 @@ fn check_vision_capability(
     Ok(())
 }
 
-/// TEMPORARY: prefix markers like the old `<image>\n` behavior. Task 8 makes
-/// this position-aware using MediaItem.position.
-fn inject_markers(
+/// Rebuild message content with the family marker inserted at each image
+/// part's true position. Text parts keep their relative order.
+fn render_markers(
     messages: &[ChatCompletionMessage],
-    _count: usize,
     marker: Option<&'static str>,
 ) -> Vec<ChatCompletionMessage> {
     let marker_text = marker.unwrap_or("<image>");
@@ -830,13 +830,19 @@ fn inject_markers(
             let Some(content) = &m.content else {
                 return m.clone();
             };
-            if !content.has_images() {
+            let MessageContent::Parts(parts) = content else {
                 return m.clone();
+            };
+            let mut out = String::new();
+            for part in parts {
+                match part {
+                    ContentPart::Text { text } => out.push_str(text),
+                    ContentPart::ImageUrl { .. } => out.push_str(marker_text),
+                }
             }
-            let prefix = format!("{marker_text}\n");
             ChatCompletionMessage {
                 role: m.role.clone(),
-                content: Some(MessageContent::Text(format!("{prefix}{}", content.text()))),
+                content: Some(MessageContent::Text(out)),
                 reasoning_content: m.reasoning_content.clone(),
                 tool_calls: m.tool_calls.clone(),
                 tool_call_id: m.tool_call_id.clone(),
@@ -1077,6 +1083,77 @@ mod tests {
             detail: higgs_models::vision::ImageDetail::Auto,
             max_dims: None,
         }
+    }
+
+    fn parts_message(role: &str, parts: Vec<ContentPart>) -> ChatCompletionMessage {
+        ChatCompletionMessage {
+            role: role.to_owned(),
+            content: Some(MessageContent::Parts(parts)),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn text_part(text: &str) -> ContentPart {
+        ContentPart::Text {
+            text: text.to_owned(),
+        }
+    }
+
+    fn image_part() -> ContentPart {
+        ContentPart::ImageUrl {
+            image_url: crate::types::openai::ImageUrl {
+                url: "data:image/png;base64,AAAA".to_owned(),
+                detail: Some(higgs_models::vision::ImageDetail::Auto),
+            },
+        }
+    }
+
+    #[test]
+    fn test_render_markers_splices_marker_at_image_positions() {
+        let msgs = vec![parts_message(
+            "user",
+            vec![
+                text_part("Look at "),
+                image_part(),
+                text_part(" then "),
+                image_part(),
+                text_part("."),
+            ],
+        )];
+        let rendered = render_markers(&msgs, Some("<image>"));
+        let content = rendered.first().and_then(|m| m.content.as_ref()).unwrap();
+        let MessageContent::Text(text) = content else {
+            panic!("expected rendered text content");
+        };
+        assert_eq!(text.as_str(), "Look at <image> then <image>.");
+        assert_eq!(rendered.first().map(|m| m.role.as_str()), Some("user"));
+    }
+
+    #[test]
+    fn test_render_markers_defaults_to_image_marker() {
+        let msgs = vec![parts_message(
+            "user",
+            vec![text_part("A "), image_part(), text_part(" B")],
+        )];
+        let rendered = render_markers(&msgs, None);
+        let content = rendered.first().and_then(|m| m.content.as_ref()).unwrap();
+        let MessageContent::Text(text) = content else {
+            panic!("expected rendered text content");
+        };
+        assert_eq!(text.as_str(), "A <image> B");
+    }
+
+    #[test]
+    fn test_render_markers_passes_plain_text_messages_through() {
+        let msgs = vec![simple_message("user", Some("plain text"))];
+        let rendered = render_markers(&msgs, Some("<image>"));
+        let content = rendered.first().and_then(|m| m.content.as_ref()).unwrap();
+        let MessageContent::Text(text) = content else {
+            panic!("expected text content");
+        };
+        assert_eq!(text.as_str(), "plain text");
     }
 
     #[test]
