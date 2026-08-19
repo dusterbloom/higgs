@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
-    turboquant::KvCacheConfig,
+    turboquant::KvCacheConfig, vision::ImageBatch,
 };
 use mlx_rs::{
     Array, Stream,
@@ -50,6 +50,10 @@ struct BatchRequest {
     logprobs: bool,
     top_logprobs: Option<u32>,
     constraint: Option<crate::constrained::ConstrainedGenerator>,
+    /// Preprocessed images for multimodal requests. When present, the prompt
+    /// is prefilled in a single merged-embedding forward (image features
+    /// cannot span chunk boundaries) and the prefix cache is bypassed.
+    image_batch: Option<ImageBatch>,
     response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
 }
 
@@ -224,7 +228,7 @@ impl BatchEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -235,7 +239,7 @@ impl BatchEngine {
             top_logprobs,
             false,
             constraint,
-            pixel_values,
+            image_batch,
         )
     }
 
@@ -250,13 +254,8 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         _enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<GenerationOutput, EngineError> {
-        if pixel_values.is_some() {
-            return Err(EngineError::Generation(
-                "Batch engine does not support multimodal (image) inputs".to_owned(),
-            ));
-        }
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -288,6 +287,7 @@ impl BatchEngine {
                 logprobs,
                 top_logprobs,
                 constraint,
+                image_batch,
                 response_tx: internal_tx,
             })
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
@@ -332,7 +332,7 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -345,7 +345,7 @@ impl BatchEngine {
             false,
             false,
             constraint,
-            pixel_values,
+            image_batch,
         )
     }
 
@@ -364,13 +364,8 @@ impl BatchEngine {
         // share the streaming interface with SimpleEngine.
         _return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        image_batch: Option<ImageBatch>,
     ) -> Result<(), EngineError> {
-        if pixel_values.is_some() {
-            return Err(EngineError::Generation(
-                "Batch engine does not support multimodal (image) inputs".to_owned(),
-            ));
-        }
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -406,6 +401,7 @@ impl BatchEngine {
                 logprobs,
                 top_logprobs,
                 constraint,
+                image_batch,
                 response_tx: internal_tx,
             })
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
@@ -741,7 +737,14 @@ fn start_prefill(
         .len()
         .try_into()
         .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))?;
-    let prefix_match = prefix_cache.find_longest_prefix(&req.prompt_tokens);
+    // Multimodal requests never reuse a prefix: image features are merged into
+    // the embedding sequence, so the cached text-only KV/SSM state would not
+    // match the prompt being prefilled.
+    let prefix_match = if req.image_batch.is_some() {
+        None
+    } else {
+        prefix_cache.find_longest_prefix(&req.prompt_tokens)
+    };
     let (tokens, cache) = if let Some(matched) = prefix_match {
         let suffix = req
             .prompt_tokens
@@ -788,6 +791,28 @@ fn advance_prefill(
     let is_complete = end == prefill.tokens.len();
 
     with_new_default_stream(Stream::new(), || {
+        if let Some(batch) = &prefill.req.image_batch {
+            // Single-pass multimodal prefill: image features are merged into
+            // the embedding sequence and cannot span chunk boundaries, so the
+            // whole prompt runs through one `forward_multimodal` call.
+            let input = Array::from(prefill.tokens.as_slice()).index(NewAxis);
+            let logits = model
+                .forward_multimodal(&input, batch, &mut prefill.cache)
+                .map_err(EngineError::Mlx)?;
+            let last_logits = logits.index((.., -1, ..));
+            prefill.offset = prefill.tokens.len();
+            return complete_prefill(
+                prefix_cache,
+                tokenizer,
+                eos_token_ids,
+                prefill.req,
+                prefill.prompt_len,
+                prefill.cache,
+                last_logits,
+            )
+            .map(PrefillAdvance::Complete);
+        }
+
         let tokens = prefill
             .tokens
             .get(start..end)
@@ -887,8 +912,12 @@ fn complete_prefill(
             eval(eval_targets).map_err(EngineError::Mlx)?;
         }
 
-        // Cache the post-prefill state
-        prefix_cache.store(&req.prompt_tokens, cache.clone());
+        // Cache the post-prefill state. Multimodal requests never enter the
+        // prefix cache: their KV/SSM state reflects merged image features and
+        // would not match a text-only prefix.
+        if req.image_batch.is_none() {
+            prefix_cache.store(&req.prompt_tokens, cache.clone());
+        }
         crate::simple::maybe_clear_mlx_cache(
             crate::simple::should_clear_mlx_cache_after_prefill(),
             "batch_post_prefill",
@@ -1238,5 +1267,120 @@ mod tests {
     fn prefill_chunk_ranges_cover_each_token_once() {
         let ranges = prefill_chunk_ranges(10, 4);
         assert_eq!(ranges, vec![0..4, 4..8, 8..10]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multimodal prefill
+    // -----------------------------------------------------------------------
+
+    /// A multimodal request must bypass the prefix cache (the full prompt is
+    /// re-prefilled so image features can be merged) and dispatch prefill to
+    /// `forward_multimodal` instead of the chunked text forward.
+    #[test]
+    fn multimodal_batch_request_skips_prefix_cache_and_runs_forward_multimodal() {
+        use higgs_models::qwen3_next::{Qwen3NextCausalLM, Qwen3NextModelArgs};
+        use higgs_models::vision::{ImageBatch, ImageTokenLayout};
+
+        // Tiny hybrid model (structure only; `make_cache` needs no weights).
+        let args: Qwen3NextModelArgs = serde_json::from_str(
+            r#"{
+                "model_type": "qwen3_next",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-06,
+                "vocab_size": 128,
+                "max_position_embeddings": 512,
+                "full_attention_interval": 4,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_conv_kernel_dim": 4,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "shared_expert_intermediate_size": 64,
+                "moe_intermediate_size": 32,
+                "norm_topk_prob": true
+            }"#,
+        )
+        .unwrap();
+        let mut model = AnyModel::Qwen3Next(Qwen3NextCausalLM::new(args).unwrap());
+
+        // Prompt longer than MIN_PREFIX_LEN (16); seed the cache with a
+        // 16-token prefix so a text request WOULD match it.
+        let prompt: Vec<u32> = (0..24).collect();
+        let mut prefix_cache = PrefixCache::new(8);
+        let partial_cache = model.make_cache().unwrap();
+        prefix_cache.store(&prompt[..16].to_vec(), partial_cache);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let make_req = |prompt_tokens: Vec<u32>, image_batch: Option<ImageBatch>| BatchRequest {
+            prompt_tokens,
+            max_tokens: 4,
+            params: SamplingParams::default(),
+            stop_sequences: vec![],
+            logprobs: false,
+            top_logprobs: None,
+            constraint: None,
+            response_tx: tx.clone(),
+            image_batch,
+        };
+        let dummy_batch = ImageBatch {
+            pixel_values: Array::from_slice(&[0.0_f32; 3], &[1, 1, 1, 3]),
+            per_image_tokens: vec![],
+            image_sizes: vec![],
+            image_offsets: vec![],
+            layout: ImageTokenLayout::default(),
+        };
+
+        // Contrast: a text request with the same prompt reuses the cached
+        // prefix and prefills only the suffix.
+        let text_prefill =
+            start_prefill(&model, &mut prefix_cache, make_req(prompt.clone(), None)).unwrap();
+        assert_eq!(
+            text_prefill.tokens,
+            prompt[16..].to_vec(),
+            "text request should reuse the 16-token prefix cache"
+        );
+
+        // Multimodal: the prefix cache must NOT be consulted — the whole
+        // prompt is re-prefilled.
+        let multimodal_prefill = start_prefill(
+            &model,
+            &mut prefix_cache,
+            make_req(prompt.clone(), Some(dummy_batch)),
+        )
+        .unwrap();
+        assert_eq!(
+            multimodal_prefill.tokens, prompt,
+            "multimodal request must re-prefill the full prompt, bypassing the prefix cache"
+        );
+        assert_eq!(multimodal_prefill.offset, 0);
+
+        // A tiny quantum must still run ONE multimodal forward: the prefill
+        // must dispatch to `forward_multimodal` (which errors on this
+        // non-VLM stub) instead of the chunked text path.
+        let tokenizer = make_tokenizer();
+        let err = match advance_prefill(
+            &mut model,
+            &mut prefix_cache,
+            &tokenizer,
+            &[],
+            multimodal_prefill,
+            1,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("multimodal prefill must run forward_multimodal, not chunked forward"),
+        };
+        assert!(
+            err.to_string()
+                .contains("does not support multimodal forward"),
+            "expected forward_multimodal dispatch error, got: {err}"
+        );
     }
 }

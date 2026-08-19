@@ -88,7 +88,10 @@ static GATED_DELTA_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
-    utils::{AttentionMask, apply_rope, create_causal_mask},
+    utils::{
+        AttentionMask, apply_rope, create_batched_decode_mask, create_causal_mask,
+        scaled_dot_product_attention,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -3978,6 +3981,254 @@ impl Qwen3NextCausalLM {
         Ok(logits)
     }
 
+    /// Batched decode: one forward pass for N requests each with 1 token over
+    /// the hybrid SSM/attention stack.
+    ///
+    /// Full-attention layers run the heavy ops (input norm, Q/K/V projections,
+    /// QK norms, SDPA, output projection, MLP) batched over the stacked `[N, 1]`
+    /// inputs; only `RoPE` and the per-request KV cache update loop over requests
+    /// (each request has its own position offset and cache), mirroring
+    /// `Transformer::forward_batched`. Gated-delta (SSM) layers keep a
+    /// per-request state machine (convolution ring buffer + recurrent state),
+    /// so the GDN block runs once per request while the residual, post-attention
+    /// norm, and MLP stay batched. The LM head is applied to the stacked hidden
+    /// states, producing `[N, 1, vocab]`.
+    ///
+    /// `TurboQuant` KV caches are materialized to dense K/V here (approximate
+    /// versus the native quantized decode path); the batch engine only ever
+    /// uses dense caches.
+    #[allow(clippy::too_many_lines, clippy::indexing_slicing)]
+    pub fn forward_batched(
+        &mut self,
+        inputs: &Array,
+        kv_caches: &mut [&mut Vec<Option<LayerCache>>],
+    ) -> Result<Array, Exception> {
+        let n = *inputs
+            .shape()
+            .first()
+            .ok_or_else(|| Exception::custom("inputs must have batch dimension"))?;
+        let n_usize = usize::try_from(n).map_err(|_| Exception::custom("batch size overflow"))?;
+        let num_layers = self.model.layers.len();
+        if kv_caches.len() != n_usize {
+            return Err(Exception::custom("kv_caches length must match batch size"));
+        }
+        for (i, cache) in kv_caches.iter_mut().enumerate() {
+            if cache.is_empty() {
+                **cache = self.make_cache();
+            }
+            if cache.len() != num_layers {
+                return Err(Exception::custom(format!(
+                    "kv_cache[{i}] length ({}) must match num layers ({num_layers})",
+                    cache.len()
+                )));
+            }
+        }
+        let head_dim = self.args.head_dim;
+
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
+            // Batched: input layernorm over the stacked [N, 1, D] hidden states.
+            let normed = layer.input_layernorm.forward(&h)?;
+
+            let r = if layer.is_linear {
+                // SSM/GDN layer: the convolution ring buffer and recurrent
+                // state are per-request, so run the block once per request
+                // with that request's cache.
+                let attn = layer
+                    .linear_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing on linear layer"))?;
+                let mut rows: Vec<Array> = Vec::with_capacity(n_usize);
+                for (req_idx, req_cache) in kv_caches.iter_mut().enumerate() {
+                    let i = i32::try_from(req_idx)
+                        .map_err(|_| Exception::custom("request index overflow"))?;
+                    let row = normed.index((i..i + 1, .., ..)); // [1, 1, D]
+                    let cache = req_cache
+                        .get_mut(layer_idx)
+                        .and_then(Option::as_mut)
+                        .ok_or_else(|| Exception::custom("Cache not initialized"))?;
+                    let LayerCache::Arrays(ssm_cache) = cache else {
+                        return Err(Exception::custom("Expected ArraysCache for linear layer"));
+                    };
+                    rows.push(attn.forward(&row, None, ssm_cache)?);
+                }
+                let refs: Vec<&Array> = rows.iter().collect();
+                ops::concatenate_axis(&refs, 0)?
+            } else {
+                // Full attention: batched Q/K/V projections and QK norms over
+                // the stacked [N, 1, D] input, then per-request RoPE + cache
+                // update, then one batched SDPA with a padded decode mask.
+                let attn = layer
+                    .self_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing on attention layer"))?;
+                let n_heads = attn.num_attention_heads;
+                let n_kv_heads = attn.num_key_value_heads;
+                let scale = attn.scale;
+
+                // Q is projected to 2 * num_heads * head_dim (doubled for gating).
+                let q_proj_output = attn.q_proj.forward_decode_fast(&normed)?;
+                let q_reshaped = q_proj_output.reshape(&[n, 1, n_heads, -1])?;
+                let q_halves = q_reshaped.split(2, Some(-1))?;
+                let queries_pre = q_halves
+                    .first()
+                    .ok_or_else(|| Exception::custom("split produced empty result"))?;
+                let gate = q_halves
+                    .get(1)
+                    .ok_or_else(|| Exception::custom("split produced empty result"))?
+                    .reshape(&[n, 1, -1])?;
+
+                let keys_raw = attn.k_proj.forward_decode_fast(&normed)?;
+                let values_raw = attn.v_proj.forward_decode_fast(&normed)?;
+
+                let queries = attn
+                    .q_norm
+                    .forward(queries_pre)?
+                    .transpose_axes(&[0, 2, 1, 3])?;
+                let keys = attn
+                    .k_norm
+                    .forward(&keys_raw.reshape(&[n, 1, n_kv_heads, -1])?)?
+                    .transpose_axes(&[0, 2, 1, 3])?;
+                let values = values_raw
+                    .reshape(&[n, 1, n_kv_heads, -1])?
+                    .transpose_axes(&[0, 2, 1, 3])?;
+
+                // Extract RoPE params as scalars (avoids borrow conflict with
+                // the mutable per-request cache references).
+                let rope_dims = attn.rope.dimensions;
+                let rope_traditional = attn.rope.traditional;
+                let rope_base = attn.rope.base;
+                let rope_scale = attn.rope.scale;
+
+                // Flatten to 2D for reliable per-request slicing.
+                let q_flat = queries.reshape(&[n, n_heads * head_dim])?;
+                let k_flat = keys.reshape(&[n, n_kv_heads * head_dim])?;
+                let v_flat = values.reshape(&[n, n_kv_heads * head_dim])?;
+
+                let mut all_queries: Vec<Array> = Vec::with_capacity(n_usize);
+                let mut all_keys: Vec<Array> = Vec::with_capacity(n_usize);
+                let mut all_values: Vec<Array> = Vec::with_capacity(n_usize);
+                let mut kv_lengths: Vec<i32> = Vec::with_capacity(n_usize);
+
+                for (req_idx, req_cache) in kv_caches.iter_mut().enumerate() {
+                    let i = i32::try_from(req_idx)
+                        .map_err(|_| Exception::custom("request index overflow"))?;
+
+                    let q_i = q_flat
+                        .index((i..i + 1, ..))
+                        .reshape(&[1, n_heads, 1, head_dim])?;
+                    let k_i = k_flat
+                        .index((i..i + 1, ..))
+                        .reshape(&[1, n_kv_heads, 1, head_dim])?;
+                    let v_i = v_flat
+                        .index((i..i + 1, ..))
+                        .reshape(&[1, n_kv_heads, 1, head_dim])?;
+
+                    let cache = req_cache
+                        .get_mut(layer_idx)
+                        .and_then(Option::as_mut)
+                        .ok_or_else(|| Exception::custom("Cache not initialized"))?;
+                    let LayerCache::KV(kv) = cache else {
+                        return Err(Exception::custom("Expected KVCache for attention layer"));
+                    };
+                    // RoPE with this request's own position offset.
+                    let offset = kv.offset();
+                    let q_rope = mlx_rs::fast::rope(
+                        &q_i,
+                        rope_dims,
+                        rope_traditional,
+                        rope_base,
+                        rope_scale,
+                        offset,
+                        None,
+                    )?;
+                    let k_rope = mlx_rs::fast::rope(
+                        &k_i,
+                        rope_dims,
+                        rope_traditional,
+                        rope_base,
+                        rope_scale,
+                        offset,
+                        None,
+                    )?;
+
+                    // Update this request's KV cache and materialize the dense
+                    // view (the batch engine only uses dense caches).
+                    let view = kv.update_and_view(k_rope, v_i)?;
+                    let (full_k, full_v) = view.into_dense()?;
+                    let seq_len = full_k
+                        .shape()
+                        .get(2)
+                        .copied()
+                        .ok_or_else(|| Exception::custom("cached keys missing seq dim"))?;
+                    kv_lengths.push(seq_len);
+                    all_queries.push(q_rope);
+                    all_keys.push(full_k);
+                    all_values.push(full_v);
+
+                    if async_layer_state_eval_enabled() {
+                        mlx_rs::transforms::async_eval(kv.eval_targets())?;
+                    }
+                }
+
+                // Right-pad shorter caches to max_kv_len and stack.
+                let max_kv_len = kv_lengths.iter().copied().max().unwrap_or(1);
+                let mut padded_keys: Vec<Array> = Vec::with_capacity(n_usize);
+                let mut padded_values: Vec<Array> = Vec::with_capacity(n_usize);
+                for (full_k, full_v) in all_keys.into_iter().zip(all_values) {
+                    let seq_len = *full_k
+                        .shape()
+                        .get(2)
+                        .ok_or_else(|| Exception::custom("cached keys missing seq dim"))?;
+                    if seq_len < max_kv_len {
+                        let pad_len = max_kv_len - seq_len;
+                        let pad_k =
+                            ops::zeros_dtype(&[1, n_kv_heads, pad_len, head_dim], full_k.dtype())?;
+                        let pad_v =
+                            ops::zeros_dtype(&[1, n_kv_heads, pad_len, head_dim], full_v.dtype())?;
+                        padded_keys.push(ops::concatenate_axis(&[&full_k, &pad_k], 2)?);
+                        padded_values.push(ops::concatenate_axis(&[&full_v, &pad_v], 2)?);
+                    } else {
+                        padded_keys.push(full_k);
+                        padded_values.push(full_v);
+                    }
+                }
+
+                let stacked_q = ops::concatenate_axis(&all_queries.iter().collect::<Vec<_>>(), 0)?;
+                let stacked_k = ops::concatenate_axis(&padded_keys.iter().collect::<Vec<_>>(), 0)?;
+                let stacked_v =
+                    ops::concatenate_axis(&padded_values.iter().collect::<Vec<_>>(), 0)?;
+
+                let mask = create_batched_decode_mask(&kv_lengths, max_kv_len)?;
+                let attn_out = scaled_dot_product_attention(
+                    stacked_q,
+                    stacked_k,
+                    stacked_v,
+                    scale,
+                    Some(&mask),
+                )?;
+                let attn_flat = attn_out
+                    .transpose_axes(&[0, 2, 1, 3])?
+                    .reshape(&[n, 1, -1])?;
+                let gated = sigmoid_mul(&gate, &attn_flat)?;
+                let out = attn.o_proj.forward_decode_fast(&gated)?;
+                mlx_rs::stop_gradient(&out)?
+            };
+
+            let h2 = h.add(r)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            h = h2.add(mlp_out)?;
+        }
+
+        let out = self.model.norm.forward(&h)?;
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&out),
+            None => self.model.embed_tokens.as_linear(&out),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // MTP (Multi-Token Prediction) speculative decode
     // -----------------------------------------------------------------------
@@ -5816,6 +6067,107 @@ mod tests {
         assert!(
             max_diff2 < 1e-5,
             "logits parity: forward_from_embeddings(embeds) != forward(ids), max |diff| = {max_diff2}"
+        );
+    }
+
+    /// Batched-decode parity gate: `forward_batched([token])` must produce
+    /// logits identical to a single-request `forward([token])` from a fresh
+    /// cache (the engine stacks one token per active request).
+    #[test]
+    fn forward_batched_matches_forward_on_single_request() {
+        use mlx_rs::module::ModuleParametersExt;
+
+        let args = valid_causal_lm_args();
+        let mut model = Qwen3NextCausalLM::new(args).unwrap();
+        randomize_weights(&mut model).unwrap();
+        model.eval().unwrap();
+
+        let token = Array::from_slice(&[42_u32], &[1, 1]);
+
+        // (a) Sequential single-token forward with a fresh cache.
+        let mut seq_cache: Vec<Option<LayerCache>> = Vec::new();
+        let seq_logits = model.forward(&token, None, &mut seq_cache).unwrap();
+
+        // (b) Batched single-request decode with a fresh cache.
+        let mut batched_cache: Vec<Option<LayerCache>> = Vec::new();
+        let mut cache_refs: Vec<&mut Vec<Option<LayerCache>>> = vec![&mut batched_cache];
+        let batched_logits = model.forward_batched(&token, &mut cache_refs).unwrap();
+
+        mlx_rs::transforms::eval([&seq_logits, &batched_logits]).unwrap();
+        assert_eq!(
+            seq_logits.shape(),
+            batched_logits.shape(),
+            "logits shapes must match"
+        );
+        let diff = seq_logits.subtract(&batched_logits).unwrap().abs().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        assert!(
+            max_diff < 1e-5,
+            "single-request batched decode != sequential forward, max |diff| = {max_diff}"
+        );
+    }
+
+    /// Batched-decode parity gate with two requests at different cache
+    /// offsets: request A has 3 cached tokens, request B has 1. Stacking
+    /// `[A_next, B_next]` through `forward_batched` must reproduce each
+    /// request's standalone `forward` at its own offset.
+    #[test]
+    fn forward_batched_two_requests_different_offsets() {
+        use mlx_rs::module::ModuleParametersExt;
+
+        let args = valid_causal_lm_args();
+        let mut model = Qwen3NextCausalLM::new(args).unwrap();
+        randomize_weights(&mut model).unwrap();
+        model.eval().unwrap();
+
+        // Prefill: A with 3 tokens (offset 3), B with 1 token (offset 1).
+        let a_prompt = Array::from_slice(&[10_u32, 20, 30], &[1, 3]);
+        let b_prompt = Array::from_slice(&[7_u32], &[1, 1]);
+        let mut cache_a: Vec<Option<LayerCache>> = Vec::new();
+        model.forward(&a_prompt, None, &mut cache_a).unwrap();
+        let mut cache_b: Vec<Option<LayerCache>> = Vec::new();
+        model.forward(&b_prompt, None, &mut cache_b).unwrap();
+
+        // Stacked decode input: [A_next, B_next] -> [2, 1].
+        let a_next = Array::from_slice(&[5_u32], &[1, 1]);
+        let b_next = Array::from_slice(&[9_u32], &[1, 1]);
+        let batched_input = mlx_rs::ops::concatenate_axis(&[&a_next, &b_next], 0).unwrap();
+        assert_eq!(batched_input.shape(), &[2, 1]);
+
+        let mut cache_refs: Vec<&mut Vec<Option<LayerCache>>> = vec![&mut cache_a, &mut cache_b];
+        let batched_logits = model
+            .forward_batched(&batched_input, &mut cache_refs)
+            .unwrap();
+        assert_eq!(
+            batched_logits.shape(),
+            &[2, 1, 1024],
+            "batched logits must be [N, 1, vocab]"
+        );
+
+        // Reference: fresh prefill + single-token forward at each request's
+        // own offset (the batched run already advanced caches A and B).
+        let mut ref_cache_a: Vec<Option<LayerCache>> = Vec::new();
+        model.forward(&a_prompt, None, &mut ref_cache_a).unwrap();
+        let ref_a = model.forward(&a_next, None, &mut ref_cache_a).unwrap();
+        let mut ref_cache_b: Vec<Option<LayerCache>> = Vec::new();
+        model.forward(&b_prompt, None, &mut ref_cache_b).unwrap();
+        let ref_b = model.forward(&b_next, None, &mut ref_cache_b).unwrap();
+
+        mlx_rs::transforms::eval([&batched_logits, &ref_a, &ref_b]).unwrap();
+
+        let row_a = batched_logits.index((0..1, .., ..));
+        let row_b = batched_logits.index((1..2, .., ..));
+        let diff_a = row_a.subtract(&ref_a).unwrap().abs().unwrap();
+        let max_a: f32 = diff_a.max(None).unwrap().item();
+        let diff_b = row_b.subtract(&ref_b).unwrap().abs().unwrap();
+        let max_b: f32 = diff_b.max(None).unwrap().item();
+        assert!(
+            max_a < 1e-5,
+            "request A (offset 3) batched != sequential, max |diff| = {max_a}"
+        );
+        assert!(
+            max_b < 1e-5,
+            "request B (offset 1) batched != sequential, max |diff| = {max_b}"
         );
     }
 

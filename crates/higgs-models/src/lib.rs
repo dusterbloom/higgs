@@ -502,46 +502,86 @@ impl AnyModel {
 
     /// Batched decode forward pass for N requests each with 1 token.
     ///
-    /// Only supported for the `Transformer` variant (Llama/Qwen/Mistral).
+    /// Supported for the `Transformer` variant (Llama/Qwen/Mistral), `LLaVA`
+    /// (delegates to its inner Qwen2 transformer), and `Qwen3Next`/`QwenVl`
+    /// (hybrid SSM/attention batched decode over `AnyCache::Hybrid`).
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
         caches: &mut [&mut AnyCache],
     ) -> Result<Array, Exception> {
-        let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
-            Vec::with_capacity(caches.len());
-        for cache in caches.iter_mut() {
-            match cache {
-                AnyCache::KV(kv) => kv_refs.push(kv),
-                AnyCache::Hybrid(_) => {
-                    return Err(Exception::custom(
-                        "Batched forward not supported for Hybrid cache",
-                    ));
-                }
-            }
-        }
-
         match self {
-            Self::Transformer(m) => m.forward_batched(inputs, &mut kv_refs),
+            Self::Transformer(m) => {
+                let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::KV(kv) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires KV cache for Transformer models",
+                        ));
+                    };
+                    kv_refs.push(kv);
+                }
+                m.forward_batched(inputs, &mut kv_refs)
+            }
+            Self::LlavaQwen2(m) => {
+                let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::KV(kv) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires KV cache for LlavaQwen2 models",
+                        ));
+                    };
+                    kv_refs.push(kv);
+                }
+                m.forward_text_batched(inputs, &mut kv_refs)
+            }
+            Self::Qwen3Next(m) => {
+                let mut hybrid_refs: Vec<&mut Vec<Option<LayerCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::Hybrid(hybrid) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires Hybrid cache for Qwen3Next models",
+                        ));
+                    };
+                    hybrid_refs.push(hybrid);
+                }
+                m.forward_batched(inputs, &mut hybrid_refs)
+            }
+            Self::QwenVl(m) => {
+                let mut hybrid_refs: Vec<&mut Vec<Option<LayerCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::Hybrid(hybrid) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires Hybrid cache for QwenVl models",
+                        ));
+                    };
+                    hybrid_refs.push(hybrid);
+                }
+                m.forward_text_batched(inputs, &mut hybrid_refs)
+            }
             Self::Qwen3Moe(_)
-            | Self::Qwen3Next(_)
             | Self::Gemma2(_)
             | Self::Gemma3(_)
             | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
-            | Self::LlavaQwen2(_)
-            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom(
-                "Batched forward only supported for Transformer models",
+                "Batched forward only supported for Transformer, LlavaQwen2, and Qwen3Next models",
             )),
         }
     }
 
     /// Whether this model supports batched decode.
     pub const fn supports_batched_decode(&self) -> bool {
-        matches!(self, Self::Transformer(_))
+        matches!(
+            self,
+            Self::Transformer(_) | Self::LlavaQwen2(_) | Self::QwenVl(_)
+        )
     }
 
     /// Whether this model has a loaded MTP head for speculative decode.

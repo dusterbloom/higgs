@@ -143,6 +143,18 @@ impl LlavaQwen2Model {
         self.language_model.forward_all_logits(inputs, mask, cache)
     }
 
+    /// Batched decode over the inner Qwen2 transformer (one token per request).
+    ///
+    /// Delegates to [`transformer::Model::forward_batched`]; the engine calls
+    /// this through `AnyModel::forward_batched` with `AnyCache::KV` caches.
+    pub fn forward_text_batched(
+        &mut self,
+        inputs: &Array,
+        kv_caches: &mut [&mut Vec<Option<crate::cache::SteppingKeyValueCache>>],
+    ) -> Result<Array, Exception> {
+        self.language_model.forward_batched(inputs, kv_caches)
+    }
+
     /// Encode an image through the vision tower and projector.
     ///
     /// Input: `pixel_values` with shape `[1, H, W, 3]` (NHWC).

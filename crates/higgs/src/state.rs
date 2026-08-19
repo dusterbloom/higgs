@@ -248,24 +248,17 @@ impl Engine {
                 constraint,
                 image_batch,
             ),
-            Self::Batch(e) => {
-                if image_batch.is_some() {
-                    return Err(EngineError::Generation(
-                        "Batch engine does not support multimodal (image) inputs".to_owned(),
-                    ));
-                }
-                e.generate_with_thinking(
-                    prompt_tokens,
-                    max_tokens,
-                    params,
-                    stop_sequences,
-                    logprobs,
-                    top_logprobs,
-                    enable_thinking,
-                    constraint,
-                    None,
-                )
-            }
+            Self::Batch(e) => e.generate_with_thinking(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                logprobs,
+                top_logprobs,
+                enable_thinking,
+                constraint,
+                image_batch,
+            ),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
         }
@@ -329,26 +322,19 @@ impl Engine {
                 constraint,
                 image_batch,
             ),
-            Self::Batch(e) => {
-                if image_batch.is_some() {
-                    return Err(EngineError::Generation(
-                        "Batch engine does not support multimodal (image) inputs".to_owned(),
-                    ));
-                }
-                e.generate_streaming_with_thinking(
-                    prompt_tokens,
-                    max_tokens,
-                    params,
-                    stop_sequences,
-                    logprobs,
-                    top_logprobs,
-                    sender,
-                    enable_thinking,
-                    return_progress,
-                    constraint,
-                    None,
-                )
-            }
+            Self::Batch(e) => e.generate_streaming_with_thinking(
+                prompt_tokens,
+                max_tokens,
+                params,
+                stop_sequences,
+                logprobs,
+                top_logprobs,
+                sender,
+                enable_thinking,
+                return_progress,
+                constraint,
+                image_batch,
+            ),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
         }

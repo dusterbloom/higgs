@@ -478,6 +478,19 @@ impl QwenVlModel {
         Ok(logits)
     }
 
+    /// Batched decode over the `Qwen3Next` backbone (one token per request).
+    ///
+    /// Delegates to [`Qwen3NextCausalLM::forward_batched`] over the hybrid
+    /// SSM/attention stack; the engine calls this through
+    /// `AnyModel::forward_batched` with `AnyCache::Hybrid` caches.
+    pub fn forward_text_batched(
+        &mut self,
+        inputs: &Array,
+        kv_caches: &mut [&mut Vec<Option<LayerCache>>],
+    ) -> Result<Array, Exception> {
+        self.language_model.forward_batched(inputs, kv_caches)
+    }
+
     /// Language-model hidden size.
     pub const fn hidden_size(&self) -> i32 {
         self.language_model.args.hidden_size

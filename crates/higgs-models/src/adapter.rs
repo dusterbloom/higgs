@@ -330,7 +330,7 @@ static LLAVA_QWEN2: BuiltinAdapter = BuiltinAdapter {
     id: "llava-qwen2",
     family: llava,
     version_range: "LLaVA-Qwen2",
-    capabilities: caps(true, false, false, false, false),
+    capabilities: caps(true, false, false, false, true),
     notes: "LLaVA vision-language model with Qwen2 text",
     kind: LoadKind::LlavaQwen2,
 };
@@ -346,7 +346,7 @@ static QWEN_VL: BuiltinAdapter = BuiltinAdapter {
     id: "qwen_vl",
     family: qwen_vl,
     version_range: "Qwen-VL",
-    capabilities: caps(true, false, false, false, false),
+    capabilities: caps(true, false, false, false, true),
     notes: "Qwen-VL vision-language family on a Qwen3Next text backbone",
     kind: LoadKind::QwenVl,
 };

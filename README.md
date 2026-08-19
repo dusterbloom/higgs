@@ -131,7 +131,7 @@ curl http://localhost:8000/v1/chat/completions \
 - Release artifacts bundle `mlx.metallib`.
 - Source builds also require `mlx.metallib` next to the executable. Higgs now restores it automatically from Cargo build output when possible, then fails loudly if it still cannot be found.
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
-- `batch=true` is only supported for transformer families with true batched decode support.
+- `batch=true` is only supported for families with true batched decode support: transformer models (`llama`, `mistral`, `qwen2`, `qwen3`) plus the `llava-qwen2` and `qwen3_5_vl` vision families.
 - For batch models, `prefill_yield_tokens` can interleave long prompt prefills with decode; use `0` or omit it for the synchronous default.
 
 ## Performance
