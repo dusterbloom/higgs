@@ -183,6 +183,7 @@ impl MediaExtractor {
                     ))
                 })?;
             self.check_size(&bytes, position, message_index)?;
+            self.check_dimensions(&bytes, position, message_index)?;
             Ok((media_type, bytes))
         } else if url.starts_with("http://") || url.starts_with("https://") {
             // Non-2xx responses (404, 5xx, ...) are fetch failures, not images.
@@ -209,6 +210,7 @@ impl MediaExtractor {
                 ))
             })?;
             self.check_size(&bytes, position, message_index)?;
+            self.check_dimensions(&bytes, position, message_index)?;
             Ok((content_type, bytes.to_vec()))
         } else {
             Err(ServerError::BadRequest(format!(
@@ -297,6 +299,7 @@ impl MediaExtractor {
                         ))
                     })?;
                 self.check_size(&bytes, position, message_index)?;
+                self.check_dimensions(&bytes, position, message_index)?;
                 bytes
             }
             (Some("url"), _, Some(image_url)) => {
@@ -337,9 +340,49 @@ impl MediaExtractor {
         }
         Ok(())
     }
+
+    /// Reject images whose decoded dimensions exceed the configured long-edge
+    /// cap (`server.max_image_dimension`), before any family preprocessing.
+    ///
+    /// Uses a header-only dimension probe ([`image::ImageReader::into_dimensions`])
+    /// so a small-byte, huge-pixel image (a decode bomb) is rejected without
+    /// ever being fully decoded. The check runs in the extractor so the 400
+    /// surfaces at the route layer as a client error.
+    fn check_dimensions(
+        &self,
+        bytes: &[u8],
+        position: usize,
+        message_index: usize,
+    ) -> Result<(), ServerError> {
+        let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| {
+                ServerError::BadRequest(format!(
+                    "failed to read image at part {position} of message {message_index}: {e}"
+                ))
+            })?;
+        let (width, height) = reader.into_dimensions().map_err(|e| {
+            ServerError::BadRequest(format!(
+                "failed to read image dimensions at part {position} of message {message_index}: {e}"
+            ))
+        })?;
+        let cap = self.max_image_dimension;
+        if width > cap || height > cap {
+            return Err(ServerError::BadRequest(format!(
+                "image at part {position} of message {message_index} is {width}x{height}, \
+                 exceeding the {cap}-pixel long-edge cap (server.max_image_dimension)"
+            )));
+        }
+        Ok(())
+    }
 }
 
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +419,69 @@ mod tests {
         let big = format!("data:image/png;base64,{}", "A".repeat(2 << 20));
         let err = e.resolve_bytes(&big, 0, 0).await.unwrap_err();
         assert!(err.to_string().contains("cap"));
+    }
+
+    /// Encode a solid `width x height` PNG in-memory (no fixture files).
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(width, height);
+        for (_, _, pixel) in img.enumerate_pixels_mut() {
+            *pixel = image::Rgb([255, 0, 0]);
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png)
+            .expect("encode test PNG");
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn rejects_image_over_max_dimension() {
+        let mut e = extractor();
+        e.max_image_dimension = 8;
+        let png = png_bytes(16, 16);
+        let url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+        let err = e.resolve_bytes(&url, 0, 0).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exceeding the 8-pixel long-edge cap"),
+            "expected dimension-cap error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_image_within_max_dimension() {
+        let mut e = extractor();
+        e.max_image_dimension = 8;
+        let png = png_bytes(8, 8);
+        let url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+        assert!(e.resolve_bytes(&url, 0, 0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dimension_cap_applies_to_anthropic_base64_image() {
+        let mut e = extractor();
+        e.max_image_dimension = 8;
+        let png = png_bytes(64, 64);
+        let msg = AnthropicMessage {
+            role: "user".to_owned(),
+            content: AnthropicContent::Blocks(vec![ContentBlock::Image {
+                source: serde_json::json!({
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64::engine::general_purpose::STANDARD.encode(&png),
+                }),
+            }]),
+        };
+        let err = e.extract_anthropic(&[msg], None).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exceeding the 8-pixel long-edge cap")
+        );
     }
 
     #[test]

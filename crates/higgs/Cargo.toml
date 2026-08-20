@@ -37,6 +37,7 @@ regex.workspace = true
 bytes.workspace = true
 http.workspace = true
 futures.workspace = true
+image.workspace = true
 toml_edit.workspace = true
 nix.workspace = true
 ctrlc.workspace = true
