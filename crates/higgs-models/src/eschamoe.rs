@@ -1467,7 +1467,7 @@ fn convert_checkpoint_impl(
     Ok((out, natives))
 }
 
-/// Whether `model_dir` holds an eschamoe checkpoint.
+/// Whether `model_dir` holds an Escha trellis-quantized checkpoint.
 ///
 /// `quantize_config.json` is the authority; `config.json`'s
 /// `quantization_config.quant_method` is accepted as a fallback because the two
@@ -1488,7 +1488,7 @@ pub fn is_eschamoe_checkpoint(model_dir: &std::path::Path) -> Result<bool, Model
         let text = std::fs::read_to_string(&path)?;
         let value: serde_json::Value = serde_json::from_str(&text)?;
         if let Some(found) = method(&value) {
-            return Ok(found == "eschamoe");
+            return Ok(matches!(found.as_str(), "eschamoe" | "escha"));
         }
     }
     Ok(false)
@@ -2023,6 +2023,18 @@ mod tests {
         // Malformed config surfaces as an error rather than a silent false.
         write("quantize_config.json", "not json");
         assert!(is_eschamoe_checkpoint(dir.path()).is_err());
+    }
+
+    #[test]
+    fn is_eschamoe_checkpoint_accepts_escha_method_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("quantize_config.json"),
+            r#"{"quant_method":"escha","bits":2.0}"#,
+        )
+        .unwrap();
+
+        assert!(is_eschamoe_checkpoint(dir.path()).unwrap());
     }
 
     #[test]
