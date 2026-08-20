@@ -204,8 +204,8 @@ fn model_object(name: String, vision: bool) -> ModelObject {
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

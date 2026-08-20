@@ -41,12 +41,7 @@ const fn default_rope_theta() -> f32 {
     10000.0
 }
 
-/// Quantization parameters from config.json.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Starcoder2 model configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -191,7 +186,7 @@ impl Starcoder2Attention {
         let rope = nn::RopeBuilder::new(head_dim)
             .traditional(false)
             .base(args.rope_theta)
-            .scale(1.0)
+            .scale(1.0_f32)
             .build()
             .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?;
 
@@ -635,7 +630,13 @@ pub fn load_starcoder2_model<P: AsRef<Path>>(
 ) -> Result<Starcoder2CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_starcoder2_model_args(model_path)?;
+    load_starcoder2_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_starcoder2_model_with_args(
+    model_path: &Path,
+    args: Starcoder2ModelArgs,
+) -> Result<Starcoder2CausalLM, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -650,6 +651,9 @@ pub fn load_starcoder2_model<P: AsRef<Path>>(
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let raw_model = Starcoder2CausalLM::new(args)?;
 
     let mut model = if let Some(ref qc) = quantization {
@@ -665,14 +669,19 @@ pub fn load_starcoder2_model<P: AsRef<Path>>(
         raw_model
     };
 
-    crate::load_quantized_safetensors_weights(&mut model, model_path, quantization.is_some())?;
+    crate::load_quantized_safetensors_weights_with_settings(
+        &mut model,
+        model_path,
+        quantization.is_some(),
+        quantization.as_ref(),
+    )?;
 
     tracing::info!("Starcoder2 model loaded successfully");
     Ok(model)
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

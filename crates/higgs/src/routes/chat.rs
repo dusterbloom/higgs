@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::HeaderMap,
     response::{
         IntoResponse, Sse,
@@ -20,12 +20,13 @@ use tokio_stream::Stream;
 use crate::{
     config::{ApiFormat, GenerationDefaults},
     error::ServerError,
-    metrics::{MetricsStore, RequestRecord},
+    media::{MediaExtractor, MediaItem},
+    metrics::{MetricsStore, RequestMetricsContext, RequestRecord},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
-        ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, MessageContent,
+        ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, ContentPart, MessageContent,
         SessionCachePolicy, StopSequence, TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction,
         ToolCallFunctionDelta, TopLogprob, merge_repetition_penalty,
     },
@@ -46,6 +47,9 @@ fn map_session_engine_error(error: higgs_engine::error::EngineError) -> ServerEr
         higgs_engine::error::EngineError::RetainedSessionUnavailable(session_id) => {
             ServerError::RetainedSessionUnavailable(session_id)
         }
+        // Image preprocessing failures are client problems on the session path
+        // too (mirrors `map_engine_error`).
+        higgs_engine::error::EngineError::Vision(v) => ServerError::BadRequest(v.to_string()),
         other => ServerError::Engine(other),
     }
 }
@@ -64,11 +68,13 @@ fn streaming_error_json(message: &str) -> String {
 #[allow(clippy::too_many_lines)]
 pub async fn chat_completions(
     State(state): State<SharedState>,
+    Extension(request_metrics): Extension<RequestMetricsContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
     let mut req: ChatCompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
+    request_metrics.set_requested_model(&req.model);
 
     if req.messages.is_empty() {
         return Err(ServerError::BadRequest(
@@ -108,6 +114,9 @@ pub async fn chat_completions(
                 )
                 .await?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                if state.metrics.is_some() {
+                    request_metrics.mark_recorded();
+                }
                 Ok(sse.into_response())
             } else {
                 let start = Instant::now();
@@ -123,8 +132,8 @@ pub async fn chat_completions(
                         id: 0,
                         timestamp: Instant::now(),
                         wallclock: chrono::Utc::now(),
-                        model: response.model.clone(),
-                        provider: "higgs".to_owned(),
+                        model: Some(response.model.clone()),
+                        provider: Some("higgs".to_owned()),
                         routing_method: routing_method.into(),
                         status: 200,
                         duration: start.elapsed(),
@@ -132,6 +141,7 @@ pub async fn chat_completions(
                         output_tokens: u64::from(response.usage.completion_tokens),
                         error_body: None,
                     });
+                    request_metrics.mark_recorded();
                 }
                 Ok(Json(response).into_response())
             }
@@ -171,8 +181,8 @@ pub async fn chat_completions(
                             id: 0,
                             timestamp: Instant::now(),
                             wallclock: chrono::Utc::now(),
-                            model: metrics_model.clone(),
-                            provider: provider_name.clone(),
+                            model: Some(metrics_model.clone()),
+                            provider: Some(provider_name.clone()),
                             routing_method: routing_method.into(),
                             status: result.as_ref().map_or(502, |resp| resp.status().as_u16()),
                             duration: start.elapsed(),
@@ -180,6 +190,7 @@ pub async fn chat_completions(
                             output_tokens: 0,
                             error_body: None,
                         });
+                        request_metrics.mark_recorded();
                     }
                     result
                 }
@@ -213,8 +224,8 @@ pub async fn chat_completions(
                                 id: 0,
                                 timestamp: Instant::now(),
                                 wallclock: chrono::Utc::now(),
-                                model: metrics_model.clone(),
-                                provider: provider_name.clone(),
+                                model: Some(metrics_model.clone()),
+                                provider: Some(provider_name.clone()),
                                 routing_method: routing_method.into(),
                                 status: upstream_status,
                                 duration: start.elapsed(),
@@ -222,6 +233,7 @@ pub async fn chat_completions(
                                 output_tokens: 0,
                                 error_body: None,
                             });
+                            request_metrics.mark_recorded();
                         }
                         if upstream_status >= 400 {
                             let status_code = axum::http::StatusCode::from_u16(upstream_status)
@@ -244,14 +256,18 @@ pub async fn chat_completions(
                         let resp_bytes = upstream.bytes().await.map_err(|e| {
                             ServerError::ProxyError(format!("Failed to read response: {e}"))
                         })?;
-                        let usage = crate::proxy::extract_usage(&resp_bytes);
+                        let usage = if (200..300).contains(&upstream_status) {
+                            crate::proxy::extract_usage(&resp_bytes)
+                        } else {
+                            (0, 0)
+                        };
                         if let Some(ref metrics) = state.metrics {
                             metrics.record(RequestRecord {
                                 id: 0,
                                 timestamp: Instant::now(),
                                 wallclock: chrono::Utc::now(),
-                                model: metrics_model.clone(),
-                                provider: provider_name.clone(),
+                                model: Some(metrics_model.clone()),
+                                provider: Some(provider_name.clone()),
                                 routing_method: routing_method.into(),
                                 status: upstream_status,
                                 duration: start.elapsed(),
@@ -259,6 +275,7 @@ pub async fn chat_completions(
                                 output_tokens: usage.1,
                                 error_body: None,
                             });
+                            request_metrics.mark_recorded();
                         }
                         let status_code = axum::http::StatusCode::from_u16(upstream_status)
                             .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
@@ -303,12 +320,23 @@ async fn chat_completions_non_streaming(
     let want_logprobs = req.logprobs.unwrap_or(false);
     let top_logprobs = req.top_logprobs;
 
-    // Extract images and inject <image> placeholders for VLMs
-    let images = extract_images(&req.messages);
-    let effective_messages = if images.is_empty() {
+    // Extract media and gate on vision capability: a strict 400 when images
+    // are sent to a model that cannot see them.
+    let media_extractor = MediaExtractor::new(
+        state.config.server.max_image_bytes,
+        state.config.server.image_fetch_timeout,
+        state.config.server.max_image_dimension,
+    )?;
+    let media = media_extractor.extract_openai(&req.messages).await?;
+    check_vision_capability(&media, engine.is_vlm(), engine.model_name())?;
+
+    // Build effective messages: text parts with the family marker spliced at
+    // each image part's true position. Text-only requests pass through
+    // unchanged. The marker tokens are expanded into sentinel runs below.
+    let effective_messages = if media.is_empty() {
         req.messages.clone()
     } else {
-        inject_image_placeholders(&req.messages)
+        render_markers(&req.messages, engine.image_marker_text())
     };
 
     let messages = convert_messages(&effective_messages);
@@ -326,7 +354,7 @@ async fn chat_completions_non_streaming(
             .or(generation_defaults.enable_thinking),
     );
 
-    let (mut prompt_tokens, pflash_policy) = engine
+    let (prompt_tokens, pflash_policy) = engine
         .prepare_chat_prompt_with_pflash_policy(&messages, tools, thinking_enabled, prompt_mode)
         .map_err(ServerError::Engine)?;
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
@@ -341,22 +369,17 @@ async fn chat_completions_non_streaming(
         .session_lease
         .is_some_and(|lease| engine.lease_retained_session(lease.session_id, lease.ttl_seconds));
 
-    // Preprocess images for VLM
-    let pixel_values = if !images.is_empty() && engine.is_vlm() {
-        engine.replace_image_tokens(&mut prompt_tokens);
-        let image_size = engine.vlm_image_size().unwrap_or(384);
-        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
-        let size = image_size as u32;
-        let first_image = images
-            .into_iter()
-            .next()
-            .ok_or_else(|| ServerError::BadRequest("Image data is empty".to_owned()))?;
-        let pv = higgs_models::siglip::preprocess_image(&first_image, size)
-            .map_err(|e| ServerError::InternalError(format!("Image preprocessing failed: {e}")))?;
-        Some(pv)
-    } else {
-        None
-    };
+    // Multimodal requests: hand the raw decoded images to the engine, which
+    // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
+    // its model lock; BatchEngine inside its worker thread) and expands each
+    // family marker token into its sentinel run. Image preprocessing
+    // failures are client problems (bad/malformed image data): they surface
+    // as `EngineError::Vision` — Simple preprocesses synchronously in the
+    // engine, and the batch worker marks worker-side preprocessing failures
+    // so its generate tails reconstruct the same error — and `map_engine_error`
+    // below maps them to strict 400s.
+    let image_inputs = (!media.is_empty() && engine.is_vlm())
+        .then(|| media.into_iter().map(MediaItem::into).collect());
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
@@ -373,7 +396,7 @@ async fn chat_completions_non_streaming(
     let checkpoint_id = req.checkpoint_id.clone();
     let session_id = session_continuation_id(
         req.session_id,
-        pixel_values.is_some(),
+        image_inputs.is_some(),
         constraint.is_some(),
         checkpoint_id.as_deref(),
         want_logprobs,
@@ -386,6 +409,7 @@ async fn chat_completions_non_streaming(
             req.session_id.unwrap_or_default(),
         ));
     }
+
     let request_id = generate_request_id();
     let allow_prefix_cache = req.cache_mode.as_deref() != Some("bypass");
     let has_tools = tools.is_some();
@@ -437,7 +461,7 @@ async fn chat_completions_non_streaming(
                 top_logprobs,
                 thinking_enabled,
                 constraint,
-                pixel_values,
+                image_inputs,
                 checkpoint_id.as_deref(),
                 &pflash_policy,
                 allow_prefix_cache,
@@ -445,7 +469,7 @@ async fn chat_completions_non_streaming(
         })
         .await
         .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-        .map_err(ServerError::Engine)?
+        .map_err(map_engine_error)?
     };
 
     let logprobs_response = output
@@ -735,12 +759,23 @@ async fn chat_completions_stream(
     let want_logprobs = req.logprobs.unwrap_or(false);
     let top_logprobs = req.top_logprobs;
 
-    // Extract images and inject <image> placeholders for VLMs
-    let images = extract_images(&req.messages);
-    let effective_messages = if images.is_empty() {
+    // Extract media and gate on vision capability: a strict 400 when images
+    // are sent to a model that cannot see them.
+    let media_extractor = MediaExtractor::new(
+        state.config.server.max_image_bytes,
+        state.config.server.image_fetch_timeout,
+        state.config.server.max_image_dimension,
+    )?;
+    let media = media_extractor.extract_openai(&req.messages).await?;
+    check_vision_capability(&media, engine.is_vlm(), engine.model_name())?;
+
+    // Build effective messages: text parts with the family marker spliced at
+    // each image part's true position. Text-only requests pass through
+    // unchanged. The marker tokens are expanded into sentinel runs below.
+    let effective_messages = if media.is_empty() {
         req.messages.clone()
     } else {
-        inject_image_placeholders(&req.messages)
+        render_markers(&req.messages, engine.image_marker_text())
     };
 
     let messages = convert_messages(&effective_messages);
@@ -764,7 +799,7 @@ async fn chat_completions_stream(
         .tools
         .as_deref()
         .and_then(|t| if t.is_empty() { None } else { Some(t) });
-    let (mut prompt_tokens, pflash_policy) = engine
+    let (prompt_tokens, pflash_policy) = engine
         .prepare_chat_prompt_with_pflash_policy(
             &messages,
             prompt_tools,
@@ -784,22 +819,16 @@ async fn chat_completions_stream(
         .session_lease
         .is_some_and(|lease| engine.lease_retained_session(lease.session_id, lease.ttl_seconds));
 
-    // Preprocess images for VLM
-    let pixel_values = if !images.is_empty() && engine.is_vlm() {
-        engine.replace_image_tokens(&mut prompt_tokens);
-        let image_size = engine.vlm_image_size().unwrap_or(384);
-        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
-        let size = image_size as u32;
-        let first_image = images
-            .into_iter()
-            .next()
-            .ok_or_else(|| ServerError::BadRequest("Image data is empty".to_owned()))?;
-        let pv = higgs_models::siglip::preprocess_image(&first_image, size)
-            .map_err(|e| ServerError::InternalError(format!("Image preprocessing failed: {e}")))?;
-        Some(pv)
-    } else {
-        None
-    };
+    // Multimodal requests: hand the raw decoded images to the engine, which
+    // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
+    // its model lock; BatchEngine inside its worker thread) and expands each
+    // family marker token into its sentinel run. Image preprocessing
+    // failures are client problems (bad/malformed image data): the
+    // non-streaming path maps `EngineError::Vision` to strict 400s, and the
+    // streaming path surfaces any engine failure as an error-finish chunk
+    // instead of a silently truncated stream.
+    let image_inputs = (!media.is_empty() && engine.is_vlm())
+        .then(|| media.into_iter().map(MediaItem::into).collect());
 
     let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
 
@@ -822,7 +851,7 @@ async fn chat_completions_stream(
     let start = Instant::now();
     let stream_session_id = session_continuation_id(
         request_session_id,
-        pixel_values.is_some(),
+        image_inputs.is_some(),
         constraint.is_some(),
         checkpoint_id.as_deref(),
         want_logprobs,
@@ -902,7 +931,7 @@ async fn chat_completions_stream(
                     thinking_enabled_stream,
                     collect_prefill_progress,
                     constraint,
-                    pixel_values,
+                    image_inputs,
                     checkpoint_id.as_deref(),
                     &pflash_policy,
                     allow_prefix_cache,
@@ -934,8 +963,8 @@ async fn chat_completions_stream(
             id: 0,
             timestamp: Instant::now(),
             wallclock: chrono::Utc::now(),
-            model: model.clone(),
-            provider: "higgs".to_owned(),
+            model: Some(model.clone()),
+            provider: Some("higgs".to_owned()),
             routing_method: routing_method.into(),
             status: 200,
             duration: Duration::ZERO,
@@ -1226,53 +1255,70 @@ fn convert_messages(
         .collect()
 }
 
-/// Extract image bytes from base64 data URIs in message content parts.
-/// Returns decoded image bytes for each image found across all messages.
-fn extract_images(messages: &[ChatCompletionMessage]) -> Vec<Vec<u8>> {
-    use base64::Engine as _;
-    let mut images = Vec::new();
-    for msg in messages {
-        let Some(content) = &msg.content else {
-            continue;
-        };
-        for url in content.image_urls() {
-            if let Some(data) = url.strip_prefix("data:") {
-                // data:[<mediatype>];base64,<data>
-                if let Some(base64_start) = data.find(";base64,") {
-                    let encoded = &data[base64_start + 8..];
-                    match base64::engine::general_purpose::STANDARD.decode(encoded) {
-                        Ok(bytes) => images.push(bytes),
-                        Err(e) => tracing::warn!(error = %e, "Failed to decode base64 image"),
-                    }
-                }
-            }
-            // HTTP/HTTPS URLs are not supported yet; could be fetched in the future
+/// Map an engine error to a server error, surfacing vision preprocessing
+/// failures (malformed client image data) as strict 400s and passing every
+/// other engine error through as a 500.
+///
+/// Shared with the Anthropic route so both surfaces map `EngineError::Vision`
+/// identically.
+pub(crate) fn map_engine_error(e: higgs_engine::error::EngineError) -> ServerError {
+    match e {
+        higgs_engine::error::EngineError::Vision(v) => ServerError::BadRequest(v.to_string()),
+        higgs_engine::error::EngineError::RetainedSessionUnavailable(session_id) => {
+            ServerError::RetainedSessionUnavailable(session_id)
         }
+        other @ (higgs_engine::error::EngineError::Model(_)
+        | higgs_engine::error::EngineError::Mlx(_)
+        | higgs_engine::error::EngineError::Tokenization(_)
+        | higgs_engine::error::EngineError::Template(_)
+        | higgs_engine::error::EngineError::Generation(_)
+        | higgs_engine::error::EngineError::Cancelled) => ServerError::Engine(other),
     }
-    images
 }
 
-/// Build text content with `<image>` placeholders injected for each image.
-/// For VLMs, each image in a message gets a `<image>\n` prefix before the text.
-fn inject_image_placeholders(messages: &[ChatCompletionMessage]) -> Vec<ChatCompletionMessage> {
+/// Reject images when the resolved model has no vision support.
+///
+/// Shared with the Anthropic route so both surfaces enforce the same 400 gate.
+pub(crate) fn check_vision_capability(
+    media: &[MediaItem],
+    engine_is_vlm: bool,
+    model_name: &str,
+) -> Result<(), ServerError> {
+    if !media.is_empty() && !engine_is_vlm {
+        return Err(ServerError::BadRequest(format!(
+            "model {model_name} does not support vision (image input); \
+             use a vision-capable model (e.g. llava-qwen2)"
+        )));
+    }
+    Ok(())
+}
+
+/// Rebuild message content with the family marker inserted at each image
+/// part's true position. Text parts keep their relative order.
+fn render_markers(
+    messages: &[ChatCompletionMessage],
+    marker: Option<&'static str>,
+) -> Vec<ChatCompletionMessage> {
+    let marker_text = marker.unwrap_or("<image>");
     messages
         .iter()
         .map(|m| {
             let Some(content) = &m.content else {
                 return m.clone();
             };
-            if !content.has_images() {
+            let MessageContent::Parts(parts) = content else {
                 return m.clone();
+            };
+            let mut out = String::new();
+            for part in parts {
+                match part {
+                    ContentPart::Text { text } => out.push_str(text),
+                    ContentPart::ImageUrl { .. } => out.push_str(marker_text),
+                }
             }
-
-            let image_count = content.image_urls().len();
-            let text = content.text();
-            let prefix = "<image>\n".repeat(image_count);
-            let combined = format!("{prefix}{text}");
-
             ChatCompletionMessage {
                 role: m.role.clone(),
-                content: Some(MessageContent::Text(combined)),
+                content: Some(MessageContent::Text(out)),
                 reasoning_content: m.reasoning_content.clone(),
                 tool_calls: m.tool_calls.clone(),
                 tool_call_id: m.tool_call_id.clone(),
@@ -1417,14 +1463,14 @@ fn generate_request_id() -> String {
 
 fn session_continuation_id(
     session_id: Option<u64>,
-    has_pixel_values: bool,
+    has_image_inputs: bool,
     has_constraint: bool,
     checkpoint_id: Option<&str>,
     want_logprobs: bool,
     has_stop_sequences: bool,
 ) -> Option<u64> {
     session_id
-        .filter(|_| !has_pixel_values)
+        .filter(|_| !has_image_inputs)
         .filter(|_| !has_constraint)
         .filter(|_| checkpoint_id.is_none())
         .filter(|_| !want_logprobs)
@@ -1498,8 +1544,8 @@ fn current_unix_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+#[allow(clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use std::collections::HashMap;
 
@@ -1557,12 +1603,19 @@ mod tests {
         body.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        Request::builder()
+        let mut request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap()
+            .unwrap();
+        // The production router injects this extension via its metrics
+        // middleware; the bare test router must do the same or the handler's
+        // `Extension<RequestMetricsContext>` extractor rejects the request.
+        request
+            .extensions_mut()
+            .insert(crate::metrics::RequestMetricsContext::default());
+        request
     }
 
     fn axum_sse_events(body: &str) -> (Vec<serde_json::Value>, usize) {
@@ -2418,5 +2471,199 @@ mod tests {
     fn test_current_unix_timestamp_reasonable_value() {
         let ts = current_unix_timestamp();
         assert!(ts > 1_700_000_000, "timestamp too old: {ts}");
+    }
+
+    fn image_item() -> MediaItem {
+        MediaItem {
+            position: 0,
+            message_index: 0,
+            bytes: vec![1, 2, 3],
+            media_type: "image/png".to_owned(),
+            detail: higgs_models::vision::ImageDetail::Auto,
+            max_dims: None,
+        }
+    }
+
+    fn parts_message(role: &str, parts: Vec<ContentPart>) -> ChatCompletionMessage {
+        ChatCompletionMessage {
+            role: role.to_owned(),
+            content: Some(MessageContent::Parts(parts)),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn text_part(text: &str) -> ContentPart {
+        ContentPart::Text {
+            text: text.to_owned(),
+        }
+    }
+
+    fn image_part() -> ContentPart {
+        ContentPart::ImageUrl {
+            image_url: crate::types::openai::ImageUrl {
+                url: "data:image/png;base64,AAAA".to_owned(),
+                detail: Some(higgs_models::vision::ImageDetail::Auto),
+            },
+        }
+    }
+
+    #[test]
+    fn test_render_markers_splices_marker_at_image_positions() {
+        let msgs = vec![parts_message(
+            "user",
+            vec![
+                text_part("Look at "),
+                image_part(),
+                text_part(" then "),
+                image_part(),
+                text_part("."),
+            ],
+        )];
+        let rendered = render_markers(&msgs, Some("<image>"));
+        let content = rendered.first().and_then(|m| m.content.as_ref()).unwrap();
+        let MessageContent::Text(text) = content else {
+            panic!("expected rendered text content");
+        };
+        assert_eq!(text.as_str(), "Look at <image> then <image>.");
+        assert_eq!(rendered.first().map(|m| m.role.as_str()), Some("user"));
+    }
+
+    #[test]
+    fn test_render_markers_defaults_to_image_marker() {
+        let msgs = vec![parts_message(
+            "user",
+            vec![text_part("A "), image_part(), text_part(" B")],
+        )];
+        let rendered = render_markers(&msgs, None);
+        let content = rendered.first().and_then(|m| m.content.as_ref()).unwrap();
+        let MessageContent::Text(text) = content else {
+            panic!("expected rendered text content");
+        };
+        assert_eq!(text.as_str(), "A <image> B");
+    }
+
+    #[test]
+    fn test_render_markers_passes_plain_text_messages_through() {
+        let msgs = vec![simple_message("user", Some("plain text"))];
+        let rendered = render_markers(&msgs, Some("<image>"));
+        let content = rendered.first().and_then(|m| m.content.as_ref()).unwrap();
+        let MessageContent::Text(text) = content else {
+            panic!("expected text content");
+        };
+        assert_eq!(text.as_str(), "plain text");
+    }
+
+    #[test]
+    fn test_check_vision_capability_rejects_images_on_text_model() {
+        let media = vec![image_item()];
+        let err = check_vision_capability(&media, false, "text-model").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not support vision"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("text-model"), "model name missing: {msg}");
+    }
+
+    #[test]
+    fn test_check_vision_capability_accepts_images_on_vlm() {
+        let media = vec![image_item()];
+        assert!(check_vision_capability(&media, true, "vlm").is_ok());
+    }
+
+    #[test]
+    fn test_check_vision_capability_accepts_no_images_on_text_model() {
+        assert!(check_vision_capability(&[], false, "text-model").is_ok());
+    }
+
+    // -- Route-level vision gate (through the full axum router) --
+
+    /// A valid 1x1 red PNG (passes byte-size and dimension checks).
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn image_chat_body(stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "model": "stub-model",
+            "stream": stream,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{TINY_PNG_B64}")}}
+            ]}]
+        })
+    }
+
+    async fn post_json(
+        app: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<axum::body::Body> {
+        use tower::ServiceExt as _;
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn error_message(response: axum::http::Response<axum::body::Body>) -> (u16, String) {
+        use http_body_util::BodyExt as _;
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (
+            status,
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_image_on_text_model_returns_400() {
+        let app = crate::build_router(
+            crate::state::test_state_with_stub_engine("stub-model"),
+            300.0,
+            None,
+            0,
+            1024 * 1024,
+            None,
+        );
+        let (status, msg) =
+            error_message(post_json(app, "/v1/chat/completions", image_chat_body(false)).await)
+                .await;
+        assert_eq!(status, 400, "expected 400, got body: {msg}");
+        assert!(
+            msg.contains("does not support vision"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("stub-model"), "model name missing: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_stream_image_on_text_model_returns_400() {
+        let app = crate::build_router(
+            crate::state::test_state_with_stub_engine("stub-model"),
+            300.0,
+            None,
+            0,
+            1024 * 1024,
+            None,
+        );
+        let (status, msg) =
+            error_message(post_json(app, "/v1/chat/completions", image_chat_body(true)).await)
+                .await;
+        assert_eq!(status, 400, "expected 400, got body: {msg}");
+        assert!(
+            msg.contains("does not support vision"),
+            "unexpected error: {msg}"
+        );
     }
 }

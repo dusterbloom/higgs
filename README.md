@@ -4,8 +4,13 @@
 [![Release](https://img.shields.io/github/v/release/panbanda/higgs)](https://github.com/panbanda/higgs/releases)
 [![Crates.io](https://img.shields.io/crates/v/higgs)](https://crates.io/crates/higgs)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![Omen Score](https://img.shields.io/badge/omen%20score-89.6%20(B)-green)](https://github.com/panbanda/omen)
 
 Run open-weight MLX models locally on Apple Silicon, route requests across local and remote providers, and expose everything through one endpoint.
+
+For a local model, set `kv_disk_dir` in its `[[models]]` entry to retain block-aligned prefix KV state across restarts. `kv_disk_space_mb` controls its on-disk LRU budget (default `4096`, minimum `64`). The disk tier is model, quantization, configuration, tokenizer, and chat-template bound; incompatible entries are ignored.
+
+For DeepSeek-V2 models, set `mla_latent_cache = true` in its `[[models]]` entry to store the MLA KV cache as compressed latent rows instead of dense per-head tensors (default off). It cannot be combined with `kv_cache = "turboquant"`, and is a no-op for non-DeepSeek-V2 architectures. The `HIGGS_MLA_LATENT_CACHE` env var, when set to a recognized value (`1`/`0`, `true`/`false`, `on`/`off`, `yes`/`no`), overrides the config value either way.
 
 Higgs is a single static Rust binary that serves local models, proxies to providers like OpenAI, Anthropic, and Ollama, and translates between OpenAI and Anthropic-style APIs so your existing tools and apps do not need a new integration.
 
@@ -126,6 +131,7 @@ curl http://localhost:8000/v1/chat/completions \
 - Serve MLX models from Hugging Face IDs or local paths.
 - Support current model families including Qwen 3.6, Qwen 3.x, Nanbeige, Llama, Mistral, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, and LLaVA-Qwen2.
 - Load EschaLabs `eschamoe` trellis-quantized checkpoints (e.g. `EschaLabs/Qwen3.6-35B-A3B-Escha-W2`) with automatic detection — no config field needed. The experts stay in their trellis form and decode on the GPU, so the 35B release holds ~11 GB and loads in seconds. See [docs/models.md](docs/models.md#eschalabs-eschamoe-checkpoints).
+- Support current model families including Qwen 3.8, Qwen 3.x, Llama, Mistral, Gemma 2, Phi-3, Starcoder2, DeepSeek-V2, LLaVA-Qwen2, and Qwen-VL. Qwen 3.5+ checkpoints (3.5, 3.6, and 3.8; dense and MoE) use the Qwen 3.5 adapters, including `*ForConditionalGeneration` wrappers whose text-model config lives in `text_config`. Unknown newer versions in a supported family use the nearest structurally compatible adapter and log an untested-version warning; unknown families are rejected with the supported family/version list.
 - Expose local serving through OpenAI and Anthropic-compatible endpoints.
 
 ### Use one endpoint for local and remote models
@@ -152,6 +158,20 @@ curl http://localhost:8000/v1/chat/completions \
 - Open the daemon metrics dashboard with `higgs attach` for routing, latency, throughput, and error visibility.
 - Validate config and model/provider setup with `higgs doctor`.
 
+## Vision Support
+
+Higgs accepts image input on the OpenAI chat endpoint (`/v1/chat/completions`, streaming and non-streaming) for three vision-language families. Each family uses its own preprocessing scheme; see [docs/models.md](docs/models.md) for the per-family table and current constraints.
+
+- **LLaVA-Qwen2** (`llava-qwen2`) — square-resize preprocessing to the checkpoint's `vision_config.image_size` (384 for nanoLLaVA). Setting `detail: "low"` on **every** image halves that target (floored at 128 px); `auto`/`high` use the full size. Each `<image>` marker expands to one embedding per vision patch.
+- **Qwen-VL** (`qwen2_5_vl`, `qwen3_vl`, `qwen3_5_vl`) — dynamic-resolution preprocessing: each image is resized into the checkpoint's `[min_pixels, max_pixels]` pixel budget (`256·28²` / `1280·28²` defaults), its patch grid is merged 2×2, and `<|vision_start|><|image_pad|><|vision_end|>` markers carry the features. The text backbone loads through the Qwen3.5 dense/MoE loaders (the Qwen3Next path); escha-w2/eschamoe backbones are expected to work under the same wrapper (per the design spec).
+- **Gemma 3 / Gemma 4** (`gemma3`, `gemma4` multimodal checkpoints) — pan-and-scan preprocessing: the image is scaled so its shorter side matches the tower's `image_size`, then several aspect-aware `image_size²` crops are encoded with positional offsets, expanding `<start_of_image><end_of_image>` markers into `mm_tokens_per_image` embeddings per crop. Text-only checkpoints (`gemma3_text`, `gemma4_text`) stay text-only and reject images with a 400.
+
+Images are supplied as OpenAI `image_url` content parts — either `data:` base64 URIs or `http(s)://` URLs (fetched with `server.image_fetch_timeout`). Supported media types: PNG, JPEG, WebP, GIF, BMP. Multiple images per request are supported, and `detail` (`auto`/`low`/`high`) selects the LLaVA resolution tier while other families ignore it. Anthropic-style `max_width`/`max_height` are parsed from image sources but not yet applied.
+
+Image handling is strict: a 400 is returned for images sent to a model without vision, for images over `server.max_image_bytes`, for malformed/unsupported images, and for failed URL fetches. Image requests never use the in-memory or disk prefix cache and disable MTP speculative decode.
+
+The new `[server]` fields (`max_image_bytes`, `image_fetch_timeout`, `max_image_dimension`) and the per-model `disable_vision` flag are in the config reference: [docs/configuration.md](docs/configuration.md).
+
 ## Apple Silicon Notes
 
 - Release artifacts bundle `mlx.metallib`.
@@ -160,6 +180,8 @@ curl http://localhost:8000/v1/chat/completions \
 - `[local].allow_runtime_model_load` defaults to `false`. Enable it to load/unload models at runtime via `POST`/`DELETE /v1/models`; protect it with `server.api_key`.
 - `batch=true` is only supported for standard transformer families with true batched decode support.
 - EschaLabs `eschamoe` checkpoints keep their experts in the trellis form by default: 12.3 GB on disk becomes ~11 GB resident for the 35B release, and the load takes seconds. Set `HIGGS_ESCHA_NATIVE=0` to decode every expert to affine 4-bit instead, which raises the same model to ~22 GB resident and ~140 s of CPU-bound conversion at start. `higgs doctor` estimates the resident size for the active mode and warns when it crowds system RAM.
+- `batch=true` is only supported for families with true batched decode support: transformer models (`llama`, `mistral`, `qwen2`, `qwen3`) plus the `llava-qwen2` and `qwen3_5_vl` vision families.
+- For batch models, `prefill_yield_tokens` can interleave long prompt prefills with decode; use `0` or omit it for the synchronous default.
 
 ## Performance
 

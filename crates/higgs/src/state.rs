@@ -15,7 +15,7 @@ use higgs_engine::simple::{
 use higgs_engine::tokenizers::Tokenizer;
 use higgs_models::SamplingParams;
 use higgs_models::turboquant::KvCacheConfig;
-use mlx_rs::Array;
+use higgs_models::vision::{ImageBatch, ImageInput, VisionCapabilities, VisionError};
 
 use crate::config::{
     HiggsConfig, LocalConfig, ModelConfig, PrefillCompressionMode, resolved_model_supports_batch,
@@ -224,7 +224,12 @@ impl Engine {
         kv_cache_config: KvCacheConfig,
         raise_wired_limit: bool,
     ) -> Result<Self, EngineError> {
-        BatchEngine::load(dir, kv_cache_config, raise_wired_limit).map(|e| Self::Batch(Box::new(e)))
+        // The merged `BatchEngine::load` takes `prefill_yield_tokens` and
+        // `disable_vision`; nightly keeps its 3-argument call shape, so both
+        // stay at their defaults (`None` = synchronous prefill; `disable_vision`
+        // is a documented no-op on nightly).
+        BatchEngine::load(dir, kv_cache_config, raise_wired_limit, None, false)
+            .map(|e| Self::Batch(Box::new(e)))
     }
 
     #[cfg(test)]
@@ -265,7 +270,7 @@ impl Engine {
         }
     }
 
-    #[cfg_attr(test, allow(clippy::panic))]
+    #[cfg_attr(test, allow(clippy::unreachable))]
     pub fn tokenizer(&self) -> &Tokenizer {
         match self {
             Self::Simple(e) => e.tokenizer(),
@@ -313,27 +318,61 @@ impl Engine {
     pub fn is_vlm(&self) -> bool {
         match self {
             Self::Simple(e) => e.is_vlm(),
-            Self::Batch(_) => false,
+            Self::Batch(e) => e.is_vlm(),
             #[cfg(test)]
             Self::Stub(_) => false,
         }
     }
 
-    pub fn vlm_image_size(&self) -> Option<i32> {
+    /// The marker text injected at each image position before tokenization.
+    pub fn image_marker_text(&self) -> Option<&'static str> {
         match self {
-            Self::Simple(e) => e.vlm_image_size(),
-            Self::Batch(_) => None,
+            Self::Simple(e) => e.image_marker_text(),
+            Self::Batch(e) => e.image_marker_text(),
             #[cfg(test)]
             Self::Stub(_) => None,
         }
     }
 
-    pub fn replace_image_tokens(&self, tokens: &mut [u32]) {
+    /// Capability metadata for the loaded model, if it supports vision.
+    pub fn vision_capabilities(&self) -> Option<VisionCapabilities> {
         match self {
-            Self::Simple(e) => e.replace_image_tokens(tokens),
-            Self::Batch(_) => {}
+            Self::Simple(e) => e.vision_capabilities(),
+            Self::Batch(e) => e.vision_capabilities(),
             #[cfg(test)]
-            Self::Stub(_) => {}
+            Self::Stub(_) => None,
+        }
+    }
+
+    /// Preprocess decoded images into a family-native [`ImageBatch`].
+    ///
+    /// Only the simple (serialized) engine preprocesses here; the batch engine
+    /// preprocesses inside its worker thread (the model lives there), so its
+    /// arm errors — the route must pass raw [`ImageInput`]s to `generate_*`
+    /// instead.
+    pub fn preprocess_images(&self, images: &[ImageInput]) -> Result<ImageBatch, VisionError> {
+        match self {
+            Self::Simple(e) => e.preprocess_images(images),
+            Self::Batch(_) => Err(VisionError::Preprocess(
+                "batch engine preprocesses images inside its worker; pass image_inputs to generate"
+                    .to_owned(),
+            )),
+            #[cfg(test)]
+            Self::Stub(_) => Err(VisionError::Preprocess("stub".to_owned())),
+        }
+    }
+
+    /// Expand image marker tokens into the sentinel runs for `batch`.
+    pub fn postprocess_image_tokens(
+        &self,
+        tokens: &mut Vec<u32>,
+        batch: &ImageBatch,
+    ) -> Result<(), VisionError> {
+        match self {
+            Self::Simple(e) => e.postprocess_image_tokens(tokens, batch),
+            Self::Batch(_) => Ok(()),
+            #[cfg(test)]
+            Self::Stub(_) => Ok(()),
         }
     }
 
@@ -747,7 +786,7 @@ impl Engine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
@@ -759,7 +798,7 @@ impl Engine {
             top_logprobs,
             self.enable_thinking(),
             constraint,
-            pixel_values,
+            image_inputs,
             checkpoint_id,
         )
     }
@@ -775,7 +814,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking_and_pflash_policy(
@@ -787,7 +826,7 @@ impl Engine {
             top_logprobs,
             enable_thinking,
             constraint,
-            pixel_values,
+            image_inputs,
             checkpoint_id,
             &PFlashPromptPolicy::default(),
         )
@@ -804,7 +843,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
     ) -> Result<GenerationOutput, EngineError> {
@@ -819,7 +858,7 @@ impl Engine {
                 top_logprobs,
                 enable_thinking,
                 constraint,
-                pixel_values,
+                image_inputs,
                 checkpoint_id,
                 pflash_policy,
             ),
@@ -832,7 +871,7 @@ impl Engine {
                 top_logprobs,
                 enable_thinking,
                 constraint,
-                pixel_values,
+                image_inputs,
             ),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
@@ -850,7 +889,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
         allow_prefix_cache: bool,
@@ -866,7 +905,7 @@ impl Engine {
                 top_logprobs,
                 enable_thinking,
                 constraint,
-                pixel_values,
+                image_inputs,
                 checkpoint_id,
                 pflash_policy,
                 allow_prefix_cache,
@@ -880,7 +919,7 @@ impl Engine {
                 top_logprobs,
                 enable_thinking,
                 constraint,
-                pixel_values,
+                image_inputs,
             ),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
@@ -898,7 +937,7 @@ impl Engine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
@@ -913,7 +952,7 @@ impl Engine {
             // /v1/completions convenience entry never streams prefill progress.
             false,
             constraint,
-            pixel_values,
+            image_inputs,
             checkpoint_id,
         )
     }
@@ -931,7 +970,7 @@ impl Engine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking_and_pflash_policy(
@@ -945,7 +984,7 @@ impl Engine {
             enable_thinking,
             return_progress,
             constraint,
-            pixel_values,
+            image_inputs,
             checkpoint_id,
             &PFlashPromptPolicy::default(),
         )
@@ -964,7 +1003,7 @@ impl Engine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
     ) -> Result<(), EngineError> {
@@ -981,7 +1020,7 @@ impl Engine {
                 enable_thinking,
                 return_progress,
                 constraint,
-                pixel_values,
+                image_inputs,
                 checkpoint_id,
                 pflash_policy,
             ),
@@ -996,7 +1035,7 @@ impl Engine {
                 enable_thinking,
                 return_progress,
                 constraint,
-                pixel_values,
+                image_inputs,
             ),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
@@ -1016,7 +1055,7 @@ impl Engine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<higgs_engine::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
         allow_prefix_cache: bool,
@@ -1034,7 +1073,7 @@ impl Engine {
                 enable_thinking,
                 return_progress,
                 constraint,
-                pixel_values,
+                image_inputs,
                 checkpoint_id,
                 pflash_policy,
                 allow_prefix_cache,
@@ -1050,7 +1089,7 @@ impl Engine {
                 enable_thinking,
                 return_progress,
                 constraint,
-                pixel_values,
+                image_inputs,
             ),
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
@@ -1083,7 +1122,7 @@ pub fn build_engine(
         .map_err(|error| format!("invalid PFlash settings: {error}"))?;
     if model_cfg.batch && !resolved_model_supports_batch(resolved)? {
         return Err(format!(
-            "batch=true is only supported for standard transformer models (llama, mistral, qwen2, qwen3); '{}' is not supported",
+            "batch=true is only supported for transformer models (llama, mistral, qwen2, qwen3), llava-qwen2, and qwen3_5_vl; '{}' is not supported",
             model_cfg.path
         ));
     }
@@ -1140,6 +1179,27 @@ pub struct AppState {
 /// Type alias for the shared state used by Axum handlers.
 pub type SharedState = Arc<AppState>;
 
+/// Build a `SharedState` whose router serves `model` from a stub (non-VLM)
+/// engine, for route-level tests of the vision capability gate.
+///
+/// The stub reports `is_vlm() == false`, so an image request routed to it must
+/// hit the 400 gate before any tokenizer or generation code runs.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn test_state_with_stub_engine(model: &str) -> SharedState {
+    let config = crate::config::HiggsConfig::default();
+    let mut engines = std::collections::HashMap::new();
+    engines.insert(model.to_owned(), Arc::new(Engine::test_stub(model)));
+    let router = crate::router::Router::from_config(&config, engines)
+        .expect("default config builds a router");
+    Arc::new(AppState {
+        router,
+        config,
+        http_client: reqwest::Client::new(),
+        metrics: None,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
@@ -1166,5 +1226,19 @@ mod tests {
             error.contains("prefill_keep_ratio"),
             "expected PFlash validation error, got {error}"
         );
+    }
+
+    #[test]
+    fn stub_engine_reports_no_vision() {
+        let engine = Engine::test_stub("test-stub");
+        assert!(!engine.is_vlm());
+        assert!(engine.vision_capabilities().is_none());
+    }
+
+    #[test]
+    fn stub_engine_preprocess_images_errors() {
+        let engine = Engine::test_stub("test-stub");
+        let err = engine.preprocess_images(&[]).unwrap_err();
+        assert!(err.to_string().contains("stub"));
     }
 }

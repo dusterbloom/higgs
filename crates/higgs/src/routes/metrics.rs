@@ -294,7 +294,7 @@ fn build_metrics_response(metrics: &MetricsStore) -> MetricsResponse {
     let snapshot = metrics.snapshot();
     let input_tokens: u64 = snapshot.iter().map(|r| r.input_tokens).sum();
     let output_tokens: u64 = snapshot.iter().map(|r| r.output_tokens).sum();
-    let errors = u64::try_from(snapshot.iter().filter(|r| r.status >= 400).count()).unwrap_or(0);
+    let errors = u64::try_from(snapshot.iter().filter(|r| r.is_error()).count()).unwrap_or(0);
     let num_buckets = usize::try_from(metrics.window_minutes().max(1)).unwrap_or(1);
 
     MetricsResponse {
@@ -332,9 +332,15 @@ fn build_groups(groups: HashMap<String, Vec<&crate::metrics::RequestRecord>>) ->
             let requests = u64::try_from(records.len()).unwrap_or(u64::MAX);
             let input_tokens: u64 = records.iter().map(|r| r.input_tokens).sum();
             let output_tokens: u64 = records.iter().map(|r| r.output_tokens).sum();
-            let durations: Vec<_> = records.iter().map(|r| r.duration).collect();
+            // Failed requests contribute error counts, but not model/provider
+            // latency percentiles because no inference latency was observed.
+            let durations: Vec<_> = records
+                .iter()
+                .filter(|r| !r.is_error())
+                .map(|r| r.duration)
+                .collect();
             let errors =
-                u64::try_from(records.iter().filter(|r| r.status >= 400).count()).unwrap_or(0);
+                u64::try_from(records.iter().filter(|r| r.is_error()).count()).unwrap_or(0);
 
             MetricsGroup {
                 name,
@@ -357,8 +363,8 @@ fn build_groups(groups: HashMap<String, Vec<&crate::metrics::RequestRecord>>) ->
     out
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -428,8 +434,8 @@ mod tests {
             id: 0,
             timestamp: Instant::now(),
             wallclock: Utc::now(),
-            model: model.to_owned(),
-            provider: provider.to_owned(),
+            model: Some(model.to_owned()),
+            provider: Some(provider.to_owned()),
             routing_method: RoutingMethod::Higgs,
             status,
             duration: Duration::from_millis(120),

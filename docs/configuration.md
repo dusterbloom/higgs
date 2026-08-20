@@ -65,6 +65,9 @@ port = 8000
 # CORS origin allow-list for browser clients. Unset = no CORS headers;
 # ["*"] allows any origin.
 # cors_origins = ["https://app.example.com"]
+# max_image_bytes = 20971520   # per-image decoded byte cap (default 20 MiB); keep below max_body_size
+# image_fetch_timeout = 10.0   # remote image URL fetch timeout in seconds
+# max_image_dimension = 4096   # long-edge pixel cap before family preprocessing
 
 # --- Local defaults ---
 [local]
@@ -78,6 +81,7 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # mlx_profile = "throughput"
 # batch = false
 # draft_model = "/path/to/dflash-drafter"   # enables DFlash speculative decoding (simple engine only)
+# prefill_yield_tokens = 512 # 0 or omitted keeps synchronous prefill
 # kv_cache = "turboquant"
 # kv_bits = 3
 # kv_key_bits = 2
@@ -91,6 +95,7 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # kv_retained_idle_secs = 300            # evict KV idle longer than N seconds (0 = never)
 # kv_max_suffix_prefill_tokens = 24576   # maximum exact suffix before degraded bootstrap
 # kv_max_retained_bytes = 2147483648     # aggregate retained session KV byte limit
+# disable_vision = true # force-disable vision for this model (escape hatch)
 
 # --- Remote providers ---
 [provider.anthropic]
@@ -193,7 +198,11 @@ That means Higgs supports:
 ## Local Model Notes
 
 - `batch=true` is only supported for standard transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, and `qwen3`.
+- `batch=true` is only supported for transformer families with true batched decode support: `llama`, `mistral`, `qwen2`, and `qwen3`, plus the vision families `llava-qwen2` and Qwen-VL (`qwen3_5_vl`, `qwen3_vl`, `qwen2_5_vl`).
 - `higgs doctor` and server startup now reject unsupported `batch=true` combinations instead of silently degrading.
+- **Vision requests**: images arrive as OpenAI `image_url` content parts (`data:` base64 URIs or `http(s)://` URLs) on `/v1/chat/completions`. A per-image decoded-byte cap (`server.max_image_bytes`, default 20 MiB) and an HTTP fetch timeout for remote URLs (`server.image_fetch_timeout`, default 10 s) apply; `server.max_image_dimension` (default 4096) is intended to cap the long edge before family preprocessing — it is currently validated by `higgs doctor` (must be within `64..=16384`), with enforcement pending. Malformed, oversize, unsupported, or unfetchable images — and images sent to a model without vision — return a strict 400. Anthropic-style image blocks are not yet processed on the local Anthropic endpoint.
+- **Multimodal requests never use the prefix or disk cache**: image features are merged into the KV state, so a multimodal prompt would never match a text-only prefix; image requests neither read from nor populate the in-memory prefix cache or the disk prefix cache (`kv_disk_dir`). Image requests also disable MTP speculative decode, since draft logits at image positions are meaningless.
+- `[[models]].disable_vision = true` is an escape hatch intended to force-disable vision processing for a model whose vision tower fails to load. Today the flag is parsed and validated by `higgs doctor` — on a checkpoint with no vision capability it is a no-op and the doctor warns — but runtime enforcement is not yet wired, so image requests are still gated solely by the loaded model's vision capability.
 - `[local].raise_wired_limit` defaults to `false`. Turn it on only when you explicitly want MLX to raise the process wired-memory limit.
 - Source builds on macOS require `mlx.metallib`. Higgs restores it from Cargo build output when possible and fails startup if it still cannot be resolved.
 - The `session_id` chat-request field opts a conversation into cache-resident multi-turn reuse (prefill only the new turn instead of the whole history). It is a **best-effort latency optimization, not exact replay** — the retained KV is TurboQuant-compressed, so a continued turn's output may differ slightly from a stateless full prefill. Omit `session_id` for bit-identical output; the radix prefix cache on the normal path reuses dense KV exactly. Per-conversation KV is bounded by the `kv_max_sessions` / `kv_max_session_tokens` / `kv_retained_idle_secs` model settings above.

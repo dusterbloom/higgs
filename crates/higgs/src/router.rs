@@ -462,7 +462,6 @@ fn build_route_target(
     })
 }
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -470,6 +469,7 @@ fn build_route_target(
     clippy::indexing_slicing,
     clippy::shadow_unrelated
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::load_config_file;

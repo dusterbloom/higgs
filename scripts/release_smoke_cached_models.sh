@@ -19,6 +19,13 @@ OPTIONAL_MODELS=(
 
 NANBEIGE_MODEL="${HIGGS_SMOKE_NANBEIGE_MODEL:-MercuriusDream/Nanbeige4.2-3B-mlx-6bit}"
 NANBEIGE_EXPECTED_NAME="${HIGGS_SMOKE_NANBEIGE_NAME:-MercuriusDream/Nanbeige4.2-3B-mlx-6bit}"
+VISION_MODELS=(
+  "mlx-community/nanoLLaVA-1.5"
+)
+
+# Tiny valid 64x64 red PNG (base64) used as the test image in vision requests;
+# small enough to inline and decodable by every supported vision adapter.
+TEST_IMAGE_B64="iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC"
 
 MODELS=("${DEFAULT_MODELS[@]}")
 if [[ "${HIGGS_SMOKE_INCLUDE_OPTIONAL_MODELS:-0}" == "1" ]]; then
@@ -110,6 +117,25 @@ EOF
 )" | grep -F 'data:' >/dev/null
 }
 
+run_vision_checks() {
+  local port="$1"
+  local model="$2"
+
+  curl -fsS "http://127.0.0.1:${port}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$(cat <<EOF
+{"model":"${model}","messages":[{"role":"user","content":[{"type":"text","text":"Describe this image."},{"type":"image_url","image_url":{"url":"data:image/png;base64,${TEST_IMAGE_B64}"}}]}],"max_tokens":24}
+EOF
+)" | grep -F '"choices"' >/dev/null
+
+  curl -fsS "http://127.0.0.1:${port}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$(cat <<EOF
+{"model":"${model}","messages":[{"role":"user","content":[{"type":"text","text":"Describe this image."},{"type":"image_url","image_url":{"url":"data:image/png;base64,${TEST_IMAGE_B64}"}}]}],"max_tokens":24,"stream":true}
+EOF
+)" | grep -F 'data:' >/dev/null
+}
+
 start_server() {
   local log_path="$1"
   shift
@@ -137,6 +163,46 @@ single_model_smoke() {
   wait_for_health "$port"
   assert_models_contains "$port" "$expected_name"
   run_chat_checks "$port" "$expected_name"
+  stop_server "$pid"
+}
+
+vision_rejection_smoke() {
+  local port="$1"
+  local model="$2"
+  local out_path="$TMP_DIR/vision-reject.out"
+
+  echo "vision rejection smoke (text-only model): $model"
+  start_server "$TMP_DIR/vision-reject.log" serve --host 127.0.0.1 --port "$port" --model "$model"
+  local pid="$cleanup_pid"
+  wait_for_health "$port"
+  local code
+  code="$(curl -sS -o "$out_path" -w "%{http_code}" \
+    "http://127.0.0.1:${port}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$(cat <<EOF
+{"model":"${model}","messages":[{"role":"user","content":[{"type":"text","text":"What is in this image?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,${TEST_IMAGE_B64}"}}]}],"max_tokens":24}
+EOF
+)")"
+  stop_server "$pid"
+  if [[ "$code" != "400" ]]; then
+    echo "expected HTTP 400 for image request to text-only model ${model}, got ${code}" >&2
+    cat "$out_path" >&2
+    exit 1
+  fi
+  grep -F 'does not support vision' "$out_path" >/dev/null
+}
+
+vision_model_smoke() {
+  local model="$1"
+  local port="$2"
+  local log_path="$TMP_DIR/$(basename "$model").log"
+
+  echo "vision-model smoke: $model"
+  start_server "$log_path" serve --host 127.0.0.1 --port "$port" --model "$model"
+  local pid="$cleanup_pid"
+  wait_for_health "$port"
+  assert_models_contains "$port" "$model"
+  run_vision_checks "$port" "$model"
   stop_server "$pid"
 }
 
@@ -276,6 +342,18 @@ main() {
   fi
   if [[ "${HIGGS_SMOKE_INCLUDE_NANBEIGE:-0}" == "1" ]]; then
     single_model_smoke "$NANBEIGE_MODEL" 8106 "$NANBEIGE_EXPECTED_NAME"
+  # Vision smoke: an image request to a text-only cached model must be a strict
+  # 400 ("does not support vision") — no VLM checkpoint needed, always runs.
+  # The positive VLM cases need a cached vision checkpoint, so they are opt-in.
+  vision_rejection_smoke 8106 "mlx-community/Llama-3.2-1B-Instruct-4bit"
+  if [[ "${HIGGS_SMOKE_INCLUDE_VISION:-0}" == "1" ]]; then
+    echo "including vision-model smoke (requires a cached VLM checkpoint)"
+    for model in "${VISION_MODELS[@]}"; do
+      require_cached_model "$model"
+    done
+    vision_model_smoke "mlx-community/nanoLLaVA-1.5" 8107
+  else
+    echo "skipping vision-model smoke (set HIGGS_SMOKE_INCLUDE_VISION=1 to include; requires a cached VLM checkpoint)"
   fi
   multi_model_smoke 8110
   unsupported_batch_smoke

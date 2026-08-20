@@ -35,12 +35,7 @@ const fn default_rope_theta() -> f32 {
     10000.0
 }
 
-/// Quantization parameters from config.json.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Phi-3 model configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -137,7 +132,7 @@ impl Phi3Attention {
         let rope = nn::RopeBuilder::new(head_dim)
             .traditional(false)
             .base(args.rope_theta)
-            .scale(1.0)
+            .scale(1.0_f32)
             .build()
             .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?;
 
@@ -564,8 +559,17 @@ pub fn load_phi3_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Phi3ModelArg
 pub fn load_phi3_model<P: AsRef<Path>>(model_dir: P) -> Result<Phi3CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_phi3_model_args(model_path)?;
+    load_phi3_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_phi3_model_with_args(
+    model_path: &Path,
+    args: Phi3ModelArgs,
+) -> Result<Phi3CausalLM, ModelError> {
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let raw_model = Phi3CausalLM::new(args)?;
 
     tracing::info!(
@@ -592,14 +596,19 @@ pub fn load_phi3_model<P: AsRef<Path>>(model_dir: P) -> Result<Phi3CausalLM, Mod
         raw_model
     };
 
-    crate::load_quantized_safetensors_weights(&mut model, model_path, quantization.is_some())?;
+    crate::load_quantized_safetensors_weights_with_settings(
+        &mut model,
+        model_path,
+        quantization.is_some(),
+        quantization.as_ref(),
+    )?;
 
     tracing::info!("Phi-3 model loaded successfully");
     Ok(model)
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

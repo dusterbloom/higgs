@@ -197,7 +197,7 @@ pub struct ServeArgs {
     #[arg(long)]
     pub api_key: Option<String>,
 
-    /// Rate limit (requests per minute per client, 0 = disabled).
+    /// Rate limit (requests per minute per client, 0 turns it off).
     #[arg(long)]
     pub rate_limit: Option<u32>,
 
@@ -285,6 +285,15 @@ pub struct ServerSection {
     pub timeout: f64,
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
+    /// Maximum decoded byte size accepted per image (20 MiB default).
+    #[serde(default = "default_max_image_bytes")]
+    pub max_image_bytes: usize,
+    /// HTTP fetch timeout for remote image URLs, in seconds.
+    #[serde(default = "default_image_fetch_timeout")]
+    pub image_fetch_timeout: f64,
+    /// Long-edge pixel cap applied before family-specific preprocessing.
+    #[serde(default = "default_max_image_dimension")]
+    pub max_image_dimension: u32,
     /// CORS allow-list of origins. Unset = no CORS headers are sent;
     /// `["*"]` allows any origin (permissive).
     pub cors_origins: Option<Vec<String>>,
@@ -300,6 +309,9 @@ impl Default for ServerSection {
             rate_limit: 0,
             timeout: default_timeout(),
             max_body_size: default_max_body_size(),
+            max_image_bytes: default_max_image_bytes(),
+            image_fetch_timeout: default_image_fetch_timeout(),
+            max_image_dimension: default_max_image_dimension(),
             cors_origins: None,
         }
     }
@@ -323,6 +335,18 @@ const fn default_timeout() -> f64 {
 
 const fn default_max_body_size() -> usize {
     10 * 1024 * 1024
+}
+
+const fn default_max_image_bytes() -> usize {
+    20 << 20
+}
+
+const fn default_image_fetch_timeout() -> f64 {
+    10.0
+}
+
+const fn default_max_image_dimension() -> u32 {
+    4096
 }
 
 // -- Local defaults ---------------------------------------------------------
@@ -419,6 +443,17 @@ pub struct ModelConfig {
     /// Enable the separate batch engine for this model.
     #[serde(default)]
     pub batch: bool,
+    /// Force-disable vision processing for this model, rejecting image input.
+    ///
+    /// Escape hatch for checkpoints whose vision tower fails to load. On a
+    /// checkpoint with no vision capability the flag is a no-op; `higgs doctor`
+    /// warns when that happens.
+    #[serde(default)]
+    pub disable_vision: bool,
+    /// Maximum prompt tokens to prefill per batch-loop iteration. `None` and
+    /// `0` retain synchronous prefill behavior.
+    #[serde(default)]
+    pub prefill_yield_tokens: Option<u32>,
     /// KV-cache storage mode.
     #[serde(default)]
     pub kv_cache: KvCacheMode,
@@ -536,6 +571,20 @@ pub struct ModelConfig {
     /// `0` (default) disables the budget.
     #[serde(default)]
     pub kv_cache_bytes: usize,
+    /// Directory used for durable, disk-backed prefix KV entries.
+    #[serde(default)]
+    pub kv_disk_dir: Option<String>,
+    /// Maximum disk-prefix-store size in MiB.
+    #[serde(default = "default_kv_disk_space_mb")]
+    pub kv_disk_space_mb: u64,
+    /// Store `DeepSeek`-V2 MLA caches as compressed latent rows.
+    ///
+    /// `None` defers to the `HIGGS_MLA_LATENT_CACHE` env var (default off).
+    /// When set, `HIGGS_MLA_LATENT_CACHE` (if also set to a recognized
+    /// value) still overrides this either way. Ignored for non-`DeepSeek`-V2
+    /// architectures. Mutually exclusive with `kv_cache = "turboquant"`.
+    #[serde(default)]
+    pub mla_latent_cache: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -705,7 +754,27 @@ const fn default_kv_max_retained_bytes() -> usize {
     2_147_483_648
 }
 
+const fn default_kv_disk_space_mb() -> u64 {
+    4096
+}
+
 impl ModelConfig {
+    /// Validate disk-prefix-store settings independently of engine startup.
+    pub fn validate_disk_prefix_store(&self) -> Result<(), String> {
+        let Some(dir) = self.kv_disk_dir.as_deref() else {
+            return Ok(());
+        };
+        if self.kv_disk_space_mb < 64 {
+            return Err("kv_disk_space_mb must be at least 64".to_owned());
+        }
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("kv_disk_dir {dir:?} is not creatable: {e}"))?;
+        let probe = std::path::Path::new(dir).join(".higgs-write-probe");
+        std::fs::write(&probe, [])
+            .map_err(|e| format!("kv_disk_dir {dir:?} is not writable: {e}"))?;
+        std::fs::remove_file(probe).map_err(|e| format!("kv_disk_dir cleanup failed: {e}"))?;
+        Ok(())
+    }
     pub const fn kv_cache_config(&self) -> KvCacheConfig {
         KvCacheConfig {
             mode: self.kv_cache,
@@ -720,6 +789,10 @@ impl ModelConfig {
             retained_idle_secs: self.kv_retained_idle_secs,
             max_retained_bytes: self.kv_max_retained_bytes,
             kv_cache_bytes: self.kv_cache_bytes,
+            mla_latent: match self.mla_latent_cache {
+                Some(v) => v,
+                None => false,
+            },
         }
     }
 
@@ -761,6 +834,8 @@ impl Default for ModelConfig {
             kv_norm_correction: default_norm_correction(),
             kv_adaptive_dense_layers: 0,
             kv_seed: 0,
+            disable_vision: false,
+            prefill_yield_tokens: None,
             draft_model: None,
             prefill_drafter: None,
             prefill_compression: PrefillCompressionMode::Off,
@@ -786,6 +861,9 @@ impl Default for ModelConfig {
             kv_max_retained_bytes: default_kv_max_retained_bytes(),
             kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
             kv_cache_bytes: 0,
+            kv_disk_dir: None,
+            kv_disk_space_mb: default_kv_disk_space_mb(),
+            mla_latent_cache: None,
         }
     }
 }
@@ -1005,6 +1083,8 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             generation_defaults: GenerationDefaults::default(),
             mlx_profile: None,
             batch: args.batch,
+            disable_vision: false,
+            prefill_yield_tokens: None,
             kv_cache,
             kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
             kv_key_bits: args.kv_key_bits,
@@ -1037,6 +1117,9 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_max_retained_bytes: default_kv_max_retained_bytes(),
             kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
             kv_cache_bytes: 0,
+            kv_disk_dir: None,
+            kv_disk_space_mb: default_kv_disk_space_mb(),
+            mla_latent_cache: None,
         })
         .collect();
 
@@ -1080,10 +1163,33 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
 
 /// Load a `HiggsConfig` from a TOML file, with env and CLI overlays (config mode).
 pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsConfig, String> {
-    let mut figment = Figment::new()
+    let figment = Figment::new()
         .merge(Toml::file(path))
         .merge(Env::prefixed("HIGGS_").split("__"));
 
+    let mut config = extract_config(figment, &path.display().to_string(), args)?;
+    validate_config(&config, false)?;
+    ensure_auto_router_model(&mut config);
+    Ok(config)
+}
+
+/// Deserialize TOML using the same typed extraction path as normal config loading.
+///
+/// This intentionally omits semantic startup validation so users can edit the
+/// commented bootstrap config one field at a time, while still rejecting any
+/// document that cannot deserialize into [`HiggsConfig`].
+pub fn validate_config_contents(contents: &str, source: &Path) -> Result<(), String> {
+    // Validate the document itself without environment overlays: an env value
+    // must not mask an invalid on-disk value that would fail on the next run.
+    let figment = Figment::new().merge(Toml::string(contents));
+    extract_config(figment, &source.display().to_string(), None).map(|_| ())
+}
+
+fn extract_config(
+    mut figment: Figment,
+    source: &str,
+    args: Option<&ServeArgs>,
+) -> Result<HiggsConfig, String> {
     // Overlay CLI args on server section
     if let Some(serve_args) = args {
         if let Some(ref host) = serve_args.host {
@@ -1118,6 +1224,8 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     generation_defaults: GenerationDefaults::default(),
                     mlx_profile: None,
                     batch: serve_args.batch,
+                    disable_vision: false,
+                    prefill_yield_tokens: None,
                     kv_cache,
                     kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
                     kv_key_bits: serve_args.kv_key_bits,
@@ -1150,11 +1258,14 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
                     kv_max_retained_bytes: default_kv_max_retained_bytes(),
                     kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
                     kv_cache_bytes: 0,
+                    kv_disk_dir: None,
+                    kv_disk_space_mb: default_kv_disk_space_mb(),
+                    mla_latent_cache: None,
                 })
                 .collect();
             let mut existing = figment
                 .extract_inner::<Option<Vec<ModelConfig>>>("models")
-                .map_err(|e| format!("failed to parse models from {}: {e}", path.display()))?
+                .map_err(|e| format!("failed to parse models from {source}: {e}"))?
                 .unwrap_or_default();
             existing.extend(extra);
             figment = figment.merge(Serialized::default("models", &existing));
@@ -1163,14 +1274,12 @@ pub fn load_config_file(path: &Path, args: Option<&ServeArgs>) -> Result<HiggsCo
 
     let mut config: HiggsConfig = figment
         .extract()
-        .map_err(|e| format!("failed to load config from {}: {e}", path.display()))?;
+        .map_err(|e| format!("failed to load config from {source}: {e}"))?;
     apply_requested_mlx_profile(
         &mut config,
         args.and_then(|serve_args| serve_args.mlx_profile),
     )?;
 
-    validate_config(&config, false)?;
-    ensure_auto_router_model(&mut config);
     Ok(config)
 }
 
@@ -1238,7 +1347,7 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
             && !supported
         {
             return Err(format!(
-                "batch=true is only supported for standard transformer models (llama, mistral, qwen2, qwen3); {} is not supported",
+                "batch=true is only supported for transformer models (llama, mistral, qwen2, qwen3), llava-qwen2, and qwen3_5_vl; {} is not supported",
                 model.path
             ));
         }
@@ -1282,10 +1391,6 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
     Ok(())
 }
 
-fn supports_batch_model_type(model_type: &str) -> bool {
-    matches!(model_type, "qwen2" | "qwen3" | "llama" | "mistral")
-}
-
 fn batch_support_for_model_path(model_path: &str) -> Result<Option<bool>, String> {
     match crate::model_resolver::resolve(model_path) {
         Ok(resolved) => resolved_model_supports_batch(&resolved).map(Some),
@@ -1302,6 +1407,23 @@ fn batch_support_check_can_be_deferred(model_path: &str, err: &str) -> bool {
             )
             || (err.starts_with(&format!("could not read HF cache ref for '{model_path}':"))
                 && err.contains("No such file or directory")))
+}
+
+/// Model types the merged batch engine can serve: standard dense transformers
+/// plus the vision families the merged adapter registry marks batch-capable
+/// (`llava-qwen2`; Qwen-VL `qwen3_5_vl`/`qwen3_vl`/`qwen2_5_vl`).
+fn supports_batch_model_type(model_type: &str) -> bool {
+    matches!(
+        model_type,
+        "qwen2"
+            | "qwen3"
+            | "llama"
+            | "mistral"
+            | "llava-qwen2"
+            | "qwen3_5_vl"
+            | "qwen3_vl"
+            | "qwen2_5_vl"
+    )
 }
 
 pub fn resolved_model_supports_batch(model_dir: &Path) -> Result<bool, String> {
@@ -1346,6 +1468,8 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         generation_defaults: GenerationDefaults::default(),
         mlx_profile: None,
         batch: false,
+        disable_vision: false,
+        prefill_yield_tokens: None,
         kv_cache: KvCacheMode::Off,
         kv_bits: default_kv_bits(),
         kv_key_bits: None,
@@ -1378,6 +1502,9 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_max_retained_bytes: default_kv_max_retained_bytes(),
         kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
         kv_cache_bytes: 0,
+        kv_disk_dir: None,
+        kv_disk_space_mb: default_kv_disk_space_mb(),
+        mla_latent_cache: None,
     });
     config.auto_router.model = name;
 }
@@ -1499,8 +1626,8 @@ pub type ServerConfig = ServerSection;
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1546,6 +1673,29 @@ mod tests {
             RequestedMlxProfile::Auto
         );
         assert_eq!(config.default.provider, "higgs");
+        assert_eq!(config.server.max_image_bytes, 20 << 20);
+        assert!((config.server.image_fetch_timeout - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.server.max_image_dimension, 4096);
+    }
+
+    #[test]
+    fn config_defaults_preserve_behavior() {
+        // An empty document must resolve to the pre-vision defaults: the same
+        // per-image cap, fetch timeout, and long-edge limit the media pipeline
+        // used as constants before these fields existed.
+        let config = extract_config(Figment::new().merge(Toml::string("")), "test", None).unwrap();
+        assert_eq!(config.server.max_image_bytes, 20 << 20);
+        assert!((config.server.image_fetch_timeout - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.server.max_image_dimension, 4096);
+
+        // Model entries parse with vision enabled by default.
+        let model_config = extract_config(
+            Figment::new().merge(Toml::string("[[models]]\npath = \"org/model\"\n")),
+            "test",
+            None,
+        )
+        .unwrap();
+        assert!(!model_config.models.first().unwrap().disable_vision);
     }
 
     #[test]
@@ -2284,6 +2434,64 @@ mod tests {
         assert_eq!(model.kv_cache, KvCacheMode::Turboquant);
         assert_eq!(model.kv_bits, 4);
         assert_eq!(model.kv_seed, 123);
+    }
+
+    #[test]
+    fn test_config_file_parses_mla_latent_cache_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "some/model"
+            mla_latent_cache = true
+            "#,
+        )
+        .unwrap();
+
+        let config = load_config_file(&path, None).unwrap();
+        let model = config.models.first().unwrap();
+        assert_eq!(model.mla_latent_cache, Some(true));
+        assert!(model.kv_cache_config().mla_latent);
+    }
+
+    #[test]
+    fn test_config_file_defaults_mla_latent_cache_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "some/model"
+            "#,
+        )
+        .unwrap();
+
+        let config = load_config_file(&path, None).unwrap();
+        let model = config.models.first().unwrap();
+        assert_eq!(model.mla_latent_cache, None);
+        assert!(!model.kv_cache_config().mla_latent);
+    }
+
+    #[test]
+    fn test_config_file_rejects_mla_latent_cache_with_turboquant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "some/model"
+            kv_cache = "turboquant"
+            mla_latent_cache = true
+            "#,
+        )
+        .unwrap();
+
+        let err = load_config_file(&path, None).unwrap_err();
+        assert!(err.contains("MLA latent cache cannot be combined with TurboQuant KV cache"));
     }
 
     #[test]

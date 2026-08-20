@@ -6,6 +6,7 @@
     clippy::manual_let_else
 )]
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +23,7 @@ use higgs_models::{
         adaptive_keep_ratio_from_importance, select_survivors_with_hard_keep,
     },
     turboquant::KvCacheConfig,
+    vision::{ImageBatch, ImageInput, VisionCapabilities, VisionError, VisionModel},
 };
 use mlx_rs::{
     Array, Dtype, Stream,
@@ -32,7 +34,8 @@ use tokenizers::Tokenizer;
 
 use crate::{
     cache::{
-        DiskPrefixCache, DiskPrefixCacheConfig, PagedKvCache,
+        DEFAULT_MAX_DISK_BLOCKS, DEFAULT_MIN_TOKENS_TO_PERSIST, DiskPrefixCache,
+        DiskPrefixCacheConfig, PagedKvCache,
         paired::{
             DflashTapFrontier, LivePair, LivePairDecodeLease, PairedCacheError, RetainedState,
             SessionDsparkPublication,
@@ -394,6 +397,7 @@ fn any_model_variant_name(model: &AnyModel) -> &'static str {
         AnyModel::Phi3(_) => "Phi3",
         AnyModel::Starcoder2(_) => "Starcoder2",
         AnyModel::LlavaQwen2(_) => "LlavaQwen2",
+        AnyModel::QwenVl(_) => "QwenVl",
         AnyModel::DeepSeekV2(_) => "DeepSeekV2",
         AnyModel::BonsaiQ1(_) => "BonsaiQ1",
     }
@@ -1562,6 +1566,24 @@ fn dflash_propose_tokens(
     })
 }
 
+/// Whether MTP speculative decode may run for this request.
+///
+/// MTP requires a model with MTP heads, greedy decoding (temperature == 0),
+/// no constraints, and no logprobs. Requests carrying images must never take
+/// the MTP path: draft logits at image positions are meaningless, so image
+/// requests always fall back to the plain decode path.
+#[allow(clippy::float_cmp, clippy::fn_params_excessive_bools)]
+fn mtp_allowed(
+    enable_mtp: bool,
+    has_mtp: bool,
+    has_images: bool,
+    constrained: bool,
+    logprobs: bool,
+    temperature: f32,
+) -> bool {
+    enable_mtp && has_mtp && !has_images && !constrained && !logprobs && temperature == 0.0
+}
+
 fn parse_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -2689,7 +2711,7 @@ pub struct SimpleEngine {
     /// Whether to enable thinking mode (Qwen3.5 `<think>` tags).
     enable_thinking: bool,
     /// Token ID for `</think>`, resolved from the tokenizer at load time.
-    /// `None` if the tokenizer doesn't know this token (thinking will be disabled).
+    /// `None` if the tokenizer doesn't know this token (thinking is unavailable).
     think_close_token: Option<u32>,
     /// Request-mode-specific exact trailing tokens added by
     /// `add_generation_prompt=true`. A reusable boundary is accepted only when
@@ -2794,7 +2816,7 @@ struct PreparedGeneration<'a> {
     actual_prompt_tokens: Vec<u32>,
     prompt_array: Array,
     prompt_len: u32,
-    pixel_values: Option<Array>,
+    image_batch: Option<ImageBatch>,
     /// Prompt tokens genuinely served from reused KV state this turn: the radix
     /// prefix-cache hit length, or the retained-session prefix on the
     /// continuation path.
@@ -3023,29 +3045,33 @@ impl SimpleEngine {
         kv_cache_config: KvCacheConfig,
         tuning: MlxRuntimeTuning,
         raise_wired_limit: bool,
+        disk_prefix_dir: Option<&Path>,
+        disk_prefix_budget: u64,
+        disable_vision: bool,
     ) -> Result<Self, EngineError> {
-        Self::load_with_dflash(
+        // `disable_vision` is a no-op on nightly (deferred): nightly's
+        // `model_loader::load_model` keeps its single-argument signature and
+        // loads vision-capable checkpoints with their vision tower (see
+        // model_loader.rs). The parameter is retained so the state/main call
+        // chain stays shape-compatible.
+        let _ = disable_vision;
+        // Map the vision-shaped `(dir, byte budget)` pair onto nightly's
+        // `DiskPrefixCacheConfig`. Nightly sizes the disk store in token
+        // blocks (`max_disk_blocks`, baked into the store file header), not
+        // bytes, so the byte budget has no direct nightly equivalent; a
+        // non-`None` dir enables the store at nightly's default block cap.
+        let _ = disk_prefix_budget;
+        let disk_cache_config = disk_prefix_dir.map(|path| DiskPrefixCacheConfig {
+            disk_path: path.to_path_buf(),
+            max_disk_blocks: DEFAULT_MAX_DISK_BLOCKS,
+            min_tokens_to_persist: DEFAULT_MIN_TOKENS_TO_PERSIST,
+        });
+        Self::load_with_disk_cache(
             dir,
             kv_cache_config,
             tuning,
             raise_wired_limit,
-            None,
-            None,
-            None,
-            PrefillCompressionMode::Off,
-            0.10,
-            4096,
-            32,
-            13,
-            8,
-            PrefillScoreMode::Full,
-            7,
-            DEFAULT_PFLASH_KEEP_RATIO_MAX,
-            DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
-            DEFAULT_PFLASH_PLAN_CACHE,
-            DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
-            DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
-            8192,
+            disk_cache_config,
         )
     }
 
@@ -3136,6 +3162,11 @@ impl SimpleEngine {
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model");
 
+        // `disable_vision` is a no-op on nightly (deferred): nightly's
+        // `model_loader::load_model` keeps its single-argument signature and
+        // loads vision-capable checkpoints with their vision tower. The `load`
+        // entry keeps the parameter so the state/main call chain stays
+        // shape-compatible.
         let model = model_loader::load_model(model_dir)?;
         let _ = model
             .make_cache_with_config(kv_cache_config)
@@ -3466,7 +3497,12 @@ impl SimpleEngine {
         );
 
         let is_vlm = model.is_vlm();
-        let vlm_image_size = model.image_size();
+        // `AnyModel::image_size` was folded into `VisionCapabilities.image_sizes`
+        // on the merged models crate; take the primary encoder size when the
+        // model has vision, `None` otherwise.
+        let vlm_image_size = model
+            .as_vision()
+            .and_then(|v| v.vision_capabilities().image_sizes.first().copied());
 
         Ok(Self {
             model: Mutex::new(model),
@@ -4376,8 +4412,59 @@ impl SimpleEngine {
         self.vlm_image_size
     }
 
+    /// The marker text injected at each image position before tokenization.
+    pub fn image_marker_text(&self) -> Option<&'static str> {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        model.as_vision().map(VisionModel::image_marker_text)
+    }
+
+    /// Capability metadata for the loaded model, if it supports vision.
+    pub fn vision_capabilities(&self) -> Option<VisionCapabilities> {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        model.as_vision().map(VisionModel::vision_capabilities)
+    }
+
+    /// Preprocess decoded images into a family-native [`ImageBatch`] ready for
+    /// the multimodal forward pass. Errors when the model has no vision.
+    pub fn preprocess_images(&self, images: &[ImageInput]) -> Result<ImageBatch, VisionError> {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let v = model
+            .as_vision()
+            .ok_or_else(|| VisionError::Preprocess("model has no vision".to_owned()))?;
+        v.preprocess_images(images)
+    }
+
+    /// Expand image marker tokens into the sentinel runs for `batch`.
+    pub fn postprocess_image_tokens(
+        &self,
+        tokens: &mut Vec<u32>,
+        batch: &ImageBatch,
+    ) -> Result<(), VisionError> {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(v) = model.as_vision() else {
+            return Ok(());
+        };
+        v.postprocess_image_tokens(tokens, &self.tokenizer, batch)
+    }
+
     /// Replace image placeholder tokens with `IMAGE_TOKEN_INDEX` in the token
     /// sequence. The `<image>` token ID is looked up from the tokenizer.
+    ///
+    /// Superseded by [`Self::postprocess_image_tokens`] (Task 8 route rewiring);
+    /// kept temporarily so existing callers compile during the transition.
+    #[deprecated(note = "use postprocess_image_tokens with an ImageBatch instead")]
     #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
     pub fn replace_image_tokens(&self, tokens: &mut [u32]) {
         let Some(image_token_id) = self.tokenizer.token_to_id("<image>") else {
@@ -4399,17 +4486,49 @@ impl SimpleEngine {
             .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))
     }
 
+    /// Preprocess raw image inputs into a family-native [`ImageBatch`] and
+    /// expand the family marker tokens in a copy of `prompt_tokens` into the
+    /// sentinel run the batch expects.
+    ///
+    /// Runs under the model lock (the engine owns `AnyModel`, unlike the batch
+    /// engine whose worker preprocesses instead). Text-only requests pass
+    /// through unchanged (the tokens are borrowed, not copied). Errors are
+    /// [`EngineError::Vision`] so the route can map malformed image data to a
+    /// client-facing 400.
+    fn resolve_images<'a>(
+        &self,
+        prompt_tokens: &'a [u32],
+        image_inputs: Option<Vec<ImageInput>>,
+    ) -> Result<(Cow<'a, [u32]>, Option<ImageBatch>), EngineError> {
+        let Some(inputs) = image_inputs else {
+            return Ok((Cow::Borrowed(prompt_tokens), None));
+        };
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let v = model.as_vision().ok_or_else(|| {
+            EngineError::Vision(VisionError::Preprocess(
+                "model has no vision; cannot process images".to_owned(),
+            ))
+        })?;
+        let batch = v.preprocess_images(&inputs)?;
+        let mut tokens = prompt_tokens.to_vec();
+        v.postprocess_image_tokens(&mut tokens, &self.tokenizer, &batch)?;
+        Ok((Cow::Owned(tokens), Some(batch)))
+    }
+
     /// Look up the prefix cache, lock the model, and resolve the actual tokens
     /// to feed into the forward pass.
     fn prepare_generation(
         &self,
         prompt_tokens: &[u32],
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
         checkpoint_id: Option<&str>,
         allow_prefix_cache: bool,
     ) -> Result<PreparedGeneration<'_>, EngineError> {
         let prompt_len = Self::prompt_len(prompt_tokens)?;
-        let has_images = pixel_values.is_some();
+        let has_images = image_batch.is_some();
 
         // Disk lookup can scan many block-aligned candidates and hash the prompt.
         // Keep that CPU-only candidate selection outside the model lock / MLX
@@ -4532,7 +4651,7 @@ impl SimpleEngine {
             actual_prompt_tokens,
             prompt_array,
             prompt_len,
-            pixel_values,
+            image_batch,
             reused_prefix_tokens,
             stored_clone: None,
             _mlx_gate: mlx_gate,
@@ -4606,11 +4725,11 @@ impl SimpleEngine {
             );
             higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
             output.logits
-        } else if let Some(ref pixel_values) = prepared.pixel_values {
+        } else if let Some(ref batch) = prepared.image_batch {
             // Multimodal path: full forward (VLMs need all tokens for vision)
             prepared
                 .model
-                .forward_multimodal(&prepared.prompt_array, pixel_values, &mut prepared.cache)
+                .forward_multimodal(&prepared.prompt_array, batch, &mut prepared.cache)
                 .map_err(EngineError::Mlx)?
         } else {
             // Text-only prefill: use chunked prefill for long sequences to bound
@@ -4790,7 +4909,7 @@ impl SimpleEngine {
         }
 
         // Skip prefix cache for multimodal (image-specific KV states)
-        if store_prefix_cache && prepared.pixel_values.is_none() {
+        if store_prefix_cache && prepared.image_batch.is_none() {
             let mut pc = self
                 .prefix_cache
                 .lock()
@@ -6474,7 +6593,7 @@ impl SimpleEngine {
                     actual_prompt_tokens: suffix,
                     prompt_array,
                     prompt_len: run_total,
-                    pixel_values: None,
+                    image_batch: None,
                     // Retained-session reuse: `prior` tokens came from the forked
                     // session cache, the rest is the suffix we prefill now.
                     reused_prefix_tokens: u32::try_from(prior).unwrap_or(u32::MAX),
@@ -8035,9 +8154,10 @@ impl SimpleEngine {
 
     /// Generate a complete response from a token prompt.
     ///
-    /// For multimodal requests, pass `pixel_values` with preprocessed image
-    /// data and ensure `prompt_tokens` contains `IMAGE_TOKEN_INDEX` at image
-    /// positions.
+    /// For multimodal requests, pass `image_inputs` with the decoded images
+    /// (in client order) and ensure `prompt_tokens` contains the family marker
+    /// tokens at image positions; the engine preprocesses them into a
+    /// family-native batch and expands the markers into sentinel runs.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -8048,7 +8168,7 @@ impl SimpleEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
@@ -8060,7 +8180,7 @@ impl SimpleEngine {
             top_logprobs,
             self.enable_thinking,
             constraint,
-            pixel_values,
+            image_inputs,
             checkpoint_id,
         )
     }
@@ -8076,7 +8196,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking_and_pflash_policy(
@@ -8088,7 +8208,7 @@ impl SimpleEngine {
             top_logprobs,
             enable_thinking,
             constraint,
-            pixel_values,
+            image_inputs,
             checkpoint_id,
             &PFlashPromptPolicy::default(),
         )
@@ -8105,7 +8225,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
     ) -> Result<GenerationOutput, EngineError> {
@@ -8118,7 +8238,7 @@ impl SimpleEngine {
             top_logprobs,
             enable_thinking,
             constraint,
-            pixel_values,
+            image_inputs,
             checkpoint_id,
             pflash_policy,
             true,
@@ -8136,7 +8256,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
         allow_prefix_cache: bool,
@@ -8144,11 +8264,15 @@ impl SimpleEngine {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
+        // Multimodal preprocessing happens here, under the model lock, so the
+        // route has a single shape for both engines. `image_inputs` becomes a
+        // family-native batch and the marker tokens expand into sentinels.
+        let (resolved_tokens, image_batch) = self.resolve_images(prompt_tokens, image_inputs)?;
         if max_tokens == 0 {
             return Ok(GenerationOutput {
                 text: String::new(),
                 finish_reason: "length".to_owned(),
-                prompt_tokens: Self::prompt_len(prompt_tokens)?,
+                prompt_tokens: Self::prompt_len(resolved_tokens.as_ref())?,
                 completion_tokens: 0,
                 token_logprobs: None,
                 reasoning_content: None,
@@ -8161,7 +8285,7 @@ impl SimpleEngine {
         // instead of creating a new Stream (5 FFI calls) per operation.
         with_new_default_stream(Stream::new(), || {
             self.generate_inner(
-                prompt_tokens,
+                resolved_tokens.as_ref(),
                 max_tokens,
                 params,
                 stop_sequences,
@@ -8169,7 +8293,7 @@ impl SimpleEngine {
                 top_logprobs,
                 enable_thinking,
                 constraint,
-                pixel_values,
+                image_batch,
                 checkpoint_id,
                 pflash_policy,
                 allow_prefix_cache,
@@ -8455,7 +8579,7 @@ impl SimpleEngine {
         generation_suffix: &[u32],
         pflash_policy: &PFlashPromptPolicy,
         _params: &SamplingParams,
-        pixel_values: Option<&Array>,
+        image_batch: Option<&ImageBatch>,
         constraint: Option<&crate::constrained::ConstrainedGenerator>,
         logprobs: bool,
         session_id: Option<&u64>,
@@ -8472,7 +8596,7 @@ impl SimpleEngine {
         {
             return Ok(None);
         }
-        if pixel_values.is_some() || constraint.is_some() || logprobs || session_id.is_some() {
+        if image_batch.is_some() || constraint.is_some() || logprobs || session_id.is_some() {
             return self.pflash_unavailable("request is incompatible", pflash_required);
         }
         // Simple engine is single-request only; no batch mode call-path reaches here.
@@ -8712,7 +8836,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         enable_thinking: bool,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
         allow_prefix_cache: bool,
@@ -8724,7 +8848,7 @@ impl SimpleEngine {
             generation_suffix,
             pflash_policy,
             params,
-            pixel_values.as_ref(),
+            image_batch.as_ref(),
             constraint.as_ref(),
             logprobs,
             None,
@@ -8764,7 +8888,7 @@ impl SimpleEngine {
                 && !sampled_dspark
                 && dflash_accepts_prefill_plan
                 && constraint.is_none()
-                && pixel_values.is_none()
+                && image_batch.is_none()
                 && !logprobs,
             stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
         );
@@ -8788,7 +8912,7 @@ impl SimpleEngine {
 
         let mut prepared = self.prepare_generation(
             prepared_prompt_tokens,
-            pixel_values,
+            image_batch,
             checkpoint_id,
             allow_prefix_cache && compressed.is_none(),
         )?;
@@ -8803,12 +8927,14 @@ impl SimpleEngine {
         let cached_prompt_tokens = prepared.reused_prefix_tokens;
         #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
-            && self.tuning.enable_mtp()
-            && prepared.model.has_mtp()
-            && prepared.pixel_values.is_none()
-            && constraint.is_none()
-            && !logprobs
-            && params.temperature == 0.0;
+            && mtp_allowed(
+                self.tuning.enable_mtp(),
+                prepared.model.has_mtp(),
+                prepared.image_batch.is_some(),
+                constraint.is_some(),
+                logprobs,
+                params.temperature,
+            );
 
         let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
             prepared_prompt_tokens,
@@ -8901,9 +9027,12 @@ impl SimpleEngine {
         // Architecture-neutral speculative decode: prompt-lookup drafting plus
         // batched verifier logits. Explicitly opt-in while benchmark data is
         // collected because the normal path has a pipelined single-token loop.
+        // Never for image requests: the verifier would run against KV states
+        // holding image embeddings, and draft logits are meaningless there.
         #[allow(clippy::float_cmp)]
         if prompt_lookup_enabled()
             && speculation_route == SpeculationRoute::MtpFamily
+            && prepared.image_batch.is_none()
             && constraint.is_none()
             && !logprobs
             && params.temperature == 0.0
@@ -8923,14 +9052,18 @@ impl SimpleEngine {
         }
 
         // MTP speculative decode: enabled by the resolved MLX runtime tuning.
-        // Only for greedy (temperature == 0), no constraints, no logprobs.
-        #[allow(clippy::float_cmp)]
-        if self.tuning.enable_mtp()
-            && speculation_route == SpeculationRoute::MtpFamily
-            && prepared.model.has_mtp()
-            && constraint.is_none()
-            && !logprobs
-            && params.temperature == 0.0
+        // Only for greedy (temperature == 0), no constraints, no logprobs,
+        // and never for image requests (draft logits at image positions are
+        // meaningless — see `mtp_allowed`).
+        if speculation_route == SpeculationRoute::MtpFamily
+            && mtp_allowed(
+                self.tuning.enable_mtp(),
+                prepared.model.has_mtp(),
+                prepared.image_batch.is_some(),
+                constraint.is_some(),
+                logprobs,
+                params.temperature,
+            )
         {
             let actual_prompt_tokens = prepared.actual_prompt_tokens.clone();
             return self.mtp_generate(
@@ -12042,7 +12175,7 @@ impl SimpleEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
@@ -12058,7 +12191,7 @@ impl SimpleEngine {
             // streams prefill progress.
             false,
             constraint,
-            pixel_values,
+            image_inputs,
             checkpoint_id,
         )
     }
@@ -12076,7 +12209,7 @@ impl SimpleEngine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking_and_pflash_policy(
@@ -12090,7 +12223,7 @@ impl SimpleEngine {
             enable_thinking,
             return_progress,
             constraint,
-            pixel_values,
+            image_inputs,
             checkpoint_id,
             &PFlashPromptPolicy::default(),
         )
@@ -12109,7 +12242,7 @@ impl SimpleEngine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
     ) -> Result<(), EngineError> {
@@ -12124,7 +12257,7 @@ impl SimpleEngine {
             enable_thinking,
             return_progress,
             constraint,
-            pixel_values,
+            image_inputs,
             checkpoint_id,
             pflash_policy,
             true,
@@ -12144,7 +12277,7 @@ impl SimpleEngine {
         enable_thinking: bool,
         return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_inputs: Option<Vec<ImageInput>>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
         allow_prefix_cache: bool,
@@ -12152,8 +12285,11 @@ impl SimpleEngine {
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
+        // Multimodal preprocessing happens here, under the model lock (see
+        // [`Self::generate_with_thinking`]).
+        let (resolved_tokens, image_batch) = self.resolve_images(prompt_tokens, image_inputs)?;
         if max_tokens == 0 {
-            let prompt_len = Self::prompt_len(prompt_tokens)?;
+            let prompt_len = Self::prompt_len(resolved_tokens.as_ref())?;
             let _ = sender.blocking_send(StreamingOutput {
                 new_text: String::new(),
                 finished: true,
@@ -12168,7 +12304,7 @@ impl SimpleEngine {
 
         with_new_default_stream(Stream::new(), || {
             self.generate_streaming_inner(
-                prompt_tokens,
+                resolved_tokens.as_ref(),
                 max_tokens,
                 params,
                 stop_sequences,
@@ -12178,7 +12314,7 @@ impl SimpleEngine {
                 enable_thinking,
                 return_progress,
                 constraint,
-                pixel_values,
+                image_batch,
                 checkpoint_id,
                 pflash_policy,
                 allow_prefix_cache,
@@ -12203,7 +12339,7 @@ impl SimpleEngine {
         enable_thinking: bool,
         return_progress: bool,
         mut constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<Array>,
+        image_batch: Option<ImageBatch>,
         checkpoint_id: Option<&str>,
         pflash_policy: &PFlashPromptPolicy,
         allow_prefix_cache: bool,
@@ -12215,7 +12351,7 @@ impl SimpleEngine {
             generation_suffix,
             pflash_policy,
             params,
-            pixel_values.as_ref(),
+            image_batch.as_ref(),
             constraint.as_ref(),
             logprobs,
             None,
@@ -12260,7 +12396,7 @@ impl SimpleEngine {
                 && !sampled_dspark
                 && dflash_accepts_prefill_plan
                 && constraint.is_none()
-                && pixel_values.is_none()
+                && image_batch.is_none()
                 && !logprobs,
             stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
         );
@@ -12281,7 +12417,7 @@ impl SimpleEngine {
 
         let mut prepared = self.prepare_generation(
             prepared_prompt_tokens,
-            pixel_values,
+            image_batch,
             checkpoint_id,
             allow_prefix_cache && compressed.is_none(),
         )?;
@@ -12289,14 +12425,15 @@ impl SimpleEngine {
             prepared.prompt_len = Self::prompt_len(prompt_tokens)?;
         }
         let prompt_len = prepared.prompt_len;
-        #[allow(clippy::float_cmp)]
         let capture_mtp_prefill = mtp_prefill_priming_enabled()
-            && self.tuning.enable_mtp()
-            && prepared.model.has_mtp()
-            && prepared.pixel_values.is_none()
-            && constraint.is_none()
-            && !logprobs
-            && params.temperature == 0.0;
+            && mtp_allowed(
+                self.tuning.enable_mtp(),
+                prepared.model.has_mtp(),
+                prepared.image_batch.is_some(),
+                constraint.is_some(),
+                logprobs,
+                params.temperature,
+            );
 
         // Stream prefill progress only when the caller opted in (OpenAI
         // `return_progress: true`). Direct higgs-engine callers and BatchEngine
@@ -12419,14 +12556,17 @@ impl SimpleEngine {
             return Ok(());
         }
 
-        // MTP speculative decode (streaming): greedy, no constraints, no logprobs.
-        #[allow(clippy::float_cmp)]
-        if self.tuning.enable_mtp()
-            && speculation_route == SpeculationRoute::MtpFamily
-            && prepared.model.has_mtp()
-            && constraint.is_none()
-            && !logprobs
-            && params.temperature == 0.0
+        // MTP speculative decode (streaming): greedy, no constraints, no
+        // logprobs, and never for image requests (see `mtp_allowed`).
+        if speculation_route == SpeculationRoute::MtpFamily
+            && mtp_allowed(
+                self.tuning.enable_mtp(),
+                prepared.model.has_mtp(),
+                prepared.image_batch.is_some(),
+                constraint.is_some(),
+                logprobs,
+                params.temperature,
+            )
         {
             let actual_prompt_tokens = prepared.actual_prompt_tokens.clone();
             return self.mtp_generate_streaming(
@@ -13347,7 +13487,7 @@ mod tests {
         dflash_resolve_target_then_draft, dflash_sparse_taps_available_for_pflash_plan,
         dflash_tail_draft_cap, drive_canonical_dspark_round, estimate_paged_kv_blocks,
         extract_eos_tokens, find_stop_in_tail, hybrid_checkpoint_boundary, lock_or_recover,
-        message_boundary_delta, paired_dflash_exact_domain, parse_enabled_flag,
+        message_boundary_delta, mtp_allowed, paired_dflash_exact_domain, parse_enabled_flag,
         pflash_actual_keep_ratio, pflash_auto_plan_worth_executing,
         pflash_cache_source_and_request_tail, pflash_cache_source_and_request_tail_with_boundary,
         pflash_full_score_budget_exceeded, prefill_sample_count, reset_prefill_sample_count,
@@ -17590,6 +17730,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path(), r#"{"model_type": "qwen3_5_moe"}"#);
         assert!(detect_thinking_support(dir.path()));
+    }
+
+    // --- MTP gate ---
+
+    /// A request carrying images must NEVER take the MTP/speculative-decode
+    /// path, even on an MTP-enabled model: draft logits at image positions are
+    /// meaningless. The gate predicate must reject any request with an image
+    /// batch while still admitting otherwise-identical text requests.
+    #[test]
+    fn image_request_disables_mtp() {
+        // Same request twice — with and without an image batch.
+        assert!(
+            mtp_allowed(true, true, false, false, false, 0.0),
+            "text-only greedy request is MTP-eligible"
+        );
+        assert!(
+            !mtp_allowed(true, true, true, false, false, 0.0),
+            "image request must never take the MTP path"
+        );
+    }
+
+    /// The other MTP preconditions stay enforced by the same predicate.
+    #[test]
+    fn mtp_allowed_keeps_existing_preconditions() {
+        // MTP disabled in runtime tuning.
+        assert!(!mtp_allowed(false, true, false, false, false, 0.0));
+        // Model without MTP heads.
+        assert!(!mtp_allowed(true, false, false, false, false, 0.0));
+        // Constrained decoding.
+        assert!(!mtp_allowed(true, true, false, true, false, 0.0));
+        // Logprobs requested.
+        assert!(!mtp_allowed(true, true, false, false, true, 0.0));
+        // Non-greedy sampling.
+        assert!(!mtp_allowed(true, true, false, false, false, 0.7));
     }
 
     /// A plain Llama (no reasoning `model_type`, no `enable_thinking` in the

@@ -1,6 +1,9 @@
+pub mod adapter;
 pub mod bonsai_q1;
 pub mod bonsai_q2;
 pub mod cache;
+/// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
+mod crossrow_qmv;
 pub mod deepseek_v2;
 pub mod dflash;
 pub mod error;
@@ -8,9 +11,8 @@ pub mod eschamoe;
 pub mod gemma2;
 pub mod gemma3;
 pub mod gemma4;
+pub mod gemma_vision;
 pub mod llava_qwen2;
-/// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
-mod crossrow_qmv;
 mod metal_kernel;
 #[doc(hidden)]
 pub mod q2_row2_bench {
@@ -33,9 +35,11 @@ pub mod q2_row2_bench {
 pub mod mlx_exec;
 pub mod phi3;
 pub mod progress;
+pub mod quant_config;
 pub mod quant_mode;
 pub mod qwen3_moe;
 pub mod qwen3_next;
+pub mod qwen_vl;
 pub mod registry;
 pub mod siglip;
 pub mod spec_prefill;
@@ -43,6 +47,7 @@ pub mod starcoder2;
 pub mod transformer;
 pub mod turboquant;
 pub mod utils;
+pub mod vision;
 pub mod yarn;
 
 use std::collections::{HashMap, HashSet};
@@ -58,6 +63,7 @@ use serde_json::Value;
 
 use crate::error::ModelError;
 use crate::turboquant::KvCacheConfig;
+use crate::vision::{ImageBatch, VisionCapabilities, VisionModel};
 
 static BONSAI_IGNORED_MASK_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -205,6 +211,63 @@ impl AnyCache {
                 }
             }
         }
+    }
+
+    /// Capture a rollback point before an operation that advances this cache.
+    ///
+    /// KV caches are rolled back by trimming their offset, so they deliberately
+    /// return `None` and are never cloned. Restoring a cloned KV cache would
+    /// make the checkpoint share the live cache's underlying MLX buffers; an
+    /// in-place `slice_update` can then donate a buffer still referenced by the
+    /// checkpoint, corrupting it and causing a double-free on drop. Hybrid SSM/
+    /// recurrent state cannot be offset-trimmed, so it requires a full clone.
+    #[must_use]
+    pub fn checkpoint_for_rollback(&self) -> Option<Self> {
+        match self {
+            Self::KV(_) => None,
+            Self::Hybrid(_) => Some(self.deep_clone()),
+        }
+    }
+
+    /// Undo an operation that advanced this cache by `advanced_by` tokens.
+    ///
+    /// A hybrid checkpoint restores recurrent state exactly. KV-only caches use
+    /// `trim_by`, avoiding MLX buffer aliasing while rewinding their offsets.
+    pub fn rollback(&mut self, checkpoint: Option<Self>, advanced_by: usize) {
+        if let Some(base) = checkpoint {
+            *self = base;
+        } else {
+            self.trim_by(advanced_by);
+        }
+    }
+
+    /// References to every array retained by this cache.
+    #[must_use]
+    pub fn eval_targets(&self) -> Vec<&Array> {
+        let mut targets = Vec::new();
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter().flatten() {
+                    targets.extend(layer.eval_targets());
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter().flatten() {
+                    match layer {
+                        LayerCache::KV(kv) => targets.extend(kv.eval_targets()),
+                        LayerCache::Arrays(arrays) => {
+                            if let Some(conv_state) = &arrays.conv_state {
+                                targets.push(conv_state);
+                            }
+                            if let Some(ssm_state) = &arrays.ssm_state {
+                                targets.push(ssm_state);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        targets
     }
 
     /// Approximate resident byte size of the KV state (keys + values + any
@@ -570,6 +633,9 @@ pub enum AnyModel {
     Starcoder2(starcoder2::Starcoder2CausalLM),
     /// LLaVA-Qwen2 vision-language model (nanoLLaVA architecture).
     LlavaQwen2(llava_qwen2::LlavaQwen2Model),
+    /// Qwen-VL vision-language model (Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL) on a
+    /// `Qwen3Next` text backbone with dynamic-resolution vision.
+    QwenVl(qwen_vl::QwenVlModel),
     /// DeepSeek-V2 with Multi-head Latent Attention and sparse `MoE`.
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
     /// Bonsai-Q1: packed 1.25-bpw Qwen3-shaped target (1.7B / 8B).
@@ -658,6 +724,7 @@ impl AnyModel {
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text(inputs, mask, c),
+            (Self::QwenVl(m), AnyCache::Hybrid(c)) => m.forward_text(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
             // BonsaiQ1 builds its causal mask internally; any externally-provided
@@ -690,6 +757,7 @@ impl AnyModel {
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_hidden(inputs, mask, c),
+            (Self::QwenVl(m), AnyCache::Hybrid(c)) => m.forward_text_hidden(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
             (Self::BonsaiQ1(m), AnyCache::KV(c)) => bonsai_q1::forward_trunk_free(m, c, inputs),
@@ -742,6 +810,7 @@ impl AnyModel {
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_all_logits(inputs, mask, c),
+            (Self::QwenVl(m), AnyCache::Hybrid(c)) => m.forward_text_all_logits(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
                 let (_, logits) = m.forward_with_hidden(inputs, mask, c)?;
@@ -817,50 +886,84 @@ impl AnyModel {
 
     /// Batched decode forward pass for N requests each with 1 token.
     ///
-    /// Only supported for the `Transformer` variant (Llama/Qwen/Mistral).
+    /// Supported for the `Transformer` variant (Llama/Qwen/Mistral), `LLaVA`
+    /// (delegates to its inner Qwen2 transformer), and `Qwen3Next`/`QwenVl`
+    /// (hybrid SSM/attention batched decode over `AnyCache::Hybrid`).
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
         caches: &mut [&mut AnyCache],
     ) -> Result<Array, Exception> {
-        let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
-            Vec::with_capacity(caches.len());
-        for cache in caches.iter_mut() {
-            match cache {
-                AnyCache::KV(kv) => kv_refs.push(kv),
-                AnyCache::Hybrid(_) => {
-                    return Err(Exception::custom(
-                        "Batched forward not supported for Hybrid cache",
-                    ));
-                }
-            }
-        }
-
         match self {
-            Self::Transformer(m) if m.supports_batched_decode() => {
+            Self::Transformer(m) => {
+                let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::KV(kv) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires KV cache for Transformer models",
+                        ));
+                    };
+                    kv_refs.push(kv);
+                }
                 m.forward_batched(inputs, &mut kv_refs)
             }
-            Self::Transformer(_) => Err(Exception::custom(
-                "Batched forward only supported for llama, mistral, qwen2, and qwen3 transformer models",
-            )),
+            Self::LlavaQwen2(m) => {
+                let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::KV(kv) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires KV cache for LlavaQwen2 models",
+                        ));
+                    };
+                    kv_refs.push(kv);
+                }
+                m.forward_text_batched(inputs, &mut kv_refs)
+            }
+            Self::Qwen3Next(m) => {
+                let mut hybrid_refs: Vec<&mut Vec<Option<LayerCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::Hybrid(hybrid) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires Hybrid cache for Qwen3Next models",
+                        ));
+                    };
+                    hybrid_refs.push(hybrid);
+                }
+                m.forward_batched(inputs, &mut hybrid_refs)
+            }
+            Self::QwenVl(m) => {
+                let mut hybrid_refs: Vec<&mut Vec<Option<LayerCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::Hybrid(hybrid) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires Hybrid cache for QwenVl models",
+                        ));
+                    };
+                    hybrid_refs.push(hybrid);
+                }
+                m.forward_text_batched(inputs, &mut hybrid_refs)
+            }
             Self::Qwen3Moe(_)
-            | Self::Qwen3Next(_)
             | Self::Gemma2(_)
             | Self::Gemma3(_)
             | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
-            | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom(
-                "Batched forward only supported for Transformer models",
+                "Batched forward only supported for Transformer, LlavaQwen2, and Qwen3Next models",
             )),
         }
     }
 
-    /// Whether this model supports true batched decode.
+    /// Whether this model supports batched decode.
     pub fn supports_batched_decode(&self) -> bool {
         matches!(self, Self::Transformer(m) if m.supports_batched_decode())
+            || matches!(self, Self::LlavaQwen2(_) | Self::QwenVl(_))
     }
 
     /// Whether this model has a loaded MTP head for speculative decode.
@@ -880,6 +983,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => None,
         }
@@ -924,6 +1028,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -946,6 +1051,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -968,6 +1074,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -990,6 +1097,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -1043,6 +1151,7 @@ impl AnyModel {
             Self::Phi3(m) => m.args.hidden_size,
             Self::Starcoder2(m) => m.args.hidden_size,
             Self::LlavaQwen2(m) => m.hidden_size(),
+            Self::QwenVl(m) => m.hidden_size(),
             Self::DeepSeekV2(m) => m.args.hidden_size,
             Self::BonsaiQ1(m) => i32::try_from(m.config.hidden).unwrap_or(i32::MAX),
         }
@@ -1081,6 +1190,7 @@ impl AnyModel {
                 m.head_dim()
                     .map_err(|err| Exception::custom(err.to_string()))?,
             )),
+            Self::QwenVl(m) => Ok((m.num_key_value_heads(), m.head_dim())),
             Self::DeepSeekV2(m) => Ok((
                 m.args.num_key_value_heads,
                 m.args.qk_nope_head_dim + m.args.qk_rope_head_dim,
@@ -1200,13 +1310,20 @@ impl AnyModel {
                 }
                 Ok(make_kv_cache(m.num_hidden_layers()))
             }
+            Self::QwenVl(m) => {
+                if kv_cache_config.is_turboquant() {
+                    Ok(AnyCache::Hybrid(m.make_lm_cache_turbo(kv_cache_config)?))
+                } else {
+                    Ok(AnyCache::Hybrid(m.make_lm_cache()))
+                }
+            }
             Self::DeepSeekV2(m) => {
                 if kv_cache_config.is_turboquant() {
                     return Err(Exception::custom(
                         "TurboQuant is only supported for standard KV transformer models",
                     ));
                 }
-                Ok(make_kv_cache(m.args.num_hidden_layers))
+                Ok(AnyCache::KV(m.make_cache_with_config(kv_cache_config)?))
             }
             Self::Qwen3Next(m) => {
                 if kv_cache_config.is_turboquant() {
@@ -1229,20 +1346,49 @@ impl AnyModel {
     }
 
     /// Whether this model is a vision-language model that supports image input.
-    pub const fn is_vlm(&self) -> bool {
-        matches!(self, Self::LlavaQwen2(_))
+    pub fn is_vlm(&self) -> bool {
+        self.as_vision().is_some()
     }
 
-    /// The expected image size for the VLM's vision encoder, or `None` for text-only models.
-    pub const fn image_size(&self) -> Option<i32> {
+    /// Capability metadata if this model supports vision.
+    pub fn vision_capabilities(&self) -> Option<VisionCapabilities> {
+        self.as_vision().map(VisionModel::vision_capabilities)
+    }
+
+    /// The vision implementation for this model, if it has one.
+    pub fn as_vision(&self) -> Option<&dyn VisionModel> {
         match self {
-            Self::LlavaQwen2(m) => Some(m.image_size()),
+            // LLaVA/Qwen-VL report vision only when their tower was actually
+            // loaded (`disable_vision` leaves a text-only model).
+            Self::LlavaQwen2(m) => m.has_vision().then_some(m),
+            Self::QwenVl(m) => m.has_vision().then_some(m),
+            // Gemma 3/4 are vision-capable only when a vision tower was loaded
+            // (multimodal checkpoints); text-only variants report `None`.
+            Self::Gemma3(m) => m.has_vision_tower().then_some(m),
+            Self::Gemma4(m) => m.has_vision_tower().then_some(m),
             Self::Transformer(_)
             | Self::Qwen3Next(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
-            | Self::Gemma3(_)
-            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => None,
+        }
+    }
+
+    /// The mutable vision implementation for this model, if it has one.
+    pub fn as_vision_mut(&mut self) -> Option<&mut dyn VisionModel> {
+        match self {
+            Self::LlavaQwen2(m) => m.has_vision().then_some(m),
+            Self::QwenVl(m) => m.has_vision().then_some(m),
+            // Gemma 3/4 are vision-capable only when a vision tower was loaded.
+            Self::Gemma3(m) => m.has_vision_tower().then_some(m),
+            Self::Gemma4(m) => m.has_vision_tower().then_some(m),
+            Self::Transformer(_)
+            | Self::Qwen3Next(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::DeepSeekV2(_)
@@ -1257,17 +1403,17 @@ impl AnyModel {
     pub fn forward_multimodal(
         &mut self,
         input_ids: &Array,
-        pixel_values: &Array,
+        batch: &ImageBatch,
         cache: &mut AnyCache,
     ) -> Result<Array, Exception> {
-        match (self, cache) {
-            (Self::LlavaQwen2(m), AnyCache::KV(c)) => {
-                m.forward_multimodal(input_ids, pixel_values, c)
-            }
-            _ => Err(Exception::custom(
-                "Model does not support multimodal forward",
-            )),
-        }
+        self.as_vision_mut().map_or_else(
+            || {
+                Err(Exception::custom(
+                    "Model does not support multimodal forward",
+                ))
+            },
+            |v| v.forward_multimodal(input_ids, batch, cache),
+        )
     }
 
     /// `DFlash`: forward returning logits + hidden states at `tap_layers` (drafter input).
@@ -1502,6 +1648,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom(
                 "embed_token_ids only implemented for Qwen3Next",
@@ -1521,6 +1668,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom(
                 "forward_all_logits_from_hidden only implemented for Qwen3Next",
@@ -1959,6 +2107,21 @@ pub fn load_quantized_safetensors_weights<M: ModuleParametersExt>(
     model_path: &Path,
     quantized: bool,
 ) -> Result<(), ModelError> {
+    let quantization = load_checkpoint_quantization_settings(model_path)?;
+    load_quantized_safetensors_weights_with_settings(
+        model,
+        model_path,
+        quantized,
+        quantization.as_ref(),
+    )
+}
+
+pub(crate) fn load_quantized_safetensors_weights_with_settings<M: ModuleParametersExt>(
+    model: &mut M,
+    model_path: &Path,
+    quantized: bool,
+    quantization: Option<&quant_config::QuantizationSettings>,
+) -> Result<(), ModelError> {
     let safetensors_files = collect_safetensors_files(model_path)?;
 
     let mut params = model.parameters_mut().flatten();
@@ -1967,6 +2130,7 @@ pub fn load_quantized_safetensors_weights<M: ModuleParametersExt>(
         tracing::debug!(file = %file_path.display(), "Loading weights");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
             if let Some(param) = params.get_mut(&*key) {
@@ -2005,6 +2169,25 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
     quantized: bool,
     prefix: &str,
 ) -> Result<(), ModelError> {
+    let quantization = load_checkpoint_quantization_settings(model_path)?;
+    load_quantized_safetensors_weights_with_prefix_and_settings(
+        model,
+        model_path,
+        quantized,
+        prefix,
+        quantization.as_ref(),
+    )
+}
+
+pub(crate) fn load_quantized_safetensors_weights_with_prefix_and_settings<
+    M: ModuleParametersExt,
+>(
+    model: &mut M,
+    model_path: &Path,
+    quantized: bool,
+    prefix: &str,
+    quantization: Option<&quant_config::QuantizationSettings>,
+) -> Result<(), ModelError> {
     const MAX_UNMATCHED_WARNS: usize = 5;
     let safetensors_files = collect_safetensors_files(model_path)?;
 
@@ -2017,6 +2200,7 @@ pub fn load_quantized_safetensors_weights_with_prefix<M: ModuleParametersExt>(
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        validate_quantized_tensor_widths(&loaded, quantization)?;
 
         let mut matched = 0usize;
         let mut unmatched = 0usize;
@@ -2083,6 +2267,25 @@ pub fn load_quantized_safetensors_weights_optional_prefix<M: ModuleParametersExt
     quantized: bool,
     optional_prefix: &str,
 ) -> Result<(), ModelError> {
+    let quantization = load_checkpoint_quantization_settings(model_path)?;
+    load_quantized_safetensors_weights_optional_prefix_with_settings(
+        model,
+        model_path,
+        quantized,
+        optional_prefix,
+        quantization.as_ref(),
+    )
+}
+
+pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
+    M: ModuleParametersExt,
+>(
+    model: &mut M,
+    model_path: &Path,
+    quantized: bool,
+    optional_prefix: &str,
+    quantization: Option<&quant_config::QuantizationSettings>,
+) -> Result<(), ModelError> {
     const MAX_UNMATCHED_WARNS: usize = 5;
     let safetensors_files = collect_safetensors_files(model_path)?;
 
@@ -2094,6 +2297,7 @@ pub fn load_quantized_safetensors_weights_optional_prefix<M: ModuleParametersExt
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+        validate_quantized_tensor_widths(&loaded, quantization)?;
 
         for (key, value) in loaded {
             let stripped = key.strip_prefix(optional_prefix).unwrap_or(&key);
@@ -2129,6 +2333,112 @@ pub fn load_quantized_safetensors_weights_optional_prefix<M: ModuleParametersExt
     Ok(())
 }
 
+pub(crate) fn load_checkpoint_quantization_settings(
+    model_path: &Path,
+) -> Result<Option<quant_config::QuantizationSettings>, ModelError> {
+    let config_path = model_path.join("config.json");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let config: Value = serde_json::from_reader(std::fs::File::open(config_path)?)?;
+    let quantization = config.get("quantization").or_else(|| {
+        config
+            .get("text_config")
+            .and_then(|text| text.get("quantization"))
+    });
+    quantization
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(ModelError::from)
+}
+
+/// Reject per-tensor overrides that a model architecture cannot honor.
+///
+/// Scalar-only model implementations use MLX's global quantization transform,
+/// which cannot represent a dense or differently packed individual tensor.
+/// Failing here keeps an incompatible checkpoint from reaching a Metal kernel
+/// with an opaque dtype error during its first forward pass.
+pub(crate) fn validate_per_tensor_quantization_support(
+    settings: &quant_config::QuantizationSettings,
+    supported_paths: &[&str],
+) -> Result<(), ModelError> {
+    for path in settings.overridden_paths() {
+        if !supported_paths.contains(&path) {
+            return Err(ModelError::ShapeMismatch(format!(
+                "per-tensor quantization for {path} is not supported by this architecture"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the packed inner dimension of a quantized tensor pair.
+///
+/// MLX stores `weight[..., in_features * bits / 32]` alongside
+/// `scales[..., in_features / group_size]`. Checking the two checkpoint
+/// tensors before assigning them prevents a malformed shard from reaching a
+/// later, less actionable Metal kernel error.
+pub(crate) fn validate_quantized_tensor_widths(
+    loaded: &HashMap<String, Array>,
+    quantization: Option<&quant_config::QuantizationSettings>,
+) -> Result<(), ModelError> {
+    let Some(settings) = quantization else {
+        return Ok(());
+    };
+
+    for (weight_key, weight) in loaded {
+        let Some(base) = weight_key.strip_suffix(".weight") else {
+            continue;
+        };
+        let scales_key = format!("{base}.scales");
+        let Some(scales) = loaded.get(&scales_key) else {
+            continue;
+        };
+        let quant = settings.resolve(base);
+        let bits = quant.bits();
+        let group_size = quant.group_size();
+        if bits <= 0 || group_size <= 0 {
+            continue;
+        }
+        let Some(&weight_width) = weight.shape().last() else {
+            continue;
+        };
+        let Some(&scales_width) = scales.shape().last() else {
+            continue;
+        };
+        let expected_scales_width = weight_width
+            .checked_mul(32)
+            .and_then(|width| width.checked_div(bits))
+            .and_then(|width| width.checked_div(group_size))
+            .ok_or_else(|| {
+                ModelError::ShapeMismatch(format!(
+                    "{scales_key}: invalid quantization group_size={group_size}, bits={bits}"
+                ))
+            })?;
+        if scales_width != expected_scales_width {
+            return Err(ModelError::ShapeMismatch(format!(
+                "{scales_key}: scales width expected {expected_scales_width}, actual {scales_width}"
+            )));
+        }
+        let expected_weight_width = scales_width
+            .checked_mul(group_size)
+            .and_then(|width| width.checked_mul(bits))
+            .and_then(|width| width.checked_div(32))
+            .ok_or_else(|| {
+                ModelError::ShapeMismatch(format!(
+                    "{weight_key}: invalid quantization group_size={group_size}, bits={bits}"
+                ))
+            })?;
+        if weight_width != expected_weight_width {
+            return Err(ModelError::ShapeMismatch(format!(
+                "{weight_key}: packed width expected {expected_weight_width}, actual {weight_width}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Whether the checkpoint contains a weight whose key ends with `suffix`.
 ///
 /// Checks `model.safetensors.index.json`'s weight map when present (cheap),
@@ -2145,6 +2455,23 @@ pub(crate) fn checkpoint_has_key_suffix(model_path: &Path, suffix: &str) -> bool
         files.iter().any(|f| {
             Array::load_safetensors(f)
                 .is_ok_and(|loaded| loaded.keys().any(|k| k.ends_with(suffix)))
+        })
+    })
+}
+
+/// Whether any weight key in the checkpoint contains `needle` (e.g. a
+/// `vision_tower.` prefix on multimodal Gemma checkpoints). Like
+/// [`checkpoint_has_key_suffix`], prefers the shard index when present.
+pub(crate) fn checkpoint_has_key_containing(model_path: &Path, needle: &str) -> bool {
+    let index_path = model_path.join("model.safetensors.index.json");
+    if let Ok(json) = std::fs::read_to_string(&index_path)
+        && let Ok(index) = serde_json::from_str::<WeightMapIndex>(&json)
+    {
+        return index.weight_map.keys().any(|k| k.contains(needle));
+    }
+    collect_safetensors_files(model_path).is_ok_and(|files| {
+        files.iter().any(|f| {
+            Array::load_safetensors(f).is_ok_and(|loaded| loaded.keys().any(|k| k.contains(needle)))
         })
     })
 }
@@ -2242,6 +2569,153 @@ fn remap_quantized_key(key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
+    use crate::qwen3_next::QLinear;
+    use mlx_rs::macros::ModuleParameters;
+
+    #[derive(ModuleParameters)]
+    struct TestQuantizedModel {
+        #[param]
+        proj: QLinear,
+    }
+
+    #[derive(ModuleParameters)]
+    struct TestMixedQuantizedModel {
+        #[param]
+        dense: QLinear,
+        #[param]
+        quantized: QLinear,
+    }
+
+    #[test]
+    fn quantized_loader_rejects_wrong_scales_width() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"quantization":{"group_size":64,"bits":4}}"#,
+        )
+        .unwrap();
+
+        let packed_weight = [0_u8; 64 * 8 * 4];
+        let scales_bytes = [0_u8; 64 * 2 * 4];
+        let weight = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::U32,
+            vec![64, 8],
+            &packed_weight,
+        )
+        .unwrap();
+        let scales_view = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![64, 2],
+            &scales_bytes,
+        )
+        .unwrap();
+        safetensors::serialize_to_file(
+            [("proj.weight", weight), ("proj.scales", scales_view)],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let mut model = TestQuantizedModel {
+            proj: QLinear::new(64, 4).unwrap(),
+        };
+        let err = load_quantized_safetensors_weights(&mut model, dir.path(), true).unwrap_err();
+        assert!(
+            err.to_string().contains("proj.scales"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("expected 1"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("actual 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn quantized_loader_supports_mixed_dense_and_quantized_projections() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "dense": false
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut dense = vec![0.0_f32; 2 * 64];
+        dense[0] = 1.0;
+        dense[65] = 1.0;
+        let packed_weight = [0_u8; 2 * 8 * 4];
+        let scales = [1.0_f32; 2];
+        let biases = [0.0_f32; 2];
+        let f32_bytes = |values: &[f32]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect::<Vec<_>>()
+        };
+        let dense_bytes = f32_bytes(&dense);
+        let scales_bytes = f32_bytes(&scales);
+        let biases_bytes = f32_bytes(&biases);
+        let dense_view = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![2, 64],
+            &dense_bytes,
+        )
+        .unwrap();
+        let weight = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::U32,
+            vec![2, 8],
+            &packed_weight,
+        )
+        .unwrap();
+        let scales_view = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![2, 1],
+            &scales_bytes,
+        )
+        .unwrap();
+        let biases_view = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![2, 1],
+            &biases_bytes,
+        )
+        .unwrap();
+        safetensors::serialize_to_file(
+            [
+                ("dense.weight", dense_view),
+                ("quantized.weight", weight),
+                ("quantized.scales", scales_view),
+                ("quantized.biases", biases_view),
+            ],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let mut model = TestMixedQuantizedModel {
+            dense: QLinear::new(0, 0).unwrap(),
+            quantized: QLinear::new(64, 4).unwrap(),
+        };
+        load_quantized_safetensors_weights(&mut model, dir.path(), true).unwrap();
+
+        let mut input_values = vec![0.0_f32; 64];
+        input_values[0] = 2.0;
+        input_values[1] = 3.0;
+        let input = Array::from_slice(&input_values, &[1, 1, 64]);
+        let dense_out = model.dense.forward(&input).unwrap();
+        let quantized_out = model.quantized.forward(&input).unwrap();
+        assert_eq!(dense_out.shape(), &[1, 1, 2]);
+        assert_eq!(quantized_out.shape(), &[1, 1, 2]);
+        assert_eq!(dense_out.as_slice::<f32>(), &[2.0, 3.0]);
+    }
 
     fn params(temp: f32, top_p: f32) -> SamplingParams {
         SamplingParams {
@@ -2343,6 +2817,17 @@ mod tests {
             remap_quantized_key("model.embed_tokens.weight"),
             Some("model.embed_tokens.inner.weight".to_owned())
         );
+    }
+
+    #[test]
+    fn rejects_unsupported_per_tensor_quantization_override() {
+        let settings: quant_config::QuantizationSettings =
+            serde_json::from_str(r#"{"group_size":64,"bits":4,"model.embed_tokens":false}"#)
+                .unwrap();
+
+        let error = validate_per_tensor_quantization_support(&settings, &[]).unwrap_err();
+        assert!(error.to_string().contains("model.embed_tokens"));
+        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]
@@ -2758,6 +3243,15 @@ mod tests {
     }
 
     #[test]
+    fn text_models_report_no_vision() {
+        let model = qwen3_moe::Qwen3MoeCausalLM::new(small_qwen3_moe_args()).unwrap();
+        let any = AnyModel::Qwen3Moe(model);
+        assert!(any.as_vision().is_none());
+        assert!(any.vision_capabilities().is_none());
+        assert!(!any.is_vlm());
+    }
+
+    #[test]
     fn any_model_qwen3_moe_make_cache_with_turboquant_returns_quantized_kv() {
         let model = qwen3_moe::Qwen3MoeCausalLM::new(small_qwen3_moe_args()).unwrap();
         let any = AnyModel::Qwen3Moe(model);
@@ -2915,7 +3409,7 @@ mod tests {
         mlx_rs::transforms::eval([&result]).unwrap();
         let vals = result.as_slice::<f32>();
         // token 0 (positive, seen): 4.0 / 2.0 = 2.0
-        // token 1 (positive, unseen): 2.0 (unchanged)
+        // token 1 (positive, unseen): stays 2.0
         // token 2 (positive, seen): 6.0 / 2.0 = 3.0
         assert!((vals[0] - 2.0).abs() < 1e-5);
         assert!((vals[1] - 2.0).abs() < 1e-5);
@@ -2933,7 +3427,7 @@ mod tests {
         mlx_rs::transforms::eval([&result]).unwrap();
         let vals = result.as_slice::<f32>();
         // token 0 (negative, seen): -4.0 * 2.0 = -8.0 (more negative = less likely)
-        // token 1 (positive, unseen): 2.0 (unchanged)
+        // token 1 (positive, unseen): stays 2.0
         // token 2 (negative, seen): -6.0 * 2.0 = -12.0 (more negative = less likely)
         assert!((vals[0] - (-8.0)).abs() < 1e-5);
         assert!((vals[1] - 2.0).abs() < 1e-5);
@@ -2951,7 +3445,7 @@ mod tests {
         let result = apply_penalties(&logits, &[1, 1, 2], &p).unwrap();
         mlx_rs::transforms::eval([&result]).unwrap();
         let vals = result.as_slice::<f32>();
-        // token 0: 4.0 (unchanged)
+        // token 0: stays 4.0
         // token 1: 2.0 - 1.0*2 = 0.0
         // token 2: 6.0 - 1.0*1 = 5.0
         assert!((vals[0] - 4.0).abs() < 1e-5);
@@ -2970,7 +3464,7 @@ mod tests {
         mlx_rs::transforms::eval([&result]).unwrap();
         let vals = result.as_slice::<f32>();
         // token 0: 4.0 - 1.5 = 2.5
-        // token 1: 2.0 (unchanged)
+        // token 1: stays 2.0
         // token 2: 6.0 - 1.5 = 4.5
         assert!((vals[0] - 2.5).abs() < 1e-5);
         assert!((vals[1] - 2.0).abs() < 1e-5);
@@ -3029,5 +3523,16 @@ mod tests {
         } else {
             panic!("expected Hybrid variant");
         }
+    }
+
+    #[test]
+    fn any_cache_checkpoint_uses_trim_for_kv_and_clone_for_hybrid() {
+        let kv = AnyCache::KV(vec![Some(cache::SteppingKeyValueCache::new())]);
+        assert!(kv.checkpoint_for_rollback().is_none());
+
+        let hybrid = AnyCache::Hybrid(vec![Some(LayerCache::KV(
+            cache::SteppingKeyValueCache::new(),
+        ))]);
+        assert!(hybrid.checkpoint_for_rollback().is_some());
     }
 }

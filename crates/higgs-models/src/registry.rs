@@ -36,6 +36,9 @@ pub fn is_supported(model_type: &str) -> bool {
             | "qwen3_moe"
             | "qwen3_5"
             | "qwen3_5_moe"
+            | "qwen3_5_vl"
+            | "qwen3_vl"
+            | "qwen2_5_vl"
             | "nanbeige"
             | "gemma2"
             | "gemma3"
@@ -50,8 +53,8 @@ pub fn is_supported(model_type: &str) -> bool {
     )
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

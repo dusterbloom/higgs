@@ -138,6 +138,9 @@ port = 8000
 # rate_limit = 0
 # CORS origin allow-list for browser clients. Unset = no CORS headers.
 # cors_origins = ["*"]
+# max_image_bytes = 20971520   # per-image decoded byte cap (default 20 MiB); keep below max_body_size
+# image_fetch_timeout = 10.0   # remote image URL fetch timeout in seconds
+# max_image_dimension = 4096   # long-edge pixel cap before family preprocessing
 
 # --- Local serving defaults ---
 # MLX profile applies to simple-engine local models. "auto" picks balanced for
@@ -183,6 +186,11 @@ port = 8000
 # # prefill_suffix_identity_threshold = 128           # small suffixes stay exact
 # # prefill_score_mode  = "full"                      # full | l7
 # # prefill_exit_layer  = 7
+# kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
+# kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
+# prefill_yield_tokens = 512 # optional: interleave decode during long prefills
+# mla_latent_cache = true # DeepSeek-V2 only: compressed latent KV cache; cannot combine with kv_cache = "turboquant"
+# disable_vision = true # force-disable vision for this model (escape hatch; no-op on nightly)
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.
@@ -718,8 +726,8 @@ pub async fn await_shutdown_signal() {
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, unsafe_code)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

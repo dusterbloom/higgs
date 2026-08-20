@@ -147,7 +147,7 @@ impl Qwen3MoeAttention {
             rope: nn::RopeBuilder::new(head_dim)
                 .traditional(false)
                 .base(args.rope_theta)
-                .scale(1.0)
+                .scale(1.0_f32)
                 .build()
                 .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?,
             num_attention_heads: args.num_attention_heads,
@@ -588,7 +588,13 @@ pub fn load_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3MoeModelArgs
 pub fn load_qwen3_moe_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3MoeCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_model_args(model_path)?;
+    load_qwen3_moe_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_qwen3_moe_model_with_args(
+    model_path: &Path,
+    args: Qwen3MoeModelArgs,
+) -> Result<Qwen3MoeCausalLM, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -601,16 +607,36 @@ pub fn load_qwen3_moe_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3MoeCaus
         "Loading qwen3_moe model"
     );
 
+    // Qwen3-MoE never resolves per-tensor overrides — every QLinear/QEmbedding
+    // is built from the scalar group_size/bits fallback. A checkpoint that
+    // declares an override for a specific tensor path would otherwise be
+    // silently ignored and loaded into a default-quantized module.
+    if let Some(settings) = args.quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(
+            &crate::quant_config::QuantizationSettings::new(settings.group_size, settings.bits),
+            &[],
+        )?;
+    }
+
+    let quantization = args.quantization.clone();
     let mut model = Qwen3MoeCausalLM::new(args)?;
 
-    crate::load_safetensors_weights(&mut model, model_path)?;
+    crate::load_quantized_safetensors_weights_with_settings(
+        &mut model,
+        model_path,
+        false,
+        quantization
+            .as_ref()
+            .map(|q| crate::quant_config::QuantizationSettings::new(q.group_size, q.bits))
+            .as_ref(),
+    )?;
 
     tracing::info!("Qwen3MoE model loaded successfully");
     Ok(model)
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

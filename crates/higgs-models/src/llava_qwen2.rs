@@ -17,18 +17,26 @@ use mlx_rs::{
     error::Exception,
     module::{Module, Param},
     nn,
-    ops::indexing::{IndexOp, NewAxis},
-    transforms::eval,
+    ops::indexing::IndexOp,
 };
 use serde::Deserialize;
+use tokenizers::Tokenizer;
 
+use crate::AnyCache;
 use crate::cache::KeyValueCache;
 use crate::error::ModelError;
-use crate::siglip::{SigLipVisionConfig, SigLipVisionModel, load_siglip_weights};
+use crate::siglip::{
+    SigLipVisionConfig, SigLipVisionModel, load_siglip_weights, preprocess_image_resized,
+    preprocess_images_batch,
+};
 use crate::transformer;
+use crate::vision::{
+    ImageBatch, ImageDetail, ImageInput, ImageTokenLayout, ImageTokenLayoutKind,
+    VisionCapabilities, VisionError, VisionModel,
+};
 
 /// Token ID used as a placeholder for image positions in the input sequence.
-pub const IMAGE_TOKEN_INDEX: i32 = -200;
+pub use crate::vision::IMAGE_TOKEN_INDEX;
 
 /// Full LLaVA-Qwen2 config from config.json.
 #[derive(Debug, Deserialize)]
@@ -42,11 +50,7 @@ pub struct LlavaQwen2Config {
     pub quantization: Option<QuantizationConfig>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 // ---------------------------------------------------------------------------
 // Multimodal Projector (MLP)
@@ -84,9 +88,18 @@ pub struct LlavaQwen2Model {
     mm_projector: MmProjector,
     language_model: transformer::Model,
     image_size: i32,
+    /// Whether the vision tower + projector were loaded. False when the
+    /// config's `disable_vision` escape hatch forces a text-only load; the
+    /// model then reports no vision capability and rejects image input.
+    vision_enabled: bool,
 }
 
 impl LlavaQwen2Model {
+    /// Whether this instance loaded its vision tower (always true except when
+    /// `disable_vision` forced a text-only load).
+    pub const fn has_vision(&self) -> bool {
+        self.vision_enabled
+    }
     /// Get the hidden size of the language model.
     pub const fn hidden_size(&self) -> i32 {
         self.language_model.args.hidden_size
@@ -142,6 +155,18 @@ impl LlavaQwen2Model {
         self.language_model.forward_all_logits(inputs, mask, cache)
     }
 
+    /// Batched decode over the inner Qwen2 transformer (one token per request).
+    ///
+    /// Delegates to [`transformer::Model::forward_batched`]; the engine calls
+    /// this through `AnyModel::forward_batched` with `AnyCache::KV` caches.
+    pub fn forward_text_batched(
+        &mut self,
+        inputs: &Array,
+        kv_caches: &mut [&mut Vec<Option<crate::cache::SteppingKeyValueCache>>],
+    ) -> Result<Array, Exception> {
+        self.language_model.forward_batched(inputs, kv_caches)
+    }
+
     /// Encode an image through the vision tower and projector.
     ///
     /// Input: `pixel_values` with shape `[1, H, W, 3]` (NHWC).
@@ -159,32 +184,165 @@ impl LlavaQwen2Model {
         self.mm_projector.forward(vision_features)
     }
 
-    /// Forward pass with an image.
+    /// Encode N images through the vision tower and projector.
     ///
-    /// `input_ids`: token IDs `[1, seq_len]` with `IMAGE_TOKEN_INDEX` at image positions.
-    /// `pixel_values`: preprocessed image `[1, H, W, 3]`.
-    /// `cache`: KV cache for the language model.
-    ///
-    /// Replaces `IMAGE_TOKEN_INDEX` positions with projected image features,
-    /// then runs the combined sequence through the language model.
-    pub fn forward_multimodal<C: KeyValueCache>(
+    /// Input: `pixel_values` with shape `[N, H, W, 3]` (NHWC).
+    /// Output: projected features `[sum(per_image_tokens), hidden]` — for
+    /// `LLaVA` each image expands to `num_patches` rows, so
+    /// `[N * num_patches, hidden]` with one row per patch.
+    pub fn encode_image_batch(&mut self, pixel_values: &Array) -> Result<Array, Exception> {
+        let n = pixel_values.shape().first().copied().unwrap_or(0);
+        if n <= 1 {
+            // Single-image path (kept for exactness with existing behavior).
+            let feats = self.encode_image(pixel_values)?; // [1, num_patches, hidden]
+            return Ok(feats.index(0));
+        }
+        let mut rows = Vec::new();
+        for i in 0..n {
+            let single = pixel_values.index((i..i + 1, .., .., ..));
+            let feats = self.encode_image(&single)?; // [1, num_patches, hidden]
+            rows.push(feats.index(0)); // [num_patches, hidden]
+        }
+        let refs: Vec<&Array> = rows.iter().collect();
+        mlx_rs::ops::concatenate_axis(&refs, 0)
+    }
+}
+
+/// Resolve the shared `LLaVA` preprocessing target from the request's detail tiers.
+///
+/// `LLaVA` is a fixed square processor, so every image in the batch is resized
+/// to the same target. The highest requested tier wins: only when *every*
+/// image is `Low` do we downscale to half the encoder's native size (floored
+/// at 128px); `Auto`/`High` (and empty inputs) use `image_size` as-is.
+#[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+fn llava_target_size(image_size: i32, details: &[ImageDetail]) -> u32 {
+    let all_low = !details.is_empty() && details.iter().all(|d| *d == ImageDetail::Low);
+    let size = if all_low {
+        (image_size / 2).max(128)
+    } else {
+        image_size
+    };
+    size as u32
+}
+
+/// Expand `<image>` marker ids into `num_patches` consecutive sentinels.
+///
+/// [`merge_embeddings`](crate::vision::merge_embeddings) requires exactly
+/// `sum(batch.per_image_tokens)` sentinel positions; `LLaVA` expands every
+/// `<image>` marker into `num_patches` (one per vision patch) so a batch of N
+/// images yields `N * num_patches` feature positions. Tokens that are not the
+/// marker (including other special tokens) pass through unchanged.
+fn expand_image_markers(tokens: &mut Vec<u32>, marker_id: u32, num_patches: usize, sentinel: u32) {
+    if num_patches == 0 {
+        return;
+    }
+    let marker_count = tokens.iter().filter(|&&t| t == marker_id).count();
+    if marker_count == 0 {
+        return;
+    }
+    tokens.reserve(marker_count * (num_patches - 1));
+    let original = std::mem::take(tokens);
+    for t in original {
+        if t == marker_id {
+            tokens.extend(std::iter::repeat_n(sentinel, num_patches));
+        } else {
+            tokens.push(t);
+        }
+    }
+}
+
+impl VisionModel for LlavaQwen2Model {
+    fn vision_capabilities(&self) -> VisionCapabilities {
+        VisionCapabilities {
+            families: vec!["llava-qwen2"],
+            image_sizes: vec![self.image_size],
+            supported_media: vec![
+                "image/png",
+                "image/jpeg",
+                "image/webp",
+                "image/gif",
+                "image/bmp",
+            ],
+            layout_kind: ImageTokenLayoutKind::Sentinel,
+        }
+    }
+
+    fn image_marker_text(&self) -> &'static str {
+        "<image>"
+    }
+
+    fn preprocess_images(&self, images: &[ImageInput]) -> Result<ImageBatch, VisionError> {
+        let details: Vec<ImageDetail> = images.iter().map(|i| i.detail).collect();
+        let target = llava_target_size(self.image_size, &details);
+
+        let bytes: Vec<&[u8]> = images.iter().map(|i| i.bytes.as_slice()).collect();
+        let pixel_values = match preprocess_images_batch(&bytes, target) {
+            Ok(pixel_values) => pixel_values,
+            Err(batch_err) => {
+                // `preprocess_images_batch` collapses every failure into
+                // `Preprocess`; re-run the offending image through the decode
+                // path so malformed bytes surface as `VisionError::Decode`
+                // rather than a server-side preprocessing error.
+                for img in images {
+                    preprocess_image_resized(
+                        &img.bytes,
+                        (target, target),
+                        image::imageops::FilterType::Lanczos3,
+                    )?;
+                }
+                return Err(batch_err);
+            }
+        };
+        let num_patches = usize::try_from(self.vision_tower.num_patches())
+            .map_err(|e| VisionError::Preprocess(format!("invalid vision num_patches: {e}")))?;
+        Ok(ImageBatch {
+            pixel_values,
+            // Each image expands to `num_patches` feature rows in the merge.
+            per_image_tokens: vec![num_patches; images.len()],
+            // LLaVA resizes every image to the same square target, so the
+            // batch canvas is unpadded and sizes are uniform.
+            image_sizes: vec![(target, target); images.len()],
+            image_offsets: vec![],
+            layout: ImageTokenLayout::default(),
+        })
+    }
+
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    fn postprocess_image_tokens(
+        &self,
+        tokens: &mut Vec<u32>,
+        tokenizer: &Tokenizer,
+        _batch: &ImageBatch,
+    ) -> Result<(), VisionError> {
+        let Some(marker_id) = tokenizer.token_to_id("<image>") else {
+            return Ok(()); // tokenizer without <image>: nothing to expand
+        };
+        let num_patches = usize::try_from(self.vision_tower.num_patches())
+            .map_err(|e| VisionError::Preprocess(format!("invalid vision num_patches: {e}")))?;
+        // Each <image> marker becomes `num_patches` consecutive sentinels so
+        // the sentinel count matches `sum(batch.per_image_tokens)` required by
+        // `merge_embeddings` (N images -> N * num_patches feature rows).
+        expand_image_markers(tokens, marker_id, num_patches, IMAGE_TOKEN_INDEX as u32);
+        Ok(())
+    }
+
+    fn forward_multimodal(
         &mut self,
         input_ids: &Array,
-        pixel_values: &Array,
-        cache: &mut Vec<Option<C>>,
+        batch: &ImageBatch,
+        cache: &mut AnyCache,
     ) -> Result<Array, Exception> {
-        // Validate batch=1 assumption
-        let batch = input_ids
-            .shape()
-            .first()
-            .copied()
-            .ok_or_else(|| Exception::custom("input_ids must have >= 2 dims"))?;
-        if batch != 1 {
+        let AnyCache::KV(c) = cache else {
+            return Err(Exception::custom("LLaVA-Qwen2 requires a KV cache"));
+        };
+        // Validate batch=1 assumption.
+        let batch_size = input_ids.shape().first().copied().unwrap_or(0);
+        if batch_size != 1 {
             return Err(Exception::custom(format!(
-                "LLaVA-Qwen2 only supports batch_size=1, got {batch}"
+                "LLaVA-Qwen2 only supports batch_size=1, got {batch_size}"
             )));
         }
-        let image_features = self.encode_image(pixel_values)?;
+        let image_features = self.encode_image_batch(&batch.pixel_values)?; // [sum(per_image_tokens), hidden]
         // Replace IMAGE_TOKEN_INDEX sentinel with 0 before embedding lookup to
         // avoid out-of-bounds access. merge_embeddings overwrites these positions.
         let sentinel = Array::from_slice(&[IMAGE_TOKEN_INDEX], &[1]);
@@ -192,77 +350,11 @@ impl LlavaQwen2Model {
         let zero = Array::from_slice(&[0_i32], &[1]);
         let safe_ids = mlx_rs::ops::r#where(&is_sentinel, &zero, input_ids)?;
         let text_embeddings = self.language_model.embed_tokens(&safe_ids)?;
-        let combined = merge_embeddings(input_ids, &text_embeddings, &image_features)?;
+        let combined =
+            crate::vision::merge_embeddings(input_ids, &text_embeddings, &image_features, batch)?;
         self.language_model
-            .forward_from_embeddings(&combined, None, cache)
+            .forward_from_embeddings(&combined, None, c)
     }
-}
-
-/// Merge text embeddings and image features at `IMAGE_TOKEN_INDEX` positions.
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
-fn merge_embeddings(
-    input_ids: &Array,
-    text_embeddings: &Array,
-    image_features: &Array,
-) -> Result<Array, Exception> {
-    // input_ids: [1, seq_len], text_embeddings: [1, seq_len, hidden_size]
-    // image_features: [1, num_patches, hidden_size]
-    eval([input_ids])?;
-    let ids: Vec<i32> = input_ids.index(0).as_slice::<i32>().to_vec();
-
-    let image_positions: Vec<usize> = ids
-        .iter()
-        .enumerate()
-        .filter(|(_, id)| **id == IMAGE_TOKEN_INDEX)
-        .map(|(i, _)| i)
-        .collect();
-
-    if image_positions.is_empty() {
-        return Ok(text_embeddings.clone());
-    }
-
-    // Only single-image is supported; multiple IMAGE_TOKEN_INDEX positions
-    // would duplicate the same features, inflating the sequence length.
-    if image_positions.len() > 1 {
-        return Err(Exception::custom(format!(
-            "Expected 1 image token position, found {}",
-            image_positions.len()
-        )));
-    }
-
-    let image_feats = image_features.index(0); // [num_patches, hidden_size]
-
-    let mut segments: Vec<Array> = Vec::new();
-    let mut text_start: usize = 0;
-
-    for &img_pos in &image_positions {
-        if img_pos > text_start {
-            let text_seg = text_embeddings.index((.., text_start as i32..img_pos as i32, ..));
-            segments.push(text_seg);
-        }
-        segments.push(image_feats.index(NewAxis));
-        text_start = img_pos + 1;
-    }
-
-    let seq_len = ids.len();
-    if text_start < seq_len {
-        let text_seg = text_embeddings.index((.., text_start as i32..seq_len as i32, ..));
-        segments.push(text_seg);
-    }
-
-    if segments.len() == 1 {
-        return segments
-            .into_iter()
-            .next()
-            .ok_or_else(|| Exception::custom("internal error: empty segments"));
-    }
-
-    let seg_refs: Vec<&Array> = segments.iter().collect();
-    mlx_rs::ops::concatenate_axis(&seg_refs, 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -273,8 +365,25 @@ fn merge_embeddings(
 pub fn load_llava_qwen2_model(model_dir: &Path) -> Result<LlavaQwen2Model, ModelError> {
     let config_path = model_dir.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)?;
-    let config: LlavaQwen2Config = serde_json::from_str(&config_str)?;
+    let raw: serde_json::Value = serde_json::from_str(&config_str)?;
+    load_llava_qwen2_model_from_value(model_dir, &raw, false)
+}
 
+pub(crate) fn load_llava_qwen2_model_from_value(
+    model_dir: &Path,
+    raw: &serde_json::Value,
+    disable_vision: bool,
+) -> Result<LlavaQwen2Model, ModelError> {
+    let config: LlavaQwen2Config = serde_json::from_value(raw.clone())?;
+    load_llava_qwen2_model_with_config(model_dir, &config, raw, disable_vision)
+}
+
+fn load_llava_qwen2_model_with_config(
+    model_dir: &Path,
+    config: &LlavaQwen2Config,
+    raw: &serde_json::Value,
+    disable_vision: bool,
+) -> Result<LlavaQwen2Model, ModelError> {
     tracing::info!(
         image_size = config.vision_config.image_size,
         vision_layers = config.vision_config.num_hidden_layers,
@@ -282,6 +391,7 @@ pub fn load_llava_qwen2_model(model_dir: &Path) -> Result<LlavaQwen2Model, Model
         lm_hidden = config.hidden_size,
         lm_layers = config.num_hidden_layers,
         projector = %config.mm_projector_type,
+        disable_vision,
         "Loading LLaVA-Qwen2 model"
     );
 
@@ -292,14 +402,23 @@ pub fn load_llava_qwen2_model(model_dir: &Path) -> Result<LlavaQwen2Model, Model
     let mut mm_projector = MmProjector::new(config.mm_hidden_size, config.hidden_size)?;
 
     // Build language model (reads text_config, strips language_model. prefix)
-    let language_model = transformer::load_vlm_language_model(model_dir)?;
+    let language_args = transformer::text_model_args_from_value(raw)?;
+    let language_model = transformer::load_vlm_language_model_with_args(model_dir, language_args)?;
 
-    // Load all safetensor weights for vision and projector
-    let weights = load_safetensor_weights(model_dir)?;
+    // `disable_vision` escape hatch: load the text backbone only. The vision
+    // tower and projector weights are skipped entirely (never decoded), and
+    // the model reports no vision capability so image requests are rejected.
+    let vision_enabled = !disable_vision;
+    if vision_enabled {
+        // Load all safetensor weights for vision and projector
+        let weights = load_safetensor_weights(model_dir)?;
 
-    let vision_prefix = "vision_tower.vision_tower.vision_model.";
-    load_siglip_weights(&mut vision_tower, &weights, vision_prefix)?;
-    load_projector_weights(&mut mm_projector, &weights)?;
+        let vision_prefix = "vision_tower.vision_tower.vision_model.";
+        load_siglip_weights(&mut vision_tower, &weights, vision_prefix)?;
+        load_projector_weights(&mut mm_projector, &weights)?;
+    } else {
+        tracing::info!("disable_vision=true: skipping vision tower and projector weights");
+    }
 
     let image_size = config.vision_config.image_size;
 
@@ -310,6 +429,7 @@ pub fn load_llava_qwen2_model(model_dir: &Path) -> Result<LlavaQwen2Model, Model
         mm_projector,
         language_model,
         image_size,
+        vision_enabled,
     })
 }
 
@@ -368,4 +488,83 @@ fn load_safetensor_weights(model_dir: &Path) -> Result<HashMap<String, Array>, M
         all_weights.extend(loaded);
     }
     Ok(all_weights)
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::indexing_slicing,
+    clippy::manual_repeat_n,
+    clippy::panic,
+    clippy::shadow_reuse,
+    clippy::unwrap_used
+)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llava_target_size_uses_native_size_unless_all_low() {
+        assert_eq!(llava_target_size(384, &[]), 384);
+        assert_eq!(llava_target_size(384, &[ImageDetail::Auto]), 384);
+        assert_eq!(llava_target_size(384, &[ImageDetail::High]), 384);
+        // Highest requested tier wins: a single Auto/High forces full size.
+        assert_eq!(
+            llava_target_size(384, &[ImageDetail::Auto, ImageDetail::Low]),
+            384
+        );
+        assert_eq!(
+            llava_target_size(384, &[ImageDetail::High, ImageDetail::Low]),
+            384
+        );
+    }
+
+    #[test]
+    fn llava_target_size_low_downscales_to_half() {
+        assert_eq!(llava_target_size(384, &[ImageDetail::Low]), 192);
+        assert_eq!(
+            llava_target_size(384, &[ImageDetail::Low, ImageDetail::Low]),
+            192
+        );
+    }
+
+    #[test]
+    fn llava_target_size_low_is_floored_at_128() {
+        assert_eq!(llava_target_size(64, &[ImageDetail::Low]), 128);
+        assert_eq!(llava_target_size(0, &[ImageDetail::Low]), 128);
+    }
+
+    #[test]
+    fn expand_image_markers_single_marker_becomes_num_patches_sentinels() {
+        // One <image> marker (id 99) must expand to `num_patches` consecutive
+        // sentinels so the count matches `sum(per_image_tokens)` in merge.
+        let mut tokens = vec![1, 2, 99, 3];
+        expand_image_markers(&mut tokens, 99, 4, IMAGE_TOKEN_INDEX as u32);
+        let s = IMAGE_TOKEN_INDEX as u32;
+        assert_eq!(tokens, vec![1, 2, s, s, s, s, 3]);
+    }
+
+    #[test]
+    fn expand_image_markers_two_markers_expand_in_order() {
+        let mut tokens = vec![1, 99, 2, 99, 3];
+        expand_image_markers(&mut tokens, 99, 3, IMAGE_TOKEN_INDEX as u32);
+        let s = IMAGE_TOKEN_INDEX as u32;
+        assert_eq!(tokens, vec![1, s, s, s, 2, s, s, s, 3]);
+        assert_eq!(tokens.len(), 9);
+    }
+
+    #[test]
+    fn expand_image_markers_without_markers_is_unchanged() {
+        let mut tokens = vec![1, 2, 3];
+        expand_image_markers(&mut tokens, 99, 4, IMAGE_TOKEN_INDEX as u32);
+        assert_eq!(tokens, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn expand_image_markers_uses_image_token_index_sentinel() {
+        let mut tokens = vec![99];
+        expand_image_markers(&mut tokens, 99, 2, IMAGE_TOKEN_INDEX as u32);
+        assert_eq!(tokens, vec![IMAGE_TOKEN_INDEX as u32; 2]);
+        assert_eq!(tokens[0], IMAGE_TOKEN_INDEX as u32);
+        assert_eq!(tokens[0] as i32, IMAGE_TOKEN_INDEX);
+    }
 }

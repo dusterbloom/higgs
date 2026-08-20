@@ -24,3 +24,4 @@ benchmarks/*.safetensors
 benchmarks/*.py
 .worktrees/
 qwen38-challenge/
+validation/**/raw/

@@ -115,7 +115,10 @@ use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
     spec_prefill::TargetSparsePrefillPlan,
-    utils::{AttentionMask, apply_rope, create_causal_mask},
+    utils::{
+        AttentionMask, apply_rope, create_batched_decode_mask, create_causal_mask,
+        scaled_dot_product_attention,
+    },
     yarn::{compute_yarn_freqs, yarn_get_mscale},
 };
 
@@ -185,7 +188,6 @@ impl Default for QuantSpec {
         }
     }
 }
-
 /// Configuration for the Qwen3-Next / Qwen3.5 hybrid architecture.
 ///
 /// Supports hybrid SSM/attention transformers with optional Sparse `MoE`.
@@ -694,6 +696,19 @@ impl QLinear {
             crate::quant_mode::QuantMode::Affine
         };
         Self::new_with_mode(group_size, bits, mode)
+    }
+
+    /// Build a dense (unquantized) linear with concrete input/output dims
+    /// (real weight rows). Used by the transformer path for unquantized
+    /// models that may forward before weight loading (e.g. the nanbeige and
+    /// pflash tests) — the `[1]` placeholder weight would make the first
+    /// matmul degenerate.
+    pub(crate) fn dense(in_features: i32, out_features: i32) -> Result<Self, Exception> {
+        let mut linear = Self::new(0, 0)?;
+        linear.weight = Param::new(
+            Array::zeros::<f32>(&[out_features, in_features])?.as_dtype(Dtype::Bfloat16)?,
+        );
+        Ok(linear)
     }
 
     /// Construct from a resolved [`QuantSpec`] (`group_size` + bits + mode).
@@ -1223,8 +1238,8 @@ pub(crate) struct QEmbedding {
     scales: Param<Array>,
     #[param]
     biases: Param<Array>,
-    group_size: i32,
-    bits: i32,
+    pub(crate) group_size: i32,
+    pub(crate) bits: i32,
     mode: crate::quant_mode::QuantMode,
 }
 
@@ -1242,6 +1257,24 @@ impl QEmbedding {
             bits,
             mode,
         }))
+    }
+
+    /// Build a dense (unquantized) embedding with concrete vocabulary and
+    /// hidden dimensions. Used by the transformer path, which constructs the
+    /// embedding before weight loading and may forward immediately (e.g. the
+    /// pflash/nanbeige tests) — placeholder `[1]` weights would produce a
+    /// degenerate hidden dimension.
+    pub(crate) fn dense(vocab_size: i32, hidden_size: i32) -> Result<Self, Exception> {
+        Ok(Self {
+            weight: Param::new(
+                Array::zeros::<f32>(&[vocab_size, hidden_size])?.as_dtype(Dtype::Bfloat16)?,
+            ),
+            scales: Param::new(Array::from_slice::<f32>(&[], &[0])),
+            biases: Param::new(Array::from_slice::<f32>(&[], &[0])),
+            group_size: 0,
+            bits: 0,
+            mode: crate::quant_mode::QuantMode::Dense,
+        })
     }
 
     pub(crate) fn new_spec(spec: QuantSpec) -> Self {
@@ -4252,7 +4285,7 @@ impl Qwen3NextAttention {
             rope: nn::RopeBuilder::new(partial_dim)
                 .traditional(false)
                 .base(args.rope_theta)
-                .scale(1.0)
+                .scale(1.0_f32)
                 .build()
                 .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?,
             yarn: build_yarn_rope(args, partial_dim, head_dim),
@@ -4559,7 +4592,6 @@ impl Qwen3NextAttention {
             self.rope.scale,
             yarn_freqs,
         )?;
-
         Ok((queries_with_rope, keys_with_rope))
     }
 }
@@ -4611,7 +4643,7 @@ impl DenseQwen3NextAttention {
             rope: nn::RopeBuilder::new(partial_dim)
                 .traditional(false)
                 .base(args.rope_theta)
-                .scale(1.0)
+                .scale(1.0_f32)
                 .build()
                 .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?,
             yarn: build_yarn_rope(args, partial_dim, head_dim),
@@ -8164,7 +8196,6 @@ pub fn diag_report_attn_diff(label: &str, short: &DiagAttnCapture, long: &DiagAt
     report("PRE-WRITE(post-rope)", short.2.as_ref(), long.2.as_ref());
     report("POST-WRITE(stored)", short.3.as_ref(), long.3.as_ref());
 }
-
 impl Qwen3NextCausalLM {
     pub fn new(args: Qwen3NextModelArgs) -> Result<Self, Exception> {
         if args.full_attention_interval <= 0 {
@@ -8472,6 +8503,27 @@ impl Qwen3NextCausalLM {
         kv_cache: &mut Vec<Option<LayerCache>>,
         tap_layers: Option<&[usize]>,
     ) -> Result<(Array, Vec<Array>), Exception> {
+        let h = self.model.embed_tokens.forward(inputs)?;
+        self.forward_raw_hidden_with_taps_from_hidden(h, kv_cache, tap_layers)
+    }
+
+    /// Layer stack from a pre-computed hidden/embedding array (no embed lookup).
+    ///
+    /// Builds the attention mask from the hidden shape, sizes `kv_cache` to the
+    /// layer count, and runs every `DecoderLayer`. The `_mask` argument of
+    /// `forward_raw_hidden` was historically ignored; this refactor preserves
+    /// that behavior exactly — no attention masking is applied here.
+    ///
+    /// `tap_layers` optionally captures per-layer hidden states for dSpark
+    /// drafter context priming; the plain VLM embedding path
+    /// ([`Qwen3NextCausalLM::forward_raw_from_hidden`]) runs this with `None`.
+    #[allow(non_snake_case, clippy::too_many_lines)]
+    fn forward_raw_hidden_with_taps_from_hidden(
+        &mut self,
+        mut h: Array,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: Option<&[usize]>,
+    ) -> Result<(Array, Vec<Array>), Exception> {
         // DIAGNOSTIC: capture h after each layer when a probe has requested it
         // (higgs_models::diag_request_hidden_capture). The probe then compares
         // two captured forwards (e.g. body vs full) directly — no "previous
@@ -8491,8 +8543,6 @@ impl Qwen3NextCausalLM {
                 "tap layers must be unique, strictly increasing, and in range",
             ));
         }
-
-        let mut h = self.model.embed_tokens.forward(inputs)?;
 
         if kv_cache.is_empty() {
             *kv_cache = self.make_cache();
@@ -8713,6 +8763,18 @@ impl Qwen3NextCausalLM {
         Ok((h, taps))
     }
 
+    /// Layer stack from a pre-computed hidden/embedding array, without tap
+    /// capture — the VLM embedding entry point used by
+    /// [`Qwen3NextCausalLM::forward_from_embeddings`].
+    fn forward_raw_from_hidden(
+        &mut self,
+        h: Array,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        self.forward_raw_hidden_with_taps_from_hidden(h, kv_cache, None)
+            .map(|(hidden, _taps)| hidden)
+    }
+
     fn forward_raw_hidden(
         &mut self,
         inputs: &Array,
@@ -8753,6 +8815,52 @@ impl Qwen3NextCausalLM {
             Some(head) => head.forward(&h_last),
             None => self.model.embed_tokens.as_linear(&h_last),
         }
+    }
+
+    /// Forward pass starting from pre-merged embeddings (VLM path), skipping
+    /// the `embed_tokens` lookup.
+    ///
+    /// The caller merges image features into the text embedding array before
+    /// calling this — the same contract as
+    /// `crate::Model::forward_from_embeddings` (the generic transformer).
+    /// Returns logits for the **last position only** (shape `[B, 1, vocab]`),
+    /// matching [`Qwen3NextCausalLM::forward`].
+    ///
+    /// Like `forward_raw_hidden`, the `mask` argument is currently ignored
+    /// (the causal mask is derived from the hidden shape and cache offset).
+    #[allow(non_snake_case)]
+    pub fn forward_from_embeddings(
+        &mut self,
+        embeddings: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_raw_from_hidden(embeddings.clone(), kv_cache)?;
+        let h_normed = self.model.norm.forward(&h)?;
+        let h_last = h_normed.index((.., -1.., ..)); // [B, 1, hidden]
+
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&h_last),
+            None => self.model.embed_tokens.as_linear(&h_last),
+        }
+    }
+
+    /// Forward pass starting from pre-merged embeddings, returning hidden
+    /// states after the final `RMSNorm` (before the LM head) for **all**
+    /// positions — the embedding counterpart of [`Qwen3NextCausalLM::forward_hidden`].
+    ///
+    /// Used by MTP-adjacent paths that need per-position hidden states from a
+    /// pre-merged (VLM) embedding array. `mask` is ignored, as in
+    /// `forward_from_embeddings`.
+    #[allow(non_snake_case)]
+    pub fn forward_from_embeddings_hidden(
+        &mut self,
+        embeddings: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_raw_from_hidden(embeddings.clone(), kv_cache)?;
+        self.model.norm.forward(&h)
     }
 
     /// Forward pass producing logits for **only the last token**.
@@ -8854,6 +8962,254 @@ impl Qwen3NextCausalLM {
         Ok(logits)
     }
 
+    /// Batched decode: one forward pass for N requests each with 1 token over
+    /// the hybrid SSM/attention stack.
+    ///
+    /// Full-attention layers run the heavy ops (input norm, Q/K/V projections,
+    /// QK norms, SDPA, output projection, MLP) batched over the stacked `[N, 1]`
+    /// inputs; only `RoPE` and the per-request KV cache update loop over requests
+    /// (each request has its own position offset and cache), mirroring
+    /// `Transformer::forward_batched`. Gated-delta (SSM) layers keep a
+    /// per-request state machine (convolution ring buffer + recurrent state),
+    /// so the GDN block runs once per request while the residual, post-attention
+    /// norm, and MLP stay batched. The LM head is applied to the stacked hidden
+    /// states, producing `[N, 1, vocab]`.
+    ///
+    /// `TurboQuant` KV caches are materialized to dense K/V here (approximate
+    /// versus the native quantized decode path); the batch engine only ever
+    /// uses dense caches.
+    #[allow(clippy::too_many_lines, clippy::indexing_slicing)]
+    pub fn forward_batched(
+        &mut self,
+        inputs: &Array,
+        kv_caches: &mut [&mut Vec<Option<LayerCache>>],
+    ) -> Result<Array, Exception> {
+        let n = *inputs
+            .shape()
+            .first()
+            .ok_or_else(|| Exception::custom("inputs must have batch dimension"))?;
+        let n_usize = usize::try_from(n).map_err(|_| Exception::custom("batch size overflow"))?;
+        let num_layers = self.model.layers.len();
+        if kv_caches.len() != n_usize {
+            return Err(Exception::custom("kv_caches length must match batch size"));
+        }
+        for (i, cache) in kv_caches.iter_mut().enumerate() {
+            if cache.is_empty() {
+                **cache = self.make_cache();
+            }
+            if cache.len() != num_layers {
+                return Err(Exception::custom(format!(
+                    "kv_cache[{i}] length ({}) must match num layers ({num_layers})",
+                    cache.len()
+                )));
+            }
+        }
+        let head_dim = self.args.head_dim;
+
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+
+        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
+            // Batched: input layernorm over the stacked [N, 1, D] hidden states.
+            let normed = layer.input_layernorm.forward(&h)?;
+
+            let r = if layer.is_linear {
+                // SSM/GDN layer: the convolution ring buffer and recurrent
+                // state are per-request, so run the block once per request
+                // with that request's cache.
+                let attn = layer
+                    .linear_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing on linear layer"))?;
+                let mut rows: Vec<Array> = Vec::with_capacity(n_usize);
+                for (req_idx, req_cache) in kv_caches.iter_mut().enumerate() {
+                    let i = i32::try_from(req_idx)
+                        .map_err(|_| Exception::custom("request index overflow"))?;
+                    let row = normed.index((i..i + 1, .., ..)); // [1, 1, D]
+                    let cache = req_cache
+                        .get_mut(layer_idx)
+                        .and_then(Option::as_mut)
+                        .ok_or_else(|| Exception::custom("Cache not initialized"))?;
+                    let LayerCache::Arrays(ssm_cache) = cache else {
+                        return Err(Exception::custom("Expected ArraysCache for linear layer"));
+                    };
+                    rows.push(attn.forward(&row, None, ssm_cache)?);
+                }
+                let refs: Vec<&Array> = rows.iter().collect();
+                ops::concatenate_axis(&refs, 0)?
+            } else {
+                // Full attention: batched Q/K/V projections and QK norms over
+                // the stacked [N, 1, D] input, then per-request RoPE + cache
+                // update, then one batched SDPA with a padded decode mask.
+                let attn = layer
+                    .self_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing on attention layer"))?;
+                let n_heads = attn.num_attention_heads;
+                let n_kv_heads = attn.num_key_value_heads;
+                let scale = attn.scale;
+
+                // Q is projected to 2 * num_heads * head_dim (doubled for gating).
+                let q_proj_output = attn.q_proj.forward_decode_fast(&normed)?;
+                let q_reshaped = q_proj_output.reshape(&[n, 1, n_heads, -1])?;
+                let q_halves = q_reshaped.split(2, Some(-1))?;
+                let queries_pre = q_halves
+                    .first()
+                    .ok_or_else(|| Exception::custom("split produced empty result"))?;
+                let gate = q_halves
+                    .get(1)
+                    .ok_or_else(|| Exception::custom("split produced empty result"))?
+                    .reshape(&[n, 1, -1])?;
+
+                let keys_raw = attn.k_proj.forward_decode_fast(&normed)?;
+                let values_raw = attn.v_proj.forward_decode_fast(&normed)?;
+
+                let queries = attn
+                    .q_norm
+                    .forward(queries_pre)?
+                    .transpose_axes(&[0, 2, 1, 3])?;
+                let keys = attn
+                    .k_norm
+                    .forward(&keys_raw.reshape(&[n, 1, n_kv_heads, -1])?)?
+                    .transpose_axes(&[0, 2, 1, 3])?;
+                let values = values_raw
+                    .reshape(&[n, 1, n_kv_heads, -1])?
+                    .transpose_axes(&[0, 2, 1, 3])?;
+
+                // Extract RoPE params as scalars (avoids borrow conflict with
+                // the mutable per-request cache references).
+                let rope_dims = attn.rope.dimensions;
+                let rope_traditional = attn.rope.traditional;
+                let rope_base = attn.rope.base;
+                let rope_scale = attn.rope.scale;
+
+                // Flatten to 2D for reliable per-request slicing.
+                let q_flat = queries.reshape(&[n, n_heads * head_dim])?;
+                let k_flat = keys.reshape(&[n, n_kv_heads * head_dim])?;
+                let v_flat = values.reshape(&[n, n_kv_heads * head_dim])?;
+
+                let mut all_queries: Vec<Array> = Vec::with_capacity(n_usize);
+                let mut all_keys: Vec<Array> = Vec::with_capacity(n_usize);
+                let mut all_values: Vec<Array> = Vec::with_capacity(n_usize);
+                let mut kv_lengths: Vec<i32> = Vec::with_capacity(n_usize);
+
+                for (req_idx, req_cache) in kv_caches.iter_mut().enumerate() {
+                    let i = i32::try_from(req_idx)
+                        .map_err(|_| Exception::custom("request index overflow"))?;
+
+                    let q_i = q_flat
+                        .index((i..i + 1, ..))
+                        .reshape(&[1, n_heads, 1, head_dim])?;
+                    let k_i = k_flat
+                        .index((i..i + 1, ..))
+                        .reshape(&[1, n_kv_heads, 1, head_dim])?;
+                    let v_i = v_flat
+                        .index((i..i + 1, ..))
+                        .reshape(&[1, n_kv_heads, 1, head_dim])?;
+
+                    let cache = req_cache
+                        .get_mut(layer_idx)
+                        .and_then(Option::as_mut)
+                        .ok_or_else(|| Exception::custom("Cache not initialized"))?;
+                    let LayerCache::KV(kv) = cache else {
+                        return Err(Exception::custom("Expected KVCache for attention layer"));
+                    };
+                    // RoPE with this request's own position offset.
+                    let offset = kv.offset();
+                    let q_rope = mlx_rs::fast::rope(
+                        &q_i,
+                        rope_dims,
+                        rope_traditional,
+                        rope_base,
+                        rope_scale,
+                        offset,
+                        None,
+                    )?;
+                    let k_rope = mlx_rs::fast::rope(
+                        &k_i,
+                        rope_dims,
+                        rope_traditional,
+                        rope_base,
+                        rope_scale,
+                        offset,
+                        None,
+                    )?;
+
+                    // Update this request's KV cache and materialize the dense
+                    // view (the batch engine only uses dense caches).
+                    let view = kv.update_and_view(k_rope, v_i)?;
+                    let (full_k, full_v) = view.into_dense()?;
+                    let seq_len = full_k
+                        .shape()
+                        .get(2)
+                        .copied()
+                        .ok_or_else(|| Exception::custom("cached keys missing seq dim"))?;
+                    kv_lengths.push(seq_len);
+                    all_queries.push(q_rope);
+                    all_keys.push(full_k);
+                    all_values.push(full_v);
+
+                    if async_layer_state_eval_enabled() {
+                        mlx_rs::transforms::async_eval(kv.eval_targets())?;
+                    }
+                }
+
+                // Right-pad shorter caches to max_kv_len and stack.
+                let max_kv_len = kv_lengths.iter().copied().max().unwrap_or(1);
+                let mut padded_keys: Vec<Array> = Vec::with_capacity(n_usize);
+                let mut padded_values: Vec<Array> = Vec::with_capacity(n_usize);
+                for (full_k, full_v) in all_keys.into_iter().zip(all_values) {
+                    let seq_len = *full_k
+                        .shape()
+                        .get(2)
+                        .ok_or_else(|| Exception::custom("cached keys missing seq dim"))?;
+                    if seq_len < max_kv_len {
+                        let pad_len = max_kv_len - seq_len;
+                        let pad_k =
+                            ops::zeros_dtype(&[1, n_kv_heads, pad_len, head_dim], full_k.dtype())?;
+                        let pad_v =
+                            ops::zeros_dtype(&[1, n_kv_heads, pad_len, head_dim], full_v.dtype())?;
+                        padded_keys.push(ops::concatenate_axis(&[&full_k, &pad_k], 2)?);
+                        padded_values.push(ops::concatenate_axis(&[&full_v, &pad_v], 2)?);
+                    } else {
+                        padded_keys.push(full_k);
+                        padded_values.push(full_v);
+                    }
+                }
+
+                let stacked_q = ops::concatenate_axis(&all_queries.iter().collect::<Vec<_>>(), 0)?;
+                let stacked_k = ops::concatenate_axis(&padded_keys.iter().collect::<Vec<_>>(), 0)?;
+                let stacked_v =
+                    ops::concatenate_axis(&padded_values.iter().collect::<Vec<_>>(), 0)?;
+
+                let mask = create_batched_decode_mask(&kv_lengths, max_kv_len)?;
+                let attn_out = scaled_dot_product_attention(
+                    stacked_q,
+                    stacked_k,
+                    stacked_v,
+                    scale,
+                    Some(&mask),
+                )?;
+                let attn_flat = attn_out
+                    .transpose_axes(&[0, 2, 1, 3])?
+                    .reshape(&[n, 1, -1])?;
+                let gated = sigmoid_mul(&gate, &attn_flat)?;
+                let out = attn.o_proj.forward_decode_fast(&gated)?;
+                mlx_rs::stop_gradient(&out)?
+            };
+
+            let h2 = h.add(r)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            let mlp_out = layer.mlp.forward(&normed_post)?;
+            h = h2.add(mlp_out)?;
+        }
+
+        let out = self.model.norm.forward(&h)?;
+        match self.lm_head.as_ref() {
+            Some(head) => head.forward(&out),
+            None => self.model.embed_tokens.as_linear(&out),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // MTP (Multi-Token Prediction) speculative decode
     // -----------------------------------------------------------------------
@@ -8885,6 +9241,15 @@ impl Qwen3NextCausalLM {
             i32::try_from(token_id).map_err(|_| Exception::custom("token_id exceeds i32 range"))?;
         let ids = Array::from_slice(&[token_id_i32], &[1, 1]);
         self.model.embed_tokens.forward(&ids)
+    }
+
+    /// Look up embeddings for a batch of token ids. Shape: `[1, L, hidden]`.
+    ///
+    /// Used by the Qwen-VL multimodal path, which embeds a masked id array
+    /// (sentinels replaced by 0) before merging image features into the
+    /// embedding sequence.
+    pub fn embed_tokens_batch(&self, ids: &Array) -> Result<Array, Exception> {
+        self.model.embed_tokens.forward(ids)
     }
 
     fn embed_tokens_from_ids(&self, token_ids: &[u32]) -> Result<Array, Exception> {
@@ -10179,6 +10544,14 @@ fn gate_quantization_override(config: &serde_json::Value) -> Option<serde_json::
         "language_model.model.layers.0.mlp.gate",
     ] {
         if let Some(gate_q) = quant.get(key) {
+            // `true` means "quantize with the scalar defaults" (see
+            // QuantizationSettings::deserialize) — identical to the key
+            // being absent. Treat it as such rather than injecting it into
+            // `gate_quantization`, whose type requires an object with
+            // group_size/bits and would fail to deserialize a bare bool.
+            if gate_q == &serde_json::Value::Bool(true) {
+                continue;
+            }
             return Some(gate_q.clone());
         }
     }
@@ -10297,7 +10670,7 @@ fn synthesize_fused_gdn_overrides(overrides: &mut serde_json::Map<String, serde_
     }
 }
 
-fn load_qwen3_next_args_from_value(
+pub(crate) fn load_qwen3_next_args_from_value(
     mut config: serde_json::Value,
 ) -> Result<Qwen3NextModelArgs, ModelError> {
     let gate_override = gate_quantization_override(&config);
@@ -10627,7 +11000,14 @@ pub fn load_qwen3_next_model<P: AsRef<Path>>(
     model_dir: P,
 ) -> Result<Qwen3NextCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
-    let mut args = load_model_args(model_path)?;
+    let args = load_model_args(model_path)?;
+    load_qwen3_next_model_with_args(model_path, args)
+}
+
+pub(crate) fn load_qwen3_next_model_with_args(
+    model_path: &Path,
+    mut args: Qwen3NextModelArgs,
+) -> Result<Qwen3NextCausalLM, ModelError> {
     maybe_disable_mtp_without_checkpoint_weights(&mut args, model_path)?;
 
     tracing::info!(
@@ -10641,6 +11021,7 @@ pub fn load_qwen3_next_model<P: AsRef<Path>>(
         "Loading qwen3_next model"
     );
 
+    let quantization = args.quantization.clone();
     let mut model = Qwen3NextCausalLM::new(args)?;
 
     // Backbone keys match model params directly, but the MTP sidecar may need
@@ -10648,7 +11029,7 @@ pub fn load_qwen3_next_model<P: AsRef<Path>>(
     // dense or MoE head (params `dense_mtp.*` / `moe_mtp.*`) while the checkpoint
     // still ships the head under the `mtp.*` namespace. The plain loader can't
     // bridge that, so it would silently leave the draft head uninitialized.
-    load_qwen3_next_weights(&mut model, model_path)?;
+    load_qwen3_next_weights(&mut model, model_path, quantization.as_ref())?;
 
     tracing::info!("Qwen3Next model loaded successfully");
     Ok(model)
@@ -10670,7 +11051,13 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
     let config: serde_json::Value = serde_json::from_reader(file)?;
+    load_qwen3_5_text_config_args_from_value(model_dir.as_ref(), &config)
+}
 
+pub(crate) fn load_qwen3_5_text_config_args_from_value(
+    model_dir: &Path,
+    config: &serde_json::Value,
+) -> Result<Qwen3NextModelArgs, ModelError> {
     let text_config = config
         .get("text_config")
         .ok_or_else(|| ModelError::UnsupportedModel("missing text_config in config.json".into()))?;
@@ -10750,7 +11137,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     // in Unsloth dynamic quants), construct the model with separate GDN
     // projection fields so the direct weight loader can match them. Otherwise,
     // construct with fused fields (weights are rearranged at load time).
-    let mixed_ba_layers = qwen3_5_mixed_ba_quantization_layers(&config, text_config);
+    let mixed_ba_layers = qwen3_5_mixed_ba_quantization_layers(config, text_config);
     let config_requests_separate = map
         .get("use_separate_gdn_projections")
         .and_then(serde_json::Value::as_bool)
@@ -10780,7 +11167,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     );
 
     // Detect per-layer gate quantization override from top-level quantization config
-    if let Some(gate_q) = gate_quantization_override(&config) {
+    if let Some(gate_q) = gate_quantization_override(config) {
         map.insert("gate_quantization".to_owned(), gate_q);
     }
 
@@ -11011,6 +11398,13 @@ pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausa
     let model_path = model_dir.as_ref();
     let mut args = load_qwen3_5_moe_text_config_args(model_path)?;
     force_eschamoe_quant_layout(&mut args, model_path)?;
+    load_qwen3_5_model_with_args(model_path, args)
+}
+
+pub(crate) fn load_qwen3_5_model_with_args(
+    model_path: &Path,
+    mut args: Qwen3NextModelArgs,
+) -> Result<Qwen3NextCausalLM, ModelError> {
     maybe_disable_mtp_without_checkpoint_weights(&mut args, model_path)?;
 
     tracing::info!(
@@ -11081,6 +11475,13 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
     let model_path = model_dir.as_ref();
     let mut args = load_qwen3_5_moe_text_config_args(model_path)?;
     force_eschamoe_quant_layout(&mut args, model_path)?;
+    load_qwen3_5_moe_model_with_args(model_path, args)
+}
+
+pub(crate) fn load_qwen3_5_moe_model_with_args(
+    model_path: &Path,
+    mut args: Qwen3NextModelArgs,
+) -> Result<Qwen3NextCausalLM, ModelError> {
     maybe_disable_mtp_without_checkpoint_weights(&mut args, model_path)?;
 
     tracing::info!(
@@ -11198,12 +11599,18 @@ fn load_qwen3_5_model_with_gdn_fallback(
     gdn_dims: &GdnDims,
     compact_symmetric_q1: bool,
 ) -> Result<Qwen3NextCausalLM, ModelError> {
+    let quantization = args.quantization.clone();
     let force_separate =
         args.use_separate_gdn_projections || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
     if force_separate {
         args.use_separate_gdn_projections = true;
         let mut model = Qwen3NextCausalLM::new(args)?;
-        load_qwen3_5_moe_weights_direct(&mut model, model_path, compact_symmetric_q1)?;
+        load_qwen3_5_moe_weights_direct(
+            &mut model,
+            model_path,
+            compact_symmetric_q1,
+            quantization.as_ref(),
+        )?;
         tracing::info!("Using SEPARATE GDN projections (4 dispatches per layer)");
         return Ok(model);
     }
@@ -11227,7 +11634,12 @@ fn load_qwen3_5_model_with_gdn_fallback(
             );
             args.use_separate_gdn_projections = true;
             let mut separate_model = Qwen3NextCausalLM::new(args)?;
-            load_qwen3_5_moe_weights_direct(&mut separate_model, model_path, compact_symmetric_q1)?;
+            load_qwen3_5_moe_weights_direct(
+                &mut separate_model,
+                model_path,
+                compact_symmetric_q1,
+                quantization.as_ref(),
+            )?;
             tracing::info!(
                 "Using SEPARATE GDN projections (4 dispatches per layer, mixed-bit fallback)"
             );
@@ -11453,10 +11865,24 @@ fn qwen35_loaded_value(
 /// `mtp.*` → `dense_mtp.*` / `moe_mtp.*` remap, which the plain loader lacks —
 /// without it a dense/MoE draft head selected by
 /// `maybe_disable_mtp_without_checkpoint_weights` is silently left uninitialized.
+/// Width-validation adapter for the shared safetensors loader.
+///
+/// Nightly's `QuantizationConfig` here is the scalar `(group_size, bits,
+/// mode)` struct; the crate-wide width validator consumes the registry's
+/// per-tensor settings type. Converting loses per-tensor overrides, which
+/// nightly's qwen3_next loader does not resolve anyway — validation uses the
+/// scalar fallback, exactly like the constructor path.
+fn quant_settings_for_width_validation(
+    quantization: Option<&QuantizationConfig>,
+) -> Option<crate::quant_config::QuantizationSettings> {
+    quantization.map(|q| crate::quant_config::QuantizationSettings::new(q.group_size, q.bits))
+}
+
 #[allow(clippy::shadow_reuse)]
 fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
+    quantization: Option<&QuantizationConfig>,
 ) -> Result<(), crate::error::ModelError> {
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
     let mut params = model.parameters_mut().flatten();
@@ -11464,6 +11890,10 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+        crate::validate_quantized_tensor_widths(
+            &loaded,
+            quant_settings_for_width_validation(quantization).as_ref(),
+        )?;
 
         for (key, value) in loaded {
             let key = normalize_sidecar_mtp_key(file_path, key);
@@ -11510,6 +11940,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     model: &mut M,
     model_path: &Path,
     compact_symmetric_q1: bool,
+    quantization: Option<&QuantizationConfig>,
 ) -> Result<(), crate::error::ModelError> {
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
     let mut params = model.parameters_mut().flatten();
@@ -11519,6 +11950,10 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     for file_path in &safetensors_files {
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+        crate::validate_quantized_tensor_widths(
+            &loaded,
+            quant_settings_for_width_validation(quantization).as_ref(),
+        )?;
 
         for (key, value) in loaded {
             let key = normalize_sidecar_mtp_key(file_path, key);
@@ -11814,7 +12249,6 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     Ok(escha_natives)
 }
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -11857,6 +12291,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     clippy::redundant_clone,
     clippy::as_conversions
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
@@ -13424,6 +13859,54 @@ mod tests {
     }
 
     #[test]
+    fn test_causal_lm_accepts_honored_expert_projection_override() {
+        // valid_causal_lm_args() has num_experts=4; resolve_uniform requires
+        // every expert in the fused group to share the override.
+        let mut args = valid_causal_lm_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.layers.0.mlp.experts.0.gate_proj": {"group_size": 32, "bits": 8},
+                    "model.layers.0.mlp.experts.1.gate_proj": {"group_size": 32, "bits": 8},
+                    "model.layers.0.mlp.experts.2.gate_proj": {"group_size": 32, "bits": 8},
+                    "model.layers.0.mlp.experts.3.gate_proj": {"group_size": 32, "bits": 8}
+                }"#,
+            )
+            .unwrap(),
+        );
+        Qwen3NextCausalLM::new(args).unwrap();
+    }
+
+    #[test]
+    fn test_causal_lm_accepts_real_checkpoint_per_layer_router_gate_overrides() {
+        // Mirrors real mlx-community Qwen3-Next 5-bit checkpoints (e.g.
+        // Qwen3-Next-80B-A3B-Thinking-5bit), which carry a per-layer 8-bit
+        // router override for both `mlp.gate` and `mlp.shared_expert_gate`
+        // at every MoE layer, not just layer 0.
+        let mut args = valid_causal_lm_args();
+        args.quantization = Some(
+            serde_json::from_str(
+                r#"{
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.layers.0.mlp.gate": {"group_size": 64, "bits": 8},
+                    "model.layers.0.mlp.shared_expert_gate": {"group_size": 64, "bits": 8},
+                    "model.layers.1.mlp.gate": {"group_size": 64, "bits": 8},
+                    "model.layers.1.mlp.shared_expert_gate": {"group_size": 64, "bits": 8},
+                    "model.layers.2.mlp.gate": {"group_size": 64, "bits": 8},
+                    "model.layers.2.mlp.shared_expert_gate": {"group_size": 64, "bits": 8},
+                    "model.layers.3.mlp.gate": {"group_size": 64, "bits": 8},
+                    "model.layers.3.mlp.shared_expert_gate": {"group_size": 64, "bits": 8}
+                }"#,
+            )
+            .unwrap(),
+        );
+        Qwen3NextCausalLM::new(args).unwrap();
+    }
+
+    #[test]
     fn test_causal_lm_rejects_zero_conv_kernel_dim() {
         let mut args = valid_causal_lm_args();
         args.linear_conv_kernel_dim = 0;
@@ -13740,8 +14223,7 @@ mod tests {
         let config = serde_json::json!({
             "model_type": "qwen3_5",
             "hidden_size": 64,
-            "num_hidden_layers": 4,
-            "intermediate_size": 128,
+            "num_hidden_layers": 4,            "intermediate_size": 128,
             "num_attention_heads": 4,
             "num_key_value_heads": 1,
             "head_dim": 16,
@@ -13761,8 +14243,7 @@ mod tests {
                 "language_model.model.embed_tokens": { "group_size": 64, "bits": 4, "mode": "affine" },
                 "language_model.model.layers.0.mlp.down_proj": { "group_size": 64, "bits": 3, "mode": "affine" },
                 "language_model.model.layers.0.linear_attn.in_proj_qkv": { "group_size": 64, "bits": 4, "mode": "affine" },
-                "language_model.model.layers.3.self_attn.q_proj": { "group_size": 64, "bits": 4, "mode": "affine" }
-            }
+                "language_model.model.layers.3.self_attn.q_proj": { "group_size": 64, "bits": 4, "mode": "affine" }            }
         });
 
         let args = load_qwen3_next_args_from_value(config).unwrap();
@@ -13891,8 +14372,7 @@ mod tests {
         let mut args: Qwen3NextModelArgs = serde_json::from_value(serde_json::json!({
             "model_type": "qwen3_5",
             "hidden_size": 64,
-            "num_hidden_layers": 4,
-            "intermediate_size": 128,
+            "num_hidden_layers": 4,            "intermediate_size": 128,
             "num_attention_heads": 4,
             "num_key_value_heads": 1,
             "head_dim": 16,
@@ -14373,6 +14853,56 @@ mod tests {
         std::fs::write(dir.path().join("config.json"), "{{bad json").unwrap();
         let result = load_model_args(dir.path());
         assert!(result.is_err());
+    }
+
+    /// A malformed `scales` width must fail at load time through the custom
+    /// `load_qwen3_next_weights` shard loop, not surface as an opaque Metal
+    /// kernel error on first forward. This exercises the same
+    /// `validate_quantized_tensor_widths` check that the generic loaders in
+    /// `lib.rs` already run, wired into the qwen3_next-specific loader.
+    #[test]
+    fn test_load_qwen3_next_weights_rejects_malformed_scales_width() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"quantization": {"group_size": 64, "bits": 4}}"#,
+        )
+        .unwrap();
+
+        // weight: [4, 8] packed i.e. bits=4, group_size=64 implies scales
+        // width should be 8*32/4/64 = 1, but we provide width 2.
+        let weight_data = vec![0_u8; 4 * 8 * 4];
+        let scales_data = vec![0_u8; 4 * 2 * 4];
+        let weight_tensor = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![4, 8],
+            &weight_data,
+        )
+        .unwrap();
+        let scales_tensor = safetensors::tensor::TensorView::new(
+            safetensors::tensor::Dtype::F32,
+            vec![4, 2],
+            &scales_data,
+        )
+        .unwrap();
+        safetensors::serialize_to_file(
+            [
+                ("model.layers.0.self_attn.q_proj.weight", weight_tensor),
+                ("model.layers.0.self_attn.q_proj.scales", scales_tensor),
+            ],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let mut model = Qwen3NextCausalLM::new(valid_causal_lm_args()).unwrap();
+        let quantization: QuantizationConfig =
+            serde_json::from_str(r#"{"group_size": 64, "bits": 4}"#).unwrap();
+        let err = load_qwen3_next_weights(&mut model, dir.path(), Some(&quantization)).unwrap_err();
+        assert!(
+            err.to_string().contains("model.layers.0.self_attn.q_proj"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -14943,7 +15473,6 @@ mod tests {
         });
 
         let mut block = SparseMoeBlock::new(&args, "test.layer.mlp").unwrap();
-
         // Set router gate weights: [num_experts, hidden_size]
         let gate_w = Array::ones::<f32>(&[4, 64]).unwrap();
         let (gw, gs, gb) = quantize_weights(&gate_w, 64, 8);

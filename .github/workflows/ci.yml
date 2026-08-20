@@ -18,64 +18,99 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: macos-latest
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
+          # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
+          prefix-key: "v1-mlx-air-macos15"
 
       - name: Run tests
         run: cargo test --all-features -- --test-threads=1
 
   build:
     name: Build
-    runs-on: macos-latest
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
+          # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
+          prefix-key: "v1-mlx-air-macos15"
 
       - name: Build release
         run: cargo build --release
 
-  lint:
-    name: Lint
-    runs-on: macos-latest
+  bench-smoke:
+    name: Bench smoke
+    # Advisory until model-backed validation has stabilized across macOS runners.
+    continue-on-error: true
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: "v1-mlx-air-macos15"
+
+      - name: Test validation PII scrubber
+        run: python3 scripts/validate/test_scrub.py
+
+      - name: Exercise validation runner offline
+        run: scripts/validate/run.sh --self-test
+
+  lint:
+    name: Lint
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
+          # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
+          prefix-key: "v1-mlx-air-macos15"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -85,47 +120,55 @@ jobs:
 
   msrv:
     name: MSRV
-    runs-on: macos-latest
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # 1.88.0
         with:
-          toolchain: "1.97.0"
+          toolchain: "1.97.1"
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
+          # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
+          prefix-key: "v1-mlx-air-macos15"
 
       - name: Check MSRV
         run: cargo check --all-features
 
   coverage:
     name: Coverage
-    runs-on: macos-latest
+    runs-on: macos-15 # pinned: macos-latest (macOS 26/Xcode 26.5) breaks MLX metallib link — deployment-target mismatch
     permissions:
       contents: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2
         with:
           tool: cargo-llvm-cov
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Bust cache poisoned by mlx-sys .air built on a different Xcode/macOS
+          # image (AIR 2.8 vs 2.7 link mismatch). Bump when the pinned image changes.
+          prefix-key: "v1-mlx-air-macos15"
 
       - name: Generate coverage and enforce threshold
         run: |
@@ -165,15 +208,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Run Omen
-        uses: panbanda/omen@omen-v4.24.1
+        uses: panbanda/omen@omen-v4.28.0
         id: omen
         with:
-          version: "4.24.1"
+          version: "4.28.0"
           comment: false
           label: false
           check: false

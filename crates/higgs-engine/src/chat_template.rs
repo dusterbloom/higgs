@@ -296,7 +296,7 @@ fn normalize_arguments_value(args: &mut serde_json::Value) {
 /// `tojson` filter. `_kwargs` absorbs keyword arguments HF chat templates pass
 /// — notably `tojson(ensure_ascii=false)` (e.g. `MiniCPM5`). `serde_json` already
 /// emits UTF-8, which matches `ensure_ascii=false`, so the kwarg is accepted and
-/// ignored rather than failing the render with "too many arguments".
+/// ignored rather than aborting the render with "too many arguments".
 #[allow(clippy::needless_pass_by_value)]
 fn tojson_filter(value: Value, _kwargs: Kwargs) -> Result<String, minijinja::Error> {
     let serialized = serde_json::to_string(&value).map_err(|e| {
@@ -326,7 +326,6 @@ fn normalize_hf_chat_template(template_source: String) -> String {
     template_source.replace("messages[::-1]", "messages|reverse")
 }
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -334,6 +333,7 @@ fn normalize_hf_chat_template(template_source: String) -> String {
     clippy::shadow_unrelated,
     clippy::shadow_reuse
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -389,7 +389,7 @@ mod tests {
     }
 
     /// HF templates (e.g. `MiniCPM5` at `chat:6`) call `tojson(ensure_ascii=…)`.
-    /// The filter must accept the kwarg instead of failing with "too many
+    /// The filter must accept the kwarg instead of aborting with "too many
     /// arguments"; the value is ignored since `serde_json` emits UTF-8.
     #[test]
     fn test_tojson_filter_accepts_ensure_ascii_kwarg() {

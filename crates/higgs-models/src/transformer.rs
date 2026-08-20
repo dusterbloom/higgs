@@ -19,6 +19,7 @@ use mlx_rs::{
 };
 use serde::Deserialize;
 
+use crate::qwen3_next::{QEmbedding, QLinear};
 use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
@@ -60,12 +61,7 @@ where
     }
 }
 
-/// Quantization parameters from config.json.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Unified model configuration, deserialized from config.json.
 ///
@@ -286,31 +282,6 @@ fn maybe_quantized_linear(
     }))
 }
 
-fn maybe_quantized_embedding(
-    embedding_count: i32,
-    dimensions: i32,
-    quantization: Option<&QuantizationConfig>,
-) -> Result<MaybeQuantized<nn::Embedding>, Exception> {
-    let Some(qc) = quantization else {
-        return Ok(MaybeQuantized::Original(nn::Embedding::new(
-            embedding_count,
-            dimensions,
-        )?));
-    };
-
-    let (weight, scales, dequant_biases) = quantized_placeholder(dimensions, qc)?;
-
-    Ok(MaybeQuantized::Quantized(nn::QuantizedEmbedding {
-        group_size: qc.group_size,
-        bits: qc.bits,
-        scales: Param::new(scales),
-        biases: Param::new(dequant_biases),
-        inner: nn::Embedding {
-            weight: Param::new(weight),
-        },
-    }))
-}
-
 /// Multi-head attention module.
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct Attention {
@@ -377,7 +348,7 @@ impl Attention {
         let rope = nn::RopeBuilder::new(head_dim)
             .traditional(false)
             .base(args.rope_theta)
-            .scale(1.0)
+            .scale(1.0_f32)
             .build()
             .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?;
 
@@ -609,9 +580,8 @@ struct TransformerModel {
     pub num_loops: i32,
     pub skip_loop_final_norm: bool,
 
-    #[quantizable]
     #[param]
-    pub embed_tokens: MaybeQuantized<nn::Embedding>,
+    pub embed_tokens: QEmbedding,
     #[quantizable]
     #[param]
     pub layers: Vec<TransformerBlock>,
@@ -620,7 +590,7 @@ struct TransformerModel {
 }
 
 impl TransformerModel {
-    fn new(args: &ModelArgs) -> Result<Self, Exception> {
+    fn new(args: &ModelArgs, embed_group_size: i32, embed_bits: i32) -> Result<Self, Exception> {
         if !args.vocab_size.is_positive() {
             return Err(Exception::custom("vocab_size must be positive"));
         }
@@ -633,17 +603,22 @@ impl TransformerModel {
         args.num_cache_layers()
             .map_err(|e| Exception::custom(e.to_string()))?;
 
-        let embed_tokens = maybe_quantized_embedding(
-            args.vocab_size,
-            args.hidden_size,
-            args.direct_quantization(),
-        )?;
         let layers = (0..args.num_hidden_layers)
             .map(|_| TransformerBlock::new(args))
             .collect::<Result<Vec<_>, _>>()?;
         let norm = nn::RmsNormBuilder::new(args.hidden_size)
             .eps(args.rms_norm_eps)
             .build()?;
+
+        // An unquantized model embeds densely: build a real [vocab, hidden]
+        // weight so forward works before (or without) weight loading. A
+        // quantized model gets the placeholder QEmbedding that the loader
+        // fills from the checkpoint.
+        let embed_tokens = if embed_bits == 0 {
+            QEmbedding::dense(args.vocab_size, args.hidden_size)?
+        } else {
+            QEmbedding::new(embed_group_size, embed_bits)?
+        };
 
         Ok(Self {
             vocab_size: args.vocab_size,
@@ -757,7 +732,6 @@ where
     }
 
     fn training_mode(&mut self, mode: bool) {
-        self.embed_tokens.training_mode(mode);
         for layer in &mut self.layers {
             <TransformerBlock as Module<AttentionInput<'_, C>>>::training_mode(layer, mode);
         }
@@ -774,22 +748,31 @@ pub struct Model {
     #[param]
     model: TransformerModel,
 
-    #[quantizable]
     #[param]
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
+    lm_head: Option<QLinear>,
 }
 
 impl Model {
     pub fn new(args: ModelArgs) -> Result<Self, Exception> {
-        let model = TransformerModel::new(&args)?;
+        let default_quant = args.quantization.as_ref();
+        let embed_quant = default_quant.map_or_else(
+            || crate::quant_config::TensorQuant::Unquantized,
+            |settings| settings.resolve("model.embed_tokens"),
+        );
+        let model = TransformerModel::new(&args, embed_quant.group_size(), embed_quant.bits())?;
+        let lm_head_quant = default_quant.map_or_else(
+            || crate::quant_config::TensorQuant::Unquantized,
+            |settings| settings.resolve("lm_head"),
+        );
         let lm_head = if args.tie_word_embeddings {
             None
+        } else if lm_head_quant.bits() == 0 {
+            // Unquantized: real dense head (see the embed_tokens note above).
+            Some(QLinear::dense(args.hidden_size, args.vocab_size)?)
         } else {
-            Some(maybe_quantized_linear(
-                args.hidden_size,
-                args.vocab_size,
-                false,
-                args.direct_quantization(),
+            Some(QLinear::new(
+                lm_head_quant.group_size(),
+                lm_head_quant.bits(),
             )?)
         };
 
@@ -1286,20 +1269,14 @@ impl Model {
         };
         match self.lm_head.as_mut() {
             Some(head) => head.forward(&lm_input),
-            None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(embed) => embed.as_linear(&lm_input),
-                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(&lm_input),
-            },
+            None => self.model.embed_tokens.as_linear(&lm_input),
         }
     }
 
     fn apply_lm_head_all(&mut self, hidden: &Array) -> Result<Array, Exception> {
         match self.lm_head.as_mut() {
             Some(head) => head.forward(hidden),
-            None => match &mut self.model.embed_tokens {
-                MaybeQuantized::Original(embed) => embed.as_linear(hidden),
-                MaybeQuantized::Quantized(q_embed) => q_embed.as_linear(hidden),
-            },
+            None => self.model.embed_tokens.as_linear(hidden),
         }
     }
 }
@@ -1433,12 +1410,21 @@ fn validate_nanbeige_config(config: &serde_json::Value) -> Result<(), ModelError
     Ok(())
 }
 
+pub(crate) fn model_args_from_value(config: &serde_json::Value) -> Result<ModelArgs, ModelError> {
+    Ok(serde_json::from_value(config.clone())?)
+}
+
 /// Load model args from the `text_config` section of config.json (used by VLMs).
 pub fn load_text_config_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, ModelError> {
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
     let config: serde_json::Value = serde_json::from_reader(file)?;
+    text_model_args_from_value(&config)
+}
 
+pub(crate) fn text_model_args_from_value(
+    config: &serde_json::Value,
+) -> Result<ModelArgs, ModelError> {
     let text_config = config
         .get("text_config")
         .ok_or_else(|| ModelError::UnsupportedModel("missing text_config in config.json".into()))?;
@@ -1459,7 +1445,7 @@ pub fn load_text_config_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, 
         }
     }
 
-    Ok(serde_json::from_value(text_obj)?)
+    model_args_from_value(&text_obj)
 }
 
 /// Load a language model for a VLM.
@@ -1469,7 +1455,13 @@ pub fn load_text_config_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, 
 pub fn load_vlm_language_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_text_config_args(model_path)?;
+    load_vlm_language_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_vlm_language_model_with_args(
+    model_path: &Path,
+    args: ModelArgs,
+) -> Result<Model, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -1498,11 +1490,12 @@ pub fn load_vlm_language_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, Mo
         raw_model
     };
 
-    crate::load_quantized_safetensors_weights_with_prefix(
+    crate::load_quantized_safetensors_weights_with_prefix_and_settings(
         &mut model,
         model_path,
         quantization.is_some(),
         "language_model.",
+        quantization.as_ref(),
     )?;
 
     tracing::info!("VLM language model loaded successfully");
@@ -1512,8 +1505,14 @@ pub fn load_vlm_language_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, Mo
 /// Load a model from a directory containing safetensors + config.json.
 pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
     let model_path = model_dir.as_ref();
-
     let args = load_model_args(model_path)?;
+    load_model_with_args(model_path, args)
+}
+
+pub(crate) fn load_model_with_args(
+    model_path: &Path,
+    args: ModelArgs,
+) -> Result<Model, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -1547,16 +1546,22 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<Model, ModelError> {
         raw_model
     };
 
-    crate::load_quantized_safetensors_weights(&mut model, model_path, quantization.is_some())?;
+    crate::load_quantized_safetensors_weights_with_settings(
+        &mut model,
+        model_path,
+        quantization.is_some(),
+        quantization.as_ref(),
+    )?;
 
     tracing::info!("Model loaded successfully");
     Ok(model)
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::module::ModuleParameters as _;
 
     /// Create a `ModelArgs` with sensible defaults. Only fields that vary
     /// between tests need to be overridden after construction.
@@ -1582,6 +1587,25 @@ mod tests {
             head_dim_override: None,
             quantization: None,
         }
+    }
+
+    #[test]
+    fn keeps_dense_embedding_and_lm_head_outside_global_quantization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut args = default_model_args();
+        args.quantization = Some(serde_json::from_str(
+            r#"{"group_size":64,"bits":4,"model.embed_tokens":false,"lm_head":false}"#,
+        )?);
+        let model = Model::new(args)?;
+        let quantized = mlx_rs::nn::quantize(model, 64, 4)?;
+        let params = quantized.parameters().flatten();
+
+        assert!(params.contains_key("model.embed_tokens.weight"));
+        assert!(!params.contains_key("model.embed_tokens.inner.weight"));
+        assert!(params.contains_key("lm_head.weight"));
+        assert!(!params.contains_key("lm_head.inner.weight"));
+        assert!(params.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
+        Ok(())
     }
 
     /// Create a `ModelArgs` with the given core parameters and defaults for
@@ -1759,10 +1783,7 @@ mod tests {
     fn test_quantization_config_deserialization() {
         let mut args = default_model_args();
         args.model_type = "qwen2".to_owned();
-        args.quantization = Some(QuantizationConfig {
-            group_size: 64,
-            bits: 4,
-        });
+        args.quantization = Some(QuantizationConfig::new(64, 4));
         let qc = args.quantization.unwrap();
         assert_eq!(qc.group_size, 64);
         assert_eq!(qc.bits, 4);
@@ -1936,18 +1957,14 @@ mod tests {
         let mut args = make_model_args("nanbeige", 128, 4, 2, 256, 1);
         args.num_loops = 2;
         args.intermediate_size = 256;
-        args.quantization = Some(QuantizationConfig {
-            group_size: 64,
-            bits: 6,
-        });
+        args.quantization = Some(QuantizationConfig::new(64, 6));
 
         let model = Model::new(args).unwrap();
         assert_eq!(model.num_cache_layers().unwrap(), 2);
         assert!(!model.supports_batched_decode());
-        assert!(matches!(
-            &model.model.embed_tokens,
-            MaybeQuantized::Quantized(_)
-        ));
+        // The merged transformer embeds through `QEmbedding` (built from the
+        // resolved embed quant) rather than a `MaybeQuantized` placeholder.
+        assert_eq!(model.model.embed_tokens.bits, 6);
         let first_layer = model.model.layers.first().unwrap();
         assert!(matches!(
             &first_layer.self_attn.q_proj,
@@ -1963,30 +1980,24 @@ mod tests {
         args.rms_norm_eps = 1e-5;
         args.rope_theta = 70_000_000.0;
         args.head_dim_override = Some(128);
-        args.quantization = Some(QuantizationConfig {
-            group_size: 64,
-            bits: 6,
-        });
+        args.quantization = Some(QuantizationConfig::new(64, 6));
 
         let model = Model::new(args).unwrap();
         assert_eq!(model.num_cache_layers().unwrap(), 2);
         assert!(!model.supports_batched_decode());
+        assert_eq!(model.model.embed_tokens.bits, 6);
     }
 
     #[test]
     fn test_non_nanbeige_quantized_constructor_defers_to_mlx_quantize() {
         let mut args = make_model_args("qwen3", 128, 4, 2, 256, 1);
         args.intermediate_size = 256;
-        args.quantization = Some(QuantizationConfig {
-            group_size: 64,
-            bits: 4,
-        });
+        args.quantization = Some(QuantizationConfig::new(64, 4));
 
         let model = Model::new(args).unwrap();
-        assert!(matches!(
-            &model.model.embed_tokens,
-            MaybeQuantized::Original(_)
-        ));
+        // Embedding is a `QEmbedding` on the merged transformer; the deferred
+        // whole-model `mlx_quantize` applies to the `MaybeQuantized` blocks.
+        assert_eq!(model.model.embed_tokens.bits, 4);
         let first_layer = model.model.layers.first().unwrap();
         assert!(matches!(
             &first_layer.self_attn.q_proj,

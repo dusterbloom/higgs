@@ -49,12 +49,7 @@ const fn default_tie_word_embeddings() -> bool {
     true
 }
 
-/// Quantization parameters from config.json.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QuantizationConfig {
-    pub group_size: i32,
-    pub bits: i32,
-}
+pub use crate::quant_config::QuantizationSettings as QuantizationConfig;
 
 /// Gemma 2 model configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -176,7 +171,7 @@ impl Gemma2Attention {
         let rope = nn::RopeBuilder::new(head_dim)
             .traditional(false)
             .base(args.rope_theta)
-            .scale(1.0)
+            .scale(1.0_f32)
             .build()
             .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?;
 
@@ -482,7 +477,7 @@ fn create_sliding_window_mask(L: i32, S: i32, window: i32) -> Result<Array, Exce
     // For query at local index i (absolute position = offset + i),
     // key at index j is visible if j >= (offset + i) - window + 1 AND j <= (offset + i)
     // The causal mask already handles j <= (offset + i).
-    // We just need: j >= (offset + i) - window + 1
+    // The remaining constraint: j >= (offset + i) - window + 1
 
     let query_positions = mlx_rs::arange!(start = offset, stop = offset + L)?;
     let key_positions = mlx_rs::arange!(stop = S)?;
@@ -920,7 +915,13 @@ pub fn load_gemma2_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Gemma2Mode
 pub fn load_gemma2_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma2CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_gemma2_model_args(model_path)?;
+    load_gemma2_model_with_args(model_path, args)
+}
 
+pub(crate) fn load_gemma2_model_with_args(
+    model_path: &Path,
+    args: Gemma2ModelArgs,
+) -> Result<Gemma2CausalLM, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -935,6 +936,9 @@ pub fn load_gemma2_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma2CausalLM,
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let raw_model = Gemma2CausalLM::new(args)?;
 
     let mut model = if let Some(ref qc) = quantization {
@@ -950,7 +954,12 @@ pub fn load_gemma2_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma2CausalLM,
         raw_model
     };
 
-    crate::load_quantized_safetensors_weights(&mut model, model_path, quantization.is_some())?;
+    crate::load_quantized_safetensors_weights_with_settings(
+        &mut model,
+        model_path,
+        quantization.is_some(),
+        quantization.as_ref(),
+    )?;
 
     // Apply RMSNorm +1 convention: add 1.0 to all norm weights
     apply_rmsnorm_plus_one(&mut model)
@@ -994,8 +1003,8 @@ fn apply_rmsnorm_plus_one(model: &mut Gemma2CausalLM) -> Result<(), Exception> {
     Ok(())
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{

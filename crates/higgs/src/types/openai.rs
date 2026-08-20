@@ -218,6 +218,9 @@ pub enum ContentPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageUrl {
     pub url: String,
+    /// `OpenAI` `detail` resolution control (`auto` / `low` / `high`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<higgs_models::vision::ImageDetail>,
 }
 
 /// A message in a chat conversation.
@@ -579,8 +582,8 @@ pub struct EmbeddingUsage {
     pub total_tokens: u32,
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -722,7 +725,7 @@ mod tests {
         }"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.max_tokens, Some(100));
-        assert!(req.stream == Some(true));
+        assert_eq!(req.stream, Some(true));
         assert!(req.reasoning.is_none());
     }
 
@@ -1261,6 +1264,7 @@ mod tests {
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,abc".to_owned(),
+                    detail: None,
                 },
             },
             ContentPart::Text {
@@ -1279,6 +1283,7 @@ mod tests {
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,abc".to_owned(),
+                    detail: None,
                 },
             },
         ]);
@@ -1300,6 +1305,7 @@ mod tests {
         let with_image = MessageContent::Parts(vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
                 url: "data:image/png;base64,abc".to_owned(),
+                detail: None,
             },
         }]);
         assert!(with_image.has_images());

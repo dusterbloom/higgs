@@ -33,7 +33,11 @@ use serde::Deserialize;
 use crate::{
     cache::KeyValueCache,
     error::ModelError,
-    utils::{apply_rope, create_causal_mask, create_windowed_causal_mask},
+    gemma_vision::{GemmaVisionTower, load_gemma_vision_tower},
+    utils::{apply_rope, apply_rope_dynamic, create_causal_mask, create_windowed_causal_mask},
+    vision::{
+        ImageBatch, ImageInput, VisionCapabilities, VisionError, VisionModel, merge_embeddings,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -642,7 +646,7 @@ impl Gemma4Attention {
         let rope = nn::RopeBuilder::new(rope_dims)
             .traditional(false)
             .base(rope_theta)
-            .scale(1.0)
+            .scale(1.0_f32)
             .build()
             .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?;
 
@@ -689,7 +693,7 @@ impl Gemma4Attention {
         let rope = nn::RopeBuilder::new(rope_dims)
             .traditional(false)
             .base(rope_theta)
-            .scale(1.0)
+            .scale(1.0_f32)
             .build()
             .map_err(|e| Exception::custom(format!("Failed to build RoPE: {e}")))?;
 
@@ -719,6 +723,7 @@ impl Gemma4Attention {
         x: &Array,
         mask: Option<&Array>,
         kv_cache: Option<&mut C>,
+        rope_offsets: Option<&Array>,
     ) -> Result<(Array, (Array, Array), i32), Exception> {
         let shape = x.shape();
         let B = *shape
@@ -766,7 +771,15 @@ impl Gemma4Attention {
         // positions. Returning the post-update offset (old + L) would shift shared
         // layers by L in prefill and by 1 per decode step.
         let offset = kv_cache.as_ref().map_or(0, KeyValueCache::offset);
-        let keys_roped = apply_rope(&k_normed, &self.rope, offset)?;
+        if rope_offsets.is_some() && offset != 0 {
+            return Err(Exception::custom(
+                "Gemma 4: dynamic RoPE offsets require a fresh KV cache (offset 0)",
+            ));
+        }
+        let keys_roped = match rope_offsets {
+            Some(off) => apply_rope_dynamic(&k_normed, &self.rope, off)?,
+            None => apply_rope(&k_normed, &self.rope, offset)?,
+        };
 
         let (keys, values) = if let Some(cache) = kv_cache {
             cache.update_and_fetch(keys_roped, values_new)?
@@ -774,7 +787,10 @@ impl Gemma4Attention {
             (keys_roped, values_new)
         };
 
-        let q_final = apply_rope(&q_normed, &self.rope, offset)?;
+        let q_final = match rope_offsets {
+            Some(off) => apply_rope_dynamic(&q_normed, &self.rope, off)?,
+            None => apply_rope(&q_normed, &self.rope, offset)?,
+        };
 
         let sdpa_mask = mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array);
         let attn_raw = mlx_rs::fast::scaled_dot_product_attention(
@@ -800,6 +816,7 @@ impl Gemma4Attention {
         mask: Option<&Array>,
         shared_kv: &(Array, Array),
         offset: i32,
+        rope_offsets: Option<&Array>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let B = *shape
@@ -819,7 +836,10 @@ impl Gemma4Attention {
             .q_norm
             .forward(&q_reshaped)?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let q_final = apply_rope(&q_normed, &self.rope, offset)?;
+        let q_final = match rope_offsets {
+            Some(off) => apply_rope_dynamic(&q_normed, &self.rope, off)?,
+            None => apply_rope(&q_normed, &self.rope, offset)?,
+        };
 
         let sdpa_mask = mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array);
         let attn_raw = mlx_rs::fast::scaled_dot_product_attention(
@@ -978,9 +998,12 @@ impl Gemma4Block {
         mask: Option<&Array>,
         kv_cache: Option<&mut C>,
         per_layer_input: Option<&Array>,
+        rope_offsets: Option<&Array>,
     ) -> Result<(Array, (Array, Array), i32), Exception> {
         let normed = self.input_layernorm.forward(x)?;
-        let (attn_raw, kv, offset) = self.self_attn.forward_owner(&normed, mask, kv_cache)?;
+        let (attn_raw, kv, offset) =
+            self.self_attn
+                .forward_owner(&normed, mask, kv_cache, rope_offsets)?;
         let attn_normed = self.post_attention_layernorm.forward(&attn_raw)?;
         let mut h = x.add(attn_normed)?;
 
@@ -1004,11 +1027,12 @@ impl Gemma4Block {
         shared_kv: &(Array, Array),
         offset: i32,
         per_layer_input: Option<&Array>,
+        rope_offsets: Option<&Array>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
-        let attn_raw = self
-            .self_attn
-            .forward_shared(&normed, mask, shared_kv, offset)?;
+        let attn_raw =
+            self.self_attn
+                .forward_shared(&normed, mask, shared_kv, offset, rope_offsets)?;
         let attn_normed = self.post_attention_layernorm.forward(&attn_raw)?;
         let mut h = x.add(attn_normed)?;
 
@@ -1283,18 +1307,14 @@ impl Gemma4TextModel {
         Ok(Some(result))
     }
 
-    #[allow(
-        non_snake_case,
-        clippy::too_many_lines,
-        clippy::as_conversions,
-        clippy::cast_precision_loss
-    )]
-    fn forward_internal<C: KeyValueCache>(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Vec<Option<C>>,
-    ) -> Result<Array, Exception> {
-        let mut h = self.embed_tokens.forward(inputs)?;
+    /// Embed lookup + `sqrt(hidden_size)` scaling (the head of
+    /// [`Gemma4TextModel::forward_internal`]).
+    ///
+    /// Split out so the `VisionModel` path can embed text ids with the same
+    /// scaling and then merge image features before the layer stack runs.
+    #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+    fn embed_and_scale(&mut self, inputs: &Array) -> Result<Array, Exception> {
+        let h = self.embed_tokens.forward(inputs)?;
 
         let needs_refresh = self
             .cached_embed_scale
@@ -1308,8 +1328,29 @@ impl Gemma4TextModel {
             .cached_embed_scale
             .as_ref()
             .ok_or_else(|| Exception::custom("cached_embed_scale not initialized"))?;
-        h = h.multiply(embed_scale)?;
+        h.multiply(embed_scale)
+    }
 
+    /// Layer stack + final `RMSNorm` from a pre-merged embedding array.
+    ///
+    /// `per_layer_inputs` (per-layer input embeddings from token ids) is
+    /// `None` on the VLM path, which cannot recover the ids; the caller must
+    /// reject that path for models with `hidden_size_per_layer_input > 0`.
+    /// `rope_offsets` (`[L]` i32) is used by the VLM path to honor pan-and-scan
+    /// crop offsets; `None` reproduces the scalar cache-offset behavior.
+    #[allow(
+        non_snake_case,
+        clippy::too_many_lines,
+        clippy::as_conversions,
+        clippy::cast_precision_loss
+    )]
+    fn forward_from_hidden<C: KeyValueCache>(
+        &mut self,
+        mut h: Array,
+        per_layer_inputs: Option<Array>,
+        rope_offsets: Option<&Array>,
+        cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
         if cache.is_empty() {
             // Cache initialization happens externally via AnyModel::make_cache.
             // For a bare forward call without prior initialization, fill with None.
@@ -1345,8 +1386,7 @@ impl Gemma4TextModel {
                 .transpose()?
         };
 
-        let pli_all = self.get_per_layer_inputs(inputs)?;
-        let projected = self.project_per_layer_inputs(&h, pli_all)?;
+        let projected = self.project_per_layer_inputs(&h, per_layer_inputs)?;
 
         let n_layers = self.layers.len();
         let mut intermediates: Vec<Option<((Array, Array), i32)>> = vec![None; n_layers];
@@ -1382,8 +1422,13 @@ impl Gemma4TextModel {
                     .ok_or_else(|| Exception::custom("cache slot out of bounds"))?
                     .as_mut();
 
-                let (new_h, kv, off) =
-                    layer.forward_owner(&h, mask, cache_ref, per_layer_in.as_ref())?;
+                let (new_h, kv, off) = layer.forward_owner(
+                    &h,
+                    mask,
+                    cache_ref,
+                    per_layer_in.as_ref(),
+                    rope_offsets,
+                )?;
                 h = new_h;
                 if let Some(slot) = intermediates.get_mut(i) {
                     *slot = Some((kv, off));
@@ -1404,11 +1449,28 @@ impl Gemma4TextModel {
                     shared_kv,
                     *shared_offset,
                     per_layer_in.as_ref(),
+                    rope_offsets,
                 )?;
             }
         }
 
         self.norm.forward(&h)
+    }
+
+    #[allow(
+        non_snake_case,
+        clippy::too_many_lines,
+        clippy::as_conversions,
+        clippy::cast_precision_loss
+    )]
+    fn forward_internal<C: KeyValueCache>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        let h = self.embed_and_scale(inputs)?;
+        let pli_all = self.get_per_layer_inputs(inputs)?;
+        self.forward_from_hidden(h, pli_all, None, cache)
     }
 }
 
@@ -1417,6 +1479,11 @@ impl Gemma4TextModel {
 // ---------------------------------------------------------------------------
 
 /// Gemma 4 causal language model.
+///
+/// Multimodal `gemma4` checkpoints additionally carry a vision tower (loaded
+/// into [`Self::vision`]); text-only `gemma4_text` checkpoints leave it `None`.
+/// The tower is deliberately not part of the parameter tree (`#[param]` is
+/// absent), so LM quantization, eval, and weight passes never touch it.
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 pub struct Gemma4CausalLM {
     pub args: Gemma4ModelArgs,
@@ -1432,6 +1499,9 @@ pub struct Gemma4CausalLM {
     // Cached dtype-specific scalars for final logit soft-capping
     cached_final_inv_cap: Option<Array>,
     cached_final_cap: Option<Array>,
+
+    /// Vision tower + pan-and-scan config; `None` for text-only checkpoints.
+    vision: Option<GemmaVisionTower>,
 }
 
 impl Gemma4CausalLM {
@@ -1452,7 +1522,13 @@ impl Gemma4CausalLM {
             lm_head,
             cached_final_inv_cap: None,
             cached_final_cap: None,
+            vision: None,
         })
+    }
+
+    /// Whether this model carries a loaded vision tower (multimodal checkpoint).
+    pub(crate) const fn has_vision_tower(&self) -> bool {
+        self.vision.is_some()
     }
 
     fn project_hidden(&mut self, hidden: &Array) -> Result<Array, Exception> {
@@ -1524,6 +1600,82 @@ impl Gemma4CausalLM {
         let _ = mask;
         self.model.forward_internal(inputs, kv_cache)
     }
+
+    /// Forward pass starting from pre-merged embeddings (VLM path), skipping
+    /// the `embed_tokens` lookup.
+    ///
+    /// The caller merges image features into the (scaled) text embedding array
+    /// before calling this — the same contract as `forward_from_embeddings`
+    /// on the generic transformer. Returns logits for the **last position
+    /// only**, matching [`Gemma4CausalLM::forward`].
+    ///
+    /// Models with per-layer inputs (`hidden_size_per_layer_input > 0`) cannot
+    /// be driven from embeddings alone (their per-layer embeddings come from
+    /// token ids) and are rejected.
+    pub fn forward_from_embeddings<C: KeyValueCache>(
+        &mut self,
+        embeddings: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        self.reject_per_layer_inputs()?;
+        let hidden = self
+            .model
+            .forward_from_hidden(embeddings.clone(), None, None, kv_cache)?;
+        let seq_len = embeddings.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if seq_len > 1 {
+            hidden.index((.., -1.., ..))
+        } else {
+            hidden
+        };
+        self.project_hidden(&lm_input)
+    }
+
+    /// Hidden-state counterpart of [`Gemma4CausalLM::forward_from_embeddings`]
+    /// (after the final `RMSNorm`, before the LM head), for **all** positions.
+    pub fn forward_from_embeddings_hidden<C: KeyValueCache>(
+        &mut self,
+        embeddings: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        self.reject_per_layer_inputs()?;
+        self.model
+            .forward_from_hidden(embeddings.clone(), None, None, kv_cache)
+    }
+
+    /// VLM forward with per-position `RoPE` offsets: image feature rows are
+    /// rotated at their pan-and-scan crop offsets instead of their sequential
+    /// position. `offsets` is `[L]` i32 aligned with `embeddings`'s sequence
+    /// (see `GemmaVisionTower::build_position_offsets`). Returns last-position
+    /// logits.
+    pub fn forward_from_embeddings_with_offsets<C: KeyValueCache>(
+        &mut self,
+        embeddings: &Array,
+        offsets: &Array,
+        kv_cache: &mut Vec<Option<C>>,
+    ) -> Result<Array, Exception> {
+        self.reject_per_layer_inputs()?;
+        let hidden =
+            self.model
+                .forward_from_hidden(embeddings.clone(), None, Some(offsets), kv_cache)?;
+        let seq_len = embeddings.shape().get(1).copied().unwrap_or(1);
+        let lm_input = if seq_len > 1 {
+            hidden.index((.., -1.., ..))
+        } else {
+            hidden
+        };
+        self.project_hidden(&lm_input)
+    }
+
+    fn reject_per_layer_inputs(&self) -> Result<(), Exception> {
+        if self.model.hidden_size_per_layer_input > 0 {
+            return Err(Exception::custom(
+                "Gemma 4 forward_from_embeddings requires token ids for per-layer inputs",
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,9 +1697,15 @@ struct Gemma4TopLevel {
 /// Supports both flat and `text_config`-wrapped HF config formats.
 pub fn load_gemma4_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4ModelArgs, ModelError> {
     let config_path = model_dir.as_ref().join("config.json");
-    let text = std::fs::read_to_string(config_path)?;
-    let raw: serde_json::Value = serde_json::from_str(&text)?;
-    let top: Gemma4TopLevel = serde_json::from_str(&text)?;
+    let file = std::fs::File::open(config_path)?;
+    let raw: serde_json::Value = serde_json::from_reader(file)?;
+    gemma4_model_args_from_value(raw)
+}
+
+pub(crate) fn gemma4_model_args_from_value(
+    raw: serde_json::Value,
+) -> Result<Gemma4ModelArgs, ModelError> {
+    let top: Gemma4TopLevel = serde_json::from_value(raw.clone())?;
 
     let mut args: Gemma4ModelArgs = if let Some(inner) = top.text_config {
         let mut a: Gemma4ModelArgs = serde_json::from_value(inner)?;
@@ -1577,7 +1735,14 @@ pub fn load_gemma4_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4Mode
 pub fn load_gemma4_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_gemma4_model_args(model_path)?;
+    load_gemma4_model_with_args(model_path, args, false)
+}
 
+pub(crate) fn load_gemma4_model_with_args(
+    model_path: &Path,
+    args: Gemma4ModelArgs,
+    disable_vision: bool,
+) -> Result<Gemma4CausalLM, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
         hidden_size = args.hidden_size,
@@ -1590,6 +1755,9 @@ pub fn load_gemma4_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4CausalLM,
     );
 
     let quantization = args.quantization.clone();
+    if let Some(settings) = quantization.as_ref() {
+        crate::validate_per_tensor_quantization_support(settings, &[])?;
+    }
     let enable_moe = args.enable_moe_block;
     let raw_model = Gemma4CausalLM::new(args)?;
 
@@ -1609,15 +1777,27 @@ pub fn load_gemma4_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4CausalLM,
     // `gemma4` (multimodal wrapper) checkpoints nest the text model under
     // `language_model.`; `gemma4_text` checkpoints start at `model.`. Strip the
     // prefix when present so both load, and skip the vision/audio tower weights.
-    crate::load_quantized_safetensors_weights_optional_prefix(
+    crate::load_quantized_safetensors_weights_optional_prefix_with_settings(
         &mut model,
         model_path,
         quantization.is_some(),
         "language_model.",
+        quantization.as_ref(),
     )?;
 
     if enable_moe {
         load_gemma4_moe_expert_weights(&mut model, model_path, quantization.is_some())?;
+    }
+
+    // Multimodal `gemma4` checkpoints carry a SigLIP-style vision tower under
+    // `vision_tower.`; text-only `gemma4_text` checkpoints have none and keep
+    // `model.vision == None` (identical behavior to before). The `disable_vision`
+    // escape hatch skips tower loading entirely, leaving a text-only model.
+    if disable_vision {
+        model.vision = None;
+        tracing::info!("disable_vision=true: skipping Gemma 4 vision tower");
+    } else {
+        model.vision = load_gemma_vision_tower(model_path)?;
     }
 
     tracing::info!("Gemma 4 model loaded successfully");
@@ -1757,10 +1937,88 @@ fn assign_param(
 }
 
 // ---------------------------------------------------------------------------
+// VisionModel (Task 13)
+// ---------------------------------------------------------------------------
+
+impl VisionModel for Gemma4CausalLM {
+    fn vision_capabilities(&self) -> VisionCapabilities {
+        self.vision
+            .as_ref()
+            .map_or_else(VisionCapabilities::default, |tower| {
+                tower.vision_capabilities(vec!["gemma4"])
+            })
+    }
+
+    fn image_marker_text(&self) -> &'static str {
+        "<start_of_image><end_of_image>"
+    }
+
+    fn preprocess_images(&self, images: &[ImageInput]) -> Result<ImageBatch, VisionError> {
+        let tower = self.vision.as_ref().ok_or_else(|| {
+            VisionError::Preprocess("Gemma 4 model has no vision tower".to_owned())
+        })?;
+        tower.preprocess_images(images)
+    }
+
+    fn postprocess_image_tokens(
+        &self,
+        tokens: &mut Vec<u32>,
+        tokenizer: &tokenizers::Tokenizer,
+        batch: &ImageBatch,
+    ) -> Result<(), VisionError> {
+        self.vision.as_ref().map_or(Ok(()), |tower| {
+            tower.postprocess_image_tokens(tokens, tokenizer, batch)
+        })
+    }
+
+    fn forward_multimodal(
+        &mut self,
+        input_ids: &Array,
+        batch: &ImageBatch,
+        cache: &mut crate::AnyCache,
+    ) -> Result<Array, Exception> {
+        // Reject per-layer-input models before taking any self borrows.
+        self.reject_per_layer_inputs()?;
+        let tower = self
+            .vision
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Gemma 4 model has no vision tower"))?;
+        let crate::AnyCache::KV(c) = cache else {
+            return Err(Exception::custom("Gemma 4 requires a KV cache"));
+        };
+
+        let image_features = tower.encode(&batch.pixel_values)?;
+        let vision_hidden = *image_features
+            .shape()
+            .last()
+            .ok_or_else(|| Exception::custom("Gemma 4 vision: empty feature rows"))?;
+        if vision_hidden != self.args.hidden_size {
+            return Err(Exception::custom(format!(
+                "Gemma 4 vision: tower hidden {vision_hidden} != language hidden {}; \
+                 the multi-modal projector is not yet implemented",
+                self.args.hidden_size
+            )));
+        }
+
+        // Replace the sentinel ids with 0 before the embed lookup so the
+        // lookup never goes out of bounds; merge_embeddings overwrites those
+        // positions with image features.
+        let sentinel = Array::from_slice(&[crate::vision::IMAGE_TOKEN_INDEX], &[1]);
+        let is_sentinel = input_ids.eq(&sentinel)?;
+        let zero = Array::from_slice(&[0_i32], &[1]);
+        let safe_ids = mlx_rs::ops::r#where(&is_sentinel, &zero, input_ids)?;
+
+        let text_embeddings = self.model.embed_and_scale(&safe_ids)?;
+        let merged = merge_embeddings(input_ids, &text_embeddings, &image_features, batch)?;
+        let offsets = tower.build_position_offsets(input_ids, batch)?;
+        self.forward_from_embeddings_with_offsets(&merged, &offsets, c)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -1780,6 +2038,7 @@ fn assign_param(
     clippy::doc_markdown,
     clippy::float_cmp
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::SteppingKeyValueCache;
@@ -2240,6 +2499,177 @@ mod tests {
         let (_, prf) = args.rope_params_for(false);
         let rope_dims = (16.0_f32 * prf).round() as i32;
         assert_eq!(rope_dims, 16); // 16 * 1.0 = 16
+    }
+
+    // -----------------------------------------------------------------------
+    // forward_from_embeddings parity (Task 13 VLM backbone contract)
+    // -----------------------------------------------------------------------
+
+    /// Backbone parity gate: running the layer stack from pre-computed
+    /// (scaled) embeddings must produce exactly the same hidden states and
+    /// last-position logits as running it from token ids. This is the contract
+    /// the Gemma `VisionModel::forward_multimodal` path relies on.
+    #[test]
+    fn forward_from_embeddings_matches_forward_hidden_on_text() {
+        let mut model = Gemma4CausalLM::new(small_model_args()).unwrap();
+        model.eval().unwrap();
+
+        let tokens: Vec<u32> = vec![3, 17, 7, 42, 5];
+        let ids = Array::from_slice(&tokens, &[1, 5]);
+
+        // h1 = model.forward_hidden(&ids)
+        let mut cache1: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+        let h1 = model.forward_hidden(&ids, None, &mut cache1).unwrap();
+
+        // emb = scaled embed lookup; h2 = forward_from_embeddings_hidden(emb)
+        let emb = model.model.embed_and_scale(&ids).unwrap();
+        let mut cache2: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+        let h2 = model
+            .forward_from_embeddings_hidden(&emb, None, &mut cache2)
+            .unwrap();
+
+        mlx_rs::transforms::eval([&h1, &h2]).unwrap();
+        assert_eq!(h1.shape(), h2.shape(), "hidden shapes must match");
+        let max_diff: f32 = h1
+            .subtract(&h2)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        assert!(
+            max_diff < 1e-5,
+            "hidden parity: forward_from_embeddings(embeds) != forward_hidden(ids), max |diff| = {max_diff}"
+        );
+
+        // forward_from_embeddings returns last-position logits; must equal forward().
+        let mut cache3: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+        let logits_token = model.forward(&ids, None, &mut cache3).unwrap();
+        let mut cache4: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+        let logits_emb = model
+            .forward_from_embeddings(&emb, None, &mut cache4)
+            .unwrap();
+
+        mlx_rs::transforms::eval([&logits_token, &logits_emb]).unwrap();
+        assert_eq!(
+            logits_token.shape(),
+            logits_emb.shape(),
+            "logits shapes must match"
+        );
+        let max_diff2: f32 = logits_token
+            .subtract(&logits_emb)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        assert!(
+            max_diff2 < 1e-5,
+            "logits parity: forward_from_embeddings(embeds) != forward(ids), max |diff| = {max_diff2}"
+        );
+    }
+
+    /// `forward_from_embeddings_with_offsets` with sequential offsets
+    /// (0..L-1, the no-image case) must equal plain `forward_from_embeddings`
+    /// — including through the cross-layer KV-sharing and dynamic-RoPE paths.
+    #[test]
+    fn forward_from_embeddings_with_offsets_sequential_matches_plain() {
+        let mut model = Gemma4CausalLM::new(small_model_args()).unwrap();
+        model.eval().unwrap();
+
+        let tokens: Vec<u32> = vec![3, 17, 7, 42, 5];
+        let ids = Array::from_slice(&tokens, &[1, 5]);
+        let emb = model.model.embed_and_scale(&ids).unwrap();
+
+        let mut cache1: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+        let logits_plain = model
+            .forward_from_embeddings(&emb, None, &mut cache1)
+            .unwrap();
+
+        let offsets = Array::from_slice(&[0i32, 1, 2, 3, 4], &[5]);
+        let mut cache2: Vec<Option<SteppingKeyValueCache>> = Vec::new();
+        let logits_offsets = model
+            .forward_from_embeddings_with_offsets(&emb, &offsets, &mut cache2)
+            .unwrap();
+
+        mlx_rs::transforms::eval([&logits_plain, &logits_offsets]).unwrap();
+        assert_eq!(logits_plain.shape(), logits_offsets.shape());
+        let max_diff: f32 = logits_plain
+            .subtract(&logits_offsets)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        assert!(
+            max_diff < 1e-5,
+            "with_offsets(sequential) != plain forward_from_embeddings, max |diff| = {max_diff}"
+        );
+    }
+
+    /// End-to-end `VisionModel::forward_multimodal`: tower encode -> pool ->
+    /// merge -> offsets -> backbone (incl. cross-layer KV sharing), with a
+    /// tower sized to the tiny LM's hidden dim so the whole pipeline runs.
+    #[test]
+    fn forward_multimodal_end_to_end_with_matching_dims() {
+        use crate::gemma_vision::{GemmaVisionConfig, GemmaVisionTower};
+        use crate::siglip::{SigLipVisionConfig, SigLipVisionModel};
+
+        let mut model = Gemma4CausalLM::new(small_model_args()).unwrap();
+        model.eval().unwrap();
+
+        // Tower hidden == LM hidden (32, see `small_model_args`) so the dim
+        // check passes.
+        let siglip = SigLipVisionConfig {
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_channels: 3,
+            patch_size: 4,
+            image_size: 16,
+            layer_norm_eps: 1e-6,
+            hidden_act: "gelu_pytorch_tanh".to_owned(),
+        };
+        let vcfg = GemmaVisionConfig {
+            image_size: 16,
+            patch_size: 4,
+            num_patches: 16,
+            tokens_per_crop: 4,
+            crop_set: crate::gemma_vision::default_crop_set(),
+        };
+        model.vision = Some(GemmaVisionTower::new(
+            vcfg,
+            SigLipVisionModel::new(&siglip).unwrap(),
+        ));
+
+        // One landscape image: 3 crops x 4 tokens = 12 rows.
+        let batch = ImageBatch {
+            pixel_values: Array::from_slice(&[0.5f32; 3 * 16 * 16 * 3], &[3, 16, 16, 3]),
+            per_image_tokens: vec![12],
+            image_sizes: vec![(16, 16)],
+            image_offsets: vec![0, 1, 3],
+            layout: crate::vision::ImageTokenLayout::default(),
+        };
+        // [text, 12 sentinels, text]
+        let mut ids = vec![7i32];
+        ids.extend(std::iter::repeat_n(crate::vision::IMAGE_TOKEN_INDEX, 12));
+        ids.push(8);
+        let input_ids = Array::from_slice(&ids, &[1, 14]);
+
+        let mut cache = crate::AnyCache::KV(vec![]);
+        let logits = model
+            .forward_multimodal(&input_ids, &batch, &mut cache)
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 1, 64]);
+        mlx_rs::transforms::eval([&logits]).unwrap();
+        assert!(
+            logits.as_slice::<f32>().iter().all(|v| v.is_finite()),
+            "forward_multimodal produced non-finite logits"
+        );
     }
 
     // -----------------------------------------------------------------------

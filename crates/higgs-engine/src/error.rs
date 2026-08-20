@@ -1,4 +1,5 @@
 use higgs_models::error::ModelError;
+use higgs_models::vision::VisionError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -22,10 +23,12 @@ pub enum EngineError {
 
     #[error("Retained session {0} is unavailable for required continuation")]
     RetainedSessionUnavailable(u64),
+    #[error("Vision error: {0}")]
+    Vision(#[from] VisionError),
 }
 
-#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

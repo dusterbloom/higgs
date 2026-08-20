@@ -5,6 +5,7 @@ pub mod cache;
 pub mod chat_template;
 pub mod constrained;
 pub(crate) mod decode;
+pub mod disk_prefix_store;
 pub mod engine;
 pub mod error;
 pub mod mlx_tuning;
