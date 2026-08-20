@@ -442,9 +442,18 @@ pub struct QwenVlModel {
     mm_projector: nn::Linear,
     language_model: Qwen3NextCausalLM,
     config: QwenVlConfig,
+    /// Whether the vision tower + projector were loaded. False when the
+    /// config's `disable_vision` escape hatch forces a text-only load; the
+    /// model then reports no vision capability and rejects image input.
+    vision_enabled: bool,
 }
 
 impl QwenVlModel {
+    /// Whether this instance loaded its vision tower (always true except when
+    /// `disable_vision` forced a text-only load).
+    pub const fn has_vision(&self) -> bool {
+        self.vision_enabled
+    }
     /// Forward pass for text-only input (no images).
     pub fn forward_text(
         &mut self,
@@ -740,6 +749,7 @@ impl VisionModel for QwenVlModel {
 pub(crate) fn load_qwen_vl_model_from_value(
     dir: &Path,
     raw: &Value,
+    disable_vision: bool,
 ) -> Result<AnyModel, ModelError> {
     let config = QwenVlConfig::from_value(raw)?;
 
@@ -776,34 +786,43 @@ pub(crate) fn load_qwen_vl_model_from_value(
         lm_hidden = language_model.args.hidden_size,
         lm_layers = language_model.args.num_hidden_layers,
         merge_size = config.merge_size,
+        disable_vision,
         "Loading Qwen-VL model"
     );
 
+    // `disable_vision` escape hatch: load the text backbone only. The vision
+    // tower and projector weights are skipped entirely, and the model reports
+    // no vision capability so image requests are rejected.
+    let vision_enabled = !disable_vision;
     let mut vision_tower = SigLipVisionModel::new(&config.vision_config)?;
     let mut mm_projector =
         nn::LinearBuilder::new(config.mm_hidden_size, language_model.args.hidden_size).build()?;
 
-    let weights = load_safetensor_weights(dir)?;
+    if vision_enabled {
+        let weights = load_safetensor_weights(dir)?;
 
-    // Vision tower weights: try both LLaVA-style prefix candidates.
-    let prefixes = [
-        "vision_tower.vision_model.",
-        "vision_tower.vision_tower.vision_model.",
-    ];
-    let mut tower_err: Option<ModelError> = None;
-    for prefix in prefixes {
-        match load_siglip_weights(&mut vision_tower, &weights, prefix) {
-            Ok(()) => {
-                tower_err = None;
-                break;
+        // Vision tower weights: try both LLaVA-style prefix candidates.
+        let prefixes = [
+            "vision_tower.vision_model.",
+            "vision_tower.vision_tower.vision_model.",
+        ];
+        let mut tower_err: Option<ModelError> = None;
+        for prefix in prefixes {
+            match load_siglip_weights(&mut vision_tower, &weights, prefix) {
+                Ok(()) => {
+                    tower_err = None;
+                    break;
+                }
+                Err(err) => tower_err = Some(err),
             }
-            Err(err) => tower_err = Some(err),
         }
+        if let Some(err) = tower_err {
+            return Err(err);
+        }
+        load_mm_projector_weights(&mut mm_projector, &weights)?;
+    } else {
+        tracing::info!("disable_vision=true: skipping vision tower and projector weights");
     }
-    if let Some(err) = tower_err {
-        return Err(err);
-    }
-    load_mm_projector_weights(&mut mm_projector, &weights)?;
 
     tracing::info!("Qwen-VL model loaded successfully");
     Ok(AnyModel::QwenVl(QwenVlModel {
@@ -811,6 +830,7 @@ pub(crate) fn load_qwen_vl_model_from_value(
         mm_projector,
         language_model,
         config,
+        vision_enabled,
     }))
 }
 
@@ -876,6 +896,7 @@ fn load_safetensor_weights(dir: &Path) -> Result<HashMap<String, Array>, ModelEr
     clippy::indexing_slicing,
     clippy::panic,
     clippy::shadow_reuse,
+    clippy::shadow_unrelated,
     clippy::unwrap_used
 )]
 mod tests {

@@ -168,8 +168,10 @@ pub trait ModelAdapter: Send + Sync {
     ///
     /// Implementations must consume `DetectedModel::raw` or `resolved_config()`
     /// rather than reopening `config.json`, and return a descriptive error when
-    /// the config or weights are incompatible.
-    fn load(&self, model: &DetectedModel) -> Result<AnyModel, ModelError>;
+    /// the config or weights are incompatible. `disable_vision` (the config's
+    /// escape hatch) asks vision-capable adapters to load their text backbone
+    /// only, skipping vision weights; the loaded model then reports no vision.
+    fn load(&self, model: &DetectedModel, disable_vision: bool) -> Result<AnyModel, ModelError>;
 }
 
 #[derive(Clone, Copy)]
@@ -551,7 +553,7 @@ impl ModelAdapter for BuiltinAdapter {
             None
         }
     }
-    fn load(&self, model: &DetectedModel) -> Result<AnyModel, ModelError> {
+    fn load(&self, model: &DetectedModel, disable_vision: bool) -> Result<AnyModel, ModelError> {
         self.validate_tolerant(model)?;
         if !self.has_exact_candidate(model) {
             tracing::warn!(model_type = %model.model_type, adapter = self.id, "loading an untested model version through a structurally compatible adapter");
@@ -585,10 +587,14 @@ impl ModelAdapter for BuiltinAdapter {
                 .and_then(|args| crate::gemma2::load_gemma2_model_with_args(dir, args))
                 .map(AnyModel::Gemma2),
             LoadKind::Gemma3 => crate::gemma3::gemma3_model_args_from_value(model.raw.clone())
-                .and_then(|args| crate::gemma3::load_gemma3_model_with_args(dir, args))
+                .and_then(|args| {
+                    crate::gemma3::load_gemma3_model_with_args(dir, args, disable_vision)
+                })
                 .map(AnyModel::Gemma3),
             LoadKind::Gemma4 => crate::gemma4::gemma4_model_args_from_value(model.raw.clone())
-                .and_then(|args| crate::gemma4::load_gemma4_model_with_args(dir, args))
+                .and_then(|args| {
+                    crate::gemma4::load_gemma4_model_with_args(dir, args, disable_vision)
+                })
                 .map(AnyModel::Gemma4),
             LoadKind::Phi3 => serde_json::from_value(model.resolved_config().clone())
                 .map_err(ModelError::Json)
@@ -598,15 +604,19 @@ impl ModelAdapter for BuiltinAdapter {
                 .map_err(ModelError::Json)
                 .and_then(|args| crate::starcoder2::load_starcoder2_model_with_args(dir, args))
                 .map(AnyModel::Starcoder2),
-            LoadKind::LlavaQwen2 => {
-                crate::llava_qwen2::load_llava_qwen2_model_from_value(dir, &model.raw)
-                    .map(AnyModel::LlavaQwen2)
-            }
+            LoadKind::LlavaQwen2 => crate::llava_qwen2::load_llava_qwen2_model_from_value(
+                dir,
+                &model.raw,
+                disable_vision,
+            )
+            .map(AnyModel::LlavaQwen2),
             LoadKind::DeepSeekV2 => serde_json::from_value(model.resolved_config().clone())
                 .map_err(ModelError::Json)
                 .and_then(|args| crate::deepseek_v2::load_deepseek_v2_model_with_args(dir, args))
                 .map(AnyModel::DeepSeekV2),
-            LoadKind::QwenVl => crate::qwen_vl::load_qwen_vl_model_from_value(dir, &model.raw),
+            LoadKind::QwenVl => {
+                crate::qwen_vl::load_qwen_vl_model_from_value(dir, &model.raw, disable_vision)
+            }
         }
     }
 }

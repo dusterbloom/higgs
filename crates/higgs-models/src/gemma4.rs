@@ -1732,12 +1732,13 @@ pub(crate) fn gemma4_model_args_from_value(
 pub fn load_gemma4_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma4CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_gemma4_model_args(model_path)?;
-    load_gemma4_model_with_args(model_path, args)
+    load_gemma4_model_with_args(model_path, args, false)
 }
 
 pub(crate) fn load_gemma4_model_with_args(
     model_path: &Path,
     args: Gemma4ModelArgs,
+    disable_vision: bool,
 ) -> Result<Gemma4CausalLM, ModelError> {
     tracing::info!(
         model_type = %args.model_type,
@@ -1787,8 +1788,14 @@ pub(crate) fn load_gemma4_model_with_args(
 
     // Multimodal `gemma4` checkpoints carry a SigLIP-style vision tower under
     // `vision_tower.`; text-only `gemma4_text` checkpoints have none and keep
-    // `model.vision == None` (identical behavior to before).
-    model.vision = load_gemma_vision_tower(model_path)?;
+    // `model.vision == None` (identical behavior to before). The `disable_vision`
+    // escape hatch skips tower loading entirely, leaving a text-only model.
+    if disable_vision {
+        model.vision = None;
+        tracing::info!("disable_vision=true: skipping Gemma 4 vision tower");
+    } else {
+        model.vision = load_gemma_vision_tower(model_path)?;
+    }
 
     tracing::info!("Gemma 4 model loaded successfully");
     Ok(model)

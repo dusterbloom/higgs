@@ -306,13 +306,14 @@ impl SimpleEngine {
         raise_wired_limit: bool,
         disk_prefix_dir: Option<&Path>,
         disk_prefix_budget: u64,
+        disable_vision: bool,
     ) -> Result<Self, EngineError> {
         let model_dir = dir.as_ref();
         let model_name = derive_model_name(model_dir);
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model");
 
-        let model = model_loader::load_model(model_dir)?;
+        let model = model_loader::load_model(model_dir, disable_vision)?;
         let _ = model
             .make_cache_with_config(kv_cache_config)
             .map_err(EngineError::Mlx)?;

@@ -33,6 +33,7 @@ impl Engine {
         raise_wired_limit: bool,
         disk_prefix_dir: Option<&Path>,
         disk_prefix_budget: u64,
+        disable_vision: bool,
     ) -> Result<Self, EngineError> {
         SimpleEngine::load(
             dir,
@@ -41,6 +42,7 @@ impl Engine {
             raise_wired_limit,
             disk_prefix_dir,
             disk_prefix_budget,
+            disable_vision,
         )
         .map(|e| Self::Simple(Box::new(e)))
     }
@@ -50,12 +52,14 @@ impl Engine {
         kv_cache_config: KvCacheConfig,
         raise_wired_limit: bool,
         prefill_yield_tokens: Option<u32>,
+        disable_vision: bool,
     ) -> Result<Self, EngineError> {
         BatchEngine::load(
             dir,
             kv_cache_config,
             raise_wired_limit,
             prefill_yield_tokens,
+            disable_vision,
         )
         .map(|e| Self::Batch(Box::new(e)))
     }
@@ -368,6 +372,28 @@ pub struct AppState {
 /// Type alias for the shared state used by Axum handlers.
 pub type SharedState = Arc<AppState>;
 
+/// Build a `SharedState` whose router serves `model` from a stub (non-VLM)
+/// engine, for route-level tests of the vision capability gate.
+///
+/// The stub reports `is_vlm() == false`, so an image request routed to it must
+/// hit the 400 gate before any tokenizer or generation code runs.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn test_state_with_stub_engine(model: &str) -> SharedState {
+    let config = crate::config::HiggsConfig::default();
+    let mut engines = std::collections::HashMap::new();
+    engines.insert(model.to_owned(), Arc::new(Engine::test_stub(model)));
+    let router = crate::router::Router::from_config(&config, engines)
+        .expect("default config builds a router");
+    Arc::new(AppState {
+        router,
+        config,
+        http_client: reqwest::Client::new(),
+        metrics: None,
+    })
+}
+
+#[allow(clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

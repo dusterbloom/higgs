@@ -45,10 +45,19 @@ impl ModelConfig {
 }
 
 /// Load a model from a directory, auto-detecting the architecture.
-pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError> {
+///
+/// `disable_vision` (the config's escape hatch) asks vision-capable adapters
+/// to load their text backbone only, skipping vision weights; the loaded
+/// model then reports no vision capability.
+pub fn load_model<P: AsRef<Path>>(
+    model_dir: P,
+    disable_vision: bool,
+) -> Result<AnyModel, EngineError> {
     let detected = adapter::detect(model_dir.as_ref()).map_err(EngineError::Model)?;
     let resolved = adapter::resolve(&detected).map_err(EngineError::Model)?;
-    resolved.load(&detected).map_err(EngineError::Model)
+    resolved
+        .load(&detected, disable_vision)
+        .map_err(EngineError::Model)
 }
 
 /// Load a tokenizer from a model directory.
@@ -228,7 +237,7 @@ mod tests {
                 "quantization": {"bits": 1, "group_size": 128}
             }"#,
         );
-        match load_model(dir.path()) {
+        match load_model(dir.path(), false) {
             Ok(_) => panic!("expected load failure: config-only dir has no weights"),
             Err(EngineError::Model(ModelError::UnsupportedModel(_))) => {
                 panic!("Bonsai-Q1 must route to the packed engine, not be rejected as unsupported")

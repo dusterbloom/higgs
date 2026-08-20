@@ -85,9 +85,18 @@ pub struct LlavaQwen2Model {
     mm_projector: MmProjector,
     language_model: transformer::Model,
     image_size: i32,
+    /// Whether the vision tower + projector were loaded. False when the
+    /// config's `disable_vision` escape hatch forces a text-only load; the
+    /// model then reports no vision capability and rejects image input.
+    vision_enabled: bool,
 }
 
 impl LlavaQwen2Model {
+    /// Whether this instance loaded its vision tower (always true except when
+    /// `disable_vision` forced a text-only load).
+    pub const fn has_vision(&self) -> bool {
+        self.vision_enabled
+    }
     /// Get the hidden size of the language model.
     pub const fn hidden_size(&self) -> i32 {
         self.language_model.args.hidden_size
@@ -354,21 +363,23 @@ pub fn load_llava_qwen2_model(model_dir: &Path) -> Result<LlavaQwen2Model, Model
     let config_path = model_dir.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)?;
     let raw: serde_json::Value = serde_json::from_str(&config_str)?;
-    load_llava_qwen2_model_from_value(model_dir, &raw)
+    load_llava_qwen2_model_from_value(model_dir, &raw, false)
 }
 
 pub(crate) fn load_llava_qwen2_model_from_value(
     model_dir: &Path,
     raw: &serde_json::Value,
+    disable_vision: bool,
 ) -> Result<LlavaQwen2Model, ModelError> {
     let config: LlavaQwen2Config = serde_json::from_value(raw.clone())?;
-    load_llava_qwen2_model_with_config(model_dir, &config, raw)
+    load_llava_qwen2_model_with_config(model_dir, &config, raw, disable_vision)
 }
 
 fn load_llava_qwen2_model_with_config(
     model_dir: &Path,
     config: &LlavaQwen2Config,
     raw: &serde_json::Value,
+    disable_vision: bool,
 ) -> Result<LlavaQwen2Model, ModelError> {
     tracing::info!(
         image_size = config.vision_config.image_size,
@@ -377,6 +388,7 @@ fn load_llava_qwen2_model_with_config(
         lm_hidden = config.hidden_size,
         lm_layers = config.num_hidden_layers,
         projector = %config.mm_projector_type,
+        disable_vision,
         "Loading LLaVA-Qwen2 model"
     );
 
@@ -390,12 +402,20 @@ fn load_llava_qwen2_model_with_config(
     let language_args = transformer::text_model_args_from_value(raw)?;
     let language_model = transformer::load_vlm_language_model_with_args(model_dir, language_args)?;
 
-    // Load all safetensor weights for vision and projector
-    let weights = load_safetensor_weights(model_dir)?;
+    // `disable_vision` escape hatch: load the text backbone only. The vision
+    // tower and projector weights are skipped entirely (never decoded), and
+    // the model reports no vision capability so image requests are rejected.
+    let vision_enabled = !disable_vision;
+    if vision_enabled {
+        // Load all safetensor weights for vision and projector
+        let weights = load_safetensor_weights(model_dir)?;
 
-    let vision_prefix = "vision_tower.vision_tower.vision_model.";
-    load_siglip_weights(&mut vision_tower, &weights, vision_prefix)?;
-    load_projector_weights(&mut mm_projector, &weights)?;
+        let vision_prefix = "vision_tower.vision_tower.vision_model.";
+        load_siglip_weights(&mut vision_tower, &weights, vision_prefix)?;
+        load_projector_weights(&mut mm_projector, &weights)?;
+    } else {
+        tracing::info!("disable_vision=true: skipping vision tower and projector weights");
+    }
 
     let image_size = config.vision_config.image_size;
 
@@ -406,6 +426,7 @@ fn load_llava_qwen2_model_with_config(
         mm_projector,
         language_model,
         image_size,
+        vision_enabled,
     })
 }
 
@@ -466,7 +487,14 @@ fn load_safetensor_weights(model_dir: &Path) -> Result<HashMap<String, Array>, M
     Ok(all_weights)
 }
 
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(
+    clippy::as_conversions,
+    clippy::indexing_slicing,
+    clippy::manual_repeat_n,
+    clippy::panic,
+    clippy::shadow_reuse,
+    clippy::unwrap_used
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

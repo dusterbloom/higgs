@@ -934,8 +934,10 @@ impl AnyModel {
     /// The vision implementation for this model, if it has one.
     pub fn as_vision(&self) -> Option<&dyn VisionModel> {
         match self {
-            Self::LlavaQwen2(m) => Some(m),
-            Self::QwenVl(m) => Some(m),
+            // LLaVA/Qwen-VL report vision only when their tower was actually
+            // loaded (`disable_vision` leaves a text-only model).
+            Self::LlavaQwen2(m) => m.has_vision().then_some(m),
+            Self::QwenVl(m) => m.has_vision().then_some(m),
             // Gemma 3/4 are vision-capable only when a vision tower was loaded
             // (multimodal checkpoints); text-only variants report `None`.
             Self::Gemma3(m) => m.has_vision_tower().then_some(m),
@@ -954,8 +956,8 @@ impl AnyModel {
     /// The mutable vision implementation for this model, if it has one.
     pub fn as_vision_mut(&mut self) -> Option<&mut dyn VisionModel> {
         match self {
-            Self::LlavaQwen2(m) => Some(m),
-            Self::QwenVl(m) => Some(m),
+            Self::LlavaQwen2(m) => m.has_vision().then_some(m),
+            Self::QwenVl(m) => m.has_vision().then_some(m),
             // Gemma 3/4 are vision-capable only when a vision tower was loaded.
             Self::Gemma3(m) => m.has_vision_tower().then_some(m),
             Self::Gemma4(m) => m.has_vision_tower().then_some(m),

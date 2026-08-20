@@ -289,6 +289,7 @@ fn load_engines(
                 kv_cache_config,
                 config.local.raise_wired_limit,
                 model_cfg.prefill_yield_tokens,
+                model_cfg.disable_vision,
             )?
         } else {
             let tuning =
@@ -300,6 +301,7 @@ fn load_engines(
                 config.local.raise_wired_limit,
                 model_cfg.kv_disk_dir.as_deref().map(std::path::Path::new),
                 model_cfg.kv_disk_space_mb.saturating_mul(1024 * 1024),
+                model_cfg.disable_vision,
             )?
         };
         let name = model_cfg

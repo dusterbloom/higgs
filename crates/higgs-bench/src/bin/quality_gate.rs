@@ -157,7 +157,7 @@ fn record(model_dir: &Path, prompts_path: &Path, max_tokens: usize, out: &Path) 
         bail!("prompt file contains no prompts");
     }
     let tokenizer = load_tokenizer(model_dir)?;
-    let mut model = load_model(model_dir)?;
+    let mut model = load_model(model_dir, false)?;
     let mut records = Vec::with_capacity(prompts.len());
     for (index, prompt) in prompts.iter().enumerate() {
         eprintln!("[record {}/{}]", index + 1, prompts.len());
@@ -211,7 +211,7 @@ fn check(
         allow_model_mismatch,
     )?;
     let tokenizer = load_tokenizer(model_dir)?;
-    let mut model = load_model(model_dir)?;
+    let mut model = load_model(model_dir, false)?;
     let mut summaries = Vec::with_capacity(fixture.prompts.len());
     for (index, record) in fixture.prompts.iter().enumerate() {
         let (token_exact, max_delta) = teacher_forced(

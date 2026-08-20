@@ -139,7 +139,7 @@ fn run(args: &Args) -> Result<()> {
         approx_size_gb: 0.0,
     });
 
-    let mut model = load_model(&args.model_dir).context("load model")?;
+    let mut model = load_model(&args.model_dir, false).context("load model")?;
     let tokenizer = load_tokenizer(&args.model_dir).context("load tokenizer")?;
     let prompt_tokens =
         synthetic_prompt(&tokenizer, *frontiers.last().expect("frontiers validated"))?;

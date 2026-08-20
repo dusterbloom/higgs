@@ -945,12 +945,13 @@ pub(crate) fn gemma3_model_args_from_value(
 pub fn load_gemma3_model<P: AsRef<Path>>(model_dir: P) -> Result<Gemma3CausalLM, ModelError> {
     let model_path = model_dir.as_ref();
     let args = load_gemma3_model_args(model_path)?;
-    load_gemma3_model_with_args(model_path, args)
+    load_gemma3_model_with_args(model_path, args, false)
 }
 
 pub(crate) fn load_gemma3_model_with_args(
     model_path: &Path,
     mut args: Gemma3ModelArgs,
+    disable_vision: bool,
 ) -> Result<Gemma3CausalLM, ModelError> {
     // HF Gemma 3 text configs omit `tie_word_embeddings`; MLX checkpoints that ship
     // a separate (often separately-quantized) `lm_head` are untied. Honor the
@@ -1010,8 +1011,14 @@ pub(crate) fn load_gemma3_model_with_args(
 
     // Multimodal `gemma3` checkpoints carry a SigLIP-style vision tower under
     // `vision_tower.`; text-only `gemma3_text` checkpoints have none and keep
-    // `model.vision == None` (identical behavior to before).
-    model.vision = load_gemma_vision_tower(model_path)?;
+    // `model.vision == None` (identical behavior to before). The `disable_vision`
+    // escape hatch skips tower loading entirely, leaving a text-only model.
+    if disable_vision {
+        model.vision = None;
+        tracing::info!("disable_vision=true: skipping Gemma 3 vision tower");
+    } else {
+        model.vision = load_gemma_vision_tower(model_path)?;
+    }
 
     tracing::info!("Gemma 3 model loaded successfully");
     Ok(model)

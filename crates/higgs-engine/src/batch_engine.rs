@@ -141,6 +141,7 @@ impl BatchEngine {
         kv_cache_config: KvCacheConfig,
         raise_wired_limit: bool,
         prefill_yield_tokens: Option<u32>,
+        disable_vision: bool,
     ) -> Result<Self, EngineError> {
         if kv_cache_config.is_turboquant() {
             return Err(EngineError::Generation(
@@ -152,7 +153,7 @@ impl BatchEngine {
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model (batch engine)");
 
-        let model = model_loader::load_model(model_dir)?;
+        let model = model_loader::load_model(model_dir, disable_vision)?;
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
         let template = ChatTemplateRenderer::from_model_dir(model_dir)?;
         let eos_token_ids = crate::simple::extract_eos_tokens(model_dir);
