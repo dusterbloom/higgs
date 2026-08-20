@@ -13,7 +13,7 @@
 //! All layers use Sparse `MoE` for the feed-forward block.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -12051,53 +12051,70 @@ fn force_eschamoe_quant_layout(
         args.quantization = serde_json::from_value(conv_spec).ok();
     }
 
-    // The checkpoint's own dense layers — the `weight_int8`/`weight_scale`
-    // pairs and the `mlp.gate` router — are 8-bit (Q8) in the reference
-    // runtime, so they get per-path 8-bit overrides. These are merged over any
-    // block-provided overrides (a block may already pin `mlp.gate` to 8-bit,
-    // but never touches the int8 projections below).
+    // The conversion code chooses Q8 only for actual `weight_int8` /
+    // `weight_scale` pairs and dense MoE router weights. Derive exactly the
+    // same paths from the checkpoint rather than guessing from the model
+    // architecture: a dense Escha model can have trellis attention/MLP paths
+    // with no Q8 tensors at all.
+    let layout = crate::eschamoe::EschaCheckpointLayout::load(model_path)?;
     let dense = crate::eschamoe::DENSE_TARGET;
-    let dense_spec = serde_json::json!({ "group_size": dense.group_size, "bits": dense.bits });
-    args.gate_quantization = serde_json::from_value(dense_spec).ok();
-
     let dense_config = QuantizationConfig {
         group_size: dense.group_size,
         bits: dense.bits,
         mode: crate::quant_mode::QuantMode::Affine,
     };
-    let mut insert_8bit = |path: &str| {
-        args.quant_overrides
-            .insert(path.to_owned(), dense_config.clone());
-    };
-    insert_8bit("model.embed_tokens");
-    insert_8bit("lm_head");
-    for layer in 0..args.num_hidden_layers {
-        let is_full = (layer + 1) % args.full_attention_interval == 0;
-        if is_full {
-            for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-                insert_8bit(&format!("model.layers.{layer}.self_attn.{proj}"));
-            }
-        } else {
-            // The GDN projections are fused (`in_proj_qkvz` = in_proj_qkv +
-            // in_proj_z) in the default layout, so the 8-bit override must key
-            // the fused path the QLinear is actually built under.
-            for proj in ["in_proj_qkvz", "out_proj"] {
-                insert_8bit(&format!("model.layers.{layer}.linear_attn.{proj}"));
-            }
-        }
-        for proj in ["gate_proj", "up_proj", "down_proj"] {
-            insert_8bit(&format!("model.layers.{layer}.mlp.shared_expert.{proj}"));
+
+    let mut q8_paths = BTreeSet::new();
+    for prefix in layout.int8_prefixes {
+        if let Some(path) = eschamoe_runtime_quant_path(&prefix) {
+            q8_paths.insert(path);
         }
     }
+    for prefix in layout.dense_router_prefixes {
+        if let Some(path) = eschamoe_runtime_quant_path(&prefix) {
+            q8_paths.insert(path);
+        }
+    }
+    for path in &q8_paths {
+        args.quant_overrides
+            .insert(path.clone(), dense_config.clone());
+    }
+
     tracing::info!(
         group_size = conv.group_size,
         bits = conv.bits,
         dense_bits = dense.bits,
-        overrides = args.quant_overrides.len(),
+        q8_overrides = q8_paths.len(),
         has_block,
-        "eschamoe checkpoint: affine experts use the conversion target, dense layers are 8-bit"
+        "eschamoe checkpoint: runtime affine layout derived from checkpoint storage"
     );
     Ok(())
+}
+
+/// Map an Escha checkpoint prefix into the QLinear path built by this loader.
+///
+/// Checkpoint keys first pass through [`crate::eschamoe::normalize_key`], then
+/// [`qwen35_checkpoint_param_key`]. GDN source tensors are fused by the
+/// loader, so their quantization override must name the fused QLinear rather
+/// than either source part. MTP prefixes do not belong to this model body and
+/// are deliberately ignored.
+fn eschamoe_runtime_quant_path(checkpoint_prefix: &str) -> Option<String> {
+    let path = qwen35_checkpoint_param_key(checkpoint_prefix)?;
+    if !path.starts_with("model.") && path != "lm_head" {
+        return None;
+    }
+    let fused = if let Some(base) = path.strip_suffix(".linear_attn.in_proj_qkv") {
+        format!("{base}.linear_attn.in_proj_qkvz")
+    } else if let Some(base) = path.strip_suffix(".linear_attn.in_proj_z") {
+        format!("{base}.linear_attn.in_proj_qkvz")
+    } else if let Some(base) = path.strip_suffix(".linear_attn.in_proj_b") {
+        format!("{base}.linear_attn.in_proj_ba")
+    } else if let Some(base) = path.strip_suffix(".linear_attn.in_proj_a") {
+        format!("{base}.linear_attn.in_proj_ba")
+    } else {
+        path.to_owned()
+    };
+    Some(fused)
 }
 
 /// Read every checkpoint tensor as `(key, value)` pairs, ready for the loader.
@@ -13797,6 +13814,85 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn eschamoe_trellis_paths_keep_the_affine_conversion_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"quantization_config":{"quant_method":"escha"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{
+                "metadata": {},
+                "weight_map": {
+                    "model.language_model.layers.0.self_attn.q_proj.escha_code": "model.safetensors",
+                    "model.language_model.embed_tokens.weight_int8": "model.safetensors",
+                    "model.language_model.embed_tokens.weight_scale": "model.safetensors",
+                    "lm_head.weight_int8": "model.safetensors",
+                    "lm_head.weight_scale": "model.safetensors"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut args = valid_causal_lm_args();
+        args.num_hidden_layers = 1;
+        args.full_attention_interval = 1;
+        force_eschamoe_quant_layout(&mut args, dir.path()).unwrap();
+
+        // A trellis projection converts at the affine default (Q4), whereas
+        // true int8 pairs convert to Q8 and must be dispatched as such.
+        assert_eq!(
+            resolve_quant_for(&args, "model.layers.0.self_attn.q_proj").bits,
+            4
+        );
+        assert_eq!(resolve_quant_for(&args, "model.embed_tokens").bits, 8);
+        assert_eq!(resolve_quant_for(&args, "lm_head").bits, 8);
+    }
+
+    #[test]
+    fn eschamoe_legacy_int8_gdn_paths_follow_the_fused_runtime_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"quantization_config":{"quant_method":"escha"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{
+                "metadata": {},
+                "weight_map": {
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int8": "model.safetensors",
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale": "model.safetensors",
+                    "model.language_model.layers.0.linear_attn.in_proj_z.weight_int8": "model.safetensors",
+                    "model.language_model.layers.0.linear_attn.in_proj_z.weight_scale": "model.safetensors",
+                    "model.language_model.layers.0.mlp.gate.weight": "model.safetensors"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut args = valid_causal_lm_args();
+        args.num_hidden_layers = 1;
+        force_eschamoe_quant_layout(&mut args, dir.path()).unwrap();
+
+        // The source keys are fused before QLinear construction; the override
+        // has to follow the built `in_proj_qkvz` path. The dense router is
+        // also Q8, but an unrelated (and absent) full-attention path stays Q4.
+        assert_eq!(
+            resolve_quant_for(&args, "model.layers.0.linear_attn.in_proj_qkvz").bits,
+            8
+        );
+        assert_eq!(resolve_gate_quant(&args, "model.layers.0.mlp.gate").bits, 8);
+        assert_eq!(
+            resolve_quant_for(&args, "model.layers.0.self_attn.q_proj").bits,
+            4
+        );
     }
 
     /// Every key shape an eschamoe checkpoint ships must resolve, after

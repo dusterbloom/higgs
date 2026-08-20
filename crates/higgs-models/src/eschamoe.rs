@@ -45,6 +45,8 @@
     clippy::indexing_slicing
 )]
 
+use std::collections::{BTreeSet, HashSet};
+
 use half::f16;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, Dtype, ops};
@@ -752,6 +754,74 @@ pub const ESCHA_SUFFIXES: [&str; 6] = [
 pub const INT8_WEIGHT_SUFFIX: &str = ".weight_int8";
 pub const INT8_SCALE_SUFFIX: &str = ".weight_scale";
 
+/// Whether a dense checkpoint weight is an MoE router projection.
+///
+/// Escha keeps these selectors in floating point. The reference runtime
+/// requantizes them to Q8, whereas trellis-coded projections use the affine
+/// conversion default. Keeping the predicate here makes the converter and the
+/// loader derive the same layout from checkpoint storage, rather than from a
+/// hard-coded model-family path list.
+pub(crate) fn is_dense_moe_router_projection(module: &str) -> bool {
+    module.ends_with(".mlp.gate") || module.ends_with(".mlp.shared_expert_gate")
+}
+
+/// Checkpoint storage facts that determine Escha's runtime affine layout.
+///
+/// The paths retain the normalized checkpoint namespace
+/// (`language_model.model...`). The Qwen loader strips that namespace before
+/// constructing its parameter tree. A projection belongs here only when the
+/// checkpoint contains both members of an int8 pair; trellis tensors are
+/// intentionally absent and therefore retain the affine conversion default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EschaCheckpointLayout {
+    pub int8_prefixes: BTreeSet<String>,
+    pub dense_router_prefixes: BTreeSet<String>,
+}
+
+impl EschaCheckpointLayout {
+    /// Inspect the cheap safetensors index when available, falling back to
+    /// tensor names from checkpoint shards for single-file exports.
+    pub(crate) fn load(model_dir: &std::path::Path) -> Result<Self, ModelError> {
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let names = if index_path.exists() {
+            let index: crate::WeightMapIndex =
+                serde_json::from_str(&std::fs::read_to_string(index_path)?)?;
+            index.weight_map.into_keys().collect()
+        } else {
+            let mut names = Vec::new();
+            for file in crate::collect_safetensors_files(model_dir)? {
+                let loaded = Array::load_safetensors(&file)
+                    .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+                names.extend(loaded.into_keys());
+            }
+            names
+        };
+        Ok(Self::from_weight_names(names))
+    }
+
+    pub(crate) fn from_weight_names(names: impl IntoIterator<Item = String>) -> Self {
+        let names: HashSet<String> = names.into_iter().collect();
+        let mut layout = Self::default();
+        for key in &names {
+            if let Some(prefix) = key.strip_suffix(INT8_WEIGHT_SUFFIX)
+                && names.contains(&format!("{prefix}{INT8_SCALE_SUFFIX}"))
+            {
+                layout
+                    .int8_prefixes
+                    .insert(normalize_key(prefix).into_owned());
+            }
+            if let Some(module) = key.strip_suffix(".weight")
+                && is_dense_moe_router_projection(module)
+            {
+                layout
+                    .dense_router_prefixes
+                    .insert(normalize_key(module).into_owned());
+            }
+        }
+        layout
+    }
+}
+
 /// Change an eschamoe key to the format that the Qwen3.5 loader accepts.
 ///
 /// Escha uses the names of transformers v5, for example
@@ -768,7 +838,7 @@ pub fn normalize_key(key: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     key.strip_prefix("model.language_model.").map_or_else(
         || {
-            if key.starts_with("lm_head.") {
+            if key == "lm_head" || key.starts_with("lm_head.") {
                 Cow::Owned(format!("language_model.{key}"))
             } else {
                 Cow::Borrowed(key)
@@ -1390,9 +1460,7 @@ fn convert_checkpoint_impl(
                             // than the 4-bit conversion target. Selecting the
                             // wrong experts is catastrophic, so gate weights get
                             // the higher precision.
-                            let target = if module.ends_with(".mlp.gate")
-                                || module.ends_with(".mlp.shared_expert_gate")
-                            {
+                            let target = if is_dense_moe_router_projection(module) {
                                 DENSE_TARGET
                             } else {
                                 AffineTarget::resolve(quantization, module)
@@ -1549,6 +1617,34 @@ mod tests {
     use mlx_rs::ops::indexing::IndexOp;
 
     use super::*;
+
+    #[test]
+    fn checkpoint_layout_requires_complete_int8_pairs_and_keeps_trellis_q4() {
+        let layout = EschaCheckpointLayout::from_weight_names([
+            // Trellis storage deliberately does not become a Q8 override.
+            "model.language_model.layers.0.self_attn.q_proj.escha_code".to_owned(),
+            // A partial pair must not be treated as a Q8 projection either.
+            "model.language_model.layers.0.self_attn.k_proj.weight_int8".to_owned(),
+            // A complete pair does become Q8.
+            "model.language_model.embed_tokens.weight_int8".to_owned(),
+            "model.language_model.embed_tokens.weight_scale".to_owned(),
+            // Dense MoE selectors are Q8 by the reference convention.
+            "model.language_model.layers.0.mlp.gate.weight".to_owned(),
+            "model.language_model.layers.0.mlp.shared_expert_gate.weight".to_owned(),
+        ]);
+
+        assert_eq!(
+            layout.int8_prefixes,
+            BTreeSet::from(["language_model.model.embed_tokens".to_owned()])
+        );
+        assert_eq!(
+            layout.dense_router_prefixes,
+            BTreeSet::from([
+                "language_model.model.layers.0.mlp.gate".to_owned(),
+                "language_model.model.layers.0.mlp.shared_expert_gate".to_owned(),
+            ])
+        );
+    }
 
     fn spec(k: usize, in_f: i32, out_f: i32) -> EschaSpec {
         EschaSpec {
@@ -2017,6 +2113,7 @@ mod tests {
                 "model.embed_tokens.weight_int8",
             ),
             ("model.language_model.norm.weight", "model.norm.weight"),
+            ("lm_head", "lm_head"),
             ("lm_head.weight_int8", "lm_head.weight_int8"),
             // MTP sidecar keys are already in the expected form.
             ("mtp.fc.weight", "mtp.fc.weight"),
