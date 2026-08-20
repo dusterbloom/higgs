@@ -1343,6 +1343,8 @@ fn materialize_decode_step(
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
     clippy::unwrap_used
 )]
 #[cfg(test)]

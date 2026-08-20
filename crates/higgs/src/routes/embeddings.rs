@@ -174,6 +174,7 @@ pub async fn embeddings(
     }
 }
 
+#[allow(clippy::panic, clippy::shadow_unrelated, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use serde_json::json;

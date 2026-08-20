@@ -229,7 +229,10 @@ pub fn merge_embeddings(
     clippy::as_conversions,
     clippy::cast_precision_loss,
     clippy::float_cmp,
+    clippy::indexing_slicing,
+    clippy::manual_repeat_n,
     clippy::panic,
+    clippy::shadow_reuse,
     clippy::unwrap_used
 )]
 mod tests {
