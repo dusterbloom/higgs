@@ -828,7 +828,10 @@ fn convert_messages(
 /// Map an engine error to a server error, surfacing vision preprocessing
 /// failures (malformed client image data) as strict 400s and passing every
 /// other engine error through as a 500.
-fn map_engine_error(e: higgs_engine::error::EngineError) -> ServerError {
+///
+/// Shared with the Anthropic route so both surfaces map `EngineError::Vision`
+/// identically.
+pub(crate) fn map_engine_error(e: higgs_engine::error::EngineError) -> ServerError {
     match e {
         higgs_engine::error::EngineError::Vision(v) => ServerError::BadRequest(v.to_string()),
         other @ (higgs_engine::error::EngineError::Model(_)
@@ -840,7 +843,9 @@ fn map_engine_error(e: higgs_engine::error::EngineError) -> ServerError {
 }
 
 /// Reject images when the resolved model has no vision support.
-fn check_vision_capability(
+///
+/// Shared with the Anthropic route so both surfaces enforce the same 400 gate.
+pub(crate) fn check_vision_capability(
     media: &[MediaItem],
     engine_is_vlm: bool,
     model_name: &str,
@@ -988,7 +993,7 @@ fn current_unix_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,5 +1219,94 @@ mod tests {
     #[test]
     fn test_check_vision_capability_accepts_no_images_on_text_model() {
         assert!(check_vision_capability(&[], false, "text-model").is_ok());
+    }
+
+    // -- Route-level vision gate (through the full axum router) --
+
+    /// A valid 1x1 red PNG (passes byte-size and dimension checks).
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn image_chat_body(stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "model": "stub-model",
+            "stream": stream,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{TINY_PNG_B64}")}}
+            ]}]
+        })
+    }
+
+    async fn post_json(
+        app: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<axum::body::Body> {
+        use tower::ServiceExt as _;
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn error_message(response: axum::http::Response<axum::body::Body>) -> (u16, String) {
+        use http_body_util::BodyExt as _;
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (
+            status,
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_image_on_text_model_returns_400() {
+        let app = crate::build_router(
+            crate::state::test_state_with_stub_engine("stub-model"),
+            300.0,
+            None,
+            0,
+            1024 * 1024,
+            None,
+        );
+        let (status, msg) =
+            error_message(post_json(app, "/v1/chat/completions", image_chat_body(false)).await)
+                .await;
+        assert_eq!(status, 400, "expected 400, got body: {msg}");
+        assert!(
+            msg.contains("does not support vision"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("stub-model"), "model name missing: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_stream_image_on_text_model_returns_400() {
+        let app = crate::build_router(
+            crate::state::test_state_with_stub_engine("stub-model"),
+            300.0,
+            None,
+            0,
+            1024 * 1024,
+            None,
+        );
+        let (status, msg) =
+            error_message(post_json(app, "/v1/chat/completions", image_chat_body(true)).await)
+                .await;
+        assert_eq!(status, 400, "expected 400, got body: {msg}");
+        assert!(
+            msg.contains("does not support vision"),
+            "unexpected error: {msg}"
+        );
     }
 }
