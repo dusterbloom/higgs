@@ -12035,25 +12035,67 @@ fn force_eschamoe_quant_layout(
     if !crate::eschamoe::is_eschamoe_checkpoint(model_path)? {
         return Ok(());
     }
-    // A checkpoint with its own `quantization` block already agrees with the
-    // conversion code, because both read that block. Do not change the
-    // arguments in that case. Only a checkpoint with no such block needs this
-    // correction, because the argument code would then read the eschamoe
-    // `quantization_config` block and get the trellis bit rate.
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(model_path.join("config.json"))?)?;
-    if config.get("quantization").is_some() {
-        return Ok(());
+    let has_block = config.get("quantization").is_some();
+
+    // The trellis experts, when the affine comparison path is used, stay at
+    // the 4-bit conversion target. A checkpoint with its own `quantization`
+    // block already carries that global default (or its own choice), so only
+    // a checkpoint with no such block needs the injection — otherwise the
+    // argument code would read the eschamoe `quantization_config` block and
+    // get the trellis bit rate.
+    let conv = crate::eschamoe::CONVERSION_TARGET;
+    if !has_block {
+        let conv_spec = serde_json::json!({ "group_size": conv.group_size, "bits": conv.bits });
+        args.quantization = serde_json::from_value(conv_spec).ok();
     }
-    let target = crate::eschamoe::CONVERSION_TARGET;
-    let spec = serde_json::json!({ "group_size": target.group_size, "bits": target.bits });
-    args.quantization = serde_json::from_value(spec.clone()).ok();
-    args.gate_quantization = serde_json::from_value(spec).ok();
-    args.quant_overrides.clear();
+
+    // The checkpoint's own dense layers — the `weight_int8`/`weight_scale`
+    // pairs and the `mlp.gate` router — are 8-bit (Q8) in the reference
+    // runtime, so they get per-path 8-bit overrides. These are merged over any
+    // block-provided overrides (a block may already pin `mlp.gate` to 8-bit,
+    // but never touches the int8 projections below).
+    let dense = crate::eschamoe::DENSE_TARGET;
+    let dense_spec = serde_json::json!({ "group_size": dense.group_size, "bits": dense.bits });
+    args.gate_quantization = serde_json::from_value(dense_spec).ok();
+
+    let dense_config = QuantizationConfig {
+        group_size: dense.group_size,
+        bits: dense.bits,
+        mode: crate::quant_mode::QuantMode::Affine,
+    };
+    let mut insert_8bit = |path: &str| {
+        args.quant_overrides
+            .insert(path.to_owned(), dense_config.clone());
+    };
+    insert_8bit("model.embed_tokens");
+    insert_8bit("lm_head");
+    for layer in 0..args.num_hidden_layers {
+        let is_full = (layer + 1) % args.full_attention_interval == 0;
+        if is_full {
+            for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                insert_8bit(&format!("model.layers.{layer}.self_attn.{proj}"));
+            }
+        } else {
+            // The GDN projections are fused (`in_proj_qkvz` = in_proj_qkv +
+            // in_proj_z) in the default layout, so the 8-bit override must key
+            // the fused path the QLinear is actually built under.
+            for proj in ["in_proj_qkvz", "out_proj"] {
+                insert_8bit(&format!("model.layers.{layer}.linear_attn.{proj}"));
+            }
+        }
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            insert_8bit(&format!("model.layers.{layer}.mlp.shared_expert.{proj}"));
+        }
+    }
     tracing::info!(
-        group_size = target.group_size,
-        bits = target.bits,
-        "eschamoe checkpoint: using the affine layout of the conversion code"
+        group_size = conv.group_size,
+        bits = conv.bits,
+        dense_bits = dense.bits,
+        overrides = args.quant_overrides.len(),
+        has_block,
+        "eschamoe checkpoint: affine experts use the conversion target, dense layers are 8-bit"
     );
     Ok(())
 }

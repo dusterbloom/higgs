@@ -159,14 +159,16 @@ fn exact_generation_body<'a>(prompt: &'a [u32], generation_suffix: &[u32]) -> Op
 /// Floors to the prefix-cache block size so the stored entry is block-aligned
 /// and its KV layers can be paged (a GDN snapshot is only valid at the exact
 /// attention boundary it was computed at). A body shorter than one block has
-/// no aligned boundary, so it keeps its exact length: `slice_into_blocks` then
-/// sees a misaligned hybrid and falls back to a whole `Cloned` entry, which is
-/// the pre-paging behaviour. Returning 0 there would disable the two-phase
-/// snapshot entirely and drop hybrid caching for short conversations.
+/// no aligned boundary and is therefore NOT split: the two-phase body/suffix
+/// split must reproduce a single-pass forward bit-for-bit, and the
+/// non-block-aligned split does not (the recurrent GDN/SSM state diverges,
+/// producing degenerate logits on short generation suffixes — observed as
+/// `!`-repetition in thinking mode). Returning 0 keeps the single-pass prefill
+/// and merely drops hybrid caching for bodies shorter than one block, where a
+/// cached prefix is never reused anyway.
 fn hybrid_checkpoint_boundary(body_len: usize) -> usize {
     let quantum = DEFAULT_BLOCK_SIZE.saturating_mul(HYBRID_CHECKPOINT_BLOCKS);
-    let aligned = body_len / quantum * quantum;
-    if aligned == 0 { body_len } else { aligned }
+    body_len / quantum * quantum
 }
 
 fn pflash_cache_source_and_request_tail<'a>(
@@ -13786,16 +13788,16 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_checkpoint_boundary_floors_to_block_without_dropping_short_bodies() {
+    fn hybrid_checkpoint_boundary_skips_short_unaligned_bodies() {
         // Long bodies floor to a block multiple so the store can be paged.
         assert_eq!(hybrid_checkpoint_boundary(64), 64);
         assert_eq!(hybrid_checkpoint_boundary(95), 64);
         assert_eq!(hybrid_checkpoint_boundary(96), 96);
-        // Sub-block bodies keep their exact length rather than collapsing to 0,
-        // which would skip the two-phase snapshot and drop hybrid caching for
-        // short conversations. These store as whole clones, as before paging.
-        assert_eq!(hybrid_checkpoint_boundary(31), 31);
-        assert_eq!(hybrid_checkpoint_boundary(1), 1);
+        // Sub-block bodies must not use a non-aligned two-phase split: recurrent
+        // GDN/SSM state then differs from a single-pass prefill. Skipping the
+        // snapshot preserves correct logits for short generation suffixes.
+        assert_eq!(hybrid_checkpoint_boundary(31), 0);
+        assert_eq!(hybrid_checkpoint_boundary(1), 0);
         // An empty body still has nothing to snapshot.
         assert_eq!(hybrid_checkpoint_boundary(0), 0);
     }

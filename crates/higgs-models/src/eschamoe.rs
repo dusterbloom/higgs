@@ -11,7 +11,7 @@
 //! | `escha_rout`  | F16   | `[E, out]`               |
 //! | `escha_s_in`  | F32   | `[E, in]`                |
 //! | `escha_s_out` | F32   | `[E, out]`               |
-//! | `escha_config`| I32   | `[9]`                    |
+//! | `escha_config`| I32   | `[6]` or `[9]`           |
 //!
 //! A dense checkpoint stores the same tensors without the `E` axis. The code
 //! tensor then has rank 3, and each scale vector has rank 1. Refer to
@@ -142,10 +142,11 @@ fn codebook_for_flag(flag: i32) -> Result<Codebook, ModelError> {
 /// The layout of one quantized projection. The data comes from the
 /// `escha_config` tensor.
 ///
-/// The tensor holds nine values in this sequence: the tile edge, the value K
-/// (the number of bits for each weight), the number of bits, the MCG codebook
+/// Legacy tensors hold nine values in this sequence: the tile edge, the value
+/// K (the number of bits for each weight), the number of bits, the MCG codebook
 /// flag, the number of experts, the input size, the output size, the padded
-/// input size, and the padded output size.
+/// input size, and the padded output size. Format V2 dense tensors omit the
+/// expert count and padded dimensions, leaving six values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EschaSpec {
     pub k: usize,
@@ -156,7 +157,8 @@ pub struct EschaSpec {
 }
 
 impl EschaSpec {
-    /// Read the layout from the `escha_config` tensor of nine values.
+    /// Read the layout from a legacy nine-value or V2 six-value
+    /// `escha_config` tensor.
     ///
     /// # Pad note
     ///
@@ -170,6 +172,25 @@ impl EschaSpec {
     /// quantize a small padded matrix with exllamav3. Then compare the two
     /// strip orders against the source matrix.
     pub fn from_config(config: &[i32]) -> Result<Self, ModelError> {
+        let normalized = match config {
+            [tile, k, bits, mcg, in_features, out_features] => [
+                *tile,
+                *k,
+                *bits,
+                *mcg,
+                0,
+                *in_features,
+                *out_features,
+                *in_features,
+                *out_features,
+            ],
+            _ => *<&[i32; 9]>::try_from(config).map_err(|_| {
+                ModelError::ShapeMismatch(format!(
+                    "escha_config must have 6 or 9 elements, got {}",
+                    config.len()
+                ))
+            })?,
+        };
         let [
             tile,
             k,
@@ -180,12 +201,7 @@ impl EschaSpec {
             out_features,
             in_p,
             out_p,
-        ] = *<&[i32; 9]>::try_from(config).map_err(|_| {
-            ModelError::ShapeMismatch(format!(
-                "escha_config must have 9 elements, got {}",
-                config.len()
-            ))
-        })?;
+        ] = normalized;
 
         if tile != TILE_I32 {
             return Err(ModelError::UnsupportedModel(format!(
@@ -835,6 +851,20 @@ pub const CONVERSION_TARGET: AffineTarget = AffineTarget {
     bits: 4,
 };
 
+/// The affine target for the checkpoint's own dense layers: `weight_int8` /
+/// `weight_scale` pairs and the `mlp.gate` router (and `shared_expert_gate`).
+///
+/// The reference `escha-mlx` runtime repacks these to exact 8-bit affine (Q8):
+/// the int8 already holds 8 bits of precision, so re-quantizing it to the 4-bit
+/// [`CONVERSION_TARGET`] discards ~5-10% of every dense weight's magnitude.
+/// `mlx-lm`'s `qwen3_5_moe` `quant_predicate` likewise pins `mlp.gate` /
+/// `shared_expert_gate` to 8 bits. 8-bit keeps the dense path within the
+/// int8 source's own precision.
+pub const DENSE_TARGET: AffineTarget = AffineTarget {
+    group_size: 64,
+    bits: 8,
+};
+
 impl Default for AffineTarget {
     fn default() -> Self {
         CONVERSION_TARGET
@@ -1354,7 +1384,19 @@ fn convert_checkpoint_impl(
                     // are.
                     match key.strip_suffix(".weight").filter(|_| value.ndim() == 2) {
                         Some(module) => {
-                            let target = AffineTarget::resolve(quantization, module);
+                            // The router gate and shared-expert gate are fp16
+                            // dense weights; the reference runtimes keep them at
+                            // 8-bit precision (mlx-lm's quant_predicate) rather
+                            // than the 4-bit conversion target. Selecting the
+                            // wrong experts is catastrophic, so gate weights get
+                            // the higher precision.
+                            let target = if module.ends_with(".mlp.gate")
+                                || module.ends_with(".mlp.shared_expert_gate")
+                            {
+                                DENSE_TARGET
+                            } else {
+                                AffineTarget::resolve(quantization, module)
+                            };
                             made.extend(triple_entries(
                                 module,
                                 quantize_affine_named(module, &value, target)?,
@@ -1382,10 +1424,12 @@ fn convert_checkpoint_impl(
                 let weight = take(&format!("{prefix}{INT8_WEIGHT_SUFFIX}"))?;
                 let scale = take(&format!("{prefix}{INT8_SCALE_SUFFIX}"))?;
                 let dense = dequant_int8(&weight, &scale)?;
-                let target = AffineTarget::resolve(quantization, prefix);
+                // `weight_int8` already holds 8 bits; re-quantizing to the
+                // 4-bit conversion target throws away ~5-10% of every dense
+                // weight. Keep 8 bits (matches escha-mlx's Q8 dense repack).
                 made.extend(triple_entries(
                     prefix,
-                    quantize_affine_named(prefix, &dense, target)?,
+                    quantize_affine_named(prefix, &dense, DENSE_TARGET)?,
                 ));
             }
             Storage::Trellis => {
@@ -1748,6 +1792,20 @@ mod tests {
         assert_eq!(s.k, 3);
         assert_eq!(s.tiles(), (32, 128));
         assert_eq!(s.words_per_tile(), 48);
+    }
+
+    /// Format V2 omits the expert count and padded dimensions from dense
+    /// projection headers. The dimensions are the logical, unpadded sizes.
+    #[test]
+    fn spec_parses_v2_dense_header() {
+        let s = EschaSpec::from_config(&[16, 2, 2, 1, 5120, 10240]).unwrap();
+
+        assert_eq!(s.k, 2);
+        assert!(s.mcg);
+        assert_eq!(s.num_experts, 0);
+        assert_eq!(s.in_features, 5120);
+        assert_eq!(s.out_features, 10240);
+        assert_eq!(s.tiles(), (320, 640));
     }
 
     /// Test the Hadamard operation on the two axes.
