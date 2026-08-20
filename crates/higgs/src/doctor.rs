@@ -316,15 +316,20 @@ fn checkpoint_declares_vision(detected: &higgs_models::adapter::DetectedModel) -
 
 /// The vision column for the capability report.
 ///
-/// Mirrors runtime capability gating at the adapter-capability level:
-/// `supported` when the resolved adapter implements vision, `tower-ignored`
-/// when the checkpoint declares vision weights that the resolved text-only
-/// adapter skips, and `none` otherwise. The parenthetical names the
-/// checkpoint's declared model type (wrapper when present), matching the
-/// family names a loaded model would report.
+/// The report is checkpoint-driven so a text-only `gemma3_text` / `gemma4_text`
+/// checkpoint never claims vision even though it shares an adapter with the
+/// multimodal `gemma3` / `gemma4` checkpoints:
+/// `supported` when the resolved adapter implements vision **and** the
+/// checkpoint declares vision weights, `tower-ignored` when the checkpoint
+/// declares vision weights that the resolved text-only adapter skips,
+/// `disabled` when the config's `disable_vision` escape hatch forces a
+/// vision-capable checkpoint to load text-only, and `none` otherwise. The
+/// parenthetical names the checkpoint's declared model type (wrapper when
+/// present), matching the family names a loaded model would report.
 fn vision_status(
     inspected: &model_loader::ModelConfig,
     detected: Option<&higgs_models::adapter::DetectedModel>,
+    disable_vision: bool,
 ) -> String {
     let Some(detected_config) = detected else {
         return "vision: none".to_owned();
@@ -333,7 +338,9 @@ fn vision_status(
         .wrapper_model_type
         .as_deref()
         .unwrap_or(detected_config.model_type.as_str());
-    if inspected.capabilities.vision {
+    if disable_vision && checkpoint_declares_vision(detected_config) {
+        format!("vision: disabled (escape hatch; {family})")
+    } else if inspected.capabilities.vision && checkpoint_declares_vision(detected_config) {
         format!("vision: supported ({family})")
     } else if checkpoint_declares_vision(detected_config) {
         format!("vision: tower-ignored ({family})")
@@ -541,7 +548,7 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 let version = inspected
                     .version
                     .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
-                let vision = vision_status(&inspected, detected.as_ref());
+                let vision = vision_status(&inspected, detected.as_ref(), model.disable_vision);
                 pass(
                     &format!(
                         "model {label} resolvable (adapter={}, family={}, version={version}; {vision}; {profile_msg})",
@@ -1820,21 +1827,73 @@ mod tests {
         let inspected = model_loader::ModelConfig::from_dir(dir.path()).unwrap();
         let detected = higgs_models::adapter::detect(dir.path()).unwrap();
         assert_eq!(
-            vision_status(&inspected, Some(&detected)),
+            vision_status(&inspected, Some(&detected), false),
             "vision: supported (llava-qwen2)"
         );
     }
 
     #[test]
+    fn test_vision_status_supported_for_multimodal_gemma() {
+        // The `gemma3` / `gemma4` adapters run `load_gemma_vision_tower`, so a
+        // multimodal checkpoint (vision weights declared) reports `supported`.
+        for model_type in ["gemma3", "gemma4"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_with_vision(dir.path(), model_type);
+            let inspected = model_loader::ModelConfig::from_dir(dir.path()).unwrap();
+            let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+            assert!(
+                inspected.capabilities.vision,
+                "{model_type} must advertise vision"
+            );
+            assert_eq!(
+                vision_status(&inspected, Some(&detected), false),
+                format!("vision: supported ({model_type})")
+            );
+        }
+    }
+
+    #[test]
+    fn test_vision_status_none_for_text_only_gemma() {
+        // `gemma3_text` / `gemma4_text` checkpoints carry no vision weights and
+        // report `none` (the shared adapter only loads a tower when the
+        // checkpoint actually has one).
+        for model_type in ["gemma3_text", "gemma4_text"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), model_type);
+            let inspected = model_loader::ModelConfig::from_dir(dir.path()).unwrap();
+            let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+            assert_eq!(
+                vision_status(&inspected, Some(&detected), false),
+                "vision: none",
+                "{model_type} must not report vision"
+            );
+        }
+    }
+
+    #[test]
     fn test_vision_status_tower_ignored_for_text_adapter() {
+        // A text-family adapter that truly implements no vision still reports
+        // `tower-ignored` when the checkpoint declares vision weights.
         let dir = tempfile::tempdir().unwrap();
-        write_model_config_with_vision(dir.path(), "gemma3");
+        write_model_config_with_vision(dir.path(), "phi3");
         let inspected = model_loader::ModelConfig::from_dir(dir.path()).unwrap();
         let detected = higgs_models::adapter::detect(dir.path()).unwrap();
         assert!(!inspected.capabilities.vision);
         assert_eq!(
-            vision_status(&inspected, Some(&detected)),
-            "vision: tower-ignored (gemma3)"
+            vision_status(&inspected, Some(&detected), false),
+            "vision: tower-ignored (phi3)"
+        );
+    }
+
+    #[test]
+    fn test_vision_status_disabled_by_escape_hatch() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_with_vision(dir.path(), "llava-qwen2");
+        let inspected = model_loader::ModelConfig::from_dir(dir.path()).unwrap();
+        let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+        assert_eq!(
+            vision_status(&inspected, Some(&detected), true),
+            "vision: disabled (escape hatch; llava-qwen2)"
         );
     }
 
@@ -1844,14 +1903,19 @@ mod tests {
         write_model_config_json(dir.path(), "qwen2");
         let inspected = model_loader::ModelConfig::from_dir(dir.path()).unwrap();
         let detected = higgs_models::adapter::detect(dir.path()).unwrap();
-        assert_eq!(vision_status(&inspected, Some(&detected)), "vision: none");
+        assert_eq!(
+            vision_status(&inspected, Some(&detected), false),
+            "vision: none"
+        );
     }
 
     #[test]
     fn test_doctor_warns_tower_ignored_for_multimodal_checkpoint() {
         with_mla_env(None, || {
             let dir = tempfile::tempdir().unwrap();
-            write_model_config_with_vision(dir.path(), "gemma3");
+            // `phi3` has no vision adapter; a vision-declaring checkpoint still
+            // warns that its tower would be ignored.
+            write_model_config_with_vision(dir.path(), "phi3");
             let model = model_with_path(dir.path().to_str().unwrap().to_owned());
             let config = HiggsConfig {
                 models: vec![model],
@@ -1861,6 +1925,24 @@ mod tests {
             check_models(&config, &mut result);
             assert_eq!(result.failures, 0);
             assert_eq!(result.warnings, 1);
+        });
+    }
+
+    #[test]
+    fn test_doctor_no_longer_warns_tower_ignored_for_multimodal_gemma() {
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            // gemma3/gemma4 adapters load towers: no "will ignore" warning.
+            write_model_config_with_vision(dir.path(), "gemma3");
+            let model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(result.failures, 0);
+            assert_eq!(result.warnings, 0);
         });
     }
 

@@ -300,7 +300,10 @@ static GEMMA3: BuiltinAdapter = BuiltinAdapter {
     id: "gemma3-text",
     family: gemma,
     version_range: "Gemma 3+ text",
-    capabilities: caps(false, false, false, false, false),
+    // The loader runs `load_gemma_vision_tower`, so multimodal `gemma3`
+    // checkpoints load with a working vision tower; text-only `gemma3_text`
+    // checkpoints keep `vision == None` and report no vision at runtime.
+    capabilities: caps(true, false, false, false, false),
     notes: "Gemma 3 text backbone",
     kind: LoadKind::Gemma3,
 };
@@ -308,7 +311,7 @@ static GEMMA4: BuiltinAdapter = BuiltinAdapter {
     id: "gemma4-text",
     family: gemma,
     version_range: "Gemma 4+ text/unified",
-    capabilities: caps(false, false, true, false, false),
+    capabilities: caps(true, false, true, false, false),
     notes: "Gemma 4 text backbone with optional MoE",
     kind: LoadKind::Gemma4,
 };
