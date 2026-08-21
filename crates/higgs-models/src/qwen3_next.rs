@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mlx_rs::{
     Array, Dtype, Stream,
@@ -490,6 +491,14 @@ pub(crate) fn quantized_forward(
 /// The custom simdgroup Q2 kernel can win isolated microbench shapes, but the
 /// full Ternary-Bonsai-27B decode path is faster with MLX stock by default.
 /// Keep the custom route opt-in for future sweeps.
+fn affine_q2_simd_eligible(row_count: i32, weight_shape: &[i32]) -> bool {
+    row_count == 1 && matches!(weight_shape, [17_408, 320])
+}
+
+static TRACE_AFFINE_Q2_DISPATCH: OnceLock<bool> = OnceLock::new();
+static AFFINE_Q2_SIMD_DISPATCH_LOGGED: AtomicBool = AtomicBool::new(false);
+static AFFINE_Q2_STOCK_DISPATCH_LOGGED: AtomicBool = AtomicBool::new(false);
+
 fn affine_q2_simd_forward(
     x: &Array,
     weight: &Array,
@@ -502,15 +511,36 @@ fn affine_q2_simd_forward(
         .iter()
         .take(x_shape.len().saturating_sub(1))
         .product();
+    let weight_shape = weight.shape();
+    let (n_rows, k_packed) = match weight_shape {
+        [n_rows, k_packed] => (*n_rows, *k_packed),
+        _ => (0, 0),
+    };
+    let k_dim = k_packed.saturating_mul(16);
     let use_simd = std::env::var("HIGGS_BONSAI_Q2_SIMD")
         .ok()
         .is_some_and(|value| value == "1")
-        && if let [n_rows, k_packed] = *weight.shape() {
-            let k_dim = k_packed.saturating_mul(16);
-            row_count == 1 && n_rows == 17408 && k_dim == 5120
+        && affine_q2_simd_eligible(row_count, weight_shape);
+
+    if *TRACE_AFFINE_Q2_DISPATCH
+        .get_or_init(|| std::env::var("HIGGS_TRACE_Q2_DISPATCH").ok().as_deref() == Some("1"))
+    {
+        let route_logged = if use_simd {
+            &AFFINE_Q2_SIMD_DISPATCH_LOGGED
         } else {
-            false
+            &AFFINE_Q2_STOCK_DISPATCH_LOGGED
         };
+        if !route_logged.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                route = if use_simd { "simd" } else { "mlx_stock" },
+                row_count,
+                n_rows,
+                k_dim,
+                group_size,
+                "Affine Q2 dispatch"
+            );
+        }
+    }
 
     if use_simd {
         crate::metal_kernel::bonsai_q2_qmv_simd(x, weight, scales, biases, group_size)
@@ -27323,6 +27353,15 @@ mod tests {
             max_diff < 1e-3,
             "dense fused/separate hidden mismatch by {max_diff}"
         );
+    }
+
+    #[test]
+    fn affine_q2_simd_eligibility_requires_single_row_and_exact_packed_shape() {
+        assert!(affine_q2_simd_eligible(1, &[17_408, 320]));
+        assert!(!affine_q2_simd_eligible(2, &[17_408, 320]));
+        assert!(!affine_q2_simd_eligible(1, &[34_816, 320]));
+        assert!(!affine_q2_simd_eligible(1, &[17_408, 319]));
+        assert!(!affine_q2_simd_eligible(1, &[17_408]));
     }
 
     #[test]
