@@ -89,6 +89,10 @@ struct Args {
     /// Skip the readiness probe and start measuring immediately.
     #[arg(long)]
     no_wait: bool,
+
+    /// Reject a measured trial unless Higgs reports an exact radix-prefix cache hit.
+    #[arg(long)]
+    require_prefix_cache: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,15 +110,18 @@ struct Params {
     repetition_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
     prompt: String,
+    require_prefix_cache: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
 struct TrialResult {
     ttft_ms: f64,
     decode_tokps: f64,
+    prompt_tokens: Option<u32>,
     tokens_after_first: u32,
     total_tokens: u32,
     wall_ms: f64,
+    cached_prompt_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -197,6 +204,8 @@ async fn run(args: Args) -> Result<()> {
     for i in 0..args.trials {
         eprintln!("[trial  {}/{}]", i + 1, args.trials);
         let trial = run_trial(&client, &base_url, &model.path, &prompt, &args).await?;
+        require_prefix_cache_hit(args.require_prefix_cache, trial.cached_prompt_tokens)
+            .with_context(|| format!("trial {} had no radix-prefix cache hit", i + 1))?;
         trials.push(trial);
     }
 
@@ -230,6 +239,7 @@ async fn run(args: Args) -> Result<()> {
         repetition_penalty: args.repetition_penalty,
         frequency_penalty: args.frequency_penalty,
         prompt,
+        require_prefix_cache: args.require_prefix_cache,
     };
 
     let output = BenchOutput {
@@ -248,6 +258,16 @@ async fn run(args: Args) -> Result<()> {
     };
     println!("{rendered}");
 
+    Ok(())
+}
+
+fn require_prefix_cache_hit(
+    require_prefix_cache: bool,
+    cached_prompt_tokens: Option<u32>,
+) -> Result<()> {
+    if require_prefix_cache && cached_prompt_tokens.unwrap_or(0) == 0 {
+        anyhow::bail!("rerun with a warmup and a cacheable prompt");
+    }
     Ok(())
 }
 
@@ -310,8 +330,7 @@ async fn run_trial(
     // doesn't send a terminal usage chunk.
     let mut chunks_after_first: u32 = 0;
     // Server-reported token counts from the terminal `usage` chunk (preferred).
-    let mut server_completion_tokens: Option<u32> = None;
-    let mut server_prompt_tokens: Option<u32> = None;
+    let mut usage_counters = UsageCounters::default();
     // Byte buffer so multibyte UTF-8 sequences split across network chunks
     // aren't corrupted by a per-chunk lossy decode.
     let mut buf: Vec<u8> = Vec::new();
@@ -326,8 +345,7 @@ async fn run_trial(
                 &line_bytes,
                 &mut first_token_at,
                 &mut chunks_after_first,
-                &mut server_completion_tokens,
-                &mut server_prompt_tokens,
+                &mut usage_counters,
             );
         }
     }
@@ -340,8 +358,7 @@ async fn run_trial(
             &buf,
             &mut first_token_at,
             &mut chunks_after_first,
-            &mut server_completion_tokens,
-            &mut server_prompt_tokens,
+            &mut usage_counters,
         );
     }
 
@@ -355,24 +372,57 @@ async fn run_trial(
     // visible token (already counted as TTFT, not part of decode wall). Fall
     // back to SSE-chunk count only when the server omits the usage chunk
     // (legacy / non-higgs backends that don't honor `stream_options.include_usage`).
-    let tokens_after_first =
-        server_completion_tokens.map_or(chunks_after_first, |total| total.saturating_sub(1));
+    let tokens_after_first = usage_counters
+        .completion_tokens
+        .map_or(chunks_after_first, |total| total.saturating_sub(1));
     let decode_tokps = if after_first.as_secs_f64() > 0.0 && tokens_after_first > 0 {
         f64::from(tokens_after_first) / after_first.as_secs_f64()
     } else {
         0.0
     };
 
-    let total_tokens = server_completion_tokens.unwrap_or(chunks_after_first + 1);
-    let _ = server_prompt_tokens; // currently unused; surface in future result schema.
+    let total_tokens = usage_counters
+        .completion_tokens
+        .unwrap_or(chunks_after_first + 1);
 
     Ok(TrialResult {
         ttft_ms,
         decode_tokps,
+        prompt_tokens: usage_counters.prompt_tokens,
         tokens_after_first,
         total_tokens,
         wall_ms: total_elapsed.as_secs_f64() * 1000.0,
+        cached_prompt_tokens: usage_counters.cached_prompt_tokens,
     })
+}
+
+#[derive(Default)]
+struct UsageCounters {
+    completion_tokens: Option<u32>,
+    prompt_tokens: Option<u32>,
+    cached_prompt_tokens: Option<u32>,
+}
+
+fn usage_u32(usage: &serde_json::Value, key: &str) -> Option<u32> {
+    usage
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+fn update_usage_counters(usage: &serde_json::Value, counters: &mut UsageCounters) {
+    if let Some(completion_tokens) = usage_u32(usage, "completion_tokens") {
+        counters.completion_tokens = Some(completion_tokens);
+    }
+    if let Some(prompt_tokens) = usage_u32(usage, "prompt_tokens") {
+        counters.prompt_tokens = Some(prompt_tokens);
+    }
+    if let Some(cached_prompt_tokens) = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| usage_u32(details, "cached_tokens"))
+    {
+        counters.cached_prompt_tokens = Some(cached_prompt_tokens);
+    }
 }
 
 /// Parse one raw SSE line (without trailing newline) and update the rolling
@@ -381,8 +431,7 @@ fn handle_sse_line(
     line_bytes: &[u8],
     first_token_at: &mut Option<Instant>,
     chunks_after_first: &mut u32,
-    server_completion_tokens: &mut Option<u32>,
-    server_prompt_tokens: &mut Option<u32>,
+    usage_counters: &mut UsageCounters,
 ) {
     let line = String::from_utf8_lossy(line_bytes);
     let line = line.trim();
@@ -397,18 +446,7 @@ fn handle_sse_line(
         return;
     };
     if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
-        if let Some(ct) = usage
-            .get("completion_tokens")
-            .and_then(serde_json::Value::as_u64)
-        {
-            *server_completion_tokens = Some(u32::try_from(ct).unwrap_or(u32::MAX));
-        }
-        if let Some(pt) = usage
-            .get("prompt_tokens")
-            .and_then(serde_json::Value::as_u64)
-        {
-            *server_prompt_tokens = Some(u32::try_from(pt).unwrap_or(u32::MAX));
-        }
+        update_usage_counters(usage, usage_counters);
     }
     let delta = value
         .get("choices")
@@ -424,5 +462,40 @@ fn handle_sse_line(
                 *chunks_after_first += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_counters_capture_radix_cached_tokens() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 1580,
+            "completion_tokens": 128,
+            "prompt_tokens_details": { "cached_tokens": 1572 }
+        });
+        let mut counters = UsageCounters::default();
+        update_usage_counters(&usage, &mut counters);
+        assert_eq!(counters.prompt_tokens, Some(1580));
+        assert_eq!(counters.completion_tokens, Some(128));
+        assert_eq!(counters.cached_prompt_tokens, Some(1572));
+    }
+
+    #[test]
+    fn usage_counters_leave_cache_unknown_when_detail_is_absent() {
+        let usage = serde_json::json!({ "prompt_tokens": 1580, "completion_tokens": 128 });
+        let mut counters = UsageCounters::default();
+        update_usage_counters(&usage, &mut counters);
+        assert_eq!(counters.cached_prompt_tokens, None);
+    }
+
+    #[test]
+    fn prefix_cache_requirement_rejects_missing_cache_hit() {
+        assert!(require_prefix_cache_hit(false, None).is_ok());
+        assert!(require_prefix_cache_hit(true, Some(1)).is_ok());
+        assert!(require_prefix_cache_hit(true, None).is_err());
+        assert!(require_prefix_cache_hit(true, Some(0)).is_err());
     }
 }
