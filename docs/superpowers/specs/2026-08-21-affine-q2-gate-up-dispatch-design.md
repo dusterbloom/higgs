@@ -12,6 +12,12 @@ This is priority 3 only. It does not change native Escha Trellis QMV, native
 Trellis prefill, checkpoint conversion, quantization format, or model defaults
 until the measured promotion gate is met.
 
+For this Escha W2 experiment, `HIGGS_ESCHA_AFFINE_BITS=2` changes only the
+conversion bit width. The conversion target retains its checkpoint-compatible
+affine group size of 64, so every Q2 test and any later Escha-specific automatic
+policy uses group size 64. Bonsai-Q2's unrelated group-size-128 fixtures are
+not the target contract.
+
 ## Confirmed Current Path
 
 For a dense affine-Q2 MLP decode token, `FfnBlock::forward` selects
@@ -132,7 +138,7 @@ that isolated QMV speed does not predict full-model AR decode; a valid null
 result is an intended outcome.
 
 If D passes, the next implementation is a decode-only, narrowly shape-gated
-automatic policy plus the tests above. It requires affine-Q2, group size 128,
+automatic policy plus the tests above. It requires affine-Q2, group size 64,
 non-empty biases, canonical layout, exactly `[17408, 320]` weights for both
 gate and up, and `seq_len == 1`. Prefill remains on the present path. The
 automatic decision must be per-call from the eligible dense MLP path; it must
@@ -142,9 +148,9 @@ kill-switches.
 
 ## Verification
 
-The first implementation adds only pure dispatch eligibility tests, Q2 SIMD
-numeric parity coverage, Q2 fused/separate coverage, and the disabled-by-default
-dispatch diagnostic needed for the matrix. It must run focused model tests,
+The first implementation adds only pure dispatch eligibility tests, Q2/G64 SIMD
+numeric parity coverage, Q2/G64 fused/separate coverage, and the
+disabled-by-default dispatch diagnostic needed for the matrix. It must run focused model tests,
 formatting, the relevant ignored Q2 microbenchmark for diagnostic context, and
 the fresh-process end-to-end matrix. The final review must inspect the diff and
 verify that no automatic runtime behavior changed before the promotion gate is
