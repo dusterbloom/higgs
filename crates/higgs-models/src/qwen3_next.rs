@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mlx_rs::{
     Array, Dtype, Stream,
@@ -313,6 +314,12 @@ pub struct Qwen3NextModelArgs {
     /// in configs.
     #[serde(default)]
     pub use_moe_mtp: bool,
+
+    /// Set only after the loader verifies the checkpoint's Escha storage
+    /// layout. Keeping this runtime fact separate from user-provided JSON
+    /// prevents a same-shaped non-Escha model from acquiring Escha defaults.
+    #[serde(skip)]
+    is_eschamoe_checkpoint: bool,
 }
 
 impl Qwen3NextModelArgs {
@@ -348,6 +355,97 @@ impl Qwen3NextModelArgs {
         self.quantization
             .as_ref()
             .map_or_else(QuantSpec::default, QuantizationConfig::spec)
+    }
+}
+
+const ESCHA_QWEN38_MODEL_TYPE: &str = "qwen3_5_text";
+const ESCHA_QWEN38_HIDDEN_SIZE: i32 = 5120;
+const ESCHA_QWEN38_INTERMEDIATE_SIZE: i32 = 17408;
+const ESCHA_QWEN38_NUM_HIDDEN_LAYERS: i32 = 64;
+const ESCHA_QWEN38_Q2_GROUP_SIZE: i32 = 64;
+const ESCHA_QWEN38_Q2_WEIGHT_SHAPE: [i32; 2] = [17408, 320];
+
+/// Decode-time policy resolved when a model is built, never in the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Q2SimdDecodePolicy {
+    Stock,
+    EschaQwen38,
+    ForceOn,
+}
+
+static TRACE_AFFINE_Q2_DISPATCH: OnceLock<bool> = OnceLock::new();
+static AFFINE_Q2_SIMD_DISPATCH_LOGGED: AtomicBool = AtomicBool::new(false);
+static AFFINE_Q2_STOCK_DISPATCH_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn escha_qwen38_q2_decode_policy(
+    is_eschamoe_checkpoint: bool,
+    args: &Qwen3NextModelArgs,
+) -> Q2SimdDecodePolicy {
+    let spec = args.default_quant_spec();
+    (is_eschamoe_checkpoint
+        && args.model_type == ESCHA_QWEN38_MODEL_TYPE
+        && args.hidden_size == ESCHA_QWEN38_HIDDEN_SIZE
+        && args.intermediate_size == ESCHA_QWEN38_INTERMEDIATE_SIZE
+        && args.num_hidden_layers == ESCHA_QWEN38_NUM_HIDDEN_LAYERS
+        && spec.mode == crate::quant_mode::QuantMode::Affine
+        && spec.bits == 2
+        && spec.group_size == ESCHA_QWEN38_Q2_GROUP_SIZE)
+        .then_some(Q2SimdDecodePolicy::EschaQwen38)
+        .unwrap_or(Q2SimdDecodePolicy::Stock)
+}
+
+fn q2_simd_decode_policy(
+    env_raw: Option<&str>,
+    is_eschamoe_checkpoint: bool,
+    args: &Qwen3NextModelArgs,
+) -> Q2SimdDecodePolicy {
+    match env_raw.map(str::trim) {
+        Some("1") => Q2SimdDecodePolicy::ForceOn,
+        Some("0") => Q2SimdDecodePolicy::Stock,
+        _ => escha_qwen38_q2_decode_policy(is_eschamoe_checkpoint, args),
+    }
+}
+
+fn q2_simd_decode_enabled(
+    env_raw: Option<&str>,
+    policy: Q2SimdDecodePolicy,
+    row_count: i32,
+    weight_shape: &[i32],
+) -> bool {
+    let policy_enabled = match env_raw.map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => policy != Q2SimdDecodePolicy::Stock,
+    };
+    policy_enabled && row_count == 1 && weight_shape == ESCHA_QWEN38_Q2_WEIGHT_SHAPE
+}
+
+fn trace_affine_q2_dispatch(
+    use_simd: bool,
+    row_count: i32,
+    weight_shape: &[i32],
+    group_size: i32,
+    q2_simd_policy: Q2SimdDecodePolicy,
+) {
+    if !*TRACE_AFFINE_Q2_DISPATCH
+        .get_or_init(|| std::env::var("HIGGS_TRACE_Q2_DISPATCH").ok().as_deref() == Some("1"))
+    {
+        return;
+    }
+    let route_logged = if use_simd {
+        &AFFINE_Q2_SIMD_DISPATCH_LOGGED
+    } else {
+        &AFFINE_Q2_STOCK_DISPATCH_LOGGED
+    };
+    if !route_logged.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            route = if use_simd { "simd" } else { "mlx_stock" },
+            row_count,
+            weight_shape = ?weight_shape,
+            group_size,
+            q2_simd_policy = ?q2_simd_policy,
+            "Affine Q2 dispatch"
+        );
     }
 }
 
@@ -474,10 +572,30 @@ pub(crate) fn quantized_forward(
     group_size: i32,
     bits: i32,
 ) -> Result<Array, Exception> {
+    quantized_forward_with_q2_simd_policy(
+        x,
+        weight,
+        scales,
+        biases,
+        group_size,
+        bits,
+        Q2SimdDecodePolicy::Stock,
+    )
+}
+
+fn quantized_forward_with_q2_simd_policy(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+    bits: i32,
+    q2_simd_policy: Q2SimdDecodePolicy,
+) -> Result<Array, Exception> {
     if bits == 1 {
         affine_q1_forward(x, weight, scales, biases, group_size)
     } else if bits == 2 {
-        affine_q2_simd_forward(x, weight, scales, biases, group_size)
+        affine_q2_simd_forward(x, weight, scales, biases, group_size, q2_simd_policy)
     } else {
         ops::quantized_matmul(x, weight, scales, biases, true, group_size, bits)
     }
@@ -485,32 +603,30 @@ pub(crate) fn quantized_forward(
 
 /// Affine 2-bit matrix multiply using the MLX-qdot simdgroup kernel.
 ///
-/// Affine 2-bit matrix multiply defaults to MLX stock for full-model AR.
-///
-/// The custom simdgroup Q2 kernel can win isolated microbench shapes, but the
-/// full Ternary-Bonsai-27B decode path is faster with MLX stock by default.
-/// Keep the custom route opt-in for future sweeps.
+/// All models stay on MLX stock unless their construction-time policy selected
+/// the validated Escha Qwen3.8 decode shape (or the legacy force-on override).
 fn affine_q2_simd_forward(
     x: &Array,
     weight: &Array,
     scales: &Array,
     biases: &Array,
     group_size: i32,
+    q2_simd_policy: Q2SimdDecodePolicy,
 ) -> Result<Array, Exception> {
     let x_shape = x.shape();
     let row_count: i32 = x_shape
         .iter()
         .take(x_shape.len().saturating_sub(1))
         .product();
-    let use_simd = std::env::var("HIGGS_BONSAI_Q2_SIMD")
-        .ok()
-        .is_some_and(|value| value == "1")
-        && if let [n_rows, k_packed] = *weight.shape() {
-            let k_dim = k_packed.saturating_mul(16);
-            row_count == 1 && n_rows == 17408 && k_dim == 5120
-        } else {
-            false
-        };
+    let use_simd = q2_simd_decode_enabled(None, q2_simd_policy, row_count, weight.shape())
+        && group_size == ESCHA_QWEN38_Q2_GROUP_SIZE;
+    trace_affine_q2_dispatch(
+        use_simd,
+        row_count,
+        weight.shape(),
+        group_size,
+        q2_simd_policy,
+    );
 
     if use_simd {
         crate::metal_kernel::bonsai_q2_qmv_simd(x, weight, scales, biases, group_size)
@@ -683,6 +799,9 @@ pub(crate) struct QLinear {
     pub(crate) mode: crate::quant_mode::QuantMode,
     weight_layout: QLinearWeightLayout,
     q2_row2: OnceLock<crate::metal_kernel::BonsaiQ2Row2>,
+    /// Model-local Q2 decode choice. Only dense Escha Qwen3.8 gate/up
+    /// projections receive a non-stock policy during construction.
+    q2_simd_decode: Q2SimdDecodePolicy,
 }
 
 impl QLinear {
@@ -750,7 +869,13 @@ impl QLinear {
             mode,
             weight_layout: QLinearWeightLayout::Canonical,
             q2_row2: OnceLock::new(),
+            q2_simd_decode: Q2SimdDecodePolicy::Stock,
         })
+    }
+
+    fn with_q2_simd_decode(mut self, policy: Q2SimdDecodePolicy) -> Self {
+        self.q2_simd_decode = policy;
+        self
     }
 
     fn reset_weight_layout(&mut self) {
@@ -993,13 +1118,14 @@ impl QLinear {
                     .as_dtype(x.dtype())?;
                     return x.matmul(&wdq.transpose()?);
                 }
-                quantized_forward(
+                quantized_forward_with_q2_simd_policy(
                     x,
                     &self.weight,
                     &self.scales,
                     &self.biases,
                     self.group_size,
                     self.bits,
+                    self.q2_simd_decode,
                 )
             }
         }
@@ -1016,7 +1142,15 @@ impl QLinear {
         let weight = take_axis(&self.weight, rows, 0)?;
         let scales = take_axis(&self.scales, rows, 0)?;
         let biases = take_axis(&self.biases, rows, 0)?;
-        quantized_forward(x, &weight, &scales, &biases, self.group_size, self.bits)
+        quantized_forward_with_q2_simd_policy(
+            x,
+            &weight,
+            &scales,
+            &biases,
+            self.group_size,
+            self.bits,
+            self.q2_simd_decode,
+        )
     }
 
     fn crossrow_qmv_forward(&self, x: &Array) -> Result<Option<Array>, Exception> {
@@ -3218,7 +3352,6 @@ static CANONICAL_CONV_ENABLED: OnceLock<bool> = OnceLock::new();
 static DECODE_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 static QGEMV_NSG_OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
 static DENSE_FFN_GEMV_MODE: OnceLock<DenseFfnGemvMode> = OnceLock::new();
-static DENSE_FFN_FUSE_GATE_UP: OnceLock<bool> = OnceLock::new();
 static MXFP4_FUSED_FFN_VERIFY_ENABLED: OnceLock<bool> = OnceLock::new();
 static MOE_FFN_FUSE_GATE_UP: OnceLock<bool> = OnceLock::new();
 
@@ -3360,18 +3493,23 @@ fn dense_ffn_gemv_mode() -> DenseFfnGemvMode {
     })
 }
 
-fn dense_ffn_fuse_gate_up() -> bool {
-    *DENSE_FFN_FUSE_GATE_UP.get_or_init(|| {
-        std::env::var("HIGGS_DENSE_FFN_GATE_UP").ok().map_or_else(
-            || !should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand()),
-            |raw| {
-                !matches!(
-                    Some(raw.trim().to_ascii_lowercase()).as_deref(),
-                    Some("separate" | "split" | "0" | "false" | "off")
-                )
-            },
-        )
-    })
+fn dense_ffn_gate_up_fused(
+    env_raw: Option<&str>,
+    q2_simd_policy: Q2SimdDecodePolicy,
+    platform_fused_default: bool,
+) -> bool {
+    match env_raw
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("separate" | "split" | "0" | "false" | "off") => false,
+        Some(_) => true,
+        // Escha Qwen3.8 needs distinct [17408, 320] gate/up projections for
+        // its model-local Q2 SIMD decode. All other model defaults stay put.
+        None if q2_simd_policy == Q2SimdDecodePolicy::EschaQwen38 => false,
+        None => platform_fused_default,
+    }
 }
 
 fn moe_ffn_fuse_gate_up() -> bool {
@@ -6825,6 +6963,9 @@ struct FfnBlock {
     is_moe: bool,
     top_k: i32,
     norm_topk_prob: bool,
+    /// Resolved at construction so the dense forward path does not read a
+    /// process-global environment setting on every token.
+    gate_up_fused: bool,
     /// Cached fused gate+up weights for dense layers (lazily computed on first forward).
     fused_gate_up: Option<(Array, Array, Array, i32)>,
 }
@@ -6843,6 +6984,7 @@ impl FfnBlock {
             is_moe: true,
             top_k: moe.top_k,
             norm_topk_prob: moe.norm_topk_prob,
+            gate_up_fused: false,
             fused_gate_up: None,
         })
     }
@@ -6851,17 +6993,28 @@ impl FfnBlock {
         let g_spec = resolve_quant_for(args, &format!("{mlp_prefix}.gate_proj"));
         let u_spec = resolve_quant_for(args, &format!("{mlp_prefix}.up_proj"));
         let d_spec = resolve_quant_for(args, &format!("{mlp_prefix}.down_proj"));
+        let q2_simd_policy = q2_simd_decode_policy(
+            std::env::var("HIGGS_BONSAI_Q2_SIMD").ok().as_deref(),
+            args.is_eschamoe_checkpoint,
+            args,
+        );
+        let gate_up_fused = dense_ffn_gate_up_fused(
+            std::env::var("HIGGS_DENSE_FFN_GATE_UP").ok().as_deref(),
+            q2_simd_policy,
+            !should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand()),
+        );
         Ok(Self {
             gate: None,
             switch_mlp: None,
             shared_expert: None,
             shared_expert_gate: None,
-            gate_proj: Some(QLinear::new_spec(g_spec)?),
-            up_proj: Some(QLinear::new_spec(u_spec)?),
+            gate_proj: Some(QLinear::new_spec(g_spec)?.with_q2_simd_decode(q2_simd_policy)),
+            up_proj: Some(QLinear::new_spec(u_spec)?.with_q2_simd_decode(q2_simd_policy)),
             down_proj: Some(QLinear::new_spec(d_spec)?),
             is_moe: false,
             top_k: 0,
             norm_topk_prob: false,
+            gate_up_fused,
             fused_gate_up: None,
         })
     }
@@ -7260,7 +7413,7 @@ impl FfnBlock {
                 hidden
             } else if let Some(hidden) = self.dense_hidden_mxfp4_fused_verify(x)? {
                 hidden
-            } else if dense_ffn_fuse_gate_up() {
+            } else if self.gate_up_fused {
                 self.dense_hidden_fused(x, use_fused_gemv)?
             } else {
                 self.dense_hidden_separate(x)?
@@ -12032,9 +12185,11 @@ fn force_eschamoe_quant_layout(
     args: &mut Qwen3NextModelArgs,
     model_path: &Path,
 ) -> Result<(), crate::error::ModelError> {
+    args.is_eschamoe_checkpoint = false;
     if !crate::eschamoe::is_eschamoe_checkpoint(model_path)? {
         return Ok(());
     }
+    args.is_eschamoe_checkpoint = true;
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(model_path.join("config.json"))?)?;
     let has_block = config.get("quantization").is_some();
@@ -12045,7 +12200,10 @@ fn force_eschamoe_quant_layout(
     // a checkpoint with no such block needs the injection — otherwise the
     // argument code would read the eschamoe `quantization_config` block and
     // get the trellis bit rate.
-    let conv = crate::eschamoe::CONVERSION_TARGET;
+    let conv = crate::eschamoe::conversion_target_for_config(
+        &config,
+        std::env::var("HIGGS_ESCHA_AFFINE_BITS").ok().as_deref(),
+    );
     if !has_block {
         let conv_spec = serde_json::json!({ "group_size": conv.group_size, "bits": conv.bits });
         args.quantization = serde_json::from_value(conv_spec).ok();
@@ -13817,6 +13975,52 @@ mod tests {
     }
 
     #[test]
+    fn escha_qwen38_q2_defaults_are_structural_and_overridable() {
+        let mut args = valid_causal_lm_args();
+        args.model_type = "qwen3_5_text".to_owned();
+        args.hidden_size = 5120;
+        args.intermediate_size = 17408;
+        args.num_hidden_layers = 64;
+        args.quantization = Some(QuantizationConfig {
+            group_size: 64,
+            bits: 2,
+            mode: crate::quant_mode::QuantMode::Affine,
+        });
+
+        let profile = escha_qwen38_q2_decode_policy(true, &args);
+        assert_eq!(profile, Q2SimdDecodePolicy::EschaQwen38);
+        assert!(q2_simd_decode_enabled(None, profile, 1, &[17408, 320],));
+        assert!(!q2_simd_decode_enabled(None, profile, 2, &[17408, 320],));
+        assert!(!q2_simd_decode_enabled(None, profile, 1, &[34816, 320],));
+        assert!(!q2_simd_decode_enabled(
+            Some("0"),
+            profile,
+            1,
+            &[17408, 320],
+        ));
+        assert!(q2_simd_decode_enabled(
+            Some("1"),
+            Q2SimdDecodePolicy::Stock,
+            1,
+            &[17408, 320],
+        ));
+        assert!(!dense_ffn_gate_up_fused(None, profile, true));
+        assert!(dense_ffn_gate_up_fused(Some("1"), profile, true));
+        assert!(!dense_ffn_gate_up_fused(Some("separate"), profile, true));
+
+        args.num_hidden_layers = 40;
+        assert_eq!(
+            escha_qwen38_q2_decode_policy(true, &args),
+            Q2SimdDecodePolicy::Stock
+        );
+        args.num_hidden_layers = 64;
+        assert_eq!(
+            escha_qwen38_q2_decode_policy(false, &args),
+            Q2SimdDecodePolicy::Stock
+        );
+    }
+
+    #[test]
     fn eschamoe_trellis_paths_keep_the_affine_conversion_layout() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -13843,6 +14047,8 @@ mod tests {
         args.num_hidden_layers = 1;
         args.full_attention_interval = 1;
         force_eschamoe_quant_layout(&mut args, dir.path()).unwrap();
+
+        assert!(args.is_eschamoe_checkpoint);
 
         // A trellis projection converts at the affine default (Q4), whereas
         // true int8 pairs convert to Q8 and must be dispatched as such.
@@ -19052,6 +19258,7 @@ mod tests {
                 mode: crate::quant_mode::QuantMode::Affine,
                 weight_layout: QLinearWeightLayout::Canonical,
                 q2_row2: std::sync::OnceLock::new(),
+                q2_simd_decode: Q2SimdDecodePolicy::Stock,
             }
         };
 
@@ -19070,6 +19277,7 @@ mod tests {
                 mode: crate::quant_mode::QuantMode::Affine,
                 weight_layout: QLinearWeightLayout::Canonical,
                 q2_row2: std::sync::OnceLock::new(),
+                q2_simd_decode: Q2SimdDecodePolicy::Stock,
             }
         };
 
@@ -26968,6 +27176,50 @@ mod tests {
         // Realistic dims: gate+up fused (2*intermediate) and down projection
         assert_qgemv_matches_reference(512, 1024, 64, "N=512 K=1024");
         assert_qgemv_matches_reference(2048, 1024, 64, "N=2048 K=1024");
+    }
+
+    #[test]
+    fn affine_q2_qmv_simd_matches_mlx_stock_for_bf16_and_f16() {
+        use mlx_rs::Dtype;
+
+        for dtype in [Dtype::Float16, Dtype::Bfloat16] {
+            for (n, k) in [(128, 256), (128, 512), (16_384, 512), (128, 5_120)] {
+                let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, k], None)
+                    .unwrap()
+                    .as_dtype(dtype)
+                    .unwrap();
+                let dense = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[n, k], None).unwrap();
+                let (weight, scales, biases) = ops::quantize(&dense, 64, 2).unwrap();
+                let scales = scales.as_dtype(dtype).unwrap();
+                let biases = biases.as_dtype(dtype).unwrap();
+                let stock =
+                    ops::quantized_matmul(&x, &weight, &scales, &biases, true, 64, 2).unwrap();
+                let simd =
+                    crate::metal_kernel::bonsai_q2_qmv_simd(&x, &weight, &scales, &biases, 64)
+                        .unwrap();
+                mlx_rs::transforms::eval([&stock, &simd]).unwrap();
+
+                assert_eq!(
+                    stock.shape(),
+                    simd.shape(),
+                    "shape mismatch for dtype={dtype:?}, N={n}, K={k}"
+                );
+                let stock = stock.as_dtype(Dtype::Float32).unwrap();
+                let simd = simd.as_dtype(Dtype::Float32).unwrap();
+                mlx_rs::transforms::eval([&stock, &simd]).unwrap();
+                for (index, (&expected, &actual)) in stock
+                    .as_slice::<f32>()
+                    .iter()
+                    .zip(simd.as_slice::<f32>())
+                    .enumerate()
+                {
+                    assert!(
+                        (expected - actual).abs() < 0.5,
+                        "Q2/G64 mismatch for dtype={dtype:?}, N={n}, K={k} at {index}: stock={expected}, simd={actual}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

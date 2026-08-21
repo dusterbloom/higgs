@@ -949,20 +949,76 @@ impl AffineTarget {
     /// checkpoints use this layout. For example, they set 8 bits for
     /// `mlp.gate`.
     pub fn resolve(quantization: Option<&serde_json::Value>, path: &str) -> Self {
+        Self::resolve_with_default(quantization, path, Self::default())
+    }
+
+    /// Resolve a checkpoint layout, using an explicit fallback when it lacks
+    /// a conventional MLX `quantization` block.
+    pub fn resolve_with_default(
+        quantization: Option<&serde_json::Value>,
+        path: &str,
+        fallback: Self,
+    ) -> Self {
         let Some(cfg) = quantization else {
-            return Self::default();
+            return fallback;
         };
         let field = |value: &serde_json::Value, key: &str| -> Option<i32> {
             value.get(key)?.as_i64()?.try_into().ok()
         };
         let base = Self {
-            group_size: field(cfg, "group_size").unwrap_or(64),
-            bits: field(cfg, "bits").unwrap_or(4),
+            group_size: field(cfg, "group_size").unwrap_or(fallback.group_size),
+            bits: field(cfg, "bits").unwrap_or(fallback.bits),
         };
         cfg.get(path).map_or(base, |over| Self {
             group_size: field(over, "group_size").unwrap_or(base.group_size),
             bits: field(over, "bits").unwrap_or(base.bits),
         })
+    }
+}
+
+fn is_qwen38_dense_config(config: &serde_json::Value) -> bool {
+    let text = config.get("text_config").unwrap_or(config);
+    let field = |name| text.get(name).and_then(serde_json::Value::as_i64);
+    text.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen3_5_text")
+        && field("hidden_size") == Some(5120)
+        && field("intermediate_size") == Some(17408)
+        && field("num_hidden_layers") == Some(64)
+        && field("num_experts").unwrap_or(0) == 0
+}
+
+/// Select the affine conversion target for one Escha checkpoint.
+///
+/// The default remains Q4. `HIGGS_ESCHA_AFFINE_BITS=2..8` affects only the
+/// structural Qwen3.8 dense profile that was validated in affine-Q2 mode;
+/// every other Escha checkpoint, including Qwen3.6-35B-A3B, stays Q4.
+pub fn conversion_target(model_dir: &std::path::Path) -> Result<AffineTarget, ModelError> {
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
+    Ok(conversion_target_for_config(
+        &config,
+        std::env::var("HIGGS_ESCHA_AFFINE_BITS").ok().as_deref(),
+    ))
+}
+
+pub(crate) fn conversion_target_for_config(
+    config: &serde_json::Value,
+    env_value: Option<&str>,
+) -> AffineTarget {
+    if is_qwen38_dense_config(config) {
+        conversion_target_from_env(env_value)
+    } else {
+        CONVERSION_TARGET
+    }
+}
+
+fn conversion_target_from_env(value: Option<&str>) -> AffineTarget {
+    let bits = value
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|bits| (2..=8).contains(bits))
+        .unwrap_or(CONVERSION_TARGET.bits);
+    AffineTarget {
+        bits,
+        ..CONVERSION_TARGET
     }
 }
 
@@ -1401,6 +1457,7 @@ fn convert_checkpoint_impl(
 ) -> Result<ConvertedCheckpoint, ModelError> {
     use std::collections::HashMap;
 
+    let affine_target = conversion_target(model_dir)?;
     let mut raw: HashMap<String, Array> = HashMap::new();
     for file in crate::collect_safetensors_files(model_dir)? {
         let loaded = Array::load_safetensors(file.to_str().unwrap_or_default())
@@ -1463,7 +1520,11 @@ fn convert_checkpoint_impl(
                             let target = if is_dense_moe_router_projection(module) {
                                 DENSE_TARGET
                             } else {
-                                AffineTarget::resolve(quantization, module)
+                                AffineTarget::resolve_with_default(
+                                    quantization,
+                                    module,
+                                    affine_target,
+                                )
                             };
                             made.extend(triple_entries(
                                 module,
@@ -1541,7 +1602,8 @@ fn convert_checkpoint_impl(
                 }
                 let targets = projection_targets(prefix, axis)?;
                 let splits = i32::try_from(targets.len()).unwrap_or(1);
-                let affine = AffineTarget::resolve(quantization, prefix);
+                let affine =
+                    AffineTarget::resolve_with_default(quantization, prefix, affine_target);
                 let converted = convert_trellis(group, splits, affine)?;
                 for (target, stacked) in targets.iter().zip(converted) {
                     made.extend(triple_entries(target, stacked));
@@ -2222,6 +2284,55 @@ mod tests {
         assert_eq!(
             AffineTarget::resolve(None, "anything"),
             AffineTarget::default()
+        );
+    }
+
+    #[test]
+    fn compact_affine_target_env_accepts_supported_bits_only() {
+        assert_eq!(
+            conversion_target_from_env(Some("2")),
+            AffineTarget {
+                group_size: 64,
+                bits: 2,
+            }
+        );
+        assert_eq!(conversion_target_from_env(Some("1")), CONVERSION_TARGET);
+        assert_eq!(conversion_target_from_env(Some("bad")), CONVERSION_TARGET);
+        assert_eq!(conversion_target_from_env(None), CONVERSION_TARGET);
+    }
+
+    #[test]
+    fn compact_affine_target_env_is_limited_to_qwen38_dense() {
+        let qwen38_dense: serde_json::Value = serde_json::json!({
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 5120,
+                "intermediate_size": 17408,
+                "num_hidden_layers": 64
+            }
+        });
+        let qwen36_moe: serde_json::Value = serde_json::json!({
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 2048,
+                "intermediate_size": 5632,
+                "num_hidden_layers": 40,
+                "num_experts": 256
+            }
+        });
+
+        assert_eq!(
+            conversion_target_for_config(&qwen38_dense, Some("2")),
+            AffineTarget {
+                group_size: 64,
+                bits: 2,
+            }
+        );
+        assert_eq!(
+            conversion_target_for_config(&qwen36_moe, Some("2")),
+            CONVERSION_TARGET
         );
     }
 

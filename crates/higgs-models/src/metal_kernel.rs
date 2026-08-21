@@ -2206,7 +2206,7 @@ inline constexpr short get_bytes_per_pack() {
   constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
   return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
 }
-template <typename T, typename U, int values_per_thread, int bits>
+template <typename U, int values_per_thread, int bits, typename T>
 inline U load_vector(const device T* x, thread U* x_thread) {
   U sum = 0;
   if (bits == 1) {
@@ -2259,7 +2259,6 @@ inline U qdot(const device uint8_t* w, const thread U* x_thread, U scale, U bias
 ";
 
 const FAST_Q2_QMV_SIMD_SOURCE: &str = r"
-typedef half T;
 typedef float U;
 
 constexpr int bits = 2;
@@ -2296,7 +2295,7 @@ x_row += int(lid) * VPT;
 int aligned_end = (K / BLK) * BLK;
 
 for (int k = 0; k < aligned_end; k += BLK) {
-    U sum = load_vector<T, U, VPT, bits>(x_row, xt);
+    U sum = load_vector<U, VPT, bits>(x_row, xt);
     for (int r = 0; r < RPS; ++r) {
         int row = out_row + r;
         if constexpr (!AlignedN) {
@@ -2318,7 +2317,7 @@ if (aligned_end < K) {
     bool in_bounds = (aligned_end + int(lid) * VPT) < K;
     U sum = 0;
     if (in_bounds) {
-        sum = load_vector<T, U, VPT, bits>(x_row, xt);
+        sum = load_vector<U, VPT, bits>(x_row, xt);
     } else {
         for (int i = 0; i < VPT; ++i) { xt[i] = 0.0f; }
     }
