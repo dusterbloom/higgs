@@ -178,6 +178,16 @@ requantizes in memory to MLX affine 4-bit — the same layout as
 spare. The path stays available for comparing the kernel against a plain
 affine baseline.
 
+### Dense Qwen3.8-27B
+
+`EschaLabs/Qwen3.8-27B-Escha-W2` is a dense checkpoint, not an MoE expert
+layout. Higgs recognizes its exact structural configuration and automatically
+converts its trellis projections to affine Q2, selects separate gate/up
+projections, and enables the matching SIMD decode path. No Escha environment
+variable is required for this release. `HIGGS_ESCHA_AFFINE_BITS=4..8` remains
+available only to compare another conversion target; structurally different
+dense Escha checkpoints stay on affine Q4 by default.
+
 `higgs doctor` estimates the resident size for whichever mode is active and
 warns when it crowds system RAM. On the native path it reads the trellis rate
 of each projection from `quantization_config.layer_meta`; note that the rate
@@ -187,6 +197,10 @@ varies per projection, so a checkpoint named `W2` is not uniformly 2-bit — the
 **Memory: the on-disk size is misleading on the affine path.** The 2-bit
 trellis download is 12.3 GB for the 35B release; converted, it is roughly
 22 GB. Size the machine for the resident number, not the download.
+
+`HIGGS_ESCHA_TRELLIS_GEMM=1` selects an experimental large-prefill MoE kernel.
+It does not affect decode and remains opt-in until its full-model validation
+promotes it.
 
 **Limitations.**
 
