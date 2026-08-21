@@ -27319,40 +27319,50 @@ mod tests {
     fn dense_hidden_fused_matches_separate_path() {
         use mlx_rs::{Dtype, module::Param};
 
-        fn assign_qlinear(layer: &mut QLinear, out_dim: i32, in_dim: i32) {
+        fn assign_qlinear(
+            layer: &mut QLinear,
+            out_dim: i32,
+            in_dim: i32,
+            group_size: i32,
+            bits: i32,
+        ) {
             let raw = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[out_dim, in_dim], None)
                 .unwrap()
                 .as_dtype(Dtype::Float16)
                 .unwrap();
-            let (w, s, b) = ops::quantize(&raw, 32, 4).unwrap();
+            let (w, s, b) = ops::quantize(&raw, group_size, bits).unwrap();
             layer.weight = Param::new(w);
             layer.scales = Param::new(s);
             layer.biases = Param::new(b);
-            layer.group_size = 32;
-            layer.bits = 4;
+            layer.group_size = group_size;
+            layer.bits = bits;
         }
 
-        let args = minimal_qwen3_next_args();
-        let mut block = FfnBlock::new_dense(&args, "test.layer.mlp").unwrap();
-        assign_qlinear(block.gate_proj.as_mut().unwrap(), 96, 64);
-        assign_qlinear(block.up_proj.as_mut().unwrap(), 96, 64);
-        assign_qlinear(block.down_proj.as_mut().unwrap(), 64, 96);
+        fn assert_fused_matches_separate(group_size: i32, bits: i32, label: &str) {
+            let args = minimal_qwen3_next_args();
+            let mut block = FfnBlock::new_dense(&args, "test.layer.mlp").unwrap();
+            assign_qlinear(block.gate_proj.as_mut().unwrap(), 96, 64, group_size, bits);
+            assign_qlinear(block.up_proj.as_mut().unwrap(), 96, 64, group_size, bits);
 
-        let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, 64], None)
-            .unwrap()
-            .as_dtype(Dtype::Float16)
-            .unwrap();
+            let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, 64], None)
+                .unwrap()
+                .as_dtype(Dtype::Float16)
+                .unwrap();
 
-        let fused = block.dense_hidden_fused(&x, false).unwrap();
-        let separate = block.dense_hidden_separate(&x).unwrap();
-        mlx_rs::transforms::eval([&fused, &separate]).unwrap();
+            let fused = block.dense_hidden_fused(&x, false).unwrap();
+            let separate = block.dense_hidden_separate(&x).unwrap();
+            mlx_rs::transforms::eval([&fused, &separate]).unwrap();
 
-        let diff = fused.subtract(&separate).unwrap().abs().unwrap();
-        let max_diff: f32 = diff.max(None).unwrap().item();
-        assert!(
-            max_diff < 1e-3,
-            "dense fused/separate hidden mismatch by {max_diff}"
-        );
+            let diff = fused.subtract(&separate).unwrap().abs().unwrap();
+            let max_diff: f32 = diff.max(None).unwrap().item();
+            assert!(
+                max_diff < 1e-3,
+                "{label}: dense fused/separate hidden mismatch by {max_diff}"
+            );
+        }
+
+        assert_fused_matches_separate(32, 4, "q4_g32");
+        assert_fused_matches_separate(64, 2, "q2_g64");
     }
 
     #[test]
@@ -27362,6 +27372,41 @@ mod tests {
         assert!(!affine_q2_simd_eligible(1, &[34_816, 320]));
         assert!(!affine_q2_simd_eligible(1, &[17_408, 319]));
         assert!(!affine_q2_simd_eligible(1, &[17_408]));
+    }
+
+    #[test]
+    fn affine_q2_qmv_simd_matches_mlx_stock_for_escha_g64() {
+        use mlx_rs::Dtype;
+
+        let (n, k, group_size) = (128, 256, 64);
+        let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, k], None)
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        let dense = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[n, k], None).unwrap();
+        let (weight, scales, biases) = ops::quantize(&dense, group_size, 2).unwrap();
+        let stock =
+            ops::quantized_matmul(&x, &weight, &scales, &biases, true, group_size, 2).unwrap();
+        let simd =
+            crate::metal_kernel::bonsai_q2_qmv_simd(&x, &weight, &scales, &biases, group_size)
+                .unwrap();
+        mlx_rs::transforms::eval([&stock, &simd]).unwrap();
+
+        assert_eq!(stock.shape(), simd.shape());
+        let stock = stock.as_dtype(Dtype::Float32).unwrap();
+        let simd = simd.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&stock, &simd]).unwrap();
+        for (index, (&expected, &actual)) in stock
+            .as_slice::<f32>()
+            .iter()
+            .zip(simd.as_slice::<f32>())
+            .enumerate()
+        {
+            assert!(
+                (expected - actual).abs() < 0.5,
+                "Q2/G64 mismatch at {index}: stock={expected}, simd={actual}"
+            );
+        }
     }
 
     #[test]
