@@ -1,32 +1,12 @@
 use crate::types::openai::ReasoningConfig;
 
-fn model_defaults_to_non_thinking(model_names: &[&str]) -> bool {
-    model_names.iter().any(|model_name| {
-        let normalized = model_name.to_ascii_lowercase();
-        normalized.match_indices("qwen3.6").any(|(idx, _)| {
-            let after = idx + "qwen3.6".len();
-            let before_is_boundary = idx == 0
-                || normalized
-                    .as_bytes()
-                    .get(idx - 1)
-                    .is_some_and(|b| !b.is_ascii_alphanumeric());
-            let after_is_boundary = after == normalized.len()
-                || normalized
-                    .as_bytes()
-                    .get(after)
-                    .is_some_and(|b| !b.is_ascii_digit());
-            before_is_boundary && after_is_boundary
-        })
-    })
-}
-
 pub fn effective_thinking_enabled(
-    engine_default: bool,
-    model_names: &[&str],
+    thinking_supported: bool,
+    _model_names: &[&str],
     reasoning: Option<&ReasoningConfig>,
     explicit: Option<bool>,
 ) -> bool {
-    if !engine_default {
+    if !thinking_supported {
         return false;
     }
 
@@ -39,7 +19,7 @@ pub fn effective_thinking_enabled(
     match reasoning.and_then(|r| r.effort.as_deref()) {
         Some(effort) if effort.is_empty() || effort.eq_ignore_ascii_case("none") => false,
         Some(_) => true,
-        None => !model_defaults_to_non_thinking(model_names),
+        None => false,
     }
 }
 
@@ -49,8 +29,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_qwen35_on() {
-        assert!(effective_thinking_enabled(
+    fn defaults_any_thinking_capable_model_off() {
+        assert!(!effective_thinking_enabled(
             true,
             &["mlx-community/Qwen3.5-foo"],
             None,
@@ -79,8 +59,8 @@ mod tests {
     }
 
     #[test]
-    fn qwen365_does_not_use_qwen36_default() {
-        assert!(effective_thinking_enabled(
+    fn defaults_unrecognized_thinking_model_off() {
+        assert!(!effective_thinking_enabled(
             true,
             &["mlx-community/Qwen3.65-35B-A3B-4bit"],
             None,
@@ -137,9 +117,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_enable_thinking_true_overrides_qwen36_default() {
-        // chat_template_kwargs.enable_thinking=true turns reasoning on even for
-        // a model that defaults off.
+    fn configured_default_can_enable_thinking() {
+        // The config-derived explicit default remains an opt-in for a model
+        // whose omitted request defaults to non-thinking.
         assert!(effective_thinking_enabled(
             true,
             &["mlx-community/Qwen3.6-35B-A3B-4bit"],
