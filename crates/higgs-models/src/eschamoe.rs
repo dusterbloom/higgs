@@ -988,9 +988,9 @@ fn is_qwen38_dense_config(config: &serde_json::Value) -> bool {
 
 /// Select the affine conversion target for one Escha checkpoint.
 ///
-/// The default remains Q4. `HIGGS_ESCHA_AFFINE_BITS=2..8` affects only the
-/// structural Qwen3.8 dense profile that was validated in affine-Q2 mode;
-/// every other Escha checkpoint, including Qwen3.6-35B-A3B, stays Q4.
+/// The exact structural Qwen3.8 dense profile defaults to Q2. Set
+/// `HIGGS_ESCHA_AFFINE_BITS=2..8` only to select a diagnostic comparison
+/// target; every other Escha checkpoint, including Qwen3.6-35B-A3B, stays Q4.
 pub fn conversion_target(model_dir: &std::path::Path) -> Result<AffineTarget, ModelError> {
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
@@ -1005,17 +1005,17 @@ pub(crate) fn conversion_target_for_config(
     env_value: Option<&str>,
 ) -> AffineTarget {
     if is_qwen38_dense_config(config) {
-        conversion_target_from_env(env_value)
+        conversion_target_from_env(env_value, 2)
     } else {
         CONVERSION_TARGET
     }
 }
 
-fn conversion_target_from_env(value: Option<&str>) -> AffineTarget {
+fn conversion_target_from_env(value: Option<&str>, default_bits: i32) -> AffineTarget {
     let bits = value
         .and_then(|value| value.parse::<i32>().ok())
         .filter(|bits| (2..=8).contains(bits))
-        .unwrap_or(CONVERSION_TARGET.bits);
+        .unwrap_or(default_bits);
     AffineTarget {
         bits,
         ..CONVERSION_TARGET
@@ -2290,15 +2290,24 @@ mod tests {
     #[test]
     fn compact_affine_target_env_accepts_supported_bits_only() {
         assert_eq!(
-            conversion_target_from_env(Some("2")),
+            conversion_target_from_env(Some("2"), CONVERSION_TARGET.bits),
             AffineTarget {
                 group_size: 64,
                 bits: 2,
             }
         );
-        assert_eq!(conversion_target_from_env(Some("1")), CONVERSION_TARGET);
-        assert_eq!(conversion_target_from_env(Some("bad")), CONVERSION_TARGET);
-        assert_eq!(conversion_target_from_env(None), CONVERSION_TARGET);
+        assert_eq!(
+            conversion_target_from_env(Some("1"), CONVERSION_TARGET.bits),
+            CONVERSION_TARGET
+        );
+        assert_eq!(
+            conversion_target_from_env(Some("bad"), CONVERSION_TARGET.bits),
+            CONVERSION_TARGET
+        );
+        assert_eq!(
+            conversion_target_from_env(None, CONVERSION_TARGET.bits),
+            CONVERSION_TARGET
+        );
     }
 
     #[test]
@@ -2331,7 +2340,18 @@ mod tests {
             }
         );
         assert_eq!(
+            conversion_target_for_config(&qwen38_dense, None),
+            AffineTarget {
+                group_size: 64,
+                bits: 2,
+            }
+        );
+        assert_eq!(
             conversion_target_for_config(&qwen36_moe, Some("2")),
+            CONVERSION_TARGET
+        );
+        assert_eq!(
+            conversion_target_for_config(&qwen36_moe, None),
             CONVERSION_TARGET
         );
     }
