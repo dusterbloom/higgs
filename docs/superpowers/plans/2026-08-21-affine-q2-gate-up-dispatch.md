@@ -57,7 +57,7 @@ fn affine_q2_simd_eligibility_requires_single_row_and_exact_packed_shape() {
 Run only after the implementation is copied into the existing active build workspace, never from this clean worktree:
 
 ```bash
-cargo test -p higgs-models --lib affine_q2_simd_eligibility_requires_single_row_and_exact_packed_shape -- --exact
+cargo test -p higgs-models --lib affine_q2_simd_eligibility_requires_single_row_and_exact_packed_shape -- --test-threads=1
 ```
 
 Expected: compilation fails because `affine_q2_simd_eligible` does not exist.
@@ -81,7 +81,7 @@ Add `OnceLock<bool>` for `HIGGS_TRACE_Q2_DISPATCH` and two `AtomicBool` values, 
 Run from the existing active build workspace after applying the reviewed patch:
 
 ```bash
-cargo test -p higgs-models --lib affine_q2_simd_eligibility_requires_single_row_and_exact_packed_shape -- --exact
+cargo test -p higgs-models --lib affine_q2_simd_eligibility_requires_single_row_and_exact_packed_shape -- --test-threads=1
 cargo fmt --check
 ```
 
@@ -139,7 +139,7 @@ fn affine_q2_qmv_simd_matches_mlx_stock_for_escha_g64() {
 Run from the existing active build workspace:
 
 ```bash
-cargo test -p higgs-models --lib affine_q2_qmv_simd_matches_mlx_stock_for_escha_g64 -- --exact --test-threads=1
+cargo test -p higgs-models --lib affine_q2_qmv_simd_matches_mlx_stock_for_escha_g64 -- --test-threads=1
 ```
 
 Expected: this is a real Metal/MLX numeric comparison, not a mock or a source-text assertion. It may pass before Task 1 because it validates the already present kernel; preserve that result in the task report.
@@ -170,9 +170,9 @@ Run the existing fused/separate construction and evaluated max-difference assert
 Run from the existing active build workspace:
 
 ```bash
-cargo test -p higgs-models --lib affine_q2_simd_eligibility_requires_single_row_and_exact_packed_shape -- --exact --test-threads=1
-cargo test -p higgs-models --lib affine_q2_qmv_simd_matches_mlx_stock_for_escha_g64 -- --exact --test-threads=1
-cargo test -p higgs-models --lib dense_hidden_fused_matches_separate_path -- --exact --test-threads=1
+cargo test -p higgs-models --lib affine_q2_simd_eligibility_requires_single_row_and_exact_packed_shape -- --test-threads=1
+cargo test -p higgs-models --lib affine_q2_qmv_simd_matches_mlx_stock_for_escha_g64 -- --test-threads=1
+cargo test -p higgs-models --lib dense_hidden_fused_matches_separate_path -- --test-threads=1
 ```
 
 Expected: all three pass. The Q2/G64 test must force evaluation before comparing values.
@@ -227,8 +227,8 @@ fn usage_counters_leave_cache_unknown_when_detail_is_absent() {
 Run from the existing active build workspace:
 
 ```bash
-cargo test -p higgs-bench --bin bench_decode usage_counters_capture_radix_cached_tokens -- --exact
-cargo test -p higgs-bench --bin bench_decode usage_counters_leave_cache_unknown_when_detail_is_absent -- --exact
+cargo test -p higgs-bench --bin bench_decode usage_counters_capture_radix_cached_tokens -- --test-threads=1
+cargo test -p higgs-bench --bin bench_decode usage_counters_leave_cache_unknown_when_detail_is_absent -- --test-threads=1
 ```
 
 Expected: compilation fails because `UsageCounters` and `update_usage_counters` do not exist.
@@ -259,8 +259,8 @@ Route terminal `usage` through this helper. Add `cached_prompt_tokens: Option<u3
 Run from the existing active build workspace:
 
 ```bash
-cargo test -p higgs-bench --bin bench_decode usage_counters_capture_radix_cached_tokens -- --exact
-cargo test -p higgs-bench --bin bench_decode usage_counters_leave_cache_unknown_when_detail_is_absent -- --exact
+cargo test -p higgs-bench --bin bench_decode usage_counters_capture_radix_cached_tokens -- --test-threads=1
+cargo test -p higgs-bench --bin bench_decode usage_counters_leave_cache_unknown_when_detail_is_absent -- --test-threads=1
 cargo check -p higgs-bench --bin bench_decode
 cargo fmt --check
 ```
