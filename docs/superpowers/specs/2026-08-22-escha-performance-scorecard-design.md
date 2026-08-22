@@ -6,7 +6,7 @@ Make speculative-decode measurements for a local Qwen3.8/Escha checkpoint reprod
 
 ## Scope
 
-Extend `bench_speculative` only. It already launches fresh servers for each mode, accepts `--model-path`, forces greedy sampling, and collects MTP completion telemetry. The benchmark will retain each trial's complete visible output in memory, compare it with the baseline trial of the same repeat, and persist an explicit parity result with the existing timing and telemetry.
+Extend `bench_speculative` only. It already launches fresh servers for each mode, accepts `--model-path`, forces greedy sampling, and collects MTP completion telemetry. The benchmark will retain each trial's complete visible output in memory, compare it with the baseline trial of the same repeat, and persist an explicit parity result with the existing timing and telemetry. It accepts an optional `--api-key` that it passes only to its fresh server and HTTP client; it never appears in the persisted parameters.
 
 No inference kernel, scheduler, ANE backend, model conversion, benchmark manifest entry, or new dependency is part of this change.
 

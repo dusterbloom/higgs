@@ -54,6 +54,10 @@ struct Args {
     #[arg(long, default_value = "./target/release/higgs")]
     higgs_bin: PathBuf,
 
+    /// API key used only between this benchmark and its fresh Higgs server.
+    #[arg(long)]
+    api_key: Option<String>,
+
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
@@ -337,6 +341,7 @@ async fn run_trial(
             &model.request_model,
             prompt,
             args.max_tokens,
+            args.api_key.as_deref(),
         )
         .await
     }
@@ -384,6 +389,7 @@ async fn request_completion(
     model_name: &str,
     prompt: &str,
     max_tokens: u32,
+    api_key: Option<&str>,
 ) -> Result<CompletionPayload> {
     let body = serde_json::json!({
         "model": model_name,
@@ -396,9 +402,7 @@ async fn request_completion(
 
     let url = format!("{base_url}/v1/chat/completions");
     let started = Instant::now();
-    let resp = client
-        .post(&url)
-        .json(&body)
+    let resp = authorize_request(client.post(&url).json(&body), api_key)
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
@@ -434,6 +438,16 @@ async fn request_completion(
         completion_tokens,
         content,
     })
+}
+
+fn authorize_request(
+    request: reqwest::RequestBuilder,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
 }
 
 fn resolve_model(args: &Args, manifest_path: &Path) -> Result<ResolvedModel> {
@@ -512,12 +526,19 @@ fn start_higgs_server(
         .stderr(Stdio::from(log_stderr));
 
     clear_speculative_env(&mut cmd);
+    configure_server_api_key(&mut cmd, args.api_key.as_deref());
     for (key, value) in &spec.env {
         cmd.env(key, value);
     }
 
     cmd.spawn()
         .with_context(|| format!("spawn {}", args.higgs_bin.display()))
+}
+
+fn configure_server_api_key(cmd: &mut Command, api_key: Option<&str>) {
+    if let Some(key) = api_key {
+        cmd.arg("--api-key").arg(key);
+    }
 }
 
 fn stop_child(child: &mut Child) {
@@ -590,8 +611,10 @@ fn read_filtered_telemetry(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        OutputSignature, SPECULATIVE_ENV_KEYS, clear_speculative_env, compare_to_baseline,
+        Args, OutputSignature, SPECULATIVE_ENV_KEYS, authorize_request, clear_speculative_env,
+        compare_to_baseline, configure_server_api_key,
     };
+    use clap::Parser;
     use std::process::Command;
 
     #[test]
@@ -631,5 +654,46 @@ mod tests {
         let candidate = OutputSignature::new(5, "same");
 
         assert!(compare_to_baseline(&baseline, &candidate).is_err());
+    }
+
+    #[test]
+    fn accepts_a_benchmark_api_key() {
+        let args = Args::try_parse_from([
+            "bench_speculative",
+            "--model-path",
+            "model",
+            "--api-key",
+            "bench-key",
+        ])
+        .unwrap();
+
+        assert_eq!(args.api_key.as_deref(), Some("bench-key"));
+    }
+
+    #[test]
+    fn sends_the_benchmark_key_as_bearer_auth() {
+        let request = authorize_request(
+            reqwest::Client::new().get("http://127.0.0.1:8098/v1/models"),
+            Some("bench-key"),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer bench-key"
+        );
+    }
+
+    #[test]
+    fn passes_the_benchmark_key_to_the_fresh_server() {
+        let mut command = Command::new("higgs");
+        configure_server_api_key(&mut command, Some("bench-key"));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, ["--api-key", "bench-key"]);
     }
 }

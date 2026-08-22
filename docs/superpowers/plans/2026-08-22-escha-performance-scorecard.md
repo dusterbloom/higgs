@@ -10,7 +10,8 @@
 
 ## Global Constraints
 
-- No new dependencies or environment flags.
+- No new dependencies or model environment flags.
+- `--api-key` is benchmark-only and must not be serialized.
 - Do not start a Higgs server or use the GPU during unit/build verification.
 - Preserve the user's unrelated `AGENTS.md`, `CLAUDE.md`, `.omen/`, and Escha-document edits.
 - A live benchmark is valid only with thinking disabled, temperature zero, a fixed prompt, and a matching thermal state.
@@ -98,6 +99,7 @@ Use, after confirming no active Higgs process:
 ./target/release/bench_speculative \
   --model-path "$HOME/.cache/lm-studio/models/EschaLabs/Qwen3.8-27B-Escha-W2" \
   --model-name escha-27b \
+  --api-key "<ephemeral-loopback-key>" \
   --trials baseline,mtp_default,mtp_adaptive \
   --max-tokens 320 --repeats 3
 ```
