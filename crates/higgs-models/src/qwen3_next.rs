@@ -363,7 +363,13 @@ const ESCHA_QWEN38_HIDDEN_SIZE: i32 = 5120;
 const ESCHA_QWEN38_INTERMEDIATE_SIZE: i32 = 17408;
 const ESCHA_QWEN38_NUM_HIDDEN_LAYERS: i32 = 64;
 const ESCHA_QWEN38_Q2_GROUP_SIZE: i32 = 64;
-const ESCHA_QWEN38_Q2_WEIGHT_SHAPE: [i32; 2] = [17408, 320];
+/// Q2/G64 decode shapes with a measured Metal-SIMD win on Escha Qwen3.8.
+/// Keep this deliberately small: every addition needs an exact-shape
+/// stock-vs-SIMD microbenchmark and an end-to-end greedy parity check.
+const ESCHA_QWEN38_Q2_SIMD_WEIGHT_SHAPES: &[[i32; 2]] = &[
+    [17_408, 320], // MLP gate/up
+    [6_144, 320],  // full-attention Q
+];
 
 /// Decode-time policy resolved when a model is built, never in the hot path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,7 +423,11 @@ fn q2_simd_decode_enabled(
         Some("0") => false,
         _ => policy != Q2SimdDecodePolicy::Stock,
     };
-    policy_enabled && row_count == 1 && weight_shape == ESCHA_QWEN38_Q2_WEIGHT_SHAPE
+    policy_enabled
+        && row_count == 1
+        && ESCHA_QWEN38_Q2_SIMD_WEIGHT_SHAPES
+            .iter()
+            .any(|candidate| weight_shape == candidate)
 }
 
 fn trace_affine_q2_dispatch(
@@ -13990,6 +14000,7 @@ mod tests {
         let profile = escha_qwen38_q2_decode_policy(true, &args);
         assert_eq!(profile, Q2SimdDecodePolicy::EschaQwen38);
         assert!(q2_simd_decode_enabled(None, profile, 1, &[17408, 320],));
+        assert!(q2_simd_decode_enabled(None, profile, 1, &[6144, 320],));
         assert!(!q2_simd_decode_enabled(None, profile, 2, &[17408, 320],));
         assert!(!q2_simd_decode_enabled(None, profile, 1, &[34816, 320],));
         assert!(!q2_simd_decode_enabled(
@@ -27219,6 +27230,95 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    fn bench_affine_q2_simd_at(label: &str, n: i32, k: i32, iters: usize) {
+        use mlx_rs::Dtype;
+
+        let x = mlx_rs::random::uniform_device::<_, f32>(
+            -1.0,
+            1.0,
+            &[1, 1, k],
+            None,
+            Stream::default(),
+        )
+        .unwrap()
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let (weight, scales, biases) = {
+            let dense = mlx_rs::random::uniform_device::<_, f32>(
+                -1.0,
+                1.0,
+                &[n, k],
+                None,
+                Stream::default(),
+            )
+            .unwrap();
+            ops::quantize(&dense, 64, 2).unwrap()
+        };
+        let scales = scales.as_dtype(Dtype::Bfloat16).unwrap();
+        let biases = biases.as_dtype(Dtype::Bfloat16).unwrap();
+        mlx_rs::transforms::eval([&x, &weight, &scales, &biases]).unwrap();
+
+        let stock = ops::quantized_matmul(&x, &weight, &scales, &biases, true, 64, 2).unwrap();
+        let simd =
+            crate::metal_kernel::bonsai_q2_qmv_simd(&x, &weight, &scales, &biases, 64).unwrap();
+        mlx_rs::transforms::eval([&stock, &simd]).unwrap();
+        let stock_f32 = stock.as_dtype(Dtype::Float32).unwrap();
+        let simd_f32 = simd.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&stock_f32, &simd_f32]).unwrap();
+        let max_error = stock_f32
+            .subtract(&simd_f32)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(max_error < 0.5, "{label}: Q2 SIMD max error {max_error}");
+
+        for _ in 0..2 {
+            let stock = ops::quantized_matmul(&x, &weight, &scales, &biases, true, 64, 2).unwrap();
+            let simd =
+                crate::metal_kernel::bonsai_q2_qmv_simd(&x, &weight, &scales, &biases, 64).unwrap();
+            mlx_rs::transforms::eval([&stock, &simd]).unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        for _ in 0..iters {
+            let output = ops::quantized_matmul(&x, &weight, &scales, &biases, true, 64, 2).unwrap();
+            mlx_rs::transforms::eval([&output]).unwrap();
+        }
+        let stock_us = started.elapsed().as_secs_f64() * 1_000_000.0 / iters as f64;
+
+        let started = std::time::Instant::now();
+        for _ in 0..iters {
+            let output =
+                crate::metal_kernel::bonsai_q2_qmv_simd(&x, &weight, &scales, &biases, 64).unwrap();
+            mlx_rs::transforms::eval([&output]).unwrap();
+        }
+        let simd_us = started.elapsed().as_secs_f64() * 1_000_000.0 / iters as f64;
+        println!(
+            "Q2/G64 {label:>11} N={n:>5} K={k:>5} stock={stock_us:>8.1}us simd={simd_us:>8.1}us speedup={:.3}x",
+            stock_us / simd_us
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark, requires GPU"]
+    fn bench_affine_q2_simd_escha_qwen38_decode_shapes() {
+        for (label, n, k) in [
+            ("attn_q", 6_144, 5_120),
+            ("attn_kv", 1_024, 5_120),
+            ("attn_o", 5_120, 6_144),
+            ("mlp_gate_up", 17_408, 5_120),
+            ("mlp_down", 5_120, 17_408),
+            ("gdn_qkv", 10_240, 5_120),
+            ("gdn_z", 6_144, 5_120),
+            ("gdn_out", 5_120, 6_144),
+        ] {
+            bench_affine_q2_simd_at(label, n, k, 8);
         }
     }
 

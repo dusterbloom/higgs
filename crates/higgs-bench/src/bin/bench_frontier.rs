@@ -59,6 +59,14 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     runs: usize,
 
+    /// Tokens per forward chunk during prefill.
+    #[arg(
+        long,
+        default_value_t = PREFILL_CHUNK_SIZE,
+        value_parser = clap::value_parser!(i32).range(1..)
+    )]
+    prefill_chunk_size: i32,
+
     /// Verify the first KV frontier against an expected bytes-per-token value.
     #[arg(long)]
     verify_kv_analytic: bool,
@@ -77,6 +85,9 @@ struct Params {
     frontiers: Vec<usize>,
     probe_tokens: usize,
     runs: usize,
+    prefill_chunk_size: i32,
+    q2_simd_override: Option<String>,
+    escha_trellis_gemm_override: Option<String>,
     verify_kv_analytic: bool,
     expect_kv_bytes_per_token: Option<f64>,
 }
@@ -88,8 +99,14 @@ struct FrontierRow {
     incremental_prefill_ms: f64,
     prefill_tokps: f64,
     probe_decode_tokps: f64,
+    probe_output_digest_fnv1a64: u64,
     kv_bytes: usize,
     kv_bytes_per_token: f64,
+}
+
+struct DecodeProbe {
+    tokps: f64,
+    output_digest_fnv1a64: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,7 +175,7 @@ fn run(args: &Args) -> Result<()> {
                 .forward_chunked(
                     &token_array(&prompt_tokens[previous..frontier])?,
                     &mut cache,
-                    PREFILL_CHUNK_SIZE,
+                    args.prefill_chunk_size,
                 )
                 .context("incremental prefill")?;
             eval([&logits]).context("evaluate prefill logits")?;
@@ -167,7 +184,7 @@ fn run(args: &Args) -> Result<()> {
 
             let kv_bytes = cache.eval_targets().into_iter().map(Array::nbytes).sum();
             let checkpoint = cache.checkpoint_for_rollback();
-            let probe_tokps = decode_probe(&mut model, &mut cache, logits, args.probe_tokens)?;
+            let probe = decode_probe(&mut model, &mut cache, logits, args.probe_tokens)?;
             cache.rollback(checkpoint, args.probe_tokens);
 
             rows.push(FrontierRow {
@@ -175,7 +192,8 @@ fn run(args: &Args) -> Result<()> {
                 frontier,
                 incremental_prefill_ms: prefill_ms,
                 prefill_tokps: incremental_tokens as f64 / (prefill_ms / 1_000.0),
-                probe_decode_tokps: probe_tokps,
+                probe_decode_tokps: probe.tokps,
+                probe_output_digest_fnv1a64: probe.output_digest_fnv1a64,
                 kv_bytes,
                 kv_bytes_per_token: kv_bytes as f64 / frontier as f64,
             });
@@ -196,6 +214,9 @@ fn run(args: &Args) -> Result<()> {
             frontiers,
             probe_tokens: args.probe_tokens,
             runs: args.runs,
+            prefill_chunk_size: args.prefill_chunk_size,
+            q2_simd_override: std::env::var("HIGGS_BONSAI_Q2_SIMD").ok(),
+            escha_trellis_gemm_override: std::env::var("HIGGS_ESCHA_TRELLIS_GEMM").ok(),
             verify_kv_analytic: args.verify_kv_analytic,
             expect_kv_bytes_per_token: args.expect_kv_bytes_per_token,
         },
@@ -242,12 +263,15 @@ fn decode_probe(
     cache: &mut AnyCache,
     mut logits: Array,
     probe_tokens: usize,
-) -> Result<f64> {
+) -> Result<DecodeProbe> {
     let mut elapsed = 0.0;
+    let mut tokens = Vec::with_capacity(probe_tokens);
     for step in 0..probe_tokens {
         let token = argmax_axis!(&logits, -1).context("argmax greedy token")?;
         eval([&token]).context("evaluate greedy token")?;
-        let input = token_array(&[token.item::<u32>()])?;
+        let token = token.item::<u32>();
+        tokens.push(token);
+        let input = token_array(&[token])?;
         let started = Instant::now();
         logits = model
             .forward_last_token(&input, None, cache)
@@ -257,7 +281,21 @@ fn decode_probe(
             elapsed += started.elapsed().as_secs_f64();
         }
     }
-    Ok((probe_tokens - 1) as f64 / elapsed)
+    Ok(DecodeProbe {
+        tokps: (probe_tokens - 1) as f64 / elapsed,
+        output_digest_fnv1a64: fnv1a64_tokens(&tokens),
+    })
+}
+
+fn fnv1a64_tokens(tokens: &[u32]) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for token in tokens {
+        for byte in token.to_le_bytes() {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    digest
 }
 
 fn parse_frontiers(raw: &str) -> Result<Vec<usize>> {
@@ -293,16 +331,17 @@ fn verify_kv_bytes(measured: usize, bytes_per_token: f64, frontier: usize) -> Re
 
 fn format_frontier_markdown(output: &BenchOutput<Params, Results>) -> Result<String> {
     let mut markdown = format_markdown(output)?;
-    markdown.push_str("\n\n## Frontier rows\n\n| Run | Frontier | Incremental prefill ms | Prefill tok/s | Probe decode tok/s | KV bytes | KV bytes/token |\n|---:|---:|---:|---:|---:|---:|---:|\n");
+    markdown.push_str("\n\n## Frontier rows\n\n| Run | Frontier | Incremental prefill ms | Prefill tok/s | Probe decode tok/s | Probe digest (FNV-1a64) | KV bytes | KV bytes/token |\n|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for row in &output.results.rows {
         writeln!(
             markdown,
-            "| {} | {} | {:.3} | {:.2} | {:.2} | {} | {:.2} |",
+            "| {} | {} | {:.3} | {:.2} | {:.2} | {:016x} | {} | {:.2} |",
             row.run,
             row.frontier,
             row.incremental_prefill_ms,
             row.prefill_tokps,
             row.probe_decode_tokps,
+            row.probe_output_digest_fnv1a64,
             row.kv_bytes,
             row.kv_bytes_per_token
         )?;
@@ -312,7 +351,28 @@ fn format_frontier_markdown(output: &BenchOutput<Params, Results>) -> Result<Str
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_frontiers, verify_kv_bytes};
+    use clap::Parser as _;
+
+    use super::{Args, fnv1a64_tokens, parse_frontiers, verify_kv_bytes};
+
+    #[test]
+    fn probe_digest_is_stable_and_order_sensitive() {
+        assert_eq!(fnv1a64_tokens(&[1, 2, 3]), fnv1a64_tokens(&[1, 2, 3]));
+        assert_ne!(fnv1a64_tokens(&[1, 2, 3]), fnv1a64_tokens(&[3, 2, 1]));
+    }
+
+    #[test]
+    fn accepts_explicit_prefill_chunk_size() {
+        let args = Args::try_parse_from([
+            "bench_frontier",
+            "--model-dir",
+            "/tmp/model",
+            "--prefill-chunk-size",
+            "1024",
+        ])
+        .unwrap();
+        assert_eq!(args.prefill_chunk_size, 1024);
+    }
 
     #[test]
     fn parses_sorted_unique_frontiers() {
