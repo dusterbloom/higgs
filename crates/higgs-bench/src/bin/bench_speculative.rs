@@ -108,7 +108,46 @@ struct TrialRun {
     completion_tokens: u32,
     tok_s: f64,
     content_prefix: String,
+    output_digest_fnv1a64: String,
+    parity_with_baseline: bool,
     telemetry: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OutputSignature {
+    completion_tokens: u32,
+    content: String,
+    digest: u64,
+}
+
+impl OutputSignature {
+    fn new(completion_tokens: u32, content: &str) -> Self {
+        Self {
+            completion_tokens,
+            content: content.to_owned(),
+            digest: fnv1a64(content.as_bytes()),
+        }
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn compare_to_baseline(baseline: &OutputSignature, candidate: &OutputSignature) -> Result<()> {
+    if baseline.completion_tokens != candidate.completion_tokens {
+        anyhow::bail!(
+            "greedy completion token count differs from baseline: expected {}, got {}",
+            baseline.completion_tokens,
+            candidate.completion_tokens
+        );
+    }
+    if baseline.content != candidate.content {
+        anyhow::bail!("greedy visible output differs from baseline");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -180,6 +219,7 @@ async fn run(args: Args) -> Result<()> {
 
     let mut summaries = Vec::with_capacity(trial_specs.len());
     let mut baseline_tok_s: Option<f64> = None;
+    let mut baseline_signatures = Vec::with_capacity(args.repeats as usize);
 
     for spec in &trial_specs {
         let mut runs = Vec::with_capacity(args.repeats as usize);
@@ -190,9 +230,30 @@ async fn run(args: Args) -> Result<()> {
                 repeat_idx + 1,
                 args.repeats
             );
-            let run =
+            let mut run =
                 run_trial(&args, spec, repeat_idx, &client, &base_url, &model, &prompt).await?;
-            runs.push(run);
+            if spec.label == "baseline_mtp_off" {
+                baseline_signatures.push(run.signature);
+            } else {
+                let baseline = baseline_signatures
+                    .get(repeat_idx as usize)
+                    .with_context(|| {
+                        format!(
+                            "trial {} requires baseline_mtp_off to run first for repeat {}",
+                            spec.label,
+                            repeat_idx + 1
+                        )
+                    })?;
+                compare_to_baseline(baseline, &run.signature).with_context(|| {
+                    format!(
+                        "trial {} repeat {} failed greedy parity",
+                        spec.label,
+                        repeat_idx + 1
+                    )
+                })?;
+            }
+            run.summary.parity_with_baseline = true;
+            runs.push(run.summary);
         }
 
         let tok_s: Vec<f64> = runs.iter().map(|run| run.tok_s).collect();
@@ -261,7 +322,7 @@ async fn run_trial(
     base_url: &str,
     model: &ResolvedModel,
     prompt: &str,
-) -> Result<TrialRun> {
+) -> Result<CompletedTrial> {
     let log_path = log_path(&spec.label, repeat_idx)?;
     let mut child = start_higgs_server(args, spec, &model.serve_path, &log_path)
         .with_context(|| format!("start higgs server for trial {}", spec.label))?;
@@ -291,13 +352,24 @@ async fn run_trial(
         0.0
     };
 
-    Ok(TrialRun {
-        elapsed_s,
-        completion_tokens: payload.completion_tokens,
-        tok_s,
-        content_prefix: payload.content.chars().take(120).collect(),
-        telemetry,
+    let signature = OutputSignature::new(payload.completion_tokens, &payload.content);
+    Ok(CompletedTrial {
+        summary: TrialRun {
+            elapsed_s,
+            completion_tokens: payload.completion_tokens,
+            tok_s,
+            content_prefix: payload.content.chars().take(120).collect(),
+            output_digest_fnv1a64: format!("{:016x}", signature.digest),
+            parity_with_baseline: false,
+            telemetry,
+        },
+        signature,
     })
+}
+
+struct CompletedTrial {
+    summary: TrialRun,
+    signature: OutputSignature,
 }
 
 struct CompletionPayload {
@@ -517,7 +589,9 @@ fn read_filtered_telemetry(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SPECULATIVE_ENV_KEYS, clear_speculative_env};
+    use super::{
+        OutputSignature, SPECULATIVE_ENV_KEYS, clear_speculative_env, compare_to_baseline,
+    };
     use std::process::Command;
 
     #[test]
@@ -533,5 +607,29 @@ mod tests {
                 "expected {key} to be explicitly removed"
             );
         }
+    }
+
+    #[test]
+    fn accepts_a_completion_that_matches_its_baseline() {
+        let baseline = OutputSignature::new(4, "same");
+        let candidate = OutputSignature::new(4, "same");
+
+        assert!(compare_to_baseline(&baseline, &candidate).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_visible_completion_that_differs_from_its_baseline() {
+        let baseline = OutputSignature::new(4, "same");
+        let candidate = OutputSignature::new(4, "different");
+
+        assert!(compare_to_baseline(&baseline, &candidate).is_err());
+    }
+
+    #[test]
+    fn rejects_a_completion_token_count_that_differs_from_its_baseline() {
+        let baseline = OutputSignature::new(4, "same");
+        let candidate = OutputSignature::new(5, "same");
+
+        assert!(compare_to_baseline(&baseline, &candidate).is_err());
     }
 }
