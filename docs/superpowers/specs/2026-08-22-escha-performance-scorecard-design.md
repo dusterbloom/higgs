@@ -14,9 +14,10 @@ No inference kernel, scheduler, ANE backend, model conversion, benchmark manifes
 
 - The baseline remains the `baseline_mtp_off` trial.
 - Every non-baseline trial with the same repeat index must have exactly the same visible response content and completion-token count as its baseline.
+- A trial with `HIGGS_MTP=1` must emit the MTP completion log record; a checkpoint without MTP weights is not a speculative result.
 - A mismatch makes the benchmark return an error after persisting no misleading comparison result.
 - The JSON output includes a stable FNV-1a digest and `parity_with_baseline` for each successful trial, so reviewers can verify parity without storing full completions.
 
 ## Verification
 
-Unit tests cover digest stability, a matching response, a visible-content mismatch, and a completion-token mismatch. The focused test and release build run without starting Higgs. A later live run, only when the GPU is free, uses `baseline,mtp_default,mtp_adaptive` plus `bench_frontier` and a Metal System Trace.
+Unit tests cover a matching response, visible-content and completion-token mismatches, benchmark authentication, and missing MTP completion telemetry. The focused test and release build run without starting Higgs. A later live run, only when the GPU is free, uses `baseline,mtp_default,mtp_adaptive` plus `bench_frontier` and a Metal System Trace.

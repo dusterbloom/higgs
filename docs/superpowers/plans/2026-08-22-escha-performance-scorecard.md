@@ -4,7 +4,7 @@
 
 **Goal:** Reject speculative benchmark results that do not reproduce the AR baseline's greedy output for a local Escha Qwen3.8 model.
 
-**Architecture:** `bench_speculative` keeps the small, existing fresh-server loop. It derives a deterministic digest from each visible completion and compares each non-baseline run to the baseline with the same repeat index before the result is persisted. Server-side MTP telemetry remains opaque log text for this milestone.
+**Architecture:** `bench_speculative` keeps the small, existing fresh-server loop. It derives a deterministic digest from each visible completion and compares each non-baseline run to the baseline with the same repeat index before the result is persisted. Any MTP-requested trial must also emit its MTP completion record; AR fallback is rejected.
 
 **Tech Stack:** Rust, Clap, Tokio, serde, existing `higgs-bench` helpers.
 
@@ -98,7 +98,6 @@ Use, after confirming no active Higgs process:
 ```bash
 ./target/release/bench_speculative \
   --model-path "$HOME/.cache/lm-studio/models/EschaLabs/Qwen3.8-27B-Escha-W2" \
-  --model-name escha-27b \
   --api-key "<ephemeral-loopback-key>" \
   --trials baseline,mtp_default,mtp_adaptive \
   --max-tokens 320 --repeats 3

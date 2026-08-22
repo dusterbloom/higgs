@@ -349,6 +349,8 @@ async fn run_trial(
 
     stop_child(&mut child);
     let telemetry = read_filtered_telemetry(&log_path);
+    ensure_requested_mtp_ran(spec, &telemetry)
+        .with_context(|| format!("trial {} did not execute requested MTP", spec.label))?;
     let payload = result?;
     let elapsed_s = payload.elapsed.as_secs_f64();
     let tok_s = if elapsed_s > 0.0 {
@@ -602,19 +604,33 @@ fn read_filtered_telemetry(path: &Path) -> String {
     };
     body.lines()
         .filter(|line| {
-            line.contains("MTP decode complete") || line.contains("Prompt-lookup decode complete")
+            line.contains("MTP decode complete")
+                || line.contains("Prompt-lookup decode complete")
+                || line.contains("AR generation complete")
+                || line.contains("checkpoint has no MTP weights")
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn ensure_requested_mtp_ran(spec: &speculative::TrialSpec, telemetry: &str) -> Result<()> {
+    let mtp_requested = spec.env.get("HIGGS_MTP").is_some_and(|value| value == "1");
+    if mtp_requested && !telemetry.contains("MTP decode complete") {
+        anyhow::bail!(
+            "MTP was requested but no MTP decode completion was recorded; telemetry: {telemetry}"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         Args, OutputSignature, SPECULATIVE_ENV_KEYS, authorize_request, clear_speculative_env,
-        compare_to_baseline, configure_server_api_key,
+        compare_to_baseline, configure_server_api_key, ensure_requested_mtp_ran,
     };
     use clap::Parser;
+    use higgs_bench::speculative::parse_trial_specs;
     use std::process::Command;
 
     #[test]
@@ -695,5 +711,19 @@ mod tests {
             .collect();
 
         assert_eq!(args, ["--api-key", "bench-key"]);
+    }
+
+    #[test]
+    fn rejects_an_mtp_trial_without_mtp_completion_telemetry() {
+        let spec = parse_trial_specs("mtp_default").unwrap().remove(0);
+
+        assert!(ensure_requested_mtp_ran(&spec, "AR generation complete").is_err());
+    }
+
+    #[test]
+    fn permits_an_mtp_trial_with_mtp_completion_telemetry() {
+        let spec = parse_trial_specs("mtp_default").unwrap().remove(0);
+
+        assert!(ensure_requested_mtp_ran(&spec, "MTP decode complete").is_ok());
     }
 }
