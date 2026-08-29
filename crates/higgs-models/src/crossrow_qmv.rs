@@ -69,23 +69,27 @@ fn push_crossrow_metal_schedule_function(
     emit_starts: bool,
 ) {
     use std::fmt::Write as _;
-    let _ = write!(
+    let _ = writeln!(
         source,
-        "template <int M>\ninline int {function_name}(int group) {{\n  switch (M) {{\n"
+        "template <int M>\ninline int {function_name}(int group) {{\n  switch (M) {{"
     );
     for m in 2..=9 {
-        let _ = write!(source, "    case {m}:\n      switch (group) {{\n");
+        let _ = writeln!(source, "    case {m}:");
+        let _ = writeln!(source, "      switch (group) {{");
         let mut first_m = 0;
         for (group, &group_size) in crossrow_group_layout(m).iter().enumerate() {
             let value = if emit_starts { first_m } else { group_size };
-            let _ = write!(source, "        case {group}: return {value};\n");
+            let _ = writeln!(source, "        case {group}: return {value};");
             first_m += group_size;
         }
         let fallback = if emit_starts { -1 } else { 0 };
-        let _ = write!(source, "        default: return {fallback};\n      }}\n");
+        let _ = writeln!(source, "        default: return {fallback};");
+        let _ = writeln!(source, "      }}");
     }
     let fallback = if emit_starts { -1 } else { 0 };
-    let _ = write!(source, "    default: return {fallback};\n  }}\n}}\n");
+    let _ = writeln!(source, "    default: return {fallback};");
+    let _ = writeln!(source, "  }}");
+    let _ = writeln!(source, "}}");
 }
 
 fn crossrow_metal_schedule_source() -> String {
@@ -286,10 +290,10 @@ fn crossrow_kernel() -> &'static CachedMetalKernel {
     })
 }
 
-/// Eligibility: affine 4-bit group-64, bf16/fp16 x, M in 2..=9, K % 512 == 0,
-/// N % 8 == 0. The caller (QLinear::forward) supplies [T, K] x and the
-/// packed [N, K/8] weight triple.
-pub(crate) fn crossrow_qmv_verify(
+/// Eligibility: affine 4-bit group-64, `bf16`/`fp16` x, `M` in 2..=9,
+/// `K % 512 == 0`, `N % 8 == 0`. The caller (`QLinear::forward`) supplies
+/// a `[T, K]` x and the packed `[N, K/8]` weight triple.
+pub fn crossrow_qmv_verify(
     x: &Array,
     weight: &Array,
     scales: &Array,
@@ -329,7 +333,7 @@ pub(crate) fn crossrow_qmv_verify(
         let grid_y = usize::try_from(n_rows).map_or(0, |n| n.saturating_add(7) / 8);
         // mlx fast kernels dispatch THREADS (dispatch_threads), so the grid
         // is total thread counts: gx groups * 64 threads each.
-        let gx = i32::try_from(grid_x).map_or(0, |g| g.saturating_mul(64));
+        let gx = grid_x.saturating_mul(64);
         let gy = i32::try_from(grid_y).unwrap_or(0);
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, gx, gy, 1);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
@@ -387,7 +391,8 @@ mod tests {
         clippy::unwrap_used,
         clippy::expect_used,
         unsafe_code,
-        clippy::as_conversions
+        clippy::as_conversions,
+        clippy::cast_precision_loss
     )]
     use super::*;
     use mlx_rs::ops;
@@ -406,10 +411,10 @@ mod tests {
         let mut rows = Vec::new();
         for r in 0..m {
             let xr = x
-                .take_axis(&Array::from_slice::<i32>(&[r], &[1]), 0)
+                .take_axis(Array::from_slice::<i32>(&[r], &[1]), 0)
                 .unwrap();
             let yr =
-                ops::quantized_matmul(&xr.reshape(&[1, k]).unwrap(), w, s, b, true, 64, 4).unwrap();
+                ops::quantized_matmul(xr.reshape(&[1, k]).unwrap(), w, s, b, true, 64, 4).unwrap();
             rows.push(yr);
         }
         let want = ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0).unwrap();
@@ -417,7 +422,7 @@ mod tests {
         let got_f32 = got.as_dtype(mlx_rs::Dtype::Float32).unwrap();
         got_f32.eval().unwrap();
         let want_f32 = want.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-        let diff = ops::abs(&ops::subtract(&got_f32, &want_f32).unwrap()).unwrap();
+        let diff = ops::abs(ops::subtract(&got_f32, &want_f32).unwrap()).unwrap();
         let max_diff: f32 = ops::max(&diff, None).unwrap().item();
         assert!(
             max_diff == 0.0,
@@ -461,7 +466,7 @@ mod tests {
             use std::fmt::Write as _;
             let mut branch = format!("    case {m}:\n      switch (group) {{\n");
             for (group, value) in values.iter().enumerate() {
-                let _ = write!(branch, "        case {group}: return {value};\n");
+                let _ = writeln!(branch, "        case {group}: return {value};");
             }
             let _ = write!(branch, "        default: return {fallback};\n      }}\n");
             branch
@@ -491,7 +496,7 @@ mod tests {
     }
 
     /// Every M in 2..=9 must produce bit-identical rows to stock
-    /// quantized_matmul executed per row (the exactness contract the MTP
+    /// `quantized_matmul` executed per row (the exactness contract the MTP
     /// verifier relies on).
     #[test]
     fn crossrow_bit_exact_vs_stock_rows() {

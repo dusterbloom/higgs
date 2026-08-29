@@ -260,7 +260,7 @@ pub(crate) struct QLinear {
     pub(crate) bits: i32,
 }
 
-fn crossrow_qmv_rows_supported(m_rows: i32) -> bool {
+const fn crossrow_qmv_rows_supported(m_rows: i32) -> bool {
     matches!(m_rows, 2 | 3 | 5 | 6 | 8 | 9)
 }
 
@@ -299,7 +299,7 @@ impl QLinear {
     /// shapes. Any kernel error deliberately falls back to stock QMV so the
     /// optimization cannot change model correctness.
     fn crossrow_qmv_forward(&self, x: &Array) -> Option<Array> {
-        if std::env::var("HIGGS_CROSSROW_QMV").map_or(false, |v| v == "0")
+        if std::env::var("HIGGS_CROSSROW_QMV").is_ok_and(|v| v == "0")
             || self.bits != 4
             || self.group_size != 64
             // The Metal kernel hard-codes a bfloat16 view of `x`; any other
@@ -322,9 +322,7 @@ impl QLinear {
         if !crossrow_qmv_rows_supported(m_rows) {
             return None;
         }
-        let Some(&k_in) = x_shape.last() else {
-            return None;
-        };
+        let &k_in = x_shape.last()?;
         let [n_rows, k_packed] = *self.weight.shape() else {
             return None;
         };
@@ -5275,11 +5273,8 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
         }
     }
 
-    if std::env::var("HIGGS_LOAD_EVAL_CHUNKED")
-        .map(|v| v != "0")
-        .unwrap_or(true)
-    {
-        for (_, param) in params.iter() {
+    if std::env::var("HIGGS_LOAD_EVAL_CHUNKED").map_or(true, |v| v != "0") {
+        for param in params.values() {
             (**param).eval().map_err(crate::error::ModelError::from)?;
         }
     }
@@ -8063,7 +8058,7 @@ mod tests {
         });
 
         candidates.into_iter().find(|path| {
-            Array::load_safetensors(path).ok().is_some_and(|loaded| {
+            Array::load_safetensors(path).is_ok_and(|loaded| {
                 loaded.keys().any(|key| {
                     key.contains("switch_mlp")
                         && key.contains("gate_proj")
