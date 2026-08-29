@@ -1165,6 +1165,13 @@ impl QLinear {
 
     fn crossrow_qmv_forward(&self, x: &Array) -> Result<Option<Array>, Exception> {
         let enabled = std::env::var("HIGGS_CROSSROW_QMV").map_or(true, |v| v != "0");
+        // The Metal kernel hard-codes a bfloat16 view of `x`. Any other
+        // activation dtype misreads the buffer (wrong row stride, garbage
+        // odd 16-bit words -> NaN/Inf patterns). Route non-bf16 inputs to
+        // the stock quantized matmul instead.
+        if x.dtype() != mlx_rs::Dtype::Bfloat16 {
+            return Ok(None);
+        }
         let x_shape = x.shape();
         let Some((m_rows, n_rows)) = crossrow_qmv_shape(
             enabled,
