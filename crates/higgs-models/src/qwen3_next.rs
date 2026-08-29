@@ -302,6 +302,10 @@ impl QLinear {
         if std::env::var("HIGGS_CROSSROW_QMV").map_or(false, |v| v == "0")
             || self.bits != 4
             || self.group_size != 64
+            // The Metal kernel hard-codes a bfloat16 view of `x`; any other
+            // activation dtype misreads the buffer (wrong row stride, garbage
+            // odd 16-bit words -> NaN/Inf patterns). Fall back to stock QMV.
+            || x.dtype() != Dtype::Bfloat16
         {
             return None;
         }
