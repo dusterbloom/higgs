@@ -59,8 +59,8 @@ const fn crossrow_group_layout(t_rows: i32) -> &'static [i32] {
     }
 }
 
-const fn crossrow_group_count(t_rows: i32) -> i32 {
-    crossrow_group_layout(t_rows).len() as i32
+fn crossrow_group_count(t_rows: i32) -> i32 {
+    i32::try_from(crossrow_group_layout(t_rows).len()).unwrap_or(0)
 }
 
 fn push_crossrow_metal_schedule_function(
@@ -68,22 +68,24 @@ fn push_crossrow_metal_schedule_function(
     function_name: &str,
     emit_starts: bool,
 ) {
-    source.push_str(&format!(
+    use std::fmt::Write as _;
+    let _ = write!(
+        source,
         "template <int M>\ninline int {function_name}(int group) {{\n  switch (M) {{\n"
-    ));
+    );
     for m in 2..=9 {
-        source.push_str(&format!("    case {m}:\n      switch (group) {{\n"));
+        let _ = write!(source, "    case {m}:\n      switch (group) {{\n");
         let mut first_m = 0;
         for (group, &group_size) in crossrow_group_layout(m).iter().enumerate() {
             let value = if emit_starts { first_m } else { group_size };
-            source.push_str(&format!("        case {group}: return {value};\n"));
+            let _ = write!(source, "        case {group}: return {value};\n");
             first_m += group_size;
         }
         let fallback = if emit_starts { -1 } else { 0 };
-        source.push_str(&format!("        default: return {fallback};\n      }}\n"));
+        let _ = write!(source, "        default: return {fallback};\n      }}\n");
     }
     let fallback = if emit_starts { -1 } else { 0 };
-    source.push_str(&format!("    default: return {fallback};\n  }}\n}}\n"));
+    let _ = write!(source, "    default: return {fallback};\n  }}\n}}\n");
 }
 
 fn crossrow_metal_schedule_source() -> String {
@@ -255,9 +257,9 @@ fn crossrow_kernel() -> &'static CachedMetalKernel {
         let output_names: [&std::ffi::CStr; 1] = [c"y"];
         let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
         let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
-        let header =
+        let header_c =
             std::ffi::CString::new(header).unwrap_or_else(|_| std::ffi::CString::default());
-        let source =
+        let source_c =
             std::ffi::CString::new(source).unwrap_or_else(|_| std::ffi::CString::default());
         unsafe {
             let in_vec = mlx_sys::mlx_vector_string_new_data(
@@ -272,8 +274,8 @@ fn crossrow_kernel() -> &'static CachedMetalKernel {
                 c"higgs_crossrow_qmv_affine4_g64".as_ptr(),
                 in_vec,
                 out_vec,
-                source.as_ptr(),
-                header.as_ptr(),
+                source_c.as_ptr(),
+                header_c.as_ptr(),
                 false,
                 false,
             );
@@ -324,11 +326,11 @@ pub(crate) fn crossrow_qmv_verify(
             n_rows,
         );
         // grid: x follows the Rust-owned row schedule; y covers 8-output tiles.
-        let grid_y = (n_rows as usize + 7) / 8;
+        let grid_y = usize::try_from(n_rows).map_or(0, |n| n.saturating_add(7) / 8);
         // mlx fast kernels dispatch THREADS (dispatch_threads), so the grid
         // is total thread counts: gx groups * 64 threads each.
-        let gx = grid_x as i32 * 64;
-        let gy = grid_y as i32;
+        let gx = i32::try_from(grid_x).map_or(0, |g| g.saturating_mul(64));
+        let gy = i32::try_from(grid_y).unwrap_or(0);
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, gx, gy, 1);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
         if std::env::var("HIGGS_CROSSROW_VERBOSE").is_ok() {
@@ -380,7 +382,13 @@ pub(crate) fn crossrow_qmv_verify(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, unsafe_code)]
+    #![allow(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        unsafe_code,
+        clippy::as_conversions
+    )]
     use super::*;
     use mlx_rs::ops;
 
@@ -406,10 +414,10 @@ mod tests {
         }
         let want = ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0).unwrap();
 
-        let got = got.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-        got.eval().unwrap();
-        let want = want.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-        let diff = ops::abs(&ops::subtract(&got, &want).unwrap()).unwrap();
+        let got_f32 = got.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        got_f32.eval().unwrap();
+        let want_f32 = want.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let diff = ops::abs(&ops::subtract(&got_f32, &want_f32).unwrap()).unwrap();
         let max_diff: f32 = ops::max(&diff, None).unwrap().item();
         assert!(
             max_diff == 0.0,
@@ -431,7 +439,10 @@ mod tests {
         ];
         for (rows, groups) in expected {
             assert_eq!(crossrow_group_layout(rows), groups);
-            assert_eq!(crossrow_group_count(rows), groups.len() as i32);
+            assert_eq!(
+                crossrow_group_count(rows),
+                i32::try_from(groups.len()).unwrap_or(0)
+            );
             assert_eq!(groups.iter().sum::<i32>(), rows);
         }
     }
@@ -447,11 +458,12 @@ mod tests {
     #[test]
     fn crossrow_metal_schedule() {
         fn schedule_case(m: i32, values: &[i32], fallback: i32) -> String {
+            use std::fmt::Write as _;
             let mut branch = format!("    case {m}:\n      switch (group) {{\n");
             for (group, value) in values.iter().enumerate() {
-                branch.push_str(&format!("        case {group}: return {value};\n"));
+                let _ = write!(branch, "        case {group}: return {value};\n");
             }
-            branch.push_str(&format!("        default: return {fallback};\n      }}\n"));
+            let _ = write!(branch, "        default: return {fallback};\n      }}\n");
             branch
         }
 
@@ -488,7 +500,7 @@ mod tests {
             // Diverse nibbles: row i, col j -> ((i*7 + j*13) % 15 - 7) / 8
             let n_i: i32 = n;
             let k_i: i32 = k;
-            let mut host = Vec::with_capacity((n_i * k_i) as usize);
+            let mut host = Vec::with_capacity(usize::try_from(n_i * k_i).unwrap_or(0));
             for i in 0..n_i {
                 for j in 0..k_i {
                     let q = ((i * 7 + j * 13).rem_euclid(15)) - 7;
@@ -499,7 +511,7 @@ mod tests {
             let (w, s, b) = ops::quantize(&w32, Some(64), Some(4)).unwrap();
             for m in 2..=9i32 {
                 let m_i: i32 = m;
-                let mut xhost = Vec::with_capacity((m_i * k) as usize);
+                let mut xhost = Vec::with_capacity(usize::try_from(m_i * k).unwrap_or(0));
                 for i in 0..m_i {
                     for j in 0..k {
                         xhost.push((((i + 1) * (j % 97)) % 31) as f32 / 16.0 - 1.0);
@@ -523,7 +535,7 @@ mod tests {
         // of 0x0, complete rows of 0xf, and alternating 0/f nibbles.
         let (n, k) = (8i32, 512i32);
         let words_per_row = k / 8;
-        let mut packed = Vec::with_capacity((n * words_per_row) as usize);
+        let mut packed = Vec::with_capacity(usize::try_from(n * words_per_row).unwrap_or(0));
         for row in 0..n {
             for word in 0..words_per_row {
                 packed.push(match row {
@@ -536,8 +548,8 @@ mod tests {
         }
         let w = Array::from_slice::<u32>(&packed, &[n, words_per_row]);
         let groups_per_row = k / 64;
-        let mut scales = Vec::with_capacity((n * groups_per_row) as usize);
-        let mut biases = Vec::with_capacity((n * groups_per_row) as usize);
+        let mut scales = Vec::with_capacity(usize::try_from(n * groups_per_row).unwrap_or(0));
+        let mut biases = Vec::with_capacity(usize::try_from(n * groups_per_row).unwrap_or(0));
         for row in 0..n {
             for group in 0..groups_per_row {
                 scales.push(if (row + group) % 2 == 0 {
@@ -552,7 +564,7 @@ mod tests {
         let b = Array::from_slice::<f32>(&biases, &[n, groups_per_row]);
 
         for m in [6i32, 8, 9] {
-            let mut activations = Vec::with_capacity((m * k) as usize);
+            let mut activations = Vec::with_capacity(usize::try_from(m * k).unwrap_or(0));
             for row in 0..m {
                 for col in 0..k {
                     let value = match row {
