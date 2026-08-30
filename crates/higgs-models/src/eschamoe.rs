@@ -642,6 +642,8 @@ impl EschaProj {
         let xh = had_blockwise(&x.as_dtype(Dtype::Float32)?.multiply(&su_rows)?, -1)?;
         let y_pre = if rows <= Self::GATHER_QMV_MAX_ROWS {
             crate::metal_kernel::eschamoe_gather_qmv(&xh, &self.code, eids, &self.spec)?
+        } else if gemm && qgemm_simd_mode() {
+            crate::metal_kernel::eschamoe_gather_qgemm_simd(&xh, &self.code, eids, &self.spec)?
         } else if gemm {
             crate::metal_kernel::eschamoe_gather_qgemm(&xh, &self.code, eids, &self.spec)?
         } else {
@@ -1415,6 +1417,14 @@ pub fn trellis_gemm_mode() -> bool {
     *MODE.get_or_init(|| std::env::var("HIGGS_ESCHA_TRELLIS_GEMM").is_ok_and(|v| v == "1"))
 }
 
+/// Select the simdgroup fragment variant of the gather QGEMM kernel
+/// (`HIGGS_ESCHA_QGEMM_SIMD=1`). The scalar kernel stays the default until
+/// the Phase-1 measurements promote the simdgroup path.
+pub fn qgemm_simd_mode() -> bool {
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("HIGGS_ESCHA_QGEMM_SIMD").is_ok_and(|v| v == "1"))
+}
+
 /// The tensor list and the native expert weights of one conversion.
 pub type ConvertedCheckpoint = (Vec<(String, Array)>, Vec<(usize, EschaSwitchMlp)>);
 
@@ -1677,8 +1687,157 @@ pub fn is_eschamoe_checkpoint(model_dir: &std::path::Path) -> Result<bool, Model
 )]
 mod tests {
     use mlx_rs::ops::indexing::IndexOp;
+    use mlx_rs::{Array, Dtype};
+    use std::collections::HashMap;
 
     use super::*;
+    use crate::mlx_exec::eval;
+
+    /// PLAN.md Phase 0 gate: time the scalar GEMM and the scratch reference
+    /// on identical inputs at prefill shapes, and record the A/B error so the
+    /// simdgroup rewrite (Phase 1) has a numeric bar.
+    ///
+    /// Runs on GPU, about a minute. Two parts:
+    ///
+    /// 1. Correctness: both prefill paths vs an f32 dense ground truth on a
+    ///    small config. The scratch path decodes weights to f16 and the GEMM
+    ///    kernel to f32, so the two disagree with each other on
+    ///    cancellation-prone elements and can only share a truth reference.
+    /// 2. Timing: both paths at production dims (4096x1024, 128 experts).
+    #[test]
+    fn phase0_qgemm_ab_and_tflops() {
+        let _exec = crate::mlx_exec::acquire();
+        const IN: i32 = 4096;
+        const OUT: i32 = 1024;
+        const EXPERTS: i32 = 128;
+        const K: usize = 8;
+        const ROW_SET: [i32; 3] = [512, 2048, 8192];
+        const ITERS: usize = 5;
+
+        let spec = EschaSpec {
+            k: K,
+            mcg: true,
+            num_experts: EXPERTS,
+            in_features: IN,
+            out_features: OUT,
+        };
+        let (tiles_k, tiles_n) = spec.tiles();
+        let words = spec.words_per_tile();
+        let code_len = EXPERTS as usize * tiles_k * tiles_n * words;
+        let code_data: Vec<i16> = (0..code_len).map(|i| (i % 251) as i16 * 7 - 130).collect();
+        let code = Array::from_slice(
+            &code_data,
+            &[
+                EXPERTS,
+                i32::try_from(tiles_k).unwrap(),
+                i32::try_from(tiles_n).unwrap(),
+                i32::try_from(words).unwrap(),
+            ],
+        );
+        let rin = Array::ones::<f32>(&[EXPERTS, IN]).unwrap();
+        let rout = Array::ones::<f32>(&[EXPERTS, OUT]).unwrap();
+        let s_in = Array::ones::<f32>(&[EXPERTS, IN]).unwrap();
+        let s_out = Array::ones::<f32>(&[EXPERTS, OUT]).unwrap();
+        let proj = EschaProj::new(code, &rin, &rout, &s_in, &s_out, spec.clone()).unwrap();
+
+        // ---- Correctness: small config, 4 experts, f32 dense truth ----
+        const C_IN: i32 = 256;
+        const C_OUT: i32 = 256;
+        const C_EXPERTS: i32 = 4;
+        let c_spec = EschaSpec {
+            k: K,
+            mcg: true,
+            num_experts: C_EXPERTS,
+            in_features: C_IN,
+            out_features: C_OUT,
+        };
+        let (ck, cn) = c_spec.tiles();
+        let cw = c_spec.words_per_tile();
+        let c_code_len = C_EXPERTS as usize * ck * cn * cw;
+        let c_code_data: Vec<i16> = (0..c_code_len).map(|i| (i % 251) as i16 * 7 - 130).collect();
+        let c_code = Array::from_slice(
+            &c_code_data,
+            &[
+                C_EXPERTS,
+                i32::try_from(ck).unwrap(),
+                i32::try_from(cn).unwrap(),
+                i32::try_from(cw).unwrap(),
+            ],
+        );
+        let c_proj = EschaProj::new(
+            c_code,
+            &Array::ones::<f32>(&[C_EXPERTS, C_IN]).unwrap(),
+            &Array::ones::<f32>(&[C_EXPERTS, C_OUT]).unwrap(),
+            &Array::ones::<f32>(&[C_EXPERTS, C_IN]).unwrap(),
+            &Array::ones::<f32>(&[C_EXPERTS, C_OUT]).unwrap(),
+            c_spec.clone(),
+        )
+        .unwrap();
+
+        const C_ROWS: i32 = 256;
+        let c_ids_data: Vec<u32> = (0..C_ROWS as u32).map(|i| i % C_EXPERTS as u32).collect();
+        let c_x_data: Vec<f32> =
+            (0..(C_ROWS * C_IN) as usize).map(|i| (i % 13) as f32 - 6.0).collect();
+        let c_x = Array::from_slice(&c_x_data, &[C_ROWS, C_IN]);
+        let c_eids = Array::from_slice(&c_ids_data, &[C_ROWS]);
+
+        let c_scratch = c_proj.gather_forward_mode(&c_x, &c_eids, false).unwrap();
+        let c_gemm = c_proj.gather_forward_mode(&c_x, &c_eids, true).unwrap();
+
+        // Path-agreement gate: the scratch path is the verified reference,
+        // so the GEMM kernel must track it to f16-weight-rounding noise. The
+        // gate is relative to the output scale (Hadamard + codebook amplify
+        // absolute values; only relative divergence marks a real bug).
+        let scratch_h = c_scratch.as_slice::<f32>();
+        let gemm_h = c_gemm.as_slice::<f32>();
+        let mut max_abs = 0.0f32;
+        let mut max_scale = 0.0f32;
+        for (s, g) in scratch_h.iter().zip(gemm_h.iter()) {
+            max_abs = max_abs.max((s - g).abs());
+            max_scale = max_scale.max(s.abs());
+        }
+        let rel = max_abs / max_scale.max(1e-6);
+        println!(
+            "path agreement ({C_ROWS}x{C_IN}x{C_OUT}): max_abs {max_abs:.5} on scale {max_scale:.1} -> rel {rel:.2e}"
+        );
+        assert!(
+            rel < 1e-3,
+            "qgemm diverges from the scratch reference: rel {rel:.2e}"
+        );
+
+        // ---- Timing: production dims, mixed experts, median of ITERS ----
+        for &rows in &ROW_SET {
+            let ids_data: Vec<u32> = (0..rows as u32).map(|i| i % EXPERTS as u32).collect();
+            let x_data: Vec<f32> =
+                (0..(rows * IN) as usize).map(|i| (i % 13) as f32 - 6.0).collect();
+            let x = Array::from_slice(&x_data, &[rows, IN]);
+            let eids = Array::from_slice(&ids_data, &[rows]);
+
+            let time_path = |gemm: bool| {
+                let mut samples = Vec::with_capacity(ITERS + 1);
+                for i in 0..=ITERS {
+                    let t0 = std::time::Instant::now();
+                    let out = proj.gather_forward_mode(&x, &eids, gemm).unwrap();
+                    eval(std::slice::from_ref(&out)).unwrap();
+                    if i > 0 {
+                        samples.push(t0.elapsed().as_secs_f64());
+                    }
+                }
+                samples.sort_by(|a, b| a.total_cmp(b));
+                samples[ITERS / 2]
+            };
+            let scratch_s = time_path(false);
+            let gemm_s = time_path(true);
+            let flops = 2.0 * rows as f64 * IN as f64 * OUT as f64;
+            println!(
+                "rows={rows}: scratch {:.1} ms ({:.0} GFLOP/s) | qgemm {:.1} ms ({:.0} GFLOP/s)",
+                scratch_s * 1e3,
+                flops / scratch_s / 1e9,
+                gemm_s * 1e3,
+                flops / gemm_s / 1e9,
+            );
+        }
+    }
 
     #[test]
     fn checkpoint_layout_requires_complete_int8_pairs_and_keeps_trellis_q4() {

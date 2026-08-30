@@ -23,6 +23,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
 use mlx_rs::{Array, Dtype, Stream, error::Exception};
+use mlx_rs::ops::indexing::IndexOp;
 
 use crate::eschamoe::EschaSpec;
 
@@ -966,6 +967,310 @@ for (uint i = 0u; i < uint(RM); ++i) {
 }
 "#;
 
+/// Simdgroup variant of the gather QGEMM. Identical staging, decode, and
+/// expert-pass walk; the per-thread scalar FMA product is replaced by 8x8
+/// fragment MMA. Layout deltas vs the scalar source: XP is 8-aligned for
+/// simdgroup_load, and the output block is written with unpredicated
+/// simdgroup_store — the caller allocates rows rounded up to BM and slices.
+const ESCHA_QGEMM_SIMD_SOURCE: &str = r#"
+constexpr int NT = 128;         // threads in the threadgroup
+constexpr int BM = 32;          // rows in a block
+constexpr int TNB = 8;          // tile columns in a block
+constexpr int BN = 16 * TNB;    // output columns in a block
+constexpr int XP = 40;          // activation stride, 8-aligned for fragment loads
+constexpr int CB = BN / 8;      // 8x8 column fragments across the block
+constexpr int WORDS = 8 * K;    // 32-bit words in one packed tile
+constexpr int IN = TK * 16;
+constexpr int OUT = TN * 16;
+constexpr int PAIRS = TNB * 128;    // code pairs in one tile row of a block
+
+static_assert(NT % 128 == 0, "a thread must own one code pair of every tile");
+static_assert(PAIRS % NT == 0, "the code pairs must divide over the threads");
+static_assert(BM * 16 % NT == 0, "the activation slab must divide over the threads");
+static_assert(BN % 8 == 0, "column fragments must divide the block");
+
+threadgroup float x_sh[16 * XP];
+threadgroup float w_sh[16 * BN];
+threadgroup uint e_sh[BM];
+
+uint tid = thread_index_in_threadgroup;
+uint sg = simdgroup_index_in_threadgroup;
+uint rows = cb[4];
+uint row0 = threadgroup_position_in_grid.y * uint(BM);
+uint col0 = threadgroup_position_in_grid.x * uint(BN);
+uint nrow = min(uint(BM), rows - row0);
+
+if (tid < nrow) {
+    e_sh[tid] = eids[row0 + tid];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// One simdgroup owns rows [sg*8, sg*8+8) of the block, all BN columns.
+simdgroup_matrix<float, 8, 8> acc[CB];
+for (uint cb = 0u; cb < CB; ++cb) {
+    acc[cb] = simdgroup_matrix<float, 8, 8>(0.0f);
+}
+
+// Decode address math — identical to the scalar kernel.
+uint p = tid & 127u;
+uint tb0 = tid >> 7;
+
+uint b0 = 2u * p * uint(K) + uint(K) + 256u * uint(K) - 16u;
+uint b2 = b0 + uint(K) + 16u;
+uint i0 = (b0 / 32u) % uint(WORDS);
+uint i1w = (b2 - 1u) / 32u;
+uint s1 = (i1w + 1u) * 32u - b2;
+uint i1 = i1w % uint(WORDS);
+
+uint woff[2];
+for (uint e = 0u; e < 2u; ++e) {
+    uint i = 2u * p + e;
+    uint g = i >> 3;
+    uint ii = i & 3u;
+    uint r = (g % 4u) * 2u + (ii & 1u) + 8u * (ii >> 1);
+    uint c = g / 4u + 8u * ((i >> 2) & 1u);
+    woff[e] = r * uint(BN) + c;
+}
+
+uint xm = tid >> 4;
+uint xk = tid & 15u;
+uint tn0 = col0 / 16u;
+
+uint valid = (nrow >= 32u) ? 0xFFFFFFFFu : ((1u << nrow) - 1u);
+uint done = 0u;
+
+while (done != valid) {
+    uint pending = valid & ~done;
+    uint cur = 0u;
+    uint live = 0u;
+    bool found = false;
+    for (uint m = 0u; m < nrow; ++m) {
+        if (((pending >> m) & 1u) == 0u) {
+            continue;
+        }
+        if (!found) {
+            cur = e_sh[m];
+            found = true;
+        }
+        if (e_sh[m] == cur) {
+            live |= 1u << m;
+        }
+    }
+    done |= live;
+
+    bool expert_valid = cur < uint(E);
+    // This simdgroup's 8 rows are the unit of participation: the branch is
+    // simdgroup-uniform, and there are no barriers inside the product.
+    uint sg_live = (live >> (sg * 8u)) & 0xFFu;
+    bool sg_active = expert_valid && sg_live != 0u;
+
+    for (uint tk = 0u; tk < uint(TK); ++tk) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint q = 0u; q < uint(BM) * 16u / uint(NT); ++q) {
+            uint m = xm + q * (uint(NT) / 16u);
+            float v = 0.0f;
+            if (expert_valid && ((live >> m) & 1u) != 0u) {
+                v = xh[(row0 + m) * uint(IN) + tk * 16u + xk];
+            }
+            x_sh[xk * uint(XP) + m] = v;
+        }
+
+        for (uint q = 0u; q < uint(PAIRS) / uint(NT); ++q) {
+            uint tb = tb0 + q * (uint(NT) / 128u);
+            uint tn = tn0 + tb;
+
+            uint w1 = 0u;
+            if (expert_valid && tn < uint(TN)) {
+                const device uint* ecode = (const device uint*)(
+                    code + ulong(cur) * ulong(TK) * ulong(TN) * ulong(16 * K));
+                const device uint* tile =
+                    ecode + (tk * uint(TN) + tn) * uint(WORDS);
+
+                ulong bits = (ulong(tile[i0]) << 32) | ulong(tile[i1]);
+                w1 = uint(bits >> s1);
+
+                uint h0 = ((w1 >> uint(K)) & 0xFFFFu) * cb[0] + cb[1];
+                uint h1 = (w1 & 0xFFFFu) * cb[0] + cb[1];
+                half2 v0 = as_type<half2>((h0 & cb[2]) ^ cb[3]);
+                half2 v1 = as_type<half2>((h1 & cb[2]) ^ cb[3]);
+                w_sh[woff[0] + tb * 16u] =
+                    float(half(float(v0.x) + float(v0.y)));
+                w_sh[woff[1] + tb * 16u] =
+                    float(half(float(v1.x) + float(v1.y)));
+            } else {
+                w_sh[woff[0] + tb * 16u] = 0.0f;
+                w_sh[woff[1] + tb * 16u] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+            // x_sh is k-major: x_sh[k * XP + m]. The transposed fragment load
+            // with origin (m0 = sg*8, k0 = kk*2 + kh) yields A(m, k) — the
+            // (M x K) operand the MMA needs. w_sh is n-major, so B loads
+            // non-transposed as (K x N).
+            for (uint kk = 0u; kk < 8u; ++kk) {
+                for (uint kh = 0u; kh < 2u; ++kh) {
+                    simdgroup_matrix<float, 8, 8> a;
+                    // x_sh is k-major: the transposed load with origin
+                    // (col = sg*8 on the m axis, row = kk*2+kh on the k axis)
+                    // yields A(m, k) in fragment orientation.
+                    simdgroup_load(a, &x_sh[(kk * 2u + kh) * XP + sg * 8u],
+                                   ulong(XP), ulong2(sg * 8u, kk * 2u + kh), true);
+                    for (uint cb = 0u; cb < CB; ++cb) {
+                        simdgroup_matrix<float, 8, 8> b;
+                        simdgroup_load(b, &w_sh[(kk * 2u + kh) * BN + cb * 8u],
+                                       ulong(BN), ulong2(cb * 8u, kk * 2u + kh), false);
+                        simdgroup_multiply_accumulate(acc[cb], a, b, acc[cb]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+for (uint cb = 0u; cb < CB; ++cb) {
+    simdgroup_store(acc[cb], &dst[(row0 + sg * 8u) * uint(OUT) + col0 + cb * 8u],
+                    ulong(OUT), ulong2(0, 0), false);
+}
+"#;
+
+#[allow(unsafe_code, dead_code)]
+fn create_escha_qgemm_simd_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"xh", c"code", c"eids", c"cb"]);
+    let out_vec = cstr_vec(&[c"dst"]);
+    let source = CString::new(ESCHA_QGEMM_SIMD_SOURCE).unwrap_or_default();
+    #[allow(unsafe_code)]
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_eschamoe_gather_qgemm_simd".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+/// SIMD-mode gather QGEMM. Same contract as [`eschamoe_gather_qgemm`], but
+/// the output rows are padded up to the 32-row block and the returned array
+/// is a front slice of the padded buffer.
+pub fn eschamoe_gather_qgemm_simd(
+    xh: &Array,
+    code: &Array,
+    expert_ids: &Array,
+    spec: &EschaSpec,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let [mul, add, mask, xor] = crate::eschamoe::gpu_codebook(spec).ok_or_else(|| {
+        Exception::custom("eschamoe_gather_qgemm_simd: the codebook has no verified GPU decode")
+    })?;
+    let k = i32::try_from(spec.k).unwrap_or(0);
+    if !(1..=8).contains(&k) {
+        return Err(Exception::custom(format!(
+            "eschamoe_gather_qgemm_simd: K={k} out of range 1..=8"
+        )));
+    }
+    let (rows, tile_dims) =
+        check_gather_inputs(xh, code, expert_ids, spec, "eschamoe_gather_qgemm_simd")?;
+    let row_count = u32::try_from(rows)
+        .map_err(|_| Exception::custom("eschamoe_gather_qgemm_simd: negative row count"))?;
+    let rows_pad = ((rows + 31) / 32) * 32;
+    let row_count_pad = u32::try_from(rows_pad)
+        .map_err(|_| Exception::custom("eschamoe_gather_qgemm_simd: negative padded rows"))?;
+
+    let stream = Stream::task_local_or_default();
+    let cached = ESCHA_QGEMM_SIMD_KERNEL.get_or_init(|| CachedMetalKernel(create_escha_qgemm_simd_kernel()));
+    let out_shape = [rows_pad, spec.out_features];
+    let cb_arr = Array::from_slice(&[mul, add, mask, xor, row_count], &[5]);
+
+    #[allow(unsafe_code)]
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"E".as_ptr(),
+            spec.num_experts,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"K".as_ptr(),
+            k,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"TK".as_ptr(),
+            tile_dims[0],
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"TN".as_ptr(),
+            tile_dims[1],
+        );
+        let blocks_n = spec.out_features.div_euclid(128)
+            + i32::from(spec.out_features.rem_euclid(128) != 0);
+        let blocks_m = rows_pad.div_euclid(32);
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config,
+            blocks_n * 128,
+            blocks_m,
+            1,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
+
+        let input_ptrs = [
+            xh.as_ptr(),
+            code.as_ptr(),
+            expert_ids.as_ptr(),
+            cb_arr.as_ptr(),
+        ];
+        let inputs_vec = mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len());
+        let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+        let status = mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        );
+
+        let result = if status == 0 {
+            let mut out_ptr = mlx_sys::mlx_array_new();
+            let get_status = mlx_sys::mlx_vector_array_get(&raw mut out_ptr, outputs_vec, 0);
+            if get_status == 0 {
+                Ok(Array::from_ptr(out_ptr))
+            } else {
+                Err(Exception::custom(
+                    "eschamoe_gather_qgemm_simd: output read failed",
+                ))
+            }
+        } else {
+            Err(Exception::custom(
+                "eschamoe_gather_qgemm_simd failed: see prior logs",
+            ))
+        };
+
+        result.map(|padded| {
+            use mlx_rs::ops::indexing::IndexOp;
+            padded
+                .index((0..rows as i32, ..))
+        })
+    }
+}
+
 #[allow(unsafe_code, dead_code)]
 fn create_escha_qgemm_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let in_vec = cstr_vec(&[c"xh", c"code", c"eids", c"cb"]);
@@ -989,6 +1294,88 @@ fn create_escha_qgemm_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 
 #[allow(dead_code)]
 static ESCHA_QGEMM_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+/// Phase-1 bisect probe: minimal simdgroup fragment kernel. If this fails to
+/// compile or run, the simdgroup path through the fast-kernel wrapper is the
+/// problem — independent of the QGEMM logic.
+const QGEMM_SIMD_PROBE_SOURCE: &str = r"
+threadgroup float buf[64];
+uint tid = thread_index_in_threadgroup;
+if (tid < 64u) { buf[tid] = float(tid); }
+threadgroup_barrier(mem_flags::mem_threadgroup);
+simdgroup_matrix<float, 8, 8> a;
+simdgroup_matrix<float, 8, 8> b;
+simdgroup_load(a, buf, 8u, ulong2(0, 0), false);
+simdgroup_load(b, buf, 8u, ulong2(0, 0), false);
+simdgroup_matrix<float, 8, 8> c;
+simdgroup_multiply(c, a, b);
+simdgroup_store(c, dst, 8u, ulong2(0, 0), false);
+";
+
+#[test]
+fn simd_probe_matrix_ops_run() {
+    let _exec = crate::mlx_exec::acquire();
+    static P: OnceLock<CachedMetalKernel> = OnceLock::new();
+    let cached = P.get_or_init(|| CachedMetalKernel(create_qgemm_simd_probe()));
+    let stream = Stream::task_local_or_default();
+    let out_shape = [64i32, 1i32];
+    #[allow(unsafe_code)]
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 64, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
+        let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+        let status = mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            mlx_sys::mlx_vector_array_new(),
+            config,
+            stream.as_ptr(),
+        );
+        assert_eq!(status, 0, "kernel apply failed");
+        let mut out_ptr = mlx_sys::mlx_array_new();
+        assert_eq!(
+            mlx_sys::mlx_vector_array_get(&raw mut out_ptr, outputs_vec, 0),
+            0
+        );
+        let out = Array::from_ptr(out_ptr);
+        crate::mlx_exec::eval([&out]).unwrap();
+        // dst[63] = sum over k of buf[k] * buf[k (acc via a*b)] — every
+        // element of the 8x8 store holds sum(buf[i]*buf[j]) for the 8x8 tile;
+        // element (7,7) = sum(buf[56+..63]^2 pairs) — just assert non-trivial.
+        assert!(
+            out.as_slice::<f32>()[63] != 0.0 || out.as_slice::<f32>()[0] != 0.0,
+            "probe produced all-zero output"
+        );
+    }
+}
+
+#[allow(unsafe_code, dead_code)]
+fn create_qgemm_simd_probe() -> mlx_sys::mlx_fast_metal_kernel {
+    let out_vec = cstr_vec(&[c"dst"]);
+    let source = CString::new(QGEMM_SIMD_PROBE_SOURCE).unwrap_or_default();
+    #[allow(unsafe_code)]
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_qgemm_simd_probe".as_ptr(),
+            cstr_vec(&[]),
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+static ESCHA_QGEMM_SIMD_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
 /// Multiply a block of activation rows with selected expert trellis weights.
 ///
