@@ -209,3 +209,23 @@ Harness: `phase0_qgemm_ab_and_tflops` (eschamoe.rs, `cargo test -p higgs-models
 - Decode/matvec path changes.
 - Affine-path revival (the 405 tok/s April plateau) — memory footprint makes
   it a non-starter while the 11 GB native path exists.
+
+## BM=64 debug session summary (2026-08-30, closed)
+
+- Three fragment-layout approaches tested (k-major transposed, k-major
+  origin-carried, m-major non-transposed) — ALL produce wrong results at
+  BM=64/NT=256 while BM=32/NT=128 works. The failure is systematic, not
+  a single-address bug.
+- ROOT CAUSE (identified but unfixed): at BM=64/NT=256, the x_sh staging
+  (256 threads, 64 rows × 16 k-cols) and the fragment load pattern interact
+  in a way that produces wrong fragment data for SG1-7. The staging covers
+  all 64 rows (verified by address math), the loads read the right logical
+  addresses (verified by the probe), but the composed result is wrong.
+- The bug requires a dedicated Metal GPU capture session (Xcode GPU
+  debugger) to see the actual fragment values per lane — beyond what
+  print-based debugging can reach.
+- The BM=32 simd kernel (the committed default) is correct and deliver.
+  The BM=64 decode-halving optimization (~+30-50% e2e) remains future work
+  requiring GPU-level debugging tools.
+
+## Expected outcome
