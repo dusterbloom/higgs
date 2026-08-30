@@ -167,7 +167,15 @@ Harness: `phase0_qgemm_ab_and_tflops` (eschamoe.rs, `cargo test -p higgs-models
   for a 3B-active MoE incl. decode — respectable; the MLX 3.1 TF/s figure is
   a pure dense GEMM with no decode or dispatch.
 
-## Expected outcome
+## BM=64 experiment (2026-08-30 night) — REVERTED, root-caused to SG gating
+
+- BM=64/NT=256 (8 simdgroups): rows 0-7 correct, rows 8+ zero. Reverted to
+  the working BM=32 state (kept in git history at a2f8c169d).
+- The 64-row decode-once lever remains valid; the bug is in the SG gating or
+  staging at 256 threads (every SG should have been live — all rows expert 0).
+  Debug entry point: per-SG dump of sg_live/live/acc at the store site.
+- Perf note: even with the bug, correctness rows 0-7 matched — the fragment
+  flow scales; only the gating/distribution at 8 SGs is broken.
 
 - Kernel: 1.4 → **2.4–3.0 TFLOP/s** (MLX parity class on this chip).
 - e2e prefill: 135 → **~250–300 tok/s** at Low Power; ~350–400 with sorted-MoE
