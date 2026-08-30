@@ -1117,14 +1117,13 @@ while (done != valid) {
             for (uint kf = 0u; kf < 2u; ++kf) {
                 simdgroup_matrix<float, 8, 8> a;
                 // x_sh is k-major: the transposed fragment load with base at
-                // (k0 = kf*8, m0 = sg*8) yields A(i,j) = act(m0+i, k0+j).
-                simdgroup_load(a, &x_sh[(kf * 8u) * XP + sg * 8u],
-                               ulong(XP), ulong2(0, 0), true);
+                // (k0 = kf*8, m0 = sg*SGR) yields A(i,j) = act(m0+i, k0+j).
+                simdgroup_load(a, &x_sh[sg * SGR],
+                               ulong(XP), ulong2(0, kf * 8u), true);
                 for (uint cb = 0u; cb < CB; ++cb) {
-                    if (kf == 1u) { continue; }  // DEBUG: kf=0-only bisection
                     simdgroup_matrix<float, 8, 8> b;
-                    simdgroup_load(b, &w_sh[(kf * 8u) * BN + cb * 8u],
-                                   ulong(BN), ulong2(0, 0), false);
+                    simdgroup_load(b, &w_sh[cb * 8u],
+                                   ulong(BN), ulong2(0, kf * 8u), false);
                     simdgroup_multiply_accumulate(acc[cb], a, b, acc[cb]);
                 }
             }
@@ -1306,14 +1305,17 @@ uint tid = thread_index_in_threadgroup;
 // 16x16 tile, element (row=k, col=m) = k*16+m
 if (tid < 256u) { buf[tid] = float(tid / 16u * 16u + tid % 16u); }
 threadgroup_barrier(mem_flags::mem_threadgroup);
-// Mirror the simd QGEMM: transposed load at m-base sg*8, k-base kf*8,
-// one 8-deep k fragment (kf=0).
+// Two candidate forms for the A-frag (m,k) load at m0 = sg*8, k0 = 0:
+// form A: base-folded (src = &x_sh[k0*XP + m0], origin 0, tr=true)
+// form B: origin-carried (src = &x_sh[m0], origin = ulong2(0, k0), tr=true)
 uint sg = tid / 32u;
 uint m0 = sg * 8u;
-ulong k0 = 0ul;
-simdgroup_matrix<float, 8, 8> a;
-simdgroup_load(a, &buf[k0 * 16u + m0], 16u, ulong2(0, 0), true);
-simdgroup_store(a, &dst[sg * 64u], 8u, ulong2(0, 0), false);
+simdgroup_matrix<float, 8, 8> fa;
+simdgroup_load(fa, &buf[m0], 16u, ulong2(0, 0), true);
+simdgroup_store(fa, &dst[sg * 64u], 8u, ulong2(0, 0), false);
+simdgroup_matrix<float, 8, 8> fb;
+simdgroup_load(fb, &buf[m0], 16u, ulong2(0, 0), true);
+simdgroup_store(fb, &dst[sg * 64u + 32u], 8u, ulong2(0, 0), false);
 ";
 
 #[test]
