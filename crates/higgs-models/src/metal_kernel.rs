@@ -1117,11 +1117,11 @@ while (done != valid) {
                     // (col = sg*8 on the m axis, row = kk*2+kh on the k axis)
                     // yields A(m, k) in fragment orientation.
                     simdgroup_load(a, &x_sh[(kk * 2u + kh) * XP + sg * 8u],
-                                   ulong(XP), ulong2(sg * 8u, kk * 2u + kh), true);
+                                   ulong(XP), ulong2(0, 0), true);
                     for (uint cb = 0u; cb < CB; ++cb) {
                         simdgroup_matrix<float, 8, 8> b;
                         simdgroup_load(b, &w_sh[(kk * 2u + kh) * BN + cb * 8u],
-                                       ulong(BN), ulong2(cb * 8u, kk * 2u + kh), false);
+                                       ulong(BN), ulong2(0, 0), false);
                         simdgroup_multiply_accumulate(acc[cb], a, b, acc[cb]);
                     }
                 }
@@ -1353,6 +1353,94 @@ fn simd_probe_matrix_ops_run() {
             out.as_slice::<f32>()[63] != 0.0 || out.as_slice::<f32>()[0] != 0.0,
             "probe produced all-zero output"
         );
+    }
+}
+
+/// Empirical semantics dump: loads buf (8x8, ld=8, buf[i*8+j]=i*10+j) under
+/// a given (transpose, origin) and stores the fragment row-major. Prints the
+/// 64 values so the host can derive Metal's exact orientation convention.
+const QGEMM_SEMANTICS_SOURCE: &str = r"
+threadgroup float buf[64];
+uint tid = thread_index_in_threadgroup;
+if (tid < 64u) { buf[tid] = float(tid / 8u * 10u + tid % 8u); }
+threadgroup_barrier(mem_flags::mem_threadgroup);
+simdgroup_matrix<float, 8, 8> a;
+simdgroup_load(a, buf, 8u, ulong2(cb_ox, cb_oy), bool(cb_tr));
+simdgroup_store(a, dst, 8u, ulong2(0, 0), false);
+";
+
+#[test]
+fn simd_semantics_dump() {
+    for (tr, ox, oy) in [(false, 0u32, 0u32), (true, 0u32, 0u32), (true, 4u32, 2u32)] {
+        let _exec = crate::mlx_exec::acquire();
+        let cached = {
+            let _in_vec = cstr_vec(&[]);
+            let out_vec = cstr_vec(&[c"dst"]);
+            let source = CString::new(
+                QGEMM_SEMANTICS_SOURCE
+                    .replace("cb_ox", "0")
+                    .replace("cb_oy", "0")
+                    .replace("cb_tr", "0"),
+            )
+            .unwrap();
+            let src2 = format!(
+                "{}",
+                QGEMM_SEMANTICS_SOURCE
+                    .replace("cb_ox", &ox.to_string())
+                    .replace("cb_oy", &oy.to_string())
+                    .replace("cb_tr", &tr.to_string())
+            );
+            let _ = source;
+            #[allow(unsafe_code)]
+            unsafe {
+                let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+                    c"higgs_qgemm_semantics".as_ptr(),
+                    cstr_vec(&[]),
+                    out_vec,
+                    CString::new(src2).unwrap().as_ptr(),
+                    c"".as_ptr(),
+                    true,
+                    false,
+                );
+                mlx_sys::mlx_vector_string_free(out_vec);
+                CachedMetalKernel(kernel)
+            }
+        };
+        let stream = Stream::task_local_or_default();
+        let out_shape = [64i32, 1i32];
+        #[allow(unsafe_code)]
+        unsafe {
+            let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+            mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 64, 1, 1);
+            mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+            mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+                config,
+                out_shape.as_ptr(),
+                out_shape.len(),
+                mlx_sys::mlx_dtype__MLX_FLOAT32,
+            );
+            let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+            let status = mlx_sys::mlx_fast_metal_kernel_apply(
+                &raw mut outputs_vec,
+                cached.0,
+                mlx_sys::mlx_vector_array_new(),
+                config,
+                stream.as_ptr(),
+            );
+            assert_eq!(status, 0, "apply failed tr={tr} ox={ox} oy={oy}");
+            let mut out_ptr = mlx_sys::mlx_array_new();
+            assert_eq!(
+                mlx_sys::mlx_vector_array_get(&raw mut out_ptr, outputs_vec, 0),
+                0
+            );
+            let out = Array::from_ptr(out_ptr);
+            crate::mlx_exec::eval([&out]).unwrap();
+            let vals = out.as_slice::<f32>().to_vec();
+            println!(
+                "tr={tr} ox={ox} oy={oy}: {}",
+                vals.iter().map(|v| format!("{}", *v as u32)).collect::<Vec<_>>().join(",")
+            );
+        }
     }
 }
 

@@ -113,6 +113,25 @@ Harness: `phase0_qgemm_ab_and_tflops` (eschamoe.rs, `cargo test -p higgs-models
   not the repeated decode). Phase 1 must beat this baseline with SORTED ids
   as well as unsorted.
 
+## Phase 1 status (2026-08-30 evening) — IN PROGRESS
+
+- simd kernel implemented (ESCHA_QGEMM_SIMD_SOURCE): verbatim decode/staging,
+  row-sliced simdgroups (sg owns 8 rows x 128 cols), transposed A-frag load
+  from k-major x_sh, ulong2 origins, padded dst + front slice,
+  HIGGS_ESCHA_QGEMM_SIMD=1 selection.
+- Empirical semantics probe (simd_semantics_dump): transpose + origin
+  semantics verified — transposed frag(i,j) = src[(oy+j)*ld + ox+i].
+- BUG FOUND, NOT YET FIXED: simd vs scalar diverges (rel 6.58, simd values
+  ~6x too large). Loads verified correct in isolation (probe passes).
+  Localized suspects: (a) pass-accumulation across expert passes (acc frags
+  accumulate tk-steps inside every pass — verify non-member zero-staging
+  actually zeroes the A side for simdgroup-owned rows), (b) whether
+  origin(0,0)+base-offset A loads alias w_sh-style strides incorrectly for
+  the transposed path when ld != frag-row-multiple.
+- NEXT: single-expert isolation test (rows=32, all expert 0, k=16 single
+  tile row) — dump the 8x8 A fragment per lane vs scalar decode. Then
+  re-enable multi-expert.
+
 ## Expected outcome
 
 - Kernel: 1.4 → **2.4–3.0 TFLOP/s** (MLX parity class on this chip).
