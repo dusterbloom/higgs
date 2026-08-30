@@ -851,13 +851,13 @@ uint tn0 = col0 / 16u;
 
 // The expert walk. Every thread reads the same e_sh and derives the same
 // mask, so the pass count is uniform across the threadgroup.
-uint valid = (nrow >= 32u) ? 0xFFFFFFFFu : ((1u << nrow) - 1u);
-uint done = 0u;
+ulong valid = (nrow >= 64u) ? 0xFFFFFFFFFFFFFFFFul : ((1ul << nrow) - 1ul);
+ulong done = 0ul;
 
 while (done != valid) {
-    uint pending = valid & ~done;
+    ulong pending = valid & ~done;
     uint cur = 0u;
-    uint live = 0u;
+    ulong live = 0ul;
     bool found = false;
     for (uint m = 0u; m < nrow; ++m) {
         if (((pending >> m) & 1u) == 0u) {
@@ -868,7 +868,7 @@ while (done != valid) {
             found = true;
         }
         if (e_sh[m] == cur) {
-            live |= 1u << m;
+            live |= 1ul << m;
         }
     }
     done |= live;
@@ -1036,13 +1036,13 @@ uint xm = tid >> 4;
 uint xk = tid & 15u;
 uint tn0 = col0 / 16u;
 
-uint valid = (nrow >= 32u) ? 0xFFFFFFFFu : ((1u << nrow) - 1u);
-uint done = 0u;
+ulong valid = (nrow >= 64u) ? 0xFFFFFFFFFFFFFFFFul : ((1ul << nrow) - 1ul);
+ulong done = 0ul;
 
 while (done != valid) {
-    uint pending = valid & ~done;
+    ulong pending = valid & ~done;
     uint cur = 0u;
-    uint live = 0u;
+    ulong live = 0ul;
     bool found = false;
     for (uint m = 0u; m < nrow; ++m) {
         if (((pending >> m) & 1u) == 0u) {
@@ -1053,7 +1053,7 @@ while (done != valid) {
             found = true;
         }
         if (e_sh[m] == cur) {
-            live |= 1u << m;
+            live |= 1ul << m;
         }
     }
     done |= live;
@@ -1104,6 +1104,19 @@ while (done != valid) {
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#ifdef ESCHA_DEBUG_DUMP_XSH
+        // Debug: store x_sh to dst after staging (before product).
+        // dst layout: dst[tk * 16 * XP + xk * XP + m] = x_sh[xk * XP + m]
+        for (uint q = 0u; q < uint(BM) * 16u / uint(NT); ++q) {
+            uint m = xm + q * (uint(NT) / 16u);
+            uint k_idx = xk;
+            float v = x_sh[xk * uint(XP) + m];
+            dst[(tk * 16u + k_idx) * uint(XP) + m] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        continue;
+#endif
 
         if (sg_active) {
             // x_sh is k-major: x_sh[k * XP + m]. The transposed fragment load
