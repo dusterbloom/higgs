@@ -1805,9 +1805,16 @@ mod tests {
             "qgemm diverges from the scratch reference: rel {rel:.2e}"
         );
 
-        // ---- Timing: production dims, mixed experts, median of ITERS ----
+        // ---- Timing: production dims, median of ITERS. Two id patterns:
+        // unsorted cycling (worst-case pass count) and sorted grouping
+        // (production sorts by expert — pass count collapses). ----
         for &rows in &ROW_SET {
-            let ids_data: Vec<u32> = (0..rows as u32).map(|i| i % EXPERTS as u32).collect();
+            for sorted in [false, true] {
+            let mut ids_data: Vec<u32> = (0..rows as u32).map(|i| i % EXPERTS as u32).collect();
+            if sorted {
+                ids_data.sort_unstable();
+            }
+            let tag = if sorted { "sorted" } else { "mixed  " };
             let x_data: Vec<f32> =
                 (0..(rows * IN) as usize).map(|i| (i % 13) as f32 - 6.0).collect();
             let x = Array::from_slice(&x_data, &[rows, IN]);
@@ -1830,12 +1837,13 @@ mod tests {
             let gemm_s = time_path(true);
             let flops = 2.0 * rows as f64 * IN as f64 * OUT as f64;
             println!(
-                "rows={rows}: scratch {:.1} ms ({:.0} GFLOP/s) | qgemm {:.1} ms ({:.0} GFLOP/s)",
+                "rows={rows} {tag}: scratch {:.1} ms ({:.0} GFLOP/s) | qgemm {:.1} ms ({:.0} GFLOP/s)",
                 scratch_s * 1e3,
                 flops / scratch_s / 1e9,
                 gemm_s * 1e3,
                 flops / gemm_s / 1e9,
             );
+            }
         }
     }
 

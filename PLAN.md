@@ -132,6 +132,25 @@ Harness: `phase0_qgemm_ab_and_tflops` (eschamoe.rs, `cargo test -p higgs-models
   tile row) — dump the 8x8 A fragment per lane vs scalar decode. Then
   re-enable multi-expert.
 
+## Phase 1 results (2026-08-30 late) — CORRECT, MARGINAL PERF
+
+- Fix: the k-walk created 16 overlapping 8-deep fragment accumulations
+  (per-row origins instead of 2 disjoint fragments). After the two-disjoint-
+  fragment fix, simd == scalar agreement (rel 2.16e-4, same as scalar vs
+  scratch).
+- Kernel timing, sorted ids (production pattern): scalar 148 / 524 / 736
+  GFLOP/s at 512 / 2048 / 8192 rows vs simd 143 / 551 / 818 — simd edges
+  ahead at scale (+5-11%), neutral at 512 rows.
+- e2e (bench_frontier, SIMD=1): 97.5 / 93.8 tok/s vs baseline 94.1 / 96.8 —
+  within noise. The expert gather is a minority of full-model prefill;
+  the plateau is set by attention + dense + KV paths.
+- Verdict: simd path is correct and the better kernel at scale. Keep it
+  opt-in (HIGGS_ESCHA_QGEMM_SIMD=1) until it matters; flipping the default
+  is free of risk but also of measurable gain today.
+- Phase 2 geometry sweep: deprioritized — the SMEM budget (10.7 KB/TG, 3 TG
+  limit) caps geometry moves, and e2e is not gather-bound. The real prefill
+  levers are elsewhere (attention path, KV writes).
+
 ## Expected outcome
 
 - Kernel: 1.4 → **2.4–3.0 TFLOP/s** (MLX parity class on this chip).

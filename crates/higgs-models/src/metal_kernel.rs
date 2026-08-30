@@ -1110,20 +1110,20 @@ while (done != valid) {
             // with origin (m0 = sg*8, k0 = kk*2 + kh) yields A(m, k) — the
             // (M x K) operand the MMA needs. w_sh is n-major, so B loads
             // non-transposed as (K x N).
-            for (uint kk = 0u; kk < 8u; ++kk) {
-                for (uint kh = 0u; kh < 2u; ++kh) {
-                    simdgroup_matrix<float, 8, 8> a;
-                    // x_sh is k-major: the transposed load with origin
-                    // (col = sg*8 on the m axis, row = kk*2+kh on the k axis)
-                    // yields A(m, k) in fragment orientation.
-                    simdgroup_load(a, &x_sh[(kk * 2u + kh) * XP + sg * 8u],
-                                   ulong(XP), ulong2(0, 0), true);
-                    for (uint cb = 0u; cb < CB; ++cb) {
-                        simdgroup_matrix<float, 8, 8> b;
-                        simdgroup_load(b, &w_sh[(kk * 2u + kh) * BN + cb * 8u],
-                                       ulong(BN), ulong2(0, 0), false);
-                        simdgroup_multiply_accumulate(acc[cb], a, b, acc[cb]);
-                    }
+            // non-transposed as (K x N). The 16-deep tile step is TWO
+            // disjoint 8-row fragments (kf 0..2); the earlier per-row origin
+            // walk produced 16 overlapping accumulations — the ~6x inflation.
+            for (uint kf = 0u; kf < 2u; ++kf) {
+                simdgroup_matrix<float, 8, 8> a;
+                // x_sh is k-major: the transposed fragment load with base at
+                // (k0 = kf*8, m0 = sg*8) yields A(i,j) = act(m0+i, k0+j).
+                simdgroup_load(a, &x_sh[(kf * 8u) * XP + sg * 8u],
+                               ulong(XP), ulong2(0, 0), true);
+                for (uint cb = 0u; cb < CB; ++cb) {
+                    simdgroup_matrix<float, 8, 8> b;
+                    simdgroup_load(b, &w_sh[(kf * 8u) * BN + cb * 8u],
+                                   ulong(BN), ulong2(0, 0), false);
+                    simdgroup_multiply_accumulate(acc[cb], a, b, acc[cb]);
                 }
             }
         }
