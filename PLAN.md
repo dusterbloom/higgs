@@ -174,6 +174,14 @@ Harness: `phase0_qgemm_ab_and_tflops` (eschamoe.rs, `cargo test -p higgs-models
 - The 64-row decode-once lever remains valid; the bug is in the SG gating or
   staging at 256 threads (every SG should have been live — all rows expert 0).
   Debug entry point: per-SG dump of sg_live/live/acc at the store site.
+
+  UPDATE (session end, bb425bc6+): gate exonerated — rows 8+ stay zero with
+  the gate removed. SG0 (rows 0-7, incl. its kf=1 fragment at base +8*XP)
+  is always correct; SG1+ (base &x_sh[kf*8*XP + 8], transposed load) read
+  zeros. The debug print was lost in a cleanup pass — RE-ADD it (per-row
+  scratch vs gemm sums) before the next iteration. FIRST MOVE: kf=0-only
+  build (skip the kf=1 A/B loads) — if rows 8+ then hold kf=0 half-sums,
+  the loads work and the kf=1 A-frag read is the culprit.
 - Perf note: even with the bug, correctness rows 0-7 matched — the fragment
   flow scales; only the gating/distribution at 8 SGs is broken.
 
