@@ -391,7 +391,7 @@ pub fn eschamoe_dequant_tiles(code: &Array, spec: &EschaSpec) -> Result<Array, E
         // One threadgroup of 128 threads decodes one tile. The grid gives
         // the total thread count on each axis.
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 128, expected[1], expected[0]);
-        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1);
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
             out_shape.as_ptr(),
@@ -666,7 +666,7 @@ pub fn eschamoe_gather_qmv(
         // output element. The grid gives total thread counts.
         let groups_x = (spec.out_features + 3) / 4;
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, groups_x * 128, rows, 1);
-        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1);
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
             out_shape.as_ptr(),
@@ -851,13 +851,13 @@ uint tn0 = col0 / 16u;
 
 // The expert walk. Every thread reads the same e_sh and derives the same
 // mask, so the pass count is uniform across the threadgroup.
-ulong valid = (nrow >= 64u) ? 0xFFFFFFFFFFFFFFFFul : ((1ul << nrow) - 1ul);
-ulong done = 0ul;
+uint valid = (nrow >= 32u) ? 0xFFFFFFFFu : ((1u << nrow) - 1u);
+uint done = 0u;
 
 while (done != valid) {
-    ulong pending = valid & ~done;
+    uint pending = valid & ~done;
     uint cur = 0u;
-    ulong live = 0ul;
+    uint live = 0u;
     bool found = false;
     for (uint m = 0u; m < nrow; ++m) {
         if (((pending >> m) & 1u) == 0u) {
@@ -868,7 +868,7 @@ while (done != valid) {
             found = true;
         }
         if (e_sh[m] == cur) {
-            live |= 1ul << m;
+            live |= 1u << m;
         }
     }
     done |= live;
@@ -973,12 +973,11 @@ for (uint i = 0u; i < uint(RM); ++i) {
 /// simdgroup_load, and the output block is written with unpredicated
 /// simdgroup_store — the caller allocates rows rounded up to BM and slices.
 const ESCHA_QGEMM_SIMD_SOURCE: &str = r#"
-constexpr int NT = 256;         // threads in the threadgroup (8 simdgroups)
-constexpr int BM = 64;          // rows in a block (one expert run: decode once)
+constexpr int NT = 128;         // threads in the threadgroup
+constexpr int BM = 32;          // rows in a block
 constexpr int TNB = 8;          // tile columns in a block
 constexpr int BN = 16 * TNB;    // output columns in a block
-constexpr int XP = 72;          // activation stride, 8-aligned for fragment loads
-constexpr int SGR = 8;          // rows per simdgroup (BM / 8 simdgroups)
+constexpr int XP = 40;          // activation stride, 8-aligned for fragment loads
 constexpr int CB = BN / 8;      // 8x8 column fragments across the block
 constexpr int WORDS = 8 * K;    // 32-bit words in one packed tile
 constexpr int IN = TK * 16;
@@ -1037,13 +1036,13 @@ uint xm = tid >> 4;
 uint xk = tid & 15u;
 uint tn0 = col0 / 16u;
 
-ulong valid = (nrow >= 64u) ? 0xFFFFFFFFFFFFFFFFul : ((1ul << nrow) - 1ul);
-ulong done = 0ul;
+uint valid = (nrow >= 32u) ? 0xFFFFFFFFu : ((1u << nrow) - 1u);
+uint done = 0u;
 
 while (done != valid) {
-    ulong pending = valid & ~done;
+    uint pending = valid & ~done;
     uint cur = 0u;
-    ulong live = 0ul;
+    uint live = 0u;
     bool found = false;
     for (uint m = 0u; m < nrow; ++m) {
         if (((pending >> m) & 1u) == 0u) {
@@ -1054,16 +1053,16 @@ while (done != valid) {
             found = true;
         }
         if (e_sh[m] == cur) {
-            live |= 1ul << m;
+            live |= 1u << m;
         }
     }
     done |= live;
 
     bool expert_valid = cur < uint(E);
-    // NO per-simdgroup activity gate: zero-staged rows make a pass contribute
-    // nothing for non-member rows, so the MMA is always safe to run. A gate
-    // that misfires (SG1-7 here) silently zeroed rows 8-63 instead of failing
-    // loudly. expert_valid still guards the decode below.
+    // This simdgroup's 8 rows are the unit of participation: the branch is
+    // simdgroup-uniform, and there are no barriers inside the product.
+    uint sg_live = (live >> (sg * 8u)) & 0xFFu;
+    bool sg_active = expert_valid && sg_live != 0u;
 
     for (uint tk = 0u; tk < uint(TK); ++tk) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1106,7 +1105,7 @@ while (done != valid) {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        {
+        if (sg_active) {
             // x_sh is k-major: x_sh[k * XP + m]. The transposed fragment load
             // with origin (m0 = sg*8, k0 = kk*2 + kh) yields A(m, k) — the
             // (M x K) operand the MMA needs. w_sh is n-major, so B loads
@@ -1117,13 +1116,13 @@ while (done != valid) {
             for (uint kf = 0u; kf < 2u; ++kf) {
                 simdgroup_matrix<float, 8, 8> a;
                 // x_sh is k-major: the transposed fragment load with base at
-                // (k0 = kf*8, m0 = sg*SGR) yields A(i,j) = act(m0+i, k0+j).
-                simdgroup_load(a, &x_sh[sg * SGR],
-                               ulong(XP), ulong2(0, kf * 8u), true);
+                // (k0 = kf*8, m0 = sg*8) yields A(i,j) = act(m0+i, k0+j).
+                simdgroup_load(a, &x_sh[(kf * 8u) * XP + sg * 8u],
+                               ulong(XP), ulong2(0, 0), true);
                 for (uint cb = 0u; cb < CB; ++cb) {
                     simdgroup_matrix<float, 8, 8> b;
-                    simdgroup_load(b, &w_sh[cb * 8u],
-                                   ulong(BN), ulong2(0, kf * 8u), false);
+                    simdgroup_load(b, &w_sh[(kf * 8u) * BN + cb * 8u],
+                                   ulong(BN), ulong2(0, 0), false);
                     simdgroup_multiply_accumulate(acc[cb], a, b, acc[cb]);
                 }
             }
@@ -1183,7 +1182,7 @@ pub fn eschamoe_gather_qgemm_simd(
         check_gather_inputs(xh, code, expert_ids, spec, "eschamoe_gather_qgemm_simd")?;
     let row_count = u32::try_from(rows)
         .map_err(|_| Exception::custom("eschamoe_gather_qgemm_simd: negative row count"))?;
-    let rows_pad = ((rows + 63) / 64) * 64;
+    let rows_pad = ((rows + 31) / 32) * 32;
     let row_count_pad = u32::try_from(rows_pad)
         .map_err(|_| Exception::custom("eschamoe_gather_qgemm_simd: negative padded rows"))?;
 
@@ -1217,14 +1216,14 @@ pub fn eschamoe_gather_qgemm_simd(
         );
         let blocks_n = spec.out_features.div_euclid(128)
             + i32::from(spec.out_features.rem_euclid(128) != 0);
-        let blocks_m = rows_pad.div_euclid(64);
+        let blocks_m = rows_pad.div_euclid(32);
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(
             config,
             blocks_n * 128,
             blocks_m,
             1,
         );
-        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1);
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
             out_shape.as_ptr(),
@@ -1300,22 +1299,17 @@ static ESCHA_QGEMM_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 /// compile or run, the simdgroup path through the fast-kernel wrapper is the
 /// problem — independent of the QGEMM logic.
 const QGEMM_SIMD_PROBE_SOURCE: &str = r"
-threadgroup float buf[256];
+threadgroup float buf[64];
 uint tid = thread_index_in_threadgroup;
-// 16x16 tile, element (row=k, col=m) = k*16+m
-if (tid < 256u) { buf[tid] = float(tid / 16u * 16u + tid % 16u); }
+if (tid < 64u) { buf[tid] = float(tid); }
 threadgroup_barrier(mem_flags::mem_threadgroup);
-// Two candidate forms for the A-frag (m,k) load at m0 = sg*8, k0 = 0:
-// form A: base-folded (src = &x_sh[k0*XP + m0], origin 0, tr=true)
-// form B: origin-carried (src = &x_sh[m0], origin = ulong2(0, k0), tr=true)
-uint sg = tid / 32u;
-uint m0 = sg * 8u;
-simdgroup_matrix<float, 8, 8> fa;
-simdgroup_load(fa, &buf[m0], 16u, ulong2(0, 0), true);
-simdgroup_store(fa, &dst[sg * 64u], 8u, ulong2(0, 0), false);
-simdgroup_matrix<float, 8, 8> fb;
-simdgroup_load(fb, &buf[m0], 16u, ulong2(0, 0), true);
-simdgroup_store(fb, &dst[sg * 64u + 32u], 8u, ulong2(0, 0), false);
+simdgroup_matrix<float, 8, 8> a;
+simdgroup_matrix<float, 8, 8> b;
+simdgroup_load(a, buf, 8u, ulong2(0, 0), false);
+simdgroup_load(b, buf, 8u, ulong2(0, 0), false);
+simdgroup_matrix<float, 8, 8> c;
+simdgroup_multiply(c, a, b);
+simdgroup_store(c, dst, 8u, ulong2(0, 0), false);
 ";
 
 #[test]
@@ -1324,12 +1318,12 @@ fn simd_probe_matrix_ops_run() {
     static P: OnceLock<CachedMetalKernel> = OnceLock::new();
     let cached = P.get_or_init(|| CachedMetalKernel(create_qgemm_simd_probe()));
     let stream = Stream::task_local_or_default();
-    let out_shape = [512i32, 1i32];
+    let out_shape = [64i32, 1i32];
     #[allow(unsafe_code)]
     unsafe {
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
-        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 256, 1, 1);
-        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 64, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
             out_shape.as_ptr(),
@@ -1352,13 +1346,13 @@ fn simd_probe_matrix_ops_run() {
         );
         let out = Array::from_ptr(out_ptr);
         crate::mlx_exec::eval([&out]).unwrap();
-        for sg in 0..8 {
-            print!("SG{sg}: ");
-            for e in 0..16 {
-                print!("{}, ", out.as_slice::<f32>()[sg * 64 + e] as u32);
-            }
-            println!();
-        }
+        // dst[63] = sum over k of buf[k] * buf[k (acc via a*b)] — every
+        // element of the 8x8 store holds sum(buf[i]*buf[j]) for the 8x8 tile;
+        // element (7,7) = sum(buf[56+..63]^2 pairs) — just assert non-trivial.
+        assert!(
+            out.as_slice::<f32>()[63] != 0.0 || out.as_slice::<f32>()[0] != 0.0,
+            "probe produced all-zero output"
+        );
     }
 }
 
