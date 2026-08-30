@@ -1800,6 +1800,18 @@ mod tests {
         println!(
             "path agreement ({C_ROWS}x{C_IN}x{C_OUT}): max_abs {max_abs:.5} on scale {max_scale:.1} -> rel {rel:.2e}"
         );
+        for row in 0..C_ROWS as usize {
+            let s_row: f32 = scratch_h[row * C_OUT as usize..(row + 1) * C_OUT as usize]
+                .iter()
+                .sum();
+            let g_row: f32 = gemm_h[row * C_OUT as usize..(row + 1) * C_OUT as usize]
+                .iter()
+                .sum();
+            println!(
+                "row {row} (expert {}): scratch_sum {s_row:.3} gemm_sum {g_row:.3}",
+                row / 64
+            );
+        }
         assert!(
             rel < 1e-3,
             "qgemm diverges from the scratch reference: rel {rel:.2e}"

@@ -1121,6 +1121,7 @@ while (done != valid) {
                 simdgroup_load(a, &x_sh[(kf * 8u) * XP + sg * 8u],
                                ulong(XP), ulong2(0, 0), true);
                 for (uint cb = 0u; cb < CB; ++cb) {
+                    if (kf == 1u) { continue; }  // DEBUG: kf=0-only bisection
                     simdgroup_matrix<float, 8, 8> b;
                     simdgroup_load(b, &w_sh[(kf * 8u) * BN + cb * 8u],
                                    ulong(BN), ulong2(0, 0), false);
