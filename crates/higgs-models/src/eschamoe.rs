@@ -1417,12 +1417,12 @@ pub fn trellis_gemm_mode() -> bool {
     *MODE.get_or_init(|| std::env::var("HIGGS_ESCHA_TRELLIS_GEMM").is_ok_and(|v| v == "1"))
 }
 
-/// Select the simdgroup fragment variant of the gather QGEMM kernel
-/// (`HIGGS_ESCHA_QGEMM_SIMD=1`). The scalar kernel stays the default until
-/// the Phase-1 measurements promote the simdgroup path.
+/// Select the gather QGEMM kernel variant. Default: simdgroup fragments
+/// (correct, faster at scale). `HIGGS_ESCHA_QGEMM_SIMD=0` falls back to the
+/// scalar kernel for A/B comparisons.
 pub fn qgemm_simd_mode() -> bool {
     static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| std::env::var("HIGGS_ESCHA_QGEMM_SIMD").is_ok_and(|v| v == "1"))
+    *MODE.get_or_init(|| !std::env::var("HIGGS_ESCHA_QGEMM_SIMD").is_ok_and(|v| v == "0"))
 }
 
 /// The tensor list and the native expert weights of one conversion.

@@ -151,6 +151,22 @@ Harness: `phase0_qgemm_ab_and_tflops` (eschamoe.rs, `cargo test -p higgs-models
   limit) caps geometry moves, and e2e is not gather-bound. The real prefill
   levers are elsewhere (attention path, KV writes).
 
+## Default flipped + GFLOP/s attribution (2026-08-30)
+
+- simd is now the DEFAULT kernel; HIGGS_ESCHA_QGEMM_SIMD=0 falls back to
+  scalar. e2e confirmed: 92.5 tok/s @ 2K (noise band 92-97).
+- Attribution at sorted-8192 (68.7 GFLOP, 77 ms measured): total decode =
+  1.07 G element-decodes across 2048 threadgroups = ~13.9 G elem/s, filling
+  ~55 ms of the window; pure MMA at MLX-class 3.1 TF/s = ~22 ms. DECODE
+  dominates ~72/28.
+- Levers, ranked: (1) halve row-block decode duplication (BM=64 expert-run
+  grouping — decode per expert-col-slice drops 2x); (2) fused
+  decode-into-register MMA (drops the w_sh round trip entirely — bigger
+  rewrite); (3) f16 w_sh (SMEM traffic, measured-worse before — retest under
+  the new balance). Absolute standing: 890 GFLOP/s at Low Power on a base M4
+  for a 3B-active MoE incl. decode — respectable; the MLX 3.1 TF/s figure is
+  a pure dense GEMM with no decode or dispatch.
+
 ## Expected outcome
 
 - Kernel: 1.4 → **2.4–3.0 TFLOP/s** (MLX parity class on this chip).
