@@ -22,12 +22,20 @@ Recovery if ever needed: commits 1fcb8e0ac → 0d486769f → aff95a79a (in order
 original WIP skeleton at 2a105668d. Test assets in ~/.cache/higgs-gguf/. Do NOT resume
 without a new product reason.
 
-## The mission (unchanged): 70B-class on 32 GB via native IQ kernels
+## Mission status update (2026-08-31, post-IQ-bench): fit-goal reachable via stock affine Q2
 
-- IQ2/IQ3 codebook-kernel path (PLAN.md "GGUF Q4_K + IQ quant" section): the eschamoe
-  simdgroup GEMM pattern (gather → threadgroup decode → fragment MMA) transfers to the
-  codebook-lookup decode. This is the differentiator; next session starts here.
-- BM=64 decode-halving insight feeds the same kernel work.
+IQ codebook kernel project (tag archive/iq-codebook) ran its Phase-2 gate and LOST:
+bit-exact IQ2_XS/IQ3_XXS qmv kernels benched 2.0-2.3x SLOWER than stock MLX affine
+bits=2 at M=1 (546 vs 1185 µs @ 17408x5120). At 2.31 bpw there is no bandwidth prize
+over affine-2; unwired per kill criterion. Recovery: tag archive/iq-codebook (format +
+quantizer + kernels, golden-vector validated vs gguf-py; design doc in
+.planning/DESIGN-iq-codebook-kernels.md). Only revisit if a QUALITY case for codebook
+vs affine at 2.3 bpw is proven (needs a cosine harness first).
+
+The 70B-on-32GB fit-goal does NOT need IQ: stock affine Q2/g64 = 2.25 bpw ≈ 19.7 GB,
+conversion pipeline already exists (eschamoe.rs convert_checkpoint + quantize_affine),
+native MLX kernels win decode. Cheapest honest next step if the mission resumes:
+Phase-0 proof — convert an existing 70B to Q2/g64, measure RAM/tok-s on the M4.
 
 ## Facts worth keeping
 
