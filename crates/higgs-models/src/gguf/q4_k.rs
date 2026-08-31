@@ -1,23 +1,27 @@
 //! Q4_K dequantization: 256 values per super-block, 144 bytes.
 //!
-//! Layout (llama.cpp ggml-quants.h `block_q4_K`):
+//! Layout (llama.cpp `block_q4_K`, verified against gguf-py dequantize):
 //!   bytes 0-1:   f16 d       (super-block scale)
 //!   bytes 2-3:   f16 dmin    (super-block min)
 //!   bytes 4-15:  12 bytes    (8 sub-block scales + mins, 6-bit each)
-//!   bytes 16-143: 128 bytes  (256 4-bit values, 2 per byte)
+//!   bytes 16-143: 128 bytes = four 32-byte pages. Page g holds the
+//!                nibbles of sub-blocks 2g and 2g+1: sub 2g takes the
+//!                LOW nibbles of all 32 bytes, sub 2g+1 the HIGH nibbles.
 //!
 //! Dequant: y[j] = d * sc[j/32] * q4 - dmin * m[j/32]
-//! where sc/m are 6-bit values extracted from the packed 12-byte scales.
 
 /// Extract 6-bit scale and min for sub-block `j` (0..8) from the packed
-/// 12-byte scales array. Matches llama.cpp `get_scale_min_k4`.
+/// 12-byte scales array. Bit layout (gguf-py `Q4_K::get_scale_min`):
+///   bytes 0-3:  sc[0..4] low 6 bits; their high 2 bits top up sc[4..8]
+///   bytes 4-7:  m[0..4] low 6 bits; their high 2 bits top up m[4..8]
+///   bytes 8-11: sc[4..8] low 4 bits, m[4..8] low 4 bits
 pub fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {
         (
-            (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
-            (q[j + 4] >> 4) | ((q[j - 4] >> 6) & 2),
+            (q[j + 4] & 0xF) | ((q[j - 4] >> 2) & 0x30),
+            (q[j + 4] >> 4) | ((q[j] >> 2) & 0x30),
         )
     }
 }
@@ -32,14 +36,15 @@ pub fn dequant_super_block(block: &[u8]) -> Vec<f32> {
 
     let mut out = vec![0.0f32; 256];
     for sub in 0..8 {
+        let page = sub / 2;
+        let high = sub % 2 == 1;
         let (sc, m) = get_scale_min_k4(sub, scales);
         let scale = d * sc as f32;
         let offset = dmin * m as f32;
-        for j in 0..32 {
-            let byte_idx = sub * 16 + j / 2;
-            let byte = qs[byte_idx];
-            let q4 = if j % 2 == 0 { byte & 0xF } else { byte >> 4 };
-            out[sub * 32 + j] = scale * q4 as f32 - offset;
+        for l in 0..32 {
+            let byte = qs[page * 32 + l];
+            let q4 = if high { byte >> 4 } else { byte & 0xF };
+            out[sub * 32 + l] = scale * q4 as f32 - offset;
         }
     }
     out
@@ -86,6 +91,80 @@ fn f32_to_f16_bits(v: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gguf::parser::{GgufFile, GgufValue};
+
+    /// End-to-end against a real GGUF file. Opt in with
+    /// HIGGS_GGUF_TEST_FILE=<path to a Q4_K gguf>.
+    #[test]
+    fn real_file_q4_k_smoke() {
+        let path = match std::env::var("HIGGS_GGUF_TEST_FILE") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("skipping: set HIGGS_GGUF_TEST_FILE to a Q4_K gguf");
+                return;
+            }
+        };
+        let data = std::fs::read(&path).expect("read gguf");
+        let file = GgufFile::parse(data).expect("parse");
+        assert_eq!(file.version, 3, "GGUF v3");
+
+        // Metadata: architecture + shape hyperparameters must be present.
+        let arch = match file.metadata.get("general.architecture") {
+            Some(GgufValue::String(s)) => s.clone(),
+            other => panic!("general.architecture missing: {other:?}"),
+        };
+        eprintln!("arch = {arch}, {} tensors", file.tensors.len());
+        let n_layers = match file.metadata.get(&format!("{arch}.block_count")) {
+            Some(GgufValue::U32(n)) => *n,
+            other => panic!("block_count missing: {other:?}"),
+        };
+        assert!(n_layers > 0);
+
+        // Every recorded tensor must resolve inside the data section.
+        let q4_k: Vec<&str> = file
+            .tensors
+            .values()
+            .filter(|t| t.dtype == 12)
+            .map(|t| t.name.as_str())
+            .collect();
+        eprintln!("{} Q4_K tensors, e.g. {:?}", q4_k.len(), q4_k.first());
+        assert!(!q4_k.is_empty(), "no Q4_K tensors in file");
+
+        // Dequant the first super-block of every Q4_K tensor: values must be
+        // finite and within the range the 6-bit scales + 4-bit qs can express
+        // (|y| <= |d|*63*15 + |dmin|*63, with slack for f16 magnitudes).
+        for name in &q4_k {
+            let bytes = file
+                .tensor_bytes(name)
+                .expect("tensor in bounds")
+                .expect("tensor fits");
+            let out = dequant_super_block(&bytes[..144]);
+            let d = f16_to_f32(&bytes[0..2]);
+            let dmin = f16_to_f32(&bytes[2..4]);
+            let bound = d.abs() * 63.0 * 15.0 + dmin.abs() * 63.0 + 1e-6;
+            for (j, v) in out.iter().enumerate() {
+                assert!(v.is_finite(), "{name}: y[{j}] not finite");
+                assert!(
+                    v.abs() <= bound,
+                    "{name}: y[{j}] = {v} outside expressible range ±{bound}"
+                );
+            }
+        }
+
+        // Spot-check one tensor against the hand-verified oracle values
+        // (gguf-py 0.19 dequantize) when running the known 100 MB file.
+        let name = std::env::var("HIGGS_GGUF_ORACLE_TENSOR").unwrap_or_default();
+        if let Some(info) = file.tensors.get(&name) {
+            let bytes = file.tensor_bytes(&name).unwrap().unwrap();
+            let out = dequant_super_block(&bytes[..144]);
+            eprintln!("{name}: dims {:?}, dtype {}", info.dims, info.dtype);
+            eprintln!("block0[:8] = {:?}", out[..8].iter().map(|v| (v * 1e6).round() / 1e6).collect::<Vec<_>>());
+            let per_sub: Vec<f32> = (0..8)
+                .map(|s| out[s * 32..(s + 1) * 32].iter().fold(0.0f32, |m, v| m.max(v.abs())))
+                .collect();
+            eprintln!("per-sub max|w| = {:?}", per_sub.iter().map(|v| (v * 1e6).round() / 1e6).collect::<Vec<_>>());
+        }
+    }
 
     /// Test the 6-bit scale extraction matches llama.cpp get_scale_min_k4.
     #[test]
@@ -98,14 +177,14 @@ mod tests {
         // j=4: d = (q[8]&0xF) | ((q[0]>>6)<<4) — but q only has 8 elements
         // so j=4 uses q[4+4]=q[8] which is OOB for an 8-element array.
         // The actual scales array is 12 bytes.
-        // j=4 exercises the high-bit paths: q12[0] = 0xFF puts 0b11 above
-        // the 6-bit field, so the <<4 and &2 branches both contribute.
-        let q12 = [0xFF, 0x2A, 0x1B, 0x0C, 0x15, 0x3E, 0x07, 0x29, 0x11, 0x22, 0x33, 0x44];
+        // j=4 exercises the high-bit paths: q12[0] and q12[4] carry 0b11
+        // above their 6-bit fields so the & 0x30 branches contribute.
+        let q12 = [0xFF, 0x2A, 0x1B, 0x0C, 0xF5, 0x3E, 0x07, 0x29, 0x11, 0x22, 0x33, 0x44];
         let (d, m) = get_scale_min_k4(4, &q12);
-        // d = (q[8] & 0xF) | ((q[0] >> 6) << 4) = (0x11 & 0xF) | ((0xFF >> 6) << 4) = 1 | 48 = 49
+        // d = (q[8] & 0xF) | ((q[0] >> 2) & 0x30) = 1 | ((0xFF >> 2) & 0x30) = 1 | 48 = 49
         assert_eq!(d, 49);
-        // m = (q[8] >> 4) | ((q[0] >> 6) & 2) = 1 | (3 & 2) = 1 | 2 = 3
-        assert_eq!(m, 3);
+        // m = (q[8] >> 4) | ((q[4] >> 2) & 0x30) = 1 | ((0xF5 >> 2) & 0x30) = 1 | 48 = 49
+        assert_eq!(m, 49);
     }
 
     /// Q4_K super-block with known values: verify dequant matches manual calc.
@@ -145,11 +224,13 @@ mod tests {
         block[2..4].copy_from_slice(&f16_to_bytes(dmin));
         block[4..16].copy_from_slice(&scales);
 
-        // Set known 4-bit values
         let q4_vals: [u8; 256] = core::array::from_fn(|i| ((i * 7 + 3) & 0xF) as u8);
-        for (j, &q) in q4_vals.iter().enumerate() {
-            let byte_idx = 16 + j / 2;
-            if j % 2 == 0 {
+        // Set known 4-bit values, encoded per the real nibble layout: sub s
+        // lives in page s/2 — low nibbles for even s, high nibbles for odd.
+        for (idx, &q) in q4_vals.iter().enumerate() {
+            let (sub, l) = (idx / 32, idx % 32);
+            let byte_idx = 16 + (sub / 2) * 32 + l;
+            if sub % 2 == 0 {
                 block[byte_idx] = (block[byte_idx] & 0xF0) | (q & 0xF);
             } else {
                 block[byte_idx] = (block[byte_idx] & 0x0F) | (q << 4);
