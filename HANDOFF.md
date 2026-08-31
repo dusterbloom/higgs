@@ -10,17 +10,17 @@
 | QGEMM row block selectable | 279725324 | ✅ BM=32 default; `HIGGS_ESCHA_QGEMM_BM=64` runs the variant. BM=64 only wins decode-heavy even-run down-proj (1.87x vs 1.59x); ragged parity. |
 | GGUF parser real-file correct | 0d486769f | ✅ u64 counts + u64-len strings + all 13 value types + data_start/alignment. Validated on real GGUF. |
 | Q4_K dequant spec-correct | 1fcb8e0ac, 0d486769f | ✅ formula `d*sc*q - dmin*m`, real nibble layout (32 lows then 32 highs per page), scale high-bits per gguf-py. Bit-exact vs oracle on real file. |
-| GGUF end-to-end forward | aff95a79a | ✅ `gguf::model::load_transformer` → SmolLM2-135M Q4_K_M generates "Paris". E2E gated by HIGGS_GGUF_E2E_FILE / HIGGS_GGUF_E2E_TOKENIZER. |
-| Q5_0/Q8_0/Q6_K/F32/F16/BF16 dequant | aff95a79a | ✅ `gguf::dequant`, mirrors gguf-py reference. |
+| GGUF end-to-end forward | aff95a79a | ↩️ REVERTED — see below |
+| Q5_0/Q8_0/Q6_K/F32/F16/BF16 dequant | aff95a79a | ↩️ REVERTED — see below |
 
-## DECISION: GGUF ingress is SHELVED — do not resume without a new reason
+## DECISION: GGUF work fully REVERTED — it was a detour
 
-Researched 2026-08-31: the trending GGUF catalog (Qwen3.8-27B finetunes, Ornith-1.5,
-Gemma-4 derivatives — millions of downloads) is qwen3_5/gemma4 arch, i.e. archs higgs
-already runs natively with better kernels. Ingress = competing with llama.cpp on its
-home turf, no differentiation. The committed parser + dequant stay as infrastructure.
-Do NOT build: qwen3_5/gemma4 name maps, GGUF tokenizer ingestion, GLM-5.3, MTP ingestion.
-Full analysis in session log; conclusion: a detour away from the mission.
+The whole gguf module (parser + dequant + e2e) was removed after research showed the
+GGUF-trending catalog is qwen3_5/gemma4 arch — models higgs already runs natively with
+better kernels. Ingress = competing with llama.cpp on its home turf, no differentiation.
+Recovery if ever needed: commits 1fcb8e0ac → 0d486769f → aff95a79a (in order), plus the
+original WIP skeleton at 2a105668d. Test assets in ~/.cache/higgs-gguf/. Do NOT resume
+without a new product reason.
 
 ## The mission (unchanged): 70B-class on 32 GB via native IQ kernels
 
