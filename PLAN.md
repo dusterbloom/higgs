@@ -229,3 +229,81 @@ Harness: `phase0_qgemm_ab_and_tflops` (eschamoe.rs, `cargo test -p higgs-models
   requiring GPU-level debugging tools.
 
 ## Expected outcome
+
+---
+
+# GGUF Q4_K + IQ quant Metal kernels for higgs
+
+## Goal
+
+Native GGUF support in higgs: Q4_K + IQ4_XS + IQ3 + IQ2 quant formats,
+simdgroup Metal kernels, enabling 70B-class models on 32 GB M4 via IQ2/IQ3.
+
+## Formats (priority order)
+
+| Priority | Format | bpw | 70B on 32GB | Kernel approach |
+|---|---|---|---|---|
+| 1 | Q4_K | 4.50 | ✗ 39.4GB | nibble unpack + 6-bit scale, simplest |
+| 2 | Q8_0 | 8.50 | ✗ | f16 scale + 8-bit values, trivial |
+| 3 | IQ4_XS | 4.25 | ✗ 37.2GB | 16-entry grid lookup (like trellis codebook) |
+| 4 | IQ3_XXS | 3.06 | ✗ 26.8GB | 256-entry vector codebook |
+| 5 | IQ2_XS | 2.31 | ✓ **20.2GB — 70B fits!** | 512-entry vector codebook |
+| 6 | IQ2_XXS | 2.06 | ✓ **18.0GB — 70B comfortable** | 256-entry vector codebook |
+
+## Architecture
+
+The IQ formats use codebook lookup — structurally identical to the trellis
+decode higgs already implements (read code pair → lookup codebook → get f16).
+The gather kernel pattern, threadgroup codebook storage, and per-thread
+decode slot assignment all transfer.
+
+## Phase 1: Q4_K scalar kernel + correctness (week 1)
+
+- [ ] GGUF parser: header, tensor infos, kv pairs, weights (use `gguf-rs-lib` or write minimal parser)
+- [ ] Q4_K dequant in Metal: 6-bit scale extraction from 12-byte packed array, nibble unpack, scale×value−min
+- [ ] Dequant → f32 dot-product kernel (scalar, correctness only)
+- [ ] Test: dequant Q4_K super-block, compare against llama.cpp `dequantize_row_q4_K` reference
+- [ ] Integration: `HIGGS_GGUF_MODEL=path/to/model.gguf` loads and serves
+
+## Phase 2: Q4_K simdgroup GEMM (week 2)
+
+- [ ] Fragment loads: A(m,k) from x_sh (m-major), B(k,n) from w_sh (k-major)
+- [ ] simdgroup_multiply_accumulate — same pattern as the trellis kernel
+- [ ] Perf: ≥ 500 GFLOP/s at sorted-8192 shapes (target: MLX-class)
+- [ ] e2e: bench_frontier with the GGUF model
+
+## Phase 3: Q8_0 + IQ4_XS (week 3)
+
+- [ ] Q8_0: f16 scale + 8-bit values — trivial dequant
+- [ ] IQ4_XS: 16-entry grid lookup — reuse the trellis codebook gather pattern
+- [ ] Test against llama.cpp reference
+
+## Phase 4: IQ3/IQ2 — the 70B unlock (weeks 4-6)
+
+- [ ] IQ3_XXS: 256-entry vector codebook — each code = 8 f16 values
+  - Codebook in threadgroup memory (256 × 8 × 2 bytes = 4 KB)
+  - Gather: read index → threadgroup codebook → get 8 values
+  - Same gather pattern as the trellis kernel
+- [ ] IQ2_XS: 512-entry vector codebook
+- [ ] IQ2_XXS: 256-entry vector codebook
+- [ ] IQ1_S: 1-bit + codebook (stretch goal)
+- [ ] Verify: 70B model loads in < 26 GB, generates coherently
+
+## Risks
+
+- The Q4_K scale extraction (get_scale_min_k4) has a non-trivial bit
+  packing that must match llama.cpp exactly — a single bit error corrupts
+  a 32-value sub-block
+- The IQ vector codebooks are large lookup tables in threadgroup memory —
+  SMEM budget must be shared with x_sh staging
+- Metal transposed loads from threadgroup memory at non-zero offsets —
+  verified working in the trellis kernel (empirical probe passed)
+- llama.cpp kernel performance is the bar — matching it requires the
+  same level of optimization (simdgroup MMA, SMEM pipelining, etc.)
+
+## What this enables
+
+- 70B models on a 32 GB M4 via IQ2/IQ3 quantization
+- All HuggingFace GGUF models served natively with the full higgs agent stack
+- nanobot's session management, tool guard, continuity, and memory system
+  working with ANY open-source model, not just trellis-quantized ones
