@@ -23,7 +23,7 @@ pub struct TensorInfo {
     pub n_dims: u32,
     /// GGUF dimension order: dims[0] is the fastest-varying (row length).
     pub dims: Vec<u64>,
-    pub dtype: u32, // GGMLQuantizationType: 0=F32, 1=F16, 8=Q8_0, 12=Q4_K, ...
+    pub dtype: u32,  // GGMLQuantizationType: 0=F32, 1=F16, 8=Q8_0, 12=Q4_K, ...
     pub offset: u64, // offset into the data section
 }
 
@@ -105,7 +105,16 @@ impl GgufFile {
             }
             let dtype = read_u32(&mut pos);
             let offset = read_u64(&mut pos);
-            tensors.insert(name.clone(), TensorInfo { name, n_dims, dims, dtype, offset });
+            tensors.insert(
+                name.clone(),
+                TensorInfo {
+                    name,
+                    n_dims,
+                    dims,
+                    dtype,
+                    offset,
+                },
+            );
         }
 
         // Align to the declared alignment
@@ -115,7 +124,13 @@ impl GgufFile {
             return Err("GGUF data section starts past end of file".into());
         }
 
-        Ok(GgufFile { version, tensors, metadata, data, data_start })
+        Ok(GgufFile {
+            version,
+            tensors,
+            metadata,
+            data,
+            data_start,
+        })
     }
 
     /// The raw bytes of one tensor.
@@ -135,18 +150,17 @@ pub fn tensor_nbytes(info: &TensorInfo) -> Option<usize> {
     let n_elems: u64 = info.dims.iter().product();
     // (type, bytes per block, values per block); f32/f16 are per-element.
     let (per_block, block_len): (u64, u64) = match info.dtype {
-        0 => (1, 4),   // F32
-        1 => (1, 2),   // F16
-        24 => (1, 1),  // BF16
-        2 => (32, 18), // Q4_0
-        3 => (32, 20), // Q4_1
-        6 => (32, 21), // Q5_0
-        7 => (32, 22), // Q5_1
-        8 => (32, 34), // Q8_0
+        0 => (1, 4),      // F32
+        1 => (1, 2),      // F16
+        30 => (1, 2),     // BF16
+        2 => (32, 18),    // Q4_0
+        3 => (32, 20),    // Q4_1
+        6 => (32, 22),    // Q5_0
+        7 => (32, 24),    // Q5_1
+        8 => (32, 34),    // Q8_0
         12 => (256, 144), // Q4_K
-        13 => (256, 210), // Q5_K
-        14 => (256, 84),  // Q6_K
-        16 => (32, 11),   // IQ2_XXS? no: 16 = IQ1_S
+        13 => (256, 176), // Q5_K
+        14 => (256, 210), // Q6_K
         _ => return None,
     };
     Some((n_elems.div_ceil(per_block) * block_len) as usize)

@@ -60,7 +60,7 @@ pub fn dequant_row(data: &[u8], num_blocks: usize) -> Vec<f32> {
 }
 
 /// Read f16 from two bytes (little-endian). Manual conversion — std f16 is unstable.
-fn f16_to_f32(bytes: &[u8]) -> f32 {
+pub(crate) fn f16_to_f32(bytes: &[u8]) -> f32 {
     let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
     let sign = ((bits >> 15) as u32) << 31;
     let exp = ((bits >> 10) & 0x1F) as u32;
@@ -80,11 +80,19 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;
     let frac = ((bits >> 13) & 0x3FF) as u16;
-    if exp == 0 { return sign; }
-    if exp == 255 { return sign | 0x7C00 | (frac & 0x3FF); }
+    if exp == 0 {
+        return sign;
+    }
+    if exp == 255 {
+        return sign | 0x7C00 | (frac & 0x3FF);
+    }
     let e = exp - 127 + 15;
-    if e <= 0 { return sign; }
-    if e >= 31 { return sign | 0x7C00; }
+    if e <= 0 {
+        return sign;
+    }
+    if e >= 31 {
+        return sign | 0x7C00;
+    }
     sign | ((e as u16) << 10) | frac
 }
 
@@ -158,11 +166,27 @@ mod tests {
             let bytes = file.tensor_bytes(&name).unwrap().unwrap();
             let out = dequant_super_block(&bytes[..144]);
             eprintln!("{name}: dims {:?}, dtype {}", info.dims, info.dtype);
-            eprintln!("block0[:8] = {:?}", out[..8].iter().map(|v| (v * 1e6).round() / 1e6).collect::<Vec<_>>());
+            eprintln!(
+                "block0[:8] = {:?}",
+                out[..8]
+                    .iter()
+                    .map(|v| (v * 1e6).round() / 1e6)
+                    .collect::<Vec<_>>()
+            );
             let per_sub: Vec<f32> = (0..8)
-                .map(|s| out[s * 32..(s + 1) * 32].iter().fold(0.0f32, |m, v| m.max(v.abs())))
+                .map(|s| {
+                    out[s * 32..(s + 1) * 32]
+                        .iter()
+                        .fold(0.0f32, |m, v| m.max(v.abs()))
+                })
                 .collect();
-            eprintln!("per-sub max|w| = {:?}", per_sub.iter().map(|v| (v * 1e6).round() / 1e6).collect::<Vec<_>>());
+            eprintln!(
+                "per-sub max|w| = {:?}",
+                per_sub
+                    .iter()
+                    .map(|v| (v * 1e6).round() / 1e6)
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
@@ -179,7 +203,9 @@ mod tests {
         // The actual scales array is 12 bytes.
         // j=4 exercises the high-bit paths: q12[0] and q12[4] carry 0b11
         // above their 6-bit fields so the & 0x30 branches contribute.
-        let q12 = [0xFF, 0x2A, 0x1B, 0x0C, 0xF5, 0x3E, 0x07, 0x29, 0x11, 0x22, 0x33, 0x44];
+        let q12 = [
+            0xFF, 0x2A, 0x1B, 0x0C, 0xF5, 0x3E, 0x07, 0x29, 0x11, 0x22, 0x33, 0x44,
+        ];
         let (d, m) = get_scale_min_k4(4, &q12);
         // d = (q[8] & 0xF) | ((q[0] >> 2) & 0x30) = 1 | ((0xFF >> 2) & 0x30) = 1 | 48 = 49
         assert_eq!(d, 49);
@@ -192,19 +218,29 @@ mod tests {
     fn dequant_known_values() {
         let mut block = vec![0u8; 144];
         // d = 1.0 (f16)
-        block[0] = 0x00; block[1] = 0x3C; // f16 1.0
+        block[0] = 0x00;
+        block[1] = 0x3C; // f16 1.0
         // dmin = 0.0 (f16)
-        block[2] = 0x00; block[3] = 0x00; // f16 0.0
+        block[2] = 0x00;
+        block[3] = 0x00; // f16 0.0
         // scales: all 8 sub-blocks get sc=1, m=0
         // j<4: q[j] & 63 = 1, q[j+4] & 63 = 0
         // j>=4: (q[j+4]&0xF) | ((q[j-4]>>6)<<4) = 1, (q[j+4]>>4) | ((q[j-4]>>6)&2) = 0
         // With q[0..4]=1 (bit 6 not set), and q[8..12]=1 (low nibble = 1):
         //   j=4: d=(q[8]&0xF)|((q[0]>>6)<<4) = 1|0 = 1, m=(q[8]>>4)|((q[0]>>6)&2) = 0|0 = 0
-        for j in 0..4 { block[4+j] = 1; }
-        for j in 4..8 { block[4+j] = 0; }
-        for j in 8..12 { block[4+j] = 1; }
+        for j in 0..4 {
+            block[4 + j] = 1;
+        }
+        for j in 4..8 {
+            block[4 + j] = 0;
+        }
+        for j in 8..12 {
+            block[4 + j] = 1;
+        }
         // qs: all 4-bit values = 1
-        for b in block[16..144].iter_mut() { *b = 0x11; } // both nibbles = 1
+        for b in block[16..144].iter_mut() {
+            *b = 0x11;
+        } // both nibbles = 1
 
         let out = dequant_super_block(&block);
         // d=1.0, sc=1, m=0, q4=1 → y = 1.0 * 1 * 1 - 1.0 * 0 * 1 = 1.0
@@ -252,7 +288,8 @@ mod tests {
                 let expected = scale * q4 - offset;
                 assert!(
                     (out[idx] - expected).abs() < 1e-5,
-                    "y[{idx}] = {}, expected {expected}", out[idx]
+                    "y[{idx}] = {}, expected {expected}",
+                    out[idx]
                 );
             }
         }
