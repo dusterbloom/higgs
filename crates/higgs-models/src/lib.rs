@@ -8,6 +8,7 @@ pub mod deepseek_v2;
 pub mod dflash;
 pub mod error;
 pub mod eschamoe;
+pub mod gguf;
 pub mod gemma2;
 pub mod gemma3;
 pub mod gemma4;
