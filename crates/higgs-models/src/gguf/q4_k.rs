@@ -6,7 +6,7 @@
 //!   bytes 4-15:  12 bytes    (8 sub-block scales + mins, 6-bit each)
 //!   bytes 16-143: 128 bytes  (256 4-bit values, 2 per byte)
 //!
-//! Dequant: y[j] = d * sc[j/32] * q4 - d * m[j/32] * q4
+//! Dequant: y[j] = d * sc[j/32] * q4 - dmin * m[j/32]
 //! where sc/m are 6-bit values extracted from the packed 12-byte scales.
 
 /// Extract 6-bit scale and min for sub-block `j` (0..8) from the packed
@@ -33,17 +33,13 @@ pub fn dequant_super_block(block: &[u8]) -> Vec<f32> {
     let mut out = vec![0.0f32; 256];
     for sub in 0..8 {
         let (sc, m) = get_scale_min_k4(sub, scales);
-        let d_sc = d * sc as f32;
-        let d_m = d * m as f32;
+        let scale = d * sc as f32;
+        let offset = dmin * m as f32;
         for j in 0..32 {
             let byte_idx = sub * 16 + j / 2;
             let byte = qs[byte_idx];
             let q4 = if j % 2 == 0 { byte & 0xF } else { byte >> 4 };
-            out[sub * 32 + j] = if q4 != 0 {
-                d_sc * q4 as f32 - d_m
-            } else {
-                0.0
-            };
+            out[sub * 32 + j] = scale * q4 as f32 - offset;
         }
     }
     out
@@ -102,12 +98,14 @@ mod tests {
         // j=4: d = (q[8]&0xF) | ((q[0]>>6)<<4) — but q only has 8 elements
         // so j=4 uses q[4+4]=q[8] which is OOB for an 8-element array.
         // The actual scales array is 12 bytes.
-        let q12 = [0x3F, 0x2A, 0x1B, 0x0C, 0x15, 0x3E, 0x07, 0x29, 0x11, 0x22, 0x33, 0x44];
+        // j=4 exercises the high-bit paths: q12[0] = 0xFF puts 0b11 above
+        // the 6-bit field, so the <<4 and &2 branches both contribute.
+        let q12 = [0xFF, 0x2A, 0x1B, 0x0C, 0x15, 0x3E, 0x07, 0x29, 0x11, 0x22, 0x33, 0x44];
         let (d, m) = get_scale_min_k4(4, &q12);
-        // d = (q[8] & 0xF) | ((q[0] >> 6) << 4) = (0x11 & 0xF) | ((0x3F >> 6) << 4) = 1 | 48 = 49
+        // d = (q[8] & 0xF) | ((q[0] >> 6) << 4) = (0x11 & 0xF) | ((0xFF >> 6) << 4) = 1 | 48 = 49
         assert_eq!(d, 49);
-        // m = (q[8] >> 4) | ((q[0] >> 6) & 2) = 1 | 0 = 1
-        assert_eq!(m, 1);
+        // m = (q[8] >> 4) | ((q[0] >> 6) & 2) = 1 | (3 & 2) = 1 | 2 = 3
+        assert_eq!(m, 3);
     }
 
     /// Q4_K super-block with known values: verify dequant matches manual calc.
@@ -159,14 +157,18 @@ mod tests {
         }
 
         let out = dequant_super_block(&block);
+        // The impl reads d and dmin back from f16, so the manual reference
+        // must use the decoded values: f16(0.1) != 0.1.
+        let d16 = f16_to_f32(&f16_to_bytes(d));
+        let dmin16 = f16_to_f32(&f16_to_bytes(dmin));
         for sub in 0..8 {
             let (sc, m) = get_scale_min_k4(sub, &scales);
-            let d_sc = d * sc as f32;
-            let d_m = d * m as f32;
+            let scale = d16 * sc as f32;
+            let offset = dmin16 * m as f32;
             for j in 0..32 {
                 let idx = sub * 32 + j;
                 let q4 = q4_vals[idx] as f32;
-                let expected = d_sc * q4 - d_m;
+                let expected = scale * q4 - offset;
                 assert!(
                     (out[idx] - expected).abs() < 1e-5,
                     "y[{idx}] = {}, expected {expected}", out[idx]
