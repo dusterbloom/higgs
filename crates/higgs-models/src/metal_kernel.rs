@@ -972,12 +972,11 @@ for (uint i = 0u; i < uint(RM); ++i) {
 /// fragment MMA. Layout deltas vs the scalar source: XP is 8-aligned for
 /// simdgroup_load, and the output block is written with unpredicated
 /// simdgroup_store — the caller allocates rows rounded up to BM and slices.
+/// NT, BM, and XP arrive as template args so both row blocks share the
+/// source; the launch config below owns the two valid tuples.
 const ESCHA_QGEMM_SIMD_SOURCE: &str = r#"
-constexpr int NT = 128;         // threads in the threadgroup
-constexpr int BM = 32;          // rows in a block
 constexpr int TNB = 8;          // tile columns in a block
 constexpr int BN = 16 * TNB;    // output columns in a block
-constexpr int XP = 40;          // activation stride, 8-aligned for fragment loads
 constexpr int CB = BN / 8;      // 8x8 column fragments across the block
 constexpr int WORDS = 8 * K;    // 32-bit words in one packed tile
 constexpr int IN = TK * 16;
@@ -1172,8 +1171,9 @@ fn create_escha_qgemm_simd_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 }
 
 /// SIMD-mode gather QGEMM. Same contract as [`eschamoe_gather_qgemm`], but
-/// the output rows are padded up to the 32-row block and the returned array
-/// is a front slice of the padded buffer.
+/// the output rows are padded up to the row block and the returned array
+/// is a front slice of the padded buffer. The row block is 32; the BM=64
+/// decode-halving variant runs with `HIGGS_ESCHA_QGEMM_BM=64`.
 pub fn eschamoe_gather_qgemm_simd(
     xh: &Array,
     code: &Array,
@@ -1195,7 +1195,18 @@ pub fn eschamoe_gather_qgemm_simd(
         check_gather_inputs(xh, code, expert_ids, spec, "eschamoe_gather_qgemm_simd")?;
     let row_count = u32::try_from(rows)
         .map_err(|_| Exception::custom("eschamoe_gather_qgemm_simd: negative row count"))?;
-    let rows_pad = ((rows + 31) / 32) * 32;
+    // Row block selection. BM=64 halves the decode when a block holds one
+    // expert (sorted runs of 64+ rows). Measured on the same machine against
+    // the scratch path at 8192 rows: BM=64 wins only on even runs of the
+    // decode-heavy K=3 projection (1.87x vs 1.59x) and loses on gate_up even
+    // runs (0.86x vs 1.22x); ragged runs are parity. BM=32 stays the default
+    // until a real-router A/B says otherwise.
+    let (nt, bm, xp) = if std::env::var("HIGGS_ESCHA_QGEMM_BM").is_ok_and(|v| v == "64") {
+        (256, 64, 72)
+    } else {
+        (128, 32, 40)
+    };
+    let rows_pad = ((rows + bm - 1) / bm) * bm;
     let row_count_pad = u32::try_from(rows_pad)
         .map_err(|_| Exception::custom("eschamoe_gather_qgemm_simd: negative padded rows"))?;
 
@@ -1227,16 +1238,32 @@ pub fn eschamoe_gather_qgemm_simd(
             c"TN".as_ptr(),
             tile_dims[1],
         );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NT".as_ptr(),
+            nt,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"BM".as_ptr(),
+            bm,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"XP".as_ptr(),
+            xp,
+        );
         let blocks_n = spec.out_features.div_euclid(128)
             + i32::from(spec.out_features.rem_euclid(128) != 0);
-        let blocks_m = rows_pad.div_euclid(32);
+        let blocks_m = rows_pad.div_euclid(bm);
+        // Grid is in threads: one column block per NT-thread threadgroup.
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(
             config,
-            blocks_n * 128,
+            blocks_n * nt,
             blocks_m,
             1,
         );
-        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, nt, 1, 1);
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
             out_shape.as_ptr(),
