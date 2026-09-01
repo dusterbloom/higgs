@@ -154,9 +154,15 @@ def subset(out_dir: str, layers: int = 4, experts: int = 32,
         begin, end = meta["data_offsets"]
         nbytes = end - begin
 
-        if any(key.endswith(s) for s in EXPERT_AXIS_KEYS) and shape[0] > experts:
-            nbytes = nbytes * experts // shape[0]
-            shape[0] = experts
+        if any(key.endswith(s) for s in EXPERT_AXIS_KEYS):
+            # Track the true expert count the tensors hold: a requested
+            # `experts` above the checkpoint's count would make config.json
+            # advertise experts the payload does not have, and escha_config
+            # would disagree with it.
+            experts = min(experts, shape[0])
+            if shape[0] > experts:
+                nbytes = nbytes * experts // shape[0]
+                shape[0] = experts
 
         plan.append({
             "key": key, "dtype": meta["dtype"], "shape": shape,

@@ -11,14 +11,19 @@ ranges (one expert slice, a few MB).
 
 from __future__ import annotations
 
+import os
 import sys
+from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, "/Users/peppi/Dev/higgs/tools")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import escha_ref as E  # noqa: E402
 
-LOCAL_ESCHA = "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2"
+LOCAL_ESCHA = os.environ.get(
+    "ESCHA_LOCAL_MODEL",
+    "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2",
+)
 
 _orig_hf_url = E.hf_url
 

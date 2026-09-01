@@ -2,24 +2,36 @@
 """Non-expert forensics: escha (int8/bf16) vs mlx-community 4-bit, tensor by tensor.
 
 Offline, numpy only, one tensor at a time via safetensors byte ranges.
-Reuses tools/escha_ref.py's Shard reader.
+Reuses tools/escha_ref.py's Shard reader. Import-only helper code — run the
+analysis by importing and calling :func:`cos_table` / :func:`layout` from a
+REPL or script.
 
-    python3 tools/escha_nonexpert.py cos        # cosine table
-    python3 tools/escha_nonexpert.py layout     # conv1d / gate / lm_head traps
+Environment:
+    ESCHA_LOCAL_MODEL   path to the eschamoe checkpoint
+                        (default: the EschaLabs Qwen3.6-35B-A3B-Escha-W2 cache)
+    BASE_LOCAL_MODEL    path to the reference 4-bit checkpoint
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
+from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, "/Users/peppi/Dev/higgs/tools")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import escha_ref as E  # noqa: E402
 
-ESCHA = "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2"
-BASE = "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.6-35B-A3B-4bit"
+ESCHA = os.environ.get(
+    "ESCHA_LOCAL_MODEL",
+    "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2",
+)
+BASE = os.environ.get(
+    "BASE_LOCAL_MODEL",
+    "/Users/peppi/.cache/lm-studio/models/mlx-community/Qwen3.6-35B-A3B-4bit",
+)
 
 E._DTYPES.setdefault("U32", np.dtype("<u4"))
 E._DTYPES.setdefault("U16", np.dtype("<u2"))
@@ -76,14 +88,24 @@ def raw_get(root: str, key: str, rows: slice | None = None) -> np.ndarray:
     return np.frombuffer(raw, dtype=dt).reshape(shape)
 
 
-QCFG = json.load(open(f"{BASE}/config.json"))["quantization"]
+_QCFG: dict | None = None
+
+
+def _qcfg() -> dict:
+    """Load the reference checkpoint's quantization block on first use, so an
+    import needs no checkpoint on disk."""
+    global _QCFG
+    if _QCFG is None:
+        _QCFG = json.load(open(f"{BASE}/config.json"))["quantization"]
+    return _QCFG
 
 
 def qbits(module: str) -> tuple[int, int]:
-    v = QCFG.get(module)
+    v = _qcfg().get(module)
     if isinstance(v, dict):
         return int(v["group_size"]), int(v["bits"])
-    return int(QCFG["group_size"]), int(QCFG["bits"])
+    cfg = _qcfg()
+    return int(cfg["group_size"]), int(cfg["bits"])
 
 
 def deq_affine(root: str, module: str, rows: slice | None = None) -> np.ndarray:

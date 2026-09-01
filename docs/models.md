@@ -57,7 +57,7 @@ Other supported architectures still serve normally in simple mode, but Higgs now
 | Qwen3.5 MoE | `NexVeridian/Qwen3.5-35B-A3B-3bit` |
 | Qwen3.6 MoE | `mlx-community/Qwen3.6-35B-A3B-4bit` |
 | Qwen3.8 dense | `mlx-community/Qwen3.8-27B-4bit` |
-| Qwen3.6 MoE (eschamoe) | `EschaLabs/Qwen3.6-35B-A3B-Escha-W2` (converted at load; see below) |
+| Qwen3.6 MoE (eschamoe) | `EschaLabs/Qwen3.6-35B-A3B-Escha-W2` (trellis experts read natively; see below) |
 | DeepSeek-V2 | `mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx` |
 
 ## Qwen 3.5+ Adapter and Version Notes
@@ -127,8 +127,8 @@ path = "EschaLabs/Qwen3.6-35B-A3B-Escha-W2"
 
 - Local models can be referenced by Hugging Face model ID or local path.
 - The model must be in MLX `safetensors` format. EschaLabs `eschamoe` trellis
-  checkpoints are the exception; Higgs converts them in memory at load (see
-  above).
+  checkpoints are the exception; Higgs reads the trellis experts natively and
+  converts only the remaining weights in memory at load (see above).
 - The checkpoint must use a supported `config.json` `model_type`.
 - macOS local serving requires `mlx.metallib` next to the executable. Release artifacts bundle it, and source builds restore it from Cargo build output when possible.
 

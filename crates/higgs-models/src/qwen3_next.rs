@@ -2189,6 +2189,11 @@ impl SwitchMlpWeights {
         indices: &Array,
         sorted: bool,
     ) -> Result<Array, Exception> {
+        // Native trellis weights have no affine gate/up tensors; route through
+        // the native gather path.
+        if self.escha.is_some() {
+            return self.forward_gather_global_sort(x, indices);
+        }
         // Reshape so x batch dims broadcast with the indices shape.
         // x: [B, L, D] -> [B, L, 1, 1, D]
         //   batch = [B, L, 1], M=1, K=D
@@ -2373,6 +2378,11 @@ impl SwitchMlpWeights {
         x: &Array,
         indices: &Array,
     ) -> Result<Array, Exception> {
+        // Native trellis weights replace the affine gate/up/down tensors, so
+        // the fused affine cache cannot be built. Use the native path instead.
+        if self.escha.is_some() {
+            return self.forward_gather_global_sort(x, indices);
+        }
         // Lazy-init: concatenate gate+up weights along axis 1 (intermediate dim).
         // MoE weights are [num_experts, intermediate_packed, hidden].
         if self.fused_gate_up.is_none() {
@@ -4550,8 +4560,10 @@ fn mtp_weight_layout_from_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> M
     // `mtp.layers.0.mlp.gate` and `mtp.layers.0.mlp.shared_expert`, but it has
     // no `mtp.layers.0.mlp.experts`. The head cannot operate without those
     // weights. Thus the function reports no MTP head, and the caller stops the
-    // MTP function for this checkpoint.
-    if has_mtp && has_moe_router && !has_moe_experts {
+    // MTP function for this checkpoint. The mirror case (routed experts with
+    // no router) is equally unusable: `MoeMtpHead` would build a router no
+    // tensor fills.
+    if has_mtp && (has_moe_router != has_moe_experts) {
         return MtpWeightLayout::None;
     }
 
@@ -5015,7 +5027,22 @@ fn load_qwen3_5_model_with_gdn_fallback(
     let quantization = args.quantization.clone();
     let force_separate =
         args.use_separate_gdn_projections || std::env::var("HIGGS_SEPARATE_GDN_PROJ").is_ok();
+    // The direct loader reads raw safetensors and never runs the escha
+    // conversion, so an eschamoe checkpoint would fail there with a
+    // placeholder report that names nothing. Reject the combination early.
+    let eschamoe = crate::eschamoe::is_eschamoe_checkpoint(model_path)?;
+    let reject_separate_escha = || {
+        ModelError::UnsupportedModel(
+            "HIGGS_SEPARATE_GDN_PROJ / use_separate_gdn_projections is not supported \
+             for eschamoe checkpoints: the direct loader cannot install native \
+             trellis experts. Unset the flag and use the fused path."
+                .to_owned(),
+        )
+    };
     if force_separate {
+        if eschamoe {
+            return Err(reject_separate_escha());
+        }
         args.use_separate_gdn_projections = true;
         let mut model = Qwen3NextCausalLM::new(args)?;
         load_qwen3_5_moe_weights_direct(&mut model, model_path, quantization.as_ref())?;
@@ -5036,6 +5063,9 @@ fn load_qwen3_5_model_with_gdn_fallback(
             Ok(fused_model)
         }
         Err(err) if is_mixed_bit_gdn_ba_fusion_error(&err) => {
+            if eschamoe {
+                return Err(reject_separate_escha());
+            }
             tracing::warn!(
                 error = %err,
                 "Detected mixed-bit GDN BA projection shapes; retrying with separate GDN projections"
@@ -5408,8 +5438,8 @@ fn force_eschamoe_quant_layout(
     }
     let target = crate::eschamoe::CONVERSION_TARGET;
     let spec = serde_json::json!({ "group_size": target.group_size, "bits": target.bits });
-    args.quantization = serde_json::from_value(spec.clone()).ok();
-    args.gate_quantization = serde_json::from_value(spec).ok();
+    args.quantization = Some(serde_json::from_value(spec.clone())?);
+    args.gate_quantization = Some(serde_json::from_value(spec)?);
     tracing::info!(
         group_size = target.group_size,
         bits = target.bits,
@@ -5564,12 +5594,17 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     );
     // In the native escha mode, the expert affine params get no tensors.
     // The forward pass uses the native weights in their place. Thus the
-    // completeness check must not flag the `switch_mlp` placeholders.
-    let native_experts = !escha_natives.is_empty();
+    // completeness check must not flag the `switch_mlp` placeholders — but
+    // only for layers the natives actually cover; an uncovered layer keeps
+    // its placeholders and must still fail validation.
+    let native_layers: std::collections::HashSet<String> = escha_natives
+        .iter()
+        .map(|(layer_idx, _)| format!("model.layers.{layer_idx}.mlp.switch_mlp."))
+        .collect();
     ensure_all_model_params_loaded(
         params
             .iter()
-            .filter(|(name, _)| !(native_experts && name.contains(".mlp.switch_mlp.")))
+            .filter(|(name, _)| !native_layers.iter().any(|p| name.contains(p.as_str())))
             .map(|(name, value)| (std::rc::Rc::<str>::clone(name), &**value)),
     )?;
 
@@ -8210,7 +8245,7 @@ mod tests {
         });
 
         candidates.into_iter().find(|path| {
-            Array::load_safetensors(path).ok().is_some_and(|loaded| {
+            Array::load_safetensors(path).is_ok_and(|loaded| {
                 loaded.keys().any(|key| {
                     key.contains("switch_mlp")
                         && key.contains("gate_proj")

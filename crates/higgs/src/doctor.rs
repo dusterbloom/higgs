@@ -585,7 +585,10 @@ fn check_quant_method_declarations(
         }
     }
     if let [(file_a, method_a), (file_b, method_b)] = methods.as_slice() {
-        if method_a != method_b {
+        // Only an eschamoe-related disagreement concerns this check; other
+        // quantization families (awq vs gptq, say) load fine and are outside
+        // its scope.
+        if method_a != method_b && (method_a == "eschamoe" || method_b == "eschamoe") {
             fail(
                 &format!(
                     "model {label} {file_a} quant_method=\"{method_a}\" conflicts with {file_b} \

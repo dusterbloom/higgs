@@ -416,12 +416,16 @@ fn check_gather_inputs(
         i32::try_from(tiles_n).unwrap_or(i32::MAX),
         i32::try_from(spec.words_per_tile()).unwrap_or(i32::MAX),
     ];
-    let code_ok = matches!(code.shape(), &[_, a, b, c] if [a, b, c] == tile_dims);
+    // Bind the expert axis: the kernels index `code` by expert id with no
+    // bound check, so a short checkpoint would read out of bounds.
+    let code_ok =
+        matches!(code.shape(), &[e, a, b, c] if e == spec.num_experts && [a, b, c] == tile_dims);
     if code.dtype() != Dtype::Int16 || !code_ok {
         return Err(Exception::custom(format!(
-            "eschamoe_gather_qmv: code {:?} {:?} does not match [E, {tile_dims:?}] int16",
+            "eschamoe_gather_qmv: code {:?} {:?} does not match [{}, {tile_dims:?}] int16",
             code.dtype(),
-            code.shape()
+            code.shape(),
+            spec.num_experts
         )));
     }
     let &[rows, cols] = xh.shape() else {
@@ -454,6 +458,11 @@ fn check_gather_inputs(
 /// carries the input scales and the input Hadamard of its expert. The
 /// input `code` is the full `[experts, tiles_k, tiles_n, 16 * K]` int16
 /// trellis tensor. The input `expert_ids` maps each row to one expert.
+/// The kernel stages the whole activation row in `x_sh[TK * 16]`, which is
+/// static threadgroup memory: Apple GPUs cap it at 32 KiB, so past 8192
+/// floats the kernel stops compiling with an error that names nothing.
+const MAX_THREADGROUP_FLOATS: i32 = 32 * 1024 / 4;
+
 /// The result is `y_pre = xh @ Ŵ` as a `[rows, out]` float32 matrix. The
 /// caller applies the output Hadamard and the output scales.
 #[allow(unsafe_code, dead_code)]
@@ -475,6 +484,12 @@ pub fn eschamoe_gather_qmv(
         )));
     }
     let (rows, tile_dims) = check_gather_inputs(xh, code, expert_ids, spec)?;
+    if spec.in_features > MAX_THREADGROUP_FLOATS {
+        return Err(Exception::custom(format!(
+            "eschamoe_gather_qmv: in_features {} exceeds the {}-float threadgroup staging limit",
+            spec.in_features, MAX_THREADGROUP_FLOATS
+        )));
+    }
 
     let stream = Stream::task_local_or_default();
     let cached = ESCHA_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_escha_qmv_kernel()));

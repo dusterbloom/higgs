@@ -91,12 +91,22 @@ class Shard:
         if not self.remote:
             with open(self.src, "rb") as f:
                 f.seek(offset)
-                return f.read(length)
+                data = f.read(length)
+            if len(data) != length:
+                raise OSError(f"short read: {len(data)} != {length}")
+            return data
         req = urllib.request.Request(
             self.src, headers={"Range": f"bytes={offset}-{offset + length - 1}"}
         )
-        with urllib.request.urlopen(req) as r:
-            return r.read()
+        # HTTPS only: the repo URL is fixed, but a redirected or spoofed
+        # scheme would otherwise pass straight through to urlopen.
+        if not req.full_url.startswith("https://"):
+            raise ValueError(f"refusing non-https URL: {req.full_url}")
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = r.read()
+        if len(data) != length:
+            raise OSError(f"short range read: {len(data)} != {length}")
+        return data
 
     def __contains__(self, key: str) -> bool:
         return key in self.header
@@ -113,6 +123,10 @@ class Shard:
         begin, end = meta["data_offsets"]
 
         if index is not None:
+            if not 0 <= index < shape[0]:
+                raise IndexError(
+                    f"{key}: index {index} out of range for axis 0 of {shape[0]}"
+                )
             stride = int(np.prod(shape[1:])) * dt.itemsize
             begin += index * stride
             end = begin + stride

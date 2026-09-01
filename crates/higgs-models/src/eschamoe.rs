@@ -2053,8 +2053,8 @@ mod tests {
             );
 
             let got = ops::dequantize(
-                &w.index(0),
-                &s.index(0),
+                w.index(0),
+                s.index(0),
                 &b.index(0),
                 target.group_size,
                 target.bits,
