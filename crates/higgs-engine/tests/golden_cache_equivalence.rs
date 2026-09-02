@@ -101,8 +101,16 @@ fn golden_radix_cache_reuse_stays_within_bound() {
     let dir = std::env::var("HIGGS_PRUNE_MODEL").expect("set HIGGS_PRUNE_MODEL");
     let model_dir = Path::new(&dir);
     let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
-    let engine =
-        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load model");
+    let engine = SimpleEngine::load(
+        model_dir,
+        KvCacheConfig::default(),
+        tuning,
+        false,
+        None,
+        0,
+        false,
+    )
+    .expect("load model");
 
     // Greedy decode: deterministic argmax, the precondition for token identity.
     let params = SamplingParams {
@@ -263,8 +271,16 @@ fn radix_reuse_vs_cold_determinism_control() {
     let dir = std::env::var("HIGGS_PRUNE_MODEL").expect("set HIGGS_PRUNE_MODEL");
     let model_dir = Path::new(&dir);
     let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
-    let engine =
-        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load model");
+    let engine = SimpleEngine::load(
+        model_dir,
+        KvCacheConfig::default(),
+        tuning,
+        false,
+        None,
+        0,
+        false,
+    )
+    .expect("load model");
     let params = SamplingParams {
         temperature: 0.0,
         ..Default::default()
@@ -355,8 +371,16 @@ fn per_session_continuation_is_best_effort() {
     let dir = std::env::var("HIGGS_PRUNE_MODEL").expect("set HIGGS_PRUNE_MODEL");
     let model_dir = Path::new(&dir);
     let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
-    let engine =
-        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load model");
+    let engine = SimpleEngine::load(
+        model_dir,
+        KvCacheConfig::default(),
+        tuning,
+        false,
+        None,
+        0,
+        false,
+    )
+    .expect("load model");
     let params = SamplingParams {
         temperature: 0.0,
         ..Default::default()

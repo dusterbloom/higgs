@@ -72,8 +72,16 @@ fn prune_smoke() {
     println!("rope: base={} dims={}", rope.base, rope.dims);
 
     let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
-    let engine =
-        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load model");
+    let engine = SimpleEngine::load(
+        model_dir,
+        KvCacheConfig::default(),
+        tuning,
+        false,
+        None,
+        0,
+        false,
+    )
+    .expect("load model");
 
     let msg = ChatMessage {
         role: "user".to_owned(),

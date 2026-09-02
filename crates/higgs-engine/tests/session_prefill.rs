@@ -68,8 +68,16 @@ fn session_continuation_saves_prefill() {
     let dir = std::env::var("HIGGS_PRUNE_MODEL").expect("set HIGGS_PRUNE_MODEL");
     let model_dir = Path::new(&dir);
     let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
-    let engine =
-        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load");
+    let engine = SimpleEngine::load(
+        model_dir,
+        KvCacheConfig::default(),
+        tuning,
+        false,
+        None,
+        0,
+        false,
+    )
+    .expect("load");
     let params = SamplingParams {
         temperature: 0.0,
         ..Default::default()
@@ -199,8 +207,16 @@ fn decode_throughput_probe() {
     let dir = std::env::var("HIGGS_PRUNE_MODEL").expect("set HIGGS_PRUNE_MODEL");
     let model_dir = Path::new(&dir);
     let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
-    let engine =
-        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load");
+    let engine = SimpleEngine::load(
+        model_dir,
+        KvCacheConfig::default(),
+        tuning,
+        false,
+        None,
+        0,
+        false,
+    )
+    .expect("load");
     let params = SamplingParams {
         temperature: 0.0,
         ..Default::default()
@@ -254,8 +270,16 @@ fn long_context_session_continuation_beats_cold_prefill() {
     let dir = std::env::var("HIGGS_PRUNE_MODEL").expect("set HIGGS_PRUNE_MODEL");
     let model_dir = Path::new(&dir);
     let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
-    let engine =
-        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load");
+    let engine = SimpleEngine::load(
+        model_dir,
+        KvCacheConfig::default(),
+        tuning,
+        false,
+        None,
+        0,
+        false,
+    )
+    .expect("load");
     let params = SamplingParams {
         temperature: 0.0,
         ..Default::default()

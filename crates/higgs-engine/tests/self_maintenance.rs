@@ -114,8 +114,16 @@ fn self_maintenance_vs_pruning() {
         traditional: false,
     };
     let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
-    let engine =
-        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load");
+    let engine = SimpleEngine::load(
+        model_dir,
+        KvCacheConfig::default(),
+        tuning,
+        false,
+        None,
+        0,
+        false,
+    )
+    .expect("load");
     let params = SamplingParams {
         temperature: 0.0,
         ..Default::default()

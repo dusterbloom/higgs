@@ -112,8 +112,16 @@ fn cross_turn_hybrid_reuse_is_approximate_within_bound() {
     let dir = std::env::var("HIGGS_PRUNE_MODEL").expect("set HIGGS_PRUNE_MODEL");
     let model_dir = Path::new(&dir);
     let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
-    let engine =
-        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load model");
+    let engine = SimpleEngine::load(
+        model_dir,
+        KvCacheConfig::default(),
+        tuning,
+        false,
+        None,
+        0,
+        false,
+    )
+    .expect("load model");
 
     // Greedy: deterministic given identical logits, so any warm-vs-cold gap is
     // the reuse approximation, not sampling noise.

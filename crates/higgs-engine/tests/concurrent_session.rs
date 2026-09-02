@@ -54,7 +54,16 @@ fn concurrent_same_session_is_serialized_and_correct() {
     let model_dir = Path::new(&dir);
     let tuning = MlxRuntimeTuning::from_model_dir(model_dir, RequestedMlxProfile::Auto);
     let engine = Arc::new(
-        SimpleEngine::load(model_dir, KvCacheConfig::default(), tuning, false).expect("load model"),
+        SimpleEngine::load(
+            model_dir,
+            KvCacheConfig::default(),
+            tuning,
+            false,
+            None,
+            0,
+            false,
+        )
+        .expect("load model"),
     );
 
     let render = |content: &str| -> Vec<u32> {
