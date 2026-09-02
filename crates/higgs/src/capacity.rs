@@ -3,6 +3,19 @@ use serde::{Deserialize, Serialize};
 pub const CAPACITY_SCHEMA_VERSION: u32 = 1;
 pub const CAPACITY_RETRY_AFTER_MS: u64 = 5_000;
 
+fn deserialize_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let schema_version = u32::deserialize(deserializer)?;
+    if schema_version != CAPACITY_SCHEMA_VERSION {
+        return Err(<D::Error as serde::de::Error>::custom(format_args!(
+            "unsupported capacity schemaVersion {schema_version}; expected {CAPACITY_SCHEMA_VERSION}"
+        )));
+    }
+    Ok(schema_version)
+}
+
 /// Whether the requested model can currently accept its minimum working request.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +45,7 @@ pub enum CapacityBasis {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapacitySnapshot {
+    #[serde(deserialize_with = "deserialize_schema_version")]
     pub schema_version: u32,
     pub model: String,
     pub model_fingerprint: String,
@@ -268,6 +282,18 @@ mod tests {
     }
 
     #[test]
+    fn capacity_snapshot_rejects_non_v1_schema_at_deserialization() {
+        let mut value = serde_json::to_value(available_snapshot()).unwrap();
+        value["schemaVersion"] = json!(2);
+
+        let error = serde_json::from_value::<CapacitySnapshot>(value).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported capacity schemaVersion 2; expected 1"
+        );
+    }
+
+    #[test]
     fn generation_is_comparable_only_within_one_boot() {
         let current = available_snapshot();
         let same = available_snapshot();
@@ -275,9 +301,14 @@ mod tests {
             boot_id: "01993654-8af2-7b31-a420-c52ebc349288".to_owned(),
             ..available_snapshot()
         };
+        let advanced = CapacitySnapshot {
+            generation: 8,
+            ..available_snapshot()
+        };
 
         assert!(current.is_same_revision(&same));
         assert!(!current.is_same_revision(&restarted));
+        assert!(!current.is_same_revision(&advanced));
     }
 
     #[test]
@@ -341,13 +372,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn typed_unknown_model_is_distinct_from_legacy_route_absence() {
+    #[tokio::test]
+    async fn typed_unknown_model_is_distinct_from_axum_legacy_route_absence() {
+        use axum::{
+            Router,
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
         let typed = serde_json::to_value(CapacityErrorEnvelope::new(
             CapacityModelNotFoundError::new("missing-model".to_owned()),
         ))
         .unwrap();
-        let generic_route_absence = "Not Found";
+        let legacy = Router::new()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/capacity?model=missing-model")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+        assert!(legacy.headers().get("content-type").is_none());
+        let legacy_body = legacy.into_body().collect().await.unwrap().to_bytes();
+        assert!(legacy_body.is_empty());
 
         assert_eq!(
             typed,
@@ -359,6 +411,6 @@ mod tests {
                 }
             })
         );
-        assert_ne!(typed.to_string(), generic_route_absence);
+        assert_ne!(typed.to_string().as_bytes(), legacy_body.as_ref());
     }
 }
