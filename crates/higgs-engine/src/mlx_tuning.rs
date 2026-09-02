@@ -11,6 +11,281 @@ const MIN_PAGED_KV_TARGET_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PAGED_KV_TARGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_MTP_DRAFT_N_MAX: usize = 8;
 
+/// Immutable process-wide allocator and device working-set facts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MlxMemorySnapshot {
+    pub active_bytes: u64,
+    pub peak_bytes: u64,
+    /// `None` means MLX reports no configured allocator limit.
+    pub memory_limit_bytes: Option<u64>,
+    /// `None` means the backend does not expose Metal's recommended limit.
+    pub metal_recommended_working_set_bytes: Option<u64>,
+}
+
+/// A content-free allocator observation for one bounded inference phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestMemoryHighWater {
+    pub phase: MemoryPhase,
+    pub active_before_bytes: u64,
+    pub active_after_bytes: u64,
+    pub peak_bytes: u64,
+    pub active_growth_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPhase {
+    Prefill,
+    Decode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlxMemoryProbeError {
+    QueryFailed(&'static str),
+    ResetPeakFailed,
+}
+
+impl std::fmt::Display for MlxMemoryProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueryFailed(operation) => {
+                write!(formatter, "MLX memory query failed: {operation}")
+            }
+            Self::ResetPeakFailed => formatter.write_str("MLX peak-memory reset failed"),
+        }
+    }
+}
+
+impl std::error::Error for MlxMemoryProbeError {}
+
+trait MlxMemoryProbe {
+    fn snapshot(&self) -> Result<MlxMemorySnapshot, MlxMemoryProbeError>;
+    fn reset_peak_memory(&self) -> Result<(), MlxMemoryProbeError>;
+}
+
+struct SystemMlxMemoryProbe;
+
+#[allow(unsafe_code)]
+impl MlxMemoryProbe for SystemMlxMemoryProbe {
+    fn snapshot(&self) -> Result<MlxMemorySnapshot, MlxMemoryProbeError> {
+        let mut active_bytes = 0_usize;
+        let mut peak_bytes = 0_usize;
+        let mut memory_limit_bytes = 0_usize;
+        unsafe {
+            if mlx_sys::mlx_get_active_memory(&raw mut active_bytes) != 0 {
+                return Err(MlxMemoryProbeError::QueryFailed("active memory"));
+            }
+            if mlx_sys::mlx_get_peak_memory(&raw mut peak_bytes) != 0 {
+                return Err(MlxMemoryProbeError::QueryFailed("peak memory"));
+            }
+            if mlx_sys::mlx_get_memory_limit(&raw mut memory_limit_bytes) != 0 {
+                return Err(MlxMemoryProbeError::QueryFailed("memory limit"));
+            }
+        }
+
+        let recommended = metal_recommended_working_set_bytes();
+        Ok(MlxMemorySnapshot {
+            active_bytes: u64::try_from(active_bytes)
+                .map_err(|_| MlxMemoryProbeError::QueryFailed("active memory conversion"))?,
+            peak_bytes: u64::try_from(peak_bytes)
+                .map_err(|_| MlxMemoryProbeError::QueryFailed("peak memory conversion"))?,
+            memory_limit_bytes: (memory_limit_bytes > 0)
+                .then(|| u64::try_from(memory_limit_bytes))
+                .transpose()
+                .map_err(|_| MlxMemoryProbeError::QueryFailed("memory limit conversion"))?,
+            metal_recommended_working_set_bytes: recommended,
+        })
+    }
+
+    fn reset_peak_memory(&self) -> Result<(), MlxMemoryProbeError> {
+        let result = unsafe { mlx_sys::mlx_reset_peak_memory() };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(MlxMemoryProbeError::ResetPeakFailed)
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn metal_recommended_working_set_bytes() -> Option<u64> {
+    unsafe {
+        let mut info = mlx_sys::mlx_device_info_new();
+        let mut device = mlx_sys::mlx_device_new();
+        mlx_sys::mlx_get_default_device(&raw mut device);
+        let value = if mlx_sys::mlx_device_info_get(&raw mut info, device) == 0 {
+            let mut bytes = 0_usize;
+            let key = c"max_recommended_working_set_size";
+            (mlx_sys::mlx_device_info_get_size(&raw mut bytes, info, key.as_ptr()) == 0
+                && bytes > 0)
+                .then(|| u64::try_from(bytes).ok())
+                .flatten()
+        } else {
+            None
+        };
+        mlx_sys::mlx_device_info_free(info);
+        mlx_sys::mlx_device_free(device);
+        value
+    }
+}
+
+fn measure_mlx_memory(
+    probe: &impl MlxMemoryProbe,
+) -> Result<MlxMemorySnapshot, MlxMemoryProbeError> {
+    probe.snapshot()
+}
+
+impl MlxMemorySnapshot {
+    /// Measure the current MLX allocator and backend working-set facts.
+    pub fn measure() -> Result<Self, MlxMemoryProbeError> {
+        measure_mlx_memory(&SystemMlxMemoryProbe)
+    }
+}
+
+/// Before/after sampler for a bounded prefill or decode phase.
+///
+/// Starting a sample resets MLX's process-global peak counter. Callers must
+/// therefore hold Higgs's process-global MLX execution gate until `finish`.
+pub struct RequestMemorySampler<'gate> {
+    phase: MemoryPhase,
+    before: MlxMemorySnapshot,
+    _mlx_gate: &'gate higgs_models::mlx_exec::MlxExecToken,
+}
+
+impl<'gate> RequestMemorySampler<'gate> {
+    pub fn start(
+        phase: MemoryPhase,
+        mlx_gate: &'gate higgs_models::mlx_exec::MlxExecToken,
+    ) -> Result<Self, MlxMemoryProbeError> {
+        Self::start_with_probe(phase, mlx_gate, &SystemMlxMemoryProbe)
+    }
+
+    fn start_with_probe(
+        phase: MemoryPhase,
+        mlx_gate: &'gate higgs_models::mlx_exec::MlxExecToken,
+        probe: &impl MlxMemoryProbe,
+    ) -> Result<Self, MlxMemoryProbeError> {
+        let before = measure_mlx_memory(probe)?;
+        probe.reset_peak_memory()?;
+        Ok(Self {
+            phase,
+            before,
+            _mlx_gate: mlx_gate,
+        })
+    }
+
+    pub fn finish(self) -> Result<RequestMemoryHighWater, MlxMemoryProbeError> {
+        self.finish_with_probe(&SystemMlxMemoryProbe)
+    }
+
+    fn finish_with_probe(
+        self,
+        probe: &impl MlxMemoryProbe,
+    ) -> Result<RequestMemoryHighWater, MlxMemoryProbeError> {
+        let after = measure_mlx_memory(probe)?;
+        Ok(RequestMemoryHighWater {
+            phase: self.phase,
+            active_before_bytes: self.before.active_bytes,
+            active_after_bytes: after.active_bytes,
+            peak_bytes: after
+                .peak_bytes
+                .max(self.before.active_bytes)
+                .max(after.active_bytes),
+            active_growth_bytes: after.active_bytes.saturating_sub(self.before.active_bytes),
+        })
+    }
+}
+
+/// Artifact and measured allocator residency attributable to one model load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelFootprint {
+    pub artifact_weight_bytes: u64,
+    pub loaded_mlx_bytes: u64,
+}
+
+impl ModelFootprint {
+    pub fn from_load_measurements(
+        model_dir: &Path,
+        before: MlxMemorySnapshot,
+        after: MlxMemorySnapshot,
+    ) -> Option<Self> {
+        Some(Self {
+            artifact_weight_bytes: model_weight_bytes(model_dir)?,
+            loaded_mlx_bytes: after.active_bytes.checked_sub(before.active_bytes)?,
+        })
+    }
+}
+
+/// Conservative transient-prefill function over a declared input domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransientPrefillEstimate {
+    pub base_bytes: u64,
+    pub bytes_per_prompt_token: u64,
+    pub bytes_per_chunk_token: u64,
+    pub max_prompt_tokens: u64,
+    pub max_chunk_tokens: u64,
+}
+
+impl TransientPrefillEstimate {
+    pub fn estimate_bytes(&self, prompt_tokens: u64, chunk_tokens: u64) -> Option<u64> {
+        if prompt_tokens > self.max_prompt_tokens || chunk_tokens > self.max_chunk_tokens {
+            return None;
+        }
+        self.base_bytes
+            .checked_add(self.bytes_per_prompt_token.checked_mul(prompt_tokens)?)?
+            .checked_add(self.bytes_per_chunk_token.checked_mul(chunk_tokens)?)
+    }
+}
+
+/// Immutable byte-domain costs required by the adaptive capacity controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineCostDescription {
+    pub fixed_live_session_bytes: u64,
+    pub persistent_bytes_per_token: u64,
+    pub decode_workspace_bytes: u64,
+    pub transient_prefill: TransientPrefillEstimate,
+}
+
+impl EngineCostDescription {
+    /// Derive the fp16 dense-KV term from model metadata without exposing the
+    /// loader's private model representation.
+    pub fn fp16_from_model_dir(
+        model_dir: &Path,
+        fixed_live_session_bytes: u64,
+        decode_workspace_bytes: u64,
+        transient_prefill: TransientPrefillEstimate,
+    ) -> Option<Self> {
+        let metadata = ModelMetadata::from_model_dir(model_dir);
+        let layers = u64::try_from(metadata.num_hidden_layers?).ok()?;
+        let kv_heads = u64::try_from(metadata.num_key_value_heads?).ok()?;
+        let head_dim = u64::try_from(metadata.head_dim?).ok()?;
+        let dense_layers = if metadata.is_hybrid_attention() {
+            let interval = u64::try_from(metadata.full_attention_interval?).ok()?;
+            if interval == 0 {
+                return None;
+            }
+            layers / interval
+        } else {
+            layers
+        };
+        let persistent_bytes_per_token = dense_layers
+            .checked_mul(2)?
+            .checked_mul(kv_heads)?
+            .checked_mul(head_dim)?
+            .checked_mul(2)?;
+
+        Some(Self {
+            fixed_live_session_bytes,
+            persistent_bytes_per_token,
+            decode_workspace_bytes,
+            transient_prefill,
+        })
+    }
+
+    pub fn persistent_bytes(&self, tokens: u64) -> Option<u64> {
+        self.persistent_bytes_per_token.checked_mul(tokens)
+    }
+}
+
 fn parse_positive_chunked_prefill_value(raw: Option<&str>, default: i32) -> i32 {
     raw.and_then(|s| s.parse::<i32>().ok())
         .filter(|v| *v > 0)
@@ -130,6 +405,9 @@ struct ModelMetadata {
     quantization_bits: Option<u8>,
     num_hidden_layers: Option<usize>,
     hidden_size: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    head_dim: Option<usize>,
+    full_attention_interval: Option<usize>,
     max_position_embeddings: Option<usize>,
     weight_bytes: Option<u64>,
 }
@@ -152,6 +430,11 @@ impl ModelMetadata {
             num_hidden_layers: config_lookup_u64(&config, "num_hidden_layers")
                 .and_then(|v| usize::try_from(v).ok()),
             hidden_size: config_lookup_u64(&config, "hidden_size")
+                .and_then(|v| usize::try_from(v).ok()),
+            num_key_value_heads: config_lookup_u64(&config, "num_key_value_heads")
+                .and_then(|v| usize::try_from(v).ok()),
+            head_dim: config_lookup_u64(&config, "head_dim").and_then(|v| usize::try_from(v).ok()),
+            full_attention_interval: config_lookup_u64(&config, "full_attention_interval")
                 .and_then(|v| usize::try_from(v).ok()),
             max_position_embeddings: config_lookup_u64(&config, "max_position_embeddings")
                 .and_then(|v| usize::try_from(v).ok()),
@@ -197,6 +480,13 @@ impl ModelMetadata {
 
     fn is_long_context(&self) -> bool {
         self.max_position_embeddings.unwrap_or_default() >= 65_536
+    }
+
+    fn is_hybrid_attention(&self) -> bool {
+        matches!(
+            self.model_type.as_deref(),
+            Some("qwen3_next" | "qwen3_5" | "qwen3_5_moe")
+        )
     }
 
     fn should_clear_cache_after_prefill(&self) -> bool {
@@ -573,13 +863,195 @@ fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MlxRuntimeTuning, ModelMetadata, ModelSizeClass, RequestedMlxProfile, ResolvedMlxProfile,
-        default_mtp_draft_n_max, heuristic_paged_kv_target_bytes_with_max, model_weight_bytes,
+        EngineCostDescription, MemoryPhase, MlxMemoryProbe, MlxMemoryProbeError, MlxMemorySnapshot,
+        MlxRuntimeTuning, ModelFootprint, ModelMetadata, ModelSizeClass, RequestMemorySampler,
+        RequestedMlxProfile, ResolvedMlxProfile, TransientPrefillEstimate, default_mtp_draft_n_max,
+        heuristic_paged_kv_target_bytes_with_max, measure_mlx_memory, model_weight_bytes,
         parse_enabled_flag, parse_mtp_draft_n_max, parse_positive_chunked_prefill_value,
         resolve_effective_mlx_profile, resolve_profile_from_metadata, resolve_runtime_tuning,
     };
+    use std::collections::VecDeque;
     use std::fs;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    struct FakeMemoryProbe {
+        snapshots: Mutex<VecDeque<MlxMemorySnapshot>>,
+        resets: Mutex<usize>,
+    }
+
+    impl FakeMemoryProbe {
+        fn new(snapshots: impl IntoIterator<Item = MlxMemorySnapshot>) -> Self {
+            Self {
+                snapshots: Mutex::new(snapshots.into_iter().collect()),
+                resets: Mutex::new(0),
+            }
+        }
+    }
+
+    impl MlxMemoryProbe for FakeMemoryProbe {
+        fn snapshot(&self) -> Result<MlxMemorySnapshot, MlxMemoryProbeError> {
+            self.snapshots
+                .lock()
+                .map_err(|_| MlxMemoryProbeError::QueryFailed("test snapshot lock"))?
+                .pop_front()
+                .ok_or(MlxMemoryProbeError::QueryFailed("test snapshot exhausted"))
+        }
+
+        fn reset_peak_memory(&self) -> Result<(), MlxMemoryProbeError> {
+            let mut resets = self
+                .resets
+                .lock()
+                .map_err(|_| MlxMemoryProbeError::QueryFailed("test reset lock"))?;
+            *resets += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn memory_snapshot_preserves_allocator_and_working_set_measurements() {
+        let expected = MlxMemorySnapshot {
+            active_bytes: 11,
+            peak_bytes: 17,
+            memory_limit_bytes: Some(23),
+            metal_recommended_working_set_bytes: Some(29),
+        };
+        let probe = FakeMemoryProbe::new([expected]);
+
+        assert_eq!(measure_mlx_memory(&probe).unwrap(), expected);
+    }
+
+    #[test]
+    fn request_memory_sampler_records_content_free_prefill_high_water() {
+        let before = MlxMemorySnapshot {
+            active_bytes: 100,
+            peak_bytes: 900,
+            memory_limit_bytes: Some(1_000),
+            metal_recommended_working_set_bytes: Some(800),
+        };
+        let after = MlxMemorySnapshot {
+            active_bytes: 140,
+            peak_bytes: 220,
+            memory_limit_bytes: Some(1_000),
+            metal_recommended_working_set_bytes: Some(800),
+        };
+        let probe = FakeMemoryProbe::new([before, after]);
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+
+        let sampler =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mlx_gate, &probe)
+                .unwrap();
+        let sample = sampler.finish_with_probe(&probe).unwrap();
+
+        assert_eq!(sample.phase, MemoryPhase::Prefill);
+        assert_eq!(sample.active_before_bytes, 100);
+        assert_eq!(sample.active_after_bytes, 140);
+        assert_eq!(sample.peak_bytes, 220);
+        assert_eq!(sample.active_growth_bytes, 40);
+        assert_eq!(*probe.resets.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn request_memory_sampler_records_decode_and_never_understates_baseline() {
+        let before = MlxMemorySnapshot {
+            active_bytes: 300,
+            peak_bytes: 700,
+            memory_limit_bytes: None,
+            metal_recommended_working_set_bytes: None,
+        };
+        let after = MlxMemorySnapshot {
+            active_bytes: 280,
+            peak_bytes: 250,
+            memory_limit_bytes: None,
+            metal_recommended_working_set_bytes: None,
+        };
+        let probe = FakeMemoryProbe::new([before, after]);
+        let mlx_gate = higgs_models::mlx_exec::acquire();
+
+        let sampler =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Decode, &mlx_gate, &probe).unwrap();
+        let sample = sampler.finish_with_probe(&probe).unwrap();
+
+        assert_eq!(sample.phase, MemoryPhase::Decode);
+        assert_eq!(sample.peak_bytes, 300);
+        assert_eq!(sample.active_growth_bytes, 0);
+    }
+
+    #[test]
+    fn model_memory_footprint_uses_artifact_bytes_and_checked_active_delta() -> std::io::Result<()>
+    {
+        let temp = TempDir::new().map_err(std::io::Error::other)?;
+        fs::write(temp.path().join("model.safetensors"), [0_u8; 13])?;
+        let before = MlxMemorySnapshot {
+            active_bytes: 80,
+            ..MlxMemorySnapshot::default()
+        };
+        let after = MlxMemorySnapshot {
+            active_bytes: 180,
+            ..MlxMemorySnapshot::default()
+        };
+
+        assert_eq!(
+            ModelFootprint::from_load_measurements(temp.path(), before, after),
+            Some(ModelFootprint {
+                artifact_weight_bytes: 13,
+                loaded_mlx_bytes: 100,
+            })
+        );
+        assert!(ModelFootprint::from_load_measurements(temp.path(), after, before).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn escha_memory_geometry_is_20480_dense_kv_bytes_per_token() -> std::io::Result<()> {
+        let temp = TempDir::new().map_err(std::io::Error::other)?;
+        write_json(
+            &temp.path().join("config.json"),
+            &serde_json::json!({
+                "model_type": "qwen3_5_moe",
+                "num_hidden_layers": 40,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "full_attention_interval": 4
+            }),
+        )?;
+        let transient = TransientPrefillEstimate {
+            base_bytes: 0,
+            bytes_per_prompt_token: 0,
+            bytes_per_chunk_token: 0,
+            max_prompt_tokens: 131_072,
+            max_chunk_tokens: 4_096,
+        };
+
+        let cost = EngineCostDescription::fp16_from_model_dir(temp.path(), 0, 0, transient)
+            .expect("complete Escha cache geometry");
+
+        assert_eq!(cost.persistent_bytes_per_token, 20_480);
+        assert_eq!(cost.persistent_bytes(49_152), Some(960 * 1024 * 1024));
+        Ok(())
+    }
+
+    #[test]
+    fn engine_memory_cost_rejects_overflow_and_out_of_domain_prefill() {
+        let transient = TransientPrefillEstimate {
+            base_bytes: u64::MAX,
+            bytes_per_prompt_token: 1,
+            bytes_per_chunk_token: 1,
+            max_prompt_tokens: 8,
+            max_chunk_tokens: 4,
+        };
+        let cost = EngineCostDescription {
+            fixed_live_session_bytes: 1,
+            persistent_bytes_per_token: u64::MAX,
+            decode_workspace_bytes: 1,
+            transient_prefill: transient,
+        };
+
+        assert_eq!(cost.persistent_bytes(2), None);
+        assert_eq!(transient.estimate_bytes(1, 1), None);
+        assert_eq!(transient.estimate_bytes(9, 1), None);
+        assert_eq!(transient.estimate_bytes(1, 5), None);
+    }
 
     #[test]
     fn test_requested_profile_env_aliases_parse() {

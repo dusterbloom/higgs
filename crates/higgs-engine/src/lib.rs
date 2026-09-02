@@ -20,4 +20,9 @@ pub mod scheduler;
 pub mod simple;
 pub mod tool_parser;
 
+pub use mlx_tuning::{
+    EngineCostDescription, MemoryPhase, MlxMemoryProbeError, MlxMemorySnapshot, ModelFootprint,
+    RequestMemoryHighWater, RequestMemorySampler, TransientPrefillEstimate,
+};
+pub use simple::CacheResidency;
 pub use tokenizers;
