@@ -37,7 +37,8 @@ fn retained_count_cap_bounds_live_sessions() {
         max_retained_sessions: 2,
         ..Default::default()
     };
-    let engine = SimpleEngine::load(model_dir, cfg, tuning, false).expect("load model");
+    let engine =
+        SimpleEngine::load(model_dir, cfg, tuning, false, None, 0, false).expect("load model");
     let params = SamplingParams {
         temperature: 0.0,
         ..Default::default()
