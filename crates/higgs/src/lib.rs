@@ -1,6 +1,7 @@
 pub mod anthropic_adapter;
 pub mod attach;
 pub mod auto_router;
+pub mod capacity;
 pub mod cli_config;
 pub mod config;
 pub mod daemon;
@@ -51,7 +52,7 @@ use crate::state::SharedState;
 type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
 
 // Observability/control-plane routes must never perturb API traffic metrics.
-const INFRASTRUCTURE_PATHS: &[&str] = &["/health", "/metrics"];
+const INFRASTRUCTURE_PATHS: &[&str] = &["/health", "/metrics", "/v1/capacity"];
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
@@ -249,5 +250,15 @@ mod cors_tests {
     fn empty_list_disables_cors() {
         let origins: Vec<String> = vec![];
         assert!(build_cors_layer(Some(&origins)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod infrastructure_path_tests {
+    use super::INFRASTRUCTURE_PATHS;
+
+    #[test]
+    fn capacity_endpoint_is_not_counted_as_api_traffic() {
+        assert!(INFRASTRUCTURE_PATHS.contains(&"/v1/capacity"));
     }
 }
