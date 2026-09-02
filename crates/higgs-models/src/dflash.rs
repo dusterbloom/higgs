@@ -2479,6 +2479,7 @@ mod tests {
         assert_eq!(accept_prefix(&draft, &verify), vec![42]);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "left == right")]
     fn accept_prefix_mismatched_lengths_panic_in_debug() {
