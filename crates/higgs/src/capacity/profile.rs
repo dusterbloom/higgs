@@ -115,6 +115,7 @@ impl LearnedProfile {
             && unique_bands
             && self.evidence.iter().all(|band| {
                 band.prompt_band.is_power_of_two()
+                    && (!band.cold_replacement_qualified || band.cold_high_water_bytes > 0)
                     && (band.cold_high_water_bytes > 0
                         || band.retained_high_water_bytes > 0
                         || band.suffix_high_water_bytes > 0)
@@ -260,6 +261,19 @@ mod tests {
         wrong_schema["schemaVersion"] = 2.into();
         std::fs::write(&path, serde_json::to_vec(&wrong_schema).unwrap()).unwrap();
         assert_eq!(store.load(&profile_key(), 12 * GIB).unwrap(), None);
+
+        let invalid_qualified = LearnedProfile::new(
+            profile_key(),
+            12 * GIB,
+            vec![LearnedBandEvidence {
+                prompt_band: 65_536,
+                cold_high_water_bytes: 0,
+                cold_replacement_qualified: true,
+                retained_high_water_bytes: GIB,
+                suffix_high_water_bytes: 0,
+            }],
+        );
+        assert!(!invalid_qualified.is_complete());
         std::fs::write(&path, b"not-json").unwrap();
         assert_eq!(store.load(&profile_key(), 12 * GIB).unwrap(), None);
     }
