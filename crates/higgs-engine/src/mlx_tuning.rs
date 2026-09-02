@@ -855,21 +855,28 @@ fn strict_model_artifact_bytes(model_dir: &Path) -> Option<u64> {
             let entry = entry_result.ok()?;
             let path = entry.path();
             let file_type = entry.file_type().ok()?;
+            let is_safetensors = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"));
+            if file_type.is_symlink() {
+                let metadata = std::fs::metadata(&path).ok()?;
+                if metadata.is_dir() {
+                    return None;
+                }
+                if is_safetensors {
+                    if !metadata.is_file() {
+                        return None;
+                    }
+                    total = checked_artifact_total(total, metadata.len())?;
+                }
+                continue;
+            }
             if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
-            if (file_type.is_file() || file_type.is_symlink())
-                && path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
-            {
-                let metadata = if file_type.is_symlink() {
-                    std::fs::metadata(&path)
-                } else {
-                    entry.metadata()
-                }
-                .ok()?;
+            if file_type.is_file() && is_safetensors {
+                let metadata = entry.metadata().ok()?;
                 if !metadata.is_file() {
                     return None;
                 }
@@ -1307,6 +1314,56 @@ mod tests {
         assert_eq!(
             ModelFootprint::from_load_measurements(&not_directory, before, after),
             None
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_memory_footprint_fails_closed_on_directory_symlink() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let model = TempDir::new().map_err(std::io::Error::other)?;
+        fs::write(model.path().join("direct.safetensors"), [0_u8; 13])?;
+        let linked_weights = TempDir::new().map_err(std::io::Error::other)?;
+        fs::write(linked_weights.path().join("linked.safetensors"), [0_u8; 17])?;
+        symlink(linked_weights.path(), model.path().join("linked-weights"))?;
+        let before = MlxMemorySnapshot::default();
+        let after = MlxMemorySnapshot {
+            active_bytes: 100,
+            ..MlxMemorySnapshot::default()
+        };
+
+        assert_eq!(
+            ModelFootprint::from_load_measurements(model.path(), before, after),
+            None,
+            "skipping a directory symlink would publish a partial direct-weight total"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_memory_footprint_counts_symlinked_safetensors_file() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let model = TempDir::new().map_err(std::io::Error::other)?;
+        let target = TempDir::new().map_err(std::io::Error::other)?;
+        let target_file = target.path().join("weight-target");
+        fs::write(&target_file, [0_u8; 17])?;
+        symlink(&target_file, model.path().join("model.safetensors"))?;
+        let before = MlxMemorySnapshot::default();
+        let after = MlxMemorySnapshot {
+            active_bytes: 100,
+            ..MlxMemorySnapshot::default()
+        };
+
+        assert_eq!(
+            ModelFootprint::from_load_measurements(model.path(), before, after),
+            Some(ModelFootprint {
+                artifact_weight_bytes: 17,
+                loaded_mlx_bytes: 100,
+            })
         );
         Ok(())
     }
