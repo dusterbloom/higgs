@@ -14,6 +14,7 @@ const MAX_MTP_DRAFT_N_MAX: usize = 8;
 /// Immutable process-wide allocator and device working-set facts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MlxMemorySnapshot {
+    /// Absolute process-wide MLX active allocation at measurement time.
     pub active_bytes: u64,
     pub peak_bytes: u64,
     /// `None` means MLX reports no configured allocator limit.
@@ -58,7 +59,10 @@ impl std::fmt::Display for MlxMemoryProbeError {
 impl std::error::Error for MlxMemoryProbeError {}
 
 trait MlxMemoryProbe {
-    fn snapshot(&self) -> Result<MlxMemorySnapshot, MlxMemoryProbeError>;
+    fn active_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError>;
+    fn peak_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError>;
+    fn memory_limit_bytes(&self) -> Result<u128, MlxMemoryProbeError>;
+    fn metal_recommended_working_set_bytes(&self) -> Result<Option<u128>, MlxMemoryProbeError>;
     fn reset_peak_memory(&self) -> Result<(), MlxMemoryProbeError>;
 }
 
@@ -66,34 +70,38 @@ struct SystemMlxMemoryProbe;
 
 #[allow(unsafe_code)]
 impl MlxMemoryProbe for SystemMlxMemoryProbe {
-    fn snapshot(&self) -> Result<MlxMemorySnapshot, MlxMemoryProbeError> {
+    fn active_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
         let mut active_bytes = 0_usize;
-        let mut peak_bytes = 0_usize;
-        let mut memory_limit_bytes = 0_usize;
         unsafe {
             if mlx_sys::mlx_get_active_memory(&raw mut active_bytes) != 0 {
                 return Err(MlxMemoryProbeError::QueryFailed("active memory"));
             }
+        }
+        Ok(active_bytes as u128)
+    }
+
+    fn peak_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+        let mut peak_bytes = 0_usize;
+        unsafe {
             if mlx_sys::mlx_get_peak_memory(&raw mut peak_bytes) != 0 {
                 return Err(MlxMemoryProbeError::QueryFailed("peak memory"));
             }
+        }
+        Ok(peak_bytes as u128)
+    }
+
+    fn memory_limit_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+        let mut memory_limit_bytes = 0_usize;
+        unsafe {
             if mlx_sys::mlx_get_memory_limit(&raw mut memory_limit_bytes) != 0 {
                 return Err(MlxMemoryProbeError::QueryFailed("memory limit"));
             }
         }
+        Ok(memory_limit_bytes as u128)
+    }
 
-        let recommended = metal_recommended_working_set_bytes();
-        Ok(MlxMemorySnapshot {
-            active_bytes: u64::try_from(active_bytes)
-                .map_err(|_| MlxMemoryProbeError::QueryFailed("active memory conversion"))?,
-            peak_bytes: u64::try_from(peak_bytes)
-                .map_err(|_| MlxMemoryProbeError::QueryFailed("peak memory conversion"))?,
-            memory_limit_bytes: (memory_limit_bytes > 0)
-                .then(|| u64::try_from(memory_limit_bytes))
-                .transpose()
-                .map_err(|_| MlxMemoryProbeError::QueryFailed("memory limit conversion"))?,
-            metal_recommended_working_set_bytes: recommended,
-        })
+    fn metal_recommended_working_set_bytes(&self) -> Result<Option<u128>, MlxMemoryProbeError> {
+        Ok(metal_recommended_working_set_bytes().map(u128::from))
     }
 
     fn reset_peak_memory(&self) -> Result<(), MlxMemoryProbeError> {
@@ -131,7 +139,28 @@ pub(crate) fn metal_recommended_working_set_bytes() -> Option<u64> {
 fn measure_mlx_memory(
     probe: &impl MlxMemoryProbe,
 ) -> Result<MlxMemorySnapshot, MlxMemoryProbeError> {
-    probe.snapshot()
+    let active_bytes = probe.active_memory_bytes()?;
+    let peak_bytes = probe.peak_memory_bytes()?;
+    let memory_limit_bytes = probe.memory_limit_bytes()?;
+    let metal_recommended_working_set_bytes = probe.metal_recommended_working_set_bytes()?;
+
+    Ok(MlxMemorySnapshot {
+        active_bytes: checked_raw_memory_bytes(active_bytes, "active memory conversion")?,
+        peak_bytes: checked_raw_memory_bytes(peak_bytes, "peak memory conversion")?,
+        memory_limit_bytes: (memory_limit_bytes > 0)
+            .then(|| checked_raw_memory_bytes(memory_limit_bytes, "memory limit conversion"))
+            .transpose()?,
+        metal_recommended_working_set_bytes: metal_recommended_working_set_bytes
+            .map(|bytes| checked_raw_memory_bytes(bytes, "Metal working-set conversion"))
+            .transpose()?,
+    })
+}
+
+fn checked_raw_memory_bytes(
+    bytes: u128,
+    operation: &'static str,
+) -> Result<u64, MlxMemoryProbeError> {
+    u64::try_from(bytes).map_err(|_| MlxMemoryProbeError::QueryFailed(operation))
 }
 
 impl MlxMemorySnapshot {
@@ -145,23 +174,35 @@ impl MlxMemorySnapshot {
 ///
 /// Starting a sample resets MLX's process-global peak counter. Callers must
 /// therefore hold Higgs's process-global MLX execution gate until `finish`.
+/// The mutable borrow prevents nested samplers from resetting the same global
+/// counter while an earlier phase is still being measured.
+///
+/// ```compile_fail
+/// use higgs_engine::{MemoryPhase, RequestMemorySampler};
+///
+/// let mut gate = higgs_models::mlx_exec::acquire();
+/// let prefill = RequestMemorySampler::start(MemoryPhase::Prefill, &mut gate).unwrap();
+/// let decode = RequestMemorySampler::start(MemoryPhase::Decode, &mut gate).unwrap();
+/// drop(prefill);
+/// drop(decode);
+/// ```
 pub struct RequestMemorySampler<'gate> {
     phase: MemoryPhase,
     before: MlxMemorySnapshot,
-    _mlx_gate: &'gate higgs_models::mlx_exec::MlxExecToken,
+    _mlx_gate: &'gate mut higgs_models::mlx_exec::MlxExecToken,
 }
 
 impl<'gate> RequestMemorySampler<'gate> {
     pub fn start(
         phase: MemoryPhase,
-        mlx_gate: &'gate higgs_models::mlx_exec::MlxExecToken,
+        mlx_gate: &'gate mut higgs_models::mlx_exec::MlxExecToken,
     ) -> Result<Self, MlxMemoryProbeError> {
         Self::start_with_probe(phase, mlx_gate, &SystemMlxMemoryProbe)
     }
 
     fn start_with_probe(
         phase: MemoryPhase,
-        mlx_gate: &'gate higgs_models::mlx_exec::MlxExecToken,
+        mlx_gate: &'gate mut higgs_models::mlx_exec::MlxExecToken,
         probe: &impl MlxMemoryProbe,
     ) -> Result<Self, MlxMemoryProbeError> {
         let before = measure_mlx_memory(probe)?;
@@ -199,17 +240,22 @@ impl<'gate> RequestMemorySampler<'gate> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelFootprint {
     pub artifact_weight_bytes: u64,
+    /// Checked `after - before` delta from a serialized model-load window.
+    ///
+    /// This is load-attributable growth, not current absolute process state;
+    /// use [`MlxMemorySnapshot::active_bytes`] for an absolute measurement.
     pub loaded_mlx_bytes: u64,
 }
 
 impl ModelFootprint {
+    /// Describe one model load measured without concurrent MLX allocations.
     pub fn from_load_measurements(
         model_dir: &Path,
         before: MlxMemorySnapshot,
         after: MlxMemorySnapshot,
     ) -> Option<Self> {
         Some(Self {
-            artifact_weight_bytes: model_weight_bytes(model_dir)?,
+            artifact_weight_bytes: strict_model_artifact_bytes(model_dir)?,
             loaded_mlx_bytes: after.active_bytes.checked_sub(before.active_bytes)?,
         })
     }
@@ -258,6 +304,9 @@ impl EngineCostDescription {
         let layers = u64::try_from(metadata.num_hidden_layers?).ok()?;
         let kv_heads = u64::try_from(metadata.num_key_value_heads?).ok()?;
         let head_dim = u64::try_from(metadata.head_dim?).ok()?;
+        if layers == 0 || kv_heads == 0 || head_dim == 0 {
+            return None;
+        }
         let dense_layers = if metadata.is_hybrid_attention() {
             let interval = u64::try_from(metadata.full_attention_interval?).ok()?;
             if interval == 0 {
@@ -267,6 +316,9 @@ impl EngineCostDescription {
         } else {
             layers
         };
+        if dense_layers == 0 {
+            return None;
+        }
         let persistent_bytes_per_token = dense_layers
             .checked_mul(2)?
             .checked_mul(kv_heads)?
@@ -790,6 +842,45 @@ fn config_lookup_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
     config_lookup(config, key).and_then(serde_json::Value::as_u64)
 }
 
+fn checked_artifact_total(total: u64, bytes: u64) -> Option<u64> {
+    total.checked_add(bytes)
+}
+
+fn strict_model_artifact_bytes(model_dir: &Path) -> Option<u64> {
+    let mut total = 0_u64;
+    let mut stack = vec![model_dir.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        for entry_result in std::fs::read_dir(&dir).ok()? {
+            let entry = entry_result.ok()?;
+            let path = entry.path();
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if (file_type.is_file() || file_type.is_symlink())
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
+            {
+                let metadata = if file_type.is_symlink() {
+                    std::fs::metadata(&path)
+                } else {
+                    entry.metadata()
+                }
+                .ok()?;
+                if !metadata.is_file() {
+                    return None;
+                }
+                total = checked_artifact_total(total, metadata.len())?;
+            }
+        }
+    }
+
+    (total > 0).then_some(total)
+}
+
 fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
     let mut total: u64 = 0;
     let mut stack = vec![model_dir.to_path_buf()];
@@ -865,40 +956,115 @@ mod tests {
     use super::{
         EngineCostDescription, MemoryPhase, MlxMemoryProbe, MlxMemoryProbeError, MlxMemorySnapshot,
         MlxRuntimeTuning, ModelFootprint, ModelMetadata, ModelSizeClass, RequestMemorySampler,
-        RequestedMlxProfile, ResolvedMlxProfile, TransientPrefillEstimate, default_mtp_draft_n_max,
-        heuristic_paged_kv_target_bytes_with_max, measure_mlx_memory, model_weight_bytes,
-        parse_enabled_flag, parse_mtp_draft_n_max, parse_positive_chunked_prefill_value,
-        resolve_effective_mlx_profile, resolve_profile_from_metadata, resolve_runtime_tuning,
+        RequestedMlxProfile, ResolvedMlxProfile, TransientPrefillEstimate, checked_artifact_total,
+        default_mtp_draft_n_max, heuristic_paged_kv_target_bytes_with_max, measure_mlx_memory,
+        model_weight_bytes, parse_enabled_flag, parse_mtp_draft_n_max,
+        parse_positive_chunked_prefill_value, resolve_effective_mlx_profile,
+        resolve_profile_from_metadata, resolve_runtime_tuning,
     };
     use std::collections::VecDeque;
     use std::fs;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
+    #[derive(Clone, Copy)]
+    struct RawMemoryMeasurement {
+        active_bytes: Result<u128, MlxMemoryProbeError>,
+        peak_bytes: Result<u128, MlxMemoryProbeError>,
+        memory_limit_bytes: Result<u128, MlxMemoryProbeError>,
+        metal_recommended_working_set_bytes: Result<Option<u128>, MlxMemoryProbeError>,
+    }
+
+    impl RawMemoryMeasurement {
+        fn successful(
+            active_bytes: u128,
+            peak_bytes: u128,
+            memory_limit_bytes: u128,
+            metal_recommended_working_set_bytes: Option<u128>,
+        ) -> Self {
+            Self {
+                active_bytes: Ok(active_bytes),
+                peak_bytes: Ok(peak_bytes),
+                memory_limit_bytes: Ok(memory_limit_bytes),
+                metal_recommended_working_set_bytes: Ok(metal_recommended_working_set_bytes),
+            }
+        }
+    }
+
     struct FakeMemoryProbe {
-        snapshots: Mutex<VecDeque<MlxMemorySnapshot>>,
+        measurements: Mutex<VecDeque<RawMemoryMeasurement>>,
+        reset_result: Result<(), MlxMemoryProbeError>,
         resets: Mutex<usize>,
     }
 
     impl FakeMemoryProbe {
         fn new(snapshots: impl IntoIterator<Item = MlxMemorySnapshot>) -> Self {
+            Self::from_raw(snapshots.into_iter().map(|snapshot| {
+                RawMemoryMeasurement::successful(
+                    u128::from(snapshot.active_bytes),
+                    u128::from(snapshot.peak_bytes),
+                    u128::from(snapshot.memory_limit_bytes.unwrap_or(0)),
+                    snapshot.metal_recommended_working_set_bytes.map(u128::from),
+                )
+            }))
+        }
+
+        fn from_raw(measurements: impl IntoIterator<Item = RawMemoryMeasurement>) -> Self {
             Self {
-                snapshots: Mutex::new(snapshots.into_iter().collect()),
+                measurements: Mutex::new(measurements.into_iter().collect()),
+                reset_result: Ok(()),
                 resets: Mutex::new(0),
             }
+        }
+
+        fn with_reset_result(mut self, result: Result<(), MlxMemoryProbeError>) -> Self {
+            self.reset_result = result;
+            self
+        }
+
+        fn current(
+            &self,
+            exhausted: &'static str,
+        ) -> Result<RawMemoryMeasurement, MlxMemoryProbeError> {
+            self.measurements
+                .lock()
+                .map_err(|_| MlxMemoryProbeError::QueryFailed("test probe lock"))?
+                .front()
+                .copied()
+                .ok_or(MlxMemoryProbeError::QueryFailed(exhausted))
+        }
+
+        fn take(&self) -> Result<RawMemoryMeasurement, MlxMemoryProbeError> {
+            self.measurements
+                .lock()
+                .map_err(|_| MlxMemoryProbeError::QueryFailed("test probe lock"))?
+                .pop_front()
+                .ok_or(MlxMemoryProbeError::QueryFailed(
+                    "test measurement exhausted",
+                ))
         }
     }
 
     impl MlxMemoryProbe for FakeMemoryProbe {
-        fn snapshot(&self) -> Result<MlxMemorySnapshot, MlxMemoryProbeError> {
-            self.snapshots
-                .lock()
-                .map_err(|_| MlxMemoryProbeError::QueryFailed("test snapshot lock"))?
-                .pop_front()
-                .ok_or(MlxMemoryProbeError::QueryFailed("test snapshot exhausted"))
+        fn active_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+            self.current("test active memory exhausted")?.active_bytes
+        }
+
+        fn peak_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+            self.current("test peak memory exhausted")?.peak_bytes
+        }
+
+        fn memory_limit_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+            self.current("test memory limit exhausted")?
+                .memory_limit_bytes
+        }
+
+        fn metal_recommended_working_set_bytes(&self) -> Result<Option<u128>, MlxMemoryProbeError> {
+            self.take()?.metal_recommended_working_set_bytes
         }
 
         fn reset_peak_memory(&self) -> Result<(), MlxMemoryProbeError> {
+            self.reset_result?;
             let mut resets = self
                 .resets
                 .lock()
@@ -910,15 +1076,97 @@ mod tests {
 
     #[test]
     fn memory_snapshot_preserves_allocator_and_working_set_measurements() {
-        let expected = MlxMemorySnapshot {
-            active_bytes: 11,
-            peak_bytes: 17,
-            memory_limit_bytes: Some(23),
-            metal_recommended_working_set_bytes: Some(29),
-        };
-        let probe = FakeMemoryProbe::new([expected]);
+        let probe =
+            FakeMemoryProbe::from_raw([RawMemoryMeasurement::successful(11, 17, 23, Some(29))]);
 
-        assert_eq!(measure_mlx_memory(&probe).unwrap(), expected);
+        assert_eq!(
+            measure_mlx_memory(&probe),
+            Ok(MlxMemorySnapshot {
+                active_bytes: 11,
+                peak_bytes: 17,
+                memory_limit_bytes: Some(23),
+                metal_recommended_working_set_bytes: Some(29),
+            })
+        );
+    }
+
+    #[test]
+    fn memory_snapshot_normalizes_zero_mlx_limit() {
+        let probe = FakeMemoryProbe::from_raw([RawMemoryMeasurement::successful(11, 17, 0, None)]);
+
+        assert_eq!(
+            measure_mlx_memory(&probe),
+            Ok(MlxMemorySnapshot {
+                active_bytes: 11,
+                peak_bytes: 17,
+                memory_limit_bytes: None,
+                metal_recommended_working_set_bytes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn memory_snapshot_propagates_each_raw_query_failure() {
+        let error = MlxMemoryProbeError::QueryFailed("injected query failure");
+        let mut cases = [
+            RawMemoryMeasurement::successful(1, 2, 3, Some(4)),
+            RawMemoryMeasurement::successful(1, 2, 3, Some(4)),
+            RawMemoryMeasurement::successful(1, 2, 3, Some(4)),
+            RawMemoryMeasurement::successful(1, 2, 3, Some(4)),
+        ];
+        cases[0].active_bytes = Err(error);
+        cases[1].peak_bytes = Err(error);
+        cases[2].memory_limit_bytes = Err(error);
+        cases[3].metal_recommended_working_set_bytes = Err(error);
+
+        for measurement in cases {
+            assert_eq!(
+                measure_mlx_memory(&FakeMemoryProbe::from_raw([measurement])),
+                Err(error)
+            );
+        }
+    }
+
+    #[test]
+    fn memory_snapshot_rejects_each_u64_conversion_overflow() {
+        let too_large = u128::from(u64::MAX) + 1;
+        let cases = [
+            (
+                RawMemoryMeasurement::successful(too_large, 2, 3, Some(4)),
+                MlxMemoryProbeError::QueryFailed("active memory conversion"),
+            ),
+            (
+                RawMemoryMeasurement::successful(1, too_large, 3, Some(4)),
+                MlxMemoryProbeError::QueryFailed("peak memory conversion"),
+            ),
+            (
+                RawMemoryMeasurement::successful(1, 2, too_large, Some(4)),
+                MlxMemoryProbeError::QueryFailed("memory limit conversion"),
+            ),
+            (
+                RawMemoryMeasurement::successful(1, 2, 3, Some(too_large)),
+                MlxMemoryProbeError::QueryFailed("Metal working-set conversion"),
+            ),
+        ];
+
+        for (measurement, expected) in cases {
+            assert_eq!(
+                measure_mlx_memory(&FakeMemoryProbe::from_raw([measurement])),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn request_memory_sampler_propagates_reset_failure() {
+        let probe = FakeMemoryProbe::new([MlxMemorySnapshot::default()])
+            .with_reset_result(Err(MlxMemoryProbeError::ResetPeakFailed));
+        let mut mlx_gate = higgs_models::mlx_exec::acquire();
+
+        assert!(matches!(
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut mlx_gate, &probe),
+            Err(MlxMemoryProbeError::ResetPeakFailed)
+        ));
     }
 
     #[test]
@@ -936,10 +1184,10 @@ mod tests {
             metal_recommended_working_set_bytes: Some(800),
         };
         let probe = FakeMemoryProbe::new([before, after]);
-        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let mut mlx_gate = higgs_models::mlx_exec::acquire();
 
         let sampler =
-            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mlx_gate, &probe)
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut mlx_gate, &probe)
                 .unwrap();
         let sample = sampler.finish_with_probe(&probe).unwrap();
 
@@ -966,15 +1214,38 @@ mod tests {
             metal_recommended_working_set_bytes: None,
         };
         let probe = FakeMemoryProbe::new([before, after]);
-        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let mut mlx_gate = higgs_models::mlx_exec::acquire();
 
         let sampler =
-            RequestMemorySampler::start_with_probe(MemoryPhase::Decode, &mlx_gate, &probe).unwrap();
+            RequestMemorySampler::start_with_probe(MemoryPhase::Decode, &mut mlx_gate, &probe)
+                .unwrap();
         let sample = sampler.finish_with_probe(&probe).unwrap();
 
         assert_eq!(sample.phase, MemoryPhase::Decode);
         assert_eq!(sample.peak_bytes, 300);
         assert_eq!(sample.active_growth_bytes, 0);
+    }
+
+    #[test]
+    fn request_memory_sampler_allows_sequential_phases_on_one_gate() {
+        let snapshot = MlxMemorySnapshot::default();
+        let probe = FakeMemoryProbe::new([snapshot; 4]);
+        let mut mlx_gate = higgs_models::mlx_exec::acquire();
+
+        let prefill =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut mlx_gate, &probe)
+                .unwrap()
+                .finish_with_probe(&probe)
+                .unwrap();
+        let decode =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Decode, &mut mlx_gate, &probe)
+                .unwrap()
+                .finish_with_probe(&probe)
+                .unwrap();
+
+        assert_eq!(prefill.phase, MemoryPhase::Prefill);
+        assert_eq!(decode.phase, MemoryPhase::Decode);
+        assert_eq!(*probe.resets.lock().unwrap(), 2);
     }
 
     #[test]
@@ -1000,6 +1271,49 @@ mod tests {
         );
         assert!(ModelFootprint::from_load_measurements(temp.path(), after, before).is_none());
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_memory_footprint_fails_closed_on_artifact_io_errors() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().map_err(std::io::Error::other)?;
+        fs::write(temp.path().join("model.safetensors"), [0_u8; 13])?;
+        symlink(
+            temp.path().join("missing-target"),
+            temp.path().join("broken.safetensors"),
+        )?;
+        let before = MlxMemorySnapshot::default();
+        let after = MlxMemorySnapshot {
+            active_bytes: 100,
+            ..MlxMemorySnapshot::default()
+        };
+
+        assert_eq!(
+            ModelFootprint::from_load_measurements(temp.path(), before, after),
+            None,
+            "a partial artifact count is unsafe when a safetensors stat fails"
+        );
+
+        let missing = temp.path().join("missing-directory");
+        assert_eq!(
+            ModelFootprint::from_load_measurements(&missing, before, after),
+            None
+        );
+
+        let not_directory = temp.path().join("plain-file");
+        fs::write(&not_directory, b"not a model directory")?;
+        assert_eq!(
+            ModelFootprint::from_load_measurements(&not_directory, before, after),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_memory_footprint_rejects_artifact_sum_overflow() {
+        assert_eq!(checked_artifact_total(u64::MAX, 1), None);
     }
 
     #[test]
@@ -1028,6 +1342,38 @@ mod tests {
 
         assert_eq!(cost.persistent_bytes_per_token, 20_480);
         assert_eq!(cost.persistent_bytes(49_152), Some(960 * 1024 * 1024));
+        Ok(())
+    }
+
+    #[test]
+    fn engine_memory_cost_rejects_zero_cache_geometry() -> std::io::Result<()> {
+        let transient = TransientPrefillEstimate {
+            base_bytes: 0,
+            bytes_per_prompt_token: 0,
+            bytes_per_chunk_token: 0,
+            max_prompt_tokens: 1,
+            max_chunk_tokens: 1,
+        };
+
+        for (layers, kv_heads, head_dim) in [(0, 2, 256), (40, 0, 256), (40, 2, 0)] {
+            let temp = TempDir::new().map_err(std::io::Error::other)?;
+            write_json(
+                &temp.path().join("config.json"),
+                &serde_json::json!({
+                    "model_type": "qwen3_5_moe",
+                    "num_hidden_layers": layers,
+                    "num_key_value_heads": kv_heads,
+                    "head_dim": head_dim,
+                    "full_attention_interval": 4
+                }),
+            )?;
+
+            assert_eq!(
+                EngineCostDescription::fp16_from_model_dir(temp.path(), 0, 0, transient),
+                None,
+                "zero geometry must fail closed: layers={layers}, kv_heads={kv_heads}, head_dim={head_dim}"
+            );
+        }
         Ok(())
     }
 
