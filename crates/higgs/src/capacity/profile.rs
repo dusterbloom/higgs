@@ -20,6 +20,8 @@ pub struct LearnedProfileKey {
     pub quantization: String,
     pub execution_mode: String,
     pub kv_representation: String,
+    pub prefill_model_identity: Option<String>,
+    pub execution_cache_fingerprint: String,
     pub drafter_identity: Option<String>,
 }
 
@@ -35,6 +37,11 @@ impl LearnedProfileKey {
             && !self.quantization.is_empty()
             && !self.execution_mode.is_empty()
             && !self.kv_representation.is_empty()
+            && !self.execution_cache_fingerprint.is_empty()
+            && self
+                .prefill_model_identity
+                .as_ref()
+                .is_none_or(|identity| !identity.is_empty())
             && self
                 .drafter_identity
                 .as_ref()
@@ -48,6 +55,7 @@ impl LearnedProfileKey {
 pub struct LearnedBandEvidence {
     pub prompt_band: u64,
     pub cold_high_water_bytes: u64,
+    pub cold_replacement_qualified: bool,
     pub retained_high_water_bytes: u64,
     pub suffix_high_water_bytes: u64,
 }
@@ -92,12 +100,35 @@ impl LearnedProfile {
         &self.evidence
     }
 
-    fn is_complete(&self) -> bool {
+    pub(super) fn is_complete(&self) -> bool {
+        let unique_bands = self
+            .evidence
+            .iter()
+            .map(|band| band.prompt_band)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == self.evidence.len();
         self.schema_version == LEARNED_PROFILE_SCHEMA_VERSION
             && self.key.is_complete()
             && self.startup_headroom_bytes > 0
             && !self.evidence.is_empty()
-            && self.evidence.iter().all(|band| band.prompt_band > 0)
+            && unique_bands
+            && self.evidence.iter().all(|band| {
+                band.prompt_band.is_power_of_two()
+                    && (band.cold_high_water_bytes > 0
+                        || band.retained_high_water_bytes > 0
+                        || band.suffix_high_water_bytes > 0)
+            })
+    }
+
+    pub(super) fn is_compatible(
+        &self,
+        expected_key: &LearnedProfileKey,
+        current_startup_headroom_bytes: u64,
+    ) -> bool {
+        self.is_complete()
+            && self.key == *expected_key
+            && current_startup_headroom_bytes >= self.startup_headroom_bytes
     }
 }
 
@@ -125,10 +156,7 @@ impl LearnedProfileStore {
         let Ok(profile) = serde_json::from_slice::<LearnedProfile>(&bytes) else {
             return Ok(None);
         };
-        if !profile.is_complete()
-            || profile.key != *expected_key
-            || current_startup_headroom_bytes < profile.startup_headroom_bytes
-        {
+        if !profile.is_compatible(expected_key, current_startup_headroom_bytes) {
             return Ok(None);
         }
         Ok(Some(profile))
@@ -180,6 +208,8 @@ mod tests {
             quantization: "3bit".into(),
             execution_mode: "native".into(),
             kv_representation: "fp16-hybrid".into(),
+            prefill_model_identity: Some("prefill-v1".into()),
+            execution_cache_fingerprint: "native;kv=fp16;radix=v1".into(),
             drafter_identity: None,
         }
     }
@@ -195,6 +225,7 @@ mod tests {
             vec![LearnedBandEvidence {
                 prompt_band: 65_536,
                 cold_high_water_bytes: 5 * GIB,
+                cold_replacement_qualified: true,
                 retained_high_water_bytes: GIB,
                 suffix_high_water_bytes: GIB / 2,
             }],
@@ -218,6 +249,12 @@ mod tests {
         let mut mismatch = profile_key();
         mismatch.model_fingerprint = "sha256:different".into();
         assert_eq!(store.load(&mismatch, 12 * GIB).unwrap(), None);
+        let mut prefill_mismatch = profile_key();
+        prefill_mismatch.prefill_model_identity = Some("prefill-v2".into());
+        assert_eq!(store.load(&prefill_mismatch, 12 * GIB).unwrap(), None);
+        let mut settings_mismatch = profile_key();
+        settings_mismatch.execution_cache_fingerprint = "affine;kv=q8".into();
+        assert_eq!(store.load(&settings_mismatch, 12 * GIB).unwrap(), None);
 
         let mut wrong_schema = json;
         wrong_schema["schemaVersion"] = 2.into();

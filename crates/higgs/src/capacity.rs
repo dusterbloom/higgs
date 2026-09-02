@@ -209,6 +209,7 @@ pub const fn floor_1024(tokens: u64) -> u64 {
 pub struct CapacityInputs {
     pub memory: MlxMemorySnapshot,
     pub costs: EngineCostDescription,
+    pub loaded_model_bytes: u64,
     pub architectural_max_tokens: u64,
     pub prefill_chunk_tokens: u64,
     pub retained_bytes: u64,
@@ -276,6 +277,7 @@ pub struct RequestCost {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteLedger {
     pub loaded_baseline_bytes: u64,
+    pub unaccounted_active_bytes: u64,
     pub fixed_session_bytes: u64,
     pub prompt_bytes: u64,
     pub output_bytes: u64,
@@ -289,6 +291,7 @@ impl ByteLedger {
     pub fn total_bytes(&self) -> Option<u64> {
         self.loaded_baseline_bytes
             .checked_add(self.fixed_session_bytes)?
+            .checked_add(self.unaccounted_active_bytes)?
             .checked_add(self.prompt_bytes)?
             .checked_add(self.output_bytes)?
             .checked_add(self.decode_bytes)?
@@ -305,6 +308,26 @@ pub struct CapacityDecision {
     pub recommended_output_tokens: u64,
     pub max_prompt_tokens: u64,
     pub usable_bytes: u64,
+}
+
+impl CapacityDecision {
+    fn bounded_by(self, total_ceiling: u64) -> Self {
+        let safe_total_tokens = self.safe_total_tokens.min(total_ceiling);
+        let recommended_output_tokens = self.recommended_output_tokens.min(safe_total_tokens);
+        Self {
+            availability: if safe_total_tokens >= recommended_output_tokens.max(TOKEN_ALIGNMENT) {
+                self.availability
+            } else {
+                CapacityAvailability::Unavailable
+            },
+            safe_total_tokens,
+            recommended_output_tokens,
+            max_prompt_tokens: safe_total_tokens
+                .checked_sub(recommended_output_tokens)
+                .unwrap_or(0),
+            usable_bytes: self.usable_bytes,
+        }
+    }
 }
 
 /// Result of checking one request against the current byte and token envelope.
@@ -333,6 +356,7 @@ pub struct AllocationObservation {
     pub observed_peak_bytes: u64,
     pub pressure: MemoryPressure,
     pub swap_out_delta: u64,
+    pub compressor_growth_bytes: u64,
     pub allocation_bearing: bool,
 }
 
@@ -353,6 +377,7 @@ impl AllocationObservation {
             observed_peak_bytes,
             pressure: MemoryPressure::Normal,
             swap_out_delta: 0,
+            compressor_growth_bytes: 0,
             allocation_bearing: true,
         }
     }
@@ -361,6 +386,7 @@ impl AllocationObservation {
         self.allocation_bearing
             && self.pressure == MemoryPressure::Normal
             && self.swap_out_delta == 0
+            && self.compressor_growth_bytes == 0
     }
 }
 
@@ -382,16 +408,17 @@ impl Clock for SystemClock {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct RuntimeBandEvidence {
     cold_high_water_bytes: u64,
+    cold_replacement_qualified: bool,
     retained_high_water_bytes: u64,
     suffix_high_water_bytes: u64,
-    clean_cold_millis: Vec<u64>,
+    clean_cold_samples: Vec<(u64, u64)>,
 }
 
 /// Pure controller over copied byte-domain inputs and content-free evidence.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CapacityController<C: Clock = SystemClock> {
     inputs: CapacityInputs,
     clock: C,
@@ -417,24 +444,7 @@ impl<C: Clock> CapacityController<C> {
             decision: unavailable_decision(),
             evidence: BTreeMap::new(),
         };
-        let raw = controller.solve_static();
-        controller.decision = if raw.availability == CapacityAvailability::Available {
-            let configured_ceiling = controller.inputs.configured_total_token_ceiling;
-            controller.inputs.configured_total_token_ceiling = None;
-            let automatic = controller.solve_static();
-            controller.inputs.configured_total_token_ceiling = configured_ceiling;
-            match automatic.safe_total_tokens.checked_mul(3) {
-                Some(tokens) => {
-                    let conservative = floor_1024(tokens / 4)
-                        .max(TOKEN_ALIGNMENT)
-                        .min(raw.safe_total_tokens);
-                    controller.decision_for_total(conservative, raw.usable_bytes)
-                }
-                None => unavailable_decision(),
-            }
-        } else {
-            raw
-        };
+        controller.decision = controller.solve_static();
         controller
     }
 
@@ -462,19 +472,36 @@ impl<C: Clock> CapacityController<C> {
             Some(tokens) => tokens,
             None => return Admission::Unavailable,
         };
+        let output_ceiling = self
+            .inputs
+            .configured_output_token_ceiling
+            .unwrap_or(request.output_tokens);
+        let bounded_output = request.output_tokens.min(output_ceiling);
+        let request_bound = self
+            .solve_for_shape(
+                request.execution_path,
+                bounded_output,
+                request.retained_growth_bytes,
+                request.suffix_tokens,
+            )
+            .bounded_by(self.decision.safe_total_tokens);
+        if request_bound.availability != CapacityAvailability::Available {
+            return Admission::Unavailable;
+        }
         let Some(ledger) = self.byte_ledger_with_evidence(request) else {
             return Admission::Unavailable;
         };
         let Some(total_bytes) = ledger.total_bytes() else {
             return Admission::Unavailable;
         };
-        if total_tokens <= self.decision.safe_total_tokens
-            && request.prompt_tokens <= self.decision.max_prompt_tokens
-            && total_bytes <= self.decision.usable_bytes
+        if request.output_tokens <= output_ceiling
+            && total_tokens <= request_bound.safe_total_tokens
+            && request.prompt_tokens <= request_bound.max_prompt_tokens
+            && total_bytes <= request_bound.usable_bytes
         {
             Admission::Admitted(ledger)
         } else {
-            Admission::Exceeded(self.decision)
+            Admission::Exceeded(request_bound)
         }
     }
 
@@ -485,6 +512,9 @@ impl<C: Clock> CapacityController<C> {
     ) -> CapacityDecision {
         let previous = self.decision.safe_total_tokens;
         self.inputs.pressure = pressure;
+        if pressure != MemoryPressure::Normal {
+            self.clear_clean_windows();
+        }
         if let Some(memory) = memory {
             self.inputs.memory = memory;
         }
@@ -500,14 +530,22 @@ impl<C: Clock> CapacityController<C> {
                 .map(|tokens| floor_1024(tokens / 100))
                 .unwrap_or(0);
             let total = downshift.min(recomputed.safe_total_tokens);
-            let mut decision = self.decision_for_total(total, recomputed.usable_bytes);
+            let mut decision = self.decision_for_total(
+                total,
+                recomputed.usable_bytes,
+                recomputed.recommended_output_tokens,
+            );
             if pressure == MemoryPressure::Critical {
                 decision.availability = CapacityAvailability::Unavailable;
             }
             decision
         } else {
             let total = previous.min(recomputed.safe_total_tokens);
-            self.decision_for_total(total, recomputed.usable_bytes)
+            self.decision_for_total(
+                total,
+                recomputed.usable_bytes,
+                recomputed.recommended_output_tokens,
+            )
         };
         self.decision
     }
@@ -515,11 +553,13 @@ impl<C: Clock> CapacityController<C> {
     pub fn observe(&mut self, observation: AllocationObservation) {
         let band = prompt_band(observation.full_prompt_tokens);
         let now = self.clock.now_millis();
-        let underpredicted = observation.observed_peak_bytes > observation.predicted_peak_bytes;
-        let high_water = observation
-            .observed_peak_bytes
-            .checked_add(observation.observed_peak_bytes / 10)
-            .unwrap_or(u64::MAX);
+        if !observation.is_clean() {
+            self.clear_clean_windows();
+        }
+        let underpredicted = observation.allocation_bearing
+            && observation.observed_peak_bytes > observation.predicted_peak_bytes;
+        let high_water =
+            add_ten_percent_ceiling(observation.observed_peak_bytes).unwrap_or(u64::MAX);
         if underpredicted {
             let evidence = self.evidence.entry(band).or_default();
             match observation.path {
@@ -541,23 +581,48 @@ impl<C: Clock> CapacityController<C> {
                         evidence.retained_high_water_bytes.max(high_water)
                 }
             }
-            self.decision = self.solve_bounded_by(self.decision.safe_total_tokens);
+            let recomputed = match observation.path {
+                ExecutionPath::Cold => self.solve_static(),
+                ExecutionPath::RetainedSuffix | ExecutionPath::RadixHit => self.solve_for_shape(
+                    observation.path,
+                    self.inputs.output_tokens(),
+                    0,
+                    observation.suffix_tokens,
+                ),
+            };
+            self.decision = recomputed.bounded_by(self.decision.safe_total_tokens);
         }
 
-        if observation.path == ExecutionPath::Cold && observation.is_clean() && !underpredicted {
+        if observation.path == ExecutionPath::Cold
+            && observation.is_clean()
+            && !underpredicted
+            && self.inputs.pressure == MemoryPressure::Normal
+        {
             let evidence = self.evidence.entry(band).or_default();
-            evidence.clean_cold_millis.push(now);
-            if evidence.clean_cold_millis.len() > 3 {
-                evidence.clean_cold_millis.remove(0);
+            evidence
+                .clean_cold_samples
+                .push((now, observation.observed_peak_bytes));
+            if evidence.clean_cold_samples.len() > 3 {
+                evidence.clean_cold_samples.remove(0);
             }
-            let ready = evidence.clean_cold_millis.len() == 3
-                && evidence.clean_cold_millis[2]
-                    .checked_sub(evidence.clean_cold_millis[0])
+            let ready = evidence.clean_cold_samples.len() == 3
+                && evidence.clean_cold_samples[2]
+                    .0
+                    .checked_sub(evidence.clean_cold_samples[0].0)
                     .is_some_and(|elapsed| elapsed >= 5 * 60 * 1000);
             if ready {
-                evidence.clean_cold_millis.clear();
+                let observed_high_water = evidence
+                    .clean_cold_samples
+                    .iter()
+                    .map(|(_, bytes)| *bytes)
+                    .max()
+                    .and_then(add_ten_percent_ceiling)
+                    .unwrap_or(u64::MAX);
+                evidence.cold_high_water_bytes = observed_high_water;
+                evidence.cold_replacement_qualified = true;
+                evidence.clean_cold_samples.clear();
             }
-            if ready && self.inputs.pressure == MemoryPressure::Normal {
+            if ready {
                 let raw = self.solve_static();
                 let step = floor_1024(self.decision.safe_total_tokens / 8).min(4096);
                 let raised = self
@@ -566,11 +631,27 @@ impl<C: Clock> CapacityController<C> {
                     .checked_add(step)
                     .unwrap_or(self.decision.safe_total_tokens)
                     .min(raw.safe_total_tokens)
-                    .min(band);
+                    .min(
+                        if observation.full_prompt_tokens >= self.decision.max_prompt_tokens {
+                            band.checked_mul(2).unwrap_or(band)
+                        } else {
+                            band
+                        },
+                    );
                 if raised > self.decision.safe_total_tokens {
-                    self.decision = self.decision_for_total(raised, raw.usable_bytes);
+                    self.decision = self.decision_for_total(
+                        raised,
+                        raw.usable_bytes,
+                        raw.recommended_output_tokens,
+                    );
                 }
             }
+        }
+    }
+
+    fn clear_clean_windows(&mut self) {
+        for evidence in self.evidence.values_mut() {
+            evidence.clean_cold_samples.clear();
         }
     }
 
@@ -580,25 +661,91 @@ impl<C: Clock> CapacityController<C> {
         path: ExecutionPath,
         full_prompt_tokens: u64,
     ) -> Option<u64> {
-        let evidence = self.evidence.get(&prompt_band(full_prompt_tokens))?;
-        let bytes = match path {
-            ExecutionPath::Cold => evidence.cold_high_water_bytes,
-            ExecutionPath::RetainedSuffix => evidence.retained_high_water_bytes,
-            ExecutionPath::RadixHit => evidence.retained_high_water_bytes,
-        };
+        let band = prompt_band(full_prompt_tokens);
+        let bytes = self
+            .evidence
+            .range(..=band)
+            .map(|(_, evidence)| match path {
+                ExecutionPath::Cold => evidence.cold_high_water_bytes,
+                ExecutionPath::RetainedSuffix | ExecutionPath::RadixHit => evidence
+                    .retained_high_water_bytes
+                    .max(evidence.suffix_high_water_bytes),
+            })
+            .max()?;
         (bytes > 0).then_some(bytes)
     }
 
-    fn solve_bounded_by(&self, ceiling: u64) -> CapacityDecision {
-        let raw = self.solve_static();
-        self.decision_for_total(raw.safe_total_tokens.min(ceiling), raw.usable_bytes)
+    #[must_use]
+    pub fn export_profile(
+        &self,
+        key: LearnedProfileKey,
+        startup_headroom_bytes: u64,
+    ) -> Option<LearnedProfile> {
+        let evidence = self
+            .evidence
+            .iter()
+            .filter_map(|(prompt_band, evidence)| {
+                (evidence.cold_high_water_bytes > 0
+                    || evidence.retained_high_water_bytes > 0
+                    || evidence.suffix_high_water_bytes > 0)
+                    .then_some(LearnedBandEvidence {
+                        prompt_band: *prompt_band,
+                        cold_high_water_bytes: evidence.cold_high_water_bytes,
+                        cold_replacement_qualified: evidence.cold_replacement_qualified,
+                        retained_high_water_bytes: evidence.retained_high_water_bytes,
+                        suffix_high_water_bytes: evidence.suffix_high_water_bytes,
+                    })
+            })
+            .collect();
+        let profile = LearnedProfile::new(key, startup_headroom_bytes, evidence);
+        profile.is_complete().then_some(profile)
+    }
+
+    pub fn restore_profile(
+        &mut self,
+        profile: &LearnedProfile,
+        expected_key: &LearnedProfileKey,
+        current_startup_headroom_bytes: u64,
+    ) -> bool {
+        if !profile.is_compatible(expected_key, current_startup_headroom_bytes) {
+            return false;
+        }
+        let evidence = profile
+            .evidence()
+            .iter()
+            .map(|persisted| {
+                (
+                    persisted.prompt_band,
+                    RuntimeBandEvidence {
+                        cold_high_water_bytes: persisted.cold_high_water_bytes,
+                        cold_replacement_qualified: persisted.cold_replacement_qualified,
+                        retained_high_water_bytes: persisted.retained_high_water_bytes,
+                        suffix_high_water_bytes: persisted.suffix_high_water_bytes,
+                        clean_cold_samples: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        self.evidence = evidence;
+        self.decision = self.solve_static();
+        true
     }
 
     fn solve_static(&self) -> CapacityDecision {
+        let output = self.inputs.output_tokens();
+        self.solve_for_shape(ExecutionPath::Cold, output, 0, u64::MAX)
+    }
+
+    fn solve_for_shape(
+        &self,
+        execution_path: ExecutionPath,
+        output: u64,
+        retained_growth_bytes: u64,
+        suffix_tokens: u64,
+    ) -> CapacityDecision {
         let Some(usable_bytes) = self.inputs.usable_bytes() else {
             return unavailable_decision();
         };
-        let output = self.inputs.output_tokens();
         let ceiling = floor_1024(self.inputs.token_ceiling());
         if output < MINIMUM_OUTPUT_TOKENS || ceiling < output || ceiling < TOKEN_ALIGNMENT {
             return unavailable_decision();
@@ -610,11 +757,11 @@ impl<C: Clock> CapacityController<C> {
             let total = midpoint * TOKEN_ALIGNMENT;
             let prompt = total.checked_sub(output).unwrap_or(0);
             let request = RequestCost {
-                execution_path: ExecutionPath::Cold,
+                execution_path,
                 prompt_tokens: prompt,
-                suffix_tokens: prompt,
+                suffix_tokens: suffix_tokens.min(prompt),
                 output_tokens: output,
-                retained_growth_bytes: 0,
+                retained_growth_bytes,
             };
             let fits = self
                 .byte_ledger_with_evidence(request)
@@ -630,12 +777,12 @@ impl<C: Clock> CapacityController<C> {
         if total < output.max(TOKEN_ALIGNMENT) {
             unavailable_decision()
         } else {
-            self.decision_for_total(total, usable_bytes)
+            self.decision_for_total(total, usable_bytes, output)
         }
     }
 
-    fn decision_for_total(&self, total: u64, usable_bytes: u64) -> CapacityDecision {
-        let output = self.inputs.output_tokens().min(total);
+    fn decision_for_total(&self, total: u64, usable_bytes: u64, output: u64) -> CapacityDecision {
+        let output = output.min(total);
         if output < MINIMUM_OUTPUT_TOKENS {
             return unavailable_decision();
         }
@@ -666,8 +813,32 @@ impl<C: Clock> CapacityController<C> {
             .costs
             .transient_prefill
             .estimate_bytes(prefill_tokens, self.inputs.prefill_chunk_tokens)?;
+        let evidence = self.evidence.get(&prompt_band(request.prompt_tokens));
         let learned_transient = self
             .learned_high_water_bytes(request.execution_path, request.prompt_tokens)
+            .unwrap_or(0);
+        let transient_bytes = match request.execution_path {
+            ExecutionPath::Cold
+                if evidence.is_some_and(|evidence| evidence.cold_replacement_qualified) =>
+            {
+                learned_transient
+            }
+            ExecutionPath::Cold | ExecutionPath::RetainedSuffix | ExecutionPath::RadixHit => {
+                static_transient.max(learned_transient)
+            }
+        };
+        let known_active_bytes = self
+            .inputs
+            .loaded_model_bytes
+            .checked_add(self.inputs.costs.fixed_live_session_bytes)?
+            .checked_add(self.inputs.retained_bytes)?
+            .checked_add(self.inputs.prefix_cache_bytes)?
+            .checked_add(self.inputs.active_reservation_bytes)?;
+        let unaccounted_active_bytes = self
+            .inputs
+            .memory
+            .active_bytes
+            .checked_sub(known_active_bytes)
             .unwrap_or(0);
         let retained_and_cache_bytes = self
             .inputs
@@ -676,13 +847,14 @@ impl<C: Clock> CapacityController<C> {
             .checked_add(self.inputs.active_reservation_bytes)?
             .checked_add(request.retained_growth_bytes)?;
         Some(ByteLedger {
-            loaded_baseline_bytes: self.inputs.memory.active_bytes,
+            loaded_baseline_bytes: self.inputs.loaded_model_bytes,
+            unaccounted_active_bytes,
             fixed_session_bytes: self.inputs.costs.fixed_live_session_bytes,
             prompt_bytes,
             output_bytes,
             decode_bytes: self.inputs.costs.decode_workspace_bytes,
             retained_and_cache_bytes,
-            transient_bytes: static_transient.max(learned_transient),
+            transient_bytes,
         })
     }
 }
@@ -702,6 +874,12 @@ fn prompt_band(tokens: u64) -> u64 {
         .max(1)
         .checked_next_power_of_two()
         .unwrap_or(u64::MAX)
+}
+
+fn add_ten_percent_ceiling(bytes: u64) -> Option<u64> {
+    let tenth = bytes / 10;
+    let remainder = u64::from(bytes % 10 != 0);
+    bytes.checked_add(tenth)?.checked_add(remainder)
 }
 
 #[cfg(test)]
@@ -942,6 +1120,7 @@ mod tests {
                 memory_limit_bytes: Some(memory_limit_gib * GIB),
                 metal_recommended_working_set_bytes: Some(metal_limit_gib * GIB),
             },
+            loaded_model_bytes: 11 * GIB,
             costs: higgs_engine::EngineCostDescription {
                 fixed_live_session_bytes: 256 * 1024 * 1024,
                 persistent_bytes_per_token: 20_480,
@@ -972,6 +1151,24 @@ mod tests {
             suffix_tokens: prompt_tokens,
             output_tokens,
             retained_growth_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    fn learned_profile_key() -> LearnedProfileKey {
+        LearnedProfileKey {
+            hardware_identifier: "Mac15,9".into(),
+            physical_memory_bytes: 64 * GIB,
+            os_version: "15.6".into(),
+            os_build: "24G90".into(),
+            backend_authority_bytes: 48 * GIB,
+            higgs_build: "abc123".into(),
+            model_fingerprint: FINGERPRINT.into(),
+            quantization: "3bit".into(),
+            execution_mode: "native".into(),
+            kv_representation: "fp16-hybrid".into(),
+            prefill_model_identity: Some("prefill-v1".into()),
+            execution_cache_fingerprint: "native;kv=fp16;radix=v1".into(),
+            drafter_identity: None,
         }
     }
 
@@ -1009,7 +1206,7 @@ mod tests {
         let mut lower = controller_inputs(48, 48);
         lower.configured_total_token_ceiling = Some(16_384);
         let lowered = CapacityController::new(lower).decision();
-        assert!(lowered.safe_total_tokens <= 16_384);
+        assert_eq!(lowered.safe_total_tokens, 16_384);
         assert!(lowered.safe_total_tokens < automatic.safe_total_tokens);
 
         let mut higher = controller_inputs(48, 48);
@@ -1027,6 +1224,16 @@ mod tests {
                 .availability,
             CapacityAvailability::Unavailable
         );
+    }
+
+    #[test]
+    fn normal_startup_has_no_invented_token_discount() {
+        let controller = CapacityController::new(controller_inputs(48, 48));
+        assert_eq!(controller.decision().safe_total_tokens, 131_072);
+        assert!(matches!(
+            controller.admit(request(127_076, 3996)),
+            Admission::Admitted(_)
+        ));
     }
 
     #[test]
@@ -1139,10 +1346,15 @@ mod tests {
     #[test]
     fn learning_requires_three_clean_allocation_observations_over_five_minutes() {
         let clock = TestClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
-        let mut controller =
-            CapacityController::with_clock(controller_inputs(48, 48), clock.clone());
+        let mut inputs = controller_inputs(24, 24);
+        inputs.costs.transient_prefill.base_bytes = 4 * GIB;
+        let mut controller = CapacityController::with_clock(inputs, clock.clone());
         let initial = controller.decision().safe_total_tokens;
         let band_prompt = initial.saturating_sub(4096);
+        let before_transient = controller
+            .byte_ledger(request(band_prompt, 4096))
+            .unwrap()
+            .transient_bytes;
 
         for seconds in [0, 150] {
             clock.set_seconds(seconds);
@@ -1150,8 +1362,8 @@ mod tests {
                 ExecutionPath::Cold,
                 band_prompt,
                 512,
-                1,
-                1,
+                6 * GIB,
+                2 * GIB,
             ));
             assert_eq!(controller.decision().safe_total_tokens, initial);
         }
@@ -1160,11 +1372,19 @@ mod tests {
             ExecutionPath::Cold,
             band_prompt,
             512,
-            1,
-            1,
+            6 * GIB,
+            2 * GIB,
         ));
         let raised = controller.decision().safe_total_tokens;
         assert!(raised > initial);
+        assert_eq!(before_transient, 6 * GIB);
+        assert_eq!(
+            controller
+                .byte_ledger(request(band_prompt, 4096))
+                .unwrap()
+                .transient_bytes,
+            2_362_232_013
+        );
         assert!(raised - initial <= 4096);
         assert!(raised - initial <= floor_1024(initial / 8).max(1024));
     }
@@ -1227,23 +1447,25 @@ mod tests {
 
     #[test]
     fn retained_and_radix_underprediction_train_only_retained_evidence() {
-        let mut controller = CapacityController::new(controller_inputs(48, 48));
+        let mut controller = CapacityController::new(controller_inputs(24, 24));
         let prompt = controller.decision().safe_total_tokens;
+        let before = controller.decision().safe_total_tokens;
         controller.observe(AllocationObservation::clean(
             ExecutionPath::RetainedSuffix,
             prompt,
             64,
             GIB,
-            2 * GIB,
+            8 * GIB,
         ));
         assert_eq!(
             controller.learned_high_water_bytes(ExecutionPath::RadixHit, prompt),
-            Some(2 * GIB + (2 * GIB) / 10)
+            Some(9_448_928_052)
         );
         assert_eq!(
             controller.learned_high_water_bytes(ExecutionPath::Cold, prompt),
             None
         );
+        assert!(controller.decision().safe_total_tokens < before);
     }
 
     #[test]
@@ -1280,9 +1502,216 @@ mod tests {
         ));
         assert_eq!(
             controller.learned_high_water_bytes(ExecutionPath::Cold, before),
-            Some(observed_peak + observed_peak / 10)
+            Some(7_086_696_039)
         );
         assert!(controller.decision().safe_total_tokens < before);
+    }
+
+    #[test]
+    fn dirty_observation_and_pressure_reset_every_clean_window() {
+        let clock = TestClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        let mut inputs = controller_inputs(24, 24);
+        inputs.costs.transient_prefill.base_bytes = 4 * GIB;
+        let mut controller = CapacityController::with_clock(inputs, clock.clone());
+        let initial = controller.decision().safe_total_tokens;
+
+        for seconds in [0, 150] {
+            clock.set_seconds(seconds);
+            controller.observe(AllocationObservation::clean(
+                ExecutionPath::Cold,
+                initial,
+                512,
+                6 * GIB,
+                2 * GIB,
+            ));
+        }
+        let mut dirty =
+            AllocationObservation::clean(ExecutionPath::Cold, initial, 512, 6 * GIB, 2 * GIB);
+        dirty.swap_out_delta = 1;
+        clock.set_seconds(300);
+        controller.observe(dirty);
+        controller.recompute_for_pressure(MemoryPressure::Constrained, None);
+        controller.recompute_for_pressure(MemoryPressure::Normal, None);
+        let after_pressure = controller.decision().safe_total_tokens;
+
+        for seconds in [301, 451] {
+            clock.set_seconds(seconds);
+            controller.observe(AllocationObservation::clean(
+                ExecutionPath::Cold,
+                after_pressure,
+                512,
+                6 * GIB,
+                2 * GIB,
+            ));
+        }
+        assert_eq!(controller.decision().safe_total_tokens, after_pressure);
+    }
+
+    #[test]
+    fn exceeded_bound_rewrites_to_an_admissible_request_for_every_path() {
+        for execution_path in [
+            ExecutionPath::Cold,
+            ExecutionPath::RetainedSuffix,
+            ExecutionPath::RadixHit,
+        ] {
+            let mut controller = CapacityController::new(controller_inputs(24, 24));
+            let observed_prompt = controller.decision().max_prompt_tokens;
+            controller.observe(AllocationObservation::clean(
+                execution_path,
+                observed_prompt,
+                512,
+                GIB,
+                4 * GIB,
+            ));
+            let oversized = RequestCost {
+                execution_path,
+                prompt_tokens: 131_072,
+                suffix_tokens: 512,
+                output_tokens: 4096,
+                retained_growth_bytes: 64 * 1024 * 1024,
+            };
+            let Admission::Exceeded(bound) = controller.admit(oversized) else {
+                panic!("oversized {execution_path:?} request was not rejected")
+            };
+            let rewritten = RequestCost {
+                prompt_tokens: bound.max_prompt_tokens,
+                suffix_tokens: 512.min(bound.max_prompt_tokens),
+                output_tokens: bound.recommended_output_tokens,
+                ..oversized
+            };
+            assert!(matches!(
+                controller.admit(rewritten),
+                Admission::Admitted(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn absolute_active_memory_charges_only_unaccounted_residual() {
+        let mut inputs = controller_inputs(24, 24);
+        inputs.active_reservation_bytes = 128 * 1024 * 1024;
+        let known_beyond_model = inputs
+            .costs
+            .fixed_live_session_bytes
+            .checked_add(inputs.retained_bytes)
+            .unwrap()
+            .checked_add(inputs.prefix_cache_bytes)
+            .unwrap()
+            .checked_add(inputs.active_reservation_bytes)
+            .unwrap();
+        inputs.memory.active_bytes = inputs.loaded_model_bytes + known_beyond_model;
+        let controller = CapacityController::new(inputs);
+        let ledger = controller
+            .byte_ledger(RequestCost {
+                retained_growth_bytes: 0,
+                ..request(1024, 1024)
+            })
+            .unwrap();
+        assert_eq!(ledger.loaded_baseline_bytes, 11 * GIB);
+        assert_eq!(ledger.unaccounted_active_bytes, 0);
+        assert_eq!(ledger.retained_and_cache_bytes, 640 * 1024 * 1024);
+    }
+
+    #[test]
+    fn configured_output_ceiling_is_enforced_during_admission() {
+        let mut inputs = controller_inputs(48, 48);
+        inputs.configured_output_token_ceiling = Some(2048);
+        let controller = CapacityController::new(inputs);
+        assert!(matches!(
+            controller.admit(request(1024, 3072)),
+            Admission::Exceeded(_)
+        ));
+        assert!(matches!(
+            controller.admit(request(1024, 2048)),
+            Admission::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn odd_high_water_rounds_ten_percent_up_and_non_allocations_do_not_train() {
+        let mut controller = CapacityController::new(controller_inputs(48, 48));
+        let prompt = controller.decision().safe_total_tokens;
+        let mut non_allocation =
+            AllocationObservation::clean(ExecutionPath::Cold, prompt, 512, 10, 11);
+        non_allocation.allocation_bearing = false;
+        controller.observe(non_allocation);
+        assert_eq!(
+            controller.learned_high_water_bytes(ExecutionPath::Cold, prompt),
+            None
+        );
+        controller.observe(AllocationObservation::clean(
+            ExecutionPath::Cold,
+            prompt,
+            512,
+            10,
+            11,
+        ));
+        assert_eq!(
+            controller.learned_high_water_bytes(ExecutionPath::Cold, prompt),
+            Some(13)
+        );
+    }
+
+    #[test]
+    fn learned_profile_roundtrip_changes_decision_and_mismatch_is_transactional() {
+        let clock = TestClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        let mut inputs = controller_inputs(24, 24);
+        inputs.costs.transient_prefill.base_bytes = 4 * GIB;
+        let mut trained = CapacityController::with_clock(inputs, clock.clone());
+        let initial = trained.decision().safe_total_tokens;
+        for seconds in [0, 150, 300] {
+            clock.set_seconds(seconds);
+            trained.observe(AllocationObservation::clean(
+                ExecutionPath::Cold,
+                initial,
+                512,
+                6 * GIB,
+                2 * GIB,
+            ));
+        }
+        let key = learned_profile_key();
+        let profile = trained.export_profile(key.clone(), 8 * GIB).unwrap();
+        let mut restored = CapacityController::new(inputs);
+        let before_restore = restored.decision();
+        assert!(restored.restore_profile(&profile, &key, 8 * GIB));
+        assert!(restored.decision().safe_total_tokens > before_restore.safe_total_tokens);
+
+        let mut wrong_key = key.clone();
+        wrong_key.prefill_model_identity = Some("different".into());
+        let after_restore = restored.decision();
+        assert!(!restored.restore_profile(&profile, &wrong_key, 8 * GIB));
+        assert_eq!(restored.decision(), after_restore);
+        assert!(!restored.restore_profile(&profile, &key, 8 * GIB - 1));
+        assert_eq!(restored.decision(), after_restore);
+    }
+
+    #[test]
+    fn restored_suffix_high_water_changes_retained_admission() {
+        let inputs = controller_inputs(24, 24);
+        let mut trained = CapacityController::new(inputs);
+        let prompt = trained.decision().max_prompt_tokens;
+        trained.observe(AllocationObservation::clean(
+            ExecutionPath::RetainedSuffix,
+            prompt,
+            64,
+            GIB,
+            8 * GIB,
+        ));
+        let key = learned_profile_key();
+        let profile = trained.export_profile(key.clone(), 8 * GIB).unwrap();
+
+        let request = RequestCost {
+            execution_path: ExecutionPath::RetainedSuffix,
+            prompt_tokens: prompt,
+            suffix_tokens: 64,
+            output_tokens: 4096,
+            retained_growth_bytes: 0,
+        };
+        let fresh = CapacityController::new(inputs);
+        assert!(matches!(fresh.admit(request), Admission::Admitted(_)));
+        let mut restored = CapacityController::new(inputs);
+        assert!(restored.restore_profile(&profile, &key, 8 * GIB));
+        assert!(!matches!(restored.admit(request), Admission::Admitted(_)));
     }
 
     #[test]
