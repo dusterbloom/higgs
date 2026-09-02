@@ -197,6 +197,8 @@ impl CapacityModelNotFoundError {
 const GIBIBYTE: u64 = 1024 * 1024 * 1024;
 const TOKEN_ALIGNMENT: u64 = 1024;
 const MINIMUM_OUTPUT_RESERVE_TOKENS: u64 = 1024;
+// Smallest aligned recovery envelope whose 12.5% ramp can advance by one aligned step.
+const MINIMUM_RECOVERY_TOTAL_TOKENS: u64 = 8 * TOKEN_ALIGNMENT;
 const DEFAULT_OUTPUT_TOKENS: u64 = 4096;
 
 #[must_use]
@@ -588,7 +590,9 @@ impl<C: Clock> CapacityController<C> {
         } else {
             let total =
                 if previous == 0 && recomputed.availability == CapacityAvailability::Available {
-                    recomputed.safe_total_tokens
+                    recomputed
+                        .safe_total_tokens
+                        .min(MINIMUM_RECOVERY_TOTAL_TOKENS)
                 } else {
                     previous.min(recomputed.safe_total_tokens)
                 };
@@ -689,10 +693,12 @@ impl<C: Clock> CapacityController<C> {
                     .min(raw.safe_total_tokens)
                     .min(
                         if observation.full_prompt_tokens >= self.decision.max_prompt_tokens {
-                            band.checked_mul(2).unwrap_or(band)
+                            band.checked_mul(2)
                         } else {
-                            band
-                        },
+                            Some(band)
+                        }
+                        .and_then(|prompt| prompt.checked_add(raw.recommended_output_tokens))
+                        .unwrap_or(band),
                     );
                 if raised > self.decision.safe_total_tokens {
                     self.decision = self.decision_for_total(
@@ -1777,7 +1783,11 @@ mod tests {
     fn critical_is_intrinsic_to_construction_restore_and_admission() {
         let mut inputs = controller_inputs(48, 48);
         inputs.pressure = MemoryPressure::Critical;
-        let mut critical = CapacityController::new(inputs);
+        let full_static = CapacityController::new(controller_inputs(48, 48))
+            .decision()
+            .safe_total_tokens;
+        let clock = TestClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        let mut critical = CapacityController::with_clock(inputs, clock.clone());
         assert_eq!(
             critical.decision().availability,
             CapacityAvailability::Unavailable
@@ -1786,12 +1796,35 @@ mod tests {
             critical.admit(request(1024, 1024)),
             Admission::Unavailable
         ));
+        let recovered = critical.recompute_for_pressure(MemoryPressure::Normal, None);
+        assert_eq!(recovered.availability, CapacityAvailability::Available);
+        assert!(recovered.safe_total_tokens > 0);
+        assert!(recovered.safe_total_tokens < full_static);
+        for seconds in [0, 150] {
+            clock.set_seconds(seconds);
+            critical.observe(AllocationObservation::clean(
+                ExecutionPath::Cold,
+                recovered.max_prompt_tokens,
+                recovered.max_prompt_tokens,
+                4 * GIB,
+                4 * GIB,
+            ));
+            assert_eq!(critical.decision(), recovered);
+        }
+        clock.set_seconds(300);
+        critical.observe(AllocationObservation::clean(
+            ExecutionPath::Cold,
+            recovered.max_prompt_tokens,
+            recovered.max_prompt_tokens,
+            4 * GIB,
+            4 * GIB,
+        ));
+        let raised = critical.decision();
         assert_eq!(
-            critical
-                .recompute_for_pressure(MemoryPressure::Normal, None)
-                .availability,
-            CapacityAvailability::Available
+            raised.safe_total_tokens - recovered.safe_total_tokens,
+            floor_1024(recovered.safe_total_tokens / 8).min(4096)
         );
+        assert!(raised.safe_total_tokens < full_static);
 
         let mut trained = CapacityController::new(controller_inputs(48, 48));
         trained.observe(AllocationObservation::clean(
@@ -1803,18 +1836,21 @@ mod tests {
         ));
         let key = learned_profile_key();
         let profile = trained.export_profile(key.clone(), 8 * GIB).unwrap();
-        let mut critical_restore = CapacityController::new(inputs);
+        let restore_clock = TestClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        let mut critical_restore = CapacityController::with_clock(inputs, restore_clock);
         assert!(critical_restore.restore_profile(&profile, &key, 8 * GIB));
         assert_eq!(
             critical_restore.decision().availability,
             CapacityAvailability::Unavailable
         );
+        let restored_recovery =
+            critical_restore.recompute_for_pressure(MemoryPressure::Normal, None);
         assert_eq!(
-            critical_restore
-                .recompute_for_pressure(MemoryPressure::Normal, None)
-                .availability,
+            restored_recovery.availability,
             CapacityAvailability::Available
         );
+        assert!(restored_recovery.safe_total_tokens > 0);
+        assert!(restored_recovery.safe_total_tokens < full_static);
     }
 
     #[test]
