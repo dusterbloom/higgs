@@ -51,7 +51,7 @@ The partial causal-boundary block is exact but does not contribute a pooled scor
 
 Selection is per query row rather than shared across a large query tile. This removes cross-head/block unions and reduces the selection rule to a logit comparison. Summary scores are recomputed instead of written to a score tensor or sparse index.
 
-At block size `B`, three key-summary scans plus one value-summary correction scan add approximately `2/B` of dense QK+PV arithmetic. At `B = 128`, this is about 1.6 percent before exact selected-block work.
+At block size `B`, the three key-summary scans plus one value-summary correction scan cost `4/B` of dense QK alone. Because dense QK+PV contains two token-width passes, the same work is approximately `2/B` of the combined dense QK+PV arithmetic. At `B = 128`, this is about 1.6 percent before exact selected-block work.
 
 ## Why this is the Apple design
 
@@ -98,12 +98,12 @@ No learned centroids, PCA, covariance matrices, clustering, or random-feature at
 
 ## Trace evaluator gate
 
-The trace evaluator precedes Metal implementation so approximation error and kernel error are never debugged simultaneously.
+The trace evaluator precedes the production Metal implementation so approximation error and kernel error are never debugged simultaneously. A benchmark-only Metal feasibility probe may run first because it has no approximation policy and exists solely to measure the hardware break-even.
 
 An environment-gated hook captures the exact SDPA inputs after query/key normalization and RoPE:
 
-- one early and one late full-attention layer;
-- one KV head and its grouped query heads;
+- at least one early, middle, and late full-attention layer;
+- every KV head for the primary checkpoint, together with its grouped query heads;
 - K/V for representative 4K, 8K, 16K, and longer prefixes when memory permits;
 - sampled query rows near block boundaries, retrieval positions, and prompt tails.
 
@@ -122,6 +122,8 @@ It reports:
 - worst row/head and prompt position;
 - next-token KL when logits are available;
 - correlation between each selection proxy and actual correction error.
+
+Promotion decisions use the worst layer/head stratum as well as aggregate percentiles. A candidate cannot pass because a small easy sample hides a difficult layer or head.
 
 The evaluator chooses the local approximation. It does not replace end-to-end quality tests.
 
@@ -151,7 +153,7 @@ Each SIMD group owns one query row/head and keeps:
 
 For selected blocks, lanes cooperate on QK reductions with `simd_sum`, compute stable online-softmax weights, and accumulate the corresponding V fragments. For corrected blocks, the same state consumes the block pseudo-token. The partial causal block is always exact.
 
-The first version deliberately uses direct loads and scalar/SIMD reductions. SIMD-group matrix multiplication, PackGQA-style sharing, and single-buffer staging are measurement-driven follow-ups, not prerequisites.
+The first production version uses whichever exact-block primitive survives the feasibility probe. Direct loads and scalar/SIMD reductions remain the simplest candidate, but they are not promoted merely because they are easy to implement. SIMD-group matrix multiplication or PackGQA-style sharing moves into the first production kernel if the probe shows that scalar math or duplicated grouped-query reads prevent a win at the evaluator's selected density. Single-buffer staging remains a measured follow-up.
 
 Kernel specialization is bounded to dtype, block size, and supported head dimensions. Sequence lengths, valid cache length, head counts, GQA ratio, query offset, scale, and `log(alpha)` are runtime inputs so arbitrary prompt lengths do not create an unbounded JIT cache.
 
@@ -163,16 +165,18 @@ The approximation is eligible only when all of these conditions hold:
 
 - batch size is one;
 - query length is greater than one;
-- this is the first prompt prefill with zero prior cache offset;
+- this is the first prompt prefill with both `offset() == 0` and `position_offset() == 0` before append;
 - the mask is ordinary causal attention;
-- cache storage is dense and contiguous;
+- cache storage is `KvCacheView::Dense`, with valid length and backing capacity passed separately;
 - dtype is BF16 or FP16;
 - head dimension has a compiled kernel specialization;
 - sequence length exceeds a fixed, benchmarked activation threshold.
 
 Everything else falls back to existing MLX SDPA. In particular, decode, canonical speculative rows, TurboQuant, MLA, arbitrary array masks, soft-capping, and model-specific sliding-window behavior are unchanged.
 
-The documented Qwen3-Next configuration uses head dimension 256. The implementation must inspect the actual benchmark checkpoint and specialize its real dimension; it must not assume the reference CUDA repository's dimensions or hardcode 128.
+Both head dimension 256 in the documented Qwen3-Next fixtures and head dimension 128 in the Escha performance target occur in this repository. The implementation must inspect the loaded checkpoint and specialize its actual dimension rather than hardcoding either value.
+
+The wrapper must define its layout contract explicitly. It either accepts the backing K/V allocation with runtime head stride, capacity, and valid length, or budgets any `ensure_row_contiguous` materialization as part of operator latency. Transposed query materialization is measured separately and is never hidden outside the paired timing boundary.
 
 After this path wins, generic Qwen/Llama integration may route eligible calls through `cached_scaled_dot_product_attention`. No public backend trait is introduced before that evidence exists.
 
@@ -190,6 +194,28 @@ Persistent block summaries are a later optimization for chunked prefill and pref
 
 TurboQuant summaries must never be mixed with exact blocks from a different representation.
 
+## Feasibility probe
+
+Before trace capture or production integration, add a benchmark-only Metal probe that measures the proposed row-local execution shape without choosing an approximation policy.
+
+The probe uses synthetic BF16/FP16 Q/K/V. It implements the intended scalar-FMA/online-softmax exact traversal with two mappings: `row4` assigns four adjacent query rows from one head to the threadgroup's four SIMD groups, while `head4` assigns the same query position for four query heads sharing one KV head. Neither mapping stages K/V. It sweeps:
+
+- KV lengths 4K, 8K, 16K, 32K, and 64K where memory permits;
+- the checkpoint's actual query-head, KV-head, and head-dimension shapes;
+- exact-block densities 6.25, 12.5, 25, 37.5, 50, and 100 percent;
+- contiguous and interleaved selected-block layouts;
+- backing-buffer views versus already compact inputs.
+
+The 100-percent-density mode must match MLX SDPA under the exact numerical metric below. Lower-density modes process a deterministic subset of blocks without correction. They are deliberately optimistic performance bounds: if exact traversal alone cannot win, adding selection and correction cannot rescue the scalar schedule. They make no approximation-quality claim.
+
+For each shape, report paired median kernel-only and mandatory-copy-inclusive latency, effective K/V bytes read, GQA reuse factor, and the measured density at which the probe crosses MLX SDPA. FastMetal automatic row-contiguity materialization is disabled; Q is copied explicitly and timed separately, while K/V use a capacity-sized backing layout with runtime `valid_len` and `capacity`. Capture Metal System Trace counters for at least the primary 16K and longest supported cases.
+
+Define `R(rho) = copy-inclusive probe latency at density rho / MLX dense latency`. Promote the scalar schedule only if `R(37.5%) <= 0.90` at both 8K and 16K, `R(25%) <= 0.75`, and GQA-8 retains at least 80 percent of the GQA-1 speedup. Kill it if even 12.5-percent density is not at least 20 percent faster at 8K and 16K, if unavoidable Q copying consumes more than 20 percent of probe latency, or if GQA-8 traffic exceeds twice the ideal packed-head lower bound and `head4` recovers less than 15 percent. A killed scalar schedule does not kill corrected sparse attention; it makes tiled SIMD-group matrix math or PackGQA a prerequisite.
+
+If only contiguous selection wins, do not promote until real traces show comparable run contiguity. If the measured break-even lies between 20 and 40 percent, run the stratified evaluator next and require its p99 selected density to remain below 80 percent of that break-even.
+
+The probe is test-only and must not add a public API, cache sidecar, runtime flag, or production dispatch.
+
 ## Dense fallback
 
 Sparse execution is not universally faster or more accurate. Diffuse rows, heterogeneous blocks, or disjoint GQA requirements may select most blocks.
@@ -200,7 +226,7 @@ The outer dispatch also retains dense MLX SDPA below the measured sequence-lengt
 
 ## Correctness requirements
 
-- `alpha <= 0` matches dense MLX SDPA within `2e-3` maximum absolute/relative error for supported BF16/FP16 shapes.
+- `alpha <= 0` matches dense MLX SDPA with maximum absolute error at most `2e-3` and maximum row-relative L2 error at most `2e-3` for supported BF16/FP16 shapes.
 - Constant K/V blocks are exact under correction even when no non-forced block is selected.
 - Future K/V perturbations cannot affect earlier causal queries.
 - Partial and diagonal blocks are always exact, mask future tokens internally, and never contribute pooled scores to selection.
@@ -212,7 +238,24 @@ The outer dispatch also retains dense MLX SDPA below the measured sequence-lengt
 
 ## Performance gates
 
-All timings warm the JIT, force evaluation, and use paired medians. Measure 4K, 8K, 16K, 32K, and 64K where the checkpoint supports them.
+All timings warm the JIT, force evaluation, alternate A/B and B/A order, and use paired medians. Measure 4K, 8K, 16K, 32K, and 64K where the checkpoint supports them.
+
+The feasibility report must state the measured dense-mode ratio
+
+```text
+r_dense = latency(MLX SDPA) / latency(probe at 100% exact density)
+```
+
+and compare every sparse point directly with MLX rather than extrapolating from unrelated GEMM throughput. A simple arithmetic estimate may predict a candidate break-even, but only measured end-to-end operator latency promotes the design.
+
+The report also includes a traffic model:
+
+```text
+exact_KV_bytes = selected_tokens * (key_bytes + value_bytes) * query_rows_per_KV_head
+summary_bytes  = visible_blocks * summary_width_bytes * query_rows_per_KV_head
+```
+
+alongside measured GPU bandwidth and cache/DRAM counters where tooling exposes them. This makes duplicated GQA reads and hidden contiguous copies visible.
 
 The kernel must show:
 
@@ -226,7 +269,7 @@ Report selector scans, exact traversal, correction traversal, total attention la
 
 ## Quality gates
 
-Run dense versus approximate prefill on RULER, needle-in-a-haystack, and representative LongBench tasks at supported long-context lengths.
+Run dense versus approximate prefill on RULER, needle-in-a-haystack, and representative LongBench tasks at supported long-context lengths. Higgs does not currently contain this end-to-end harness, so the implementation plan must name and budget an external harness or add a separate harness task before any approximate path is enabled by default. The existing synthetic needle importance tests do not satisfy this gate.
 
 The initial release target is:
 
@@ -256,19 +299,21 @@ The following are explicitly outside the first implementation:
 - MLA;
 - arbitrary masks, soft-capping, and model-specific window semantics;
 - global score tensors, CSR indices, compaction, prefix sums, and scheduler workspaces;
-- PackGQA, SIMD-group matrix attention, cross-layer selection reuse, and double buffering;
+- cross-layer selection reuse and double buffering;
 - learned or model-specific selection policies;
 - public attention-backend APIs and runtime autotuning;
 - combining this approximation with PFlash token pruning.
 
 ## Implementation sequence
 
-1. Add the QKV trace hook and offline evaluator.
-2. Select mean, mean-plus-risk, or Haar-2 using the stated promotion gates.
-3. Add the semantic oracle and correctness tests.
-4. Add the private Metal kernel in dense mode, then corrected sparse mode.
-5. Add the narrow Qwen3-Next offset-zero dispatch and dense fallback.
-6. Run operator, TTFT, memory, and quality gates.
-7. Only after a passing result, decide whether persistent summaries, chunked prefill, or generic transformer integration deserve separate designs.
+1. Add and run the benchmark-only Metal feasibility probe.
+2. Stop if no useful density/access-pattern point beats MLX SDPA; otherwise record whether scalar/SIMD, SIMD-group matrix math, or PackGQA is required for production.
+3. Add the QKV trace hook and stratified offline evaluator.
+4. Select mean, mean-plus-risk, or Haar-2 using the stated promotion gates.
+5. Add the semantic oracle and correctness tests.
+6. Add the private production Metal kernel in dense mode, then corrected sparse mode.
+7. Add the narrow Qwen3-Next offset-zero dispatch and dense fallback.
+8. Run operator, TTFT, memory, and externally budgeted quality gates.
+9. Only after a passing result, decide whether persistent summaries, chunked prefill, or generic transformer integration deserve separate designs.
 
-Approximate first-implementation footprint is 700--1,000 lines across the evaluator, oracle, Metal wrapper/source, tests, and narrow dispatch. Persistent cache summaries would add roughly 250--350 lines in a later phase.
+The benchmark-only feasibility probe is budgeted at roughly 350--550 lines and is deleted or kept test-only after the decision. A production implementation is expected to require roughly 1,200--1,800 lines across the evaluator, oracle, Metal wrapper/source, tests, and narrow dispatch, excluding the external long-context quality harness. Persistent cache summaries would add roughly 250--350 lines in a later phase.
