@@ -1,5 +1,54 @@
 # Task 5A report: bind model lifecycle
 
+## Controller review correction round 4/5
+
+- [x] Bind allocator-decrease recovery evidence to the exact capacity-policy
+  revision current when the memory measurement is published.
+- [x] Invalidate recovery evidence on pressure, cache-publication, and lifecycle
+  recomputations that can alter capacity or availability.
+- [x] Define normal no-op policy observations conservatively: they invalidate an
+  outstanding recovery token.
+- [x] Fail permanently closed if the capacity-policy revision overflows.
+
+### Round 4 implementation evidence
+
+- Fresh pre-edit GitNexus impact rated `recompute_registry_with` CRITICAL (50
+  upstream, 3 direct, 24 processes), `recompute_active_models` CRITICAL (32/2/23),
+  `refresh_memory` CRITICAL lower-bound (48/15/25 with four unresolved receivers),
+  `finish_unregister` CRITICAL (6 direct), and
+  `publish_cache_allocation_revision` HIGH (5/3/3). The change therefore stayed
+  inside the existing registry lifecycle transaction and added no hot-path or
+  router symbols.
+- `PublishedMemoryMeasurement` now carries the private optional monotonic
+  capacity-policy revision captured under the same registry mutex as the
+  before/after allocator epoch and bytes. `finish_unregister` permits
+  `BoundedMinimum` only when boot, adjacent memory epoch, exact active bytes,
+  strict decrease, and the current capacity-policy revision all match.
+- Every shared-ledger recomputation advances the policy revision. Route
+  publication advances it directly because availability becomes externally
+  visible without a solver pass. Pressure observations, cache-plan
+  acknowledgement, registration, drain, finish, rollback, and drain
+  cancellation therefore invalidate older recovery evidence before they can
+  change capacity.
+- Revision advancement uses checked arithmetic over `Option<u64>`. Overflow
+  changes the authority to `None`; subsequent updates cannot restore it, and
+  both refresh and finish preserve zero capacity permanently.
+
+### Round 4 TDD and mutation evidence
+
+- The exact interleaving published a current 5 GiB to 4 GiB decrease, then a
+  constrained-pressure observation drove a 1,024-token survivor to zero. Before
+  the policy revision was bound, finish restored 1,024; it now preserves zero.
+- With no intervening policy revision, the draining model remains reserved at a
+  14 GiB envelope after the measured 20 GiB to 5 GiB decrease; finish alone
+  releases it and recovers the survivor to exactly 8,192 tokens, not full.
+- Cache-plan publication and a normal no-op pressure observation each
+  invalidate the outstanding token and preserve zero at finish. Overflow at
+  `u64::MAX` permanently disables recovery authority.
+- Mutation evidence removed the exact policy-revision equality check. The
+  pressure interleaving failed with 1,024 tokens instead of zero; restoring the
+  equality returned the complete 41-test registry suite to green.
+
 ## Controller review correction round 3/5
 
 - [x] Make measured allocator decrease the sole authority for zero-capacity
@@ -266,19 +315,19 @@ cancellation, and shutdown-order fixes, and reported no remaining findings.
 
 ## Release verification
 
-- Focused registry correction suite: 37 passed, 0 failed.
+- Focused registry correction suite: 41 passed, 0 failed.
 - Focused Qwen identity correction: 1 passed, 0 failed.
 - Focused route lifecycle correction suite: 21 passed, 0 failed.
 - `higgs-models` release library: 753 passed, 0 failed, 46 ignored.
 - `higgs-engine` release library: 596 passed, 0 failed, 5 ignored.
 - Runtime-identity integration: 3 passed, 0 failed.
-- Higgs release library: 723 passed, 0 failed.
+- Higgs release library: 727 passed, 0 failed.
 - Higgs release integration: 107 passed, 0 failed, 10 ignored.
 - Higgs release binary: 4 passed, 0 failed.
 - Higgs release build: passed.
-- GitNexus staged detection: 2 files, 22 changed symbols, 53
+- GitNexus staged detection: 2 files, 18 changed symbols, 73
   affected processes, CRITICAL as expected for the lifecycle/router surface.
-- GitNexus compare-to-`main` detection: 236 files, 4,631 changed symbols, 862
+- GitNexus compare-to-`main` detection: 236 files, 4,640 changed symbols, 863
   affected processes, CRITICAL across the complete multi-task branch; the
   Task 5A staged set remains the bounded 2-file subset above.
 

@@ -146,6 +146,7 @@ struct RegistryState {
     pressure: MemoryPressure,
     memory: MlxMemorySnapshot,
     memory_revision: u64,
+    capacity_policy_revision: Option<u64>,
     desired_cache_allocations: BTreeMap<String, CacheAllocation>,
     published_cache_allocations: BTreeMap<String, CacheAllocation>,
     cache_revision: u64,
@@ -174,6 +175,7 @@ pub struct PublishedMemoryMeasurement {
     revision: u64,
     previous_active_bytes: u64,
     active_bytes: u64,
+    capacity_policy_revision: Option<u64>,
 }
 
 impl PublishedMemoryMeasurement {
@@ -183,6 +185,8 @@ impl PublishedMemoryMeasurement {
             && self.revision == state.memory_revision
             && self.active_bytes == state.memory.active_bytes
             && self.active_bytes < self.previous_active_bytes
+            && self.capacity_policy_revision == state.capacity_policy_revision
+            && self.capacity_policy_revision.is_some()
     }
 }
 
@@ -225,6 +229,7 @@ impl CapacityRegistry {
                 pressure: MemoryPressure::Normal,
                 memory: MlxMemorySnapshot::default(),
                 memory_revision: 0,
+                capacity_policy_revision: Some(0),
                 desired_cache_allocations: BTreeMap::new(),
                 published_cache_allocations: BTreeMap::new(),
                 cache_revision: 0,
@@ -353,6 +358,7 @@ impl CapacityRegistry {
         }
         active.published = true;
         entry.generation = entry.generation.saturating_add(1);
+        advance_capacity_policy_revision(&mut state);
         publish();
         true
     }
@@ -625,20 +631,22 @@ impl CapacityRegistry {
         let previous_active_bytes = state.memory.active_bytes;
         state.memory = memory;
         state.memory_revision = state.memory_revision.saturating_add(1);
-        let measurement = PublishedMemoryMeasurement {
-            boot_id: self.boot_id.clone(),
-            previous_revision,
-            revision: state.memory_revision,
-            previous_active_bytes,
-            active_bytes: memory.active_bytes,
-        };
-        let zero_recovery = if measurement.authorizes_bounded_recovery(&self.boot_id, &state) {
+        let zero_recovery = if previous_revision.checked_add(1) == Some(state.memory_revision)
+            && memory.active_bytes < previous_active_bytes
+        {
             ZeroCapacityRecovery::BoundedMinimum
         } else {
             ZeroCapacityRecovery::Preserve
         };
         recompute_registry_with(&mut state, zero_recovery);
-        measurement
+        PublishedMemoryMeasurement {
+            boot_id: self.boot_id.clone(),
+            previous_revision,
+            revision: state.memory_revision,
+            previous_active_bytes,
+            active_bytes: memory.active_bytes,
+            capacity_policy_revision: state.capacity_policy_revision,
+        }
     }
 
     fn rollback_active(&self, model: &str, nonce: uuid::Uuid, remove_on_rollback: bool) {
@@ -673,6 +681,7 @@ impl CapacityRegistry {
         }
         active.published = true;
         entry.generation = entry.generation.saturating_add(1);
+        advance_capacity_policy_revision(&mut state);
         true
     }
 
@@ -946,6 +955,12 @@ fn recompute_active_models(
     shared: SharedLedger,
     zero_recovery: ZeroCapacityRecovery,
 ) {
+    advance_capacity_policy_revision(state);
+    let zero_recovery = if state.capacity_policy_revision.is_some() {
+        zero_recovery
+    } else {
+        ZeroCapacityRecovery::Preserve
+    };
     for entry in state.models.values_mut() {
         if let Some(active) = entry.active.as_mut() {
             let before = active.controller.decision();
@@ -955,6 +970,12 @@ fn recompute_active_models(
             }
         }
     }
+}
+
+fn advance_capacity_policy_revision(state: &mut RegistryState) {
+    state.capacity_policy_revision = state
+        .capacity_policy_revision
+        .and_then(|revision| revision.checked_add(1));
 }
 
 fn recompute_registry(state: &mut RegistryState) {
@@ -2099,9 +2120,14 @@ mod tests {
         let decreased = registry.refresh_memory(MlxMemorySnapshot {
             active_bytes: 5 * GIB,
             peak_bytes: 20 * GIB,
-            memory_limit_bytes: Some(24 * GIB),
-            metal_recommended_working_set_bytes: Some(24 * GIB),
+            memory_limit_bytes: Some(14 * GIB),
+            metal_recommended_working_set_bytes: Some(14 * GIB),
         });
+        assert_eq!(
+            registry.snapshot("first").unwrap().safe_total_tokens,
+            0,
+            "the measured decrease alone has no headroom while the draining model is reserved"
+        );
         registry.finish_unregister(drain, Some(decreased)).unwrap();
         let recovered = registry.snapshot("first").unwrap().safe_total_tokens;
         assert_eq!(recovered, 8_192);
@@ -2132,6 +2158,107 @@ mod tests {
             .finish_unregister(drain, Some(stale_decrease))
             .unwrap();
         assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+    }
+
+    #[test]
+    fn pressure_after_measurement_invalidates_unregister_recovery() {
+        let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
+        let mut first = facts("first", 5 * GIB);
+        first.configured_total_token_ceiling = Some(1_024);
+        first.configured_output_token_ceiling = Some(1_024);
+        register(&registry, first);
+        register(&registry, facts("second", 5 * GIB));
+        let drain = registry.begin_drain("second").unwrap();
+        let decreased = registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 4 * GIB,
+            peak_bytes: 5 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 1,
+        });
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+        registry.finish_unregister(drain, Some(decreased)).unwrap();
+        assert_eq!(
+            registry.snapshot("first").unwrap().safe_total_tokens,
+            0,
+            "a later pressure policy must invalidate earlier recovery evidence"
+        );
+    }
+
+    fn draining_registry_with_bounded_recovery_token() -> (
+        Arc<CapacityRegistry>,
+        DrainRegistration,
+        PublishedMemoryMeasurement,
+    ) {
+        let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
+        register(&registry, facts("first", 5 * GIB));
+        register(&registry, facts("second", 5 * GIB));
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 20 * GIB,
+            peak_bytes: 20 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+        let drain = registry.begin_drain("second").unwrap();
+        let decreased = registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 5 * GIB,
+            peak_bytes: 20 * GIB,
+            memory_limit_bytes: Some(14 * GIB),
+            metal_recommended_working_set_bytes: Some(14 * GIB),
+        });
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+        (registry, drain, decreased)
+    }
+
+    #[test]
+    fn cache_publication_invalidates_unregister_recovery() {
+        let (registry, drain, decreased) = draining_registry_with_bounded_recovery_token();
+        let plan = registry.cache_allocation_plan();
+        assert!(registry.publish_cache_allocation_revision(plan.revision));
+
+        registry.finish_unregister(drain, Some(decreased)).unwrap();
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+    }
+
+    #[test]
+    fn normal_noop_policy_recompute_conservatively_invalidates_recovery() {
+        let (registry, drain, decreased) = draining_registry_with_bounded_recovery_token();
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+
+        registry.finish_unregister(drain, Some(decreased)).unwrap();
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+    }
+
+    #[test]
+    fn policy_revision_overflow_permanently_disables_recovery_authority() {
+        let (registry, drain, _) = draining_registry_with_bounded_recovery_token();
+        registry.lock().capacity_policy_revision = Some(u64::MAX);
+        let decreased = registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 4 * GIB,
+            peak_bytes: 20 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        assert_eq!(registry.lock().capacity_policy_revision, None);
+
+        registry.finish_unregister(drain, Some(decreased)).unwrap();
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(registry.lock().capacity_policy_revision, None);
     }
 
     #[test]
